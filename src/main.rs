@@ -1,6 +1,7 @@
-use tokio::net::UdpSocket;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Duration, timeout, sleep};
 use tokio::sync::mpsc;
+use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use rand::Rng;
 use chrono::{DateTime, Utc};
 
@@ -9,64 +10,70 @@ fn generate_random_u8_array(length: usize) -> Vec<u8> {
     (0..length).map(|_| rng.random_range(0..=255)).collect()
 }
 
-// Send data over UDP
+// Send data over TCP
 async fn send_throughput(ip: &str, port: u16) -> Result<(), std::io::Error> {
-    let socket = UdpSocket::bind("127.0.0.1:0").await?;
-    socket.connect(format!("{}:{}", ip, port)).await?;
+    let mut stream = TcpStream::connect(format!("{}:{}", ip, port)).await?;
 
-    // we should make an adaptive MTU algorithm here to max all connections
-    let data = generate_random_u8_array(1400);
+    // TCP can handle larger chunks efficiently due to its streaming nature
+    let data = generate_random_u8_array(8192);
 
     let start_time = std::time::Instant::now();
 
-    // send first packet outside loop to catch MTU error etc
-    socket.send(data.as_slice()).await?;
+    // Send data continuously for 10 seconds
     while start_time.elapsed() < Duration::from_secs(10) {
-        match socket.send(data.as_slice()).await {
+        match stream.write_all(&data).await {
             Ok(_) => {}
             Err(_) => { break; }
         }
     }
 
+    // Ensure all data is sent before closing
+    stream.shutdown().await?;
     Ok(())
 }
 
 // Receive data and measure throughput
 async fn receive_throughput(port: u16, stats_tx: mpsc::Sender<(std::time::SystemTime, std::net::SocketAddr, usize, Duration)>) -> Result<(), std::io::Error> {
+    let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
+    
     loop {
-        let socket = UdpSocket::bind(format!("0.0.0.0:{}", port)).await?;
-        let mut buffer = [0; 65535]; // max UDP payload
-        let mut total_bytes = 0;
+        let (mut stream, client_addr) = listener.accept().await?;
+        let stats_tx = stats_tx.clone();
+        
+        // Handle each connection in a separate task
+        tokio::spawn(async move {
+            let mut buffer = [0; 8192];
+            let mut total_bytes = 0;
 
-        let start_time: std::time::Instant;
-        let test_time: std::time::SystemTime;
-        let client: std::net::SocketAddr;
+            // Start timing when connection is established
+            let start_time = std::time::Instant::now();
+            let test_time = std::time::SystemTime::now();
 
-        // wait for first connection and log the client
-        (_, client) = socket.recv_from(&mut buffer).await?;
+            let timeout_duration = Duration::from_secs(15); // Longer timeout for TCP
 
-        // start the clocks
-        start_time = std::time::Instant::now();
-        test_time = std::time::SystemTime::now();
-
-        let timeout_duration = Duration::from_secs(3);
-
-        while start_time.elapsed() < timeout_duration {
-            let (bytes, src) = timeout(timeout_duration,socket.recv_from(&mut buffer)).await??;
-            if src == client {
-                total_bytes += bytes;
+            // Read data until connection closes or timeout
+            loop {
+                match timeout(timeout_duration, stream.read(&mut buffer)).await {
+                    Ok(Ok(0)) => {
+                        // Connection closed by client
+                        break;
+                    }
+                    Ok(Ok(bytes_read)) => {
+                        total_bytes += bytes_read;
+                    }
+                    Ok(Err(_)) | Err(_) => {
+                        // Read error or timeout
+                        break;
+                    }
+                }
             }
-        }
 
-        let duration: Duration = start_time.elapsed();
+            let duration = start_time.elapsed();
 
-        // tell our caller
-        _ = stats_tx.send((test_time, client, total_bytes, duration)).await;
-
-        drop(socket);
-        sleep(Duration::from_secs(1)).await;
+            // Send stats back to main thread
+            _ = stats_tx.send((test_time, client_addr, total_bytes, duration)).await;
+        });
     }
-
 }
 
 fn format_bandwidth(
@@ -121,11 +128,12 @@ async fn main() {
         _ = receive_throughput(send_port, stats_tx).await;
     });
 
-    // Start sender
-    match send_throughput(send_ip, send_port).await {
-        Ok(()) => println!("Send completed successfully"),
-        Err(e) => eprintln!("Error testing throughput: {}", e),
-    }
+    // Give the receiver time to start listening
+    sleep(Duration::from_millis(100)).await;
+
+    // Start sender(s) to test
+    let promiseA = tokio::spawn(send_throughput(send_ip, send_port));
+    let promiseB = tokio::spawn(send_throughput(send_ip, send_port));
 
     while let Some((start_time, client, total_bytes, duration)) = stats_rx.recv().await {
         let throughput = (total_bytes as f64) / duration.as_secs_f64();
