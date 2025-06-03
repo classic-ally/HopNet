@@ -193,13 +193,15 @@ async fn receive_latency(port: u16, startup_tx: oneshot::Sender<()>) -> Result<(
 }
 
 async fn select_port() -> Result<(JoinHandle<Result<(), LatencyError>>, u16), LatencyError> {
-
     // pick random port in safe range
-    let mut rng = rand::rng();
     const MIN_PORT: u16 = 49152;
     const MAX_PORT: u16 = 65535;
 
-    let latency_port: u16 = rng.random_range(MIN_PORT..=MAX_PORT);
+    // Generate random port outside of async context to avoid Send issues
+    let latency_port: u16 = {
+        let mut rng = rand::rng();
+        rng.random_range(MIN_PORT..=MAX_PORT)
+    };
 
     // start the latency listener on this port
     let (latency_startup_tx, latency_startup_rx) = oneshot::channel();
@@ -220,7 +222,6 @@ async fn select_port() -> Result<(JoinHandle<Result<(), LatencyError>>, u16), La
             return Err(LatencyError::TimeoutError);
         }
     }
-
 }
 
 pub async fn listener() -> Result<(JoinHandle<Result<(), LatencyError>>, u16), LatencyError> {
