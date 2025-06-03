@@ -1,12 +1,14 @@
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc::error;
 use tokio::time::{Duration, timeout, sleep};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc,oneshot};
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use rand::Rng;
 use chrono::{DateTime, Utc};
 use core::time;
 use std::alloc::System;
 use std::net::IpAddr;
+use std::sync::mpsc::Receiver;
 use std::time::{SystemTime, SystemTimeError, UNIX_EPOCH};
 
 fn generate_random_u8_array(length: usize) -> Vec<u8> {
@@ -151,8 +153,11 @@ async fn send_latency(ip: IpAddr, port: u16) -> Result<(), LatencyError> {
     Ok(())
 }
 
-async fn receive_latency(port: u16) -> Result<(), std::io::Error> {
+async fn receive_latency(port: u16, startup_tx: oneshot::Sender<()>) -> Result<(), std::io::Error> {
     let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
+
+    // alert startup channel we've bound properly
+    _ = startup_tx.send(());
 
     let (mut stream, client_addr) = listener.accept().await?;
 
@@ -294,7 +299,7 @@ fn format_bandwidth(
 #[tokio::main]
 async fn main() {
     let send_ip: IpAddr = "127.0.0.1".parse().unwrap();
-    let send_port = 49369;
+    let send_port = 49370;
 
     // Interface to receiving task
     // let (stats_tx, mut stats_rx) = mpsc::channel(10);
@@ -304,19 +309,46 @@ async fn main() {
     //     _ = receive_throughput(send_port, stats_tx).await;
     // });
 
-    // Give the receiver time to start listening
-    sleep(Duration::from_millis(100)).await;
+    // startup task for latency listener
+    let (latency_startup_tx, latency_startup_rx) = oneshot::channel();
 
-    let latency_task = tokio::spawn(receive_latency(send_port));
+    let latency_task = tokio::spawn(receive_latency(send_port, latency_startup_tx));
 
-    _ = sleep(Duration::from_secs(1)).await;
+    // timeout for maximum time to wait for latency task to start up
+    let timeout_duration = Duration::from_secs(5);
+
+    match timeout(timeout_duration, latency_startup_rx).await {
+        Ok(Ok(())) => {
+            let send_task = tokio::spawn(send_latency(send_ip, send_port));
+            match send_task.await {
+                Ok(Ok(())) => {
+                    println!("Send latency task completed successfully");
+                    _ = latency_task.await;
+                }
+                Ok(Err(e)) => {
+                    println!("Send latency task failed: {:?}", e);
+                }
+                Err(e) => {
+                    println!("Send latency task panicked: {:?}", e);
+                }
+            }
+            
+        }
+        Ok(Err(_)) => {
+            println!("Failed to receive startup signal from latency task");
+            return;
+        }
+        Err(_) => {
+            println!("Timeout waiting for latency task to start");
+            return;
+        }
+    }
 
     // Start sender(s) to test
     // let promiseA = tokio::spawn(send_throughput(send_ip, send_port));
     // let promiseB = tokio::spawn(send_throughput(send_ip, send_port));
 
-    let latency_sender = tokio::spawn(send_latency(send_ip, send_port));
-
+    
     // while let Some((start_time, client, total_bytes, duration)) = stats_rx.recv().await {
     //     let throughput = (total_bytes as f64) / duration.as_secs_f64();
     //     let datetime: DateTime<Utc> = start_time.into();
@@ -325,6 +357,5 @@ async fn main() {
     // } 
 
     // _ = receive_task.await;
-    _ = latency_task.await;
 
 }
