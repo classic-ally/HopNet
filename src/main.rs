@@ -1,27 +1,39 @@
 use axum::{
-    extract::Query,
-    http::StatusCode,
-    routing::get,
-    serve,
-    Router,
-    Json,
-    response::IntoResponse
+    extract::Query, http::{HeaderValue, StatusCode, Method}, response::IntoResponse, routing::get, serve, Json, Router
 };
 use std::net::IpAddr;
 use serde::{Serialize, Deserialize};
-use serde_json;
+use tower_serve_static::ServeDir;
+use tower_http::cors::CorsLayer;
+use include_dir::{Dir, include_dir};
 
 mod metrics;
+
+static ASSETS_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../frontend/dist");
 
 #[tokio::main]
 async fn main() {
     // tracing
     tracing_subscriber::fmt::init();
 
-    let app = Router::new()
-        .route("/", get(get_root))
+    let admin_service = ServeDir::new(&ASSETS_DIR);
+
+    let base_app = Router::new()
+        .fallback_service(admin_service) // routes we don't have get sent to vite frontend
         .route("/rpc/latency-server", get(get_latency_server))
         .route("/rpc/get-remote-latency", get(get_remote_latency_handler));
+
+    let app = if cfg!(debug_assertions) {
+        let cors = CorsLayer::new()
+            .allow_origin("http://localhost:5173".parse::<HeaderValue>().unwrap()) // allow vite dev
+            .allow_methods([Method::GET])
+            .max_age(std::time::Duration::from_secs(3600))
+            .allow_credentials(false);
+
+        base_app.layer(cors)
+    } else {
+        base_app // no CORS in prod
+    };
 
     match tokio::net::TcpListener::bind("0.0.0.0:34632").await {
         Ok(listener) => {
@@ -29,10 +41,6 @@ async fn main() {
         }
         Err(error) => {panic!("{}", error)}
     }
-}
-
-async fn get_root() -> &'static str {
-    "Version 2025-06-03"
 }
 
 async fn get_latency_server() -> impl IntoResponse {
