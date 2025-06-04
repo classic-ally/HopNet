@@ -1,4 +1,5 @@
 use axum::{
+    extract::Query,
     http::StatusCode,
     routing::get,
     serve,
@@ -6,6 +7,9 @@ use axum::{
     Json,
     response::IntoResponse
 };
+use std::net::IpAddr;
+use serde::{Serialize, Deserialize};
+use serde_json;
 
 mod metrics;
 
@@ -15,10 +19,11 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     let app = Router::new()
-        .route("/", get(root))
-        .route("/rpc/start-latency", get(start_latency));
+        .route("/", get(get_root))
+        .route("/rpc/latency-server", get(get_latency_server))
+        .route("/rpc/get-remote-latency", get(get_remote_latency_handler));
 
-    match tokio::net::TcpListener::bind("0.0.0.0:6000").await {
+    match tokio::net::TcpListener::bind("0.0.0.0:34632").await {
         Ok(listener) => {
             serve(listener, app).await.unwrap();
         }
@@ -26,11 +31,11 @@ async fn main() {
     }
 }
 
-async fn root() -> &'static str {
+async fn get_root() -> &'static str {
     "Version 2025-06-03"
 }
 
-async fn start_latency() -> impl IntoResponse {
+async fn get_latency_server() -> impl IntoResponse {
     match metrics::latency::listener().await {
         Ok((_, latency_port)) => {
             (StatusCode::CREATED, Json(latency_port))
@@ -39,4 +44,89 @@ async fn start_latency() -> impl IntoResponse {
             (StatusCode::INTERNAL_SERVER_ERROR, Json(0))
         }
     }
+}
+
+#[derive(Deserialize)]
+struct RemoteLatencyQuery {
+    ip: String,
+}
+
+async fn get_remote_latency_handler(Query(params): Query<RemoteLatencyQuery>) -> impl IntoResponse {
+    let (status, response) = get_remote_latency(&params.ip).await;
+    match response {
+        Some(latency_response) => (status, Json(LatencyResponseWrapper::Success(latency_response))),
+        None => (status, Json(LatencyResponseWrapper::Error(ErrorResponse { error: "Failed to get remote latency".to_string() })))
+    }
+}
+
+async fn get_remote_latency(str_ip: &str) -> (StatusCode, Option<LatencyResponse>) {
+    // let's hit the remote
+    let url = format!("http://{}:34632/rpc/latency-server", str_ip);
+    match reqwest::get(&url).await {
+        Ok(response) => {
+            if response.status().is_success() {
+                match response.text().await {
+                    Ok(str) => {
+                        match str.parse::<u16>() {
+                            // yes it's a u16
+                            Ok(port) => {
+                                match str_ip.parse::<IpAddr>() {
+                                    Ok(ip) => {
+                                        match metrics::latency::send_latency(ip, port).await {
+                                            Ok((average_rtt, variance, jitter)) => {
+                                                let response = LatencyResponse {
+                                                    address: str_ip.to_string() + ":" + &str,
+                                                    average_rtt: average_rtt,
+                                                    variance: variance,
+                                                    jitter: jitter,
+                                                };
+                                                return (StatusCode::OK, Some(response));
+                                            }
+                                            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, None)
+                                        }
+                                    }
+                                    Err(_) => (StatusCode::UNPROCESSABLE_ENTITY, None)
+                                }
+                            }
+                            // port isn't a u16-> gateway is naughty
+                            Err(_) => (StatusCode::BAD_GATEWAY, None)
+                        }
+                    }
+                    Err(_) => (StatusCode::BAD_GATEWAY, None)
+                }
+            } else {
+                return (response.status(), None)
+            }
+        }
+        Err(e) => {
+            // handle reqwest errors
+            match e.status() {
+                Some(status) => (status, None),
+                None => (StatusCode::GATEWAY_TIMEOUT, None)
+            }
+        }
+    }
+}
+
+// response for remote latency
+#[derive(Serialize)]
+struct LatencyResponse {
+    address: String,
+    average_rtt: f64,
+    variance: f64,
+    jitter: f64,
+}
+
+// error response
+#[derive(Serialize)]
+struct ErrorResponse {
+    error: String,
+}
+
+// unified response wrapper
+#[derive(Serialize)]
+#[serde(untagged)]
+enum LatencyResponseWrapper {
+    Success(LatencyResponse),
+    Error(ErrorResponse),
 }

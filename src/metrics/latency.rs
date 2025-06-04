@@ -105,12 +105,11 @@ fn calculate_rtt_metrics(rtts: Vec<Duration>) -> (f64, f64, f64) {
 }
 
 // Send latency data over TCP
-pub async fn send_latency(ip: IpAddr, port: u16) -> Result<(), LatencyError> {
+pub async fn send_latency(ip: IpAddr, port: u16) -> Result<(f64, f64, f64), LatencyError> {
     let mut stream = match TcpStream::connect(format!("{}:{}", ip, port)).await {
         Ok(stream) => stream,
         Err(_) => return Err(LatencyError::NetworkError)
     };
-    println!("Connected to {}:{}", ip, port);
     let mut buffer = [0; 24];
 
     let mut rtts: Vec<Duration> = Vec::new();
@@ -142,9 +141,9 @@ pub async fn send_latency(ip: IpAddr, port: u16) -> Result<(), LatencyError> {
     // calculate RTT average, variance, jitter
     let (average_rtt, variance, jitter) = calculate_rtt_metrics(rtts);
 
-    println!("RTT Average: {:.2} ms | RTT Variance: {:.2} ms^2 | Jitter: {:.2} ms", average_rtt, variance, jitter);
+    // println!("RTT Average: {:.2} ms | RTT Variance: {:.2} ms^2 | Jitter: {:.2} ms", average_rtt, variance, jitter);
 
-    Ok(())
+    Ok((average_rtt, variance, jitter))
 }
 
 async fn receive_latency(port: u16, startup_tx: oneshot::Sender<()>) -> Result<(), LatencyError> {
