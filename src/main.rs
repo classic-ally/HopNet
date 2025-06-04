@@ -9,7 +9,7 @@ use include_dir::{Dir, include_dir};
 
 mod metrics;
 
-static ASSETS_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../frontend/dist");
+static ASSETS_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/frontend/dist");
 
 #[tokio::main]
 async fn main() {
