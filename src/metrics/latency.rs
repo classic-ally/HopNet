@@ -7,6 +7,8 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use rand::Rng;
 
+use crate::db;
+
 #[derive(Debug)]
 pub enum LatencyError {
     MalformedTimestamp,
@@ -17,7 +19,8 @@ pub enum LatencyError {
     PortError,
     TimeoutError,
     CrashError,
-    SocketError
+    SocketError,
+    DatabaseError
 }
 
 // Measure latency
@@ -105,7 +108,11 @@ fn calculate_rtt_metrics(rtts: Vec<Duration>) -> (f64, f64, f64) {
 }
 
 // Send latency data over TCP
-pub async fn send_latency(ip: IpAddr, port: u16) -> Result<(f64, f64, f64), LatencyError> {
+pub async fn send_latency(
+    db: &std::sync::Arc<std::sync::Mutex<duckdb::Connection>>, 
+    ip: IpAddr, 
+    port: u16
+) -> Result<(f64, f64, f64), LatencyError> {
     let mut stream = match TcpStream::connect(format!("{}:{}", ip, port)).await {
         Ok(stream) => stream,
         Err(_) => return Err(LatencyError::NetworkError)
@@ -118,6 +125,7 @@ pub async fn send_latency(ip: IpAddr, port: u16) -> Result<(f64, f64, f64), Late
     let max_total_duration = Duration::from_secs(5);
 
     let start_time = std::time::Instant::now();
+    let sys_start_time = std::time::SystemTime::now();
 
     while start_time.elapsed() < max_total_duration {
         // Actual data transmission
@@ -141,9 +149,27 @@ pub async fn send_latency(ip: IpAddr, port: u16) -> Result<(f64, f64, f64), Late
     // calculate RTT average, variance, jitter
     let (average_rtt, variance, jitter) = calculate_rtt_metrics(rtts);
 
+    let metric = db::Metric {
+        from_node: 1000,
+        to_node: 1000,
+        start_time: sys_start_time,
+        duration: max_total_duration,
+        rtt_latency: Some(average_rtt),
+        rtt_variance: Some(variance),
+        rtt_jitter: Some(jitter),
+        throughput: None,
+        version: 0
+    };
+
+    // database write
+    match db::insert_metric(db, metric) {
+        Ok(()) => Ok((average_rtt, variance, jitter)),
+        Err(_) => Err(LatencyError::DatabaseError)
+    }
+
     // println!("RTT Average: {:.2} ms | RTT Variance: {:.2} ms^2 | Jitter: {:.2} ms", average_rtt, variance, jitter);
 
-    Ok((average_rtt, variance, jitter))
+    
 }
 
 async fn receive_latency(port: u16, startup_tx: oneshot::Sender<()>) -> Result<(), LatencyError> {
