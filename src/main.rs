@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Query, State}, http::{HeaderValue, Method, StatusCode}, response::IntoResponse, routing::get, serve, Json, Router
+    extract::{Query, State}, http::{HeaderValue, Method, StatusCode}, response::IntoResponse, routing::{get,post}, serve, Json, Router
 };
 use std::net::IpAddr;
 use serde::{Serialize, Deserialize};
@@ -26,6 +26,8 @@ async fn main() {
             let base_app = Router::new()
                 .fallback_service(admin_service) // routes we don't have get sent to vite frontend
                 .route("/metrics/get-all", get(get_metrics))
+                .route("/users", get(get_users))
+                .route("/users", post(post_users))
                 .route("/rpc/latency-server", get(get_latency_server))
                 .route("/rpc/get-remote-latency", get(get_remote_latency_handler));
 
@@ -84,6 +86,46 @@ async fn get_metrics(
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(Vec::<db::Metric>::new())),
+    }
+}
+
+async fn get_users(
+    State(db): State<std::sync::Arc<std::sync::Mutex<duckdb::Connection>>>,
+) -> impl IntoResponse {
+    match db::get_users(&db) {
+        Ok(users) => {
+            (StatusCode::OK, Json(users))
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(Vec::<db::User>::new())
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct UserRequest {
+    username: String,
+    password_hash: String,
+}
+
+async fn post_users (
+    State(db): State<std::sync::Arc<std::sync::Mutex<duckdb::Connection>>>,
+    Json(payload): Json<UserRequest>
+) -> impl IntoResponse {
+    let user = db::User {
+        user_id: 0,
+        username: payload.username,
+        password_hash: payload.password_hash,
+    };
+
+    match db::insert_user(&db, user) {
+        Ok(()) => {
+            (StatusCode::CREATED)
+        },
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR
+        ),
     }
 }
 

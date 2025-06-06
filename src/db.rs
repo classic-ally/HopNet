@@ -25,10 +25,57 @@ pub struct Metric {
     pub version: u8
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+pub struct User {
+    pub user_id: i32,
+    pub username: String,
+    pub password_hash: String,
+}
+
 pub fn initialize() -> Result<Arc<Mutex<Connection>>, Error> {
     let db = Connection::open(":memory:")?;
     db.execute_batch(
         "
+            CREATE TABLE sequences (
+                name            TEXT PRIMARY KEY,
+                next_id         INTEGER NOT NULL
+            );
+
+            INSERT INTO sequences (name, next_id) VALUES ('users', 1);
+            INSERT INTO sequences (name, next_id) VALUES ('nodes', 1);
+
+            CREATE TABLE users (
+                user_id         INTEGER PRIMARY KEY,
+                username        VARCHAR NOT NULL,
+                password_hash   VARCHAR NOT NULL,
+
+                CONSTRAINT unique_username UNIQUE (username)
+            );
+
+            CREATE TABLE nodes (
+                node_id         INTEGER PRIMARY KEY,
+                ip_address      VARCHAR NOT NULL,
+                port            INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
+                owner           INTEGER NOT NULL,
+
+                -- CONSTRAINT enables indexed lookup of these
+                CONSTRAINT unique_endpoint UNIQUE (ip_address, port),
+
+                FOREIGN KEY (owner) REFERENCES users(user_id)
+            );
+
+            -- Common query patterns: 
+            -- 1. user owns what nodes?
+            CREATE INDEX idx_nodes_owner ON nodes(owner);
+            -- 2. what node is this IP? (enabled by CONSTRAINT)
+
+            CREATE TABLE this_node (
+                internal_id     INTEGER PRIMARY KEY DEFAULT 1,
+                node_id         INTEGER NOT NULL UNIQUE,
+
+                FOREIGN KEY (node_id) REFERENCES nodes(node_id)
+            );
+
             CREATE TABLE metrics (
                 from_node       INTEGER NOT NULL,
                 to_node         INTEGER NOT NULL,
@@ -38,13 +85,16 @@ pub fn initialize() -> Result<Arc<Mutex<Connection>>, Error> {
                 rtt_variance    REAL,
                 rtt_jitter      REAL,
                 throughput      BIGINT,
-                version         TINYINT NOT NULL,
-                PRIMARY KEY     (from_node, to_node, start_time)
+                version         TINYINT NOT NULL DEFAULT 0,
+                PRIMARY KEY     (from_node, to_node, start_time),
+                FOREIGN KEY (from_node) REFERENCES nodes(node_id),
+                FOREIGN KEY (to_node)   REFERENCES nodes(node_id)
             );
 
             -- Create indexes for common query patterns
-            CREATE INDEX idx_start_time ON metrics(start_time);
-            CREATE INDEX idx_version ON metrics(version);
+            CREATE INDEX idx_metrics_time_range ON metrics(start_time, from_node, to_node);
+            CREATE INDEX idx_metrics_from_node ON metrics(from_node, start_time);
+            CREATE INDEX idx_metrics_to_node ON metrics(to_node, start_time);
 
             -- Add comments for documentation
             COMMENT ON TABLE metrics IS 'Network performance metrics between distributed system nodes';
@@ -144,6 +194,69 @@ pub fn get_metric(
 
             match results {
                 Ok(metrics) => Ok(metrics.collect::<Result<_, _>>().map_err(|_| DatabaseError::ProcessingError)?), // collect into Vec
+                Err(e) => {
+                    dbg!(e);
+                    Err(DatabaseError::RecordError)
+                }
+            }
+        },
+        Err(e) => {
+            dbg!(e);
+            Err(DatabaseError::LockError)
+        }
+    }
+}
+
+pub fn insert_user(
+    db: &Arc<Mutex<Connection>>,
+    user: User,
+) -> Result<(), DatabaseError> {
+
+    match db.lock() {
+        Ok(mut db_lock) => {
+            let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
+            let next_id = tx.query_row(
+                "SELECT next_id FROM sequences WHERE name = 'users'",
+                [],
+                |row| row.get::<_, i32>(0)
+            ).map_err(|_| DatabaseError::RecallError)?;
+            tx.execute(
+                "INSERT INTO users (user_id, username, password_hash) VALUES (?, ?, ?)",
+                params![next_id, user.username, user.password_hash]
+            ).map_err(|_| DatabaseError::InsertError)?;
+            
+            // Update the sequence for next user
+            tx.execute(
+                "UPDATE sequences SET next_id = next_id + 1 WHERE name = 'users'",
+                []
+            ).map_err(|_| DatabaseError::InsertError)?;
+            
+            // Commit the transaction
+            tx.commit().map_err(|_| DatabaseError::InsertError)?;
+            
+            dbg!("Successfully inserted user");
+            Ok(())
+        },
+        Err(_) => Err(DatabaseError::LockError),
+    }
+}
+
+pub fn get_users(
+    db: &Arc<Mutex<Connection>>,
+) -> Result<Vec<User>, DatabaseError> {
+    match db.lock() {
+        Ok(db_lock) => {
+            let mut stmt = db_lock.prepare("SELECT * FROM users").map_err(|_| DatabaseError::RecallError)?;
+            let results = stmt.query_map([], |row| {
+                Ok(User {
+                    user_id: row.get(0)?,
+                    username: row.get(1)?,
+                    password_hash: row.get(2)?,
+                })
+            });
+
+            match results {
+                Ok(users) => Ok(users.collect::<Result<_, _>>().map_err(|_| DatabaseError::ProcessingError)?),
                 Err(e) => {
                     dbg!(e);
                     Err(DatabaseError::RecordError)
