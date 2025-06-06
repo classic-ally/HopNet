@@ -4,13 +4,14 @@
     import SetupPane from "./SetupPane.svelte";
 
     export let onBackButton: () => void;
+    export let onForwardButton: () => void;
     export let username = '';
     export let password = '';
 </script>
 
 <SetupPane
-        title="Create a User Account"
-        body="This is your shared identity across the network, used for encrypting and delegating access to your files."
+    title="Create a User Account"
+    body="This is your shared identity across the network, used for encrypting and delegating access to your files."
 >
     {#snippet features()}
         <EntryRow
@@ -32,6 +33,12 @@
             icon="i-carbon-chevron-left"
             text="Back"
             onClick={() => {onBackButton()}}
+        />
+        <Button
+            icon="i-carbon-chevron-right"
+            text="Next"
+            onClick={() => {onForwardButton()}}
+            position="right"
         />
     {/snippet}
 </SetupPane>

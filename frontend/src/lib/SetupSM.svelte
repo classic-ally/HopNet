@@ -5,11 +5,17 @@
 -->
 
 <script lang="ts">
+    import ConfigureDevice from "./ConfigureDevice.svelte";
     import CreateNetwork from "./CreateNetwork.svelte";
     import InitialSetup from "./InitialSetup.svelte";
     let initialSetup = true;
+
+    // pane 1
     let createNetwork = false;
     let joinNetwork = false;
+
+    // pane 2
+    let configureDevice = false;
 </script>
 
 <div>
@@ -31,7 +37,19 @@
             initialSetup = true;
             createNetwork = false;
           }}
+          onForwardButton={() => {
+            configureDevice = true;
+            createNetwork = false;
+          }}
         />
+      {/if}
+      {#if configureDevice}
+          <ConfigureDevice
+            onBackButton={() => {
+              createNetwork = true;
+              configureDevice = false;
+            }}
+          />
       {/if}
     {/if}
 

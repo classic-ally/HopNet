@@ -54,6 +54,7 @@ pub fn initialize() -> Result<Arc<Mutex<Connection>>, Error> {
 
             CREATE TABLE nodes (
                 node_id         INTEGER PRIMARY KEY,
+                name            VARCHAR NOT NULL,
                 ip_address      VARCHAR NOT NULL,
                 port            INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
                 owner           INTEGER NOT NULL,
