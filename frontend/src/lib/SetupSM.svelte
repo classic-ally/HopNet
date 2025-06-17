@@ -6,6 +6,7 @@
 
 <script lang="ts">
     import ConfigureDevice from "./ConfigureDevice.svelte";
+    import ConfirmPane from "./ConfirmPane.svelte";
     import CreateNetwork from "./CreateNetwork.svelte";
     import InitialSetup from "./InitialSetup.svelte";
     let initialSetup = true;
@@ -16,6 +17,16 @@
 
     // pane 2
     let configureDevice = false;
+
+    // pane 3
+    let confirmSelections = false;
+
+    // State variables for user data
+    let username = '';
+    let password = '';
+    let computername = '';
+    let ip = '';
+
 </script>
 
 <div>
@@ -33,6 +44,8 @@
     {:else}
       {#if createNetwork}
         <CreateNetwork
+          bind:username
+          bind:password
           onBackButton={() => {
             initialSetup = true;
             createNetwork = false;
@@ -45,11 +58,29 @@
       {/if}
       {#if configureDevice}
           <ConfigureDevice
+            bind:computername
+            bind:ip
             onBackButton={() => {
               createNetwork = true;
               configureDevice = false;
             }}
+            onForwardButton={() => {
+              confirmSelections = true;
+              configureDevice = false;
+            }}
           />
+      {/if}
+      {#if confirmSelections}
+            <ConfirmPane
+              username={username}
+              password={password}
+              computername={computername}
+              ip={ip}
+              onBackButton={() => {
+                configureDevice = true;
+                confirmSelections = false;
+              }}
+            />
       {/if}
     {/if}
 

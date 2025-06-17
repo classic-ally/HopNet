@@ -18,13 +18,13 @@
             icon="i-carbon-user"
             title="Username"
             password={false}
-            value={username}
+            bind:value={username}
         />
         <EntryRow
             icon="i-carbon-password"
             title="Password"
             password={true}
-            value={password}
+            bind:value={password}
         />
     {/snippet}
 

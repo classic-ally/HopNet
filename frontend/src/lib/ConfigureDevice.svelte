@@ -5,6 +5,7 @@
     import SetupPane from "./SetupPane.svelte";
 
     export let onBackButton: () => void;
+    export let onForwardButton: () => void;
     export let computername = '';
 
     export let ip: string;
@@ -20,12 +21,12 @@
             icon="i-carbon-devices"
             title="Device name"
             password={false}
-            value={computername}
+            bind:value={computername}
         />
         <NetworkDropdown
             icon="i-carbon-plug"
             title="Select network interface"
-            selected={ip}
+            bind:selected={ip}
         />
 
     {/snippet}
@@ -35,6 +36,12 @@
             icon="i-carbon-chevron-left"
             text="Back"
             onClick={() => {onBackButton()}}
+        />
+        <Button
+            icon="i-carbon-chevron-right"
+            text="Next"
+            onClick={() => {onForwardButton()}}
+            position="right"
         />
     {/snippet}
 </SetupPane>
