@@ -11,6 +11,7 @@ use duckdb::{Connection, Error};
 
 mod metrics;
 mod db;
+mod interfaces;
 
 static ASSETS_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/frontend/dist");
 
@@ -28,6 +29,7 @@ async fn main() {
                 .route("/metrics/get-all", get(get_metrics))
                 .route("/users", get(get_users))
                 .route("/users", post(post_users))
+                .route("/interfaces", get(interfaces::get_interfaces))
                 .route("/rpc/latency-server", get(get_latency_server))
                 .route("/rpc/get-remote-latency", get(get_remote_latency_handler));
 

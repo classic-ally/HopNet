@@ -7,6 +7,8 @@
     export let onBackButton: () => void;
     export let computername = '';
 
+    export let ip: string;
+
 </script>
 
 <SetupPane
@@ -21,7 +23,9 @@
             value={computername}
         />
         <NetworkDropdown
-            
+            icon="i-carbon-plug"
+            title="Select network interface"
+            selected={ip}
         />
 
     {/snippet}
