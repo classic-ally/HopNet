@@ -4,6 +4,14 @@ use std::time::{SystemTime,Duration};
 use serde::{Serialize,Deserialize};
 use chrono::{DateTime, Utc};
 
+use argon2::{
+    password_hash::{
+        rand_core::OsRng,
+        PasswordHasher, SaltString
+    },
+    Argon2
+};
+
 pub enum DatabaseError {
     LockError,
     InsertError,
@@ -29,7 +37,16 @@ pub struct Metric {
 pub struct User {
     pub user_id: i32,
     pub username: String,
-    pub password_hash: String,
+    pub password: String,
+}
+
+impl User {
+    pub fn password_hash(&mut self) -> Result<String, argon2::password_hash::Error> {
+        let salt = SaltString::generate(&mut OsRng);
+        let argon2 = Argon2::default();
+        let password_hash = argon2.hash_password(self.password.as_bytes(), &salt)?.to_string();
+        Ok(password_hash)
+    }
 }
 
 pub fn initialize() -> Result<Arc<Mutex<Connection>>, Error> {
@@ -108,6 +125,77 @@ pub fn initialize() -> Result<Arc<Mutex<Connection>>, Error> {
         "
     )?;
     Ok(Arc::new(Mutex::new(db)))
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Node {
+    pub node_id: i32,
+    pub name: String,
+    pub ip_address: String,
+    pub port: i32,
+    pub owner: i32, // userid corresponding to owner
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SetupObject {
+    pub user: User,
+    pub node: Node,
+}
+
+pub fn initial_setup(
+    db: &Arc<Mutex<Connection>>,
+    mut setupobj: SetupObject
+) -> Result<(), DatabaseError> {
+    match db.lock() {
+        Ok(mut db_lock) => {
+
+            // compute user password
+            let password_hash = setupobj.user.password_hash().map_err(|_| DatabaseError::ProcessingError)?;
+
+            // insert the user first
+            let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
+            let next_user_id = tx.query_row(
+                "SELECT next_id FROM sequences WHERE name = 'users'",
+                [],
+                |row| row.get::<_, i32>(0)
+            ).map_err(|_| DatabaseError::RecallError)?;
+            tx.execute(
+                "INSERT INTO users (user_id, username, password_hash) VALUES (?, ?, ?)",
+                params![next_user_id, setupobj.user.username, password_hash]
+            ).map_err(|_| DatabaseError::InsertError)?;
+            // Update the sequence for next user
+            tx.execute(
+                "UPDATE sequences SET next_id = next_id + 1 WHERE name = 'users'",
+                []
+            ).map_err(|_| DatabaseError::InsertError)?;
+
+            // insert the node
+            let next_node_id = tx.query_row(
+                "SELECT next_id FROM sequences WHERE name = 'nodes'",
+                [],
+                |row| row.get::<_, i32>(0)
+            ).map_err(|_| DatabaseError::RecallError)?;
+            tx.execute(
+                "INSERT INTO nodes (node_id, name, ip_address, port, owner) VALUES (?, ?, ?, ?, ?)",
+                params![next_node_id, setupobj.node.name, setupobj.node.ip_address, setupobj.node.port, next_user_id]
+            ).map_err(|_| DatabaseError::InsertError)?;
+
+            // Update sequence
+            tx.execute(
+                "UPDATE sequences SET next_id = next_id + 1 WHERE name = 'nodes'", 
+                []
+            ).map_err(|_| DatabaseError::InsertError)?;
+
+            // Commit the transaction
+            tx.commit().map_err(|_| DatabaseError::InsertError)?;
+            
+            dbg!("Successfully inserted setup info");
+
+            Ok(())
+
+        }
+        Err(_) => Err(DatabaseError::LockError)
+    }
 }
 
 pub fn insert_metric(
@@ -223,7 +311,7 @@ pub fn insert_user(
             ).map_err(|_| DatabaseError::RecallError)?;
             tx.execute(
                 "INSERT INTO users (user_id, username, password_hash) VALUES (?, ?, ?)",
-                params![next_id, user.username, user.password_hash]
+                params![next_id, user.username, user.password]
             ).map_err(|_| DatabaseError::InsertError)?;
             
             // Update the sequence for next user
@@ -252,7 +340,7 @@ pub fn get_users(
                 Ok(User {
                     user_id: row.get(0)?,
                     username: row.get(1)?,
-                    password_hash: row.get(2)?,
+                    password: row.get(2)?,
                 })
             });
 

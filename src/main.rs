@@ -7,7 +7,7 @@ use tower_serve_static::ServeDir;
 use tower_http::cors::CorsLayer;
 use include_dir::{Dir, include_dir};
 
-use duckdb::{Connection, Error};
+use duckdb::Connection;
 
 mod metrics;
 mod db;
@@ -29,6 +29,7 @@ async fn main() {
                 .route("/metrics/get-all", get(get_metrics))
                 .route("/users", get(get_users))
                 .route("/users", post(post_users))
+                .route("/setup", post(post_setup))
                 .route("/interfaces", get(interfaces::get_interfaces))
                 .route("/rpc/latency-server", get(get_latency_server))
                 .route("/rpc/get-remote-latency", get(get_remote_latency_handler));
@@ -36,7 +37,8 @@ async fn main() {
             let app = if cfg!(debug_assertions) {
                 let cors = CorsLayer::new()
                     .allow_origin("http://localhost:5173".parse::<HeaderValue>().unwrap()) // allow vite dev
-                    .allow_methods([Method::GET])
+                    .allow_methods([Method::GET, Method::POST])
+                    .allow_headers([axum::http::header::CONTENT_TYPE])
                     .max_age(std::time::Duration::from_secs(3600))
                     .allow_credentials(false);
 
@@ -108,7 +110,7 @@ async fn get_users(
 #[derive(Deserialize)]
 struct UserRequest {
     username: String,
-    password_hash: String,
+    password: String,
 }
 
 async fn post_users (
@@ -118,19 +120,24 @@ async fn post_users (
     let user = db::User {
         user_id: 0,
         username: payload.username,
-        password_hash: payload.password_hash,
+        password: payload.password,
     };
 
     match db::insert_user(&db, user) {
-        Ok(()) => {
-            (StatusCode::CREATED)
-        },
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR
-        ),
+        Ok(()) => StatusCode::CREATED,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
+async fn post_setup(
+    State(db): State<std::sync::Arc<std::sync::Mutex<duckdb::Connection>>>,
+    Json(payload): Json<db::SetupObject>
+) -> impl IntoResponse {
+    match db::initial_setup(&db, payload) {
+        Ok(()) => StatusCode::CREATED,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
 
 async fn get_remote_latency_handler(
     Query(params): Query<RemoteLatencyQuery>,
