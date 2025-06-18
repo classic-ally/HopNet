@@ -52,6 +52,8 @@
             if (response.ok) {
                 console.log('Setup completed successfully');
                 onSetupComplete();
+                // Reload the page to trigger the setup check in App.svelte
+                window.location.reload();
             } else {
                 throw new Error(`Setup failed with status: ${response.status}`);
             }

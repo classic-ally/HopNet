@@ -80,6 +80,9 @@
                 configureDevice = true;
                 confirmSelections = false;
               }}
+              onSetupComplete={() => {
+                // Setup completed, page will reload automatically
+              }}
             />
       {/if}
     {/if}

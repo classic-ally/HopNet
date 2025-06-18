@@ -1,4 +1,6 @@
+use argon2::PasswordVerifier;
 use duckdb::{params, Connection, Error};
+use reqwest::StatusCode;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime,Duration};
 use serde::{Serialize,Deserialize};
@@ -7,7 +9,7 @@ use chrono::{DateTime, Utc};
 use argon2::{
     password_hash::{
         rand_core::OsRng,
-        PasswordHasher, SaltString
+        PasswordHash, PasswordHasher, SaltString
     },
     Argon2
 };
@@ -46,6 +48,10 @@ impl User {
         let argon2 = Argon2::default();
         let password_hash = argon2.hash_password(self.password.as_bytes(), &salt)?.to_string();
         Ok(password_hash)
+    }
+    pub fn verify_password(&mut self, check_password: &[u8]) -> Result<bool, argon2::password_hash::Error> {
+        let parsed_hash = PasswordHash::new(&self.password)?;
+        return Ok(Argon2::default().verify_password(check_password, &parsed_hash).is_ok());
     }
 }
 
@@ -142,7 +148,29 @@ pub struct SetupObject {
     pub node: Node,
 }
 
-pub fn initial_setup(
+pub fn get_initial_setup(
+    db: &Arc<Mutex<Connection>>
+) -> Result<StatusCode, DatabaseError> {
+    match db.lock() {
+        Ok(db_lock) => {
+            // if there is entry in the this_node table, we're set up
+            let count = db_lock.query_row(
+                "SELECT COUNT(*) FROM this_node",
+                [],
+                |row| row.get::<_, i32>(0)
+            ).map_err(|_| DatabaseError::RecallError)?;
+
+            if count > 0 {
+                return Ok(StatusCode::OK);
+            } else {
+                return Ok(StatusCode::NOT_FOUND);
+            }
+        },
+        Err(_) => Err(DatabaseError::LockError)
+    }
+}
+
+pub fn post_initial_setup(
     db: &Arc<Mutex<Connection>>,
     mut setupobj: SetupObject
 ) -> Result<(), DatabaseError> {
@@ -184,6 +212,13 @@ pub fn initial_setup(
             tx.execute(
                 "UPDATE sequences SET next_id = next_id + 1 WHERE name = 'nodes'", 
                 []
+            ).map_err(|_| DatabaseError::InsertError)?;
+            
+
+            // also write this node so we know setup is completed
+            tx.execute(
+                "INSERT INTO this_node (internal_id, node_id) VALUES (?, ?)",
+                params![1, next_node_id]
             ).map_err(|_| DatabaseError::InsertError)?;
 
             // Commit the transaction
@@ -356,5 +391,59 @@ pub fn get_users(
             dbg!(e);
             Err(DatabaseError::LockError)
         }
+    }
+}
+
+pub fn get_user_by_username(
+    db: &Arc<Mutex<Connection>>,
+    username: String,
+) -> Result<Option<User>, DatabaseError> {
+    match db.lock() {
+        Ok(db_lock) => {
+            let mut stmt = db_lock.prepare(
+                "SELECT * FROM users WHERE username = ?"
+            ).map_err(|_|DatabaseError::RecallError)?;
+
+            let mut rows = stmt.query(&[&username]).map_err(|_|DatabaseError::RecallError)?;
+
+            if let Some(row) = rows.next().map_err(|_| DatabaseError::RecallError)? {
+                let user = User {
+                    user_id: row.get(0).map_err(|_| DatabaseError::RecallError)?,
+                    username: row.get(1).map_err(|_| DatabaseError::RecallError)?,
+                    password: row.get(2).map_err(|_| DatabaseError::RecallError)?
+                };
+                return Ok(Some(user))
+            } else {
+                return Ok(None)
+            }
+        }
+        Err(_) => Err(DatabaseError::LockError)
+    }
+}
+
+pub fn get_user_by_userid(
+    db: &Arc<Mutex<Connection>>,
+    userid: i32,
+) -> Result<Option<User>, DatabaseError> {
+    match db.lock() {
+        Ok(db_lock) => {
+            let mut stmt = db_lock.prepare(
+                "SELECT * FROM users WHERE user_id = ?"
+            ).map_err(|_|DatabaseError::RecallError)?;
+
+            let mut rows = stmt.query(&[&userid]).map_err(|_|DatabaseError::RecallError)?;
+
+            if let Some(row) = rows.next().map_err(|_| DatabaseError::RecallError)? {
+                let user = User {
+                    user_id: row.get(0).map_err(|_| DatabaseError::RecallError)?,
+                    username: row.get(1).map_err(|_| DatabaseError::RecallError)?,
+                    password: row.get(2).map_err(|_| DatabaseError::RecallError)?
+                };
+                return Ok(Some(user))
+            } else {
+                return Ok(None)
+            }
+        }
+        Err(_) => Err(DatabaseError::LockError)
     }
 }

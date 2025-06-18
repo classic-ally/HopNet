@@ -1,0 +1,132 @@
+use axum::http;
+use chrono::{TimeDelta, Utc, Duration};
+use jsonwebtoken::{TokenData, Validation};
+use jsonwebtoken::{DecodingKey, EncodingKey, Header, encode, decode};
+use axum::{
+    extract::{Request, State},
+    response::{Response, IntoResponse},
+    body::Body,
+    Json,
+    http::StatusCode,
+    middleware::Next,
+};
+use serde::{Serialize, Deserialize};
+use rand::Rng;
+
+use crate::db;
+use crate::AppState;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Claims {
+    exp: usize,         // expiry of our token
+    iss: String,        // issuer is nodeID that issued it
+    uid: String,        // userid id userID it's valid for
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct SignInData {
+    pub username: String,
+    pub password: String,
+}
+
+pub struct AuthError {
+    message: String,
+    status_code: StatusCode,
+}
+
+impl IntoResponse for AuthError {
+    fn into_response(self) -> Response<Body> {
+        (self.status_code, self.message).into_response()
+    }
+}
+
+// generate the random key, rolled every startup
+pub fn generate_jwt_key() -> (EncodingKey, DecodingKey) {
+    let mut rng = rand::rng();
+    let secret: Vec<u8> = (0..16).map(|_| rng.random_range(0..=255)).collect();
+    let encodingkey = EncodingKey::from_secret(secret.as_ref());
+    let decodingkey = DecodingKey::from_secret(secret.as_ref());
+    return (encodingkey, decodingkey);
+}
+
+// middleware for validation
+pub async fn auth_middleware(
+    State(app_state): State<AppState>,
+    mut req: Request, 
+    next: Next
+) -> Result<Response<Body>, AuthError> {
+    let auth_header = req.headers_mut().get(http::header::AUTHORIZATION);
+    
+    let auth_header = match auth_header {
+        Some(header) => header.to_str().map_err(|_| AuthError {
+            message: "Empty header is not allowed".to_string(),
+            status_code: StatusCode::FORBIDDEN
+        })?,
+        None => return Err(AuthError {
+            message: "Please add the JWT token to the header".to_string(),
+            status_code: StatusCode::FORBIDDEN
+        }),
+    };
+
+    let mut header = auth_header.split_whitespace();
+
+    let (bearer, token) = (header.next(), header.next());
+
+    let token_data = match decode_jwt(token.unwrap().to_string(), app_state.decoding_key) {
+        Ok(data) => data,
+        Err(_) => return Err(AuthError {
+            message: "Unable to decode token".to_string(),
+            status_code: StatusCode::UNAUTHORIZED
+        }),
+    };
+
+    // check user exists in db (what if deleted?)
+    let uid: i32 = token_data.claims.uid.parse().map_err(|_| AuthError{ message: "Malformed JWT".to_string(), status_code: StatusCode::BAD_REQUEST })?;
+    match db::get_user_by_userid(&app_state.db, uid) {
+        Ok(Some(user)) => return Ok(next.run(req).await), // future can check user perms here
+        Ok(None) => return Err(AuthError { message: "User does not exist".to_string(), status_code: StatusCode::UNAUTHORIZED }),
+        Err(_) => return Err(AuthError { message: "Error checking user database".to_string(), status_code: StatusCode::INTERNAL_SERVER_ERROR })
+    };
+    
+
+}
+
+fn decode_jwt(jwt_token: String, key: DecodingKey) -> Result<TokenData<Claims>, StatusCode> {
+    return decode(&jwt_token, &key, &Validation::default()).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+fn encode_jwt(iss: String, uid: String, key: EncodingKey) -> Result<String, StatusCode> {
+    let now = Utc::now();
+    let expire: TimeDelta = Duration::hours(1);
+    let exp: usize = (now + expire).timestamp() as usize;
+    let claim = Claims {
+        exp,
+        iss,
+        uid
+    };
+
+    return encode(
+        &Header::default(),
+        &claim,
+        &key
+    ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+pub async fn sign_in(
+    State(app_state): State<AppState>,
+    Json(user_data): Json<SignInData>
+) -> Result<Json<String>, StatusCode> {
+    // get user by username from db
+    match db::get_user_by_username(&app_state.db, user_data.username) {
+        Ok(Some(mut db_user)) => {
+            // verify user password against hash
+            match db_user.verify_password(user_data.password.as_bytes()) {
+                Ok(true) => return Ok(Json(encode_jwt('1'.to_string(), db_user.user_id.to_string(), app_state.encoding_key)?)), // return a JWT
+                Ok(false) => return Err(StatusCode::UNAUTHORIZED),      // bad password
+                Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR) // some error
+            }
+        }
+        Ok(None) => return Err(StatusCode::UNAUTHORIZED),               // no user exists
+        Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR)         // some error
+    }
+}

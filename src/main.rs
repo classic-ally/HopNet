@@ -1,6 +1,7 @@
 use axum::{
-    extract::{Query, State}, http::{HeaderValue, Method, StatusCode}, response::IntoResponse, routing::{get,post}, serve, Json, Router
+    extract::{Query, State}, http::{HeaderValue, Method, StatusCode}, response::IntoResponse, routing::{get,post}, serve, Json, Router, middleware
 };
+use jsonwebtoken::{DecodingKey, EncodingKey};
 use std::net::IpAddr;
 use serde::{Serialize, Deserialize};
 use tower_serve_static::ServeDir;
@@ -12,8 +13,16 @@ use duckdb::Connection;
 mod metrics;
 mod db;
 mod interfaces;
+mod auth;
 
 static ASSETS_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/frontend/dist");
+
+#[derive(Clone)]
+pub struct AppState {
+    db: std::sync::Arc<std::sync::Mutex<duckdb::Connection>>,
+    encoding_key: EncodingKey,
+    decoding_key: DecodingKey
+}
 
 #[tokio::main]
 async fn main() {
@@ -22,17 +31,32 @@ async fn main() {
 
     let admin_service = ServeDir::new(&ASSETS_DIR);
 
+    let (encodingkey, decodingkey) = auth::generate_jwt_key();
+
     match db::initialize() {
         Ok(database) => {
+            let app_state = AppState {
+                db: database,
+                encoding_key: encodingkey,
+                decoding_key: decodingkey
+            };
+
+            // Protected routes that require authentication
+            let protected_routes = Router::new()
+                .route("/users", get(get_users))
+                .route("/users", post(post_users))
+                .layer(middleware::from_fn_with_state(app_state.clone(), auth::auth_middleware));
+
             let base_app = Router::new()
                 .fallback_service(admin_service) // routes we don't have get sent to vite frontend
                 .route("/metrics/get-all", get(get_metrics))
-                .route("/users", get(get_users))
-                .route("/users", post(post_users))
+                .merge(protected_routes)
+                .route("/setup", get(get_setup))
                 .route("/setup", post(post_setup))
                 .route("/interfaces", get(interfaces::get_interfaces))
                 .route("/rpc/latency-server", get(get_latency_server))
-                .route("/rpc/get-remote-latency", get(get_remote_latency_handler));
+                .route("/rpc/get-remote-latency", get(get_remote_latency_handler))
+                .route("/login", post(auth::sign_in));
 
             let app = if cfg!(debug_assertions) {
                 let cors = CorsLayer::new()
@@ -44,10 +68,10 @@ async fn main() {
 
                 base_app
                     .layer(cors)
-                    .with_state(database)
+                    .with_state(app_state)
             } else {
                 base_app // no CORS in prod
-                    .with_state(database)
+                    .with_state(app_state)
             };
 
             match tokio::net::TcpListener::bind("0.0.0.0:34632").await {
@@ -80,9 +104,9 @@ struct RemoteLatencyQuery {
 }
 
 async fn get_metrics(
-    State(db): State<std::sync::Arc<std::sync::Mutex<duckdb::Connection>>>,
+    State(app_state): State<AppState>,
 ) -> impl IntoResponse {
-    match db::get_metric(&db) {
+    match db::get_metric(&app_state.db) {
         Ok(metrics) => {
             println!("{:?}", metrics);    
             (StatusCode::OK, Json(metrics))
@@ -94,9 +118,9 @@ async fn get_metrics(
 }
 
 async fn get_users(
-    State(db): State<std::sync::Arc<std::sync::Mutex<duckdb::Connection>>>,
+    State(app_state): State<AppState>,
 ) -> impl IntoResponse {
-    match db::get_users(&db) {
+    match db::get_users(&app_state.db) {
         Ok(users) => {
             (StatusCode::OK, Json(users))
         }
@@ -114,7 +138,7 @@ struct UserRequest {
 }
 
 async fn post_users (
-    State(db): State<std::sync::Arc<std::sync::Mutex<duckdb::Connection>>>,
+    State(app_state): State<AppState>,
     Json(payload): Json<UserRequest>
 ) -> impl IntoResponse {
     let user = db::User {
@@ -123,17 +147,26 @@ async fn post_users (
         password: payload.password,
     };
 
-    match db::insert_user(&db, user) {
+    match db::insert_user(&app_state.db, user) {
         Ok(()) => StatusCode::CREATED,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
+async fn get_setup(
+    State(app_state): State<AppState>,
+) -> impl IntoResponse {
+    match db::get_initial_setup(&app_state.db) {
+        Ok(setupstatus) => setupstatus,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
 async fn post_setup(
-    State(db): State<std::sync::Arc<std::sync::Mutex<duckdb::Connection>>>,
+    State(app_state): State<AppState>,
     Json(payload): Json<db::SetupObject>
 ) -> impl IntoResponse {
-    match db::initial_setup(&db, payload) {
+    match db::post_initial_setup(&app_state.db, payload) {
         Ok(()) => StatusCode::CREATED,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR
     }
@@ -141,9 +174,9 @@ async fn post_setup(
 
 async fn get_remote_latency_handler(
     Query(params): Query<RemoteLatencyQuery>,
-    State(db): State<std::sync::Arc<std::sync::Mutex<duckdb::Connection>>>,
+    State(app_state): State<AppState>,
 ) -> impl IntoResponse {
-    let (status, response) = get_remote_latency(&db, &params.ip).await;
+    let (status, response) = get_remote_latency(&app_state.db, &params.ip).await;
     match response {
         Some(latency_response) => (status, Json(LatencyResponseWrapper::Success(latency_response))),
         None => (status, Json(LatencyResponseWrapper::Error(ErrorResponse { error: "Failed to get remote latency".to_string() })))
