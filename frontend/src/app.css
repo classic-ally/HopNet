@@ -9,6 +9,11 @@
   -moz-osx-font-smoothing: grayscale;
 }
 
+/* Ensure buttons inherit the font family */
+button {
+  font-family: inherit;
+}
+
 #app {
   max-width: 1280px;
 }

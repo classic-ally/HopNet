@@ -447,3 +447,34 @@ pub fn get_user_by_userid(
         Err(_) => Err(DatabaseError::LockError)
     }
 }
+
+pub fn get_nodes(
+    db: &Arc<Mutex<Connection>>
+) -> Result<Vec<Node>, DatabaseError> {
+    match db.lock() {
+        Ok(db_lock) => {
+            let mut stmt = db_lock.prepare("SELECT * FROM nodes").map_err(|_| DatabaseError::RecallError)?;
+            let results = stmt.query_map([], |row| {
+                Ok(Node {
+                    node_id: row.get(0)?,
+                    name: row.get(1)?,
+                    ip_address: row.get(2)?,
+                    port: row.get(3)?,
+                    owner: row.get(4)?
+                })
+            });
+
+            match results {
+                Ok(users) => Ok(users.collect::<Result<_, _>>().map_err(|_| DatabaseError::ProcessingError)?),
+                Err(e) => {
+                    dbg!(e);
+                    Err(DatabaseError::RecordError)
+                }
+            }
+        },
+        Err(e) => {
+            dbg!(e);
+            Err(DatabaseError::LockError)
+        }
+    }
+}

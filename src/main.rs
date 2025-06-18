@@ -45,6 +45,7 @@ async fn main() {
             let protected_routes = Router::new()
                 .route("/users", get(get_users))
                 .route("/users", post(post_users))
+                .route("/nodes", get(get_nodes))
                 .layer(middleware::from_fn_with_state(app_state.clone(), auth::auth_middleware));
 
             let base_app = Router::new()
@@ -128,6 +129,15 @@ async fn get_users(
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(Vec::<db::User>::new())
         ),
+    }
+}
+
+async fn get_nodes(
+    State(app_state): State<AppState>
+) -> impl IntoResponse {
+    match db::get_nodes(&app_state.db) {
+        Ok(nodes) => return (StatusCode::OK, Json(nodes)),
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(Vec::<db::Node>::new())),
     }
 }
 

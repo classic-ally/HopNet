@@ -4,6 +4,7 @@
   import LoginPane from './lib/LoginPane.svelte';
   import BackendError from './lib/BackendError.svelte';
   import { tokenStore } from './lib/stores';
+    import Interface from './lib/Interface/Interface.svelte';
 
   let currentComponent: 'setup' | 'operation' | 'error' = 'setup';
   let username = '';
@@ -37,7 +38,7 @@
       <Setup/>
     {:else if currentComponent === 'operation'}
       {#if token}
-        <p>Logged in</p>
+        <Interface />
       {:else}
         <LoginPane bind:username bind:password/>
       {/if}
