@@ -2,6 +2,7 @@
     import AccountSidebarItem from "./AccountSidebarItem.svelte";
     import FileBrowserHeader from "./FileBrowserHeader.svelte";
     import NodesHeader from "./NodesHeader.svelte";
+    import NodesTable from "./NodesTable.svelte";
     import SidebarItem from "./SidebarItem.svelte";
 
     // State to track which sidebar item is selected
@@ -69,6 +70,7 @@
         {/if}
         {#if selectedItem == "nodes"}
             <NodesHeader/>
+            <NodesTable/>
         {/if}
         
 
