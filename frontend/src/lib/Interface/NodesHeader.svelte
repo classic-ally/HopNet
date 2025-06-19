@@ -1,5 +1,6 @@
-<script>
+<script lang="ts">
     import ControlBarIcon from "./ControlBarIcon.svelte";
+    export let onAddNode: () => void;
 </script>
 
 <div class="flex gap-1">
@@ -7,6 +8,7 @@
         <ControlBarIcon
             icon="i-carbon-add"
             title="Add a node"
+            onClick={onAddNode}
         />
     </div>
     <!-- <div class="flex flex-1 min-w-0 justify-center gap-1">
@@ -19,6 +21,7 @@
         <ControlBarIcon
             icon="i-carbon-trash-can"
             title="Delete node"
+            onClick={() => {}}
         />
     </div>
 </div>

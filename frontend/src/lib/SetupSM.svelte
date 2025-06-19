@@ -9,6 +9,7 @@
     import ConfirmPane from "./ConfirmPane.svelte";
     import CreateNetwork from "./CreateNetwork.svelte";
     import InitialSetup from "./InitialSetup.svelte";
+    import JoinQr from "./Setup/JoinQR.svelte";
     let initialSetup = true;
 
     // pane 1
@@ -17,6 +18,7 @@
 
     // pane 2
     let configureDevice = false;
+    let joinQR = false;
 
     // pane 3
     let confirmSelections = false;
@@ -56,6 +58,20 @@
           }}
         />
       {/if}
+      {#if joinNetwork}
+          <ConfigureDevice
+            bind:computername
+            bind:ip
+            onBackButton={() => {
+              initialSetup = true;
+              joinNetwork = false;
+            }}
+            onForwardButton={() => {
+              joinQR = true;
+              joinNetwork = false;
+            }}
+          />
+      {/if}
       {#if configureDevice}
           <ConfigureDevice
             bind:computername
@@ -69,6 +85,9 @@
               configureDevice = false;
             }}
           />
+      {/if}
+      {#if joinQR}
+          <JoinQr />
       {/if}
       {#if confirmSelections}
             <ConfirmPane

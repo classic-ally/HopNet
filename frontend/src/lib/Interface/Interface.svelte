@@ -1,6 +1,7 @@
 <script>
     import AccountSidebarItem from "./AccountSidebarItem.svelte";
     import FileBrowserHeader from "./FileBrowserHeader.svelte";
+    import NodeAddPane from "./NodeAddPane.svelte";
     import NodesHeader from "./NodesHeader.svelte";
     import NodesTable from "./NodesTable.svelte";
     import SidebarItem from "./SidebarItem.svelte";
@@ -29,6 +30,8 @@
         // When back is clicked from account, go back to recents
         selectedItem = "recents";
     }
+
+    let isNodeAddOpen = false;
 </script>
 <div class="flex text-white h-screen w-screen">
     <!-- Sidebar -->
@@ -69,8 +72,15 @@
             test
         {/if}
         {#if selectedItem == "nodes"}
-            <NodesHeader/>
+            <NodesHeader
+                onAddNode={() => {isNodeAddOpen = !isNodeAddOpen}}
+            />
             <NodesTable/>
+            {#if isNodeAddOpen}
+                <NodeAddPane
+                    onBackButton={() => {isNodeAddOpen = !isNodeAddOpen}}
+                />
+            {/if}
         {/if}
         
 
