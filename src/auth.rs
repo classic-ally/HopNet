@@ -83,7 +83,11 @@ pub async fn auth_middleware(
     // check user exists in db (what if deleted?)
     let uid: i32 = token_data.claims.uid.parse().map_err(|_| AuthError{ message: "Malformed JWT".to_string(), status_code: StatusCode::BAD_REQUEST })?;
     match db::get_user_by_userid(&app_state.db, uid) {
-        Ok(Some(user)) => return Ok(next.run(req).await), // future can check user perms here
+        Ok(Some(user)) => {
+            // store the user ID in request extensions
+            req.extensions_mut().insert(uid);
+            return Ok(next.run(req).await) // future can check user perms here
+        },
         Ok(None) => return Err(AuthError { message: "User does not exist".to_string(), status_code: StatusCode::UNAUTHORIZED }),
         Err(_) => return Err(AuthError { message: "Error checking user database".to_string(), status_code: StatusCode::INTERNAL_SERVER_ERROR })
     };

@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Query, State}, http::{HeaderValue, Method, StatusCode}, response::IntoResponse, routing::{get,post}, serve, Json, Router, middleware
+    extract::{Query, State}, http::{HeaderValue, Method, StatusCode}, middleware, response::IntoResponse, routing::{get,post}, serve, Json, Router
 };
 use jsonwebtoken::{DecodingKey, EncodingKey};
 use std::net::IpAddr;
@@ -10,6 +10,7 @@ use include_dir::{Dir, include_dir};
 
 use duckdb::Connection;
 
+mod nodes;
 mod metrics;
 mod db;
 mod interfaces;
@@ -45,7 +46,8 @@ async fn main() {
             let protected_routes = Router::new()
                 .route("/users", get(get_users))
                 .route("/users", post(post_users))
-                .route("/nodes", get(get_nodes))
+                .route("/nodes", get(nodes::get_nodes))
+                .route("/nodes", post(nodes::post_nodes))
                 .layer(middleware::from_fn_with_state(app_state.clone(), auth::auth_middleware));
 
             let base_app = Router::new()
@@ -132,14 +134,6 @@ async fn get_users(
     }
 }
 
-async fn get_nodes(
-    State(app_state): State<AppState>
-) -> impl IntoResponse {
-    match db::get_nodes(&app_state.db) {
-        Ok(nodes) => return (StatusCode::OK, Json(nodes)),
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(Vec::<db::Node>::new())),
-    }
-}
 
 #[derive(Deserialize)]
 struct UserRequest {

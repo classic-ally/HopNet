@@ -478,3 +478,35 @@ pub fn get_nodes(
         }
     }
 }
+
+pub fn insert_node(
+    db: &Arc<Mutex<Connection>>,
+    node: Node,
+) -> Result<(), DatabaseError> {
+    match db.lock() {
+        Ok(mut db_lock) => {
+            let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
+            let next_id = tx.query_row(
+                "SELECT next_id FROM sequences WHERE name = 'nodes'",
+                [],
+                |row| row.get::<_, i32>(0)
+            ).map_err(|_| DatabaseError::RecallError)?;
+            tx.execute(
+                "INSERT INTO nodes (node_id, name, ip_address, port, owner) VALUES (?, ?, ?, ?, ?)",
+                params![next_id, node.name, node.ip_address, node.port, node.owner]
+            ).map_err(|_| DatabaseError::InsertError)?;
+
+            // Update the sequence for the next node
+            tx.execute(
+                "UPDATE sequences SET next_id = next_id + 1 WHERE name = 'nodes'",
+                []
+            ).map_err(|_| DatabaseError::InsertError)?;
+
+            // Commit the transaction
+            tx.commit().map_err(|_| DatabaseError::InsertError)?;
+
+            Ok(())
+        }
+        Err(_) => Err(DatabaseError::LockError),
+    }
+}
