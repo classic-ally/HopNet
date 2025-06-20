@@ -39,6 +39,12 @@ pub struct Metric {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+pub struct Sequence {
+    pub name: String,
+    pub next_id: i32,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 pub struct User {
     pub user_id: i32,
     pub username: String,
@@ -66,9 +72,6 @@ pub fn initialize() -> Result<Arc<Mutex<Connection>>, Error> {
                 name            TEXT PRIMARY KEY,
                 next_id         INTEGER NOT NULL
             );
-
-            INSERT INTO sequences (name, next_id) VALUES ('users', 1);
-            INSERT INTO sequences (name, next_id) VALUES ('nodes', 1);
 
             CREATE TABLE users (
                 user_id         INTEGER PRIMARY KEY,
@@ -173,12 +176,18 @@ pub fn post_initial_setup(
 ) -> Result<(), DatabaseError> {
     match db.lock() {
         Ok(mut db_lock) => {
+            let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
+
+            // initialize counters
+            tx.execute_batch("
+                INSERT INTO sequences (name, next_id) VALUES ('users', 1);
+                INSERT INTO sequences (name, next_id) VALUES ('nodes', 1);
+            ").map_err(|_| DatabaseError::InsertError)?;
 
             // compute user password
             let password_hash = setupobj.user.password_hash().map_err(|_| DatabaseError::ProcessingError)?;
 
             // insert the user first
-            let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
             let next_user_id = tx.query_row(
                 "SELECT next_id FROM sequences WHERE name = 'users'",
                 [],
@@ -252,6 +261,14 @@ pub fn put_join_setup(
                 tx.execute(
                     "INSERT INTO nodes (node_id, name, ip_address, port, owner) VALUES (?, ?, ?, ?, ?)",
                     params![node.node_id, node.name, node.ip_address, node.port, node.owner]
+                ).map_err(|_| DatabaseError::InsertError)?;
+            }
+
+            dbg!("Inserting sequences");
+            for sequence in setupobj.sequences {
+                tx.execute(
+                    "INSERT INTO sequences (name, next_id) VALUES (?, ?)",
+                    params![sequence.name, sequence.next_id]
                 ).map_err(|_| DatabaseError::InsertError)?;
             }
 
@@ -560,6 +577,19 @@ pub async fn insert_node(
             let mut nodes: Vec<Node> = rows_nodes.collect::<Result<Vec<Node>, _>>()
                 .map_err(|_| DatabaseError::ProcessingError)?;
 
+            // sequence data extract
+            let mut stmt_sequences = tx.prepare(
+                "SELECT * FROM sequences",
+            ).map_err(|_| DatabaseError::RecallError)?;
+            let rows_sequences = stmt_sequences.query_map([], |row| {
+                Ok(Sequence {
+                    name: row.get(0)?,
+                    next_id: row.get(1)?,
+                })
+            }).map_err(|_| DatabaseError::RecallError)?;
+            let sequences: Vec<Sequence> = rows_sequences.collect::<Result<Vec<Sequence>, _>>()
+                .map_err(|_| DatabaseError::ProcessingError)?;
+
             ///////////////
             // 3. Compute next node, append to node vec
             ///////////////
@@ -597,12 +627,16 @@ pub async fn insert_node(
             let sync_msg = SyncSetupObject {
                 users: users,
                 nodes: nodes,
+                sequences: sequences,
                 yournode: ThisNode {
                     node_id: next_id
                 }
             };
             // tx to main thread
-            dump_tx.send(sync_msg);
+            match dump_tx.send(sync_msg) {
+                Ok(_) => {},
+                Err(_) => return Err(DatabaseError::ProcessingError)
+            }
 
             ///////////////
             // 6. If PUT succeeds, send OK message to DB thread
@@ -625,49 +659,5 @@ pub async fn insert_node(
             Ok(())
         }
         Err(_) => Err(DatabaseError::LockError),
-    }
-}
-
-pub fn dump_database(
-    db: &Arc<Mutex<Connection>>,
-) -> Result<(Vec<User>, Vec<Node>), DatabaseError> {
-    match db.lock() {
-        Ok(mut db_lock) => {
-            let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
-
-            // user data extract
-            let mut stmt_users = tx.prepare(
-                "SELECT * FROM users",
-            ).map_err(|_| DatabaseError::RecallError)?;
-            let rows_users = stmt_users.query_map([], |row| {
-                Ok(User {
-                    user_id: row.get(0)?,
-                    username: row.get(1)?,
-                    password: row.get(2)?,
-                })
-            }).map_err(|_| DatabaseError::RecallError)?;
-            let users: Vec<User> = rows_users.collect::<Result<Vec<User>, _>>()
-                .map_err(|_| DatabaseError::ProcessingError)?;
-
-            // node data extract
-            let mut stmt_nodes = tx.prepare(
-                "SELECT * FROM nodes",
-            ).map_err(|_| DatabaseError::RecallError)?;
-            let rows_nodes = stmt_nodes.query_map([], |row| {
-                Ok(Node {
-                    node_id: row.get(0)?,
-                    name: row.get(1)?,
-                    ip_address: row.get(2)?,
-                    port: row.get(3)?,
-                    owner: row.get(4)?,
-                })
-            }).map_err(|_| DatabaseError::RecallError)?;
-            let nodes: Vec<Node> = rows_nodes.collect::<Result<Vec<Node>, _>>()
-                .map_err(|_| DatabaseError::ProcessingError)?;
-
-            Ok((users, nodes))
-
-        }
-        Err(_) => Err(DatabaseError::LockError)
     }
 }

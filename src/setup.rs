@@ -7,6 +7,7 @@ use axum::{
 use serde::{Serialize,Deserialize};
 
 
+use crate::db::Sequence;
 use crate::AppState;
 use crate::{
     db,
@@ -29,6 +30,7 @@ pub struct InitialSetupObject {
 pub struct SyncSetupObject {
     pub users: Vec<User>,
     pub nodes: Vec<Node>,
+    pub sequences: Vec<Sequence>,
     pub yournode: ThisNode,
 }
 
