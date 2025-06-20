@@ -1,6 +1,7 @@
 use argon2::PasswordVerifier;
 use duckdb::{params, Connection, Error};
 use reqwest::StatusCode;
+use tokio::sync::oneshot;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime,Duration};
 use serde::{Serialize,Deserialize};
@@ -13,6 +14,8 @@ use argon2::{
     },
     Argon2
 };
+
+use crate::setup::{self, SyncSetupObject, ThisNode};
 
 pub enum DatabaseError {
     LockError,
@@ -142,12 +145,6 @@ pub struct Node {
     pub owner: i32, // userid corresponding to owner
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-pub struct SetupObject {
-    pub user: User,
-    pub node: Node,
-}
-
 pub fn get_initial_setup(
     db: &Arc<Mutex<Connection>>
 ) -> Result<StatusCode, DatabaseError> {
@@ -172,7 +169,7 @@ pub fn get_initial_setup(
 
 pub fn post_initial_setup(
     db: &Arc<Mutex<Connection>>,
-    mut setupobj: SetupObject
+    mut setupobj: crate::setup::InitialSetupObject
 ) -> Result<(), DatabaseError> {
     match db.lock() {
         Ok(mut db_lock) => {
@@ -228,6 +225,47 @@ pub fn post_initial_setup(
 
             Ok(())
 
+        }
+        Err(_) => Err(DatabaseError::LockError)
+    }
+}
+
+pub fn put_join_setup(
+    db: &Arc<Mutex<Connection>>,
+    setupobj: crate::setup::SyncSetupObject
+) -> Result<(), DatabaseError> {
+    match db.lock() {
+        Ok(mut db_lock) => {
+            // in this case we need to write the list of nodes and users to the DB
+            let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
+
+            dbg!("Inserting users");
+            for user in setupobj.users {
+                tx.execute(
+                    "INSERT INTO users (user_id, username, password_hash) VALUES (?, ?, ?)",
+                    params![user.user_id, user.username, user.password]
+                ).map_err(|_| DatabaseError::InsertError)?;
+            }
+
+            dbg!("Inserting nodes");
+            for node in setupobj.nodes {
+                tx.execute(
+                    "INSERT INTO nodes (node_id, name, ip_address, port, owner) VALUES (?, ?, ?, ?, ?)",
+                    params![node.node_id, node.name, node.ip_address, node.port, node.owner]
+                ).map_err(|_| DatabaseError::InsertError)?;
+            }
+
+            // also write to this_node table so we know setup is completed
+            dbg!("Inserting this_node");
+            tx.execute(
+                "INSERT INTO this_node (internal_id, node_id) VALUES (?, ?)",
+                params![1, setupobj.yournode.node_id]
+            ).map_err(|_| DatabaseError::InsertError)?;
+
+            dbg!("TX Commit");
+            tx.commit().map_err(|_| DatabaseError::InsertError)?;
+            
+            Ok(())
         }
         Err(_) => Err(DatabaseError::LockError)
     }
@@ -479,13 +517,52 @@ pub fn get_nodes(
     }
 }
 
-pub fn insert_node(
+pub async fn insert_node(
     db: &Arc<Mutex<Connection>>,
     node: Node,
+    dump_tx: oneshot::Sender<setup::SyncSetupObject>,
+    mut confirm_write_rx: oneshot::Receiver<Result<(), Error>>
 ) -> Result<(), DatabaseError> {
     match db.lock() {
         Ok(mut db_lock) => {
+            ///////////////
+            // 2. Get the current DB state, dump into vecs
+            ///////////////
             let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
+
+            // user data extract
+            let mut stmt_users = tx.prepare(
+                "SELECT * FROM users",
+            ).map_err(|_| DatabaseError::RecallError)?;
+            let rows_users = stmt_users.query_map([], |row| {
+                Ok(User {
+                    user_id: row.get(0)?,
+                    username: row.get(1)?,
+                    password: row.get(2)?,
+                })
+            }).map_err(|_| DatabaseError::RecallError)?;
+            let users: Vec<User> = rows_users.collect::<Result<Vec<User>, _>>()
+                .map_err(|_| DatabaseError::ProcessingError)?;
+
+            // node data extract
+            let mut stmt_nodes = tx.prepare(
+                "SELECT * FROM nodes",
+            ).map_err(|_| DatabaseError::RecallError)?;
+            let rows_nodes = stmt_nodes.query_map([], |row| {
+                Ok(Node {
+                    node_id: row.get(0)?,
+                    name: row.get(1)?,
+                    ip_address: row.get(2)?,
+                    port: row.get(3)?,
+                    owner: row.get(4)?,
+                })
+            }).map_err(|_| DatabaseError::RecallError)?;
+            let mut nodes: Vec<Node> = rows_nodes.collect::<Result<Vec<Node>, _>>()
+                .map_err(|_| DatabaseError::ProcessingError)?;
+
+            ///////////////
+            // 3. Compute next node, append to node vec
+            ///////////////
             let next_id = tx.query_row(
                 "SELECT next_id FROM sequences WHERE name = 'nodes'",
                 [],
@@ -502,11 +579,95 @@ pub fn insert_node(
                 []
             ).map_err(|_| DatabaseError::InsertError)?;
 
-            // Commit the transaction
-            tx.commit().map_err(|_| DatabaseError::InsertError)?;
+            // Construct and append
+            let new_node = Node {
+                node_id: next_id,
+                name: node.name,
+                ip_address: node.ip_address,
+                port: node.port,
+                owner: node.owner
+            };
+            nodes.push(new_node);
+            
+            ///////////////
+            // 4. Send our sync message to main thread
+            ///////////////
+            
+            // formulate syncsetupobject
+            let sync_msg = SyncSetupObject {
+                users: users,
+                nodes: nodes,
+                yournode: ThisNode {
+                    node_id: next_id
+                }
+            };
+            // tx to main thread
+            dump_tx.send(sync_msg);
+
+            ///////////////
+            // 6. If PUT succeeds, send OK message to DB thread
+            ///////////////
+            match confirm_write_rx.await {
+                Ok(Ok(())) => {
+                    // If confirmed, commit the transaction
+                    tx.commit().map_err(|_| DatabaseError::LockError)?;
+                }
+                Ok(Err(e)) => {
+                    // If error, log or handle it
+                    return Err(DatabaseError::LockError);
+                }
+                Err(_) => {
+                    // If channel was closed, return error
+                    return Err(DatabaseError::LockError);
+                }
+            }
 
             Ok(())
         }
         Err(_) => Err(DatabaseError::LockError),
+    }
+}
+
+pub fn dump_database(
+    db: &Arc<Mutex<Connection>>,
+) -> Result<(Vec<User>, Vec<Node>), DatabaseError> {
+    match db.lock() {
+        Ok(mut db_lock) => {
+            let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
+
+            // user data extract
+            let mut stmt_users = tx.prepare(
+                "SELECT * FROM users",
+            ).map_err(|_| DatabaseError::RecallError)?;
+            let rows_users = stmt_users.query_map([], |row| {
+                Ok(User {
+                    user_id: row.get(0)?,
+                    username: row.get(1)?,
+                    password: row.get(2)?,
+                })
+            }).map_err(|_| DatabaseError::RecallError)?;
+            let users: Vec<User> = rows_users.collect::<Result<Vec<User>, _>>()
+                .map_err(|_| DatabaseError::ProcessingError)?;
+
+            // node data extract
+            let mut stmt_nodes = tx.prepare(
+                "SELECT * FROM nodes",
+            ).map_err(|_| DatabaseError::RecallError)?;
+            let rows_nodes = stmt_nodes.query_map([], |row| {
+                Ok(Node {
+                    node_id: row.get(0)?,
+                    name: row.get(1)?,
+                    ip_address: row.get(2)?,
+                    port: row.get(3)?,
+                    owner: row.get(4)?,
+                })
+            }).map_err(|_| DatabaseError::RecallError)?;
+            let nodes: Vec<Node> = rows_nodes.collect::<Result<Vec<Node>, _>>()
+                .map_err(|_| DatabaseError::ProcessingError)?;
+
+            Ok((users, nodes))
+
+        }
+        Err(_) => Err(DatabaseError::LockError)
     }
 }

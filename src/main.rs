@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Query, State}, http::{HeaderValue, Method, StatusCode}, middleware, response::IntoResponse, routing::{get,post}, serve, Json, Router
+    extract::{Query, State}, http::{HeaderValue, Method, StatusCode}, middleware, response::IntoResponse, routing::{get,post,put}, serve, Json, Router
 };
 use jsonwebtoken::{DecodingKey, EncodingKey};
 use std::net::IpAddr;
@@ -11,6 +11,7 @@ use include_dir::{Dir, include_dir};
 use duckdb::Connection;
 
 mod nodes;
+mod setup;
 mod metrics;
 mod db;
 mod interfaces;
@@ -31,6 +32,17 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     let admin_service = ServeDir::new(&ASSETS_DIR);
+
+    // port selection by system
+    let mut port = 34632;
+    let os = std::env::consts::OS;
+    if os == "linux" {
+        port = port + 1;
+        dbg!("Running on Linux on port {}", port);
+    }
+
+    let bindurl = format!("0.0.0.0:{}", port);
+    
 
     let (encodingkey, decodingkey) = auth::generate_jwt_key();
 
@@ -54,8 +66,9 @@ async fn main() {
                 .fallback_service(admin_service) // routes we don't have get sent to vite frontend
                 .route("/metrics/get-all", get(get_metrics))
                 .merge(protected_routes)
-                .route("/setup", get(get_setup))
-                .route("/setup", post(post_setup))
+                .route("/setup", get(setup::get_setup))
+                .route("/setup", post(setup::post_setup))
+                .route("/setup", put(setup::put_setup))
                 .route("/interfaces", get(interfaces::get_interfaces))
                 .route("/rpc/latency-server", get(get_latency_server))
                 .route("/rpc/get-remote-latency", get(get_remote_latency_handler))
@@ -77,8 +90,9 @@ async fn main() {
                     .with_state(app_state)
             };
 
-            match tokio::net::TcpListener::bind("0.0.0.0:34632").await {
+            match tokio::net::TcpListener::bind(bindurl).await {
                 Ok(listener) => {
+                    dbg!("beginning server");
                     serve(listener, app).await.unwrap();
                 }
                 Err(error) => {panic!("{}", error)}
@@ -154,25 +168,6 @@ async fn post_users (
     match db::insert_user(&app_state.db, user) {
         Ok(()) => StatusCode::CREATED,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
-    }
-}
-
-async fn get_setup(
-    State(app_state): State<AppState>,
-) -> impl IntoResponse {
-    match db::get_initial_setup(&app_state.db) {
-        Ok(setupstatus) => setupstatus,
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR
-    }
-}
-
-async fn post_setup(
-    State(app_state): State<AppState>,
-    Json(payload): Json<db::SetupObject>
-) -> impl IntoResponse {
-    match db::post_initial_setup(&app_state.db, payload) {
-        Ok(()) => StatusCode::CREATED,
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR
     }
 }
 
