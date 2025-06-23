@@ -386,7 +386,7 @@ pub fn get_metric(
 
 pub fn insert_user(
     db: &Arc<Mutex<Connection>>,
-    user: User,
+    mut user: User,
 ) -> Result<(), DatabaseError> {
 
     match db.lock() {
@@ -397,9 +397,12 @@ pub fn insert_user(
                 [],
                 |row| row.get::<_, i32>(0)
             ).map_err(|_| DatabaseError::RecallError)?;
+
+            let password_hash = user.password_hash().map_err(|_| DatabaseError::ProcessingError)?;
+
             tx.execute(
                 "INSERT INTO users (user_id, username, password_hash) VALUES (?, ?, ?)",
-                params![next_id, user.username, user.password]
+                params![next_id, user.username, password_hash]
             ).map_err(|_| DatabaseError::InsertError)?;
             
             // Update the sequence for next user
