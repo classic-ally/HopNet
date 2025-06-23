@@ -51,7 +51,7 @@ pub async fn put_setup(
     State(app_state): State<AppState>,
     Json(payload): Json<SyncSetupObject>
 ) -> impl IntoResponse {
-    match db::put_join_setup(&app_state.db, payload) {
+    match db::put_join_setup(&app_state.db, payload, app_state.private_key.as_bytes()) {
         Ok(()) => StatusCode::CREATED,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR
     }
@@ -78,7 +78,7 @@ pub async fn post_setup(
         pubkey: crate::types::PubKey::from_bytes(vec![]), // Placeholder, will use app_state.public_key
     };
 
-    match db::post_initial_setup(&app_state.db, user, node, app_state.public_key.as_bytes()) {
+    match db::post_initial_setup(&app_state.db, user, node, app_state.public_key.as_bytes(), app_state.private_key.as_bytes()) {
         Ok(()) => StatusCode::CREATED,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR
     }

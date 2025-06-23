@@ -104,6 +104,7 @@ pub fn initialize() -> Result<Arc<Mutex<Connection>>, Error> {
             CREATE TABLE this_node (
                 internal_id     INTEGER PRIMARY KEY DEFAULT 1,
                 node_id         INTEGER NOT NULL UNIQUE,
+                privkey         BLOB NOT NULL,
 
                 FOREIGN KEY (node_id) REFERENCES nodes(node_id)
             );
@@ -167,7 +168,8 @@ pub fn post_initial_setup(
     db: &Arc<Mutex<Connection>>,
     mut user: User,
     node: Node,
-    pubkey: &[u8]
+    pubkey: &[u8],
+    privkey: &[u8]
 ) -> Result<(), DatabaseError> {
     match db.lock() {
         Ok(mut db_lock) => {
@@ -218,8 +220,8 @@ pub fn post_initial_setup(
 
             // also write this node so we know setup is completed
             tx.execute(
-                "INSERT INTO this_node (internal_id, node_id) VALUES (?, ?)",
-                params![1, next_node_id]
+                "INSERT INTO this_node (internal_id, node_id, privkey) VALUES (?, ?, ?)",
+                params![1, next_node_id, privkey]
             ).map_err(|_| DatabaseError::InsertError)?;
 
             // Commit the transaction
@@ -236,7 +238,8 @@ pub fn post_initial_setup(
 
 pub fn put_join_setup(
     db: &Arc<Mutex<Connection>>,
-    setupobj: crate::setup::SyncSetupObject
+    setupobj: crate::setup::SyncSetupObject,
+    privkey: &[u8]
 ) -> Result<(), DatabaseError> {
     match db.lock() {
         Ok(mut db_lock) => {
@@ -270,8 +273,8 @@ pub fn put_join_setup(
             // also write to this_node table so we know setup is completed
             dbg!("Inserting this_node");
             tx.execute(
-                "INSERT INTO this_node (internal_id, node_id) VALUES (?, ?)",
-                params![1, setupobj.yournode.node_id]
+                "INSERT INTO this_node (internal_id, node_id, privkey) VALUES (?, ?, ?)",
+                params![1, setupobj.yournode.node_id, privkey]
             ).map_err(|_| DatabaseError::InsertError)?;
 
             dbg!("TX Commit");
