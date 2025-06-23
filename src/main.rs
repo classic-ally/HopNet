@@ -1,6 +1,7 @@
 use axum::{
     extract::{Query, State}, http::{HeaderValue, Method, StatusCode}, middleware, response::IntoResponse, routing::{get,post,put}, serve, Json, Router
 };
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use jsonwebtoken::{DecodingKey, EncodingKey};
 use std::net::IpAddr;
 use serde::{Serialize, Deserialize};
@@ -16,6 +17,8 @@ mod metrics;
 mod db;
 mod interfaces;
 mod auth;
+mod consensus;
+mod types;
 
 static ASSETS_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/frontend/dist");
 
@@ -23,7 +26,9 @@ static ASSETS_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/frontend/dis
 pub struct AppState {
     db: std::sync::Arc<std::sync::Mutex<duckdb::Connection>>,
     encoding_key: EncodingKey,
-    decoding_key: DecodingKey
+    decoding_key: DecodingKey,
+    private_key: SigningKey,
+    public_key: VerifyingKey
 }
 
 #[tokio::main]
@@ -42,16 +47,18 @@ async fn main() {
     }
 
     let bindurl = format!("0.0.0.0:{}", port);
-    
 
     let (encodingkey, decodingkey) = auth::generate_jwt_key();
+    let (privatekey, publickey) = consensus::generate_ed25519_key();
 
     match db::initialize() {
         Ok(database) => {
             let app_state = AppState {
                 db: database,
                 encoding_key: encodingkey,
-                decoding_key: decodingkey
+                decoding_key: decodingkey,
+                private_key: privatekey,
+                public_key: publickey
             };
 
             // Protected routes that require authentication

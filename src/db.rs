@@ -16,6 +16,7 @@ use argon2::{
 };
 
 use crate::setup::{self, SyncSetupObject, ThisNode};
+use crate::types::Node;
 
 pub enum DatabaseError {
     LockError,
@@ -87,6 +88,7 @@ pub fn initialize() -> Result<Arc<Mutex<Connection>>, Error> {
                 ip_address      VARCHAR NOT NULL,
                 port            INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
                 owner           INTEGER NOT NULL,
+                pubkey          BLOB NOT NULL,
 
                 -- CONSTRAINT enables indexed lookup of these
                 CONSTRAINT unique_endpoint UNIQUE (ip_address, port),
@@ -139,15 +141,6 @@ pub fn initialize() -> Result<Arc<Mutex<Connection>>, Error> {
     Ok(Arc::new(Mutex::new(db)))
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-pub struct Node {
-    pub node_id: i32,
-    pub name: String,
-    pub ip_address: String,
-    pub port: i32,
-    pub owner: i32, // userid corresponding to owner
-}
-
 pub fn get_initial_setup(
     db: &Arc<Mutex<Connection>>
 ) -> Result<StatusCode, DatabaseError> {
@@ -172,7 +165,9 @@ pub fn get_initial_setup(
 
 pub fn post_initial_setup(
     db: &Arc<Mutex<Connection>>,
-    mut setupobj: crate::setup::InitialSetupObject
+    mut user: User,
+    node: Node,
+    pubkey: &[u8]
 ) -> Result<(), DatabaseError> {
     match db.lock() {
         Ok(mut db_lock) => {
@@ -185,7 +180,7 @@ pub fn post_initial_setup(
             ").map_err(|_| DatabaseError::InsertError)?;
 
             // compute user password
-            let password_hash = setupobj.user.password_hash().map_err(|_| DatabaseError::ProcessingError)?;
+            let password_hash = user.password_hash().map_err(|_| DatabaseError::ProcessingError)?;
 
             // insert the user first
             let next_user_id = tx.query_row(
@@ -195,7 +190,7 @@ pub fn post_initial_setup(
             ).map_err(|_| DatabaseError::RecallError)?;
             tx.execute(
                 "INSERT INTO users (user_id, username, password_hash) VALUES (?, ?, ?)",
-                params![next_user_id, setupobj.user.username, password_hash]
+                params![next_user_id, user.username, password_hash]
             ).map_err(|_| DatabaseError::InsertError)?;
             // Update the sequence for next user
             tx.execute(
@@ -210,8 +205,8 @@ pub fn post_initial_setup(
                 |row| row.get::<_, i32>(0)
             ).map_err(|_| DatabaseError::RecallError)?;
             tx.execute(
-                "INSERT INTO nodes (node_id, name, ip_address, port, owner) VALUES (?, ?, ?, ?, ?)",
-                params![next_node_id, setupobj.node.name, setupobj.node.ip_address, setupobj.node.port, next_user_id]
+                "INSERT INTO nodes (node_id, name, ip_address, port, owner, pubkey) VALUES (?, ?, ?, ?, ?, ?)",
+                params![next_node_id, node.name, node.ip_address, node.port, next_user_id, pubkey]
             ).map_err(|_| DatabaseError::InsertError)?;
 
             // Update sequence
@@ -259,8 +254,8 @@ pub fn put_join_setup(
             dbg!("Inserting nodes");
             for node in setupobj.nodes {
                 tx.execute(
-                    "INSERT INTO nodes (node_id, name, ip_address, port, owner) VALUES (?, ?, ?, ?, ?)",
-                    params![node.node_id, node.name, node.ip_address, node.port, node.owner]
+                    "INSERT INTO nodes (node_id, name, ip_address, port, owner, pubkey) VALUES (?, ?, ?, ?, ?, ?)",
+                    params![node.node_id, node.name, node.ip_address, node.port, node.owner, node.pubkey.as_bytes()]
                 ).map_err(|_| DatabaseError::InsertError)?;
             }
 
@@ -510,12 +505,14 @@ pub fn get_nodes(
         Ok(db_lock) => {
             let mut stmt = db_lock.prepare("SELECT * FROM nodes").map_err(|_| DatabaseError::RecallError)?;
             let results = stmt.query_map([], |row| {
+                let pubkey_bytes: Vec<u8> = row.get(5)?;
                 Ok(Node {
                     node_id: row.get(0)?,
                     name: row.get(1)?,
                     ip_address: row.get(2)?,
                     port: row.get(3)?,
-                    owner: row.get(4)?
+                    owner: row.get(4)?,
+                    pubkey: crate::types::PubKey::from_bytes(pubkey_bytes)
                 })
             });
 
@@ -566,12 +563,14 @@ pub async fn insert_node(
                 "SELECT * FROM nodes",
             ).map_err(|_| DatabaseError::RecallError)?;
             let rows_nodes = stmt_nodes.query_map([], |row| {
+                let pubkey_bytes: Vec<u8> = row.get(5)?;
                 Ok(Node {
                     node_id: row.get(0)?,
                     name: row.get(1)?,
                     ip_address: row.get(2)?,
                     port: row.get(3)?,
                     owner: row.get(4)?,
+                    pubkey: crate::types::PubKey::from_bytes(pubkey_bytes)
                 })
             }).map_err(|_| DatabaseError::RecallError)?;
             let mut nodes: Vec<Node> = rows_nodes.collect::<Result<Vec<Node>, _>>()
@@ -599,8 +598,8 @@ pub async fn insert_node(
                 |row| row.get::<_, i32>(0)
             ).map_err(|_| DatabaseError::RecallError)?;
             tx.execute(
-                "INSERT INTO nodes (node_id, name, ip_address, port, owner) VALUES (?, ?, ?, ?, ?)",
-                params![next_id, node.name, node.ip_address, node.port, node.owner]
+                "INSERT INTO nodes (node_id, name, ip_address, port, owner, pubkey) VALUES (?, ?, ?, ?, ?, ?)",
+                params![next_id, node.name, node.ip_address, node.port, node.owner, node.pubkey.as_bytes()]
             ).map_err(|_| DatabaseError::InsertError)?;
 
             // Update the sequence for the next node
@@ -615,7 +614,8 @@ pub async fn insert_node(
                 name: node.name,
                 ip_address: node.ip_address,
                 port: node.port,
-                owner: node.owner
+                owner: node.owner,
+                pubkey: node.pubkey
             };
             nodes.push(new_node);
             

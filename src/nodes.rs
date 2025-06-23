@@ -12,16 +12,16 @@ use tokio::sync::oneshot;
 
 use crate::{
     db,
-    db::Node
+    types::Node
 };
-use crate::{nodes, AppState};
+use crate::AppState;
 
 pub async fn get_nodes(
     State(app_state): State<AppState>
 ) -> impl IntoResponse {
     match db::get_nodes(&app_state.db) {
         Ok(nodes) => return (StatusCode::OK, Json(nodes)),
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(Vec::<db::Node>::new())),
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(Vec::<Node>::new())),
     }
 }
 
@@ -61,10 +61,25 @@ pub async fn post_nodes(
     match client.get(&url)
         .timeout(timeout_duration)
         .send()
-        .await 
+        .await
     {
-        Ok(response) => if response.status() != StatusCode::NOT_FOUND {
-            return StatusCode::BAD_GATEWAY
+        Ok(response) => {
+            if response.status() != StatusCode::NOT_FOUND {
+                return StatusCode::BAD_GATEWAY
+            }
+            
+            // Extract the response text (hex-encoded pubkey)
+            match response.text().await {
+                Ok(response_pubkey_hex) => {
+                    // Compare with the payload pubkey
+                    let payload_pubkey_hex = payload.pubkey.to_hex();
+                    if response_pubkey_hex != payload_pubkey_hex {
+                        // Pubkey mismatch - the node's actual pubkey doesn't match what was claimed
+                        return StatusCode::UNAUTHORIZED
+                    }
+                }
+                Err(_) => return StatusCode::BAD_GATEWAY
+            }
         }
         Err(_) => return StatusCode::GATEWAY_TIMEOUT
     }
