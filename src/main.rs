@@ -68,6 +68,7 @@ async fn main() {
                 .route("/users", post(users::post_users))
                 .route("/nodes", get(nodes::get_nodes))
                 .route("/nodes", post(nodes::post_nodes))
+                .route("/consensus", get(consensus::get_consensus))
                 .layer(middleware::from_fn_with_state(app_state.clone(), auth::auth_middleware));
 
             let base_app = Router::new()

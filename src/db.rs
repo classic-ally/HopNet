@@ -101,10 +101,78 @@ pub fn initialize() -> Result<Arc<Mutex<Connection>>, Error> {
             CREATE INDEX idx_nodes_owner ON nodes(owner);
             -- 2. what node is this IP? (enabled by CONSTRAINT)
 
+            -- Consensus architecture
+            CREATE TABLE blocks (
+                block_hash      BLOB PRIMARY KEY,
+                height          INTEGER NOT NULL,
+                view_number     INTEGER NOT NULL,
+                parent_hash     BLOB,
+                transactions    BLOB
+            );
+
+            -- Common query patterns:
+            -- 1. Give me latest blocks, most recent few
+            -- 2. Give me blocks for a given view
+            -- 3. Look up parent of a block
+            CREATE INDEX idx_blocks_height ON blocks(height DESC);
+            CREATE INDEX idx_blocks_view ON blocks(view_number);
+            CREATE INDEX idx_blocks_parent ON blocks(parent_hash);
+
+            CREATE TABLE quorum_certificates (
+                view_number         INTEGER NOT NULL,
+                phase               ENUM('propose', 'vote') NOT NULL,
+                block_hash          BLOB NOT NULL,
+                proposer_signature  BLOB NOT NULL,
+                voter_signatures    BLOB,
+
+                PRIMARY KEY (view_number, phase, block_hash),
+                FOREIGN KEY (block_hash) REFERENCES blocks(block_hash)
+            );
+
+            CREATE INDEX idx_qc_block ON quorum_certificates(block_hash);
+            CREATE INDEX idx_view_phase ON quorum_certificates(view_number, phase);
+
+            -- Track validators that are acceptable at any given time
+            -- Not using views (nodes can be in different views due to network partitions)
+            -- Not using timestamps (time sync requirement)
+            -- Using height (deterministic, directly tied to the block being committed)
+            CREATE TABLE validators (
+                effective_height    INTEGER NOT NULL,   -- When this validator set becomes active
+                node_id             INTEGER NOT NULL,
+                is_active           BOOLEAN NOT NULL DEFAULT true,
+
+                PRIMARY KEY (effective_height, node_id),
+                FOREIGN KEY (node_id) REFERENCES nodes(node_id)
+            );
+
+            -- Common query patterns:
+            -- 1. Give me current validators (e.g. latest effective height for leave/rejoin)
+            -- 2. For consensus rebuild, give me nodes active at a given height
+            CREATE INDEX idx_validator_height ON validators(effective_height DESC); 
+            CREATE INDEX idx_validator_active ON validators(effective_height, is_active);
+
             CREATE TABLE this_node (
-                internal_id     INTEGER PRIMARY KEY DEFAULT 1,
-                node_id         INTEGER NOT NULL UNIQUE,
-                privkey         BLOB NOT NULL,
+                internal_id             INTEGER PRIMARY KEY DEFAULT 1,
+                node_id                 INTEGER NOT NULL UNIQUE,
+                privkey                 BLOB NOT NULL,
+
+                -- Consensus mechanics
+                -- View stored in case of leader change without block written
+                -- Block height not stored -> always computable
+                current_phase           ENUM('propose', 'vote') NOT NULL DEFAULT 'propose',
+                current_view            INTEGER NOT NULL DEFAULT 0,
+                -- Block is prepared when it has a QC
+                prepared_block_hash     BLOB,
+                -- HotStuff-2 efficiency improvement:
+                -- Block is committed when we're working on a later block
+                -- (Working on block n+1 implies we commit block n)
+                committed_block_hash    BLOB,
+                -- Safety: track highest QC seen (highest view for ordered execution)
+                highest_qc_block_hash   BLOB,
+
+                FOREIGN KEY (prepared_block_hash) REFERENCES blocks(block_hash),
+                FOREIGN KEY (committed_block_hash) REFERENCES blocks(block_hash),
+                FOREIGN KEY (highest_qc_block_hash) REFERENCES blocks(block_hash),
 
                 FOREIGN KEY (node_id) REFERENCES nodes(node_id)
             );
@@ -119,6 +187,7 @@ pub fn initialize() -> Result<Arc<Mutex<Connection>>, Error> {
                 rtt_jitter      REAL,
                 throughput      BIGINT,
                 version         TINYINT NOT NULL DEFAULT 0,
+                
                 PRIMARY KEY     (from_node, to_node, start_time),
                 FOREIGN KEY (from_node) REFERENCES nodes(node_id),
                 FOREIGN KEY (to_node)   REFERENCES nodes(node_id)
@@ -177,8 +246,8 @@ pub fn post_initial_setup(
 
             // initialize counters
             tx.execute_batch("
-                INSERT INTO sequences (name, next_id) VALUES ('users', 1);
-                INSERT INTO sequences (name, next_id) VALUES ('nodes', 1);
+                INSERT INTO sequences (name, next_id) VALUES ('users', 0);
+                INSERT INTO sequences (name, next_id) VALUES ('nodes', 0);
             ").map_err(|_| DatabaseError::InsertError)?;
 
             // compute user password
@@ -665,5 +734,117 @@ pub async fn insert_node(
             Ok(())
         }
         Err(_) => Err(DatabaseError::LockError),
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ConsensusState {
+    pub leader: Node,
+    pub view: i32,
+    pub prepared_block: Option<crate::types::Block>,
+    pub committed_block: Option<crate::types::Block>,
+    pub highest_qc_block: Option<crate::types::Block>,
+}
+
+pub fn get_consensus(
+    db: &Arc<Mutex<Connection>>
+) -> Result<ConsensusState, DatabaseError> {
+    match db.lock() {
+        Ok(db_lock) => {
+            let mut stmt = db_lock.prepare(
+                "SELECT
+                    n.node_id, n.name, n.ip_address, n.port, n.owner, n.pubkey, t.current_view,
+                    -- Prepared block data (excluding transactions for performance)
+                    pb.block_hash AS prepared_hash, pb.height AS prepared_height,
+                    pb.view_number AS prepared_view, pb.parent_hash AS prepared_parent,
+                    -- Committed block data
+                    cb.block_hash AS committed_hash, cb.height AS committed_height,
+                    cb.view_number AS committed_view, cb.parent_hash AS committed_parent,
+                    -- Highest QC block data
+                    hb.block_hash AS highest_qc_hash, hb.height AS highest_qc_height,
+                    hb.view_number AS highest_qc_view, hb.parent_hash AS highest_qc_parent
+                FROM nodes n
+                JOIN this_node t ON n.node_id = (t.current_view % (SELECT COUNT(*) FROM nodes))
+                LEFT JOIN blocks pb ON t.prepared_block_hash = pb.block_hash
+                LEFT JOIN blocks cb ON t.committed_block_hash = cb.block_hash
+                LEFT JOIN blocks hb ON t.highest_qc_block_hash = hb.block_hash
+                WHERE t.internal_id = 1"
+            ).map_err(|_| DatabaseError::RecallError)?;
+            
+            let result = stmt.query_row([], |row| {
+                // Leader node data
+                let node_id: i32 = row.get(0)?;
+                let name: String = row.get(1)?;
+                let ip_address: String = row.get(2)?;
+                let port: i32 = row.get(3)?;
+                let owner: i32 = row.get(4)?;
+                let pubkey_bytes: Vec<u8> = row.get(5)?;
+                let current_view: i32 = row.get(6)?;
+                
+                // Helper function to build block from row data (without transactions)
+                let build_block = |hash_col: usize, height_col: usize, view_col: usize, parent_col: usize| -> Result<Option<crate::types::Block>, duckdb::Error> {
+                    let hash_bytes: Option<Vec<u8>> = row.get(hash_col)?;
+                    if let Some(hash_bytes) = hash_bytes {
+                        let height: i32 = row.get(height_col)?;
+                        let view_number: i32 = row.get(view_col)?;
+                        let parent_hash_bytes: Option<Vec<u8>> = row.get(parent_col)?;
+                        
+                        let block_hash_array: [u8; 32] = hash_bytes.as_slice().try_into()
+                            .map_err(|_| duckdb::Error::InvalidColumnIndex(hash_col))?;
+                        let block_hash = blake3::Hash::from_bytes(block_hash_array);
+                        
+                        let parent_hash = if let Some(parent_bytes) = parent_hash_bytes {
+                            let parent_hash_array: [u8; 32] = parent_bytes.as_slice().try_into()
+                                .map_err(|_| duckdb::Error::InvalidColumnIndex(parent_col))?;
+                            Some(blake3::Hash::from_bytes(parent_hash_array))
+                        } else {
+                            None
+                        };
+                        
+                        Ok(Some(crate::types::Block {
+                            block_hash,
+                            height,
+                            view_number,
+                            parent_hash,
+                            transactions: None, // Not loading transactions for performance
+                        }))
+                    } else {
+                        Ok(None)
+                    }
+                };
+                
+                // Build blocks (column indices: prepared=7-10, committed=11-14, highest_qc=15-18)
+                let prepared_block = build_block(7, 8, 9, 10)?;
+                let committed_block = build_block(11, 12, 13, 14)?;
+                let highest_qc_block = build_block(15, 16, 17, 18)?;
+                
+                Ok((node_id, name, ip_address, port, owner, pubkey_bytes, current_view,
+                    prepared_block, committed_block, highest_qc_block))
+            }).map_err(|_| DatabaseError::RecallError)?;
+            
+            let (node_id, name, ip_address, port, owner, pubkey_bytes, current_view,
+                 prepared_block, committed_block, highest_qc_block) = result;
+            
+            let pubkey = crate::types::PubKey::from_bytes(pubkey_bytes);
+            let leader = crate::types::Node {
+                node_id,
+                name,
+                ip_address,
+                port,
+                owner,
+                pubkey,
+            };
+            
+            let consensus_state = ConsensusState {
+                leader,
+                view: current_view,
+                prepared_block,
+                committed_block,
+                highest_qc_block,
+            };
+            
+            return Ok(consensus_state)
+        }
+        Err(_) => {Err(DatabaseError::LockError)}
     }
 }
