@@ -4,9 +4,10 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use bincode::{encode_to_vec, Encode, config};
 use serde::Deserialize;
 
-use crate::{AppState, db};
+use crate::{consensus::{self, Ballot, VoteSignMessage}, db, types::{Block, Transaction}, AppState};
 
 pub async fn get_users(
     State(app_state): State<AppState>,
@@ -23,24 +24,48 @@ pub async fn get_users(
 }
 
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Encode)]
 pub struct UserRequest {
     username: String,
     password: String,
+}
+
+impl UserRequest {
+    pub fn encode(&self) -> Result<Vec<u8>, StatusCode> {
+        return encode_to_vec(&self, config::standard()).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    }
 }
 
 pub async fn post_users (
     State(app_state): State<AppState>,
     Json(payload): Json<UserRequest>
 ) -> impl IntoResponse {
-    let user = db::User {
-        user_id: 0,
-        username: payload.username,
-        password: payload.password,
-    };
+    // Consensus block generation
+    match payload.encode() {
+        Ok(encoded_payload) => {
+            let transaction = Transaction {
+                function: "post_users".to_string(),
+                payload: encoded_payload,
+            };
+            let transactions = vec![transaction];
 
-    match db::insert_user(&app_state.db, user) {
-        Ok(()) => StatusCode::CREATED,
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            // quorum middleware test
+            match consensus::consensus_middleware(&app_state, transactions).await {
+                Ok(qc) => println!("{:?}", qc),
+                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR
+            }
+
+            let user = db::User {
+                user_id: 0,
+                username: payload.username,
+                password: payload.password,
+            };
+
+            match db::insert_user(&app_state.db, user) {
+                Ok(()) => StatusCode::CREATED,
+                Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            }
+        }
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR
     }
 }

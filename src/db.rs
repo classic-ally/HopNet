@@ -1,5 +1,6 @@
 use argon2::PasswordVerifier;
-use duckdb::{params, Connection, Error};
+use duckdb::{params, Connection, Error, types::ValueRef};
+use ed25519_dalek::SigningKey;
 use reqwest::StatusCode;
 use tokio::sync::oneshot;
 use std::sync::{Arc, Mutex};
@@ -361,11 +362,61 @@ pub fn put_join_setup(
                 ).map_err(|_| DatabaseError::InsertError)?;
             }
 
+            dbg!("Inserting blocks");
+            for block in setupobj.blocks {
+                // Encode transactions to blob if present
+                let transactions_blob = match &block.data.transactions {
+                    Some(transactions) => {
+                        match bincode::encode_to_vec(transactions, bincode::config::standard()) {
+                            Ok(blob) => Some(blob),
+                            Err(_) => return Err(DatabaseError::ProcessingError),
+                        }
+                    }
+                    None => None,
+                };
+
+                // Convert parent_hash to bytes if present
+                let parent_hash_bytes = block.data.parent_hash
+                    .map(|hash| hash.as_bytes().to_vec());
+
+                tx.execute(
+                    "INSERT INTO blocks (block_hash, height, view_number, parent_hash, transactions) VALUES (?, ?, ?, ?, ?)",
+                    params![
+                        block.block_hash.as_bytes(),
+                        block.data.height,
+                        block.data.view_number,
+                        parent_hash_bytes,
+                        transactions_blob
+                    ]
+                ).map_err(|_| DatabaseError::InsertError)?;
+            }
+
             // also write to this_node table so we know setup is completed
+            dbg!("Preparing for this_node");
+            
+            // Convert consensus phase to string for database storage
+            let phase_str = match setupobj.yournode.current_phase {
+                crate::consensus::ConsensusPhase::Propose => "propose",
+                crate::consensus::ConsensusPhase::Vote => "vote",
+            };
+            
+            // Convert optional prepared block hash to bytes
+            let prepared_block_bytes = setupobj.yournode.prepared_block_hash
+                .map(|hash| hash.as_bytes().to_vec());
+            
             dbg!("Inserting this_node");
             tx.execute(
-                "INSERT INTO this_node (internal_id, node_id, privkey) VALUES (?, ?, ?)",
-                params![1, setupobj.yournode.node_id, privkey]
+                "INSERT INTO this_node (internal_id, node_id, privkey, current_phase, current_view, prepared_block_hash, committed_block_hash, highest_qc_block_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    1,
+                    setupobj.yournode.node_id,
+                    privkey,
+                    phase_str,
+                    setupobj.yournode.current_view,
+                    prepared_block_bytes,
+                    setupobj.yournode.committed_block_hash.as_bytes(),
+                    setupobj.yournode.highest_qc_block_hash.as_bytes()
+                ]
             ).map_err(|_| DatabaseError::InsertError)?;
 
             dbg!("TX Commit");
@@ -686,6 +737,122 @@ pub async fn insert_node(
             let sequences: Vec<Sequence> = rows_sequences.collect::<Result<Vec<Sequence>, _>>()
                 .map_err(|_| DatabaseError::ProcessingError)?;
 
+            // blocks data extract
+            dbg!("Fetching block state");
+            let mut stmt_blocks = tx.prepare(
+                "SELECT block_hash, height, view_number, parent_hash, transactions FROM blocks",
+            ).map_err(|_| DatabaseError::RecallError)?;
+            let rows_blocks = stmt_blocks.query_map([], |row| {
+                let block_hash: crate::types::Blake3Hash = row.get(0)?;
+                let height: i32 = row.get(1)?;
+                let view_number: i32 = row.get(2)?;
+                let parent_hash: Option<Vec<u8>> = row.get(3)?;
+                let transactions_blob: Option<Vec<u8>> = row.get(4)?;
+                
+                // Convert parent_hash from Option<Vec<u8>> to Option<Blake3Hash>
+                let parent_hash = match parent_hash {
+                    Some(bytes) => {
+                        if bytes.len() == 32 {
+                            let mut array = [0u8; 32];
+                            array.copy_from_slice(&bytes);
+                            Some(crate::types::Blake3Hash::from_bytes(array))
+                        } else {
+                            None
+                        }
+                    }
+                    None => None,
+                };
+                
+                // Decode transactions from blob if present
+                let transactions = match transactions_blob {
+                    Some(blob) => {
+                        match bincode::decode_from_slice(&blob, bincode::config::standard()) {
+                            Ok((txs, _)) => Some(txs),
+                            Err(_) => None,
+                        }
+                    }
+                    None => None,
+                };
+                
+                Ok(Block {
+                    block_hash,
+                    data: crate::types::BlockData {
+                        height,
+                        view_number,
+                        parent_hash,
+                        transactions,
+                    },
+                })
+            }).map_err(|_| DatabaseError::RecallError)?;
+            let blocks: Vec<Block> = rows_blocks.collect::<Result<Vec<Block>, _>>()
+                .map_err(|_| DatabaseError::ProcessingError)?;
+
+            dbg!("Fetching consensus state");
+            // Get the consensus state from this_node table
+            let (current_phase, current_view, prepared_block_hash, committed_block_hash, highest_qc_block_hash) = tx.query_row(
+                "SELECT current_phase, current_view, prepared_block_hash, committed_block_hash, highest_qc_block_hash FROM this_node WHERE internal_id = 1",
+                [],
+                |row| {
+                    // Handle DuckDB enum - try getting as string first, fallback to enum handling
+                    let phase = match row.get_ref_unwrap(0) {
+                        ValueRef::Text(text) => {
+                            let text_str = std::str::from_utf8(text).unwrap_or("propose");
+                            match text_str {
+                                "propose" => crate::consensus::ConsensusPhase::Propose,
+                                "vote" => crate::consensus::ConsensusPhase::Vote,
+                                _ => crate::consensus::ConsensusPhase::Propose, // default fallback
+                            }
+                        },
+                        ValueRef::Enum(_enum_type, idx) => {
+                            // For now, map index directly to enum values
+                            // This assumes: 0 = "propose", 1 = "vote"
+                            match idx {
+                                0 => crate::consensus::ConsensusPhase::Propose,
+                                1 => crate::consensus::ConsensusPhase::Vote,
+                                _ => crate::consensus::ConsensusPhase::Propose, // default fallback
+                            }
+                        },
+                        _ => {
+                            // Fallback: try to get as string
+                            let phase_str: String = row.get(0)?;
+                            match phase_str.as_str() {
+                                "propose" => crate::consensus::ConsensusPhase::Propose,
+                                "vote" => crate::consensus::ConsensusPhase::Vote,
+                                _ => crate::consensus::ConsensusPhase::Propose, // default fallback
+                            }
+                        }
+                    };
+                    let view: i32 = row.get(1)?;
+                    let prepared_hash: Option<Vec<u8>> = row.get(2)?;
+                    let committed_hash: Vec<u8> = row.get(3)?;
+                    let highest_qc_hash: Vec<u8> = row.get(4)?;
+                    Ok((phase, view, prepared_hash, committed_hash, highest_qc_hash))
+                }
+            ).map_err(|_| DatabaseError::RecallError)?;
+
+            dbg!("Consensus phase fetched successfully");
+
+            dbg!("Mapping prepared hash");
+            // Convert byte arrays to Blake3Hash using standardized database pattern
+            let prepared_block_hash_opt = match prepared_block_hash {
+                Some(bytes) => {
+                    let hash_array: [u8; 32] = bytes.as_slice().try_into()
+                        .map_err(|_| DatabaseError::ProcessingError)?;
+                    Some(crate::types::Blake3Hash::new(blake3::Hash::from_bytes(hash_array)))
+                },
+                None => None
+            };
+
+            dbg!("Mapping committed hash");
+            let committed_hash_array: [u8; 32] = committed_block_hash.as_slice().try_into()
+                .map_err(|_| DatabaseError::ProcessingError)?;
+            let committed_block_hash_blake3 = crate::types::Blake3Hash::new(blake3::Hash::from_bytes(committed_hash_array));
+
+            dbg!("Mapping QC hash");
+            let highest_qc_hash_array: [u8; 32] = highest_qc_block_hash.as_slice().try_into()
+                .map_err(|_| DatabaseError::ProcessingError)?;
+            let highest_qc_block_hash_blake3 = crate::types::Blake3Hash::new(blake3::Hash::from_bytes(highest_qc_hash_array));
+
             ///////////////
             // 3. Compute next node, append to node vec
             ///////////////
@@ -705,6 +872,22 @@ pub async fn insert_node(
                 []
             ).map_err(|_| DatabaseError::InsertError)?;
 
+            // Get current block height from committed block to add validator
+            let current_height = {
+                let committed_block_height = tx.query_row(
+                    "SELECT height FROM blocks WHERE block_hash = (SELECT committed_block_hash FROM this_node WHERE internal_id = 1)",
+                    [],
+                    |row| row.get::<_, i32>(0)
+                ).map_err(|_| DatabaseError::RecallError)?;
+                committed_block_height
+            };
+
+            // Add the new node as a validator starting from the current block height
+            tx.execute(
+                "INSERT INTO validators (effective_height, node_id, is_active) VALUES (?, ?, ?)",
+                params![current_height, next_id, true]
+            ).map_err(|_| DatabaseError::InsertError)?;
+
             // Construct and append
             let new_node = Node {
                 node_id: next_id,
@@ -720,13 +903,19 @@ pub async fn insert_node(
             // 4. Send our sync message to main thread
             ///////////////
             
-            // formulate syncsetupobject
+            // formulate syncsetupobject with complete ThisNode
             let sync_msg = SyncSetupObject {
                 users: users,
                 nodes: nodes,
                 sequences: sequences,
+                blocks: blocks,
                 yournode: ThisNode {
-                    node_id: next_id
+                    node_id: next_id,
+                    current_phase: current_phase,
+                    current_view: current_view,
+                    prepared_block_hash: prepared_block_hash_opt,
+                    committed_block_hash: committed_block_hash_blake3,
+                    highest_qc_block_hash: highest_qc_block_hash_blake3,
                 }
             };
             // tx to main thread
@@ -940,5 +1129,44 @@ pub fn get_validators(
             }
         },
         Err(_) => {Err(DatabaseError::LockError)}
+    }
+}
+
+pub struct MyNode {
+    pub node_id: i32,
+    pub privkey: SigningKey,
+}
+
+pub fn get_me(
+    db: &Arc<Mutex<Connection>>,
+) -> Result<MyNode, DatabaseError> {
+    match db.lock() {
+        Ok(db_lock) => {
+            let mut stmt = db_lock.prepare(
+                "
+                SELECT node_id, privkey FROM this_node
+                "
+            ).map_err(|_| DatabaseError::RecallError)?;
+
+            let result = stmt.query_row([], |row| {
+                let node_id: i32 = row.get(0)?;
+                let privkey_bytes: Vec<u8> = row.get(1)?;
+
+                // Reconstruct SigningKey from bytes
+                let privkey_array: [u8; 32] = privkey_bytes.as_slice()
+                    .try_into()
+                    .map_err(|_| duckdb::Error::InvalidColumnType(0, "privkey".to_string(), duckdb::types::Type::Blob))?;
+                
+                let signing_key = SigningKey::from_bytes(&privkey_array);
+
+                Ok(MyNode {
+                    node_id,
+                    privkey: signing_key
+                })
+            }).map_err(|_| DatabaseError::RecallError)?;
+            
+            Ok(result)
+        }
+        Err(_) => Err(DatabaseError::LockError)
     }
 }

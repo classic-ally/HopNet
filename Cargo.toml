@@ -20,7 +20,7 @@ duckdb = { version = "1.3.0", features = ["bundled"] }
 network-interface = { version = "2.0.1", features = ["serde"] }
 argon2 = {version = "0.5.3", features = ["std"]}
 jsonwebtoken = "9.3.1"
-ed25519-dalek = { version = "2.1.1", features = ["rand_core", "batch"] }
+ed25519-dalek = { version = "2.1.1", features = ["rand_core", "batch", "serde"] }
 rand_core = "0.6"
 hex = "0.4.3"
 blake3 = { version = "1.8.2", features = ["serde"] }

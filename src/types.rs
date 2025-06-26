@@ -2,6 +2,7 @@ use serde::{Serialize, Deserialize, Deserializer, Serializer};
 use ed25519_dalek::VerifyingKey;
 use bincode::{encode_to_vec, decode_from_slice, config, Encode, Decode};
 use blake3::Hasher;
+use duckdb::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 
 use crate::{db, AppState};
 
@@ -128,6 +129,31 @@ impl<'de, Context> bincode::BorrowDecode<'de, Context> for Blake3Hash {
         let mut array = [0u8; 32];
         array.copy_from_slice(bytes);
         Ok(Blake3Hash::from_bytes(array))
+    }
+}
+
+impl FromSql for Blake3Hash {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        match value {
+            ValueRef::Blob(bytes) => {
+                if bytes.len() != 32 {
+                    return Err(FromSqlError::Other(format!(
+                        "Blake3Hash must be exactly 32 bytes, got {} bytes",
+                        bytes.len()
+                    ).into()));
+                }
+                let mut array = [0u8; 32];
+                array.copy_from_slice(bytes);
+                Ok(Blake3Hash::from_bytes(array))
+            }
+            _ => Err(FromSqlError::InvalidType),
+        }
+    }
+}
+
+impl ToSql for Blake3Hash {
+    fn to_sql(&self) -> duckdb::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::from(self.as_bytes()))
     }
 }
 
@@ -266,7 +292,7 @@ impl Block {
     }
     
     pub fn new_tip(
-        app_state: AppState, 
+        app_state: &AppState, 
         transactions: Vec<Transaction>
     ) -> Result<Block, BlockError> {
         // get the current tip

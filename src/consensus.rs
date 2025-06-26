@@ -5,10 +5,15 @@ use axum::{
     Json
 };
 
+use reqwest::Client;
+use serde_json::Value;
+use std::time::Duration;
+
 use crate::types::{Blake3Hash, Block};
 use crate::{
-    db, types::PubKey
+    db, types::Node, types::Transaction
 };
+use tokio::sync::mpsc;
 
 /// CONSENSUS ARCHITECTURE
 /// Key notes:
@@ -28,12 +33,12 @@ use crate::{
 /// 
 ///   - We may want to address this later based on % overhead stats
 
-use ed25519_dalek::{SigningKey, VerifyingKey, Signer, Signature, Verifier};
+use ed25519_dalek::{SigningKey, VerifyingKey, Signer, Signature};
 use rand_core::OsRng;
 use serde::{Serialize,Deserialize};
-use bincode::{encode_to_vec, decode_from_slice, config, Encode, Decode};
+use bincode::{encode_to_vec, config, Encode, Decode};
 
-use crate::{AppState};
+use crate::AppState;
 
 pub fn generate_ed25519_key() -> (SigningKey, VerifyingKey) {
     let mut csprng = OsRng;
@@ -57,7 +62,8 @@ pub enum CertificateError {
     ValidationError,
 }
 
-pub struct Vote {
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Ballot {
     // initiator of the vote, must be leader
     pub initiator: VoteSignMessage,
 
@@ -66,13 +72,10 @@ pub struct Vote {
 
     // associated block
     pub block: Block,
-
-    // our reply
-    pub signoff: Option<VoteSignMessage>,
 }
 
-#[derive(Encode)]
-struct VoteSignData {
+#[derive(Encode, Serialize, Deserialize, Clone)]
+pub struct VoteSignData {
     pub block_hash: Blake3Hash,
     pub block_height: i32,
     pub view: i32,
@@ -86,29 +89,29 @@ impl VoteSignData {
     pub fn from_block(block: Block, phase: ConsensusPhase) -> VoteSignData {
         return VoteSignData { block_hash: block.block_hash, block_height: block.data.height, view: block.data.view_number, phase: phase }
     }
-    pub fn sign(&mut self, replica_id: i32, private_key: SigningKey) -> Result<Signature, VoteError> {
-        let data = self.encode()?;
+    pub fn sign(&self, private_key: &SigningKey) -> Result<Signature, VoteError> {
+        let data = &self.encode()?;
         let signature = private_key.try_sign(&data).map_err(|_| VoteError::ProcessingError)?;
         return Ok(signature);
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct VoteSignMessage {
     pub replica_id: i32,
     pub signature: Signature,
 }
 
-impl Vote {
-    pub fn propose(data: VoteSignData, block: Block, from: VoteSignMessage) -> Vote {
-        return Vote {
+impl Ballot {
+    pub fn propose(data: VoteSignData, block: Block, from: VoteSignMessage) -> Ballot {
+        return Ballot {
             initiator: from,
             data: data,
             block: block,
-            signoff: None,
         };
     }
 
-    pub fn verify_proposal(&self, state: AppState) -> Result<(), VoteError> {
+    pub fn verify_proposal(&self, state: &AppState) -> Result<(), VoteError> {
         // Check leader signature is valid and leader is authorized for view
         let consensus_state = db::get_consensus(&state.db).map_err(|_| VoteError::DatabaseError)?;
 
@@ -170,22 +173,23 @@ impl Vote {
         Ok(())
     }
 
-    pub fn sign(&mut self, replica_id: i32, private_key: SigningKey) -> Result<(), VoteError> {
-        let signature = self.data.sign(replica_id, private_key).map_err(|_| VoteError::ProcessingError)?;
-        self.signoff = Some(VoteSignMessage{
-            replica_id: replica_id,
+    pub fn sign(&self, app_state: AppState) -> Result<VoteSignMessage, VoteError> {
+        let me = db::get_me(&app_state.db).map_err(|_| VoteError::DatabaseError)?;
+        let signature = self.data.sign(&me.privkey).map_err(|_| VoteError::ProcessingError)?;
+        Ok(VoteSignMessage{
+            replica_id: me.node_id,
             signature: signature
-        });
-        Ok(())
+        })
     }
 }
 
-#[derive(Encode, Decode, Clone)]
+#[derive(Encode, Decode, Clone, Serialize, Deserialize, Debug)]
 pub enum ConsensusPhase {
     Propose,
     Vote,
 }
 
+#[derive(Debug)]
 pub struct QuorumCertificate {
     pub view_number: i32,
     pub phase: ConsensusPhase,
@@ -202,11 +206,11 @@ impl QuorumCertificate {
         block: Block,
         phase: ConsensusPhase,
         proposer_id: i32,
-        proposer_key: SigningKey,
+        proposer_key: &SigningKey,
         voter_signatures: Vec<VoteSignMessage>,
     ) -> Result<QuorumCertificate, CertificateError> {
         // sign off ourselves
-        let proposer_signature = VoteSignData::from_block(block.clone(), phase.clone()).sign(proposer_id, proposer_key).map_err(|_| CertificateError::SigningError)?;
+        let proposer_signature = VoteSignData::from_block(block.clone(), phase.clone()).sign(&proposer_key).map_err(|_| CertificateError::SigningError)?;
         let proposer_signature_message = VoteSignMessage {
             replica_id: proposer_id,
             signature: proposer_signature
@@ -220,7 +224,7 @@ impl QuorumCertificate {
             voter_signatures: voter_signatures 
         })
     }
-    pub fn verify(&self, state: AppState, block: Block) -> Result<(), CertificateError> {
+    pub fn verify(&self, state: &AppState, block: Block) -> Result<(), CertificateError> {
         // Get validators for this height
         let validators = db::get_validators(&state.db, block.data.height).map_err(|_| CertificateError::DatabaseError)?;
         let num_validators = validators.len();
@@ -307,4 +311,163 @@ pub async fn get_validators(
         Ok(nodes) => (StatusCode::OK, Json(nodes)).into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Failed to get validators").into_response(),
     }
+}
+
+// route to accept ballots and operate on them
+pub async fn post_ballot(
+    State(app_state): State<AppState>,
+    Json(ballot): Json<Ballot>
+) -> impl IntoResponse {
+    // validate the ballot proposal
+    match ballot.verify_proposal(&app_state) {
+        Ok(()) => {
+            // sign and return the response
+            match ballot.sign(app_state) {
+                Ok(signoff) => {
+                    dbg!("Signing off on block hash {}", ballot.block.block_hash);
+                    return (StatusCode::OK, Json(signoff)).into_response()
+                }
+                Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Error signing ballot").into_response(),
+            }
+        }
+        Err(_) => (StatusCode::UNAUTHORIZED, "Ballot rejected").into_response(),
+    }
+}
+
+pub enum ConsensusError {
+    InsufficientVotes,
+    BlockError,
+    DatabaseError,
+    SigningError,
+    TimeoutError,
+    MalformedReply,
+    ThreadError,
+}
+
+pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transaction>) -> Result<QuorumCertificate, ConsensusError> {
+    let block = Block::new_tip(&app_state, transactions).map_err(|_| ConsensusError::BlockError)?;
+    let vote_data = VoteSignData::from_block(block.clone(), ConsensusPhase::Propose);
+
+    let me = db::get_me(&app_state.db).map_err(|_| ConsensusError::DatabaseError)?;
+    let my_signature = vote_data.sign(&app_state.private_key).map_err(|_| ConsensusError::SigningError)?;
+    let initiator_signoff = VoteSignMessage {
+        replica_id: me.node_id,
+        signature: my_signature,
+    };
+
+    let ballot_proposal = Ballot::propose(vote_data, block.clone(), initiator_signoff);
+    
+    // Get validators and broadcast ballot to collect votes
+    let validators = db::get_validators(&app_state.db, ballot_proposal.block.data.height).map_err(|_| ConsensusError::DatabaseError)?;
+    let voter_signatures = broadcast_and_collect_votes(ballot_proposal, validators).await?;
+    
+    // Create quorum certificate with collected signatures
+    let qc = QuorumCertificate::create(
+        block.clone(),
+        ConsensusPhase::Propose,
+        me.node_id,
+        &app_state.private_key,
+        voter_signatures,
+    ).map_err(|_| ConsensusError::SigningError)?;
+
+    // verify the QC for sanity check
+    match qc.verify(&app_state, block) {
+        Ok(_) => return Ok(qc),
+        Err(_) => return Err(ConsensusError::SigningError)
+    };
+    // return Ok(qc)
+}
+
+async fn broadcast_and_collect_votes(
+    ballot: Ballot,
+    validators: Vec<Node>,
+) -> Result<Vec<VoteSignMessage>, ConsensusError> {
+    // make sure we don't contact ourself
+    let filtered_validators: Vec<Node> = validators
+        .into_iter()
+        .filter(|node| node.node_id != ballot.initiator.replica_id)
+        .collect();
+
+    let (votes_tx, mut votes_rx) = mpsc::channel::<VoteSignMessage>(100); //100 channel capacity
+
+    // Calculate quorum threshold (2/3 majority)
+    let required_votes = (filtered_validators.len() * 2) / 3;
+    
+    // Spawn tasks for each validator
+    for node in filtered_validators {
+        let ballot_clone = ballot.clone();
+        let votes_tx_clone = votes_tx.clone();
+        
+        tokio::spawn(async move {
+            // Ignore errors from individual nodes - they'll just timeout or fail
+            let _ = ballot_send(ballot_clone, node, votes_tx_clone).await;
+        });
+    }
+    
+    // Drop the original sender so the channel closes when all tasks complete
+    drop(votes_tx);
+    
+    // Collect votes until we have enough for quorum or all tasks complete
+    let mut voter_signatures = Vec::new();
+    let timeout = tokio::time::sleep(std::time::Duration::from_secs(30));
+    tokio::pin!(timeout);
+    
+    loop {
+        tokio::select! {
+            vote_opt = votes_rx.recv() => {
+                match vote_opt {
+                    Some(vote) => {
+                        voter_signatures.push(vote);
+                        
+                        // Early termination on quorum
+                        if voter_signatures.len() >= required_votes {
+                            return Ok(voter_signatures);
+                        }
+                    }
+                    None => {
+                        // Channel closed - all tasks completed
+                        break;
+                    }
+                }
+            }
+            _ = &mut timeout => {
+                // Overall timeout reached
+                break;
+            }
+        }
+    }
+    
+    // Check if we have enough votes after timeout or all tasks complete
+    if voter_signatures.len() >= required_votes {
+        Ok(voter_signatures)
+    } else {
+        Err(ConsensusError::InsufficientVotes)
+    }
+}
+
+async fn ballot_send(
+    ballot: Ballot,
+    node: Node,
+    votes_tx: mpsc::Sender<VoteSignMessage>,
+) -> Result<(), ConsensusError> {
+    let client = Client::new();
+    let url = format!("http://{}:{}/ballot", node.ip_address, node.port);
+    match client.post(url)
+        .json(&ballot)
+        .send()
+        .await
+    {
+        Ok(response) => {
+            if response.status().is_success() {
+                let result: Value =  response.json().await.map_err(|_| ConsensusError::MalformedReply)?;
+                let vote_sign_msg: VoteSignMessage = serde_json::from_value(result).map_err(|_| ConsensusError::MalformedReply)?;
+                votes_tx.send(vote_sign_msg).await.map_err(|_| ConsensusError::ThreadError)?;
+                Ok(())
+            } else {
+                return Err(ConsensusError::MalformedReply)
+            }
+        }
+        Err(_) => return Err(ConsensusError::TimeoutError)
+    }
+
 }

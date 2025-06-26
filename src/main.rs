@@ -82,7 +82,8 @@ async fn main() {
                 .route("/interfaces", get(interfaces::get_interfaces))
                 .route("/rpc/latency-server", get(get_latency_server))
                 .route("/rpc/get-remote-latency", get(get_remote_latency_handler))
-                .route("/login", post(auth::sign_in));
+                .route("/login", post(auth::sign_in))
+                .route("/ballot", post(consensus::post_ballot));
 
             let app = if cfg!(debug_assertions) {
                 let cors = CorsLayer::new()

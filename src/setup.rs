@@ -7,17 +7,24 @@ use axum::{
 use serde::{Serialize,Deserialize};
 
 
+use crate::consensus::ConsensusPhase;
 use crate::db::Sequence;
 use crate::AppState;
 use crate::{
+    types::Block,
     db,
     db::User,
 };
-use crate::types::Node;
+use crate::types::{Blake3Hash, Node};
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ThisNode {
-    pub node_id: i32
+    pub node_id: i32,
+    pub current_phase: ConsensusPhase,
+    pub current_view: i32,
+    pub prepared_block_hash: Option<Blake3Hash>,
+    pub committed_block_hash: Blake3Hash,
+    pub highest_qc_block_hash: Blake3Hash
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -34,6 +41,7 @@ pub struct SyncSetupObject {
     pub users: Vec<User>,
     pub nodes: Vec<Node>,
     pub sequences: Vec<Sequence>,
+    pub blocks: Vec<Block>,
     pub yournode: ThisNode,
 }
 
