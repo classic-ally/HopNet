@@ -16,7 +16,7 @@ use argon2::{
 };
 
 use crate::setup::{self, SyncSetupObject, ThisNode};
-use crate::types::Node;
+use crate::types::{Block, BlockData, Node};
 
 pub enum DatabaseError {
     LockError,
@@ -107,7 +107,9 @@ pub fn initialize() -> Result<Arc<Mutex<Connection>>, Error> {
                 height          INTEGER NOT NULL,
                 view_number     INTEGER NOT NULL,
                 parent_hash     BLOB,
-                transactions    BLOB
+                transactions    BLOB,
+
+                CONSTRAINT fk_parent_exists FOREIGN KEY (parent_hash) REFERENCES blocks(block_hash)
             );
 
             -- Common query patterns:
@@ -137,9 +139,9 @@ pub fn initialize() -> Result<Arc<Mutex<Connection>>, Error> {
             -- Not using timestamps (time sync requirement)
             -- Using height (deterministic, directly tied to the block being committed)
             CREATE TABLE validators (
-                effective_height    INTEGER NOT NULL,   -- When this validator set becomes active
+                effective_height    INTEGER NOT NULL,   -- Height when this validator changes state
                 node_id             INTEGER NOT NULL,
-                is_active           BOOLEAN NOT NULL DEFAULT true,
+                is_active           BOOLEAN NOT NULL,
 
                 PRIMARY KEY (effective_height, node_id),
                 FOREIGN KEY (node_id) REFERENCES nodes(node_id)
@@ -166,9 +168,9 @@ pub fn initialize() -> Result<Arc<Mutex<Connection>>, Error> {
                 -- HotStuff-2 efficiency improvement:
                 -- Block is committed when we're working on a later block
                 -- (Working on block n+1 implies we commit block n)
-                committed_block_hash    BLOB,
+                committed_block_hash    BLOB NOT NULL,
                 -- Safety: track highest QC seen (highest view for ordered execution)
-                highest_qc_block_hash   BLOB,
+                highest_qc_block_hash   BLOB NOT NULL,
 
                 FOREIGN KEY (prepared_block_hash) REFERENCES blocks(block_hash),
                 FOREIGN KEY (committed_block_hash) REFERENCES blocks(block_hash),
@@ -285,12 +287,32 @@ pub fn post_initial_setup(
                 "UPDATE sequences SET next_id = next_id + 1 WHERE name = 'nodes'", 
                 []
             ).map_err(|_| DatabaseError::InsertError)?;
-            
+
+            // create genesis block for database
+            let genesis_block = Block::new(
+                BlockData {
+                    height: 0,
+                    view_number: 0,
+                    parent_hash: None,
+                    transactions: None,
+                }
+            ).map_err(|_| DatabaseError::ProcessingError)?;
+
+            tx.execute(
+                "INSERT INTO blocks (block_hash, height, view_number) VALUES (?, ?, ?)",
+                params![genesis_block.block_hash.as_bytes(), genesis_block.data.height, genesis_block.data.view_number]
+            ).map_err(|_| DatabaseError::InsertError)?;
+
+            // mark myself as a validator from view 0
+            tx.execute(
+                "INSERT INTO validators (effective_height, node_id, is_active) VALUES (?, ?, ?)",
+                params![0, next_node_id, true]
+            ).map_err(|_| DatabaseError::InsertError)?;
 
             // also write this node so we know setup is completed
             tx.execute(
-                "INSERT INTO this_node (internal_id, node_id, privkey) VALUES (?, ?, ?)",
-                params![1, next_node_id, privkey]
+                "INSERT INTO this_node (internal_id, node_id, privkey, committed_block_hash, highest_qc_block_hash) VALUES (?, ?, ?, ?, ?)",
+                params![1, next_node_id, privkey, genesis_block.block_hash.as_bytes(), genesis_block.block_hash.as_bytes()]
             ).map_err(|_| DatabaseError::InsertError)?;
 
             // Commit the transaction
@@ -742,8 +764,8 @@ pub struct ConsensusState {
     pub leader: Node,
     pub view: i32,
     pub prepared_block: Option<crate::types::Block>,
-    pub committed_block: Option<crate::types::Block>,
-    pub highest_qc_block: Option<crate::types::Block>,
+    pub committed_block: crate::types::Block,
+    pub highest_qc_block: crate::types::Block,
 }
 
 pub fn get_consensus(
@@ -791,22 +813,24 @@ pub fn get_consensus(
                         
                         let block_hash_array: [u8; 32] = hash_bytes.as_slice().try_into()
                             .map_err(|_| duckdb::Error::InvalidColumnIndex(hash_col))?;
-                        let block_hash = blake3::Hash::from_bytes(block_hash_array);
+                        let block_hash = crate::types::Blake3Hash::new(blake3::Hash::from_bytes(block_hash_array));
                         
                         let parent_hash = if let Some(parent_bytes) = parent_hash_bytes {
                             let parent_hash_array: [u8; 32] = parent_bytes.as_slice().try_into()
                                 .map_err(|_| duckdb::Error::InvalidColumnIndex(parent_col))?;
-                            Some(blake3::Hash::from_bytes(parent_hash_array))
+                            Some(crate::types::Blake3Hash::new(blake3::Hash::from_bytes(parent_hash_array)))
                         } else {
                             None
                         };
                         
                         Ok(Some(crate::types::Block {
                             block_hash,
-                            height,
-                            view_number,
-                            parent_hash,
-                            transactions: None, // Not loading transactions for performance
+                            data: BlockData {
+                                height,
+                                view_number,
+                                parent_hash,
+                                transactions: None, // Not loading transactions for performance
+                            }
                         }))
                     } else {
                         Ok(None)
@@ -835,6 +859,11 @@ pub fn get_consensus(
                 pubkey,
             };
             
+            // Since committed_block and highest_qc_block are now always required,
+            // we need to ensure they exist in the database
+            let committed_block = committed_block.ok_or(DatabaseError::RecallError)?;
+            let highest_qc_block = highest_qc_block.ok_or(DatabaseError::RecallError)?;
+            
             let consensus_state = ConsensusState {
                 leader,
                 view: current_view,
@@ -845,6 +874,71 @@ pub fn get_consensus(
             
             return Ok(consensus_state)
         }
+        Err(_) => {Err(DatabaseError::LockError)}
+    }
+}
+
+pub fn get_validators(
+    db: &Arc<Mutex<Connection>>,
+    height: i32,
+) -> Result<Vec<Node>, DatabaseError> {
+    match db.lock() {
+        Ok(db_lock) => {
+            let mut stmt = db_lock.prepare(
+                "
+                WITH latest_effective AS (
+                    SELECT 
+                        node_id,
+                        MAX(effective_height) AS max_eff
+                    FROM validators
+                    WHERE effective_height <= ?
+                    GROUP BY node_id
+                ),
+                active_validators AS (
+                    SELECT 
+                        v.node_id,
+                        v.is_active
+                    FROM validators v
+                    JOIN latest_effective le 
+                        ON v.node_id = le.node_id 
+                        AND v.effective_height = le.max_eff
+                    WHERE v.is_active = true
+                )
+                SELECT n.node_id, n.name, n.ip_address, n.port, n.owner, n.pubkey
+                FROM active_validators av
+                JOIN nodes n ON av.node_id = n.node_id;
+                "
+            ).map_err(|_| DatabaseError::RecallError)?;
+            
+            let results = stmt.query_map([height], |row| {
+                let node_id: i32 = row.get(0)?;
+                let name: String = row.get(1)?;
+                let ip_address: String = row.get(2)?;
+                let port: i32 = row.get(3)?;
+                let owner: i32 = row.get(4)?;
+                let pubkey_bytes: Vec<u8> = row.get(5)?;
+
+                Ok(Node {
+                    node_id,
+                    name,
+                    ip_address,
+                    port,
+                    owner,
+                    pubkey: crate::types::PubKey::from_bytes(pubkey_bytes),
+                })
+            });
+
+            match results {
+                Ok(rows) => {
+                    let nodes: Vec<Node> = rows.collect::<Result<_, _>>().map_err(|_| DatabaseError::ProcessingError)?;
+                    Ok(nodes)
+                }
+                Err(e) => {
+                    dbg!(e);
+                    Err(DatabaseError::RecordError)
+                }
+            }
+        },
         Err(_) => {Err(DatabaseError::LockError)}
     }
 }
