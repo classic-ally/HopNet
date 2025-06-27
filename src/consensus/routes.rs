@@ -79,7 +79,7 @@ pub async fn post_ballot(
             match ballot.sign(&app_state) {
                 Ok(signoff) => {
                     dbg!("Adding to database block hash {}", ballot.block.block_hash);
-                    match db::insert_block(&app_state.db, ballot.block) {
+                    match db::insert_block(&app_state.db, &ballot.block) {
                         Ok(()) => {
                             dbg!("Block saved!");
                             return (StatusCode::OK, Json(signoff)).into_response()
@@ -95,26 +95,37 @@ pub async fn post_ballot(
 }
 
 // route to accept qcs and operate on them
-// pub async fn post_qc(
-//     State(app_state): State<AppState>,
-//     Json(qc): Json<QuorumCertificate>
-// ) -> impl IntoResponse {
-//     // validate the QC against internal block
-//     match db::get_block(&app_state.db, qc.block_hash) {
-//         Ok(block) => {
-//             match qc.verify(&app_state, block) {
-//                 Ok(()) => {
-//                     // save it to db
-
-//                 }
-//                 Err(_) => (StatusCode::UNAUTHORIZED, "QC does not match").into_response()
-//             }
-//         }
-//         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Cannot recall block").into_response()
-//     }
+pub async fn post_qc(
+    State(app_state): State<AppState>,
+    Json(qc): Json<QuorumCertificate>
+) -> impl IntoResponse {
+    // validate the QC against internal block
+    dbg!("Received QC");
+    match db::get_block(&app_state.db, qc.block_hash) {
+        Ok(block) => {
+            dbg!("We have the block, verifying...");
+            match qc.verify(&app_state, &block) {
+                Ok(()) => {
+                    // save it to db
+                    dbg!("QC looks good, committing");
+                    match db::insert_qc(&app_state.db, qc) {
+                        Ok(()) => StatusCode::OK,
+                        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                    }
+                }
+                Err(e) => {
+                    dbg!("Don't like the QC, printing error");
+                    dbg!(e);
+                    StatusCode::UNAUTHORIZED
+                }
+            }
+        }
+        Err(_) => StatusCode::NOT_FOUND
+    }
     
-// }
+}
 
+#[derive (Debug)]
 pub enum ConsensusError {
     InsufficientVotes,
     BlockError,
@@ -126,7 +137,14 @@ pub enum ConsensusError {
 }
 
 pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transaction>) -> Result<QuorumCertificate, ConsensusError> {
+    dbg!("Begin middleware");
     let block = Block::new_tip(&app_state, transactions).map_err(|_| ConsensusError::BlockError)?;
+    // add block to database irrespective of its acceptance
+    match db::insert_block(&app_state.db, &block) {
+        Ok(()) => {}
+        Err(_) => return Err(ConsensusError::DatabaseError)
+    }
+
     let vote_data = VoteSignData::from_block(block.clone(), ConsensusPhase::Propose);
 
     let me = db::get_me(&app_state.db).map_err(|_| ConsensusError::DatabaseError)?;
@@ -152,14 +170,38 @@ pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transa
     ).map_err(|_| ConsensusError::SigningError)?;
 
     // verify the QC for sanity check
-    match qc.verify(&app_state, block) {
-        Ok(_) => return Ok(qc),
+    match qc.verify(&app_state, &block) {
+        Ok(_) => {
+            // save it to db
+            dbg!("QC looks good, committing");
+            db::insert_qc(&app_state.db, qc.clone()).map_err(|_| ConsensusError::DatabaseError)?;
+        },
         Err(_) => return Err(ConsensusError::SigningError)
     };
 
+    dbg!("Validator filter");
     // broadcast the QC to all validators
+    let filtered_validators: Vec<Node> = validators
+        .iter()
+        .filter(|node| node.node_id != me.node_id)
+        .cloned()
+        .collect();
 
+    dbg!("Contact threads");
+    for node in filtered_validators {
+        let qc_clone = qc.clone();
+        tokio::spawn(async move {
+            match qc_send(qc_clone, &node).await {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    dbg!(&e);
+                    return Err(e)
+                }
+            }
+        });
+    }
 
+    Ok(qc)
 }
 
 async fn broadcast_and_collect_votes(
@@ -269,12 +311,18 @@ async fn qc_send(
         .await
     {
         Ok(response) => {
+            dbg!("Received a response");
             if response.status().is_success() {
+                dbg!("Response OK");
                 Ok(())
             } else {
+                dbg!("Response MalformedReply");
                 return Err(ConsensusError::MalformedReply)
             }
         }
-        Err(_) => return Err(ConsensusError::TimeoutError)
+        Err(_) => {
+            dbg!("TimeoutError");
+            return Err(ConsensusError::TimeoutError)
+        }
     }
 }

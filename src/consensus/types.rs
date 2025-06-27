@@ -3,7 +3,7 @@ use serde::{Serialize, Deserialize};
 use std::ops::Deref;
 use duckdb::{ToSql,types::ToSqlOutput,types::FromSql,types::FromSqlResult,types::ValueRef};
 use crate::db::consensus as db;
-use bincode::serde::{encode_to_vec,decode_from_slice};
+use bincode::serde::encode_to_vec;
 use ed25519_dalek::Signature;
 use bincode::config;
 use blake3::Hasher;
@@ -16,10 +16,12 @@ pub enum VoteError {
     BlockError,
 }
 
+#[derive(Debug)]
 pub enum CertificateError {
     DatabaseError,
     SigningError,
     ValidationError,
+    SignerNotFound,
 }
 
 pub enum BlockError {
@@ -188,7 +190,7 @@ pub struct VoteSignMessage {
     pub signature: Signature,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct VoteSignMessages(Vec<VoteSignMessage>);
 
 impl ToSql for VoteSignMessage {
@@ -218,7 +220,7 @@ impl ToSql for VoteSignMessages {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct QuorumCertificate {
     pub view_number: i32,
     pub phase: ConsensusPhase,
@@ -255,9 +257,10 @@ impl QuorumCertificate {
             voter_signatures: vsm 
         })
     }
-    pub fn verify(&self, state: &AppState, block: Block) -> Result<(), CertificateError> {
+    pub fn verify(&self, state: &AppState, block: &Block) -> Result<(), CertificateError> {
         // Get validators for this height
         let validators = db::get_validators(&state.db, block.data.height).map_err(|_| CertificateError::DatabaseError)?;
+        dbg!(&validators.len());
         let num_validators = validators.len();
         
         // Check we have enough signatures for quorum (2/3 + 1)
@@ -283,7 +286,7 @@ impl QuorumCertificate {
         // Find proposer's public key
         let proposer_node = validators.iter()
             .find(|v| v.node_id == self.proposer_signature.replica_id)
-            .ok_or(CertificateError::ValidationError)?;
+            .ok_or(CertificateError::SignerNotFound)?;
         let proposer_pubkey = proposer_node.pubkey.to_verifying_key()
             .map_err(|_| CertificateError::ValidationError)?;
         public_keys.push(proposer_pubkey);
@@ -296,7 +299,7 @@ impl QuorumCertificate {
             // Find voter's public key
             let voter_node = validators.iter()
                 .find(|v| v.node_id == voter_sig.replica_id)
-                .ok_or(CertificateError::ValidationError)?;
+                .ok_or(CertificateError::SignerNotFound)?;
             let voter_pubkey = voter_node.pubkey.to_verifying_key()
                 .map_err(|_| CertificateError::ValidationError)?;
             public_keys.push(voter_pubkey);
@@ -318,7 +321,9 @@ impl QuorumCertificate {
                 
                 Ok(())
             }
-            Err(_) => Err(CertificateError::ValidationError)
+            Err(_) => {
+                Err(CertificateError::ValidationError)
+            }
         }
     }
 }
@@ -337,7 +342,7 @@ pub struct BlockData {
     pub height: i32,
     pub view_number: i32,
     pub parent_hash: Option<Blake3Hash>,
-    pub transactions: Option<Vec<Transaction>>
+    pub transactions: Option<Transactions>
 }
 
 impl BlockData {
@@ -377,7 +382,7 @@ impl Block {
                     height: consensus_state.committed_block.data.height + 1,
                     view_number: consensus_state.view,
                     parent_hash: Some(consensus_state.committed_block.block_hash),
-                    transactions: Some(transactions)
+                    transactions: Some(Transactions(transactions))
                 };
                 let new_block = Block::new(tip_data)?;
                 Ok(new_block)
@@ -394,19 +399,6 @@ impl Block {
         }
         Ok(())
     }
-
-    pub fn tx_to_db(&self) -> Result<Vec<u8>, bincode::error::EncodeError> {
-        match &self.data.transactions {
-            Some(transactions) => encode_to_vec(transactions, config::standard()),
-            None => encode_to_vec(&Vec::<Transaction>::new(), config::standard())
-        }
-    }
-    
-    pub fn db_to_tx(&mut self, data: Vec<u8>) -> Result<(), bincode::error::DecodeError> {
-        let (transactions, _): (Vec<Transaction>, usize) = decode_from_slice(&data, config::standard())?;
-        self.data.transactions = Some(transactions);
-        Ok(())
-    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -415,6 +407,41 @@ pub struct Transaction {
     pub function: String,
     // data passed into function, with input data type
     pub payload: Vec<u8>
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Transactions(pub Vec<Transaction>);
+
+impl Deref for Transactions {
+    type Target = Vec<Transaction>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl ToSql for Transactions {
+    fn to_sql(&self) -> Result<ToSqlOutput<'_>, duckdb::Error> {
+        // let's turn transactions into Vec<u8>
+        match bincode::serde::encode_to_vec(&self, bincode::config::standard()) {
+            Ok(data) => Ok(ToSqlOutput::Owned(duckdb::types::Value::Blob(data))),
+            Err(e) => Err(duckdb::Error::ToSqlConversionFailure(Box::new(e)))
+        }
+    }
+}
+
+impl FromSql for Transactions {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        match value {
+            ValueRef::Blob(b) => {
+                match bincode::serde::decode_from_slice(b, bincode::config::standard()) {
+                    Ok((data, _)) => Ok(Transactions(data)),
+                    Err(_) => Err(duckdb::types::FromSqlError::InvalidType),
+                }
+            }
+            _ => Err(duckdb::types::FromSqlError::InvalidType),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -427,49 +454,3 @@ pub struct ConsensusState {
 }
 
 use crate::db::DatabaseError;
-/// Helper function to serialize transactions to blob format
-pub fn serialize_transactions(transactions: &Option<Vec<Transaction>>) -> Result<Option<Vec<u8>>, DatabaseError> {
-    match transactions {
-        Some(transactions) => {
-            match encode_to_vec(transactions, bincode::config::standard()) {
-                Ok(blob) => Ok(Some(blob)),
-                Err(_) => Err(DatabaseError::ProcessingError),
-            }
-        }
-        None => Ok(None),
-    }
-}
-
-/// Helper function to serialize parent hash to bytes
-pub fn serialize_parent_hash(parent_hash: Option<crate::types::Blake3Hash>) -> Option<Vec<u8>> {
-    parent_hash.map(|hash| hash.as_bytes().to_vec())
-}
-
-/// Helper function to deserialize transactions from blob format
-pub fn deserialize_transactions(transactions_blob: Option<Vec<u8>>) -> Result<Option<Vec<Transaction>>, DatabaseError> {
-    match transactions_blob {
-        Some(blob) => {
-            match decode_from_slice(&blob, bincode::config::standard()) {
-                Ok((txs, _)) => Ok(Some(txs)),
-                Err(_) => Err(DatabaseError::ProcessingError),
-            }
-        }
-        None => Ok(None),
-    }
-}
-
-/// Helper function to deserialize parent hash from bytes
-pub fn deserialize_parent_hash(parent_hash_bytes: Option<Vec<u8>>) -> Option<crate::types::Blake3Hash> {
-    match parent_hash_bytes {
-        Some(bytes) => {
-            if bytes.len() == 32 {
-                let mut array = [0u8; 32];
-                array.copy_from_slice(&bytes);
-                Some(crate::types::Blake3Hash::from_bytes(array))
-            } else {
-                None
-            }
-        }
-        None => None,
-    }
-}

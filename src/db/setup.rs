@@ -152,9 +152,6 @@ pub fn put_join_setup(
 
             dbg!("Inserting blocks");
             for block in setupobj.blocks {
-                // Use helper functions for serialization
-                let transactions_blob = crate::consensus::types::serialize_transactions(&block.data.transactions)?;
-
                 tx.execute(
                     "INSERT INTO blocks (block_hash, height, view_number, parent_hash, transactions) VALUES (?, ?, ?, ?, ?)",
                     params![
@@ -162,15 +159,19 @@ pub fn put_join_setup(
                         block.data.height,
                         block.data.view_number,
                         block.data.parent_hash,
-                        transactions_blob
+                        block.data.transactions
                     ]
                 ).map_err(|_| DatabaseError::InsertError)?;
             }
-            
-            // Convert optional prepared block hash to bytes
-            let prepared_block_bytes = setupobj.yournode.prepared_block_hash
-                .map(|hash| hash.as_bytes().to_vec());
-            
+
+            dbg!("Inserting validators");
+            for validator in setupobj.validators {
+                tx.execute(
+                    "INSERT INTO validators (effective_height, node_id, is_active) VALUES (?, ?, ?)",
+                    params![validator.effective_height, validator.node_id, validator.is_active]
+                ).map_err(|_| DatabaseError::InsertError)?;
+            }
+
             dbg!("Inserting this_node");
             tx.execute(
                 "INSERT INTO this_node (internal_id, node_id, privkey, current_phase, current_view, prepared_block_hash, committed_block_hash, highest_qc_block_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -180,7 +181,7 @@ pub fn put_join_setup(
                     privkey,
                     setupobj.yournode.current_phase,
                     setupobj.yournode.current_view,
-                    prepared_block_bytes,
+                    setupobj.yournode.prepared_block_hash,
                     setupobj.yournode.committed_block_hash,
                     setupobj.yournode.highest_qc_block_hash
                 ]

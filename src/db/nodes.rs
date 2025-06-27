@@ -1,6 +1,6 @@
 use super::*;
 use tokio::sync::oneshot;
-use crate::setup::SyncSetupObject;
+use crate::setup::{SyncSetupObject, Validator};
 use tokio::io::Error;
 use crate::consensus::types::{Block,BlockData,ConsensusPhase};
 use crate::setup::ThisNode;
@@ -104,22 +104,8 @@ pub async fn insert_node(
                 let block_hash: crate::types::Blake3Hash = row.get(0)?;
                 let height: i32 = row.get(1)?;
                 let view_number: i32 = row.get(2)?;
-                let parent_hash: Option<Vec<u8>> = row.get(3)?;
+                let parent_hash: Option<crate::types::Blake3Hash> = row.get(3)?;
                 let transactions_blob: Option<Vec<u8>> = row.get(4)?;
-                
-                // Convert parent_hash from Option<Vec<u8>> to Option<Blake3Hash>
-                let parent_hash = match parent_hash {
-                    Some(bytes) => {
-                        if bytes.len() == 32 {
-                            let mut array = [0u8; 32];
-                            array.copy_from_slice(&bytes);
-                            Some(crate::types::Blake3Hash::from_bytes(array))
-                        } else {
-                            None
-                        }
-                    }
-                    None => None,
-                };
                 
                 // Decode transactions from blob if present
                 let transactions = match transactions_blob {
@@ -147,41 +133,34 @@ pub async fn insert_node(
 
             dbg!("Fetching consensus state");
             // Get the consensus state from this_node table
-            let (current_phase, current_view, prepared_block_hash, committed_block_hash, highest_qc_block_hash) = tx.query_row(
+            let (current_phase, current_view, prepared_block_hash_opt, committed_block_hash_blake3, highest_qc_block_hash_blake3) = tx.query_row(
                 "SELECT current_phase, current_view, prepared_block_hash, committed_block_hash, highest_qc_block_hash FROM this_node WHERE internal_id = 1",
                 [],
                 |row| {
                     let phase: ConsensusPhase = row.get(0)?;
                     let view: i32 = row.get(1)?;
-                    let prepared_hash: Option<Vec<u8>> = row.get(2)?;
-                    let committed_hash: Vec<u8> = row.get(3)?;
-                    let highest_qc_hash: Vec<u8> = row.get(4)?;
+                    let prepared_hash: Option<crate::types::Blake3Hash> = row.get(2)?;
+                    let committed_hash: crate::types::Blake3Hash = row.get(3)?;
+                    let highest_qc_hash: crate::types::Blake3Hash = row.get(4)?;
                     Ok((phase, view, prepared_hash, committed_hash, highest_qc_hash))
                 }
             ).map_err(|_| DatabaseError::RecallError)?;
 
+            dbg!("Fetching validator state");
+            let mut stmt_validators = tx.prepare(
+                "SELECT effective_height, node_id, is_active FROM validators"
+            ).map_err(|_| DatabaseError::RecallError)?;
+            let rows_validators = stmt_validators.query_map([], |row| {
+                Ok(Validator {
+                    effective_height: row.get(0)?,
+                    node_id: row.get(1)?,
+                    is_active: row.get(2)?,
+                })
+            }).map_err(|_| DatabaseError::RecallError)?;
+            let mut validators: Vec<Validator> = rows_validators.collect::<Result<Vec<Validator>, _>>()
+                .map_err(|_| DatabaseError::ProcessingError)?;
+
             dbg!("Consensus phase fetched successfully");
-
-            dbg!("Mapping prepared hash");
-            // Convert byte arrays to Blake3Hash using standardized database pattern
-            let prepared_block_hash_opt = match prepared_block_hash {
-                Some(bytes) => {
-                    let hash_array: [u8; 32] = bytes.as_slice().try_into()
-                        .map_err(|_| DatabaseError::ProcessingError)?;
-                    Some(crate::types::Blake3Hash::new(blake3::Hash::from_bytes(hash_array)))
-                },
-                None => None
-            };
-
-            dbg!("Mapping committed hash");
-            let committed_hash_array: [u8; 32] = committed_block_hash.as_slice().try_into()
-                .map_err(|_| DatabaseError::ProcessingError)?;
-            let committed_block_hash_blake3 = crate::types::Blake3Hash::new(blake3::Hash::from_bytes(committed_hash_array));
-
-            dbg!("Mapping QC hash");
-            let highest_qc_hash_array: [u8; 32] = highest_qc_block_hash.as_slice().try_into()
-                .map_err(|_| DatabaseError::ProcessingError)?;
-            let highest_qc_block_hash_blake3 = crate::types::Blake3Hash::new(blake3::Hash::from_bytes(highest_qc_hash_array));
 
             ///////////////
             // 3. Compute next node, append to node vec
@@ -228,6 +207,12 @@ pub async fn insert_node(
                 pubkey: node.pubkey
             };
             nodes.push(new_node);
+            let new_validator = Validator {
+                effective_height: current_height,
+                node_id: next_id,
+                is_active: true
+            };
+            validators.push(new_validator);
             
             ///////////////
             // 4. Send our sync message to main thread
@@ -239,6 +224,7 @@ pub async fn insert_node(
                 nodes: nodes,
                 sequences: sequences,
                 blocks: blocks,
+                validators: validators,
                 yournode: ThisNode {
                     node_id: next_id,
                     current_phase: current_phase,

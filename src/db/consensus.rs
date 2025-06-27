@@ -38,23 +38,11 @@ pub fn get_consensus(
                 
                 // Helper function to build block from row data (without transactions)
                 let build_block = |hash_col: usize, height_col: usize, view_col: usize, parent_col: usize| -> Result<Option<Block>, duckdb::Error> {
-                    let hash_bytes: Option<Vec<u8>> = row.get(hash_col)?;
-                    if let Some(hash_bytes) = hash_bytes {
+                    let block_hash: Option<Blake3Hash> = row.get(hash_col)?;
+                    if let Some(block_hash) = block_hash {
                         let height: i32 = row.get(height_col)?;
                         let view_number: i32 = row.get(view_col)?;
-                        let parent_hash_bytes: Option<Vec<u8>> = row.get(parent_col)?;
-                        
-                        let block_hash_array: [u8; 32] = hash_bytes.as_slice().try_into()
-                            .map_err(|_| duckdb::Error::InvalidColumnIndex(hash_col))?;
-                        let block_hash = crate::types::Blake3Hash::new(blake3::Hash::from_bytes(block_hash_array));
-                        
-                        let parent_hash = if let Some(parent_bytes) = parent_hash_bytes {
-                            let parent_hash_array: [u8; 32] = parent_bytes.as_slice().try_into()
-                                .map_err(|_| duckdb::Error::InvalidColumnIndex(parent_col))?;
-                            Some(crate::types::Blake3Hash::new(blake3::Hash::from_bytes(parent_hash_array)))
-                        } else {
-                            None
-                        };
+                        let parent_hash: Option<Blake3Hash> = row.get(parent_col)?;
                         
                         Ok(Some(Block {
                             block_hash,
@@ -178,13 +166,10 @@ pub fn get_validators(
 
 pub fn insert_block(
     db: &Arc<Mutex<Connection>>,
-    block: Block,
+    block: &Block,
 ) -> Result<(), DatabaseError> {
     match db.lock() {
         Ok(mut db_lock) => {
-            // Use helper functions for serialization
-            let transactions_blob = serialize_transactions(&block.data.transactions)?;
-            
             let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
             tx.execute(
                 "INSERT INTO blocks (block_hash, height, view_number, parent_hash, transactions) VALUES (?, ?, ?, ?, ?)",
@@ -193,7 +178,7 @@ pub fn insert_block(
                     block.data.height,
                     block.data.view_number,
                     block.data.parent_hash,
-                    transactions_blob
+                    block.data.transactions
                 ]
             ).map_err(|_| DatabaseError::InsertError)?;
             tx.commit().map_err(|_| DatabaseError::InsertError)?;
@@ -213,21 +198,17 @@ pub fn get_block(
                 "SELECT block_hash, height, view_number, parent_hash, transactions FROM blocks WHERE block_hash = ?"
             ).map_err(|_| DatabaseError::RecallError)?;
 
-            let result = stmt.query_row([block_hash.as_bytes()], |row| {
+            let result = stmt.query_row([block_hash], |row| {
                 let block_hash: Blake3Hash = row.get(0)?;
                 let height: i32 = row.get(1)?;
                 let view_number: i32 = row.get(2)?;
-                let parent_hash_bytes: Option<Vec<u8>> = row.get(3)?;
-                let transactions_blob: Option<Vec<u8>> = row.get(4)?;
+                let parent_hash: Option<Blake3Hash> = row.get(3)?;
+                let transactions: Option<Transactions> = row.get(4)?;
 
-                Ok((block_hash, height, view_number, parent_hash_bytes, transactions_blob))
+                Ok((block_hash, height, view_number, parent_hash, transactions))
             }).map_err(|_| DatabaseError::RecallError)?;
 
-            let (block_hash, height, view_number, parent_hash_bytes, transactions_blob) = result;
-
-            // Use helper functions for deserialization
-            let parent_hash = deserialize_parent_hash(parent_hash_bytes);
-            let transactions = deserialize_transactions(transactions_blob)?;
+            let (block_hash, height, view_number, parent_hash, transactions) = result;
 
             Ok(Block {
                 block_hash,
@@ -250,6 +231,7 @@ pub fn insert_qc(
     match db.lock() {
         Ok(mut db_lock) => {
             let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
+            dbg!("Attempting transaction");
             tx.execute(
                 "INSERT INTO quorum_certificates (view_number, phase, block_hash, proposer_signature, voter_signatures) VALUES (?, ?, ?, ?, ?)",
                 params![
@@ -259,7 +241,8 @@ pub fn insert_qc(
                     qc.proposer_signature,
                     qc.voter_signatures,
                 ]
-            );
+            ).map_err(|_| DatabaseError::InsertError)?;
+            dbg!("QC inserted.");
             Ok(())
         }
         Err(_) => Err(DatabaseError::LockError)

@@ -41,7 +41,15 @@ pub struct SyncSetupObject {
     pub nodes: Vec<Node>,
     pub sequences: Vec<Sequence>,
     pub blocks: Vec<Block>,
+    pub validators: Vec<Validator>,
     pub yournode: ThisNode,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Validator {
+    pub effective_height: i32,
+    pub node_id: i32,
+    pub is_active: bool
 }
 
 pub async fn get_setup(
