@@ -1,15 +1,11 @@
 use axum::{
-    extract::{Query, State}, http::{HeaderValue, Method, StatusCode}, middleware, response::IntoResponse, routing::{get,post,put}, serve, Json, Router
+    http::{HeaderValue, Method}, middleware, routing::{get,post,put}, serve, Router
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use jsonwebtoken::{DecodingKey, EncodingKey};
-use std::net::IpAddr;
-use serde::{Serialize, Deserialize};
 use tower_serve_static::ServeDir;
 use tower_http::cors::CorsLayer;
 use include_dir::{Dir, include_dir};
-
-use duckdb::Connection;
 
 mod nodes;
 mod setup;
@@ -50,9 +46,9 @@ async fn main() {
     let bindurl = format!("0.0.0.0:{}", port);
 
     let (encodingkey, decodingkey) = auth::generate_jwt_key();
-    let (privatekey, publickey) = consensus::generate_ed25519_key();
+    let (privatekey, publickey) = consensus::routes::generate_ed25519_key();
 
-    match db::initialize() {
+    match db::shared::initialize() {
         Ok(database) => {
             let app_state = AppState {
                 db: database,
@@ -68,22 +64,22 @@ async fn main() {
                 .route("/users", post(users::post_users))
                 .route("/nodes", get(nodes::get_nodes))
                 .route("/nodes", post(nodes::post_nodes))
-                .route("/validators", get(consensus::get_validators))
-                .route("/consensus", get(consensus::get_consensus))
+                .route("/validators", get(consensus::routes::get_validators))
+                .route("/consensus", get(consensus::routes::get_consensus))
                 .layer(middleware::from_fn_with_state(app_state.clone(), auth::auth_middleware));
 
             let base_app = Router::new()
                 .fallback_service(admin_service) // routes we don't have get sent to vite frontend
-                .route("/metrics/get-all", get(get_metrics))
+                .route("/metrics/get-all", get(metrics::routes::get_metrics))
                 .merge(protected_routes)
                 .route("/setup", get(setup::get_setup))
                 .route("/setup", post(setup::post_setup))
                 .route("/setup", put(setup::put_setup))
                 .route("/interfaces", get(interfaces::get_interfaces))
-                .route("/rpc/latency-server", get(get_latency_server))
-                .route("/rpc/get-remote-latency", get(get_remote_latency_handler))
+                .route("/rpc/latency-server", get(metrics::routes::get_latency_server))
+                .route("/rpc/get-remote-latency", get(metrics::routes::get_remote_latency_handler))
                 .route("/login", post(auth::sign_in))
-                .route("/ballot", post(consensus::post_ballot));
+                .route("/ballot", post(consensus::routes::post_ballot));
 
             let app = if cfg!(debug_assertions) {
                 let cors = CorsLayer::new()
@@ -113,120 +109,4 @@ async fn main() {
     }
     
 
-}
-
-async fn get_latency_server() -> impl IntoResponse {
-    match metrics::latency::listener().await {
-        Ok((_, latency_port)) => {
-            (StatusCode::CREATED, Json(latency_port))
-        }
-        Err(_error) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(0))
-        }
-    }
-}
-
-#[derive(Deserialize)]
-struct RemoteLatencyQuery {
-    ip: String,
-}
-
-async fn get_metrics(
-    State(app_state): State<AppState>,
-) -> impl IntoResponse {
-    match db::get_metric(&app_state.db) {
-        Ok(metrics) => {
-            println!("{:?}", metrics);    
-            (StatusCode::OK, Json(metrics))
-        }
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(Vec::<db::Metric>::new())),
-    }
-}
-
-async fn get_remote_latency_handler(
-    Query(params): Query<RemoteLatencyQuery>,
-    State(app_state): State<AppState>,
-) -> impl IntoResponse {
-    let (status, response) = get_remote_latency(&app_state.db, &params.ip).await;
-    match response {
-        Some(latency_response) => (status, Json(LatencyResponseWrapper::Success(latency_response))),
-        None => (status, Json(LatencyResponseWrapper::Error(ErrorResponse { error: "Failed to get remote latency".to_string() })))
-    }
-}
-
-async fn get_remote_latency(
-    db: &std::sync::Arc<std::sync::Mutex<Connection>>, 
-    str_ip: &str
-) -> (StatusCode, Option<LatencyResponse>) {
-    // let's hit the remote
-    let url = format!("http://{}:34632/rpc/latency-server", str_ip);
-    match reqwest::get(&url).await {
-        Ok(response) => {
-            if response.status().is_success() {
-                match response.text().await {
-                    Ok(str) => {
-                        match str.parse::<u16>() {
-                            // yes it's a u16
-                            Ok(port) => {
-                                match str_ip.parse::<IpAddr>() {
-                                    Ok(ip) => {
-                                        match metrics::latency::send_latency(db, ip, port).await {
-                                            Ok((average_rtt, variance, jitter)) => {
-                                                let response = LatencyResponse {
-                                                    address: str_ip.to_string() + ":" + &str,
-                                                    average_rtt: average_rtt,
-                                                    variance: variance,
-                                                    jitter: jitter,
-                                                };
-                                                return (StatusCode::OK, Some(response));
-                                            }
-                                            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, None)
-                                        }
-                                    }
-                                    Err(_) => (StatusCode::UNPROCESSABLE_ENTITY, None)
-                                }
-                            }
-                            // port isn't a u16-> gateway is naughty
-                            Err(_) => (StatusCode::BAD_GATEWAY, None)
-                        }
-                    }
-                    Err(_) => (StatusCode::BAD_GATEWAY, None)
-                }
-            } else {
-                return (response.status(), None)
-            }
-        }
-        Err(e) => {
-            // handle reqwest errors
-            match e.status() {
-                Some(status) => (status, None),
-                None => (StatusCode::GATEWAY_TIMEOUT, None)
-            }
-        }
-    }
-}
-
-// response for remote latency
-#[derive(Serialize)]
-struct LatencyResponse {
-    address: String,
-    average_rtt: f64,
-    variance: f64,
-    jitter: f64,
-}
-
-// error response
-#[derive(Serialize)]
-struct ErrorResponse {
-    error: String,
-}
-
-// unified response wrapper
-#[derive(Serialize)]
-#[serde(untagged)]
-enum LatencyResponseWrapper {
-    Success(LatencyResponse),
-    Error(ErrorResponse),
 }

@@ -8,7 +8,7 @@ use tokio::task::JoinHandle;
 use rand::Rng;
 
 use crate::db;
-
+use crate::metrics::types::*;
 #[derive(Debug)]
 pub enum LatencyError {
     MalformedTimestamp,
@@ -149,7 +149,7 @@ pub async fn send_latency(
     // calculate RTT average, variance, jitter
     let (average_rtt, variance, jitter) = calculate_rtt_metrics(rtts);
 
-    let metric = db::Metric {
+    let metric = Metric {
         from_node: 1000,
         to_node: 1000,
         start_time: sys_start_time,
@@ -162,7 +162,7 @@ pub async fn send_latency(
     };
 
     // database write
-    match db::insert_metric(db, metric) {
+    match db::metrics::insert_metric(db, metric) {
         Ok(()) => Ok((average_rtt, variance, jitter)),
         Err(_) => Err(LatencyError::DatabaseError)
     }

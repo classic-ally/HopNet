@@ -1,13 +1,11 @@
 use serde::{Serialize, Deserialize, Deserializer, Serializer};
 use ed25519_dalek::VerifyingKey;
-use bincode::{encode_to_vec, decode_from_slice, config, Encode, Decode};
-use blake3::Hasher;
+use bincode::{Encode, Decode};
 use duckdb::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
-
-use crate::{db, AppState};
+pub use ed25519_dalek::{SigningKey,Signer};
 
 /// A wrapper around blake3::Hash that implements bincode's Encode and Decode traits
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
 pub struct Blake3Hash(blake3::Hash);
 
 impl Blake3Hash {
@@ -160,6 +158,22 @@ impl ToSql for Blake3Hash {
 #[derive(Debug, Clone)]
 pub struct PubKey(pub Vec<u8>);
 
+impl ToSql for PubKey {
+    fn to_sql(&self) -> duckdb::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::from(self.as_bytes()))
+    }
+}
+impl FromSql for PubKey {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        match value {
+            ValueRef::Blob(bytes) => {
+                Ok(PubKey(bytes.to_vec()))
+            }
+            _ => Err(FromSqlError::InvalidType),
+        }
+    }
+}
+
 impl PubKey {
     pub fn from_hex(hex_str: &str) -> Result<Self, hex::FromHexError> {
         hex::decode(hex_str).map(PubKey)
@@ -234,7 +248,7 @@ impl<'de> Deserialize<'de> for PubKey {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Node {
     pub node_id: i32,
     pub name: String,
@@ -244,101 +258,36 @@ pub struct Node {
     pub pubkey: PubKey,
 }
 
-#[derive(Serialize, Deserialize, Debug, Encode, Decode, Clone)]
-pub struct Block {
-    // hash of this block: db key
-    pub block_hash: Blake3Hash,
-
-    // computed based on these: db value
-    pub data: BlockData,
+#[derive(Serialize, Deserialize, Debug)]
+pub struct User {
+    pub user_id: i32,
+    pub username: String,
+    pub password: String,
 }
 
-#[derive(Serialize, Deserialize, Debug, Encode, Decode, Clone)]
-pub struct BlockData {
-    pub height: i32,
-    pub view_number: i32,
-    pub parent_hash: Option<Blake3Hash>,
-    pub transactions: Option<Vec<Transaction>>
-}
+use argon2::{
+    password_hash::{
+        rand_core::OsRng,
+        PasswordHash, PasswordHasher, SaltString
+    },
+    Argon2, PasswordVerifier
+};
 
-pub enum BlockError {
-    EncodingError,
-    DatabaseError,
-}
-
-impl BlockData {
-    pub fn encode(&self) -> Result<Vec<u8>, BlockError> {
-        return encode_to_vec(&self, config::standard()).map_err(|_| BlockError::EncodingError);
+impl User {
+    pub fn password_hash(&mut self) -> Result<String, argon2::password_hash::Error> {
+        let salt = SaltString::generate(&mut OsRng);
+        let argon2 = Argon2::default();
+        let password_hash = argon2.hash_password(self.password.as_bytes(), &salt)?.to_string();
+        Ok(password_hash)
     }
-
-    pub fn compute_hash(&self) -> Result<Blake3Hash, BlockError> {
-        let mut hasher = Hasher::new();
-        let encoded_data = &self.encode()?;
-        hasher.update(encoded_data.as_slice());
-        let digest = Blake3Hash::new(hasher.finalize());
-        Ok(digest)
+    pub fn verify_password(&mut self, check_password: &[u8]) -> Result<bool, argon2::password_hash::Error> {
+        let parsed_hash = PasswordHash::new(&self.password)?;
+        return Ok(Argon2::default().verify_password(check_password, &parsed_hash).is_ok());
     }
 }
 
-impl Block {
-    pub fn new(data: BlockData) -> Result<Block, BlockError> {
-        // compute hash over blockdata
-        let digest = data.compute_hash()?;
-        
-        return Ok(Block {
-            block_hash: digest,
-            data: data
-        })
-    }
-    
-    pub fn new_tip(
-        app_state: &AppState, 
-        transactions: Vec<Transaction>
-    ) -> Result<Block, BlockError> {
-        // get the current tip
-        // it is the committed_block
-        match db::get_consensus(&app_state.db) {
-            Ok(consensus_state) => {
-                let tip_data = BlockData {
-                    height: consensus_state.committed_block.data.height + 1,
-                    view_number: consensus_state.view,
-                    parent_hash: Some(consensus_state.committed_block.block_hash),
-                    transactions: Some(transactions)
-                };
-                let new_block = Block::new(tip_data)?;
-                Ok(new_block)
-            }
-            Err(_) => Err(BlockError::DatabaseError)
-        }
-    }
-
-    pub fn verify(&self) -> Result<(), BlockError> {
-        // compute hash and compare to self
-        let digest = self.data.compute_hash()?;
-        if digest != self.block_hash {
-            return Err(BlockError::EncodingError)
-        }
-        Ok(())
-    }
-
-    pub fn tx_to_db(&self) -> Result<Vec<u8>, bincode::error::EncodeError> {
-        match &self.data.transactions {
-            Some(transactions) => encode_to_vec(transactions, config::standard()),
-            None => encode_to_vec(&Vec::<Transaction>::new(), config::standard())
-        }
-    }
-    
-    pub fn db_to_tx(&mut self, data: Vec<u8>) -> Result<(), bincode::error::DecodeError> {
-        let (transactions, _): (Vec<Transaction>, usize) = decode_from_slice(&data, config::standard())?;
-        self.data.transactions = Some(transactions);
-        Ok(())
-    }
-}
-
-#[derive(Serialize, Deserialize, Encode, Decode, Debug, Clone)]
-pub struct Transaction {
-    // function the data is passed to
-    pub function: String,
-    // data passed into function, with input data type
-    pub payload: Vec<u8>
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Sequence {
+    pub name: String,
+    pub next_id: i32,
 }

@@ -7,18 +7,25 @@ use axum::{
 use bincode::{encode_to_vec, Encode, config};
 use serde::Deserialize;
 
-use crate::{consensus::{self, Ballot, VoteSignMessage}, db, types::{Block, Transaction}, AppState};
+use crate::{
+    consensus::{
+        types::Transaction,
+        routes::consensus_middleware
+    },
+    types::User,
+    db::users, 
+AppState};
 
 pub async fn get_users(
     State(app_state): State<AppState>,
 ) -> impl IntoResponse {
-    match db::get_users(&app_state.db) {
+    match users::get_users(&app_state.db) {
         Ok(users) => {
             (StatusCode::OK, Json(users))
         }
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(Vec::<db::User>::new())
+            Json(Vec::<User>::new())
         ),
     }
 }
@@ -50,18 +57,18 @@ pub async fn post_users (
             let transactions = vec![transaction];
 
             // quorum middleware test
-            match consensus::consensus_middleware(&app_state, transactions).await {
+            match consensus_middleware(&app_state, transactions).await {
                 Ok(qc) => println!("{:?}", qc),
                 Err(_) => return StatusCode::INTERNAL_SERVER_ERROR
             }
 
-            let user = db::User {
+            let user = User {
                 user_id: 0,
                 username: payload.username,
                 password: payload.password,
             };
 
-            match db::insert_user(&app_state.db, user) {
+            match users::insert_user(&app_state.db, user) {
                 Ok(()) => StatusCode::CREATED,
                 Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
             }

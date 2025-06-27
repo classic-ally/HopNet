@@ -11,7 +11,7 @@ use reqwest::Client;
 use tokio::sync::oneshot;
 
 use crate::{
-    db,
+    db::nodes,
     types::Node
 };
 use crate::AppState;
@@ -19,7 +19,7 @@ use crate::AppState;
 pub async fn get_nodes(
     State(app_state): State<AppState>
 ) -> impl IntoResponse {
-    match db::get_nodes(&app_state.db) {
+    match nodes::get_nodes(&app_state.db) {
         Ok(nodes) => return (StatusCode::OK, Json(nodes)),
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(Vec::<Node>::new())),
     }
@@ -96,7 +96,7 @@ pub async fn post_nodes(
     let db_task = tokio::task::spawn_blocking(move || {
         // Use spawn_blocking for database operations since DuckDB is not async-safe
         tokio::runtime::Handle::current().block_on(async move {
-            db::insert_node(&db_clone, payload, dump_tx, confirm_write_rx).await
+            nodes::insert_node(&db_clone, payload, dump_tx, confirm_write_rx).await
         })
     });
 

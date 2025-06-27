@@ -7,12 +7,11 @@ use axum::{
 use serde::{Serialize,Deserialize};
 
 
-use crate::consensus::ConsensusPhase;
+use crate::consensus::types::{ConsensusPhase, Block};
 use crate::db::Sequence;
 use crate::AppState;
 use crate::{
-    types::Block,
-    db,
+    db::setup,
     db::User,
 };
 use crate::types::{Blake3Hash, Node};
@@ -48,7 +47,7 @@ pub struct SyncSetupObject {
 pub async fn get_setup(
     State(app_state): State<AppState>,
 ) -> impl IntoResponse {
-    match db::get_initial_setup(&app_state.db) {
+    match setup::get_initial_setup(&app_state.db) {
         Ok(setupstatus) => (setupstatus, hex::encode(app_state.public_key.to_bytes())),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, String::new())
     }
@@ -59,7 +58,7 @@ pub async fn put_setup(
     State(app_state): State<AppState>,
     Json(payload): Json<SyncSetupObject>
 ) -> impl IntoResponse {
-    match db::put_join_setup(&app_state.db, payload, app_state.private_key.as_bytes()) {
+    match setup::put_join_setup(&app_state.db, payload, app_state.private_key.as_bytes()) {
         Ok(()) => StatusCode::CREATED,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR
     }
@@ -86,7 +85,7 @@ pub async fn post_setup(
         pubkey: crate::types::PubKey::from_bytes(vec![]), // Placeholder, will use app_state.public_key
     };
 
-    match db::post_initial_setup(&app_state.db, user, node, app_state.public_key.as_bytes(), app_state.private_key.as_bytes()) {
+    match setup::post_initial_setup(&app_state.db, user, node, app_state.public_key.as_bytes(), app_state.private_key.as_bytes()) {
         Ok(()) => StatusCode::CREATED,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR
     }
