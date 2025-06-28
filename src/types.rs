@@ -1,8 +1,11 @@
+use axum::response::{IntoResponse,Response};
 use serde::{Serialize, Deserialize, Deserializer, Serializer};
+use std::ops::Deref;
 use ed25519_dalek::VerifyingKey;
 use bincode::{Encode, Decode};
 use duckdb::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 pub use ed25519_dalek::{SigningKey,Signer};
+use hex;
 
 /// A wrapper around blake3::Hash that implements bincode's Encode and Decode traits
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
@@ -155,69 +158,22 @@ impl ToSql for Blake3Hash {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct PubKey(pub Vec<u8>);
-
-impl ToSql for PubKey {
-    fn to_sql(&self) -> duckdb::Result<ToSqlOutput<'_>> {
-        Ok(ToSqlOutput::from(self.as_bytes()))
-    }
-}
-impl FromSql for PubKey {
-    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
-        match value {
-            ValueRef::Blob(bytes) => {
-                Ok(PubKey(bytes.to_vec()))
-            }
-            _ => Err(FromSqlError::InvalidType),
-        }
-    }
-}
-
-impl PubKey {
-    pub fn from_hex(hex_str: &str) -> Result<Self, hex::FromHexError> {
-        hex::decode(hex_str).map(PubKey)
-    }
-    
-    pub fn from_bytes(bytes: Vec<u8>) -> Self {
-        PubKey(bytes)
-    }
-    
-    /// Create PubKey from ed25519_dalek::VerifyingKey
-    pub fn from_verifying_key(verifying_key: &VerifyingKey) -> Self {
-        PubKey(verifying_key.to_bytes().to_vec())
-    }
-    
-    pub fn to_hex(&self) -> String {
-        hex::encode(&self.0)
-    }
-    
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-    
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.0
-    }
-    
-    /// Convert PubKey back to ed25519_dalek::VerifyingKey for cryptographic operations
-    pub fn to_verifying_key(&self) -> Result<VerifyingKey, ed25519_dalek::SignatureError> {
-        // ed25519 public keys are exactly 32 bytes
-        let key_bytes: [u8; 32] = self.0.as_slice()
-            .try_into()
-            .map_err(|_| ed25519_dalek::SignatureError::new())?;
-        
-        VerifyingKey::from_bytes(&key_bytes)
-    }
-}
+#[derive(Debug, Copy, Clone)]
+pub struct PubKey(pub VerifyingKey);
 
 impl Serialize for PubKey {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        // Always serialize as hex string for JSON compatibility
-        serializer.serialize_str(&self.to_hex())
+        // Check if we're serializing to a human-readable format (like JSON)
+        if serializer.is_human_readable() {
+            // Use hex string for JSON and other human-readable formats
+            serializer.serialize_str(&self.to_hex())
+        } else {
+            // Use binary format for non-human-readable formats (like bincode)
+            serializer.serialize_bytes(&self.to_bytes())
+        }
     }
 }
 
@@ -226,24 +182,152 @@ impl<'de> Deserialize<'de> for PubKey {
     where
         D: Deserializer<'de>,
     {
-        use serde::de::Error;
-        
-        // Try to deserialize as string first (hex format)
-        let value = serde_json::Value::deserialize(deserializer)?;
-        
+        use serde::de::{Error, Visitor};
+        use std::fmt;
+
+        struct PubKeyVisitor;
+
+        impl<'de> Visitor<'de> for PubKeyVisitor {
+            type Value = PubKey;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a hex string or binary data representing a public key")
+            }
+
+            // Handle hex string format (for user input)
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: Error,
+            {
+                PubKey::from_hex(value).map_err(E::custom)
+            }
+
+            // Handle binary format (for internal/database usage)
+            fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
+            where
+                E: Error,
+            {
+                if value.len() != 32 {
+                    return Err(E::custom("Public key must be exactly 32 bytes"));
+                }
+                
+                let mut array = [0u8; 32];
+                array.copy_from_slice(value);
+                
+                match VerifyingKey::from_bytes(&array) {
+                    Ok(verifying_key) => Ok(PubKey(verifying_key)),
+                    Err(_) => Err(E::custom("Invalid public key bytes")),
+                }
+            }
+
+            // Handle sequence format (for default serde)
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut bytes = Vec::new();
+                while let Some(byte) = seq.next_element::<u8>()? {
+                    bytes.push(byte);
+                }
+                self.visit_bytes(&bytes)
+            }
+        }
+
+        deserializer.deserialize_any(PubKeyVisitor)
+    }
+}
+
+impl Deref for PubKey {
+    type Target = VerifyingKey;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+
+impl ToSql for PubKey {
+    fn to_sql(&self) -> duckdb::Result<ToSqlOutput<'_>, duckdb::Error> {
+        match bincode::serde::encode_to_vec(&self, bincode::config::standard()) {
+            Ok(data) => Ok(ToSqlOutput::Owned(duckdb::types::Value::Blob(data))),
+            Err(e) => Err(duckdb::Error::ToSqlConversionFailure(Box::new(e)))
+        }
+    }
+}
+
+impl FromSql for PubKey {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
         match value {
-            serde_json::Value::String(hex_str) => {
-                PubKey::from_hex(&hex_str).map_err(D::Error::custom)
+            ValueRef::Blob(b) => {
+                match bincode::serde::decode_from_slice(b, bincode::config::standard()) {
+                    Ok((data, _)) => Ok(PubKey(data)),
+                    Err(_) => Err(duckdb::types::FromSqlError::InvalidType)
+                }
             }
-            serde_json::Value::Array(arr) => {
-                // Handle Vec<u8> format
-                let bytes: Result<Vec<u8>, _> = arr.into_iter()
-                    .map(|v| v.as_u64().ok_or_else(|| D::Error::custom("Invalid byte value"))
-                         .and_then(|n| if n <= 255 { Ok(n as u8) } else { Err(D::Error::custom("Byte value out of range")) }))
-                    .collect();
-                bytes.map(PubKey::from_bytes)
+            _ => Err(FromSqlError::InvalidType),
+        }
+    }
+}
+
+impl IntoResponse for PubKey {
+    fn into_response(self) -> Response {
+        // Use the custom serializer which will output hex for JSON
+        let json = serde_json::to_string(&self).unwrap();
+        json.into_response()
+    }
+}
+
+impl PubKey {
+    /// Create a PubKey from a hex string (for parsing JSON responses)
+    pub fn from_hex(hex_str: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let bytes = hex::decode(hex_str)?;
+        
+        if bytes.len() != 32 {
+            return Err("Public key must be exactly 32 bytes".into());
+        }
+        
+        let mut array = [0u8; 32];
+        array.copy_from_slice(&bytes);
+        let verifying_key = VerifyingKey::from_bytes(&array)?;
+        Ok(PubKey(verifying_key))
+    }
+    
+    /// Convert to hex string
+    pub fn to_hex(&self) -> String {
+        hex::encode(self.0.to_bytes())
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct PrivKey(pub SigningKey);
+
+impl Deref for PrivKey {
+    type Target = SigningKey;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl ToSql for PrivKey {
+    fn to_sql(&self) -> duckdb::Result<ToSqlOutput<'_>, duckdb::Error> {
+        match bincode::serde::encode_to_vec(&self, bincode::config::standard()) {
+            Ok(data) => Ok(ToSqlOutput::Owned(duckdb::types::Value::Blob(data))),
+            Err(e) => Err(duckdb::Error::ToSqlConversionFailure(Box::new(e)))
+        }
+    }
+}
+
+impl FromSql for PrivKey {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        match value {
+            ValueRef::Blob(b) => {
+                match bincode::serde::decode_from_slice(b, bincode::config::standard()) {
+                    Ok((data, _)) => Ok(PrivKey(data)),
+                    Err(_) => Err(duckdb::types::FromSqlError::InvalidType)
+                }
             }
-            _ => Err(D::Error::custom("Expected string (hex) or array (bytes) for pubkey"))
+            _ => Err(FromSqlError::InvalidType),
         }
     }
 }

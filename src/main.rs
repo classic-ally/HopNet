@@ -1,11 +1,12 @@
 use axum::{
     http::{HeaderValue, Method}, middleware, routing::{get,post,put}, serve, Router
 };
-use ed25519_dalek::{SigningKey, VerifyingKey};
 use jsonwebtoken::{DecodingKey, EncodingKey};
 use tower_serve_static::ServeDir;
 use tower_http::cors::CorsLayer;
 use include_dir::{Dir, include_dir};
+
+use crate::db::{PrivKey, PubKey};
 
 mod nodes;
 mod setup;
@@ -24,8 +25,8 @@ pub struct AppState {
     db: std::sync::Arc<std::sync::Mutex<duckdb::Connection>>,
     encoding_key: EncodingKey,
     decoding_key: DecodingKey,
-    private_key: SigningKey,
-    public_key: VerifyingKey
+    private_key: PrivKey,
+    public_key: PubKey
 }
 
 #[tokio::main]
@@ -54,8 +55,8 @@ async fn main() {
                 db: database,
                 encoding_key: encodingkey,
                 decoding_key: decodingkey,
-                private_key: privatekey,
-                public_key: publickey
+                private_key: PrivKey(privatekey),
+                public_key: PubKey(publickey)
             };
 
             // Protected routes that require authentication

@@ -87,7 +87,10 @@ pub async fn post_ballot(
                         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Error adding block to database").into_response(),
                     }
                 }
-                Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Error signing ballot").into_response(),
+                Err(e) => {
+                    dbg!(e);
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "Error signing ballot").into_response()
+                },
             }
         }
         Err(_) => (StatusCode::UNAUTHORIZED, "Ballot rejected").into_response(),
@@ -162,7 +165,7 @@ pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transa
     
     // Create quorum certificate with collected signatures
     let qc = QuorumCertificate::create(
-        block.clone(),
+        &block,
         ConsensusPhase::Propose,
         me.node_id,
         &app_state.private_key,

@@ -1,5 +1,6 @@
 use super::*;
 use tokio::sync::oneshot;
+use crate::consensus::QuorumCertificate;
 use crate::setup::{SyncSetupObject, Validator};
 use tokio::io::Error;
 use crate::consensus::types::{Block,BlockData,ConsensusPhase};
@@ -160,6 +161,22 @@ pub async fn insert_node(
             let mut validators: Vec<Validator> = rows_validators.collect::<Result<Vec<Validator>, _>>()
                 .map_err(|_| DatabaseError::ProcessingError)?;
 
+            dbg!("Fetching quorum certificate state");
+            let mut stmt_qcs = tx.prepare(
+                "SELECT view_number, phase, block_hash, proposer_signature, voter_signatures FROM quorum_certificates"
+            ).map_err(|_| DatabaseError::RecallError)?;
+            let rows_qcs = stmt_qcs.query_map([], |row| {
+                Ok(QuorumCertificate {
+                    view_number: row.get(0)?,
+                    phase: row.get(1)?,
+                    block_hash: row.get(2)?,
+                    proposer_signature: row.get(3)?,
+                    voter_signatures: row.get(4)?
+                })
+            }).map_err(|_| DatabaseError::RecallError)?;
+            let qcs: Vec<QuorumCertificate> = rows_qcs.collect::<Result<Vec<QuorumCertificate>, _>>()
+                .map_err(|_| DatabaseError::ProcessingError)?;
+
             dbg!("Consensus phase fetched successfully");
 
             ///////////////
@@ -172,7 +189,7 @@ pub async fn insert_node(
             ).map_err(|_| DatabaseError::RecallError)?;
             tx.execute(
                 "INSERT INTO nodes (node_id, name, ip_address, port, owner, pubkey) VALUES (?, ?, ?, ?, ?, ?)",
-                params![next_id, node.name, node.ip_address, node.port, node.owner, node.pubkey.as_bytes()]
+                params![next_id, node.name, node.ip_address, node.port, node.owner, node.pubkey]
             ).map_err(|_| DatabaseError::InsertError)?;
 
             // Update the sequence for the next node
@@ -225,6 +242,7 @@ pub async fn insert_node(
                 sequences: sequences,
                 blocks: blocks,
                 validators: validators,
+                quorum_certificates: qcs,
                 yournode: ThisNode {
                     node_id: next_id,
                     current_phase: current_phase,

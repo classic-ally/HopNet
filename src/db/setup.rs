@@ -1,5 +1,5 @@
 use super::*;
-use crate::consensus::types::{Block, BlockData};
+use crate::consensus::{types::{Block, BlockData, VoteSignMessage}, ConsensusPhase, QuorumCertificate};
 use axum::http::StatusCode;
 
 pub fn get_initial_setup(
@@ -28,8 +28,8 @@ pub fn post_initial_setup(
     db: &Arc<Mutex<Connection>>,
     mut user: User,
     node: Node,
-    pubkey: &[u8],
-    privkey: &[u8]
+    pubkey: PubKey,
+    privkey: PrivKey,
 ) -> Result<(), DatabaseError> {
     match db.lock() {
         Ok(mut db_lock) => {
@@ -98,6 +98,22 @@ pub fn post_initial_setup(
                 params![0, next_node_id, true]
             ).map_err(|_| DatabaseError::InsertError)?;
 
+            // create a quorum certificate for this block such that we always have a chain of QCs
+            // it will validate because at block height zero we are only validator
+            let signatures: Vec<VoteSignMessage> = Vec::new();
+            let genesis_qc = QuorumCertificate::create(
+                &genesis_block, 
+                ConsensusPhase::Propose, 
+                next_node_id, 
+                &privkey, 
+                signatures
+            ).map_err(|_| DatabaseError::ProcessingError)?;
+
+            tx.execute(
+                "INSERT INTO quorum_certificates (view_number, phase, block_hash, proposer_signature, voter_signatures) VALUES (?, ?, ?, ?, ?)",
+                params![genesis_qc.view_number, genesis_qc.phase, genesis_qc.block_hash, genesis_qc.proposer_signature, genesis_qc.voter_signatures]
+            ).map_err(|_| DatabaseError::InsertError)?;
+
             // also write this node so we know setup is completed
             tx.execute(
                 "INSERT INTO this_node (internal_id, node_id, privkey, committed_block_hash, highest_qc_block_hash) VALUES (?, ?, ?, ?, ?)",
@@ -119,7 +135,7 @@ pub fn post_initial_setup(
 pub fn put_join_setup(
     db: &Arc<Mutex<Connection>>,
     setupobj: crate::setup::SyncSetupObject,
-    privkey: &[u8]
+    privkey: PrivKey
 ) -> Result<(), DatabaseError> {
     match db.lock() {
         Ok(mut db_lock) => {
@@ -169,6 +185,14 @@ pub fn put_join_setup(
                 tx.execute(
                     "INSERT INTO validators (effective_height, node_id, is_active) VALUES (?, ?, ?)",
                     params![validator.effective_height, validator.node_id, validator.is_active]
+                ).map_err(|_| DatabaseError::InsertError)?;
+            }
+
+            dbg!("Inserting quorum certificates");
+            for quorum_certificate in setupobj.quorum_certificates {
+                tx.execute(
+                    "INSERT INTO quorum_certificates (view_number, phase, block_hash, proposer_signature, voter_signatures) VALUES (?, ?, ?, ?, ?)", 
+                    params![quorum_certificate.view_number, quorum_certificate.phase, quorum_certificate.block_hash, quorum_certificate.proposer_signature, quorum_certificate.voter_signatures]
                 ).map_err(|_| DatabaseError::InsertError)?;
             }
 

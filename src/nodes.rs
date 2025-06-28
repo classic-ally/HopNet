@@ -10,6 +10,7 @@ use axum::{
 use reqwest::Client;
 use tokio::sync::oneshot;
 
+use crate::db::PubKey;
 use crate::{
     db::nodes,
     types::Node
@@ -70,12 +71,23 @@ pub async fn post_nodes(
             
             // Extract the response text (hex-encoded pubkey)
             match response.text().await {
-                Ok(response_pubkey_hex) => {
-                    // Compare with the payload pubkey
-                    let payload_pubkey_hex = payload.pubkey.to_hex();
-                    if response_pubkey_hex != payload_pubkey_hex {
-                        // Pubkey mismatch - the node's actual pubkey doesn't match what was claimed
-                        return StatusCode::UNAUTHORIZED
+                Ok(response_pubkey_str) => {
+                    // Parse the hex string response (it's a JSON string containing hex)
+                    match serde_json::from_str::<String>(&response_pubkey_str) {
+                        Ok(hex_str) => {
+                            // Convert hex string to PubKey
+                            match PubKey::from_hex(&hex_str) {
+                                Ok(response_pubkey) => {
+                                    // Compare with the payload pubkey
+                                    if response_pubkey.0 != *payload.pubkey {
+                                        // Pubkey mismatch - the node's actual pubkey doesn't match what was claimed
+                                        return StatusCode::UNAUTHORIZED
+                                    }
+                                }
+                                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR
+                            }
+                        }
+                        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR
                     }
                 }
                 Err(_) => return StatusCode::BAD_GATEWAY

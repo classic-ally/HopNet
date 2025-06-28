@@ -6,8 +6,8 @@ pub enum DatabaseError {
     ProcessingError
 }
 
-use ed25519_dalek::SigningKey;
+use crate::db::PrivKey;
 pub struct MyNode {
     pub node_id: i32,
-    pub privkey: SigningKey,
+    pub privkey: PrivKey,
 }

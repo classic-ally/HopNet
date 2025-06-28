@@ -33,7 +33,7 @@ pub fn get_consensus(
                 let ip_address: String = row.get(2)?;
                 let port: i32 = row.get(3)?;
                 let owner: i32 = row.get(4)?;
-                let pubkey_bytes: Vec<u8> = row.get(5)?;
+                let pubkey: PubKey = row.get(5)?;
                 let current_view: i32 = row.get(6)?;
                 
                 // Helper function to build block from row data (without transactions)
@@ -63,14 +63,14 @@ pub fn get_consensus(
                 let committed_block = build_block(11, 12, 13, 14)?;
                 let highest_qc_block = build_block(15, 16, 17, 18)?;
                 
-                Ok((node_id, name, ip_address, port, owner, pubkey_bytes, current_view,
+                Ok((node_id, name, ip_address, port, owner, pubkey, current_view,
                     prepared_block, committed_block, highest_qc_block))
             }).map_err(|_| DatabaseError::RecallError)?;
             
-            let (node_id, name, ip_address, port, owner, pubkey_bytes, current_view,
+            let (node_id, name, ip_address, port, owner, pubkey, current_view,
                  prepared_block, committed_block, highest_qc_block) = result;
             
-            let pubkey = crate::types::PubKey::from_bytes(pubkey_bytes);
+            let pubkey = pubkey;
             let leader = crate::types::Node {
                 node_id,
                 name,
@@ -262,18 +262,11 @@ pub fn get_me(
 
             let result = stmt.query_row([], |row| {
                 let node_id: i32 = row.get(0)?;
-                let privkey_bytes: Vec<u8> = row.get(1)?;
-
-                // Reconstruct SigningKey from bytes
-                let privkey_array: [u8; 32] = privkey_bytes.as_slice()
-                    .try_into()
-                    .map_err(|_| duckdb::Error::InvalidColumnType(0, "privkey".to_string(), duckdb::types::Type::Blob))?;
-                
-                let signing_key = SigningKey::from_bytes(&privkey_array);
+                let privkey: PrivKey = row.get(1)?;
 
                 Ok(MyNode {
                     node_id,
-                    privkey: signing_key
+                    privkey
                 })
             }).map_err(|_| DatabaseError::RecallError)?;
             

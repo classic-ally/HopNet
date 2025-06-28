@@ -8,6 +8,7 @@ use ed25519_dalek::Signature;
 use bincode::config;
 use blake3::Hasher;
 
+#[derive(Debug)]
 pub enum VoteError {
     DatabaseError,
     InitiatorError,
@@ -94,7 +95,7 @@ impl Ballot {
         // Check leader signature is valid and leader is authorized for view
         let consensus_state = db::get_consensus(&state.db).map_err(|_| VoteError::DatabaseError)?;
 
-        let leader_verifyingkey = consensus_state.leader.pubkey.to_verifying_key().map_err(|_| VoteError::DatabaseError)?;
+        let leader_verifyingkey = consensus_state.leader.pubkey;
         let message = self.data.encode().map_err(|_| VoteError::ProcessingError)?;
         match leader_verifyingkey.verify_strict(message.as_slice(), &self.initiator.signature) {
             Ok(_) => {
@@ -177,7 +178,7 @@ impl VoteSignData {
     pub fn from_block(block: Block, phase: ConsensusPhase) -> VoteSignData {
         return VoteSignData { block_hash: block.block_hash, block_height: block.data.height, view: block.data.view_number, phase: phase }
     }
-    pub fn sign(&self, private_key: &SigningKey) -> Result<Signature, VoteError> {
+    pub fn sign(&self, private_key: &PrivKey) -> Result<Signature, VoteError> {
         let data = &self.encode()?;
         let signature = private_key.try_sign(&data).map_err(|_| VoteError::ProcessingError)?;
         return Ok(signature);
@@ -203,6 +204,20 @@ impl ToSql for VoteSignMessage {
     }
 }
 
+impl FromSql for VoteSignMessage {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        match value {
+            ValueRef::Blob(b) => {
+                match bincode::serde::decode_from_slice(b, bincode::config::standard()) {
+                    Ok((data, _)) => Ok(data),
+                    Err(_) => Err(duckdb::types::FromSqlError::InvalidType),
+                }
+            }
+            _ => Err(duckdb::types::FromSqlError::InvalidType),
+        }
+    }
+}
+
 impl Deref for VoteSignMessages {
     type Target = Vec<VoteSignMessage>;
 
@@ -216,6 +231,20 @@ impl ToSql for VoteSignMessages {
         match bincode::serde::encode_to_vec(&self, bincode::config::standard()) {
             Ok(data) => Ok(ToSqlOutput::Owned(duckdb::types::Value::Blob(data))),
             Err(e) => Err(duckdb::Error::ToSqlConversionFailure(Box::new(e)))
+        }
+    }
+}
+
+impl FromSql for VoteSignMessages {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        match value {
+            ValueRef::Blob(b) => {
+                match bincode::serde::decode_from_slice(b, bincode::config::standard()) {
+                    Ok((data, _)) => Ok(data),
+                    Err(_) => Err(duckdb::types::FromSqlError::InvalidType),
+                }
+            }
+            _ => Err(duckdb::types::FromSqlError::InvalidType),
         }
     }
 }
@@ -234,10 +263,10 @@ pub struct QuorumCertificate {
 
 impl QuorumCertificate {
     pub fn create(
-        block: Block,
+        block: &Block,
         phase: ConsensusPhase,
         proposer_id: i32,
-        proposer_key: &SigningKey,
+        proposer_key: &PrivKey,
         voter_signatures: Vec<VoteSignMessage>,
     ) -> Result<QuorumCertificate, CertificateError> {
         // sign off ourselves
@@ -268,11 +297,15 @@ impl QuorumCertificate {
         let total_signatures = 1 + self.voter_signatures.len(); // proposer + voters
         
         if total_signatures < required_signatures {
+            dbg!("Not enough signatures");
+            dbg!(total_signatures);
+            dbg!(required_signatures);
             return Err(CertificateError::ValidationError);
         }
         
         // Prepare data for batch verification
         let vote_data = VoteSignData::from_block(block.clone(), self.phase.clone());
+        dbg!("Message construction");
         let message = vote_data.encode().map_err(|_| CertificateError::ValidationError)?;
         
         // Collect all signatures and public keys for batch verification
@@ -287,9 +320,8 @@ impl QuorumCertificate {
         let proposer_node = validators.iter()
             .find(|v| v.node_id == self.proposer_signature.replica_id)
             .ok_or(CertificateError::SignerNotFound)?;
-        let proposer_pubkey = proposer_node.pubkey.to_verifying_key()
-            .map_err(|_| CertificateError::ValidationError)?;
-        public_keys.push(proposer_pubkey);
+        let proposer_pubkey = proposer_node.pubkey;
+        public_keys.push(*proposer_pubkey);
         messages.push(message.as_slice());
         
         // Add voter signatures
@@ -300,9 +332,8 @@ impl QuorumCertificate {
             let voter_node = validators.iter()
                 .find(|v| v.node_id == voter_sig.replica_id)
                 .ok_or(CertificateError::SignerNotFound)?;
-            let voter_pubkey = voter_node.pubkey.to_verifying_key()
-                .map_err(|_| CertificateError::ValidationError)?;
-            public_keys.push(voter_pubkey);
+            let voter_pubkey = voter_node.pubkey;
+            public_keys.push(*voter_pubkey);
             messages.push(message.as_slice());
         }
         
@@ -311,17 +342,20 @@ impl QuorumCertificate {
             Ok(_) => {
                 // Additional validation: ensure block hash matches
                 if self.block_hash != block.block_hash {
+                    dbg!("Block hash doesn't match");
                     return Err(CertificateError::ValidationError);
                 }
                 
                 // Ensure view number matches
                 if self.view_number != block.data.view_number {
+                    dbg!("View number doesn't match");
                     return Err(CertificateError::ValidationError);
                 }
                 
                 Ok(())
             }
             Err(_) => {
+                dbg!("Message signature doesn't match");
                 Err(CertificateError::ValidationError)
             }
         }
@@ -452,5 +486,3 @@ pub struct ConsensusState {
     pub committed_block: Block,
     pub highest_qc_block: Block,
 }
-
-use crate::db::DatabaseError;
