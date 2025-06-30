@@ -60,7 +60,7 @@ pub fn initialize() -> Result<Arc<Mutex<Connection>>, Error> {
 
             CREATE TABLE quorum_certificates (
                 view_number         INTEGER NOT NULL,
-                phase               ENUM('propose', 'vote') NOT NULL,
+                phase               ENUM('propose', 'lock') NOT NULL,
                 block_hash          BLOB NOT NULL,
                 proposer_signature  BLOB NOT NULL,
                 voter_signatures    BLOB,
@@ -99,7 +99,7 @@ pub fn initialize() -> Result<Arc<Mutex<Connection>>, Error> {
                 -- Consensus mechanics
                 -- View stored in case of leader change without block written
                 -- Block height not stored -> always computable
-                current_phase           ENUM('propose', 'vote') NOT NULL DEFAULT 'propose',
+                current_phase           ENUM('propose', 'lock') NOT NULL DEFAULT 'propose',
                 current_view            INTEGER NOT NULL DEFAULT 0,
                 -- Block is prepared when it has a QC
                 prepared_block_hash     BLOB,

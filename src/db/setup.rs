@@ -101,9 +101,18 @@ pub fn post_initial_setup(
             // create a quorum certificate for this block such that we always have a chain of QCs
             // it will validate because at block height zero we are only validator
             let signatures: Vec<VoteSignMessage> = Vec::new();
-            let genesis_qc = QuorumCertificate::create(
+
+            let genesis_qc_1 = QuorumCertificate::create(
                 &genesis_block, 
                 ConsensusPhase::Propose, 
+                next_node_id, 
+                &privkey, 
+                signatures.clone()
+            ).map_err(|_| DatabaseError::ProcessingError)?;
+
+            let genesis_qc_2 = QuorumCertificate::create(
+                &genesis_block, 
+                ConsensusPhase::Lock, 
                 next_node_id, 
                 &privkey, 
                 signatures
@@ -111,13 +120,18 @@ pub fn post_initial_setup(
 
             tx.execute(
                 "INSERT INTO quorum_certificates (view_number, phase, block_hash, proposer_signature, voter_signatures) VALUES (?, ?, ?, ?, ?)",
-                params![genesis_qc.view_number, genesis_qc.phase, genesis_qc.block_hash, genesis_qc.proposer_signature, genesis_qc.voter_signatures]
+                params![genesis_qc_1.view_number, genesis_qc_1.phase, genesis_qc_1.block_hash, genesis_qc_1.proposer_signature, genesis_qc_1.voter_signatures]
+            ).map_err(|_| DatabaseError::InsertError)?;
+
+            tx.execute(
+                "INSERT INTO quorum_certificates (view_number, phase, block_hash, proposer_signature, voter_signatures) VALUES (?, ?, ?, ?, ?)",
+                params![genesis_qc_2.view_number, genesis_qc_2.phase, genesis_qc_2.block_hash, genesis_qc_2.proposer_signature, genesis_qc_2.voter_signatures]
             ).map_err(|_| DatabaseError::InsertError)?;
 
             // also write this node so we know setup is completed
             tx.execute(
-                "INSERT INTO this_node (internal_id, node_id, privkey, committed_block_hash, highest_qc_block_hash) VALUES (?, ?, ?, ?, ?)",
-                params![1, next_node_id, privkey, genesis_block.block_hash, genesis_block.block_hash]
+                "INSERT INTO this_node (internal_id, node_id, privkey, current_view, committed_block_hash, highest_qc_block_hash) VALUES (?, ?, ?, ?, ?, ?)",
+                params![1, next_node_id, privkey, genesis_block.data.view_number + 1, genesis_block.block_hash, genesis_block.block_hash]
             ).map_err(|_| DatabaseError::InsertError)?;
 
             // Commit the transaction

@@ -208,7 +208,7 @@ pub async fn insert_node(
                 committed_block_height
             };
 
-            // Add the new node as a validator starting from the current block height
+            // Add the new node as a validator starting from the next block height
             tx.execute(
                 "INSERT INTO validators (effective_height, node_id, is_active) VALUES (?, ?, ?)",
                 params![current_height, next_id, true]
@@ -225,7 +225,7 @@ pub async fn insert_node(
             };
             nodes.push(new_node);
             let new_validator = Validator {
-                effective_height: current_height,
+                effective_height: current_height + 1,
                 node_id: next_id,
                 is_active: true
             };

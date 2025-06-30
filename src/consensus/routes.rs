@@ -11,6 +11,7 @@ use reqwest::Client;
 use serde_json::Value;
 
 use crate::db::consensus as db;
+use crate::db::MyNode;
 use crate::types::Node;
 use tokio::sync::mpsc;
 
@@ -78,13 +79,20 @@ pub async fn post_ballot(
             dbg!("Signing off on block hash {}", ballot.block.block_hash);
             match ballot.sign(&app_state) {
                 Ok(signoff) => {
-                    dbg!("Adding to database block hash {}", ballot.block.block_hash);
-                    match db::insert_block(&app_state.db, &ballot.block) {
-                        Ok(()) => {
-                            dbg!("Block saved!");
-                            return (StatusCode::OK, Json(signoff)).into_response()
-                        },
-                        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Error adding block to database").into_response(),
+                    // Only insert block during Propose phase, not Lock phase
+                    if ballot.data.phase == ConsensusPhase::Propose {
+                        dbg!("Adding to database block hash {}", ballot.block.block_hash);
+                        match db::insert_block(&app_state.db, &ballot.block) {
+                            Ok(()) => {
+                                dbg!("Block saved!");
+                                return (StatusCode::OK, Json(signoff)).into_response()
+                            },
+                            Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Error adding block to database").into_response(),
+                        }
+                    } else {
+                        // Lock phase - block should already exist, just return the signature
+                        dbg!("Lock phase - block already exists, returning signature");
+                        return (StatusCode::OK, Json(signoff)).into_response()
                     }
                 }
                 Err(e) => {
@@ -93,7 +101,10 @@ pub async fn post_ballot(
                 },
             }
         }
-        Err(_) => (StatusCode::UNAUTHORIZED, "Ballot rejected").into_response(),
+        Err(e) => {
+            dbg!(e);
+            return (StatusCode::UNAUTHORIZED, "Ballot rejected").into_response()
+        },
     }
 }
 
@@ -139,18 +150,37 @@ pub enum ConsensusError {
     ThreadError,
 }
 
-pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transaction>) -> Result<QuorumCertificate, ConsensusError> {
+pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transaction>) -> Result<(), ConsensusError> {
     dbg!("Begin middleware");
     let block = Block::new_tip(&app_state, transactions).map_err(|_| ConsensusError::BlockError)?;
-    // add block to database irrespective of its acceptance
-    match db::insert_block(&app_state.db, &block) {
-        Ok(()) => {}
-        Err(_) => return Err(ConsensusError::DatabaseError)
-    }
-
-    let vote_data = VoteSignData::from_block(block.clone(), ConsensusPhase::Propose);
-
     let me = db::get_me(&app_state.db).map_err(|_| ConsensusError::DatabaseError)?;
+    let validators = db::get_validators(&app_state.db, block.data.height).map_err(|_| ConsensusError::DatabaseError)?
+        .iter()
+        .filter(|node| node.node_id != me.node_id)
+        .cloned()
+        .collect();
+
+    // Get QC1 from ballot round
+    let qc1 = ballot_round(&block, &me, ConsensusPhase::Propose, &validators, app_state).await?;
+    // Broadcast QC1 and wait for enough confirmations
+    broadcast_qc(&validators, qc1).await?;
+    // Get QC2 from ballot round
+    let qc2 = ballot_round(&block, &me, ConsensusPhase::Lock, &validators, app_state).await?;
+    // Broadcast QC2 and wait for enough confirmations
+    broadcast_qc(&validators, qc2).await?;
+
+    Ok(())
+}
+
+async fn ballot_round(
+    block: &Block,
+    me: &MyNode,
+    phase: ConsensusPhase,
+    validators: &Vec<Node>,
+    app_state: &AppState
+) -> Result<QuorumCertificate, ConsensusError> {
+    let vote_data = VoteSignData::from_block(block.clone(), phase.clone());
+
     let my_signature = vote_data.sign(&app_state.private_key).map_err(|_| ConsensusError::SigningError)?;
     let initiator_signoff = VoteSignMessage {
         replica_id: me.node_id,
@@ -158,21 +188,17 @@ pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transa
     };
 
     let ballot_proposal = Ballot::propose(vote_data, block.clone(), initiator_signoff);
-    
-    // Get validators and broadcast ballot to collect votes
-    let validators = db::get_validators(&app_state.db, ballot_proposal.block.data.height).map_err(|_| ConsensusError::DatabaseError)?;
+
     let voter_signatures = broadcast_and_collect_votes(ballot_proposal, &validators).await?;
-    
-    // Create quorum certificate with collected signatures
+
     let qc = QuorumCertificate::create(
         &block,
-        ConsensusPhase::Propose,
+        phase,
         me.node_id,
         &app_state.private_key,
         voter_signatures,
     ).map_err(|_| ConsensusError::SigningError)?;
 
-    // verify the QC for sanity check
     match qc.verify(&app_state, &block) {
         Ok(_) => {
             // save it to db
@@ -182,28 +208,6 @@ pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transa
         Err(_) => return Err(ConsensusError::SigningError)
     };
 
-    dbg!("Validator filter");
-    // broadcast the QC to all validators
-    let filtered_validators: Vec<Node> = validators
-        .iter()
-        .filter(|node| node.node_id != me.node_id)
-        .cloned()
-        .collect();
-
-    dbg!("Contact threads");
-    for node in filtered_validators {
-        let qc_clone = qc.clone();
-        tokio::spawn(async move {
-            match qc_send(qc_clone, &node).await {
-                Ok(()) => Ok(()),
-                Err(e) => {
-                    dbg!(&e);
-                    return Err(e)
-                }
-            }
-        });
-    }
-
     Ok(qc)
 }
 
@@ -211,20 +215,13 @@ async fn broadcast_and_collect_votes(
     ballot: Ballot,
     validators: &Vec<Node>,
 ) -> Result<Vec<VoteSignMessage>, ConsensusError> {
-    // make sure we don't contact ourself
-    let filtered_validators: Vec<Node> = validators
-        .iter()
-        .filter(|node| node.node_id != ballot.initiator.replica_id)
-        .cloned()
-        .collect();
-
     let (votes_tx, mut votes_rx) = mpsc::channel::<VoteSignMessage>(100); //100 channel capacity
 
     // Calculate quorum threshold (2/3 majority)
-    let required_votes = (filtered_validators.len() * 2) / 3;
+    let required_votes = (validators.len() * 2) / 3;
     
     // Spawn tasks for each validator
-    for node in filtered_validators {
+    for node in validators.clone() {
         let ballot_clone = ballot.clone();
         let votes_tx_clone = votes_tx.clone();
         
@@ -270,6 +267,75 @@ async fn broadcast_and_collect_votes(
     // Check if we have enough votes after timeout or all tasks complete
     if voter_signatures.len() >= required_votes {
         Ok(voter_signatures)
+    } else {
+        Err(ConsensusError::InsufficientVotes)
+    }
+}
+
+async fn broadcast_qc(
+    validators: &Vec<Node>,
+    qc: QuorumCertificate
+) -> Result<(), ConsensusError> {
+    let (confirmations_tx, mut confirmations_rx) = mpsc::channel::<()>(100);
+
+    // Calculate quorum threshold (2/3 majority)
+    let required_confirmations = (validators.len() * 2) / 3;
+    
+    // Spawn tasks for each validator
+    for node in validators.clone() {
+        let qc_clone = qc.clone();
+        let confirmations_tx_clone = confirmations_tx.clone();
+        
+        tokio::spawn(async move {
+            // Send QC and notify on success
+            match qc_send(qc_clone, &node).await {
+                Ok(()) => {
+                    let _ = confirmations_tx_clone.send(()).await;
+                }
+                Err(e) => {
+                    dbg!("Failed to send QC to node: {:?}", &e);
+                    // Don't send confirmation on failure
+                }
+            }
+        });
+    }
+    
+    // Drop the original sender so the channel closes when all tasks complete
+    drop(confirmations_tx);
+    
+    // Collect confirmations until we have enough for quorum or all tasks complete
+    let mut confirmations = 0;
+    let timeout = tokio::time::sleep(std::time::Duration::from_secs(30));
+    tokio::pin!(timeout);
+    
+    loop {
+        tokio::select! {
+            confirmation_opt = confirmations_rx.recv() => {
+                match confirmation_opt {
+                    Some(()) => {
+                        confirmations += 1;
+                        
+                        // Early termination on quorum
+                        if confirmations >= required_confirmations {
+                            return Ok(());
+                        }
+                    }
+                    None => {
+                        // Channel closed - all tasks completed
+                        break;
+                    }
+                }
+            }
+            _ = &mut timeout => {
+                // Overall timeout reached
+                break;
+            }
+        }
+    }
+    
+    // Check if we have enough confirmations after timeout or all tasks complete
+    if confirmations >= required_confirmations {
+        Ok(())
     } else {
         Err(ConsensusError::InsufficientVotes)
     }

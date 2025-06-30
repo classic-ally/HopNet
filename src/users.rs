@@ -58,7 +58,7 @@ pub async fn post_users (
 
             // quorum middleware test
             match consensus_middleware(&app_state, transactions).await {
-                Ok(qc) => println!("{:?}", qc),
+                Ok(()) => {},
                 Err(_) => return StatusCode::INTERNAL_SERVER_ERROR
             }
 

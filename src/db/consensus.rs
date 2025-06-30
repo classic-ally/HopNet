@@ -7,8 +7,41 @@ pub fn get_consensus(
     match db.lock() {
         Ok(db_lock) => {
             let mut stmt = db_lock.prepare(
-                "SELECT
-                    n.node_id, n.name, n.ip_address, n.port, n.owner, n.pubkey, t.current_view,
+                "WITH latest_effective AS (
+                    SELECT
+                        node_id,
+                        MAX(effective_height) AS max_eff
+                    FROM validators
+                    WHERE effective_height <= (
+                        SELECT COALESCE(
+                            (SELECT height FROM blocks WHERE block_hash = t.committed_block_hash),
+                            0
+                        )
+                        FROM this_node t WHERE t.internal_id = 1
+                    )
+                    GROUP BY node_id
+                ),
+                active_validators AS (
+                    SELECT
+                        v.node_id,
+                        v.is_active,
+                        ROW_NUMBER() OVER (ORDER BY v.node_id) as validator_index
+                    FROM validators v
+                    JOIN latest_effective le
+                        ON v.node_id = le.node_id
+                        AND v.effective_height = le.max_eff
+                    WHERE v.is_active = true
+                ),
+                leader_selection AS (
+                    SELECT node_id
+                    FROM active_validators
+                    WHERE validator_index = (
+                        (SELECT current_view FROM this_node WHERE internal_id = 1) %
+                        (SELECT COUNT(*) FROM active_validators)
+                    ) + 1
+                )
+                SELECT
+                    n.node_id, n.name, n.ip_address, n.port, n.owner, n.pubkey, t.current_view, t.current_phase,
                     -- Prepared block data (excluding transactions for performance)
                     pb.block_hash AS prepared_hash, pb.height AS prepared_height,
                     pb.view_number AS prepared_view, pb.parent_hash AS prepared_parent,
@@ -18,12 +51,12 @@ pub fn get_consensus(
                     -- Highest QC block data
                     hb.block_hash AS highest_qc_hash, hb.height AS highest_qc_height,
                     hb.view_number AS highest_qc_view, hb.parent_hash AS highest_qc_parent
-                FROM nodes n
-                JOIN this_node t ON n.node_id = (t.current_view % (SELECT COUNT(*) FROM nodes))
+                FROM leader_selection ls
+                JOIN nodes n ON ls.node_id = n.node_id
+                JOIN this_node t ON t.internal_id = 1
                 LEFT JOIN blocks pb ON t.prepared_block_hash = pb.block_hash
                 LEFT JOIN blocks cb ON t.committed_block_hash = cb.block_hash
-                LEFT JOIN blocks hb ON t.highest_qc_block_hash = hb.block_hash
-                WHERE t.internal_id = 1"
+                LEFT JOIN blocks hb ON t.highest_qc_block_hash = hb.block_hash"
             ).map_err(|_| DatabaseError::RecallError)?;
             
             let result = stmt.query_row([], |row| {
@@ -35,6 +68,7 @@ pub fn get_consensus(
                 let owner: i32 = row.get(4)?;
                 let pubkey: PubKey = row.get(5)?;
                 let current_view: i32 = row.get(6)?;
+                let current_phase: ConsensusPhase = row.get(7)?;
                 
                 // Helper function to build block from row data (without transactions)
                 let build_block = |hash_col: usize, height_col: usize, view_col: usize, parent_col: usize| -> Result<Option<Block>, duckdb::Error> {
@@ -58,16 +92,16 @@ pub fn get_consensus(
                     }
                 };
                 
-                // Build blocks (column indices: prepared=7-10, committed=11-14, highest_qc=15-18)
-                let prepared_block = build_block(7, 8, 9, 10)?;
-                let committed_block = build_block(11, 12, 13, 14)?;
-                let highest_qc_block = build_block(15, 16, 17, 18)?;
+                // Build blocks (column indices: prepared=8-11, committed=12-15, highest_qc=16-19)
+                let prepared_block = build_block(8, 9, 10, 11)?;
+                let committed_block = build_block(12, 13, 14, 15)?;
+                let highest_qc_block = build_block(16, 17, 18, 19)?;
                 
-                Ok((node_id, name, ip_address, port, owner, pubkey, current_view,
+                Ok((node_id, name, ip_address, port, owner, pubkey, current_view, current_phase,
                     prepared_block, committed_block, highest_qc_block))
             }).map_err(|_| DatabaseError::RecallError)?;
             
-            let (node_id, name, ip_address, port, owner, pubkey, current_view,
+            let (node_id, name, ip_address, port, owner, pubkey, current_view, current_phase,
                  prepared_block, committed_block, highest_qc_block) = result;
             
             let pubkey = pubkey;
@@ -88,6 +122,7 @@ pub fn get_consensus(
             let consensus_state = ConsensusState {
                 leader,
                 view: current_view,
+                phase: current_phase,
                 prepared_block,
                 committed_block,
                 highest_qc_block,
@@ -232,6 +267,8 @@ pub fn insert_qc(
         Ok(mut db_lock) => {
             let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
             dbg!("Attempting transaction");
+            
+            // Insert the QC into quorum_certificates table
             tx.execute(
                 "INSERT INTO quorum_certificates (view_number, phase, block_hash, proposer_signature, voter_signatures) VALUES (?, ?, ?, ?, ?)",
                 params![
@@ -242,6 +279,29 @@ pub fn insert_qc(
                     qc.voter_signatures,
                 ]
             ).map_err(|_| DatabaseError::InsertError)?;
+            
+            // Update this_node table based on QC's phase and view
+            match qc.phase {
+                ConsensusPhase::Propose => {
+                    // If QC phase is propose, change to lock
+                    tx.execute(
+                        "UPDATE this_node SET highest_qc_block_hash = ?, current_phase = 'lock' WHERE internal_id = 1",
+                        params![qc.block_hash]
+                    ).map_err(|_| DatabaseError::InsertError)?;
+                    dbg!("Updated this_node: propose -> lock, highest_qc_block_hash updated");
+                }
+                ConsensusPhase::Lock => {
+                    // If QC phase is lock, change to propose, set current_view to QC view + 1,
+                    // and commit the block (set committed_block_hash = highest_qc_block_hash)
+                    tx.execute(
+                        "UPDATE this_node SET highest_qc_block_hash = ?, committed_block_hash = ?, current_phase = 'propose', current_view = ? WHERE internal_id = 1",
+                        params![qc.block_hash, qc.block_hash, qc.view_number + 1]
+                    ).map_err(|_| DatabaseError::InsertError)?;
+                    dbg!("Updated this_node: lock -> propose, view set to QC view + 1, highest_qc_block_hash updated, block committed");
+                }
+            }
+            
+            tx.commit().map_err(|_| DatabaseError::InsertError)?;
             dbg!("QC inserted.");
             Ok(())
         }

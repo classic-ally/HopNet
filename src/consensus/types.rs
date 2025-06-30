@@ -30,17 +30,17 @@ pub enum BlockError {
     DatabaseError,
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub enum ConsensusPhase {
     Propose,
-    Vote,
+    Lock,
 }
 
 impl ToSql for ConsensusPhase {
     fn to_sql(&self) -> Result<ToSqlOutput<'_>, duckdb::Error> {
         let phase_str = match self {
             ConsensusPhase::Propose => "propose",
-            ConsensusPhase::Vote => "vote",
+            ConsensusPhase::Lock => "lock",
         };
         return Ok(phase_str.into())
     }
@@ -52,16 +52,16 @@ impl FromSql for ConsensusPhase {
             ValueRef::Text(s) => {
                 match s {
                     b"propose" => Ok(ConsensusPhase::Propose),
-                    b"vote" => Ok(ConsensusPhase::Vote),
+                    b"lock" => Ok(ConsensusPhase::Lock),
                     _ => Err(duckdb::types::FromSqlError::InvalidType),
                 }
             }
             ValueRef::Enum(_, index) => {
                 // DuckDB stores enums as dictionary arrays with indices
-                // Index 0 = "propose", Index 1 = "vote"
+                // Index 0 = "propose", Index 1 = "lock"
                 match index {
                     0 => Ok(ConsensusPhase::Propose),
-                    1 => Ok(ConsensusPhase::Vote),
+                    1 => Ok(ConsensusPhase::Lock),
                     _ => Err(duckdb::types::FromSqlError::InvalidType),
                 }
             }
@@ -117,9 +117,26 @@ impl Ballot {
             Err(_) => {return Err(VoteError::BlockError)}
         }
 
-        // 1. View number progression
-        // Reject proposals with views less than highest QC view seen
-        if self.data.view < consensus_state.highest_qc_block.data.view_number {
+        // 0. Double certificate check
+        // Only vote on LOCK phase if we agree that PREPARE phase was quorum'd right before
+        if self.data.phase == ConsensusPhase::Lock {
+            if self.data.block_hash != consensus_state.highest_qc_block.block_hash {
+                // we're locking a phase we didn't just get phase 1 QC for
+                return Err(VoteError::ProgressionError);
+            }
+            // not checking view number matches original
+            // logic: if crash after phase1 issuance, later view leader can request phase2 votes
+            // if phase2 quorum received, later view can issue the QC2 for earlier block proposal
+        } else if self.data.view <= consensus_state.highest_qc_block.data.view_number {
+            // 1. View number progression
+            // Reject proposals with views less than or equal to highest QC view seen
+            // View number must go up with each successful proposal
+            // One leader cannot make two proposals 
+            return Err(VoteError::ProgressionError);
+        }
+
+        // View must equal our current view
+        if self.data.view != consensus_state.view {
             return Err(VoteError::ProgressionError);
         }
 
@@ -412,6 +429,7 @@ impl Block {
         // it is the committed_block
         match db::get_consensus(&app_state.db) {
             Ok(consensus_state) => {
+                dbg!("Creating block with", consensus_state.committed_block.data.height +1, consensus_state.view);
                 let tip_data = BlockData {
                     height: consensus_state.committed_block.data.height + 1,
                     view_number: consensus_state.view,
@@ -419,7 +437,11 @@ impl Block {
                     transactions: Some(Transactions(transactions))
                 };
                 let new_block = Block::new(tip_data)?;
-                Ok(new_block)
+                // add it to DB
+                match db::insert_block(&app_state.db, &new_block) {
+                    Ok(()) => Ok(new_block),
+                    Err(_) => Err(BlockError::DatabaseError)
+                }
             }
             Err(_) => Err(BlockError::DatabaseError)
         }
@@ -482,6 +504,7 @@ impl FromSql for Transactions {
 pub struct ConsensusState {
     pub leader: Node,
     pub view: i32,
+    pub phase: ConsensusPhase,
     pub prepared_block: Option<Block>,
     pub committed_block: Block,
     pub highest_qc_block: Block,
