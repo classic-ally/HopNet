@@ -6,3 +6,4 @@ pub use crate::{
 
 pub mod routes;
 pub mod types;
+pub mod functions;

@@ -25,3 +25,5 @@ rand_core = "0.6"
 hex = "0.4.3"
 blake3 = { version = "1.8.2", features = ["serde"] }
 bincode = {version = "2.0.1", features = ["serde"] }
+inventory = "0.3.20"
+once_cell = "1.21.3"

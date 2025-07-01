@@ -5,8 +5,10 @@ use jsonwebtoken::{DecodingKey, EncodingKey};
 use tower_serve_static::ServeDir;
 use tower_http::cors::CorsLayer;
 use include_dir::{Dir, include_dir};
+use once_cell::sync::Lazy;
+use std::collections::HashMap;
 
-use crate::db::{PrivKey, PubKey};
+use crate::{db::{PrivKey, PubKey}, handlers::TransactionHandler};
 
 mod nodes;
 mod setup;
@@ -17,6 +19,7 @@ mod interfaces;
 mod auth;
 mod consensus;
 mod types;
+mod handlers;
 
 static ASSETS_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/frontend/dist");
 
@@ -28,6 +31,17 @@ pub struct AppState {
     private_key: PrivKey,
     public_key: PubKey
 }
+
+static DISPATCH_TABLE: Lazy<HashMap<&'static str, &'static dyn TransactionHandler>> = Lazy::new(|| {
+    dbg!("Building dispatch table from registered handlers...");
+    let mut table = HashMap::new();
+    // iterate over the globally collected handlers
+    for handler in inventory::iter::<&'static dyn TransactionHandler> {
+        dbg!(" - Registering handler: {}", handler.name());
+        table.insert(handler.name(), *handler);
+    }
+    table
+});
 
 #[tokio::main]
 async fn main() {
@@ -47,7 +61,7 @@ async fn main() {
     let bindurl = format!("0.0.0.0:{}", port);
 
     let (encodingkey, decodingkey) = auth::generate_jwt_key();
-    let (privatekey, publickey) = consensus::routes::generate_ed25519_key();
+    let (privatekey, publickey) = consensus::functions::generate_ed25519_key();
 
     match db::shared::initialize() {
         Ok(database) => {
@@ -61,8 +75,8 @@ async fn main() {
 
             // Protected routes that require authentication
             let protected_routes = Router::new()
-                .route("/users", get(users::get_users))
-                .route("/users", post(users::post_users))
+                .route("/users", get(users::routes::get_users))
+                .route("/users", post(users::routes::post_users))
                 .route("/nodes", get(nodes::get_nodes))
                 .route("/nodes", post(nodes::post_nodes))
                 .route("/validators", get(consensus::routes::get_validators))

@@ -10,7 +10,7 @@ use serde::Deserialize;
 use crate::{
     consensus::{
         types::Transaction,
-        routes::consensus_middleware
+        functions::consensus_middleware
     },
     types::User,
     db::users, 
@@ -48,31 +48,29 @@ pub async fn post_users (
     Json(payload): Json<UserRequest>
 ) -> impl IntoResponse {
     // Consensus block generation
-    match payload.encode() {
-        Ok(encoded_payload) => {
+    let user = User {
+        user_id: 0,
+        username: payload.username,
+        password: payload.password,
+    };
+
+    // Encode user with bincode::serde standard config
+    match bincode::serde::encode_to_vec(&user, bincode::config::standard()) {
+        Ok(encoded_user) => {
             let transaction = Transaction {
-                function: "post_users".to_string(),
-                payload: encoded_payload,
+                function: "insert_user".to_string(),
+                payload: encoded_user,
             };
             let transactions = vec![transaction];
 
             // quorum middleware test
             match consensus_middleware(&app_state, transactions).await {
-                Ok(()) => {},
-                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR
-            }
-
-            let user = User {
-                user_id: 0,
-                username: payload.username,
-                password: payload.password,
-            };
-
-            match users::insert_user(&app_state.db, user) {
                 Ok(()) => StatusCode::CREATED,
-                Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                Err(_) => StatusCode::INTERNAL_SERVER_ERROR
             }
         }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR
     }
+    
+    
 }

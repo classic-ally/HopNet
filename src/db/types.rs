@@ -4,7 +4,8 @@ pub enum DatabaseError {
     InsertError,
     RecordError,
     RecallError,
-    ProcessingError
+    ProcessingError,
+    InvalidPayload
 }
 
 use crate::db::PrivKey;
