@@ -62,10 +62,10 @@ pub fn insert_files(
             
             for inode in inodes {
                 // Handle the data_id which can be Either<CustomUUID, DataRecord>
-                let data_id = match inode.data_id {
+                let data_id: Option<CustomUUID> = match inode.data_id {
                     Some(either::Either::Left(uuid)) => {
                         // If it's already a UUID, use it directly
-                        Ok(uuid)
+                        Ok(Some(uuid))
                     },
                     Some(either::Either::Right(data_record)) => {
                         // If it's a DataRecord, we need to insert it first
@@ -136,9 +136,9 @@ pub fn insert_files(
                             ]
                         ).map_err(|_| DatabaseError::InsertError)?;
                         
-                        Ok(data_id)
+                        Ok(Some(data_id))
                     },
-                    None => Err(DatabaseError::InvalidPayload)
+                    None => Ok(None)
                 }?;
                 
                 // Get the owner_id from the inode

@@ -1,9 +1,11 @@
 <script>
     import ControlBarIcon from "./ControlBarIcon.svelte";
     import UploadFiles from "./UploadFiles.svelte";
+    import CreateFolder from "./CreateFolder.svelte";
     import { refreshTriggerStore } from '../stores';
     
     let showUploadPopover = false;
+    let showCreateFolderPopover = false;
     
     function handleUploadClick() {
         showUploadPopover = true;
@@ -18,6 +20,21 @@
         // Trigger refresh of the browse pane
         refreshTriggerStore.update(n => n + 1);
         console.log('Files uploaded successfully');
+    }
+    
+    function handleCreateFolderClick() {
+        showCreateFolderPopover = true;
+    }
+    
+    function handleCreateFolderClose() {
+        showCreateFolderPopover = false;
+    }
+    
+    function handleFolderCreated() {
+        showCreateFolderPopover = false;
+        // Trigger refresh of the browse pane
+        refreshTriggerStore.update(n => n + 1);
+        console.log('Folder created successfully');
     }
     
     function handleViewModeClick() {
@@ -51,6 +68,11 @@
             title="Upload..."
             onClick={handleUploadClick}
         />
+        <ControlBarIcon
+            icon="i-carbon-folder-add"
+            title="Add a folder"
+            onClick={handleCreateFolderClick}
+        />
     </div>
     <div class="flex flex-1 min-w-0 justify-end gap-1">
         <ControlBarIcon
@@ -76,4 +98,11 @@
     bind:isOpen={showUploadPopover}
     on:close={handleUploadClose}
     on:uploaded={handleFilesUploaded}
+/>
+
+<!-- Create Folder Popover -->
+<CreateFolder
+    bind:isOpen={showCreateFolderPopover}
+    on:close={handleCreateFolderClose}
+    on:created={handleFolderCreated}
 />

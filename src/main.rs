@@ -89,6 +89,7 @@ async fn main() {
                 .route("/nodes", post(nodes::post_nodes))
                 .route("/files", get(files::routes::get_files))
                 .route("/files", post(files::routes::post_files)).layer(DefaultBodyLimit::max(500*1_000_000))
+                .route("/files", put(files::routes::put_folder))
                 .route("/validators", get(consensus::routes::get_validators))
                 .route("/consensus", get(consensus::routes::get_consensus))
                 .layer(middleware::from_fn_with_state(app_state.clone(), auth::auth_middleware));
@@ -110,7 +111,7 @@ async fn main() {
             let app = if cfg!(debug_assertions) {
                 let cors = CorsLayer::new()
                     .allow_origin("http://localhost:5173".parse::<HeaderValue>().unwrap()) // allow vite dev
-                    .allow_methods([Method::GET, Method::POST])
+                    .allow_methods([Method::GET, Method::POST, Method::PUT])
                     .allow_headers([axum::http::header::CONTENT_TYPE, axum::http::header::AUTHORIZATION])
                     .max_age(std::time::Duration::from_secs(3600))
                     .allow_credentials(false);

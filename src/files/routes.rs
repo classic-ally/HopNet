@@ -35,6 +35,30 @@ pub async fn get_files(
     }
 }
 
+pub async fn put_folder(
+    State(app_state): State<AppState>,
+    Query(params): Query<GetQueryParams>
+) -> Result<(), StatusCode> {
+    let path = encrypt_path(params.path, &app_state.siv_key, &app_state.siv_nonce).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let folder_inode = Inode {
+        owner: Left(0),
+        path: path,
+        inode_type: crate::db::InodeType::Folder,
+        data_id: None
+    };
+
+    let inodes = vec![folder_inode];
+
+    match db::insert_files(&app_state.db, inodes) {
+        Ok(_) => return Ok(()),
+        Err(e) => {
+            dbg!(e);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
 pub async fn post_files(
     State(app_state): State<AppState>,
     mut multipart: Multipart
