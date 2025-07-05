@@ -138,6 +138,70 @@ pub fn initialize() -> Result<Arc<Mutex<Connection>>, Error> {
             CREATE INDEX idx_metrics_from_node ON metrics(from_node, start_time);
             CREATE INDEX idx_metrics_to_node ON metrics(to_node, start_time);
 
+            -- File system
+            CREATE TABLE data_blocks (
+                id               UUID PRIMARY KEY,
+                access_list      BLOB NOT NULL,
+                modified_at      TIMESTAMP,
+
+                file_hash        BLOB NOT NULL,
+
+                fragment_hash_01 BLOB NOT NULL,
+                fragment_hash_02 BLOB NOT NULL,
+                fragment_hash_03 BLOB NOT NULL,
+                fragment_hash_04 BLOB NOT NULL,
+                fragment_hash_05 BLOB NOT NULL,
+                fragment_hash_06 BLOB NOT NULL,
+                fragment_hash_07 BLOB NOT NULL,
+                fragment_hash_08 BLOB NOT NULL,
+                fragment_hash_09 BLOB NOT NULL,
+                fragment_hash_10 BLOB NOT NULL,
+                fragment_hash_11 BLOB NOT NULL,
+                fragment_hash_12 BLOB NOT NULL,
+                fragment_hash_13 BLOB NOT NULL,
+                fragment_hash_14 BLOB NOT NULL,
+                fragment_hash_15 BLOB NOT NULL,
+                fragment_hash_16 BLOB NOT NULL,
+                fragment_hash_17 BLOB NOT NULL,
+                fragment_hash_18 BLOB NOT NULL,
+                fragment_hash_19 BLOB NOT NULL,
+                fragment_hash_20 BLOB NOT NULL,
+                fragment_hash_21 BLOB NOT NULL,
+                fragment_hash_22 BLOB NOT NULL,
+                fragment_hash_23 BLOB NOT NULL,
+                fragment_hash_24 BLOB NOT NULL,
+                fragment_hash_25 BLOB NOT NULL,
+                fragment_hash_26 BLOB NOT NULL,
+                fragment_hash_27 BLOB NOT NULL,
+                fragment_hash_28 BLOB NOT NULL,
+                fragment_hash_29 BLOB NOT NULL,
+                fragment_hash_30 BLOB NOT NULL,
+
+                added_bytes      UTINYINT NOT NULL,
+            );
+
+            CREATE TABLE inodes (
+                -- PK for a single file or folder node
+                id              UUID PRIMARY KEY,
+                -- owner of this reference
+                owner_id        INTEGER REFERENCES users(user_id) NOT NULL,
+                -- denormalized deterministically encrypted string
+                -- enables fast folder listing queries without need for recursive parent_id
+                path            VARCHAR NOT NULL,
+                -- type of the inode
+                type            ENUM('file', 'folder') NOT NULL,
+                -- FK to the content block
+                data_id         UUID REFERENCES data_blocks(id) NOT NULL
+            );
+
+            -- 1. The MOST IMPORTANT index for listing folder contents.
+            -- Don't need text_pattern_ops due to ART index
+            CREATE INDEX idx_inodes_path ON inodes (path);
+
+            -- 2. An index to quickly find all inodes belonging to a specific user.
+            CREATE INDEX idx_inodes_owner ON inodes (owner_id);
+
+
             -- Add comments for documentation
             COMMENT ON TABLE metrics IS 'Network performance metrics between distributed system nodes';
             COMMENT ON COLUMN metrics.duration IS 'Measurement duration in milliseconds (max ~32 seconds)';

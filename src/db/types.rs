@@ -8,8 +8,230 @@ pub enum DatabaseError {
     InvalidPayload
 }
 
-use crate::db::PrivKey;
+use crate::db::{Blake3Hash, PrivKey, User};
+use std::{collections::HashMap, ops::Deref};
 pub struct MyNode {
     pub node_id: i32,
     pub privkey: PrivKey,
+}
+use chrono::{DateTime, Utc};
+use either::Either;
+use serde::{Serialize, Deserialize};
+use uuid::{Timestamp, Uuid};
+use duckdb::types::{ToSql, ToSqlOutput, FromSql, FromSqlResult, ValueRef, FromSqlError};
+
+#[derive(Serialize)]
+pub struct CustomUUID(Uuid);
+
+impl CustomUUID{
+    pub fn new(timestamp: Option<&Timestamp>) -> CustomUUID {
+        match timestamp {
+            Some(timestamp) => {return CustomUUID(Uuid::new_v7(*timestamp))},
+            None => {return CustomUUID(Uuid::now_v7())}
+        }
+    }
+}
+
+impl Deref for CustomUUID {
+    type Target = Uuid;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl ToSql for CustomUUID {
+    fn to_sql(&self) -> duckdb::Result<ToSqlOutput<'_>> {
+        let insert_string = self.to_string();
+        Ok(ToSqlOutput::from(insert_string))
+    }
+}
+
+impl FromSql for CustomUUID {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        match value {
+            ValueRef::Text(str) => {
+                match std::str::from_utf8(str) {
+                    Ok(utf_value) => {
+                        match Uuid::parse_str(utf_value) {
+                            Ok(data) => Ok(CustomUUID(data)),
+                            Err(_) => Err(duckdb::types::FromSqlError::InvalidType)
+                        }
+                    }
+                    Err(_) => Err(FromSqlError::InvalidType)
+                }
+            }
+            _ => Err(FromSqlError::InvalidType),
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct CustomDateTime(DateTime<Utc>);
+
+impl Deref for CustomDateTime {
+    type Target = DateTime<Utc>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl ToSql for CustomDateTime {
+    fn to_sql(&self) -> duckdb::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::from(self.to_rfc3339()))
+    }
+}
+
+#[derive(Serialize)]
+pub enum InodeType {
+    File,
+    Folder
+}
+
+impl ToSql for InodeType {
+    fn to_sql(&self) -> Result<ToSqlOutput<'_>, duckdb::Error> {
+        let phase_str = match self {
+            InodeType::File => "file",
+            InodeType::Folder => "folder",
+        };
+        return Ok(phase_str.into())
+    }
+}
+
+impl FromSql for InodeType {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        match value {
+            ValueRef::Text(s) => {
+                match s {
+                    b"file" => Ok(InodeType::File),
+                    b"folder" => Ok(InodeType::Folder),
+                    _ => Err(duckdb::types::FromSqlError::InvalidType),
+                }
+            }
+            ValueRef::Enum(_, index) => {
+                // DuckDB stores enums as dictionary arrays with indices
+                // Index 0 = "file", Index 1 = "folder"
+                match index {
+                    0 => Ok(InodeType::File),
+                    1 => Ok(InodeType::Folder),
+                    _ => Err(duckdb::types::FromSqlError::InvalidType),
+                }
+            }
+            _ => Err(duckdb::types::FromSqlError::InvalidType)
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct Inode {
+    // identifies this inode.
+    // one piece of data can have multiple inodes, e.g. if shared.
+    pub id: CustomUUID,
+    // the owner for this specific node:
+    pub owner: Either<i32, User>,
+    // path is split by /
+    // each segment encrypted with AES-SIV with the owner's key
+    // this way, we can compute all files in a folder quickly whilst maintaining OK privacy
+    pub path: String,
+    // it is either a folder or file
+    pub inode_type: InodeType,
+    // if file, point to datablock
+    // if folder, null
+    pub data_id: Either<CustomUUID, DataRecord>
+}
+
+#[derive(Serialize)]
+pub struct DataRecord {
+    // PK for this datablock
+    // referenced by inoderecord
+    // distinct from hash to allow file update without needing to update inode
+    pub id: CustomUUID,
+    // map of { user_id -> encrypted_file_key }
+    // on share:
+    // 1. through DH key exchange, x25519 privkey of original owner + x25519 pubkey of sharee
+    // 2. we add record to database encrypted with this
+    // 3. slow lookup of list of access keys only needed when materializing file
+    pub access_list: AccessList,
+    pub modified_at: Option<CustomDateTime>,
+
+    pub data: Data,
+}
+
+#[derive(Serialize, Debug)]
+pub struct Data {
+    // data hash for integrity
+    pub hash: Blake3Hash,
+    // list of fragment hashes
+    pub fragment_01: DataBlockRepresentation,
+    pub fragment_02: DataBlockRepresentation,
+    pub fragment_03: DataBlockRepresentation,
+    pub fragment_04: DataBlockRepresentation,
+    pub fragment_05: DataBlockRepresentation,
+    pub fragment_06: DataBlockRepresentation,
+    pub fragment_07: DataBlockRepresentation,
+    pub fragment_08: DataBlockRepresentation,
+    pub fragment_09: DataBlockRepresentation,
+    pub fragment_10: DataBlockRepresentation,
+
+    pub fragment_11: DataBlockRepresentation,
+    pub fragment_12: DataBlockRepresentation,
+    pub fragment_13: DataBlockRepresentation,
+    pub fragment_14: DataBlockRepresentation,
+    pub fragment_15: DataBlockRepresentation,
+    pub fragment_16: DataBlockRepresentation,
+    pub fragment_17: DataBlockRepresentation,
+    pub fragment_18: DataBlockRepresentation,
+    pub fragment_19: DataBlockRepresentation,
+    pub fragment_20: DataBlockRepresentation,
+
+    pub fragment_21: DataBlockRepresentation,
+    pub fragment_22: DataBlockRepresentation,
+    pub fragment_23: DataBlockRepresentation,
+    pub fragment_24: DataBlockRepresentation,
+    pub fragment_25: DataBlockRepresentation,
+    pub fragment_26: DataBlockRepresentation,
+    pub fragment_27: DataBlockRepresentation,
+    pub fragment_28: DataBlockRepresentation,
+    pub fragment_29: DataBlockRepresentation,
+    pub fragment_30: DataBlockRepresentation,
+
+    pub added_bytes: u8,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct AccessList {
+    // string probably will change
+    pub keys: HashMap<i32, String>
+}
+
+impl ToSql for AccessList {
+    fn to_sql(&self) -> duckdb::Result<ToSqlOutput<'_>> {
+        let encoded = bincode::serde::encode_to_vec(self, bincode::config::standard())
+            .map_err(|_| duckdb::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Failed to encode AccessList"))))?;
+        Ok(ToSqlOutput::from(encoded))
+    }
+}
+
+impl FromSql for AccessList {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        match value {
+            ValueRef::Blob(blob) => {
+                let (decoded, _): (AccessList, usize) = bincode::serde::decode_from_slice(blob, bincode::config::standard())
+                    .map_err(|_| FromSqlError::InvalidType)?;
+                Ok(decoded)
+            }
+            _ => Err(FromSqlError::InvalidType),
+        }
+    }
+}
+
+
+// not using Either for DataBlockRepresentation
+// possible for other cases in future?
+// direct fetch from API of other nodes?
+#[derive(Serialize, Debug)]
+pub enum DataBlockRepresentation {
+    Hash(Blake3Hash),
+    Data(Vec<u8>)
 }

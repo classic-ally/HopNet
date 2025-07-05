@@ -1,5 +1,5 @@
 use axum::{
-    http::{HeaderValue, Method}, middleware, routing::{get,post,put}, serve, Router
+    extract::DefaultBodyLimit, http::{HeaderValue, Method}, middleware, routing::{get,post,put}, serve, Router
 };
 use jsonwebtoken::{DecodingKey, EncodingKey};
 use tower_serve_static::ServeDir;
@@ -20,6 +20,7 @@ mod auth;
 mod consensus;
 mod types;
 mod handlers;
+mod files;
 
 static ASSETS_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/frontend/dist");
 
@@ -79,6 +80,8 @@ async fn main() {
                 .route("/users", post(users::routes::post_users))
                 .route("/nodes", get(nodes::get_nodes))
                 .route("/nodes", post(nodes::post_nodes))
+                .route("/files", get(files::routes::get_files))
+                .route("/files", post(files::routes::post_files)).layer(DefaultBodyLimit::max(500*1_000_000))
                 .route("/validators", get(consensus::routes::get_validators))
                 .route("/consensus", get(consensus::routes::get_consensus))
                 .layer(middleware::from_fn_with_state(app_state.clone(), auth::auth_middleware));
