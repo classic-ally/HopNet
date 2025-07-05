@@ -4,6 +4,8 @@ use either::Either;
 
 use crate::files::functions::decrypt_path;
 
+use duckdb::Transaction;
+
 pub fn get_files(
     db: &Arc<Mutex<Connection>>,
     path: String,
@@ -12,17 +14,19 @@ pub fn get_files(
 ) -> Result<Vec<Inode>, DatabaseError> {
     match db.lock() {
         Ok(db_lock) => {
-            let mut stmt = db_lock.prepare("SELECT id, owner_id, path, type, data_id FROM inodes WHERE path LIKE ?").map_err(|_| DatabaseError::RecallError)?;
-            let like_path = format!("{}%", path);
-            let inodes = stmt.query_map(params![like_path], |row| {
-                let path = row.get(2)?;
+            let mut stmt = db_lock.prepare("SELECT owner_id, path, type, data_id FROM inodes WHERE path LIKE ? AND path NOT LIKE ?").map_err(|_| DatabaseError::RecallError)?;
+            let like_path = format!("{}/%", path);
+            let not_like_path = format!("{}/%", like_path);
+            dbg!(&like_path, &not_like_path);
+            let inodes = stmt.query_map(params![like_path, not_like_path], |row| {
+                let path = row.get(1)?;
                 let decrypted_path = decrypt_path(path, key, nonce)?;
+                let data_id: Option<CustomUUID> = row.get(3)?;
                 Ok(Inode {
-                    id: row.get(0)?,
-                    owner: Either::Left(row.get(1)?),
+                    owner: Either::Left(row.get(0)?),
                     path: decrypted_path,
-                    inode_type: row.get(3)?,
-                    data_id: Either::Left(row.get(4)?),
+                    inode_type: row.get(2)?,
+                    data_id: data_id.map(Either::Left),
                 })
             }).map_err(|_| DatabaseError::ProcessingError)?;
             
@@ -42,15 +46,28 @@ pub fn insert_files(
     match db.lock() {
         Ok(mut db_lock) => {
             let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
+
+            // STEP 1: Collect all paths that need to be inserted
+            let new_paths: Vec<String> = inodes.iter()
+                .map(|inode| inode.path.clone())
+                .collect();
+            
+            // STEP 2: Find all missing parent directories in one query
+            let missing_parents = find_missing_parents(&tx, &new_paths)?;
+            
+            // STEP 3: Insert missing parent directories first
+            if !missing_parents.is_empty() {
+                insert_parent_directories(&tx, &missing_parents, &inodes)?;
+            }
             
             for inode in inodes {
                 // Handle the data_id which can be Either<CustomUUID, DataRecord>
                 let data_id = match inode.data_id {
-                    either::Either::Left(uuid) => {
+                    Some(either::Either::Left(uuid)) => {
                         // If it's already a UUID, use it directly
-                        uuid
+                        Ok(uuid)
                     },
-                    either::Either::Right(data_record) => {
+                    Some(either::Either::Right(data_record)) => {
                         // If it's a DataRecord, we need to insert it first
                         let data_id = data_record.id;
                                                 
@@ -119,9 +136,10 @@ pub fn insert_files(
                             ]
                         ).map_err(|_| DatabaseError::InsertError)?;
                         
-                        data_id
-                    }
-                };
+                        Ok(data_id)
+                    },
+                    None => Err(DatabaseError::InvalidPayload)
+                }?;
                 
                 // Get the owner_id from the inode
                 let owner_id = match inode.owner {
@@ -131,9 +149,8 @@ pub fn insert_files(
 
                 // Insert into inodes table
                 tx.execute(
-                    "INSERT INTO inodes (id, owner_id, path, type, data_id) VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO inodes (owner_id, path, type, data_id) VALUES (?, ?, ?, ?)",
                     params![
-                        inode.id,
                         owner_id,
                         inode.path,
                         inode.inode_type,
@@ -149,4 +166,99 @@ pub fn insert_files(
         }
         Err(_) => Err(DatabaseError::LockError)
     }
+}
+
+// Helper function to find missing parent directories
+fn find_missing_parents(
+    tx: &Transaction,
+    new_paths: &[String]
+) -> Result<Vec<String>, DatabaseError> {
+    if new_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    
+    // Create a temporary table with the new paths
+    tx.execute(
+        "CREATE TEMP TABLE temp_new_paths (path VARCHAR)",
+        []
+    ).map_err(|_| DatabaseError::InsertError)?;
+    
+    // Insert new paths into temp table
+    for path in new_paths {
+        tx.execute(
+            "INSERT INTO temp_new_paths VALUES (?)",
+            params![path]
+        ).map_err(|_| DatabaseError::InsertError)?;
+    }
+    
+    // Find all missing parent directories
+    let query = r#"
+        WITH RECURSIVE path_parents AS (
+            -- Generate all required parent paths
+            SELECT DISTINCT 
+                '/' || array_to_string(
+                    list_slice(
+                        string_split(ltrim(tnp.path, '/'), '/'), 
+                        1, 
+                        i
+                    ), 
+                    '/'
+                ) as parent_path
+            FROM temp_new_paths tnp,
+            LATERAL (
+                SELECT unnest(
+                    generate_series(1, array_length(string_split(ltrim(tnp.path, '/'), '/')) - 1)
+                ) as i
+            )
+            WHERE array_length(string_split(ltrim(tnp.path, '/'), '/')) > 1
+        )
+        SELECT DISTINCT pp.parent_path
+        FROM path_parents pp
+        LEFT JOIN inodes i ON pp.parent_path = i.path
+        WHERE i.path IS NULL
+        ORDER BY pp.parent_path
+    "#;
+    
+    let mut stmt = tx.prepare(query).map_err(|_| DatabaseError::ProcessingError)?;
+    let rows = stmt.query_map([], |row| {
+        Ok(row.get::<_, String>(0)?)
+    }).map_err(|_| DatabaseError::ProcessingError)?;
+    
+    let mut missing_parents = Vec::new();
+    for row in rows {
+        missing_parents.push(row.map_err(|_| DatabaseError::ProcessingError)?);
+    }
+    
+    // Clean up temp table
+    tx.execute("DROP TABLE temp_new_paths", [])
+        .map_err(|_| DatabaseError::ProcessingError)?;
+    
+    Ok(missing_parents)
+}
+
+// Helper function to insert parent directories
+fn insert_parent_directories(
+    tx: &Transaction,
+    missing_parents: &[String],
+    inodes: &[Inode]
+) -> Result<(), DatabaseError> {
+    // Get owner_id from the first inode (assuming same owner for batch)
+    let owner_id = match &inodes[0].owner {
+        either::Either::Left(user_id) => *user_id,
+        either::Either::Right(user) => user.user_id,
+    };
+    
+    // Insert each missing parent directory
+    for parent_path in missing_parents {
+        
+        tx.execute(
+            "INSERT INTO inodes (owner_id, path, type, data_id) VALUES (?, ?, 'folder', NULL)",
+            params![
+                owner_id,
+                parent_path
+            ]
+        ).map_err(|_| DatabaseError::InsertError)?;
+    }
+    
+    Ok(())
 }

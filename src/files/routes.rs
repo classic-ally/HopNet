@@ -78,11 +78,10 @@ pub async fn post_files(
                         };
                         // assemble inode for database
                         let inode = Inode {
-                            id: CustomUUID::new(None),
                             owner: Left(0),
                             path: filepath,
                             inode_type: crate::db::InodeType::File,
-                            data_id: Right(datarecord)
+                            data_id: Some(Right(datarecord))
                         };
                         inodes.push(inode);
                         

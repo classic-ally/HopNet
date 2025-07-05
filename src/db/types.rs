@@ -141,9 +141,6 @@ impl FromSql for InodeType {
 
 #[derive(Serialize)]
 pub struct Inode {
-    // identifies this inode.
-    // one piece of data can have multiple inodes, e.g. if shared.
-    pub id: CustomUUID,
     // the owner for this specific node:
     pub owner: Either<i32, User>,
     // path is split by /
@@ -153,8 +150,8 @@ pub struct Inode {
     // it is either a folder or file
     pub inode_type: InodeType,
     // if file, point to datablock
-    // if folder, null
-    pub data_id: Either<CustomUUID, DataRecord>
+    // if folder, None
+    pub data_id: Option<Either<CustomUUID, DataRecord>>
 }
 
 #[derive(Serialize)]
@@ -162,6 +159,7 @@ pub struct DataRecord {
     // PK for this datablock
     // referenced by inoderecord
     // distinct from hash to allow file update without needing to update inode
+    // also encodes creation time due to uuidv7
     pub id: CustomUUID,
     // map of { user_id -> encrypted_file_key }
     // on share:

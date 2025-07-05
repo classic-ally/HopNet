@@ -1,7 +1,6 @@
 use super::*;
 
 use duckdb::{Connection, Error};
-use ed25519_dalek::SigningKey;
 
 pub fn initialize() -> Result<Arc<Mutex<Connection>>, Error> {
     let db = Connection::open(":memory:")?;
@@ -181,8 +180,6 @@ pub fn initialize() -> Result<Arc<Mutex<Connection>>, Error> {
             );
 
             CREATE TABLE inodes (
-                -- PK for a single file or folder node
-                id              UUID PRIMARY KEY,
                 -- owner of this reference
                 owner_id        INTEGER REFERENCES users(user_id) NOT NULL,
                 -- denormalized deterministically encrypted string
@@ -191,7 +188,9 @@ pub fn initialize() -> Result<Arc<Mutex<Connection>>, Error> {
                 -- type of the inode
                 type            ENUM('file', 'folder') NOT NULL,
                 -- FK to the content block
-                data_id         UUID REFERENCES data_blocks(id) NOT NULL
+                data_id         UUID REFERENCES data_blocks(id),
+
+                PRIMARY KEY     (owner_id, path)
             );
 
             -- 1. The MOST IMPORTANT index for listing folder contents.
