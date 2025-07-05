@@ -8,7 +8,7 @@ pub fn get_files(
 ) -> Result<Vec<Inode>, DatabaseError> {
     match db.lock() {
         Ok(db_lock) => {
-            let mut stmt = db_lock.prepare("SELECT * FROM inodes WHERE path LIKE ?").map_err(|_| DatabaseError::RecallError)?;
+            let mut stmt = db_lock.prepare("SELECT id, owner_id, path, type, data_id FROM inodes WHERE path LIKE ?").map_err(|_| DatabaseError::RecallError)?;
             let like_path = format!("{}%", path);
             let inodes = stmt.query_map(params![like_path], |row| {
                 Ok(Inode {

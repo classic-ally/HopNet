@@ -3,6 +3,7 @@ use serde::{Serialize, Deserialize};
 use std::ops::Deref;
 use duckdb::{ToSql,types::ToSqlOutput,types::FromSql,types::FromSqlResult,types::ValueRef};
 use crate::db::consensus as db;
+use crate::db::types::extract_enum_string;
 use bincode::serde::encode_to_vec;
 use ed25519_dalek::Signature;
 use bincode::config;
@@ -48,24 +49,15 @@ impl ToSql for ConsensusPhase {
 
 impl FromSql for ConsensusPhase {
     fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
-        match value {
-            ValueRef::Text(s) => {
-                match s {
-                    b"propose" => Ok(ConsensusPhase::Propose),
-                    b"lock" => Ok(ConsensusPhase::Lock),
-                    _ => Err(duckdb::types::FromSqlError::InvalidType),
-                }
+        if let ValueRef::Enum(enum_type, row_idx) = value {
+            let enum_value = extract_enum_string(enum_type, row_idx)?;
+            match enum_value.as_str() {
+                "propose" => Ok(ConsensusPhase::Propose),
+                "lock" => Ok(ConsensusPhase::Lock),
+                _ => Err(duckdb::types::FromSqlError::InvalidType),
             }
-            ValueRef::Enum(_, index) => {
-                // DuckDB stores enums as dictionary arrays with indices
-                // Index 0 = "propose", Index 1 = "lock"
-                match index {
-                    0 => Ok(ConsensusPhase::Propose),
-                    1 => Ok(ConsensusPhase::Lock),
-                    _ => Err(duckdb::types::FromSqlError::InvalidType),
-                }
-            }
-            _ => Err(duckdb::types::FromSqlError::InvalidType)
+        } else {
+            Err(duckdb::types::FromSqlError::InvalidType)
         }
     }
 }

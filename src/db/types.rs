@@ -18,7 +18,32 @@ use chrono::{DateTime, Utc};
 use either::Either;
 use serde::{Serialize, Deserialize};
 use uuid::{Timestamp, Uuid};
-use duckdb::types::{ToSql, ToSqlOutput, FromSql, FromSqlResult, ValueRef, FromSqlError};
+use duckdb::types::{ToSql, ToSqlOutput, FromSql, FromSqlResult, ValueRef, FromSqlError, EnumType};
+use duckdb::arrow::array::StringArray;
+
+/// Helper function to extract string value from DuckDB enum
+pub fn extract_enum_string(enum_type: EnumType<'_>, row_idx: usize) -> Result<String, FromSqlError> {
+    // Get the string values array
+    let dict_values = match enum_type {
+        EnumType::UInt8(dict_array) => dict_array.values(),
+        EnumType::UInt16(dict_array) => dict_array.values(),
+        EnumType::UInt32(dict_array) => dict_array.values(),
+    }
+    .as_any()
+    .downcast_ref::<StringArray>()
+    .ok_or(FromSqlError::InvalidType)?;
+    
+    // Get the dictionary key for this row
+    let dict_key = match enum_type {
+        EnumType::UInt8(dict_array) => dict_array.key(row_idx),
+        EnumType::UInt16(dict_array) => dict_array.key(row_idx),
+        EnumType::UInt32(dict_array) => dict_array.key(row_idx),
+    }
+    .ok_or(FromSqlError::InvalidType)?;
+    
+    // Get the actual string value
+    Ok(dict_values.value(dict_key).to_string())
+}
 
 #[derive(Serialize)]
 pub struct CustomUUID(Uuid);
@@ -101,24 +126,15 @@ impl ToSql for InodeType {
 
 impl FromSql for InodeType {
     fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
-        match value {
-            ValueRef::Text(s) => {
-                match s {
-                    b"file" => Ok(InodeType::File),
-                    b"folder" => Ok(InodeType::Folder),
-                    _ => Err(duckdb::types::FromSqlError::InvalidType),
-                }
+        if let ValueRef::Enum(enum_type, row_idx) = value {
+            let enum_value = extract_enum_string(enum_type, row_idx)?;
+            match enum_value.as_str() {
+                "file" => Ok(InodeType::File),
+                "folder" => Ok(InodeType::Folder),
+                _ => Err(FromSqlError::InvalidType),
             }
-            ValueRef::Enum(_, index) => {
-                // DuckDB stores enums as dictionary arrays with indices
-                // Index 0 = "file", Index 1 = "folder"
-                match index {
-                    0 => Ok(InodeType::File),
-                    1 => Ok(InodeType::Folder),
-                    _ => Err(duckdb::types::FromSqlError::InvalidType),
-                }
-            }
-            _ => Err(duckdb::types::FromSqlError::InvalidType)
+        } else {
+            Err(FromSqlError::InvalidType)
         }
     }
 }

@@ -1,7 +1,6 @@
 use axum::{
     extract::{
-        State,
-        Multipart
+        Multipart, Query, State
     },
     response::IntoResponse,
     Json
@@ -9,22 +8,29 @@ use axum::{
 use reqwest::StatusCode;
 
 use crate::db::{DataRecord, Inode};
+use serde::Deserialize;
 
 use super::*;
 use crate::{db::{AccessList, CustomUUID}, files::functions::shard_file};
 use either::Either::{Left, Right};
 
+#[derive(Deserialize)]
+pub struct GetQueryParams {
+    path: String
+}
+
 pub async fn get_files(
-    State(app_state): State<AppState>
+    State(app_state): State<AppState>,
+    Query(params): Query<GetQueryParams>
 ) -> impl IntoResponse {
-    match db::get_files(&app_state.db, String::new()) {
+    match db::get_files(&app_state.db, params.path) {
         Ok(files) => {
             (StatusCode::OK, Json(files))
         }
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(Vec::<Inode>::new())
-        )
+        Err(e) => {
+            dbg!(e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(Vec::<Inode>::new()))
+        }
     }
 }
 
@@ -69,7 +75,7 @@ pub async fn post_files(
                             id: CustomUUID::new(None),
                             owner: Left(0),
                             path: path.clone(),
-                            inode_type: crate::db::InodeType::Folder,
+                            inode_type: crate::db::InodeType::File,
                             data_id: Right(datarecord)
                         };
                         inodes.push(inode);
