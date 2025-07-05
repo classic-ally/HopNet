@@ -1,5 +1,8 @@
 import { writable } from 'svelte/store';
 
+// API Configuration
+export const API_BASE_URL = 'http://localhost:34632';
+
 // Helper to parse a JWT and get its expiration time
 function getJwtExpiration(token: string) {
   try {

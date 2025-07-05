@@ -3,7 +3,7 @@
   import Setup from './lib/SetupSM.svelte';
   import LoginPane from './lib/LoginPane.svelte';
   import BackendError from './lib/BackendError.svelte';
-  import { tokenStore } from './lib/stores';
+  import { tokenStore, API_BASE_URL } from './lib/stores';
     import Interface from './lib/Interface/Interface.svelte';
 
   let currentComponent: 'setup' | 'operation' | 'error' = 'setup';
@@ -16,7 +16,7 @@
   // are we set up?
   onMount(async () => {
     try {
-      const response = await fetch('http://localhost:34632/setup');
+      const response = await fetch(`${API_BASE_URL}/setup`);
       
       if (response.status === 404) {
         currentComponent = 'setup';
