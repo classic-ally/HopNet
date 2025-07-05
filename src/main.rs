@@ -1,3 +1,4 @@
+use aes_siv::{siv::Aes256Siv, Key, Nonce};
 use axum::{
     extract::DefaultBodyLimit, http::{HeaderValue, Method}, middleware, routing::{get,post,put}, serve, Router
 };
@@ -8,7 +9,7 @@ use include_dir::{Dir, include_dir};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 
-use crate::{db::{PrivKey, PubKey}, handlers::TransactionHandler};
+use crate::{db::{PrivKey, PubKey}, files::functions::{generate_siv_key, generate_siv_nonce}, handlers::TransactionHandler};
 
 mod nodes;
 mod setup;
@@ -30,7 +31,9 @@ pub struct AppState {
     encoding_key: EncodingKey,
     decoding_key: DecodingKey,
     private_key: PrivKey,
-    public_key: PubKey
+    public_key: PubKey,
+    siv_key: Key<Aes256Siv>,
+    siv_nonce: Nonce
 }
 
 static DISPATCH_TABLE: Lazy<HashMap<&'static str, &'static dyn TransactionHandler>> = Lazy::new(|| {
@@ -63,6 +66,8 @@ async fn main() {
 
     let (encodingkey, decodingkey) = auth::generate_jwt_key();
     let (privatekey, publickey) = consensus::functions::generate_ed25519_key();
+    let siv_key = generate_siv_key();
+    let siv_nonce = generate_siv_nonce();
 
     match db::shared::initialize() {
         Ok(database) => {
@@ -71,7 +76,9 @@ async fn main() {
                 encoding_key: encodingkey,
                 decoding_key: decodingkey,
                 private_key: PrivKey(privatekey),
-                public_key: PubKey(publickey)
+                public_key: PubKey(publickey),
+                siv_key: siv_key,
+                siv_nonce: siv_nonce
             };
 
             // Protected routes that require authentication

@@ -2,12 +2,11 @@ use axum::{
     extract::{
         Multipart, Query, State
     },
-    response::IntoResponse,
     Json
 };
 use reqwest::StatusCode;
 
-use crate::db::{DataRecord, Inode};
+use crate::{db::{DataRecord, Inode}, files::functions::{encrypt_part, encrypt_path}};
 use serde::Deserialize;
 
 use super::*;
@@ -22,14 +21,16 @@ pub struct GetQueryParams {
 pub async fn get_files(
     State(app_state): State<AppState>,
     Query(params): Query<GetQueryParams>
-) -> impl IntoResponse {
-    match db::get_files(&app_state.db, params.path) {
+) -> Result<Json<Vec<Inode>>, StatusCode> {
+    // let's encrypt the path so we can search for it
+    let enc_path = encrypt_path(params.path, &app_state.siv_key, &app_state.siv_nonce).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    match db::get_files(&app_state.db, enc_path, &app_state.siv_key, &app_state.siv_nonce) {
         Ok(files) => {
-            (StatusCode::OK, Json(files))
+            Ok(Json(files))
         }
         Err(e) => {
             dbg!(e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(Vec::<Inode>::new()))
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }
@@ -41,18 +42,23 @@ pub async fn post_files(
     // read path part first
     // need path in later file processing
     let mut inodes: Vec<Inode> = Vec::new();
+
     match multipart.next_field().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? {
         Some(part) => {
             if part.name() != Some("path") {
                 return Err(StatusCode::BAD_REQUEST);
             }
-            let path = part.text().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let unencrypted_path = part.text().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let path = encrypt_path(unencrypted_path, &app_state.siv_key, &app_state.siv_nonce).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
             while let Some(part) = multipart.next_field().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? {
                 match part.name() {
                     Some("file") => {
                         // instantiate data
-                        let filename = part.file_name().ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+                        let filename = part.file_name().map(|s| s.to_string()).ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
                         let filedata = part.bytes().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+                        // encrypt filename - deterministic AES-SIV
+                        let filepath = path.clone() + &encrypt_part(&filename, &app_state.siv_key, &app_state.siv_nonce).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
                         let accessors = AccessList{
                             keys: vec![
@@ -74,7 +80,7 @@ pub async fn post_files(
                         let inode = Inode {
                             id: CustomUUID::new(None),
                             owner: Left(0),
-                            path: path.clone(),
+                            path: filepath,
                             inode_type: crate::db::InodeType::File,
                             data_id: Right(datarecord)
                         };

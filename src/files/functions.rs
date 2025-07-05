@@ -1,13 +1,30 @@
 use crate::db::Data;
 use crate::types::Blake3Hash;
 use crate::db::DataBlockRepresentation;
+use aes_siv::{
+    aead::{Aead, OsRng}, siv::Aes256Siv, Aes256SivAead, Key, KeyInit, Nonce
+};
+use duckdb::arrow::datatypes::ToByteSlice;
 use rayon::prelude::*;
+use rand::Rng;
+use hex;
 
+#[derive(Debug)]
 pub enum FileError {
     ShardingError,
     HashingError,
     InvalidChunkCount,
     TaskJoinError,
+    EncryptionError
+}
+
+impl From<FileError> for duckdb::Error {
+    fn from(err: FileError) -> Self {
+        duckdb::Error::DuckDBFailure(
+            duckdb::ffi::Error::new(duckdb::ffi::DuckDBError),
+            Some(format!("File operation failed: {:?}", err))
+        )
+    }
 }
 
 pub async fn shard_file(mut file: Vec<u8>) -> Result<Data, FileError> {
@@ -114,7 +131,104 @@ pub async fn shard_file(mut file: Vec<u8>) -> Result<Data, FileError> {
         fragment_30: DataBlockRepresentation::Hash(recovery_hashes[19]),
         added_bytes: added_bytes,
     };
-    dbg!(&data);
     
     Ok(data)
+}
+
+pub fn generate_siv_nonce() -> Nonce {
+    // we generate this SIV nonce once for each user
+    // it's stored for the user forever + synced between nodes
+    // probably not needed for security, but defence-in-depth?
+    let mut rng = rand::rng();
+
+    let random_value: u128 = rng.random();
+    let random_bytes = random_value.to_be_bytes();
+    let nonce = Nonce::from_slice(&random_bytes).clone();
+    return nonce;
+}
+
+pub fn generate_siv_key() -> Key<Aes256Siv> {
+    let key: Key<Aes256Siv> = Aes256SivAead::generate_key(&mut OsRng);
+    return key;
+}
+
+pub async fn encrypt_path(
+    path: String,
+    key: &Key<Aes256Siv>,
+    nonce: &Nonce
+) -> Result<String, FileError> {
+    let mut output_path: String = "".to_string();
+
+    let split_path = path.split('/').collect::<Vec<&str>>();
+    dbg!(split_path.len());
+    if split_path.len() > 1 {
+        for part in split_path {
+            if part.len() != 0 {
+                let encrypted_part = encrypt_part(part, &key, nonce).await?;
+                output_path = output_path + &encrypted_part;
+            }
+        }
+    } else {
+        output_path = output_path + "/";
+    }
+
+    dbg!(&output_path);
+
+    Ok(output_path)
+}
+
+pub async fn encrypt_part(
+    part: &str,
+    key: &Key<Aes256Siv>,
+    nonce: &Nonce
+) -> Result<String, FileError> {
+    let cipher = Aes256SivAead::new(&key);
+    let ciphertext = cipher.encrypt(nonce, part.as_bytes()).map_err(|_| FileError::EncryptionError)?;
+    // we encode as hex to enable splitting by /
+    // base64 more space efficient but collisions
+    let base64_str = hex::encode(ciphertext);
+    let this_part = "/".to_string() + &base64_str;
+    Ok(this_part)
+}
+
+pub fn decrypt_path(
+    enc_path: String,
+    key: &Key<Aes256Siv>,
+    nonce: &Nonce
+) -> Result<String, FileError> {
+    let mut output_path: String = "".to_string();
+
+    let split_path = enc_path.split('/').collect::<Vec<&str>>();
+    if split_path.len() > 1 {
+        for part in split_path {
+            if part.len() != 0 {
+                let decrypted_part = decrypt_part(part, &key, nonce)?;
+                output_path = output_path + "/" + &decrypted_part;
+            }
+        }
+    } else {
+        output_path = output_path + "/"
+    }
+
+    Ok(output_path)
+}
+
+pub fn decrypt_part(
+    part: &str,
+    key: &Key<Aes256Siv>,
+    nonce: &Nonce
+) -> Result<String, FileError> {
+    let cipher = Aes256SivAead::new(key);
+    match hex::decode(part) {
+        Ok(binary) => {
+            match cipher.decrypt(nonce, binary.to_byte_slice()) {
+                Ok(bytes) => {
+                    let string = String::from_utf8(bytes).map_err(|_| FileError::EncryptionError)?;
+                    Ok(string)
+                }
+                Err(_) => Err(FileError::EncryptionError)
+            }
+        }
+        Err(_) => Err(FileError::EncryptionError)
+    }
 }

@@ -1,20 +1,26 @@
 use super::*;
+use aes_siv::{siv::Aes256Siv, Key, Nonce};
 use either::Either;
 
+use crate::files::functions::decrypt_path;
 
 pub fn get_files(
     db: &Arc<Mutex<Connection>>,
     path: String,
+    key: &Key<Aes256Siv>,
+    nonce: &Nonce
 ) -> Result<Vec<Inode>, DatabaseError> {
     match db.lock() {
         Ok(db_lock) => {
             let mut stmt = db_lock.prepare("SELECT id, owner_id, path, type, data_id FROM inodes WHERE path LIKE ?").map_err(|_| DatabaseError::RecallError)?;
             let like_path = format!("{}%", path);
             let inodes = stmt.query_map(params![like_path], |row| {
+                let path = row.get(2)?;
+                let decrypted_path = decrypt_path(path, key, nonce)?;
                 Ok(Inode {
                     id: row.get(0)?,
                     owner: Either::Left(row.get(1)?),
-                    path: row.get(2)?,
+                    path: decrypted_path,
                     inode_type: row.get(3)?,
                     data_id: Either::Left(row.get(4)?),
                 })
