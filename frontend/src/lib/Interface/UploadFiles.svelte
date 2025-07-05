@@ -1,13 +1,14 @@
 <script lang="ts">
     import { createEventDispatcher } from 'svelte';
-    import { API_BASE_URL, tokenStore } from '../stores';
+    import { API_BASE_URL, tokenStore, currentPathStore } from '../stores';
     
     export let isOpen = false;
     
     const dispatch = createEventDispatcher();
     
-    // Get token from store
+    // Get token and current path from stores
     $: token = $tokenStore;
+    $: currentPath = $currentPathStore;
     
     let files: File[] = [];
     let isDragOver = false;
@@ -71,8 +72,8 @@
         try {
             const formData = new FormData();
             
-            // Add path parameter (always "/" for now as specified)
-            formData.append('path', '/');
+            // Add path parameter (use current browse path)
+            formData.append('path', currentPath);
             
             // Add all files
             files.forEach(file => {
@@ -217,7 +218,7 @@
         
         <!-- Footer -->
         <div class="flex items-center justify-between p-4">
-            <p class="text-xs text-gray-400">Upload path: /</p>
+            <p class="text-xs text-gray-400">Upload path: {currentPath}</p>
             <div class="flex gap-2">
                 <button 
                     class="px-4 py-2 bg-red-500 rounded-md border-none hover:bg-red-600 text-white transition-colors"

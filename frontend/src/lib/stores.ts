@@ -3,6 +3,12 @@ import { writable } from 'svelte/store';
 // API Configuration
 export const API_BASE_URL = 'http://localhost:34632';
 
+// Current browse path store
+export const currentPathStore = writable('/');
+
+// Refresh trigger store - increment to trigger refresh
+export const refreshTriggerStore = writable(0);
+
 // Helper to parse a JWT and get its expiration time
 function getJwtExpiration(token: string) {
   try {

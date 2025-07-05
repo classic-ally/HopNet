@@ -1,6 +1,7 @@
 <script>
     import ControlBarIcon from "./ControlBarIcon.svelte";
     import UploadFiles from "./UploadFiles.svelte";
+    import { refreshTriggerStore } from '../stores';
     
     let showUploadPopover = false;
     
@@ -14,7 +15,8 @@
     
     function handleFilesUploaded() {
         showUploadPopover = false;
-        // You can add additional logic here to refresh the file list
+        // Trigger refresh of the browse pane
+        refreshTriggerStore.update(n => n + 1);
         console.log('Files uploaded successfully');
     }
     
@@ -67,10 +69,6 @@
             onClick={handleShareClick}
         />
     </div>
-</div>
-<div>
-    <h3>Recents</h3>
-    <p class="text-sm text-gray-300">50 items</p>
 </div>
 
 <!-- Upload Files Popover -->

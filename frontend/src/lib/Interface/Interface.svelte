@@ -1,5 +1,6 @@
 <script>
     import AccountSidebarItem from "./AccountSidebarItem.svelte";
+    import BrowsePane from "./BrowsePane.svelte";
     import FileBrowserHeader from "./FileBrowserHeader.svelte";
     import NodeAddPane from "./NodeAddPane.svelte";
     import NodesHeader from "./NodesHeader.svelte";
@@ -65,13 +66,12 @@
     </div>
     <!-- Main content -->
     <div class="p-5 flex flex-col gap-3 w-full">
-        {#if selectedItem != "nodes"}
+        {#if selectedItem === "browse"}
             <!-- Header area -->
             <FileBrowserHeader/>
-            <!-- Body area -->
-            test
-        {/if}
-        {#if selectedItem == "nodes"}
+            <!-- Browse pane -->
+            <BrowsePane/>
+        {:else if selectedItem === "nodes"}
             <NodesHeader
                 onAddNode={() => {isNodeAddOpen = !isNodeAddOpen}}
             />
@@ -81,8 +81,14 @@
                     onBackButton={() => {isNodeAddOpen = !isNodeAddOpen}}
                 />
             {/if}
+        {:else if selectedItem === "recents"}
+            <!-- Header area -->
+            <FileBrowserHeader/>
+            <!-- Body area -->
+            <div class="text-indigo-300">Recent files will be shown here</div>
+        {:else if selectedItem === "account"}
+            <!-- Account management will be shown here -->
+            <div class="text-indigo-300">Account settings will be shown here</div>
         {/if}
-        
-
     </div>
 </div>
