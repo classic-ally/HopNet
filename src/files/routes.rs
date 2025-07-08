@@ -128,3 +128,17 @@ pub async fn post_files(
     }
 
 }
+
+pub async fn delete_files(
+    State(app_state): State<AppState>,
+    Query(params): Query<GetQueryParams>
+) -> Result<(), StatusCode> {
+    let enc_path = encrypt_path(params.path, &app_state.siv_key, &app_state.siv_nonce).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    match db::delete_files(&app_state.db, enc_path) {
+        Ok(_) => return Ok(()),
+        Err(e) => {
+            dbg!(e);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}

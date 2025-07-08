@@ -1,6 +1,6 @@
 use aes_siv::{siv::Aes256Siv, Key, Nonce};
 use axum::{
-    extract::DefaultBodyLimit, http::{HeaderValue, Method}, middleware, routing::{get,post,put}, serve, Router
+    extract::DefaultBodyLimit, http::{HeaderValue, Method}, middleware, routing::{get,post,put,delete}, serve, Router
 };
 use jsonwebtoken::{DecodingKey, EncodingKey};
 use tower_serve_static::ServeDir;
@@ -90,6 +90,7 @@ async fn main() {
                 .route("/files", get(files::routes::get_files))
                 .route("/files", post(files::routes::post_files)).layer(DefaultBodyLimit::max(500*1_000_000))
                 .route("/files", put(files::routes::put_folder))
+                .route("/files", delete(files::routes::delete_files))
                 .route("/validators", get(consensus::routes::get_validators))
                 .route("/consensus", get(consensus::routes::get_consensus))
                 .layer(middleware::from_fn_with_state(app_state.clone(), auth::auth_middleware));

@@ -10,6 +10,7 @@ stdenv.mkDerivation {
     pkgs.cargo
     pkgs.rustc
     pkgs.rust-analyzer
+    pkgs.clippy
 
     # openssl
     pkgs.openssl.dev

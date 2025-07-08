@@ -1,3 +1,4 @@
 /target
 .DS_Store
 frontend/public/assets/fonts/
+.direnv/*

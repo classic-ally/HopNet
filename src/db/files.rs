@@ -262,3 +262,27 @@ fn insert_parent_directories(
     
     Ok(())
 }
+
+pub fn delete_files(
+    db: &Arc<Mutex<Connection>>,
+    path: String,
+) -> Result<(), DatabaseError> {
+    match db.lock() {
+        Ok(mut db_lock) => {
+            let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
+            
+            // Delete the file/folder and all its children
+            tx.execute(
+                "DELETE FROM inodes WHERE path = ? OR path LIKE ?",
+                params![path, format!("{}/%", path)]
+            ).map_err(|_| DatabaseError::ProcessingError)?;
+            
+            tx.commit().map_err(|_| DatabaseError::ProcessingError)?;
+            Ok(())
+        }
+        Err(e) => {
+            dbg!(e);
+            Err(DatabaseError::LockError)
+        }
+    }
+}
