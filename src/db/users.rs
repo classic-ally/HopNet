@@ -12,6 +12,7 @@ pub fn get_users(
                     user_id: row.get(0)?,
                     username: row.get(1)?,
                     password: row.get(2)?,
+                    pubkey: row.get(3)?
                 })
             });
 
@@ -46,7 +47,8 @@ pub fn get_user_by_username(
                 let user = User {
                     user_id: row.get(0).map_err(|_| DatabaseError::RecallError)?,
                     username: row.get(1).map_err(|_| DatabaseError::RecallError)?,
-                    password: row.get(2).map_err(|_| DatabaseError::RecallError)?
+                    password: row.get(2).map_err(|_| DatabaseError::RecallError)?,
+                    pubkey: row.get(3).map_err(|_| DatabaseError::RecallError)?
                 };
                 return Ok(Some(user))
             } else {
@@ -73,7 +75,8 @@ pub fn get_user_by_userid(
                 let user = User {
                     user_id: row.get(0).map_err(|_| DatabaseError::RecallError)?,
                     username: row.get(1).map_err(|_| DatabaseError::RecallError)?,
-                    password: row.get(2).map_err(|_| DatabaseError::RecallError)?
+                    password: row.get(2).map_err(|_| DatabaseError::RecallError)?,
+                    pubkey: row.get(3).map_err(|_| DatabaseError::RecallError)?,
                 };
                 return Ok(Some(user))
             } else {
@@ -101,8 +104,8 @@ pub fn insert_user(
             let password_hash = user.password_hash().map_err(|_| DatabaseError::ProcessingError)?;
 
             tx.execute(
-                "INSERT INTO users (user_id, username, password_hash) VALUES (?, ?, ?)",
-                params![next_id, user.username, password_hash]
+                "INSERT INTO users (user_id, username, password_hash, pubkey) VALUES (?, ?, ?, ?)",
+                params![next_id, user.username, password_hash, user.pubkey]
             ).map_err(|_| DatabaseError::InsertError)?;
             
             // Update the sequence for next user

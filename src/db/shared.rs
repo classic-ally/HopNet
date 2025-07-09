@@ -15,6 +15,7 @@ pub fn initialize() -> Result<Arc<Mutex<Connection>>, Error> {
                 user_id         INTEGER PRIMARY KEY,
                 username        VARCHAR NOT NULL,
                 password_hash   VARCHAR NOT NULL,
+                pubkey          BLOB NOT NULL,
 
                 CONSTRAINT unique_username UNIQUE (username)
             );
@@ -94,6 +95,7 @@ pub fn initialize() -> Result<Arc<Mutex<Connection>>, Error> {
                 internal_id             INTEGER PRIMARY KEY DEFAULT 1,
                 node_id                 INTEGER NOT NULL UNIQUE,
                 privkey                 BLOB NOT NULL,
+                user_privkey            BLOB NOT NULL,
 
                 -- Consensus mechanics
                 -- View stored in case of leader change without block written

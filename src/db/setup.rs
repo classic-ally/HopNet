@@ -30,6 +30,7 @@ pub fn post_initial_setup(
     node: Node,
     pubkey: PubKey,
     privkey: PrivKey,
+    user_privkey: PrivKey
 ) -> Result<(), DatabaseError> {
     match db.lock() {
         Ok(mut db_lock) => {
@@ -51,8 +52,8 @@ pub fn post_initial_setup(
                 |row| row.get::<_, i32>(0)
             ).map_err(|_| DatabaseError::RecallError)?;
             tx.execute(
-                "INSERT INTO users (user_id, username, password_hash) VALUES (?, ?, ?)",
-                params![next_user_id, user.username, password_hash]
+                "INSERT INTO users (user_id, username, password_hash, pubkey) VALUES (?, ?, ?, ?)",
+                params![next_user_id, user.username, password_hash, user.pubkey]
             ).map_err(|_| DatabaseError::InsertError)?;
             // Update the sequence for next user
             tx.execute(
@@ -130,8 +131,8 @@ pub fn post_initial_setup(
 
             // also write this node so we know setup is completed
             tx.execute(
-                "INSERT INTO this_node (internal_id, node_id, privkey, current_view, committed_block_hash, highest_qc_block_hash) VALUES (?, ?, ?, ?, ?, ?)",
-                params![1, next_node_id, privkey, genesis_block.data.view_number + 1, genesis_block.block_hash, genesis_block.block_hash]
+                "INSERT INTO this_node (internal_id, node_id, privkey, current_view, committed_block_hash, highest_qc_block_hash, user_privkey) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                params![1, next_node_id, privkey, genesis_block.data.view_number + 1, genesis_block.block_hash, genesis_block.block_hash, user_privkey]
             ).map_err(|_| DatabaseError::InsertError)?;
 
             // Commit the transaction
@@ -159,8 +160,8 @@ pub fn put_join_setup(
             dbg!("Inserting users");
             for user in setupobj.users {
                 tx.execute(
-                    "INSERT INTO users (user_id, username, password_hash) VALUES (?, ?, ?)",
-                    params![user.user_id, user.username, user.password]
+                    "INSERT INTO users (user_id, username, password_hash, pubkey) VALUES (?, ?, ?, ?)",
+                    params![user.user_id, user.username, user.password, user.pubkey]
                 ).map_err(|_| DatabaseError::InsertError)?;
             }
 
@@ -212,7 +213,7 @@ pub fn put_join_setup(
 
             dbg!("Inserting this_node");
             tx.execute(
-                "INSERT INTO this_node (internal_id, node_id, privkey, current_phase, current_view, prepared_block_hash, committed_block_hash, highest_qc_block_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO this_node (internal_id, node_id, privkey, current_phase, current_view, prepared_block_hash, committed_block_hash, highest_qc_block_hash, user_privkey) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     1,
                     setupobj.yournode.node_id,
@@ -221,7 +222,8 @@ pub fn put_join_setup(
                     setupobj.yournode.current_view,
                     setupobj.yournode.prepared_block_hash,
                     setupobj.yournode.committed_block_hash,
-                    setupobj.yournode.highest_qc_block_hash
+                    setupobj.yournode.highest_qc_block_hash,
+                    setupobj.user_privkey
                 ]
             ).map_err(|_| DatabaseError::InsertError)?;
 

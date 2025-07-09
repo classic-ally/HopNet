@@ -4,17 +4,13 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use bincode::{encode_to_vec, Encode, config};
-use serde::Deserialize;
+use bincode::config;
+use serde::{Serialize,Deserialize};
 
 use crate::{
     consensus::{
-        types::Transaction,
-        functions::consensus_middleware
-    },
-    types::User,
-    db::users, 
-AppState};
+        functions::consensus_middleware, types::Transaction
+    }, db::{users, PubKey}, types::User, AppState};
 
 pub async fn get_users(
     State(app_state): State<AppState>,
@@ -31,15 +27,16 @@ pub async fn get_users(
 }
 
 
-#[derive(Deserialize, Encode)]
+#[derive(Serialize, Deserialize)]
 pub struct UserRequest {
     username: String,
     password: String,
+    pubkey: PubKey
 }
 
 impl UserRequest {
     pub fn encode(&self) -> Result<Vec<u8>, StatusCode> {
-        return encode_to_vec(&self, config::standard()).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        return bincode::serde::encode_to_vec(&self, config::standard()).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
     }
 }
 
@@ -52,6 +49,7 @@ pub async fn post_users (
         user_id: 0,
         username: payload.username,
         password: payload.password,
+        pubkey: payload.pubkey,
     };
 
     // Encode user with bincode::serde standard config

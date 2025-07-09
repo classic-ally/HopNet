@@ -233,7 +233,13 @@ impl<'de> Deserialize<'de> for PubKey {
             }
         }
 
-        deserializer.deserialize_any(PubKeyVisitor)
+        if deserializer.is_human_readable() {
+            // For human-readable formats (JSON), use deserialize_any to handle strings
+            deserializer.deserialize_any(PubKeyVisitor)
+        } else {
+            // For binary formats (bincode), expect bytes
+            deserializer.deserialize_bytes(PubKeyVisitor)
+        }
     }
 }
 
@@ -298,7 +304,7 @@ impl PubKey {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PrivKey(pub SigningKey);
 
 impl Deref for PrivKey {
@@ -347,6 +353,7 @@ pub struct User {
     pub user_id: i32,
     pub username: String,
     pub password: String,
+    pub pubkey: PubKey
 }
 
 use argon2::{

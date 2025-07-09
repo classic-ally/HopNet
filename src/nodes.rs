@@ -53,6 +53,12 @@ pub async fn post_nodes(
         return StatusCode::FORBIDDEN
     }
 
+    // check if the app state user keys are set up
+    // (our node needs to be set up)
+    let Ok(_) = app_state.get_user_keys() else {
+        return StatusCode::NOT_ACCEPTABLE
+    };
+
     ///////////////
     // 1. Check, can we ping other server? Is it already setup?
     ///////////////
@@ -105,10 +111,11 @@ pub async fn post_nodes(
 
     // Clone the Arc to avoid moving the entire app_state
     let db_clone = app_state.db.clone();
+    let user_private_key = app_state.get_user_keys().unwrap().private_key.clone();
     let db_task = tokio::task::spawn_blocking(move || {
         // Use spawn_blocking for database operations since DuckDB is not async-safe
         tokio::runtime::Handle::current().block_on(async move {
-            nodes::insert_node(&db_clone, payload, dump_tx, confirm_write_rx).await
+            nodes::insert_node(&db_clone, payload, dump_tx, confirm_write_rx, user_private_key).await
         })
     });
 

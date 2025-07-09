@@ -43,7 +43,8 @@ pub async fn insert_node(
     db: &Arc<Mutex<Connection>>,
     node: Node,
     dump_tx: oneshot::Sender<SyncSetupObject>,
-    confirm_write_rx: oneshot::Receiver<Result<(), Error>>
+    confirm_write_rx: oneshot::Receiver<Result<(), Error>>,
+    user_privkey: PrivKey
 ) -> Result<(), DatabaseError> {
     match db.lock() {
         Ok(mut db_lock) => {
@@ -61,6 +62,7 @@ pub async fn insert_node(
                     user_id: row.get(0)?,
                     username: row.get(1)?,
                     password: row.get(2)?,
+                    pubkey: row.get(3)?,
                 })
             }).map_err(|_| DatabaseError::RecallError)?;
             let users: Vec<User> = rows_users.collect::<Result<Vec<User>, _>>()
@@ -250,7 +252,8 @@ pub async fn insert_node(
                     prepared_block_hash: prepared_block_hash_opt,
                     committed_block_hash: committed_block_hash_blake3,
                     highest_qc_block_hash: highest_qc_block_hash_blake3,
-                }
+                },
+                user_privkey: user_privkey
             };
             // tx to main thread
             match dump_tx.send(sync_msg) {

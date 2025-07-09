@@ -1,12 +1,13 @@
 use aes_siv::{siv::Aes256Siv, Key, Nonce};
 use axum::{
-    extract::DefaultBodyLimit, http::{HeaderValue, Method}, middleware, routing::{get,post,put,delete}, serve, Router
+    extract::DefaultBodyLimit, http::{HeaderValue, Method, StatusCode}, middleware, routing::{get,post,put,delete}, serve, Router
 };
 use jsonwebtoken::{DecodingKey, EncodingKey};
 use tower_serve_static::ServeDir;
 use tower_http::cors::CorsLayer;
 use include_dir::{Dir, include_dir};
-use once_cell::sync::Lazy;
+use once_cell::sync::{Lazy, OnceCell};
+use std::sync::Arc;
 use std::collections::HashMap;
 
 use crate::{db::{PrivKey, PubKey}, files::functions::{generate_siv_key, generate_siv_nonce}, handlers::TransactionHandler};
@@ -18,6 +19,7 @@ mod metrics;
 mod db;
 mod interfaces;
 mod auth;
+mod dht;
 mod consensus;
 mod types;
 mod handlers;
@@ -26,14 +28,27 @@ mod files;
 static ASSETS_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/frontend/dist");
 
 #[derive(Clone)]
+pub struct UserKeys {
+    pub private_key: PrivKey,
+    pub public_key: PubKey,
+}
+
+#[derive(Clone)]
 pub struct AppState {
     db: std::sync::Arc<std::sync::Mutex<duckdb::Connection>>,
     encoding_key: EncodingKey,
     decoding_key: DecodingKey,
     private_key: PrivKey,
     public_key: PubKey,
+    user_keys: Arc<OnceCell<UserKeys>>,
     siv_key: Key<Aes256Siv>,
     siv_nonce: Nonce
+}
+
+impl AppState {
+    pub fn get_user_keys(&self) -> Result<&UserKeys, StatusCode> {
+        self.user_keys.get().ok_or(StatusCode::PRECONDITION_REQUIRED)
+    }
 }
 
 static DISPATCH_TABLE: Lazy<HashMap<&'static str, &'static dyn TransactionHandler>> = Lazy::new(|| {
@@ -77,6 +92,7 @@ async fn main() {
                 decoding_key: decodingkey,
                 private_key: PrivKey(privatekey),
                 public_key: PubKey(publickey),
+                user_keys: Arc::new(OnceCell::new()),
                 siv_key: siv_key,
                 siv_nonce: siv_nonce
             };
@@ -91,6 +107,7 @@ async fn main() {
                 .route("/files", post(files::routes::post_files)).layer(DefaultBodyLimit::max(500*1_000_000))
                 .route("/files", put(files::routes::put_folder))
                 .route("/files", delete(files::routes::delete_files))
+                .route("/files/{*path}", get(files::routes::get_file_fragments))
                 .route("/validators", get(consensus::routes::get_validators))
                 .route("/consensus", get(consensus::routes::get_consensus))
                 .layer(middleware::from_fn_with_state(app_state.clone(), auth::auth_middleware));
