@@ -1,13 +1,13 @@
 use axum::{
     extract::{
-        Multipart, Query, State
+        Multipart, Path, Query, State
     },
     Json
 };
 use reqwest::StatusCode;
 
-use crate::{db::{DataRecord, Inode}, files::functions::{encrypt_part, encrypt_path}};
-use serde::Deserialize;
+use crate::{db::{DataRecord, Inode, Blake3Hash}, files::functions::{encrypt_part, encrypt_path}};
+use serde::{Deserialize, Serialize};
 
 use super::*;
 use crate::{db::{AccessList, CustomUUID}, files::functions::shard_file};
@@ -16,6 +16,12 @@ use either::Either::{Left, Right};
 #[derive(Deserialize)]
 pub struct GetQueryParams {
     path: String
+}
+
+#[derive(Serialize)]
+pub struct FileFragmentsResponse {
+    pub file_hash: Blake3Hash,
+    pub fragments: Vec<(Blake3Hash, crate::db::ChunkType)>,
 }
 
 pub async fn get_files(
@@ -28,6 +34,31 @@ pub async fn get_files(
         Ok(files) => {
             Ok(Json(files))
         }
+        Err(e) => {
+            dbg!(e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+pub async fn get_file_fragments(
+    State(app_state): State<AppState>,
+    Path(path): Path<String>
+) -> Result<Json<FileFragmentsResponse>, StatusCode> {
+    // Convert the path: /files/ -> "/" and /files/test -> "/test"
+    let file_path = if path.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", path)
+    };
+    
+    // Encrypt the path for database lookup
+    let enc_path = encrypt_path(file_path, &app_state.siv_key, &app_state.siv_nonce)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    
+    match db::get_file_fragments(&app_state.db, enc_path) {
+        Ok(fragments_response) => Ok(Json(fragments_response)),
         Err(e) => {
             dbg!(e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
@@ -90,22 +121,36 @@ pub async fn post_files(
                             ].into_iter().collect(),
                         };
 
-                        let data = shard_file(filedata.to_vec()).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                        let data_option = shard_file(filedata.to_vec()).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-                        let dataid = CustomUUID::new(None);
-                        // assemble data record for database
-                        let datarecord = DataRecord {
-                            id: dataid,
-                            access_list: accessors,
-                            modified_at: None,
-                            data: data
-                        };
                         // assemble inode for database
-                        let inode = Inode {
-                            owner: Left(0),
-                            path: filepath,
-                            inode_type: crate::db::InodeType::File,
-                            data_id: Some(Right(datarecord))
+                        let inode = match data_option {
+                            Some(data) => {
+                                let dataid = CustomUUID::new(None);
+                                // assemble data record for database
+                                let datarecord = DataRecord {
+                                    id: dataid,
+                                    access_list: accessors,
+                                    modified_at: None,
+                                    data: data
+                                };
+                                
+                                Inode {
+                                    owner: Left(0),
+                                    path: filepath,
+                                    inode_type: crate::db::InodeType::File,
+                                    data_id: Some(Right(datarecord))
+                                }
+                            }
+                            None => {
+                                // Empty file - no data record
+                                Inode {
+                                    owner: Left(0),
+                                    path: filepath,
+                                    inode_type: crate::db::InodeType::File,
+                                    data_id: None
+                                }
+                            }
                         };
                         inodes.push(inode);
                         

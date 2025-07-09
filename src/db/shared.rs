@@ -151,6 +151,7 @@ pub fn initialize() -> Result<Arc<Mutex<Connection>>, Error> {
                 data_block_id    UUID NOT NULL,
                 fragment_index   INTEGER NOT NULL,
                 fragment_hash    BLOB NOT NULL,
+                chunk_type       ENUM('original', 'recovery') NOT NULL,
                 
                 PRIMARY KEY (data_block_id, fragment_index),
                 FOREIGN KEY (data_block_id) REFERENCES data_blocks(id)

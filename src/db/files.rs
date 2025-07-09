@@ -74,23 +74,23 @@ pub fn insert_files(
                         // Convert Data to individual fragment hashes
                         let data = &data_record.data;
                         
-                        // Helper function to extract hash from DataBlockRepresentation
-                        let extract_hash = |fragment: &crate::db::DataBlockRepresentation| -> Result<Blake3Hash, DatabaseError> {
+                        // Helper function to extract hash and chunk type from DataBlockRepresentation
+                        let extract_hash_and_type = |fragment: &crate::db::DataBlockRepresentation| -> Result<(Blake3Hash, crate::db::ChunkType), DatabaseError> {
                             match fragment {
-                                crate::db::DataBlockRepresentation::Hash(hash) => Ok(hash.clone()),
-                                crate::db::DataBlockRepresentation::Data(_) => {
+                                crate::db::DataBlockRepresentation::Hash(hash, chunk_type) => Ok((hash.clone(), chunk_type.clone())),
+                                crate::db::DataBlockRepresentation::Data(_, _) => {
                                     // Return error for Data type since encryption will be applied
                                     Err(DatabaseError::InvalidPayload)
                                 }
                             }
                         };
                         
-                        // Extract fragment hashes from the fragments vector
-                        let fragment_hashes: Result<Vec<Blake3Hash>, DatabaseError> = data.fragments
+                        // Extract fragment hashes and types from the fragments vector
+                        let fragment_data: Result<Vec<(Blake3Hash, crate::db::ChunkType)>, DatabaseError> = data.fragments
                             .iter()
-                            .map(extract_hash)
+                            .map(extract_hash_and_type)
                             .collect();
-                        let fragment_hashes = fragment_hashes?;
+                        let fragment_data = fragment_data?;
                         
                         // Insert into data_blocks table
                         tx.execute(
@@ -100,16 +100,16 @@ pub fn insert_files(
                                 data_record.access_list,
                                 data_record.modified_at,
                                 data.hash,
-                                fragment_hashes.len() as i32,
+                                fragment_data.len() as i32,
                                 data.added_bytes
                             ]
                         ).map_err(|_| DatabaseError::InsertError)?;
                         
                         // Insert fragment hashes into fragment_hashes table
-                        for (index, fragment_hash) in fragment_hashes.iter().enumerate() {
+                        for (index, (fragment_hash, chunk_type)) in fragment_data.iter().enumerate() {
                             tx.execute(
-                                "INSERT INTO fragment_hashes (data_block_id, fragment_index, fragment_hash) VALUES (?, ?, ?)",
-                                params![data_id, index as i32, fragment_hash]
+                                "INSERT INTO fragment_hashes (data_block_id, fragment_index, fragment_hash, chunk_type) VALUES (?, ?, ?, ?)",
+                                params![data_id, index as i32, fragment_hash, chunk_type]
                             ).map_err(|_| DatabaseError::InsertError)?;
                         }
                         
@@ -272,7 +272,7 @@ pub fn get_file_fragments(
         Ok(db_lock) => {
             // Query for a specific file by path and get its fragments
             let mut stmt = db_lock.prepare(
-                "SELECT db.file_hash, fh.fragment_hash 
+                "SELECT db.file_hash, fh.fragment_hash, fh.chunk_type
                  FROM inodes i 
                  JOIN data_blocks db ON i.data_id = db.id 
                  JOIN fragment_hashes fh ON db.id = fh.data_block_id
@@ -283,18 +283,19 @@ pub fn get_file_fragments(
             let rows = stmt.query_map(params![encrypted_path], |row| {
                 let file_hash: Blake3Hash = row.get(0)?;
                 let fragment_hash: Blake3Hash = row.get(1)?;
-                Ok((file_hash, fragment_hash))
+                let chunk_type: crate::db::ChunkType = row.get(2)?;
+                Ok((file_hash, fragment_hash, chunk_type))
             }).map_err(|_| DatabaseError::ProcessingError)?;
             
             let mut file_hash: Option<Blake3Hash> = None;
             let mut fragments = Vec::new();
             
             for row in rows {
-                let (f_hash, fragment_hash) = row.map_err(|_| DatabaseError::ProcessingError)?;
+                let (f_hash, fragment_hash, chunk_type) = row.map_err(|_| DatabaseError::ProcessingError)?;
                 if file_hash.is_none() {
                     file_hash = Some(f_hash);
                 }
-                fragments.push(fragment_hash);
+                fragments.push((fragment_hash, chunk_type));
             }
             
             match file_hash {

@@ -188,8 +188,8 @@ mod tests {
             // Verify all fragments are hashes
             for (i, fragment) in data.fragments.iter().enumerate() {
                 match fragment {
-                    DataBlockRepresentation::Hash(_) => {}, // Good
-                    DataBlockRepresentation::Data(_) => panic!("Fragment {} should be Hash, not Data", i),
+                    DataBlockRepresentation::Hash(_, _) => {}, // Good
+                    DataBlockRepresentation::Data(_, _) => panic!("Fragment {} should be Hash, not Data", i),
                 }
             }
         }
@@ -242,7 +242,7 @@ mod tests {
         
         // All fragments should be hashes (Reed-Solomon succeeded)
         for fragment in &data.fragments {
-            assert!(matches!(fragment, DataBlockRepresentation::Hash(_)), 
+            assert!(matches!(fragment, DataBlockRepresentation::Hash(_, _)), 
                 "All fragments should be hashes after successful Reed-Solomon encoding");
         }
     }

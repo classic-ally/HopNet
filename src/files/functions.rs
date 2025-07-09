@@ -162,12 +162,12 @@ pub async fn shard_file(file: Vec<u8>) -> Result<Option<Data>, FileError> {
     
     // Add original hashes (fragments 1-10)
     for hash in original_hashes {
-        all_fragments.push(DataBlockRepresentation::Hash(hash));
+        all_fragments.push(DataBlockRepresentation::Hash(hash, crate::db::ChunkType::Original));
     }
     
     // Add recovery hashes (fragments 11-30)
     for hash in recovery_hashes {
-        all_fragments.push(DataBlockRepresentation::Hash(hash));
+        all_fragments.push(DataBlockRepresentation::Hash(hash, crate::db::ChunkType::Recovery));
     }
     
     let data = Data {

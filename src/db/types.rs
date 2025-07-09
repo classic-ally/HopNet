@@ -114,6 +114,12 @@ pub enum InodeType {
     Folder
 }
 
+#[derive(Serialize, Debug, PartialEq, Clone)]
+pub enum ChunkType {
+    Original,
+    Recovery
+}
+
 impl ToSql for InodeType {
     fn to_sql(&self) -> Result<ToSqlOutput<'_>, duckdb::Error> {
         let phase_str = match self {
@@ -131,6 +137,31 @@ impl FromSql for InodeType {
             match enum_value.as_str() {
                 "file" => Ok(InodeType::File),
                 "folder" => Ok(InodeType::Folder),
+                _ => Err(FromSqlError::InvalidType),
+            }
+        } else {
+            Err(FromSqlError::InvalidType)
+        }
+    }
+}
+
+impl ToSql for ChunkType {
+    fn to_sql(&self) -> Result<ToSqlOutput<'_>, duckdb::Error> {
+        let chunk_str = match self {
+            ChunkType::Original => "original",
+            ChunkType::Recovery => "recovery",
+        };
+        return Ok(chunk_str.into())
+    }
+}
+
+impl FromSql for ChunkType {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        if let ValueRef::Enum(enum_type, row_idx) = value {
+            let enum_value = extract_enum_string(enum_type, row_idx)?;
+            match enum_value.as_str() {
+                "original" => Ok(ChunkType::Original),
+                "recovery" => Ok(ChunkType::Recovery),
                 _ => Err(FromSqlError::InvalidType),
             }
         } else {
@@ -214,6 +245,6 @@ impl FromSql for AccessList {
 // direct fetch from API of other nodes?
 #[derive(Serialize, Debug, PartialEq)]
 pub enum DataBlockRepresentation {
-    Hash(Blake3Hash),
-    Data(Vec<u8>)
+    Hash(Blake3Hash, ChunkType),
+    Data(Vec<u8>, ChunkType)
 }
