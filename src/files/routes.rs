@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use super::*;
 use crate::{db::{AccessList, CustomUUID}, files::functions::shard_file};
 use either::Either::{Left, Right};
+use crate::consensus::{functions::consensus_middleware, types::Transaction};
 
 #[derive(Deserialize)]
 pub struct GetQueryParams {
@@ -153,9 +154,24 @@ pub async fn post_files(
         None => return Err(StatusCode::BAD_REQUEST)
     }
     
-    // Insert the collected inodes into the database
-    match db::insert_files(&app_state.db, inodes) {
-        Ok(_) => return Ok(()),
+    // Insert the collected inodes into the database via consensus
+    match bincode::serde::encode_to_vec(&inodes, bincode::config::standard()) {
+        Ok(encoded_inodes) => {
+            let transaction = Transaction {
+                function: "insert_files".to_string(),
+                payload: encoded_inodes,
+            };
+            let transactions = vec![transaction];
+
+            // Use consensus middleware to ensure distributed agreement
+            match consensus_middleware(&app_state, transactions).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    dbg!(e);
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR)
+                }
+            }
+        }
         Err(e) => {
             dbg!(e);
             return Err(StatusCode::INTERNAL_SERVER_ERROR)
