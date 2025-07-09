@@ -85,56 +85,33 @@ pub fn insert_files(
                             }
                         };
                         
+                        // Extract fragment hashes from the fragments vector
+                        let fragment_hashes: Result<Vec<Blake3Hash>, DatabaseError> = data.fragments
+                            .iter()
+                            .map(extract_hash)
+                            .collect();
+                        let fragment_hashes = fragment_hashes?;
+                        
                         // Insert into data_blocks table
                         tx.execute(
-                            "INSERT INTO data_blocks (
-                                id, access_list, modified_at, file_hash,
-                                fragment_hash_01, fragment_hash_02, fragment_hash_03, fragment_hash_04, fragment_hash_05,
-                                fragment_hash_06, fragment_hash_07, fragment_hash_08, fragment_hash_09, fragment_hash_10,
-                                fragment_hash_11, fragment_hash_12, fragment_hash_13, fragment_hash_14, fragment_hash_15,
-                                fragment_hash_16, fragment_hash_17, fragment_hash_18, fragment_hash_19, fragment_hash_20,
-                                fragment_hash_21, fragment_hash_22, fragment_hash_23, fragment_hash_24, fragment_hash_25,
-                                fragment_hash_26, fragment_hash_27, fragment_hash_28, fragment_hash_29, fragment_hash_30,
-                                added_bytes
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            "INSERT INTO data_blocks (id, access_list, modified_at, file_hash, fragment_count, added_bytes) VALUES (?, ?, ?, ?, ?, ?)",
                             params![
                                 data_id,
                                 data_record.access_list,
                                 data_record.modified_at,
                                 data.hash,
-                                extract_hash(&data.fragment_01)?,
-                                extract_hash(&data.fragment_02)?,
-                                extract_hash(&data.fragment_03)?,
-                                extract_hash(&data.fragment_04)?,
-                                extract_hash(&data.fragment_05)?,
-                                extract_hash(&data.fragment_06)?,
-                                extract_hash(&data.fragment_07)?,
-                                extract_hash(&data.fragment_08)?,
-                                extract_hash(&data.fragment_09)?,
-                                extract_hash(&data.fragment_10)?,
-                                extract_hash(&data.fragment_11)?,
-                                extract_hash(&data.fragment_12)?,
-                                extract_hash(&data.fragment_13)?,
-                                extract_hash(&data.fragment_14)?,
-                                extract_hash(&data.fragment_15)?,
-                                extract_hash(&data.fragment_16)?,
-                                extract_hash(&data.fragment_17)?,
-                                extract_hash(&data.fragment_18)?,
-                                extract_hash(&data.fragment_19)?,
-                                extract_hash(&data.fragment_20)?,
-                                extract_hash(&data.fragment_21)?,
-                                extract_hash(&data.fragment_22)?,
-                                extract_hash(&data.fragment_23)?,
-                                extract_hash(&data.fragment_24)?,
-                                extract_hash(&data.fragment_25)?,
-                                extract_hash(&data.fragment_26)?,
-                                extract_hash(&data.fragment_27)?,
-                                extract_hash(&data.fragment_28)?,
-                                extract_hash(&data.fragment_29)?,
-                                extract_hash(&data.fragment_30)?,
+                                fragment_hashes.len() as i32,
                                 data.added_bytes
                             ]
                         ).map_err(|_| DatabaseError::InsertError)?;
+                        
+                        // Insert fragment hashes into fragment_hashes table
+                        for (index, fragment_hash) in fragment_hashes.iter().enumerate() {
+                            tx.execute(
+                                "INSERT INTO fragment_hashes (data_block_id, fragment_index, fragment_hash) VALUES (?, ?, ?)",
+                                params![data_id, index as i32, fragment_hash]
+                            ).map_err(|_| DatabaseError::InsertError)?;
+                        }
                         
                         Ok(Some(data_id))
                     },
@@ -284,5 +261,50 @@ pub fn delete_files(
             dbg!(e);
             Err(DatabaseError::LockError)
         }
+    }
+}
+
+pub fn get_file_fragments(
+    db: &Arc<Mutex<Connection>>,
+    encrypted_path: String,
+) -> Result<crate::files::routes::FileFragmentsResponse, DatabaseError> {
+    match db.lock() {
+        Ok(db_lock) => {
+            // Query for a specific file by path and get its fragments
+            let mut stmt = db_lock.prepare(
+                "SELECT db.file_hash, fh.fragment_hash 
+                 FROM inodes i 
+                 JOIN data_blocks db ON i.data_id = db.id 
+                 JOIN fragment_hashes fh ON db.id = fh.data_block_id
+                 WHERE i.path = ? AND i.type = 'file'
+                 ORDER BY fh.fragment_index"
+            ).map_err(|_| DatabaseError::RecallError)?;
+            
+            let rows = stmt.query_map(params![encrypted_path], |row| {
+                let file_hash: Blake3Hash = row.get(0)?;
+                let fragment_hash: Blake3Hash = row.get(1)?;
+                Ok((file_hash, fragment_hash))
+            }).map_err(|_| DatabaseError::ProcessingError)?;
+            
+            let mut file_hash: Option<Blake3Hash> = None;
+            let mut fragments = Vec::new();
+            
+            for row in rows {
+                let (f_hash, fragment_hash) = row.map_err(|_| DatabaseError::ProcessingError)?;
+                if file_hash.is_none() {
+                    file_hash = Some(f_hash);
+                }
+                fragments.push(fragment_hash);
+            }
+            
+            match file_hash {
+                Some(file_hash) => Ok(crate::files::routes::FileFragmentsResponse {
+                    file_hash,
+                    fragments,
+                }),
+                None => Err(DatabaseError::RecallError), // File not found
+            }
+        }
+        Err(_) => Err(DatabaseError::LockError)
     }
 }

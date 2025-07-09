@@ -18,6 +18,74 @@ pub enum FileError {
     EncryptionError
 }
 
+// Maximum fragment size for consumer network performance
+const MAX_FRAGMENT_SIZE: usize = 64 * 1024 * 1024; // 64MB
+
+/// Calculate optimal number of original and recovery chunks based on file size
+pub fn calculate_optimal_chunks(file_size: usize) -> (usize, usize) {
+    if file_size == 0 {
+        return (0, 0); // Empty files have no chunks
+    }
+    
+    // Calculate minimum chunks needed to stay under fragment size limit
+    let min_original_chunks = (file_size + MAX_FRAGMENT_SIZE - 1) / MAX_FRAGMENT_SIZE;
+    
+    // Ensure at least 10 original chunks for good Reed-Solomon efficiency
+    let original_chunks = min_original_chunks.max(10);
+    
+    // Use 2:1 redundancy ratio (2 recovery for every 1 original)
+    let recovery_chunks = original_chunks * 2;
+    
+    (original_chunks, recovery_chunks)
+}
+
+/// Calculate padding needed to ensure even chunk sizes
+/// Returns (padded_file, added_bytes)
+pub fn calculate_padding_and_chunks(mut file: Vec<u8>, num_chunks: usize) -> (Vec<Vec<u8>>, u8) {
+    let original_len = file.len();
+    
+    // Calculate padding needed for the chosen number of chunks
+    let mut remainder = if original_len == 0 {
+        0
+    } else {
+        (num_chunks - (original_len % num_chunks)) % num_chunks
+    };
+    
+    // Ensure chunk length is even
+    let chunk_len_after_padding = if original_len + remainder == 0 {
+        0
+    } else {
+        (original_len + remainder) / num_chunks
+    };
+    
+    if chunk_len_after_padding % 2 != 0 {
+        remainder += num_chunks;
+    }
+    
+    // Apply padding in one go
+    if remainder > 0 {
+        file.resize(original_len + remainder, 0);
+    }
+    let added_bytes = remainder as u8;
+    
+    // Split into chunks
+    let chunks = if file.is_empty() {
+        vec![vec![]; num_chunks] // Empty chunks for empty file
+    } else {
+        let chunk_size = file.len() / num_chunks;
+        let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(num_chunks);
+        while !file.is_empty() {
+            let current_len = file.len();
+            let chunk = file.split_off(current_len - chunk_size);
+            chunks.push(chunk);
+        }
+        chunks.reverse();
+        chunks
+    };
+    
+    (chunks, added_bytes)
+}
+
 impl From<FileError> for duckdb::Error {
     fn from(err: FileError) -> Self {
         duckdb::Error::DuckDBFailure(
@@ -27,38 +95,24 @@ impl From<FileError> for duckdb::Error {
     }
 }
 
-pub async fn shard_file(mut file: Vec<u8>) -> Result<Data, FileError> {
-    let data = tokio::task::spawn_blocking(move || -> Result<_, FileError> {
+pub async fn shard_file(file: Vec<u8>) -> Result<Option<Data>, FileError> {
+    let data = tokio::task::spawn_blocking(move || -> Result<Option<_>, FileError> {
+        // Handle empty files - no data record needed
+        if file.is_empty() {
+            return Ok(None);
+        }
+        
         // Hash the whole file first
         let whole_file_hash = Blake3Hash::new(blake3::hash(&file));
         
-        // Calculate padding needed
+        // Calculate optimal chunk sizes based on file size
         let original_len = file.len();
-        let mut remainder = (10 - (original_len % 10)) % 10;
+        let (num_original_chunks, num_recovery_chunks) = calculate_optimal_chunks(original_len);
         
-        // Ensure chunk length is even
-        let chunk_len_after_padding = (original_len + remainder) / 10;
-        if chunk_len_after_padding % 2 != 0 {
-            remainder += 10;
-        }
-        
-        // Apply padding in one go
-        if remainder > 0 {
-            file.resize(original_len + remainder, 0);
-        }
-        let added_bytes = remainder as u8;
-        
-        // Split into chunks more efficiently
-        let chunk_size = file.len() / 10;
-        let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(10);
-        while !file.is_empty() {
-            let current_len = file.len();
-            let chunk = file.split_off(current_len - chunk_size);
-            chunks.push(chunk);
-        }
-        chunks.reverse();
+        // Calculate padding and split into chunks
+        let (chunks, added_bytes) = calculate_padding_and_chunks(file, num_original_chunks);
 
-        if chunks.len() != 10 {
+        if chunks.len() != num_original_chunks {
             return Err(FileError::InvalidChunkCount);
         }
 
@@ -69,7 +123,7 @@ pub async fn shard_file(mut file: Vec<u8>) -> Result<Data, FileError> {
             .collect();
         
         // Reed-Solomon encoding (CPU-bound, keep synchronous)
-        let recovery_chunks = reed_solomon_simd::encode(10, 20, &chunks)
+        let recovery_chunks = reed_solomon_simd::encode(num_original_chunks, num_recovery_chunks, &chunks)
             .map_err(|_| FileError::ShardingError)?;
         
         // Hash recovery chunks in parallel
@@ -79,60 +133,50 @@ pub async fn shard_file(mut file: Vec<u8>) -> Result<Data, FileError> {
             .collect();
         
         // Build the result using array indexing with bounds checking
-        if original_hashes.len() != 10 || recovery_hashes.len() != 20 {
+        if original_hashes.len() != num_original_chunks || recovery_hashes.len() != num_recovery_chunks {
             return Err(FileError::InvalidChunkCount);
         }
 
-        Ok((
+        Ok(Some((
             whole_file_hash,
             original_hashes,
             recovery_hashes,
             added_bytes
-        ))
+        )))
 
     })
     .await
     .map_err(|_| FileError::TaskJoinError)??;
 
+    // Handle empty file case
+    let data = match data {
+        Some(data) => data,
+        None => return Ok(None), // Empty file, no data record
+    };
+    
     // Destructure the results from the blocking task
     let (whole_file_hash, original_hashes, recovery_hashes, added_bytes) = data;
 
+    // Combine original and recovery hashes into a single vector
+    let mut all_fragments = Vec::new();
+    
+    // Add original hashes (fragments 1-10)
+    for hash in original_hashes {
+        all_fragments.push(DataBlockRepresentation::Hash(hash));
+    }
+    
+    // Add recovery hashes (fragments 11-30)
+    for hash in recovery_hashes {
+        all_fragments.push(DataBlockRepresentation::Hash(hash));
+    }
+    
     let data = Data {
         hash: whole_file_hash,
-        fragment_01: DataBlockRepresentation::Hash(original_hashes[0]),
-        fragment_02: DataBlockRepresentation::Hash(original_hashes[1]),
-        fragment_03: DataBlockRepresentation::Hash(original_hashes[2]),
-        fragment_04: DataBlockRepresentation::Hash(original_hashes[3]),
-        fragment_05: DataBlockRepresentation::Hash(original_hashes[4]),
-        fragment_06: DataBlockRepresentation::Hash(original_hashes[5]),
-        fragment_07: DataBlockRepresentation::Hash(original_hashes[6]),
-        fragment_08: DataBlockRepresentation::Hash(original_hashes[7]),
-        fragment_09: DataBlockRepresentation::Hash(original_hashes[8]),
-        fragment_10: DataBlockRepresentation::Hash(original_hashes[9]),
-        fragment_11: DataBlockRepresentation::Hash(recovery_hashes[0]),
-        fragment_12: DataBlockRepresentation::Hash(recovery_hashes[1]),
-        fragment_13: DataBlockRepresentation::Hash(recovery_hashes[2]),
-        fragment_14: DataBlockRepresentation::Hash(recovery_hashes[3]),
-        fragment_15: DataBlockRepresentation::Hash(recovery_hashes[4]),
-        fragment_16: DataBlockRepresentation::Hash(recovery_hashes[5]),
-        fragment_17: DataBlockRepresentation::Hash(recovery_hashes[6]),
-        fragment_18: DataBlockRepresentation::Hash(recovery_hashes[7]),
-        fragment_19: DataBlockRepresentation::Hash(recovery_hashes[8]),
-        fragment_20: DataBlockRepresentation::Hash(recovery_hashes[9]),
-        fragment_21: DataBlockRepresentation::Hash(recovery_hashes[10]),
-        fragment_22: DataBlockRepresentation::Hash(recovery_hashes[11]),
-        fragment_23: DataBlockRepresentation::Hash(recovery_hashes[12]),
-        fragment_24: DataBlockRepresentation::Hash(recovery_hashes[13]),
-        fragment_25: DataBlockRepresentation::Hash(recovery_hashes[14]),
-        fragment_26: DataBlockRepresentation::Hash(recovery_hashes[15]),
-        fragment_27: DataBlockRepresentation::Hash(recovery_hashes[16]),
-        fragment_28: DataBlockRepresentation::Hash(recovery_hashes[17]),
-        fragment_29: DataBlockRepresentation::Hash(recovery_hashes[18]),
-        fragment_30: DataBlockRepresentation::Hash(recovery_hashes[19]),
+        fragments: all_fragments,
         added_bytes: added_bytes,
     };
     
-    Ok(data)
+    Ok(Some(data))
 }
 
 pub fn generate_siv_nonce() -> Nonce {

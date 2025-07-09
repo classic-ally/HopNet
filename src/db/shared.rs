@@ -142,42 +142,22 @@ pub fn initialize() -> Result<Arc<Mutex<Connection>>, Error> {
                 id               UUID PRIMARY KEY,
                 access_list      BLOB NOT NULL,
                 modified_at      TIMESTAMP,
-
                 file_hash        BLOB NOT NULL,
-
-                fragment_hash_01 BLOB NOT NULL,
-                fragment_hash_02 BLOB NOT NULL,
-                fragment_hash_03 BLOB NOT NULL,
-                fragment_hash_04 BLOB NOT NULL,
-                fragment_hash_05 BLOB NOT NULL,
-                fragment_hash_06 BLOB NOT NULL,
-                fragment_hash_07 BLOB NOT NULL,
-                fragment_hash_08 BLOB NOT NULL,
-                fragment_hash_09 BLOB NOT NULL,
-                fragment_hash_10 BLOB NOT NULL,
-                fragment_hash_11 BLOB NOT NULL,
-                fragment_hash_12 BLOB NOT NULL,
-                fragment_hash_13 BLOB NOT NULL,
-                fragment_hash_14 BLOB NOT NULL,
-                fragment_hash_15 BLOB NOT NULL,
-                fragment_hash_16 BLOB NOT NULL,
-                fragment_hash_17 BLOB NOT NULL,
-                fragment_hash_18 BLOB NOT NULL,
-                fragment_hash_19 BLOB NOT NULL,
-                fragment_hash_20 BLOB NOT NULL,
-                fragment_hash_21 BLOB NOT NULL,
-                fragment_hash_22 BLOB NOT NULL,
-                fragment_hash_23 BLOB NOT NULL,
-                fragment_hash_24 BLOB NOT NULL,
-                fragment_hash_25 BLOB NOT NULL,
-                fragment_hash_26 BLOB NOT NULL,
-                fragment_hash_27 BLOB NOT NULL,
-                fragment_hash_28 BLOB NOT NULL,
-                fragment_hash_29 BLOB NOT NULL,
-                fragment_hash_30 BLOB NOT NULL,
-
-                added_bytes      UTINYINT NOT NULL,
+                fragment_count   INTEGER NOT NULL,
+                added_bytes      UTINYINT NOT NULL
             );
+
+            CREATE TABLE fragment_hashes (
+                data_block_id    UUID NOT NULL,
+                fragment_index   INTEGER NOT NULL,
+                fragment_hash    BLOB NOT NULL,
+                
+                PRIMARY KEY (data_block_id, fragment_index),
+                FOREIGN KEY (data_block_id) REFERENCES data_blocks(id)
+            );
+
+            -- Index for DHT lookups: which files contain fragment X
+            CREATE INDEX idx_fragment_hash ON fragment_hashes(fragment_hash);
 
             CREATE TABLE inodes (
                 -- owner of this reference

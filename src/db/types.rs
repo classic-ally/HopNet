@@ -172,44 +172,12 @@ pub struct DataRecord {
     pub data: Data,
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, PartialEq)]
 pub struct Data {
     // data hash for integrity
     pub hash: Blake3Hash,
     // list of fragment hashes
-    pub fragment_01: DataBlockRepresentation,
-    pub fragment_02: DataBlockRepresentation,
-    pub fragment_03: DataBlockRepresentation,
-    pub fragment_04: DataBlockRepresentation,
-    pub fragment_05: DataBlockRepresentation,
-    pub fragment_06: DataBlockRepresentation,
-    pub fragment_07: DataBlockRepresentation,
-    pub fragment_08: DataBlockRepresentation,
-    pub fragment_09: DataBlockRepresentation,
-    pub fragment_10: DataBlockRepresentation,
-
-    pub fragment_11: DataBlockRepresentation,
-    pub fragment_12: DataBlockRepresentation,
-    pub fragment_13: DataBlockRepresentation,
-    pub fragment_14: DataBlockRepresentation,
-    pub fragment_15: DataBlockRepresentation,
-    pub fragment_16: DataBlockRepresentation,
-    pub fragment_17: DataBlockRepresentation,
-    pub fragment_18: DataBlockRepresentation,
-    pub fragment_19: DataBlockRepresentation,
-    pub fragment_20: DataBlockRepresentation,
-
-    pub fragment_21: DataBlockRepresentation,
-    pub fragment_22: DataBlockRepresentation,
-    pub fragment_23: DataBlockRepresentation,
-    pub fragment_24: DataBlockRepresentation,
-    pub fragment_25: DataBlockRepresentation,
-    pub fragment_26: DataBlockRepresentation,
-    pub fragment_27: DataBlockRepresentation,
-    pub fragment_28: DataBlockRepresentation,
-    pub fragment_29: DataBlockRepresentation,
-    pub fragment_30: DataBlockRepresentation,
-
+    pub fragments: Vec<DataBlockRepresentation>,
     pub added_bytes: u8,
 }
 
@@ -244,7 +212,7 @@ impl FromSql for AccessList {
 // not using Either for DataBlockRepresentation
 // possible for other cases in future?
 // direct fetch from API of other nodes?
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, PartialEq)]
 pub enum DataBlockRepresentation {
     Hash(Blake3Hash),
     Data(Vec<u8>)
