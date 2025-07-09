@@ -10,7 +10,7 @@ use once_cell::sync::{Lazy, OnceCell};
 use std::sync::Arc;
 use std::collections::HashMap;
 
-use crate::{db::{PrivKey, PubKey}, files::functions::{generate_siv_key, generate_siv_nonce}, handlers::TransactionHandler};
+use crate::{db::{PrivKey, PubKey}, handlers::TransactionHandler};
 
 mod nodes;
 mod setup;
@@ -41,13 +41,31 @@ pub struct AppState {
     private_key: PrivKey,
     public_key: PubKey,
     user_keys: Arc<OnceCell<UserKeys>>,
-    siv_key: Key<Aes256Siv>,
-    siv_nonce: Nonce
+    siv_key: Arc<OnceCell<Key<Aes256Siv>>>,
+    siv_nonce: Arc<OnceCell<Nonce>>,
 }
 
 impl AppState {
     pub fn get_user_keys(&self) -> Result<&UserKeys, StatusCode> {
         self.user_keys.get().ok_or(StatusCode::PRECONDITION_REQUIRED)
+    }
+    
+    pub fn get_siv_key(&self) -> Result<&Key<Aes256Siv>, StatusCode> {
+        self.siv_key.get().ok_or(StatusCode::PRECONDITION_REQUIRED)
+    }
+    
+    pub fn get_siv_nonce(&self) -> Result<&Nonce, StatusCode> {
+        self.siv_nonce.get().ok_or(StatusCode::PRECONDITION_REQUIRED)
+    }
+    
+    pub fn initialize_siv_keys(&self) -> Result<(), StatusCode> {
+        let user_keys = self.get_user_keys()?;
+        let (siv_key, siv_nonce) = auth::derive_siv_key_from_user(&user_keys.private_key, "file_path");
+        
+        self.siv_key.set(siv_key).map_err(|_| StatusCode::CONFLICT)?;
+        self.siv_nonce.set(siv_nonce).map_err(|_| StatusCode::CONFLICT)?;
+        
+        Ok(())
     }
 }
 
@@ -81,8 +99,6 @@ async fn main() {
 
     let (encodingkey, decodingkey) = auth::generate_jwt_key();
     let (privatekey, publickey) = consensus::functions::generate_ed25519_key();
-    let siv_key = generate_siv_key();
-    let siv_nonce = generate_siv_nonce();
 
     match db::shared::initialize() {
         Ok(database) => {
@@ -93,8 +109,8 @@ async fn main() {
                 private_key: PrivKey(privatekey),
                 public_key: PubKey(publickey),
                 user_keys: Arc::new(OnceCell::new()),
-                siv_key: siv_key,
-                siv_nonce: siv_nonce
+                siv_key: Arc::new(OnceCell::new()),
+                siv_nonce: Arc::new(OnceCell::new()),
             };
 
             // Protected routes that require authentication

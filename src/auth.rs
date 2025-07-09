@@ -12,9 +12,10 @@ use axum::{
 };
 use serde::{Serialize, Deserialize};
 use rand::Rng;
+use aes_siv::{siv::Aes256Siv, Key, Nonce};
 
 use crate::db;
-use crate::AppState;
+use crate::{AppState, PrivKey};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
@@ -133,4 +134,28 @@ pub async fn sign_in(
         Ok(None) => return Err(StatusCode::UNAUTHORIZED),               // no user exists
         Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR)         // some error
     }
+}
+
+/// Derives SIV key and nonce from user's private key using Blake3 key derivation
+pub fn derive_siv_key_from_user(user_privkey: &PrivKey, context: &str) -> (Key<Aes256Siv>, Nonce) {
+    // Use the user's private key bytes as input key material
+    let ikm = user_privkey.to_bytes();
+    
+    // Derive SIV key (64 bytes for AES-256-SIV) using XOF for custom length
+    let mut siv_key_bytes = [0u8; 64];
+    let mut hasher = blake3::Hasher::new_derive_key(&format!("hopnet {} siv_key", context));
+    hasher.update(&ikm);
+    let mut xof = hasher.finalize_xof();
+    xof.fill(&mut siv_key_bytes);
+    let siv_key = Key::<Aes256Siv>::from(siv_key_bytes);
+    
+    // Derive SIV nonce (16 bytes) using XOF for custom length
+    let mut siv_nonce_bytes = [0u8; 16];
+    let mut hasher = blake3::Hasher::new_derive_key(&format!("hopnet {} siv_nonce", context));
+    hasher.update(&ikm);
+    let mut xof = hasher.finalize_xof();
+    xof.fill(&mut siv_nonce_bytes);
+    let siv_nonce = Nonce::from(siv_nonce_bytes);
+    
+    (siv_key, siv_nonce)
 }

@@ -88,6 +88,9 @@ pub async fn put_setup(
     app_state.user_keys.set(user_keys)
         .map_err(|_| StatusCode::CONFLICT)?; // Already initialized
     
+    // Initialize SIV keys from user private key
+    app_state.initialize_siv_keys()?;
+    
     match setup::put_join_setup(&app_state.db, payload, app_state.private_key) {
         Ok(()) => Ok(StatusCode::CREATED),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR)
@@ -110,6 +113,9 @@ pub async fn post_setup(
     // Set user keys in app state (can only be done once)
     app_state.user_keys.set(user_keys.clone())
         .map_err(|_| StatusCode::CONFLICT)?; // Already initialized
+    
+    // Initialize SIV keys from user private key
+    app_state.initialize_siv_keys()?;
 
     // Construct User and Node from the simplified payload
     let user = User {

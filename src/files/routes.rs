@@ -29,8 +29,8 @@ pub async fn get_files(
     Query(params): Query<GetQueryParams>
 ) -> Result<Json<Vec<Inode>>, StatusCode> {
     // let's encrypt the path so we can search for it
-    let enc_path = encrypt_path(params.path, &app_state.siv_key, &app_state.siv_nonce).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    match db::get_files(&app_state.db, enc_path, &app_state.siv_key, &app_state.siv_nonce) {
+    let enc_path = encrypt_path(params.path, app_state.get_siv_key()?, app_state.get_siv_nonce()?).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    match db::get_files(&app_state.db, enc_path, app_state.get_siv_key()?, app_state.get_siv_nonce()?) {
         Ok(files) => {
             Ok(Json(files))
         }
@@ -53,7 +53,7 @@ pub async fn get_file_fragments(
     };
     
     // Encrypt the path for database lookup
-    let enc_path = encrypt_path(file_path, &app_state.siv_key, &app_state.siv_nonce)
+    let enc_path = encrypt_path(file_path, app_state.get_siv_key()?, app_state.get_siv_nonce()?)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     
@@ -70,7 +70,7 @@ pub async fn put_folder(
     State(app_state): State<AppState>,
     Query(params): Query<GetQueryParams>
 ) -> Result<(), StatusCode> {
-    let path = encrypt_path(params.path, &app_state.siv_key, &app_state.siv_nonce).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let path = encrypt_path(params.path, app_state.get_siv_key()?, app_state.get_siv_nonce()?).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let folder_inode = Inode {
         owner: Left(0),
@@ -104,7 +104,7 @@ pub async fn post_files(
                 return Err(StatusCode::BAD_REQUEST);
             }
             let unencrypted_path = part.text().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            let path = encrypt_path(unencrypted_path, &app_state.siv_key, &app_state.siv_nonce).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let path = encrypt_path(unencrypted_path, app_state.get_siv_key()?, app_state.get_siv_nonce()?).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
             while let Some(part) = multipart.next_field().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? {
                 match part.name() {
                     Some("file") => {
@@ -113,7 +113,7 @@ pub async fn post_files(
                         let filedata = part.bytes().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
                         // encrypt filename - deterministic AES-SIV
-                        let filepath = path.clone() + &encrypt_part(&filename, &app_state.siv_key, &app_state.siv_nonce).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                        let filepath = path.clone() + &encrypt_part(&filename, app_state.get_siv_key()?, app_state.get_siv_nonce()?).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
                         let accessors = AccessList{
                             keys: vec![
@@ -178,7 +178,7 @@ pub async fn delete_files(
     State(app_state): State<AppState>,
     Query(params): Query<GetQueryParams>
 ) -> Result<(), StatusCode> {
-    let enc_path = encrypt_path(params.path, &app_state.siv_key, &app_state.siv_nonce).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let enc_path = encrypt_path(params.path, app_state.get_siv_key()?, app_state.get_siv_nonce()?).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     match db::delete_files(&app_state.db, enc_path) {
         Ok(_) => return Ok(()),
         Err(e) => {
