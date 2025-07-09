@@ -211,6 +211,39 @@ pub fn put_join_setup(
                 ).map_err(|_| DatabaseError::InsertError)?;
             }
 
+            dbg!("Inserting data_blocks");
+            for data_block in setupobj.data_blocks {
+                tx.execute(
+                    "INSERT INTO data_blocks (id, access_list, modified_at, file_hash, fragment_count, added_bytes) VALUES (?, ?, ?, ?, ?, ?)",
+                    params![data_block.id, data_block.access_list, data_block.modified_at, data_block.data.hash, data_block.data.fragments.len() as i32, data_block.data.added_bytes]
+                ).map_err(|_| DatabaseError::InsertError)?;
+            }
+
+            dbg!("Inserting fragment_hashes");
+            for fragment_hash in setupobj.fragment_hashes {
+                tx.execute(
+                    "INSERT INTO fragment_hashes (data_block_id, fragment_index, fragment_hash, chunk_type) VALUES (?, ?, ?, ?)",
+                    params![fragment_hash.data_block_id, fragment_hash.fragment_index, fragment_hash.fragment_hash, fragment_hash.chunk_type]
+                ).map_err(|_| DatabaseError::InsertError)?;
+            }
+
+            dbg!("Inserting inodes");
+            for inode in setupobj.inodes {
+                let owner_id = match inode.owner {
+                    either::Either::Left(id) => id,
+                    either::Either::Right(user) => user.user_id,
+                };
+                let data_id = match inode.data_id {
+                    Some(either::Either::Left(uuid)) => Some(uuid),
+                    Some(either::Either::Right(data_record)) => Some(data_record.id),
+                    None => None,
+                };
+                tx.execute(
+                    "INSERT INTO inodes (owner_id, path, type, data_id) VALUES (?, ?, ?, ?)",
+                    params![owner_id, inode.path, inode.inode_type, data_id]
+                ).map_err(|_| DatabaseError::InsertError)?;
+            }
+
             dbg!("Inserting this_node");
             tx.execute(
                 "INSERT INTO this_node (internal_id, node_id, privkey, current_phase, current_view, prepared_block_hash, committed_block_hash, highest_qc_block_hash, user_privkey) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",

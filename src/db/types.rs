@@ -45,7 +45,7 @@ pub fn extract_enum_string(enum_type: EnumType<'_>, row_idx: usize) -> Result<St
     Ok(dict_values.value(dict_key).to_string())
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct CustomUUID(Uuid);
 
 impl CustomUUID{
@@ -91,7 +91,7 @@ impl FromSql for CustomUUID {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct CustomDateTime(DateTime<Utc>);
 
 impl Deref for CustomDateTime {
@@ -108,13 +108,32 @@ impl ToSql for CustomDateTime {
     }
 }
 
-#[derive(Serialize)]
+impl FromSql for CustomDateTime {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        match value {
+            ValueRef::Text(str) => {
+                match std::str::from_utf8(str) {
+                    Ok(utf_value) => {
+                        match DateTime::parse_from_rfc3339(utf_value) {
+                            Ok(dt) => Ok(CustomDateTime(dt.with_timezone(&Utc))),
+                            Err(_) => Err(FromSqlError::InvalidType)
+                        }
+                    }
+                    Err(_) => Err(FromSqlError::InvalidType)
+                }
+            }
+            _ => Err(FromSqlError::InvalidType),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 pub enum InodeType {
     File,
     Folder
 }
 
-#[derive(Serialize, Debug, PartialEq, Clone)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 pub enum ChunkType {
     Original,
     Recovery
@@ -170,7 +189,7 @@ impl FromSql for ChunkType {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct Inode {
     // the owner for this specific node:
     pub owner: Either<i32, User>,
@@ -185,7 +204,7 @@ pub struct Inode {
     pub data_id: Option<Either<CustomUUID, DataRecord>>
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct DataRecord {
     // PK for this datablock
     // referenced by inoderecord
@@ -203,7 +222,7 @@ pub struct DataRecord {
     pub data: Data,
 }
 
-#[derive(Serialize, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub struct Data {
     // data hash for integrity
     pub hash: Blake3Hash,
@@ -212,7 +231,7 @@ pub struct Data {
     pub added_bytes: u8,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct AccessList {
     // string probably will change
     pub keys: HashMap<i32, String>
@@ -243,8 +262,16 @@ impl FromSql for AccessList {
 // not using Either for DataBlockRepresentation
 // possible for other cases in future?
 // direct fetch from API of other nodes?
-#[derive(Serialize, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub enum DataBlockRepresentation {
     Hash(Blake3Hash, ChunkType),
     Data(Vec<u8>, ChunkType)
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct FragmentHash {
+    pub data_block_id: CustomUUID,
+    pub fragment_index: i32,
+    pub fragment_hash: Blake3Hash,
+    pub chunk_type: ChunkType,
 }

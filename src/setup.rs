@@ -16,6 +16,7 @@ use crate::{
     db::setup,
     db::User,
 };
+use crate::db::{DataRecord, FragmentHash, Inode};
 use crate::types::{Blake3Hash, Node};
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -45,6 +46,9 @@ pub struct SyncSetupObject {
     pub blocks: Vec<Block>,
     pub validators: Vec<Validator>,
     pub quorum_certificates: Vec<QuorumCertificate>,
+    pub data_blocks: Vec<DataRecord>,
+    pub fragment_hashes: Vec<FragmentHash>,
+    pub inodes: Vec<Inode>,
     pub yournode: ThisNode,
     pub user_privkey: PrivKey
 }

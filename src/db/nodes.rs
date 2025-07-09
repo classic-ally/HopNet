@@ -6,6 +6,8 @@ use tokio::io::Error;
 use crate::consensus::types::{Block,BlockData,ConsensusPhase};
 use crate::setup::ThisNode;
 use bincode::serde::decode_from_slice;
+use crate::db::{DataRecord, FragmentHash, Inode, Data};
+use either::Either;
 
 pub fn get_nodes(
     db: &Arc<Mutex<Connection>>
@@ -179,6 +181,57 @@ pub async fn insert_node(
             let qcs: Vec<QuorumCertificate> = rows_qcs.collect::<Result<Vec<QuorumCertificate>, _>>()
                 .map_err(|_| DatabaseError::ProcessingError)?;
 
+            // File system data extract
+            dbg!("Fetching data_blocks");
+            let mut stmt_data_blocks = tx.prepare(
+                "SELECT id, access_list, modified_at, file_hash, fragment_count, added_bytes FROM data_blocks"
+            ).map_err(|_| DatabaseError::RecallError)?;
+            let rows_data_blocks = stmt_data_blocks.query_map([], |row| {
+                Ok(DataRecord {
+                    id: row.get(0)?,
+                    access_list: row.get(1)?,
+                    modified_at: row.get(2)?,
+                    data: Data {
+                        hash: row.get(3)?,
+                        fragments: vec![], // Will be populated from fragment_hashes
+                        added_bytes: row.get(5)?,
+                    },
+                })
+            }).map_err(|_| DatabaseError::RecallError)?;
+            let data_blocks: Vec<DataRecord> = rows_data_blocks.collect::<Result<Vec<DataRecord>, _>>()
+                .map_err(|_| DatabaseError::ProcessingError)?;
+
+            dbg!("Fetching fragment_hashes");
+            let mut stmt_fragment_hashes = tx.prepare(
+                "SELECT data_block_id, fragment_index, fragment_hash, chunk_type FROM fragment_hashes"
+            ).map_err(|_| DatabaseError::RecallError)?;
+            let rows_fragment_hashes = stmt_fragment_hashes.query_map([], |row| {
+                Ok(FragmentHash {
+                    data_block_id: row.get(0)?,
+                    fragment_index: row.get(1)?,
+                    fragment_hash: row.get(2)?,
+                    chunk_type: row.get(3)?,
+                })
+            }).map_err(|_| DatabaseError::RecallError)?;
+            let fragment_hashes: Vec<FragmentHash> = rows_fragment_hashes.collect::<Result<Vec<FragmentHash>, _>>()
+                .map_err(|_| DatabaseError::ProcessingError)?;
+
+            dbg!("Fetching inodes");
+            let mut stmt_inodes = tx.prepare(
+                "SELECT owner_id, path, type, data_id FROM inodes"
+            ).map_err(|_| DatabaseError::RecallError)?;
+            let rows_inodes = stmt_inodes.query_map([], |row| {
+                let data_id: Option<CustomUUID> = row.get(3)?;
+                Ok(Inode {
+                    owner: Either::Left(row.get(0)?),
+                    path: row.get(1)?,
+                    inode_type: row.get(2)?,
+                    data_id: data_id.map(Either::Left),
+                })
+            }).map_err(|_| DatabaseError::RecallError)?;
+            let inodes: Vec<Inode> = rows_inodes.collect::<Result<Vec<Inode>, _>>()
+                .map_err(|_| DatabaseError::ProcessingError)?;
+
             dbg!("Consensus phase fetched successfully");
 
             ///////////////
@@ -245,6 +298,9 @@ pub async fn insert_node(
                 blocks: blocks,
                 validators: validators,
                 quorum_certificates: qcs,
+                data_blocks: data_blocks,
+                fragment_hashes: fragment_hashes,
+                inodes: inodes,
                 yournode: ThisNode {
                     node_id: next_id,
                     current_phase: current_phase,
