@@ -47,15 +47,16 @@
             // Construct the full path for the new folder
             const folderPath = currentPath === '/' ? `/${folderName}` : `${currentPath}/${folderName}`;
             
-            const url = new URL(`${API_BASE_URL}/files`);
-            url.searchParams.append('path', folderPath);
+            // Create FormData with just the path (no files = folder creation)
+            const formData = new FormData();
+            formData.append('path', folderPath);
             
-            const response = await fetch(url.toString(), {
-                method: 'PUT',
+            const response = await fetch(`${API_BASE_URL}/files`, {
+                method: 'POST',
                 headers: {
                     'Authorization': `Bearer ${token}`,
-                    'Content-Type': 'application/json',
-                }
+                },
+                body: formData
             });
             
             if (!response.ok) {

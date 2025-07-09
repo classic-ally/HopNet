@@ -66,30 +66,6 @@ pub async fn get_file_fragments(
     }
 }
 
-pub async fn put_folder(
-    State(app_state): State<AppState>,
-    Query(params): Query<GetQueryParams>
-) -> Result<(), StatusCode> {
-    let path = encrypt_path(params.path, app_state.get_siv_key()?, app_state.get_siv_nonce()?).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let folder_inode = Inode {
-        owner: Left(0),
-        path: path,
-        inode_type: crate::db::InodeType::Folder,
-        data_id: None
-    };
-
-    let inodes = vec![folder_inode];
-
-    match db::insert_files(&app_state.db, inodes) {
-        Ok(_) => return Ok(()),
-        Err(e) => {
-            dbg!(e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR)
-        }
-    }
-}
-
 pub async fn post_files(
     State(app_state): State<AppState>,
     mut multipart: Multipart
@@ -97,6 +73,7 @@ pub async fn post_files(
     // read path part first
     // need path in later file processing
     let mut inodes: Vec<Inode> = Vec::new();
+    let mut has_files = false;
 
     match multipart.next_field().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? {
         Some(part) => {
@@ -105,9 +82,11 @@ pub async fn post_files(
             }
             let unencrypted_path = part.text().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
             let path = encrypt_path(unencrypted_path, app_state.get_siv_key()?, app_state.get_siv_nonce()?).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            
             while let Some(part) = multipart.next_field().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? {
                 match part.name() {
                     Some("file") => {
+                        has_files = true;
                         // instantiate data
                         let filename = part.file_name().map(|s| s.to_string()).ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
                         let filedata = part.bytes().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -158,6 +137,17 @@ pub async fn post_files(
                     Some(_) => {}
                     None => {}
                 }
+            }
+            
+            // If no files were found, create a folder
+            if !has_files {
+                let folder_inode = Inode {
+                    owner: Left(0),
+                    path: path,
+                    inode_type: crate::db::InodeType::Folder,
+                    data_id: None
+                };
+                inodes.push(folder_inode);
             }
         }
         None => return Err(StatusCode::BAD_REQUEST)
