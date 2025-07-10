@@ -79,14 +79,70 @@
         }
     }
 
-    function handleItemClick(item: FileItem) {
+    async function handleItemClick(item: FileItem) {
         if (item.inode_type === "Folder") {
             // Navigate into the folder
             pathHistory.push(currentPath)
             fetchFiles(item.path)
+        } else if (item.inode_type === "File") {
+            // Download the file
+            await downloadFile(item)
         }
-        // For files, we could potentially open them or show details
-        // For now, we'll just do nothing for files
+    }
+
+    async function downloadFile(item: FileItem) {
+        try {
+            const token = $tokenStore
+            if (!token) {
+                error = 'No authentication token found'
+                return
+            }
+
+            // Extract the path part after the first slash for the API call
+            // Convert "/folder/file.txt" to "folder/file.txt"
+            let apiPath = item.path
+            if (apiPath.startsWith('/')) {
+                apiPath = apiPath.substring(1)
+            }
+            
+            const response = await fetch(`${API_BASE_URL}/files/${apiPath}`, {
+                method: 'GET',
+                headers: {
+                    'Authorization': `Bearer ${token}`,
+                },
+            })
+
+            if (response.ok) {
+                // Get the filename from the response headers or extract from path
+                const contentDisposition = response.headers.get('Content-Disposition')
+                let filename = getFileName(item.path)
+                
+                // Try to extract filename from Content-Disposition header if present
+                if (contentDisposition) {
+                    const match = contentDisposition.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/)
+                    if (match && match[1]) {
+                        filename = match[1].replace(/['"]/g, '')
+                    }
+                }
+
+                // Create blob and trigger download
+                const blob = await response.blob()
+                const url = window.URL.createObjectURL(blob)
+                const a = document.createElement('a')
+                a.href = url
+                a.download = filename
+                document.body.appendChild(a)
+                a.click()
+                window.URL.revokeObjectURL(url)
+                document.body.removeChild(a)
+            } else {
+                error = `Failed to download file: ${response.status} ${response.statusText}`
+                console.error('Failed to download file:', response.status)
+            }
+        } catch (err) {
+            error = `Download error: ${err instanceof Error ? err.message : 'Unknown error'}`
+            console.error('Error downloading file:', err)
+        }
     }
 
     function navigateBack() {

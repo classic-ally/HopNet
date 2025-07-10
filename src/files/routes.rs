@@ -2,11 +2,14 @@ use axum::{
     extract::{
         Multipart, Path, Query, State
     },
-    Json
+    Json,
+    response::Response,
+    http::header,
+    body::Body
 };
 use reqwest::StatusCode;
 
-use crate::{db::{DataRecord, Inode, Blake3Hash}, files::functions::{encrypt_part, encrypt_path}};
+use crate::{db::{DataRecord, Inode, Blake3Hash, DatabaseError}, files::functions::{encrypt_part, encrypt_path}};
 use serde::{Deserialize, Serialize};
 
 use super::*;
@@ -45,7 +48,7 @@ pub async fn get_files(
 pub async fn get_file_fragments(
     State(app_state): State<AppState>,
     Path(path): Path<String>
-) -> Result<Json<FileFragmentsResponse>, StatusCode> {
+) -> Result<Response<Body>, StatusCode> {
     // Convert the path: /files/ -> "/" and /files/test -> "/test"
     let file_path = if path.is_empty() {
         "/".to_string()
@@ -53,18 +56,41 @@ pub async fn get_file_fragments(
         format!("/{}", path)
     };
     
+    // Extract filename from path for Content-Disposition header
+    let filename = path.split('/').last().unwrap_or("download");
+    
     // Encrypt the path for database lookup
     let enc_path = encrypt_path(file_path, app_state.get_siv_key()?, app_state.get_siv_nonce()?)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     
-    match db::get_file_fragments(&app_state.db, enc_path) {
-        Ok(fragments_response) => Ok(Json(fragments_response)),
+    // Get file reassembly data from database
+    let file_data = match db::get_file_fragments(&app_state.db, enc_path) {
+        Ok(data) => data,
+        Err(DatabaseError::RecallError) => return Err(StatusCode::NOT_FOUND),
         Err(e) => {
             dbg!(e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
-    }
+    };
+    
+    // Reassemble the file from fragments
+    let file_contents = match functions::reassemble_file(&app_state.fragments_dir, file_data) {
+        Ok(contents) => contents,
+        Err(e) => {
+            dbg!(e);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    
+    // Build response with proper headers
+    let response = Response::builder()
+        .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{}\"", filename))
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(file_contents))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    
+    Ok(response)
 }
 
 pub async fn post_files(
@@ -101,12 +127,14 @@ pub async fn post_files(
                             ].into_iter().collect(),
                         };
 
-                        let data_option = shard_file(filedata.to_vec()).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                        // Generate data block ID before sharding
+                        let dataid = CustomUUID::new(None);
+                        
+                        let data_option = shard_file(filedata.to_vec(), &app_state.fragments_dir, dataid.clone()).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
                         // assemble inode for database
                         let inode = match data_option {
                             Some(data) => {
-                                let dataid = CustomUUID::new(None);
                                 // assemble data record for database
                                 let datarecord = DataRecord {
                                     id: dataid,

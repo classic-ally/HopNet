@@ -43,6 +43,7 @@ pub struct AppState {
     user_keys: Arc<OnceCell<UserKeys>>,
     siv_key: Arc<OnceCell<Key<Aes256Siv>>>,
     siv_nonce: Arc<OnceCell<Nonce>>,
+    fragments_dir: String,
 }
 
 impl AppState {
@@ -102,6 +103,12 @@ async fn main() {
 
     match db::shared::initialize() {
         Ok(database) => {
+            // Initialize fragments directory
+            let fragments_dir = files::functions::get_fragments_dir().unwrap_or_else(|_| {
+                eprintln!("Failed to get fragments directory, using current directory");
+                "./hopnet/fragments".to_string()
+            });
+            
             let app_state = AppState {
                 db: database,
                 encoding_key: encodingkey,
@@ -111,6 +118,7 @@ async fn main() {
                 user_keys: Arc::new(OnceCell::new()),
                 siv_key: Arc::new(OnceCell::new()),
                 siv_nonce: Arc::new(OnceCell::new()),
+                fragments_dir,
             };
 
             // Protected routes that require authentication

@@ -1,6 +1,5 @@
 use crate::db::Data;
 use crate::types::Blake3Hash;
-use crate::db::DataBlockRepresentation;
 use aes_siv::{
     aead::{Aead, OsRng}, siv::Aes256Siv, Aes256SivAead, Key, KeyInit, Nonce
 };
@@ -8,6 +7,10 @@ use duckdb::arrow::datatypes::ToByteSlice;
 use rayon::prelude::*;
 use rand::Rng;
 use hex;
+use std::path::Path;
+use std::fs;
+use std::io;
+use std::collections::HashMap;
 
 #[derive(Debug)]
 pub enum FileError {
@@ -15,7 +18,8 @@ pub enum FileError {
     HashingError,
     InvalidChunkCount,
     TaskJoinError,
-    EncryptionError
+    EncryptionError,
+    StorageError(io::Error)
 }
 
 // Maximum fragment size for consumer network performance
@@ -95,7 +99,8 @@ impl From<FileError> for duckdb::Error {
     }
 }
 
-pub async fn shard_file(file: Vec<u8>) -> Result<Option<Data>, FileError> {
+pub async fn shard_file(file: Vec<u8>, fragments_dir: &str, data_block_id: crate::db::CustomUUID) -> Result<Option<Data>, FileError> {
+    let fragments_dir = fragments_dir.to_string(); // Clone for move into closure
     let data = tokio::task::spawn_blocking(move || -> Result<Option<_>, FileError> {
         // Handle empty files - no data record needed
         if file.is_empty() {
@@ -132,6 +137,15 @@ pub async fn shard_file(file: Vec<u8>) -> Result<Option<Data>, FileError> {
             .map(|chunk| Blake3Hash::new(blake3::hash(chunk)))
             .collect();
         
+        // Store all fragments locally in parallel
+        // Store original chunks
+        chunks.par_iter().zip(original_hashes.par_iter())
+            .try_for_each(|(chunk, hash)| store_fragment(&fragments_dir, hash, chunk))?;
+        
+        // Store recovery chunks
+        recovery_chunks.par_iter().zip(recovery_hashes.par_iter())
+            .try_for_each(|(chunk, hash)| store_fragment(&fragments_dir, hash, chunk))?;
+        
         // Build the result using array indexing with bounds checking
         if original_hashes.len() != num_original_chunks || recovery_hashes.len() != num_recovery_chunks {
             return Err(FileError::InvalidChunkCount);
@@ -157,17 +171,30 @@ pub async fn shard_file(file: Vec<u8>) -> Result<Option<Data>, FileError> {
     // Destructure the results from the blocking task
     let (whole_file_hash, original_hashes, recovery_hashes, added_bytes) = data;
 
-    // Combine original and recovery hashes into a single vector
+    // Combine original and recovery hashes into a single vector of FragmentHash
     let mut all_fragments = Vec::new();
     
-    // Add original hashes (fragments 1-10)
-    for hash in original_hashes {
-        all_fragments.push(DataBlockRepresentation::Hash(hash, crate::db::ChunkType::Original));
+    // Add original hashes (fragments 0, 1, 2...)
+    for (index, hash) in original_hashes.into_iter().enumerate() {
+        all_fragments.push(crate::db::FragmentHash {
+            data_block_id: data_block_id.clone(),
+            fragment_index: index as i32,
+            fragment_hash: hash,
+            chunk_type: crate::db::ChunkType::Original,
+            stored_locally: false, // Will be verified by disk check later
+        });
     }
     
-    // Add recovery hashes (fragments 11-30)
-    for hash in recovery_hashes {
-        all_fragments.push(DataBlockRepresentation::Hash(hash, crate::db::ChunkType::Recovery));
+    // Add recovery hashes (continue index from original chunks)
+    let original_count = all_fragments.len();
+    for (index, hash) in recovery_hashes.into_iter().enumerate() {
+        all_fragments.push(crate::db::FragmentHash {
+            data_block_id: data_block_id.clone(),
+            fragment_index: (original_count + index) as i32,
+            fragment_hash: hash,
+            chunk_type: crate::db::ChunkType::Recovery,
+            stored_locally: false, // Will be verified by disk check later
+        });
     }
     
     let data = Data {
@@ -274,5 +301,201 @@ pub fn decrypt_part(
             }
         }
         Err(_) => Err(FileError::EncryptionError)
+    }
+}
+
+/// Get the XDG data directory for storing fragments
+pub fn get_fragments_dir() -> Result<String, FileError> {
+    let data_dir = std::env::var("XDG_DATA_HOME")
+        .unwrap_or_else(|_| format!("{}/.local/share", std::env::var("HOME").unwrap_or_else(|_| ".".to_string())));
+    
+    let fragments_dir = format!("{}/hopnet/fragments", data_dir);
+    println!("Using fragments directory: {}", fragments_dir);
+    Ok(fragments_dir)
+}
+
+/// Create 2-level directory structure for a fragment hash
+/// e.g., "abcdef123..." -> "fragments/ab/cd/"
+pub fn create_fragment_path(fragments_dir: &str, fragment_hash: &Blake3Hash) -> Result<String, FileError> {
+    let hash_str = fragment_hash.to_hex();
+    
+    // Take first 4 hex characters for 2-level nesting
+    if hash_str.len() < 4 {
+        return Err(FileError::StorageError(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Fragment hash too short"
+        )));
+    }
+    
+    let first_level = &hash_str[0..2];
+    let second_level = &hash_str[2..4];
+    
+    let full_path = format!("{}/{}/{}", fragments_dir, first_level, second_level);
+    
+    Ok(full_path)
+}
+
+/// Store a fragment to disk using 2-level directory structure
+pub fn store_fragment(fragments_dir: &str, fragment_hash: &Blake3Hash, data: &[u8]) -> Result<(), FileError> {
+    let dir_path = create_fragment_path(fragments_dir, fragment_hash)?;
+    let full_file_path = format!("{}/{}", dir_path, fragment_hash.to_hex());
+    
+    // Create directory structure if it doesn't exist
+    fs::create_dir_all(&dir_path)
+        .map_err(|e| FileError::StorageError(e))?;
+    
+    // Write the fragment data
+    fs::write(&full_file_path, data)
+        .map_err(|e| FileError::StorageError(e))?;
+    
+    Ok(())
+}
+
+/// Fetch a fragment from local storage only
+/// Returns the fragment data if found locally, otherwise returns an error
+pub fn fetch_fragment_local(fragments_dir: &str, fragment_hash: &Blake3Hash) -> Result<Vec<u8>, FileError> {
+    let dir_path = create_fragment_path(fragments_dir, fragment_hash)?;
+    let full_file_path = format!("{}/{}", dir_path, fragment_hash.to_hex());
+    
+    // Read the fragment data
+    fs::read(&full_file_path)
+        .map_err(|e| FileError::StorageError(e))
+}
+
+/// Fetch and verify a fragment from local storage
+/// Returns the fragment data if found locally and hash matches, otherwise returns an error
+fn fetch_and_verify_fragment(fragments_dir: &str, fragment_hash: &Blake3Hash) -> Result<Vec<u8>, FileError> {
+    let chunk_data = fetch_fragment_local(fragments_dir, fragment_hash)?;
+    
+    // Verify chunk hash matches expected
+    let actual_chunk_hash = Blake3Hash::new(blake3::hash(&chunk_data));
+    if actual_chunk_hash != *fragment_hash {
+        return Err(FileError::HashingError);
+    }
+    
+    Ok(chunk_data)
+}
+
+/// Finalize reconstructed file by removing padding and verifying hash
+fn finalize_file(mut file: Vec<u8>, added_bytes: u8, expected_hash: Blake3Hash) -> Result<Vec<u8>, FileError> {
+    // Remove padding
+    if added_bytes > 0 {
+        let final_length = file.len().saturating_sub(added_bytes as usize);
+        file.truncate(final_length);
+    }
+    
+    // Verify file hash
+    let actual_hash = Blake3Hash::new(blake3::hash(&file));
+    if actual_hash != expected_hash {
+        return Err(FileError::HashingError);
+    }
+    
+    Ok(file)
+}
+
+/// Data structure for file reassembly containing organized fragment information
+pub struct FileReassemblyData {
+    pub original_fragments: HashMap<usize, (Blake3Hash, bool)>,  // index -> (hash, exists_locally)
+    pub recovery_fragments: HashMap<usize, (Blake3Hash, bool)>,  // index -> (hash, exists_locally)
+    pub added_bytes: u8,
+    pub expected_file_hash: Blake3Hash,
+}
+
+/// Reassemble a complete file from fragments using Reed-Solomon reconstruction
+/// Uses streaming approach to minimize memory usage
+pub fn reassemble_file(
+    fragments_dir: &str,
+    file_data: FileReassemblyData,
+) -> Result<Vec<u8>, FileError> {
+    let num_original_chunks = file_data.original_fragments.len();
+    let num_recovery_chunks = file_data.recovery_fragments.len();
+    
+    // Handle empty file case
+    if num_original_chunks == 0 {
+        return Ok(Vec::new());
+    }
+    
+    // Check if all original chunks are available locally (fast path)
+    let all_original_available = file_data.original_fragments.values()
+        .all(|(_, exists_locally)| *exists_locally);
+    
+    if all_original_available {
+        // Fast path: reconstruct by concatenating original chunks in order
+        let mut reconstructed_file = Vec::new();
+        
+        for i in 0..num_original_chunks {
+            if let Some((hash, _)) = file_data.original_fragments.get(&i) {
+                let chunk_data = fetch_and_verify_fragment(fragments_dir, hash)?;
+                reconstructed_file.extend_from_slice(&chunk_data);
+                // chunk_data is dropped here, minimizing memory usage
+            } else {
+                return Err(FileError::ShardingError);
+            }
+        }
+        
+        return finalize_file(reconstructed_file, file_data.added_bytes, file_data.expected_file_hash);
+    }
+    
+    // Slow path: need Reed-Solomon reconstruction
+    // Count available fragments
+    let available_original = file_data.original_fragments.values()
+        .filter(|(_, exists_locally)| *exists_locally)
+        .count();
+    let available_recovery = file_data.recovery_fragments.values()
+        .filter(|(_, exists_locally)| *exists_locally)
+        .count();
+    
+    // Check if we have enough fragments total
+    let total_available = available_original + available_recovery;
+    if total_available < num_original_chunks {
+        return Err(FileError::ShardingError);
+    }
+    
+    // Collect available fragments for Reed-Solomon (need indexed chunks)
+    let mut available_original = Vec::new();
+    let mut available_recovery = Vec::new();
+    
+    // Add available original chunks with their indices
+    for i in 0..num_original_chunks {
+        if let Some((hash, exists_locally)) = file_data.original_fragments.get(&i) {
+            if *exists_locally {
+                let chunk_data = fetch_and_verify_fragment(fragments_dir, hash)?;
+                available_original.push((i, chunk_data));
+            }
+        }
+    }
+    
+    // Add available recovery chunks with their indices
+    for i in 0..num_recovery_chunks {
+        if let Some((hash, exists_locally)) = file_data.recovery_fragments.get(&i) {
+            if *exists_locally {
+                let chunk_data = fetch_and_verify_fragment(fragments_dir, hash)?;
+                available_recovery.push((i, chunk_data));
+            }
+        }
+    }
+    
+    // Perform Reed-Solomon reconstruction
+    let reconstructed_map = reed_solomon_simd::decode(num_original_chunks, num_recovery_chunks, available_original, available_recovery)
+        .map_err(|_| FileError::ShardingError)?;
+    
+    // Convert HashMap to ordered vector and concatenate chunks
+    let mut reconstructed_file = Vec::new();
+    for i in 0..num_original_chunks {
+        if let Some(chunk) = reconstructed_map.get(&i) {
+            reconstructed_file.extend_from_slice(chunk);
+        } else {
+            return Err(FileError::ShardingError); // Missing chunk after reconstruction
+        }
+    }
+    
+    finalize_file(reconstructed_file, file_data.added_bytes, file_data.expected_file_hash)
+}
+
+/// Check if a fragment exists on disk and is valid (hash matches)
+pub fn fragment_exists_and_valid(fragments_dir: &str, fragment_hash: &Blake3Hash) -> bool {
+    match fetch_and_verify_fragment(fragments_dir, fragment_hash) {
+        Ok(_) => true,  // Exists and hash matches
+        Err(_) => false // Missing, unreadable, or corrupted
     }
 }

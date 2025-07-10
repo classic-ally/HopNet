@@ -45,7 +45,7 @@ pub fn extract_enum_string(enum_type: EnumType<'_>, row_idx: usize) -> Result<St
     Ok(dict_values.value(dict_key).to_string())
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct CustomUUID(Uuid);
 
 impl CustomUUID{
@@ -226,8 +226,8 @@ pub struct DataRecord {
 pub struct Data {
     // data hash for integrity
     pub hash: Blake3Hash,
-    // list of fragment hashes
-    pub fragments: Vec<DataBlockRepresentation>,
+    // list of fragment hashes with metadata
+    pub fragments: Vec<FragmentHash>,
     pub added_bytes: u8,
 }
 
@@ -258,20 +258,11 @@ impl FromSql for AccessList {
     }
 }
 
-
-// not using Either for DataBlockRepresentation
-// possible for other cases in future?
-// direct fetch from API of other nodes?
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
-pub enum DataBlockRepresentation {
-    Hash(Blake3Hash, ChunkType),
-    Data(Vec<u8>, ChunkType)
-}
-
-#[derive(Serialize, Deserialize, Debug)]
 pub struct FragmentHash {
     pub data_block_id: CustomUUID,
     pub fragment_index: i32,
     pub fragment_hash: Blake3Hash,
     pub chunk_type: ChunkType,
+    pub stored_locally: bool,
 }

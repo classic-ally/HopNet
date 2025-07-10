@@ -222,7 +222,7 @@ pub fn put_join_setup(
             dbg!("Inserting fragment_hashes");
             for fragment_hash in setupobj.fragment_hashes {
                 tx.execute(
-                    "INSERT INTO fragment_hashes (data_block_id, fragment_index, fragment_hash, chunk_type) VALUES (?, ?, ?, ?)",
+                    "INSERT INTO fragment_hashes (data_block_id, fragment_index, fragment_hash, chunk_type, stored_locally) VALUES (?, ?, ?, ?, FALSE)",
                     params![fragment_hash.data_block_id, fragment_hash.fragment_index, fragment_hash.fragment_hash, fragment_hash.chunk_type]
                 ).map_err(|_| DatabaseError::InsertError)?;
             }

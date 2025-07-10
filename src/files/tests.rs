@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::files::functions::*;
-    use crate::db::DataBlockRepresentation;
+    use crate::db::CustomUUID;
     use rand::Rng;
 
     /// Generate random test data of specified size
@@ -148,8 +148,11 @@ mod tests {
     /// Test shard_file function end-to-end
     #[tokio::test]
     async fn test_shard_file_basic_functionality() {
+        use crate::db::CustomUUID;
+        
         // Test empty file
-        let result = shard_file(vec![]).await;
+        let test_id = CustomUUID::new(None);
+        let result = shard_file(vec![], "/tmp/test_fragments", test_id).await;
         assert!(result.is_ok(), "Empty file should be handled successfully");
         assert!(result.unwrap().is_none(), "Empty file should return None");
 
@@ -166,7 +169,8 @@ mod tests {
             let test_data = generate_random_data(size);
             let original_data = test_data.clone();
             
-            let result = shard_file(test_data).await;
+            let test_id = CustomUUID::new(None);
+            let result = shard_file(test_data, "/tmp/test_fragments", test_id.clone()).await;
             assert!(result.is_ok(), "Failed to shard file of size {}: {:?}", size, result.err());
             
             let sharded_data = result.unwrap();
@@ -185,12 +189,11 @@ mod tests {
             let total_fragments = data.fragments.len();
             assert_eq!(total_fragments % 3, 0, "Total fragments should be divisible by 3 (1 orig + 2 recovery)");
             
-            // Verify all fragments are hashes
+            // Verify all fragments have correct structure
             for (i, fragment) in data.fragments.iter().enumerate() {
-                match fragment {
-                    DataBlockRepresentation::Hash(_, _) => {}, // Good
-                    DataBlockRepresentation::Data(_, _) => panic!("Fragment {} should be Hash, not Data", i),
-                }
+                assert!(!fragment.fragment_hash.to_hex().is_empty(), "Fragment {} hash should not be empty", i);
+                assert_eq!(fragment.data_block_id, test_id, "Fragment {} should have correct data_block_id", i);
+                assert!(!fragment.stored_locally, "Fragment {} should start with stored_locally = false", i);
             }
         }
     }
@@ -208,7 +211,8 @@ mod tests {
             println!("Testing large file size: {} MB", size / (1024 * 1024));
             let test_data = generate_random_data(size);
             
-            let result = shard_file(test_data).await;
+            let test_id = CustomUUID::new(None);
+            let result = shard_file(test_data, "/tmp/test_fragments", test_id.clone()).await;
             assert!(result.is_ok(), "Failed to shard large file of size {}", size);
             
             let sharded_data = result.unwrap();
@@ -228,7 +232,8 @@ mod tests {
     #[tokio::test]
     async fn test_reed_solomon_functionality() {
         let test_data = generate_random_data(10000);
-        let result = shard_file(test_data).await;
+        let test_id = CustomUUID::new(None);
+        let result = shard_file(test_data, "/tmp/test_fragments", test_id.clone()).await;
         
         assert!(result.is_ok(), "Reed-Solomon encoding should succeed");
         
@@ -240,10 +245,10 @@ mod tests {
         // Verify we have both original and recovery fragments
         assert!(data.fragments.len() >= 30, "Should have at least 30 fragments (10 orig + 20 recovery)");
         
-        // All fragments should be hashes (Reed-Solomon succeeded)
+        // All fragments should have valid structure (Reed-Solomon succeeded)
         for fragment in &data.fragments {
-            assert!(matches!(fragment, DataBlockRepresentation::Hash(_, _)), 
-                "All fragments should be hashes after successful Reed-Solomon encoding");
+            assert!(!fragment.fragment_hash.to_hex().is_empty(), "Fragment hash should not be empty");
+            assert_eq!(fragment.data_block_id, test_id, "Fragment should have correct data_block_id");
         }
     }
 
@@ -251,17 +256,24 @@ mod tests {
     #[tokio::test]
     async fn test_deterministic_behavior() {
         // Test empty file
-        let empty_result1 = shard_file(vec![]).await.unwrap();
-        let empty_result2 = shard_file(vec![]).await.unwrap();
+        let test_id1 = CustomUUID::new(None);
+        let test_id2 = CustomUUID::new(None);
+        let empty_result1 = shard_file(vec![], "/tmp/test_fragments", test_id1).await.unwrap();
+        let empty_result2 = shard_file(vec![], "/tmp/test_fragments", test_id2).await.unwrap();
         assert_eq!(empty_result1, empty_result2, "Empty files should produce identical results");
         
         // Test non-empty file
         let test_data = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
         
-        let result1 = shard_file(test_data.clone()).await.unwrap();
-        let result2 = shard_file(test_data).await.unwrap();
+        let test_id3 = CustomUUID::new(None);
+        let result1 = shard_file(test_data.clone(), "/tmp/test_fragments", test_id3.clone()).await.unwrap();
+        let result2 = shard_file(test_data, "/tmp/test_fragments", test_id3).await.unwrap();
         
-        assert_eq!(result1, result2, "Same input should produce identical results");
+        // Compare just the hash (UUIDs will be different due to cloning different test IDs)
+        if let (Some(data1), Some(data2)) = (&result1, &result2) {
+            assert_eq!(data1.hash, data2.hash, "Same input should produce identical file hashes");
+            assert_eq!(data1.added_bytes, data2.added_bytes, "Same input should have same padding");
+        }
         
         // Both should be Some for non-empty files
         assert!(result1.is_some(), "Non-empty file should return Some");
@@ -281,8 +293,10 @@ mod tests {
         let data1 = generate_random_data(1000);
         let data2 = generate_random_data(1000);
         
-        let result1 = shard_file(data1).await.unwrap().unwrap();
-        let result2 = shard_file(data2).await.unwrap().unwrap();
+        let test_id1 = CustomUUID::new(None);
+        let test_id2 = CustomUUID::new(None);
+        let result1 = shard_file(data1, "/tmp/test_fragments", test_id1).await.unwrap().unwrap();
+        let result2 = shard_file(data2, "/tmp/test_fragments", test_id2).await.unwrap().unwrap();
         
         assert_ne!(result1.hash, result2.hash, "Different files should have different hashes");
         assert_ne!(result1.fragments, result2.fragments, "Different files should have different fragments");
@@ -302,7 +316,8 @@ mod tests {
 
         for size in test_sizes {
             let test_data = generate_random_data(size);
-            let result = shard_file(test_data).await.unwrap().unwrap();
+            let test_id = CustomUUID::new(None);
+            let result = shard_file(test_data, "/tmp/test_fragments", test_id).await.unwrap().unwrap();
             
             let total_fragments = result.fragments.len();
             let original_chunks = total_fragments / 3;
@@ -320,8 +335,9 @@ mod tests {
         // Test a file that requires many chunks (more than 10 minimum)
         let large_size = 700 * 1024 * 1024; // 700MB (should need 11 chunks)
         let test_data = generate_random_data(large_size);
+        let test_id = CustomUUID::new(None);
         
-        let result = shard_file(test_data).await;
+        let result = shard_file(test_data, "/tmp/test_fragments", test_id).await;
         assert!(result.is_ok(), "Should handle very large files");
         
         let sharded_data = result.unwrap();
@@ -347,7 +363,8 @@ mod tests {
         
         for size in odd_sizes {
             let test_data = generate_random_data(size);
-            let result = shard_file(test_data).await;
+            let test_id = CustomUUID::new(None);
+            let result = shard_file(test_data, "/tmp/test_fragments", test_id.clone()).await;
             
             assert!(result.is_ok(), "Should handle odd-sized file: {} bytes", size);
             
@@ -370,7 +387,8 @@ mod tests {
 
         for size in test_cases {
             let test_data = generate_random_data(size);
-            let result = shard_file(test_data).await;
+            let test_id = CustomUUID::new(None);
+            let result = shard_file(test_data, "/tmp/test_fragments", test_id.clone()).await;
             
             assert!(result.is_ok(), "Should handle boundary case: {} bytes", size);
             

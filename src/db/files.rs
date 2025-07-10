@@ -71,26 +71,8 @@ pub fn insert_files(
                         // If it's a DataRecord, we need to insert it first
                         let data_id = data_record.id;
                                                 
-                        // Convert Data to individual fragment hashes
+                        // Access fragment hashes directly (now Vec<FragmentHash>)
                         let data = &data_record.data;
-                        
-                        // Helper function to extract hash and chunk type from DataBlockRepresentation
-                        let extract_hash_and_type = |fragment: &crate::db::DataBlockRepresentation| -> Result<(Blake3Hash, crate::db::ChunkType), DatabaseError> {
-                            match fragment {
-                                crate::db::DataBlockRepresentation::Hash(hash, chunk_type) => Ok((hash.clone(), chunk_type.clone())),
-                                crate::db::DataBlockRepresentation::Data(_, _) => {
-                                    // Return error for Data type since encryption will be applied
-                                    Err(DatabaseError::InvalidPayload)
-                                }
-                            }
-                        };
-                        
-                        // Extract fragment hashes and types from the fragments vector
-                        let fragment_data: Result<Vec<(Blake3Hash, crate::db::ChunkType)>, DatabaseError> = data.fragments
-                            .iter()
-                            .map(extract_hash_and_type)
-                            .collect();
-                        let fragment_data = fragment_data?;
                         
                         // Insert into data_blocks table
                         tx.execute(
@@ -100,16 +82,16 @@ pub fn insert_files(
                                 data_record.access_list,
                                 data_record.modified_at,
                                 data.hash,
-                                fragment_data.len() as i32,
+                                data.fragments.len() as i32,
                                 data.added_bytes
                             ]
                         ).map_err(|_| DatabaseError::InsertError)?;
                         
                         // Insert fragment hashes into fragment_hashes table
-                        for (index, (fragment_hash, chunk_type)) in fragment_data.iter().enumerate() {
+                        for fragment in &data.fragments {
                             tx.execute(
-                                "INSERT INTO fragment_hashes (data_block_id, fragment_index, fragment_hash, chunk_type) VALUES (?, ?, ?, ?)",
-                                params![data_id, index as i32, fragment_hash, chunk_type]
+                                "INSERT INTO fragment_hashes (data_block_id, fragment_index, fragment_hash, chunk_type, stored_locally) VALUES (?, ?, ?, ?, ?)",
+                                params![fragment.data_block_id, fragment.fragment_index, fragment.fragment_hash, fragment.chunk_type, fragment.stored_locally]
                             ).map_err(|_| DatabaseError::InsertError)?;
                         }
                         
@@ -267,12 +249,12 @@ pub fn delete_files(
 pub fn get_file_fragments(
     db: &Arc<Mutex<Connection>>,
     encrypted_path: String,
-) -> Result<crate::files::routes::FileFragmentsResponse, DatabaseError> {
+) -> Result<crate::files::functions::FileReassemblyData, DatabaseError> {
     match db.lock() {
         Ok(db_lock) => {
-            // Query for a specific file by path and get its fragments
+            // Query for a specific file by path and get its fragments with reassembly info
             let mut stmt = db_lock.prepare(
-                "SELECT db.file_hash, fh.fragment_hash, fh.chunk_type
+                "SELECT db.file_hash, db.added_bytes, fh.fragment_index, fh.fragment_hash, fh.chunk_type, fh.stored_locally
                  FROM inodes i 
                  JOIN data_blocks db ON i.data_id = db.id 
                  JOIN fragment_hashes fh ON db.id = fh.data_block_id
@@ -282,28 +264,45 @@ pub fn get_file_fragments(
             
             let rows = stmt.query_map(params![encrypted_path], |row| {
                 let file_hash: Blake3Hash = row.get(0)?;
-                let fragment_hash: Blake3Hash = row.get(1)?;
-                let chunk_type: crate::db::ChunkType = row.get(2)?;
-                Ok((file_hash, fragment_hash, chunk_type))
+                let added_bytes: u8 = row.get(1)?;
+                let fragment_index: i32 = row.get(2)?;
+                let fragment_hash: Blake3Hash = row.get(3)?;
+                let chunk_type: crate::db::ChunkType = row.get(4)?;
+                let stored_locally: bool = row.get(5)?;
+                Ok((file_hash, added_bytes, fragment_index, fragment_hash, chunk_type, stored_locally))
             }).map_err(|_| DatabaseError::ProcessingError)?;
             
             let mut file_hash: Option<Blake3Hash> = None;
-            let mut fragments = Vec::new();
+            let mut added_bytes: Option<u8> = None;
+            let mut original_fragments = std::collections::HashMap::new();
+            let mut recovery_fragments = std::collections::HashMap::new();
             
             for row in rows {
-                let (f_hash, fragment_hash, chunk_type) = row.map_err(|_| DatabaseError::ProcessingError)?;
+                let (f_hash, a_bytes, fragment_index, fragment_hash, chunk_type, stored_locally) = row.map_err(|_| DatabaseError::ProcessingError)?;
+                
                 if file_hash.is_none() {
                     file_hash = Some(f_hash);
+                    added_bytes = Some(a_bytes);
                 }
-                fragments.push((fragment_hash, chunk_type));
+                
+                match chunk_type {
+                    crate::db::ChunkType::Original => {
+                        original_fragments.insert(fragment_index as usize, (fragment_hash, stored_locally));
+                    }
+                    crate::db::ChunkType::Recovery => {
+                        recovery_fragments.insert(fragment_index as usize, (fragment_hash, stored_locally));
+                    }
+                }
             }
             
-            match file_hash {
-                Some(file_hash) => Ok(crate::files::routes::FileFragmentsResponse {
-                    file_hash,
-                    fragments,
+            match (file_hash, added_bytes) {
+                (Some(file_hash), Some(added_bytes)) => Ok(crate::files::functions::FileReassemblyData {
+                    original_fragments,
+                    recovery_fragments,
+                    added_bytes,
+                    expected_file_hash: file_hash,
                 }),
-                None => Err(DatabaseError::RecallError), // File not found
+                _ => Err(DatabaseError::RecallError), // File not found
             }
         }
         Err(_) => Err(DatabaseError::LockError)

@@ -203,7 +203,7 @@ pub async fn insert_node(
 
             dbg!("Fetching fragment_hashes");
             let mut stmt_fragment_hashes = tx.prepare(
-                "SELECT data_block_id, fragment_index, fragment_hash, chunk_type FROM fragment_hashes"
+                "SELECT data_block_id, fragment_index, fragment_hash, chunk_type, stored_locally FROM fragment_hashes"
             ).map_err(|_| DatabaseError::RecallError)?;
             let rows_fragment_hashes = stmt_fragment_hashes.query_map([], |row| {
                 Ok(FragmentHash {
@@ -211,6 +211,7 @@ pub async fn insert_node(
                     fragment_index: row.get(1)?,
                     fragment_hash: row.get(2)?,
                     chunk_type: row.get(3)?,
+                    stored_locally: row.get(4)?,
                 })
             }).map_err(|_| DatabaseError::RecallError)?;
             let fragment_hashes: Vec<FragmentHash> = rows_fragment_hashes.collect::<Result<Vec<FragmentHash>, _>>()
