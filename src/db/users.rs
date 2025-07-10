@@ -12,7 +12,8 @@ pub fn get_users(
                     user_id: row.get(0)?,
                     username: row.get(1)?,
                     password: row.get(2)?,
-                    pubkey: row.get(3)?
+                    pubkey: row.get(3)?,
+                    x25519_pubkey: row.get(4)?
                 })
             });
 
@@ -48,7 +49,8 @@ pub fn get_user_by_username(
                     user_id: row.get(0).map_err(|_| DatabaseError::RecallError)?,
                     username: row.get(1).map_err(|_| DatabaseError::RecallError)?,
                     password: row.get(2).map_err(|_| DatabaseError::RecallError)?,
-                    pubkey: row.get(3).map_err(|_| DatabaseError::RecallError)?
+                    pubkey: row.get(3).map_err(|_| DatabaseError::RecallError)?,
+                    x25519_pubkey: row.get(4).map_err(|_| DatabaseError::RecallError)?
                 };
                 return Ok(Some(user))
             } else {
@@ -77,6 +79,7 @@ pub fn get_user_by_userid(
                     username: row.get(1).map_err(|_| DatabaseError::RecallError)?,
                     password: row.get(2).map_err(|_| DatabaseError::RecallError)?,
                     pubkey: row.get(3).map_err(|_| DatabaseError::RecallError)?,
+                    x25519_pubkey: row.get(4).map_err(|_| DatabaseError::RecallError)?
                 };
                 return Ok(Some(user))
             } else {
@@ -104,8 +107,8 @@ pub fn insert_user(
             let password_hash = user.password_hash().map_err(|_| DatabaseError::ProcessingError)?;
 
             tx.execute(
-                "INSERT INTO users (user_id, username, password_hash, pubkey) VALUES (?, ?, ?, ?)",
-                params![next_id, user.username, password_hash, user.pubkey]
+                "INSERT INTO users (user_id, username, password_hash, pubkey, x25519_pubkey) VALUES (?, ?, ?, ?, ?)",
+                params![next_id, user.username, password_hash, user.pubkey, user.x25519_pubkey]
             ).map_err(|_| DatabaseError::InsertError)?;
             
             // Update the sequence for next user

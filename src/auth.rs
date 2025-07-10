@@ -13,9 +13,11 @@ use axum::{
 use serde::{Serialize, Deserialize};
 use rand::Rng;
 use aes_siv::{siv::Aes256Siv, Key, Nonce};
+use chacha20poly1305::{ChaCha20Poly1305, aead::{Aead, KeyInit}};
 
 use crate::db;
 use crate::{AppState, PrivKey};
+use crate::db::types::XPubKey;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
@@ -158,4 +160,77 @@ pub fn derive_siv_key_from_user(user_privkey: &PrivKey, context: &str) -> (Key<A
     let siv_nonce = Nonce::from(siv_nonce_bytes);
     
     (siv_key, siv_nonce)
+}
+
+/// Derives X25519 public key from user's Ed25519 private key using Blake3 key derivation
+pub fn derive_x25519_pubkey_from_user(user_privkey: &PrivKey) -> XPubKey {
+    // Use the user's private key bytes as input key material
+    let ikm = user_privkey.to_bytes();
+    
+    // Derive X25519 secret key (32 bytes) using Blake3 for deterministic key derivation
+    let mut x25519_secret_bytes = [0u8; 32];
+    let mut hasher = blake3::Hasher::new_derive_key("hopnet x25519_secret");
+    hasher.update(&ikm);
+    let mut xof = hasher.finalize_xof();
+    xof.fill(&mut x25519_secret_bytes);
+    
+    // Create X25519 static secret and derive public key
+    let x25519_secret = x25519_dalek::StaticSecret::from(x25519_secret_bytes);
+    let x25519_pubkey = x25519_dalek::PublicKey::from(&x25519_secret);
+    XPubKey::from(x25519_pubkey)
+}
+
+/// Derives X25519 private key from user's Ed25519 private key using Blake3 key derivation
+pub fn derive_x25519_privkey_from_user(user_privkey: &PrivKey) -> x25519_dalek::StaticSecret {
+    // Use the user's private key bytes as input key material
+    let ikm = user_privkey.to_bytes();
+    
+    // Derive X25519 secret key (32 bytes) using Blake3 for deterministic key derivation
+    let mut x25519_secret_bytes = [0u8; 32];
+    let mut hasher = blake3::Hasher::new_derive_key("hopnet x25519_secret");
+    hasher.update(&ikm);
+    let mut xof = hasher.finalize_xof();
+    xof.fill(&mut x25519_secret_bytes);
+    
+    // Create X25519 static secret
+    x25519_dalek::StaticSecret::from(x25519_secret_bytes)
+}
+
+/// Decrypt a wrapped per-file key using X25519 ECDH and ChaCha20-Poly1305
+pub fn decrypt_wrapped_file_key(
+    file_access: &crate::db::types::FileAccess,
+    user_x25519_privkey: &x25519_dalek::StaticSecret,
+) -> Result<chacha20poly1305::Key, Box<dyn std::error::Error>> {
+    // Perform ECDH with ephemeral public key
+    let shared_secret = user_x25519_privkey.diffie_hellman(file_access.ephemeral_pubkey.as_x25519());
+    
+    // Derive ChaCha20Poly1305 key from shared secret using Blake3
+    let mut wrap_key_bytes = [0u8; 32];
+    let mut hasher = blake3::Hasher::new_derive_key("hopnet key_wrap");
+    hasher.update(shared_secret.as_bytes());
+    let mut xof = hasher.finalize_xof();
+    xof.fill(&mut wrap_key_bytes);
+    let wrap_key = chacha20poly1305::Key::from(wrap_key_bytes);
+    
+    // Derive deterministic nonce from data_block_id + user_id + ephemeral_pubkey
+    let mut nonce_bytes = [0u8; 12];
+    let mut nonce_hasher = blake3::Hasher::new_derive_key("hopnet wrap_nonce");
+    nonce_hasher.update(file_access.data_block_id.as_bytes());
+    nonce_hasher.update(&file_access.user_id.to_le_bytes());
+    nonce_hasher.update(file_access.ephemeral_pubkey.as_bytes());
+    nonce_hasher.finalize_xof().fill(&mut nonce_bytes);
+    let wrap_nonce = chacha20poly1305::Nonce::from(nonce_bytes);
+    
+    // Decrypt the per-file key
+    let wrap_cipher = ChaCha20Poly1305::new(&wrap_key);
+    let decrypted_file_key = wrap_cipher.decrypt(&wrap_nonce, file_access.encrypted_file_key.as_slice())
+        .map_err(|e| format!("Decryption failed: {:?}", e))?;
+    
+    if decrypted_file_key.len() != 32 {
+        return Err("Invalid decrypted key length".into());
+    }
+    
+    let mut key_bytes = [0u8; 32];
+    key_bytes.copy_from_slice(&decrypted_file_key);
+    Ok(chacha20poly1305::Key::from(key_bytes))
 }

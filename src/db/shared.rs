@@ -16,6 +16,7 @@ pub fn initialize() -> Result<Arc<Mutex<Connection>>, Error> {
                 username        VARCHAR NOT NULL,
                 password_hash   VARCHAR NOT NULL,
                 pubkey          BLOB NOT NULL,
+                x25519_pubkey   BLOB NOT NULL,  -- 32 bytes X25519 public key for file access
 
                 CONSTRAINT unique_username UNIQUE (username)
             );
@@ -142,16 +143,27 @@ pub fn initialize() -> Result<Arc<Mutex<Connection>>, Error> {
             -- File system
             CREATE TABLE data_blocks (
                 id               UUID PRIMARY KEY,
-                access_list      BLOB NOT NULL,
                 modified_at      TIMESTAMP,
                 file_hash        BLOB NOT NULL,
                 fragment_count   INTEGER NOT NULL,
                 added_bytes      UTINYINT NOT NULL
             );
 
+            CREATE TABLE file_access (
+                data_block_id    UUID NOT NULL,
+                user_id          INTEGER NOT NULL,
+                ephemeral_pubkey BLOB NOT NULL,  -- 32 bytes X25519 ephemeral public key
+                encrypted_file_key BLOB NOT NULL, -- 48 bytes (32 + 16 auth tag)
+                
+                PRIMARY KEY (data_block_id, user_id),
+                FOREIGN KEY (data_block_id) REFERENCES data_blocks(id),
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            );
+
             CREATE TABLE fragment_hashes (
                 data_block_id    UUID NOT NULL,
                 fragment_index   INTEGER NOT NULL,
+                fragment_id      UUID NOT NULL,
                 fragment_hash    BLOB NOT NULL,
                 chunk_type       ENUM('original', 'recovery') NOT NULL,
                 stored_locally   BOOLEAN DEFAULT FALSE,

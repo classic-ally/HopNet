@@ -3,6 +3,10 @@ use crate::types::Blake3Hash;
 use aes_siv::{
     aead::{Aead, OsRng}, siv::Aes256Siv, Aes256SivAead, Key, KeyInit, Nonce
 };
+use chacha20poly1305::{
+    aead::{Aead as ChaChaAead, AeadCore, stream::{EncryptorBE32, DecryptorBE32, NewStream}, generic_array::GenericArray},
+    ChaCha20Poly1305, KeyInit as ChaChaKeyInit
+};
 use duckdb::arrow::datatypes::ToByteSlice;
 use rayon::prelude::*;
 use rand::Rng;
@@ -11,6 +15,7 @@ use std::path::Path;
 use std::fs;
 use std::io;
 use std::collections::HashMap;
+use crate::db::CustomUUID;
 
 #[derive(Debug)]
 pub enum FileError {
@@ -99,16 +104,23 @@ impl From<FileError> for duckdb::Error {
     }
 }
 
-pub async fn shard_file(file: Vec<u8>, fragments_dir: &str, data_block_id: crate::db::CustomUUID) -> Result<Option<Data>, FileError> {
+pub async fn shard_file(file: Vec<u8>, fragments_dir: &str, data_block_id: crate::db::CustomUUID, per_file_key: &chacha20poly1305::Key) -> Result<Option<Data>, FileError> {
     let fragments_dir = fragments_dir.to_string(); // Clone for move into closure
+    let per_file_key = per_file_key.clone(); // Clone for move into closure
+    let data_block_id_for_closure = data_block_id.clone(); // Clone for move into closure
     let data = tokio::task::spawn_blocking(move || -> Result<Option<_>, FileError> {
         // Handle empty files - no data record needed
         if file.is_empty() {
             return Ok(None);
         }
         
-        // Hash the whole file first
-        let whole_file_hash = Blake3Hash::new(blake3::hash(&file));
+        // Hash the whole file with data_block_id appended for privacy
+        let whole_file_hash = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&file);
+            hasher.update(data_block_id_for_closure.as_bytes());
+            Blake3Hash::new(hasher.finalize())
+        };
         
         // Calculate optimal chunk sizes based on file size
         let original_len = file.len();
@@ -121,40 +133,63 @@ pub async fn shard_file(file: Vec<u8>, fragments_dir: &str, data_block_id: crate
             return Err(FileError::InvalidChunkCount);
         }
 
-        // Hash original chunks in parallel using rayon (CPU-bound work)
-        let original_hashes: Vec<Blake3Hash> = chunks
-            .par_iter()
-            .map(|chunk| Blake3Hash::new(blake3::hash(chunk)))
-            .collect();
+        // Encrypt chunks in parallel and collect results
+        let encryption_results: Vec<(crate::db::CustomUUID, Vec<u8>, Blake3Hash)> = chunks
+            .into_par_iter()
+            .map(|chunk| {
+                let fragment_id = crate::db::CustomUUID::new(None);
+                let encrypted_chunk = encrypt_chunk(chunk, &per_file_key, &fragment_id)?;
+                let chunk_hash = Blake3Hash::new(blake3::hash(&encrypted_chunk));
+                Ok((fragment_id, encrypted_chunk, chunk_hash))
+            })
+            .collect::<Result<Vec<_>, FileError>>()?;
         
-        // Reed-Solomon encoding (CPU-bound, keep synchronous)
-        let recovery_chunks = reed_solomon_simd::encode(num_original_chunks, num_recovery_chunks, &chunks)
+        // Separate metadata from encrypted chunks to avoid clones
+        let (original_fragment_metadata, encrypted_original_chunks): (Vec<_>, Vec<_>) = encryption_results
+            .into_iter()
+            .map(|(fragment_id, encrypted_chunk, chunk_hash)| {
+                ((fragment_id, chunk_hash), encrypted_chunk)
+            })
+            .unzip();
+        
+        // Reed-Solomon encoding on encrypted chunks (takes ownership, frees memory)
+        let recovery_chunks = reed_solomon_simd::encode(num_original_chunks, num_recovery_chunks, &encrypted_original_chunks)
             .map_err(|_| FileError::ShardingError)?;
         
-        // Hash recovery chunks in parallel
-        let recovery_hashes: Vec<Blake3Hash> = recovery_chunks
+        // Generate metadata for recovery chunks in parallel
+        let recovery_fragment_metadata: Vec<(crate::db::CustomUUID, Blake3Hash)> = recovery_chunks
             .par_iter()
-            .map(|chunk| Blake3Hash::new(blake3::hash(chunk)))
+            .map(|chunk| {
+                let fragment_id = crate::db::CustomUUID::new(None);
+                let chunk_hash = Blake3Hash::new(blake3::hash(chunk));
+                (fragment_id, chunk_hash)
+            })
             .collect();
         
         // Store all fragments locally in parallel
-        // Store original chunks
-        chunks.par_iter().zip(original_hashes.par_iter())
-            .try_for_each(|(chunk, hash)| store_fragment(&fragments_dir, hash, chunk))?;
+        // Store original encrypted chunks
+        encrypted_original_chunks.par_iter()
+            .zip(original_fragment_metadata.par_iter())
+            .try_for_each(|(encrypted_chunk, (fragment_id, chunk_hash))| {
+                store_fragment(&fragments_dir, chunk_hash, encrypted_chunk)
+            })?;
         
         // Store recovery chunks
-        recovery_chunks.par_iter().zip(recovery_hashes.par_iter())
-            .try_for_each(|(chunk, hash)| store_fragment(&fragments_dir, hash, chunk))?;
+        recovery_chunks.par_iter()
+            .zip(recovery_fragment_metadata.par_iter())
+            .try_for_each(|(chunk, (fragment_id, chunk_hash))| {
+                store_fragment(&fragments_dir, chunk_hash, chunk)
+            })?;
         
         // Build the result using array indexing with bounds checking
-        if original_hashes.len() != num_original_chunks || recovery_hashes.len() != num_recovery_chunks {
+        if original_fragment_metadata.len() != num_original_chunks || recovery_fragment_metadata.len() != num_recovery_chunks {
             return Err(FileError::InvalidChunkCount);
         }
 
         Ok(Some((
             whole_file_hash,
-            original_hashes,
-            recovery_hashes,
+            original_fragment_metadata,
+            recovery_fragment_metadata,
             added_bytes
         )))
 
@@ -169,29 +204,31 @@ pub async fn shard_file(file: Vec<u8>, fragments_dir: &str, data_block_id: crate
     };
     
     // Destructure the results from the blocking task
-    let (whole_file_hash, original_hashes, recovery_hashes, added_bytes) = data;
+    let (whole_file_hash, original_fragment_metadata, recovery_fragment_metadata, added_bytes) = data;
 
-    // Combine original and recovery hashes into a single vector of FragmentHash
+    // Combine original and recovery fragments into a single vector of FragmentHash
     let mut all_fragments = Vec::new();
     
-    // Add original hashes (fragments 0, 1, 2...)
-    for (index, hash) in original_hashes.into_iter().enumerate() {
+    // Add original fragments (fragments 0, 1, 2...)
+    for (index, (fragment_id, chunk_hash)) in original_fragment_metadata.into_iter().enumerate() {
         all_fragments.push(crate::db::FragmentHash {
             data_block_id: data_block_id.clone(),
             fragment_index: index as i32,
-            fragment_hash: hash,
+            fragment_id,
+            fragment_hash: chunk_hash,
             chunk_type: crate::db::ChunkType::Original,
             stored_locally: false, // Will be verified by disk check later
         });
     }
     
-    // Add recovery hashes (continue index from original chunks)
+    // Add recovery fragments (continue index from original chunks)
     let original_count = all_fragments.len();
-    for (index, hash) in recovery_hashes.into_iter().enumerate() {
+    for (index, (fragment_id, chunk_hash)) in recovery_fragment_metadata.into_iter().enumerate() {
         all_fragments.push(crate::db::FragmentHash {
             data_block_id: data_block_id.clone(),
             fragment_index: (original_count + index) as i32,
-            fragment_hash: hash,
+            fragment_id,
+            fragment_hash: chunk_hash,
             chunk_type: crate::db::ChunkType::Recovery,
             stored_locally: false, // Will be verified by disk check later
         });
@@ -370,6 +407,7 @@ fn fetch_and_verify_fragment(fragments_dir: &str, fragment_hash: &Blake3Hash) ->
     // Verify chunk hash matches expected
     let actual_chunk_hash = Blake3Hash::new(blake3::hash(&chunk_data));
     if actual_chunk_hash != *fragment_hash {
+        dbg!("Unexpected chunk hash");
         return Err(FileError::HashingError);
     }
     
@@ -377,16 +415,22 @@ fn fetch_and_verify_fragment(fragments_dir: &str, fragment_hash: &Blake3Hash) ->
 }
 
 /// Finalize reconstructed file by removing padding and verifying hash
-fn finalize_file(mut file: Vec<u8>, added_bytes: u8, expected_hash: Blake3Hash) -> Result<Vec<u8>, FileError> {
+fn finalize_file(mut file: Vec<u8>, added_bytes: u8, expected_hash: Blake3Hash, data_block_id: &crate::db::CustomUUID) -> Result<Vec<u8>, FileError> {
     // Remove padding
     if added_bytes > 0 {
         let final_length = file.len().saturating_sub(added_bytes as usize);
         file.truncate(final_length);
     }
-    
-    // Verify file hash
-    let actual_hash = Blake3Hash::new(blake3::hash(&file));
+    dbg!("Recalled", &data_block_id); 
+    // Verify file hash (with data_block_id appended for privacy)
+    let actual_hash = {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&file);
+        hasher.update(data_block_id.as_bytes());
+        Blake3Hash::new(hasher.finalize())
+    };
     if actual_hash != expected_hash {
+        dbg!("Unexpected reconstructed file hash");
         return Err(FileError::HashingError);
     }
     
@@ -395,10 +439,18 @@ fn finalize_file(mut file: Vec<u8>, added_bytes: u8, expected_hash: Blake3Hash) 
 
 /// Data structure for file reassembly containing organized fragment information
 pub struct FileReassemblyData {
-    pub original_fragments: HashMap<usize, (Blake3Hash, bool)>,  // index -> (hash, exists_locally)
-    pub recovery_fragments: HashMap<usize, (Blake3Hash, bool)>,  // index -> (hash, exists_locally)
+    pub original_fragments: HashMap<usize, (Blake3Hash, CustomUUID, bool)>,  // index -> (hash, exists_locally)
+    pub recovery_fragments: HashMap<usize, (Blake3Hash, CustomUUID, bool)>,  // index -> (hash, exists_locally)
     pub added_bytes: u8,
     pub expected_file_hash: Blake3Hash,
+    pub data_block_id: crate::db::CustomUUID,  // Needed for hash verification
+    pub per_file_key: Option<chacha20poly1305::Key>,  // Decrypted per-file key for chunk decryption
+}
+
+/// Data structure containing file metadata and access control information from database
+pub struct FileAccessData {
+    pub file_reassembly_data: FileReassemblyData,
+    pub file_access_entry: Option<crate::db::types::FileAccess>,
 }
 
 /// Reassemble a complete file from fragments using Reed-Solomon reconstruction
@@ -417,32 +469,40 @@ pub fn reassemble_file(
     
     // Check if all original chunks are available locally (fast path)
     let all_original_available = file_data.original_fragments.values()
-        .all(|(_, exists_locally)| *exists_locally);
+        .all(|(_, _, exists_locally)| *exists_locally);
     
     if all_original_available {
         // Fast path: reconstruct by concatenating original chunks in order
         let mut reconstructed_file = Vec::new();
         
         for i in 0..num_original_chunks {
-            if let Some((hash, _)) = file_data.original_fragments.get(&i) {
+            if let Some((hash, fragment_id, _)) = file_data.original_fragments.get(&i) {
                 let chunk_data = fetch_and_verify_fragment(fragments_dir, hash)?;
-                reconstructed_file.extend_from_slice(&chunk_data);
+                
+                if let Some(ref per_file_key) = file_data.per_file_key {
+                    // Decrypt the chunk using the per-file key
+                    let decrypted_chunk_data = decrypt_chunk(&chunk_data, per_file_key, fragment_id)?;
+                    reconstructed_file.extend_from_slice(&decrypted_chunk_data);
+                } else {
+                    // No decryption needed (for backward compatibility or empty files)
+                    reconstructed_file.extend_from_slice(&chunk_data);
+                }
                 // chunk_data is dropped here, minimizing memory usage
             } else {
                 return Err(FileError::ShardingError);
             }
         }
         
-        return finalize_file(reconstructed_file, file_data.added_bytes, file_data.expected_file_hash);
+        return finalize_file(reconstructed_file, file_data.added_bytes, file_data.expected_file_hash, &file_data.data_block_id);
     }
     
     // Slow path: need Reed-Solomon reconstruction
     // Count available fragments
     let available_original = file_data.original_fragments.values()
-        .filter(|(_, exists_locally)| *exists_locally)
+        .filter(|(_, _, exists_locally)| *exists_locally)
         .count();
     let available_recovery = file_data.recovery_fragments.values()
-        .filter(|(_, exists_locally)| *exists_locally)
+        .filter(|(_, _, exists_locally)| *exists_locally)
         .count();
     
     // Check if we have enough fragments total
@@ -457,20 +517,36 @@ pub fn reassemble_file(
     
     // Add available original chunks with their indices
     for i in 0..num_original_chunks {
-        if let Some((hash, exists_locally)) = file_data.original_fragments.get(&i) {
+        if let Some((hash, fragment_id, exists_locally)) = file_data.original_fragments.get(&i) {
             if *exists_locally {
                 let chunk_data = fetch_and_verify_fragment(fragments_dir, hash)?;
-                available_original.push((i, chunk_data));
+                
+                if let Some(ref per_file_key) = file_data.per_file_key {
+                    // Decrypt the chunk using the per-file key
+                    let decrypted_chunk_data = decrypt_chunk(&chunk_data, per_file_key, fragment_id)?;
+                    available_original.push((i, decrypted_chunk_data));
+                } else {
+                    // No decryption needed (for backward compatibility or empty files)
+                    available_original.push((i, chunk_data));
+                }
             }
         }
     }
     
     // Add available recovery chunks with their indices
     for i in 0..num_recovery_chunks {
-        if let Some((hash, exists_locally)) = file_data.recovery_fragments.get(&i) {
+        if let Some((hash, fragment_id, exists_locally)) = file_data.recovery_fragments.get(&i) {
             if *exists_locally {
                 let chunk_data = fetch_and_verify_fragment(fragments_dir, hash)?;
-                available_recovery.push((i, chunk_data));
+                
+                if let Some(ref per_file_key) = file_data.per_file_key {
+                    // Decrypt the chunk using the per-file key
+                    let decrypted_chunk_data = decrypt_chunk(&chunk_data, per_file_key, fragment_id)?;
+                    available_recovery.push((i, decrypted_chunk_data));
+                } else {
+                    // No decryption needed (for backward compatibility or empty files)
+                    available_recovery.push((i, chunk_data));
+                }
             }
         }
     }
@@ -489,7 +565,7 @@ pub fn reassemble_file(
         }
     }
     
-    finalize_file(reconstructed_file, file_data.added_bytes, file_data.expected_file_hash)
+    finalize_file(reconstructed_file, file_data.added_bytes, file_data.expected_file_hash, &file_data.data_block_id)
 }
 
 /// Check if a fragment exists on disk and is valid (hash matches)
@@ -498,4 +574,107 @@ pub fn fragment_exists_and_valid(fragments_dir: &str, fragment_hash: &Blake3Hash
         Ok(_) => true,  // Exists and hash matches
         Err(_) => false // Missing, unreadable, or corrupted
     }
+}
+
+/// Derive chunk encryption key from per-file key and fragment UUID
+pub fn derive_chunk_key(per_file_key: &chacha20poly1305::Key, fragment_id: &crate::db::CustomUUID) -> chacha20poly1305::Key {
+    let mut key_bytes = [0u8; 32];
+    let mut hasher = blake3::Hasher::new_derive_key("hopnet chunk_key");
+    hasher.update(per_file_key);
+    hasher.update(fragment_id.as_bytes());
+    let mut xof = hasher.finalize_xof();
+    xof.fill(&mut key_bytes);
+    key_bytes.into()
+}
+
+/// Derive nonce from fragment UUID using Blake3 for collision resistance
+pub fn derive_chunk_nonce(fragment_id: &crate::db::CustomUUID) -> [u8; 7] {
+    let mut nonce_bytes = [0u8; 7];
+    let mut hasher = blake3::Hasher::new_derive_key("hopnet chunk_nonce");
+    hasher.update(fragment_id.as_bytes());
+    let mut xof = hasher.finalize_xof();
+    xof.fill(&mut nonce_bytes);
+    nonce_bytes
+}
+
+/// Encrypt a chunk using streaming ChaCha20-Poly1305 with true memory efficiency
+pub fn encrypt_chunk(
+    mut chunk: Vec<u8>,  // Take ownership so we can consume it
+    per_file_key: &chacha20poly1305::Key, 
+    fragment_id: &crate::db::CustomUUID
+) -> Result<Vec<u8>, FileError> {
+    let chunk_key = derive_chunk_key(per_file_key, fragment_id);
+    let nonce = derive_chunk_nonce(fragment_id);
+    let cipher = ChaCha20Poly1305::new(&chunk_key);
+    
+    let mut stream_encryptor = EncryptorBE32::from_aead(cipher, nonce.as_ref().into());
+    let mut encrypted_output = Vec::with_capacity(chunk.len() + 16);
+    
+    const BUFFER_SIZE: usize = 4096;
+    
+    // Process all segments except the last one
+    while chunk.len() > BUFFER_SIZE {
+        let segment: Vec<u8> = chunk.drain(0..BUFFER_SIZE).collect();
+        
+        let ciphertext = stream_encryptor
+            .encrypt_next(segment.as_slice())
+            .map_err(|_| FileError::EncryptionError)?;
+        
+        encrypted_output.extend_from_slice(&ciphertext);
+        // segment is dropped here, freeing memory
+    }
+    
+    // Process the last segment (or entire chunk if smaller than BUFFER_SIZE)
+    if !chunk.is_empty() {
+        let ciphertext = stream_encryptor
+            .encrypt_last(chunk.as_slice())
+            .map_err(|_| FileError::EncryptionError)?;
+        
+        encrypted_output.extend_from_slice(&ciphertext);
+    }
+    
+    Ok(encrypted_output)
+}
+
+/// Decrypt a chunk using streaming ChaCha20-Poly1305 with memory efficiency
+pub fn decrypt_chunk(
+    encrypted_chunk: &[u8], 
+    per_file_key: &chacha20poly1305::Key, 
+    fragment_id: &crate::db::CustomUUID
+) -> Result<Vec<u8>, FileError> {
+    let chunk_key = derive_chunk_key(per_file_key, fragment_id);
+    let nonce = derive_chunk_nonce(fragment_id);
+    let cipher = ChaCha20Poly1305::new(&chunk_key);
+    
+    let mut stream_decryptor = DecryptorBE32::from_aead(cipher, nonce.as_ref().into());
+    let mut decrypted_output = Vec::with_capacity(encrypted_chunk.len());
+    
+    const BUFFER_SIZE: usize = 4096;
+    const ENCRYPTED_SEGMENT_SIZE: usize = BUFFER_SIZE + 16; // Each segment has 16-byte auth tag
+    let mut chunk_offset = 0;
+    
+    // Process all segments except the last one  
+    while chunk_offset + ENCRYPTED_SEGMENT_SIZE < encrypted_chunk.len() {
+        let segment = &encrypted_chunk[chunk_offset..chunk_offset + ENCRYPTED_SEGMENT_SIZE];
+        
+        let plaintext = stream_decryptor
+            .decrypt_next(segment)
+            .map_err(|_| FileError::EncryptionError)?;
+        
+        decrypted_output.extend_from_slice(&plaintext);
+        chunk_offset += ENCRYPTED_SEGMENT_SIZE;
+    }
+    
+    // Process the last segment (or entire chunk if smaller than ENCRYPTED_SEGMENT_SIZE)
+    if chunk_offset < encrypted_chunk.len() {
+        let segment = &encrypted_chunk[chunk_offset..];
+        
+        let plaintext = stream_decryptor
+            .decrypt_last(segment)
+            .map_err(|_| FileError::EncryptionError)?;
+        
+        decrypted_output.extend_from_slice(&plaintext);
+    }
+    
+    Ok(decrypted_output)
 }

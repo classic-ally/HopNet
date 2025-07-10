@@ -31,7 +31,8 @@ pub async fn get_users(
 pub struct UserRequest {
     username: String,
     password: String,
-    pubkey: PubKey
+    pubkey: PubKey,
+    xpubkey: crate::db::types::XPubKey
 }
 
 impl UserRequest {
@@ -50,6 +51,7 @@ pub async fn post_users (
         username: payload.username,
         password: payload.password,
         pubkey: payload.pubkey,
+        x25519_pubkey: payload.xpubkey,
     };
 
     // Encode user with bincode::serde standard config

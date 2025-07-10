@@ -9,7 +9,7 @@ pub enum DatabaseError {
 }
 
 use crate::db::{Blake3Hash, PrivKey, User};
-use std::{collections::HashMap, ops::Deref};
+use std::ops::Deref;
 pub struct MyNode {
     pub node_id: i32,
     pub privkey: PrivKey,
@@ -20,6 +20,10 @@ use serde::{Serialize, Deserialize};
 use uuid::{Timestamp, Uuid};
 use duckdb::types::{ToSql, ToSqlOutput, FromSql, FromSqlResult, ValueRef, FromSqlError, EnumType};
 use duckdb::arrow::array::StringArray;
+use x25519_dalek::{PublicKey as X25519PublicKey, EphemeralSecret};
+use chacha20poly1305::{ChaCha20Poly1305, aead::{Aead, OsRng, KeyInit}};
+use std::sync::{Arc, Mutex};
+use duckdb::Connection;
 
 /// Helper function to extract string value from DuckDB enum
 pub fn extract_enum_string(enum_type: EnumType<'_>, row_idx: usize) -> Result<String, FromSqlError> {
@@ -211,15 +215,9 @@ pub struct DataRecord {
     // distinct from hash to allow file update without needing to update inode
     // also encodes creation time due to uuidv7
     pub id: CustomUUID,
-    // map of { user_id -> encrypted_file_key }
-    // on share:
-    // 1. through DH key exchange, x25519 privkey of original owner + x25519 pubkey of sharee
-    // 2. we add record to database encrypted with this
-    // 3. slow lookup of list of access keys only needed when materializing file
-    pub access_list: AccessList,
     pub modified_at: Option<CustomDateTime>,
-
     pub data: Data,
+    pub file_access_entries: Option<Vec<FileAccess>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -231,30 +229,115 @@ pub struct Data {
     pub added_bytes: u8,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-pub struct AccessList {
-    // string probably will change
-    pub keys: HashMap<i32, String>
-}
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct XPubKey(X25519PublicKey);
 
-impl ToSql for AccessList {
-    fn to_sql(&self) -> duckdb::Result<ToSqlOutput<'_>> {
-        let encoded = bincode::serde::encode_to_vec(self, bincode::config::standard())
-            .map_err(|_| duckdb::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Failed to encode AccessList"))))?;
-        Ok(ToSqlOutput::from(encoded))
+impl XPubKey {
+    pub fn from_x25519(pubkey: X25519PublicKey) -> Self {
+        XPubKey(pubkey)
+    }
+    
+    pub fn as_x25519(&self) -> &X25519PublicKey {
+        &self.0
+    }
+    
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        self.0.as_bytes()
     }
 }
 
-impl FromSql for AccessList {
+impl From<X25519PublicKey> for XPubKey {
+    fn from(pubkey: X25519PublicKey) -> Self {
+        XPubKey(pubkey)
+    }
+}
+
+impl From<[u8; 32]> for XPubKey {
+    fn from(bytes: [u8; 32]) -> Self {
+        XPubKey(X25519PublicKey::from(bytes))
+    }
+}
+
+impl ToSql for XPubKey {
+    fn to_sql(&self) -> duckdb::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::from(self.as_bytes().to_vec()))
+    }
+}
+
+impl FromSql for XPubKey {
     fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
         match value {
             ValueRef::Blob(blob) => {
-                let (decoded, _): (AccessList, usize) = bincode::serde::decode_from_slice(blob, bincode::config::standard())
-                    .map_err(|_| FromSqlError::InvalidType)?;
-                Ok(decoded)
+                if blob.len() != 32 {
+                    return Err(FromSqlError::InvalidType);
+                }
+                let mut bytes = [0u8; 32];
+                bytes.copy_from_slice(blob);
+                Ok(XPubKey::from(bytes))
             }
             _ => Err(FromSqlError::InvalidType),
         }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct FileAccess {
+    pub data_block_id: CustomUUID,
+    pub user_id: i32,
+    pub ephemeral_pubkey: XPubKey,
+    pub encrypted_file_key: Vec<u8>,  // 48 bytes (32 key + 16 auth tag)
+}
+
+impl FileAccess {
+    /// Create a new FileAccess entry by wrapping the per-file key for the specified user
+    pub fn new_for_user(
+        db: &Arc<Mutex<Connection>>,
+        data_block_id: CustomUUID,
+        user_id: i32,
+        per_file_key: &chacha20poly1305::Key,
+    ) -> Result<Self, DatabaseError> {
+        // Look up user from database to get their X25519 public key
+        let user = match crate::db::users::get_user_by_userid(db, user_id) {
+            Ok(Some(user)) => user,
+            Ok(None) => return Err(DatabaseError::RecallError), // User not found
+            Err(e) => return Err(e),
+        };
+
+        // Generate ephemeral key pair for this file
+        let ephemeral_secret = EphemeralSecret::random_from_rng(&mut OsRng);
+        let ephemeral_public = X25519PublicKey::from(&ephemeral_secret);
+        
+        // Perform ECDH with user's X25519 public key
+        let shared_secret = ephemeral_secret.diffie_hellman(user.x25519_pubkey.as_x25519());
+        
+        // Derive ChaCha20Poly1305 key from shared secret using Blake3
+        let mut wrap_key_bytes = [0u8; 32];
+        let mut hasher = blake3::Hasher::new_derive_key("hopnet key_wrap");
+        hasher.update(shared_secret.as_bytes());
+        let mut xof = hasher.finalize_xof();
+        xof.fill(&mut wrap_key_bytes);
+        let wrap_key = chacha20poly1305::Key::from(wrap_key_bytes);
+        
+        // Derive deterministic nonce from data_block_id + user_id + ephemeral_pubkey
+        let mut nonce_bytes = [0u8; 12];
+        let mut nonce_hasher = blake3::Hasher::new_derive_key("hopnet wrap_nonce");
+        nonce_hasher.update(data_block_id.as_bytes());
+        nonce_hasher.update(&user_id.to_le_bytes());
+        nonce_hasher.update(ephemeral_public.as_bytes());
+        nonce_hasher.finalize_xof().fill(&mut nonce_bytes);
+        let wrap_nonce = chacha20poly1305::Nonce::from(nonce_bytes);
+        
+        // Encrypt the per-file key
+        let wrap_cipher = ChaCha20Poly1305::new(&wrap_key);
+        let encrypted_file_key = wrap_cipher.encrypt(&wrap_nonce, per_file_key.as_slice())
+            .map_err(|_| DatabaseError::ProcessingError)?;
+        
+        Ok(FileAccess {
+            data_block_id,
+            user_id,
+            ephemeral_pubkey: XPubKey::from(ephemeral_public),
+            encrypted_file_key,
+        })
     }
 }
 
@@ -262,7 +345,8 @@ impl FromSql for AccessList {
 pub struct FragmentHash {
     pub data_block_id: CustomUUID,
     pub fragment_index: i32,
-    pub fragment_hash: Blake3Hash,
+    pub fragment_id: CustomUUID,        // UUID v7 for chunk identification and nonce derivation
+    pub fragment_hash: Blake3Hash,      // Hash of encrypted chunk for storage verification
     pub chunk_type: ChunkType,
     pub stored_locally: bool,
 }

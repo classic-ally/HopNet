@@ -353,7 +353,8 @@ pub struct User {
     pub user_id: i32,
     pub username: String,
     pub password: String,
-    pub pubkey: PubKey
+    pub pubkey: PubKey,
+    pub x25519_pubkey: crate::db::types::XPubKey
 }
 
 use argon2::{

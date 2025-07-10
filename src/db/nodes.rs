@@ -65,6 +65,7 @@ pub async fn insert_node(
                     username: row.get(1)?,
                     password: row.get(2)?,
                     pubkey: row.get(3)?,
+                    x25519_pubkey: row.get(4)?,
                 })
             }).map_err(|_| DatabaseError::RecallError)?;
             let users: Vec<User> = rows_users.collect::<Result<Vec<User>, _>>()
@@ -184,18 +185,18 @@ pub async fn insert_node(
             // File system data extract
             dbg!("Fetching data_blocks");
             let mut stmt_data_blocks = tx.prepare(
-                "SELECT id, access_list, modified_at, file_hash, fragment_count, added_bytes FROM data_blocks"
+                "SELECT id, modified_at, file_hash, fragment_count, added_bytes FROM data_blocks"
             ).map_err(|_| DatabaseError::RecallError)?;
             let rows_data_blocks = stmt_data_blocks.query_map([], |row| {
                 Ok(DataRecord {
                     id: row.get(0)?,
-                    access_list: row.get(1)?,
-                    modified_at: row.get(2)?,
+                    modified_at: row.get(1)?,
                     data: Data {
-                        hash: row.get(3)?,
+                        hash: row.get(2)?,
                         fragments: vec![], // Will be populated from fragment_hashes
-                        added_bytes: row.get(5)?,
+                        added_bytes: row.get(4)?,
                     },
+                    file_access_entries: None, // Will be populated separately if needed
                 })
             }).map_err(|_| DatabaseError::RecallError)?;
             let data_blocks: Vec<DataRecord> = rows_data_blocks.collect::<Result<Vec<DataRecord>, _>>()
@@ -203,15 +204,16 @@ pub async fn insert_node(
 
             dbg!("Fetching fragment_hashes");
             let mut stmt_fragment_hashes = tx.prepare(
-                "SELECT data_block_id, fragment_index, fragment_hash, chunk_type, stored_locally FROM fragment_hashes"
+                "SELECT data_block_id, fragment_index, fragment_id, fragment_hash, chunk_type, stored_locally FROM fragment_hashes"
             ).map_err(|_| DatabaseError::RecallError)?;
             let rows_fragment_hashes = stmt_fragment_hashes.query_map([], |row| {
                 Ok(FragmentHash {
                     data_block_id: row.get(0)?,
                     fragment_index: row.get(1)?,
-                    fragment_hash: row.get(2)?,
-                    chunk_type: row.get(3)?,
-                    stored_locally: row.get(4)?,
+                    fragment_id: row.get(2)?,
+                    fragment_hash: row.get(3)?,
+                    chunk_type: row.get(4)?,
+                    stored_locally: row.get(5)?,
                 })
             }).map_err(|_| DatabaseError::RecallError)?;
             let fragment_hashes: Vec<FragmentHash> = rows_fragment_hashes.collect::<Result<Vec<FragmentHash>, _>>()
@@ -231,6 +233,21 @@ pub async fn insert_node(
                 })
             }).map_err(|_| DatabaseError::RecallError)?;
             let inodes: Vec<Inode> = rows_inodes.collect::<Result<Vec<Inode>, _>>()
+                .map_err(|_| DatabaseError::ProcessingError)?;
+
+            dbg!("Fetching file_access entries");
+            let mut stmt_file_access = tx.prepare(
+                "SELECT data_block_id, user_id, ephemeral_pubkey, encrypted_file_key FROM file_access"
+            ).map_err(|_| DatabaseError::RecallError)?;
+            let rows_file_access = stmt_file_access.query_map([], |row| {
+                Ok(crate::db::types::FileAccess {
+                    data_block_id: row.get(0)?,
+                    user_id: row.get(1)?,
+                    ephemeral_pubkey: row.get(2)?,
+                    encrypted_file_key: row.get(3)?,
+                })
+            }).map_err(|_| DatabaseError::RecallError)?;
+            let file_access_entries: Vec<crate::db::types::FileAccess> = rows_file_access.collect::<Result<Vec<crate::db::types::FileAccess>, _>>()
                 .map_err(|_| DatabaseError::ProcessingError)?;
 
             dbg!("Consensus phase fetched successfully");
@@ -301,6 +318,7 @@ pub async fn insert_node(
                 quorum_certificates: qcs,
                 data_blocks: data_blocks,
                 fragment_hashes: fragment_hashes,
+                file_access_entries: file_access_entries,
                 inodes: inodes,
                 yournode: ThisNode {
                     node_id: next_id,

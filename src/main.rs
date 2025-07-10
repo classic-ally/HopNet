@@ -128,7 +128,7 @@ async fn main() {
                 .route("/nodes", get(nodes::get_nodes))
                 .route("/nodes", post(nodes::post_nodes))
                 .route("/files", get(files::routes::get_files))
-                .route("/files", post(files::routes::post_files)).layer(DefaultBodyLimit::max(500*1_000_000))
+                .route("/files", post(files::routes::post_files)).layer(DefaultBodyLimit::max(5000*1_000_000))
                 .route("/files", delete(files::routes::delete_files))
                 .route("/files/{*path}", get(files::routes::get_file_fragments))
                 .route("/validators", get(consensus::routes::get_validators))

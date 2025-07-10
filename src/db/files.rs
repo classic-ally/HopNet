@@ -76,10 +76,9 @@ pub fn insert_files(
                         
                         // Insert into data_blocks table
                         tx.execute(
-                            "INSERT INTO data_blocks (id, access_list, modified_at, file_hash, fragment_count, added_bytes) VALUES (?, ?, ?, ?, ?, ?)",
+                            "INSERT INTO data_blocks (id, modified_at, file_hash, fragment_count, added_bytes) VALUES (?, ?, ?, ?, ?)",
                             params![
                                 data_id,
-                                data_record.access_list,
                                 data_record.modified_at,
                                 data.hash,
                                 data.fragments.len() as i32,
@@ -90,9 +89,19 @@ pub fn insert_files(
                         // Insert fragment hashes into fragment_hashes table
                         for fragment in &data.fragments {
                             tx.execute(
-                                "INSERT INTO fragment_hashes (data_block_id, fragment_index, fragment_hash, chunk_type, stored_locally) VALUES (?, ?, ?, ?, ?)",
-                                params![fragment.data_block_id, fragment.fragment_index, fragment.fragment_hash, fragment.chunk_type, fragment.stored_locally]
+                                "INSERT INTO fragment_hashes (data_block_id, fragment_index, fragment_id, fragment_hash, chunk_type, stored_locally) VALUES (?, ?, ?, ?, ?, ?)",
+                                params![fragment.data_block_id, fragment.fragment_index, fragment.fragment_id, fragment.fragment_hash, fragment.chunk_type, fragment.stored_locally]
                             ).map_err(|_| DatabaseError::InsertError)?;
+                        }
+                        
+                        // Insert file access entries if present
+                        if let Some(ref file_access_entries) = data_record.file_access_entries {
+                            for access_entry in file_access_entries {
+                                tx.execute(
+                                    "INSERT INTO file_access (data_block_id, user_id, ephemeral_pubkey, encrypted_file_key) VALUES (?, ?, ?, ?)",
+                                    params![access_entry.data_block_id, access_entry.user_id, access_entry.ephemeral_pubkey, access_entry.encrypted_file_key]
+                                ).map_err(|_| DatabaseError::InsertError)?;
+                            }
                         }
                         
                         Ok(Some(data_id))
@@ -249,12 +258,13 @@ pub fn delete_files(
 pub fn get_file_fragments(
     db: &Arc<Mutex<Connection>>,
     encrypted_path: String,
-) -> Result<crate::files::functions::FileReassemblyData, DatabaseError> {
+    user_id: i32,
+) -> Result<crate::files::functions::FileAccessData, DatabaseError> {
     match db.lock() {
         Ok(db_lock) => {
             // Query for a specific file by path and get its fragments with reassembly info
             let mut stmt = db_lock.prepare(
-                "SELECT db.file_hash, db.added_bytes, fh.fragment_index, fh.fragment_hash, fh.chunk_type, fh.stored_locally
+                "SELECT db.id, db.file_hash, db.added_bytes, fh.fragment_index, fh.fragment_id, fh.fragment_hash, fh.chunk_type, fh.stored_locally
                  FROM inodes i 
                  JOIN data_blocks db ON i.data_id = db.id 
                  JOIN fragment_hashes fh ON db.id = fh.data_block_id
@@ -263,45 +273,72 @@ pub fn get_file_fragments(
             ).map_err(|_| DatabaseError::RecallError)?;
             
             let rows = stmt.query_map(params![encrypted_path], |row| {
-                let file_hash: Blake3Hash = row.get(0)?;
-                let added_bytes: u8 = row.get(1)?;
-                let fragment_index: i32 = row.get(2)?;
-                let fragment_hash: Blake3Hash = row.get(3)?;
-                let chunk_type: crate::db::ChunkType = row.get(4)?;
-                let stored_locally: bool = row.get(5)?;
-                Ok((file_hash, added_bytes, fragment_index, fragment_hash, chunk_type, stored_locally))
+                let data_block_id: CustomUUID = row.get(0)?;
+                let file_hash: Blake3Hash = row.get(1)?;
+                let added_bytes: u8 = row.get(2)?;
+                let fragment_index: i32 = row.get(3)?;
+                let fragment_id: CustomUUID = row.get(4)?;
+                let fragment_hash: Blake3Hash = row.get(5)?;
+                let chunk_type: crate::db::ChunkType = row.get(6)?;
+                let stored_locally: bool = row.get(7)?;
+                Ok((data_block_id, file_hash, added_bytes, fragment_index, fragment_id, fragment_hash, chunk_type, stored_locally))
             }).map_err(|_| DatabaseError::ProcessingError)?;
             
+            let mut data_block_id: Option<CustomUUID> = None;
             let mut file_hash: Option<Blake3Hash> = None;
             let mut added_bytes: Option<u8> = None;
             let mut original_fragments = std::collections::HashMap::new();
             let mut recovery_fragments = std::collections::HashMap::new();
             
             for row in rows {
-                let (f_hash, a_bytes, fragment_index, fragment_hash, chunk_type, stored_locally) = row.map_err(|_| DatabaseError::ProcessingError)?;
+                let (d_block_id, f_hash, a_bytes, fragment_index, fragment_id, fragment_hash, chunk_type, stored_locally) = row.map_err(|_| DatabaseError::ProcessingError)?;
                 
-                if file_hash.is_none() {
+                if data_block_id.is_none() {
+                    data_block_id = Some(d_block_id);
                     file_hash = Some(f_hash);
                     added_bytes = Some(a_bytes);
                 }
                 
                 match chunk_type {
                     crate::db::ChunkType::Original => {
-                        original_fragments.insert(fragment_index as usize, (fragment_hash, stored_locally));
+                        original_fragments.insert(fragment_index as usize, (fragment_hash, fragment_id, stored_locally));
                     }
                     crate::db::ChunkType::Recovery => {
-                        recovery_fragments.insert(fragment_index as usize, (fragment_hash, stored_locally));
+                        recovery_fragments.insert(fragment_index as usize, (fragment_hash, fragment_id, stored_locally));
                     }
                 }
             }
             
-            match (file_hash, added_bytes) {
-                (Some(file_hash), Some(added_bytes)) => Ok(crate::files::functions::FileReassemblyData {
-                    original_fragments,
-                    recovery_fragments,
-                    added_bytes,
-                    expected_file_hash: file_hash,
-                }),
+            match (data_block_id, file_hash, added_bytes) {
+                (Some(data_block_id), Some(file_hash), Some(added_bytes)) => {
+                    // Get file_access entry for this user and file
+                    let file_access_entry = db_lock.prepare(
+                        "SELECT data_block_id, user_id, ephemeral_pubkey, encrypted_file_key FROM file_access WHERE data_block_id = ? AND user_id = ?"
+                    ).and_then(|mut stmt| {
+                        stmt.query_row(params![data_block_id, user_id], |row| {
+                            Ok(crate::db::types::FileAccess {
+                                data_block_id: row.get(0)?,
+                                user_id: row.get(1)?,
+                                ephemeral_pubkey: row.get(2)?,
+                                encrypted_file_key: row.get(3)?,
+                            })
+                        })
+                    }).ok(); // Convert error to None - user might not have access
+                    
+                    let file_reassembly_data = crate::files::functions::FileReassemblyData {
+                        original_fragments,
+                        recovery_fragments,
+                        added_bytes,
+                        expected_file_hash: file_hash,
+                        data_block_id,
+                        per_file_key: None, // Will be set after decryption
+                    };
+                    
+                    Ok(crate::files::functions::FileAccessData {
+                        file_reassembly_data,
+                        file_access_entry,
+                    })
+                },
                 _ => Err(DatabaseError::RecallError), // File not found
             }
         }

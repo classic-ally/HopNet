@@ -1,6 +1,6 @@
 use axum::{
     extract::{
-        Multipart, Path, Query, State
+        Multipart, Path, Query, State, Extension
     },
     Json,
     response::Response,
@@ -8,12 +8,13 @@ use axum::{
     body::Body
 };
 use reqwest::StatusCode;
+use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::OsRng};
 
 use crate::{db::{DataRecord, Inode, Blake3Hash, DatabaseError}, files::functions::{encrypt_part, encrypt_path}};
 use serde::{Deserialize, Serialize};
 
 use super::*;
-use crate::{db::{AccessList, CustomUUID}, files::functions::shard_file};
+use crate::{db::CustomUUID, files::functions::shard_file};
 use either::Either::{Left, Right};
 use crate::consensus::{functions::consensus_middleware, types::Transaction};
 
@@ -47,6 +48,7 @@ pub async fn get_files(
 
 pub async fn get_file_fragments(
     State(app_state): State<AppState>,
+    Extension(user_id): Extension<i32>,  // Extract user_id from JWT via auth middleware
     Path(path): Path<String>
 ) -> Result<Response<Body>, StatusCode> {
     // Convert the path: /files/ -> "/" and /files/test -> "/test"
@@ -64,14 +66,41 @@ pub async fn get_file_fragments(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     
-    // Get file reassembly data from database
-    let file_data = match db::get_file_fragments(&app_state.db, enc_path) {
+    // Get file access data from database
+    let file_access_data = match db::get_file_fragments(&app_state.db, enc_path, user_id) {
         Ok(data) => data,
         Err(DatabaseError::RecallError) => return Err(StatusCode::NOT_FOUND),
         Err(e) => {
             dbg!(e);
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
+    };
+
+    // Decrypt the per-file key if user has access
+    let mut file_data = file_access_data.file_reassembly_data;
+    if let Some(file_access_entry) = file_access_data.file_access_entry {
+        // Get user's private key from app_state
+        let user_private_key = match app_state.user_keys.get() {
+            Some(user_keys) => &user_keys.private_key,
+            None => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+        };
+        
+        // Derive user's X25519 private key from app_state private key
+        let user_x25519_privkey = crate::auth::derive_x25519_privkey_from_user(user_private_key);
+        
+        // Decrypt the wrapped per-file key
+        match crate::auth::decrypt_wrapped_file_key(&file_access_entry, &user_x25519_privkey) {
+            Ok(per_file_key) => {
+                file_data.per_file_key = Some(per_file_key);
+            }
+            Err(e) => {
+                dbg!("Failed to decrypt file key:", e);
+                return Err(StatusCode::FORBIDDEN);
+            }
+        }
+    } else {
+        // User doesn't have access to this file
+        return Err(StatusCode::FORBIDDEN);
     };
     
     // Reassemble the file from fragments
@@ -95,8 +124,16 @@ pub async fn get_file_fragments(
 
 pub async fn post_files(
     State(app_state): State<AppState>,
+    Extension(user_id): Extension<i32>,  // Extract user_id from JWT via auth middleware
     mut multipart: Multipart
 ) -> Result<(), StatusCode> {
+    // Get user from database to access their X25519 public key
+    let user = match crate::db::users::get_user_by_userid(&app_state.db, user_id) {
+        Ok(Some(user)) => user,
+        Ok(None) => return Err(StatusCode::UNAUTHORIZED),
+        Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+
     // read path part first
     // need path in later file processing
     let mut inodes: Vec<Inode> = Vec::new();
@@ -121,16 +158,22 @@ pub async fn post_files(
                         // encrypt filename - deterministic AES-SIV
                         let filepath = path.clone() + &encrypt_part(&filename, app_state.get_siv_key()?, app_state.get_siv_nonce()?).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-                        let accessors = AccessList{
-                            keys: vec![
-                                (1, "will be value".to_string()),
-                            ].into_iter().collect(),
-                        };
-
                         // Generate data block ID before sharding
                         let dataid = CustomUUID::new(None);
+                        dbg!("Creating", &dataid); 
                         
-                        let data_option = shard_file(filedata.to_vec(), &app_state.fragments_dir, dataid.clone()).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                        // Generate per-file encryption key
+                        let per_file_key = ChaCha20Poly1305::generate_key(&mut OsRng);
+                        
+                        // Create file access entry for the authenticated user
+                        let file_access = crate::db::types::FileAccess::new_for_user(
+                            &app_state.db, 
+                            dataid.clone(), 
+                            user_id, 
+                            &per_file_key
+                        ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                        
+                        let data_option = shard_file(filedata.to_vec(), &app_state.fragments_dir, dataid.clone(), &per_file_key).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
                         // assemble inode for database
                         let inode = match data_option {
@@ -138,22 +181,22 @@ pub async fn post_files(
                                 // assemble data record for database
                                 let datarecord = DataRecord {
                                     id: dataid,
-                                    access_list: accessors,
                                     modified_at: None,
-                                    data: data
+                                    data: data,
+                                    file_access_entries: Some(vec![file_access])
                                 };
                                 
                                 Inode {
-                                    owner: Left(0),
+                                    owner: Left(user_id),
                                     path: filepath,
                                     inode_type: crate::db::InodeType::File,
                                     data_id: Some(Right(datarecord))
                                 }
                             }
                             None => {
-                                // Empty file - no data record
+                                // Empty file - no data record, no access entries needed
                                 Inode {
-                                    owner: Left(0),
+                                    owner: Left(user_id),
                                     path: filepath,
                                     inode_type: crate::db::InodeType::File,
                                     data_id: None
@@ -171,7 +214,7 @@ pub async fn post_files(
             // If no files were found, create a folder
             if !has_files {
                 let folder_inode = Inode {
-                    owner: Left(0),
+                    owner: Left(user_id),
                     path: path,
                     inode_type: crate::db::InodeType::Folder,
                     data_id: None

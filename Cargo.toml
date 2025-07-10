@@ -21,6 +21,7 @@ network-interface = { version = "2.0.1", features = ["serde"] }
 argon2 = {version = "0.5.3", features = ["std"]}
 jsonwebtoken = "9.3.1"
 ed25519-dalek = { version = "2.1.1", features = ["rand_core", "batch", "serde"] }
+x25519-dalek = { version = "2.0.1", features = ["serde", "static_secrets"] }
 rand_core = "0.6"
 hex = "0.4.3"
 blake3 = { version = "1.8.2", features = ["serde", "rayon"] }
@@ -32,3 +33,4 @@ either = { version = "1.15.0", features = ["serde"] }
 reed-solomon-simd = "3.0.1"
 rayon = "1.10.0"
 aes-siv = "0.7.0"
+chacha20poly1305 = { version = "0.10.1", features = ["stream"] }

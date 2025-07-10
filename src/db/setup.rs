@@ -45,6 +45,9 @@ pub fn post_initial_setup(
             // compute user password
             let password_hash = user.password_hash().map_err(|_| DatabaseError::ProcessingError)?;
 
+            // derive X25519 public key from user's private key
+            let x25519_pubkey = crate::auth::derive_x25519_pubkey_from_user(&user_privkey);
+
             // insert the user first
             let next_user_id = tx.query_row(
                 "SELECT next_id FROM sequences WHERE name = 'users'",
@@ -52,8 +55,8 @@ pub fn post_initial_setup(
                 |row| row.get::<_, i32>(0)
             ).map_err(|_| DatabaseError::RecallError)?;
             tx.execute(
-                "INSERT INTO users (user_id, username, password_hash, pubkey) VALUES (?, ?, ?, ?)",
-                params![next_user_id, user.username, password_hash, user.pubkey]
+                "INSERT INTO users (user_id, username, password_hash, pubkey, x25519_pubkey) VALUES (?, ?, ?, ?, ?)",
+                params![next_user_id, user.username, password_hash, user.pubkey, x25519_pubkey]
             ).map_err(|_| DatabaseError::InsertError)?;
             // Update the sequence for next user
             tx.execute(
@@ -160,8 +163,8 @@ pub fn put_join_setup(
             dbg!("Inserting users");
             for user in setupobj.users {
                 tx.execute(
-                    "INSERT INTO users (user_id, username, password_hash, pubkey) VALUES (?, ?, ?, ?)",
-                    params![user.user_id, user.username, user.password, user.pubkey]
+                    "INSERT INTO users (user_id, username, password_hash, pubkey, x25519_pubkey) VALUES (?, ?, ?, ?, ?)",
+                    params![user.user_id, user.username, user.password, user.pubkey, user.x25519_pubkey]
                 ).map_err(|_| DatabaseError::InsertError)?;
             }
 
@@ -214,16 +217,24 @@ pub fn put_join_setup(
             dbg!("Inserting data_blocks");
             for data_block in setupobj.data_blocks {
                 tx.execute(
-                    "INSERT INTO data_blocks (id, access_list, modified_at, file_hash, fragment_count, added_bytes) VALUES (?, ?, ?, ?, ?, ?)",
-                    params![data_block.id, data_block.access_list, data_block.modified_at, data_block.data.hash, data_block.data.fragments.len() as i32, data_block.data.added_bytes]
+                    "INSERT INTO data_blocks (id, modified_at, file_hash, fragment_count, added_bytes) VALUES (?, ?, ?, ?, ?)",
+                    params![data_block.id, data_block.modified_at, data_block.data.hash, data_block.data.fragments.len() as i32, data_block.data.added_bytes]
                 ).map_err(|_| DatabaseError::InsertError)?;
             }
 
             dbg!("Inserting fragment_hashes");
             for fragment_hash in setupobj.fragment_hashes {
                 tx.execute(
-                    "INSERT INTO fragment_hashes (data_block_id, fragment_index, fragment_hash, chunk_type, stored_locally) VALUES (?, ?, ?, ?, FALSE)",
-                    params![fragment_hash.data_block_id, fragment_hash.fragment_index, fragment_hash.fragment_hash, fragment_hash.chunk_type]
+                    "INSERT INTO fragment_hashes (data_block_id, fragment_index, fragment_id, fragment_hash, chunk_type, stored_locally) VALUES (?, ?, ?, ?, ?, FALSE)",
+                    params![fragment_hash.data_block_id, fragment_hash.fragment_index, fragment_hash.fragment_id, fragment_hash.fragment_hash, fragment_hash.chunk_type]
+                ).map_err(|_| DatabaseError::InsertError)?;
+            }
+
+            dbg!("Inserting file_access entries");
+            for file_access in setupobj.file_access_entries {
+                tx.execute(
+                    "INSERT INTO file_access (data_block_id, user_id, ephemeral_pubkey, encrypted_file_key) VALUES (?, ?, ?, ?)",
+                    params![file_access.data_block_id, file_access.user_id, file_access.ephemeral_pubkey, file_access.encrypted_file_key]
                 ).map_err(|_| DatabaseError::InsertError)?;
             }
 
