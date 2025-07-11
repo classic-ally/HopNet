@@ -1,6 +1,6 @@
 pub use {
-    std::sync::{Arc, Mutex},
-    duckdb::{Connection,params},
+    duckdb::{params, DuckdbConnectionManager, Error as DuckdbError},
+    r2d2::PooledConnection,
     types::*,
     crate::types::*
 };

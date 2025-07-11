@@ -4,14 +4,13 @@ use aes_siv::{
     aead::{Aead, OsRng}, siv::Aes256Siv, Aes256SivAead, Key, KeyInit, Nonce
 };
 use chacha20poly1305::{
-    aead::{Aead as ChaChaAead, AeadCore, stream::{EncryptorBE32, DecryptorBE32, NewStream}, generic_array::GenericArray},
-    ChaCha20Poly1305, KeyInit as ChaChaKeyInit
+    aead::stream::{EncryptorBE32, DecryptorBE32},
+    ChaCha20Poly1305
 };
 use duckdb::arrow::datatypes::ToByteSlice;
 use rayon::prelude::*;
 use rand::Rng;
 use hex;
-use std::path::Path;
 use std::fs;
 use std::io;
 use std::collections::HashMap;

@@ -1,9 +1,6 @@
 use super::*;
 
-use duckdb::{Error, DuckdbConnectionManager};
-use r2d2::PooledConnection;
-
-pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), Error> {
+pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), DuckdbError> {
     db.execute_batch(
         "
             CREATE TABLE sequences (

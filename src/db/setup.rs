@@ -1,7 +1,6 @@
 use super::*;
 use crate::consensus::{types::{Block, BlockData, VoteSignMessage}, ConsensusPhase, QuorumCertificate};
 use axum::http::StatusCode;
-use duckdb::DuckdbConnectionManager;
 
 pub fn get_initial_setup(
     db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,

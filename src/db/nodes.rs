@@ -1,5 +1,4 @@
 use super::*;
-use duckdb::DuckdbConnectionManager;
 use tokio::sync::oneshot;
 use crate::consensus::QuorumCertificate;
 use crate::setup::{SyncSetupObject, Validator};

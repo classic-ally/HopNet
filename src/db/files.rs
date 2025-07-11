@@ -4,7 +4,7 @@ use either::Either;
 
 use crate::files::functions::decrypt_path;
 
-use duckdb::{DuckdbConnectionManager, Transaction};
+use duckdb::Transaction;
 
 pub fn get_files(
     db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,

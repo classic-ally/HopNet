@@ -21,7 +21,6 @@ mod metrics;
 mod db;
 mod interfaces;
 mod auth;
-mod dht;
 mod consensus;
 mod types;
 mod handlers;

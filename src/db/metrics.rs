@@ -2,7 +2,6 @@ use super::*;
 use crate::metrics::types::Metric;
 use std::time::{SystemTime, Duration};
 use chrono::{DateTime,Utc};
-use duckdb::DuckdbConnectionManager;
 
 pub fn get_metric(
     db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,

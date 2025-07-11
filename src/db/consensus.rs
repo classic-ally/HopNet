@@ -1,5 +1,3 @@
-use duckdb::DuckdbConnectionManager;
-
 use super::*;
 use crate::consensus::types::*;
 
