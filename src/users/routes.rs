@@ -15,7 +15,7 @@ use crate::{
 pub async fn get_users(
     State(app_state): State<AppState>,
 ) -> impl IntoResponse {
-    match users::get_users(&app_state.db) {
+    match users::get_users(app_state.db_pool.get()) {
         Ok(users) => {
             (StatusCode::OK, Json(users))
         }

@@ -20,7 +20,7 @@ use crate::AppState;
 pub async fn get_nodes(
     State(app_state): State<AppState>
 ) -> impl IntoResponse {
-    match nodes::get_nodes(&app_state.db) {
+    match nodes::get_nodes(app_state.db_pool.get()) {
         Ok(nodes) => return (StatusCode::OK, Json(nodes)),
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(Vec::<Node>::new())),
     }
@@ -109,13 +109,13 @@ pub async fn post_nodes(
     let (dump_tx, dump_rx) = oneshot::channel();
     let (confirm_write_tx, confirm_write_rx) = oneshot::channel(); // for confirm PUT
 
-    // Clone the Arc to avoid moving the entire app_state
-    let db_clone = app_state.db.clone();
+    // Get a connection to give to our thread
+    let db_conn = app_state.db_pool.get();
     let user_private_key = app_state.get_user_keys().unwrap().private_key.clone();
     let db_task = tokio::task::spawn_blocking(move || {
         // Use spawn_blocking for database operations since DuckDB is not async-safe
         tokio::runtime::Handle::current().block_on(async move {
-            nodes::insert_node(&db_clone, payload, dump_tx, confirm_write_rx, user_private_key).await
+            nodes::insert_node(db_conn, payload, dump_tx, confirm_write_rx, user_private_key).await
         })
     });
 

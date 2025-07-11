@@ -1,11 +1,12 @@
 use super::*;
 use crate::consensus::{types::{Block, BlockData, VoteSignMessage}, ConsensusPhase, QuorumCertificate};
 use axum::http::StatusCode;
+use duckdb::DuckdbConnectionManager;
 
 pub fn get_initial_setup(
-    db: &Arc<Mutex<Connection>>
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
 ) -> Result<StatusCode, DatabaseError> {
-    match db.lock() {
+    match db_connection {
         Ok(db_lock) => {
             // if there is entry in the this_node table, we're set up
             let count = db_lock.query_row(
@@ -25,14 +26,14 @@ pub fn get_initial_setup(
 }
 
 pub fn post_initial_setup(
-    db: &Arc<Mutex<Connection>>,
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     mut user: User,
     node: Node,
     pubkey: PubKey,
     privkey: PrivKey,
     user_privkey: PrivKey
 ) -> Result<(), DatabaseError> {
-    match db.lock() {
+    match db_connection {
         Ok(mut db_lock) => {
             let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
 
@@ -151,11 +152,11 @@ pub fn post_initial_setup(
 }
 
 pub fn put_join_setup(
-    db: &Arc<Mutex<Connection>>,
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     setupobj: crate::setup::SyncSetupObject,
     privkey: PrivKey
 ) -> Result<(), DatabaseError> {
-    match db.lock() {
+    match db_connection {
         Ok(mut db_lock) => {
             // in this case we need to write the list of nodes and users to the DB
             let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;

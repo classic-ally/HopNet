@@ -85,7 +85,7 @@ impl Ballot {
 
     pub fn verify_proposal(&self, state: &AppState) -> Result<(), VoteError> {
         // Check leader signature is valid and leader is authorized for view
-        let consensus_state = db::get_consensus(&state.db).map_err(|_| VoteError::DatabaseError)?;
+        let consensus_state = db::get_consensus(state.db_pool.get()).map_err(|_| VoteError::DatabaseError)?;
 
         let leader_verifyingkey = consensus_state.leader.pubkey;
         let message = self.data.encode().map_err(|_| VoteError::ProcessingError)?;
@@ -163,7 +163,7 @@ impl Ballot {
     }
 
     pub fn sign(&self, app_state: &AppState) -> Result<VoteSignMessage, VoteError> {
-        let me = db::get_me(&app_state.db).map_err(|_| VoteError::DatabaseError)?;
+        let me = db::get_me(app_state.db_pool.get()).map_err(|_| VoteError::DatabaseError)?;
         let signature = self.data.sign(&me.privkey).map_err(|_| VoteError::ProcessingError)?;
         Ok(VoteSignMessage{
             replica_id: me.node_id,
@@ -297,7 +297,7 @@ impl QuorumCertificate {
     }
     pub fn verify(&self, state: &AppState, block: &Block) -> Result<(), CertificateError> {
         // Get validators for this height
-        let validators = db::get_validators(&state.db, block.data.height).map_err(|_| CertificateError::DatabaseError)?;
+        let validators = db::get_validators(state.db_pool.get(), block.data.height).map_err(|_| CertificateError::DatabaseError)?;
         dbg!(&validators.len());
         let num_validators = validators.len();
         
@@ -419,7 +419,7 @@ impl Block {
     ) -> Result<Block, BlockError> {
         // get the current tip
         // it is the committed_block
-        match db::get_consensus(&app_state.db) {
+        match db::get_consensus(app_state.db_pool.get()) {
             Ok(consensus_state) => {
                 dbg!("Creating block with", consensus_state.committed_block.data.height +1, consensus_state.view);
                 let tip_data = BlockData {
@@ -430,7 +430,7 @@ impl Block {
                 };
                 let new_block = Block::new(tip_data)?;
                 // add it to DB
-                match db::insert_block(&app_state.db, &new_block) {
+                match db::insert_block(app_state.db_pool.get(), &new_block) {
                     Ok(()) => Ok(new_block),
                     Err(_) => Err(BlockError::DatabaseError)
                 }

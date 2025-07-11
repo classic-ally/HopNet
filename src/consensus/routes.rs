@@ -33,7 +33,7 @@ use crate::AppState;
 pub async fn get_consensus(
     State(app_state): State<AppState>,
 ) -> impl IntoResponse {
-    match db::get_consensus(&app_state.db) {
+    match db::get_consensus(app_state.db_pool.get()) {
         Ok(info) => (StatusCode::OK, Json(info)).into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Failed to get leader info").into_response(),
     }
@@ -44,7 +44,7 @@ pub async fn get_validators(
     State(app_state): State<AppState>,
     Json(height): Json<i32>,
 ) -> impl IntoResponse {
-    match db::get_validators(&app_state.db, height) {
+    match db::get_validators(app_state.db_pool.get(), height) {
         Ok(nodes) => (StatusCode::OK, Json(nodes)).into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Failed to get validators").into_response(),
     }
@@ -65,7 +65,7 @@ pub async fn post_ballot(
                     // Only insert block during Propose phase, not Lock phase
                     if ballot.data.phase == ConsensusPhase::Propose {
                         dbg!("Adding to database block hash {}", ballot.block.block_hash);
-                        match db::insert_block(&app_state.db, &ballot.block) {
+                        match db::insert_block(app_state.db_pool.get(), &ballot.block) {
                             Ok(()) => {
                                 dbg!("Block saved!");
                                 return (StatusCode::OK, Json(signoff)).into_response()
@@ -98,14 +98,14 @@ pub async fn post_qc(
 ) -> impl IntoResponse {
     // validate the QC against internal block
     dbg!("Received QC");
-    match db::get_block(&app_state.db, qc.block_hash) {
+    match db::get_block(app_state.db_pool.get(), qc.block_hash) {
         Ok(block) => {
             dbg!("We have the block, verifying...");
             match qc.verify(&app_state, &block) {
                 Ok(()) => {
                     // save it to db
                     dbg!("QC looks good, committing");
-                    match db::insert_qc(&app_state.db, qc.clone()) {
+                    match db::insert_qc(app_state.db_pool.get(), qc.clone()) {
                         Ok(()) => {
                             // Process transactions if this is a Lock phase QC
                             if qc.phase == ConsensusPhase::Lock {

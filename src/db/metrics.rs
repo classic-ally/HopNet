@@ -2,11 +2,12 @@ use super::*;
 use crate::metrics::types::Metric;
 use std::time::{SystemTime, Duration};
 use chrono::{DateTime,Utc};
+use duckdb::DuckdbConnectionManager;
 
 pub fn get_metric(
-    db: &Arc<Mutex<Connection>>,
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
 ) -> Result<Vec<Metric>, DatabaseError> {
-    match db.lock() {
+    match db_connection {
         Ok(db_lock) => {
             // Prepare the query
             let mut stmt = db_lock.prepare("SELECT * FROM metrics").map_err(|_| DatabaseError::RecallError)?;
@@ -50,10 +51,10 @@ pub fn get_metric(
 }
 
 pub fn insert_metric(
-    db: &Arc<Mutex<Connection>>,
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     metric: Metric,
 ) -> Result<(), DatabaseError> {
-    match db.lock() {
+    match db_connection {
         Ok(db_lock) => {
             // Convert SystemTime to DateTime<Utc>
             let start_time_utc: DateTime<Utc> = match metric.start_time {

@@ -1,9 +1,9 @@
 use super::*;
 
-use duckdb::{Connection, Error};
+use duckdb::{Error, DuckdbConnectionManager};
+use r2d2::PooledConnection;
 
-pub fn initialize() -> Result<Arc<Mutex<Connection>>, Error> {
-    let db = Connection::open(":memory:")?;
+pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), Error> {
     db.execute_batch(
         "
             CREATE TABLE sequences (
@@ -207,5 +207,5 @@ pub fn initialize() -> Result<Arc<Mutex<Connection>>, Error> {
             COMMENT ON COLUMN metrics.version IS 'Schema version for backwards compatibility';
         "
     )?;
-    Ok(Arc::new(Mutex::new(db)))
+    Ok(())
 }

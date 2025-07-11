@@ -1,10 +1,12 @@
+use duckdb::DuckdbConnectionManager;
+
 use super::*;
 use crate::types::User;
 
 pub fn get_users(
-    db: &Arc<Mutex<Connection>>,
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
 ) -> Result<Vec<User>, DatabaseError> {
-    match db.lock() {
+    match db_connection {
         Ok(db_lock) => {
             let mut stmt = db_lock.prepare("SELECT * FROM users").map_err(|_| DatabaseError::RecallError)?;
             let results = stmt.query_map([], |row| {
@@ -33,10 +35,10 @@ pub fn get_users(
 }
 
 pub fn get_user_by_username(
-    db: &Arc<Mutex<Connection>>,
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     username: String,
 ) -> Result<Option<User>, DatabaseError> {
-    match db.lock() {
+    match db_connection {
         Ok(db_lock) => {
             let mut stmt = db_lock.prepare(
                 "SELECT * FROM users WHERE username = ?"
@@ -62,10 +64,10 @@ pub fn get_user_by_username(
 }
 
 pub fn get_user_by_userid(
-    db: &Arc<Mutex<Connection>>,
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     userid: i32,
 ) -> Result<Option<User>, DatabaseError> {
-    match db.lock() {
+    match db_connection {
         Ok(db_lock) => {
             let mut stmt = db_lock.prepare(
                 "SELECT * FROM users WHERE user_id = ?"
@@ -91,11 +93,11 @@ pub fn get_user_by_userid(
 }
 
 pub fn insert_user(
-    db: &Arc<Mutex<Connection>>,
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     mut user: User,
 ) -> Result<(), DatabaseError> {
 
-    match db.lock() {
+    match db_connection {
         Ok(mut db_lock) => {
             let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
             let next_id = tx.query_row(

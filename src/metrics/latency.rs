@@ -1,3 +1,4 @@
+use duckdb::DuckdbConnectionManager;
 use tokio::net::{TcpStream, TcpListener};
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use tokio::time::{Duration, timeout};
@@ -109,7 +110,7 @@ fn calculate_rtt_metrics(rtts: Vec<Duration>) -> (f64, f64, f64) {
 
 // Send latency data over TCP
 pub async fn send_latency(
-    db: &std::sync::Arc<std::sync::Mutex<duckdb::Connection>>, 
+    db_conn: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     ip: IpAddr, 
     port: u16
 ) -> Result<(f64, f64, f64), LatencyError> {
@@ -162,7 +163,7 @@ pub async fn send_latency(
     };
 
     // database write
-    match db::metrics::insert_metric(db, metric) {
+    match db::metrics::insert_metric(db_conn, metric) {
         Ok(()) => Ok((average_rtt, variance, jitter)),
         Err(_) => Err(LatencyError::DatabaseError)
     }

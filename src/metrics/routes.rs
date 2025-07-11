@@ -15,12 +15,12 @@ use crate::metrics::{
         ErrorResponse,
     },
 };
-use duckdb::Connection;
+use duckdb::DuckdbConnectionManager;
 
 pub async fn get_metrics(
     State(app_state): State<AppState>,
 ) -> impl IntoResponse {
-    match get_metric(&app_state.db) {
+    match get_metric(app_state.db_pool.get()) {
         Ok(metrics) => {
             println!("{:?}", metrics);    
             (StatusCode::OK, Json(metrics))
@@ -35,7 +35,7 @@ pub async fn get_remote_latency_handler(
     Query(params): Query<RemoteLatencyQuery>,
     State(app_state): State<AppState>,
 ) -> impl IntoResponse {
-    let (status, response) = get_remote_latency(&app_state.db, &params.ip).await;
+    let (status, response) = get_remote_latency(app_state.db_pool.get(), &params.ip).await;
     match response {
         Some(latency_response) => (status, Json(LatencyResponseWrapper::Success(latency_response))),
         None => (status, Json(LatencyResponseWrapper::Error(ErrorResponse { error: "Failed to get remote latency".to_string() })))
@@ -43,7 +43,7 @@ pub async fn get_remote_latency_handler(
 }
 
 async fn get_remote_latency(
-    db: &std::sync::Arc<std::sync::Mutex<Connection>>, 
+    db_conn: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     str_ip: &str
 ) -> (StatusCode, Option<LatencyResponse>) {
     // let's hit the remote
@@ -58,7 +58,7 @@ async fn get_remote_latency(
                             Ok(port) => {
                                 match str_ip.parse::<IpAddr>() {
                                     Ok(ip) => {
-                                        match send_latency(db, ip, port).await {
+                                        match send_latency(db_conn, ip, port).await {
                                             Ok((average_rtt, variance, jitter)) => {
                                                 let response = LatencyResponse {
                                                     address: str_ip.to_string() + ":" + &str,

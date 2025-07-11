@@ -1,10 +1,12 @@
+use duckdb::DuckdbConnectionManager;
+
 use super::*;
 use crate::consensus::types::*;
 
 pub fn get_consensus(
-    db: &Arc<Mutex<Connection>>
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
 ) -> Result<ConsensusState, DatabaseError> {
-    match db.lock() {
+    match db_connection {
         Ok(db_lock) => {
             let mut stmt = db_lock.prepare(
                 "WITH latest_effective AS (
@@ -135,10 +137,10 @@ pub fn get_consensus(
 }
 
 pub fn get_validators(
-    db: &Arc<Mutex<Connection>>,
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     height: i32,
 ) -> Result<Vec<Node>, DatabaseError> {
-    match db.lock() {
+    match db_connection {
         Ok(db_lock) => {
             let mut stmt = db_lock.prepare(
                 "
@@ -200,10 +202,10 @@ pub fn get_validators(
 }
 
 pub fn insert_block(
-    db: &Arc<Mutex<Connection>>,
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     block: &Block,
 ) -> Result<(), DatabaseError> {
-    match db.lock() {
+    match db_connection {
         Ok(mut db_lock) => {
             let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
             tx.execute(
@@ -224,10 +226,10 @@ pub fn insert_block(
 }
 
 pub fn get_block(
-    db: &Arc<Mutex<Connection>>,
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     block_hash: Blake3Hash,
 ) -> Result<Block, DatabaseError> {
-    match db.lock() {
+    match db_connection {
         Ok(db_lock) => {
             let mut stmt = db_lock.prepare(
                 "SELECT block_hash, height, view_number, parent_hash, transactions FROM blocks WHERE block_hash = ?"
@@ -260,10 +262,10 @@ pub fn get_block(
 }
 
 pub fn insert_qc(
-    db: &Arc<Mutex<Connection>>,
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     qc: QuorumCertificate,
 ) -> Result<(), DatabaseError> {
-    match db.lock() {
+    match db_connection {
         Ok(mut db_lock) => {
             let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
             dbg!("Attempting transaction");
@@ -310,9 +312,9 @@ pub fn insert_qc(
 }
 
 pub fn get_me(
-    db: &Arc<Mutex<Connection>>,
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
 ) -> Result<MyNode, DatabaseError> {
-    match db.lock() {
+    match db_connection {
         Ok(db_lock) => {
             let mut stmt = db_lock.prepare(
                 "

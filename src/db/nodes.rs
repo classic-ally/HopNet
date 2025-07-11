@@ -1,4 +1,5 @@
 use super::*;
+use duckdb::DuckdbConnectionManager;
 use tokio::sync::oneshot;
 use crate::consensus::QuorumCertificate;
 use crate::setup::{SyncSetupObject, Validator};
@@ -10,9 +11,9 @@ use crate::db::{DataRecord, FragmentHash, Inode, Data};
 use either::Either;
 
 pub fn get_nodes(
-    db: &Arc<Mutex<Connection>>
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
 ) -> Result<Vec<Node>, DatabaseError> {
-    match db.lock() {
+    match db_connection {
         Ok(db_lock) => {
             let mut stmt = db_lock.prepare("SELECT * FROM nodes").map_err(|_| DatabaseError::RecallError)?;
             let results = stmt.query_map([], |row| {
@@ -42,13 +43,13 @@ pub fn get_nodes(
 }
 
 pub async fn insert_node(
-    db: &Arc<Mutex<Connection>>,
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     node: Node,
     dump_tx: oneshot::Sender<SyncSetupObject>,
     confirm_write_rx: oneshot::Receiver<Result<(), Error>>,
     user_privkey: PrivKey
 ) -> Result<(), DatabaseError> {
-    match db.lock() {
+    match db_connection {
         Ok(mut db_lock) => {
             ///////////////
             // 2. Get the current DB state, dump into vecs

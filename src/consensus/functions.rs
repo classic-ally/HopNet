@@ -33,8 +33,8 @@ pub enum ConsensusError {
 pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transaction>) -> Result<(), ConsensusError> {
     dbg!("Begin middleware");
     let block = Block::new_tip(&app_state, transactions).map_err(|_| ConsensusError::BlockError)?;
-    let me = db::get_me(&app_state.db).map_err(|_| ConsensusError::DatabaseError)?;
-    let validators = db::get_validators(&app_state.db, block.data.height).map_err(|_| ConsensusError::DatabaseError)?
+    let me = db::get_me(app_state.db_pool.get()).map_err(|_| ConsensusError::DatabaseError)?;
+    let validators = db::get_validators(app_state.db_pool.get(), block.data.height).map_err(|_| ConsensusError::DatabaseError)?
         .iter()
         .filter(|node| node.node_id != me.node_id)
         .cloned()
@@ -85,7 +85,7 @@ async fn ballot_round(
         Ok(_) => {
             // save it to db
             dbg!("QC looks good, committing");
-            db::insert_qc(&app_state.db, qc.clone()).map_err(|_| ConsensusError::DatabaseError)?;
+            db::insert_qc(app_state.db_pool.get(), qc.clone()).map_err(|_| ConsensusError::DatabaseError)?;
         },
         Err(_) => return Err(ConsensusError::SigningError)
     };

@@ -35,7 +35,7 @@ pub async fn get_files(
 ) -> Result<Json<Vec<Inode>>, StatusCode> {
     // let's encrypt the path so we can search for it
     let enc_path = encrypt_path(params.path, app_state.get_siv_key()?, app_state.get_siv_nonce()?).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    match db::get_files(&app_state.db, enc_path, app_state.get_siv_key()?, app_state.get_siv_nonce()?) {
+    match db::get_files(app_state.db_pool.get(), enc_path, app_state.get_siv_key()?, app_state.get_siv_nonce()?) {
         Ok(files) => {
             Ok(Json(files))
         }
@@ -67,7 +67,7 @@ pub async fn get_file_fragments(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     
     // Get file access data from database
-    let file_access_data = match db::get_file_fragments(&app_state.db, enc_path, user_id) {
+    let file_access_data = match db::get_file_fragments(app_state.db_pool.get(), enc_path, user_id) {
         Ok(data) => data,
         Err(DatabaseError::RecallError) => return Err(StatusCode::NOT_FOUND),
         Err(e) => {
@@ -128,7 +128,7 @@ pub async fn post_files(
     mut multipart: Multipart
 ) -> Result<(), StatusCode> {
     // Get user from database to access their X25519 public key
-    let user = match crate::db::users::get_user_by_userid(&app_state.db, user_id) {
+    let user = match crate::db::users::get_user_by_userid(app_state.db_pool.get(), user_id) {
         Ok(Some(user)) => user,
         Ok(None) => return Err(StatusCode::UNAUTHORIZED),
         Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
@@ -167,7 +167,7 @@ pub async fn post_files(
                         
                         // Create file access entry for the authenticated user
                         let file_access = crate::db::types::FileAccess::new_for_user(
-                            &app_state.db, 
+                            app_state.db_pool.get(), 
                             dataid.clone(), 
                             user_id, 
                             &per_file_key
@@ -256,7 +256,7 @@ pub async fn delete_files(
     Query(params): Query<GetQueryParams>
 ) -> Result<(), StatusCode> {
     let enc_path = encrypt_path(params.path, app_state.get_siv_key()?, app_state.get_siv_nonce()?).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    match db::delete_files(&app_state.db, enc_path) {
+    match db::delete_files(app_state.db_pool.get(), enc_path) {
         Ok(_) => return Ok(()),
         Err(e) => {
             dbg!(e);

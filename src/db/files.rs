@@ -4,15 +4,15 @@ use either::Either;
 
 use crate::files::functions::decrypt_path;
 
-use duckdb::Transaction;
+use duckdb::{DuckdbConnectionManager, Transaction};
 
 pub fn get_files(
-    db: &Arc<Mutex<Connection>>,
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     path: String,
     key: &Key<Aes256Siv>,
     nonce: &Nonce
 ) -> Result<Vec<Inode>, DatabaseError> {
-    match db.lock() {
+    match db_connection {
         Ok(db_lock) => {
             let mut stmt = db_lock.prepare("SELECT owner_id, path, type, data_id FROM inodes WHERE path LIKE ? AND path NOT LIKE ?").map_err(|_| DatabaseError::RecallError)?;
             let like_path = format!("{}/%", path);
@@ -40,10 +40,10 @@ pub fn get_files(
 }
 
 pub fn insert_files(
-    db: &Arc<Mutex<Connection>>,
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     inodes: Vec<Inode>,
 ) -> Result<(), DatabaseError> {
-    match db.lock() {
+    match db_connection {
         Ok(mut db_lock) => {
             let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
 
@@ -232,10 +232,10 @@ fn insert_parent_directories(
 }
 
 pub fn delete_files(
-    db: &Arc<Mutex<Connection>>,
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     path: String,
 ) -> Result<(), DatabaseError> {
-    match db.lock() {
+    match db_connection {
         Ok(mut db_lock) => {
             let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
             
@@ -256,11 +256,11 @@ pub fn delete_files(
 }
 
 pub fn get_file_fragments(
-    db: &Arc<Mutex<Connection>>,
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     encrypted_path: String,
     user_id: i32,
 ) -> Result<crate::files::functions::FileAccessData, DatabaseError> {
-    match db.lock() {
+    match db_connection {
         Ok(db_lock) => {
             // Query for a specific file by path and get its fragments with reassembly info
             let mut stmt = db_lock.prepare(

@@ -64,7 +64,7 @@ pub struct Validator {
 pub async fn get_setup(
     State(app_state): State<AppState>,
 ) -> impl IntoResponse {
-    match setup::get_initial_setup(&app_state.db) {
+    match setup::get_initial_setup(app_state.db_pool.get()) {
         Ok(setupstatus) => (setupstatus, app_state.public_key),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, app_state.public_key)
     }
@@ -96,7 +96,7 @@ pub async fn put_setup(
     // Initialize SIV keys from user private key
     app_state.initialize_siv_keys()?;
     
-    match setup::put_join_setup(&app_state.db, payload, app_state.private_key) {
+    match setup::put_join_setup(app_state.db_pool.get(), payload, app_state.private_key) {
         Ok(()) => Ok(StatusCode::CREATED),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR)
     }
@@ -141,7 +141,7 @@ pub async fn post_setup(
         pubkey: app_state.public_key, // Placeholder, will use app_state.public_key
     };
 
-    match setup::post_initial_setup(&app_state.db, user, node, app_state.public_key, app_state.private_key, user_keys.private_key) {
+    match setup::post_initial_setup(app_state.db_pool.get(), user, node, app_state.public_key, app_state.private_key, user_keys.private_key) {
         Ok(()) => Ok(StatusCode::CREATED),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR)
     }

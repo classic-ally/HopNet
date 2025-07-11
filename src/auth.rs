@@ -85,7 +85,7 @@ pub async fn auth_middleware(
 
     // check user exists in db (what if deleted?)
     let uid: i32 = token_data.claims.uid.parse().map_err(|_| AuthError{ message: "Malformed JWT".to_string(), status_code: StatusCode::BAD_REQUEST })?;
-    match db::users::get_user_by_userid(&app_state.db, uid) {
+    match db::users::get_user_by_userid(app_state.db_pool.get(), uid) {
         Ok(Some(_user)) => {
             // store the user ID in request extensions
             req.extensions_mut().insert(uid);
@@ -124,7 +124,7 @@ pub async fn sign_in(
     Json(user_data): Json<SignInData>
 ) -> Result<Json<String>, StatusCode> {
     // get user by username from db
-    match db::users::get_user_by_username(&app_state.db, user_data.username) {
+    match db::users::get_user_by_username(app_state.db_pool.get(), user_data.username) {
         Ok(Some(mut db_user)) => {
             // verify user password against hash
             match db_user.verify_password(user_data.password.as_bytes()) {

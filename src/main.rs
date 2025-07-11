@@ -9,6 +9,8 @@ use include_dir::{Dir, include_dir};
 use once_cell::sync::{Lazy, OnceCell};
 use std::sync::Arc;
 use std::collections::HashMap;
+use duckdb::DuckdbConnectionManager;
+use r2d2::Pool;
 
 use crate::{db::{PrivKey, PubKey}, handlers::TransactionHandler};
 
@@ -35,7 +37,7 @@ pub struct UserKeys {
 
 #[derive(Clone)]
 pub struct AppState {
-    db: std::sync::Arc<std::sync::Mutex<duckdb::Connection>>,
+    db_pool: Pool<DuckdbConnectionManager>,
     encoding_key: EncodingKey,
     decoding_key: DecodingKey,
     private_key: PrivKey,
@@ -101,8 +103,18 @@ async fn main() {
     let (encodingkey, decodingkey) = auth::generate_jwt_key();
     let (privatekey, publickey) = consensus::functions::generate_ed25519_key();
 
-    match db::shared::initialize() {
-        Ok(database) => {
+    // Create database connection pool
+    // Unwrapping since unsuccessful means failed startup anyway
+    let manager = DuckdbConnectionManager::memory().unwrap();
+    let pool = Pool::builder()
+        .max_size(8)         // 8 concurrent connections
+        .min_idle(Some(2))   // Keep 2 connections warm
+        .build(manager).unwrap();
+    
+    // Initialize database schema
+    let conn = pool.get().unwrap();
+    match db::shared::initialize(conn) {
+        Ok(()) => {
             // Initialize fragments directory
             let fragments_dir = files::functions::get_fragments_dir().unwrap_or_else(|_| {
                 eprintln!("Failed to get fragments directory, using current directory");
@@ -110,7 +122,7 @@ async fn main() {
             });
             
             let app_state = AppState {
-                db: database,
+                db_pool: pool,
                 encoding_key: encodingkey,
                 decoding_key: decodingkey,
                 private_key: PrivKey(privatekey),

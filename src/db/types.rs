@@ -22,8 +22,7 @@ use duckdb::types::{ToSql, ToSqlOutput, FromSql, FromSqlResult, ValueRef, FromSq
 use duckdb::arrow::array::StringArray;
 use x25519_dalek::{PublicKey as X25519PublicKey, EphemeralSecret};
 use chacha20poly1305::{ChaCha20Poly1305, aead::{Aead, OsRng, KeyInit}};
-use std::sync::{Arc, Mutex};
-use duckdb::Connection;
+use duckdb::DuckdbConnectionManager;
 
 /// Helper function to extract string value from DuckDB enum
 pub fn extract_enum_string(enum_type: EnumType<'_>, row_idx: usize) -> Result<String, FromSqlError> {
@@ -291,13 +290,13 @@ pub struct FileAccess {
 impl FileAccess {
     /// Create a new FileAccess entry by wrapping the per-file key for the specified user
     pub fn new_for_user(
-        db: &Arc<Mutex<Connection>>,
+        db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
         data_block_id: CustomUUID,
         user_id: i32,
         per_file_key: &chacha20poly1305::Key,
     ) -> Result<Self, DatabaseError> {
         // Look up user from database to get their X25519 public key
-        let user = match crate::db::users::get_user_by_userid(db, user_id) {
+        let user = match crate::db::users::get_user_by_userid(db_connection, user_id) {
             Ok(Some(user)) => user,
             Ok(None) => return Err(DatabaseError::RecallError), // User not found
             Err(e) => return Err(e),

@@ -10,7 +10,7 @@ impl TransactionHandler for InsertUserHandler {
         match bincode::serde::decode_from_slice::<User, _>(payload, bincode::config::standard()) {
             Ok((user_data, _)) => {
                 // Insert the user into the database using the existing insert_user function
-                insert_user(&state.db, user_data)?;
+                insert_user(state.db_pool.get(), user_data)?;
                 Ok(())
             },
             Err(_) => Err(DatabaseError::InvalidPayload),

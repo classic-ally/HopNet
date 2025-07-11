@@ -25,7 +25,7 @@ impl TransactionHandler for InsertFilesHandler {
                 }
                 
                 // Insert the files into the database with corrected stored_locally flags
-                insert_files(&state.db, inodes)?;
+                insert_files(state.db_pool.get(), inodes)?;
                 Ok(())
             },
             Err(_) => Err(DatabaseError::InvalidPayload),
