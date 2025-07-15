@@ -7,10 +7,11 @@ use axum::{
     http::header,
     body::Body
 };
+use reed_solomon_simd::ReedSolomonEncoder;
 use reqwest::StatusCode;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::OsRng};
 
-use crate::{db::{DataRecord, Inode, Blake3Hash, DatabaseError}, files::functions::{encrypt_part, encrypt_path}};
+use crate::{db::{Blake3Hash, Data, DataRecord, DatabaseError, FragmentHash, Inode}, files::functions::{calculate_chunk_padding, calculate_encrypted_chunk_length, calculate_optimal_chunks, encrypt_chunk, encrypt_part, encrypt_path, store_fragment}};
 use serde::{Deserialize, Serialize};
 
 use super::*;
@@ -147,20 +148,21 @@ pub async fn post_files(
             let unencrypted_path = part.text().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
             let path = encrypt_path(unencrypted_path, app_state.get_siv_key()?, app_state.get_siv_nonce()?).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
             
-            while let Some(part) = multipart.next_field().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? {
+            while let Some(mut part) = multipart.next_field().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? {
                 match part.name() {
-                    Some("file") => {
+                    Some(field_name) if field_name.starts_with("file_") => {
                         has_files = true;
                         // instantiate data
                         let filename = part.file_name().map(|s| s.to_string()).ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-                        let filedata = part.bytes().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                        // Parse file size from field name (format: file_123456)
+                        let file_size_str = field_name.strip_prefix("file_").ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+                        let file_size = file_size_str.parse::<usize>().map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
 
                         // encrypt filename - deterministic AES-SIV
                         let filepath = path.clone() + &encrypt_part(&filename, app_state.get_siv_key()?, app_state.get_siv_nonce()?).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
                         // Generate data block ID before sharding
                         let dataid = CustomUUID::new(None);
-                        dbg!("Creating", &dataid); 
                         
                         // Generate per-file encryption key
                         let per_file_key = ChaCha20Poly1305::generate_key(&mut OsRng);
@@ -173,7 +175,111 @@ pub async fn post_files(
                             &per_file_key
                         ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
                         
-                        let data_option = shard_file(filedata.to_vec(), &app_state.fragments_dir, dataid.clone(), &per_file_key).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                        // we will have to assume the length value is legit until the end
+                        let mut chunk_buffer: Vec<u8> = Vec::new();
+                        let mut output_chunk_metadata = Vec::new();
+
+                        let (num_original_chunks, num_recovery_chunks) = calculate_optimal_chunks(file_size);
+                        let needed_padding = calculate_chunk_padding(file_size, num_original_chunks);
+                        let target_chunk_length = (file_size + needed_padding) / num_original_chunks;
+                        let mut full_file_hasher = blake3::Hasher::new();
+
+                        let mut encoder = ReedSolomonEncoder::new(
+                            num_original_chunks,
+                            num_recovery_chunks,
+                            calculate_encrypted_chunk_length(target_chunk_length)
+                        ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+                        // stream the field chunk by chunk
+                        while let Some(chunk) = part.chunk().await.map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)? {
+                            chunk_buffer.extend_from_slice(&chunk);
+
+                            // keep loading until we reach target_chunk_length
+                            while chunk_buffer.len() >= target_chunk_length {
+                                let file_chunk = chunk_buffer.drain(..target_chunk_length).collect::<Vec<u8>>();
+                                // add to full file hash
+                                full_file_hasher.update(&file_chunk);
+                                // encrypt chunk immediately
+                                let fragment_id = CustomUUID::new(None);
+                                let encrypted_chunk = encrypt_chunk(file_chunk, &per_file_key, &fragment_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                                encoder.add_original_shard(&encrypted_chunk).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                                let chunk_hash = Blake3Hash::new(blake3::hash(&encrypted_chunk));
+                                store_fragment(&app_state.fragments_dir, &chunk_hash, encrypted_chunk).map_err(|_| StatusCode::INSUFFICIENT_STORAGE)?;
+                                let my_chunk = FragmentHash {
+                                    data_block_id: dataid.clone(),
+                                    fragment_index: output_chunk_metadata.len() as i32,
+                                    fragment_id: fragment_id,
+                                    fragment_hash: chunk_hash,
+                                    chunk_type: crate::db::ChunkType::Original,
+                                    stored_locally: false // later stage verify local storage
+                                };
+                                output_chunk_metadata.push(my_chunk);
+                            }
+                        }
+
+                        dbg!("Final chunk");
+                        // if we still have stuff in buffer, apply padding (it's final chunk)
+                        if !chunk_buffer.is_empty() {
+                            full_file_hasher.update(&chunk_buffer);
+                            chunk_buffer.resize(target_chunk_length, 0);
+
+                            let final_chunk = chunk_buffer;
+                            let fragment_id = CustomUUID::new(None);
+                            let encrypted_chunk = encrypt_chunk(final_chunk, &per_file_key, &fragment_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                            encoder.add_original_shard(&encrypted_chunk).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                            let chunk_hash = Blake3Hash::new(blake3::hash(&encrypted_chunk));
+                            store_fragment(&app_state.fragments_dir, &chunk_hash, encrypted_chunk).map_err(|_| StatusCode::INSUFFICIENT_STORAGE)?;
+                            let my_chunk = FragmentHash {
+                                data_block_id: dataid.clone(),
+                                fragment_index: output_chunk_metadata.len() as i32,
+                                fragment_id: fragment_id,
+                                fragment_hash: chunk_hash,
+                                chunk_type: crate::db::ChunkType::Original,
+                                stored_locally: false // later stage verify local storage
+                            };
+                            output_chunk_metadata.push(my_chunk);
+                        }
+
+                        // finalize full file hash with data_block_id
+                        full_file_hasher.update(dataid.as_bytes());
+                        let full_file_hash = Blake3Hash::new(full_file_hasher.finalize());
+
+                        let recovery_generator = encoder.encode().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                        let mut recovery_iter = recovery_generator.recovery_iter();
+                        while let Some(recovery_chunk) = recovery_iter.next() {
+                            let fragment_id = CustomUUID::new(None);
+                            let chunk_hash = Blake3Hash::new(blake3::hash(&recovery_chunk));
+                            store_fragment(&app_state.fragments_dir, &chunk_hash, recovery_chunk.to_vec()).map_err(|_| StatusCode::INSUFFICIENT_STORAGE)?;
+                            let my_chunk = FragmentHash {
+                                data_block_id: dataid.clone(),
+                                fragment_index: output_chunk_metadata.len() as i32,
+                                fragment_id: fragment_id,
+                                fragment_hash: chunk_hash,
+                                chunk_type: crate::db::ChunkType::Recovery,
+                                stored_locally: false // later stage verify local storage
+                            };
+                            output_chunk_metadata.push(my_chunk);
+                        }
+
+                        let data_option: Option<Data> = if output_chunk_metadata.is_empty() {
+                            None
+                        } else {
+                            Some(
+                                Data {
+                                    hash: full_file_hash,
+                                    fragments: output_chunk_metadata,
+                                    added_bytes: needed_padding as u8
+                                }
+                            )
+                        };
+                        
+                        // let filedata = part.bytes().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                        
+                        // // Debug: Compare parsed size vs actual bytes
+                        // dbg!("Actual bytes length in memory:", filedata.len());
+                        // dbg!("Size match:", file_size == filedata.len());
+                        
+                        // let data_option = shard_file(filedata.to_vec(), &app_state.fragments_dir, dataid.clone(), &per_file_key).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
                         // assemble inode for database
                         let inode = match data_option {
@@ -206,7 +312,7 @@ pub async fn post_files(
                         inodes.push(inode);
                         
                     }
-                    Some(_) => {}
+                    Some(_) => return Err(StatusCode::UNPROCESSABLE_ENTITY),
                     None => {}
                 }
             }

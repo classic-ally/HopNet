@@ -27,7 +27,7 @@ pub enum FileError {
 }
 
 // Maximum fragment size for consumer network performance
-const MAX_FRAGMENT_SIZE: usize = 64 * 1024 * 1024; // 64MB
+const MAX_FRAGMENT_SIZE: usize = 4 * 1024 * 1024; // 4MB
 
 /// Calculate optimal number of original and recovery chunks based on file size
 pub fn calculate_optimal_chunks(file_size: usize) -> (usize, usize) {
@@ -47,29 +47,35 @@ pub fn calculate_optimal_chunks(file_size: usize) -> (usize, usize) {
     (original_chunks, recovery_chunks)
 }
 
-/// Calculate padding needed to ensure even chunk sizes
-/// Returns (padded_file, added_bytes)
-pub fn calculate_padding_and_chunks(mut file: Vec<u8>, num_chunks: usize) -> (Vec<Vec<u8>>, u8) {
-    let original_len = file.len();
-    
+pub fn calculate_chunk_padding(file_size: usize, num_chunks: usize) -> usize {
     // Calculate padding needed for the chosen number of chunks
-    let mut remainder = if original_len == 0 {
+    let mut remainder = if file_size == 0 {
         0
     } else {
-        (num_chunks - (original_len % num_chunks)) % num_chunks
+        (num_chunks - (file_size % num_chunks)) % num_chunks
     };
     
     // Ensure chunk length is even
-    let chunk_len_after_padding = if original_len + remainder == 0 {
+    let chunk_len_after_padding = if file_size + remainder == 0 {
         0
     } else {
-        (original_len + remainder) / num_chunks
+        (file_size + remainder) / num_chunks
     };
     
     if chunk_len_after_padding % 2 != 0 {
         remainder += num_chunks;
     }
+
+    return remainder
+}
+
+/// Calculate padding needed to ensure even chunk sizes
+/// Returns (padded_file, added_bytes)
+pub fn calculate_padding_and_chunks(mut file: Vec<u8>, num_chunks: usize) -> (Vec<Vec<u8>>, u8) {
+    let original_len = file.len();
     
+    let remainder = calculate_chunk_padding(original_len, num_chunks);
+
     // Apply padding in one go
     if remainder > 0 {
         file.resize(original_len + remainder, 0);
@@ -170,14 +176,14 @@ pub async fn shard_file(file: Vec<u8>, fragments_dir: &str, data_block_id: crate
         encrypted_original_chunks.par_iter()
             .zip(original_fragment_metadata.par_iter())
             .try_for_each(|(encrypted_chunk, (fragment_id, chunk_hash))| {
-                store_fragment(&fragments_dir, chunk_hash, encrypted_chunk)
+                store_fragment(&fragments_dir, chunk_hash, encrypted_chunk.to_vec())
             })?;
         
         // Store recovery chunks
         recovery_chunks.par_iter()
             .zip(recovery_fragment_metadata.par_iter())
             .try_for_each(|(chunk, (fragment_id, chunk_hash))| {
-                store_fragment(&fragments_dir, chunk_hash, chunk)
+                store_fragment(&fragments_dir, chunk_hash, chunk.to_vec())
             })?;
         
         // Build the result using array indexing with bounds checking
@@ -372,7 +378,7 @@ pub fn create_fragment_path(fragments_dir: &str, fragment_hash: &Blake3Hash) -> 
 }
 
 /// Store a fragment to disk using 2-level directory structure
-pub fn store_fragment(fragments_dir: &str, fragment_hash: &Blake3Hash, data: &[u8]) -> Result<(), FileError> {
+pub fn store_fragment(fragments_dir: &str, fragment_hash: &Blake3Hash, data: Vec<u8>) -> Result<(), FileError> {
     let dir_path = create_fragment_path(fragments_dir, fragment_hash)?;
     let full_file_path = format!("{}/{}", dir_path, fragment_hash.to_hex());
     
@@ -596,6 +602,14 @@ pub fn derive_chunk_nonce(fragment_id: &crate::db::CustomUUID) -> [u8; 7] {
     nonce_bytes
 }
 
+const BUFFER_SIZE: usize = 4096;
+
+pub fn calculate_encrypted_chunk_length(
+    chunk_length: usize
+) -> usize {
+    chunk_length + (((chunk_length + BUFFER_SIZE - 1) / BUFFER_SIZE) * 16)
+}
+
 /// Encrypt a chunk using streaming ChaCha20-Poly1305 with true memory efficiency
 pub fn encrypt_chunk(
     mut chunk: Vec<u8>,  // Take ownership so we can consume it
@@ -608,8 +622,6 @@ pub fn encrypt_chunk(
     
     let mut stream_encryptor = EncryptorBE32::from_aead(cipher, nonce.as_ref().into());
     let mut encrypted_output = Vec::with_capacity(chunk.len() + 16);
-    
-    const BUFFER_SIZE: usize = 4096;
     
     // Process all segments except the last one
     while chunk.len() > BUFFER_SIZE {

@@ -75,9 +75,9 @@
             // Add path parameter (use current browse path)
             formData.append('path', currentPath);
             
-            // Add all files
+            // Add all files with size encoded in the field name
             files.forEach(file => {
-                formData.append('file', file);
+                formData.append(`file_${file.size}`, file);
             });
             
             const response = await fetch(`${API_BASE_URL}/files`, {
