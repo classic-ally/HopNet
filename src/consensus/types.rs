@@ -24,6 +24,7 @@ pub enum CertificateError {
     SigningError,
     ValidationError,
     SignerNotFound,
+    InsufficientVotes,
 }
 
 pub enum BlockError {
@@ -31,7 +32,7 @@ pub enum BlockError {
     DatabaseError,
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq)]
 pub enum ConsensusPhase {
     Propose,
     Lock,
@@ -368,6 +369,171 @@ impl QuorumCertificate {
                 Err(CertificateError::ValidationError)
             }
         }
+    }
+}
+
+// Timeout data structures following VoteSignMessage/Ballot pattern
+#[derive(Serialize, Deserialize, Clone)]
+pub struct TimeoutSignData {
+    pub view_number: i32,
+    pub highest_qc_view: i32,
+    pub highest_qc_phase: ConsensusPhase,
+    pub highest_qc_hash: Blake3Hash,
+}
+
+impl TimeoutSignData {
+    pub fn encode(&self) -> Result<Vec<u8>, VoteError> {
+        return encode_to_vec(&self, config::standard()).map_err(|_| VoteError::ProcessingError);
+    }
+    
+    pub fn sign(&self, private_key: &PrivKey) -> Result<Signature, VoteError> {
+        let data = &self.encode()?;
+        let signature = private_key.try_sign(&data).map_err(|_| VoteError::ProcessingError)?;
+        return Ok(signature);
+    }
+    
+    pub fn from_consensus_state(view_number: i32, consensus_state: &ConsensusState) -> TimeoutSignData {
+        TimeoutSignData {
+            view_number,
+            highest_qc_view: consensus_state.highest_qc_block.data.view_number,
+            highest_qc_phase: consensus_state.phase,
+            highest_qc_hash: consensus_state.highest_qc_block.block_hash,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct TimeoutVote {
+    // sender of the timeout vote (like Ballot.initiator)
+    pub sender: VoteSignMessage,
+    
+    // timeout vote contents (like Ballot.data)
+    pub data: TimeoutSignData,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TimeoutCertificate {
+    pub view_number: i32,           // View that timed out
+    pub highest_qc: QuorumCertificate,
+    pub signatures: VoteSignMessages,
+}
+
+impl TimeoutCertificate {
+    pub fn create(
+        timeout_votes: Vec<TimeoutVote>,
+        app_state: &AppState,
+    ) -> Result<TimeoutCertificate, CertificateError> {
+        if timeout_votes.is_empty() {
+            return Err(CertificateError::InsufficientVotes);
+        }
+        
+        // Find majority timeout data with quorum validation for each view
+        let (majority_timeout_data, valid_votes) = Self::find_majority_timeout_data_and_filter(timeout_votes, app_state)?;
+        
+        // Get the QC from the majority timeout data
+        let highest_qc = db::get_quorum_certificate_by_hash(app_state.db_pool.get(), &majority_timeout_data.highest_qc_view, &majority_timeout_data.highest_qc_hash, &majority_timeout_data.highest_qc_phase)
+            .map_err(|_| CertificateError::DatabaseError)?;
+
+        // Extract signatures from valid votes
+        let signatures: Vec<VoteSignMessage> = valid_votes
+            .into_iter()
+            .map(|vote| vote.sender)
+            .collect();
+        
+        Ok(TimeoutCertificate {
+            view_number: majority_timeout_data.view_number,
+            highest_qc,
+            signatures: VoteSignMessages(signatures),
+        })
+    }
+    
+    pub fn verify(&self, app_state: &AppState) -> Result<(), CertificateError> {
+        // Get validators for this view
+        let validators = db::get_validators(app_state.db_pool.get(), self.view_number)
+            .map_err(|_| CertificateError::DatabaseError)?;
+        let num_validators = validators.len();
+        
+        // Check we have enough signatures for quorum (2/3 + 1)
+        let required_signatures = (num_validators * 2) / 3 + 1;
+        let total_signatures = self.signatures.len();
+        
+        if total_signatures < required_signatures {
+            return Err(CertificateError::InsufficientVotes);
+        }
+        
+        // Verify signatures on timeout data
+        let timeout_data = TimeoutSignData {
+            view_number: self.view_number,
+            highest_qc_view: self.highest_qc.view_number,
+            highest_qc_phase: self.highest_qc.phase,
+            highest_qc_hash: self.highest_qc.block_hash,
+        };
+        let message = timeout_data.encode().map_err(|_| CertificateError::ValidationError)?;
+        
+        // Collect signatures and public keys for batch verification
+        let mut signatures = Vec::new();
+        let mut public_keys = Vec::new();
+        let mut messages = Vec::new();
+        
+        for vote_sig in &*self.signatures {
+            signatures.push(vote_sig.signature);
+            
+            // Find voter's public key
+            let voter_node = validators.iter()
+                .find(|v| v.node_id == vote_sig.replica_id)
+                .ok_or(CertificateError::SignerNotFound)?;
+            public_keys.push(*voter_node.pubkey);
+            messages.push(message.as_slice());
+        }
+        
+        // Perform batch verification
+        match ed25519_dalek::verify_batch(&messages, &signatures, &public_keys) {
+            Ok(_) => Ok(()),
+            Err(_) => Err(CertificateError::ValidationError),
+        }
+    }
+    
+    fn find_majority_timeout_data_and_filter(
+        timeout_votes: Vec<TimeoutVote>,
+        app_state: &AppState,
+    ) -> Result<(TimeoutSignData, Vec<TimeoutVote>), CertificateError> {
+        use std::collections::HashMap;
+        
+        let mut data_counts = HashMap::new();
+        
+        // Group votes by their timeout data hash
+        for vote in &timeout_votes {
+            let data_hash = vote.data.encode().map_err(|_| CertificateError::ValidationError)?;
+            data_counts.entry(data_hash).or_insert(Vec::new()).push(vote);
+        }
+        
+        // Check each group to see if it has sufficient quorum for its view
+        let mut valid_groups = Vec::new();
+        
+        for (data_hash, votes) in data_counts {
+            let view_number = votes[0].data.view_number;
+            
+            // Get validator count for this specific view
+            let validators = db::get_validators(app_state.db_pool.get(), view_number)
+                .map_err(|_| CertificateError::DatabaseError)?;
+            let required_quorum = (validators.len() * 2) / 3 + 1;
+            
+            // Check if this group has sufficient quorum
+            if votes.len() >= required_quorum {
+                valid_groups.push((data_hash, votes));
+            }
+        }
+        
+        // Find the group with the most votes among valid groups
+        let (_, majority_votes) = valid_groups
+            .into_iter()
+            .max_by_key(|(_, votes)| votes.len())
+            .ok_or(CertificateError::InsufficientVotes)?;  // Fail if no group has quorum
+        
+        let majority_timeout_data = majority_votes[0].data.clone();
+        let valid_votes = majority_votes.into_iter().cloned().collect();
+        
+        Ok((majority_timeout_data, valid_votes))
     }
 }
 

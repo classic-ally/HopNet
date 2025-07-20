@@ -259,6 +259,67 @@ pub fn get_block(
     }
 }
 
+pub fn get_quorum_certificate_by_hash(
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    view_number: &i32,
+    block_hash: &Blake3Hash,
+    phase: &ConsensusPhase
+) -> Result<QuorumCertificate, DatabaseError> {
+    match db_connection {
+        Ok(db_lock) => {
+            let mut stmt = db_lock.prepare(
+                "SELECT view_number, phase, block_hash, proposer_signature, voter_signatures FROM quorum_certificates WHERE view_number = ? AND phase = ? AND block_hash = ?"
+            ).map_err(|_| DatabaseError::RecallError)?;
+
+            let result = stmt.query_row(params![view_number, phase, block_hash], |row| {
+                Ok(QuorumCertificate {
+                    view_number: row.get(0)?,
+                    phase: row.get(1)?,
+                    block_hash: row.get(2)?,
+                    proposer_signature: row.get(3)?,
+                    voter_signatures: row.get(4)?,
+                })
+            }).map_err(|_| DatabaseError::RecallError)?;
+            Ok(result)
+        }
+        Err(_) => Err(DatabaseError::LockError)
+    }
+}
+
+pub fn insert_tc(
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    tc: TimeoutCertificate,
+) -> Result<(), DatabaseError> {
+    match db_connection {
+        Ok(mut db_lock) => {
+            let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
+            
+            // Insert the TC into timeout_certificates table
+            tx.execute(
+                "INSERT INTO timeout_certificates (view_number, highest_qc_view, highest_qc_phase, highest_qc_block_hash, signatures) VALUES (?, ?, ?, ?, ?)",
+                params![
+                    tc.view_number,
+                    tc.highest_qc.view_number,
+                    tc.highest_qc.phase,
+                    tc.highest_qc.block_hash,
+                    tc.signatures,
+                ]
+            ).map_err(|_| DatabaseError::InsertError)?;
+            
+            // Update consensus state to new view
+            let new_view = tc.view_number + 1;
+            tx.execute(
+                "UPDATE this_node SET current_view = ?, current_phase = 'propose' WHERE internal_id = 1",
+                params![new_view]
+            ).map_err(|_| DatabaseError::InsertError)?;
+            
+            tx.commit().map_err(|_| DatabaseError::InsertError)?;
+            Ok(())
+        }
+        Err(_) => Err(DatabaseError::LockError)
+    }
+}
+
 pub fn insert_qc(
     db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     qc: QuorumCertificate,

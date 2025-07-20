@@ -128,3 +128,121 @@ pub async fn post_qc(
     }
     
 }
+
+// route to receive timeout votes for distributed TC generation
+pub async fn post_timeout_vote(
+    State(app_state): State<AppState>,
+    Json(timeout_vote): Json<TimeoutVote>,
+) -> impl IntoResponse {
+    match app_state.timeout_vote_collector.add_vote(timeout_vote, &app_state).await {
+        Ok(Some(tc)) => {
+            // TC was created - apply it locally first, then broadcast
+            match apply_timeout_certificate(tc.clone(), &app_state).await {
+                Ok(_) => {
+                    // Now broadcast to other nodes
+                    match broadcast_timeout_certificate(tc, &app_state).await {
+                        Ok(_) => StatusCode::CREATED, // Applied locally and broadcast succeeded
+                        Err(_) => StatusCode::CREATED, // Applied locally but broadcast failed (still success)
+                    }
+                }
+                Err(_) => StatusCode::INTERNAL_SERVER_ERROR, // Failed to apply locally
+            }
+        }
+        Ok(None) => StatusCode::CREATED, // Vote added, no TC yet
+        Err(CertificateError::ValidationError) => StatusCode::OK, // Duplicate vote
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR, // Other error
+    }
+}
+
+// route to receive timeout certificates from other nodes
+pub async fn post_tc(
+    State(app_state): State<AppState>,
+    Json(timeout_cert): Json<TimeoutCertificate>,
+) -> impl IntoResponse {
+    // Verify TC is valid
+    match timeout_cert.verify(&app_state) {
+        Ok(_) => {
+            // Apply TC to advance consensus view
+            match apply_timeout_certificate(timeout_cert, &app_state).await {
+                Ok(_) => StatusCode::OK,
+                Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            }
+        }
+        Err(_) => StatusCode::BAD_REQUEST, // Invalid TC
+    }
+}
+
+// Helper function to broadcast timeout certificate to all validators
+pub async fn broadcast_timeout_certificate(
+    tc: TimeoutCertificate,
+    app_state: &AppState,
+) -> Result<(), CertificateError> {
+    // Get all validators except ourselves
+    let me = db::get_me(app_state.db_pool.get()).map_err(|_| CertificateError::DatabaseError)?;
+    let validators = db::get_validators(app_state.db_pool.get(), tc.view_number)
+        .map_err(|_| CertificateError::DatabaseError)?
+        .into_iter()
+        .filter(|node| node.node_id != me.node_id)
+        .collect::<Vec<_>>();
+    
+    // Broadcast TC to all other validators
+    let client = reqwest::Client::new();
+    let mut broadcast_tasks = Vec::new();
+    
+    for validator in validators {
+        let tc_clone = tc.clone();
+        let client_clone = client.clone();
+        let url = format!("http://{}:{}/consensus/tc", validator.ip_address, validator.port);
+        
+        let task = tokio::spawn(async move {
+            client_clone
+                .post(&url)
+                .json(&tc_clone)
+                .send()
+                .await
+        });
+        broadcast_tasks.push(task);
+    }
+    
+    // Wait for all broadcasts (but don't fail if some fail)
+    for task in broadcast_tasks {
+        if let Ok(result) = task.await {
+            if let Err(e) = result {
+                dbg!("Failed to broadcast TC to validator: {}", e);
+                // Continue with other broadcasts
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+// Helper function to apply timeout certificate and advance consensus view
+pub async fn apply_timeout_certificate(
+    tc: TimeoutCertificate,
+    app_state: &AppState,
+) -> Result<(), CertificateError> {
+    // Get current consensus state to validate TC view
+    let consensus_state = db::get_consensus(app_state.db_pool.get())
+        .map_err(|_| CertificateError::DatabaseError)?;
+    
+    // TC must be for our current view to maintain chain consistency
+    if tc.view_number != consensus_state.view {
+        if tc.view_number < consensus_state.view {
+            tracing::warn!("Rejecting TC for old view {} (current view: {})", tc.view_number, consensus_state.view);
+            return Err(CertificateError::ValidationError);
+        } else {
+            tracing::warn!("Rejecting TC for future view {} (current view: {})", tc.view_number, consensus_state.view);
+            return Err(CertificateError::ValidationError);
+        }
+    }
+    
+    // Store the TC in database
+    match db::insert_tc(app_state.db_pool.get(), tc.clone()) {
+        Ok(_) => {
+            tracing::info!("Applied timeout certificate for view {}", tc.view_number);
+            Ok(())
+        }
+        Err(_) => Err(CertificateError::DatabaseError),
+    }
+}

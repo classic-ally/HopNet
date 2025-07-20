@@ -70,6 +70,20 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
             CREATE INDEX idx_qc_block ON quorum_certificates(block_hash);
             CREATE INDEX idx_view_phase ON quorum_certificates(view_number, phase);
 
+            CREATE TABLE timeout_certificates (
+                view_number             INTEGER PRIMARY KEY,    -- View that timed out
+                highest_qc_view         INTEGER NOT NULL,       -- QC's view number
+                highest_qc_phase        ENUM('propose', 'lock') NOT NULL,  -- QC's phase
+                highest_qc_block_hash   BLOB NOT NULL,          -- QC's block hash
+                signatures              BLOB NOT NULL,          -- Timeout vote signatures
+
+                FOREIGN KEY (highest_qc_view, highest_qc_phase, highest_qc_block_hash) 
+                    REFERENCES quorum_certificates(view_number, phase, block_hash)
+            );
+
+            CREATE INDEX idx_tc_view ON timeout_certificates(view_number);
+            CREATE INDEX idx_tc_highest_qc ON timeout_certificates(highest_qc_view, highest_qc_phase, highest_qc_block_hash);
+
             -- Track validators that are acceptable at any given time
             -- Not using views (nodes can be in different views due to network partitions)
             -- Not using timestamps (time sync requirement)

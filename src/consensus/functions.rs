@@ -9,6 +9,8 @@ use crate::DISPATCH_TABLE;
 use tokio::sync::mpsc;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand_core::OsRng;
+use std::collections::HashMap;
+use tokio::sync::Mutex;
 
 
 pub fn generate_ed25519_key() -> (SigningKey, VerifyingKey) {
@@ -301,5 +303,95 @@ fn process_transaction(tx: &Transaction, app_state: &AppState) -> HandlerResult 
     } else {
         dbg!("No handler found for function:", &tx.function);
         Err(crate::db::DatabaseError::InvalidPayload)
+    }
+}
+
+// Timeout Vote Collection for distributed TC generation
+pub struct TimeoutVoteCollector {
+    // Map: view_number -> HashMap<timeout_data_hash, Vec<TimeoutVote>>
+    pending_votes: Mutex<HashMap<i32, HashMap<Vec<u8>, Vec<TimeoutVote>>>>,
+}
+
+impl TimeoutVoteCollector {
+    pub fn new() -> Self {
+        Self {
+            pending_votes: Mutex::new(HashMap::new()),
+        }
+    }
+    
+    pub async fn add_vote(&self, vote: TimeoutVote, app_state: &AppState) -> Result<Option<TimeoutCertificate>, CertificateError> {
+        // Poll current consensus state for cleanup
+        let consensus_state = db::get_consensus(app_state.db_pool.get())
+            .map_err(|_| CertificateError::DatabaseError)?;
+        let current_view = consensus_state.view;
+        
+        // Clean up old votes
+        self.cleanup_old_votes(current_view).await;
+        
+        // Only reject timeout votes for old views (nodes might be ahead of us)
+        if vote.data.view_number < current_view {
+            tracing::debug!("Ignoring timeout vote for old view {} (current view: {})", vote.data.view_number, current_view);
+            return Err(CertificateError::ValidationError);
+        }
+        
+        // Verify the timeout vote signature
+        self.verify_timeout_vote(&vote, app_state)?;
+        
+        // Add vote to pending collection
+        let mut pending = self.pending_votes.lock().await;
+        let view_votes = pending.entry(vote.data.view_number).or_insert_with(HashMap::new);
+        
+        // Group by timeout data hash
+        let data_hash = vote.data.encode().map_err(|_| CertificateError::ValidationError)?;
+        let data_votes = view_votes.entry(data_hash).or_insert_with(Vec::new);
+        
+        // Check for duplicate vote from same replica BEFORE adding
+        if data_votes.iter().any(|v| v.sender.replica_id == vote.sender.replica_id) {
+            return Err(CertificateError::ValidationError); // Duplicate vote
+        }
+        
+        // Add vote to collection
+        data_votes.push(vote);
+        
+        // Always try to create TC - let it decide if there's quorum
+        let timeout_votes = data_votes.clone();
+        drop(pending); // Release lock before TC creation
+        
+        match TimeoutCertificate::create(timeout_votes, app_state) {
+            Ok(tc) => Ok(Some(tc)),
+            Err(CertificateError::InsufficientVotes) => Ok(None), // Not enough votes yet
+            Err(e) => Err(e), // Real error
+        }
+    }
+    
+    async fn cleanup_old_votes(&self, current_view: i32) {
+        let mut pending = self.pending_votes.lock().await;
+        pending.retain(|&view, _| view >= current_view);
+    }
+    
+    fn verify_timeout_vote(&self, vote: &TimeoutVote, app_state: &AppState) -> Result<(), CertificateError> {
+        // Get validators to find the public key
+        let validators = db::get_validators(app_state.db_pool.get(), vote.data.view_number)
+            .map_err(|_| CertificateError::DatabaseError)?;
+        
+        // Find validator's public key
+        let validator = validators.iter()
+            .find(|v| v.node_id == vote.sender.replica_id)
+            .ok_or(CertificateError::SignerNotFound)?;
+        
+        // Verify signature
+        let message = vote.data.encode().map_err(|_| CertificateError::ValidationError)?;
+        
+        match validator.pubkey.verify_strict(&message, &vote.sender.signature) {
+            Ok(_) => Ok(()),
+            Err(_) => Err(CertificateError::ValidationError),
+        }
+    }
+    
+    pub async fn get_vote_count(&self, view: i32) -> usize {
+        let pending = self.pending_votes.lock().await;
+        pending.get(&view)
+            .map(|view_votes| view_votes.values().map(|votes| votes.len()).sum())
+            .unwrap_or(0)
     }
 }

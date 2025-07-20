@@ -8,7 +8,7 @@ use serde::{Serialize,Deserialize};
 use crate::consensus::functions::generate_ed25519_key;
 use crate::{PubKey, PrivKey, UserKeys};
 
-use crate::consensus::types::{ConsensusPhase, Block};
+use crate::consensus::types::{ConsensusPhase, Block, VoteSignMessages};
 use crate::consensus::QuorumCertificate;
 use crate::db::Sequence;
 use crate::AppState;
@@ -46,6 +46,7 @@ pub struct SyncSetupObject {
     pub blocks: Vec<Block>,
     pub validators: Vec<Validator>,
     pub quorum_certificates: Vec<QuorumCertificate>,
+    pub timeout_certificates: Vec<TimeoutSyncCertificate>,
     pub data_blocks: Vec<DataRecord>,
     pub fragment_hashes: Vec<FragmentHash>,
     pub file_access_entries: Vec<crate::db::types::FileAccess>,
@@ -59,6 +60,15 @@ pub struct Validator {
     pub effective_height: i32,
     pub node_id: i32,
     pub is_active: bool
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct TimeoutSyncCertificate {
+    pub view_number: i32,
+    pub highest_qc_view: i32,
+    pub highest_qc_phase: ConsensusPhase,
+    pub highest_qc_block_hash: Blake3Hash,
+    pub signatures: VoteSignMessages,
 }
 
 pub async fn get_setup(

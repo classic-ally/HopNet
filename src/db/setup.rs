@@ -214,6 +214,14 @@ pub fn put_join_setup(
                 ).map_err(|_| DatabaseError::InsertError)?;
             }
 
+            dbg!("Inserting timeout certificates");
+            for timeout_certificate in setupobj.timeout_certificates {
+                tx.execute(
+                    "INSERT INTO timeout_certificates (view_number, highest_qc_view, highest_qc_phase, highest_qc_block_hash, signatures) VALUES (?, ?, ?, ?, ?)",
+                    params![timeout_certificate.view_number, timeout_certificate.highest_qc_view, timeout_certificate.highest_qc_phase, timeout_certificate.highest_qc_block_hash, timeout_certificate.signatures]
+                ).map_err(|_| DatabaseError::InsertError)?;
+            }
+
             dbg!("Inserting data_blocks");
             for data_block in setupobj.data_blocks {
                 tx.execute(

@@ -182,6 +182,22 @@ pub async fn insert_node(
             let qcs: Vec<QuorumCertificate> = rows_qcs.collect::<Result<Vec<QuorumCertificate>, _>>()
                 .map_err(|_| DatabaseError::ProcessingError)?;
 
+            dbg!("Fetching timeout certificates");
+            let mut stmt_tcs = tx.prepare(
+                "SELECT view_number, highest_qc_view, highest_qc_phase, highest_qc_block_hash, signatures FROM timeout_certificates"
+            ).map_err(|_| DatabaseError::RecallError)?;
+            let rows_tcs = stmt_tcs.query_map([], |row| {
+                Ok(crate::setup::TimeoutSyncCertificate {
+                    view_number: row.get(0)?,
+                    highest_qc_view: row.get(1)?,
+                    highest_qc_phase: row.get(2)?,
+                    highest_qc_block_hash: row.get(3)?,
+                    signatures: row.get(4)?,
+                })
+            }).map_err(|_| DatabaseError::RecallError)?;
+            let tcs: Vec<crate::setup::TimeoutSyncCertificate> = rows_tcs.collect::<Result<Vec<crate::setup::TimeoutSyncCertificate>, _>>()
+                .map_err(|_| DatabaseError::ProcessingError)?;
+
             // File system data extract
             dbg!("Fetching data_blocks");
             let mut stmt_data_blocks = tx.prepare(
@@ -316,6 +332,7 @@ pub async fn insert_node(
                 blocks: blocks,
                 validators: validators,
                 quorum_certificates: qcs,
+                timeout_certificates: tcs,
                 data_blocks: data_blocks,
                 fragment_hashes: fragment_hashes,
                 file_access_entries: file_access_entries,

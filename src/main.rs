@@ -11,6 +11,8 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use duckdb::DuckdbConnectionManager;
 use r2d2::Pool;
+use apalis::prelude::*;
+use std::str::FromStr;
 
 use crate::{db::{PrivKey, PubKey}, handlers::TransactionHandler};
 
@@ -45,6 +47,7 @@ pub struct AppState {
     siv_key: Arc<OnceCell<Key<Aes256Siv>>>,
     siv_nonce: Arc<OnceCell<Nonce>>,
     fragments_dir: String,
+    timeout_vote_collector: Arc<consensus::functions::TimeoutVoteCollector>,
 }
 
 impl AppState {
@@ -130,7 +133,21 @@ async fn main() {
                 siv_key: Arc::new(OnceCell::new()),
                 siv_nonce: Arc::new(OnceCell::new()),
                 fragments_dir,
+                timeout_vote_collector: Arc::new(consensus::functions::TimeoutVoteCollector::new()),
             };
+
+            // Start timeout detection worker with cron schedule (every minute)
+            let schedule = apalis_cron::Schedule::from_str("0 * * * * *").unwrap(); // Every minute
+            let cron_stream = apalis_cron::CronStream::new(schedule);
+            
+            let timeout_worker = WorkerBuilder::new("timeout-detection")
+                .data(app_state.clone())
+                .backend(cron_stream)
+                .build_fn(consensus::jobs::handle_timeout_detection);
+            
+            tokio::spawn(async move {
+                timeout_worker.run().await;
+            });
 
             // Protected routes that require authentication
             let protected_routes = Router::new()
@@ -158,7 +175,9 @@ async fn main() {
                 .route("/rpc/get-remote-latency", get(metrics::routes::get_remote_latency_handler))
                 .route("/login", post(auth::sign_in))
                 .route("/ballot", post(consensus::routes::post_ballot))
-                .route("/qc", post(consensus::routes::post_qc));
+                .route("/qc", post(consensus::routes::post_qc))
+                .route("/consensus/timeout_vote", post(consensus::routes::post_timeout_vote))
+                .route("/consensus/tc", post(consensus::routes::post_tc));
 
             let app = if cfg!(debug_assertions) {
                 let cors = CorsLayer::new()
