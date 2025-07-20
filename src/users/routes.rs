@@ -2,6 +2,7 @@ use axum::{
     extract::State,
     http::StatusCode,
     response::IntoResponse,
+    Extension,
     Json,
 };
 use bincode::config;
@@ -43,6 +44,7 @@ impl UserRequest {
 
 pub async fn post_users (
     State(app_state): State<AppState>,
+    Extension(user_id): Extension<i32>,  // Extract user_id from JWT via auth middleware
     Json(payload): Json<UserRequest>
 ) -> impl IntoResponse {
     // Consensus block generation
@@ -64,7 +66,7 @@ pub async fn post_users (
             let transactions = vec![transaction];
 
             // quorum middleware test
-            match consensus_middleware(&app_state, transactions).await {
+            match consensus_middleware(&app_state, transactions, user_id).await {
                 Ok(()) => StatusCode::CREATED,
                 Err(_) => StatusCode::INTERNAL_SERVER_ERROR
             }

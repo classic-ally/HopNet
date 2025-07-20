@@ -30,12 +30,32 @@ pub enum ConsensusError {
     TimeoutError,
     MalformedReply,
     ThreadError,
+    ForwardingError,
+    NetworkError,
 }
 
-pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transaction>) -> Result<(), ConsensusError> {
+pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transaction>, user_id: i32) -> Result<(), ConsensusError> {
     dbg!("Begin middleware");
+    
+    // Check if we are the current leader
+    let consensus_state = db::get_consensus(app_state.db_pool.get()).map_err(|_| ConsensusError::DatabaseError)?;
+    let my_node_id = app_state.get_node_id().map_err(|_| ConsensusError::DatabaseError)?;
+    
+    if consensus_state.leader.node_id != my_node_id {
+        // Forward to leader instead of initiating consensus
+        dbg!("Not the leader ({}), forwarding to leader ({})", my_node_id, consensus_state.leader.node_id);
+        return forward_to_leader(consensus_state.leader, transactions, user_id, app_state).await;
+    }
+    
+    dbg!("We are the leader, initiating consensus");
     let block = Block::new_tip(&app_state, transactions).map_err(|_| ConsensusError::BlockError)?;
-    let me = db::get_me(app_state.db_pool.get()).map_err(|_| ConsensusError::DatabaseError)?;
+    
+    // Construct MyNode from AppState
+    let me = MyNode {
+        node_id: my_node_id,
+        privkey: app_state.private_key.clone(),
+    };
+    
     let validators = db::get_validators(app_state.db_pool.get(), block.data.height).map_err(|_| ConsensusError::DatabaseError)?
         .iter()
         .filter(|node| node.node_id != me.node_id)
@@ -393,5 +413,51 @@ impl TimeoutVoteCollector {
         pending.get(&view)
             .map(|view_votes| view_votes.values().map(|votes| votes.len()).sum())
             .unwrap_or(0)
+    }
+}
+
+// Leader forwarding function for non-leader nodes
+async fn forward_to_leader(
+    leader: crate::types::Node,
+    transactions: Vec<Transaction>,
+    user_id: i32,
+    app_state: &AppState
+) -> Result<(), ConsensusError> {
+    let my_node_id = app_state.get_node_id().map_err(|_| ConsensusError::DatabaseError)?;
+    let user_keys = app_state.get_user_keys().map_err(|_| ConsensusError::DatabaseError)?;
+    
+    // Serialize transactions for signing
+    let body = serde_json::to_vec(&transactions).map_err(|_| ConsensusError::SigningError)?;
+    
+    // Sign with both node and user keys
+    let node_signature = app_state.private_key.try_sign(&body).map_err(|_| ConsensusError::SigningError)?;
+    let user_signature = user_keys.private_key.try_sign(&body).map_err(|_| ConsensusError::SigningError)?;
+    
+    // Forward to leader
+    let client = reqwest::Client::new();
+    let url = format!("http://{}:{}/consensus/propose", leader.ip_address, leader.port);
+    
+    dbg!("Forwarding to leader at: {} (user_id: {}, node_id: {})", &url, user_id, my_node_id);
+    
+    let response = client
+        .post(&url)
+        .header("X-Node-ID", my_node_id.to_string())
+        .header("X-User-ID", user_id.to_string())
+        .header("X-Node-Signature", hex::encode(node_signature.to_bytes()))
+        .header("X-User-Signature", hex::encode(user_signature.to_bytes()))
+        .json(&transactions)
+        .send()
+        .await
+        .map_err(|_| ConsensusError::NetworkError)?;
+    
+    match response.status() {
+        reqwest::StatusCode::OK | reqwest::StatusCode::CREATED => {
+            dbg!("Leader successfully processed transactions");
+            Ok(())
+        }
+        _ => {
+            dbg!("Leader rejected transactions: {}", response.status());
+            Err(ConsensusError::ForwardingError)
+        }
     }
 }

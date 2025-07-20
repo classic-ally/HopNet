@@ -31,7 +31,7 @@ pub fn post_initial_setup(
     pubkey: PubKey,
     privkey: PrivKey,
     user_privkey: PrivKey
-) -> Result<(), DatabaseError> {
+) -> Result<i32, DatabaseError> {
     match db_connection {
         Ok(mut db_lock) => {
             let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
@@ -143,7 +143,7 @@ pub fn post_initial_setup(
             
             dbg!("Successfully inserted setup info");
 
-            Ok(())
+            Ok(next_node_id)
 
         }
         Err(_) => Err(DatabaseError::LockError)

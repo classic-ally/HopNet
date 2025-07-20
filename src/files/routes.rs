@@ -341,7 +341,7 @@ pub async fn post_files(
             let transactions = vec![transaction];
 
             // Use consensus middleware to ensure distributed agreement
-            match consensus_middleware(&app_state, transactions).await {
+            match consensus_middleware(&app_state, transactions, user_id).await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     dbg!(e);

@@ -28,6 +28,17 @@ use crate::db::consensus as db;
 
 
 use crate::AppState;
+use axum::middleware::{self, Next};
+use axum::http::Request;
+use axum::body::Body;
+
+// Authenticated user information passed to routes
+#[derive(Clone, Debug)]
+pub struct AuthenticatedUser {
+    pub user_id: i32,
+    pub node_id: i32,
+    pub user_owns_node: bool,
+}
 
 // route to get the consensus status
 pub async fn get_consensus(
@@ -215,6 +226,130 @@ pub async fn broadcast_timeout_certificate(
     }
     
     Ok(())
+}
+
+// RPC middleware for verifying dual Ed25519 signatures (node + user) on inter-node requests
+pub async fn rpc_auth_middleware(
+    State(app_state): State<AppState>,
+    mut req: Request<Body>,
+    next: Next,
+) -> impl IntoResponse {
+    // Extract required headers
+    let headers = req.headers();
+    let node_id_header = headers.get("X-Node-ID");
+    let user_id_header = headers.get("X-User-ID");
+    let node_signature_header = headers.get("X-Node-Signature");
+    let user_signature_header = headers.get("X-User-Signature");
+    
+    match (node_id_header, user_id_header, node_signature_header, user_signature_header) {
+        (Some(node_id_val), Some(user_id_val), Some(node_sig_val), Some(user_sig_val)) => {
+            // Parse IDs
+            let node_id: i32 = match node_id_val.to_str().ok().and_then(|s| s.parse().ok()) {
+                Some(id) => id,
+                None => return StatusCode::BAD_REQUEST.into_response(),
+            };
+            let user_id: i32 = match user_id_val.to_str().ok().and_then(|s| s.parse().ok()) {
+                Some(id) => id,
+                None => return StatusCode::BAD_REQUEST.into_response(),
+            };
+            
+            // Parse signatures
+            let node_signature = match node_sig_val.to_str().ok()
+                .and_then(|s| hex::decode(s).ok())
+                .and_then(|bytes| {
+                    if bytes.len() == 64 {
+                        let mut sig_bytes = [0u8; 64];
+                        sig_bytes.copy_from_slice(&bytes);
+                        Some(ed25519_dalek::Signature::from_bytes(&sig_bytes))
+                    } else {
+                        None
+                    }
+                }) {
+                Some(sig) => sig,
+                None => return StatusCode::BAD_REQUEST.into_response(),
+            };
+            let user_signature = match user_sig_val.to_str().ok()
+                .and_then(|s| hex::decode(s).ok())
+                .and_then(|bytes| {
+                    if bytes.len() == 64 {
+                        let mut sig_bytes = [0u8; 64];
+                        sig_bytes.copy_from_slice(&bytes);
+                        Some(ed25519_dalek::Signature::from_bytes(&sig_bytes))
+                    } else {
+                        None
+                    }
+                }) {
+                Some(sig) => sig,
+                None => return StatusCode::BAD_REQUEST.into_response(),
+            };
+            
+            // Get authentication info from database
+            let (node_pubkey, user_pubkey, user_owns_node) = match db::get_node_user_auth_info(
+                app_state.db_pool.get(), 
+                node_id, 
+                user_id
+            ) {
+                Ok(info) => info,
+                Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+            };
+            
+            // Extract and verify signatures against request body
+            let (parts, body) = req.into_parts();
+            let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+                Ok(bytes) => bytes,
+                Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+            };
+            
+            // Verify both signatures
+            let verification_result = (|| -> Result<(), ()> {
+                // Verify node signature
+                node_pubkey.verify_strict(&body_bytes, &node_signature).map_err(|_| ())?;
+                // Verify user signature  
+                user_pubkey.verify_strict(&body_bytes, &user_signature).map_err(|_| ())?;
+                Ok(())
+            })();
+            
+            if verification_result.is_err() {
+                dbg!("Signature verification failed for user {} on node {}", user_id, node_id);
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+            
+            dbg!("Signatures verified for user {} on node {} (owns_node: {})", 
+                 user_id, node_id, user_owns_node);
+            
+            // Reconstruct request with verified auth info
+            let auth_user = AuthenticatedUser {
+                user_id,
+                node_id,
+                user_owns_node,
+            };
+            
+            let mut new_req = Request::from_parts(parts, Body::from(body_bytes));
+            new_req.extensions_mut().insert(auth_user);
+            
+            next.run(new_req).await
+        }
+        _ => {
+            dbg!("Missing required RPC headers: X-Node-ID, X-User-ID, X-Node-Signature, X-User-Signature");
+            StatusCode::UNAUTHORIZED.into_response()
+        }
+    }
+}
+
+// Route for non-leaders to forward transactions to the leader (pre-authenticated by middleware)
+pub async fn post_propose(
+    State(app_state): State<AppState>,
+    axum::Extension(auth_user): axum::Extension<AuthenticatedUser>,
+    Json(transactions): Json<Vec<Transaction>>,
+) -> impl IntoResponse {
+    dbg!("Processing authenticated transaction request from user {} on node {} (owns_node: {})", 
+         auth_user.user_id, auth_user.node_id, auth_user.user_owns_node);
+    
+    // Process transactions through consensus (already authenticated)
+    match crate::consensus::functions::consensus_middleware(&app_state, transactions, auth_user.user_id).await {
+        Ok(()) => StatusCode::OK,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
 }
 
 // Helper function to apply timeout certificate and advance consensus view

@@ -370,6 +370,34 @@ pub fn insert_qc(
     }
 }
 
+// Efficient function to get node and user pubkeys for RPC authentication
+// Also returns whether the user owns the node
+pub fn get_node_user_auth_info(
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    node_id: i32,
+    user_id: i32,
+) -> Result<(PubKey, PubKey, bool), DatabaseError> {
+    match db_connection {
+        Ok(db_lock) => {
+            let mut stmt = db_lock.prepare(
+                "SELECT n.pubkey as node_pubkey, u.pubkey as user_pubkey, (n.owner = u.user_id) as user_owns_node
+                 FROM nodes n, users u 
+                 WHERE n.node_id = ? AND u.user_id = ?"
+            ).map_err(|_| DatabaseError::RecallError)?;
+
+            let result = stmt.query_row([node_id, user_id], |row| {
+                let node_pubkey: PubKey = row.get(0)?;
+                let user_pubkey: PubKey = row.get(1)?;
+                let user_owns_node: bool = row.get(2)?;
+                Ok((node_pubkey, user_pubkey, user_owns_node))
+            }).map_err(|_| DatabaseError::RecallError)?;
+            
+            Ok(result)
+        }
+        Err(_) => Err(DatabaseError::LockError)
+    }
+}
+
 pub fn get_me(
     db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
 ) -> Result<MyNode, DatabaseError> {

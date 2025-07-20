@@ -103,6 +103,10 @@ pub async fn put_setup(
     app_state.user_keys.set(user_keys)
         .map_err(|_| StatusCode::CONFLICT)?; // Already initialized
     
+    // Set node_id from the payload
+    app_state.node_id.set(payload.yournode.node_id)
+        .map_err(|_| StatusCode::CONFLICT)?; // Already initialized
+    
     // Initialize SIV keys from user private key
     app_state.initialize_siv_keys()?;
     
@@ -152,7 +156,12 @@ pub async fn post_setup(
     };
 
     match setup::post_initial_setup(app_state.db_pool.get(), user, node, app_state.public_key, app_state.private_key, user_keys.private_key) {
-        Ok(()) => Ok(StatusCode::CREATED),
+        Ok(node_id) => {
+            // Set the generated node_id in app state
+            app_state.node_id.set(node_id)
+                .map_err(|_| StatusCode::CONFLICT)?; // Already initialized
+            Ok(StatusCode::CREATED)
+        },
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR)
     }
 }

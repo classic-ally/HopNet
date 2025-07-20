@@ -43,6 +43,7 @@ pub struct AppState {
     decoding_key: DecodingKey,
     private_key: PrivKey,
     public_key: PubKey,
+    node_id: Arc<OnceCell<i32>>,
     user_keys: Arc<OnceCell<UserKeys>>,
     siv_key: Arc<OnceCell<Key<Aes256Siv>>>,
     siv_nonce: Arc<OnceCell<Nonce>>,
@@ -53,6 +54,10 @@ pub struct AppState {
 impl AppState {
     pub fn get_user_keys(&self) -> Result<&UserKeys, StatusCode> {
         self.user_keys.get().ok_or(StatusCode::PRECONDITION_REQUIRED)
+    }
+    
+    pub fn get_node_id(&self) -> Result<i32, StatusCode> {
+        self.node_id.get().copied().ok_or(StatusCode::PRECONDITION_REQUIRED)
     }
     
     pub fn get_siv_key(&self) -> Result<&Key<Aes256Siv>, StatusCode> {
@@ -129,6 +134,7 @@ async fn main() {
                 decoding_key: decodingkey,
                 private_key: PrivKey(privatekey),
                 public_key: PubKey(publickey),
+                node_id: Arc::new(OnceCell::new()),
                 user_keys: Arc::new(OnceCell::new()),
                 siv_key: Arc::new(OnceCell::new()),
                 siv_nonce: Arc::new(OnceCell::new()),
@@ -163,10 +169,16 @@ async fn main() {
                 .route("/consensus", get(consensus::routes::get_consensus))
                 .layer(middleware::from_fn_with_state(app_state.clone(), auth::auth_middleware));
 
+            // RPC routes for inter-node communication with dual signature authentication
+            let rpc_routes = Router::new()
+                .route("/consensus/propose", post(consensus::routes::post_propose))
+                .layer(middleware::from_fn_with_state(app_state.clone(), consensus::routes::rpc_auth_middleware));
+
             let base_app = Router::new()
                 .fallback_service(admin_service) // routes we don't have get sent to vite frontend
                 .route("/metrics/get-all", get(metrics::routes::get_metrics))
                 .merge(protected_routes)
+                .merge(rpc_routes)
                 .route("/setup", get(setup::get_setup))
                 .route("/setup", post(setup::post_setup))
                 .route("/setup", put(setup::put_setup))
