@@ -300,7 +300,7 @@ pub async fn insert_node(
             // Add the new node as a validator starting from the next block height
             tx.execute(
                 "INSERT INTO validators (effective_height, node_id, is_active) VALUES (?, ?, ?)",
-                params![current_height, next_id, true]
+                params![current_height + 1, next_id, true]
             ).map_err(|_| DatabaseError::InsertError)?;
 
             // Construct and append
