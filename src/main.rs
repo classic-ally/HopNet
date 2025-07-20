@@ -80,11 +80,11 @@ impl AppState {
 }
 
 static DISPATCH_TABLE: Lazy<HashMap<&'static str, &'static dyn TransactionHandler>> = Lazy::new(|| {
-    dbg!("Building dispatch table from registered handlers...");
+    tracing::info!("Building dispatch table from registered handlers");
     let mut table = HashMap::new();
     // iterate over the globally collected handlers
     for handler in inventory::iter::<&'static dyn TransactionHandler> {
-        dbg!(" - Registering handler: {}", handler.name());
+        tracing::debug!("Registering handler: {}", handler.name());
         table.insert(handler.name(), *handler);
     }
     table
@@ -102,7 +102,7 @@ async fn main() {
     let os = std::env::consts::OS;
     if os == "linux" {
         port = port + 1;
-        dbg!("Running on Linux on port {}", port);
+        tracing::info!("Running on Linux on port {}", port);
     }
 
     let bindurl = format!("0.0.0.0:{}", port);
@@ -207,9 +207,9 @@ async fn main() {
                     .with_state(app_state)
             };
 
-            match tokio::net::TcpListener::bind(bindurl).await {
+            match tokio::net::TcpListener::bind(&bindurl).await {
                 Ok(listener) => {
-                    dbg!("beginning server");
+                    tracing::info!("Server starting on {}", bindurl);
                     serve(listener, app).await.unwrap();
                 }
                 Err(error) => {panic!("{}", error)}

@@ -69,34 +69,58 @@ pub async fn post_ballot(
     // validate the ballot proposal
     match ballot.verify_proposal(&app_state) {
         Ok(()) => {
-            // sign and return the response
-            dbg!("Signing off on block hash {}", ballot.block.block_hash);
+            tracing::debug!(
+                "Ballot verified for view {} phase {:?} block {:?}",
+                ballot.data.view, ballot.data.phase, ballot.block.block_hash
+            );
+            
             match ballot.sign(&app_state) {
                 Ok(signoff) => {
                     // Only insert block during Propose phase, not Lock phase
                     if ballot.data.phase == ConsensusPhase::Propose {
-                        dbg!("Adding to database block hash {}", ballot.block.block_hash);
+                        tracing::debug!(
+                            "Inserting new block {:?} for view {} into database",
+                            ballot.block.block_hash, ballot.data.view
+                        );
                         match db::insert_block(app_state.db_pool.get(), &ballot.block) {
                             Ok(()) => {
-                                dbg!("Block saved!");
+                                tracing::debug!(
+                                    "Block {:?} saved and signed for view {} propose phase",
+                                    ballot.block.block_hash, ballot.data.view
+                                );
                                 return (StatusCode::OK, Json(signoff)).into_response()
                             },
-                            Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Error adding block to database").into_response(),
+                            Err(_) => {
+                                tracing::error!(
+                                    "Failed to save block {:?} to database",
+                                    ballot.block.block_hash
+                                );
+                                return (StatusCode::INTERNAL_SERVER_ERROR, "Error adding block to database").into_response()
+                            },
                         }
                     } else {
                         // Lock phase - block should already exist, just return the signature
-                        dbg!("Lock phase - block already exists, returning signature");
+                        tracing::debug!(
+                            "Lock phase vote signed for view {} block {:?}",
+                            ballot.data.view, ballot.block.block_hash
+                        );
                         return (StatusCode::OK, Json(signoff)).into_response()
                     }
                 }
                 Err(e) => {
-                    dbg!(e);
+                    tracing::error!(
+                        "Failed to sign ballot for view {} phase {:?}: {:?}",
+                        ballot.data.view, ballot.data.phase, e
+                    );
                     return (StatusCode::INTERNAL_SERVER_ERROR, "Error signing ballot").into_response()
                 },
             }
         }
         Err(e) => {
-            dbg!(e);
+            tracing::warn!(
+                "Ballot rejected for view {} phase {:?}: {:?}",
+                ballot.data.view, ballot.data.phase, e
+            );
             return (StatusCode::UNAUTHORIZED, "Ballot rejected").into_response()
         },
     }
@@ -107,35 +131,62 @@ pub async fn post_qc(
     State(app_state): State<AppState>,
     Json(qc): Json<QuorumCertificate>
 ) -> impl IntoResponse {
-    // validate the QC against internal block
-    dbg!("Received QC");
+    tracing::debug!(
+        "Received QC for view {} phase {:?} block {:?}",
+        qc.view_number, qc.phase, qc.block_hash
+    );
+    
     match db::get_block(app_state.db_pool.get(), qc.block_hash) {
         Ok(block) => {
-            dbg!("We have the block, verifying...");
+            tracing::debug!(
+                "Found block {:?} for QC verification",
+                qc.block_hash
+            );
+            
             match qc.verify(&app_state, &block) {
                 Ok(()) => {
-                    // save it to db
-                    dbg!("QC looks good, committing");
+                    tracing::debug!(
+                        "QC verified, inserting into database for view {} phase {:?}",
+                        qc.view_number, qc.phase
+                    );
+                    
                     match db::insert_qc(app_state.db_pool.get(), qc.clone()) {
                         Ok(()) => {
                             // Process transactions if this is a Lock phase QC
                             if qc.phase == ConsensusPhase::Lock {
-                                dbg!("Lock phase QC committed, processing transactions");
+                                tracing::info!(
+                                    "Lock phase QC committed for view {}, processing transactions",
+                                    qc.view_number
+                                );
                                 crate::consensus::functions::process_transactions(&block.data.transactions, &app_state);
                             }
                             StatusCode::OK
                         },
-                        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                        Err(_) => {
+                            tracing::error!(
+                                "Failed to insert QC for view {} phase {:?}",
+                                qc.view_number, qc.phase
+                            );
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        },
                     }
                 }
                 Err(e) => {
-                    dbg!("Don't like the QC, printing error");
-                    dbg!(e);
+                    tracing::warn!(
+                        "QC verification failed for view {} phase {:?}: {:?}",
+                        qc.view_number, qc.phase, e
+                    );
                     StatusCode::UNAUTHORIZED
                 }
             }
         }
-        Err(_) => StatusCode::NOT_FOUND
+        Err(_) => {
+            tracing::warn!(
+                "Block {:?} not found for QC verification",
+                qc.block_hash
+            );
+            StatusCode::NOT_FOUND
+        }
     }
     
 }
@@ -219,7 +270,7 @@ pub async fn broadcast_timeout_certificate(
     for task in broadcast_tasks {
         if let Ok(result) = task.await {
             if let Err(e) = result {
-                dbg!("Failed to broadcast TC to validator: {}", e);
+                tracing::debug!("Failed to broadcast TC to validator: {}", e);
                 // Continue with other broadcasts
             }
         }
@@ -310,12 +361,17 @@ pub async fn rpc_auth_middleware(
             })();
             
             if verification_result.is_err() {
-                dbg!("Signature verification failed for user {} on node {}", user_id, node_id);
+                tracing::warn!(
+                    "RPC signature verification failed for user {} on node {}",
+                    user_id, node_id
+                );
                 return StatusCode::UNAUTHORIZED.into_response();
             }
             
-            dbg!("Signatures verified for user {} on node {} (owns_node: {})", 
-                 user_id, node_id, user_owns_node);
+            tracing::info!(
+                "RPC signatures verified for user {} on node {} (owns_node: {})",
+                user_id, node_id, user_owns_node
+            );
             
             // Reconstruct request with verified auth info
             let auth_user = AuthenticatedUser {
@@ -330,7 +386,7 @@ pub async fn rpc_auth_middleware(
             next.run(new_req).await
         }
         _ => {
-            dbg!("Missing required RPC headers: X-Node-ID, X-User-ID, X-Node-Signature, X-User-Signature");
+            tracing::warn!("Missing required RPC headers: X-Node-ID, X-User-ID, X-Node-Signature, X-User-Signature");
             StatusCode::UNAUTHORIZED.into_response()
         }
     }
@@ -342,8 +398,10 @@ pub async fn post_propose(
     axum::Extension(auth_user): axum::Extension<AuthenticatedUser>,
     Json(transactions): Json<Vec<Transaction>>,
 ) -> impl IntoResponse {
-    dbg!("Processing authenticated transaction request from user {} on node {} (owns_node: {})", 
-         auth_user.user_id, auth_user.node_id, auth_user.user_owns_node);
+    tracing::info!(
+        "Processing authenticated consensus proposal from user {} on node {} (owns_node: {})",
+        auth_user.user_id, auth_user.node_id, auth_user.user_owns_node
+    );
     
     // Process transactions through consensus (already authenticated)
     match crate::consensus::functions::consensus_middleware(&app_state, transactions, auth_user.user_id).await {

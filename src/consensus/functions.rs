@@ -35,7 +35,7 @@ pub enum ConsensusError {
 }
 
 pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transaction>, user_id: i32) -> Result<(), ConsensusError> {
-    dbg!("Begin middleware");
+    tracing::debug!("Starting consensus middleware for {} transactions", transactions.len());
     
     // Check if we are the current leader
     let consensus_state = db::get_consensus(app_state.db_pool.get()).map_err(|_| ConsensusError::DatabaseError)?;
@@ -43,11 +43,17 @@ pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transa
     
     if consensus_state.leader.node_id != my_node_id {
         // Forward to leader instead of initiating consensus
-        dbg!("Not the leader ({}), forwarding to leader ({})", my_node_id, consensus_state.leader.node_id);
+        tracing::info!(
+            "Not the leader (node {}), forwarding transactions to leader (node {})",
+            my_node_id, consensus_state.leader.node_id
+        );
         return forward_to_leader(consensus_state.leader, transactions, user_id, app_state).await;
     }
     
-    dbg!("We are the leader, initiating consensus");
+    tracing::info!(
+        "Acting as leader (node {}) for view {}, initiating consensus",
+        my_node_id, consensus_state.view
+    );
     let block = Block::new_tip(&app_state, transactions).map_err(|_| ConsensusError::BlockError)?;
     
     // Construct MyNode from AppState
@@ -105,8 +111,10 @@ async fn ballot_round(
 
     match qc.verify(&app_state, &block) {
         Ok(_) => {
-            // save it to db
-            dbg!("QC looks good, committing");
+            tracing::info!(
+                "QC verification passed, inserting QC for view {} phase {:?}",
+                qc.view_number, qc.phase
+            );
             db::insert_qc(app_state.db_pool.get(), qc.clone()).map_err(|_| ConsensusError::DatabaseError)?;
         },
         Err(_) => return Err(ConsensusError::SigningError)
@@ -197,7 +205,7 @@ async fn broadcast_qc(
                     let _ = confirmations_tx_clone.send(()).await;
                 }
                 Err(e) => {
-                    dbg!("Failed to send QC to node: {:?}", &e);
+                    tracing::debug!("Failed to send QC to node: {:?}", &e);
                     // Don't send confirmation on failure
                 }
             }
@@ -283,17 +291,17 @@ async fn qc_send(
         .await
     {
         Ok(response) => {
-            dbg!("Received a response");
+            tracing::debug!("Received response from validator");
             if response.status().is_success() {
-                dbg!("Response OK");
+                tracing::debug!("Validator response OK");
                 Ok(())
             } else {
-                dbg!("Response MalformedReply");
+                tracing::warn!("Validator returned error status: {}", response.status());
                 return Err(ConsensusError::MalformedReply)
             }
         }
-        Err(_) => {
-            dbg!("TimeoutError");
+        Err(e) => {
+            tracing::warn!("Failed to reach validator: {:?}", e);
             return Err(ConsensusError::TimeoutError)
         }
     }
@@ -304,10 +312,10 @@ pub fn process_transactions(transactions: &Option<Transactions>, app_state: &App
         for tx in transactions.iter() {
             match process_transaction(tx, app_state) {
                 Ok(_) => {
-                    dbg!("Transaction processed successfully: {}", &tx.function);
+                    tracing::debug!("Transaction processed successfully: {}", &tx.function);
                 }
                 Err(e) => {
-                    dbg!("Failed to process transaction {}: {:?}", &tx.function, e);
+                    tracing::error!("Failed to process transaction {}: {:?}", &tx.function, e);
                     // Continue processing other transactions even if one fails
                 }
             }
@@ -321,7 +329,7 @@ fn process_transaction(tx: &Transaction, app_state: &AppState) -> HandlerResult 
         // if found, execute it with the payload
         handler.handle(app_state, &tx.payload)
     } else {
-        dbg!("No handler found for function:", &tx.function);
+        tracing::warn!("No handler found for function: {}", &tx.function);
         Err(crate::db::DatabaseError::InvalidPayload)
     }
 }
@@ -437,7 +445,10 @@ async fn forward_to_leader(
     let client = reqwest::Client::new();
     let url = format!("http://{}:{}/consensus/propose", leader.ip_address, leader.port);
     
-    dbg!("Forwarding to leader at: {} (user_id: {}, node_id: {})", &url, user_id, my_node_id);
+    tracing::info!(
+        "Forwarding {} transactions to leader at {} (user_id: {}, node_id: {})",
+        transactions.len(), &url, user_id, my_node_id
+    );
     
     let response = client
         .post(&url)
@@ -452,11 +463,14 @@ async fn forward_to_leader(
     
     match response.status() {
         reqwest::StatusCode::OK | reqwest::StatusCode::CREATED => {
-            dbg!("Leader successfully processed transactions");
+            tracing::debug!("Leader successfully processed {} transactions", transactions.len());
             Ok(())
         }
         _ => {
-            dbg!("Leader rejected transactions: {}", response.status());
+            tracing::warn!(
+                "Leader rejected transactions with status: {}",
+                response.status()
+            );
             Err(ConsensusError::ForwardingError)
         }
     }

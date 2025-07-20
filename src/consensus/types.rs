@@ -299,7 +299,6 @@ impl QuorumCertificate {
     pub fn verify(&self, state: &AppState, block: &Block) -> Result<(), CertificateError> {
         // Get validators for this height
         let validators = db::get_validators(state.db_pool.get(), block.data.height).map_err(|_| CertificateError::DatabaseError)?;
-        dbg!(&validators.len());
         let num_validators = validators.len();
         
         // Check we have enough signatures for quorum (2/3 + 1)
@@ -307,15 +306,20 @@ impl QuorumCertificate {
         let total_signatures = 1 + self.voter_signatures.len(); // proposer + voters
         
         if total_signatures < required_signatures {
-            dbg!("Not enough signatures");
-            dbg!(total_signatures);
-            dbg!(required_signatures);
+            tracing::warn!(
+                "QC verification failed: insufficient signatures (got: {}, required: {}, validators: {})",
+                total_signatures, required_signatures, num_validators
+            );
             return Err(CertificateError::ValidationError);
         }
         
+        tracing::debug!(
+            "Verifying QC for view {} phase {:?} with {} signatures from {} validators",
+            self.view_number, self.phase, total_signatures, num_validators
+        );
+        
         // Prepare data for batch verification
         let vote_data = VoteSignData::from_block(block.clone(), self.phase.clone());
-        dbg!("Message construction");
         let message = vote_data.encode().map_err(|_| CertificateError::ValidationError)?;
         
         // Collect all signatures and public keys for batch verification
@@ -352,20 +356,33 @@ impl QuorumCertificate {
             Ok(_) => {
                 // Additional validation: ensure block hash matches
                 if self.block_hash != block.block_hash {
-                    dbg!("Block hash doesn't match");
+                    tracing::warn!(
+                        "QC verification failed: block hash mismatch (qc: {:?}, block: {:?})",
+                        self.block_hash, block.block_hash
+                    );
                     return Err(CertificateError::ValidationError);
                 }
                 
                 // Ensure view number matches
                 if self.view_number != block.data.view_number {
-                    dbg!("View number doesn't match");
+                    tracing::warn!(
+                        "QC verification failed: view number mismatch (qc: {}, block: {})",
+                        self.view_number, block.data.view_number
+                    );
                     return Err(CertificateError::ValidationError);
                 }
                 
+                tracing::debug!(
+                    "QC verified successfully for view {} phase {:?} block {:?}",
+                    self.view_number, self.phase, self.block_hash
+                );
                 Ok(())
             }
             Err(_) => {
-                dbg!("Message signature doesn't match");
+                tracing::warn!(
+                    "QC verification failed: signature verification failed for view {} phase {:?}",
+                    self.view_number, self.phase
+                );
                 Err(CertificateError::ValidationError)
             }
         }
@@ -587,10 +604,15 @@ impl Block {
         // it is the committed_block
         match db::get_consensus(app_state.db_pool.get()) {
             Ok(consensus_state) => {
-                dbg!("Creating block with", consensus_state.committed_block.data.height +1, consensus_state.view);
+                let height = consensus_state.committed_block.data.height + 1;
+                let view = consensus_state.view;
+                tracing::info!(
+                    "Creating new block at height {} for view {}",
+                    height, view
+                );
                 let tip_data = BlockData {
-                    height: consensus_state.committed_block.data.height + 1,
-                    view_number: consensus_state.view,
+                    height,
+                    view_number: view,
                     parent_hash: Some(consensus_state.committed_block.block_hash),
                     transactions: Some(Transactions(transactions))
                 };

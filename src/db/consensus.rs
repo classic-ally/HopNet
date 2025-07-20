@@ -190,7 +190,7 @@ pub fn get_validators(
                     Ok(nodes)
                 }
                 Err(e) => {
-                    dbg!(e);
+                    tracing::error!("Failed to query validators: {:?}", e);
                     Err(DatabaseError::RecordError)
                 }
             }
@@ -327,7 +327,7 @@ pub fn insert_qc(
     match db_connection {
         Ok(mut db_lock) => {
             let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
-            dbg!("Attempting transaction");
+            tracing::debug!("Starting QC insertion transaction");
             
             // Insert the QC into quorum_certificates table
             tx.execute(
@@ -349,7 +349,7 @@ pub fn insert_qc(
                         "UPDATE this_node SET highest_qc_block_hash = ?, current_phase = 'lock' WHERE internal_id = 1",
                         params![qc.block_hash]
                     ).map_err(|_| DatabaseError::InsertError)?;
-                    dbg!("Updated this_node: propose -> lock, highest_qc_block_hash updated");
+                    tracing::info!("Updated consensus state: propose -> lock phase for view {}", qc.view_number);
                 }
                 ConsensusPhase::Lock => {
                     // If QC phase is lock, change to propose, set current_view to QC view + 1,
@@ -358,12 +358,18 @@ pub fn insert_qc(
                         "UPDATE this_node SET highest_qc_block_hash = ?, committed_block_hash = ?, current_phase = 'propose', current_view = ? WHERE internal_id = 1",
                         params![qc.block_hash, qc.block_hash, qc.view_number + 1]
                     ).map_err(|_| DatabaseError::InsertError)?;
-                    dbg!("Updated this_node: lock -> propose, view set to QC view + 1, highest_qc_block_hash updated, block committed");
+                    tracing::info!(
+                        "Updated consensus state: lock -> propose, view {} -> {}, committed block {:?}",
+                        qc.view_number, qc.view_number + 1, qc.block_hash
+                    );
                 }
             }
             
             tx.commit().map_err(|_| DatabaseError::InsertError)?;
-            dbg!("QC inserted.");
+            tracing::debug!(
+                "QC successfully inserted for view {} phase {:?}",
+                qc.view_number, qc.phase
+            );
             Ok(())
         }
         Err(_) => Err(DatabaseError::LockError)
