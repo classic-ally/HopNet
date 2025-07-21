@@ -28,6 +28,12 @@ pub async fn handle_timeout_detection(
     
     // Only create timeout votes if we're stuck in the same view
     if last_observed == current_view {
+        // Check if we've already issued a timeout vote for this view
+        if consensus_state.last_timeout_vote_view == current_view {
+            tracing::warn!("Already issued timeout vote for view {}, skipping - may indicate progression issues", current_view);
+            return Ok(());
+        }
+        
         tracing::info!("View {} has not progressed since last check, creating timeout vote", current_view);
         
         // Create timeout vote for current view and process it
