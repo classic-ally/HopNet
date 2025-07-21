@@ -29,13 +29,13 @@ pub fn get_nodes(
             match results {
                 Ok(users) => Ok(users.collect::<Result<_, _>>().map_err(|_| DatabaseError::ProcessingError)?),
                 Err(e) => {
-                    dbg!(e);
+                    tracing::error!("Failed to execute query in get_nodes: {:?}", e);
                     Err(DatabaseError::RecordError)
                 }
             }
         },
         Err(e) => {
-            dbg!(e);
+            tracing::error!("Failed to execute query in get_nodes: {:?}", e);
             Err(DatabaseError::LockError)
         }
     }
@@ -102,7 +102,7 @@ pub async fn insert_node(
                 .map_err(|_| DatabaseError::ProcessingError)?;
 
             // blocks data extract
-            dbg!("Fetching block state");
+            tracing::debug!("Fetching block state for database dump");
             let mut stmt_blocks = tx.prepare(
                 "SELECT block_hash, height, view_number, parent_hash, transactions FROM blocks",
             ).map_err(|_| DatabaseError::RecallError)?;
@@ -137,7 +137,7 @@ pub async fn insert_node(
             let blocks: Vec<Block> = rows_blocks.collect::<Result<Vec<Block>, _>>()
                 .map_err(|_| DatabaseError::ProcessingError)?;
 
-            dbg!("Fetching consensus state");
+            tracing::debug!("Fetching consensus state for database dump");
             // Get the consensus state from this_node table
             let (current_phase, current_view, prepared_block_hash_opt, committed_block_hash_blake3, highest_qc_block_hash_blake3) = tx.query_row(
                 "SELECT current_phase, current_view, prepared_block_hash, committed_block_hash, highest_qc_block_hash FROM this_node WHERE internal_id = 1",
@@ -152,7 +152,7 @@ pub async fn insert_node(
                 }
             ).map_err(|_| DatabaseError::RecallError)?;
 
-            dbg!("Fetching validator state");
+            tracing::debug!("Fetching validator state for database dump");
             let mut stmt_validators = tx.prepare(
                 "SELECT effective_height, node_id, is_active FROM validators"
             ).map_err(|_| DatabaseError::RecallError)?;
@@ -166,7 +166,7 @@ pub async fn insert_node(
             let mut validators: Vec<Validator> = rows_validators.collect::<Result<Vec<Validator>, _>>()
                 .map_err(|_| DatabaseError::ProcessingError)?;
 
-            dbg!("Fetching quorum certificate state");
+            tracing::debug!("Fetching quorum certificate state for database dump");
             let mut stmt_qcs = tx.prepare(
                 "SELECT view_number, phase, block_hash, proposer_signature, voter_signatures FROM quorum_certificates"
             ).map_err(|_| DatabaseError::RecallError)?;
@@ -182,7 +182,7 @@ pub async fn insert_node(
             let qcs: Vec<QuorumCertificate> = rows_qcs.collect::<Result<Vec<QuorumCertificate>, _>>()
                 .map_err(|_| DatabaseError::ProcessingError)?;
 
-            dbg!("Fetching timeout certificates");
+            tracing::debug!("Fetching timeout certificates for database dump");
             let mut stmt_tcs = tx.prepare(
                 "SELECT view_number, highest_qc_view, highest_qc_phase, highest_qc_block_hash, signatures FROM timeout_certificates"
             ).map_err(|_| DatabaseError::RecallError)?;
@@ -199,7 +199,7 @@ pub async fn insert_node(
                 .map_err(|_| DatabaseError::ProcessingError)?;
 
             // File system data extract
-            dbg!("Fetching data_blocks");
+            tracing::debug!("Fetching data blocks for database dump");
             let mut stmt_data_blocks = tx.prepare(
                 "SELECT id, modified_at, file_hash, fragment_count, added_bytes FROM data_blocks"
             ).map_err(|_| DatabaseError::RecallError)?;
@@ -218,7 +218,7 @@ pub async fn insert_node(
             let data_blocks: Vec<DataRecord> = rows_data_blocks.collect::<Result<Vec<DataRecord>, _>>()
                 .map_err(|_| DatabaseError::ProcessingError)?;
 
-            dbg!("Fetching fragment_hashes");
+            tracing::debug!("Fetching fragment hashes for database dump");
             let mut stmt_fragment_hashes = tx.prepare(
                 "SELECT data_block_id, fragment_index, fragment_id, fragment_hash, chunk_type, stored_locally FROM fragment_hashes"
             ).map_err(|_| DatabaseError::RecallError)?;
@@ -235,7 +235,7 @@ pub async fn insert_node(
             let fragment_hashes: Vec<FragmentHash> = rows_fragment_hashes.collect::<Result<Vec<FragmentHash>, _>>()
                 .map_err(|_| DatabaseError::ProcessingError)?;
 
-            dbg!("Fetching inodes");
+            tracing::debug!("Fetching inodes for database dump");
             let mut stmt_inodes = tx.prepare(
                 "SELECT owner_id, path, type, data_id FROM inodes"
             ).map_err(|_| DatabaseError::RecallError)?;
@@ -251,7 +251,7 @@ pub async fn insert_node(
             let inodes: Vec<Inode> = rows_inodes.collect::<Result<Vec<Inode>, _>>()
                 .map_err(|_| DatabaseError::ProcessingError)?;
 
-            dbg!("Fetching file_access entries");
+            tracing::debug!("Fetching file access entries for database dump");
             let mut stmt_file_access = tx.prepare(
                 "SELECT data_block_id, user_id, ephemeral_pubkey, encrypted_file_key FROM file_access"
             ).map_err(|_| DatabaseError::RecallError)?;
@@ -266,7 +266,7 @@ pub async fn insert_node(
             let file_access_entries: Vec<crate::db::types::FileAccess> = rows_file_access.collect::<Result<Vec<crate::db::types::FileAccess>, _>>()
                 .map_err(|_| DatabaseError::ProcessingError)?;
 
-            dbg!("Consensus phase fetched successfully");
+            tracing::debug!("Database dump completed successfully");
 
             ///////////////
             // 3. Compute next node, append to node vec

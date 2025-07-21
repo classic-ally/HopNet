@@ -141,7 +141,7 @@ pub fn post_initial_setup(
             // Commit the transaction
             tx.commit().map_err(|_| DatabaseError::InsertError)?;
             
-            dbg!("Successfully inserted setup info");
+            tracing::info!("Successfully completed initial database setup for node {}", next_node_id);
 
             Ok(next_node_id)
 
@@ -160,7 +160,7 @@ pub fn put_join_setup(
             // in this case we need to write the list of nodes and users to the DB
             let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
 
-            dbg!("Inserting users");
+            tracing::debug!("Inserting {} users", setupobj.users.len());
             for user in setupobj.users {
                 tx.execute(
                     "INSERT INTO users (user_id, username, password_hash, pubkey, x25519_pubkey) VALUES (?, ?, ?, ?, ?)",
@@ -168,7 +168,7 @@ pub fn put_join_setup(
                 ).map_err(|_| DatabaseError::InsertError)?;
             }
 
-            dbg!("Inserting nodes");
+            tracing::debug!("Inserting {} nodes", setupobj.nodes.len());
             for node in setupobj.nodes {
                 tx.execute(
                     "INSERT INTO nodes (node_id, name, ip_address, port, owner, pubkey) VALUES (?, ?, ?, ?, ?, ?)",
@@ -176,7 +176,7 @@ pub fn put_join_setup(
                 ).map_err(|_| DatabaseError::InsertError)?;
             }
 
-            dbg!("Inserting sequences");
+            tracing::debug!("Inserting {} sequences", setupobj.sequences.len());
             for sequence in setupobj.sequences {
                 tx.execute(
                     "INSERT INTO sequences (name, next_id) VALUES (?, ?)",
@@ -184,7 +184,7 @@ pub fn put_join_setup(
                 ).map_err(|_| DatabaseError::InsertError)?;
             }
 
-            dbg!("Inserting blocks");
+            tracing::debug!("Inserting {} blocks", setupobj.blocks.len());
             for block in setupobj.blocks {
                 tx.execute(
                     "INSERT INTO blocks (block_hash, height, view_number, parent_hash, transactions) VALUES (?, ?, ?, ?, ?)",
@@ -198,7 +198,7 @@ pub fn put_join_setup(
                 ).map_err(|_| DatabaseError::InsertError)?;
             }
 
-            dbg!("Inserting validators");
+            tracing::debug!("Inserting {} validators", setupobj.validators.len());
             for validator in setupobj.validators {
                 tx.execute(
                     "INSERT INTO validators (effective_height, node_id, is_active) VALUES (?, ?, ?)",
@@ -206,7 +206,7 @@ pub fn put_join_setup(
                 ).map_err(|_| DatabaseError::InsertError)?;
             }
 
-            dbg!("Inserting quorum certificates");
+            tracing::debug!("Inserting {} quorum certificates", setupobj.quorum_certificates.len());
             for quorum_certificate in setupobj.quorum_certificates {
                 tx.execute(
                     "INSERT INTO quorum_certificates (view_number, phase, block_hash, proposer_signature, voter_signatures) VALUES (?, ?, ?, ?, ?)", 
@@ -214,7 +214,7 @@ pub fn put_join_setup(
                 ).map_err(|_| DatabaseError::InsertError)?;
             }
 
-            dbg!("Inserting timeout certificates");
+            tracing::debug!("Inserting {} timeout certificates", setupobj.timeout_certificates.len());
             for timeout_certificate in setupobj.timeout_certificates {
                 tx.execute(
                     "INSERT INTO timeout_certificates (view_number, highest_qc_view, highest_qc_phase, highest_qc_block_hash, signatures) VALUES (?, ?, ?, ?, ?)",
@@ -222,7 +222,7 @@ pub fn put_join_setup(
                 ).map_err(|_| DatabaseError::InsertError)?;
             }
 
-            dbg!("Inserting data_blocks");
+            tracing::debug!("Inserting {} data blocks", setupobj.data_blocks.len());
             for data_block in setupobj.data_blocks {
                 tx.execute(
                     "INSERT INTO data_blocks (id, modified_at, file_hash, fragment_count, added_bytes) VALUES (?, ?, ?, ?, ?)",
@@ -230,7 +230,7 @@ pub fn put_join_setup(
                 ).map_err(|_| DatabaseError::InsertError)?;
             }
 
-            dbg!("Inserting fragment_hashes");
+            tracing::debug!("Inserting {} fragment hashes", setupobj.fragment_hashes.len());
             for fragment_hash in setupobj.fragment_hashes {
                 tx.execute(
                     "INSERT INTO fragment_hashes (data_block_id, fragment_index, fragment_id, fragment_hash, chunk_type, stored_locally) VALUES (?, ?, ?, ?, ?, FALSE)",
@@ -238,7 +238,7 @@ pub fn put_join_setup(
                 ).map_err(|_| DatabaseError::InsertError)?;
             }
 
-            dbg!("Inserting file_access entries");
+            tracing::debug!("Inserting {} file access entries", setupobj.file_access_entries.len());
             for file_access in setupobj.file_access_entries {
                 tx.execute(
                     "INSERT INTO file_access (data_block_id, user_id, ephemeral_pubkey, encrypted_file_key) VALUES (?, ?, ?, ?)",
@@ -246,7 +246,7 @@ pub fn put_join_setup(
                 ).map_err(|_| DatabaseError::InsertError)?;
             }
 
-            dbg!("Inserting inodes");
+            tracing::debug!("Inserting {} inodes", setupobj.inodes.len());
             for inode in setupobj.inodes {
                 let owner_id = match inode.owner {
                     either::Either::Left(id) => id,
@@ -263,7 +263,7 @@ pub fn put_join_setup(
                 ).map_err(|_| DatabaseError::InsertError)?;
             }
 
-            dbg!("Inserting this_node");
+            tracing::debug!("Inserting this_node configuration");
             tx.execute(
                 "INSERT INTO this_node (internal_id, node_id, privkey, current_phase, current_view, prepared_block_hash, committed_block_hash, highest_qc_block_hash, user_privkey) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
@@ -279,7 +279,7 @@ pub fn put_join_setup(
                 ]
             ).map_err(|_| DatabaseError::InsertError)?;
 
-            dbg!("TX Commit");
+            tracing::info!("Committing join setup transaction");
             tx.commit().map_err(|_| DatabaseError::InsertError)?;
             
             Ok(())

@@ -130,7 +130,7 @@ pub async fn post_nodes(
     ///////////////
     // 5. Send the PUT of state to the new client
     ///////////////
-    dbg!("Attempting PUT");
+    tracing::info!("Attempting PUT to setup new node at {}", url);
     match client.put(&url)
         .json(&db_dump)
         .send()
