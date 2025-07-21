@@ -114,6 +114,8 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
                 -- Block height not stored -> always computable
                 current_phase           ENUM('propose', 'lock') NOT NULL DEFAULT 'propose',
                 current_view            INTEGER NOT NULL DEFAULT 0,
+                -- Track last view where we issued a timeout vote to prevent conflicting votes
+                last_timeout_vote_view  INTEGER DEFAULT 0,
                 -- Block is prepared when it has a QC
                 prepared_block_hash     BLOB,
                 -- HotStuff-2 efficiency improvement:

@@ -133,6 +133,12 @@ impl Ballot {
             return Err(VoteError::ProgressionError);
         }
 
+        // Check if we've already issued a timeout vote for this view
+        if consensus_state.last_timeout_vote_view == self.data.view {
+            tracing::warn!("Rejecting ballot for view {} - already issued timeout vote", self.data.view);
+            return Err(VoteError::ProgressionError);
+        }
+
         // 2. Chain validity check
         // Reject proposals that aren't listing tip of chain as parent
         match &self.block.data.parent_hash {
@@ -688,4 +694,5 @@ pub struct ConsensusState {
     pub prepared_block: Option<Block>,
     pub committed_block: Block,
     pub highest_qc_block: Block,
+    pub last_timeout_vote_view: i32,
 }

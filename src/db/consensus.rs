@@ -41,7 +41,7 @@ pub fn get_consensus(
                     ) + 1
                 )
                 SELECT
-                    n.node_id, n.name, n.ip_address, n.port, n.owner, n.pubkey, t.current_view, t.current_phase,
+                    n.node_id, n.name, n.ip_address, n.port, n.owner, n.pubkey, t.current_view, t.current_phase, t.last_timeout_vote_view,
                     -- Prepared block data (excluding transactions for performance)
                     pb.block_hash AS prepared_hash, pb.height AS prepared_height,
                     pb.view_number AS prepared_view, pb.parent_hash AS prepared_parent,
@@ -69,6 +69,7 @@ pub fn get_consensus(
                 let pubkey: PubKey = row.get(5)?;
                 let current_view: i32 = row.get(6)?;
                 let current_phase: ConsensusPhase = row.get(7)?;
+                let last_timeout_vote_view: i32 = row.get(8)?;
                 
                 // Helper function to build block from row data (without transactions)
                 let build_block = |hash_col: usize, height_col: usize, view_col: usize, parent_col: usize| -> Result<Option<Block>, duckdb::Error> {
@@ -92,16 +93,16 @@ pub fn get_consensus(
                     }
                 };
                 
-                // Build blocks (column indices: prepared=8-11, committed=12-15, highest_qc=16-19)
-                let prepared_block = build_block(8, 9, 10, 11)?;
-                let committed_block = build_block(12, 13, 14, 15)?;
-                let highest_qc_block = build_block(16, 17, 18, 19)?;
+                // Build blocks (column indices: prepared=9-12, committed=13-16, highest_qc=17-20)
+                let prepared_block = build_block(9, 10, 11, 12)?;
+                let committed_block = build_block(13, 14, 15, 16)?;
+                let highest_qc_block = build_block(17, 18, 19, 20)?;
                 
-                Ok((node_id, name, ip_address, port, owner, pubkey, current_view, current_phase,
+                Ok((node_id, name, ip_address, port, owner, pubkey, current_view, current_phase, last_timeout_vote_view,
                     prepared_block, committed_block, highest_qc_block))
             }).map_err(|_| DatabaseError::RecallError)?;
             
-            let (node_id, name, ip_address, port, owner, pubkey, current_view, current_phase,
+            let (node_id, name, ip_address, port, owner, pubkey, current_view, current_phase, last_timeout_vote_view,
                  prepared_block, committed_block, highest_qc_block) = result;
             
             let pubkey = pubkey;
@@ -126,6 +127,7 @@ pub fn get_consensus(
                 prepared_block,
                 committed_block,
                 highest_qc_block,
+                last_timeout_vote_view,
             };
             
             return Ok(consensus_state)
@@ -426,6 +428,23 @@ pub fn get_me(
             }).map_err(|_| DatabaseError::RecallError)?;
             
             Ok(result)
+        }
+        Err(_) => Err(DatabaseError::LockError)
+    }
+}
+
+pub fn mark_timeout_vote_issued(
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    view: i32,
+) -> Result<(), DatabaseError> {
+    match db_connection {
+        Ok(db_lock) => {
+            db_lock.execute(
+                "UPDATE this_node SET last_timeout_vote_view = ? WHERE internal_id = 1",
+                params![view]
+            ).map_err(|_| DatabaseError::InsertError)?;
+            
+            Ok(())
         }
         Err(_) => Err(DatabaseError::LockError)
     }

@@ -33,27 +33,36 @@ pub async fn handle_timeout_detection(
         // Create timeout vote for current view and process it
         match create_timeout_vote_for_view(current_view, app_state).await {
             Ok(timeout_vote) => {
-                // Send to our own timeout vote handler (which will broadcast if TC is formed)
-                match app_state.timeout_vote_collector.add_vote(timeout_vote.clone(), app_state).await {
-                    Ok(Some(tc)) => {
-                        tracing::info!("Timeout vote for view {} created TC", current_view);
-                        // Apply TC locally first, then broadcast
-                        if let Err(e) = apply_timeout_certificate(tc.clone(), app_state).await {
-                            tracing::error!("Failed to apply our own TC locally: {:?}", e);
-                        } else {
-                            // Now broadcast to other nodes  
-                            if let Err(e) = broadcast_timeout_certificate(tc, app_state).await {
-                                tracing::warn!("Failed to broadcast our TC: {:?}", e);
+                // Mark that we've issued a timeout vote for this view - must succeed before proceeding
+                match db::mark_timeout_vote_issued(app_state.db_pool.get(), current_view) {
+                    Ok(_) => {
+                        // Send to our own timeout vote handler (which will broadcast if TC is formed)
+                        match app_state.timeout_vote_collector.add_vote(timeout_vote.clone(), app_state).await {
+                            Ok(Some(tc)) => {
+                                tracing::info!("Timeout vote for view {} created TC", current_view);
+                                // Apply TC locally first, then broadcast
+                                if let Err(e) = apply_timeout_certificate(tc.clone(), app_state).await {
+                                    tracing::error!("Failed to apply our own TC locally: {:?}", e);
+                                } else {
+                                    // Now broadcast to other nodes  
+                                    if let Err(e) = broadcast_timeout_certificate(tc, app_state).await {
+                                        tracing::warn!("Failed to broadcast our TC: {:?}", e);
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                tracing::info!("Timeout vote for view {} added, waiting for more", current_view);
+                                // Also broadcast our vote to other nodes
+                                let _ = broadcast_our_timeout_vote(timeout_vote, app_state).await;
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to process our own timeout vote: {:?}", e);
                             }
                         }
                     }
-                    Ok(None) => {
-                        tracing::info!("Timeout vote for view {} added, waiting for more", current_view);
-                        // Also broadcast our vote to other nodes
-                        let _ = broadcast_our_timeout_vote(timeout_vote, app_state).await;
-                    }
                     Err(e) => {
-                        tracing::error!("Failed to process our own timeout vote: {:?}", e);
+                        tracing::error!("Failed to mark timeout vote issued for view {}: {:?}", current_view, e);
+                        return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("Database write failed: {:?}", e))))));
                     }
                 }
             }
