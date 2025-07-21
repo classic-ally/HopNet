@@ -49,6 +49,7 @@ pub struct AppState {
     siv_nonce: Arc<OnceCell<Nonce>>,
     fragments_dir: String,
     timeout_vote_collector: Arc<consensus::functions::TimeoutVoteCollector>,
+    last_observed_view: Arc<std::sync::atomic::AtomicI32>,
 }
 
 impl AppState {
@@ -140,6 +141,7 @@ async fn main() {
                 siv_nonce: Arc::new(OnceCell::new()),
                 fragments_dir,
                 timeout_vote_collector: Arc::new(consensus::functions::TimeoutVoteCollector::new()),
+                last_observed_view: Arc::new(std::sync::atomic::AtomicI32::new(-1)),
             };
 
             // Start timeout detection worker with cron schedule (every minute)

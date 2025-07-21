@@ -23,11 +23,15 @@ pub async fn handle_timeout_detection(
     let consensus_state = db::get_consensus(app_state.db_pool.get())
         .map_err(|e| Error::Failed(Arc::new(Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to get consensus state: {:?}", e))))))?;
     
-    // Always check for timeout - we'll create timeout votes for current view
     let current_view = consensus_state.view;
+    let last_observed = app_state.last_observed_view.load(std::sync::atomic::Ordering::SeqCst);
     
-    // Create timeout vote for current view and process it
-    match create_timeout_vote_for_view(current_view, app_state).await {
+    // Only create timeout votes if we're stuck in the same view
+    if last_observed == current_view {
+        tracing::info!("View {} has not progressed since last check, creating timeout vote", current_view);
+        
+        // Create timeout vote for current view and process it
+        match create_timeout_vote_for_view(current_view, app_state).await {
             Ok(timeout_vote) => {
                 // Send to our own timeout vote handler (which will broadcast if TC is formed)
                 match app_state.timeout_vote_collector.add_vote(timeout_vote.clone(), app_state).await {
@@ -58,6 +62,11 @@ pub async fn handle_timeout_detection(
                 return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("Timeout vote creation failed: {:?}", e))))));
             }
         }
+    } else {
+        // View has progressed, update our tracking
+        tracing::debug!("View progressed from {} to {}, updating tracking", last_observed, current_view);
+        app_state.last_observed_view.store(current_view, std::sync::atomic::Ordering::SeqCst);
+    }
     
     Ok(())
 }
