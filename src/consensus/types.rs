@@ -303,6 +303,19 @@ impl QuorumCertificate {
         })
     }
     pub fn verify(&self, state: &AppState, block: &Block) -> Result<(), CertificateError> {
+        // Get current consensus state for view validation
+        let consensus_state = db::get_consensus(state.db_pool.get())
+            .map_err(|_| CertificateError::DatabaseError)?;
+        
+        // Validate view number - only accept current view
+        if self.view_number != consensus_state.view {
+            tracing::warn!(
+                "QC verification failed: invalid view {} (current view: {})",
+                self.view_number, consensus_state.view
+            );
+            return Err(CertificateError::ValidationError);
+        }
+        
         // Get validators for this height
         let validators = db::get_validators(state.db_pool.get(), block.data.height).map_err(|_| CertificateError::DatabaseError)?;
         let num_validators = validators.len();
@@ -695,4 +708,13 @@ pub struct ConsensusState {
     pub committed_block: Block,
     pub highest_qc_block: Block,
     pub last_timeout_vote_view: i32,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ViewConsensusData {
+    pub view: i32,
+    pub timeout_certificate: Option<TimeoutCertificate>,
+    pub propose_qc: Option<QuorumCertificate>,
+    pub lock_qc: Option<QuorumCertificate>,
+    pub blocks: Vec<Block>,
 }

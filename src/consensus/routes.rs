@@ -1,13 +1,15 @@
 use super::*;
 
 use axum::{
-    extract::State,
+    extract::{State, Path},
     response::IntoResponse,
     http::StatusCode,
-    Json
+    Json,
+    Extension
 };
 
 use crate::db::consensus as db;
+use crate::consensus::functions::ConsensusError;
 /// CONSENSUS ARCHITECTURE
 /// Key notes:
 /// - Using ed25519 over threshold w/ distributed key generation (e.g. BLS)
@@ -58,6 +60,23 @@ pub async fn get_validators(
     match db::get_validators(app_state.db_pool.get(), height) {
         Ok(nodes) => (StatusCode::OK, Json(nodes)).into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Failed to get validators").into_response(),
+    }
+}
+
+// route to get all consensus data for a specific view (RPC-protected for inter-node catch-up)
+pub async fn get_view_consensus_data(
+    State(app_state): State<AppState>,
+    Path(view): Path<i32>,
+    Extension(auth): Extension<AuthenticatedUser>,
+) -> impl IntoResponse {
+    // Only allow node owners to request view data for catch-up operations
+    if !auth.user_owns_node {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    
+    match db::get_view_consensus_data(app_state.db_pool.get(), view) {
+        Ok(view_data) => (StatusCode::OK, Json(view_data)).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Failed to get view consensus data").into_response(),
     }
 }
 
@@ -277,6 +296,361 @@ pub async fn broadcast_timeout_certificate(
     }
     
     Ok(())
+}
+
+#[derive(Debug)]
+pub enum ViewComparison {
+    Behind { our_view: i32, max_network_view: i32 },
+    CaughtUp { view: i32 },
+    Ahead { our_view: i32, sampled_max_view: i32 },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum CatchUpStrictness {
+    Lenient,  // Allow 1 view behind (normal consensus operations might advance us)
+    Strict,   // Always catch up regardless of gap (timeout scenarios)
+}
+
+#[derive(Debug)]
+pub struct CatchUpNeeded {
+    pub our_view: i32,
+    pub target_view: i32,
+}
+
+/// Check if we're caught up with the network by polling a subset of validators
+/// Returns the view comparison result for decision making
+pub async fn check_view_status(app_state: &AppState) -> Result<ViewComparison, ConsensusError> {
+    use crate::consensus::functions;
+    
+    // Get our current view (single DB call)
+    let consensus_state = db::get_consensus(app_state.db_pool.get())
+        .map_err(|_| ConsensusError::DatabaseError)?;
+    let our_view = consensus_state.view;
+    
+    // Poll network for max view (pass consensus_state to avoid duplicate DB call)
+    let max_network_view = functions::poll_subset_for_max_view(app_state, &consensus_state).await?;
+    
+    // Compare and categorize the relationship
+    use std::cmp::Ordering;
+    let result = match max_network_view.cmp(&our_view) {
+        Ordering::Greater => {
+            ViewComparison::Behind { our_view, max_network_view }
+        }
+        Ordering::Equal => {
+            ViewComparison::CaughtUp { view: our_view }
+        }
+        Ordering::Less => {
+            ViewComparison::Ahead { our_view, sampled_max_view: max_network_view }
+        }
+    };
+    
+    tracing::debug!("View status check: {:?}", result);
+    Ok(result)
+}
+
+/// Fetch consensus data for a specific view from a validator node
+async fn fetch_view(
+    view: i32,
+    validator: &crate::types::Node,
+    app_state: &AppState,
+) -> Result<ViewConsensusData, ConsensusError> {
+    let my_node_id = app_state.get_node_id().map_err(|_| ConsensusError::DatabaseError)?;
+    let user_id = app_state.get_user_id().map_err(|_| ConsensusError::DatabaseError)?;
+    let user_keys = app_state.get_user_keys().map_err(|_| ConsensusError::DatabaseError)?;
+    
+    // Sign empty body for GET request authentication
+    let body = b"";
+    let node_signature = app_state.private_key.try_sign(body).map_err(|_| ConsensusError::SigningError)?;
+    let user_signature = user_keys.private_key.try_sign(body).map_err(|_| ConsensusError::SigningError)?;
+    
+    let client = reqwest::Client::new();
+    let url = format!("http://{}:{}/consensus/view/{}", validator.ip_address, validator.port, view);
+    
+    tracing::debug!("Fetching view {} data from validator {}", view, validator.node_id);
+    
+    let response = client
+        .get(&url)
+        .header("X-Node-ID", my_node_id.to_string())
+        .header("X-User-ID", user_id.to_string())
+        .header("X-Node-Signature", hex::encode(node_signature.to_bytes()))
+        .header("X-User-Signature", hex::encode(user_signature.to_bytes()))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::warn!("Network error fetching view {} from validator {}: {:?}", view, validator.node_id, e);
+            ConsensusError::NetworkError
+        })?;
+    
+    if !response.status().is_success() {
+        tracing::warn!("Failed to fetch view {} data from validator {}: status {}", 
+            view, validator.node_id, response.status());
+        return Err(ConsensusError::NetworkError);
+    }
+    
+    let view_data: ViewConsensusData = response.json().await
+        .map_err(|e| {
+            tracing::warn!("Failed to parse view {} data from validator {}: {:?}", view, validator.node_id, e);
+            ConsensusError::NetworkError
+        })?;
+    
+    tracing::debug!("Successfully fetched view {} data: TC={}, propose_QC={}, lock_QC={}, blocks={}",
+        view,
+        view_data.timeout_certificate.is_some(),
+        view_data.propose_qc.is_some(),
+        view_data.lock_qc.is_some(),
+        view_data.blocks.len()
+    );
+    
+    Ok(view_data)
+}
+
+/// Integrate fetched view data into our local database with validation
+async fn integrate_view(
+    view: i32,
+    view_data: ViewConsensusData,
+    app_state: &AppState,
+) -> Result<(), ConsensusError> {
+    tracing::info!("Integrating view {} data", view);
+    
+    // Insert blocks first (they're referenced by QCs and TCs)
+    for block in &view_data.blocks {
+        match db::insert_block(app_state.db_pool.get(), block) {
+            Ok(_) => {
+                tracing::debug!("Inserted block {:?} for view {}", block.block_hash, view);
+            }
+            Err(_) => {
+                tracing::debug!("Block {:?} already exists for view {}", block.block_hash, view);
+                // Continue - block might already exist
+            }
+        }
+    }
+    
+    // Validate and insert propose QC if present
+    if let Some(propose_qc) = &view_data.propose_qc {
+        // Find the corresponding block for validation
+        if let Some(block) = view_data.blocks.iter().find(|b| b.block_hash == propose_qc.block_hash) {
+            match propose_qc.verify(app_state, block) {
+                Ok(_) => {
+                    match db::insert_qc(app_state.db_pool.get(), propose_qc.clone()) {
+                        Ok(_) => {
+                            tracing::debug!("Validated and inserted propose QC for view {}", view);
+                        }
+                        Err(_) => {
+                            tracing::debug!("Propose QC for view {} already exists", view);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Invalid propose QC for view {}: {:?}", view, e);
+                    return Err(ConsensusError::SigningError);
+                }
+            }
+        } else {
+            tracing::warn!("Block not found for propose QC in view {}", view);
+            return Err(ConsensusError::BlockError);
+        }
+    }
+    
+    // Validate and insert lock QC if present
+    if let Some(lock_qc) = &view_data.lock_qc {
+        // Find the corresponding block for validation
+        if let Some(block) = view_data.blocks.iter().find(|b| b.block_hash == lock_qc.block_hash) {
+            match lock_qc.verify(app_state, block) {
+                Ok(_) => {
+                    match db::insert_qc(app_state.db_pool.get(), lock_qc.clone()) {
+                        Ok(_) => {
+                            tracing::debug!("Validated and inserted lock QC for view {}", view);
+                            
+                            // Process transactions if this is a Lock phase QC (same logic as post_qc)
+                            if lock_qc.phase == ConsensusPhase::Lock {
+                                tracing::info!(
+                                    "Lock phase QC committed for view {}, processing transactions",
+                                    lock_qc.view_number
+                                );
+                                crate::consensus::functions::process_transactions(&block.data.transactions, app_state);
+                            }
+                        }
+                        Err(_) => {
+                            tracing::debug!("Lock QC for view {} already exists", view);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Invalid lock QC for view {}: {:?}", view, e);
+                    return Err(ConsensusError::SigningError);
+                }
+            }
+        } else {
+            tracing::warn!("Block not found for lock QC in view {}", view);
+            return Err(ConsensusError::BlockError);
+        }
+    }
+    
+    // Validate and insert timeout certificate if present (this advances our view)
+    if let Some(tc) = &view_data.timeout_certificate {
+        match tc.verify(app_state) {
+            Ok(_) => {
+                match db::insert_tc(app_state.db_pool.get(), tc.clone()) {
+                    Ok(_) => {
+                        tracing::info!("Validated and applied timeout certificate for view {}, advanced to view {}", view, view + 1);
+                    }
+                    Err(_) => {
+                        tracing::debug!("Timeout certificate for view {} already exists", view);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Invalid timeout certificate for view {}: {:?}", view, e);
+                return Err(ConsensusError::SigningError);
+            }
+        }
+    }
+    
+    tracing::debug!("Successfully integrated view {} data", view);
+    Ok(())
+}
+
+/// Perform catch-up from our current view to the target view
+pub async fn perform_catch_up(app_state: &AppState, our_view: i32, target_view: i32) -> Result<(), ConsensusError> {
+    tracing::info!("Starting catch-up: our_view={}, target_view={}", our_view, target_view);
+    
+    // Get available validators to request data from
+    let my_node_id = app_state.get_node_id().map_err(|_| ConsensusError::DatabaseError)?;
+    let validators = db::get_validators(app_state.db_pool.get(), our_view)
+        .map_err(|_| ConsensusError::DatabaseError)?;
+    let other_validators: Vec<_> = validators.into_iter()
+        .filter(|v| v.node_id != my_node_id)
+        .collect();
+    
+    if other_validators.is_empty() {
+        tracing::warn!("No other validators found for catch-up");
+        return Err(ConsensusError::NetworkError);
+    }
+    
+    // Include current view since we might have missed QCs/TCs
+    let views_to_fetch: Vec<i32> = (our_view..=target_view).collect();
+    
+    // Launch parallel fetch tasks for all views
+    let mut fetch_tasks = Vec::new();
+    for view in &views_to_fetch {
+        // Round-robin through validators to distribute load
+        let validator = &other_validators[(*view as usize) % other_validators.len()];
+        let view = *view;
+        let validator = validator.clone();
+        let app_state = app_state.clone();
+        
+        let task = tokio::spawn(async move {
+            fetch_view(view, &validator, &app_state).await
+        });
+        
+        fetch_tasks.push((view, task));
+    }
+    
+    // Process views sequentially as their data becomes available
+    for (expected_view, task) in fetch_tasks {
+        match task.await {
+            Ok(Ok(view_data)) => {
+                tracing::info!("Processing view {} data", expected_view);
+                
+                match integrate_view(expected_view, view_data, app_state).await {
+                    Ok(_) => {
+                        tracing::debug!("Successfully integrated view {}", expected_view);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to integrate view {}: {:?} - continuing with next view", expected_view, e);
+                        // Continue with next view - some integration failures shouldn't stop catch-up
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("Failed to fetch view {} data: {:?} - continuing with next view", expected_view, e);
+                // Continue with next view - some views might be missing data
+            }
+            Err(e) => {
+                tracing::warn!("Fetch task failed for view {}: {:?} - continuing with next view", expected_view, e);
+                // Continue with next view - task panicked or was cancelled
+            }
+        }
+    }
+    
+    tracing::info!("Catch-up completed: reached view {}", target_view);
+    Ok(())
+}
+
+/// Ensure we're caught up with the network before participating in consensus
+/// This middleware automatically catches up behind nodes and then allows consensus participation
+pub async fn ensure_caught_up_middleware(
+    State(app_state): State<AppState>,
+    Extension(strictness): Extension<CatchUpStrictness>,
+    req: Request<Body>,
+    next: Next,
+) -> impl IntoResponse {
+    match check_view_status(&app_state).await {
+        Ok(ViewComparison::Behind { our_view, max_network_view }) => {
+            let views_behind = max_network_view - our_view;
+            
+            // Check if we should skip catch-up based on strictness
+            let should_catch_up = match strictness {
+                CatchUpStrictness::Strict => true,  // Always catch up
+                CatchUpStrictness::Lenient => views_behind > 1,  // Only if more than 1 view behind
+            };
+            
+            if should_catch_up {
+                tracing::info!("Node is {} views behind: our_view={}, max_network_view={} - performing catch-up (strictness: {:?})", views_behind, our_view, max_network_view, strictness);
+                
+                match perform_catch_up(&app_state, our_view, max_network_view).await {
+                    Ok(()) => {
+                        tracing::info!("Catch-up completed successfully, proceeding with consensus operation");
+                        next.run(req).await
+                    }
+                    Err(e) => {
+                        tracing::error!("Catch-up failed: {:?} - rejecting consensus operation", e);
+                        StatusCode::SERVICE_UNAVAILABLE.into_response()
+                    }
+                }
+            } else {
+                tracing::debug!("Node is {} views behind: our_view={}, max_network_view={} - allowing normal consensus progression (strictness: {:?})", views_behind, our_view, max_network_view, strictness);
+                next.run(req).await
+            }
+        }
+        Ok(ViewComparison::CaughtUp { view }) => {
+            tracing::debug!("Node is caught up at view {}, proceeding with consensus operation", view);
+            next.run(req).await
+        }
+        Ok(ViewComparison::Ahead { our_view, sampled_max_view }) => {
+            tracing::debug!("Node is ahead of sampled validators: our_view={}, sampled_max_view={} - proceeding", our_view, sampled_max_view);
+            next.run(req).await
+        }
+        Err(e) => {
+            tracing::error!("Failed to check view status: {:?} - allowing operation to proceed", e);
+            // On error, allow operation to proceed (fail open for availability)
+            next.run(req).await
+        }
+    }
+}
+
+// Combined middleware that accepts either JWT auth (for users) or RPC auth (for nodes)
+pub async fn jwt_or_rpc_auth_middleware(
+    State(app_state): State<AppState>,
+    req: Request<Body>,
+    next: Next,
+) -> impl IntoResponse {
+    // First try JWT authentication
+    if let Some(auth_header) = req.headers().get("Authorization") {
+        if let Ok(auth_str) = auth_header.to_str() {
+            if auth_str.starts_with("Bearer ") {
+                // This looks like JWT auth, let the JWT middleware handle it
+                match crate::auth::auth_middleware(State(app_state), req, next).await {
+                    Ok(response) => return response.into_response(),
+                    Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+                }
+            }
+        }
+    }
+    
+    // If no JWT, try RPC authentication
+    rpc_auth_middleware(State(app_state), req, next).await.into_response()
 }
 
 // RPC middleware for verifying dual Ed25519 signatures (node + user) on inter-node requests

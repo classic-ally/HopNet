@@ -449,3 +449,108 @@ pub fn mark_timeout_vote_issued(
         Err(_) => Err(DatabaseError::LockError)
     }
 }
+
+pub fn get_view_consensus_data(
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    view: i32,
+) -> Result<ViewConsensusData, DatabaseError> {
+    use crate::consensus::types::*;
+    use duckdb::OptionalExt;
+    
+    match db_connection {
+        Ok(db_lock) => {
+            // Get timeout certificate for this view (if exists)
+            let timeout_certificate = db_lock.query_row(
+                "SELECT tc.view_number, tc.signatures, qc.view_number, qc.phase, qc.block_hash, qc.proposer_signature, qc.voter_signatures
+                 FROM timeout_certificates tc
+                 JOIN quorum_certificates qc ON tc.highest_qc_view = qc.view_number 
+                   AND tc.highest_qc_phase = qc.phase 
+                   AND tc.highest_qc_block_hash = qc.block_hash
+                 WHERE tc.view_number = ?",
+                params![view],
+                |row| {
+                    Ok(TimeoutCertificate {
+                        view_number: row.get(0)?,
+                        highest_qc: QuorumCertificate {
+                            view_number: row.get(2)?,
+                            phase: row.get(3)?,
+                            block_hash: row.get(4)?,
+                            proposer_signature: row.get(5)?,
+                            voter_signatures: row.get(6)?,
+                        },
+                        signatures: row.get(1)?,
+                    })
+                }
+            ).optional().map_err(|_| DatabaseError::RecallError)?;
+
+            // Get all QCs for this view (both propose and lock phases)
+            let mut qc_stmt = db_lock.prepare(
+                "SELECT view_number, phase, block_hash, proposer_signature, voter_signatures
+                 FROM quorum_certificates WHERE view_number = ?"
+            ).map_err(|_| DatabaseError::RecallError)?;
+            
+            let qc_rows = qc_stmt.query_map(params![view], |row| {
+                Ok(QuorumCertificate {
+                    view_number: row.get(0)?,
+                    phase: row.get(1)?,
+                    block_hash: row.get(2)?,
+                    proposer_signature: row.get(3)?,
+                    voter_signatures: row.get(4)?,
+                })
+            }).map_err(|_| DatabaseError::RecallError)?;
+
+            let mut propose_qc = None;
+            let mut lock_qc = None;
+            let mut block_hashes = Vec::new();
+
+            for qc_result in qc_rows {
+                let qc = qc_result.map_err(|_| DatabaseError::RecallError)?;
+                block_hashes.push(qc.block_hash.clone());
+                match qc.phase {
+                    ConsensusPhase::Propose => propose_qc = Some(qc),
+                    ConsensusPhase::Lock => lock_qc = Some(qc),
+                }
+            }
+
+            // Add block from timeout certificate if present
+            if let Some(ref tc) = timeout_certificate {
+                block_hashes.push(tc.highest_qc.block_hash.clone());
+            }
+
+            // Get all referenced blocks (deduplicate hashes)
+            let mut blocks = Vec::new();
+            let mut seen_hashes = std::collections::HashSet::new();
+            for block_hash in block_hashes {
+                if seen_hashes.insert(block_hash.clone()) {
+                    if let Some(block) = db_lock.query_row(
+                        "SELECT block_hash, height, view_number, parent_hash, transactions
+                         FROM blocks WHERE block_hash = ?",
+                        params![block_hash],
+                        |row| {
+                            Ok(Block {
+                                block_hash: row.get(0)?,
+                                data: BlockData {
+                                    height: row.get(1)?,
+                                    view_number: row.get(2)?,
+                                    parent_hash: row.get(3)?,
+                                    transactions: row.get(4)?,
+                                }
+                            })
+                        }
+                    ).optional().map_err(|_| DatabaseError::RecallError)? {
+                        blocks.push(block);
+                    }
+                }
+            }
+
+            Ok(ViewConsensusData {
+                view,
+                timeout_certificate,
+                propose_qc,
+                lock_qc,
+                blocks,
+            })
+        }
+        Err(_) => Err(DatabaseError::LockError)
+    }
+}

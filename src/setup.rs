@@ -88,19 +88,22 @@ pub async fn put_setup(
     // Extract user keys from payload
     let user_private_key = payload.user_privkey.clone();
     
-    // Find the corresponding user's public key
+    // Find the corresponding user's public key and user_id
     // Assuming the user's private key corresponds to the first user in the payload
-    let user_public_key = payload.users.get(0)
-        .ok_or(StatusCode::BAD_REQUEST)?
-        .pubkey;
+    let first_user = payload.users.get(0)
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let user_public_key = first_user.pubkey;
+    let user_id = first_user.user_id;
     
     let user_keys = UserKeys {
         private_key: user_private_key,
         public_key: user_public_key,
     };
     
-    // Set user keys in app state (can only be done once)
+    // Set user keys and user_id in app state (can only be done once)
     app_state.user_keys.set(user_keys)
+        .map_err(|_| StatusCode::CONFLICT)?; // Already initialized
+    app_state.user_id.set(user_id)
         .map_err(|_| StatusCode::CONFLICT)?; // Already initialized
     
     // Set node_id from the payload
@@ -156,8 +159,10 @@ pub async fn post_setup(
     };
 
     match setup::post_initial_setup(app_state.db_pool.get(), user, node, app_state.public_key, app_state.private_key, user_keys.private_key) {
-        Ok(node_id) => {
-            // Set the generated node_id in app state
+        Ok((user_id, node_id)) => {
+            // Set the generated user_id and node_id in app state
+            app_state.user_id.set(user_id)
+                .map_err(|_| StatusCode::CONFLICT)?; // Already initialized
             app_state.node_id.set(node_id)
                 .map_err(|_| StatusCode::CONFLICT)?; // Already initialized
             Ok(StatusCode::CREATED)

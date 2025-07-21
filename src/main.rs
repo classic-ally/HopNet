@@ -44,6 +44,7 @@ pub struct AppState {
     private_key: PrivKey,
     public_key: PubKey,
     node_id: Arc<OnceCell<i32>>,
+    user_id: Arc<OnceCell<i32>>,
     user_keys: Arc<OnceCell<UserKeys>>,
     siv_key: Arc<OnceCell<Key<Aes256Siv>>>,
     siv_nonce: Arc<OnceCell<Nonce>>,
@@ -59,6 +60,10 @@ impl AppState {
     
     pub fn get_node_id(&self) -> Result<i32, StatusCode> {
         self.node_id.get().copied().ok_or(StatusCode::PRECONDITION_REQUIRED)
+    }
+    
+    pub fn get_user_id(&self) -> Result<i32, StatusCode> {
+        self.user_id.get().copied().ok_or(StatusCode::PRECONDITION_REQUIRED)
     }
     
     pub fn get_siv_key(&self) -> Result<&Key<Aes256Siv>, StatusCode> {
@@ -136,6 +141,7 @@ async fn main() {
                 private_key: PrivKey(privatekey),
                 public_key: PubKey(publickey),
                 node_id: Arc::new(OnceCell::new()),
+                user_id: Arc::new(OnceCell::new()),
                 user_keys: Arc::new(OnceCell::new()),
                 siv_key: Arc::new(OnceCell::new()),
                 siv_nonce: Arc::new(OnceCell::new()),
@@ -168,19 +174,40 @@ async fn main() {
                 .route("/files", delete(files::routes::delete_files))
                 .route("/files/{*path}", get(files::routes::get_file_fragments))
                 .route("/validators", get(consensus::routes::get_validators))
-                .route("/consensus", get(consensus::routes::get_consensus))
                 .layer(middleware::from_fn_with_state(app_state.clone(), auth::auth_middleware));
+
+            // Routes that accept either JWT (users) or RPC (nodes) authentication
+            let jwt_or_rpc_routes = Router::new()
+                .route("/consensus", get(consensus::routes::get_consensus))
+                .layer(middleware::from_fn_with_state(app_state.clone(), consensus::routes::jwt_or_rpc_auth_middleware));
 
             // RPC routes for inter-node communication with dual signature authentication
             let rpc_routes = Router::new()
                 .route("/consensus/propose", post(consensus::routes::post_propose))
+                .route("/consensus/view/{view}", get(consensus::routes::get_view_consensus_data))
                 .layer(middleware::from_fn_with_state(app_state.clone(), consensus::routes::rpc_auth_middleware));
+
+            // Strict catch-up routes (must be fully caught up)
+            let strict_consensus_routes = Router::new()
+                .route("/ballot", post(consensus::routes::post_ballot))
+                .layer(middleware::from_fn_with_state(app_state.clone(), consensus::routes::ensure_caught_up_middleware))
+                .layer(axum::Extension(consensus::routes::CatchUpStrictness::Strict));
+
+            // Lenient catch-up routes (allow 1 view behind)
+            let lenient_consensus_routes = Router::new()
+                .route("/qc", post(consensus::routes::post_qc))
+                .route("/consensus/tc", post(consensus::routes::post_tc))
+                .layer(middleware::from_fn_with_state(app_state.clone(), consensus::routes::ensure_caught_up_middleware))
+                .layer(axum::Extension(consensus::routes::CatchUpStrictness::Lenient));
 
             let base_app = Router::new()
                 .fallback_service(admin_service) // routes we don't have get sent to vite frontend
                 .route("/metrics/get-all", get(metrics::routes::get_metrics))
                 .merge(protected_routes)
+                .merge(jwt_or_rpc_routes)
                 .merge(rpc_routes)
+                .merge(strict_consensus_routes)
+                .merge(lenient_consensus_routes)
                 .route("/setup", get(setup::get_setup))
                 .route("/setup", post(setup::post_setup))
                 .route("/setup", put(setup::put_setup))
@@ -188,10 +215,7 @@ async fn main() {
                 .route("/rpc/latency-server", get(metrics::routes::get_latency_server))
                 .route("/rpc/get-remote-latency", get(metrics::routes::get_remote_latency_handler))
                 .route("/login", post(auth::sign_in))
-                .route("/ballot", post(consensus::routes::post_ballot))
-                .route("/qc", post(consensus::routes::post_qc))
-                .route("/consensus/timeout_vote", post(consensus::routes::post_timeout_vote))
-                .route("/consensus/tc", post(consensus::routes::post_tc));
+                .route("/consensus/timeout_vote", post(consensus::routes::post_timeout_vote));
 
             let app = if cfg!(debug_assertions) {
                 let cors = CorsLayer::new()

@@ -26,6 +26,29 @@ pub async fn handle_timeout_detection(
     let current_view = consensus_state.view;
     let last_observed = app_state.last_observed_view.load(std::sync::atomic::Ordering::SeqCst);
     
+    // Check if we're caught up with the network before timeout detection
+    use crate::consensus::routes::{check_view_status, ViewComparison, perform_catch_up};
+    match check_view_status(app_state).await {
+        Ok(ViewComparison::Behind { our_view, max_network_view }) => {
+            tracing::info!("Detected behind network: our_view={}, max_network_view={} - triggering catch-up", our_view, max_network_view);
+            match perform_catch_up(app_state, our_view, max_network_view).await {
+                Ok(_) => {
+                    tracing::info!("Catch-up completed successfully, skipping timeout detection this cycle");
+                }
+                Err(e) => {
+                    tracing::warn!("Catch-up failed: {:?} - skipping timeout detection this cycle", e);
+                }
+            }
+            return Ok(());
+        }
+        Ok(ViewComparison::CaughtUp { .. }) | Ok(ViewComparison::Ahead { .. }) => {
+            // We're caught up or ahead, proceed with normal timeout detection
+        }
+        Err(e) => {
+            tracing::warn!("Failed to check view status: {:?} - proceeding with timeout detection", e);
+        }
+    }
+    
     // Only create timeout votes if we're stuck in the same view
     if last_observed == current_view {
         // Check if we've already issued a timeout vote for this view
