@@ -80,7 +80,7 @@ pub async fn handle_timeout_detection(
                                 }
                             }
                             Ok(None) => {
-                                tracing::info!("Timeout vote for view {} added, waiting for more", current_view);
+                                tracing::debug!("Timeout vote for view {} added, waiting for more", current_view);
                                 // Also broadcast our vote to other nodes
                                 let _ = broadcast_our_timeout_vote(timeout_vote, app_state).await;
                             }

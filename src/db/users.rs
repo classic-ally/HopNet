@@ -20,13 +20,13 @@ pub fn get_users(
             match results {
                 Ok(users) => Ok(users.collect::<Result<_, _>>().map_err(|_| DatabaseError::ProcessingError)?),
                 Err(e) => {
-                    dbg!(e);
+                    tracing::error!("Error querying users: {:?}", e);
                     Err(DatabaseError::RecordError)
                 }
             }
         },
         Err(e) => {
-            dbg!(e);
+            tracing::error!("Database connection error in get_users: {:?}", e);
             Err(DatabaseError::LockError)
         }
     }
@@ -120,7 +120,7 @@ pub fn insert_user(
             // Commit the transaction
             tx.commit().map_err(|_| DatabaseError::InsertError)?;
             
-            dbg!("Successfully inserted user");
+            tracing::info!("Successfully inserted user");
             Ok(())
         },
         Err(_) => Err(DatabaseError::LockError),

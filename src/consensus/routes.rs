@@ -742,7 +742,7 @@ pub async fn rpc_auth_middleware(
                 return StatusCode::UNAUTHORIZED.into_response();
             }
             
-            tracing::info!(
+            tracing::debug!(
                 "RPC signatures verified for user {} on node {} (owns_node: {})",
                 user_id, node_id, user_owns_node
             );

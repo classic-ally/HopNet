@@ -37,13 +37,13 @@ pub fn get_metric(
             match results {
                 Ok(metrics) => Ok(metrics.collect::<Result<_, _>>().map_err(|_| DatabaseError::ProcessingError)?), // collect into Vec
                 Err(e) => {
-                    dbg!(e);
+                    tracing::error!("Error querying metrics: {:?}", e);
                     Err(DatabaseError::RecordError)
                 }
             }
         },
         Err(e) => {
-            dbg!(e);
+            tracing::error!("Database connection error in get_metric: {:?}", e);
             Err(DatabaseError::LockError)
         }
     }
@@ -71,7 +71,7 @@ pub fn insert_metric(
 
             let duration_ms = metric.duration.as_millis() as i32;
 
-            dbg!("Attempting to place metric into db");
+            tracing::debug!("Inserting metric into database");
             let result = db_lock.execute(
                 "INSERT INTO metrics (from_node, to_node, start_time, duration, rtt_latency, rtt_variance, rtt_jitter, throughput, version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
@@ -88,11 +88,11 @@ pub fn insert_metric(
             );
             match result {
                 Ok(_) => {
-                    dbg!("Successfully placed metric into db");
+                    tracing::debug!("Successfully inserted metric into database");
                     Ok(())
                 }
                 Err(e) => {
-                    dbg!(e);
+                    tracing::error!("Error inserting metric: {:?}", e);
                     Err(DatabaseError::InsertError)
                 }
             }

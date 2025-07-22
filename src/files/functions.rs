@@ -273,7 +273,6 @@ pub async fn encrypt_path(
     let mut output_path: String = "".to_string();
 
     let split_path = path.split('/').collect::<Vec<&str>>();
-    dbg!(split_path.len());
     if split_path.len() > 1 {
         for part in split_path {
             if part.len() != 0 {
@@ -285,7 +284,7 @@ pub async fn encrypt_path(
         output_path = output_path + "/";
     }
 
-    dbg!(&output_path);
+    tracing::debug!("Encrypted path: {}", output_path);
 
     Ok(output_path)
 }
@@ -412,7 +411,7 @@ fn fetch_and_verify_fragment(fragments_dir: &str, fragment_hash: &Blake3Hash) ->
     // Verify chunk hash matches expected
     let actual_chunk_hash = Blake3Hash::new(blake3::hash(&chunk_data));
     if actual_chunk_hash != *fragment_hash {
-        dbg!("Unexpected chunk hash");
+        tracing::error!("Fragment hash mismatch: expected {:?}, got {:?}", fragment_hash, actual_chunk_hash);
         return Err(FileError::HashingError);
     }
     
@@ -426,7 +425,7 @@ fn finalize_file(mut file: Vec<u8>, added_bytes: u8, expected_hash: Blake3Hash, 
         let final_length = file.len().saturating_sub(added_bytes as usize);
         file.truncate(final_length);
     }
-    dbg!("Recalled", &data_block_id); 
+    
     // Verify file hash (with data_block_id appended for privacy)
     let actual_hash = {
         let mut hasher = blake3::Hasher::new();
@@ -435,7 +434,7 @@ fn finalize_file(mut file: Vec<u8>, added_bytes: u8, expected_hash: Blake3Hash, 
         Blake3Hash::new(hasher.finalize())
     };
     if actual_hash != expected_hash {
-        dbg!("Unexpected reconstructed file hash");
+        tracing::error!("File hash mismatch after reconstruction: expected {:?}, got {:?}", expected_hash, actual_hash);
         return Err(FileError::HashingError);
     }
     

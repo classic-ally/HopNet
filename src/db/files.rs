@@ -17,7 +17,7 @@ pub fn get_files(
             let mut stmt = db_lock.prepare("SELECT owner_id, path, type, data_id FROM inodes WHERE path LIKE ? AND path NOT LIKE ?").map_err(|_| DatabaseError::RecallError)?;
             let like_path = format!("{}/%", path);
             let not_like_path = format!("{}/%", like_path);
-            dbg!(&like_path, &not_like_path);
+            tracing::debug!("Querying files with like_path: {}, not_like_path: {}", like_path, not_like_path);
             let inodes = stmt.query_map(params![like_path, not_like_path], |row| {
                 let path = row.get(1)?;
                 let decrypted_path = decrypt_path(path, key, nonce)?;
@@ -33,7 +33,7 @@ pub fn get_files(
             Ok(inodes.collect::<Result<Vec<_>, _>>().map_err(|_| DatabaseError::ProcessingError)?)
         }
         Err(e) => {
-            dbg!(e);
+            tracing::error!("Database connection error in get_files: {:?}", e);
             Err(DatabaseError::LockError)
         }
     }
@@ -249,7 +249,7 @@ pub fn delete_files(
             Ok(())
         }
         Err(e) => {
-            dbg!(e);
+            tracing::error!("Database connection error in delete_files: {:?}", e);
             Err(DatabaseError::LockError)
         }
     }

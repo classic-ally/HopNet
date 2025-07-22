@@ -86,7 +86,7 @@ impl AppState {
 }
 
 static DISPATCH_TABLE: Lazy<HashMap<&'static str, &'static dyn TransactionHandler>> = Lazy::new(|| {
-    tracing::info!("Building dispatch table from registered handlers");
+    tracing::debug!("Building dispatch table from registered handlers");
     let mut table = HashMap::new();
     // iterate over the globally collected handlers
     for handler in inventory::iter::<&'static dyn TransactionHandler> {

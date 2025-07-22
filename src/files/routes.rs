@@ -41,7 +41,7 @@ pub async fn get_files(
             Ok(Json(files))
         }
         Err(e) => {
-            dbg!(e);
+            tracing::error!("Error getting files: {:?}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -72,7 +72,7 @@ pub async fn get_file_fragments(
         Ok(data) => data,
         Err(DatabaseError::RecallError) => return Err(StatusCode::NOT_FOUND),
         Err(e) => {
-            dbg!(e);
+            tracing::error!("Error getting file fragments: {:?}", e);
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
@@ -95,7 +95,7 @@ pub async fn get_file_fragments(
                 file_data.per_file_key = Some(per_file_key);
             }
             Err(e) => {
-                dbg!("Failed to decrypt file key:", e);
+                tracing::error!("Failed to decrypt file key: {:?}", e);
                 return Err(StatusCode::FORBIDDEN);
             }
         }
@@ -108,7 +108,7 @@ pub async fn get_file_fragments(
     let file_contents = match functions::reassemble_file(&app_state.fragments_dir, file_data) {
         Ok(contents) => contents,
         Err(e) => {
-            dbg!(e);
+            tracing::error!("Error reassembling file: {:?}", e);
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
@@ -217,7 +217,7 @@ pub async fn post_files(
                             }
                         }
 
-                        dbg!("Final chunk");
+                        tracing::debug!("Processing final chunk");
                         // if we still have stuff in buffer, apply padding (it's final chunk)
                         if !chunk_buffer.is_empty() {
                             full_file_hasher.update(&chunk_buffer);
@@ -344,13 +344,13 @@ pub async fn post_files(
             match consensus_middleware(&app_state, transactions, user_id).await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    dbg!(e);
+                    tracing::error!("Consensus middleware error: {:?}", e);
                     return Err(StatusCode::INTERNAL_SERVER_ERROR)
                 }
             }
         }
         Err(e) => {
-            dbg!(e);
+            tracing::error!("Bincode encoding error: {:?}", e);
             return Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -365,7 +365,7 @@ pub async fn delete_files(
     match db::delete_files(app_state.db_pool.get(), enc_path) {
         Ok(_) => return Ok(()),
         Err(e) => {
-            dbg!(e);
+            tracing::error!("Error deleting files: {:?}", e);
             return Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }

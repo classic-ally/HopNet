@@ -112,7 +112,7 @@ async fn ballot_round(
 
     match qc.verify(&app_state, &block) {
         Ok(_) => {
-            tracing::info!(
+            tracing::debug!(
                 "QC verification passed, inserting QC for view {} phase {:?}",
                 qc.view_number, qc.phase
             );
