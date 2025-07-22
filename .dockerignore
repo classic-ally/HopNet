@@ -1,0 +1,5 @@
+# Rust build artifacts
+target/
+
+# Frontend node modules
+frontend/node_modules/

@@ -37,3 +37,14 @@ aes-siv = "0.7.0"
 chacha20poly1305 = { version = "0.10.1", features = ["stream"] }
 apalis = "0.7.2"
 apalis-cron = "0.7.2"
+bollard = "0.19.1"
+anyhow = "1.0.98"
+clap = { version = "4.5.41", features = ["derive"] }
+
+[[bin]]
+name = "hopnet"
+path = "src/main.rs"
+
+[[bin]]
+name = "orchestrator"
+path = "orchestrator/main.rs"
