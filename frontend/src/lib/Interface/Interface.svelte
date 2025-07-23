@@ -37,7 +37,7 @@
 <div class="flex text-white h-screen w-screen">
     <!-- Sidebar -->
     <div class="flex flex-col gap-3 p-5 min-w-[200px] border-r-solid border-r-indigo-950">
-        <h2>AppName</h2>
+        <img src="/hopnet-logo.png" alt="HopNet" class="w-32 h-auto" />
         <div class="flex flex-col flex-grow">
             <SidebarItem
                 icon="i-carbon-time"
