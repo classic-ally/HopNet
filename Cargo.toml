@@ -3,6 +3,11 @@ name = "network-metrics"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["headless"]
+gui = ["tauri", "tauri-build", "cocoa"]
+headless = []
+
 [dependencies]
 axum = { version = "0.8.4", features = ["multipart"] }
 chrono = { version = "0.4.41", features = ["serde"] }
@@ -40,6 +45,15 @@ apalis-cron = "0.7.2"
 bollard = "0.19.1"
 anyhow = "1.0.98"
 clap = { version = "4.5.41", features = ["derive"] }
+
+# Tauri dependencies (optional for GUI mode)
+tauri = { version = "2.7.0", features = ["tray-icon"], optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cocoa = { version = "0.26", optional = true }
+
+[build-dependencies]
+tauri-build = { version = "2.3.1", optional = true }
 
 [[bin]]
 name = "hopnet"

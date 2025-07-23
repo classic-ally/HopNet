@@ -96,8 +96,7 @@ static DISPATCH_TABLE: Lazy<HashMap<&'static str, &'static dyn TransactionHandle
     table
 });
 
-#[tokio::main]
-async fn main() {
+async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // tracing
     tracing_subscriber::fmt::init();
 
@@ -233,16 +232,190 @@ async fn main() {
                     .with_state(app_state)
             };
 
-            match tokio::net::TcpListener::bind(&bindurl).await {
-                Ok(listener) => {
-                    tracing::info!("Server starting on {}", bindurl);
-                    serve(listener, app).await.unwrap();
-                }
-                Err(error) => {panic!("{}", error)}
-            }
+            let listener = tokio::net::TcpListener::bind(&bindurl).await?;
+            tracing::info!("Server starting on {}", bindurl);
+            serve(listener, app).await?;
         }
-        Err(error) => {panic!{"{}", error}}
+        Err(error) => return Err(error.into()),
     }
     
+    Ok(())
+}
 
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "gui")]
+    {
+        run_with_gui().await
+    }
+    
+    #[cfg(not(feature = "gui"))]
+    {
+        run_server().await
+    }
+}
+
+#[cfg(feature = "gui")]
+async fn run_with_gui() -> Result<(), Box<dyn std::error::Error>> {
+    use tauri::{Manager, menu::{Menu, MenuItem, PredefinedMenuItem}, tray::TrayIconBuilder, TitleBarStyle, WebviewWindowBuilder};
+    
+    // Start the server in a background task
+    let server_handle = tokio::spawn(async {
+        if let Err(e) = run_server().await {
+            tracing::error!("Server error: {}", e);
+        }
+    });
+    
+    // Give the server a moment to start
+    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+    
+    // Determine the port (same logic as in run_server)
+    let mut port = 34632;
+    if std::env::consts::OS == "linux" {
+        port = 34633;
+    }
+    
+    // Create Tauri app
+    let context = tauri::generate_context!();
+    let app = tauri::Builder::default()
+        .setup(move |app| {
+            // Use Accessory policy to never show in dock
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            // Create tray menu with toggle item (text will be updated dynamically)
+            let toggle_item = MenuItem::with_id(app, "toggle", "Toggle window", true, None::<&str>)?;
+            let separator = PredefinedMenuItem::separator(app)?;
+            let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+            
+            let menu = Menu::with_items(app, &[
+                &toggle_item,
+                &separator,
+                &quit_item,
+            ])?;
+            
+            // Create tray icon with proper error handling
+            let mut tray_builder = TrayIconBuilder::with_id("main_tray")
+                .menu(&menu);
+            
+            // Set icon if available
+            if let Some(icon) = app.default_window_icon() {
+                tray_builder = tray_builder.icon(icon.clone());
+            }
+            
+            let toggle_item_ref = toggle_item.clone();
+            let _tray = tray_builder
+                .on_menu_event(move |app, event| {
+                    if let Some(window) = app.get_webview_window("main") {
+                        match event.id.0.as_str() {
+                            "toggle" => {
+                                // Simply toggle window visibility
+                                if window.is_visible().unwrap_or(false) {
+                                    if let Err(e) = window.hide() {
+                                        tracing::error!("Failed to hide window: {}", e);
+                                    }
+                                } else {
+                                    if let Err(e) = window.show() {
+                                        tracing::error!("Failed to show window: {}", e);
+                                    }
+                                    if let Err(e) = window.set_focus() {
+                                        tracing::error!("Failed to focus window: {}", e);
+                                    }
+                                }
+                            }
+                            "quit" => {
+                                app.exit(0);
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        tracing::error!("Main window not found");
+                    }
+                })
+                .on_tray_icon_event({
+                    let app_handle = app.handle().clone();
+                    move |_tray, event| {
+                        // Update menu text when tray is right-clicked (before menu shows)
+                        if let tauri::tray::TrayIconEvent::Click { button: tauri::tray::MouseButton::Right, .. } = event {
+                            if let Some(window) = app_handle.get_webview_window("main") {
+                                let text = if window.is_visible().unwrap_or(false) {
+                                    "Hide window"
+                                } else {
+                                    "Show window"  
+                                };
+                                if let Err(e) = toggle_item_ref.set_text(text) {
+                                    tracing::error!("Failed to update menu text: {}", e);
+                                }
+                            }
+                        }
+                    }
+                })
+                .build(app)?;
+            
+            // Create the main window programmatically with transparent titlebar
+            let win_builder = WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::default())
+                .title("HopNet")
+                .inner_size(1200.0, 800.0);
+            
+            // Set transparent title bar only when building for macOS
+            #[cfg(target_os = "macos")]
+            let win_builder = win_builder.title_bar_style(TitleBarStyle::Transparent);
+            
+            let window = win_builder.build().unwrap();
+            
+            // Set background color only when building for macOS
+            #[cfg(target_os = "macos")]
+            {
+                use cocoa::appkit::{NSColor, NSWindow};
+                use cocoa::base::{id, nil};
+                
+                let ns_window = window.ns_window().unwrap() as id;
+                unsafe {
+                    let bg_color = NSColor::colorWithRed_green_blue_alpha_(
+                        nil,
+                        15.0 / 255.0,   // #0f172b red component
+                        23.0 / 255.0,   // #0f172b green component 
+                        43.0 / 255.0,   // #0f172b blue component
+                        1.0,
+                    );
+                    ns_window.setBackgroundColor_(bg_color);
+                }
+            }
+            
+            // Handle close request - hide instead of quit
+            let window_clone = window.clone();
+            window.on_window_event(move |event| {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    // Prevent the default close behavior
+                    api.prevent_close();
+                    // Hide the window instead
+                    if let Err(e) = window_clone.hide() {
+                        tracing::error!("Failed to hide window on close: {}", e);
+                    }
+                }
+            });
+            
+            // Load the local server
+            let url = format!("http://localhost:{}", port);
+            window.navigate(url.parse()
+                .map_err(|e| format!("Invalid URL: {}", e))?)?;
+            
+            // Start visible (no dock icon due to Accessory policy)
+            window.show()?;
+            window.set_focus()?;
+            
+            Ok(())
+        })
+        .build(context)?;
+    
+    // Run the Tauri app (this blocks until the app is closed)
+    app.run(|_app_handle, event| {
+        if let tauri::RunEvent::ExitRequested { .. } = event {
+            // App is closing, we could clean up here if needed
+        }
+    });
+    
+    // If we get here, the GUI was closed, so stop the server
+    server_handle.abort();
+    
+    Ok(())
 }

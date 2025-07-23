@@ -3,6 +3,11 @@ use std::env;
 use std::path::Path;
 
 fn main() {
+    // Handle Tauri build if GUI feature is enabled
+    #[cfg(feature = "gui")]
+    tauri_build::build();
+    
+    // Frontend build (always runs)
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let frontend_dir = Path::new(&manifest_dir).join("frontend");
     

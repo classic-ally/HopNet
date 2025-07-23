@@ -1,0 +1,26 @@
+{
+  "productName": "HopNet",
+  "version": "0.1.0",
+  "identifier": "com.hopnet.app",
+  "build": {
+    "frontendDist": "../frontend/dist",
+    "devUrl": "http://localhost:34632"
+  },
+  "app": {
+    "windows": []
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/icon.png"
+    ],
+    "resources": [],
+    "externalBin": [],
+    "copyright": "",
+    "category": "DeveloperTool",
+    "short-description": "HopNet Consensus Network",
+    "long-description": "A distributed consensus network with file storage capabilities"
+  },
+  "plugins": {}
+}
