@@ -9,9 +9,14 @@ use axum::{
 };
 use reqwest::Client;
 use tokio::sync::oneshot;
+use bincode::config;
 
 use crate::db::PubKey;
 use crate::{
+    consensus::{
+        functions::consensus_middleware, 
+        types::Transaction
+    },
     db::nodes,
     types::Node
 };
@@ -103,34 +108,75 @@ pub async fn post_nodes(
     }
 
     ///////////////
-    // 2-3: occur in DB thread
+    // 2. Get next node ID and create complete node object
     ///////////////
-    // we are going to need one worker to do our database comms which we communicate back+forth with
-    let (dump_tx, dump_rx) = oneshot::channel();
-    let (confirm_write_tx, confirm_write_rx) = oneshot::channel(); // for confirm PUT
+    let next_node_id = match nodes::get_next_node_id(app_state.db_pool.get()) {
+        Ok(id) => id,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+    };
 
-    // Get a connection to give to our thread
+    let complete_node = Node {
+        node_id: next_node_id,
+        name: payload.name.clone(),
+        ip_address: payload.ip_address.clone(),
+        port: payload.port,
+        owner: payload.owner,
+        pubkey: payload.pubkey,
+    };
+
+    ///////////////
+    // 3. Submit node addition to consensus FIRST
+    ///////////////
+    
+    // Encode the complete node for consensus transaction
+    match bincode::serde::encode_to_vec(&complete_node, config::standard()) {
+        Ok(encoded_node) => {
+            let transaction = Transaction {
+                function: "insert_node".to_string(),
+                payload: encoded_node,
+            };
+            let transactions = vec![transaction];
+
+            // Submit to consensus middleware
+            match consensus_middleware(&app_state, transactions, uid).await {
+                Ok(()) => {
+                    // Consensus succeeded - now sync the accepted node
+                },
+                Err(_) => {
+                    // Consensus failed - node was rejected
+                    return StatusCode::INTERNAL_SERVER_ERROR;
+                }
+            }
+        },
+        Err(_) => {
+            // Encoding failed
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
+    }
+
+    ///////////////
+    // 4. Post-consensus: Dump current state and sync accepted node
+    ///////////////
+    let (dump_tx, dump_rx) = oneshot::channel();
     let db_conn = app_state.db_pool.get();
     let user_private_key = app_state.get_user_keys().unwrap().private_key.clone();
+    
     let db_task = tokio::task::spawn_blocking(move || {
-        // Use spawn_blocking for database operations since DuckDB is not async-safe
         tokio::runtime::Handle::current().block_on(async move {
-            nodes::insert_node(db_conn, payload, dump_tx, confirm_write_rx, user_private_key).await
+            nodes::get_sync_dump(db_conn, complete_node, dump_tx, user_private_key).await
         })
     });
 
-    ///////////////
-    // 4. Get sync message from DB thread
-    ///////////////
+    // Get sync message from DB thread
     let db_dump = match dump_rx.await {
         Ok(data) => data,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
     };
 
     ///////////////
-    // 5. Send the PUT of state to the new client
+    // 5. Send the PUT of current state to the accepted node
     ///////////////
-    tracing::info!("Attempting PUT to setup new node at {}", url);
+    tracing::info!("Syncing accepted node at {}", url);
     match client.put(&url)
         .json(&db_dump)
         .send()
@@ -142,27 +188,11 @@ pub async fn post_nodes(
         Err(_) => return StatusCode::GATEWAY_TIMEOUT
     }
 
-    ///////////////
-    // 6. Send OK message to DB thread (PUT must succeed to be here)
-    ///////////////
-    let _ = confirm_write_tx.send(Ok(()));
-
-    ///////////////
-    // 8. Ok() if success
-    ///////////////
+    // Wait for DB task completion
     match db_task.await {
-        Ok(Ok(())) => {
-            // The task completed successfully (insert was confirmed)
-            return StatusCode::CREATED;
-        },
-        Ok(Err(e)) => {
-            // The task returned an error
-            return StatusCode::INTERNAL_SERVER_ERROR;
-        },
-        Err(e) => {
-            // The task panicked or was cancelled
-            return StatusCode::INTERNAL_SERVER_ERROR;
-        }
+        Ok(Ok(())) => StatusCode::CREATED,
+        Ok(Err(_)) => StatusCode::INTERNAL_SERVER_ERROR,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 
 }

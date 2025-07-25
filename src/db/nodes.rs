@@ -41,11 +41,10 @@ pub fn get_nodes(
     }
 }
 
-pub async fn insert_node(
+pub async fn get_sync_dump(
     db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     node: Node,
     dump_tx: oneshot::Sender<SyncSetupObject>,
-    confirm_write_rx: oneshot::Receiver<Result<(), Error>>,
     user_privkey: PrivKey
 ) -> Result<(), DatabaseError> {
     match db_connection {
@@ -268,57 +267,8 @@ pub async fn insert_node(
 
             tracing::debug!("Database dump completed successfully");
 
-            ///////////////
-            // 3. Compute next node, append to node vec
-            ///////////////
-            let next_id = tx.query_row(
-                "SELECT next_id FROM sequences WHERE name = 'nodes'",
-                [],
-                |row| row.get::<_, i32>(0)
-            ).map_err(|_| DatabaseError::RecallError)?;
-            tx.execute(
-                "INSERT INTO nodes (node_id, name, ip_address, port, owner, pubkey) VALUES (?, ?, ?, ?, ?, ?)",
-                params![next_id, node.name, node.ip_address, node.port, node.owner, node.pubkey]
-            ).map_err(|_| DatabaseError::InsertError)?;
-
-            // Update the sequence for the next node
-            tx.execute(
-                "UPDATE sequences SET next_id = next_id + 1 WHERE name = 'nodes'",
-                []
-            ).map_err(|_| DatabaseError::InsertError)?;
-
-            // Get current block height from committed block to add validator
-            let current_height = {
-                let committed_block_height = tx.query_row(
-                    "SELECT height FROM blocks WHERE block_hash = (SELECT committed_block_hash FROM this_node WHERE internal_id = 1)",
-                    [],
-                    |row| row.get::<_, i32>(0)
-                ).map_err(|_| DatabaseError::RecallError)?;
-                committed_block_height
-            };
-
-            // Add the new node as a validator starting from the next block height
-            tx.execute(
-                "INSERT INTO validators (effective_height, node_id, is_active) VALUES (?, ?, ?)",
-                params![current_height + 1, next_id, true]
-            ).map_err(|_| DatabaseError::InsertError)?;
-
-            // Construct and append
-            let new_node = Node {
-                node_id: next_id,
-                name: node.name,
-                ip_address: node.ip_address,
-                port: node.port,
-                owner: node.owner,
-                pubkey: node.pubkey
-            };
-            nodes.push(new_node);
-            let new_validator = Validator {
-                effective_height: current_height + 1,
-                node_id: next_id,
-                is_active: true
-            };
-            validators.push(new_validator);
+            // All data is already current since consensus has run
+            // No need to add anything - just dump current state
             
             ///////////////
             // 4. Send our sync message to main thread
@@ -338,7 +288,7 @@ pub async fn insert_node(
                 file_access_entries: file_access_entries,
                 inodes: inodes,
                 yournode: ThisNode {
-                    node_id: next_id,
+                    node_id: node.node_id,
                     current_phase: current_phase,
                     current_view: current_view,
                     prepared_block_hash: prepared_block_hash_opt,
@@ -353,26 +303,76 @@ pub async fn insert_node(
                 Err(_) => return Err(DatabaseError::ProcessingError)
             }
 
-            ///////////////
-            // 6. If PUT succeeds, send OK message to DB thread
-            ///////////////
-            match confirm_write_rx.await {
-                Ok(Ok(())) => {
-                    // If confirmed, commit the transaction
-                    tx.commit().map_err(|_| DatabaseError::LockError)?;
-                }
-                Ok(Err(e)) => {
-                    // If error, log or handle it
-                    return Err(DatabaseError::LockError);
-                }
-                Err(_) => {
-                    // If channel was closed, return error
-                    return Err(DatabaseError::LockError);
-                }
-            }
-
             Ok(())
         }
+        Err(_) => Err(DatabaseError::LockError),
+    }
+}
+
+pub fn get_next_node_id(
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+) -> Result<i32, DatabaseError> {
+    match db_connection {
+        Ok(db_lock) => {
+            let next_id = db_lock.query_row(
+                "SELECT next_id FROM sequences WHERE name = 'nodes'",
+                [],
+                |row| row.get::<_, i32>(0)
+            ).map_err(|_| DatabaseError::RecallError)?;
+            Ok(next_id)
+        },
+        Err(_) => Err(DatabaseError::LockError),
+    }
+}
+
+pub fn insert_node_consensus(
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    mut node: Node,
+) -> Result<(), DatabaseError> {
+    // Consensus-safe node insertion - just adds node to DB and validator set
+    // No database dump/sync since coordinator handles that
+    match db_connection {
+        Ok(mut db_lock) => {
+            let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
+            
+            // Get next node ID from sequence
+            let next_id = tx.query_row(
+                "SELECT next_id FROM sequences WHERE name = 'nodes'",
+                [],
+                |row| row.get::<_, i32>(0)
+            ).map_err(|_| DatabaseError::RecallError)?;
+            
+            // Insert the new node
+            tx.execute(
+                "INSERT INTO nodes (node_id, name, ip_address, port, owner, pubkey) VALUES (?, ?, ?, ?, ?, ?)",
+                params![next_id, node.name, node.ip_address, node.port, node.owner, node.pubkey]
+            ).map_err(|_| DatabaseError::InsertError)?;
+
+            // Update the sequence for the next node
+            tx.execute(
+                "UPDATE sequences SET next_id = next_id + 1 WHERE name = 'nodes'",
+                []
+            ).map_err(|_| DatabaseError::InsertError)?;
+
+            // Get current block height from committed block to add validator
+            let current_height = tx.query_row(
+                "SELECT height FROM blocks WHERE block_hash = (SELECT committed_block_hash FROM this_node WHERE internal_id = 1)",
+                [],
+                |row| row.get::<_, i32>(0)
+            ).map_err(|_| DatabaseError::RecallError)?;
+
+            // Add the new node as a validator starting from the next block height
+            tx.execute(
+                "INSERT INTO validators (effective_height, node_id, is_active) VALUES (?, ?, ?)",
+                params![current_height + 1, next_id, true]
+            ).map_err(|_| DatabaseError::InsertError)?;
+
+            // Commit the transaction
+            tx.commit().map_err(|_| DatabaseError::InsertError)?;
+            
+            tracing::info!("Node {} added to validator set via consensus at height {}", next_id, current_height + 1);
+            Ok(())
+        },
         Err(_) => Err(DatabaseError::LockError),
     }
 }
