@@ -3,7 +3,7 @@
     import Header from './Header.svelte'
 </script>
 
-<div class="flex-col flex gap-4 bg-indigo-950 rounded-lg p-4 text-white max-w-[400px] m-2">
+<div class="flex-col flex gap-4 bg-surface0 rounded-lg p-4 text-primary max-w-[400px] m-2">
     {#if title || body}
         <Header
             title={title}

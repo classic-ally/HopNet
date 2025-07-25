@@ -1,6 +1,7 @@
 <script lang="ts">
     import { createEventDispatcher } from 'svelte';
     import { API_BASE_URL, tokenStore, currentPathStore } from '../stores';
+    import ModalButton from './ModalButton.svelte';
     
     export let isOpen = false;
     
@@ -128,12 +129,12 @@
     ></div>
     
     <!-- Popover -->
-    <div class="fixed top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 bg-gray-800 border border-gray-600 rounded-lg shadow-xl z-50 w-96 max-w-[90vw] max-h-[80vh] overflow-hidden">
+    <div class="fixed top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 bg-surface0 border border-overlay1 rounded-lg shadow-xl z-50 w-96 max-w-[90vw] max-h-[80vh] overflow-hidden">
         <!-- Header -->
-        <div class="flex items-center justify-between p-4 border-b border-gray-600">
+        <div class="flex items-center justify-between p-4 border-b border-overlay0">
             <h3 class="text-lg font-semibold text-white">Upload Files</h3>
             <button 
-                class="text-gray-400 hover:text-white transition-colors"
+                class="text-muted hover:text-primary transition-colors"
                 on:click={closePopover}
                 aria-label="Close"
             >
@@ -145,7 +146,7 @@
         <div class="p-4 space-y-4 max-h-[60vh] overflow-y-auto">
             <!-- Drop Zone -->
             <div 
-                class="border-2 border-dashed rounded-lg p-6 text-center transition-colors {isDragOver ? 'border-indigo-400 bg-indigo-900/20' : 'border-gray-500 hover:border-gray-400'}"
+                class="border-2 border-dashed rounded-lg p-6 text-center transition-colors {isDragOver ? 'border-mauve bg-mauve/20' : 'border-overlay1 hover:border-overlay2'}"
                 on:dragover={handleDragOver}
                 on:dragleave={handleDragLeave}
                 on:drop={handleDrop}
@@ -153,12 +154,14 @@
                 tabindex="0"
                 on:keydown={(e: KeyboardEvent) => e.key === 'Enter' && document.getElementById('file-input')?.click()}
             >
-                <div class="i-carbon-cloud-upload text-4xl text-gray-400 mx-auto mb-2"></div>
-                <p class="text-gray-300 mb-2">Drag and drop files here</p>
-                <p class="text-gray-500 text-sm mb-3">or</p>
-                <label for="file-input" class="inline-block bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded cursor-pointer transition-colors">
-                    Choose Files
-                </label>
+                <div class="i-carbon-cloud-upload text-4xl text-muted mx-auto mb-2"></div>
+                <p class="text-subtitle mb-2">Drag and drop files here</p>
+                <p class="text-muted text-sm mb-3">or</p>
+                <ModalButton variant="primary" type="button">
+                    <label for="file-input" class="cursor-pointer">
+                        Choose Files
+                    </label>
+                </ModalButton>
                 <input 
                     id="file-input"
                     type="file" 
@@ -171,16 +174,16 @@
             <!-- File List -->
             {#if files.length > 0}
                 <div class="space-y-2">
-                    <h4 class="text-sm font-medium text-gray-300">Selected Files ({files.length})</h4>
+                    <h4 class="text-sm font-medium text-subtitle">Selected Files ({files.length})</h4>
                     <div class="space-y-1 max-h-40 overflow-y-auto">
                         {#each files as file, index}
-                            <div class="flex items-center justify-between bg-gray-700 rounded p-2">
+                            <div class="flex items-center justify-between bg-surface1 rounded p-2">
                                 <div class="flex-1 min-w-0">
                                     <p class="text-sm text-white truncate">{file.name}</p>
-                                    <p class="text-xs text-gray-400">{formatFileSize(file.size)}</p>
+                                    <p class="text-xs text-muted">{formatFileSize(file.size)}</p>
                                 </div>
                                 <button 
-                                    class="text-gray-400 hover:text-red-400 ml-2 transition-colors"
+                                    class="text-muted hover:text-red ml-2 transition-colors"
                                     on:click={() => removeFile(index)}
                                     aria-label="Remove file"
                                 >
@@ -196,12 +199,12 @@
             {#if isUploading}
                 <div class="space-y-2">
                     <div class="flex items-center justify-between">
-                        <span class="text-sm text-gray-300">Uploading...</span>
-                        <span class="text-sm text-gray-300">{uploadProgress}%</span>
+                        <span class="text-sm text-subtitle">Uploading...</span>
+                        <span class="text-sm text-subtitle">{uploadProgress}%</span>
                     </div>
-                    <div class="w-full bg-gray-600 rounded-full h-2">
+                    <div class="w-full bg-surface1 rounded-full h-2">
                         <div 
-                            class="bg-indigo-600 h-2 rounded-full transition-all duration-300"
+                            class="bg-mauve h-2 rounded-full transition-all duration-300"
                             style="width: {uploadProgress}%"
                         ></div>
                     </div>
@@ -210,31 +213,22 @@
             
             <!-- Error Message -->
             {#if uploadError}
-                <div class="bg-red-900/50 border border-red-500 rounded p-3">
-                    <p class="text-red-300 text-sm">{uploadError}</p>
+                <div class="bg-red/20 border border-red rounded p-3">
+                    <p class="text-red text-sm">{uploadError}</p>
                 </div>
             {/if}
         </div>
         
         <!-- Footer -->
         <div class="flex items-center justify-between p-4">
-            <p class="text-xs text-gray-400">Upload path: {currentPath}</p>
-            <div class="flex gap-2">
-                <button 
-                    class="px-4 py-2 bg-red-500 rounded-md border-none hover:bg-red-600 text-white transition-colors"
-                    on:click={closePopover}
-                    disabled={isUploading}
-                >
-                    Cancel
-                </button>
-                <button 
-                    class="px-4 py-2 bg-indigo-600 rounded-md border-none hover:bg-indigo-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded transition-colors"
-                    on:click={uploadFiles}
-                    disabled={files.length === 0 || isUploading}
-                >
-                    {isUploading ? 'Uploading...' : `Upload ${files.length} file${files.length !== 1 ? 's' : ''}`}
-                </button>
-            </div>
+            <p class="text-xs text-muted">Upload path: {currentPath}</p>
+            <ModalButton
+                variant="primary"
+                disabled={files.length === 0 || isUploading}
+                onclick={uploadFiles}
+            >
+                {isUploading ? 'Uploading...' : `Upload ${files.length} file${files.length !== 1 ? 's' : ''}`}
+            </ModalButton>
         </div>
     </div>
 {/if}

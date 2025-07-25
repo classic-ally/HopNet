@@ -1,6 +1,7 @@
 <script lang="ts">
     import { createEventDispatcher } from 'svelte';
     import { API_BASE_URL, tokenStore, currentPathStore } from '../stores';
+    import ModalButton from './ModalButton.svelte';
     
     export let isOpen = false;
     
@@ -105,12 +106,12 @@
     ></div>
     
     <!-- Popover -->
-    <div class="fixed top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 bg-gray-800 border border-gray-600 rounded-lg shadow-xl z-50 w-full max-w-md mx-4 max-h-[80vh] overflow-hidden">
+    <div class="fixed top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 bg-surface0 border border-overlay1 rounded-lg shadow-xl z-50 w-full max-w-md mx-4 max-h-[80vh] overflow-hidden">
         <!-- Header -->
-        <div class="flex items-center justify-between p-4 border-b border-gray-600">
+        <div class="flex items-center justify-between p-4 border-b border-overlay0">
             <h3 class="text-lg font-semibold text-white">Create New Folder</h3>
             <button 
-                class="text-gray-400 hover:text-white transition-colors"
+                class="text-muted hover:text-primary transition-colors"
                 on:click={closePopover}
                 aria-label="Close"
             >
@@ -122,13 +123,13 @@
         <div class="p-4 space-y-4">
             <!-- Folder Name Input -->
             <div class="space-y-2">
-                <label for="folder-name" class="block text-sm font-medium text-gray-300">
+                <label for="folder-name" class="block text-sm font-medium text-subtitle">
                     Folder Name
                 </label>
                 <input 
                     id="folder-name"
                     type="text" 
-                    class="w-full bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                    class="w-full bg-surface1 border border-overlay1 rounded-lg px-3 py-2 text-primary placeholder-muted focus:outline-none focus:ring-2 focus:ring-mauve focus:border-transparent"
                     placeholder="Enter folder name"
                     bind:value={folderName}
                     on:keydown={handleInputKeydown}
@@ -139,38 +140,29 @@
             
             <!-- Error Message -->
             {#if createError}
-                <div class="bg-red-900/50 border border-red-500 rounded p-3">
-                    <p class="text-red-300 text-sm">{createError}</p>
+                <div class="bg-red/20 border border-red rounded p-3">
+                    <p class="text-red text-sm">{createError}</p>
                 </div>
             {/if}
             
             <!-- Success Indicator -->
             {#if isCreating}
-                <div class="bg-indigo-900/50 border border-indigo-500 rounded p-3">
-                    <p class="text-indigo-300 text-sm">Creating folder...</p>
+                <div class="bg-mauve/20 border border-mauve rounded p-3">
+                    <p class="text-mauve text-sm">Creating folder...</p>
                 </div>
             {/if}
         </div>
         
         <!-- Footer -->
-        <div class="flex items-center justify-between p-4 border-t border-gray-600 min-w-0">
-            <p class="text-xs text-gray-400 truncate mr-4 min-w-0 flex-1">Create in: {currentPath}</p>
-            <div class="flex gap-2 flex-shrink-0">
-                <button
-                    class="px-4 py-2 bg-red-500 rounded-md border-none hover:bg-red-600 text-white transition-colors whitespace-nowrap"
-                    on:click={closePopover}
-                    disabled={isCreating}
-                >
-                    Cancel
-                </button>
-                <button
-                    class="px-4 py-2 bg-indigo-600 rounded-md border-none hover:bg-indigo-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white transition-colors whitespace-nowrap"
-                    on:click={createFolder}
-                    disabled={!validateFolderName(folderName) || isCreating}
-                >
-                    {isCreating ? 'Creating...' : 'Create Folder'}
-                </button>
-            </div>
+        <div class="flex items-center justify-between p-4 border-t border-overlay0 min-w-0">
+            <p class="text-xs text-muted truncate mr-4 min-w-0 flex-1">Create in: {currentPath}</p>
+            <ModalButton
+                variant="primary"
+                disabled={!validateFolderName(folderName) || isCreating}
+                onclick={createFolder}
+            >
+                {isCreating ? 'Creating...' : 'Create Folder'}
+            </ModalButton>
         </div>
     </div>
 {/if}

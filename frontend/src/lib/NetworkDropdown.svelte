@@ -154,7 +154,7 @@
 
 <div class="relative">
     <div
-        class={`flex border border-indigo-500 border-solid rounded-lg gap-3 p-2 cursor-pointer items-center ${isFocused ? 'highlight-on-focus' : ''}`}
+        class={`flex border border-overlay1 border-solid rounded-lg gap-3 p-2 cursor-pointer items-center hover:bg-surface0 hover:border-mauve transition-colors ${isFocused ? 'bg-surface0 border-mauve' : ''}`}
         onclick={toggleDropdown}
         onkeydown={handleKeydown}
         onfocus={handleFocus}
@@ -164,11 +164,11 @@
     >
         <div class={icon + " text-xl"}></div>
         {#if !selected}
-            <div class="text-base text-gray">
+            <div class="text-base text-muted">
                 {title}
             </div>
         {:else}
-            <div class="text-base">
+            <div class="text-sm text-primary">
                 {selected}
             </div>
         {/if}
@@ -176,20 +176,20 @@
     
     {#if isOpen}
         <div
-            class="absolute mt-1 w-full border-indigo-900 border-solid rounded-lg bg-blue-950 z-50"
+            class="absolute mt-1 w-full border-overlay0 border-solid rounded-lg bg-surface0 z-50"
         >
             {#if loading}
                 <div class="dropdown-item">
                     <div class="ml-2">
-                        <div class="font-medium">Loading interfaces...</div>
+                        <div class="font-medium text-primary">Loading interfaces...</div>
                     </div>
                 </div>
             {:else if error}
                 <div class="dropdown-item">
                     <div class="ml-2">
-                        <div class="font-medium text-red-500">Error: {error}</div>
+                        <div class="font-medium text-red">Error: {error}</div>
                         <button
-                            class="text-sm text-blue-500 hover:underline"
+                            class="text-sm text-blue hover:underline"
                             onclick={fetchInterfaces}
                         >
                             Retry
@@ -199,7 +199,7 @@
             {:else if interfaces.length === 0}
                 <div class="dropdown-item">
                     <div class="ml-2">
-                        <div class="font-medium">No interfaces found</div>
+                        <div class="font-medium text-primary">No interfaces found</div>
                     </div>
                 </div>
             {:else}
@@ -215,8 +215,8 @@
                     >
                         <span class={getInterfaceIcon(thisinterface.type)}></span>
                         <div class="ml-2 flex flex-1 flex-row justify-between">
-                            <div class="font-medium">{thisinterface.interface}</div>
-                            <div class="text-sm text-gray-500">{thisinterface.ip}</div>
+                            <div class="font-medium text-primary">{thisinterface.interface}</div>
+                            <div class="text-sm text-muted">{thisinterface.ip}</div>
                         </div>
                     </div>
                 {/each}
@@ -243,9 +243,9 @@
     } */
 
     .highlight-on-focus {
-        border-color: #3b82f6; /* Indigo highlight */
-        outline: 2px solid #3b82f6;
-        background-color: rgba(59, 130, 246, 0.1); /* Optional: slight background */
+        border-color: #cba6f7; /* Mauve highlight */
+        outline: 2px solid #cba6f7;
+        background-color: rgba(203, 166, 247, 0.1); /* Mauve background */
     }
 
     .dropdown-item {

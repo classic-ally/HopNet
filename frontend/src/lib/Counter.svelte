@@ -35,7 +35,7 @@
   }
 </script>
 
-<div class="bg-gray-200 rounded-lg p-4 inline-block">
+<div class="bg-surface0 rounded-lg p-4 inline-block">
   <h1 class="text-lg">This Computer</h1>
   <div class="flex justify-between gap-2 items-center">
     <p class="text-base">Ping</p>
@@ -46,7 +46,7 @@
   {#if result.address}
     <table class="mt-2 border-collapse border">
       <thead>
-        <tr class="bg-gray-300">
+        <tr class="bg-surface1">
           <th class="border p-2">Address</th>
           <th class="border p-2">Average RTT (ms)</th>
           <th class="border p-2">Variance</th>

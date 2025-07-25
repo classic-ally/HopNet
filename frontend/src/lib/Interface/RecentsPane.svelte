@@ -39,5 +39,5 @@
 
 <div>
     <h3>Recents</h3>
-    <p class="text-sm text-gray-300">50 items</p>
+    <p class="text-sm text-muted">50 items</p>
 </div>

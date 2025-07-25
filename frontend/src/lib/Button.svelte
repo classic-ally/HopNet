@@ -6,7 +6,7 @@
 </script>
 
 <button 
-    class="rounded-4 p-2 bg-blue-950 border border-solid border-blue-800 font-sans text-white text-base flex justify-center items-center gap-2 cursor-pointer"
+    class="rounded-4 p-2 bg-surface0 border border-solid border-overlay1 font-sans text-primary text-sm flex justify-center items-center gap-2 cursor-pointer hover:bg-surface1 hover:border-mauve transition-colors"
     onclick={onClick}
 >
     {#if position === 'left'}

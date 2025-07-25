@@ -34,9 +34,9 @@
 
     let isNodeAddOpen = false;
 </script>
-<div class="flex text-white h-screen w-screen">
+<div class="flex text-primary h-screen w-screen">
     <!-- Sidebar -->
-    <div class="flex flex-col gap-3 p-5 min-w-[200px] border-r-solid border-r-indigo-950">
+    <div class="flex flex-col gap-3 p-5 min-w-[200px] border-r-solid border-r-overlay0 bg-mantle">
         <img src="/hopnet-logo.png" alt="HopNet" class="w-32 h-auto" />
         <div class="flex flex-col flex-grow">
             <SidebarItem
@@ -65,7 +65,7 @@
         />
     </div>
     <!-- Main content -->
-    <div class="p-5 flex flex-col gap-3 w-full">
+    <div class="p-5 flex flex-col gap-3 w-full bg-base">
         {#if selectedItem === "browse"}
             <!-- Header area -->
             <FileBrowserHeader/>
@@ -85,10 +85,10 @@
             <!-- Header area -->
             <FileBrowserHeader/>
             <!-- Body area -->
-            <div class="text-indigo-300">Recent files will be shown here</div>
+            <div class="text-muted">Recent files will be shown here</div>
         {:else if selectedItem === "account"}
             <!-- Account management will be shown here -->
-            <div class="text-indigo-300">Account settings will be shown here</div>
+            <div class="text-muted">Account settings will be shown here</div>
         {/if}
     </div>
 </div>

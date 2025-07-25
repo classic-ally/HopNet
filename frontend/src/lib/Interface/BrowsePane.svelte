@@ -186,15 +186,15 @@
 
 <div>
     <h3>Browse</h3>
-    <p class="text-sm text-gray-300">{files.length} {files.length === 1 ? 'item' : 'items'} in this folder</p>
+    <p class="text-sm text-muted">{files.length} {files.length === 1 ? 'item' : 'items'} in this folder</p>
 </div>
 
-<div class="border-solid border-1 rounded-lg p-1 border-indigo-500 max-w-[800px]">
+<div class="border-solid border-1 rounded-lg p-1 border-overlay1 max-w-[800px]">
     {#if error}
-        <div class="text-red-400 p-2 mb-2 border border-red-600 rounded">
+        <div class="text-red p-2 mb-2 border border-red rounded">
             {error}
             <button
-                class="ml-2 text-blue-400 underline"
+                class="ml-2 text-blue underline"
                 onclick={() => fetchFiles(currentPath)}
             >
                 Retry
@@ -203,9 +203,9 @@
     {/if}
     
     <!-- Navigation breadcrumb -->
-    <div class="flex items-center gap-2 p-2 border-b border-indigo-900 mb-2">
+    <div class="flex items-center gap-2 p-2 border-b border-overlay0 mb-2">
         <button
-            class="border-1 border-indigo-500 text-indigo-500 border-solid rounded-md p-1 cursor-pointer bg-transparent hover:text-white disabled:opacity-50 disabled:cursor-not-allowed"
+            class="border-1 border-overlay1 text-muted border-solid rounded-md p-1 cursor-pointer bg-transparent hover:text-primary hover:border-mauve hover:bg-surface0 disabled:opacity-50 disabled:cursor-not-allowed"
             onclick={navigateToRoot}
             aria-label="Navigate to root"
             disabled={loading || currentPath === '/'}
@@ -214,7 +214,7 @@
         </button>
         {#if currentPath !== '/'}
             <button
-                class="border-1 border-indigo-500 text-indigo-500 border-solid rounded-md p-1 cursor-pointer bg-transparent hover:text-white disabled:opacity-50 disabled:cursor-not-allowed"
+                class="border-1 border-overlay1 text-muted border-solid rounded-md p-1 cursor-pointer bg-transparent hover:text-primary hover:border-mauve hover:bg-surface0 disabled:opacity-50 disabled:cursor-not-allowed"
                 onclick={navigateUp}
                 aria-label="Navigate up a folder"
                 disabled={loading}
@@ -222,13 +222,13 @@
                 <div class="i-carbon-chevron-up w-4 h-4"></div>
             </button>
         {/if}
-        <span class="text-indigo-200 text-sm font-mono">{currentPath}</span>
+        <span class="text-subtitle text-sm font-mono">{currentPath}</span>
     </div>
     
     <div class="flex gap-1">
         <!-- Search bar -->
         <input
-            class="w-full bg-transparent text-white border-indigo-900 border-2 border-solid rounded-md p-1"
+            class="w-full bg-transparent text-primary border-overlay0 border-2 border-solid rounded-md p-1"
             type="text"
             placeholder="Search files and folders"
             bind:value={search.value}
@@ -237,7 +237,7 @@
         >
         <!-- Selector of qty -->
         <select
-            class="p-1 border-indigo-900 border-2 border-solid rounded-md bg-transparent text-white"
+            class="p-1 border-overlay0 border-2 border-solid rounded-md bg-transparent text-primary"
             bind:value={table.rowsPerPage}
             onchange={() => table.setPage(1)}
             disabled={loading}
@@ -249,14 +249,14 @@
     </div>
     
     {#if loading}
-        <div class="text-indigo-300 p-4 text-center">
+        <div class="text-muted p-4 text-center">
             Loading files...
         </div>
     {:else}
         <Datatable {table}>
             <table>
                 <thead>
-                    <tr class="text-indigo-300">
+                    <tr class="text-subtitle">
                         <ThSort {table} field="inode_type">Type</ThSort>
                         <ThSort {table} field="path">Name</ThSort>
                     </tr>
@@ -264,17 +264,17 @@
                 <tbody>
                     {#each table.rows as row}
                         <tr
-                            class="text-left cursor-pointer hover:bg-indigo-900/30"
+                            class="text-left cursor-pointer hover:bg-surface0"
                             onclick={() => handleItemClick(row)}
                         >
                             <td class="w-8">
-                                <div class="{getFileIcon(row.inode_type)} w-4 h-4 text-indigo-300"></div>
+                                <div class="{getFileIcon(row.inode_type)} w-4 h-4 text-muted"></div>
                             </td>
-                            <td class="font-mono">{getFileName(row.path)}</td>
+                            <td>{getFileName(row.path)}</td>
                         </tr>
                     {:else}
                         <tr>
-                            <td colspan="3" class="text-center text-indigo-300 p-4">
+                            <td colspan="3" class="text-center text-muted p-4">
                                 {currentPath === '/' ? 'No files or folders found' : 'This folder is empty'}
                             </td>
                         </tr>
@@ -287,7 +287,7 @@
 
 <style>
     tbody tr:hover {
-        background-color: #1d1b4b !important;
+        background-color: #313244 !important; /* surface0 */
     }
 
     :global(footer) {
@@ -296,15 +296,15 @@
 
     /* Footer text */
     :global(aside) {
-        color: #d1d5db !important;
+        color: #bac2de !important; /* subtitle */
     }
     
     :global(td) {
-        border: 1px solid #1d1b4b !important;
+        border: 1px solid #313244 !important; /* surface0 - very subtle borders */
     }
 
     :global(th) {
-        border-bottom: 1px solid #1d1b4b !important;
+        border-bottom: 1px solid #313244 !important; /* surface0 - header separator */
     }
 
     /* Make folder rows more obviously clickable */
@@ -313,6 +313,6 @@
     }
     
     tbody tr:has(.i-carbon-folder):hover {
-        background-color: #2563eb20 !important;
+        background-color: #45475a !important; /* surface1 - slightly more emphasis for folders */
     }
 </style>

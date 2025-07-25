@@ -372,9 +372,9 @@ async fn run_with_gui() -> Result<(), Box<dyn std::error::Error>> {
                 unsafe {
                     let bg_color = NSColor::colorWithRed_green_blue_alpha_(
                         nil,
-                        15.0 / 255.0,   // #0f172b red component
-                        23.0 / 255.0,   // #0f172b green component 
-                        43.0 / 255.0,   // #0f172b blue component
+                        17.0 / 255.0,   // #11111b red component (crust)
+                        17.0 / 255.0,   // #11111b green component (crust)
+                        27.0 / 255.0,   // #11111b blue component (crust)
                         1.0,
                     );
                     ns_window.setBackgroundColor_(bg_color);

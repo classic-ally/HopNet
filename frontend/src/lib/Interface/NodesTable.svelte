@@ -66,12 +66,12 @@
     }
 </script>
 
-<div class="border-solid border-1 rounded-lg p-1 border-indigo-500 max-w-[500px]">
+<div class="border-solid border-1 rounded-lg p-1 border-overlay1 max-w-[500px]">
     {#if error}
-        <div class="text-red-400 p-2 mb-2 border border-red-600 rounded">
+        <div class="text-red p-2 mb-2 border border-red rounded">
             {error}
             <button
-                class="ml-2 text-blue-400 underline"
+                class="ml-2 text-blue underline"
                 onclick={fetchNodes}
             >
                 Retry
@@ -82,7 +82,7 @@
     <div class="flex gap-1">
     <!-- Search bar -->
     <input
-        class="w-full bg-transparent text-white border-indigo-900 border-2 border-solid rounded-md p-1"
+        class="w-full bg-transparent text-primary border-overlay0 border-2 border-solid rounded-md p-1"
         type="text"
         placeholder="Search"
         bind:value={search.value}
@@ -91,7 +91,7 @@
     >
     <!-- Selector of qty -->
     <select
-        class="p-1 border-indigo-900 border-2 border-solid rounded-md bg-transparent text-white"
+        class="p-1 border-overlay0 border-2 border-solid rounded-md bg-transparent text-primary"
         bind:value={table.rowsPerPage}
         onchange={() => table.setPage(1)}
         disabled={loading}
@@ -103,14 +103,14 @@
     </div>
     
     {#if loading}
-        <div class="text-indigo-300 p-4 text-center">
+        <div class="text-muted p-4 text-center">
             Loading nodes...
         </div>
     {:else}
         <Datatable {table}>
             <table>
                 <thead>
-                    <tr class="text-indigo-300">
+                    <tr class="text-subtitle">
                         <Th></Th>
                         <ThSort {table} field="name">Name</ThSort>
                         <Th>IP</Th>
@@ -132,7 +132,7 @@
                         </tr>
                     {:else}
                         <tr>
-                            <td colspan="4" class="text-center text-indigo-300 p-4">
+                            <td colspan="4" class="text-center text-muted p-4">
                                 No nodes found
                             </td>
                         </tr>
@@ -145,7 +145,7 @@
 
 <style>
     tbody tr:hover {
-        background-color: #1d1b4b !important;
+        background-color: #313244 !important; /* surface0 */
     }
 
     :global(footer) {
@@ -154,15 +154,15 @@
 
     /* Footer text */
     :global(aside) {
-        color: #d1d5db !important;
+        color: #bac2de !important; /* subtitle */
     }
     
     :global(td) {
-        border: 1px solid #1d1b4b !important; /* This is the line width between rows and columns */
+        border: 1px solid #313244 !important; /* surface0 - very subtle borders */
     }
 
     :global(th)  {
-        border-bottom: 1px solid #1d1b4b !important; /* Optional: Add row separator */
+        border-bottom: 1px solid #313244 !important; /* surface0 - header separator */
     }
 
 </style>

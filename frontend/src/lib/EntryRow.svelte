@@ -84,14 +84,14 @@
     }
 
     .highlight-on-focus {
-        border-color: #3b82f6; /* Indigo highlight */
-        outline: 2px solid #3b82f6;
-        background-color: rgba(59, 130, 246, 0.1); /* Optional: slight background */
+        border-color: #cba6f7; /* Mauve highlight */
+        outline: 2px solid #cba6f7;
+        background-color: rgba(203, 166, 247, 0.1); /* Mauve background */
     }
 </style>
 
 <div
-    class={`flex gap-3 ${multiline ? 'items-start' : 'items-center'} border border-indigo-500 border-solid rounded-lg p-2 ${isFocused && !readonly ? 'highlight-on-focus' : ''} ${readonly ? 'opacity-75 cursor-not-allowed' : 'cursor-pointer'}`}
+    class={`flex gap-3 ${multiline ? 'items-start' : 'items-center'} border border-overlay1 border-solid rounded-lg p-2 hover:bg-surface0 hover:border-mauve transition-colors ${isFocused && !readonly ? 'bg-surface0 border-mauve' : ''} ${readonly ? 'opacity-75 cursor-not-allowed' : 'cursor-pointer'}`}
     role="button"
     onclick={handleClick}
     onkeydown={handleClick}
@@ -101,7 +101,7 @@
     {#if multiline}
         <textarea
             bind:this={inputRef}
-            class="bg-transparent text-sm border-none text-white text-base flex-grow min-h-[1.5rem] leading-6"
+            class="bg-transparent text-sm border-none text-primary text-base flex-grow min-h-[1.5rem] leading-6"
             placeholder={title}
             onfocus={handleFocus}
             onblur={handleBlur}
@@ -116,7 +116,7 @@
         <input
             bind:this={inputRef}
             type={password ? 'password' : 'text'}
-            class="bg-transparent border-none text-white text-base flex-grow"
+            class="bg-transparent border-none text-white text-sm flex-grow"
             placeholder={title}
             onfocus={handleFocus}
             onblur={handleBlur}

@@ -27,5 +27,5 @@
 </div>
 <div>
     <h3>Networked Nodes</h3>
-    <p class="text-sm text-gray-300">Total nodes: 1</p>
+    <p class="text-sm text-muted">Total nodes: 1</p>
 </div>

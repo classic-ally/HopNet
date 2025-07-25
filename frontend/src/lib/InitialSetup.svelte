@@ -9,7 +9,7 @@
 
 <SetupPane 
     title="Welcome."
-    body="AppName is a distributed filesystem designed for everyone, from enthusiast to enterprise."
+    body="HopNet is a distributed filesystem designed for everyone, from enthusiast to enterprise."
 >
     {#snippet features()}
         <FeatureItem

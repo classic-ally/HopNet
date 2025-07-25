@@ -3,7 +3,7 @@
   export let text: string;
 </script>
 
-<div class="grid grid-cols-[auto_1fr] items-center gap-3 border-indigo-500 border-solid border rounded-lg px-2 py-2">
+<div class="grid grid-cols-[auto_1fr] items-center gap-3 border-overlay1 border-solid border rounded-lg px-2 py-2">
   <div class={icon + " text-3xl"}></div>
   <p class="text-sm">{text}</p>
 </div>
