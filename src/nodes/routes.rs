@@ -144,10 +144,36 @@ pub async fn post_nodes(
             // Submit to consensus middleware
             match consensus_middleware(&app_state, transactions, uid).await {
                 Ok(()) => {
-                    // Consensus succeeded - now sync the accepted node
+                    tracing::info!("Consensus succeeded for node {}, waiting for database commit", complete_node.node_id);
+                    
+                    // Poll database to confirm node was committed before proceeding to sync
+                    let mut attempts = 0;
+                    const MAX_ATTEMPTS: u32 = 50; // 5 seconds max wait
+                    const POLL_INTERVAL_MS: u64 = 100;
+                    
+                    loop {
+                        match nodes::node_exists(app_state.db_pool.get(), complete_node.node_id) {
+                            Ok(true) => {
+                                tracing::info!("Node {} confirmed in database after {} attempts", complete_node.node_id, attempts);
+                                break; // Node is registered, proceed to sync
+                            },
+                            Ok(false) => {
+                                attempts += 1;
+                                if attempts >= MAX_ATTEMPTS {
+                                    tracing::error!("Node {} was not committed to database after {} attempts", complete_node.node_id, MAX_ATTEMPTS);
+                                    return StatusCode::INTERNAL_SERVER_ERROR;
+                                }
+                                tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+                            },
+                            Err(e) => {
+                                tracing::error!("Database error checking node existence: {:?}", e);
+                                return StatusCode::INTERNAL_SERVER_ERROR;
+                            }
+                        }
+                    }
                 },
-                Err(_) => {
-                    // Consensus failed - node was rejected
+                Err(e) => {
+                    tracing::error!("Consensus failed for node {}: {:?}", complete_node.node_id, e);
                     return StatusCode::INTERNAL_SERVER_ERROR;
                 }
             }

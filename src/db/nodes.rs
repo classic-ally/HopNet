@@ -325,6 +325,23 @@ pub fn get_next_node_id(
     }
 }
 
+pub fn node_exists(
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    node_id: i32,
+) -> Result<bool, DatabaseError> {
+    match db_connection {
+        Ok(db_lock) => {
+            let count: i32 = db_lock.query_row(
+                "SELECT COUNT(*) FROM nodes WHERE node_id = ?",
+                params![node_id],
+                |row| row.get(0)
+            ).map_err(|_| DatabaseError::RecallError)?;
+            Ok(count > 0)
+        },
+        Err(_) => Err(DatabaseError::LockError),
+    }
+}
+
 pub fn insert_node_consensus(
     db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     mut node: Node,
