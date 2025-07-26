@@ -85,15 +85,22 @@ pub async fn put_setup(
     State(app_state): State<AppState>,
     Json(payload): Json<SyncSetupObject>
 ) -> Result<StatusCode, StatusCode> {
+    tracing::debug!("PUT /setup called - starting node sync process");
+    
     // Extract user keys from payload
     let user_private_key = payload.user_privkey.clone();
+    tracing::debug!("Extracted user private key from payload");
     
     // Find the corresponding user's public key and user_id
     // Assuming the user's private key corresponds to the first user in the payload
     let first_user = payload.users.get(0)
-        .ok_or(StatusCode::BAD_REQUEST)?;
+        .ok_or_else(|| {
+            tracing::error!("No users found in sync payload");
+            StatusCode::BAD_REQUEST
+        })?;
     let user_public_key = first_user.pubkey;
     let user_id = first_user.user_id;
+    tracing::debug!("Found first user: id={}, pubkey={}", user_id, user_public_key.to_hex());
     
     let user_keys = UserKeys {
         private_key: user_private_key,
@@ -102,20 +109,46 @@ pub async fn put_setup(
     
     // Set user keys and user_id in app state (can only be done once)
     app_state.user_keys.set(user_keys)
-        .map_err(|_| StatusCode::CONFLICT)?; // Already initialized
+        .map_err(|_| {
+            tracing::error!("Failed to set user keys in app state - already initialized");
+            StatusCode::CONFLICT
+        })?; // Already initialized
+    tracing::debug!("Successfully set user keys in app state");
+    
     app_state.user_id.set(user_id)
-        .map_err(|_| StatusCode::CONFLICT)?; // Already initialized
+        .map_err(|_| {
+            tracing::error!("Failed to set user_id in app state - already initialized");
+            StatusCode::CONFLICT
+        })?; // Already initialized
+    tracing::debug!("Successfully set user_id={} in app state", user_id);
     
     // Set node_id from the payload
     app_state.node_id.set(payload.yournode.node_id)
-        .map_err(|_| StatusCode::CONFLICT)?; // Already initialized
+        .map_err(|_| {
+            tracing::error!("Failed to set node_id in app state - already initialized");
+            StatusCode::CONFLICT
+        })?; // Already initialized
+    tracing::debug!("Successfully set node_id={} in app state", payload.yournode.node_id);
     
     // Initialize SIV keys from user private key
-    app_state.initialize_siv_keys()?;
+    app_state.initialize_siv_keys().map_err(|e| {
+        tracing::error!("Failed to initialize SIV keys: {:?}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    tracing::debug!("Successfully initialized SIV keys");
+    
+    tracing::debug!("Starting database setup with {} users, {} nodes, {} blocks", 
+                   payload.users.len(), payload.nodes.len(), payload.blocks.len());
     
     match setup::put_join_setup(app_state.db_pool.get(), payload, app_state.private_key) {
-        Ok(()) => Ok(StatusCode::CREATED),
-        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR)
+        Ok(()) => {
+            tracing::info!("PUT /setup completed successfully - node sync finished");
+            Ok(StatusCode::CREATED)
+        },
+        Err(e) => {
+            tracing::error!("Database setup failed during PUT /setup: {:?}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
     }
 }
 

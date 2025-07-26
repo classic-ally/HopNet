@@ -149,8 +149,11 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 last_observed_view: Arc::new(std::sync::atomic::AtomicI32::new(-1)),
             };
 
-            // Start timeout detection worker with cron schedule (every minute)
-            let schedule = apalis_cron::Schedule::from_str("0 * * * * *").unwrap(); // Every minute
+            // Start timeout detection worker with randomized cron schedule (every minute at random second)
+            use rand::Rng;
+            let random_second = rand::rng().random_range(5..55);
+            let cron_expression = format!("{} * * * * *", random_second);
+            let schedule = apalis_cron::Schedule::from_str(&cron_expression).unwrap();
             let cron_stream = apalis_cron::CronStream::new(schedule);
             
             let timeout_worker = WorkerBuilder::new("timeout-detection")

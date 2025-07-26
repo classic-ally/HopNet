@@ -157,15 +157,23 @@ pub fn put_join_setup(
 ) -> Result<(), DatabaseError> {
     match db_connection {
         Ok(mut db_lock) => {
+            tracing::debug!("Database connection acquired for put_join_setup");
             // in this case we need to write the list of nodes and users to the DB
-            let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
+            let tx = db_lock.transaction().map_err(|e| {
+                tracing::error!("Failed to start transaction for put_join_setup: {:?}", e);
+                DatabaseError::LockError
+            })?;
+            tracing::debug!("Database transaction started successfully");
 
             tracing::debug!("Inserting {} users", setupobj.users.len());
             for user in setupobj.users {
                 tx.execute(
                     "INSERT INTO users (user_id, username, password_hash, pubkey, x25519_pubkey) VALUES (?, ?, ?, ?, ?)",
                     params![user.user_id, user.username, user.password, user.pubkey, user.x25519_pubkey]
-                ).map_err(|_| DatabaseError::InsertError)?;
+                ).map_err(|e| {
+                    tracing::error!("Failed to insert user {}: {:?}", user.user_id, e);
+                    DatabaseError::InsertError
+                })?;
             }
 
             tracing::debug!("Inserting {} nodes", setupobj.nodes.len());
@@ -173,7 +181,10 @@ pub fn put_join_setup(
                 tx.execute(
                     "INSERT INTO nodes (node_id, name, ip_address, port, owner, pubkey) VALUES (?, ?, ?, ?, ?, ?)",
                     params![node.node_id, node.name, node.ip_address, node.port, node.owner, node.pubkey]
-                ).map_err(|_| DatabaseError::InsertError)?;
+                ).map_err(|e| {
+                    tracing::error!("Failed to insert node {} ({}:{}): {:?}", node.node_id, node.ip_address, node.port, e);
+                    DatabaseError::InsertError
+                })?;
             }
 
             tracing::debug!("Inserting {} sequences", setupobj.sequences.len());
@@ -263,7 +274,8 @@ pub fn put_join_setup(
                 ).map_err(|_| DatabaseError::InsertError)?;
             }
 
-            tracing::debug!("Inserting this_node configuration");
+            tracing::debug!("Inserting this_node configuration for node_id={}, view={}, phase={:?}", 
+                          setupobj.yournode.node_id, setupobj.yournode.current_view, setupobj.yournode.current_phase);
             tx.execute(
                 "INSERT INTO this_node (internal_id, node_id, privkey, current_phase, current_view, prepared_block_hash, committed_block_hash, highest_qc_block_hash, user_privkey) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
@@ -277,13 +289,25 @@ pub fn put_join_setup(
                     setupobj.yournode.highest_qc_block_hash,
                     setupobj.user_privkey
                 ]
-            ).map_err(|_| DatabaseError::InsertError)?;
+            ).map_err(|e| {
+                tracing::error!("Failed to insert this_node configuration: {:?}", e);
+                tracing::error!("this_node data: internal_id=1, node_id={}, current_view={}, phase={:?}", 
+                              setupobj.yournode.node_id, setupobj.yournode.current_view, setupobj.yournode.current_phase);
+                DatabaseError::InsertError
+            })?;
 
             tracing::info!("Committing join setup transaction");
-            tx.commit().map_err(|_| DatabaseError::InsertError)?;
+            tx.commit().map_err(|e| {
+                tracing::error!("Failed to commit join setup transaction: {:?}", e);
+                DatabaseError::InsertError
+            })?;
             
+            tracing::info!("Successfully completed put_join_setup");
             Ok(())
         }
-        Err(_) => Err(DatabaseError::LockError)
+        Err(e) => {
+            tracing::error!("Failed to get database connection for put_join_setup: {:?}", e);
+            Err(DatabaseError::LockError)
+        }
     }
 }

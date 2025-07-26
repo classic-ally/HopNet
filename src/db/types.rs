@@ -48,7 +48,7 @@ pub fn extract_enum_string(enum_type: EnumType<'_>, row_idx: usize) -> Result<St
     Ok(dict_values.value(dict_key).to_string())
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CustomUUID(Uuid);
 
 impl CustomUUID{

@@ -69,14 +69,20 @@ pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transa
         .cloned()
         .collect();
 
+    let validators_elect = db::get_validators_elect(app_state.db_pool.get(), block.data.height).map_err(|_| ConsensusError::DatabaseError)?
+        .iter()
+        .filter(|node| node.node_id != me.node_id)
+        .cloned()
+        .collect();
+
     // Get QC1 from ballot round
-    let qc1 = ballot_round(&block, &me, ConsensusPhase::Propose, &validators, app_state).await?;
+    let qc1 = ballot_round(&block, &me, ConsensusPhase::Propose, &validators, &validators_elect, app_state).await?;
     // Broadcast QC1 and wait for enough confirmations
-    broadcast_qc(&validators, qc1).await?;
+    broadcast_qc(&validators, &validators_elect, qc1).await?;
     // Get QC2 from ballot round
-    let qc2 = ballot_round(&block, &me, ConsensusPhase::Lock, &validators, app_state).await?;
+    let qc2 = ballot_round(&block, &me, ConsensusPhase::Lock, &validators, &validators_elect, app_state).await?;
     // Broadcast QC2 and wait for enough confirmations
-    broadcast_qc(&validators, qc2).await?;
+    broadcast_qc(&validators, &validators_elect, qc2).await?;
 
     process_transactions(&block.data.transactions, app_state);
 
@@ -88,6 +94,7 @@ async fn ballot_round(
     me: &MyNode,
     phase: ConsensusPhase,
     validators: &Vec<Node>,
+    validators_elect: &Vec<Node>,
     app_state: &AppState
 ) -> Result<QuorumCertificate, ConsensusError> {
     let vote_data = VoteSignData::from_block(block.clone(), phase.clone());
@@ -100,7 +107,7 @@ async fn ballot_round(
 
     let ballot_proposal = Ballot::propose(vote_data, block.clone(), initiator_signoff);
 
-    let voter_signatures = broadcast_and_collect_votes(ballot_proposal, &validators).await?;
+    let voter_signatures = broadcast_and_collect_votes(ballot_proposal, &validators, &validators_elect).await?;
 
     let qc = QuorumCertificate::create(
         &block,
@@ -127,11 +134,17 @@ async fn ballot_round(
 async fn broadcast_and_collect_votes(
     ballot: Ballot,
     validators: &Vec<Node>,
+    validators_elect: &Vec<Node>,
 ) -> Result<Vec<VoteSignMessage>, ConsensusError> {
+    // Handle single validator case (no other nodes to vote)
+    if validators.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let (votes_tx, mut votes_rx) = mpsc::channel::<VoteSignMessage>(100); //100 channel capacity
 
-    // Calculate quorum threshold (2/3 majority)
-    let required_votes = (validators.len() * 2) / 3;
+    // Calculate quorum threshold (2/3 majority + 1)
+    let required_votes = (validators.len() * 2) / 3 + 1;
     
     // Spawn tasks for each validator
     for node in validators.clone() {
@@ -141,6 +154,17 @@ async fn broadcast_and_collect_votes(
         tokio::spawn(async move {
             // Ignore errors from individual nodes - they'll just timeout or fail
             let _ = ballot_send(ballot_clone, &node, votes_tx_clone).await;
+        });
+    }
+    
+    // NON-CRITICAL PATH: Inform validators elect (fire-and-forget, don't collect votes)
+    for node in validators_elect.clone() {
+        let ballot_clone = ballot.clone();
+        tokio::spawn(async move {
+            // Create a dummy channel that we never read from
+            let (dummy_votes_tx, _dummy_votes_rx) = mpsc::channel::<VoteSignMessage>(1);
+            // Best effort delivery - don't care about result or votes
+            let _ = ballot_send(ballot_clone, &node, dummy_votes_tx).await;
         });
     }
     
@@ -187,12 +211,18 @@ async fn broadcast_and_collect_votes(
 
 async fn broadcast_qc(
     validators: &Vec<Node>,
+    validators_elect: &Vec<Node>,
     qc: QuorumCertificate
 ) -> Result<(), ConsensusError> {
+    // Handle single validator case (no other nodes to broadcast to)
+    if validators.is_empty() {
+        return Ok(());
+    }
+
     let (confirmations_tx, mut confirmations_rx) = mpsc::channel::<()>(100);
 
-    // Calculate quorum threshold (2/3 majority)
-    let required_confirmations = (validators.len() * 2) / 3;
+    // Calculate quorum threshold (2/3 majority + 1)
+    let required_confirmations = (validators.len() * 2) / 3 + 1;
     
     // Spawn tasks for each validator
     for node in validators.clone() {
@@ -210,6 +240,15 @@ async fn broadcast_qc(
                     // Don't send confirmation on failure
                 }
             }
+        });
+    }
+    
+    // NON-CRITICAL PATH: Inform validators elect (fire-and-forget, don't wait)
+    for node in validators_elect.clone() {
+        let qc_clone = qc.clone();
+        tokio::spawn(async move {
+            // Best effort delivery - don't care about result
+            let _ = qc_send(qc_clone, &node).await;
         });
     }
     

@@ -11,7 +11,7 @@ use reqwest::Client;
 use tokio::sync::oneshot;
 use bincode::config;
 
-use crate::db::PubKey;
+use crate::db::{PubKey, DatabaseError};
 use crate::{
     consensus::{
         functions::consensus_middleware, 
@@ -112,6 +112,10 @@ pub async fn post_nodes(
     ///////////////
     let next_node_id = match nodes::get_next_node_id(app_state.db_pool.get()) {
         Ok(id) => id,
+        Err(DatabaseError::LockError) => {
+            tracing::warn!("Database connection pool exhausted during get_next_node_id");
+            return StatusCode::TOO_MANY_REQUESTS;
+        },
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
     };
 
@@ -170,7 +174,10 @@ pub async fn post_nodes(
     // Get sync message from DB thread
     let db_dump = match dump_rx.await {
         Ok(data) => data,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+        Err(_) => {
+            tracing::warn!("Database sync dump communication failed");
+            return StatusCode::SERVICE_UNAVAILABLE;
+        },
     };
 
     ///////////////
@@ -191,6 +198,10 @@ pub async fn post_nodes(
     // Wait for DB task completion
     match db_task.await {
         Ok(Ok(())) => StatusCode::CREATED,
+        Ok(Err(crate::db::DatabaseError::LockError)) => {
+            tracing::warn!("Database connection pool exhausted during sync dump");
+            StatusCode::TOO_MANY_REQUESTS
+        },
         Ok(Err(_)) => StatusCode::INTERNAL_SERVER_ERROR,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }

@@ -201,6 +201,58 @@ pub fn get_validators(
     }
 }
 
+pub fn get_validators_elect(
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    current_height: i32,
+) -> Result<Vec<Node>, DatabaseError> {
+    match db_connection {
+        Ok(db_lock) => {
+            let mut stmt = db_lock.prepare(
+                "
+                WITH validators_elect AS (
+                    SELECT DISTINCT node_id
+                    FROM validators
+                    WHERE effective_height > ? AND is_active = true
+                )
+                SELECT n.node_id, n.name, n.ip_address, n.port, n.owner, n.pubkey
+                FROM validators_elect ve
+                JOIN nodes n ON ve.node_id = n.node_id;
+                "
+            ).map_err(|_| DatabaseError::RecallError)?;
+            
+            let results = stmt.query_map([current_height], |row| {
+                let node_id: i32 = row.get(0)?;
+                let name: String = row.get(1)?;
+                let ip_address: String = row.get(2)?;
+                let port: i32 = row.get(3)?;
+                let owner: i32 = row.get(4)?;
+                let pubkey: PubKey = row.get(5)?;
+
+                Ok(Node {
+                    node_id,
+                    name,
+                    ip_address,
+                    port,
+                    owner,
+                    pubkey,
+                })
+            });
+
+            match results {
+                Ok(rows) => {
+                    let nodes: Vec<Node> = rows.collect::<Result<_, _>>().map_err(|_| DatabaseError::ProcessingError)?;
+                    Ok(nodes)
+                }
+                Err(e) => {
+                    tracing::error!("Failed to query validators elect: {:?}", e);
+                    Err(DatabaseError::RecordError)
+                }
+            }
+        },
+        Err(_) => {Err(DatabaseError::LockError)}
+    }
+}
+
 pub fn insert_block(
     db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     block: &Block,

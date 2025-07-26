@@ -10,6 +10,7 @@ use axum::{
 
 use crate::db::consensus as db;
 use crate::consensus::functions::ConsensusError;
+use std::cmp::Ordering;
 /// CONSENSUS ARCHITECTURE
 /// Key notes:
 /// - Using ed25519 over threshold w/ distributed key generation (e.g. BLS)
@@ -85,6 +86,53 @@ pub async fn post_ballot(
     State(app_state): State<AppState>,
     Json(ballot): Json<Ballot>
 ) -> impl IntoResponse {
+    tracing::debug!(
+        "Received ballot for view {} phase {:?} block {:?}",
+        ballot.data.view, ballot.data.phase, ballot.block.block_hash
+    );
+    
+    // Check if this is a future ballot that should trigger catch-up
+    let consensus_state = match db::get_consensus(app_state.db_pool.get()) {
+        Ok(state) => state,
+        Err(crate::db::DatabaseError::LockError) => {
+            tracing::warn!("Database connection pool exhausted during consensus state fetch");
+            return StatusCode::TOO_MANY_REQUESTS.into_response();
+        },
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    
+    match ballot.data.view.cmp(&consensus_state.view) {
+        Ordering::Greater => {
+            // Future ballot - trigger catch-up using existing mechanism
+            let views_behind = ballot.data.view - consensus_state.view;
+            tracing::info!(
+                "Received future ballot for view {} (current: {}), {} views behind - initiating catch-up", 
+                ballot.data.view, consensus_state.view, views_behind
+            );
+            
+            // Use existing catch-up mechanism
+            match perform_catch_up(&app_state, consensus_state.view, ballot.data.view).await {
+                Ok(()) => {
+                    tracing::info!("Successfully caught up to view {}", ballot.data.view);
+                },
+                Err(e) => {
+                    tracing::warn!("Catch-up failed: {:?} - continuing with partial catch-up", e);
+                    // Continue with ballot processing even if catch-up failed partially
+                }
+            }
+            
+            tracing::info!("Catch-up complete, processing original ballot for view {}", ballot.data.view);
+        },
+        Ordering::Less => {
+            tracing::debug!("Received old ballot for view {} (current: {})", ballot.data.view, consensus_state.view);
+            // Continue with normal processing - old ballots might still be valid
+        },
+        Ordering::Equal => {
+            tracing::debug!("Received ballot for current view {}", ballot.data.view);
+            // Continue with normal processing
+        }
+    }
+    
     // validate the ballot proposal
     match ballot.verify_proposal(&app_state) {
         Ok(()) => {
@@ -155,6 +203,49 @@ pub async fn post_qc(
         qc.view_number, qc.phase, qc.block_hash
     );
     
+    // Check if this is a future QC that should trigger catch-up
+    let consensus_state = match db::get_consensus(app_state.db_pool.get()) {
+        Ok(state) => state,
+        Err(crate::db::DatabaseError::LockError) => {
+            tracing::warn!("Database connection pool exhausted during consensus state fetch");
+            return StatusCode::TOO_MANY_REQUESTS;
+        },
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    
+    match qc.view_number.cmp(&consensus_state.view) {
+        Ordering::Greater => {
+            // Future QC - trigger catch-up using existing mechanism
+            let views_behind = qc.view_number - consensus_state.view;
+            tracing::info!(
+                "Received future QC for view {} (current: {}), {} views behind - initiating catch-up", 
+                qc.view_number, consensus_state.view, views_behind
+            );
+            
+            // Use existing catch-up mechanism
+            match perform_catch_up(&app_state, consensus_state.view, qc.view_number).await {
+                Ok(()) => {
+                    tracing::info!("Successfully caught up to view {}", qc.view_number);
+                },
+                Err(e) => {
+                    tracing::warn!("Catch-up failed: {:?} - continuing with partial catch-up", e);
+                    // Continue with QC processing even if catch-up failed partially
+                }
+            }
+            
+            tracing::info!("Catch-up complete, processing original QC for view {}", qc.view_number);
+        },
+        Ordering::Less => {
+            tracing::debug!("Received old QC for view {} (current: {})", qc.view_number, consensus_state.view);
+            // Continue with normal processing - old QCs are still valid
+        },
+        Ordering::Equal => {
+            tracing::debug!("Received QC for current view {}", qc.view_number);
+            // Continue with normal processing
+        }
+    }
+    
+    // Normal QC processing (existing logic)
     match db::get_block(app_state.db_pool.get(), qc.block_hash) {
         Ok(block) => {
             tracing::debug!(
