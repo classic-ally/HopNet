@@ -42,6 +42,7 @@ pub fn get_files(
 pub fn insert_files(
     db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     inodes: Vec<Inode>,
+    execute: bool,
 ) -> Result<(), DatabaseError> {
     match db_connection {
         Ok(mut db_lock) => {
@@ -60,6 +61,7 @@ pub fn insert_files(
                 insert_parent_directories(&tx, &missing_parents, &inodes)?;
             }
             
+            let inode_count = inodes.len();
             for inode in inodes {
                 // Handle the data_id which can be Either<CustomUUID, DataRecord>
                 let data_id: Option<CustomUUID> = match inode.data_id {
@@ -127,8 +129,14 @@ pub fn insert_files(
                 ).map_err(|_| DatabaseError::InsertError)?;
             }
             
-            // Commit the transaction
-            tx.commit().map_err(|_| DatabaseError::InsertError)?;
+            // Commit or rollback based on execute flag
+            if execute {
+                tx.commit().map_err(|_| DatabaseError::InsertError)?;
+                tracing::info!("Successfully inserted {} files", inode_count);
+            } else {
+                tx.rollback().map_err(|_| DatabaseError::LockError)?;
+                tracing::debug!("File insertion for {} files validated successfully (rolled back)", inode_count);
+            }
             
             Ok(())
         }

@@ -8,6 +8,7 @@ use bincode::serde::encode_to_vec;
 use ed25519_dalek::Signature;
 use bincode::config;
 use blake3::Hasher;
+use crate::consensus::functions::validate_transaction;
 
 #[derive(Debug)]
 pub enum VoteError {
@@ -16,6 +17,7 @@ pub enum VoteError {
     ProcessingError,
     ProgressionError,
     BlockError,
+    TransactionValidationError(String),
 }
 
 #[derive(Debug)]
@@ -164,6 +166,21 @@ impl Ballot {
         // need to increase by 1 height each time
         if self.data.block_height != consensus_state.committed_block.data.height + 1 {
             return Err(VoteError::ProgressionError)
+        }
+
+        // 5. Transaction validation (only for Propose phase)
+        // Validate that all transactions can actually succeed before voting
+        if self.data.phase == ConsensusPhase::Propose {
+            if let Some(transactions) = &self.block.data.transactions {
+                for tx in transactions.iter() {
+                    if let Err(e) = validate_transaction(tx, state) {
+                        let error_msg = format!("Transaction '{}' failed validation: {:?}", tx.function, e);
+                        tracing::warn!("Refusing to vote for ballot - {}", error_msg);
+                        return Err(VoteError::TransactionValidationError(error_msg));
+                    }
+                }
+                tracing::debug!("All {} transactions validated successfully before voting", transactions.len());
+            }
         }
 
         Ok(())

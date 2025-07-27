@@ -8,7 +8,7 @@ pub struct InsertFilesHandler;
 impl TransactionHandler for InsertFilesHandler {
     fn name(&self) -> &'static str { "insert_files" }
 
-    fn handle(&self, state: &AppState, payload: &[u8]) -> HandlerResult {
+    fn process(&self, state: &AppState, payload: &[u8], execute: bool) -> HandlerResult {
         match bincode::serde::decode_from_slice::<Vec<Inode>, _>(payload, bincode::config::standard()) {
             Ok((mut inodes, _)) => {
                 // Preprocess inodes to verify fragments exist locally and update stored_locally flags
@@ -24,8 +24,8 @@ impl TransactionHandler for InsertFilesHandler {
                     }
                 }
                 
-                // Insert the files into the database with corrected stored_locally flags
-                insert_files(state.db_pool.get(), inodes)?;
+                // Insert the files into the database with execute flag
+                insert_files(state.db_pool.get(), inodes, execute)?;
                 Ok(())
             },
             Err(_) => Err(DatabaseError::InvalidPayload),

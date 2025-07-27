@@ -345,6 +345,7 @@ pub fn node_exists(
 pub fn insert_node_consensus(
     db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     mut node: Node,
+    execute: bool,
 ) -> Result<(), DatabaseError> {
     // Consensus-safe node insertion - just adds node to DB and validator set
     // No database dump/sync since coordinator handles that
@@ -384,10 +385,15 @@ pub fn insert_node_consensus(
                 params![current_height + 1, next_id, true]
             ).map_err(|_| DatabaseError::InsertError)?;
 
-            // Commit the transaction
-            tx.commit().map_err(|_| DatabaseError::InsertError)?;
+            // Commit or rollback based on execute flag
+            if execute {
+                tx.commit().map_err(|_| DatabaseError::InsertError)?;
+                tracing::info!("Node {} added to validator set via consensus at height {}", next_id, current_height + 1);
+            } else {
+                tx.rollback().map_err(|_| DatabaseError::LockError)?;
+                tracing::debug!("Node {} insertion validated successfully (rolled back)", next_id);
+            }
             
-            tracing::info!("Node {} added to validator set via consensus at height {}", next_id, current_height + 1);
             Ok(())
         },
         Err(_) => Err(DatabaseError::LockError),

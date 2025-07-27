@@ -366,8 +366,19 @@ pub fn process_transactions(transactions: &Option<Transactions>, app_state: &App
 fn process_transaction(tx: &Transaction, app_state: &AppState) -> HandlerResult {
     // look up handler by name
     if let Some(handler) = DISPATCH_TABLE.get(tx.function.as_str()) {
-        // if found, execute it with the payload
-        handler.handle(app_state, &tx.payload)
+        // Execute the transaction (commit to database)
+        handler.process(app_state, &tx.payload, true)
+    } else {
+        tracing::warn!("No handler found for function: {}", &tx.function);
+        Err(crate::db::DatabaseError::InvalidPayload)
+    }
+}
+
+pub fn validate_transaction(tx: &Transaction, app_state: &AppState) -> HandlerResult {
+    // look up handler by name
+    if let Some(handler) = DISPATCH_TABLE.get(tx.function.as_str()) {
+        // Validate the transaction (dry run without commit)
+        handler.process(app_state, &tx.payload, false)
     } else {
         tracing::warn!("No handler found for function: {}", &tx.function);
         Err(crate::db::DatabaseError::InvalidPayload)

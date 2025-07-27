@@ -6,8 +6,8 @@ pub trait TransactionHandler: Send + Sync {
     // Stable lookup name for function that handles thing
     fn name(&self) -> &'static str;
 
-    // The method that executes the logic
-    fn handle(&self, state: &AppState, payload: &[u8]) -> HandlerResult;
+    // Process with execution flag - same logic, commit or rollback based on execute
+    fn process(&self, state: &AppState, payload: &[u8], execute: bool) -> HandlerResult;
 
 }
 

@@ -188,7 +188,25 @@ pub async fn post_ballot(
                 "Ballot rejected for view {} phase {:?}: {:?}",
                 ballot.data.view, ballot.data.phase, e
             );
-            return (StatusCode::UNAUTHORIZED, "Ballot rejected").into_response()
+            
+            // Provide detailed feedback for transaction validation errors
+            match e {
+                super::types::VoteError::TransactionValidationError(details) => {
+                    return (StatusCode::BAD_REQUEST, format!("Transaction validation failed: {}", details)).into_response()
+                },
+                super::types::VoteError::InitiatorError => {
+                    return (StatusCode::UNAUTHORIZED, "Invalid signature or unauthorized proposer").into_response()
+                },
+                super::types::VoteError::ProgressionError => {
+                    return (StatusCode::CONFLICT, "Proposal conflicts with consensus state").into_response()
+                },
+                super::types::VoteError::BlockError => {
+                    return (StatusCode::BAD_REQUEST, "Invalid block data").into_response()
+                },
+                _ => {
+                    return (StatusCode::UNAUTHORIZED, "Ballot rejected").into_response()
+                }
+            }
         },
     }
 }

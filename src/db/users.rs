@@ -93,6 +93,7 @@ pub fn get_user_by_userid(
 pub fn insert_user(
     db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     mut user: User,
+    execute: bool,
 ) -> Result<(), DatabaseError> {
 
     match db_connection {
@@ -117,10 +118,15 @@ pub fn insert_user(
                 []
             ).map_err(|_| DatabaseError::InsertError)?;
             
-            // Commit the transaction
-            tx.commit().map_err(|_| DatabaseError::InsertError)?;
+            // Commit or rollback based on execute flag
+            if execute {
+                tx.commit().map_err(|_| DatabaseError::InsertError)?;
+                tracing::info!("Successfully inserted user {}", next_id);
+            } else {
+                tx.rollback().map_err(|_| DatabaseError::LockError)?;
+                tracing::debug!("User {} insertion validated successfully (rolled back)", next_id);
+            }
             
-            tracing::info!("Successfully inserted user");
             Ok(())
         },
         Err(_) => Err(DatabaseError::LockError),

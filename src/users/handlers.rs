@@ -6,11 +6,11 @@ pub struct InsertUserHandler;
 impl TransactionHandler for InsertUserHandler {
     fn name(&self) -> &'static str { "insert_user" }
 
-    fn handle(&self, state: &AppState, payload: &[u8]) -> HandlerResult {
+    fn process(&self, state: &AppState, payload: &[u8], execute: bool) -> HandlerResult {
         match bincode::serde::decode_from_slice::<User, _>(payload, bincode::config::standard()) {
             Ok((user_data, _)) => {
-                // Insert the user into the database using the existing insert_user function
-                insert_user(state.db_pool.get(), user_data)?;
+                // Insert the user into the database with execute flag
+                insert_user(state.db_pool.get(), user_data, execute)?;
                 Ok(())
             },
             Err(_) => Err(DatabaseError::InvalidPayload),
