@@ -27,7 +27,7 @@ pub enum FileError {
 }
 
 // Maximum fragment size for consumer network performance
-const MAX_FRAGMENT_SIZE: usize = 4 * 1024 * 1024; // 4MB
+pub const MAX_FRAGMENT_SIZE: usize = 4 * 1024 * 1024; // 4MB
 
 /// Calculate optimal number of original and recovery chunks based on file size
 pub fn calculate_optimal_chunks(file_size: usize) -> (usize, usize) {
@@ -405,7 +405,7 @@ pub fn fetch_fragment_local(fragments_dir: &str, fragment_hash: &Blake3Hash) -> 
 
 /// Fetch and verify a fragment from local storage
 /// Returns the fragment data if found locally and hash matches, otherwise returns an error
-fn fetch_and_verify_fragment(fragments_dir: &str, fragment_hash: &Blake3Hash) -> Result<Vec<u8>, FileError> {
+pub fn fetch_and_verify_fragment(fragment_hash: &Blake3Hash, fragments_dir: &str) -> Result<Vec<u8>, FileError> {
     let chunk_data = fetch_fragment_local(fragments_dir, fragment_hash)?;
     
     // Verify chunk hash matches expected
@@ -481,7 +481,7 @@ pub fn reassemble_file(
         
         for i in 0..num_original_chunks {
             if let Some((hash, fragment_id, _)) = file_data.original_fragments.get(&i) {
-                let chunk_data = fetch_and_verify_fragment(fragments_dir, hash)?;
+                let chunk_data = fetch_and_verify_fragment(hash, fragments_dir)?;
                 
                 if let Some(ref per_file_key) = file_data.per_file_key {
                     // Decrypt the chunk using the per-file key
@@ -523,7 +523,7 @@ pub fn reassemble_file(
     for i in 0..num_original_chunks {
         if let Some((hash, fragment_id, exists_locally)) = file_data.original_fragments.get(&i) {
             if *exists_locally {
-                let chunk_data = fetch_and_verify_fragment(fragments_dir, hash)?;
+                let chunk_data = fetch_and_verify_fragment(hash, fragments_dir)?;
                 
                 if let Some(ref per_file_key) = file_data.per_file_key {
                     // Decrypt the chunk using the per-file key
@@ -541,7 +541,7 @@ pub fn reassemble_file(
     for i in 0..num_recovery_chunks {
         if let Some((hash, fragment_id, exists_locally)) = file_data.recovery_fragments.get(&i) {
             if *exists_locally {
-                let chunk_data = fetch_and_verify_fragment(fragments_dir, hash)?;
+                let chunk_data = fetch_and_verify_fragment(hash, fragments_dir)?;
                 
                 if let Some(ref per_file_key) = file_data.per_file_key {
                     // Decrypt the chunk using the per-file key
@@ -574,7 +574,7 @@ pub fn reassemble_file(
 
 /// Check if a fragment exists on disk and is valid (hash matches)
 pub fn fragment_exists_and_valid(fragments_dir: &str, fragment_hash: &Blake3Hash) -> bool {
-    match fetch_and_verify_fragment(fragments_dir, fragment_hash) {
+    match fetch_and_verify_fragment(fragment_hash, fragments_dir) {
         Ok(_) => true,  // Exists and hash matches
         Err(_) => false // Missing, unreadable, or corrupted
     }

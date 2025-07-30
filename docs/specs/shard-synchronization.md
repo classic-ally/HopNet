@@ -29,6 +29,13 @@ This document outlines the requirements for implementing distributed shard synch
 
 ## Fragment Placement Requirements
 
+### 3. Deterministic Node Selection Strategy
+- **Algorithm Output**: Returns preference-ordered list of 1/3 of total storage nodes for each fragment
+- **Cascading Failure Protection**: 1/3 limit prevents same nodes handling original + recovery fragments during failures
+- **Sequential Retry Logic**: Try first node → second node → third node, etc. until successful or exhausted
+- **Minimum Network Size**: Below 3 nodes, cascading protection unavoidable but system still functional
+- **Preference Ordering**: Based on node reliability metrics, geographic distribution, and user proximity
+
 ### 4. Erasure-Code Aware Placement
 - **Requirement**: Different erasure code sets (original vs recovery fragments) must prefer different node sets
 - **Background**: HopNet uses 2:1 redundancy (N original + 2N recovery fragments)
@@ -87,12 +94,13 @@ This document outlines the requirements for implementing distributed shard synch
 
 ## System Architecture Requirements
 
-### 11. Fragment Discovery Protocol
-- **Requirement**: Efficient fragment location without centralized metadata
-- **Primary Method**: Query deterministic candidate set in parallel
-- **Fallback Method**: Expand search scope geometrically if not found in initial candidates
-- **Caching**: Local caching of successful lookups to reduce repeat queries
-- **Performance Target**: Single round-trip latency for common case
+### 11. Fragment Discovery and Retrieval Protocol
+- **Primary Method**: Local database check first (fragments may be cached from previous requests)
+- **Deterministic Placement**: Query preference-ordered list of 1/3 of storage nodes for missing fragments
+- **Sequential Fallback**: Try nodes in preference order (first → second → third, etc.) to handle node failures
+- **Broadcast Fallback**: If deterministic placement fails, query all nodes before expensive Reed-Solomon reconstruction
+- **No Discovery Queries**: No separate discovery step - deterministic placement tells us which nodes to try
+- **Health Monitoring Exception**: Health checks do require separate discovery queries with disk verification and checksum validation
 
 ### 12. Existing System Integration
 - **Requirement**: Leverage existing HopNet infrastructure

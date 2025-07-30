@@ -95,35 +95,42 @@ X-User-Signature: {hex_encoded_ed25519_signature}
 
 ## Fragment Transfer Protocols
 
-### Protocol Requirements
+### Protocol Design Philosophy
 
-#### Bulk Transfer Support
-- **Batch Operations**: Transfer multiple fragments in single operation enabling efficient fragment redistribution during network changes
-- **Efficiency**: Ensure serialized content is efficiently represented to avoid overhead in large transfers
-- **Progress Tracking**: Transfer progress indication for large operations
+#### Simplified Transfer Architecture
+- **No Streaming Required**: Dynamic fragment sizing (4MB maximum) eliminates need for streaming individual fragment transfers
+- **No Bulk Operations**: Simple HTTP requests more reliable than complex bulk protocols; network efficiency gained through parallel requests  
+- **Atomic Fragment Operations**: Each fragment transfer completes atomically or fails entirely
+- **Any-Node Serving**: Nodes serve any fragment they possess, enabling flexible error recovery
+- **Automatic Deserialization**: Blake3Hash path parameters automatically parsed from hex by Axum
 
-#### Streaming Protocol
-- **Progressive Download**: Stream large files as fragments become available
-- **Ordered Delivery**: Maintain fragment order for streaming reconstruction
-- **Parallel Streams**: Concurrent fragment retrieval from multiple nodes
-
-#### Transfer Validation
-- **Fragment Integrity**: Blake3 hash verification for transferred fragments
+#### Transfer Validation and Integrity
+- **Blake3 Hash Verification**: All fragment transfers validated using Blake3 content hashing
 - **Authentication**: All transfers authenticated with dual signature system
-- **Retry Logic**: Automatic retry for failed transfers with exponential backoff
-- **Deduplication**: Avoid redundant transfers of already-present fragments
+- **Local Caching**: Fragments cached locally after successful retrieval for performance
+- **Checksum Health Monitoring**: Health checks verify fragment integrity on disk
 
-### Integration with File Operations
+### Fragment Transfer Workflows
 
-#### User-Facing File Transfers
-- **Resumable Downloads**: Support resumable file downloads for large files
-- **Upload Progress**: Granular progress tracking for file uploads
-- **Error Recovery**: Graceful handling of interrupted file operations
+#### Download Workflow Integration
+1. **Local Database Check**: First check if fragment available locally (may be cached from previous requests)
+2. **Deterministic Placement Query**: Get preference-ordered list of 1/3 of storage nodes for missing fragments
+3. **Sequential Node Attempts**: Try nodes in preference order (first → second → third, etc.)
+4. **Broadcast Fallback**: If deterministic placement fails, query all nodes before expensive Reed-Solomon reconstruction
+5. **File Reconstruction**: Combine available fragments and serve decrypted file to client
 
-#### Fragment-Level Operations
-- **Small Fragment Size**: Fragment transfers typically don't require resumability
-- **Atomic Operations**: Fragment transfers complete atomically or fail
-- **Efficient Protocols**: Optimized for small, frequent transfers
+#### Upload Workflow Integration  
+1. **Local Fragment Storage**: Commit fragments to local storage first
+2. **Client Response**: Return HTTP 200 to client immediately after local commit
+3. **Push Synchronization**: POST fragments to target nodes using preference-ordered 1/3 node list
+4. **Safety Retention**: Don't delete local fragments until receiving 201 CREATED responses
+5. **Background Health Monitoring**: Periodic self-checks and pull synchronization for missing fragments
+
+#### Error Recovery Strategy
+- **Preference-Ordered Fallback**: Try multiple nodes from deterministic placement before giving up
+- **1/3 Node Limitation**: Prevents same nodes handling original + recovery fragments during cascading failures
+- **Cross-Network Fragment Queries**: Any node can serve any fragment it possesses for maximum flexibility
+- **Graceful Degradation**: System continues operating with partial node availability
 
 ## API Architecture and Endpoints
 
@@ -136,9 +143,9 @@ X-User-Signature: {hex_encoded_ed25519_signature}
 - **Timeout Certificates**: `/consensus/tc` for view progression
 
 #### Fragment Management
-- **Fragment Query**: Endpoints for fragment discovery and availability
-- **Fragment Transfer**: Bulk and streaming fragment transfer endpoints
-- **Fragment Validation**: Fragment integrity verification endpoints
+- **Fragment Retrieval**: `GET /fragments/{fragment_hash}` - Retrieve specific fragment by Blake3 hash
+- **Fragment Storage**: `POST /fragments/{fragment_hash}` - Store fragment on target node
+- **Fragment Health Check**: `GET /fragments/{fragment_hash}/health` - Verify fragment exists with disk checksum validation (health monitoring only)
 
 #### Node Management
 - **Node Registration**: `/nodes` for adding new nodes to network
@@ -271,13 +278,13 @@ X-User-Signature: {hex_encoded_ed25519_signature}
 
 ## Implementation Priorities
 
-### Phase 1A: Fragment Transfer Protocol (Critical Blocker) [ ]
-- [ ] Research and select fragment transfer HTTP endpoint architecture (early implementation priority)
-- [ ] Design bulk fragment transfer protocol for efficient multi-fragment operations
-- [ ] Implement streaming fragment delivery for large file reconstruction
-- [ ] Add fragment discovery and availability query endpoints
-- [ ] Integrate fragment transfer validation with Blake3 hash verification
-- [ ] Enable progress tracking for bulk transfer operations
+### Phase 1A: Fragment Transfer Protocol (Critical Blocker) [x]
+- [x] Implement fragment transfer HTTP endpoints (GET/POST /fragments/{hash})
+- [x] Add fragment health check endpoint (/fragments/{hash}/health) with disk verification
+- [x] Integrate Blake3 hash verification and automatic Axum deserialization
+- [x] Add fragment size validation using MAX_FRAGMENT_SIZE constant
+- [x] Implement dual signature authentication for inter-node operations
+- [x] Add comprehensive error handling and logging
 
 ### Phase 1B: Network Foundation [~]
 - [ ] Complete TLS transport layer with certificate management strategy

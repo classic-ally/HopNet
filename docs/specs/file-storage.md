@@ -207,22 +207,22 @@ fn reconstruct_file_reed_solomon(available_fragments: &[Fragment]) -> Result<Vec
 - **Order Preservation**: Maintain chunk order for coherent file streaming
 - **Error Recovery**: Handle missing fragments gracefully during streaming
 
-#### Streaming Implementation Strategy
-1. **Fragment Availability Check**: Determine which fragments are locally available
-2. **Missing Fragment Request**: Initiate parallel requests for unavailable fragments (via shard sync)
-3. **Progressive Decryption**: Decrypt and stream available chunks in order
-4. **Reed-Solomon Integration**: Fall back to erasure decoding when necessary fragments arrive
-5. **Bandwidth Management**: Throttle fragment requests based on streaming requirements
+#### Download Workflow Implementation
+1. **Local Database Check**: Query local fragment database first (may be cached from previous downloads)
+2. **Missing Fragment Identification**: Determine which fragments need retrieval from remote nodes
+3. **Deterministic Placement Query**: Get preference-ordered list of 1/3 storage nodes for each missing fragment
+4. **Sequential Fragment Retrieval**: Try nodes in preference order using HTTP GET /fragments/{hash} endpoints
+5. **Broadcast Fallback**: If deterministic placement fails, query all nodes before Reed-Solomon reconstruction
+6. **Progressive File Reconstruction**: Decrypt and stream file content as fragments become available
+7. **Client Streaming**: Stream reconstructed file to client (this is where streaming happens, not fragment transfer)
 
-#### Integration with Distributed Fragment Discovery
-```rust
-// Integration contract with RFC-004 (Shard Synchronization)
-trait FragmentDiscovery {
-    async fn locate_fragment(&self, fragment_id: UUID) -> Result<Vec<NodeId>, DiscoveryError>;
-    async fn request_fragment(&self, fragment_id: UUID, from_node: NodeId) -> Result<Fragment, TransferError>;
-    async fn request_fragments_batch(&self, fragments: &[UUID]) -> Result<Vec<Fragment>, TransferError>;
-}
-```
+#### Upload Workflow Implementation  
+1. **Fragment Generation**: Create, encrypt, and hash fragments locally from uploaded file
+2. **Local Fragment Storage**: Commit fragments to local database and filesystem
+3. **Client Response**: Return HTTP 200 to client immediately after local storage commit
+4. **Background Push Synchronization**: POST fragments to target nodes using preference-ordered node lists
+5. **Safety Retention**: Don't delete local fragment copies until receiving 201 CREATED responses from target nodes
+6. **Health Monitoring**: Periodic background jobs verify fragment integrity and pull missing fragments
 
 ## Distributed Storage Integration
 
@@ -231,15 +231,19 @@ trait FragmentDiscovery {
 #### Storage Interface for Shard Synchronization
 ```rust
 pub trait DistributedFragmentStorage {
-    // Fragment placement decisions (implemented by RFC-004)
-    async fn determine_fragment_placement(&self, fragment: &Fragment, redundancy: u8) -> Vec<NodeId>;
+    // Fragment placement decisions (implemented by RFC-004)  
+    async fn get_fragment_target_nodes(&self, fragment_hash: Blake3Hash) -> Vec<NodeId>; // Returns 1/3 of nodes, preference-ordered
     
-    // Fragment transfer operations (implemented by RFC-004)  
-    async fn store_fragment_remotely(&self, fragment: &Fragment, target_nodes: &[NodeId]) -> Result<(), StorageError>;
-    async fn retrieve_fragment(&self, fragment_id: UUID) -> Result<Fragment, RetrievalError>;
+    // Fragment transfer operations (implemented by RFC-003)
+    async fn store_fragment_on_node(&self, fragment: &Fragment, target_node: NodeId) -> Result<(), StorageError>; // POST /fragments/{hash}
+    async fn retrieve_fragment_from_node(&self, fragment_hash: Blake3Hash, source_node: NodeId) -> Result<Fragment, RetrievalError>; // GET /fragments/{hash}
     
-    // Fragment discovery (implemented by RFC-004)
-    async fn discover_fragment_locations(&self, fragment_id: UUID) -> Result<Vec<NodeId>, DiscoveryError>;
+    // Local fragment management
+    async fn check_fragment_locally(&self, fragment_hash: Blake3Hash) -> bool; // Database check first
+    async fn store_fragment_locally(&self, fragment: &Fragment) -> Result<(), StorageError>; // Local commit
+    
+    // Health monitoring
+    async fn verify_fragment_health(&self, fragment_hash: Blake3Hash, node: NodeId) -> Result<bool, HealthError>; // GET /fragments/{hash}/health
 }
 ```
 

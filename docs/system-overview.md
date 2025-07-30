@@ -39,9 +39,9 @@ Reed-Solomon encoded file storage with encryption and fragment management.
 - [ ] Preview data extraction while maintaining encryption
 
 ### 3. Node Communication System ([RFC-003](specs/node-communication.md))
-**Status**: Core complete but requires hardcoded IPs; we may want to use some NAT punching approach
+**Status**: Fragment transfer endpoints complete, NAT traversal pending
 
-HTTP-based inter-node communication with authentication and basic monitoring.
+HTTP-based inter-node communication with authentication and fragment transfer capabilities.
 
 - [x] HTTP API with RESTful endpoints for consensus operations
 - [x] Dual Ed25519 signature authentication (node + user signatures)
@@ -49,13 +49,14 @@ HTTP-based inter-node communication with authentication and basic monitoring.
 - [x] Request routing (non-leaders forward to current leader)
 - [x] Basic RTT latency measurement between nodes
 - [x] Node discovery and network membership management
-- [ ] Fragment transfer protocols and endpoints
+- [x] Fragment transfer protocols and endpoints (GET/POST /fragments/{hash}, health checks)
 - [ ] Bandwidth monitoring and quality-of-service metrics
 - [ ] Connection pooling and performance optimization
 - [ ] Network topology awareness and geographic information
+- [ ] NAT traversal implementation (deprioritized for defined IP infrastructure)
 
 ### 4. Shard Synchronization System ([RFC-004](specs/shard-synchronization.md))
-**Status**: In design
+**Status**: Ready for implementation (fragment transfer infrastructure complete)
 
 Intelligent fragment distribution system optimizing for performance, reliability, and geographic redundancy.
 
@@ -108,15 +109,15 @@ End-to-end encryption and comprehensive authentication system.
 
 **Phase 1A Critical Path**: Infrastructure completion to enable distributed operations
 
-**Primary**: RFC-003 Fragment Transfer Protocol Implementation
-- Design fragment transfer HTTP endpoint architecture
-- Implement bulk and streaming fragment transfer capabilities
-- Enable cross-node fragment discovery and retrieval protocols
+**Primary**: RFC-004 Shard Synchronization Implementation  
+- Implement deterministic fragment placement algorithm (1/3 node selection strategy)
+- Integrate with completed fragment transfer endpoints (GET/POST /fragments/{hash})
+- Build fragment discovery and cross-node retrieval workflows
 
-**Secondary**: Consensus Height Integration
-- Complete height-based versioning across file storage system
-- Integrate consensus height tracking with distributed operations
-- Enable Time Machine functionality using consensus height progression
+**Secondary**: Upload/Download Workflow Integration
+- Integrate fragment transfer with file download (missing fragment retrieval)
+- Implement background push synchronization for uploaded files
+- Add fragment health monitoring using /fragments/{hash}/health endpoint
 
 ### Reliability Goals
 - **Single node failure**: No data loss, minimal performance impact

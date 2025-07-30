@@ -187,6 +187,9 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             let rpc_routes = Router::new()
                 .route("/consensus/propose", post(consensus::routes::post_propose))
                 .route("/consensus/view/{view}", get(consensus::routes::get_view_consensus_data))
+                .route("/fragments/{fragment_hash}", get(files::routes::get_fragment))
+                .route("/fragments/{fragment_hash}", post(files::routes::post_fragment))
+                .route("/fragments/{fragment_hash}/health", get(files::routes::get_fragment_health))
                 .layer(middleware::from_fn_with_state(app_state.clone(), consensus::routes::rpc_auth_middleware));
 
             // Strict catch-up routes (must be fully caught up)

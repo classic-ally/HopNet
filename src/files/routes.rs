@@ -3,7 +3,7 @@ use axum::{
         Multipart, Path, Query, State, Extension
     },
     Json,
-    response::Response,
+    response::{Response, IntoResponse},
     http::header,
     body::Body
 };
@@ -367,6 +367,157 @@ pub async fn delete_files(
         Err(e) => {
             tracing::error!("Error deleting files: {:?}", e);
             return Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+// =============================================================================
+// FRAGMENT TRANSFER ENDPOINTS (RFC-003)
+// Inter-node fragment transfer for distributed storage
+// =============================================================================
+
+use crate::consensus::routes::AuthenticatedUser;
+use crate::files::functions::{fetch_and_verify_fragment, fragment_exists_and_valid, MAX_FRAGMENT_SIZE};
+
+/// GET /fragments/{fragment_hash}
+/// Retrieve a fragment by its Blake3 hash from local storage
+/// Used by other nodes to fetch missing fragments during file reconstruction
+pub async fn get_fragment(
+    State(app_state): State<AppState>,
+    Path(fragment_hash): Path<Blake3Hash>,
+    Extension(auth): Extension<AuthenticatedUser>,
+) -> impl IntoResponse {
+    // Allow any authenticated user to request fragments (supports roaming users)
+    
+    // Check if we have this fragment locally and verify it's valid
+    if !fragment_exists_and_valid(&app_state.fragments_dir, &fragment_hash) {
+        tracing::debug!("Fragment not found locally: {}", fragment_hash.to_hex());
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    
+    // Fetch and verify the fragment from local storage
+    match fetch_and_verify_fragment(&fragment_hash, &app_state.fragments_dir) {
+        Ok(fragment_data) => {
+            tracing::debug!("Successfully served fragment: {} ({} bytes)", fragment_hash.to_hex(), fragment_data.len());
+            
+            // Return the raw fragment bytes with appropriate content type
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/octet-stream")
+                .header("Content-Length", fragment_data.len().to_string())
+                .header("X-Fragment-Hash", fragment_hash.to_hex())
+                .body(Body::from(fragment_data))
+                .unwrap()
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!("Failed to fetch fragment {}: {:?}", fragment_hash.to_hex(), e);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// POST /fragments/{fragment_hash}
+/// Store a fragment received from another node
+/// Used during upload synchronization and background fragment replication
+pub async fn post_fragment(
+    State(app_state): State<AppState>,
+    Path(expected_hash): Path<Blake3Hash>,
+    Extension(auth): Extension<AuthenticatedUser>,
+    body: Body
+) -> impl IntoResponse {
+    // Only allow node owners to store fragments for inter-node operations
+    if !auth.user_owns_node {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    
+    // Read the request body (fragment data) with size limit matching our fragment chunking
+    let fragment_data = match axum::body::to_bytes(body, MAX_FRAGMENT_SIZE + 1024).await { // Add small buffer for headers
+        Ok(data) => data.to_vec(),
+        Err(e) => {
+            tracing::error!("Failed to read fragment data: {:?}", e);
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    };
+    
+    // Verify fragment size doesn't exceed maximum
+    if fragment_data.len() > MAX_FRAGMENT_SIZE {
+        tracing::warn!("Fragment too large: {} bytes (max: {})", fragment_data.len(), MAX_FRAGMENT_SIZE);
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    
+    // Verify the fragment hash matches the provided hash
+    let actual_hash = Blake3Hash::new(blake3::hash(&fragment_data));
+    if actual_hash != expected_hash {
+        tracing::warn!("Fragment hash mismatch: expected {}, got {}", expected_hash.to_hex(), actual_hash.to_hex());
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    
+    // Check if we already have this fragment to avoid redundant storage
+    if fragment_exists_and_valid(&app_state.fragments_dir, &expected_hash) {
+        tracing::debug!("Fragment already exists locally: {}", expected_hash.to_hex());
+        return StatusCode::OK.into_response(); // Already have it, that's fine
+    }
+    
+    // Store the fragment to local storage
+    let fragment_len = fragment_data.len(); // Get length before moving data
+    match store_fragment(&app_state.fragments_dir, &expected_hash, fragment_data) {
+        Ok(_) => {
+            tracing::debug!("Successfully stored fragment: {} ({} bytes)", expected_hash.to_hex(), fragment_len);
+            StatusCode::CREATED.into_response()
+        }
+        Err(e) => {
+            tracing::error!("Failed to store fragment {}: {:?}", expected_hash.to_hex(), e);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// GET /fragments/{fragment_hash}/health
+/// Health check endpoint that verifies fragment exists and has correct checksum
+/// Used by background monitoring jobs to verify fragment integrity across the network
+pub async fn get_fragment_health(
+    State(app_state): State<AppState>,
+    Path(fragment_hash): Path<Blake3Hash>,
+    Extension(auth): Extension<AuthenticatedUser>,
+) -> impl IntoResponse {
+    // Only allow node owners to perform health checks for inter-node operations
+    if !auth.user_owns_node {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    
+    // Perform comprehensive health check: existence + disk read + checksum verification
+    match fragment_exists_and_valid(&app_state.fragments_dir, &fragment_hash) {
+        true => {
+            // Double-check by actually reading and verifying the fragment
+            match fetch_and_verify_fragment(&fragment_hash, &app_state.fragments_dir) {
+                Ok(_) => {
+                    tracing::debug!("Fragment health check passed: {}", fragment_hash.to_hex());
+                    
+                    #[derive(Serialize)]
+                    struct HealthResponse {
+                        fragment_hash: String,
+                        status: String,
+                        verified: bool,
+                    }
+                    
+                    let response = HealthResponse {
+                        fragment_hash: fragment_hash.to_hex(),
+                        status: "healthy".to_string(),
+                        verified: true,
+                    };
+                    
+                    (StatusCode::OK, Json(response)).into_response()
+                }
+                Err(e) => {
+                    tracing::warn!("Fragment health check failed for {}: {:?}", fragment_hash.to_hex(), e);
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+            }
+        }
+        false => {
+            tracing::debug!("Fragment health check failed - not found: {}", fragment_hash.to_hex());
+            StatusCode::NOT_FOUND.into_response()
         }
     }
 }
