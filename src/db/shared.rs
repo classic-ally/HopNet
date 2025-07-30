@@ -141,7 +141,8 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
                 rtt_variance    REAL,
                 rtt_jitter      REAL,
                 throughput      BIGINT,
-                version         TINYINT NOT NULL DEFAULT 0,
+                height          INTEGER NOT NULL,  -- Consensus height for deterministic versioning
+                available       BOOLEAN NOT NULL DEFAULT TRUE, -- Node availability (false if unreachable)
                 
                 PRIMARY KEY     (from_node, to_node, start_time),
                 FOREIGN KEY (from_node) REFERENCES nodes(node_id),
@@ -152,6 +153,7 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
             CREATE INDEX idx_metrics_time_range ON metrics(start_time, from_node, to_node);
             CREATE INDEX idx_metrics_from_node ON metrics(from_node, start_time);
             CREATE INDEX idx_metrics_to_node ON metrics(to_node, start_time);
+            CREATE INDEX idx_metrics_height ON metrics(height DESC, to_node); -- For placement decisions at specific heights
 
             -- File system
             CREATE TABLE data_blocks (
@@ -217,7 +219,8 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
             COMMENT ON COLUMN metrics.rtt_variance IS 'RTT variance in milliseconds';
             COMMENT ON COLUMN metrics.rtt_jitter IS 'RTT jitter in milliseconds';
             COMMENT ON COLUMN metrics.throughput IS 'Network throughput in bytes per second';
-            COMMENT ON COLUMN metrics.version IS 'Schema version for backwards compatibility';
+            COMMENT ON COLUMN metrics.height IS 'Consensus height for deterministic versioning';
+            COMMENT ON COLUMN metrics.available IS 'Node availability (false if unreachable during measurement)';
         "
     )?;
     Ok(())

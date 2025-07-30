@@ -176,6 +176,8 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/files", delete(files::routes::delete_files))
                 .route("/files/{*path}", get(files::routes::get_file_fragments))
                 .route("/validators", get(consensus::routes::get_validators))
+                .route("/metrics", get(metrics::routes::get_metrics))
+                .route("/metrics/trigger", get(metrics::routes::get_metrics_trigger))
                 .layer(middleware::from_fn_with_state(app_state.clone(), auth::auth_middleware));
 
             // Routes that accept either JWT (users) or RPC (nodes) authentication
@@ -207,7 +209,6 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
             let base_app = Router::new()
                 .fallback_service(admin_service) // routes we don't have get sent to vite frontend
-                .route("/metrics/get-all", get(metrics::routes::get_metrics))
                 .merge(protected_routes)
                 .merge(jwt_or_rpc_routes)
                 .merge(rpc_routes)

@@ -18,7 +18,7 @@ Byzantine fault-tolerant consensus engine providing network coordination and sta
 - [x] Leader rotation and timeout handling
 - [x] Quorum certificate generation and validation
 - [x] Node catch-up mechanism for network synchronization
-- [ ] Performance metrics integration for node reliability
+- [~] Performance metrics integration for node reliability (infrastructure complete, worker pending)
 - [ ] Node health monitoring and automatic validator management
 
 ### 2. File Storage System ([RFC-002](specs/file-storage.md))  
@@ -50,7 +50,7 @@ HTTP-based inter-node communication with authentication and fragment transfer ca
 - [x] Basic RTT latency measurement between nodes
 - [x] Node discovery and network membership management
 - [x] Fragment transfer protocols and endpoints (GET/POST /fragments/{hash}, health checks)
-- [ ] Bandwidth monitoring and quality-of-service metrics
+- [~] Bandwidth monitoring and quality-of-service metrics (latency complete, throughput integration pending)
 - [ ] Connection pooling and performance optimization
 - [ ] Network topology awareness and geographic information
 - [ ] NAT traversal implementation (deprioritized for defined IP infrastructure)
@@ -109,8 +109,17 @@ End-to-end encryption and comprehensive authentication system.
 
 **Phase 1A Critical Path**: Infrastructure completion to enable distributed operations
 
+**Infrastructure Blocker**: Background Metrics Collection (prerequisite for shard synchronization)
+- [x] Extended metrics table with consensus height and availability tracking  
+- [x] Created reusable metrics collection infrastructure with timeout handling
+- [x] Implemented consensus transaction batching for metrics submissions ("submit_metrics" handler)
+- [x] Added manual metrics trigger API endpoint with consensus integration for debugging and testing
+- [x] Fixed metrics retrieval API (GET /metrics) with proper timestamp handling for DuckDB compatibility
+- [~] Implement automated background metrics collection worker with randomized 10-minute intervals
+- [ ] Integrate throughput measurement using existing infrastructure (HIGH PRIORITY)
+
 **Primary**: RFC-004 Shard Synchronization Implementation  
-- Implement deterministic fragment placement algorithm (1/3 node selection strategy)
+- Implement deterministic fragment placement algorithm using collected node reliability metrics
 - Integrate with completed fragment transfer endpoints (GET/POST /fragments/{hash})
 - Build fragment discovery and cross-node retrieval workflows
 
@@ -156,19 +165,20 @@ End-to-end encryption and comprehensive authentication system.
 ### Phase 1A: Infrastructure Completion (Critical Path)
 **Goal**: Resolve blocking dependencies preventing distributed operations
 
-1. **Complete RFC-003 fragment transfer protocols** - Critical blocker for all distributed functionality
-   - Design and implement bulk fragment transfer HTTP endpoints
-   - Add fragment discovery and retrieval protocols
-   - Enable streaming fragment transfers for large files
+1. **Complete RFC-003 fragment transfer protocols** ✅ - Critical blocker resolved
+   - Fragment transfer HTTP endpoints implemented (GET/POST /fragments/{hash}, health checks)
+   - Authentication integrated with dual signature system
+   - Fragment size validation and automatic hash verification
    
-2. **Finish consensus height integration** - Required for consistent versioning across systems
-   - Complete height-based versioning in file storage system
-   - Implement consensus height tracking for all distributed operations
-   - Add height-based Time Machine functionality
+2. **Implement background metrics collection infrastructure** - New critical blocker identified  
+   - Extend metrics table with consensus height and availability boolean columns
+   - Automated background metrics collection with randomized scheduling (every 10 minutes)
+   - Consensus transaction batching to minimize network overhead
+   - Manual trigger API endpoint for debugging and testing
    
 3. **Enable RFC-002 distributed fragment storage** - Foundation for distributed network
-   - Implement distributed fragment placement (depends on fragment transfer)
-   - Add cross-node fragment discovery and retrieval
+   - Implement distributed fragment placement using metrics-based node reliability scoring
+   - Add cross-node fragment discovery and retrieval (depends on RFC-003 ✅)
    - Complete storage capacity monitoring and basic quota management
 
 ### Phase 1B: Basic Distributed Operations

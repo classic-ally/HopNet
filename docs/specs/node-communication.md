@@ -278,7 +278,7 @@ X-User-Signature: {hex_encoded_ed25519_signature}
 
 ## Implementation Priorities
 
-### Phase 1A: Fragment Transfer Protocol (Critical Blocker) [x]
+### Phase 1A: Fragment Transfer Protocol (Complete) [x]
 - [x] Implement fragment transfer HTTP endpoints (GET/POST /fragments/{hash})
 - [x] Add fragment health check endpoint (/fragments/{hash}/health) with disk verification
 - [x] Integrate Blake3 hash verification and automatic Axum deserialization
@@ -286,10 +286,13 @@ X-User-Signature: {hex_encoded_ed25519_signature}
 - [x] Implement dual signature authentication for inter-node operations
 - [x] Add comprehensive error handling and logging
 
-### Phase 1B: Network Foundation [~]
+### Phase 1B: Network Foundation and Metrics Infrastructure [~]
+- [ ] **Priority**: Implement automated background metrics collection (10-minute randomized intervals)
+- [ ] **Priority**: Add consensus-based metrics storage with height versioning and availability tracking
+- [ ] **Priority**: Create metrics batching for consensus transactions to minimize network overhead
+- [ ] **High Priority**: Integrate throughput measurement with existing throughput infrastructure (metrics/throughput.rs)
 - [ ] Complete TLS transport layer with certificate management strategy
 - [ ] Enhance dual signature authentication system for production use
-- [ ] Implement comprehensive performance metrics collection for node reliability scoring
 - [ ] Add basic connection pooling and error handling
 
 ### Phase 2: Performance and Reliability [ ]

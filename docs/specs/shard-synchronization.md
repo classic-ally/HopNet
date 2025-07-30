@@ -69,17 +69,22 @@ This document outlines the requirements for implementing distributed shard synch
 
 ### 8. Consensus-Tracked Node Metrics
 - **Requirement**: Node reliability metrics must be tracked via consensus to ensure deterministic placement
+- **Implementation Strategy**: Automated background collection with consensus batching
+  - Each node measures all other active validators every 10 minutes (randomized scheduling)
+  - RTT latency, variance, jitter measurements using existing metrics infrastructure
+  - Node availability tracking via boolean flag (successful vs failed measurements)
+  - Batch all measurements into single consensus transaction per collection cycle
 - **Metrics to Track**:
-  - Uptime percentage (30-day rolling window)
-  - Average response time and variance
-  - Consensus participation rate
-  - Storage capacity and utilization
-- **Update Frequency**: Periodic consensus operations (not per-fragment)
-- **Versioning**: Metrics must be versioned using consensus height for deterministic placement consistency
+  - RTT latency and variance (existing infrastructure)
+  - Node availability boolean (uptime calculation)
+  - Consensus participation rate (from validator tracking)
+  - Storage capacity and utilization (future enhancement)
+- **Update Frequency**: 10-minute randomized intervals to prevent thundering herd
+- **Versioning**: All metrics stored with consensus height for deterministic placement consistency
 - **Database Schema Changes**:
-  - Extend metrics tables with `effective_height` columns
-  - Create consensus-triggered metric update transactions
-  - Implement height-based metric lookup for placement decisions
+  - Add `height` column to metrics table for consensus versioning
+  - Add `available` boolean column for explicit uptime tracking
+  - Create `submit_metrics` consensus transaction handler for batched submissions
 
 ### 9. Roaming Device Detection and Penalization
 - **Requirement**: Mobile/roaming devices should be discouraged from storing original fragments
@@ -163,12 +168,18 @@ This document outlines the requirements for implementing distributed shard synch
 
 ## Implementation Priorities
 
-### Phase 1A: Foundation (Depends on RFC-003 Fragment Transfer) [ ]
-- [~] Consensus height-based versioning implementation
+### Phase 1A: Foundation (Depends on Background Metrics Collection) [~]
+- [x] **BLOCKER RESOLVED**: Extended metrics table with height and availability columns for reliable node scoring
+- [x] **INFRASTRUCTURE**: Implemented reusable metrics collection infrastructure with timeout handling  
+- [x] **CONSENSUS INTEGRATION**: Implemented consensus transaction batching for metrics submissions ("submit_metrics" handler)
+- [x] **API ENDPOINTS**: Added manual metrics trigger API endpoint with consensus integration for debugging
+- [x] **DATABASE COMPATIBILITY**: Fixed metrics retrieval API with proper DuckDB timestamp handling (GET /metrics)  
+- [~] **IN PROGRESS**: Background metrics collection worker with randomized 10-minute scheduling
+- [ ] **HIGH PRIORITY**: Integrate throughput measurement using existing infrastructure
 - [~] Rendezvous hashing placement algorithm
 - [~] Erasure-code aware placement logic
-- [ ] Database schema extensions for height tracking
-- [ ] Integration with fragment transfer protocols (blocked by RFC-003 Phase 1A)
+- [x] Database schema extensions for height tracking
+- [x] Integration with fragment transfer protocols (RFC-003 complete)
 
 ### Phase 1B: Fragment Discovery and Basic Geographic Distribution [ ]
 - [ ] Parallel fragment query implementation using RFC-003 fragment discovery endpoints

@@ -1,4 +1,3 @@
-use duckdb::DuckdbConnectionManager;
 use tokio::net::{TcpStream, TcpListener};
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use tokio::time::{Duration, timeout};
@@ -7,9 +6,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use rand::Rng;
-
-use crate::db;
-use crate::metrics::types::*;
 #[derive(Debug)]
 pub enum LatencyError {
     MalformedTimestamp,
@@ -110,7 +106,6 @@ fn calculate_rtt_metrics(rtts: Vec<Duration>) -> (f64, f64, f64) {
 
 // Send latency data over TCP
 pub async fn send_latency(
-    db_conn: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     ip: IpAddr, 
     port: u16
 ) -> Result<(f64, f64, f64), LatencyError> {
@@ -126,7 +121,6 @@ pub async fn send_latency(
     let max_total_duration = Duration::from_secs(5);
 
     let start_time = std::time::Instant::now();
-    let sys_start_time = std::time::SystemTime::now();
 
     while start_time.elapsed() < max_total_duration {
         // Actual data transmission
@@ -150,23 +144,8 @@ pub async fn send_latency(
     // calculate RTT average, variance, jitter
     let (average_rtt, variance, jitter) = calculate_rtt_metrics(rtts);
 
-    let metric = Metric {
-        from_node: 1000,
-        to_node: 1000,
-        start_time: sys_start_time,
-        duration: max_total_duration,
-        rtt_latency: Some(average_rtt),
-        rtt_variance: Some(variance),
-        rtt_jitter: Some(jitter),
-        throughput: None,
-        version: 0
-    };
-
-    // database write
-    match db::metrics::insert_metric(db_conn, metric) {
-        Ok(()) => Ok((average_rtt, variance, jitter)),
-        Err(_) => Err(LatencyError::DatabaseError)
-    }
+    // Return raw metrics - let the caller decide whether/how to store them
+    Ok((average_rtt, variance, jitter))
 
     // println!("RTT Average: {:.2} ms | RTT Variance: {:.2} ms^2 | Jitter: {:.2} ms", average_rtt, variance, jitter);
 
