@@ -6,3 +6,4 @@ pub mod routes;
 pub mod collector;
 pub mod handlers;
 pub mod functions;
+pub mod jobs;

@@ -109,14 +109,14 @@ End-to-end encryption and comprehensive authentication system.
 
 **Phase 1A Critical Path**: Infrastructure completion to enable distributed operations
 
-**Infrastructure Blocker**: Background Metrics Collection (prerequisite for shard synchronization)
+**Infrastructure Complete**: Background Metrics Collection
 - [x] Extended metrics table with consensus height and availability tracking  
 - [x] Created reusable metrics collection infrastructure with timeout handling
 - [x] Implemented consensus transaction batching for metrics submissions ("submit_metrics" handler)
 - [x] Added manual metrics trigger API endpoint with consensus integration for debugging and testing
 - [x] Fixed metrics retrieval API (GET /metrics) with proper timestamp handling for DuckDB compatibility
-- [~] Implement automated background metrics collection worker with randomized 10-minute intervals
-- [ ] Integrate throughput measurement using existing infrastructure (HIGH PRIORITY)
+- [x] Implemented automated background metrics collection worker with randomized 10-minute intervals
+- [x] Integrated throughput measurement using existing infrastructure
 
 **Primary**: RFC-004 Shard Synchronization Implementation  
 - Implement deterministic fragment placement algorithm using collected node reliability metrics

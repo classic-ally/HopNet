@@ -167,6 +167,22 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 timeout_worker.run().await;
             });
 
+            // Start metrics collection worker with randomized 10-minute schedule
+            let random_second = rand::rng().random_range(5..55);
+            let random_minute = rand::rng().random_range(0..10); // 0-9 minutes offset within each 10-minute window
+            let metrics_cron_expression = format!("{} {}/10 * * * *", random_second, random_minute);
+            let metrics_schedule = apalis_cron::Schedule::from_str(&metrics_cron_expression).unwrap();
+            let metrics_cron_stream = apalis_cron::CronStream::new(metrics_schedule);
+            
+            let metrics_worker = WorkerBuilder::new("metrics-collection")
+                .data(app_state.clone())
+                .backend(metrics_cron_stream)
+                .build_fn(metrics::jobs::handle_metrics_collection);
+            
+            tokio::spawn(async move {
+                metrics_worker.run().await;
+            });
+
             // Protected routes that require authentication
             let protected_routes = Router::new()
                 .route("/users", get(users::routes::get_users))

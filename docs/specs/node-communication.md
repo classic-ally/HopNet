@@ -286,8 +286,8 @@ X-User-Signature: {hex_encoded_ed25519_signature}
 - [x] Implement dual signature authentication for inter-node operations
 - [x] Add comprehensive error handling and logging
 
-### Phase 1B: Network Foundation and Metrics Infrastructure [~]
-- [ ] **Priority**: Implement automated background metrics collection (10-minute randomized intervals)
+### Phase 1B: Network Foundation and Metrics Infrastructure [x]
+- [x] **Priority**: Implement automated background metrics collection (10-minute randomized intervals)
 - [x] **Priority**: Add consensus-based metrics storage with height versioning and availability tracking
 - [x] **Priority**: Create metrics batching for consensus transactions to minimize network overhead
 - [x] **High Priority**: Integrate throughput measurement with existing throughput infrastructure (metrics/throughput.rs)
