@@ -288,9 +288,9 @@ X-User-Signature: {hex_encoded_ed25519_signature}
 
 ### Phase 1B: Network Foundation and Metrics Infrastructure [~]
 - [ ] **Priority**: Implement automated background metrics collection (10-minute randomized intervals)
-- [ ] **Priority**: Add consensus-based metrics storage with height versioning and availability tracking
-- [ ] **Priority**: Create metrics batching for consensus transactions to minimize network overhead
-- [ ] **High Priority**: Integrate throughput measurement with existing throughput infrastructure (metrics/throughput.rs)
+- [x] **Priority**: Add consensus-based metrics storage with height versioning and availability tracking
+- [x] **Priority**: Create metrics batching for consensus transactions to minimize network overhead
+- [x] **High Priority**: Integrate throughput measurement with existing throughput infrastructure (metrics/throughput.rs)
 - [ ] Complete TLS transport layer with certificate management strategy
 - [ ] Enhance dual signature authentication system for production use
 - [ ] Add basic connection pooling and error handling

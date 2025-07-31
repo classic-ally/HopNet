@@ -5,3 +5,4 @@ pub mod types;
 pub mod routes;
 pub mod collector;
 pub mod handlers;
+pub mod functions;

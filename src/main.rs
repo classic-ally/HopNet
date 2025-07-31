@@ -50,6 +50,7 @@ pub struct AppState {
     siv_nonce: Arc<OnceCell<Nonce>>,
     fragments_dir: String,
     timeout_vote_collector: Arc<consensus::functions::TimeoutVoteCollector>,
+    throughput_result_collector: Arc<metrics::functions::ThroughputResultCollector>,
     last_observed_view: Arc<std::sync::atomic::AtomicI32>,
 }
 
@@ -146,6 +147,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 siv_nonce: Arc::new(OnceCell::new()),
                 fragments_dir,
                 timeout_vote_collector: Arc::new(consensus::functions::TimeoutVoteCollector::new()),
+                throughput_result_collector: Arc::new(metrics::functions::ThroughputResultCollector::new()),
                 last_observed_view: Arc::new(std::sync::atomic::AtomicI32::new(-1)),
             };
 
@@ -192,6 +194,8 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/fragments/{fragment_hash}", get(files::routes::get_fragment))
                 .route("/fragments/{fragment_hash}", post(files::routes::post_fragment))
                 .route("/fragments/{fragment_hash}/health", get(files::routes::get_fragment_health))
+                .route("/rpc/throughput-server", get(metrics::routes::get_throughput_server))
+                .route("/rpc/throughput-result/{session_id}", get(metrics::routes::get_throughput_result))
                 .layer(middleware::from_fn_with_state(app_state.clone(), consensus::routes::rpc_auth_middleware));
 
             // Strict catch-up routes (must be fully caught up)

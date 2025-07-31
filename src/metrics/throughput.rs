@@ -93,11 +93,13 @@ async fn receive_throughput(port: u16, startup_tx: oneshot::Sender<()>) -> Resul
 
 async fn select_port() -> Result<(JoinHandle<Result<(SystemTime, std::net::SocketAddr, usize, Duration), ThroughputError>>, u16), ThroughputError> {
     // pick random port in safe range
-    let mut rng = rand::rng();
     const MIN_PORT: u16 = 49152;
     const MAX_PORT: u16 = 65535;
 
-    let throughput_port: u16 = rng.random_range(MIN_PORT..=MAX_PORT);
+    let throughput_port: u16 = {
+        let mut rng = rand::rng();
+        rng.random_range(MIN_PORT..=MAX_PORT)
+    };
 
     // start the throughput listener on this port as well as the stats channel
     let (throughput_startup_tx, throughput_startup_rx) = oneshot::channel();

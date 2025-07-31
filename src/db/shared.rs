@@ -136,7 +136,6 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
                 from_node       INTEGER NOT NULL,
                 to_node         INTEGER NOT NULL,
                 start_time      TIMESTAMP NOT NULL,
-                duration        SMALLINT NOT NULL,
                 rtt_latency     REAL,
                 rtt_variance    REAL,
                 rtt_jitter      REAL,
@@ -214,7 +213,6 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
 
             -- Add comments for documentation
             COMMENT ON TABLE metrics IS 'Network performance metrics between distributed system nodes';
-            COMMENT ON COLUMN metrics.duration IS 'Measurement duration in milliseconds (max ~32 seconds)';
             COMMENT ON COLUMN metrics.rtt_latency IS 'Round-trip time latency in milliseconds';
             COMMENT ON COLUMN metrics.rtt_variance IS 'RTT variance in milliseconds';
             COMMENT ON COLUMN metrics.rtt_jitter IS 'RTT jitter in milliseconds';

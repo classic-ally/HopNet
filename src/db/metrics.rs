@@ -1,6 +1,5 @@
 use super::*;
 use crate::metrics::types::Metric;
-use std::time::Duration;
 use chrono::DateTime;
 
 pub fn get_metric(
@@ -25,20 +24,16 @@ pub fn get_metric(
                         duckdb::Error::InvalidColumnName("start_time".to_string())
                     })?;
                 
-                // Convert duration from milliseconds to Duration - note: SMALLINT in DB
-                let duration_ms: i16 = row.get(3)?;
-                
                 Ok(Metric {
                     from_node,
                     to_node,
                     start_time,
-                    duration: Duration::from_millis(duration_ms as u64),
-                    rtt_latency: row.get(4)?,
-                    rtt_variance: row.get(5)?,
-                    rtt_jitter: row.get(6)?,
-                    throughput: row.get(7)?,
-                    height: row.get(8)?,        // New: consensus height
-                    available: row.get(9)?,     // New: node availability
+                    rtt_latency: row.get(3)?,
+                    rtt_variance: row.get(4)?,
+                    rtt_jitter: row.get(5)?,
+                    throughput: row.get(6)?,
+                    height: row.get(7)?,        // New: consensus height
+                    available: row.get(8)?,     // New: node availability
                 })
             });
 
@@ -71,16 +66,13 @@ pub fn insert_metric(
         Ok(db_lock) => {
             // Use DateTime directly - no conversion needed!
             let start_time_str = metric.start_time.to_rfc3339();
-            let duration_ms = metric.duration.as_millis() as i32;
-
             tracing::debug!("Inserting metric into database");
             let result = db_lock.execute(
-                "INSERT INTO metrics (from_node, to_node, start_time, duration, rtt_latency, rtt_variance, rtt_jitter, throughput, height, available) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO metrics (from_node, to_node, start_time, rtt_latency, rtt_variance, rtt_jitter, throughput, height, available) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     metric.from_node,
                     metric.to_node,
                     start_time_str,
-                    duration_ms,
                     metric.rtt_latency,
                     metric.rtt_variance,
                     metric.rtt_jitter,
@@ -117,15 +109,12 @@ pub fn insert_metrics_batch(
             let metrics_len = metrics.len();
             for metric in metrics {
                 let start_time_str = metric.start_time.to_rfc3339();
-                let duration_ms = metric.duration.as_millis() as i16;
-
                 tx.execute(
-                    "INSERT INTO metrics (from_node, to_node, start_time, duration, rtt_latency, rtt_variance, rtt_jitter, throughput, height, available) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO metrics (from_node, to_node, start_time, rtt_latency, rtt_variance, rtt_jitter, throughput, height, available) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         metric.from_node,
                         metric.to_node,
                         start_time_str,
-                        duration_ms,
                         metric.rtt_latency,
                         metric.rtt_variance,
                         metric.rtt_jitter,

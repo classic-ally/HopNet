@@ -18,7 +18,7 @@ Byzantine fault-tolerant consensus engine providing network coordination and sta
 - [x] Leader rotation and timeout handling
 - [x] Quorum certificate generation and validation
 - [x] Node catch-up mechanism for network synchronization
-- [~] Performance metrics integration for node reliability (infrastructure complete, worker pending)
+- [x] Performance metrics integration for node reliability (latency + throughput measurement complete)
 - [ ] Node health monitoring and automatic validator management
 
 ### 2. File Storage System ([RFC-002](specs/file-storage.md))  
@@ -50,7 +50,7 @@ HTTP-based inter-node communication with authentication and fragment transfer ca
 - [x] Basic RTT latency measurement between nodes
 - [x] Node discovery and network membership management
 - [x] Fragment transfer protocols and endpoints (GET/POST /fragments/{hash}, health checks)
-- [~] Bandwidth monitoring and quality-of-service metrics (latency complete, throughput integration pending)
+- [x] Bandwidth monitoring and quality-of-service metrics (latency + throughput measurement complete)
 - [ ] Connection pooling and performance optimization
 - [ ] Network topology awareness and geographic information
 - [ ] NAT traversal implementation (deprioritized for defined IP infrastructure)

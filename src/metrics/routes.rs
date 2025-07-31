@@ -1,6 +1,6 @@
 use std::net::IpAddr;
-use axum::{extract::{State, Query}, response::IntoResponse, http::StatusCode, Json};
-use crate::AppState;
+use axum::{extract::{Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Extension, Json};
+use crate::{consensus::routes::AuthenticatedUser, AppState};
 use crate::db::metrics::get_metric;
 use crate::metrics::collector::{collect_all_node_metrics, CollectionError};
 use crate::consensus::functions::consensus_middleware;
@@ -10,6 +10,8 @@ use crate::metrics::{
         listener,
         send_latency
     },
+    throughput::{downloader, send_throughput},
+    functions::{ThroughputResult, ThroughputResultCollector},
     types::{
         LatencyResponseWrapper,
         LatencyResponse,
@@ -19,6 +21,14 @@ use crate::metrics::{
     },
 };
 use duckdb::DuckdbConnectionManager;
+use serde::{Deserialize, Serialize};
+use crate::db::CustomUUID;
+
+#[derive(Serialize)]
+pub struct ThroughputServerResponse {
+    pub port: u16,
+    pub session_id: CustomUUID,
+}
 
 pub async fn get_metrics(
     State(app_state): State<AppState>,
@@ -105,6 +115,80 @@ pub async fn get_latency_server() -> impl IntoResponse {
         }
         Err(_error) => {
             (StatusCode::INTERNAL_SERVER_ERROR, Json(0))
+        }
+    }
+}
+
+#[axum::debug_handler]
+pub async fn get_throughput_server(
+    State(app_state): State<AppState>,
+    Extension(_auth): Extension<AuthenticatedUser>,
+) -> impl IntoResponse {
+    match downloader().await {
+        Ok((task_handle, throughput_port)) => {
+            // Generate session ID for this measurement
+            let session_id = CustomUUID::new(None);
+            let session_id_clone = session_id.clone();
+            
+            // Spawn task to handle measurement and store results
+            let collector = app_state.throughput_result_collector.clone();
+            tokio::spawn(async move {
+                if let Ok(result) = task_handle.await {
+                    match result {
+                        Ok((timestamp, client_addr, total_bytes, duration)) => {
+                            let throughput_result = ThroughputResult {
+                                throughput_bps: if duration.as_secs_f64() > 0.0 {
+                                    (total_bytes as f64 / duration.as_secs_f64()) as i64
+                                } else {
+                                    0
+                                },
+                                total_bytes,
+                                duration_ms: duration.as_millis() as u64,
+                                client_addr: client_addr.to_string(),
+                            };
+                            
+                            collector.store_result(session_id_clone.clone(), throughput_result).await;
+                        }
+                        Err(e) => {
+                            tracing::debug!("Throughput measurement failed for session {:?}: {:?}", session_id_clone, e);
+                        }
+                    }
+                }
+            });
+            
+            let response = ThroughputServerResponse {
+                port: throughput_port,
+                session_id,
+            };
+            
+            (StatusCode::CREATED, Json(response))
+        }
+        Err(_error) => {
+            let error_response = ThroughputServerResponse {
+                port: 0,
+                session_id: CustomUUID::new(None),
+            };
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(error_response))
+        }
+    }
+}
+
+#[axum::debug_handler]
+pub async fn get_throughput_result(
+    State(app_state): State<AppState>,
+    Path(session_id): Path<CustomUUID>,
+    Extension(_auth): Extension<AuthenticatedUser>,
+) -> impl IntoResponse {
+    let session_id_for_log = session_id.clone();
+    match app_state.throughput_result_collector.get_result(session_id).await {
+        Some(result) => {
+            tracing::debug!("Retrieved throughput result for session {:?}: {} bytes/sec", 
+                session_id_for_log, result.throughput_bps);
+            (StatusCode::OK, Json(serde_json::json!(result)))
+        }
+        None => {
+            tracing::debug!("No throughput result found for session {:?}", session_id_for_log);
+            (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Session not found or expired"})))
         }
     }
 }
