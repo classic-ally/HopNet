@@ -60,9 +60,9 @@ HTTP-based inter-node communication with authentication and fragment transfer ca
 
 Intelligent fragment distribution system optimizing for performance, reliability, and geographic redundancy.
 
-- [~] Consensus height-based versioning for deterministic placement
-- [~] Rendezvous hashing algorithm for fragment placement
-- [~] Erasure-code aware placement (separate original vs recovery sets)
+- [x] Consensus height-based versioning for deterministic placement
+- [x] Rendezvous hashing algorithm for fragment placement
+- [x] Erasure-code aware placement (separate original vs recovery sets)
 - [ ] Fragment discovery protocol with parallel queries
 - [ ] Performance-optimized original fragment placement
 - [ ] Geographic redundancy for recovery fragments
@@ -121,11 +121,12 @@ End-to-end encryption and comprehensive authentication system.
 - [x] **COMPLETED**: Cross-platform storage metrics endpoint (/rpc/storage-server) with JWT+RPC dual authentication
 
 **Primary**: RFC-004 Shard Synchronization Implementation  
-- Implement deterministic fragment placement algorithm using collected node reliability metrics
+- ✅ **COMPLETED**: Deterministic fragment placement algorithm using collected node reliability metrics
   - Two-phase approach: rendezvous hashing for candidates, then metrics-based selection
   - Storage capacity tracking integration (✅ completed: storage_total_gb, storage_used_gb in metrics)
   - Performance target: <100ms placement decisions using DuckDB analytical queries with caching
   - Time-weighted metrics with probationary period for new nodes
+  - Placement scores debugging API (/metrics/scores) with raw metrics and weighted scoring for original/recovery fragments
 - Integrate with completed fragment transfer endpoints (GET/POST /fragments/{hash})
 - Build fragment discovery and cross-node retrieval workflows
 

@@ -196,6 +196,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/validators", get(consensus::routes::get_validators))
                 .route("/metrics", get(metrics::routes::get_metrics))
                 .route("/metrics/trigger", get(metrics::routes::get_metrics_trigger))
+                .route("/metrics/scores", get(metrics::routes::get_placement_scores))
                 .layer(middleware::from_fn_with_state(app_state.clone(), auth::auth_middleware));
 
             // Routes that accept either JWT (users) or RPC (nodes) authentication

@@ -1,7 +1,7 @@
 use std::net::IpAddr;
 use axum::{extract::{Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Extension, Json};
 use crate::{consensus::routes::AuthenticatedUser, AppState};
-use crate::db::metrics::get_metric;
+use crate::db::metrics::{get_metric, get_all_node_metrics};
 use crate::metrics::collector::{collect_all_node_metrics, CollectionError};
 use crate::consensus::functions::consensus_middleware;
 use crate::consensus::types::Transaction;
@@ -21,6 +21,7 @@ use crate::metrics::{
         StorageResponse,
     },
 };
+use crate::files::placement::{FragmentType, calculate_final_placement_scores};
 use duckdb::DuckdbConnectionManager;
 use serde::{Deserialize, Serialize};
 use crate::db::CustomUUID;
@@ -29,6 +30,12 @@ use crate::db::CustomUUID;
 pub struct ThroughputServerResponse {
     pub port: u16,
     pub session_id: CustomUUID,
+}
+
+#[derive(Deserialize)]
+pub struct PlacementScoresQuery {
+    pub height: i32,
+    pub fragment_type: Option<String>,  // "original" or "recovery"
 }
 
 pub async fn get_metrics(
@@ -207,6 +214,50 @@ pub async fn get_storage_server(
                 used_gb: 0,
             }))
         }
+    }
+}
+
+pub async fn get_placement_scores(
+    Query(params): Query<PlacementScoresQuery>,
+    State(app_state): State<AppState>,
+) -> impl IntoResponse {
+    // Get all node metrics at the specified consensus height
+    let node_metrics = match get_all_node_metrics(app_state.db_pool.get(), params.height) {
+        Ok(metrics) => metrics,
+        Err(e) => {
+            tracing::error!("Failed to retrieve node metrics for height {}: {:?}", params.height, e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": "Failed to retrieve node metrics"
+            })));
+        }
+    };
+
+    // If fragment_type is specified, apply weighted scoring
+    if let Some(fragment_type_str) = params.fragment_type {
+        let fragment_type = match fragment_type_str.as_str() {
+            "original" => FragmentType::Original,
+            "recovery" => FragmentType::Recovery,
+            _ => {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                    "error": "fragment_type must be 'original' or 'recovery'"
+                })));
+            }
+        };
+
+        // Calculate final placement scores using the placement algorithm
+        let scored_candidates = calculate_final_placement_scores(node_metrics, fragment_type);
+        
+        (StatusCode::OK, Json(serde_json::json!({
+            "height": params.height,
+            "fragment_type": fragment_type_str,
+            "weighted_scores": scored_candidates
+        })))
+    } else {
+        // Return raw metrics without fragment-specific weighting
+        (StatusCode::OK, Json(serde_json::json!({
+            "height": params.height,
+            "raw_metrics": node_metrics
+        })))
     }
 }
 
