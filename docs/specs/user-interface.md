@@ -129,12 +129,15 @@ Every feature implementation must meet these baseline requirements:
 - **Node Addition**: Guided workflow for adding new nodes to the network
 - **Health Monitoring**: Real-time status indicators and performance graphs
 - **Node Configuration**: Per-node settings and role management
+- **Storage Visualization**: Per-node storage capacity and utilization display in nodes pane
+- **Fragment Distribution**: Visual representation of fragment placement across network
 
 #### Network Administration
 - **Network Settings**: Configuration of network-wide policies
 - **User Management**: User invitation and permission management
 - **Storage Analytics**: Network-wide storage utilization and health metrics
 - **Backup Status**: Overview of data redundancy and recovery capabilities
+- **Rebalancing Controls**: Manual rebalancing trigger interface (future implementation)
 
 ### 6. Mobile & Thin Client Requirements
 

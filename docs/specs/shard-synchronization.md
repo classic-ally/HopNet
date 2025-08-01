@@ -35,12 +35,49 @@ This document outlines the requirements for implementing distributed shard synch
 - **Sequential Retry Logic**: Try first node → second node → third node, etc. until successful or exhausted
 - **Minimum Network Size**: Below 3 nodes, cascading protection unavoidable but system still functional
 - **Preference Ordering**: Based on node reliability metrics, geographic distribution, and user proximity
+- **Implementation Details**:
+  - **Phase 1 - Candidate Selection**: Use rendezvous hashing with XOR distance metric
+    - `fragment_key = hash(fragment_hash)`
+    - `distance = fragment_key XOR hash(node_id)` where node hashes are cached
+    - Sort nodes by distance, take top 1/3 as candidates
+  - **Phase 2 - Metrics-Based Placement**: Apply performance weighting within candidates
+    - Query metrics at specific consensus height for consistency
+    - Calculate base score from weighted metrics: availability, throughput, latency, geographic diversity
+    - Original fragments: availability (0.4) > throughput (0.3) > latency (0.2) > proximity (0.1)
+    - Recovery fragments: availability (0.4) + inverse throughput (0.3) + inverse latency (0.2) + inverse proximity (0.1)
+      - Keeps availability positive (need reliable nodes for disaster recovery)
+      - Inverts performance metrics: `(1.0 - metric_score)` for throughput/latency/proximity
+      - Achieves load distribution by preferring lower-performance nodes
+      - Storage multiplier prevents placement on nearly-full nodes regardless of score
+    - Apply storage capacity multiplier: `e^(-k * utilization)` where k=5
+      - 50% full: 0.082x multiplier, 70% full: 0.030x, 90% full: 0.011x
+      - Incentivizes balanced storage contribution across all nodes
+    - Final score: `base_score * storage_multiplier`
+    - Try nodes in weighted order until successful placement
+  - **Performance Optimizations**:
+    - Single DuckDB analytical query computes all node scores with time-weighted aggregates
+    - Leverages columnar storage for fast aggregations (~10-50ms for 100 nodes)
+    - Query results cached per consensus height to avoid repeated calculations
+    - All placement logic after initial query runs in-memory on cached data
+  - **New Node Handling**:
+    - Probationary period using trust factor: `(sample_count / 100).min(1.0)`
+    - Blend measured metrics with network statistics (p75 latency, median availability)
+    - Natural progression from conservative to trusted over ~16 hours (100 samples)
+  - **Metric Calculation Details**:
+    - **Availability**: `availability_24h * 0.7 + availability_7d * 0.3` where availability = successful/total pings
+    - **Throughput**: `log(1 + percentile_rank * 9) / log(10) * consistency_factor`
+      - Percentile-based to adapt to network capabilities (no hard thresholds)
+      - Logarithmic scaling for diminishing returns at high throughput
+      - Consistency factor: `1 / (1 + coefficient_of_variation)`
+    - **Latency**: `1 / (1 + normalized_latency)` with exponential time decay
+    - **Stability**: `1 / (1 + latency_variance_7d)` to prefer predictable nodes
+    - **Geographic diversity**: Achieved implicitly through inverse performance scoring for recovery fragments
 
 ### 4. Erasure-Code Aware Placement
 - **Requirement**: Different erasure code sets (original vs recovery fragments) must prefer different node sets
 - **Background**: HopNet uses 2:1 redundancy (N original + 2N recovery fragments)
 - **Goal**: Prevent single node failure from eliminating entire erasure capability
-- **Implementation**: Use different type seeds in deterministic algorithm for original vs recovery placement
+- **Implementation**: Natural separation through fragment indices (0 to N-1 for original, N to 3N-1 for recovery) combined with metrics-based weighting in Phase 2
 
 ### 5. Performance-Optimized Original Fragment Placement
 - **Requirement**: Original fragments must be placed on most reliable and performant nodes
@@ -54,8 +91,9 @@ This document outlines the requirements for implementing distributed shard synch
 - **Requirement**: Recovery fragments should be distributed to maximize geographic diversity
 - **Rationale**: Provides resilience against regional outages or natural disasters
 - **Implementation Strategy**: 
-  - **Phase 1B**: Use RTT clustering as distance proxy for basic geographic distribution
-  - **Phase 1B**: Integrate IP geolocation services for improved geographic awareness
+  - **Phase 1A**: Implicit geographic distribution through inverse performance scoring
+    - High latency nodes (geographically distant) naturally preferred for recovery
+    - Low throughput nodes (different networks) provide network diversity
   - **Phase 3**: Add user-provided geographic regions for compliance requirements (regulatory constraints, data sovereignty)
   - **Future**: Advanced jurisdiction restrictions and cross-border data flow controls
 
@@ -78,12 +116,13 @@ This document outlines the requirements for implementing distributed shard synch
   - RTT latency and variance (existing infrastructure)
   - Node availability boolean (uptime calculation)
   - Consensus participation rate (from validator tracking)
-  - Storage capacity and utilization (future enhancement)
+  - Storage capacity and utilization in GB (UINTEGER storage_total_gb, storage_used_gb)
 - **Update Frequency**: 10-minute randomized intervals to prevent thundering herd
 - **Versioning**: All metrics stored with consensus height for deterministic placement consistency
 - **Database Schema Changes**:
   - Add `height` column to metrics table for consensus versioning
   - Add `available` boolean column for explicit uptime tracking
+  - Add `storage_total_gb`, `storage_used_gb` UINTEGER columns for capacity tracking
   - Create `submit_metrics` consensus transaction handler for batched submissions
 
 ### 9. Roaming Device Detection and Penalization
@@ -96,6 +135,10 @@ This document outlines the requirements for implementing distributed shard synch
 - **Requirement**: Consistency must be weighted higher than absolute performance
 - **Implementation**: Variance penalties more severe than high-latency penalties
 - **Goal**: Prefer predictably good nodes over occasionally excellent but unreliable nodes
+- **Storage Multiplier Design**: Exponential decay ensures storage capacity acts as a strong filter
+  - Prevents overloading nodes regardless of other performance metrics
+  - Creates natural load balancing across network
+  - Nodes at same utilization percentage contribute equally regardless of absolute size
 
 ## System Architecture Requirements
 
@@ -106,8 +149,33 @@ This document outlines the requirements for implementing distributed shard synch
 - **Broadcast Fallback**: If deterministic placement fails, query all nodes before expensive Reed-Solomon reconstruction
 - **No Discovery Queries**: No separate discovery step - deterministic placement tells us which nodes to try
 - **Health Monitoring Exception**: Health checks do require separate discovery queries with disk verification and checksum validation
+- **Performance Requirements**:
+  - Fragment placement decision must complete in <100ms for responsive file access
+  - Leverage DuckDB query result caching to amortize metrics calculation cost
+  - Pre-compute node hashes at startup for O(1) lookup during placement
+  - Batch fragment placement decisions when possible to reuse metrics queries
 
-### 12. Existing System Integration
+### 12. Fragment Placement Lifecycle
+- **Placement Scheduling**: Background job triggered after local storage completion and on periodic schedule
+- **Non-blocking Upload**: Fragment distribution does not block user upload process
+- **Network Failure Handling**: Retain local fragments if network issues prevent distribution, retry on next schedule
+- **Database Schema**: Add `placement_height` column to `data_blocks` table to track placement consensus height
+- **Full Network Storage**: Alert users when network approaches capacity limits (future enhancement)
+
+### 13. Rebalancing and Node Lifecycle
+- **Rebalancing Algorithm**: Recompute placement at current consensus height, transmit fragments, update `placement_height`
+- **Cleanup Process**: Nodes cleanup fragments where current placement differs from stored `placement_height`
+- **Node Lifecycle Events**: Manual rebalancing trigger for graceful node removal, automatic detection of storage expansion
+- **Fragment Health Verification**: Use existing `/fragments/{hash}/health` endpoint for integrity checks during rebalancing
+- **Future Enhancements**: Hierarchical metrics sampling for networks >1000 nodes
+
+### 14. Configuration Parameters
+- **Storage Capacity Decay**: k=5 in `e^(-k * utilization)` storage multiplier formula
+- **New Node Trust Building**: 100 samples required for full trust factor (approximately 16 hours)
+- **Metrics Query Caching**: Cache results within background job execution (per consensus height)
+- **Rebalancing Frequency**: Configurable interval (value to be determined during implementation)
+
+### 15. Existing System Integration
 - **Requirement**: Leverage existing HopNet infrastructure
 - **Consensus System**: Use existing BFT consensus for metrics and policy coordination
 - **Authentication**: Integrate with existing Ed25519 node authentication
@@ -115,7 +183,7 @@ This document outlines the requirements for implementing distributed shard synch
 - **Database**: Extend existing DuckDB schema with height-based versioning columns
 - **Height Integration**: Utilize existing `committed_block_height` tracking from consensus state
 
-### 13. Multiple User Support
+### 16. Multiple User Support
 - **Requirement**: Handle shared files across multiple users efficiently
 - **Approach**: Equal weighting of all users with file access
 - **Avoid**: Complex access frequency tracking or weighted user preferences
@@ -123,13 +191,13 @@ This document outlines the requirements for implementing distributed shard synch
 
 ## Performance Requirements
 
-### 14. Network Efficiency
+### 17. Network Efficiency
 - **Requirement**: Minimize network overhead for fragment operations
 - **Target**: O(replication_factor) queries for fragment discovery
 - **Constraint**: Avoid O(log N) multi-hop routing complexity of DHTs
 - **Optimization**: Parallel queries to reduce latency
 
-### 15. Streaming Performance
+### 18. Streaming Performance
 - **Requirement**: Optimize for low-latency file access
 - **Priority**: Original fragment availability critical for streaming use cases
 - **Backup Strategy**: Reed-Solomon reconstruction acceptable for rare original fragment loss
@@ -137,13 +205,13 @@ This document outlines the requirements for implementing distributed shard synch
 
 ## Future Extensibility Requirements
 
-### 16. Compliance Framework Readiness
+### 19. Compliance Framework Readiness
 - **Requirement**: Architecture must support future jurisdiction-based placement restrictions
 - **Design**: Extensible location tracking system
 - **Implementation**: Pluggable location detection methods (RTT proxy -> IP geolocation -> user-declared)
 - **Constraint Checking**: Framework for validating placement against compliance rules
 
-### 17. Scalable Metrics Collection
+### 20. Scalable Metrics Collection
 - **Requirement**: Metrics system must scale with network growth
 - **Current Scope**: Validator-sized networks (< 100 nodes)
 - **Future**: Support larger networks without consensus bottlenecks
@@ -151,15 +219,15 @@ This document outlines the requirements for implementing distributed shard synch
 
 ## Success Criteria
 
-### 18. Performance Targets
+### 21. Performance Targets
 - Deterministic consistency: 100% placement agreement across nodes using height-based versioning
 
-### 19. Reliability Goals
+### 22. Reliability Goals
 - Single node failure: No data loss, minimal performance impact
 - Regional outage: Full data availability through geographic redundancy
 - Roaming device issues: No impact on network performance or availability
 
-### 20. Integration Requirements
+### 23. Integration Requirements
 - Zero downtime deployment of shard synchronization
 - Backward compatibility with existing file operations
 - Minimal changes to existing consensus and database schemas (add height columns)

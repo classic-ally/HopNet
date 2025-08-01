@@ -109,7 +109,7 @@ End-to-end encryption and comprehensive authentication system.
 
 **Phase 1A Critical Path**: Infrastructure completion to enable distributed operations
 
-**Infrastructure Complete**: Background Metrics Collection
+**Infrastructure Partially Complete**: Background Metrics Collection
 - [x] Extended metrics table with consensus height and availability tracking  
 - [x] Created reusable metrics collection infrastructure with timeout handling
 - [x] Implemented consensus transaction batching for metrics submissions ("submit_metrics" handler)
@@ -117,9 +117,14 @@ End-to-end encryption and comprehensive authentication system.
 - [x] Fixed metrics retrieval API (GET /metrics) with proper timestamp handling for DuckDB compatibility
 - [x] Implemented automated background metrics collection worker with randomized 10-minute intervals
 - [x] Integrated throughput measurement using existing infrastructure
+- [ ] **BLOCKING**: Storage capacity metrics collection (storage_total_gb, storage_used_gb columns)
 
 **Primary**: RFC-004 Shard Synchronization Implementation  
 - Implement deterministic fragment placement algorithm using collected node reliability metrics
+  - Two-phase approach: rendezvous hashing for candidates, then metrics-based selection
+  - Storage capacity tracking integration (requires adding storage_total_gb, storage_used_gb to metrics)
+  - Performance target: <100ms placement decisions using DuckDB analytical queries with caching
+  - Time-weighted metrics with probationary period for new nodes
 - Integrate with completed fragment transfer endpoints (GET/POST /fragments/{hash})
 - Build fragment discovery and cross-node retrieval workflows
 
