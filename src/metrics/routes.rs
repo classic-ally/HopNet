@@ -18,6 +18,7 @@ use crate::metrics::{
         RemoteLatencyQuery,
         Metric,
         ErrorResponse,
+        StorageResponse,
     },
 };
 use duckdb::DuckdbConnectionManager;
@@ -191,6 +192,48 @@ pub async fn get_throughput_result(
             (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Session not found or expired"})))
         }
     }
+}
+
+pub async fn get_storage_server(
+    State(app_state): State<AppState>,
+) -> impl IntoResponse {
+    // Calculate local storage metrics using configured fragments directory
+    match calculate_storage_usage(&app_state.fragments_dir).await {
+        Ok(storage) => (StatusCode::OK, Json(storage)),
+        Err(e) => {
+            tracing::error!("Failed to calculate storage usage: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(StorageResponse {
+                total_gb: 0,
+                used_gb: 0,
+            }))
+        }
+    }
+}
+
+async fn calculate_storage_usage(fragments_dir: &str) -> Result<StorageResponse, Box<dyn std::error::Error>> {
+    use tokio::task;
+    
+    let fragments_dir_owned = fragments_dir.to_string();
+    let (total_bytes, used_bytes) = task::spawn_blocking(move || -> Result<(u64, u64), std::io::Error> {
+        use fs4::statvfs;
+        
+        let stats = statvfs(&fragments_dir_owned)?;
+        let total = stats.total_space();
+        let available = stats.available_space();
+        let used = total - available;
+        
+        Ok((total, used))
+    }).await.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?
+      .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+    
+    // Convert to GB (using 1024^3 for consistency)
+    let used_gb = (used_bytes / (1024_u64.pow(3))) as u32;
+    let total_gb = (total_bytes / (1024_u64.pow(3))) as u32;
+    
+    Ok(StorageResponse {
+        total_gb,
+        used_gb,
+    })
 }
 
 /// GET endpoint to manually trigger metrics collection and return results

@@ -124,6 +124,11 @@ This document outlines the requirements for implementing distributed shard synch
   - Add `available` boolean column for explicit uptime tracking
   - Add `storage_total_gb`, `storage_used_gb` UINTEGER columns for capacity tracking
   - Create `submit_metrics` consensus transaction handler for batched submissions
+- **Storage Metrics Collection**:
+  - `/rpc/storage-server` endpoint with JWT or RPC authentication for direct user monitoring
+  - Cross-platform filesystem queries using `fs4::statvfs` for fast capacity calculations
+  - Storage utilization: `used_gb = total_gb - available_gb` (no slow directory traversal)
+  - Integrated into existing metrics collection workflow with timeout handling
 
 ### 9. Roaming Device Detection and Penalization
 - **Requirement**: Mobile/roaming devices should be discouraged from storing original fragments
@@ -242,8 +247,10 @@ This document outlines the requirements for implementing distributed shard synch
 - [x] **CONSENSUS INTEGRATION**: Implemented consensus transaction batching for metrics submissions ("submit_metrics" handler)
 - [x] **API ENDPOINTS**: Added manual metrics trigger API endpoint with consensus integration for debugging
 - [x] **DATABASE COMPATIBILITY**: Fixed metrics retrieval API with proper DuckDB timestamp handling (GET /metrics)  
-- [~] **IN PROGRESS**: Background metrics collection worker with randomized 10-minute scheduling
-- [ ] **HIGH PRIORITY**: Integrate throughput measurement using existing infrastructure
+- [x] **COMPLETED**: Background metrics collection worker with randomized 10-minute scheduling
+- [x] **COMPLETED**: Integrate throughput measurement using existing infrastructure
+- [x] **COMPLETED**: Storage capacity metrics collection (storage_total_gb, storage_used_gb columns)
+- [x] **COMPLETED**: Cross-platform storage metrics endpoint (/rpc/storage-server) with dual authentication
 - [~] Rendezvous hashing placement algorithm
 - [~] Erasure-code aware placement logic
 - [x] Database schema extensions for height tracking

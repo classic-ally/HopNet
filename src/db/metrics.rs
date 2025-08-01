@@ -34,6 +34,8 @@ pub fn get_metric(
                     throughput: row.get(6)?,
                     height: row.get(7)?,        // New: consensus height
                     available: row.get(8)?,     // New: node availability
+                    storage_total_gb: row.get(9)?,  // New: storage capacity
+                    storage_used_gb: row.get(10)?,  // New: storage utilization
                 })
             });
 
@@ -68,7 +70,7 @@ pub fn insert_metric(
             let start_time_str = metric.start_time.to_rfc3339();
             tracing::debug!("Inserting metric into database");
             let result = db_lock.execute(
-                "INSERT INTO metrics (from_node, to_node, start_time, rtt_latency, rtt_variance, rtt_jitter, throughput, height, available) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO metrics (from_node, to_node, start_time, rtt_latency, rtt_variance, rtt_jitter, throughput, height, available, storage_total_gb, storage_used_gb) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     metric.from_node,
                     metric.to_node,
@@ -79,6 +81,8 @@ pub fn insert_metric(
                     metric.throughput,
                     metric.height,
                     metric.available,
+                    metric.storage_total_gb,
+                    metric.storage_used_gb,
                 ]
             );
             match result {
@@ -110,7 +114,7 @@ pub fn insert_metrics_batch(
             for metric in metrics {
                 let start_time_str = metric.start_time.to_rfc3339();
                 tx.execute(
-                    "INSERT INTO metrics (from_node, to_node, start_time, rtt_latency, rtt_variance, rtt_jitter, throughput, height, available) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO metrics (from_node, to_node, start_time, rtt_latency, rtt_variance, rtt_jitter, throughput, height, available, storage_total_gb, storage_used_gb) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         metric.from_node,
                         metric.to_node,
@@ -121,6 +125,8 @@ pub fn insert_metrics_batch(
                         metric.throughput,
                         metric.height,
                         metric.available,
+                        metric.storage_total_gb,
+                        metric.storage_used_gb,
                     ]
                 ).map_err(|e| {
                     tracing::error!("Error inserting metric from {} to {}: {:?}", metric.from_node, metric.to_node, e);

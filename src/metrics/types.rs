@@ -11,7 +11,9 @@ pub struct Metric {
     pub rtt_jitter: Option<f64>,
     pub throughput: Option<i64>,
     pub height: i32,           // Consensus height when measurement was taken
-    pub available: bool        // Whether target node was reachable
+    pub available: bool,       // Whether target node was reachable
+    pub storage_total_gb: Option<u32>,  // Total storage capacity in GB
+    pub storage_used_gb: Option<u32>,   // Used storage capacity in GB
 }
 
 #[derive(Deserialize)]
@@ -40,4 +42,11 @@ pub struct ErrorResponse {
 pub enum LatencyResponseWrapper {
     Success(LatencyResponse),
     Error(ErrorResponse),
+}
+
+// response for storage metrics
+#[derive(Serialize, Deserialize)]
+pub struct StorageResponse {
+    pub total_gb: u32,
+    pub used_gb: u32,
 }

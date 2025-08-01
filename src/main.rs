@@ -201,6 +201,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             // Routes that accept either JWT (users) or RPC (nodes) authentication
             let jwt_or_rpc_routes = Router::new()
                 .route("/consensus", get(consensus::routes::get_consensus))
+                .route("/rpc/storage-server", get(metrics::routes::get_storage_server))
                 .layer(middleware::from_fn_with_state(app_state.clone(), consensus::routes::jwt_or_rpc_auth_middleware));
 
             // RPC routes for inter-node communication with dual signature authentication

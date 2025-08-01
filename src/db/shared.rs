@@ -142,6 +142,8 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
                 throughput      BIGINT,
                 height          INTEGER NOT NULL,  -- Consensus height for deterministic versioning
                 available       BOOLEAN NOT NULL DEFAULT TRUE, -- Node availability (false if unreachable)
+                storage_total_gb UINTEGER,  -- Total storage capacity in GB
+                storage_used_gb UINTEGER,   -- Used storage capacity in GB
                 
                 PRIMARY KEY     (from_node, to_node, start_time),
                 FOREIGN KEY (from_node) REFERENCES nodes(node_id),
@@ -219,6 +221,8 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
             COMMENT ON COLUMN metrics.throughput IS 'Network throughput in bytes per second';
             COMMENT ON COLUMN metrics.height IS 'Consensus height for deterministic versioning';
             COMMENT ON COLUMN metrics.available IS 'Node availability (false if unreachable during measurement)';
+            COMMENT ON COLUMN metrics.storage_total_gb IS 'Total storage capacity in gigabytes';
+            COMMENT ON COLUMN metrics.storage_used_gb IS 'Used storage capacity in gigabytes';
         "
     )?;
     Ok(())

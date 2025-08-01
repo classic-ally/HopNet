@@ -23,6 +23,47 @@ impl From<DatabaseError> for CollectionError {
     }
 }
 
+/// Get storage metrics from a remote node
+async fn get_remote_storage(str_ip: &str, app_state: &AppState) -> Result<(u32, u32), String> {
+    use crate::metrics::types::StorageResponse;
+    
+    // Get authentication credentials
+    let my_node_id = app_state.get_node_id()
+        .map_err(|_| "Node not properly configured".to_string())?;
+    let user_keys = app_state.get_user_keys()
+        .map_err(|_| "User keys not available".to_string())?;
+    let user_id = app_state.get_user_id()
+        .map_err(|_| "User ID not available".to_string())?;
+    
+    // Request storage metrics from remote node
+    let url = format!("http://{}:34632/rpc/storage-server", str_ip);
+    
+    // Prepare authentication for GET request (empty body)
+    let body = b"";
+    let node_signature = app_state.private_key.sign(body);
+    let user_signature = user_keys.private_key.sign(body);
+    
+    let client = reqwest::Client::new();
+    let response = client
+        .get(&url)
+        .header("X-Node-ID", my_node_id.to_string())
+        .header("X-User-ID", user_id.to_string())
+        .header("X-Node-Signature", hex::encode(node_signature.to_bytes()))
+        .header("X-User-Signature", hex::encode(user_signature.to_bytes()))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to connect to storage server: {}", e))?;
+    
+    if !response.status().is_success() {
+        return Err(format!("Storage server returned status: {}", response.status()));
+    }
+    
+    let storage_response: StorageResponse = response.json().await
+        .map_err(|e| format!("Failed to parse storage response: {}", e))?;
+    
+    Ok((storage_response.total_gb, storage_response.used_gb))
+}
+
 /// Measure throughput to a remote node using Option D: Session-based results retrieval
 async fn get_remote_throughput(str_ip: &str, app_state: &AppState) -> Result<i64, String> {
     use serde::{Deserialize, Serialize};
@@ -182,6 +223,12 @@ pub async fn collect_all_node_metrics(
             get_remote_throughput(&node.ip_address, app_state)
         ).await;
         
+        // Measure storage metrics using new infrastructure
+        let storage_result = timeout(
+            measurement_timeout_per_node,
+            get_remote_storage(&node.ip_address, app_state)
+        ).await;
+        
         // Extract throughput measurement result
         let throughput_value = match throughput_result {
             Ok(Ok(throughput)) => {
@@ -196,6 +243,23 @@ pub async fn collect_all_node_metrics(
             Err(_) => {
                 tracing::debug!("Throughput measurement timeout for node {}", node.node_id);
                 None
+            }
+        };
+        
+        // Extract storage measurement result
+        let (storage_total_gb, storage_used_gb) = match storage_result {
+            Ok(Ok((total, used))) => {
+                tracing::debug!("Successful storage measurement for node {}: {}/{} GB", 
+                    node.node_id, used, total);
+                (Some(total), Some(used))
+            }
+            Ok(Err(e)) => {
+                tracing::debug!("Storage measurement failed for node {}: {}", node.node_id, e);
+                (None, None)
+            }
+            Err(_) => {
+                tracing::debug!("Storage measurement timeout for node {}", node.node_id);
+                (None, None)
             }
         };
         
@@ -227,6 +291,8 @@ pub async fn collect_all_node_metrics(
             throughput: throughput_value, // May be Some even if latency failed
             height: current_height,
             available,
+            storage_total_gb,
+            storage_used_gb,
         };
         
         metrics.push(metric);
