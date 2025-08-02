@@ -139,6 +139,7 @@ pub async fn post_files(
     // need path in later file processing
     let mut inodes: Vec<Inode> = Vec::new();
     let mut has_files = false;
+    let mut uploaded_data_block_ids: Vec<crate::db::types::CustomUUID> = Vec::new();
 
     match multipart.next_field().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? {
         Some(part) => {
@@ -284,6 +285,9 @@ pub async fn post_files(
                         // assemble inode for database
                         let inode = match data_option {
                             Some(data) => {
+                                // Track this data block for distribution
+                                uploaded_data_block_ids.push(dataid.clone());
+                                
                                 // assemble data record for database
                                 let datarecord = DataRecord {
                                     id: dataid,
@@ -342,7 +346,29 @@ pub async fn post_files(
 
             // Use consensus middleware to ensure distributed agreement
             match consensus_middleware(&app_state, transactions, user_id).await {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    // Trigger fragment distribution for each uploaded file
+                    for data_block_id in uploaded_data_block_ids {
+                        tracing::info!("Triggering fragment distribution for uploaded file {}", data_block_id);
+                        
+                        // Spawn distribution task to avoid blocking the upload response
+                        let app_state_clone = app_state.clone();
+                        let data_block_id_clone = data_block_id.clone();
+                        tokio::spawn(async move {
+                            match crate::files::distribution::distribute_fragments_for_upload(&app_state_clone, data_block_id_clone).await {
+                                Ok(()) => {
+                                    tracing::info!("Successfully completed fragment distribution for {}", data_block_id);
+                                }
+                                Err(e) => {
+                                    tracing::error!("Fragment distribution failed for {}: {:?}", data_block_id, e);
+                                    // TODO: Add to orphan recovery queue for retry
+                                }
+                            }
+                        });
+                    }
+                    
+                    return Ok(());
+                },
                 Err(e) => {
                     tracing::error!("Consensus middleware error: {:?}", e);
                     return Err(StatusCode::INTERNAL_SERVER_ERROR)
@@ -463,11 +489,44 @@ pub async fn post_fragment(
     let fragment_len = fragment_data.len(); // Get length before moving data
     match store_fragment(&app_state.fragments_dir, &expected_hash, fragment_data) {
         Ok(_) => {
-            tracing::debug!("Successfully stored fragment: {} ({} bytes)", expected_hash.to_hex(), fragment_len);
+            // Mark the fragment as stored locally in the database
+            match crate::db::files::mark_fragment_local_state(app_state.db_pool.get(), &expected_hash, true) {
+                Ok(rows_affected) => {
+                    tracing::debug!("Successfully stored fragment: {} ({} bytes), updated {} database records", 
+                                   expected_hash.to_hex(), fragment_len, rows_affected);
+                }
+                Err(e) => {
+                    tracing::warn!("Fragment stored to disk but failed to update database for {}: {:?}", 
+                                  expected_hash.to_hex(), e);
+                    // Continue since fragment is physically stored - database can be updated later
+                }
+            }
             StatusCode::CREATED.into_response()
         }
         Err(e) => {
             tracing::error!("Failed to store fragment {}: {:?}", expected_hash.to_hex(), e);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// GET /fragments  
+/// Get count of fragments stored locally on this node
+pub async fn get_fragments_count(
+    State(app_state): State<AppState>,
+    Extension(user_id): Extension<i32>,  // Extract user_id from JWT via auth middleware
+) -> impl IntoResponse {
+    match crate::db::files::get_local_fragment_count(app_state.db_pool.get()) {
+        Ok(count) => {
+            #[derive(Serialize)]
+            struct FragmentCountResponse {
+                locally_stored_fragments: i64,
+            }
+            
+            (StatusCode::OK, Json(FragmentCountResponse { locally_stored_fragments: count })).into_response()
+        }
+        Err(e) => {
+            tracing::error!("Failed to get local fragment count: {:?}", e);
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }

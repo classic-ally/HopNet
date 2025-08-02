@@ -162,7 +162,8 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
                 modified_at      TIMESTAMP,
                 file_hash        BLOB NOT NULL,
                 fragment_count   INTEGER NOT NULL,
-                added_bytes      UTINYINT NOT NULL
+                added_bytes      UTINYINT NOT NULL,
+                placement_height INTEGER  -- Consensus height when fragment placement was determined
             );
 
             CREATE TABLE file_access (

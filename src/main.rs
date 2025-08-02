@@ -193,6 +193,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/files", post(files::routes::post_files)).layer(DefaultBodyLimit::max(5000*1_000_000))
                 .route("/files", delete(files::routes::delete_files))
                 .route("/files/{*path}", get(files::routes::get_file_fragments))
+                .route("/fragments", get(files::routes::get_fragments_count))
                 .route("/validators", get(consensus::routes::get_validators))
                 .route("/metrics", get(metrics::routes::get_metrics))
                 .route("/metrics/trigger", get(metrics::routes::get_metrics_trigger))

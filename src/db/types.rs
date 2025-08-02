@@ -349,3 +349,9 @@ pub struct FragmentHash {
     pub chunk_type: ChunkType,
     pub stored_locally: bool,
 }
+
+impl std::fmt::Display for CustomUUID {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}

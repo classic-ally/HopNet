@@ -187,6 +187,8 @@ pub fn get_nodes_to_measure(
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct NodeMetrics {
     pub node_id: i32,
+    pub ip_address: String,
+    pub port: i32,
     pub sample_count_7d: u32,
     pub trust_factor: f64,
     pub availability_score: f64,      // Time-weighted: 24h * 0.7 + 7d * 0.3
@@ -243,6 +245,8 @@ pub fn get_all_node_metrics(
                 )
                 SELECT 
                     n.node_id,
+                    n.ip_address,
+                    n.port,
                     COALESCE(nm.sample_count_7d, 0) as sample_count_7d,
                     -- Trust factor: gradual confidence building for new nodes
                     LEAST(CAST(COALESCE(nm.sample_count_7d, 0) AS REAL) / 100.0, 1.0) as trust_factor,
@@ -293,6 +297,8 @@ pub fn get_all_node_metrics(
             let metrics = stmt.query_map(&params, |row| {
                 Ok(NodeMetrics {
                     node_id: row.get("node_id")?,
+                    ip_address: row.get("ip_address")?,
+                    port: row.get("port")?,
                     sample_count_7d: row.get::<_, i64>("sample_count_7d")? as u32,
                     trust_factor: row.get("trust_factor")?,
                     availability_score: row.get("availability_score")?,

@@ -236,8 +236,8 @@ pub fn put_join_setup(
             tracing::debug!("Inserting {} data blocks", setupobj.data_blocks.len());
             for data_block in setupobj.data_blocks {
                 tx.execute(
-                    "INSERT INTO data_blocks (id, modified_at, file_hash, fragment_count, added_bytes) VALUES (?, ?, ?, ?, ?)",
-                    params![data_block.id, data_block.modified_at, data_block.data.hash, data_block.data.fragments.len() as i32, data_block.data.added_bytes]
+                    "INSERT INTO data_blocks (id, modified_at, file_hash, fragment_count, added_bytes, placement_height) VALUES (?, ?, ?, ?, ?, ?)",
+                    params![data_block.id, data_block.modified_at, data_block.data.hash, data_block.data.fragments.len() as i32, data_block.data.added_bytes, None::<i32>]
                 ).map_err(|_| DatabaseError::InsertError)?;
             }
 

@@ -1,4 +1,8 @@
-use crate::{db::{DatabaseError, files::insert_files}, handlers::{HandlerResult, TransactionHandler}, db::Inode};
+use crate::{
+    db::{DatabaseError, files::{insert_files, update_placement_heights_batch, PlacementHeightUpdate}}, 
+    handlers::{HandlerResult, TransactionHandler}, 
+    db::Inode
+};
 use crate::AppState;
 use crate::files::functions::fragment_exists_and_valid;
 use either::Either;
@@ -35,4 +39,25 @@ impl TransactionHandler for InsertFilesHandler {
 
 inventory::submit! {
     &InsertFilesHandler as &dyn TransactionHandler
+}
+
+pub struct UpdatePlacementHeightsHandler;
+
+impl TransactionHandler for UpdatePlacementHeightsHandler {
+    fn name(&self) -> &'static str { "update_placement_heights" }
+
+    fn process(&self, state: &AppState, payload: &[u8], execute: bool) -> HandlerResult {
+        match bincode::serde::decode_from_slice::<Vec<PlacementHeightUpdate>, _>(payload, bincode::config::standard()) {
+            Ok((updates_data, _)) => {
+                // Update placement heights using the consensus-safe version with execute flag
+                update_placement_heights_batch(state.db_pool.get(), updates_data, execute)?;
+                Ok(())
+            },
+            Err(_) => Err(DatabaseError::InvalidPayload),
+        }
+    }
+}
+
+inventory::submit! {
+    &UpdatePlacementHeightsHandler as &dyn TransactionHandler
 }

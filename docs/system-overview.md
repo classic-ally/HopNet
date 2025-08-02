@@ -22,7 +22,7 @@ Byzantine fault-tolerant consensus engine providing network coordination and sta
 - [ ] Node health monitoring and automatic validator management
 
 ### 2. File Storage System ([RFC-002](specs/file-storage.md))  
-**Status**: Local node download and upload implemented, no update support, distribution pending
+**Status**: Local storage complete, distribution implemented, download needs deterministic lookup
 
 Reed-Solomon encoded file storage with encryption and fragment management.
 
@@ -32,7 +32,8 @@ Reed-Solomon encoded file storage with encryption and fragment management.
 - [x] Local fragment storage with 2-level directory structure
 - [x] File reconstruction from available fragments
 - [x] Fast-path reconstruction when all original fragments available
-- [ ] Distributed fragment placement across network nodes
+- [x] Event-driven fragment distribution after upload completion
+- [ ] Download logic with deterministic fragment lookup across nodes
 - [ ] Fragment lifecycle management and garbage collection
 - [ ] Storage capacity monitoring and quota management
 - [ ] Secure thumbnail generation for encrypted files
@@ -56,16 +57,20 @@ HTTP-based inter-node communication with authentication and fragment transfer ca
 - [ ] NAT traversal implementation (deprioritized for defined IP infrastructure)
 
 ### 4. Shard Synchronization System ([RFC-004](specs/shard-synchronization.md))
-**Status**: Ready for implementation (fragment transfer infrastructure complete)
+**Status**: Core distribution implemented, recovery and discovery pending
 
 Intelligent fragment distribution system optimizing for performance, reliability, and geographic redundancy.
 
 - [x] Consensus height-based versioning for deterministic placement
-- [x] Rendezvous hashing algorithm for fragment placement
+- [x] Rendezvous hashing algorithm for fragment placement (Phase 1)
+- [x] Metrics-based scoring for optimal node selection (Phase 2)
 - [x] Erasure-code aware placement (separate original vs recovery sets)
-- [ ] Fragment discovery protocol with parallel queries
-- [ ] Performance-optimized original fragment placement
-- [ ] Geographic redundancy for recovery fragments
+- [x] Event-driven distribution with consensus integration
+- [x] Self-skip optimization (avoid sending fragments to local node)
+- [x] Retry logic with exponential backoff and connection timeouts
+- [x] Inter-node authentication for secure fragment transfer
+- [ ] Fragment discovery protocol for download reconstruction
+- [ ] Background orphan recovery with adaptive thresholds
 - [ ] Node reliability scoring and roaming device detection
 - [ ] Background rebalancing and fragment migration
 - [ ] User proximity optimization for shared files

@@ -161,9 +161,13 @@ This document outlines the requirements for implementing distributed shard synch
 - **Primary Method**: Local database check first (fragments may be cached from previous requests)
 - **Deterministic Placement**: Query preference-ordered list of 1/3 of storage nodes for missing fragments
 - **Sequential Fallback**: Try nodes in preference order (first → second → third, etc.) to handle node failures
-- **Broadcast Fallback**: If deterministic placement fails, query all nodes before expensive Reed-Solomon reconstruction
-- **No Discovery Queries**: No separate discovery step - deterministic placement tells us which nodes to try
-- **Health Monitoring Exception**: Health checks do require separate discovery queries with disk verification and checksum validation
+- **Gossip Fallback**: If deterministic placement fails, use health-check-first gossip across all nodes
+  - Parallel `/fragments/{hash}/health` queries to all nodes
+  - Fetch from first node to respond positively (don't wait for all responses)
+  - If first fetch fails, try next available node from remaining health responses
+- **Reed-Solomon Reconstruction**: Final fallback if both deterministic placement and gossip fail
+- **Fragment Verification**: Verify hash after retrieval; retry from other nodes if corrupted
+- **No Discovery Queries**: No separate discovery step for deterministic placement
 - **Performance Requirements**:
   - Fragment placement decision must complete in <100ms for responsive file access
   - Leverage DuckDB query result caching to amortize metrics calculation cost
@@ -171,11 +175,17 @@ This document outlines the requirements for implementing distributed shard synch
   - Batch fragment placement decisions when possible to reuse metrics queries
 
 ### 12. Fragment Placement Lifecycle
-- **Placement Scheduling**: Background job triggered after local storage completion and on periodic schedule
+- **Placement Scheduling**: Event-driven only (triggered by each upload completion)
+- **Job Scope**: Each event processes only the specific uploaded file, no batching or queuing
+- **Job Concurrency**: Unlimited - each upload triggers independent distribution
 - **Non-blocking Upload**: Fragment distribution does not block user upload process
-- **Network Failure Handling**: Retain local fragments if network issues prevent distribution, retry on next schedule
-- **Database Schema**: Add `placement_height` column to `data_blocks` table to track placement consensus height
-- **Full Network Storage**: Alert users when network approaches capacity limits (future enhancement)
+- **Processing Limits**: Cap at ~100 fragments in memory (400MB) processed concurrently per file
+- **Consensus Height**: Lock height at start of distribution for deterministic placement
+- **Storage Efficiency**: Update `stored_locally = FALSE` immediately per fragment after successful distribution
+- **Consensus Updates**: Submit single `PlacementHeightUpdate` per file after all fragments distributed
+- **Database Schema**: `placement_height` column tracks distribution state (NULL = local-only, value = distributed at height)
+- **Failure Handling**: No retries within distribution job; orphan recovery handles all failure cases
+- **Orphan Recovery**: Separate job finds stuck files using dynamic threshold: 30min + (fragment_count × 4MB / median_network_throughput)
 
 ### 13. Rebalancing and Node Lifecycle
 - **Rebalancing Algorithm**: Recompute placement at current consensus height, transmit fragments, update `placement_height`
@@ -265,10 +275,23 @@ This document outlines the requirements for implementing distributed shard synch
 - [x] **COMPLETED**: Two-phase placement: Phase1Candidate (XOR distance) → Phase2Candidate (final scoring)
 - [x] **COMPLETED**: Erasure-code aware placement logic with fragment-type-specific scoring
 - [x] **COMPLETED**: Placement scores debugging API (/metrics/scores) with raw metrics and weighted scoring
-- [x] Database schema extensions for height tracking
+- [x] Database schema extensions for height tracking (placement_height column added)
 - [x] Integration with fragment transfer protocols (RFC-003 complete)
+- [x] **COMPLETED**: Consensus transaction handler for placement_height updates ("update_placement_heights")
 
-### Phase 1B: Fragment Discovery and Basic Geographic Distribution [ ]
+### Phase 1B: Fragment Distribution Implementation [x]
+- [x] **COMPLETED**: Event-driven fragment distribution system
+  - Triggers automatically after upload consensus completion
+  - Memory-limited batch processing (100 fragments per batch)
+  - Self-skip optimization (avoids HTTP calls to local node)
+  - Retry logic with exponential backoff (3 attempts, 5s connection + 30s request timeouts)
+  - Inter-node authentication with dual Ed25519 signatures
+  - Consensus integration for placement_height updates
+  - Database state tracking (stored_locally flags)
+- [ ] **NEXT**: Download logic with deterministic fragment lookup across nodes
+- [ ] Orphan recovery job with adaptive thresholds based on network throughput
+
+### Phase 1C: Fragment Discovery and Basic Geographic Distribution [ ]
 - [ ] Parallel fragment query implementation using RFC-003 fragment discovery endpoints
 - [ ] Caching layer for fragment locations
 - [ ] Basic node reliability scoring using performance metrics

@@ -78,13 +78,14 @@ pub fn insert_files(
                         
                         // Insert into data_blocks table
                         tx.execute(
-                            "INSERT INTO data_blocks (id, modified_at, file_hash, fragment_count, added_bytes) VALUES (?, ?, ?, ?, ?)",
+                            "INSERT INTO data_blocks (id, modified_at, file_hash, fragment_count, added_bytes, placement_height) VALUES (?, ?, ?, ?, ?, ?)",
                             params![
                                 data_id,
                                 data_record.modified_at,
                                 data.hash,
                                 data.fragments.len() as i32,
-                                data.added_bytes
+                                data.added_bytes,
+                                None::<i32>  // placement_height is NULL initially, set during fragment placement
                             ]
                         ).map_err(|_| DatabaseError::InsertError)?;
                         
@@ -349,6 +350,150 @@ pub fn get_file_fragments(
                 },
                 _ => Err(DatabaseError::RecallError), // File not found
             }
+        }
+        Err(_) => Err(DatabaseError::LockError)
+    }
+}
+
+use serde::{Deserialize, Serialize};
+
+/// Payload for placement height updates consensus transaction
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlacementHeightUpdate {
+    pub data_block_id: CustomUUID,
+    pub placement_height: i32,
+}
+
+/// Update placement_height for data blocks after successful fragment distribution
+/// Consensus-safe function with execute flag for validation/rollback support
+pub fn update_placement_heights_batch(
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    updates: Vec<PlacementHeightUpdate>,
+    execute: bool,
+) -> Result<(), DatabaseError> {
+    match db_connection {
+        Ok(mut db_lock) => {
+            let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
+            
+            let updates_len = updates.len();
+            for update in updates {
+                tx.execute(
+                    "UPDATE data_blocks SET placement_height = ? WHERE id = ?",
+                    params![update.placement_height, update.data_block_id]
+                ).map_err(|e| {
+                    tracing::error!("Error updating placement_height for {:?}: {:?}", update.data_block_id, e);
+                    DatabaseError::ProcessingError
+                })?;
+            }
+            
+            if execute {
+                tx.commit().map_err(|_| DatabaseError::ProcessingError)?;
+                tracing::debug!("Successfully updated placement_height for {} data blocks", updates_len);
+            } else {
+                // Validation only - rollback the transaction
+                tx.rollback().map_err(|_| DatabaseError::ProcessingError)?;
+                tracing::debug!("Validated placement_height updates for {} data blocks (dry run)", updates_len);
+            }
+            Ok(())
+        }
+        Err(_) => Err(DatabaseError::LockError)
+    }
+}
+
+/// Get a specific file if it needs distribution (placement_height = NULL and all fragments stored locally)
+pub fn get_distributable_file(
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    data_block_id: CustomUUID,
+) -> Result<Option<DistributableFileData>, DatabaseError> {
+    match db_connection {
+        Ok(db_lock) => {
+            let mut stmt = db_lock.prepare(
+                "SELECT fh.fragment_index, fh.fragment_hash, fh.chunk_type
+                 FROM data_blocks db
+                 JOIN fragment_hashes fh ON db.id = fh.data_block_id
+                 WHERE db.id = ? 
+                   AND db.placement_height IS NULL 
+                   AND fh.stored_locally = TRUE
+                   AND (SELECT COUNT(*) FROM fragment_hashes WHERE data_block_id = db.id AND stored_locally = TRUE) = db.fragment_count
+                 ORDER BY fh.fragment_index"
+            ).map_err(|_| DatabaseError::RecallError)?;
+            
+            let fragments = stmt.query_map([data_block_id.clone()], |row| {
+                let index: i32 = row.get(0)?;
+                let fragment_hash: crate::types::Blake3Hash = row.get(1)?;
+                let chunk_type: crate::db::ChunkType = row.get(2)?;
+                
+                let fragment_type = match chunk_type {
+                    crate::db::ChunkType::Original => crate::files::placement::FragmentType::Original,
+                    crate::db::ChunkType::Recovery => crate::files::placement::FragmentType::Recovery,
+                };
+                
+                Ok((index as usize, fragment_hash, fragment_type))
+            }).map_err(|_| DatabaseError::RecallError)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| DatabaseError::ProcessingError)?;
+            
+            if fragments.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(DistributableFileData {
+                    id: data_block_id,
+                    fragment_hashes: fragments,
+                }))
+            }
+        }
+        Err(_) => Err(DatabaseError::LockError)
+    }
+}
+
+/// Update local storage state for a fragment by its hash
+pub fn mark_fragment_local_state(
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    fragment_hash: &crate::types::Blake3Hash,
+    stored_locally: bool,
+) -> Result<usize, DatabaseError> {
+    match db_connection {
+        Ok(db_lock) => {
+            let rows_affected = db_lock.execute(
+                "UPDATE fragment_hashes SET stored_locally = ? WHERE fragment_hash = ?",
+                params![stored_locally, fragment_hash]
+            ).map_err(|e| {
+                tracing::error!("Error updating stored_locally for fragment hash {}: {:?}", fragment_hash, e);
+                DatabaseError::ProcessingError
+            })?;
+            
+            let state_text = if stored_locally { "stored locally" } else { "not stored locally" };
+            tracing::debug!("Marked {} fragment records with hash {} as {}", rows_affected, fragment_hash, state_text);
+            Ok(rows_affected)
+        }
+        Err(_) => Err(DatabaseError::LockError)
+    }
+}
+
+/// Data about a file ready for distribution
+#[derive(Debug, Clone)]
+pub struct DistributableFileData {
+    pub id: CustomUUID,
+    pub fragment_hashes: Vec<(usize, crate::types::Blake3Hash, crate::files::placement::FragmentType)>,
+}
+
+/// Get count of fragments stored locally on this node
+pub fn get_local_fragment_count(
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+) -> Result<i64, DatabaseError> {
+    match db_connection {
+        Ok(db_lock) => {
+            let count = db_lock.query_row(
+                "SELECT COUNT(*) FROM fragment_hashes WHERE stored_locally = TRUE",
+                [],
+                |row| row.get::<_, i64>(0)
+            ).map_err(|e| {
+                tracing::error!("Error querying local fragment count: {:?}", e);
+                DatabaseError::RecallError
+            })?;
+            
+            tracing::debug!("Found {} fragments stored locally", count);
+            Ok(count)
         }
         Err(_) => Err(DatabaseError::LockError)
     }
