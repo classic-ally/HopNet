@@ -273,7 +273,7 @@ pub fn get_file_fragments(
         Ok(db_lock) => {
             // Query for a specific file by path and get its fragments with reassembly info
             let mut stmt = db_lock.prepare(
-                "SELECT db.id, db.file_hash, db.added_bytes, fh.fragment_index, fh.fragment_id, fh.fragment_hash, fh.chunk_type, fh.stored_locally
+                "SELECT db.id, db.file_hash, db.added_bytes, db.placement_height, fh.fragment_index, fh.fragment_id, fh.fragment_hash, fh.chunk_type, fh.stored_locally
                  FROM inodes i 
                  JOIN data_blocks db ON i.data_id = db.id 
                  JOIN fragment_hashes fh ON db.id = fh.data_block_id
@@ -285,27 +285,30 @@ pub fn get_file_fragments(
                 let data_block_id: CustomUUID = row.get(0)?;
                 let file_hash: Blake3Hash = row.get(1)?;
                 let added_bytes: u8 = row.get(2)?;
-                let fragment_index: i32 = row.get(3)?;
-                let fragment_id: CustomUUID = row.get(4)?;
-                let fragment_hash: Blake3Hash = row.get(5)?;
-                let chunk_type: crate::db::ChunkType = row.get(6)?;
-                let stored_locally: bool = row.get(7)?;
-                Ok((data_block_id, file_hash, added_bytes, fragment_index, fragment_id, fragment_hash, chunk_type, stored_locally))
+                let placement_height: Option<i32> = row.get(3)?;
+                let fragment_index: i32 = row.get(4)?;
+                let fragment_id: CustomUUID = row.get(5)?;
+                let fragment_hash: Blake3Hash = row.get(6)?;
+                let chunk_type: crate::db::ChunkType = row.get(7)?;
+                let stored_locally: bool = row.get(8)?;
+                Ok((data_block_id, file_hash, added_bytes, placement_height, fragment_index, fragment_id, fragment_hash, chunk_type, stored_locally))
             }).map_err(|_| DatabaseError::ProcessingError)?;
             
             let mut data_block_id: Option<CustomUUID> = None;
             let mut file_hash: Option<Blake3Hash> = None;
             let mut added_bytes: Option<u8> = None;
+            let mut placement_height: Option<i32> = None;
             let mut original_fragments = std::collections::HashMap::new();
             let mut recovery_fragments = std::collections::HashMap::new();
             
             for row in rows {
-                let (d_block_id, f_hash, a_bytes, fragment_index, fragment_id, fragment_hash, chunk_type, stored_locally) = row.map_err(|_| DatabaseError::ProcessingError)?;
+                let (d_block_id, f_hash, a_bytes, p_height, fragment_index, fragment_id, fragment_hash, chunk_type, stored_locally) = row.map_err(|_| DatabaseError::ProcessingError)?;
                 
                 if data_block_id.is_none() {
                     data_block_id = Some(d_block_id);
                     file_hash = Some(f_hash);
                     added_bytes = Some(a_bytes);
+                    placement_height = p_height;
                 }
                 
                 match chunk_type {
@@ -341,6 +344,7 @@ pub fn get_file_fragments(
                         expected_file_hash: file_hash,
                         data_block_id,
                         per_file_key: None, // Will be set after decryption
+                        placement_height,
                     };
                     
                     Ok(crate::files::functions::FileAccessData {

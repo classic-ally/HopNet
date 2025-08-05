@@ -2,7 +2,6 @@ use crate::{
     AppState,
     db::{DatabaseError, files::{PlacementHeightUpdate, get_distributable_file, mark_fragment_local_state, DistributableFileData}, consensus},
     consensus::{functions::{consensus_middleware, ConsensusError}, types::Transaction},
-    files::placement::{calculate_rendezvous_distances, calculate_final_placement_scores, FragmentType},
     db::metrics::get_all_node_metrics,
     types::Blake3Hash,
     db::types::CustomUUID,
@@ -106,10 +105,7 @@ async fn distribute_file_fragments(
     
     // Get all node metrics at the locked consensus height
     let node_metrics = get_all_node_metrics(app_state.db_pool.get(), consensus_height)?;
-    
-    // Get all node IDs for rendezvous hashing
-    let node_ids: Vec<i32> = node_metrics.iter().map(|m| m.node_id).collect();
-    
+        
     // Create lookup map for node connection info to avoid separate DB calls
     let node_connections: std::collections::HashMap<i32, (&str, i32)> = node_metrics
         .iter()
@@ -136,19 +132,12 @@ async fn distribute_file_fragments(
         
         // Process this batch of fragments
         for (_index, fragment_hash, fragment_type) in batch {
-            // Calculate placement for this fragment
-            let phase1_candidates = calculate_rendezvous_distances(fragment_hash, &node_ids);
-            
-            // Take top 1/3 of nodes as candidates
-            let candidate_count = (node_ids.len() / 3).max(1);
-            let candidate_metrics: Vec<_> = phase1_candidates
-                .into_iter()
-                .take(candidate_count)
-                .filter_map(|c| node_metrics.iter().find(|m| m.node_id == c.node_id).cloned())
-                .collect();
-            
-            // Apply metrics-based scoring
-            let scored_candidates = calculate_final_placement_scores(candidate_metrics, *fragment_type);
+            // Calculate placement for this fragment using standardized algorithm
+            let scored_candidates = crate::files::discovery::get_fragment_placement_candidates(
+                fragment_hash,
+                *fragment_type,
+                &node_metrics,
+            );
             
             // Try to place fragment on nodes in preference order
             let mut placed = false;

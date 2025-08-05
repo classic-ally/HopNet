@@ -36,6 +36,33 @@ pub struct UserKeys {
     pub public_key: PubKey,
 }
 
+/// Authentication info for inter-node requests
+/// Populated once and reused to avoid repeated AppState getter calls
+#[derive(Clone)]
+pub struct NodeAuthInfo {
+    pub node_id: i32,
+    pub user_id: i32,
+    pub user_keys: UserKeys,
+    pub node_private_key: PrivKey,
+}
+
+impl NodeAuthInfo {
+    /// Extract authentication info from AppState once for reuse
+    pub fn from_app_state(app_state: &AppState) -> Result<Self, StatusCode> {
+        let node_id = app_state.get_node_id()?;
+        let user_id = app_state.get_user_id()?;
+        let user_keys = app_state.get_user_keys()?.clone();
+        let node_private_key = app_state.private_key.clone();
+        
+        Ok(NodeAuthInfo {
+            node_id,
+            user_id,
+            user_keys,
+            node_private_key,
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     db_pool: Pool<DuckdbConnectionManager>,

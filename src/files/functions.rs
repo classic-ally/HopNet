@@ -15,6 +15,10 @@ use std::fs;
 use std::io;
 use std::collections::HashMap;
 use crate::db::CustomUUID;
+use reed_solomon_simd::ReedSolomonDecoder;
+use crate::AppState;
+use crate::files::discovery::find_fragment;
+use crate::files::placement::FragmentType;
 
 #[derive(Debug)]
 pub enum FileError {
@@ -23,7 +27,9 @@ pub enum FileError {
     InvalidChunkCount,
     TaskJoinError,
     EncryptionError,
-    StorageError(io::Error)
+    StorageError(io::Error),
+    DatabaseError,
+    NetworkError,
 }
 
 // Maximum fragment size for consumer network performance
@@ -449,6 +455,7 @@ pub struct FileReassemblyData {
     pub expected_file_hash: Blake3Hash,
     pub data_block_id: crate::db::CustomUUID,  // Needed for hash verification
     pub per_file_key: Option<chacha20poly1305::Key>,  // Decrypted per-file key for chunk decryption
+    pub placement_height: Option<i32>,  // Consensus height when fragments were distributed
 }
 
 /// Data structure containing file metadata and access control information from database
@@ -457,18 +464,281 @@ pub struct FileAccessData {
     pub file_access_entry: Option<crate::db::types::FileAccess>,
 }
 
-/// Reassemble a complete file from fragments using Reed-Solomon reconstruction
-/// Uses streaming approach to minimize memory usage
-pub fn reassemble_file(
+/// Perform concurrent fragment discovery using work queue pattern with thread reuse
+async fn perform_concurrent_fragment_discovery(
+    file_data: &mut FileReassemblyData,
     fragments_dir: &str,
-    file_data: FileReassemblyData,
+    min_needed_fragments: usize,
+    app_state: &crate::AppState,
+    consensus_height: i32,
+) -> Result<(), FileError> {
+    use crate::files::discovery::find_fragment;
+    use crate::files::placement::FragmentType;
+    
+    // Get node metrics at consensus height for placement calculations
+    let conn = app_state.db_pool.get()
+        .map_err(|_| FileError::StorageError(io::Error::new(io::ErrorKind::Other, "Database connection failed")))?;
+    
+    let node_metrics = crate::db::metrics::get_all_node_metrics(Ok(conn), consensus_height)
+        .map_err(|_| FileError::StorageError(io::Error::new(io::ErrorKind::Other, "Failed to get node metrics")))?;
+    
+    // Create authentication info for inter-node requests
+    let auth = crate::NodeAuthInfo::from_app_state(app_state)
+        .map_err(|_| FileError::StorageError(io::Error::new(io::ErrorKind::Other, "Failed to get auth info")))?;
+    
+    // Build list of missing fragments (prioritize originals over recovery)
+    let mut missing_fragments = Vec::new();
+    
+    // Add missing original fragments first (avoid Reed-Solomon if possible)
+    for (index, (hash, fragment_id, exists_locally)) in &file_data.original_fragments {
+        if !exists_locally {
+            missing_fragments.push((*index, *hash, fragment_id.clone(), FragmentType::Original));
+        }
+    }
+    
+    // Add missing recovery fragments
+    for (index, (hash, fragment_id, exists_locally)) in &file_data.recovery_fragments {
+        if !exists_locally {
+            missing_fragments.push((*index, *hash, fragment_id.clone(), FragmentType::Recovery));
+        }
+    }
+    
+    // Create work queue for fragments to try
+    let work_queue = std::sync::Arc::new(tokio::sync::Mutex::new(missing_fragments));
+    let (success_tx, mut success_rx) = tokio::sync::mpsc::unbounded_channel();
+    let successful_downloads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    
+    // Spawn exactly min_needed_fragments worker threads
+    let mut worker_handles = Vec::new();
+    
+    for worker_id in 0..min_needed_fragments {
+        let tx = success_tx.clone();
+        let queue = work_queue.clone();
+        let node_metrics_clone = node_metrics.clone();
+        let auth_clone = auth.clone();
+        let fragments_dir_clone = fragments_dir.to_string();
+        let db_pool = app_state.db_pool.clone();
+        let successful_downloads_clone = successful_downloads.clone();
+        
+        let worker_handle = tokio::spawn(async move {
+            tracing::debug!("Worker {} starting fragment discovery", worker_id);
+            
+            // Keep working until we have enough successful downloads or run out of work
+            loop {
+                // Check if we already have enough successful downloads
+                if successful_downloads_clone.load(std::sync::atomic::Ordering::Relaxed) >= min_needed_fragments {
+                    tracing::debug!("Worker {} stopping - enough fragments downloaded", worker_id);
+                    break;
+                }
+                
+                // Get next fragment to try from work queue
+                let next_work = {
+                    let mut queue_lock = queue.lock().await;
+                    queue_lock.pop()
+                };
+                
+                let (index, fragment_hash, fragment_id, fragment_type) = match next_work {
+                    Some(work) => work,
+                    None => {
+                        tracing::debug!("Worker {} stopping - no more fragments to try", worker_id);
+                        break;
+                    }
+                };
+                
+                tracing::debug!("Worker {} trying fragment {} (type: {:?})", worker_id, fragment_hash.to_hex(), fragment_type);
+                
+                // Try to find and fetch the fragment from network
+                match find_fragment(&fragment_hash, fragment_type, &node_metrics_clone, &auth_clone).await {
+                Ok(encrypted_data) => {
+                        // Store fragment locally
+                        if let Err(e) = store_fragment(&fragments_dir_clone, &fragment_hash, encrypted_data) {
+                            tracing::error!("Worker {} failed to store fragment {}: {:?}", worker_id, fragment_hash.to_hex(), e);
+                            let _ = tx.send(Err((index, fragment_type)));
+                            continue; // Try next fragment
+                        }
+                        
+                        tracing::info!("Worker {} successfully cached fragment {} from network", worker_id, fragment_hash.to_hex());
+                        
+                        // Update database to mark fragment as stored locally
+                        let conn_result = db_pool.get();
+                        if let Err(e) = crate::db::files::mark_fragment_local_state(conn_result, &fragment_hash, true) {
+                            tracing::error!("Worker {} failed to update database for fragment {}: {:?}", worker_id, fragment_hash.to_hex(), e);
+                            // Continue anyway - fragment is cached on disk
+                        }
+                        
+                        // Increment successful downloads and report success
+                        successful_downloads_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let _ = tx.send(Ok((index, fragment_type, fragment_hash)));
+                    }
+                    Err(e) => {
+                        tracing::warn!("Worker {} failed to discover fragment {}: {:?}", worker_id, fragment_hash.to_hex(), e);
+                        let _ = tx.send(Err((index, fragment_type)));
+                        // Continue loop to try next fragment
+                    }
+                }
+            }
+        });
+        
+        worker_handles.push(worker_handle);
+    }
+    
+    drop(success_tx); // Close sender so channel ends when all workers complete
+    
+    // Collect results and update file_data
+    let mut completed_downloads = 0;
+    while let Some(result) = success_rx.recv().await {
+        match result {
+            Ok((index, fragment_type, fragment_hash)) => {
+                // Update the exists_locally flag in file_data
+                match fragment_type {
+                    FragmentType::Original => {
+                        if let Some((_, _, exists_locally)) = file_data.original_fragments.get_mut(&index) {
+                            *exists_locally = true;
+                        }
+                    }
+                    FragmentType::Recovery => {
+                        if let Some((_, _, exists_locally)) = file_data.recovery_fragments.get_mut(&index) {
+                            *exists_locally = true;
+                        }
+                    }
+                }
+                
+                completed_downloads += 1;
+                let total_successful = successful_downloads.load(std::sync::atomic::Ordering::Relaxed);
+                tracing::debug!("Fragment discovery progress: {}/{} min needed, {} total successful", 
+                               completed_downloads, min_needed_fragments, total_successful);
+            }
+            Err((index, fragment_type)) => {
+                tracing::debug!("Failed to download fragment at index {} (type: {:?})", index, fragment_type);
+            }
+        }
+    }
+    
+    // Wait for all worker threads to complete
+    for worker_handle in worker_handles {
+        let _ = worker_handle.await;
+    }
+    
+    // Re-count total available fragments after discovery
+    let new_total_local = file_data.original_fragments.values()
+        .filter(|(_, _, exists_locally)| *exists_locally)
+        .count() +
+        file_data.recovery_fragments.values()
+        .filter(|(_, _, exists_locally)| *exists_locally)
+        .count();
+    
+    if new_total_local < file_data.original_fragments.len() {
+        tracing::error!(
+            "Insufficient fragments after discovery: have {}/{} needed",
+            new_total_local, file_data.original_fragments.len()
+        );
+        return Err(FileError::ShardingError);
+    }
+    
+    let final_successful = successful_downloads.load(std::sync::atomic::Ordering::Relaxed);
+    tracing::info!(
+        "Fragment discovery complete: successfully fetched {} fragments, now have {}/{} needed",
+        final_successful, new_total_local, file_data.original_fragments.len()
+    );
+    
+    Ok(())
+}
+
+/// Fetch a single fragment from network and cache it locally
+async fn fetch_and_cache_fragment(
+    fragment_hash: &Blake3Hash,
+    fragments_dir: &str,
+    app_state: &AppState,
+    placement_height: Option<i32>,
+    auth: &crate::NodeAuthInfo,
+) -> Result<(), FileError> {
+    // Get node metrics for fragment discovery
+    let node_metrics = match placement_height {
+        Some(height) => crate::db::metrics::get_all_node_metrics(app_state.db_pool.get(), height)
+            .map_err(|_| FileError::DatabaseError)?,
+        None => {
+            tracing::warn!("No placement height available for fragment discovery");
+            return Err(FileError::DatabaseError);
+        }
+    };
+
+    // Try to find and fetch the fragment
+    match find_fragment(fragment_hash, FragmentType::Original, &node_metrics, auth).await {
+        Ok(fragment_data) => {
+            // Store fragment locally
+            store_fragment(fragments_dir, fragment_hash, fragment_data)?;
+            
+            // Update database to mark as stored locally
+            if let Err(e) = crate::db::files::mark_fragment_local_state(app_state.db_pool.get(), fragment_hash, true) {
+                tracing::warn!("Failed to update database for fragment {}: {:?}", fragment_hash.to_hex(), e);
+            }
+            
+            tracing::debug!("Successfully fetched and cached fragment {}", fragment_hash.to_hex());
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!("Failed to fetch fragment {} from network: {:?}", fragment_hash.to_hex(), e);
+            Err(FileError::NetworkError)
+        }
+    }
+}
+
+/// Reassemble a complete file from fragments using Reed-Solomon reconstruction
+/// Uses streaming approach to minimize memory usage with distributed fragment discovery
+pub async fn reassemble_file(
+    fragments_dir: &str,
+    mut file_data: FileReassemblyData,
+    app_state: Option<&crate::AppState>,
+    consensus_height: Option<i32>,
 ) -> Result<Vec<u8>, FileError> {
     let num_original_chunks = file_data.original_fragments.len();
     let num_recovery_chunks = file_data.recovery_fragments.len();
     
+    // Create authentication info for inter-node requests (if needed)
+    let auth = if let Some(app_state) = app_state {
+        Some(crate::NodeAuthInfo::from_app_state(app_state)
+            .map_err(|_| FileError::DatabaseError)?)
+    } else {
+        None
+    };
+    
     // Handle empty file case
     if num_original_chunks == 0 {
         return Ok(Vec::new());
+    }
+    
+    // Count total available fragments (original + recovery)
+    let total_local_fragments = file_data.original_fragments.values()
+        .filter(|(_, _, exists_locally)| *exists_locally)
+        .count() +
+        file_data.recovery_fragments.values()
+        .filter(|(_, _, exists_locally)| *exists_locally)
+        .count();
+    
+    // If we need more fragments for reconstruction, fetch them from network
+    if total_local_fragments < num_original_chunks && app_state.is_some() {
+        // Use placement_height from file data if available, otherwise use provided consensus_height
+        let effective_height = file_data.placement_height.or(consensus_height);
+        
+        if let Some(height) = effective_height {
+            let needed_fragments = num_original_chunks - total_local_fragments;
+            
+            tracing::info!(
+                "Need {} more fragments for file reconstruction (have {}/{} needed) at consensus height {}",
+                needed_fragments, total_local_fragments, num_original_chunks, height
+            );
+            
+            // Perform concurrent fragment discovery
+            perform_concurrent_fragment_discovery(
+                &mut file_data,
+                fragments_dir,
+                needed_fragments,
+                app_state.unwrap(),
+                height,
+            ).await?;
+        } else {
+            tracing::warn!("No consensus height available for distributed fragment discovery");
+        }
     }
     
     // Check if all original chunks are available locally (fast path)
@@ -485,8 +755,16 @@ pub fn reassemble_file(
                 
                 if let Some(ref per_file_key) = file_data.per_file_key {
                     // Decrypt the chunk using the per-file key
-                    let decrypted_chunk_data = decrypt_chunk(&chunk_data, per_file_key, fragment_id)?;
-                    reconstructed_file.extend_from_slice(&decrypted_chunk_data);
+                    tracing::debug!("Fast path: Decrypting chunk {} with fragment_id {}", i, fragment_id);
+                    match decrypt_chunk(&chunk_data, per_file_key, fragment_id) {
+                        Ok(decrypted_chunk_data) => {
+                            reconstructed_file.extend_from_slice(&decrypted_chunk_data);
+                        }
+                        Err(e) => {
+                            tracing::error!("Fast path: Failed to decrypt chunk {} with fragment_id {}: {:?}", i, fragment_id, e);
+                            return Err(e);
+                        }
+                    }
                 } else {
                     // No decryption needed (for backward compatibility or empty files)
                     reconstructed_file.extend_from_slice(&chunk_data);
@@ -512,6 +790,10 @@ pub fn reassemble_file(
     // Check if we have enough fragments total
     let total_available = available_original + available_recovery;
     if total_available < num_original_chunks {
+        tracing::error!(
+            "Insufficient fragments for Reed-Solomon reconstruction: have {} ({}+{} original+recovery), need {}",
+            total_available, available_original, available_recovery, num_original_chunks
+        );
         return Err(FileError::ShardingError);
     }
     
@@ -523,15 +805,49 @@ pub fn reassemble_file(
     for i in 0..num_original_chunks {
         if let Some((hash, fragment_id, exists_locally)) = file_data.original_fragments.get(&i) {
             if *exists_locally {
-                let chunk_data = fetch_and_verify_fragment(hash, fragments_dir)?;
-                
-                if let Some(ref per_file_key) = file_data.per_file_key {
-                    // Decrypt the chunk using the per-file key
-                    let decrypted_chunk_data = decrypt_chunk(&chunk_data, per_file_key, fragment_id)?;
-                    available_original.push((i, decrypted_chunk_data));
-                } else {
-                    // No decryption needed (for backward compatibility or empty files)
-                    available_original.push((i, chunk_data));
+                match fetch_and_verify_fragment(hash, fragments_dir) {
+                    Ok(chunk_data) => {
+                        // Use original chunks in encrypted form for Reed-Solomon reconstruction
+                        // They will be decrypted after reconstruction
+                        tracing::debug!("Using original chunk {} in encrypted form for Reed-Solomon", i);
+                        available_original.push((i, chunk_data));
+                    }
+                    Err(e) => {
+                        tracing::warn!("Fragment {} marked as stored locally but not found on disk: {:?}. Updating database and attempting immediate fetch.", hash.to_hex(), e);
+                        
+                        // Update database to reflect that fragment is not actually stored locally
+                        if let Some(app_state) = app_state {
+                            if let Err(db_err) = crate::db::files::mark_fragment_local_state(app_state.db_pool.get(), hash, false) {
+                                tracing::warn!("Failed to update database for missing fragment {}: {:?}", hash.to_hex(), db_err);
+                            }
+                        }
+                        
+                        // Try to fetch and cache the fragment immediately
+                        if let (Some(app_state), Some(auth)) = (app_state, &auth) {
+                            match fetch_and_cache_fragment(hash, fragments_dir, app_state, consensus_height, auth).await {
+                                Ok(()) => {
+                                    // Retry loading the fragment after caching
+                                    match fetch_and_verify_fragment(hash, fragments_dir) {
+                                        Ok(chunk_data) => {
+                                            tracing::debug!("Successfully fetched and loaded original chunk {} after caching", i);
+                                            available_original.push((i, chunk_data));
+                                        }
+                                        Err(e2) => {
+                                            tracing::error!("Fragment {} still not available after fetch and cache: {:?}", hash.to_hex(), e2);
+                                            return Err(FileError::ShardingError);
+                                        }
+                                    }
+                                }
+                                Err(fetch_err) => {
+                                    tracing::error!("Failed to fetch fragment {} from network: {:?}", hash.to_hex(), fetch_err);
+                                    return Err(FileError::ShardingError);
+                                }
+                            }
+                        } else {
+                            tracing::error!("Cannot fetch fragment {} - no app_state provided for network access", hash.to_hex());
+                            return Err(FileError::ShardingError);
+                        }
+                    }
                 }
             }
         }
@@ -539,31 +855,128 @@ pub fn reassemble_file(
     
     // Add available recovery chunks with their indices
     for i in 0..num_recovery_chunks {
-        if let Some((hash, fragment_id, exists_locally)) = file_data.recovery_fragments.get(&i) {
+        // Recovery chunks are stored with offset in database (after original chunks)
+        let database_index = i + num_original_chunks;
+        if let Some((hash, fragment_id, exists_locally)) = file_data.recovery_fragments.get(&database_index) {
             if *exists_locally {
-                let chunk_data = fetch_and_verify_fragment(hash, fragments_dir)?;
-                
-                if let Some(ref per_file_key) = file_data.per_file_key {
-                    // Decrypt the chunk using the per-file key
-                    let decrypted_chunk_data = decrypt_chunk(&chunk_data, per_file_key, fragment_id)?;
-                    available_recovery.push((i, decrypted_chunk_data));
-                } else {
-                    // No decryption needed (for backward compatibility or empty files)
-                    available_recovery.push((i, chunk_data));
+                match fetch_and_verify_fragment(hash, fragments_dir) {
+                    Ok(chunk_data) => {
+                        // Recovery chunks are not encrypted with per-chunk keys
+                        // They are the output of Reed-Solomon encoding on already-encrypted original chunks
+                        tracing::debug!("Using recovery chunk {} (database index {}) directly (no decryption needed)", i, database_index);
+                        available_recovery.push((i, chunk_data));
+                    }
+                    Err(e) => {
+                        tracing::warn!("Fragment {} marked as stored locally but not found on disk: {:?}. Updating database and attempting immediate fetch.", hash.to_hex(), e);
+                        
+                        // Update database to reflect that fragment is not actually stored locally
+                        if let Some(app_state) = app_state {
+                            if let Err(db_err) = crate::db::files::mark_fragment_local_state(app_state.db_pool.get(), hash, false) {
+                                tracing::warn!("Failed to update database for missing fragment {}: {:?}", hash.to_hex(), db_err);
+                            }
+                        }
+                        
+                        // Try to fetch and cache the fragment immediately
+                        if let (Some(app_state), Some(auth)) = (app_state, &auth) {
+                            match fetch_and_cache_fragment(hash, fragments_dir, app_state, consensus_height, auth).await {
+                                Ok(()) => {
+                                    // Retry loading the fragment after caching
+                                    match fetch_and_verify_fragment(hash, fragments_dir) {
+                                        Ok(chunk_data) => {
+                                            tracing::debug!("Successfully fetched and loaded recovery chunk {} (database index {}) after caching", i, database_index);
+                                            available_recovery.push((i, chunk_data));
+                                        }
+                                        Err(e2) => {
+                                            tracing::error!("Fragment {} still not available after fetch and cache: {:?}", hash.to_hex(), e2);
+                                            return Err(FileError::ShardingError);
+                                        }
+                                    }
+                                }
+                                Err(fetch_err) => {
+                                    tracing::error!("Failed to fetch fragment {} from network: {:?}", hash.to_hex(), fetch_err);
+                                    return Err(FileError::ShardingError);
+                                }
+                            }
+                        } else {
+                            tracing::error!("Cannot fetch fragment {} - no app_state provided for network access", hash.to_hex());
+                            return Err(FileError::ShardingError);
+                        }
+                    }
                 }
             }
         }
     }
     
-    // Perform Reed-Solomon reconstruction
-    let reconstructed_map = reed_solomon_simd::decode(num_original_chunks, num_recovery_chunks, available_original, available_recovery)
+    // Perform Reed-Solomon reconstruction on encrypted chunks using streaming decoder
+    let chunk_len = if let Some((_, first_chunk)) = available_original.first() {
+        first_chunk.len()
+    } else if let Some((_, first_chunk)) = available_recovery.first() {
+        first_chunk.len()
+    } else {
+        return Err(FileError::ShardingError); // No chunks available
+    };
+    
+    let mut decoder = ReedSolomonDecoder::new(num_original_chunks, num_recovery_chunks, chunk_len)
         .map_err(|_| FileError::ShardingError)?;
     
-    // Convert HashMap to ordered vector and concatenate chunks
+    // Add available original chunks
+    for (index, chunk_data) in &available_original {
+        decoder.add_original_shard(*index, chunk_data)
+            .map_err(|_| FileError::ShardingError)?;
+    }
+    
+    // Add available recovery chunks  
+    for (index, chunk_data) in available_recovery {
+        decoder.add_recovery_shard(index, &chunk_data)
+            .map_err(|_| FileError::ShardingError)?;
+    }
+    
+    // Perform the reconstruction
+    let decoder_result = decoder.decode()
+        .map_err(|_| FileError::ShardingError)?;
+    
+    // Build a map of all original chunks (existing + reconstructed)
+    let mut reconstructed_map = std::collections::HashMap::new();
+    
+    // First, add any restored/reconstructed chunks
+    for (index, chunk_data) in decoder_result.restored_original_iter() {
+        tracing::debug!("Reed-Solomon reconstructed chunk {} ({} bytes)", index, chunk_data.len());
+        reconstructed_map.insert(index, chunk_data.to_vec());
+    }
+    
+    // Then add any original chunks we already had (they might not be in restored_original_iter)
+    for (index, chunk_data) in &available_original {
+        if !reconstructed_map.contains_key(index) {
+            tracing::debug!("Using locally available chunk {} ({} bytes)", index, chunk_data.len());
+        }
+        reconstructed_map.entry(*index).or_insert_with(|| chunk_data.clone());
+    }
+    
+    // Decrypt the reconstructed chunks and concatenate them
     let mut reconstructed_file = Vec::new();
     for i in 0..num_original_chunks {
-        if let Some(chunk) = reconstructed_map.get(&i) {
-            reconstructed_file.extend_from_slice(chunk);
+        if let Some(encrypted_chunk) = reconstructed_map.get(&i) {
+            if let Some(ref per_file_key) = file_data.per_file_key {
+                // Find the fragment_id for this chunk
+                if let Some((chunk_hash, fragment_id, _)) = file_data.original_fragments.get(&i) {
+                    tracing::debug!("Decrypting reconstructed chunk {} with fragment_id {} (hash: {}, len: {} bytes)", 
+                                   i, fragment_id, chunk_hash.to_hex(), encrypted_chunk.len());
+                    match decrypt_chunk(encrypted_chunk, per_file_key, fragment_id) {
+                        Ok(decrypted_chunk_data) => {
+                            reconstructed_file.extend_from_slice(&decrypted_chunk_data);
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to decrypt reconstructed chunk {} with fragment_id {}: {:?}", i, fragment_id, e);
+                            return Err(e);
+                        }
+                    }
+                } else {
+                    return Err(FileError::ShardingError); // Missing fragment metadata
+                }
+            } else {
+                // No decryption needed (for backward compatibility or empty files)
+                reconstructed_file.extend_from_slice(encrypted_chunk);
+            }
         } else {
             return Err(FileError::ShardingError); // Missing chunk after reconstruction
         }

@@ -11,11 +11,11 @@ use reed_solomon_simd::ReedSolomonEncoder;
 use reqwest::StatusCode;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::OsRng};
 
-use crate::{db::{Blake3Hash, Data, DataRecord, DatabaseError, FragmentHash, Inode}, files::functions::{calculate_chunk_padding, calculate_encrypted_chunk_length, calculate_optimal_chunks, encrypt_chunk, encrypt_part, encrypt_path, store_fragment}};
+use crate::{db::{self, Blake3Hash, Data, DataRecord, DatabaseError, FragmentHash, Inode, files::*}, files::functions::{calculate_chunk_padding, calculate_encrypted_chunk_length, calculate_optimal_chunks, encrypt_chunk, encrypt_part, encrypt_path, store_fragment}};
 use serde::{Deserialize, Serialize};
 
 use super::*;
-use crate::{db::CustomUUID, files::functions::shard_file};
+use crate::db::CustomUUID;
 use either::Either::{Left, Right};
 use crate::consensus::{functions::consensus_middleware, types::Transaction};
 
@@ -36,7 +36,7 @@ pub async fn get_files(
 ) -> Result<Json<Vec<Inode>>, StatusCode> {
     // let's encrypt the path so we can search for it
     let enc_path = encrypt_path(params.path, app_state.get_siv_key()?, app_state.get_siv_nonce()?).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    match db::get_files(app_state.db_pool.get(), enc_path, app_state.get_siv_key()?, app_state.get_siv_nonce()?) {
+    match db::files::get_files(app_state.db_pool.get(), enc_path, app_state.get_siv_key()?, app_state.get_siv_nonce()?) {
         Ok(files) => {
             Ok(Json(files))
         }
@@ -68,7 +68,7 @@ pub async fn get_file_fragments(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     
     // Get file access data from database
-    let file_access_data = match db::get_file_fragments(app_state.db_pool.get(), enc_path, user_id) {
+    let file_access_data = match db::files::get_file_fragments(app_state.db_pool.get(), enc_path, user_id) {
         Ok(data) => data,
         Err(DatabaseError::RecallError) => return Err(StatusCode::NOT_FOUND),
         Err(e) => {
@@ -77,6 +77,9 @@ pub async fn get_file_fragments(
         }
     };
 
+    // Extract placement_height before moving file_data
+    let placement_height = file_access_data.file_reassembly_data.placement_height;
+    
     // Decrypt the per-file key if user has access
     let mut file_data = file_access_data.file_reassembly_data;
     if let Some(file_access_entry) = file_access_data.file_access_entry {
@@ -104,8 +107,13 @@ pub async fn get_file_fragments(
         return Err(StatusCode::FORBIDDEN);
     };
     
-    // Reassemble the file from fragments
-    let file_contents = match functions::reassemble_file(&app_state.fragments_dir, file_data) {
+    // Reassemble the file from fragments with distributed discovery support
+    let file_contents = match functions::reassemble_file(
+        &app_state.fragments_dir, 
+        file_data,
+        Some(&app_state),
+        placement_height
+    ).await {
         Ok(contents) => contents,
         Err(e) => {
             tracing::error!("Error reassembling file: {:?}", e);
@@ -205,7 +213,11 @@ pub async fn post_files(
                                 let encrypted_chunk = encrypt_chunk(file_chunk, &per_file_key, &fragment_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
                                 encoder.add_original_shard(&encrypted_chunk).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
                                 let chunk_hash = Blake3Hash::new(blake3::hash(&encrypted_chunk));
+                                let encrypted_len = encrypted_chunk.len();
                                 store_fragment(&app_state.fragments_dir, &chunk_hash, encrypted_chunk).map_err(|_| StatusCode::INSUFFICIENT_STORAGE)?;
+                                
+                                tracing::debug!("Upload: Original chunk {} -> fragment_id: {}, hash: {}, encrypted_len: {}", 
+                                               output_chunk_metadata.len(), fragment_id, chunk_hash.to_hex(), encrypted_len);
                                 let my_chunk = FragmentHash {
                                     data_block_id: dataid.clone(),
                                     fragment_index: output_chunk_metadata.len() as i32,
@@ -388,7 +400,7 @@ pub async fn delete_files(
     Query(params): Query<GetQueryParams>
 ) -> Result<(), StatusCode> {
     let enc_path = encrypt_path(params.path, app_state.get_siv_key()?, app_state.get_siv_nonce()?).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    match db::delete_files(app_state.db_pool.get(), enc_path) {
+    match db::files::delete_files(app_state.db_pool.get(), enc_path) {
         Ok(_) => return Ok(()),
         Err(e) => {
             tracing::error!("Error deleting files: {:?}", e);

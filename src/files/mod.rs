@@ -6,6 +6,7 @@ pub mod functions;
 pub mod handlers;
 pub mod placement;
 pub mod distribution;
+pub mod discovery;
 
 #[cfg(test)]
 mod tests;

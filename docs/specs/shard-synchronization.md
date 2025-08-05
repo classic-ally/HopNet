@@ -160,9 +160,13 @@ This document outlines the requirements for implementing distributed shard synch
 ### 11. Fragment Discovery and Retrieval Protocol
 - **Primary Method**: Local database check first (fragments may be cached from previous requests)
 - **Deterministic Placement**: Query preference-ordered list of 1/3 of storage nodes for missing fragments
-- **Sequential Fallback**: Try nodes in preference order (first → second → third, etc.) to handle node failures
-- **Gossip Fallback**: If deterministic placement fails, use health-check-first gossip across all nodes
-  - Parallel `/fragments/{hash}/health` queries to all nodes
+- **Accelerated Fallback**: Best-candidate-first with reactive parallel discovery
+  - Try highest-ranked deterministic candidate immediately for optimal case performance
+  - Launch parallel health checks on remaining deterministic candidates (no waiting)
+  - Spawn download tasks reactively as nodes report having fragments
+  - Network-wide gossip fallback if deterministic candidates exhausted
+- **Gossip Fallback**: Health-check-first gossip across all nodes when triggered
+  - Parallel `/fragments/{hash}/health` queries to all nodes with 200ms timeout
   - Fetch from first node to respond positively (don't wait for all responses)
   - If first fetch fails, try next available node from remaining health responses
 - **Reed-Solomon Reconstruction**: Final fallback if both deterministic placement and gossip fail
@@ -288,15 +292,23 @@ This document outlines the requirements for implementing distributed shard synch
   - Inter-node authentication with dual Ed25519 signatures
   - Consensus integration for placement_height updates
   - Database state tracking (stored_locally flags)
-- [ ] **NEXT**: Download logic with deterministic fragment lookup across nodes
+- [x] **COMPLETED**: Download logic integration with accelerated fragment discovery system
 - [ ] Orphan recovery job with adaptive thresholds based on network throughput
 
-### Phase 1C: Fragment Discovery and Basic Geographic Distribution [ ]
-- [ ] Parallel fragment query implementation using RFC-003 fragment discovery endpoints
-- [ ] Caching layer for fragment locations
-- [ ] Basic node reliability scoring using performance metrics
+### Phase 1C: Fragment Discovery and Basic Geographic Distribution [x]
+- [x] **COMPLETED**: Accelerated fragment discovery with reactive tokio-based fallback
+  - Standardized placement algorithm shared between distribution and discovery systems
+  - Best-candidate-first strategy with immediate parallel health checks on remaining candidates
+  - Reactive downloading: spawn download tasks as soon as nodes report having fragments
+  - Network-wide gossip fallback using health-check-first pattern with 200ms timeouts
+  - Pure tokio implementation (tasks + channels) with automatic cleanup on success
+- [x] **COMPLETED**: Download logic integration - reassemble_file() calls discovery functions when stored_locally=false
+  - Work queue pattern with thread reuse for efficient concurrent fragment retrieval
+  - Database consistency management with automatic state correction when fragments missing from disk
+  - Ed25519 cryptographic authentication for all inter-node fragment requests
+  - Robust Reed-Solomon reconstruction handling missing/corrupted fragments
+- [ ] Basic node reliability scoring using performance metrics  
 - [ ] Geographic distribution using RTT clustering + IP geolocation (early implementation)
-- [ ] Fallback search expansion algorithm
 
 ### Phase 2: Performance Optimization [ ]
 - [ ] Performance-optimized original fragment placement

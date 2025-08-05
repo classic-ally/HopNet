@@ -22,7 +22,7 @@ Byzantine fault-tolerant consensus engine providing network coordination and sta
 - [ ] Node health monitoring and automatic validator management
 
 ### 2. File Storage System ([RFC-002](specs/file-storage.md))  
-**Status**: Local storage complete, distribution implemented, download needs deterministic lookup
+**Status**: Complete core functionality including distributed downloads with robust fragment discovery
 
 Reed-Solomon encoded file storage with encryption and fragment management.
 
@@ -33,8 +33,12 @@ Reed-Solomon encoded file storage with encryption and fragment management.
 - [x] File reconstruction from available fragments
 - [x] Fast-path reconstruction when all original fragments available
 - [x] Event-driven fragment distribution after upload completion
-- [ ] Download logic with deterministic fragment lookup across nodes
+- [x] **NEW**: Distributed fragment discovery with accelerated fallback pattern
+- [x] **NEW**: Work queue pattern for efficient concurrent fragment retrieval
+- [x] **NEW**: Database consistency management with automatic state correction
+- [x] **NEW**: Cryptographic authentication for all fragment transfer operations
 - [ ] Fragment lifecycle management and garbage collection
+- [ ] **NEW**: Automated maintenance reconciliation (route + scheduled job)
 - [ ] Storage capacity monitoring and quota management
 - [ ] Secure thumbnail generation for encrypted files
 - [ ] Preview data extraction while maintaining encryption
