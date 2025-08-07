@@ -316,6 +316,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn run_with_gui() -> Result<(), Box<dyn std::error::Error>> {
     use tauri::{Manager, menu::{Menu, MenuItem, PredefinedMenuItem}, tray::TrayIconBuilder, TitleBarStyle, WebviewWindowBuilder};
     
+    // Helper function to create and configure the main window
+    fn create_main_window(app: &tauri::AppHandle, port: u16) -> Result<tauri::WebviewWindow, Box<dyn std::error::Error>> {
+        let win_builder = WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::default())
+            .title("HopNet")
+            .inner_size(1200.0, 800.0);
+        
+        // Set transparent title bar only when building for macOS
+        #[cfg(target_os = "macos")]
+        let win_builder = win_builder.title_bar_style(TitleBarStyle::Transparent);
+        
+        let window = win_builder.build()?;
+        
+        // Set background color only when building for macOS
+        #[cfg(target_os = "macos")]
+        {
+            use cocoa::appkit::{NSColor, NSWindow};
+            use cocoa::base::{id, nil};
+            
+            let ns_window = window.ns_window().unwrap() as id;
+            unsafe {
+                let bg_color = NSColor::colorWithRed_green_blue_alpha_(
+                    nil,
+                    17.0 / 255.0,   // #11111b red component (crust)
+                    17.0 / 255.0,   // #11111b green component (crust)
+                    27.0 / 255.0,   // #11111b blue component (crust)
+                    1.0,
+                );
+                ns_window.setBackgroundColor_(bg_color);
+            }
+        }
+        
+        // Load the local server
+        let url = format!("http://localhost:{}", port);
+        window.navigate(url.parse()?)?;
+        
+        Ok(window)
+    }
+    
     // Start the server in a background task
     let server_handle = tokio::spawn(async {
         if let Err(e) = run_server().await {
@@ -360,32 +398,38 @@ async fn run_with_gui() -> Result<(), Box<dyn std::error::Error>> {
             }
             
             let toggle_item_ref = toggle_item.clone();
+            let port_for_toggle = port;
             let _tray = tray_builder
                 .on_menu_event(move |app, event| {
-                    if let Some(window) = app.get_webview_window("main") {
-                        match event.id.0.as_str() {
-                            "toggle" => {
-                                // Simply toggle window visibility
-                                if window.is_visible().unwrap_or(false) {
-                                    if let Err(e) = window.hide() {
-                                        tracing::error!("Failed to hide window: {}", e);
+                    match event.id.0.as_str() {
+                        "toggle" => {
+                            if let Some(window) = app.get_webview_window("main") {
+                                // Window exists, close it to free resources
+                                if let Err(e) = window.close() {
+                                    tracing::error!("Failed to close window: {}", e);
+                                }
+                            } else {
+                                // Window doesn't exist, create it
+                                match create_main_window(app, port_for_toggle) {
+                                    Ok(window) => {
+                                        // Show and focus
+                                        if let Err(e) = window.show() {
+                                            tracing::error!("Failed to show window: {}", e);
+                                        }
+                                        if let Err(e) = window.set_focus() {
+                                            tracing::error!("Failed to focus window: {}", e);
+                                        }
                                     }
-                                } else {
-                                    if let Err(e) = window.show() {
-                                        tracing::error!("Failed to show window: {}", e);
-                                    }
-                                    if let Err(e) = window.set_focus() {
-                                        tracing::error!("Failed to focus window: {}", e);
+                                    Err(e) => {
+                                        tracing::error!("Failed to create window: {}", e);
                                     }
                                 }
                             }
-                            "quit" => {
-                                app.exit(0);
-                            }
-                            _ => {}
                         }
-                    } else {
-                        tracing::error!("Main window not found");
+                        "quit" => {
+                            app.exit(0);
+                        }
+                        _ => {}
                     }
                 })
                 .on_tray_icon_event({
@@ -393,68 +437,21 @@ async fn run_with_gui() -> Result<(), Box<dyn std::error::Error>> {
                     move |_tray, event| {
                         // Update menu text when tray is right-clicked (before menu shows)
                         if let tauri::tray::TrayIconEvent::Click { button: tauri::tray::MouseButton::Right, .. } = event {
-                            if let Some(window) = app_handle.get_webview_window("main") {
-                                let text = if window.is_visible().unwrap_or(false) {
-                                    "Hide window"
-                                } else {
-                                    "Show window"  
-                                };
-                                if let Err(e) = toggle_item_ref.set_text(text) {
-                                    tracing::error!("Failed to update menu text: {}", e);
-                                }
+                            let text = if app_handle.get_webview_window("main").is_some() {
+                                "Close window"
+                            } else {
+                                "Open window"  
+                            };
+                            if let Err(e) = toggle_item_ref.set_text(text) {
+                                tracing::error!("Failed to update menu text: {}", e);
                             }
                         }
                     }
                 })
                 .build(app)?;
             
-            // Create the main window programmatically with transparent titlebar
-            let win_builder = WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::default())
-                .title("HopNet")
-                .inner_size(1200.0, 800.0);
-            
-            // Set transparent title bar only when building for macOS
-            #[cfg(target_os = "macos")]
-            let win_builder = win_builder.title_bar_style(TitleBarStyle::Transparent);
-            
-            let window = win_builder.build().unwrap();
-            
-            // Set background color only when building for macOS
-            #[cfg(target_os = "macos")]
-            {
-                use cocoa::appkit::{NSColor, NSWindow};
-                use cocoa::base::{id, nil};
-                
-                let ns_window = window.ns_window().unwrap() as id;
-                unsafe {
-                    let bg_color = NSColor::colorWithRed_green_blue_alpha_(
-                        nil,
-                        17.0 / 255.0,   // #11111b red component (crust)
-                        17.0 / 255.0,   // #11111b green component (crust)
-                        27.0 / 255.0,   // #11111b blue component (crust)
-                        1.0,
-                    );
-                    ns_window.setBackgroundColor_(bg_color);
-                }
-            }
-            
-            // Handle close request - hide instead of quit
-            let window_clone = window.clone();
-            window.on_window_event(move |event| {
-                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                    // Prevent the default close behavior
-                    api.prevent_close();
-                    // Hide the window instead
-                    if let Err(e) = window_clone.hide() {
-                        tracing::error!("Failed to hide window on close: {}", e);
-                    }
-                }
-            });
-            
-            // Load the local server
-            let url = format!("http://localhost:{}", port);
-            window.navigate(url.parse()
-                .map_err(|e| format!("Invalid URL: {}", e))?)?;
+            // Create the main window using the helper function
+            let window = create_main_window(&app.handle(), port)?;
             
             // Start visible (no dock icon due to Accessory policy)
             window.show()?;
@@ -465,9 +462,29 @@ async fn run_with_gui() -> Result<(), Box<dyn std::error::Error>> {
         .build(context)?;
     
     // Run the Tauri app (this blocks until the app is closed)
-    app.run(|_app_handle, event| {
-        if let tauri::RunEvent::ExitRequested { .. } = event {
-            // App is closing, we could clean up here if needed
+    app.run(|app_handle, event| {
+        match event {
+            tauri::RunEvent::ExitRequested { api, code, .. } => {
+                // Only allow exit if explicitly requested (e.g., from tray menu)
+                if code != Some(0) {
+                    api.prevent_exit();
+                }
+            }
+            tauri::RunEvent::WindowEvent { 
+                label, 
+                event: tauri::WindowEvent::CloseRequested { .. }, 
+                .. 
+            } => {
+                // Window close requested - let it close but don't exit app
+                if label == "main" {
+                    // Window will be destroyed, app continues running
+                }
+            }
+            tauri::RunEvent::MainEventsCleared => {
+                // Check if we should exit (no windows and user chose quit)
+                // App will keep running as long as tray is active
+            }
+            _ => {}
         }
     });
     
