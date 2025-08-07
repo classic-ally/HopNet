@@ -3,9 +3,23 @@
     import UploadFiles from "./UploadFiles.svelte";
     import CreateFolder from "./CreateFolder.svelte";
     import { refreshTriggerStore } from '../stores';
+    import { onMount } from 'svelte';
+    
+    export let onToggleSidebar;
     
     let showUploadPopover = false;
     let showCreateFolderPopover = false;
+    let isMobile = false;
+    
+    function checkMobile() {
+        isMobile = window.innerWidth < 768;
+    }
+    
+    onMount(() => {
+        checkMobile();
+        window.addEventListener('resize', checkMobile);
+        return () => window.removeEventListener('resize', checkMobile);
+    });
     
     function handleUploadClick() {
         showUploadPopover = true;
@@ -56,6 +70,13 @@
 
 <div class="flex gap-1">
     <div class="flex flex-1 min-w-0 justify-start gap-1">
+        {#if isMobile}
+            <ControlBarIcon
+                icon="i-carbon-menu"
+                title="Toggle sidebar"
+                onClick={onToggleSidebar}
+            />
+        {/if}
         <ControlBarIcon
             icon="i-carbon-list"
             title="Change view mode"
