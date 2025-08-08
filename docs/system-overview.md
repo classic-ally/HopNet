@@ -114,6 +114,22 @@ End-to-end encryption and comprehensive authentication system.
 - [ ] Geographic compliance and data sovereignty controls
 - [ ] Thin client architecture for mobile/constrained devices
 
+### 7. Maintenance & Operations System ([RFC-007](specs/maintenance-operations.md))
+**Status**: Design Complete, Implementation Pending
+
+Automated background processes ensuring network health and storage efficiency.
+
+- [ ] Threshold-based fragment cleanup with Time Machine preservation
+- [ ] Availability-aware cleanup prioritization (redundant vs historical)
+- [ ] Network rebalancing for node join/leave events
+- [ ] Lost shard recovery with Reed-Solomon reconstruction
+- [ ] Redundant copy cleanup for download/rebalancing artifacts
+- [ ] Fragment health monitoring and remediation
+- [ ] Consensus state management and archival
+- [ ] UUIDv7-based fragment age tracking for efficient cleanup
+- [ ] Job coordination using node ID proximity to minimize duplicate work
+- [ ] Integration with existing apalis job infrastructure
+
 ## Current Focus
 
 **Phase 1A Critical Path**: Infrastructure completion to enable distributed operations
@@ -205,12 +221,18 @@ End-to-end encryption and comprehensive authentication system.
    - Add node reliability scoring with basic metrics collection
    - Enable geographic distribution using RTT clustering + IP geolocation
    
-2. **Complete UI features for distributed operations** - User-facing distributed functionality  
+2. **RFC-007 maintenance and operations** - Network health and efficiency
+   - Implement threshold-based fragment cleanup with UUIDv7 age tracking
+   - Add availability-aware cleanup prioritization
+   - Build network rebalancing system for topology changes
+   - Create redundant copy cleanup for storage optimization
+   
+3. **Complete UI features for distributed operations** - User-facing distributed functionality  
    - Advanced file operations (multi-select, drag-drop) with distributed backend
    - Network health dashboard showing distributed node status
    - File sharing controls leveraging distributed storage
    
-3. **Node performance monitoring** - Foundation for reliability scoring
+4. **Node performance monitoring** - Foundation for reliability scoring
    - Implement comprehensive node metrics collection
    - Add automatic node health scoring for placement decisions
    - Build monitoring dashboard for network health
