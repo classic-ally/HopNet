@@ -13,3 +13,4 @@ pub mod types;
 pub mod setup;
 pub mod nodes;
 pub mod files;
+pub mod fragments;

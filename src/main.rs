@@ -221,6 +221,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/files", delete(files::routes::delete_files))
                 .route("/files/{*path}", get(files::routes::get_file_fragments))
                 .route("/fragments", get(files::routes::get_fragments_count))
+                .route("/maintenance/cleanup-orphaned", post(files::routes::post_cleanup_orphaned_data_blocks))
                 .route("/validators", get(consensus::routes::get_validators))
                 .route("/metrics", get(metrics::routes::get_metrics))
                 .route("/metrics/trigger", get(metrics::routes::get_metrics_trigger))

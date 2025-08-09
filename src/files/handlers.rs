@@ -1,11 +1,12 @@
 use crate::{
-    db::{DatabaseError, files::{insert_files, update_placement_heights_batch, PlacementHeightUpdate}}, 
+    db::{DatabaseError, CustomUUID, files::{insert_files, update_placement_heights_batch, PlacementHeightUpdate}, fragments::delete_orphaned_data_blocks_consensus}, 
     handlers::{HandlerResult, TransactionHandler}, 
     db::Inode
 };
 use crate::AppState;
 use crate::files::functions::fragment_exists_and_valid;
 use either::Either;
+use serde::{Serialize, Deserialize};
 
 pub struct InsertFilesHandler;
 
@@ -60,4 +61,55 @@ impl TransactionHandler for UpdatePlacementHeightsHandler {
 
 inventory::submit! {
     &UpdatePlacementHeightsHandler as &dyn TransactionHandler
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DeleteOrphanedDataBlocksPayload {
+    pub data_block_ids: Vec<CustomUUID>,
+}
+
+pub struct DeleteOrphanedDataBlocksHandler;
+
+impl TransactionHandler for DeleteOrphanedDataBlocksHandler {
+    fn name(&self) -> &'static str { "delete_orphaned_data_blocks" }
+
+    fn process(&self, state: &AppState, payload: &[u8], execute: bool) -> HandlerResult {
+        match bincode::serde::decode_from_slice::<DeleteOrphanedDataBlocksPayload, _>(payload, bincode::config::standard()) {
+            Ok((payload_data, _)) => {
+                let deleted_fragment_hashes = delete_orphaned_data_blocks_consensus(
+                    state.db_pool.get(), 
+                    payload_data.data_block_ids, 
+                    execute
+                )?;
+                
+                // If executing, opportunistically delete local fragment files
+                if execute && !deleted_fragment_hashes.is_empty() {
+                    tracing::info!("Opportunistically cleaning up {} local fragment files", deleted_fragment_hashes.len());
+                    
+                    let mut successfully_deleted = 0;
+                    for fragment_hash in &deleted_fragment_hashes {
+                        match crate::files::functions::delete_fragment(&state.fragments_dir, fragment_hash) {
+                            Ok(()) => {
+                                successfully_deleted += 1;
+                                tracing::debug!("Deleted local fragment file: {}", fragment_hash.to_hex());
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to delete local fragment file {}: {:?}", fragment_hash.to_hex(), e);
+                                // Continue with other deletions - this fragment will be caught by filesystem cleanup job
+                            }
+                        }
+                    }
+                    
+                    tracing::info!("Successfully deleted {}/{} local fragment files", successfully_deleted, deleted_fragment_hashes.len());
+                }
+                
+                Ok(())
+            },
+            Err(_) => Err(DatabaseError::InvalidPayload),
+        }
+    }
+}
+
+inventory::submit! {
+    &DeleteOrphanedDataBlocksHandler as &dyn TransactionHandler
 }

@@ -398,6 +398,23 @@ pub fn store_fragment(fragments_dir: &str, fragment_hash: &Blake3Hash, data: Vec
     Ok(())
 }
 
+/// Delete a fragment from local storage
+/// Simple deletion without directory cleanup for performance
+pub fn delete_fragment(fragments_dir: &str, fragment_hash: &Blake3Hash) -> Result<(), FileError> {
+    let dir_path = create_fragment_path(fragments_dir, fragment_hash)?;
+    let full_file_path = format!("{}/{}", dir_path, fragment_hash.to_hex());
+    
+    // Remove the fragment file
+    match fs::remove_file(&full_file_path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Fragment file doesn't exist - consider it successfully "deleted"
+            Ok(())
+        }
+        Err(e) => Err(FileError::StorageError(e))
+    }
+}
+
 /// Fetch a fragment from local storage only
 /// Returns the fragment data if found locally, otherwise returns an error
 pub fn fetch_fragment_local(fragments_dir: &str, fragment_hash: &Blake3Hash) -> Result<Vec<u8>, FileError> {

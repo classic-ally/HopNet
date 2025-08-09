@@ -7,6 +7,7 @@ pub mod handlers;
 pub mod placement;
 pub mod distribution;
 pub mod discovery;
+pub mod jobs;
 
 #[cfg(test)]
 mod tests;

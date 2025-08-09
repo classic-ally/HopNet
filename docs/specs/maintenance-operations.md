@@ -29,47 +29,60 @@ The HopNet Maintenance and Operations System provides automated background proce
 - Initially only manual cleanup request through admin interface
 - Never triggers based purely on time/age
 
-**Cleanup Algorithm with UUIDv7 Timestamps**:
-1. **Timestamp Extraction**: Extract creation timestamp from fragment_id UUIDv7 for efficient age-based sorting
-2. **Safety Checks**: Verify fragment not needed for active files
-3. **UUIDv7-Based Prioritization**: Sort fragments by embedded timestamp, prioritizing cleanup of oldest eligible fragments first
-4. **Emergency Mode**: More aggressive cleanup when critical storage threshold reached
+**Cleanup Algorithm**:
+1. **Orphan Detection**: Identify data blocks with no inode references from any user
+2. **Safety Verification**: Ensure data block is truly orphaned (no active files reference it)
+3. **Consensus Operation**: Submit transaction to delete orphaned data blocks and their fragment_hashes records
+4. **Age Prioritization**: Process oldest data blocks first using data block ID (UUIDv7 timestamp)
+5. **Threshold Enforcement**: Only clean when storage capacity exceeded, preserving history otherwise
+
+**Implementation Status**: [x] Complete - Manual API trigger with configurable batch size and retention days, includes opportunistic local fragment cleanup
+
+**Note**: Includes opportunistic deletion of local fragment files during consensus execution for immediate space reclamation. Any missed fragments cleaned by Fragment Filesystem Cleanup job
 
 **UUIDv7 Integration Benefits**:
 ```rust
-impl CustomUUID {
-    /// Extract the timestamp from a UUIDv7 fragment_id
-    pub fn get_timestamp(&self) -> Result<DateTime<Utc>, TimeError> {
-        match self.0.get_timestamp() {
-            Some(timestamp) => Ok(DateTime::from_timestamp_millis(timestamp.to_unix(Timestamp::UNIX_EPOCH) as i64).unwrap()),
-            None => Err(TimeError::InvalidUUID)
-        }
+// CustomUUID already provides timestamp access through Deref<Target=Uuid>
+// Example usage from existing codebase (metrics/functions.rs):
+match uuid.get_timestamp() {
+    Some(timestamp) => {
+        let (seconds, nanos) = timestamp.to_unix();
+        let timestamp_millis = seconds as i64 * 1000 + nanos as i64 / 1_000_000;
+        timestamp_millis > cutoff_time.timestamp_millis()
     }
-    
-    /// Check if fragment is older than retention policy
-    pub fn is_cleanup_eligible(&self, retention_policy: &RetentionPolicy) -> bool {
-        if let Ok(creation_time) = self.get_timestamp() {
-            let age = Utc::now() - creation_time;
-            age.num_days() > retention_policy.minimum_age_days as i64
-        } else {
-            false // If we can't extract timestamp, don't clean up
-        }
+    None => false, // Not a v7 UUID or invalid timestamp
+}
+
+// For cleanup eligibility checking:
+pub fn is_fragment_cleanup_eligible(
+    fragment_id: &CustomUUID, 
+    retention_days: i64
+) -> bool {
+    if let Some(timestamp) = fragment_id.get_timestamp() {
+        let (seconds, _) = timestamp.to_unix();
+        let creation_time = DateTime::from_timestamp(seconds as i64, 0).unwrap();
+        let age = Utc::now() - creation_time;
+        age.num_days() > retention_days
+    } else {
+        false // If we can't extract timestamp, don't clean up
     }
 }
 ```
 
 **Efficient Cleanup Query using UUIDv7**:
 ```sql
--- Get fragments eligible for cleanup, ordered by age (oldest first)  
--- UUIDv7 allows direct lexicographical sorting by age
-SELECT fragment_id, fragment_hash, data_block_id
-FROM fragment_hashes fh
-JOIN data_blocks db ON fh.data_block_id = db.id  
-WHERE fh.stored_locally = TRUE
-  AND db.deleted_at IS NOT NULL  -- Only consider fragments from deleted files
-  AND fragment_id < ? -- UUIDv7 cutoff timestamp for minimum_age_days
-ORDER BY fragment_id ASC -- Oldest fragments first (UUIDv7 lexicographical = chronological)
-LIMIT ?; -- Process in batches to avoid overwhelming storage I/O
+-- Find orphaned data blocks ordered by age (oldest first)
+SELECT db.id
+FROM data_blocks db
+LEFT JOIN inodes i ON db.id = i.data_id
+WHERE i.data_id IS NULL
+  AND db.id < ? -- UUIDv7 cutoff for minimum retention
+ORDER BY db.id ASC -- Oldest first (UUIDv7 lexicographical = chronological)
+LIMIT ?; -- Process in batches
+
+-- Then for each batch, consensus transaction deletes:
+-- DELETE FROM fragment_hashes WHERE data_block_id = ANY(?);
+-- DELETE FROM data_blocks WHERE id = ANY(?);
 ```
 
 #### Lost Shard Recovery System
@@ -114,10 +127,10 @@ pub enum CleanupPriority {
 ```
 
 **Priority Modulation Based on Node Availability**:
-- **Availability threshold**: Nodes with <80% average availability are considered "low-availability"
-- **High-availability nodes**: Follow standard priority (redundant → historical) since network can provide fragments
-- **Low-availability nodes**: Inverted priority (historical → redundant) to maintain local copies for offline operation
-- **Detection**: Rolling 30-day average of successful health check responses
+- **Statistical Classification**: Compare node's availability against network-wide average
+- **Below-average nodes**: Clean historical data first, keep redundant copies (historical → redundant)
+- **Above-average nodes**: Clean redundant copies first, keep historical data (redundant → historical)  
+- **Detection**: Rolling 30-day average availability compared to network mean
 
 **Triggers**:
 - Manually to free up local space
@@ -190,6 +203,22 @@ pub async fn is_fragment_safely_removable(
 5. **Defer Source Cleanup**: Don't remove fragment from source node after successful migration as this is outside job scope; cleaned up automatically by redundant copy cleanup job
 
 ### 3. Health Monitoring System
+
+#### Fragment Filesystem Cleanup
+**Purpose**: Remove orphaned fragment files that have no corresponding database records
+
+**Detection**:
+- Scan fragments directory periodically
+- Check each fragment file against `fragment_hashes` table
+- Identify fragment files with no database record
+
+**Cleanup Process**:
+1. List all fragment files in local storage directory
+2. Query database for existence of each fragment hash
+3. Remove files that have no corresponding `fragment_hashes` record
+4. Log removed fragments for audit trail
+
+**Scheduling**: Run weekly or when filesystem/database inconsistency suspected
 
 #### Fragment Health Assessment
 **Purpose**: Ensure fragments remain accessible and intact across the network
@@ -270,6 +299,7 @@ let maintenance_worker = WorkerBuilder::new("fragment-health-monitoring")
 - [ ] Add orphan recovery system with distributed fragment retrieval
 - [ ] Create fragment health monitoring with automated remediation
 - [ ] Build network rebalancing system for dynamic node changes
+- [ ] Implement fragment filesystem cleanup for orphaned files
 
 ### Phase 2: Advanced Operations [Future]
 - [ ] Add predictive rebalancing based on historical patterns

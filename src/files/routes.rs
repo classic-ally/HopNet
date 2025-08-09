@@ -24,6 +24,12 @@ pub struct GetQueryParams {
     path: String
 }
 
+#[derive(Deserialize)]
+pub struct CleanupQueryParams {
+    batch_size: i32,
+    retention_days: i64,
+}
+
 #[derive(Serialize)]
 pub struct FileFragmentsResponse {
     pub file_hash: Blake3Hash,
@@ -589,6 +595,50 @@ pub async fn get_fragment_health(
         false => {
             tracing::debug!("Fragment health check failed - not found: {}", fragment_hash.to_hex());
             StatusCode::NOT_FOUND.into_response()
+        }
+    }
+}
+
+/// Manual trigger for orphaned data block cleanup
+pub async fn post_cleanup_orphaned_data_blocks(
+    State(app_state): State<AppState>,
+    Query(params): Query<CleanupQueryParams>,
+    Extension(uid): Extension<i32>,
+) -> impl IntoResponse {
+    tracing::info!("Manual cleanup trigger requested by user {} (batch_size: {}, retention_days: {})", 
+                   uid, params.batch_size, params.retention_days);
+    
+    // Run the cleanup job directly with parameters
+    match super::jobs::run_orphaned_data_block_cleanup(&app_state, params.batch_size, params.retention_days).await {
+        Ok(data_blocks_cleaned) => {
+            #[derive(Serialize)]
+            struct CleanupResponse {
+                status: String,
+                data_blocks_cleaned: usize,
+            }
+            
+            let response = CleanupResponse {
+                status: "success".to_string(),
+                data_blocks_cleaned,
+            };
+            
+            (StatusCode::OK, Json(response)).into_response()
+        }
+        Err(e) => {
+            tracing::error!("Manual cleanup failed: {:?}", e);
+            
+            #[derive(Serialize)]
+            struct ErrorResponse {
+                status: String,
+                error: String,
+            }
+            
+            let response = ErrorResponse {
+                status: "error".to_string(),
+                error: format!("Cleanup failed: {:?}", e),
+            };
+            
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(response)).into_response()
         }
     }
 }
