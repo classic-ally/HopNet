@@ -243,18 +243,29 @@ fn insert_parent_directories(
 pub fn delete_files(
     db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     path: String,
+    user_id: i32,
+    execute: bool,
 ) -> Result<(), DatabaseError> {
     match db_connection {
         Ok(mut db_lock) => {
             let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
             
-            // Delete the file/folder and all its children
-            tx.execute(
-                "DELETE FROM inodes WHERE path = ? OR path LIKE ?",
-                params![path, format!("{}/%", path)]
+            // Delete the file/folder and all its children (only for this user)
+            let deleted_count = tx.execute(
+                "DELETE FROM inodes WHERE (path = ? OR path LIKE ?) AND owner_id = ?",
+                params![path, format!("{}/%", path), user_id]
             ).map_err(|_| DatabaseError::ProcessingError)?;
             
-            tx.commit().map_err(|_| DatabaseError::ProcessingError)?;
+            if execute {
+                tx.commit().map_err(|_| DatabaseError::ProcessingError)?;
+            } else {
+                // Validation mode - rollback first, then check count
+                tx.rollback().map_err(|_| DatabaseError::ProcessingError)?;
+                if deleted_count == 0 {
+                    return Err(DatabaseError::NotFound);
+                }
+            }
+            
             Ok(())
         }
         Err(e) => {

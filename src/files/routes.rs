@@ -11,7 +11,7 @@ use reed_solomon_simd::ReedSolomonEncoder;
 use reqwest::StatusCode;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::OsRng};
 
-use crate::{db::{self, Blake3Hash, Data, DataRecord, DatabaseError, FragmentHash, Inode, files::*}, files::functions::{calculate_chunk_padding, calculate_encrypted_chunk_length, calculate_optimal_chunks, encrypt_chunk, encrypt_part, encrypt_path, store_fragment}};
+use crate::{db::{self, Blake3Hash, Data, DataRecord, DatabaseError, FragmentHash, Inode}, files::functions::{calculate_chunk_padding, calculate_encrypted_chunk_length, calculate_optimal_chunks, encrypt_chunk, encrypt_part, encrypt_path, store_fragment}};
 use serde::{Deserialize, Serialize};
 
 use super::*;
@@ -403,14 +403,55 @@ pub async fn post_files(
 
 pub async fn delete_files(
     State(app_state): State<AppState>,
+    Extension(user_id): Extension<i32>,  // Extract user_id from JWT via auth middleware
     Query(params): Query<GetQueryParams>
 ) -> Result<(), StatusCode> {
     let enc_path = encrypt_path(params.path, app_state.get_siv_key()?, app_state.get_siv_nonce()?).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    match db::files::delete_files(app_state.db_pool.get(), enc_path) {
-        Ok(_) => return Ok(()),
+    
+    // Validate that files exist before submitting to consensus
+    match crate::db::files::delete_files(app_state.db_pool.get(), enc_path.clone(), user_id, false) {
+        Ok(_) => {
+            // Files exist, proceed with consensus
+        },
+        Err(DatabaseError::NotFound) => {
+            return Err(StatusCode::NOT_FOUND);
+        },
         Err(e) => {
-            tracing::error!("Error deleting files: {:?}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR)
+            tracing::error!("Error validating file deletion: {:?}", e);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
+    
+    // Create payload for consensus
+    let payload = crate::files::handlers::DeleteFilesPayload {
+        encrypted_path: enc_path,
+        user_id,
+    };
+    
+    // Serialize payload for consensus submission
+    match bincode::serde::encode_to_vec(&payload, bincode::config::standard()) {
+        Ok(encoded_payload) => {
+            let transaction = Transaction {
+                function: "delete_files".to_string(),
+                payload: encoded_payload,
+            };
+            let transactions = vec![transaction];
+
+            // Use consensus middleware to ensure distributed agreement
+            match consensus_middleware(&app_state, transactions, user_id).await {
+                Ok(()) => {
+                    tracing::info!("Successfully submitted file deletion to consensus for user {}", user_id);
+                    Ok(())
+                },
+                Err(e) => {
+                    tracing::error!("Failed to submit file deletion to consensus: {:?}", e);
+                    Err(StatusCode::INTERNAL_SERVER_ERROR)
+                }
+            }
+        },
+        Err(e) => {
+            tracing::error!("Failed to serialize delete files payload: {:?}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }

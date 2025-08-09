@@ -37,6 +37,7 @@ Reed-Solomon encoded file storage with encryption and fragment management.
 - [x] **NEW**: Work queue pattern for efficient concurrent fragment retrieval
 - [x] **NEW**: Database consistency management with automatic state correction
 - [x] **NEW**: Cryptographic authentication for all fragment transfer operations
+- [x] **NEW**: Consensus-based file deletion with user ownership validation and proper error handling
 - [ ] Fragment lifecycle management and garbage collection
 - [ ] **NEW**: Automated maintenance reconciliation (route + scheduled job)
 - [ ] Storage capacity monitoring and quota management
@@ -115,18 +116,20 @@ End-to-end encryption and comprehensive authentication system.
 - [ ] Thin client architecture for mobile/constrained devices
 
 ### 7. Maintenance & Operations System ([RFC-007](specs/maintenance-operations.md))
-**Status**: Design Complete, Implementation Pending
+**Status**: Design Complete, Orphaned Data Block Cleanup Implemented
 
 Automated background processes ensuring network health and storage efficiency.
 
-- [ ] Threshold-based fragment cleanup with Time Machine preservation
+- [x] **NEW**: Threshold-based orphaned data block cleanup with UUIDv7 age prioritization and consensus deletion
+- [x] **NEW**: Two-transaction approach for DuckDB foreign key constraint handling 
+- [x] **NEW**: Opportunistic local fragment deletion during consensus execution
 - [ ] Availability-aware cleanup prioritization (redundant vs historical)
 - [ ] Network rebalancing for node join/leave events
 - [ ] Lost shard recovery with Reed-Solomon reconstruction
 - [ ] Redundant copy cleanup for download/rebalancing artifacts
 - [ ] Fragment health monitoring and remediation
 - [ ] Consensus state management and archival
-- [ ] UUIDv7-based fragment age tracking for efficient cleanup
+- [ ] Fragment filesystem cleanup for orphaned files
 - [ ] Job coordination using node ID proximity to minimize duplicate work
 - [ ] Integration with existing apalis job infrastructure
 

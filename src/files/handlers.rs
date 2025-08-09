@@ -68,6 +68,12 @@ pub struct DeleteOrphanedDataBlocksPayload {
     pub data_block_ids: Vec<CustomUUID>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DeleteFilesPayload {
+    pub encrypted_path: String,
+    pub user_id: i32,
+}
+
 pub struct DeleteOrphanedDataBlocksHandler;
 
 impl TransactionHandler for DeleteOrphanedDataBlocksHandler {
@@ -112,4 +118,35 @@ impl TransactionHandler for DeleteOrphanedDataBlocksHandler {
 
 inventory::submit! {
     &DeleteOrphanedDataBlocksHandler as &dyn TransactionHandler
+}
+
+pub struct DeleteFilesHandler;
+
+impl TransactionHandler for DeleteFilesHandler {
+    fn name(&self) -> &'static str { "delete_files" }
+
+    fn process(&self, state: &AppState, payload: &[u8], execute: bool) -> HandlerResult {
+        match bincode::serde::decode_from_slice::<DeleteFilesPayload, _>(payload, bincode::config::standard()) {
+            Ok((payload_data, _)) => {
+                crate::db::files::delete_files(
+                    state.db_pool.get(), 
+                    payload_data.encrypted_path, 
+                    payload_data.user_id,
+                    execute
+                )?;
+                
+                if execute {
+                    tracing::info!("Deleted files at path for user {}", payload_data.user_id);
+                } else {
+                    tracing::debug!("Validation passed: files exist for deletion for user {}", payload_data.user_id);
+                }
+                Ok(())
+            },
+            Err(_) => Err(DatabaseError::InvalidPayload),
+        }
+    }
+}
+
+inventory::submit! {
+    &DeleteFilesHandler as &dyn TransactionHandler
 }

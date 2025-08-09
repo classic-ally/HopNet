@@ -341,6 +341,25 @@ impl HistoricalFileSystem {
 
 ## Storage Management and Operations
 
+### File Deletion Operations
+
+#### Consensus-Based File Deletion **[IMPLEMENTED]**
+File deletion operations use consensus to ensure network-wide consistency:
+
+```rust
+// DELETE /files?path=/some/file
+// 1. Validation phase - check files exist and user owns them
+// 2. Consensus submission for distributed agreement  
+// 3. Database deletion with user ownership enforcement
+// 4. Automatic orphaned data block cleanup via RFC-007
+```
+
+**Implementation Status**: 
+- [x] User ownership validation with proper HTTP error codes (404 NOT_FOUND)
+- [x] Consensus-based deletion for network consistency
+- [x] Integration with orphaned data block cleanup system
+- [x] Atomic database operations with rollback for validation
+
 ### Retention and Garbage Collection
 
 #### Time-Based Retention Policies

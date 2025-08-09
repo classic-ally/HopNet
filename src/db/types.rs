@@ -5,7 +5,8 @@ pub enum DatabaseError {
     RecordError,
     RecallError,
     ProcessingError,
-    InvalidPayload
+    InvalidPayload,
+    NotFound
 }
 
 use crate::db::{Blake3Hash, PrivKey, User};
