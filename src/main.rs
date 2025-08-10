@@ -222,6 +222,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/files/{*path}", get(files::routes::get_file_fragments))
                 .route("/fragments", get(files::routes::get_fragments_count))
                 .route("/maintenance/cleanup-orphaned", post(files::routes::post_cleanup_orphaned_data_blocks))
+                .route("/maintenance/rebalance", post(files::routes::post_rebalance_network))
                 .route("/validators", get(consensus::routes::get_validators))
                 .route("/metrics", get(metrics::routes::get_metrics))
                 .route("/metrics/trigger", get(metrics::routes::get_metrics_trigger))
@@ -241,6 +242,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/fragments/{fragment_hash}", get(files::routes::get_fragment))
                 .route("/fragments/{fragment_hash}", post(files::routes::post_fragment))
                 .route("/fragments/{fragment_hash}/health", get(files::routes::get_fragment_health))
+                .route("/rpc/fetch-fragments", post(files::routes::post_fetch_fragments))
                 .route("/rpc/throughput-server", get(metrics::routes::get_throughput_server))
                 .route("/rpc/throughput-result/{session_id}", get(metrics::routes::get_throughput_result))
                 .layer(middleware::from_fn_with_state(app_state.clone(), consensus::routes::rpc_auth_middleware));

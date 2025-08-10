@@ -88,6 +88,8 @@ LIMIT ?; -- Process in batches
 #### Lost Shard Recovery System
 **Purpose**: Ensure expected fragments exist and are retrievable across the network
 
+**Implementation Status**: [ ] Pending - Design complete, implementation deferred
+
 **Detection Methods and Triggers**:
 - Database indicates fragment should exist locally but local storage missing
 - Database indicates fragment should exist remotely but we fail to fetch it
@@ -101,8 +103,15 @@ LIMIT ?; -- Process in batches
 4. **In-Place Recovery**: If possible, upload the missing fragment to the node that was meant to be responsible for it at the given consensus height. No consensus operation required in this case (consensus state remains the same)
 5. **Automatic Rebalance if Node Unsuitable**: If unable to upload missing fragment to the responsible node, begin rebalance for this data block such that the fragment will become the responsibility of another node, using existing network rebalance routine
 
+**Integration with Existing Systems**: 
+- Can leverage existing fragment discovery and transfer infrastructure from rebalancing implementation
+- Will use existing Reed-Solomon reconstruction capabilities from file reassembly system
+- Can trigger existing rebalancing job if in-place recovery fails
+
 #### Redundant Copy Cleanup
 **Purpose**: Ensure redundant copies of fragments are cleaned up safely while preserving network redundancy
+
+**Implementation Status**: [ ] Pending - Design complete, availability-aware logic partially implemented in orphaned data block cleanup
 
 **Potential Causes**:
 - **Download-Induced Redundancy**: Fragments cached locally during file downloads but not optimal storage locations
@@ -125,6 +134,8 @@ pub enum CleanupPriority {
     }
 }
 ```
+
+**Current Implementation Status**: Basic availability classification implemented in orphaned data block cleanup using simple above/below network average availability. Sophisticated redundant copy cleanup with the above strategy is not yet implemented, pending the full redundant copy cleanup job implementation.
 
 **Priority Modulation Based on Node Availability**:
 - **Statistical Classification**: Compare node's availability against network-wide average
@@ -182,25 +193,50 @@ pub async fn is_fragment_safely_removable(
 #### Dynamic Node Assessment
 **Purpose**: Adapt fragment placement as network topology and node performance changes
 
+**Implementation Status**: [x] Manual rebalancing complete, automated triggers pending
+
 **Rebalancing Triggers**:
-- New node joins network (detected via consensus validator set changes)
-- Node leaves network (detected via extended unavailability or explicit departure)
-- Significant node performance changes (% threshold change in reliability score TBD)
-- Network imbalance detected (% disparity in storage consumption TBD)
-- Scheduled job which checks oldest placement height and rebalances files placed a long time ago (consensus height delta threshold TBD)
-- Manual rebalance request through admin interface
+- [x] **IMPLEMENTED**: Manual rebalance request through admin interface (POST /maintenance/rebalance)
+- [ ] New node joins network (detected via consensus validator set changes)
+- [ ] Node leaves network (detected via extended unavailability or explicit departure)
+- [ ] Significant node performance changes (% threshold change in reliability score TBD)
+- [ ] Network imbalance detected (% disparity in storage consumption TBD)
+- [ ] Scheduled job which checks oldest placement height and rebalances files placed a long time ago (consensus height delta threshold TBD)
 
-**Prioritization**:
-- Operate on oldest placement height data blocks first
-- When ran in an automated fashion, limited on execution time and/or minimum age of height to rebalance (e.g. don't waste resources moving recently placed file) 
-- Node should prioritize data blocks which hash closest to our node ID, so that multiple nodes are less likely to request rebalance of the same block at the same time
+**Prioritization**: [x] IMPLEMENTED
+- Operate on oldest placement height data blocks first (ORDER BY placement_height ASC)
+- Configurable parameters: max_data_blocks (batch size), min_age_heights (minimum age threshold)
+- **Future**: Node should prioritize data blocks which hash closest to our node ID for distributed coordination
 
-**Migration Process**:
-1. **Placement Recalculation**: Run current placement algorithm with updated node metrics
-2. **Gap Analysis**: Identify fragments that should migrate based on new optimal placement
-3. **No Middleman Transfer**: Inform newly responsible nodes that they should request fragment transfer from previously responsible nodes; await success
-4. **Consistency Update**: Update fragment location metadata through consensus
-5. **Defer Source Cleanup**: Don't remove fragment from source node after successful migration as this is outside job scope; cleaned up automatically by redundant copy cleanup job
+**Migration Process**: [x] IMPLEMENTED
+1. **Placement Recalculation**: Run current placement algorithm with updated node metrics at current consensus height
+2. **Gap Analysis**: Identify fragments that should migrate based on new optimal placement using deterministic fragment placement
+3. **Direct Node-to-Node Transfer**: Send RPC fetch instructions to target nodes with fragment lists and placement heights
+4. **Atomic Data Block Processing**: Only update placement_height after ALL fragments successfully migrate for each data block
+5. **Consensus Integration**: Submit placement height updates through consensus ("update_placement_heights" transaction)
+
+**Technical Implementation**:
+- **RPC Endpoint**: POST /rpc/fetch-fragments with Ed25519 dual signature authentication
+- **Timeout Management**: Dynamic timeout calculation based on fragment count (1GB/30min transfer rate)
+- **Error Handling**: Failed fragments tracked per node, data block processing is atomic (all-or-nothing)
+- **Database Integration**: get_data_blocks_for_rebalancing() with placement_height filtering and ChunkType enum handling
+
+**Current Limitations & Future Improvements**:
+- **Single Replica Placement**: Currently uses only the best candidate node per fragment
+  - **Future**: Spread fragments across multiple candidates based on configurable replication factor
+  - **Benefit**: Improved fault tolerance and load distribution
+- **Sequential Fragment Processing**: RPC /rpc/fetch-fragments processes fragments sequentially on receiving node
+  - **Future**: Spawn concurrent tasks for parallel fragment fetching per request
+  - **Benefit**: Significantly faster rebalancing, especially for data blocks with many fragments
+- **No Retry Logic**: Failed fragment fetches are logged but not automatically retried
+  - **Future**: Implement intelligent retry logic with exponential backoff
+  - **Benefit**: Higher success rates for transient network issues
+- **Manual Trigger Only**: No automated triggers for network topology changes
+  - **Future**: Detect node joins/leaves and automatically trigger targeted rebalancing
+  - **Benefit**: Self-healing network that maintains optimal placement automatically
+- **Simple Availability Classification**: Cleanup prioritization uses basic above/below average availability
+  - **Future**: Implement sophisticated node reliability scoring and availability-aware cleanup
+  - **Benefit**: Better storage optimization decisions based on predicted node longevity
 
 ### 3. Health Monitoring System
 
@@ -294,14 +330,24 @@ let maintenance_worker = WorkerBuilder::new("fragment-health-monitoring")
 
 ## Implementation Phases
 
-### Phase 1: Core Fragment Lifecycle [Pending]
-- [ ] Implement threshold-based fragment cleanup with retention policy
+### Phase 1: Core Fragment Lifecycle [Partially Complete]
+- [x] **COMPLETED**: Threshold-based orphaned data block cleanup with UUIDv7 age prioritization and consensus deletion
+- [x] **COMPLETED**: Manual network rebalancing system with atomic data block processing and consensus integration
 - [ ] Add orphan recovery system with distributed fragment retrieval
 - [ ] Create fragment health monitoring with automated remediation
-- [ ] Build network rebalancing system for dynamic node changes
+- [ ] Implement automated rebalancing triggers for dynamic node changes
 - [ ] Implement fragment filesystem cleanup for orphaned files
 
 ### Phase 2: Advanced Operations [Future]
+- [ ] **Performance Optimizations**:
+  - Parallel fragment processing in /rpc/fetch-fragments endpoint (spawn concurrent tasks per fragment)
+  - Multi-replica fragment placement for improved fault tolerance
+  - Intelligent retry logic with exponential backoff for failed transfers
+  - Advanced timeout calculation based on network conditions and fragment sizes
+- [ ] **Automated Triggers**: 
+  - Node join/leave detection for targeted rebalancing
+  - Performance threshold-based rebalancing triggers
+  - Background scheduled rebalancing for oldest placement heights
 - [ ] Add predictive rebalancing based on historical patterns
 - [ ] Implement intelligent archival with ML-based data access prediction
 - [ ] Create advanced monitoring dashboard for operations visibility

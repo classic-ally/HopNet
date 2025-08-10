@@ -30,6 +30,12 @@ pub struct CleanupQueryParams {
     retention_days: i64,
 }
 
+#[derive(Deserialize)]
+pub struct RebalanceQueryParams {
+    max_data_blocks: i32,
+    min_age_heights: i32,
+}
+
 #[derive(Serialize)]
 pub struct FileFragmentsResponse {
     pub file_hash: Blake3Hash,
@@ -677,6 +683,148 @@ pub async fn post_cleanup_orphaned_data_blocks(
             let response = ErrorResponse {
                 status: "error".to_string(),
                 error: format!("Cleanup failed: {:?}", e),
+            };
+            
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(response)).into_response()
+        }
+    }
+}
+
+/// POST /rpc/fetch-fragments
+/// RPC endpoint for rebalancing - instructs node to fetch specific fragments
+/// Used during network rebalancing to distribute fragments to optimal nodes
+pub async fn post_fetch_fragments(
+    State(app_state): State<AppState>,
+    Extension(auth): Extension<AuthenticatedUser>,
+    Json(request): Json<FetchFragmentsRequest>
+) -> impl IntoResponse {
+    // Only allow node owners to receive fragment fetch instructions
+    if !auth.user_owns_node {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    
+    tracing::info!("Received fragment fetch request for {} fragments", request.fragments.len());
+    
+    let mut successful_fetches = 0;
+    let mut failed_fetches = Vec::new();
+    
+    // Create node auth info for fragment discovery
+    let node_auth = match crate::NodeAuthInfo::from_app_state(&app_state) {
+        Ok(auth_info) => auth_info,
+        Err(_) => {
+            tracing::error!("Failed to create node auth info for fragment discovery");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    
+    // Process each fragment
+    for fragment_info in &request.fragments {
+        let fragment_hash = &fragment_info.fragment_hash;
+        let placement_height = fragment_info.placement_height;
+        
+        // Check if we already have this fragment locally
+        if crate::files::functions::fragment_exists_and_valid(&app_state.fragments_dir, fragment_hash) {
+            tracing::debug!("Fragment {} already exists locally, skipping", fragment_hash.to_hex());
+            successful_fetches += 1;
+            continue;
+        }
+        
+        // Fetch and cache the fragment using existing discovery infrastructure with provided placement height
+        match crate::files::functions::fetch_and_cache_fragment(
+            fragment_hash,
+            &app_state.fragments_dir,
+            &app_state,
+            Some(placement_height),
+            &node_auth
+        ).await {
+            Ok(()) => {
+                tracing::info!("Successfully fetched and cached fragment {} (height {})", 
+                             fragment_hash.to_hex(), placement_height);
+                successful_fetches += 1;
+            }
+            Err(e) => {
+                tracing::error!("Failed to fetch fragment {} (height {}): {:?}", 
+                              fragment_hash.to_hex(), placement_height, e);
+                failed_fetches.push(fragment_hash.to_hex());
+            }
+        }
+    }
+    
+    let response = FetchFragmentsResponse {
+        status: if failed_fetches.is_empty() { "success".to_string() } else { "partial".to_string() },
+        successful_fetches,
+        failed_fetches,
+        total_requested: request.fragments.len(),
+    };
+    
+    tracing::info!("Fragment fetch completed: {}/{} successful", 
+                  successful_fetches, request.fragments.len());
+    
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct FetchFragmentsRequest {
+    pub fragments: Vec<FragmentFetchInfo>,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct FragmentFetchInfo {
+    pub fragment_hash: Blake3Hash,
+    pub placement_height: i32,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct FetchFragmentsResponse {
+    pub status: String,
+    pub successful_fetches: usize,
+    pub failed_fetches: Vec<String>,
+    pub total_requested: usize,
+}
+
+/// POST /maintenance/rebalance
+/// Manually trigger network rebalancing to redistribute fragments to optimal nodes
+pub async fn post_rebalance_network(
+    State(app_state): State<AppState>,
+    Query(params): Query<RebalanceQueryParams>,
+    Extension(uid): Extension<i32>,
+) -> impl IntoResponse {
+    tracing::info!("Manual rebalancing trigger requested by user {} (max_data_blocks: {}, min_age_heights: {})", 
+                   uid, params.max_data_blocks, params.min_age_heights);
+    
+    // Validate parameters
+    if params.max_data_blocks <= 0 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "status": "error",
+            "error": "max_data_blocks must be positive"
+        }))).into_response();
+    }
+    
+    if params.min_age_heights < 0 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "status": "error",
+            "error": "min_age_heights cannot be negative"
+        }))).into_response();
+    }
+    
+    // Run the rebalancing job directly with parameters
+    match super::jobs::run_network_rebalancing(&app_state, params.max_data_blocks, params.min_age_heights).await {
+        Ok(result) => {
+            tracing::info!("Manual rebalancing completed: {:?}", result);
+            (StatusCode::OK, Json(result)).into_response()
+        }
+        Err(e) => {
+            tracing::error!("Manual rebalancing failed: {:?}", e);
+            
+            #[derive(Serialize)]
+            struct ErrorResponse {
+                status: String,
+                error: String,
+            }
+            
+            let response = ErrorResponse {
+                status: "error".to_string(),
+                error: format!("Rebalancing failed: {:?}", e),
             };
             
             (StatusCode::INTERNAL_SERVER_ERROR, Json(response)).into_response()

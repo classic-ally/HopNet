@@ -662,7 +662,7 @@ async fn perform_concurrent_fragment_discovery(
 }
 
 /// Fetch a single fragment from network and cache it locally
-async fn fetch_and_cache_fragment(
+pub async fn fetch_and_cache_fragment(
     fragment_hash: &Blake3Hash,
     fragments_dir: &str,
     app_state: &AppState,

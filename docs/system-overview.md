@@ -62,7 +62,7 @@ HTTP-based inter-node communication with authentication and fragment transfer ca
 - [ ] NAT traversal implementation (deprioritized for defined IP infrastructure)
 
 ### 4. Shard Synchronization System ([RFC-004](specs/shard-synchronization.md))
-**Status**: Core distribution implemented, recovery and discovery pending
+**Status**: Core distribution, discovery, and manual rebalancing complete, automated recovery pending
 
 Intelligent fragment distribution system optimizing for performance, reliability, and geographic redundancy.
 
@@ -74,10 +74,13 @@ Intelligent fragment distribution system optimizing for performance, reliability
 - [x] Self-skip optimization (avoid sending fragments to local node)
 - [x] Retry logic with exponential backoff and connection timeouts
 - [x] Inter-node authentication for secure fragment transfer
-- [ ] Fragment discovery protocol for download reconstruction
+- [x] Fragment discovery protocol for download reconstruction
+- [x] **NEW**: Manual network rebalancing with atomic data block processing
+- [x] **NEW**: Dynamic timeout calculation based on fragment count (1GB/30min transfer rate)
+- [x] **NEW**: Direct node-to-node fragment transfer without intermediary
 - [ ] Background orphan recovery with adaptive thresholds
 - [ ] Node reliability scoring and roaming device detection
-- [ ] Background rebalancing and fragment migration
+- [ ] Automated background rebalancing and fragment migration
 - [ ] User proximity optimization for shared files
 
 ### 5. User Interface System ([RFC-005](specs/user-interface.md))
@@ -116,22 +119,24 @@ End-to-end encryption and comprehensive authentication system.
 - [ ] Thin client architecture for mobile/constrained devices
 
 ### 7. Maintenance & Operations System ([RFC-007](specs/maintenance-operations.md))
-**Status**: Design Complete, Orphaned Data Block Cleanup Implemented
+**Status**: Orphaned data cleanup and manual rebalancing complete, automated recovery pending
 
 Automated background processes ensuring network health and storage efficiency.
 
 - [x] **NEW**: Threshold-based orphaned data block cleanup with UUIDv7 age prioritization and consensus deletion
 - [x] **NEW**: Two-transaction approach for DuckDB foreign key constraint handling 
 - [x] **NEW**: Opportunistic local fragment deletion during consensus execution
+- [x] **NEW**: Manual network rebalancing trigger with placement height consensus updates
+- [x] **NEW**: Atomic data block rebalancing (only update placement_height after all fragments migrate)
+- [x] **NEW**: RPC fragment fetch instructions with dual Ed25519 authentication
 - [ ] Availability-aware cleanup prioritization (redundant vs historical)
-- [ ] Network rebalancing for node join/leave events
+- [ ] Automated background network rebalancing for node join/leave events
 - [ ] Lost shard recovery with Reed-Solomon reconstruction
 - [ ] Redundant copy cleanup for download/rebalancing artifacts
 - [ ] Fragment health monitoring and remediation
 - [ ] Consensus state management and archival
 - [ ] Fragment filesystem cleanup for orphaned files
 - [ ] Job coordination using node ID proximity to minimize duplicate work
-- [ ] Integration with existing apalis job infrastructure
 
 ## Current Focus
 
@@ -155,11 +160,14 @@ Automated background processes ensuring network health and storage efficiency.
   - Performance target: <100ms placement decisions using DuckDB analytical queries with caching
   - Time-weighted metrics with probationary period for new nodes
   - Placement scores debugging API (/metrics/scores) with raw metrics and weighted scoring for original/recovery fragments
-- Integrate with completed fragment transfer endpoints (GET/POST /fragments/{hash})
-- Build fragment discovery and cross-node retrieval workflows
+- ✅ **COMPLETED**: Fragment discovery and cross-node retrieval workflows with accelerated fallback pattern
+  - Work queue pattern for efficient concurrent fragment retrieval  
+  - Database consistency management with automatic state correction
+  - Ed25519 cryptographic authentication for all fragment requests
+  - 3-phase fallback: best candidate → deterministic placement → network-wide gossip
 
 **Secondary**: Upload/Download Workflow Integration
-- Integrate fragment transfer with file download (missing fragment retrieval)
+- ✅ **COMPLETED**: Fragment transfer integration with file download (missing fragment retrieval)
 - Implement background push synchronization for uploaded files
 - Add fragment health monitoring using /fragments/{hash}/health endpoint
 
