@@ -138,6 +138,39 @@ Automated background processes ensuring network health and storage efficiency.
 - [ ] Fragment filesystem cleanup for orphaned files
 - [ ] Job coordination using node ID proximity to minimize duplicate work
 
+### 8. Apple FileProvider Integration ([RFC-009](specs/apple-fileprovider.md))
+**Status**: Specification complete, ready for implementation
+
+Native macOS Finder and iOS Files app integration through Apple's FileProvider framework.
+
+- [ ] Rust-based FileProvider extension using objc2-file-provider
+- [ ] HTTP API communication with scoped authentication
+- [ ] Stable file identity using data_block_id for files, encrypted paths for folders
+- [ ] Read-only MVP (enumerate, fetch metadata, download files)
+- [ ] Process isolation maintaining consensus integrity
+- [ ] Manual domain registration in HopNet settings
+- [ ] Fragment-level progress reporting
+- [ ] Foundation for iOS thin client architecture
+- [ ] Write operations (create, modify, delete files/folders)
+- [ ] Working sets support (recents, favorites, shared)
+- [ ] Thumbnail generation and Quick Look integration
+
+### 9. S3-Compatible API ([RFC-008](specs/s3-compatibility.md))
+**Status**: Specification complete, implementation not started
+
+S3-compatible API layer enabling standard S3 clients and SDKs to interact with HopNet.
+
+- [ ] Virtual bucket layer mapping S3 buckets to encrypted paths
+- [ ] Dual-mode credentials (secure proxy mode and portable standalone mode)
+- [ ] AWS Signature v4 authentication
+- [ ] Core S3 operations (ListBuckets, CreateBucket, GetObject, PutObject, etc.)
+- [ ] Local proxy mode for secure key management
+- [ ] Standalone mode for environments without local HopNet client
+- [ ] Bucket-level access control and sharing
+- [ ] Multipart upload support
+- [ ] Pre-signed URLs for temporary access
+- [ ] Integration with AWS CLI and standard S3 SDKs
+
 ## Current Focus
 
 **Phase 1A Critical Path**: Infrastructure completion to enable distributed operations
@@ -224,7 +257,17 @@ Automated background processes ensuring network health and storage efficiency.
    - Add cross-node fragment discovery and retrieval (depends on RFC-003 ✅)
    - Complete storage capacity monitoring and basic quota management
 
-### Phase 1B: Basic Distributed Operations
+### Phase 1B: Native OS Integration
+**Goal**: Enable seamless native OS file access
+
+1. **RFC-009 Apple FileProvider Integration** - Native macOS/iOS file access (HIGH PRIORITY)
+   - Implement read-only FileProvider extension using objc2-file-provider
+   - Add scoped HTTP API endpoints for FileProvider communication
+   - Create stable file identity system using data_block_id
+   - Enable manual domain registration in settings
+   - Add fragment assembly streaming for FileProvider downloads
+   
+### Phase 1C: Basic Distributed Operations
 **Goal**: Enable core distributed filesystem functionality
 
 1. **RFC-004 fragment placement and discovery** - Smart fragment distribution
@@ -265,3 +308,20 @@ Automated background processes ensuring network health and storage efficiency.
 - Integration with cloud storage providers
 - Advanced geographic redundancy with regulatory compliance
 - Developer APIs and third-party integrations
+
+### Phase 5: Enterprise Integration APIs
+**Goal**: Enable enterprise adoption through standard APIs
+
+**FileProvider Write Operations:**
+- Implement file/folder creation, modification, and deletion through FileProvider
+- Add conflict resolution for concurrent edits
+- Enable working sets (recents, favorites, shared documents)
+- Add thumbnail generation and Quick Look integration
+
+**S3 Compatibility Layer:**
+- Implement core S3 operations with AWS Signature v4 authentication
+- Build virtual bucket layer with encrypted path mappings
+- Create dual-mode credential system (proxy and standalone)
+- Add multipart upload and pre-signed URL support
+- Integrate with existing file sharing and permission architecture
+- Validate compatibility with AWS CLI and major S3 SDKs
