@@ -3,3 +3,8 @@
 frontend/public/assets/fonts/
 .direnv/*
 gen/
+.env
+apple/HopNetFileProvider/.build
+apple/HopNetFileProvider/.swiftpm
+apple/HopNetFileProvider/Sources/HopNetFileProviderExtension/Generated/HopNetTypes.swift
+.vscode/launch.json

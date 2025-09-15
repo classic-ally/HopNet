@@ -163,7 +163,8 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
                 file_hash        BLOB NOT NULL,
                 fragment_count   INTEGER NOT NULL,
                 added_bytes      UTINYINT NOT NULL,
-                placement_height INTEGER  -- Consensus height when fragment placement was determined
+                placement_height INTEGER,  -- Consensus height when fragment placement was determined
+                file_size        UBIGINT NOT NULL  -- Total size of the file in bytes
             );
 
             CREATE TABLE file_access (
@@ -193,6 +194,8 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
             CREATE INDEX idx_fragment_hash ON fragment_hashes(fragment_hash);
 
             CREATE TABLE inodes (
+                -- stable identifier for FileProvider (UUIDv7 encodes creation time)
+                id              UUID UNIQUE NOT NULL,
                 -- owner of this reference
                 owner_id        INTEGER REFERENCES users(user_id) NOT NULL,
                 -- denormalized deterministically encrypted string
@@ -212,9 +215,28 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
 
             -- 2. An index to quickly find all inodes belonging to a specific user.
             CREATE INDEX idx_inodes_owner ON inodes (owner_id);
+            
+            -- 3. Index for FileProvider lookups by stable ID
+            CREATE INDEX idx_inodes_id ON inodes (id);
 
+            -- NOTE: modification_log is NOT consensus tracked - it's used for local FileProvider state delta computation
+            -- This table tracks all file/folder modifications to support incremental sync in FileProvider
+            -- It provides a unified change tracking mechanism for all file system operations
+            CREATE TABLE modification_log (
+                inode_id           UUID NOT NULL,     -- Stable inode identifier
+                owner_id           INTEGER NOT NULL,
+                old_parent_id      UUID,              -- Parent folder BEFORE modification (NULL for new items)
+                modified_at_height INTEGER NOT NULL,
+                
+                PRIMARY KEY (inode_id, modified_at_height),
+                FOREIGN KEY (owner_id) REFERENCES users(user_id)
+            );
+            
+            -- Index for efficient queries: what was modified for user X since height Y?
+            CREATE INDEX idx_modification_log_height ON modification_log (owner_id, modified_at_height);
 
             -- Add comments for documentation
+            COMMENT ON TABLE modification_log IS 'Local-only table for tracking all file modifications to support FileProvider incremental sync (NOT consensus tracked)';
             COMMENT ON TABLE metrics IS 'Network performance metrics between distributed system nodes';
             COMMENT ON COLUMN metrics.rtt_latency IS 'Round-trip time latency in milliseconds';
             COMMENT ON COLUMN metrics.rtt_variance IS 'RTT variance in milliseconds';

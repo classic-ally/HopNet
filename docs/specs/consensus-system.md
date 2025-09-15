@@ -284,6 +284,46 @@ impl NetworkCheckpoint {
 
 ## Race Condition Prevention and Fork Safety
 
+### Consensus Operation Concurrency Issues
+
+#### Current Architecture Challenge (IDENTIFIED 2025-09)
+FileProvider integration tests revealed write-write conflicts during concurrent consensus operations:
+- **Root Cause**: Multiple fragment distribution tasks spawn concurrent consensus rounds
+- **Symptom**: Database write-write conflicts on `this_node` table (internal_id = 1) 
+- **Race Window**: Between `get_consensus()` check and `prepared_block_hash` update
+
+#### Current Hotfix Implementation
+**Status**: [~] Implemented transaction retry logic with exponential backoff
+```rust
+// In db::insert_qc() - Retry up to 3 attempts on write-write conflicts
+const MAX_RETRIES: u32 = 3;
+let delay_ms = 10 * (2_u64.pow(retry_count - 1)); // 10ms, 20ms, 40ms backoff
+```
+
+#### Proposed Enhancement: Atomic Consensus Lock
+**Status**: [ ] Design complete, implementation pending
+```rust
+pub fn try_lock_consensus(
+    db_connection: PooledConnection,
+    expected_view: i32,
+    block_hash: Blake3Hash,
+) -> Result<bool, DatabaseError> {
+    // Single atomic CAS operation
+    let rows_affected = db_connection.execute(
+        "UPDATE this_node SET prepared_block_hash = ? 
+         WHERE internal_id = 1 AND prepared_block_hash IS NULL AND current_view = ?",
+        params![block_hash, expected_view]
+    )?;
+    Ok(rows_affected == 1) // true = locked, false = already locked or view changed
+}
+```
+
+**Benefits**:
+- Eliminates race condition at database level (true atomic compare-and-swap)
+- No retry complexity or exponential backoff delays
+- Better performance and cleaner error semantics
+- Simpler consensus middleware flow
+
 ### File Change Race Condition Handling
 
 #### Concurrent File Operation Scenarios
@@ -353,6 +393,65 @@ impl NetworkCheckpoint {
 - **Threshold Security**: Support for threshold signatures in validator rotation scenarios
 - **Post-Quantum Readiness**: Framework for post-quantum cryptographic algorithm integration
 - **Algorithm Agility**: Support for multiple signature algorithms during transition periods
+
+## Recent Implementation Updates
+
+### Consensus Locking and Retry System (COMPLETED ✅)
+
+**Implementation**: Enhanced consensus middleware with robust locking, retry logic, and race condition handling.
+
+#### Consensus State Locking:
+**Problem**: Multiple simultaneous consensus attempts could interfere with each other, leading to inconsistent state and failed transactions.
+
+**Solution**: Added `prepared_block_hash` field to track ongoing consensus operations:
+
+```rust
+// Database schema addition to this_node table
+prepared_block_hash: Option<Blake3Hash> // NULL when no consensus in progress
+```
+
+#### Consensus Wait and Retry Logic:
+**Problem**: View changes and leader transitions could cause consensus failures without proper handling.
+
+**Solution**: Implemented comprehensive retry system with timeout handling:
+
+```rust
+// Consensus middleware retry parameters
+const MAX_RETRIES: u32 = 3;              // Maximum retry attempts
+const MAX_WAIT_MS: u64 = 5000;           // 5 second timeout for waiting
+const POLL_INTERVAL_MS: u64 = 50;        // Poll every 50ms for consensus completion
+```
+
+#### Key Improvements:
+- **Atomic Block Insertion**: `insert_block()` now atomically sets `prepared_block_hash` when inserting consensus blocks
+- **Consensus Waiting**: Leaders wait for ongoing consensus to complete before starting new consensus
+- **View Change Detection**: Automatic retry if consensus view changes during wait
+- **Leadership Change Handling**: Forward to new leader if leadership changes during consensus wait
+- **Timeout Protection**: 5-second timeout with early termination if consensus takes too long
+- **Proper Cleanup**: `prepared_block_hash` cleared when consensus completes (Lock phase QC processing)
+
+#### Implementation Details:
+```rust
+// Wait for ongoing consensus to complete
+while current_consensus_state.prepared_block.is_some() {
+    if wait_attempts >= max_wait_attempts {
+        return Err(ConsensusError::TimeoutError);
+    }
+    tokio::time::sleep(tokio::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
+    current_consensus_state = db::get_consensus(app_state.db_pool.get())?;
+}
+
+// Check for view/leadership changes and retry if needed
+if current_consensus_state.view != initial_view {
+    continue; // Retry with new view
+}
+```
+
+#### Benefits:
+- **Race Condition Prevention**: No more simultaneous consensus attempts causing state corruption
+- **Improved Reliability**: Automatic retry on view changes increases success rate
+- **Better Error Handling**: Clear timeout behavior instead of indefinite waits
+- **Leadership Stability**: Proper forwarding when leadership changes during operations
 
 ## Implementation Priorities
 

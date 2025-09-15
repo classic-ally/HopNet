@@ -19,6 +19,7 @@ When making changes to the codebase:
 # Logging
 - Use tracing for all Rust logging
 - Use INFO levels sparingly to avoid slowdown due to excessive logging
+- macOS debugging with the `log` command requires the use of sudo 
 
 # Important Instruction Reminders
 Do what has been asked; nothing more, nothing less.

@@ -269,8 +269,8 @@ pub fn put_join_setup(
                     None => None,
                 };
                 tx.execute(
-                    "INSERT INTO inodes (owner_id, path, type, data_id) VALUES (?, ?, ?, ?)",
-                    params![owner_id, inode.path, inode.inode_type, data_id]
+                    "INSERT INTO inodes (id, owner_id, path, type, data_id) VALUES (?, ?, ?, ?, ?)",
+                    params![inode.id, owner_id, inode.path, inode.inode_type, data_id]
                 ).map_err(|_| DatabaseError::InsertError)?;
             }
 

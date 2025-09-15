@@ -14,3 +14,4 @@ pub mod setup;
 pub mod nodes;
 pub mod files;
 pub mod fragments;
+pub mod fileprovider;

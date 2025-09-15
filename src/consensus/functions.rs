@@ -38,55 +38,116 @@ pub enum ConsensusError {
 pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transaction>, user_id: i32) -> Result<(), ConsensusError> {
     tracing::debug!("Starting consensus middleware for {} transactions", transactions.len());
     
-    // Check if we are the current leader
-    let consensus_state = db::get_consensus(app_state.db_pool.get()).map_err(|_| ConsensusError::DatabaseError)?;
     let my_node_id = app_state.get_node_id().map_err(|_| ConsensusError::DatabaseError)?;
     
-    if consensus_state.leader.node_id != my_node_id {
-        // Forward to leader instead of initiating consensus
+    // Retry loop to handle view changes during consensus waits
+    const MAX_RETRIES: u32 = 3;
+    const MAX_WAIT_MS: u64 = 5000; // 5 second timeout for waiting
+    const POLL_INTERVAL_MS: u64 = 50; // Poll every 50ms
+    
+    for retry_attempt in 0..MAX_RETRIES {
+        // Check if we are the current leader
+        let initial_consensus_state = db::get_consensus(app_state.db_pool.get()).map_err(|_| ConsensusError::DatabaseError)?;
+        
+        if initial_consensus_state.leader.node_id != my_node_id {
+            // Forward to leader instead of initiating consensus
+            tracing::info!(
+                "Not the leader (node {}), forwarding transactions to leader (node {})",
+                my_node_id, initial_consensus_state.leader.node_id
+            );
+            return forward_to_leader(initial_consensus_state.leader, transactions, user_id, app_state).await;
+        }
+        
+        // Wait for any ongoing consensus to complete
+        let initial_view = initial_consensus_state.view;
+        let mut wait_attempts = 0;
+        let max_wait_attempts = MAX_WAIT_MS / POLL_INTERVAL_MS;
+        
+        let mut current_consensus_state = initial_consensus_state;
+        while current_consensus_state.prepared_block.is_some() {
+            if wait_attempts >= max_wait_attempts {
+                tracing::error!(
+                    "Timeout waiting for consensus to complete after {}ms (view: {}, prepared_block: {:?})",
+                    MAX_WAIT_MS, current_consensus_state.view, current_consensus_state.prepared_block
+                );
+                return Err(ConsensusError::TimeoutError);
+            }
+            
+            tracing::debug!(
+                "Consensus in progress for view {} (prepared_block: {:?}), waiting... (attempt {})",
+                current_consensus_state.view, current_consensus_state.prepared_block, wait_attempts + 1
+            );
+            
+            tokio::time::sleep(tokio::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
+            wait_attempts += 1;
+            
+            // Re-check consensus state
+            current_consensus_state = db::get_consensus(app_state.db_pool.get()).map_err(|_| ConsensusError::DatabaseError)?;
+        }
+        
+        // Check if view changed during wait
+        if current_consensus_state.view != initial_view {
+            tracing::debug!(
+                "View changed during wait ({}→{}), retrying consensus (attempt {})",
+                initial_view, current_consensus_state.view, retry_attempt + 1
+            );
+            continue; // Retry with new view
+        }
+        
+        // Check if we're still the leader (leader can change during consensus)
+        if current_consensus_state.leader.node_id != my_node_id {
+            tracing::info!(
+                "Leadership changed during wait, forwarding to new leader (node {})",
+                current_consensus_state.leader.node_id
+            );
+            return forward_to_leader(current_consensus_state.leader, transactions, user_id, app_state).await;
+        }
+        
+        // Safe to proceed - same view, propose phase, still leader
         tracing::info!(
-            "Not the leader (node {}), forwarding transactions to leader (node {})",
-            my_node_id, consensus_state.leader.node_id
+            "Acting as leader (node {}) for view {}, initiating consensus",
+            my_node_id, current_consensus_state.view
         );
-        return forward_to_leader(consensus_state.leader, transactions, user_id, app_state).await;
+        let block = Block::new_tip(&app_state, transactions).map_err(|_| ConsensusError::BlockError)?;
+        
+        // Construct MyNode from AppState
+        let me = MyNode {
+            node_id: my_node_id,
+            privkey: app_state.private_key.clone(),
+        };
+        
+        let validators = db::get_validators(app_state.db_pool.get(), block.data.height).map_err(|_| ConsensusError::DatabaseError)?
+            .iter()
+            .filter(|node| node.node_id != me.node_id)
+            .cloned()
+            .collect();
+
+        let validators_elect = db::get_validators_elect(app_state.db_pool.get(), block.data.height).map_err(|_| ConsensusError::DatabaseError)?
+            .iter()
+            .filter(|node| node.node_id != me.node_id)
+            .cloned()
+            .collect();
+
+        // Get QC1 from ballot round
+        let qc1 = ballot_round(&block, &me, ConsensusPhase::Propose, &validators, &validators_elect, app_state).await?;
+        // Broadcast QC1 and wait for enough confirmations
+        broadcast_qc(&validators, &validators_elect, qc1).await?;
+        // Get QC2 from ballot round
+        let qc2 = ballot_round(&block, &me, ConsensusPhase::Lock, &validators, &validators_elect, app_state).await?;
+        // Broadcast QC2 and wait for enough confirmations
+        broadcast_qc(&validators, &validators_elect, qc2).await?;
+
+        process_transactions(&block.data.transactions, app_state);
+
+        return Ok(());
     }
     
-    tracing::info!(
-        "Acting as leader (node {}) for view {}, initiating consensus",
-        my_node_id, consensus_state.view
+    // If we've exhausted all retries, return an error
+    tracing::error!(
+        "Consensus failed after {} retries due to view changes or timeouts",
+        MAX_RETRIES
     );
-    let block = Block::new_tip(&app_state, transactions).map_err(|_| ConsensusError::BlockError)?;
-    
-    // Construct MyNode from AppState
-    let me = MyNode {
-        node_id: my_node_id,
-        privkey: app_state.private_key.clone(),
-    };
-    
-    let validators = db::get_validators(app_state.db_pool.get(), block.data.height).map_err(|_| ConsensusError::DatabaseError)?
-        .iter()
-        .filter(|node| node.node_id != me.node_id)
-        .cloned()
-        .collect();
-
-    let validators_elect = db::get_validators_elect(app_state.db_pool.get(), block.data.height).map_err(|_| ConsensusError::DatabaseError)?
-        .iter()
-        .filter(|node| node.node_id != me.node_id)
-        .cloned()
-        .collect();
-
-    // Get QC1 from ballot round
-    let qc1 = ballot_round(&block, &me, ConsensusPhase::Propose, &validators, &validators_elect, app_state).await?;
-    // Broadcast QC1 and wait for enough confirmations
-    broadcast_qc(&validators, &validators_elect, qc1).await?;
-    // Get QC2 from ballot round
-    let qc2 = ballot_round(&block, &me, ConsensusPhase::Lock, &validators, &validators_elect, app_state).await?;
-    // Broadcast QC2 and wait for enough confirmations
-    broadcast_qc(&validators, &validators_elect, qc2).await?;
-
-    process_transactions(&block.data.transactions, app_state);
-
-    Ok(())
+    Err(ConsensusError::ThreadError) // Using existing error variant, could add MaxRetriesExceeded later
 }
 
 async fn ballot_round(

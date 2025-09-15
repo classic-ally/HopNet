@@ -149,7 +149,7 @@ pub async fn post_ballot(
                             "Inserting new block {:?} for view {} into database",
                             ballot.block.block_hash, ballot.data.view
                         );
-                        match db::insert_block(app_state.db_pool.get(), &ballot.block) {
+                        match db::insert_block(app_state.db_pool.get(), &ballot.block, true) {
                             Ok(()) => {
                                 tracing::debug!(
                                     "Block {:?} saved and signed for view {} propose phase",
@@ -524,7 +524,7 @@ async fn integrate_view(
     
     // Insert blocks first (they're referenced by QCs and TCs)
     for block in &view_data.blocks {
-        match db::insert_block(app_state.db_pool.get(), block) {
+        match db::insert_block(app_state.db_pool.get(), block, true) {
             Ok(_) => {
                 tracing::debug!("Inserted block {:?} for view {}", block.block_hash, view);
             }
