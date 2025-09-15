@@ -200,7 +200,7 @@ pub async fn get_sync_dump(
             // File system data extract
             tracing::debug!("Fetching data blocks for database dump");
             let mut stmt_data_blocks = tx.prepare(
-                "SELECT id, modified_at, file_hash, fragment_count, added_bytes FROM data_blocks"
+                "SELECT id, modified_at, file_hash, fragment_count, added_bytes, file_size FROM data_blocks"
             ).map_err(|_| DatabaseError::RecallError)?;
             let rows_data_blocks = stmt_data_blocks.query_map([], |row| {
                 Ok(DataRecord {
@@ -212,6 +212,7 @@ pub async fn get_sync_dump(
                         added_bytes: row.get(4)?,
                     },
                     file_access_entries: None, // Will be populated separately if needed
+                    file_size: row.get(5)?,
                 })
             }).map_err(|_| DatabaseError::RecallError)?;
             let data_blocks: Vec<DataRecord> = rows_data_blocks.collect::<Result<Vec<DataRecord>, _>>()
@@ -236,14 +237,15 @@ pub async fn get_sync_dump(
 
             tracing::debug!("Fetching inodes for database dump");
             let mut stmt_inodes = tx.prepare(
-                "SELECT owner_id, path, type, data_id FROM inodes"
+                "SELECT id, owner_id, path, type, data_id FROM inodes"
             ).map_err(|_| DatabaseError::RecallError)?;
             let rows_inodes = stmt_inodes.query_map([], |row| {
-                let data_id: Option<CustomUUID> = row.get(3)?;
+                let data_id: Option<CustomUUID> = row.get(4)?;
                 Ok(Inode {
-                    owner: Either::Left(row.get(0)?),
-                    path: row.get(1)?,
-                    inode_type: row.get(2)?,
+                    id: row.get(0)?,
+                    owner: Either::Left(row.get(1)?),
+                    path: row.get(2)?,
+                    inode_type: row.get(3)?,
                     data_id: data_id.map(Either::Left),
                 })
             }).map_err(|_| DatabaseError::RecallError)?;

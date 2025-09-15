@@ -1,10 +1,12 @@
 {
   "productName": "HopNet",
   "version": "0.1.0",
-  "identifier": "com.hopnet.app",
+  "identifier": "com.hopnet.desktop",
   "build": {
-    "frontendDist": "../frontend/dist",
-    "devUrl": "http://localhost:34632"
+    "frontendDist": "frontend/dist",
+    "devUrl": "http://localhost:34632",
+    "features": ["gui"],
+    "beforeBundleCommand": ""
   },
   "app": {
     "windows": []
@@ -19,8 +21,20 @@
     "externalBin": [],
     "copyright": "",
     "category": "DeveloperTool",
-    "short-description": "HopNet Consensus Network",
-    "long-description": "A distributed consensus network with file storage capabilities"
+    "shortDescription": "HopNet Consensus Network",
+    "longDescription": "A distributed consensus network with file storage capabilities",
+    "macOS": {
+      "frameworks": [],
+      "minimumSystemVersion": "10.15",
+      "signingIdentity": null,
+      "hardenedRuntime": true,
+      "entitlements": "apple/entitlements.plist",
+      "files": {
+        "embedded.provisionprofile": "apple/HopNet_Dev.provisionprofile"
+      },
+      "providerShortName": null,
+      "exceptionDomain": null
+    }
   },
   "plugins": {}
 }

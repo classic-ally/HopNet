@@ -52,6 +52,13 @@ pub fn generate_jwt_key() -> (EncodingKey, DecodingKey) {
     return (encodingkey, decodingkey);
 }
 
+// generate a secure API key for FileProvider, rolled every startup
+pub fn generate_fileprovider_api_key() -> String {
+    let mut rng = rand::rng();
+    let key_bytes: Vec<u8> = (0..32).map(|_| rng.random_range(0..=255)).collect();
+    hex::encode(key_bytes)
+}
+
 // middleware for validation
 pub async fn auth_middleware(
     State(app_state): State<AppState>,

@@ -18,6 +18,7 @@ use super::*;
 use crate::db::CustomUUID;
 use either::Either::{Left, Right};
 use crate::consensus::{functions::consensus_middleware, types::Transaction};
+use axum::extract::multipart::Field;
 
 #[derive(Deserialize)]
 pub struct GetQueryParams {
@@ -28,6 +29,158 @@ pub struct GetQueryParams {
 pub struct CleanupQueryParams {
     batch_size: i32,
     retention_days: i64,
+}
+
+/// Shared file processing function for both create and modify operations
+/// Handles Reed-Solomon encoding, fragmentation, encryption, and storage
+/// Returns a DataRecord ready for database insertion
+pub async fn process_uploaded_file(
+    mut field: Field<'_>,
+    file_size: usize,
+    dataid: CustomUUID,
+    per_file_key: &chacha20poly1305::Key,
+    fragments_dir: &str,
+) -> Result<DataRecord, StatusCode> {
+    let mut chunk_buffer: Vec<u8> = Vec::new();
+    let mut output_chunk_metadata = Vec::new();
+
+    let (num_original_chunks, num_recovery_chunks) = calculate_optimal_chunks(file_size);
+    let needed_padding = calculate_chunk_padding(file_size, num_original_chunks);
+    let target_chunk_length = (file_size + needed_padding) / num_original_chunks;
+    let encrypted_chunk_length = calculate_encrypted_chunk_length(target_chunk_length);
+    
+    tracing::debug!("process_uploaded_file: file_size={}, num_original_chunks={}, num_recovery_chunks={}", 
+                   file_size, num_original_chunks, num_recovery_chunks);
+    tracing::debug!("process_uploaded_file: needed_padding={}, target_chunk_length={}, encrypted_chunk_length={}", 
+                   needed_padding, target_chunk_length, encrypted_chunk_length);
+    
+    let mut full_file_hasher = blake3::Hasher::new();
+
+    let mut encoder = ReedSolomonEncoder::new(
+        num_original_chunks,
+        num_recovery_chunks,
+        encrypted_chunk_length
+    ).map_err(|e| {
+        tracing::error!("process_uploaded_file: Reed-Solomon encoder creation failed: {:?}", e);
+        tracing::error!("process_uploaded_file: Parameters - original: {}, recovery: {}, encrypted_length: {}", 
+                       num_original_chunks, num_recovery_chunks, encrypted_chunk_length);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Process original chunks
+    while let Some(chunk) = field.chunk().await.map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)? {
+        tracing::debug!("process_uploaded_file: received HTTP chunk of {} bytes", chunk.len());
+        chunk_buffer.extend_from_slice(&chunk);
+
+        while chunk_buffer.len() >= target_chunk_length {
+            let file_chunk = chunk_buffer.drain(..target_chunk_length).collect::<Vec<u8>>();
+            tracing::debug!("process_uploaded_file: processing chunk {} of {} bytes", 
+                   output_chunk_metadata.len(), file_chunk.len());
+            full_file_hasher.update(&file_chunk);
+            
+            let fragment_id = CustomUUID::new(None);
+            let encrypted_chunk = encrypt_chunk(file_chunk, per_file_key, &fragment_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            encoder.add_original_shard(&encrypted_chunk).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let chunk_hash = Blake3Hash::new(blake3::hash(&encrypted_chunk));
+            store_fragment(fragments_dir, &chunk_hash, encrypted_chunk).map_err(|_| StatusCode::INSUFFICIENT_STORAGE)?;
+            
+            let my_chunk = FragmentHash {
+                data_block_id: dataid.clone(),
+                fragment_index: output_chunk_metadata.len() as i32,
+                fragment_id: fragment_id,
+                fragment_hash: chunk_hash,
+                chunk_type: crate::db::ChunkType::Original,
+                stored_locally: false
+            };
+            output_chunk_metadata.push(my_chunk);
+        }
+    }
+
+    // Process final chunk with padding
+    if !chunk_buffer.is_empty() {
+        tracing::debug!("process_uploaded_file: processing final chunk of {} bytes", chunk_buffer.len());
+        full_file_hasher.update(&chunk_buffer);
+        chunk_buffer.resize(target_chunk_length, 0);
+
+        let final_chunk = chunk_buffer;
+        let fragment_id = CustomUUID::new(None);
+        let encrypted_chunk = encrypt_chunk(final_chunk, per_file_key, &fragment_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        encoder.add_original_shard(&encrypted_chunk).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let chunk_hash = Blake3Hash::new(blake3::hash(&encrypted_chunk));
+        store_fragment(fragments_dir, &chunk_hash, encrypted_chunk).map_err(|_| StatusCode::INSUFFICIENT_STORAGE)?;
+        
+        let my_chunk = FragmentHash {
+            data_block_id: dataid.clone(),
+            fragment_index: output_chunk_metadata.len() as i32,
+            fragment_id: fragment_id,
+            fragment_hash: chunk_hash,
+            chunk_type: crate::db::ChunkType::Original,
+            stored_locally: false
+        };
+        output_chunk_metadata.push(my_chunk);
+    }
+    
+    tracing::debug!("process_uploaded_file: processed {} original chunks, need {} total", 
+                   output_chunk_metadata.len(), num_original_chunks);
+
+    // For small files, ensure we have exactly the required number of original chunks
+    while output_chunk_metadata.len() < num_original_chunks {
+        tracing::debug!("process_uploaded_file: adding empty chunk {} for Reed-Solomon", output_chunk_metadata.len());
+        let empty_chunk = vec![0u8; target_chunk_length];
+        let fragment_id = CustomUUID::new(None);
+        let encrypted_chunk = encrypt_chunk(empty_chunk, per_file_key, &fragment_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        encoder.add_original_shard(&encrypted_chunk).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let chunk_hash = Blake3Hash::new(blake3::hash(&encrypted_chunk));
+        store_fragment(fragments_dir, &chunk_hash, encrypted_chunk).map_err(|_| StatusCode::INSUFFICIENT_STORAGE)?;
+        
+        let my_chunk = FragmentHash {
+            data_block_id: dataid.clone(),
+            fragment_index: output_chunk_metadata.len() as i32,
+            fragment_id: fragment_id,
+            fragment_hash: chunk_hash,
+            chunk_type: crate::db::ChunkType::Original,
+            stored_locally: false
+        };
+        output_chunk_metadata.push(my_chunk);
+    }
+
+    // Generate file hash including data_block_id
+    full_file_hasher.update(dataid.as_bytes());
+    let full_file_hash = Blake3Hash::new(full_file_hasher.finalize());
+
+    // Generate recovery chunks
+    let recovery_generator = encoder.encode().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut recovery_iter = recovery_generator.recovery_iter();
+    while let Some(recovery_chunk) = recovery_iter.next() {
+        let fragment_id = CustomUUID::new(None);
+        let chunk_hash = Blake3Hash::new(blake3::hash(&recovery_chunk));
+        store_fragment(fragments_dir, &chunk_hash, recovery_chunk.to_vec()).map_err(|_| StatusCode::INSUFFICIENT_STORAGE)?;
+        
+        let my_chunk = FragmentHash {
+            data_block_id: dataid.clone(),
+            fragment_index: output_chunk_metadata.len() as i32,
+            fragment_id: fragment_id,
+            fragment_hash: chunk_hash,
+            chunk_type: crate::db::ChunkType::Recovery,
+            stored_locally: false
+        };
+        output_chunk_metadata.push(my_chunk);
+    }
+
+    // Create DataRecord
+    let data = Data {
+        hash: full_file_hash,
+        fragments: output_chunk_metadata,
+        added_bytes: needed_padding as u8
+    };
+
+    Ok(DataRecord {
+        id: dataid,
+        modified_at: None, // Deprecated - timestamps come from UUIDv7
+        data: data,
+        file_access_entries: None, // Will be set by caller
+        file_size: file_size as u64,
+    })
 }
 
 #[derive(Deserialize)]
@@ -155,208 +308,171 @@ pub async fn post_files(
         Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
     };
 
-    // read path part first
+    // read path part first (either "path" or "parent_item_identifier" + "filename")
     // need path in later file processing
     let mut inodes: Vec<Inode> = Vec::new();
     let mut has_files = false;
     let mut uploaded_data_block_ids: Vec<crate::db::types::CustomUUID> = Vec::new();
+    let mut folder_name: Option<String> = None;
 
-    match multipart.next_field().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? {
+    // Handle both regular path and FileProvider parent_item_identifier approaches
+    let path = match multipart.next_field().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? {
         Some(part) => {
-            if part.name() != Some("path") {
-                return Err(StatusCode::BAD_REQUEST);
-            }
-            let unencrypted_path = part.text().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            let path = encrypt_path(unencrypted_path, app_state.get_siv_key()?, app_state.get_siv_nonce()?).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            
-            while let Some(mut part) = multipart.next_field().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? {
-                match part.name() {
-                    Some(field_name) if field_name.starts_with("file_") => {
-                        has_files = true;
-                        // instantiate data
-                        let filename = part.file_name().map(|s| s.to_string()).ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-                        // Parse file size from field name (format: file_123456)
-                        let file_size_str = field_name.strip_prefix("file_").ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
-                        let file_size = file_size_str.parse::<usize>().map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
-
-                        // encrypt filename - deterministic AES-SIV
-                        let filepath = path.clone() + &encrypt_part(&filename, app_state.get_siv_key()?, app_state.get_siv_nonce()?).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-                        // Generate data block ID before sharding
-                        let dataid = CustomUUID::new(None);
-                        
-                        // Generate per-file encryption key
-                        let per_file_key = ChaCha20Poly1305::generate_key(&mut OsRng);
-                        
-                        // Create file access entry for the authenticated user
-                        let file_access = crate::db::types::FileAccess::new_for_user(
-                            app_state.db_pool.get(), 
-                            dataid.clone(), 
-                            user_id, 
-                            &per_file_key
-                        ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                        
-                        // we will have to assume the length value is legit until the end
-                        let mut chunk_buffer: Vec<u8> = Vec::new();
-                        let mut output_chunk_metadata = Vec::new();
-
-                        let (num_original_chunks, num_recovery_chunks) = calculate_optimal_chunks(file_size);
-                        let needed_padding = calculate_chunk_padding(file_size, num_original_chunks);
-                        let target_chunk_length = (file_size + needed_padding) / num_original_chunks;
-                        let mut full_file_hasher = blake3::Hasher::new();
-
-                        let mut encoder = ReedSolomonEncoder::new(
-                            num_original_chunks,
-                            num_recovery_chunks,
-                            calculate_encrypted_chunk_length(target_chunk_length)
-                        ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-                        // stream the field chunk by chunk
-                        while let Some(chunk) = part.chunk().await.map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)? {
-                            chunk_buffer.extend_from_slice(&chunk);
-
-                            // keep loading until we reach target_chunk_length
-                            while chunk_buffer.len() >= target_chunk_length {
-                                let file_chunk = chunk_buffer.drain(..target_chunk_length).collect::<Vec<u8>>();
-                                // add to full file hash
-                                full_file_hasher.update(&file_chunk);
-                                // encrypt chunk immediately
-                                let fragment_id = CustomUUID::new(None);
-                                let encrypted_chunk = encrypt_chunk(file_chunk, &per_file_key, &fragment_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                                encoder.add_original_shard(&encrypted_chunk).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                                let chunk_hash = Blake3Hash::new(blake3::hash(&encrypted_chunk));
-                                let encrypted_len = encrypted_chunk.len();
-                                store_fragment(&app_state.fragments_dir, &chunk_hash, encrypted_chunk).map_err(|_| StatusCode::INSUFFICIENT_STORAGE)?;
-                                
-                                tracing::debug!("Upload: Original chunk {} -> fragment_id: {}, hash: {}, encrypted_len: {}", 
-                                               output_chunk_metadata.len(), fragment_id, chunk_hash.to_hex(), encrypted_len);
-                                let my_chunk = FragmentHash {
-                                    data_block_id: dataid.clone(),
-                                    fragment_index: output_chunk_metadata.len() as i32,
-                                    fragment_id: fragment_id,
-                                    fragment_hash: chunk_hash,
-                                    chunk_type: crate::db::ChunkType::Original,
-                                    stored_locally: false // later stage verify local storage
-                                };
-                                output_chunk_metadata.push(my_chunk);
+            match part.name() {
+                Some("path") => {
+                    // Regular path approach
+                    let unencrypted_path = part.text().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                    encrypt_path(unencrypted_path, app_state.get_siv_key()?, app_state.get_siv_nonce()?).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                },
+                Some("parent_item_identifier") => {
+                    // FileProvider approach - need to look up parent path and construct full path
+                    let parent_item_identifier = part.text().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                    
+                    tracing::debug!("Received parent_item_identifier: '{}'", parent_item_identifier);
+                    
+                    // Get parent path and return it encrypted
+                    if parent_item_identifier == "NSFileProviderRootContainerItemIdentifier" {
+                        tracing::debug!("Handling root container case");
+                        encrypt_path("/".to_string(), app_state.get_siv_key()?, app_state.get_siv_nonce()?).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                    } else if parent_item_identifier.starts_with("item:") {
+                        // Extract inode_id and look up encrypted path
+                        let inode_id_str = &parent_item_identifier[5..];
+                        tracing::debug!("Trying to parse inode_id: '{}' from parent_item_identifier: '{}'", inode_id_str, parent_item_identifier);
+                        let inode_id = crate::db::CustomUUID::from_str(inode_id_str).map_err(|_| StatusCode::BAD_REQUEST)?;
+                
+                        tracing::debug!("Looking up inode_id: {} for user_id: {}", inode_id, user_id);
+                        match crate::db::fileprovider::get_item_metadata_by_inode_id(
+                            app_state.db_pool.get(),
+                            inode_id,
+                            user_id,
+                        ) {
+                            Ok((encrypted_path, _, _, _, _, _)) => {
+                                tracing::debug!("Found encrypted_path: {}", &encrypted_path);
+                                encrypted_path
+                            },
+                            Err(e) => {
+                                tracing::error!("Failed to find item metadata: {:?}", e);
+                                return Err(StatusCode::NOT_FOUND);
                             }
                         }
-
-                        tracing::debug!("Processing final chunk");
-                        // if we still have stuff in buffer, apply padding (it's final chunk)
-                        if !chunk_buffer.is_empty() {
-                            full_file_hasher.update(&chunk_buffer);
-                            chunk_buffer.resize(target_chunk_length, 0);
-
-                            let final_chunk = chunk_buffer;
-                            let fragment_id = CustomUUID::new(None);
-                            let encrypted_chunk = encrypt_chunk(final_chunk, &per_file_key, &fragment_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                            encoder.add_original_shard(&encrypted_chunk).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                            let chunk_hash = Blake3Hash::new(blake3::hash(&encrypted_chunk));
-                            store_fragment(&app_state.fragments_dir, &chunk_hash, encrypted_chunk).map_err(|_| StatusCode::INSUFFICIENT_STORAGE)?;
-                            let my_chunk = FragmentHash {
-                                data_block_id: dataid.clone(),
-                                fragment_index: output_chunk_metadata.len() as i32,
-                                fragment_id: fragment_id,
-                                fragment_hash: chunk_hash,
-                                chunk_type: crate::db::ChunkType::Original,
-                                stored_locally: false // later stage verify local storage
-                            };
-                            output_chunk_metadata.push(my_chunk);
-                        }
-
-                        // finalize full file hash with data_block_id
-                        full_file_hasher.update(dataid.as_bytes());
-                        let full_file_hash = Blake3Hash::new(full_file_hasher.finalize());
-
-                        let recovery_generator = encoder.encode().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                        let mut recovery_iter = recovery_generator.recovery_iter();
-                        while let Some(recovery_chunk) = recovery_iter.next() {
-                            let fragment_id = CustomUUID::new(None);
-                            let chunk_hash = Blake3Hash::new(blake3::hash(&recovery_chunk));
-                            store_fragment(&app_state.fragments_dir, &chunk_hash, recovery_chunk.to_vec()).map_err(|_| StatusCode::INSUFFICIENT_STORAGE)?;
-                            let my_chunk = FragmentHash {
-                                data_block_id: dataid.clone(),
-                                fragment_index: output_chunk_metadata.len() as i32,
-                                fragment_id: fragment_id,
-                                fragment_hash: chunk_hash,
-                                chunk_type: crate::db::ChunkType::Recovery,
-                                stored_locally: false // later stage verify local storage
-                            };
-                            output_chunk_metadata.push(my_chunk);
-                        }
-
-                        let data_option: Option<Data> = if output_chunk_metadata.is_empty() {
-                            None
-                        } else {
-                            Some(
-                                Data {
-                                    hash: full_file_hash,
-                                    fragments: output_chunk_metadata,
-                                    added_bytes: needed_padding as u8
-                                }
-                            )
-                        };
-                        
-                        // let filedata = part.bytes().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                        
-                        // // Debug: Compare parsed size vs actual bytes
-                        // dbg!("Actual bytes length in memory:", filedata.len());
-                        // dbg!("Size match:", file_size == filedata.len());
-                        
-                        // let data_option = shard_file(filedata.to_vec(), &app_state.fragments_dir, dataid.clone(), &per_file_key).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-                        // assemble inode for database
-                        let inode = match data_option {
-                            Some(data) => {
-                                // Track this data block for distribution
-                                uploaded_data_block_ids.push(dataid.clone());
-                                
-                                // assemble data record for database
-                                let datarecord = DataRecord {
-                                    id: dataid,
-                                    modified_at: None,
-                                    data: data,
-                                    file_access_entries: Some(vec![file_access])
-                                };
-                                
-                                Inode {
-                                    owner: Left(user_id),
-                                    path: filepath,
-                                    inode_type: crate::db::InodeType::File,
-                                    data_id: Some(Right(datarecord))
-                                }
-                            }
-                            None => {
-                                // Empty file - no data record, no access entries needed
-                                Inode {
-                                    owner: Left(user_id),
-                                    path: filepath,
-                                    inode_type: crate::db::InodeType::File,
-                                    data_id: None
-                                }
-                            }
-                        };
-                        inodes.push(inode);
-                        
+                    } else {
+                        return Err(StatusCode::BAD_REQUEST);
                     }
-                    Some(_) => return Err(StatusCode::UNPROCESSABLE_ENTITY),
-                    None => {}
-                }
+                },
+                _ => return Err(StatusCode::BAD_REQUEST),
             }
-            
-            // If no files were found, create a folder
-            if !has_files {
-                let folder_inode = Inode {
-                    owner: Left(user_id),
-                    path: path,
-                    inode_type: crate::db::InodeType::Folder,
-                    data_id: None
+        },
+        None => return Err(StatusCode::BAD_REQUEST),
+    };
+    
+    tracing::debug!("Final path after ALL path processing: '{}'", path);
+    
+    while let Some(mut part) = multipart.next_field().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? {
+        match part.name() {
+            Some(field_name) if field_name.starts_with("file_") => {
+                has_files = true;
+                // instantiate data
+                let filename = part.file_name().map(|s| s.to_string()).ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+                // Parse file size from field name (format: file_123456)
+                let file_size_str = field_name.strip_prefix("file_").ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+                let file_size = file_size_str.parse::<usize>().map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
+
+                // encrypt filename - deterministic AES-SIV
+                let filepath = path.clone() + &encrypt_part(&filename, app_state.get_siv_key()?, app_state.get_siv_nonce()?).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+                // Generate data block ID before sharding
+                let dataid = CustomUUID::new(None);
+                
+                // Generate per-file encryption key
+                let per_file_key = ChaCha20Poly1305::generate_key(&mut OsRng);
+                
+                // Create file access entry for the authenticated user
+                let file_access = crate::db::types::FileAccess::new_for_user(
+                    app_state.db_pool.get(), 
+                    dataid.clone(), 
+                    user_id, 
+                    &per_file_key
+                ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                
+                // Process the uploaded file using shared function
+                let datarecord = if file_size == 0 {
+                    // Empty file - no need for Reed-Solomon processing, create minimal DataRecord
+                    tracing::debug!("Creating empty file (size=0) without Reed-Solomon processing");
+                    None
+                } else {
+                    match process_uploaded_file(
+                        part,
+                        file_size,
+                        dataid.clone(),
+                        &per_file_key,
+                        &app_state.fragments_dir
+                    ).await {
+                        Ok(mut data_record) => {
+                            // Add file access entry and set file size
+                            data_record.file_access_entries = Some(vec![file_access]);
+                            data_record.file_size = file_size as u64;
+                            Some(data_record)
+                        }
+                        Err(status) => return Err(status),
+                    }
                 };
-                inodes.push(folder_inode);
+
+                // assemble inode for database
+                let inode = match datarecord {
+                    Some(data_record) => {
+                        // Track this data block for distribution
+                        uploaded_data_block_ids.push(dataid.clone());
+                        
+                        Inode {
+                            id: CustomUUID::new(None),
+                            owner: Left(user_id),
+                            path: filepath,
+                            inode_type: hopnet_common::InodeType::File,
+                            data_id: Some(Right(data_record))
+                        }
+                    }
+                    None => {
+                        // Empty file - no data record, no access entries needed
+                        Inode {
+                            id: CustomUUID::new(None),
+                            owner: Left(user_id),
+                            path: filepath,
+                            inode_type: hopnet_common::InodeType::File,
+                            data_id: None
+                        }
+                    }
+                };
+                inodes.push(inode);
+                
+                    }
+            Some("folder_name") => {
+                folder_name = Some(part.text().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?);
             }
+            Some(_) => return Err(StatusCode::UNPROCESSABLE_ENTITY),
+            None => {}
         }
-        None => return Err(StatusCode::BAD_REQUEST)
+    }
+    
+    // If no files were found, create a folder
+    if !has_files {
+        tracing::debug!("NO FILES FOUND, FOLDER CREATION");
+        let folder_path = if let Some(folder_name) = folder_name {
+            // FileProvider approach - concatenate parent path + folder name (same as file creation)
+            tracing::debug!("FOLDER CREATION FILEPROVIDER: '{}'", &folder_name);
+            path + &encrypt_part(&folder_name, app_state.get_siv_key()?, app_state.get_siv_nonce()?).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        } else {
+            // Old API approach - path already contains the full folder path
+            path
+        };
+        tracing::debug!("CREATING: '{}'", &folder_path);
+        let folder_inode = Inode {
+            id: CustomUUID::new(None),
+            owner: Left(user_id),
+            path: folder_path,
+            inode_type: hopnet_common::InodeType::Folder,
+            data_id: None
+        };
+        inodes.push(folder_inode);
     }
     
     // Insert the collected inodes into the database via consensus
@@ -558,11 +674,11 @@ pub async fn post_fragment(
             match crate::db::files::mark_fragment_local_state(app_state.db_pool.get(), &expected_hash, true) {
                 Ok(rows_affected) => {
                     tracing::debug!("Successfully stored fragment: {} ({} bytes), updated {} database records", 
-                                   expected_hash.to_hex(), fragment_len, rows_affected);
+                           expected_hash.to_hex(), fragment_len, rows_affected);
                 }
                 Err(e) => {
                     tracing::warn!("Fragment stored to disk but failed to update database for {}: {:?}", 
-                                  expected_hash.to_hex(), e);
+                          expected_hash.to_hex(), e);
                     // Continue since fragment is physically stored - database can be updated later
                 }
             }
@@ -620,15 +736,15 @@ pub async fn get_fragment_health(
                     
                     #[derive(Serialize)]
                     struct HealthResponse {
-                        fragment_hash: String,
-                        status: String,
-                        verified: bool,
+                fragment_hash: String,
+                status: String,
+                verified: bool,
                     }
                     
                     let response = HealthResponse {
-                        fragment_hash: fragment_hash.to_hex(),
-                        status: "healthy".to_string(),
-                        verified: true,
+                fragment_hash: fragment_hash.to_hex(),
+                status: "healthy".to_string(),
+                verified: true,
                     };
                     
                     (StatusCode::OK, Json(response)).into_response()
@@ -739,12 +855,12 @@ pub async fn post_fetch_fragments(
         ).await {
             Ok(()) => {
                 tracing::info!("Successfully fetched and cached fragment {} (height {})", 
-                             fragment_hash.to_hex(), placement_height);
+                     fragment_hash.to_hex(), placement_height);
                 successful_fetches += 1;
             }
             Err(e) => {
                 tracing::error!("Failed to fetch fragment {} (height {}): {:?}", 
-                              fragment_hash.to_hex(), placement_height, e);
+                      fragment_hash.to_hex(), placement_height, e);
                 failed_fetches.push(fragment_hash.to_hex());
             }
         }

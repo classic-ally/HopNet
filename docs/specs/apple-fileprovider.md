@@ -2,7 +2,7 @@
 
 ## Abstract
 
-This RFC specifies the integration of Apple's FileProvider framework with HopNet, enabling native macOS Finder and iOS Files app access to distributed HopNet storage. The implementation provides a read-only FileProvider extension that communicates with the main HopNet process via scoped HTTP APIs, maintaining security and consensus integrity while delivering seamless native OS integration.
+This RFC specifies the integration of Apple's FileProvider framework with HopNet, enabling native macOS Finder and iOS Files app access to distributed HopNet storage. The implementation provides a FileProvider extension that communicates with the main HopNet process via scoped HTTP APIs, maintaining security and consensus integrity while delivering seamless native OS integration with read, write, and sync capabilities.
 
 ## Motivation
 
@@ -47,7 +47,7 @@ Key implications:
 ┌─────────────────┐    HTTP API     ┌──────────────────┐
 │ FileProvider    │◄─────────────►│ HopNet Main      │
 │ Extension       │                 │ Process          │
-│ (Rust Binary)   │                 │ (Consensus Node) │
+│ (Swift Binary)  │                 │ (Consensus Node) │
 └─────────────────┘                 └──────────────────┘
         │                                    │
         ▼                                    ▼
@@ -68,31 +68,31 @@ Benefits:
 ### Technology Stack
 
 **FileProvider Extension:**
-- **Language**: Rust with `objc2-file-provider` crate
-- **Communication**: HTTP client using `reqwest`
-- **Authentication**: Scoped API key for FileProvider endpoints only
-- **Binary**: Separate Rust binary compiled into `.appex` bundle
+- **Language**: Swift (Native implementation for better Apple framework integration)
+- **Communication**: URLSession for HTTP requests
+- **Authentication**: Scoped API key stored in macOS Keychain
+- **Bundle**: Swift Package Manager project compiled into `.appex` bundle
 
 **Main HopNet Application:**
-- **New API Routes**: `/integrations/fileprovider/*` endpoints
-- **Authentication**: Generate FileProvider-specific API key at startup
-- **File Assembly**: Extend existing fragment assembly for FileProvider requests
+- **API Routes**: `/integrations/fileprovider/*` endpoints (implemented)
+- **Authentication**: FileProvider-specific API key stored in keychain
+- **File Assembly**: Fragment assembly integrated with download endpoint
 
-### Stable File Identity
+### Stable File Identity (Implemented)
 
-Leverage HopNet's existing database schema for stable identifiers:
+Leverages HopNet's existing database schema for stable identifiers:
 
-```rust
-// File identification strategy
-match inode.data_id {
-    Some(data_block_id) => {
-        // Files: Use stable data_block_id (persists across renames)
-        itemIdentifier = format!("file:{}", data_block_id)
-    }
-    None => {
-        // Folders: Use base64-encoded encrypted path
-        itemIdentifier = format!("folder:{}", base64_encode(encrypted_path))
-    }
+```swift
+// File identification strategy (implemented)
+switch itemType {
+case .file:
+    // Files: Use stable data_block_id (persists across renames)
+    itemIdentifier = "file:\(dataBlockId)"
+case .folder:
+    // Folders: Use hex-encoded path
+    itemIdentifier = "folder:\(hexEncodedPath)"
+case .rootContainer:
+    itemIdentifier = NSFileProviderItemIdentifier.rootContainer
 }
 ```
 
@@ -101,93 +101,213 @@ This approach:
 - ✅ No additional database schema changes required
 - ✅ Works with existing HopNet file operations
 - ✅ Clean separation between files and folders
+- ✅ Folder identifiers use encrypted paths for consistency with database queries
 
-### API Design
+### API Design (Implemented)
 
-**Core Endpoints:**
+**Implemented Endpoints:**
 ```rust
-// File/folder metadata
-GET /integrations/fileprovider/item/{identifier}
-Response: FileProviderItem { identifier, filename, parent, type, ... }
+// File/folder metadata ✅
+GET /integrations/fileprovider/item?identifier={identifier}
+Response: FileProviderItem { identifier, filename, parent, type, file_size, creation_date, content_modification_date, modification_height }
 
-// Directory enumeration
-GET /integrations/fileprovider/enumerate?parent={identifier}&page={token}
-Response: { items: [FileProviderItem], next_page: Option<String> }
+// Directory enumeration ✅ (includes timestamps)
+GET /integrations/fileprovider/enumerate?parent_path={path}&page={token}
+Response: { items: [FileProviderItem], next_page: Option<String>, current_consensus_height }
 
-// File download (assembled from fragments)
-GET /integrations/fileprovider/download/{identifier}
+// File download (assembled from fragments) ✅
+GET /integrations/fileprovider/download?identifier={identifier}
 Response: Binary stream of assembled file content
 
-// Health check
+// Health check ✅
 GET /integrations/fileprovider/health
 Response: { status: "ready" | "not_ready" }
+
+// Incremental sync ✅ (includes timestamps)
+GET /integrations/fileprovider/changes?parent_path={path}&since_height={height}
+Response: { items: [FileProviderItem], deleted_identifiers: [String], current_consensus_height }
+
+// Delete operation ✅
+DELETE /integrations/fileprovider/delete
+Body: { identifier: String, recursive: bool }
+Response: 200 OK or error
 ```
 
-**Authentication:**
-- FileProvider-scoped API key generated at HopNet startup
-- Stored in macOS Keychain for FileProvider extension access
-- Restricted to `/integrations/fileprovider/*` routes only (prevents privilege escalation)
+// Create item ✅ 
+POST /integrations/fileprovider/create
+Body: multipart/form-data with path field and optional file field
+
+// Modify item ✅ (Phase 4a complete - metadata only, Phase 4b - content)
+PUT /integrations/fileprovider/modify
+Body: { identifier, new_filename?, new_parent?, content? }
+Response: 200 OK or error
+
+**Authentication (Implemented):**
+- FileProvider-scoped API key stored in macOS Keychain ✅
+- Extension reads from keychain at initialization ✅
+- Restricted to `/integrations/fileprovider/*` routes only ✅
 
 ## NSFileProviderReplicatedExtension Implementation
 
-### Core Protocol Methods
+### Core Protocol Methods (Swift Implementation)
 
-**MVP Implementation (Read-Only):**
+**Current Implementation Status:**
 
-```rust
-impl NSFileProviderReplicatedExtension for HopNetFileProvider {
-    // Fetch metadata for specific file/folder
-    fn item(identifier: NSFileProviderItemIdentifier) -> Result<NSFileProviderItem> {
-        let response: FileProviderItem = self.client
-            .get(format!("{}/api/fileprovider/item/{}", self.base_url, identifier))
-            .bearer_auth(&self.api_key)
-            .send()?
-            .json()?;
-        
-        Ok(HopNetItem::from(response))
+```swift
+// ✅ IMPLEMENTED - Core read operations
+class HopNetFileProviderExtension: NSFileProviderReplicatedExtension {
+    
+    // ✅ Fetch metadata for specific file/folder
+    func item(for identifier: NSFileProviderItemIdentifier) -> NSFileProviderItem {
+        let item = apiClient.getItem(identifier: identifier.rawValue)
+        return HopNetFileProviderItem(apiItem: item)
     }
     
-    // List contents of a folder
-    fn enumerator(container: NSFileProviderItemIdentifier) -> NSFileProviderEnumerator {
-        HopNetEnumerator::new(container, self.client.clone())
+    // ✅ List contents of a folder with pagination
+    func enumerator(for container: NSFileProviderItemIdentifier) -> NSFileProviderEnumerator {
+        return HopNetEnumerator(containerItemIdentifier: container, apiClient: apiClient)
     }
     
-    // Download file content
-    fn fetch_contents(
-        identifier: NSFileProviderItemIdentifier,
-        version: NSFileProviderItemVersion,
-        request: NSFileProviderRequest,
-        completion: |URL, NSFileProviderItem, NSError|
-    ) {
-        tokio::spawn(async move {
-            // Stream file from HopNet to FileProvider's URL
-            let mut response = self.client
-                .get(format!("{}/api/fileprovider/download/{}", self.base_url, identifier))
-                .send()
-                .await?;
-            
-            let mut file = File::create(request.url())?;
-            while let Some(chunk) = response.chunk().await? {
-                file.write_all(&chunk)?;
+    // ✅ Download file content with progress tracking
+    func fetchContents(for identifier: NSFileProviderItemIdentifier) -> Progress {
+        let progress = Progress()
+        Task {
+            let tempUrl = try await apiClient.downloadFile(identifier: identifier.rawValue)
+            // Move to FileProvider temp directory and return
+        }
+        return progress
+    }
+    
+    // ✅ Delete items with recursive support
+    func deleteItem(identifier: NSFileProviderItemIdentifier) -> Progress {
+        let progress = Progress()
+        Task {
+            try await apiClient.deleteItem(identifier: identifier.rawValue, recursive: options.contains(.recursive))
+        }
+        return progress
+    }
+    
+    // ✅ Create files and folders with multipart upload
+    func createItem(basedOn itemTemplate: NSFileProviderItem) -> Progress {
+        let progress = Progress()
+        Task {
+            let parentPath = try await getPathFromIdentifier(itemTemplate.parentItemIdentifier)
+            try await apiClient.createItem(parentPath: parentPath, filename: itemTemplate.filename, fileUrl: url)
+            // Fetch actual item from backend to get correct encrypted identifiers
+        }
+        return progress
+    }
+    
+    // ✅ IMPLEMENTED - Metadata modifications (rename/move)  
+    func modifyItem(_ item: NSFileProviderItem) -> Progress {
+        let progress = Progress()
+        Task {
+            // Phase 4a: Handle rename and move operations
+            if item.parentItemIdentifier == NSFileProviderItemIdentifier.trashContainer {
+                // Reject trashing with NSFeatureUnsupportedError
+                completionHandler(nil, [], false, NSError(...))
+                return
             }
             
-            completion(request.url(), item, nil);
-        });
+            let newPath = try await getPathFromIdentifier(item.parentItemIdentifier)
+            try await apiClient.modifyItem(identifier: item.itemIdentifier.rawValue, 
+                                         newPath: newPath, newFilename: item.filename)
+            
+            // Signal enumerator changes and return updated item
+        }
+        return progress
     }
 }
 ```
 
-**NSFileProviderItem Implementation:**
-```rust
-struct HopNetItem {
-    item_identifier: String,        // "file:uuid" or "folder:base64path"
-    filename: String,               // Decrypted filename from API
-    parent_item_identifier: String, // Parent folder identifier
-    type_identifier: String,        // UTI (public.folder, public.data, etc.)
-    content_modification_date: Date, // From data_blocks.modified_at
-    capabilities: NSFileProviderItemCapabilities, // .allowsReading for MVP
+**NSFileProviderItem Implementation (Current):**
+```swift
+class HopNetFileProviderItem: NSFileProviderItem {
+    // ✅ Required properties
+    var itemIdentifier: NSFileProviderItemIdentifier  // "file:uuid" or "folder:hex(encrypted_path)"
+    var filename: String                              // Decrypted filename
+    var parentItemIdentifier: NSFileProviderItemIdentifier
+    var contentType: UTType                          // .folder or .data
+    var capabilities: NSFileProviderItemCapabilities // Reading, deleting, writing
+    var documentSize: NSNumber?                      // File size in bytes
+    var itemVersion: NSFileProviderItemVersion       // Consensus height-based version tracking
+    
+    // ✅ Download state tracking
+    var isDownloaded: Bool
+    var isMostRecentVersionDownloaded: Bool
+    
+    // ✅ Enhanced metadata properties (Phase 3)
+    var creationDate: Date?               // From UUIDv7 timestamp extraction
+    var contentModificationDate: Date?    // From modified_at or fallback to creation_date
+    
+    // ❌ Missing properties (Future phases)
+    // var lastUsedDate: Date?           // For working set
+    // var childItemCount: NSNumber?     // For folders
+    // var typeIdentifier: String        // Specific file types
+    // var favoriteRank: NSNumber?       // For starred items
 }
 ```
+
+### Consensus Height-Based Versioning (COMPLETED ✅)
+
+**Problem**: FileProvider requires proper versioning via `NSFileProviderItemVersion` for change detection and sync operations. Initial implementation used static identifiers that never changed, breaking incremental sync.
+
+**Solution**: Implement consensus height-based versioning that leverages HopNet's modification tracking system.
+
+#### Implementation Details:
+
+**Backend Enhancement**:
+```rust
+// Added modification_height field to all FileProvider database structures
+pub struct FileProviderItemData {
+    // ... existing fields ...
+    pub modification_height: Option<i32>, // Consensus height when item was last modified
+}
+```
+
+All FileProvider database queries now JOIN with `modification_log` table to provide the consensus height when each item was last modified:
+```sql
+LEFT JOIN (
+    SELECT inode_id, MAX(modified_at_height) as modified_at_height
+    FROM modification_log WHERE owner_id = ?
+    GROUP BY inode_id
+) ml ON i.id = ml.inode_id
+```
+
+**Swift Implementation**:
+```swift
+// HopNetFileProviderItem.swift - Enhanced itemVersion property
+public var itemVersion: NSFileProviderItemVersion {
+    let versionData: Data
+    
+    if let modHeight = apiItem.modification_height {
+        // Convert consensus height to Data safely
+        var height = modHeight
+        versionData = Data(bytes: &height, count: MemoryLayout<Int32>.size)
+    } else {
+        // Timestamp fallback for items without modification height
+        let timestamp = Date().timeIntervalSince1970
+        var timestampInt = Int64(timestamp * 1000) // milliseconds for precision
+        versionData = Data(bytes: &timestampInt, count: MemoryLayout<Int64>.size)
+    }
+    
+    return NSFileProviderItemVersion(contentVersion: versionData, metadataVersion: versionData)
+}
+```
+
+**Key Benefits**:
+- ✅ **Monotonic Versioning**: Consensus heights always increase, ensuring proper change detection
+- ✅ **Consistency**: All instances of HopNet report identical versions for the same items
+- ✅ **Efficient Sync**: FileProvider can use consensus height for precise incremental enumeration
+- ✅ **Parent Updates**: When child items are modified, parent folder versions automatically update
+- ✅ **Safe Fallback**: Timestamp-based versioning when consensus height unavailable (though this should be rare)
+
+**Testing Integration**:
+Comprehensive test suite validates version behavior:
+- Version consistency across all created items
+- Parent version changes when children are modified
+- No timestamp fallback in normal operations (all items should have consensus height versions)
+- Version data format validation (Int32 for consensus heights vs Int64 for timestamps)
 
 ### File Assembly Integration
 
@@ -273,27 +393,195 @@ let domain = NSFileProviderDomain::new(
 
 ## Implementation Phases
 
-### Phase 1: Read-Only MVP (2-3 weeks)
-- [ ] Core FileProvider extension with `objc2-file-provider`
-- [ ] HTTP API endpoints in main HopNet process
-- [ ] Scoped authentication with API keys
-- [ ] File enumeration and metadata retrieval
-- [ ] File download with fragment assembly
-- [ ] Manual domain registration
+### Phase 1: Read Operations (COMPLETED ✅)
+- [x] Core FileProvider extension in Swift
+- [x] HTTP API endpoints in main HopNet process
+- [x] Scoped authentication with API keys via Keychain
+- [x] File enumeration with pagination
+- [x] File metadata retrieval
+- [x] File download with fragment assembly
+- [x] Delete operations with recursive support
+- [x] Incremental sync with consensus height tracking
+- [x] Basic error handling and API status checks
 
-### Phase 2: Enhanced Functionality (1-2 weeks)
-- [ ] Progress reporting during file assembly
-- [ ] Error handling and retry logic
-- [ ] Working sets support (recents, favorites)
-- [ ] Basic thumbnail support
+### Phase 2: Create Operations (COMPLETED ✅)
+- [x] Implement `createItem()` method
+  - [x] Create new files with content upload via multipart form data
+  - [x] Create new folders using path-based approach
+  - [x] Handle file upload via consensus (wraps existing post_files endpoint)
+- [x] Add POST `/integrations/fileprovider/create` endpoint
+- [x] Fragment creation and distribution for new files (reuses existing upload logic)
+- [x] Fix folder identifier consistency (use encrypted paths from backend)
+- [x] Add .allowsWriting capability to enable file/folder creation
+- [ ] Progress reporting during upload (basic implementation)
 
-### Phase 3: Write Operations (2-3 weeks)
-- [ ] File upload through FileProvider
-- [ ] File/folder creation and deletion
-- [ ] Move and rename operations
-- [ ] Conflict resolution
+### Phase 3: Enhanced Metadata (COMPLETED ✅)
+- [x] Add creation and modification dates from database
+  - [x] Extract creation dates from UUIDv7 timestamps using `uuid_extract_timestamp()`
+  - [x] Use `modified_at` from data_blocks table with fallback to creation date
+  - [x] Fixed CustomDateTime deserialization to handle DuckDB native timestamps
+  - [x] Added ISO 8601 timestamp formatting for Swift Date parsing
+  - [x] Resolved NULL handling to prevent epoch-based timestamps
+- [ ] Add last used date tracking for working set
+- [ ] Add child item count for folders  
+- [ ] Improve type identifier detection based on file extensions
+- [ ] Add favorite rank support for starred items
+- [ ] Enhance contentType with specific UTTypes
 
-### Phase 4: iOS Thin Client Foundation (1-2 weeks)
+### Phase 4a: Metadata Modification (COMPLETED ✅)
+- [x] Implement `modifyItem()` method for metadata-only changes
+  - [x] Rename files and folders with proper identifier handling
+  - [x] Move items between folders with path updates
+  - [x] **NEW**: Unified modification log for comprehensive change tracking
+- [x] Add PUT `/integrations/fileprovider/modify` endpoint
+- [x] Authentication header fix (Bearer token format)
+- [x] Trash detection with NSFeatureUnsupportedError
+- [x] **NEW**: Replace deletion_log with modification_log for all file system changes
+- [x] **NEW**: Efficient single-query change enumeration using LEFT JOIN pattern
+
+#### Unified Change Tracking Implementation:
+
+**Problem Solved**: Previous system only tracked content changes via `placement_height`, missing file/folder moves, renames, and metadata changes without content updates.
+
+**Solution**: Comprehensive `modification_log` table tracking all file system operations:
+```sql
+CREATE TABLE modification_log (
+    inode_id           UUID NOT NULL,
+    owner_id           INTEGER NOT NULL,
+    modified_at_height INTEGER NOT NULL,
+    PRIMARY KEY (inode_id, modified_at_height)
+);
+```
+
+**Key Improvements**:
+- All consensus handlers (insert, modify, delete) log changes to modification_log
+- Single efficient query determines both existing items and deleted items
+- Deleted items properly appear in `deleted_identifiers` array
+- No longer depends on complex placement_height logic for change detection
+
+### Phase 4b: Content Modification (COMPLETED ✅)
+
+**Architecture Decision**: Create new data blocks for modified content while maintaining stable file identifiers.
+
+#### Core Changes:
+
+1. **Database Schema Evolution**:
+   - [x] ~~Add `id` column (UUIDv7) to `inodes` table~~ (already exists, leveraged existing schema)
+   - [x] **COMPLETED**: Replace `deletion_log` with `modification_log` for unified change tracking
+   - [x] **COMPLETED**: Track all file operations (create, modify, move, delete) in single table
+   - [x] **COMPLETED**: UUIDv7 timestamps provide intrinsic creation/modification dates
+
+2. **Identifier Strategy**:
+   - [x] **COMPLETED**: Unified `item:{inode_id}` identifiers for files and folders
+   - [x] **COMPLETED**: Inode ID remains stable across renames, moves, and content updates
+   - [ ] Leverage UUIDv7 for intrinsic timestamp information:
+     - `inode.id` timestamp = creation time (for both files and folders)
+     - `data_block.id` timestamp = modification time (files only)
+
+3. **Content Update Flow**:
+   - [x] **COMPLETED**: `modifyItem()` HTTP endpoint handles multipart file uploads
+   - [x] **COMPLETED**: Multipart upload processing with Reed-Solomon encoding
+   - [x] **COMPLETED**: Create new data_block with new fragments (full file replacement)  
+   - [x] **COMPLETED**: Update inode's `data_id` to point to new data_block via consensus
+   - [x] **COMPLETED**: Original data_block becomes orphaned (cleaned up by maintenance)
+
+4. **Consensus Operations**:
+   - [x] **COMPLETED**: `modify_item` database function accepts:
+     - `new_data_block_id: Option<CustomUUID>`
+     - `new_data_record: Option<DataRecord>`
+   - [x] **COMPLETED**: Atomic inode update in transaction handler
+   - [x] **COMPLETED**: Last-write-wins semantics via consensus transaction ordering
+
+5. **API Endpoints**:
+   - [x] **COMPLETED**: PUT `/integrations/fileprovider/modify` accepts multipart content
+   - [x] **COMPLETED**: Reuses existing file processing pipeline from creation logic
+   - [x] **COMPLETED**: Returns updated metadata with new modification timestamp
+
+#### Design Rationale:
+
+- **Why new data blocks**: Preserves sharing semantics where multiple users can reference same content
+- **Why full file replacement**: Reed-Solomon encoding requires complete re-encoding anyway
+- **Why inode.id**: Provides stable identity that survives all file operations
+- **Future optimization**: Delta encoding can be added later without changing architecture
+
+#### Testing Considerations:
+- Large file modifications (up to 5GB limit)
+- Rapid successive updates to same file  
+- Concurrent modifications from multiple FileProvider instances
+- Combined operations (rename + content update)
+
+#### Recursive Folder Modification Dates (COMPLETED ✅)
+**Enhancement**: Folders now display the most recent modification date from any descendant (files or subfolders).
+
+**Implementation**: Enhanced all FileProvider database queries to compute recursive modification dates:
+```sql
+CASE 
+    WHEN i.data_id IS NOT NULL THEN uuid_extract_timestamp(i.data_id)  -- Files
+    WHEN i.type = 'folder' THEN (
+        SELECT MAX(uuid_extract_timestamp(COALESCE(child.data_id, child.id)))
+        FROM inodes child
+        WHERE child.owner_id = i.owner_id
+          AND child.path LIKE i.path || '/%'
+    )  -- Folders: most recent child modification
+    ELSE NULL
+END as content_modification_date
+```
+
+**Benefits**:
+- Intuitive folder timestamps matching standard filesystem behavior
+- FileProvider automatically inherits this for native macOS integration
+- No schema changes required
+
+#### Parent Folder Change Inclusion (COMPLETED ✅)
+**Enhancement**: Change queries now include ALL ancestor folders when children are modified.
+
+**Completed Implementation**: Full ancestor folder modification logging with comprehensive path tracking:
+- Enhanced `log_modification()` to accept `old_path` and `new_path` parameters
+- Added `get_all_ancestor_folders()` helper using efficient single-query path matching (`? LIKE path || '/%'`)
+- Automatically logs ALL ancestor folders for create, delete, move, and modify operations
+- Uses existing `old_parent_id` column for tracking parent relationships at modification time
+
+**Key Features**:
+- **File creation** (`/a/b/c/file.txt`): Logs file + `/a/b/c` + `/a/b` + `/a`
+- **File deletion** (`/x/y/file.txt`): Logs file + `/x/y` + `/x` 
+- **File moves** (`/a/b/file.txt` → `/x/y/file.txt`): Logs file + old ancestors (`/a/b`, `/a`) + new ancestors (`/x/y`, `/x`)
+- **Shared ancestors**: Handled gracefully with `INSERT OR IGNORE` for duplicate entries
+
+**Implementation**:
+```rust
+/// Enhanced log_modification with automatic ancestor logging
+pub fn log_modification(
+    tx: &Transaction,
+    inode_id: CustomUUID,
+    owner_id: i32,
+    old_parent_id: Option<CustomUUID>,
+    old_path: Option<&str>,  // Path BEFORE modification
+    new_path: Option<&str>,  // Path AFTER modification  
+    modification_height: i32,
+) -> Result<(), DatabaseError>
+
+/// Efficient single-query ancestor discovery
+fn get_all_ancestor_folders(tx: &Transaction, path: &str, owner_id: i32) -> Result<Vec<CustomUUID>, DatabaseError> {
+    // SELECT id FROM inodes WHERE owner_id = ? AND type = 'folder' AND ? LIKE path || '/%'
+}
+```
+
+**Benefits**:
+- ✅ Guarantees ALL ancestor folders appear for ANY child operation (including deletes/moves)
+- ✅ Complete ancestor chain tracking for deep hierarchies (e.g., `/grandparent/parent/child.txt` logs all three levels)
+- ✅ Root enumeration automatically shows all affected ancestor folders without query changes
+- ✅ Single efficient query per path using SQL pattern matching
+- ✅ No schema changes required - leverages existing `modification_log` structure
+
+### Phase 5: Advanced Features
+- [ ] Working set enumeration (recent files)
+- [ ] Thumbnail generation and caching
+- [ ] File eviction support (`evictItem()`)
+- [ ] Materialized state management
+- [ ] Conflict resolution UI
+- [ ] File coordination improvements
+
+### Phase 6: iOS Thin Client Foundation
 - [ ] Remote endpoint configuration
 - [ ] Enhanced authentication for remote access
 - [ ] iOS Files app compatibility testing
@@ -323,6 +611,18 @@ let domain = NSFileProviderDomain::new(
 - **Xcode Project**: Extension bundle must be signed with FileProvider entitlement
 - **Rust Toolchain**: Uses objc2 crate ecosystem for Objective-C bridging
 
+## Outstanding Considerations
+
+### Consensus Timing Race Condition
+On non-leader nodes, FileProvider operations may experience a brief inconsistency window where:
+1. API returns 200 OK immediately after forwarding transaction to leader
+2. FileProvider queries for changes before local consensus processing completes
+3. Changes appear missing until the Lock phase QC arrives and triggers `signal_fileprovider_refresh()`
+
+**Current Mitigation**: The existing `signal_fileprovider_refresh()` mechanism provides eventual consistency by notifying FileProvider to re-enumerate after transaction processing completes.
+
+**Future Enhancement**: A subscription mechanism tied to block commitment (tolerant of both leader and follower scenarios) could ensure stronger consistency between transactions marked as accepted by FileProvider and those actually committed by the backend.
+
 ## Future Enhancements
 
 ### Multi-Device Sync
@@ -341,6 +641,12 @@ FileProviderConfig {
 - Spotlight search integration
 - Quick Actions and context menus
 - Collaborative editing support
+
+### Phase 5: Streaming File Upload Support
+- **Current Limitation**: 5GB body limit on FileProvider routes for large file uploads
+- **Enhancement**: Implement streaming upload support to eliminate arbitrary file size limits
+- **Benefits**: Enable upload of files larger than available RAM, better memory efficiency
+- **Implementation**: Replace multipart body parsing with streaming chunk processing
 
 ## Conclusion
 

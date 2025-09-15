@@ -6,7 +6,8 @@ pub enum DatabaseError {
     RecallError,
     ProcessingError,
     InvalidPayload,
-    NotFound
+    NotFound,
+    ConflictError  // Resource already exists at the specified location/identifier
 }
 
 use crate::db::{Blake3Hash, PrivKey, User};
@@ -59,6 +60,13 @@ impl CustomUUID{
             None => {return CustomUUID(Uuid::now_v7())}
         }
     }
+    
+    pub fn from_str(uuid_str: &str) -> Result<CustomUUID, uuid::Error> {
+        match Uuid::parse_str(uuid_str) {
+            Ok(uuid) => Ok(CustomUUID(uuid)),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 impl Deref for CustomUUID {
@@ -95,7 +103,7 @@ impl FromSql for CustomUUID {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CustomDateTime(DateTime<Utc>);
 
 impl Deref for CustomDateTime {
@@ -126,16 +134,29 @@ impl FromSql for CustomDateTime {
                     Err(_) => Err(FromSqlError::InvalidType)
                 }
             }
-            _ => Err(FromSqlError::InvalidType),
+            ValueRef::Timestamp(unit, value) => {
+                // Convert DuckDB timestamp to DateTime<Utc>
+                // DuckDB timestamps are microseconds since Unix epoch
+                let timestamp_seconds = value as f64 / 1_000_000.0;
+                let seconds = timestamp_seconds.floor() as i64;
+                let nanoseconds = ((timestamp_seconds - seconds as f64) * 1_000_000_000.0) as u32;
+                
+                match DateTime::from_timestamp(seconds, nanoseconds) {
+                    Some(dt) => {
+                        Ok(CustomDateTime(dt))
+                    }
+                    None => {
+                        Err(FromSqlError::InvalidType)
+                    }
+                }
+            }
+            _ => {
+                Err(FromSqlError::InvalidType)
+            }
         }
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-pub enum InodeType {
-    File,
-    Folder
-}
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 pub enum ChunkType {
@@ -143,30 +164,6 @@ pub enum ChunkType {
     Recovery
 }
 
-impl ToSql for InodeType {
-    fn to_sql(&self) -> Result<ToSqlOutput<'_>, duckdb::Error> {
-        let phase_str = match self {
-            InodeType::File => "file",
-            InodeType::Folder => "folder",
-        };
-        return Ok(phase_str.into())
-    }
-}
-
-impl FromSql for InodeType {
-    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
-        if let ValueRef::Enum(enum_type, row_idx) = value {
-            let enum_value = extract_enum_string(enum_type, row_idx)?;
-            match enum_value.as_str() {
-                "file" => Ok(InodeType::File),
-                "folder" => Ok(InodeType::Folder),
-                _ => Err(FromSqlError::InvalidType),
-            }
-        } else {
-            Err(FromSqlError::InvalidType)
-        }
-    }
-}
 
 impl ToSql for ChunkType {
     fn to_sql(&self) -> Result<ToSqlOutput<'_>, duckdb::Error> {
@@ -195,6 +192,8 @@ impl FromSql for ChunkType {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Inode {
+    // stable identifier (UUIDv7 encodes creation time)
+    pub id: CustomUUID,
     // the owner for this specific node:
     pub owner: Either<i32, User>,
     // path is split by /
@@ -202,13 +201,13 @@ pub struct Inode {
     // this way, we can compute all files in a folder quickly whilst maintaining OK privacy
     pub path: String,
     // it is either a folder or file
-    pub inode_type: InodeType,
+    pub inode_type: hopnet_common::InodeType,
     // if file, point to datablock
     // if folder, None
     pub data_id: Option<Either<CustomUUID, DataRecord>>
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DataRecord {
     // PK for this datablock
     // referenced by inoderecord
@@ -218,9 +217,10 @@ pub struct DataRecord {
     pub modified_at: Option<CustomDateTime>,
     pub data: Data,
     pub file_access_entries: Option<Vec<FileAccess>>,
+    pub file_size: u64,  // Total size of the file in bytes
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Data {
     // data hash for integrity
     pub hash: Blake3Hash,
@@ -280,7 +280,7 @@ impl FromSql for XPubKey {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FileAccess {
     pub data_block_id: CustomUUID,
     pub user_id: i32,
@@ -341,7 +341,7 @@ impl FileAccess {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct FragmentHash {
     pub data_block_id: CustomUUID,
     pub fragment_index: i32,

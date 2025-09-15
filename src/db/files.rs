@@ -4,7 +4,29 @@ use either::Either;
 
 use crate::files::functions::decrypt_path;
 
-use duckdb::Transaction;
+use duckdb::{Transaction, OptionalExt};
+
+/// Helper function to log ancestor folder modifications (extracted from log_modification)
+fn log_ancestor_modifications(
+    tx: &Transaction,
+    path: &str,
+    owner_id: i32,
+    modification_height: i32,
+) -> Result<(), DatabaseError> {
+    let ancestors = get_all_ancestor_folders(tx, path, owner_id)?;
+    for ancestor_id in &ancestors {
+        tx.execute(
+            "INSERT OR IGNORE INTO modification_log (inode_id, owner_id, old_parent_id, modified_at_height) VALUES (?, ?, ?, ?)",
+            params![ancestor_id, owner_id, None::<CustomUUID>, modification_height]
+        ).map_err(|e| {
+            tracing::error!("Failed to log ancestor modification for path {} ancestor {}: {:?}", 
+                           path, ancestor_id, e);
+            DatabaseError::ProcessingError
+        })?;
+    }
+    tracing::debug!("Logged {} ancestor modifications for path: {}", ancestors.len(), path);
+    Ok(())
+}
 
 pub fn get_files(
     db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
@@ -14,18 +36,19 @@ pub fn get_files(
 ) -> Result<Vec<Inode>, DatabaseError> {
     match db_connection {
         Ok(db_lock) => {
-            let mut stmt = db_lock.prepare("SELECT owner_id, path, type, data_id FROM inodes WHERE path LIKE ? AND path NOT LIKE ?").map_err(|_| DatabaseError::RecallError)?;
+            let mut stmt = db_lock.prepare("SELECT id, owner_id, path, type, data_id FROM inodes WHERE path LIKE ? AND path NOT LIKE ?").map_err(|_| DatabaseError::RecallError)?;
             let like_path = format!("{}/%", path);
             let not_like_path = format!("{}/%", like_path);
             tracing::debug!("Querying files with like_path: {}, not_like_path: {}", like_path, not_like_path);
             let inodes = stmt.query_map(params![like_path, not_like_path], |row| {
-                let path = row.get(1)?;
+                let path = row.get(2)?;
                 let decrypted_path = decrypt_path(path, key, nonce)?;
-                let data_id: Option<CustomUUID> = row.get(3)?;
+                let data_id: Option<CustomUUID> = row.get(4)?;
                 Ok(Inode {
-                    owner: Either::Left(row.get(0)?),
+                    id: row.get(0)?,
+                    owner: Either::Left(row.get(1)?),
                     path: decrypted_path,
-                    inode_type: row.get(2)?,
+                    inode_type: row.get(3)?,
                     data_id: data_id.map(Either::Left),
                 })
             }).map_err(|_| DatabaseError::ProcessingError)?;
@@ -62,6 +85,10 @@ pub fn insert_files(
             }
             
             let inode_count = inodes.len();
+            
+            // Get consensus height once for modification logging
+            let current_height = crate::db::consensus::get_current_consensus_height(&tx)?;
+            
             for inode in inodes {
                 // Handle the data_id which can be Either<CustomUUID, DataRecord>
                 let data_id: Option<CustomUUID> = match inode.data_id {
@@ -78,14 +105,15 @@ pub fn insert_files(
                         
                         // Insert into data_blocks table
                         tx.execute(
-                            "INSERT INTO data_blocks (id, modified_at, file_hash, fragment_count, added_bytes, placement_height) VALUES (?, ?, ?, ?, ?, ?)",
+                            "INSERT INTO data_blocks (id, modified_at, file_hash, fragment_count, added_bytes, placement_height, file_size) VALUES (?, ?, ?, ?, ?, ?, ?)",
                             params![
                                 data_id,
                                 data_record.modified_at,
                                 data.hash,
                                 data.fragments.len() as i32,
                                 data.added_bytes,
-                                None::<i32>  // placement_height is NULL initially, set during fragment placement
+                                None::<i32>,  // placement_height is NULL initially, set during fragment placement
+                                data_record.file_size
                             ]
                         ).map_err(|_| DatabaseError::InsertError)?;
                         
@@ -118,16 +146,24 @@ pub fn insert_files(
                     either::Either::Right(user) => user.user_id,
                 };
 
+                // Generate stable UUIDv7 for inode identity
+                let inode_id = crate::db::CustomUUID::new(None);
+                
                 // Insert into inodes table
                 tx.execute(
-                    "INSERT INTO inodes (owner_id, path, type, data_id) VALUES (?, ?, ?, ?)",
+                    "INSERT INTO inodes (id, owner_id, path, type, data_id) VALUES (?, ?, ?, ?, ?)",
                     params![
+                        inode_id,
                         owner_id,
                         inode.path,
                         inode.inode_type,
                         data_id
                     ]
                 ).map_err(|_| DatabaseError::InsertError)?;
+                
+                // Log modification for FileProvider change tracking  
+                // New items have None as old_parent_id (didn't exist before)
+                log_modification(&tx, inode_id, owner_id, None, None, Some(&inode.path), current_height)?;
             }
             
             // Commit or rollback based on execute flag
@@ -227,10 +263,13 @@ fn insert_parent_directories(
     
     // Insert each missing parent directory
     for parent_path in missing_parents {
+        // Generate stable UUIDv7 for folder identity
+        let folder_id = crate::db::CustomUUID::new(None);
         
         tx.execute(
-            "INSERT INTO inodes (owner_id, path, type, data_id) VALUES (?, ?, 'folder', NULL)",
+            "INSERT INTO inodes (id, owner_id, path, type, data_id) VALUES (?, ?, ?, 'folder', NULL)",
             params![
+                folder_id,
                 owner_id,
                 parent_path
             ]
@@ -249,6 +288,44 @@ pub fn delete_files(
     match db_connection {
         Ok(mut db_lock) => {
             let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
+            
+            if execute {
+                // Get current consensus height for modification tracking
+                let current_height = crate::db::consensus::get_current_consensus_height(&tx)?;
+                
+                // Log ancestor folder modifications (reusing existing logic)
+                log_ancestor_modifications(&tx, &path, user_id, current_height)?;
+                
+                // Log deletion for ALL items that will be deleted (target + children) in a single SQL operation
+                let logged_count = tx.execute(
+                    r#"
+                    INSERT OR IGNORE INTO modification_log (inode_id, owner_id, old_parent_id, modified_at_height)
+                    SELECT 
+                        i.id,
+                        i.owner_id,
+                        p.id as old_parent_id,
+                        ? as modified_at_height
+                    FROM inodes i 
+                    LEFT JOIN inodes p ON (
+                        p.owner_id = i.owner_id 
+                        AND p.type = 'folder'
+                        AND p.path = substr(i.path, 1, length(i.path) - length(reverse(substr(reverse(i.path), 1, strpos(reverse(i.path), '/') - 1))) - 1)
+                        AND length(i.path) - length(replace(i.path, '/', '')) > 1
+                    )
+                    WHERE (i.path = ? OR i.path LIKE ?) AND i.owner_id = ?
+                    "#,
+                    params![current_height, path, format!("{}/%", path), user_id]
+                ).map_err(|e| {
+                    tracing::error!("Failed to log modifications for deletion: {:?}", e);
+                    DatabaseError::ProcessingError
+                })?;
+                
+                if logged_count == 0 {
+                    return Err(DatabaseError::NotFound);
+                }
+                
+                tracing::debug!("Logged deletion of {} items (including children and ancestors) at height {}", logged_count, current_height);
+            }
             
             // Delete the file/folder and all its children (only for this user)
             let deleted_count = tx.execute(
@@ -272,6 +349,195 @@ pub fn delete_files(
             tracing::error!("Database connection error in delete_files: {:?}", e);
             Err(DatabaseError::LockError)
         }
+    }
+}
+
+pub fn modify_item(
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    user_id: i32,
+    inode_id: crate::db::CustomUUID,
+    new_encrypted_path: Option<String>,
+    new_data_block_id: Option<crate::db::CustomUUID>,
+    new_data_record: Option<crate::db::DataRecord>,
+    execute: bool,
+) -> Result<(), DatabaseError> {
+    match db_connection {
+        Ok(mut db_lock) => {
+            let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
+            
+            // Check if the item exists and get its type and current path using inode_id
+            tracing::debug!("modify_item: Querying inodes table for inode_id={} user_id={} execute={}", inode_id, user_id, execute);
+            let item_info: Option<(hopnet_common::InodeType, String)> = tx.query_row(
+                "SELECT type, path FROM inodes WHERE id = ? AND owner_id = ?",
+                params![inode_id, user_id],
+                |row| Ok((row.get(0)?, row.get(1)?))
+            ).optional().map_err(|_| DatabaseError::RecallError)?;
+            
+            let (item_type, current_encrypted_path) = match item_info {
+                Some((itype, path)) => (itype, path),
+                None => {
+                    tracing::warn!("modify_item: Item not found - inode_id: {}, user_id: {}", inode_id, user_id);
+                    return Err(DatabaseError::NotFound);
+                },
+            };
+            
+            // Capture old parent BEFORE any modifications
+            let old_parent_id = get_parent_id(&tx, &current_encrypted_path, user_id)
+                .unwrap_or_else(|e| {
+                    tracing::warn!("Failed to get parent for path {}: {:?}", current_encrypted_path, e);
+                    None
+                });
+            
+            if let Some(ref new_path) = new_encrypted_path {
+                // Circular reference prevention for folders
+                if item_type == hopnet_common::InodeType::Folder {
+                    // Check if new path would place folder inside itself or its descendants
+                    // This happens when the new path starts with the current folder's path
+                    if new_path.starts_with(&format!("{}/", current_encrypted_path)) || new_path == &current_encrypted_path {
+                        tracing::warn!("Circular reference prevented: Cannot move folder '{}' into itself at '{}'", 
+                                     current_encrypted_path, new_path);
+                        return Err(DatabaseError::InvalidPayload);  // Invalid operation - circular reference
+                    }
+                }
+                
+                // Check if the new path already exists (exclude current inode to allow "move to same location")
+                let new_exists: bool = tx.query_row(
+                    "SELECT COUNT(*) > 0 FROM inodes WHERE path = ? AND owner_id = ? AND id != ?",
+                    params![new_path, user_id, inode_id],
+                    |row| row.get(0)
+                ).map_err(|_| DatabaseError::RecallError)?;
+                
+                if new_exists {
+                    return Err(DatabaseError::ConflictError); // Path already occupied
+                }
+                
+                let rows_updated = match item_type {
+                    hopnet_common::InodeType::File => {
+                        // For files: simple path update
+                        tx.execute(
+                            "UPDATE inodes SET path = ? WHERE path = ? AND owner_id = ?",
+                            params![new_path, current_encrypted_path, user_id]
+                        ).map_err(|_| DatabaseError::ProcessingError)?
+                    }
+                    hopnet_common::InodeType::Folder => {
+                        // For folders: update the folder and all descendants
+                        // Use SQL string concatenation to update all child paths
+                        tx.execute(
+                            "UPDATE inodes 
+                             SET path = ? || substr(path, length(?) + 1)
+                             WHERE owner_id = ? 
+                               AND (path = ? OR path LIKE ?)",
+                            params![
+                                new_path,
+                                current_encrypted_path,
+                                user_id,
+                                current_encrypted_path,
+                                format!("{}/%", current_encrypted_path)
+                            ]
+                        ).map_err(|_| DatabaseError::ProcessingError)?
+                    }
+                };
+                
+                tracing::debug!("modify_item: Path change validation successful - {} row(s) would be updated", rows_updated);
+            }
+            
+            // Phase 4b: Handle content updates if new data is provided (works with or without path changes)
+            if let (Some(new_data_id), Some(data_record)) = (new_data_block_id, new_data_record) {
+                tracing::debug!("modify_item: Updating content for inode_id={} to new_data_id={}", inode_id, new_data_id);
+                
+                // Insert new data_block
+                tracing::debug!("modify_item: Inserting data_block with id={} hash={} file_size={} fragment_count={}", 
+                               data_record.id, data_record.data.hash.to_hex(), data_record.file_size, data_record.data.fragments.len());
+                tx.execute(
+                    "INSERT INTO data_blocks (id, file_hash, file_size, fragment_count, added_bytes, placement_height) VALUES (?, ?, ?, ?, ?, ?)",
+                    params![
+                        data_record.id,
+                        data_record.data.hash,
+                        data_record.file_size,
+                        data_record.data.fragments.len() as i32,
+                        data_record.data.added_bytes,
+                        None::<i32>  // placement_height is NULL initially, set during fragment placement
+                    ]
+                ).map_err(|e| {
+                    tracing::error!("modify_item: Failed to insert data_block id={}: {:?}", data_record.id, e);
+                    DatabaseError::InsertError
+                })?;
+                    
+                // Insert fragment hashes for the new data block
+                tracing::debug!("modify_item: Inserting {} fragment_hashes for data_block_id={}", data_record.data.fragments.len(), data_record.id);
+                for (i, fragment) in data_record.data.fragments.iter().enumerate() {
+                    tracing::debug!("modify_item: Inserting fragment_hash [{}/{}] index={} id={} hash={}", 
+                                    i + 1, data_record.data.fragments.len(), fragment.fragment_index, fragment.fragment_id, fragment.fragment_hash.to_hex());
+                    tx.execute(
+                        "INSERT INTO fragment_hashes (data_block_id, fragment_index, fragment_id, fragment_hash, chunk_type, stored_locally) VALUES (?, ?, ?, ?, ?, ?)",
+                        params![
+                            data_record.id,
+                            fragment.fragment_index,
+                            fragment.fragment_id,
+                            fragment.fragment_hash,
+                            fragment.chunk_type,
+                            fragment.stored_locally
+                        ]
+                    ).map_err(|e| {
+                        tracing::error!("modify_item: Failed to insert fragment_hash index={} id={}: {:?}", fragment.fragment_index, fragment.fragment_id, e);
+                        DatabaseError::InsertError
+                    })?;
+                }
+                
+                // Insert file access entries for the new data block
+                if let Some(ref file_access_entries) = data_record.file_access_entries {
+                    tracing::debug!("modify_item: Inserting {} file_access entries for data_block_id={}", file_access_entries.len(), data_record.id);
+                    for (i, access_entry) in file_access_entries.iter().enumerate() {
+                        tracing::debug!("modify_item: Inserting file_access [{}/{}] data_block_id={} user_id={}", 
+                                        i + 1, file_access_entries.len(), access_entry.data_block_id, access_entry.user_id);
+                        tx.execute(
+                            "INSERT INTO file_access (data_block_id, user_id, ephemeral_pubkey, encrypted_file_key) VALUES (?, ?, ?, ?)",
+                            params![access_entry.data_block_id, access_entry.user_id, access_entry.ephemeral_pubkey, access_entry.encrypted_file_key]
+                        ).map_err(|e| {
+                            tracing::error!("modify_item: Failed to insert file_access data_block_id={} user_id={}: {:?}", access_entry.data_block_id, access_entry.user_id, e);
+                            DatabaseError::InsertError
+                        })?;
+                    }
+                } else {
+                    tracing::debug!("modify_item: No file_access entries to insert for data_block_id={}", data_record.id);
+                }
+                
+                // Update inode to point to new data block (this changes the modification time via UUIDv7)
+                tracing::debug!("modify_item: Updating inode id={} to point to new data_id={} for user_id={}", inode_id, new_data_id, user_id);
+                let rows_updated = tx.execute(
+                    "UPDATE inodes SET data_id = ? WHERE id = ? AND owner_id = ?",
+                    params![new_data_id, inode_id, user_id]
+                ).map_err(|e| {
+                    tracing::error!("modify_item: Failed to update inode id={} data_id={} user_id={}: {:?}", inode_id, new_data_id, user_id, e);
+                    DatabaseError::ProcessingError
+                })?;
+                
+                tracing::debug!("modify_item: Updated {} inode rows to new data_id={}", rows_updated, new_data_id);
+                
+                tracing::info!("Updated content for inode_id={} to data_id={}", inode_id, new_data_id);
+            }
+            
+            // Phase 4a: Metadata-only changes don't update modification time
+            // The modification time comes from data_block.id UUIDv7 timestamp, which only changes with content
+            
+            // Log modification for FileProvider change tracking
+            let current_height = crate::db::consensus::get_current_consensus_height(&tx)?;
+            // For moves: pass old path and new path. For content updates: only new path (current location).
+            let old_path_ref = if new_encrypted_path.is_some() { Some(current_encrypted_path.as_str()) } else { None };
+            let new_path_ref = new_encrypted_path.as_deref().or(Some(current_encrypted_path.as_str()));
+            log_modification(&tx, inode_id.clone(), user_id, old_parent_id, old_path_ref, new_path_ref, current_height)?;
+            
+            if execute {
+                tx.commit().map_err(|_| DatabaseError::ProcessingError)?;
+                tracing::debug!("modify_item: Transaction committed successfully for inode_id={}", inode_id);
+            } else {
+                tx.rollback().map_err(|_| DatabaseError::ProcessingError)?;
+                tracing::debug!("modify_item: Transaction rolled back (dry run) for inode_id={}", inode_id);
+            }
+            
+            Ok(())
+        }
+        Err(_) => Err(DatabaseError::LockError)
     }
 }
 
@@ -512,4 +778,80 @@ pub fn get_local_fragment_count(
         }
         Err(_) => Err(DatabaseError::LockError)
     }
+}
+
+/// Extract all ancestor folder IDs from a path for modification tracking
+/// Returns list of ancestor folder IDs from immediate parent up to root
+/// Example: "/a/b/c/file.txt" returns IDs for ["/a/b/c", "/a/b", "/a"] if they exist
+fn get_all_ancestor_folders(tx: &Transaction, path: &str, owner_id: i32) -> Result<Vec<CustomUUID>, DatabaseError> {
+    let mut stmt = tx.prepare(
+        "SELECT id FROM inodes 
+         WHERE owner_id = ? AND type = 'folder' AND ? LIKE path || '/%'
+         ORDER BY LENGTH(path) DESC"
+    ).map_err(|_| DatabaseError::ProcessingError)?;
+    
+    let rows = stmt.query_map(params![owner_id, path], |row| {
+        row.get::<_, CustomUUID>(0)
+    }).map_err(|_| DatabaseError::ProcessingError)?;
+    
+    let ancestors: Result<Vec<_>, _> = rows.collect();
+    ancestors.map_err(|_| DatabaseError::ProcessingError)
+}
+
+/// Extract parent folder's inode_id from a path
+/// Returns None for root level items or if parent folder doesn't exist
+fn get_parent_id(tx: &Transaction, path: &str, owner_id: i32) -> Result<Option<CustomUUID>, DatabaseError> {
+    let parent_path = match path.rfind('/') {
+        Some(idx) if idx > 1 => &path[..idx],  // Has parent (not root level)
+        _ => return Ok(None),  // Root level item, no parent
+    };
+    
+    match tx.query_row(
+        "SELECT id FROM inodes WHERE path = ? AND owner_id = ? AND type = 'folder'",
+        params![parent_path, owner_id],
+        |row| row.get::<_, CustomUUID>(0)
+    ) {
+        Ok(parent_id) => Ok(Some(parent_id)),
+        Err(duckdb::Error::QueryReturnedNoRows) => Ok(None),  // Parent folder doesn't exist
+        Err(e) => {
+            tracing::error!("Error looking up parent folder for path {}: {:?}", path, e);
+            Err(DatabaseError::ProcessingError)
+        }
+    }
+}
+
+/// Log a modification to the modification_log for FileProvider change tracking
+/// Automatically logs all ancestor folders to ensure proper modification time cascading
+pub fn log_modification(
+    tx: &Transaction,
+    inode_id: CustomUUID,
+    owner_id: i32,
+    old_parent_id: Option<CustomUUID>,  // Parent BEFORE modification (None for new items)
+    old_path: Option<&str>,  // Path BEFORE modification (for moves/deletes)
+    new_path: Option<&str>,  // Path AFTER modification (for inserts/moves)
+    modification_height: i32,
+) -> Result<(), DatabaseError> {
+    // Log the primary item modification
+    tx.execute(
+        "INSERT OR IGNORE INTO modification_log (inode_id, owner_id, old_parent_id, modified_at_height) VALUES (?, ?, ?, ?)",
+        params![inode_id, owner_id, old_parent_id, modification_height]
+    ).map_err(|e| {
+        tracing::error!("Failed to log modification for inode_id {} at height {}: {:?}", 
+                       inode_id, modification_height, e);
+        DatabaseError::ProcessingError
+    })?;
+    
+    // Log ancestor folders for old path (for deletes/moves)
+    if let Some(old) = old_path {
+        log_ancestor_modifications(tx, old, owner_id, modification_height)?;
+    }
+    
+    // Log ancestor folders for new path (for inserts/moves)
+    if let Some(new) = new_path {
+        log_ancestor_modifications(tx, new, owner_id, modification_height)?;
+    }
+    
+    tracing::debug!("Logged modification for inode_id {} with old_parent_id {:?} at height {}", 
+                   inode_id, old_parent_id, modification_height);
+    Ok(())
 }

@@ -256,10 +256,13 @@ pub fn get_validators_elect(
 pub fn insert_block(
     db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     block: &Block,
+    set_prepared: bool,
 ) -> Result<(), DatabaseError> {
     match db_connection {
         Ok(mut db_lock) => {
             let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
+            
+            // Insert the block
             tx.execute(
                 "INSERT INTO blocks (block_hash, height, view_number, parent_hash, transactions) VALUES (?, ?, ?, ?, ?)",
                 params![
@@ -270,6 +273,20 @@ pub fn insert_block(
                     block.data.transactions
                 ]
             ).map_err(|_| DatabaseError::InsertError)?;
+            
+            // Optionally set prepared_block_hash to mark consensus in progress
+            if set_prepared {
+                tx.execute(
+                    "UPDATE this_node SET prepared_block_hash = ? WHERE internal_id = 1",
+                    params![block.block_hash]
+                ).map_err(|_| DatabaseError::InsertError)?;
+                
+                tracing::debug!(
+                    "Set prepared_block_hash to {:?} (height: {}, view: {})",
+                    block.block_hash, block.data.height, block.data.view_number
+                );
+            }
+            
             tx.commit().map_err(|_| DatabaseError::InsertError)?;
             Ok(())
         }
@@ -380,51 +397,74 @@ pub fn insert_qc(
 ) -> Result<(), DatabaseError> {
     match db_connection {
         Ok(mut db_lock) => {
-            let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
-            tracing::debug!("Starting QC insertion transaction");
+            // Retry logic for write-write conflicts
+            const MAX_RETRIES: u32 = 3;
+            let mut retry_count = 0;
             
-            // Insert the QC into quorum_certificates table
-            tx.execute(
-                "INSERT INTO quorum_certificates (view_number, phase, block_hash, proposer_signature, voter_signatures) VALUES (?, ?, ?, ?, ?)",
-                params![
-                    qc.view_number,
-                    qc.phase,
-                    qc.block_hash,
-                    qc.proposer_signature,
-                    qc.voter_signatures,
-                ]
-            ).map_err(|_| DatabaseError::InsertError)?;
-            
-            // Update this_node table based on QC's phase and view
-            match qc.phase {
-                ConsensusPhase::Propose => {
-                    // If QC phase is propose, change to lock
-                    tx.execute(
-                        "UPDATE this_node SET highest_qc_block_hash = ?, current_phase = 'lock' WHERE internal_id = 1",
-                        params![qc.block_hash]
-                    ).map_err(|_| DatabaseError::InsertError)?;
-                    tracing::info!("Updated consensus state: propose -> lock phase for view {}", qc.view_number);
+            loop {
+                let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
+                
+                // Insert the QC into quorum_certificates table
+                tx.execute(
+                    "INSERT INTO quorum_certificates (view_number, phase, block_hash, proposer_signature, voter_signatures) VALUES (?, ?, ?, ?, ?)",
+                    params![
+                        qc.view_number,
+                        qc.phase,
+                        qc.block_hash,
+                        qc.proposer_signature,
+                        qc.voter_signatures,
+                    ]
+                ).map_err(|_| DatabaseError::InsertError)?;
+                
+                // Update this_node table based on QC's phase and view
+                match qc.phase {
+                    ConsensusPhase::Propose => {
+                        // If QC phase is propose, change to lock and set prepared_block_hash
+                        tx.execute(
+                            "UPDATE this_node SET highest_qc_block_hash = ?, current_phase = 'lock', prepared_block_hash = ? WHERE internal_id = 1",
+                            params![qc.block_hash, qc.block_hash]
+                        ).map_err(|_| DatabaseError::InsertError)?;
+                        tracing::info!("Updated consensus state: propose -> lock phase for view {}, set prepared_block_hash", qc.view_number);
+                    }
+                    ConsensusPhase::Lock => {
+                        // If QC phase is lock, change to propose, set current_view to QC view + 1,
+                        // commit the block, and clear prepared_block_hash (consensus completed)
+                        tx.execute(
+                            "UPDATE this_node SET highest_qc_block_hash = ?, committed_block_hash = ?, current_phase = 'propose', current_view = ?, prepared_block_hash = NULL WHERE internal_id = 1",
+                            params![qc.block_hash, qc.block_hash, qc.view_number + 1]
+                        ).map_err(|_| DatabaseError::InsertError)?;
+                        tracing::info!(
+                            "Updated consensus state: lock -> propose, view {} -> {}, committed block {:?}, cleared prepared_block_hash",
+                            qc.view_number, qc.view_number + 1, qc.block_hash
+                        );
+                    }
                 }
-                ConsensusPhase::Lock => {
-                    // If QC phase is lock, change to propose, set current_view to QC view + 1,
-                    // and commit the block (set committed_block_hash = highest_qc_block_hash)
-                    tx.execute(
-                        "UPDATE this_node SET highest_qc_block_hash = ?, committed_block_hash = ?, current_phase = 'propose', current_view = ? WHERE internal_id = 1",
-                        params![qc.block_hash, qc.block_hash, qc.view_number + 1]
-                    ).map_err(|_| DatabaseError::InsertError)?;
-                    tracing::info!(
-                        "Updated consensus state: lock -> propose, view {} -> {}, committed block {:?}",
-                        qc.view_number, qc.view_number + 1, qc.block_hash
-                    );
+                
+                match tx.commit() {
+                    Ok(_) => {
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        let error_msg = format!("{:?}", e);
+                        if error_msg.contains("write-write conflict") && retry_count < MAX_RETRIES - 1 {
+                            retry_count += 1;
+                            let delay_ms = 10 * (2_u64.pow(retry_count - 1)); // Exponential backoff: 10ms, 20ms, 40ms
+                            tracing::warn!(
+                                "Write-write conflict on QC insertion (view: {}, phase: {:?}), retrying in {}ms (attempt {}/{})",
+                                qc.view_number, qc.phase, delay_ms, retry_count + 1, MAX_RETRIES
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                            continue;
+                        } else {
+                            tracing::error!(
+                                "Failed to commit QC insertion transaction (view: {}, phase: {:?}) after {} attempts: {:?}",
+                                qc.view_number, qc.phase, retry_count + 1, e
+                            );
+                            return Err(DatabaseError::InsertError);
+                        }
+                    }
                 }
             }
-            
-            tx.commit().map_err(|_| DatabaseError::InsertError)?;
-            tracing::debug!(
-                "QC successfully inserted for view {} phase {:?}",
-                qc.view_number, qc.phase
-            );
-            Ok(())
         }
         Err(_) => Err(DatabaseError::LockError)
     }
@@ -605,4 +645,19 @@ pub fn get_view_consensus_data(
         }
         Err(_) => Err(DatabaseError::LockError)
     }
+}
+
+/// Get the current consensus height (height of the committed block)
+/// This is used consistently across the system for modification tracking
+pub fn get_current_consensus_height(tx: &duckdb::Transaction) -> Result<i32, DatabaseError> {
+    let current_height: i32 = tx.query_row(
+        "SELECT COALESCE(b.height, 0) as committed_height
+         FROM this_node t
+         LEFT JOIN blocks b ON t.committed_block_hash = b.block_hash
+         WHERE t.internal_id = 1",
+        [],
+        |row| row.get(0)
+    ).map_err(|_| DatabaseError::RecallError)?;
+    
+    Ok(current_height)
 }

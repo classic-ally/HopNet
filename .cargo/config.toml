@@ -1,0 +1,5 @@
+# Cargo configuration for HopNet project
+
+[alias]
+# Run FileProvider integration tests with clean output
+test-fileprovider = "test --quiet fileprovider_integration --test fileprovider_integration -- --nocapture"

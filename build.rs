@@ -30,38 +30,48 @@ fn main() {
     // Run npm install if node_modules doesn't exist
     if !frontend_dir.join("node_modules").exists() {
         println!("cargo:warning=Installing frontend dependencies...");
-        let output = Command::new("npm")
+        match Command::new("npm")
             .args(&["install"])
             .current_dir(&frontend_dir)
-            .output()
-            .expect("Failed to run npm install - make sure npm is installed and available in PATH");
-            
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            panic!("npm install failed:\nSTDOUT: {}\nSTDERR: {}", stdout, stderr);
+            .output() {
+            Ok(output) => {
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    panic!("npm install failed:\nSTDOUT: {}\nSTDERR: {}", stdout, stderr);
+                }
+                println!("cargo:warning=Frontend dependencies installed successfully");
+            }
+            Err(e) => {
+                println!("cargo:warning=npm install failed: {} - skipping frontend build", e);
+                println!("cargo:warning=To build frontend, install Node.js/npm or use pre-built dist");
+            }
         }
-        println!("cargo:warning=Frontend dependencies installed successfully");
     }
     
     // Run npm run build
     println!("cargo:warning=Building frontend with Vite...");
-    let output = Command::new("npm")
+    match Command::new("npm")
         .args(&["run", "build"])
         .current_dir(&frontend_dir)
-        .output()
-        .expect("Failed to run npm run build - make sure npm is installed and available in PATH");
-        
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        panic!("npm run build failed:\nSTDOUT: {}\nSTDERR: {}", stdout, stderr);
+        .output() {
+        Ok(output) => {
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                panic!("npm run build failed:\nSTDOUT: {}\nSTDERR: {}", stdout, stderr);
+            }
+        }
+        Err(e) => {
+            println!("cargo:warning=npm run build failed: {} - skipping frontend build", e);
+            println!("cargo:warning=To build frontend, install Node.js/npm or use pre-built dist");
+        }
     }
     
     // Verify that the dist directory was created
     let dist_dir = frontend_dir.join("dist");
     if !dist_dir.exists() {
-        panic!("Frontend build completed but dist directory was not created at: {}", dist_dir.display());
+        panic!("Frontend dist directory not found at: {} - either build frontend with npm or provide pre-built dist", dist_dir.display());
     }
     
     println!("cargo:warning=Frontend build completed successfully");

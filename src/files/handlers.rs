@@ -31,6 +31,20 @@ impl TransactionHandler for InsertFilesHandler {
                 
                 // Insert the files into the database with execute flag
                 insert_files(state.db_pool.get(), inodes, execute)?;
+                
+                // Signal FileProvider to refresh when files are actually inserted (execute=true)
+                if execute {
+                    #[cfg(target_os = "macos")]
+                    {
+                        let test_mode = state.test_mode;
+                        tokio::spawn(async move {
+                            if let Err(e) = crate::fileprovider::domain::signal_fileprovider_refresh(test_mode).await {
+                                tracing::warn!("Failed to signal FileProvider refresh after file insertion: {}", e);
+                            }
+                        });
+                    }
+                }
+                
                 Ok(())
             },
             Err(_) => Err(DatabaseError::InvalidPayload),
@@ -120,6 +134,86 @@ inventory::submit! {
     &DeleteOrphanedDataBlocksHandler as &dyn TransactionHandler
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ModifyItemPayload {
+    pub user_id: i32,
+    pub inode_id: crate::db::CustomUUID,  // Stable inode identifier
+    pub new_encrypted_path: Option<String>,  // New path if renaming/moving
+    // Phase 4b: Content update fields
+    pub new_data_block_id: Option<crate::db::CustomUUID>,  // New content version
+    pub new_data_record: Option<crate::db::DataRecord>,    // Fragment info for new version
+}
+
+pub struct ModifyItemHandler;
+
+impl TransactionHandler for ModifyItemHandler {
+    fn name(&self) -> &'static str { "modify_item" }
+
+    fn process(&self, state: &AppState, payload: &[u8], execute: bool) -> HandlerResult {
+        match bincode::serde::decode_from_slice::<ModifyItemPayload, _>(payload, bincode::config::standard()) {
+            Ok((mut payload_data, _)) => {
+                tracing::debug!("ModifyItemHandler processing: inode_id={} user_id={} execute={} new_encrypted_path={:?}", 
+                    payload_data.inode_id, payload_data.user_id, execute, payload_data.new_encrypted_path);
+                
+                // Validate fragments exist locally and update stored_locally flags (like InsertFilesHandler)
+                if let Some(ref mut data_record) = payload_data.new_data_record {
+                    for fragment in &mut data_record.data.fragments {
+                        // Check if fragment exists and is valid on this node
+                        fragment.stored_locally = fragment_exists_and_valid(
+                            &state.fragments_dir, 
+                            &fragment.fragment_hash
+                        );
+                    }
+                }
+                
+                match crate::db::files::modify_item(
+                    state.db_pool.get(),
+                    payload_data.user_id,
+                    payload_data.inode_id.clone(),
+                    payload_data.new_encrypted_path.clone(),
+                    payload_data.new_data_block_id.clone(),
+                    payload_data.new_data_record.clone(),
+                    execute
+                ) {
+                    Ok(()) => {
+                        tracing::debug!("modify_item succeeded for inode_id={} user_id={} execute={}", 
+                            payload_data.inode_id, payload_data.user_id, execute);
+                    },
+                    Err(e) => {
+                        tracing::error!("modify_item failed for inode_id={} user_id={} execute={} error={:?}", 
+                            payload_data.inode_id, payload_data.user_id, execute, e);
+                        return Err(e);
+                    }
+                }
+                
+                if execute {
+                    tracing::info!("Modified item at path for user {}", payload_data.user_id);
+                    
+                    // Signal FileProvider to refresh when item is actually modified
+                    #[cfg(target_os = "macos")]
+                    {
+                        let test_mode = state.test_mode;
+                        tokio::spawn(async move {
+                            if let Err(e) = crate::fileprovider::domain::signal_fileprovider_refresh(test_mode).await {
+                                tracing::warn!("Failed to signal FileProvider refresh after item modification: {}", e);
+                            }
+                        });
+                    }
+                } else {
+                    tracing::debug!("Validation passed: item exists for modification for user {}", payload_data.user_id);
+                }
+                
+                Ok(())
+            },
+            Err(_) => Err(DatabaseError::InvalidPayload),
+        }
+    }
+}
+
+inventory::submit! {
+    &ModifyItemHandler as &dyn TransactionHandler
+}
+
 pub struct DeleteFilesHandler;
 
 impl TransactionHandler for DeleteFilesHandler {
@@ -137,6 +231,17 @@ impl TransactionHandler for DeleteFilesHandler {
                 
                 if execute {
                     tracing::info!("Deleted files at path for user {}", payload_data.user_id);
+                    
+                    // Signal FileProvider to refresh when files are actually deleted
+                    #[cfg(target_os = "macos")]
+                    {
+                        let test_mode = state.test_mode;
+                        tokio::spawn(async move {
+                            if let Err(e) = crate::fileprovider::domain::signal_fileprovider_refresh(test_mode).await {
+                                tracing::warn!("Failed to signal FileProvider refresh after file deletion: {}", e);
+                            }
+                        });
+                    }
                 } else {
                     tracing::debug!("Validation passed: files exist for deletion for user {}", payload_data.user_id);
                 }

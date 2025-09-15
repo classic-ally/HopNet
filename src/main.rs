@@ -1,6 +1,6 @@
 use aes_siv::{siv::Aes256Siv, Key, Nonce};
 use axum::{
-    extract::DefaultBodyLimit, http::{HeaderValue, Method, StatusCode}, middleware, routing::{get,post,put,delete}, serve, Router
+    extract::DefaultBodyLimit, http::{HeaderValue, Method, StatusCode}, middleware, routing::{get,post,put,patch,delete}, serve, Router
 };
 use jsonwebtoken::{DecodingKey, EncodingKey};
 use tower_serve_static::ServeDir;
@@ -27,6 +27,7 @@ mod consensus;
 mod types;
 mod handlers;
 mod files;
+mod fileprovider;
 
 static ASSETS_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/frontend/dist");
 
@@ -79,6 +80,9 @@ pub struct AppState {
     timeout_vote_collector: Arc<consensus::functions::TimeoutVoteCollector>,
     throughput_result_collector: Arc<metrics::functions::ThroughputResultCollector>,
     last_observed_view: Arc<std::sync::atomic::AtomicI32>,
+    fileprovider_api_key: String,
+    port: u16,
+    test_mode: bool,
 }
 
 impl AppState {
@@ -130,18 +134,48 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
     let admin_service = ServeDir::new(&ASSETS_DIR);
 
-    // port selection by system
+    // port selection by system and mode
     let mut port = 34632;
     let os = std::env::consts::OS;
     if os == "linux" {
         port = port + 1;
         tracing::info!("Running on Linux on port {}", port);
     }
+    
+    // Use dedicated test port in debug mode to avoid collisions
+    if cfg!(debug_assertions) {
+        port = 34634;
+        tracing::info!("Running in test mode on dedicated port {}", port);
+    }
 
     let bindurl = format!("0.0.0.0:{}", port);
 
     let (encodingkey, decodingkey) = auth::generate_jwt_key();
     let (privatekey, publickey) = consensus::functions::generate_ed25519_key();
+    
+    // Check if FileProvider API key already exists in keychain (release builds only)
+    let fileprovider_api_key = {
+        #[cfg(all(target_os = "macos", not(debug_assertions)))]
+        {
+            // Only try to load from keychain in release builds to avoid permission prompts in development/CI
+            match fileprovider::keychain::load_config(fileprovider::keychain::KeychainEnvironment::Production) {
+                Ok(existing_config) => {
+                    tracing::info!("Using existing FileProvider API key from keychain");
+                    existing_config.api_key
+                }
+                Err(e) => {
+                    tracing::info!("No existing FileProvider API key found ({}), generating new one", e);
+                    auth::generate_fileprovider_api_key()
+                }
+            }
+        }
+        #[cfg(any(not(target_os = "macos"), debug_assertions))]
+        {
+            // Always generate fresh API key in debug builds or non-macOS to avoid keychain prompts
+            tracing::info!("Generating fresh FileProvider API key (debug build or non-macOS)");
+            auth::generate_fileprovider_api_key()
+        }
+    };
 
     // Create database connection pool
     // Unwrapping since unsuccessful means failed startup anyway
@@ -176,7 +210,54 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 timeout_vote_collector: Arc::new(consensus::functions::TimeoutVoteCollector::new()),
                 throughput_result_collector: Arc::new(metrics::functions::ThroughputResultCollector::new()),
                 last_observed_view: Arc::new(std::sync::atomic::AtomicI32::new(-1)),
+                fileprovider_api_key: fileprovider_api_key.clone(),
+                port,
+                test_mode: cfg!(debug_assertions), // Enable test routes in debug builds only
             };
+            
+            tracing::info!("FileProvider API key: {}", fileprovider_api_key);
+            
+            // Warn about test mode being enabled
+            if cfg!(debug_assertions) {
+                tracing::warn!("⚠️  TEST MODE ENABLED: Test endpoints are exposed and will return API credentials");
+                tracing::warn!("⚠️  This is a SECURITY RISK in production - test mode is automatically disabled in release builds");
+            }
+
+            // Store FileProvider configuration in keychain for Swift extension (release builds only)
+            #[cfg(all(target_os = "macos", not(debug_assertions)))]
+            {
+                let base_url = format!("http://localhost:{}", port);
+                let keychain_config = fileprovider::keychain::FileProviderConfig::new(
+                    fileprovider_api_key.clone(),
+                    base_url,
+                );
+                
+                if let Err(e) = fileprovider::keychain::store_config(&keychain_config, fileprovider::keychain::KeychainEnvironment::Production) {
+                    tracing::warn!("Failed to store FileProvider configuration in keychain: {}", e);
+                } else {
+                    tracing::info!("FileProvider configuration stored/updated in keychain");
+                }
+            }
+            
+            #[cfg(all(target_os = "macos", debug_assertions))]
+            {
+                tracing::info!("Skipping keychain storage in debug build - use environment variables or run release build for keychain support");
+            }
+
+            // Initialize FileProvider on startup - only cleans up if app is uninitialized (release builds only)
+            #[cfg(all(target_os = "macos", not(debug_assertions)))]
+            {
+                if let Err(e) = fileprovider::domain::initialize_fileprovider_on_startup(&app_state).await {
+                    tracing::warn!("Failed to initialize FileProvider on startup: {}", e);
+                } else {
+                    tracing::info!("FileProvider startup initialization completed");
+                }
+            }
+            
+            #[cfg(all(target_os = "macos", debug_assertions))]
+            {
+                tracing::info!("Skipping FileProvider domain initialization in debug build - testing API endpoints only");
+            }
 
             // Start timeout detection worker with randomized cron schedule (every minute at random second)
             use rand::Rng;
@@ -235,6 +316,19 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/rpc/storage-server", get(metrics::routes::get_storage_server))
                 .layer(middleware::from_fn_with_state(app_state.clone(), consensus::routes::jwt_or_rpc_auth_middleware));
 
+            // FileProvider routes with scoped authentication (all routes require auth)
+            let fileprovider_routes = Router::new()
+                .route("/health", get(fileprovider::routes::get_health))
+                .route("/enumerate", get(fileprovider::routes::get_enumerate))
+                .route("/changes", get(fileprovider::routes::get_changes))
+                .route("/delete", delete(fileprovider::routes::delete_item))
+                .route("/download", get(fileprovider::routes::download_file))
+                .route("/item", get(fileprovider::routes::get_item))
+                .route("/create", post(fileprovider::routes::create_item))
+                .route("/modify", patch(fileprovider::routes::modify_item))
+                .layer(DefaultBodyLimit::max(5000*1_000_000)) // 5GB limit for file uploads
+                .layer(middleware::from_fn_with_state(app_state.clone(), fileprovider::auth::fileprovider_auth_middleware));
+
             // RPC routes for inter-node communication with dual signature authentication
             let rpc_routes = Router::new()
                 .route("/consensus/propose", post(consensus::routes::post_propose))
@@ -260,6 +354,15 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .layer(middleware::from_fn_with_state(app_state.clone(), consensus::routes::ensure_caught_up_middleware))
                 .layer(axum::Extension(consensus::routes::CatchUpStrictness::Lenient));
 
+            // Test routes - only available in test mode
+            let test_routes = if app_state.test_mode {
+                Router::new()
+                    .route("/integrations/fileprovider/test", get(fileprovider::routes::get_test))
+                    .route("/integrations/fileprovider/test/signals", get(fileprovider::routes::get_test_signals))
+            } else {
+                Router::new() // Empty router when not in test mode
+            };
+
             let base_app = Router::new()
                 .fallback_service(admin_service) // routes we don't have get sent to vite frontend
                 .merge(protected_routes)
@@ -267,6 +370,8 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .merge(rpc_routes)
                 .merge(strict_consensus_routes)
                 .merge(lenient_consensus_routes)
+                .nest("/integrations/fileprovider", fileprovider_routes)
+                .merge(test_routes)
                 .route("/setup", get(setup::get_setup))
                 .route("/setup", post(setup::post_setup))
                 .route("/setup", put(setup::put_setup))

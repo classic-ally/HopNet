@@ -187,10 +187,10 @@ impl Ballot {
     }
 
     pub fn sign(&self, app_state: &AppState) -> Result<VoteSignMessage, VoteError> {
-        let me = db::get_me(app_state.db_pool.get()).map_err(|_| VoteError::DatabaseError)?;
-        let signature = self.data.sign(&me.privkey).map_err(|_| VoteError::ProcessingError)?;
+        let node_id = app_state.get_node_id().map_err(|_| VoteError::DatabaseError)?;
+        let signature = self.data.sign(&app_state.private_key).map_err(|_| VoteError::ProcessingError)?;
         Ok(VoteSignMessage{
-            replica_id: me.node_id,
+            replica_id: node_id,
             signature: signature
         })
     }
@@ -653,8 +653,8 @@ impl Block {
                     transactions: Some(Transactions(transactions))
                 };
                 let new_block = Block::new(tip_data)?;
-                // add it to DB
-                match db::insert_block(app_state.db_pool.get(), &new_block) {
+                // add it to DB and set prepared_block_hash atomically
+                match db::insert_block(app_state.db_pool.get(), &new_block, true) {
                     Ok(()) => Ok(new_block),
                     Err(_) => Err(BlockError::DatabaseError)
                 }
