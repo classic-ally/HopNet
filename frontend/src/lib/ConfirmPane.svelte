@@ -2,6 +2,7 @@
     import SetupPane from './SetupPane.svelte';
     import Button from "./Button.svelte";
     import EntryRow from './EntryRow.svelte';
+    import { API_BASE_URL } from './stores';
 
     interface Props {
         username?: string;
@@ -34,7 +35,7 @@
                 port: 34632 // Default port from main.rs
             };
 
-            const response = await fetch('http://localhost:34632/setup', {
+            const response = await fetch(`${API_BASE_URL}/setup`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',

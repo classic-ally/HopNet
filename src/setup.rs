@@ -45,6 +45,7 @@ pub struct SyncSetupObject {
     pub fragment_hashes: Vec<FragmentHash>,
     pub file_access_entries: Vec<crate::db::types::FileAccess>,
     pub inodes: Vec<Inode>,
+    pub takeouts: Vec<crate::db::takeout::TakeoutPayload>,
     pub yournode: ThisNode,
     pub user_privkey: PrivKey
 }

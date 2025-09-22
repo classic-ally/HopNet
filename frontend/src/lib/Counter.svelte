@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { API_BASE_URL } from './stores';
+
   let ip: string = $state('');
   let isSubmitDisabled = $state(true);
 
@@ -10,7 +12,7 @@
     if (!ip) return;
 
     // Make a fetch request to the specified endpoint
-    fetch(`http://localhost:34632/rpc/get-remote-latency?ip=${encodeURIComponent(ip)}`)
+    fetch(`${API_BASE_URL}/rpc/get-remote-latency?ip=${encodeURIComponent(ip)}`)
       .then(response => {
         if (!response.ok) throw new Error('Network response was not ok');
         return response.json(); // assuming the endpoint returns JSON

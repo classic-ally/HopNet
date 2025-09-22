@@ -261,7 +261,7 @@ pub async fn get_placement_scores(
     }
 }
 
-async fn calculate_storage_usage(fragments_dir: &str) -> Result<StorageResponse, Box<dyn std::error::Error>> {
+pub async fn calculate_storage_usage(fragments_dir: &str) -> Result<StorageResponse, Box<dyn std::error::Error>> {
     use tokio::task;
     
     let fragments_dir_owned = fragments_dir.to_string();

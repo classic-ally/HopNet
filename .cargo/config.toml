@@ -1,5 +1,10 @@
 # Cargo configuration for HopNet project
 
 [alias]
-# Run FileProvider integration tests with clean output
+# Run FileProvider integration tests with clean output and correct Swift SDK
 test-fileprovider = "test --quiet fileprovider_integration --test fileprovider_integration -- --nocapture"
+
+[env]
+# Force use of system SDK instead of Nix SDK for Swift compilation
+DEVELOPER_DIR = "/Applications/Xcode.app/Contents/Developer"
+SDKROOT = "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"

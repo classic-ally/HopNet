@@ -28,6 +28,7 @@ mod types;
 mod handlers;
 mod files;
 mod fileprovider;
+mod takeout;
 
 static ASSETS_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/frontend/dist");
 
@@ -291,6 +292,23 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 metrics_worker.run().await;
             });
 
+            // Start takeout maintenance worker with randomized 4-6 hour schedule
+            let random_second = rand::rng().random_range(5..55);
+            let random_minute = rand::rng().random_range(0..60);
+            let random_hour_offset = rand::rng().random_range(4..7); // 4-6 hours
+            let takeout_cron_expression = format!("{} {} */{} * * *", random_second, random_minute, random_hour_offset);
+            let takeout_schedule = apalis_cron::Schedule::from_str(&takeout_cron_expression).unwrap();
+            let takeout_cron_stream = apalis_cron::CronStream::new(takeout_schedule);
+
+            let takeout_worker = WorkerBuilder::new("takeout-maintenance")
+                .data(app_state.clone())
+                .backend(takeout_cron_stream)
+                .build_fn(takeout::jobs::handle_takeout_maintenance);
+
+            tokio::spawn(async move {
+                takeout_worker.run().await;
+            });
+
             // Protected routes that require authentication
             let protected_routes = Router::new()
                 .route("/users", get(users::routes::get_users))
@@ -304,10 +322,12 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/fragments", get(files::routes::get_fragments_count))
                 .route("/maintenance/cleanup-orphaned", post(files::routes::post_cleanup_orphaned_data_blocks))
                 .route("/maintenance/rebalance", post(files::routes::post_rebalance_network))
+                .route("/maintenance/takeout", post(takeout::routes::post_takeout_maintenance))
                 .route("/validators", get(consensus::routes::get_validators))
                 .route("/metrics", get(metrics::routes::get_metrics))
                 .route("/metrics/trigger", get(metrics::routes::get_metrics_trigger))
                 .route("/metrics/scores", get(metrics::routes::get_placement_scores))
+                .nest("/takeout", takeout::takeout_routes())
                 .layer(middleware::from_fn_with_state(app_state.clone(), auth::auth_middleware));
 
             // Routes that accept either JWT (users) or RPC (nodes) authentication

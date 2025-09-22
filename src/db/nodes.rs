@@ -267,6 +267,23 @@ pub async fn get_sync_dump(
             let file_access_entries: Vec<crate::db::types::FileAccess> = rows_file_access.collect::<Result<Vec<crate::db::types::FileAccess>, _>>()
                 .map_err(|_| DatabaseError::ProcessingError)?;
 
+            tracing::debug!("Fetching takeouts for database dump");
+            let mut stmt_takeouts = tx.prepare(
+                "SELECT id, user_id, owner_node_id, status, expires_at, consensus_height FROM takeouts"
+            ).map_err(|_| DatabaseError::RecallError)?;
+            let rows_takeouts = stmt_takeouts.query_map([], |row| {
+                Ok(crate::db::takeout::TakeoutPayload {
+                    takeout_id: row.get(0)?,
+                    user_id: row.get(1)?,
+                    owner_node_id: row.get(2)?,
+                    status: row.get(3)?,
+                    expires_at: row.get(4)?,
+                    consensus_height: row.get(5)?,
+                })
+            }).map_err(|_| DatabaseError::RecallError)?;
+            let takeouts: Vec<crate::db::takeout::TakeoutPayload> = rows_takeouts.collect::<Result<Vec<crate::db::takeout::TakeoutPayload>, _>>()
+                .map_err(|_| DatabaseError::ProcessingError)?;
+
             tracing::debug!("Database dump completed successfully");
 
             // All data is already current since consensus has run
@@ -289,6 +306,7 @@ pub async fn get_sync_dump(
                 fragment_hashes: fragment_hashes,
                 file_access_entries: file_access_entries,
                 inodes: inodes,
+                takeouts: takeouts,
                 yournode: ThisNode {
                     node_id: node.node_id,
                     current_phase: current_phase,

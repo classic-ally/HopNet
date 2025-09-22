@@ -2,14 +2,14 @@
     import Button from './Button.svelte';
     import EntryRow from './EntryRow.svelte';
     import SetupPane from './SetupPane.svelte';
-    import { tokenStore } from './stores';
+    import { tokenStore, API_BASE_URL } from './stores';
 
     export let username = '';
     export let password = '';
 
     async function handleLogin() {
         try {
-            const response = await fetch('http://localhost:34632/login', {
+            const response = await fetch(`${API_BASE_URL}/login`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',

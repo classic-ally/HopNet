@@ -40,6 +40,11 @@ echo "🔄 Running typeshare..."
 if [ $? -eq 0 ]; then
     echo "✅ Swift types generated successfully"
     echo "📄 Output: $OUTPUT_FILE"
+
+    # Remove TakeoutRecord from Swift types (not needed for FileProvider)
+    echo "🔧 Removing TakeoutRecord from Swift types..."
+    sed -i '' '/^\/\/\/ Takeout record for user data export requests$/,/^}$/d' "$OUTPUT_FILE"
+    echo "✅ TakeoutRecord removed from Swift types"
 else
     echo "❌ Failed to generate Swift types"
     exit 1

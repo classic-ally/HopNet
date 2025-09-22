@@ -1,4 +1,4 @@
-# Typeshare configuration for generating Swift types
+# Typeshare configuration for generating Swift and TypeScript types
 
 [swift]
 # Output directory for generated Swift files
@@ -9,8 +9,21 @@ swift_file = "apple/HopNetFileProvider/Sources/HopNetFileProviderExtension/Gener
 # Use camelCase for Swift property names
 rename_all = "camelCase"
 
+[typescript]
+# Output directory for generated TypeScript files
+typescript_file = "frontend/src/lib/types.ts"
+
+# TypeScript type substitutions
+[typescript.type_mappings]
+"DateTime<chrono::Utc>" = "string"
+"chrono::DateTime<chrono::Utc>" = "string"
+
 # Optional: Specify which Rust crates to process
 [[targets]]
 target = "swift"
 # Process types from the common crate
+input_path = "common/src/"
+
+[[targets]]
+target = "typescript"
 input_path = "common/src/"
