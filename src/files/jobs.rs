@@ -30,6 +30,22 @@ pub async fn handle_orphaned_data_block_cleanup(job: TaskId, ctx: Data<AppState>
 pub async fn run_orphaned_data_block_cleanup(app_state: &AppState, batch_size: i32, retention_days: i64) -> Result<usize, Error> {
     tracing::info!("Starting orphaned data block cleanup");
     
+    // Pre-flight check: Ensure no active takeouts are in progress
+    match crate::db::takeout::has_active_takeout(app_state.db_pool.get(), None) {
+        Ok(true) => {
+            let error_msg = "Cannot run orphaned data cleanup: active takeout(s) in progress. Wait for takeouts to expire or complete before running cleanup.";
+            tracing::warn!("{}", error_msg);
+            return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(std::io::ErrorKind::Other, error_msg)))));
+        }
+        Ok(false) => {
+            tracing::info!("Pre-flight check passed: no active takeouts found");
+        }
+        Err(e) => {
+            tracing::error!("Failed to check for active takeouts before cleanup: {:?}", e);
+            return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Failed to check active takeouts")))));
+        }
+    }
+    
     // Get node ID for availability classification
     let node_id = match app_state.get_node_id() {
         Ok(id) => id,

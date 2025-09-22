@@ -274,6 +274,17 @@ pub fn put_join_setup(
                 ).map_err(|_| DatabaseError::InsertError)?;
             }
 
+            tracing::debug!("Inserting {} takeouts", setupobj.takeouts.len());
+            for takeout in setupobj.takeouts {
+                tx.execute(
+                    "INSERT INTO takeouts (id, user_id, owner_node_id, status, expires_at, consensus_height) VALUES (?, ?, ?, ?, ?, ?)",
+                    params![takeout.takeout_id, takeout.user_id, takeout.owner_node_id, takeout.status, takeout.expires_at, takeout.consensus_height]
+                ).map_err(|e| {
+                    tracing::error!("Failed to insert takeout {}: {:?}", takeout.takeout_id, e);
+                    DatabaseError::InsertError
+                })?;
+            }
+            
             tracing::debug!("Inserting this_node configuration for node_id={}, view={}, phase={:?}", 
                           setupobj.yournode.node_id, setupobj.yournode.current_view, setupobj.yournode.current_phase);
             tx.execute(

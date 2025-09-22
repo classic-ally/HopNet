@@ -235,7 +235,24 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
             -- Index for efficient queries: what was modified for user X since height Y?
             CREATE INDEX idx_modification_log_height ON modification_log (owner_id, modified_at_height);
 
+            -- User data takeout tracking (consensus-tracked for network-wide coordination)
+            CREATE TABLE takeouts (
+                id UUID PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(user_id),
+                owner_node_id INTEGER NOT NULL,         -- Node that owns and processes this takeout
+                status ENUM('pending', 'materializing', 'ready', 'expired', 'cancelled') NOT NULL DEFAULT 'pending',
+                expires_at TIMESTAMP NOT NULL,
+                consensus_height INTEGER NOT NULL
+            );
+
+            -- Index for efficient lookups of active takeouts and cleanup
+            CREATE INDEX idx_takeouts_user_status ON takeouts (user_id, status);
+            CREATE INDEX idx_takeouts_expires ON takeouts (expires_at);
+            CREATE INDEX idx_takeouts_owner_node ON takeouts (owner_node_id);
+
             -- Add comments for documentation
+            COMMENT ON TABLE takeouts IS 'Consensus-tracked table for coordinating user data export requests network-wide with 24-hour validity';
+            COMMENT ON COLUMN takeouts.owner_node_id IS 'Node ID that owns this takeout and performs the processing work';
             COMMENT ON TABLE modification_log IS 'Local-only table for tracking all file modifications to support FileProvider incremental sync (NOT consensus tracked)';
             COMMENT ON TABLE metrics IS 'Network performance metrics between distributed system nodes';
             COMMENT ON COLUMN metrics.rtt_latency IS 'Round-trip time latency in milliseconds';

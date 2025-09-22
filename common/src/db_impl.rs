@@ -3,7 +3,7 @@
 
 use duckdb::types::{ToSql, ToSqlOutput, FromSql, FromSqlResult, ValueRef, FromSqlError, EnumType};
 use duckdb::arrow::array::StringArray;
-use super::InodeType;
+use super::{InodeType, TakeoutStatus};
 
 /// Helper function to extract string value from DuckDB enum
 fn extract_enum_string(enum_type: EnumType<'_>, row_idx: usize) -> Result<String, FromSqlError> {
@@ -46,6 +46,37 @@ impl FromSql for InodeType {
             match enum_value.as_str() {
                 "file" => Ok(InodeType::File),
                 "folder" => Ok(InodeType::Folder),
+                _ => Err(FromSqlError::InvalidType),
+            }
+        } else {
+            Err(FromSqlError::InvalidType)
+        }
+    }
+}
+
+impl ToSql for TakeoutStatus {
+    fn to_sql(&self) -> Result<ToSqlOutput<'_>, duckdb::Error> {
+        let status_str = match self {
+            TakeoutStatus::Pending => "pending",
+            TakeoutStatus::Materializing => "materializing",
+            TakeoutStatus::Ready => "ready",
+            TakeoutStatus::Expired => "expired",
+            TakeoutStatus::Cancelled => "cancelled",
+        };
+        return Ok(status_str.into())
+    }
+}
+
+impl FromSql for TakeoutStatus {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        if let ValueRef::Enum(enum_type, row_idx) = value {
+            let enum_value = extract_enum_string(enum_type, row_idx)?;
+            match enum_value.as_str() {
+                "pending" => Ok(TakeoutStatus::Pending),
+                "materializing" => Ok(TakeoutStatus::Materializing),
+                "ready" => Ok(TakeoutStatus::Ready),
+                "expired" => Ok(TakeoutStatus::Expired),
+                "cancelled" => Ok(TakeoutStatus::Cancelled),
                 _ => Err(FromSqlError::InvalidType),
             }
         } else {

@@ -8,6 +8,7 @@ pub mod placement;
 pub mod distribution;
 pub mod discovery;
 pub mod jobs;
+pub mod download;
 
 #[cfg(test)]
 mod tests;

@@ -1,6 +1,6 @@
 <script lang="ts">
     import { TableHandler, ThSort, ThFilter, Th, Datatable } from '@vincjo/datatables'
-    import { tokenStore } from '../stores'
+    import { tokenStore, API_BASE_URL } from '../stores'
     import { onMount } from 'svelte'
 
     interface Node {
@@ -32,7 +32,7 @@
                 return
             }
 
-            const response = await fetch('http://localhost:34632/nodes', {
+            const response = await fetch(`${API_BASE_URL}/nodes`, {
                 method: 'GET',
                 headers: {
                     'Authorization': `Bearer ${token}`,

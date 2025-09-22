@@ -232,57 +232,17 @@ pub async fn get_file_fragments(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     
-    // Get file access data from database
-    let file_access_data = match db::files::get_file_fragments(app_state.db_pool.get(), enc_path, user_id) {
-        Ok(data) => data,
-        Err(DatabaseError::RecallError) => return Err(StatusCode::NOT_FOUND),
-        Err(e) => {
-            tracing::error!("Error getting file fragments: {:?}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        }
-    };
-
-    // Extract placement_height before moving file_data
-    let placement_height = file_access_data.file_reassembly_data.placement_height;
-    
-    // Decrypt the per-file key if user has access
-    let mut file_data = file_access_data.file_reassembly_data;
-    if let Some(file_access_entry) = file_access_data.file_access_entry {
-        // Get user's private key from app_state
-        let user_private_key = match app_state.user_keys.get() {
-            Some(user_keys) => &user_keys.private_key,
-            None => return Err(StatusCode::INTERNAL_SERVER_ERROR),
-        };
-        
-        // Derive user's X25519 private key from app_state private key
-        let user_x25519_privkey = crate::auth::derive_x25519_privkey_from_user(user_private_key);
-        
-        // Decrypt the wrapped per-file key
-        match crate::auth::decrypt_wrapped_file_key(&file_access_entry, &user_x25519_privkey) {
-            Ok(per_file_key) => {
-                file_data.per_file_key = Some(per_file_key);
-            }
-            Err(e) => {
-                tracing::error!("Failed to decrypt file key: {:?}", e);
-                return Err(StatusCode::FORBIDDEN);
-            }
-        }
-    } else {
-        // User doesn't have access to this file
-        return Err(StatusCode::FORBIDDEN);
-    };
-    
-    // Reassemble the file from fragments with distributed discovery support
-    let file_contents = match functions::reassemble_file(
-        &app_state.fragments_dir, 
-        file_data,
-        Some(&app_state),
-        placement_height
+    // Use shared file reconstruction logic
+    let file_contents = match crate::files::download::reconstruct_file_for_user(
+        &app_state,
+        enc_path,
+        user_id,
+        &app_state.fragments_dir,
     ).await {
         Ok(contents) => contents,
         Err(e) => {
-            tracing::error!("Error reassembling file: {:?}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            tracing::error!("Error reconstructing file: {:?}", e);
+            return Err(StatusCode::from(e));
         }
     };
     

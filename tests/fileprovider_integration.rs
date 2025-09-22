@@ -438,13 +438,16 @@ async fn test_fileprovider_integration() -> Result<(), Box<dyn std::error::Error
 fn run_swift_command(executable: &str, test_case: &str) -> std::process::Output {
     Command::new("swift")
         .args(&[
-            "run", 
+            "run",
             "--package-path", "apple/HopNetFileProvider",
             executable,
             test_case
         ])
         .env("HOPNET_TEST_API_KEY", std::env::var("HOPNET_TEST_API_KEY").unwrap_or_default())
         .env("HOPNET_TEST_BACKEND_URL", std::env::var("HOPNET_TEST_BACKEND_URL").unwrap_or_default())
+        // Force use of system SDK instead of Nix SDK for Swift compilation
+        .env("DEVELOPER_DIR", "/Applications/Xcode.app/Contents/Developer")
+        .env("SDKROOT", "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk")
         .output()
         .expect("Failed to run Swift test")
 }

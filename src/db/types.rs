@@ -106,6 +106,12 @@ impl FromSql for CustomUUID {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CustomDateTime(DateTime<Utc>);
 
+impl CustomDateTime {
+    pub fn new(dt: DateTime<Utc>) -> Self {
+        CustomDateTime(dt)
+    }
+}
+
 impl Deref for CustomDateTime {
     type Target = DateTime<Utc>;
 

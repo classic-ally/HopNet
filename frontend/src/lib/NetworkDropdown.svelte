@@ -7,6 +7,7 @@
 
 <script lang="ts">
     import { onMount } from 'svelte';
+    import { API_BASE_URL } from './stores';
 
     interface NetworkInterface {
         name: string;
@@ -119,7 +120,7 @@
             loading = true;
             error = null;
             
-            const response = await fetch('http://localhost:34632/interfaces');
+            const response = await fetch(`${API_BASE_URL}/interfaces`);
             if (!response.ok) {
                 throw new Error(`HTTP error! status: ${response.status}`);
             }

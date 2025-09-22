@@ -145,7 +145,28 @@ Automated background processes ensuring network health and storage efficiency.
 - [ ] Fragment filesystem cleanup for orphaned files
 - [ ] Job coordination using node ID proximity to minimize duplicate work
 
-### 8. Apple FileProvider Integration ([RFC-009](specs/apple-fileprovider.md))
+### 8. User Data Takeout System ([RFC-010](specs/user-data-takeout.md))
+**Status**: Complete implementation with responsive frontend
+
+Consensus-coordinated user data export system enabling portable data extraction from the distributed network.
+
+- [x] Consensus-tracked takeout lifecycle management with network-wide coordination
+- [x] Rate limiting with one active takeout per user validation
+- [x] Event-driven file materialization with real-time progress tracking
+- [x] Streaming archive creation with tar.gz compression and encryption
+- [x] Fragment retention coordination preventing cleanup during active takeouts
+- [x] Automated maintenance jobs with batched consensus operations for expiration handling
+- [x] Complete REST API endpoints (initiate, list, download, delete, can-create status)
+- [x] Responsive frontend interface with selection-based bulk operations
+- [x] Auto-refresh functionality with intelligent pausing during user actions
+- [x] Account mode sidebar integration with proper UI state management
+- [x] TypeScript type generation with DateTime serialization support
+- [ ] **Future**: Incremental exports (changes since last takeout)
+- [ ] **Future**: Selective folder/file export capabilities
+- [ ] **Future**: Multiple archive format support (ZIP, 7z)
+- [ ] **Future**: WebSocket-based real-time progress updates
+
+### 9. Apple FileProvider Integration ([RFC-009](specs/apple-fileprovider.md))
 **Status**: Phase 4b Complete ✅ + Comprehensive Testing Framework ✅ - Full Read/Write Support with Unified Change Tracking
 
 Native macOS Finder and iOS Files app integration through Apple's FileProvider framework.
@@ -186,7 +207,7 @@ Native macOS Finder and iOS Files app integration through Apple's FileProvider f
 - [ ] Foundation for iOS thin client architecture
 - [ ] Thumbnail generation and Quick Look integration
 
-### 9. S3-Compatible API ([RFC-008](specs/s3-compatibility.md))
+### 10. S3-Compatible API ([RFC-008](specs/s3-compatibility.md))
 **Status**: Specification complete, implementation not started
 
 S3-compatible API layer enabling standard S3 clients and SDKs to interact with HopNet.

@@ -245,6 +245,13 @@ pub fn delete_orphaned_data_blocks_consensus(
                     DatabaseError::LockError
                 })?;
                 
+                // Additional validation: Check for non-expired takeouts before proceeding
+                // This prevents race conditions between pre-flight check and consensus execution
+                if crate::db::takeout::has_active_takeout_tx(&tx, None)? {
+                    tracing::error!("Validation failed: active takeout(s) in network prevent cleanup");
+                    return Err(DatabaseError::ConflictError);
+                }
+                
                 // Check if the data blocks exist and are truly orphaned
                 for data_block_id in &data_block_ids {
                     // Verify the data block exists
