@@ -144,7 +144,7 @@ pub fn process_takeout_creation(
                 tracing::debug!("Owner node creating temporary table: {}", temp_table_name);
                 
                 tx.execute_batch(&format!(
-                    "CREATE TEMPORARY TABLE {} (
+                    "CREATE TABLE IF NOT EXISTS {} (
                         id UUID NOT NULL,
                         path VARCHAR NOT NULL,
                         type ENUM('file', 'folder') NOT NULL,
@@ -153,7 +153,7 @@ pub fn process_takeout_creation(
                         error_message VARCHAR
                     )", temp_table_name
                 )).map_err(|e| {
-                    tracing::error!("Failed to create temporary table {}: {:?}", temp_table_name, e);
+                    tracing::error!("Failed to create table {}: {:?}", temp_table_name, e);
                     DatabaseError::InsertError
                 })?;
                 
@@ -615,6 +615,7 @@ pub fn process_takeout_status_update(
                     if current_node_id == owner_node_id {
                         let takeout_id = payload.takeout_id.clone();
                         let fragments_dir = state.fragments_dir.clone();
+                        let db_pool = state.db_pool.clone();
 
                         tracing::info!("Owner node triggering cleanup for takeout {} (status: {:?})",
                                       takeout_id, payload.new_status);
@@ -622,8 +623,10 @@ pub fn process_takeout_status_update(
                         // Spawn async task that doesn't block consensus
                         tokio::spawn(async move {
                             if let Err(e) = cleanup_expired_takeout_files(&takeout_id, &fragments_dir).await {
-                                tracing::error!("Failed to clean up takeout {}: {:?}", takeout_id, e);
-                                // Don't panic - fallback job will catch this later
+                                tracing::error!("Failed to clean up takeout files {}: {:?}", takeout_id, e);
+                            }
+                            if let Err(e) = cleanup_takeout_table(db_pool.get(), &takeout_id) {
+                                tracing::error!("Failed to clean up takeout table {}: {:?}", takeout_id, e);
                             }
                         });
                     } else {
@@ -951,6 +954,29 @@ async fn cleanup_expired_takeout_files(
 
     // Return success even if some cleanups failed - this is best effort
     Ok(())
+}
+
+/// Clean up database table associated with a takeout
+/// This drops the inode snapshot table created during takeout creation
+pub fn cleanup_takeout_table(
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    takeout_id: &CustomUUID,
+) -> Result<(), DatabaseError> {
+    match db_connection {
+        Ok(db_lock) => {
+            let temp_table_name = format!("takeout_inodes_{}", takeout_id.simple());
+
+            db_lock.execute(&format!("DROP TABLE IF EXISTS {}", temp_table_name), [])
+                .map_err(|e| {
+                    tracing::error!("Failed to drop table {}: {:?}", temp_table_name, e);
+                    DatabaseError::ProcessingError
+                })?;
+
+            tracing::debug!("Dropped takeout table: {}", temp_table_name);
+            Ok(())
+        }
+        Err(_) => Err(DatabaseError::LockError)
+    }
 }
 
 /// Get takeouts that are past their expiry time but not marked as Expired or Cancelled
