@@ -1,6 +1,7 @@
 use super::*;
 use aes_siv::{siv::Aes256Siv, Key, Nonce};
 use either::Either;
+use hopnet_common::FileItem;
 
 use crate::files::functions::decrypt_path;
 
@@ -33,27 +34,57 @@ pub fn get_files(
     path: String,
     key: &Key<Aes256Siv>,
     nonce: &Nonce
-) -> Result<Vec<Inode>, DatabaseError> {
+) -> Result<Vec<FileItem>, DatabaseError> {
     match db_connection {
         Ok(db_lock) => {
-            let mut stmt = db_lock.prepare("SELECT id, owner_id, path, type, data_id FROM inodes WHERE path LIKE ? AND path NOT LIKE ?").map_err(|_| DatabaseError::RecallError)?;
+            // Updated query to include data_blocks join for file_size and timestamps
+            let query = r#"
+                SELECT
+                    i.id,
+                    i.path,
+                    i.type,
+                    i.data_id,
+                    db.file_size,
+                    uuid_extract_timestamp(i.id) as creation_date,
+                    CASE
+                        WHEN i.data_id IS NOT NULL THEN uuid_extract_timestamp(i.data_id)
+                        ELSE NULL
+                    END as modification_date
+                FROM inodes i
+                LEFT JOIN data_blocks db ON i.data_id = db.id
+                WHERE i.path LIKE ? AND i.path NOT LIKE ?
+            "#;
+
+            let mut stmt = db_lock.prepare(query).map_err(|_| DatabaseError::RecallError)?;
             let like_path = format!("{}/%", path);
             let not_like_path = format!("{}/%", like_path);
-            tracing::debug!("Querying files with like_path: {}, not_like_path: {}", like_path, not_like_path);
-            let inodes = stmt.query_map(params![like_path, not_like_path], |row| {
-                let path = row.get(2)?;
-                let decrypted_path = decrypt_path(path, key, nonce)?;
-                let data_id: Option<CustomUUID> = row.get(4)?;
-                Ok(Inode {
-                    id: row.get(0)?,
-                    owner: Either::Left(row.get(1)?),
+            tracing::debug!("Querying files with metadata: like_path: {}, not_like_path: {}", like_path, not_like_path);
+
+            let files = stmt.query_map(params![like_path, not_like_path], |row| {
+                let id: CustomUUID = row.get(0)?;
+                let encrypted_path: String = row.get(1)?;
+                let decrypted_path = decrypt_path(encrypted_path, key, nonce)?;
+                let inode_type: hopnet_common::InodeType = row.get(2)?;
+                let _data_id: Option<CustomUUID> = row.get(3)?; // Not used in FileItem
+                let file_size: Option<u64> = row.get(4)?;
+                let creation_date: CustomDateTime = row.get(5)?;
+                let modification_date: Option<CustomDateTime> = row.get(6)?;
+
+                // Convert our internal CustomUUID to common module's CustomUUID
+                let common_uuid = hopnet_common::CustomUUID::from_str(&id.to_string())
+                    .map_err(|_| duckdb::Error::InvalidQuery)?;
+
+                Ok(FileItem {
+                    id: common_uuid,
                     path: decrypted_path,
-                    inode_type: row.get(3)?,
-                    data_id: data_id.map(Either::Left),
+                    inode_type,
+                    file_size,
+                    creation_date: *creation_date, // Dereference CustomDateTime to get DateTime<Utc>
+                    modification_date: modification_date.map(|dt| *dt), // Dereference if present
                 })
             }).map_err(|_| DatabaseError::ProcessingError)?;
-            
-            Ok(inodes.collect::<Result<Vec<_>, _>>().map_err(|_| DatabaseError::ProcessingError)?)
+
+            Ok(files.collect::<Result<Vec<_>, _>>().map_err(|_| DatabaseError::ProcessingError)?)
         }
         Err(e) => {
             tracing::error!("Database connection error in get_files: {:?}", e);

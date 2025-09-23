@@ -3,7 +3,8 @@
 
 use duckdb::types::{ToSql, ToSqlOutput, FromSql, FromSqlResult, ValueRef, FromSqlError, EnumType};
 use duckdb::arrow::array::StringArray;
-use super::{InodeType, TakeoutStatus};
+use super::{InodeType, TakeoutStatus, CustomUUID};
+use uuid::Uuid;
 
 /// Helper function to extract string value from DuckDB enum
 fn extract_enum_string(enum_type: EnumType<'_>, row_idx: usize) -> Result<String, FromSqlError> {
@@ -81,6 +82,37 @@ impl FromSql for TakeoutStatus {
             }
         } else {
             Err(FromSqlError::InvalidType)
+        }
+    }
+}
+
+/// Database implementations for CustomUUID
+impl ToSql for CustomUUID {
+    fn to_sql(&self) -> duckdb::Result<ToSqlOutput<'_>> {
+        let insert_string = self.to_string();
+        Ok(ToSqlOutput::from(insert_string))
+    }
+}
+
+impl FromSql for CustomUUID {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        match value {
+            ValueRef::Text(str) => {
+                match std::str::from_utf8(str) {
+                    Ok(utf_value) => {
+                        match Uuid::parse_str(utf_value) {
+                            Ok(_) => {
+                                // Use from_str to construct CustomUUID properly
+                                CustomUUID::from_str(utf_value)
+                                    .map_err(|_| FromSqlError::InvalidType)
+                            },
+                            Err(_) => Err(FromSqlError::InvalidType)
+                        }
+                    }
+                    Err(_) => Err(FromSqlError::InvalidType)
+                }
+            }
+            _ => Err(FromSqlError::InvalidType),
         }
     }
 }

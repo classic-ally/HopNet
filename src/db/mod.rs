@@ -5,6 +5,9 @@ pub use {
     crate::types::*
 };
 
+// Re-export CustomUUID from common module for backward compatibility
+pub use hopnet_common::CustomUUID;
+
 pub mod shared;
 pub mod users;
 pub mod consensus;

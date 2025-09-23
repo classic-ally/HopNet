@@ -19,12 +19,12 @@ pub struct MyNode {
 use chrono::{DateTime, Utc};
 use either::Either;
 use serde::{Serialize, Deserialize};
-use uuid::{Timestamp, Uuid};
 use duckdb::types::{ToSql, ToSqlOutput, FromSql, FromSqlResult, ValueRef, FromSqlError, EnumType};
 use duckdb::arrow::array::StringArray;
 use x25519_dalek::{PublicKey as X25519PublicKey, EphemeralSecret};
 use chacha20poly1305::{ChaCha20Poly1305, aead::{Aead, OsRng, KeyInit}};
 use duckdb::DuckdbConnectionManager;
+pub use hopnet_common::CustomUUID;
 
 /// Helper function to extract string value from DuckDB enum
 pub fn extract_enum_string(enum_type: EnumType<'_>, row_idx: usize) -> Result<String, FromSqlError> {
@@ -48,59 +48,6 @@ pub fn extract_enum_string(enum_type: EnumType<'_>, row_idx: usize) -> Result<St
     
     // Get the actual string value
     Ok(dict_values.value(dict_key).to_string())
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
-pub struct CustomUUID(Uuid);
-
-impl CustomUUID{
-    pub fn new(timestamp: Option<&Timestamp>) -> CustomUUID {
-        match timestamp {
-            Some(timestamp) => {return CustomUUID(Uuid::new_v7(*timestamp))},
-            None => {return CustomUUID(Uuid::now_v7())}
-        }
-    }
-    
-    pub fn from_str(uuid_str: &str) -> Result<CustomUUID, uuid::Error> {
-        match Uuid::parse_str(uuid_str) {
-            Ok(uuid) => Ok(CustomUUID(uuid)),
-            Err(e) => Err(e),
-        }
-    }
-}
-
-impl Deref for CustomUUID {
-    type Target = Uuid;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl ToSql for CustomUUID {
-    fn to_sql(&self) -> duckdb::Result<ToSqlOutput<'_>> {
-        let insert_string = self.to_string();
-        Ok(ToSqlOutput::from(insert_string))
-    }
-}
-
-impl FromSql for CustomUUID {
-    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
-        match value {
-            ValueRef::Text(str) => {
-                match std::str::from_utf8(str) {
-                    Ok(utf_value) => {
-                        match Uuid::parse_str(utf_value) {
-                            Ok(data) => Ok(CustomUUID(data)),
-                            Err(_) => Err(duckdb::types::FromSqlError::InvalidType)
-                        }
-                    }
-                    Err(_) => Err(FromSqlError::InvalidType)
-                }
-            }
-            _ => Err(FromSqlError::InvalidType),
-        }
-    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -355,10 +302,4 @@ pub struct FragmentHash {
     pub fragment_hash: Blake3Hash,      // Hash of encrypted chunk for storage verification
     pub chunk_type: ChunkType,
     pub stored_locally: bool,
-}
-
-impl std::fmt::Display for CustomUUID {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
 }
