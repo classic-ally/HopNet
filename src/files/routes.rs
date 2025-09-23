@@ -12,6 +12,7 @@ use reqwest::StatusCode;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::OsRng};
 
 use crate::{db::{self, Blake3Hash, Data, DataRecord, DatabaseError, FragmentHash, Inode}, files::functions::{calculate_chunk_padding, calculate_encrypted_chunk_length, calculate_optimal_chunks, encrypt_chunk, encrypt_part, encrypt_path, store_fragment}};
+use hopnet_common::FileItem;
 use serde::{Deserialize, Serialize};
 
 use super::*;
@@ -198,7 +199,7 @@ pub struct FileFragmentsResponse {
 pub async fn get_files(
     State(app_state): State<AppState>,
     Query(params): Query<GetQueryParams>
-) -> Result<Json<Vec<Inode>>, StatusCode> {
+) -> Result<Json<Vec<FileItem>>, StatusCode> {
     // let's encrypt the path so we can search for it
     let enc_path = encrypt_path(params.path, app_state.get_siv_key()?, app_state.get_siv_nonce()?).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     match db::files::get_files(app_state.db_pool.get(), enc_path, app_state.get_siv_key()?, app_state.get_siv_nonce()?) {

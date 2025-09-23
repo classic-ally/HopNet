@@ -8,5 +8,5 @@ pub mod setup;
 pub mod db_impl;
 
 // Re-export commonly used types at the top level
-pub use db::{InodeType, TakeoutStatus, TakeoutRecord};
+pub use db::{InodeType, TakeoutStatus, TakeoutRecord, CustomUUID, FileItem};
 pub use fileprovider::{HealthStatus, HealthResponse, FileProviderItem, EnumerateResponse, DeleteItemRequest, ChangesResponse, ChangesQuery};

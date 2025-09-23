@@ -2,42 +2,43 @@
     import { TableHandler, ThSort, ThFilter, Th, Datatable } from '@vincjo/datatables'
     import { tokenStore, API_BASE_URL, currentPathStore, refreshTriggerStore } from '../stores'
     import { onMount } from 'svelte'
-
-    interface FileItem {
-        owner: {
-            Left: number;
-        };
-        path: string;
-        inode_type: "File" | "Folder";
-        data_id: any;
-    }
+    import type { FileItem } from '../types'
+    import { InodeType } from '../types'
+    import { formatFileSize, getFileIcon, formatDateForContainer, getFileName } from '../utils/formatters'
+    import { tableColumns, fileBrowserColumns } from '../utils/tableColumns'
+    import FilePreview from './FilePreview.svelte'
 
     let files: FileItem[] = []
     let loading = true
     let error = ''
     let currentPath = '/'
     let pathHistory: string[] = ['/'] // Track navigation history
+    let showPreview = false
+    let previewFile: FileItem | null = null
+    let previewFileIndex = 0
+    let fileOnlyList: FileItem[] = []
+    let showSearchBar = false
 
     // Subscribe to current path store
     $: currentPath = $currentPathStore
 
+    // Auto-adjust pagination based on directory size
+    $: shouldPaginate = files.length > 300
+    $: rowsPerPage = shouldPaginate ? 50 : files.length || 1
+
+    // Update table when pagination setting changes
+    $: if (table && rowsPerPage) {
+        table.rowsPerPage = rowsPerPage
+        table.setPage(1)
+    }
+
     const table = new TableHandler(files, {
-        rowsPerPage: 50,
+        rowsPerPage: rowsPerPage,
         selectBy: 'path',
     })
     const search = table.createSearch()
 
-    // Extract filename from full path
-    function getFileName(fullPath: string): string {
-        if (fullPath === '/') return '/'
-        const segments = fullPath.split('/').filter(segment => segment.length > 0)
-        return segments[segments.length - 1] || '/'
-    }
 
-    // Get icon based on file type
-    function getFileIcon(inodeType: "File" | "Folder"): string {
-        return inodeType === "Folder" ? "i-carbon-folder" : "i-carbon-document"
-    }
 
     async function fetchFiles(path: string = '/') {
         try {
@@ -80,13 +81,22 @@
     }
 
     async function handleItemClick(item: FileItem) {
-        if (item.inode_type === "Folder") {
+        if (item.inode_type === InodeType.Folder) {
             // Navigate into the folder
             pathHistory.push(currentPath)
+            // Clear search when navigating to a new folder
+            search.value = ''
+            search.set()
             fetchFiles(item.path)
-        } else if (item.inode_type === "File") {
-            // Download the file
-            await downloadFile(item)
+        } else if (item.inode_type === InodeType.File) {
+            // Find the index of this file in the file-only list (respects sorting/filtering)
+            const fileRows = table.rows.filter(row => row.inode_type === InodeType.File)
+            const fileIndex = fileRows.findIndex(row => row.path === item.path)
+            if (fileIndex !== -1) {
+                previewFileIndex = fileIndex
+                previewFile = item
+                showPreview = true
+            }
         }
     }
 
@@ -149,6 +159,9 @@
         if (pathHistory.length > 1) {
             pathHistory.pop() // Remove current path
             const previousPath = pathHistory[pathHistory.length - 1]
+            // Clear search when navigating
+            search.value = ''
+            search.set()
             fetchFiles(previousPath)
         }
     }
@@ -160,14 +173,79 @@
             segments.pop() // Remove the last segment
             const parentPath = segments.length > 0 ? '/' + segments.join('/') : '/'
             pathHistory.push(currentPath) // Add current to history
+            // Clear search when navigating
+            search.value = ''
+            search.set()
             fetchFiles(parentPath)
         }
     }
 
     function navigateToRoot() {
         pathHistory = ['/']
+        // Clear search when navigating
+        search.value = ''
+        search.set()
         fetchFiles('/')
     }
+
+    function toggleSearchBar() {
+        showSearchBar = !showSearchBar
+        if (!showSearchBar) {
+            // Clear search when closing search bar
+            search.value = ''
+            search.set()
+        }
+    }
+
+    function navigateToPath(targetPath: string) {
+        if (targetPath !== currentPath) {
+            pathHistory.push(currentPath)
+            // Clear search when navigating
+            search.value = ''
+            search.set()
+            fetchFiles(targetPath)
+        }
+    }
+
+    // Parse current path into clickable breadcrumb segments
+    $: pathSegments = (() => {
+        if (currentPath === '/') {
+            return []
+        }
+
+        const segments = currentPath.split('/').filter(segment => segment.length > 0)
+        const breadcrumbs = []
+
+        let buildPath = ''
+        for (const segment of segments) {
+            buildPath += '/' + segment
+            breadcrumbs.push({
+                name: segment,
+                path: buildPath
+            })
+        }
+
+        return breadcrumbs
+    })()
+
+    function closePreview() {
+        showPreview = false
+        previewFile = null
+        previewFileIndex = 0
+    }
+
+    function handlePreviewNavigation(newIndex: number) {
+        // Get only files from the table rows (filter out folders)
+        const fileRows = table.rows.filter(row => row.inode_type === InodeType.File)
+
+        if (newIndex >= 0 && newIndex < fileRows.length && fileRows[newIndex] && !loading) {
+            previewFileIndex = newIndex
+            previewFile = fileRows[newIndex]
+        }
+    }
+
+    // Get file-only list for preview navigation (use table.rows to respect sorting/filtering)
+    $: fileOnlyList = table.rows ? table.rows.filter(row => row.inode_type === InodeType.File) : files.filter(row => row.inode_type === InodeType.File)
 
     onMount(() => {
         fetchFiles()
@@ -189,7 +267,7 @@
     <p class="text-sm text-muted">{files.length} {files.length === 1 ? 'item' : 'items'} in this folder</p>
 </div>
 
-<div class="border-solid border-1 rounded-lg p-1 border-overlay1 max-w-[800px]">
+<div class="border-solid border-1 rounded-lg p-1 border-overlay1">
     {#if error}
         <div class="text-red p-2 mb-2 border border-red rounded">
             {error}
@@ -203,49 +281,65 @@
     {/if}
     
     <!-- Navigation breadcrumb -->
-    <div class="flex items-center gap-2 p-2 border-b border-overlay0 mb-2">
-        <button
-            class="border-1 border-overlay1 text-muted border-solid rounded-md p-1 cursor-pointer bg-transparent hover:text-primary hover:border-mauve hover:bg-surface0 disabled:opacity-50 disabled:cursor-not-allowed"
-            onclick={navigateToRoot}
-            aria-label="Navigate to root"
-            disabled={loading || currentPath === '/'}
-        >
-            <div class="i-carbon-home w-4 h-4"></div>
-        </button>
-        {#if currentPath !== '/'}
+    <div class="flex items-center justify-between gap-2 p-2 border-b border-overlay0">
+        <div class="flex items-center gap-2">
             <button
                 class="border-1 border-overlay1 text-muted border-solid rounded-md p-1 cursor-pointer bg-transparent hover:text-primary hover:border-mauve hover:bg-surface0 disabled:opacity-50 disabled:cursor-not-allowed"
-                onclick={navigateUp}
-                aria-label="Navigate up a folder"
+                onclick={toggleSearchBar}
+                aria-label={showSearchBar ? "Close search" : "Open search"}
                 disabled={loading}
             >
-                <div class="i-carbon-chevron-up w-4 h-4"></div>
+                <div class="{showSearchBar ? 'i-carbon-close' : 'i-carbon-search'} w-4 h-4"></div>
             </button>
+            {#if !showSearchBar}
+                <button
+                    class="border-1 border-overlay1 text-muted border-solid rounded-md p-1 cursor-pointer bg-transparent hover:text-primary hover:border-mauve hover:bg-surface0 disabled:opacity-50 disabled:cursor-not-allowed"
+                    onclick={navigateToRoot}
+                    aria-label="Navigate to root"
+                    disabled={loading || currentPath === '/'}
+                >
+                    <div class="i-carbon-home w-4 h-4"></div>
+                </button>
+            {/if}
+            {#if !showSearchBar}
+                {#if currentPath !== '/'}
+                    <button
+                        class="border-1 border-overlay1 text-muted border-solid rounded-md p-1 cursor-pointer bg-transparent hover:text-primary hover:border-mauve hover:bg-surface0 disabled:opacity-50 disabled:cursor-not-allowed"
+                        onclick={navigateUp}
+                        aria-label="Navigate up a folder"
+                        disabled={loading}
+                    >
+                        <div class="i-carbon-chevron-up w-4 h-4"></div>
+                    </button>
+                {/if}
+                <span class="text-subtitle text-sm font-mono">{#if currentPath === '/'}<span class="text-primary">/</span>{:else}{#each pathSegments as segment, i}<span class="text-muted">/</span>{#if i === pathSegments.length - 1}<span class="text-primary">{segment.name}</span>{:else}<span class="text-blue hover:text-primary hover:underline cursor-pointer transition-colors" onclick={() => navigateToPath(segment.path)}>{segment.name}</span>{/if}{/each}{/if}</span>
+            {:else}
+                <!-- Search input when search bar is open -->
+                <input
+                    class="flex-1 bg-transparent text-primary border-overlay0 border-2 border-solid rounded-md p-1"
+                    type="text"
+                    placeholder="Search in {currentPath}"
+                    bind:value={search.value}
+                    oninput={() => search.set()}
+                    disabled={loading}
+                    autofocus
+                >
+            {/if}
+        </div>
+
+        <!-- Pagination selector on the right -->
+        {#if shouldPaginate}
+            <select
+                class="p-1 border-overlay0 border-2 border-solid rounded-md bg-transparent text-primary text-sm"
+                bind:value={table.rowsPerPage}
+                onchange={() => table.setPage(1)}
+                disabled={loading}
+            >
+                {#each [10, 25, 50, 100] as option}
+                    <option value={option}>{option} items</option>
+                {/each}
+            </select>
         {/if}
-        <span class="text-subtitle text-sm font-mono">{currentPath}</span>
-    </div>
-    
-    <div class="flex gap-1">
-        <!-- Search bar -->
-        <input
-            class="w-full bg-transparent text-primary border-overlay0 border-2 border-solid rounded-md p-1"
-            type="text"
-            placeholder="Search files and folders"
-            bind:value={search.value}
-            oninput={() => search.set()}
-            disabled={loading}
-        >
-        <!-- Selector of qty -->
-        <select
-            class="p-1 border-overlay0 border-2 border-solid rounded-md bg-transparent text-primary"
-            bind:value={table.rowsPerPage}
-            onchange={() => table.setPage(1)}
-            disabled={loading}
-        >
-            {#each [10, 25, 50, 100] as option}
-                <option value={option}>{option} items</option>
-            {/each}
-        </select>
     </div>
     
     {#if loading}
@@ -253,28 +347,49 @@
             Loading files...
         </div>
     {:else}
+        <div class="table-wrapper">
         <Datatable {table}>
-            <table>
+            <table use:tableColumns={fileBrowserColumns} class="browse-table">
                 <thead>
                     <tr class="text-subtitle">
                         <ThSort {table} field="inode_type">Type</ThSort>
                         <ThSort {table} field="path">Name</ThSort>
+                        <ThSort {table} field="file_size">Size</ThSort>
+                        <ThSort {table} field="creation_date">Created</ThSort>
+                        <ThSort {table} field="modification_date">Modified</ThSort>
                     </tr>
                 </thead>
                 <tbody>
                     {#each table.rows as row}
+                        {@const createdFormats = formatDateForContainer(row.creation_date)}
+                        {@const modFormats = row.modification_date ? formatDateForContainer(row.modification_date) : null}
                         <tr
                             class="text-left cursor-pointer hover:bg-surface0"
                             onclick={() => handleItemClick(row)}
                         >
                             <td class="w-8">
-                                <div class="{getFileIcon(row.inode_type)} w-4 h-4 text-muted"></div>
+                                <div class="{getFileIcon(row.inode_type === InodeType.Folder ? 'Folder' : 'File', getFileName(row.path), 'list')} w-4 h-4 text-muted"></div>
                             </td>
                             <td>{getFileName(row.path)}</td>
+                            <td class="text-sm text-muted text-right font-mono">{formatFileSize(row.file_size)}</td>
+                            <td class="date-cell text-sm text-muted">
+                                <span class="date-full">{createdFormats.full}</span>
+                                <span class="date-time">{createdFormats.dateTime}</span>
+                                <span class="date-only">{createdFormats.dateOnly}</span>
+                            </td>
+                            <td class="date-cell text-sm text-muted">
+                                {#if modFormats}
+                                    <span class="date-full">{modFormats.full}</span>
+                                    <span class="date-time">{modFormats.dateTime}</span>
+                                    <span class="date-only">{modFormats.dateOnly}</span>
+                                {:else}
+                                    -
+                                {/if}
+                            </td>
                         </tr>
                     {:else}
                         <tr>
-                            <td colspan="3" class="text-center text-muted p-4">
+                            <td colspan="6" class="text-center text-muted p-4">
                                 {currentPath === '/' ? 'No files or folders found' : 'This folder is empty'}
                             </td>
                         </tr>
@@ -282,10 +397,74 @@
                 </tbody>
             </table>
         </Datatable>
+        </div>
     {/if}
 </div>
 
+<!-- Preview Modal -->
+{#if showPreview && previewFile}
+    <FilePreview
+        file={previewFile}
+        fileList={fileOnlyList}
+        currentIndex={previewFileIndex}
+        onClose={closePreview}
+        onNavigate={handlePreviewNavigation}
+    />
+{/if}
+
 <style>
+    /* Scrollable table wrapper */
+    .table-wrapper {
+        overflow-x: auto;
+        overflow-y: visible;
+    }
+
+    /* Fixed table layout - required for precise column control */
+    .browse-table {
+        table-layout: fixed;
+        width: 100%;
+        /* min-width is set dynamically by tableColumns action */
+    }
+
+    /* Handle text overflow in all columns */
+    .browse-table td {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    /* Hide text in type column header but keep sorting functionality */
+    .browse-table :global(th:nth-child(1)) {
+        text-indent: -9999px;
+        overflow: hidden;
+        position: relative;
+        text-align: center;
+    }
+
+    /* Center the sorting arrows in the type column, compensating for their left padding */
+    .browse-table :global(th:nth-child(1) > *) {
+        position: relative;
+        left: 50%;
+        transform: translateX(calc(-50% - 4px)); /* Shift back by half their padding */
+        padding-left: 0 !important; /* Remove the left padding entirely */
+    }
+
+    /* Responsive padding for table cells - use !important to override Datatable defaults */
+    :global(.padding-normal) td,
+    :global(.padding-normal) :global(th) {
+        padding: 8px 12px !important;
+    }
+
+    :global(.padding-compact) td,
+    :global(.padding-compact) :global(th) {
+        padding: 6px 8px !important;
+    }
+
+    :global(.padding-mini) td,
+    :global(.padding-mini) :global(th) {
+        padding: 4px 4px !important;
+    }
+
     tbody tr:hover {
         background-color: #313244 !important; /* surface0 */
     }
@@ -297,6 +476,32 @@
     /* Footer text */
     :global(aside) {
         color: #bac2de !important; /* subtitle */
+    }
+
+    /* Responsive date formatting */
+    :global(.date-cell .date-only),
+    :global(.date-cell .date-time) {
+        display: none;
+    }
+    :global(.date-cell .date-full) {
+        display: inline;
+    }
+
+    /* Compact: show date+time, hide full timestamp */
+    :global(.date-compact .date-cell .date-full) {
+        display: none;
+    }
+    :global(.date-compact .date-cell .date-time) {
+        display: inline;
+    }
+
+    /* Mini: show date only */
+    :global(.date-mini .date-cell .date-full),
+    :global(.date-mini .date-cell .date-time) {
+        display: none;
+    }
+    :global(.date-mini .date-cell .date-only) {
+        display: inline;
     }
     
     :global(td) {
@@ -316,3 +521,4 @@
         background-color: #45475a !important; /* surface1 - slightly more emphasis for folders */
     }
 </style>
+
