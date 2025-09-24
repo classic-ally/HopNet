@@ -59,14 +59,19 @@ pub async fn post_users (
     // Encode user with bincode::serde standard config
     match bincode::serde::encode_to_vec(&user, bincode::config::standard()) {
         Ok(encoded_user) => {
-            let transaction = Transaction {
-                function: "insert_user".to_string(),
-                payload: encoded_user,
+            let transaction = match crate::consensus::functions::create_signed_user_transaction(
+                &app_state,
+                "insert_user".to_string(),
+                encoded_user,
+                user_id,
+            ) {
+                Ok(tx) => tx,
+                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
             };
             let transactions = vec![transaction];
 
             // quorum middleware test
-            match consensus_middleware(&app_state, transactions, user_id).await {
+            match consensus_middleware(&app_state, transactions).await {
                 Ok(()) => StatusCode::CREATED,
                 Err(_) => StatusCode::INTERNAL_SERVER_ERROR
             }

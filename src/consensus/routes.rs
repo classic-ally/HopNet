@@ -35,12 +35,9 @@ use axum::middleware::{self, Next};
 use axum::http::Request;
 use axum::body::Body;
 
-// Authenticated user information passed to routes
 #[derive(Clone, Debug)]
-pub struct AuthenticatedUser {
-    pub user_id: i32,
+pub struct AuthenticatedNode {
     pub node_id: i32,
-    pub user_owns_node: bool,
 }
 
 // route to get the consensus status
@@ -68,12 +65,8 @@ pub async fn get_validators(
 pub async fn get_view_consensus_data(
     State(app_state): State<AppState>,
     Path(view): Path<i32>,
-    Extension(auth): Extension<AuthenticatedUser>,
+    Extension(auth): Extension<AuthenticatedNode>,
 ) -> impl IntoResponse {
-    // Only allow node owners to request view data for catch-up operations
-    if !auth.user_owns_node {
-        return StatusCode::FORBIDDEN.into_response();
-    }
     
     match db::get_view_consensus_data(app_state.db_pool.get(), view) {
         Ok(view_data) => (StatusCode::OK, Json(view_data)).into_response(),
@@ -286,7 +279,7 @@ pub async fn post_qc(
                                     "Lock phase QC committed for view {}, processing transactions",
                                     qc.view_number
                                 );
-                                crate::consensus::functions::process_transactions(&block.data.transactions, &app_state);
+                                let _ = crate::consensus::functions::process_transactions(&block.data.transactions, &app_state, true);
                             }
                             StatusCode::OK
                         },
@@ -464,25 +457,20 @@ async fn fetch_view(
     app_state: &AppState,
 ) -> Result<ViewConsensusData, ConsensusError> {
     let my_node_id = app_state.get_node_id().map_err(|_| ConsensusError::DatabaseError)?;
-    let user_id = app_state.get_user_id().map_err(|_| ConsensusError::DatabaseError)?;
-    let user_keys = app_state.get_user_keys().map_err(|_| ConsensusError::DatabaseError)?;
-    
+
     // Sign empty body for GET request authentication
     let body = b"";
     let node_signature = app_state.private_key.try_sign(body).map_err(|_| ConsensusError::SigningError)?;
-    let user_signature = user_keys.private_key.try_sign(body).map_err(|_| ConsensusError::SigningError)?;
-    
+
     let client = reqwest::Client::new();
     let url = format!("http://{}:{}/consensus/view/{}", validator.ip_address, validator.port, view);
-    
+
     tracing::debug!("Fetching view {} data from validator {}", view, validator.node_id);
-    
+
     let response = client
         .get(&url)
         .header("X-Node-ID", my_node_id.to_string())
-        .header("X-User-ID", user_id.to_string())
         .header("X-Node-Signature", hex::encode(node_signature.to_bytes()))
-        .header("X-User-Signature", hex::encode(user_signature.to_bytes()))
         .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
@@ -577,7 +565,7 @@ async fn integrate_view(
                                     "Lock phase QC committed for view {}, processing transactions",
                                     lock_qc.view_number
                                 );
-                                crate::consensus::functions::process_transactions(&block.data.transactions, app_state);
+                                let _ = crate::consensus::functions::process_transactions(&block.data.transactions, app_state, true);
                             }
                         }
                         Err(_) => {
@@ -762,7 +750,7 @@ pub async fn jwt_or_rpc_auth_middleware(
     rpc_auth_middleware(State(app_state), req, next).await.into_response()
 }
 
-// RPC middleware for verifying dual Ed25519 signatures (node + user) on inter-node requests
+// RPC middleware for verifying node Ed25519 signatures on inter-node requests
 pub async fn rpc_auth_middleware(
     State(app_state): State<AppState>,
     mut req: Request<Body>,
@@ -771,23 +759,17 @@ pub async fn rpc_auth_middleware(
     // Extract required headers
     let headers = req.headers();
     let node_id_header = headers.get("X-Node-ID");
-    let user_id_header = headers.get("X-User-ID");
     let node_signature_header = headers.get("X-Node-Signature");
-    let user_signature_header = headers.get("X-User-Signature");
-    
-    match (node_id_header, user_id_header, node_signature_header, user_signature_header) {
-        (Some(node_id_val), Some(user_id_val), Some(node_sig_val), Some(user_sig_val)) => {
-            // Parse IDs
+
+    match (node_id_header, node_signature_header) {
+        (Some(node_id_val), Some(node_sig_val)) => {
+            // Parse node ID
             let node_id: i32 = match node_id_val.to_str().ok().and_then(|s| s.parse().ok()) {
                 Some(id) => id,
                 None => return StatusCode::BAD_REQUEST.into_response(),
             };
-            let user_id: i32 = match user_id_val.to_str().ok().and_then(|s| s.parse().ok()) {
-                Some(id) => id,
-                None => return StatusCode::BAD_REQUEST.into_response(),
-            };
-            
-            // Parse signatures
+
+            // Parse node signature
             let node_signature = match node_sig_val.to_str().ok()
                 .and_then(|s| hex::decode(s).ok())
                 .and_then(|bytes| {
@@ -802,28 +784,13 @@ pub async fn rpc_auth_middleware(
                 Some(sig) => sig,
                 None => return StatusCode::BAD_REQUEST.into_response(),
             };
-            let user_signature = match user_sig_val.to_str().ok()
-                .and_then(|s| hex::decode(s).ok())
-                .and_then(|bytes| {
-                    if bytes.len() == 64 {
-                        let mut sig_bytes = [0u8; 64];
-                        sig_bytes.copy_from_slice(&bytes);
-                        Some(ed25519_dalek::Signature::from_bytes(&sig_bytes))
-                    } else {
-                        None
-                    }
-                }) {
-                Some(sig) => sig,
-                None => return StatusCode::BAD_REQUEST.into_response(),
-            };
-            
-            // Get authentication info from database
-            let (node_pubkey, user_pubkey, user_owns_node) = match db::get_node_user_auth_info(
-                app_state.db_pool.get(), 
-                node_id, 
-                user_id
+
+            // Get node public key from database
+            let node_pubkey = match db::get_node_pubkey(
+                app_state.db_pool.get(),
+                node_id
             ) {
-                Ok(info) => info,
+                Ok(pubkey) => pubkey,
                 Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
             };
             
@@ -834,42 +801,37 @@ pub async fn rpc_auth_middleware(
                 Err(_) => return StatusCode::BAD_REQUEST.into_response(),
             };
             
-            // Verify both signatures
+            // Verify node signature only (user auth is now per-transaction)
             let verification_result = (|| -> Result<(), ()> {
-                // Verify node signature
                 node_pubkey.verify_strict(&body_bytes, &node_signature).map_err(|_| ())?;
-                // Verify user signature  
-                user_pubkey.verify_strict(&body_bytes, &user_signature).map_err(|_| ())?;
                 Ok(())
             })();
             
             if verification_result.is_err() {
                 tracing::warn!(
-                    "RPC signature verification failed for user {} on node {}",
-                    user_id, node_id
+                    "RPC signature verification failed for node {}",
+                    node_id
                 );
                 return StatusCode::UNAUTHORIZED.into_response();
             }
-            
+
             tracing::debug!(
-                "RPC signatures verified for user {} on node {} (owns_node: {})",
-                user_id, node_id, user_owns_node
+                "RPC signature verified for node {}",
+                node_id
             );
-            
-            // Reconstruct request with verified auth info
-            let auth_user = AuthenticatedUser {
-                user_id,
+
+            // Reconstruct request with verified node info
+            let auth_node = AuthenticatedNode {
                 node_id,
-                user_owns_node,
             };
             
             let mut new_req = Request::from_parts(parts, Body::from(body_bytes));
-            new_req.extensions_mut().insert(auth_user);
-            
+            new_req.extensions_mut().insert(auth_node);
+
             next.run(new_req).await
         }
         _ => {
-            tracing::warn!("Missing required RPC headers: X-Node-ID, X-User-ID, X-Node-Signature, X-User-Signature");
+            tracing::warn!("Missing required RPC headers: X-Node-ID, X-Node-Signature");
             StatusCode::UNAUTHORIZED.into_response()
         }
     }
@@ -878,16 +840,16 @@ pub async fn rpc_auth_middleware(
 // Route for non-leaders to forward transactions to the leader (pre-authenticated by middleware)
 pub async fn post_propose(
     State(app_state): State<AppState>,
-    axum::Extension(auth_user): axum::Extension<AuthenticatedUser>,
+    axum::Extension(auth_node): axum::Extension<AuthenticatedNode>,
     Json(transactions): Json<Vec<Transaction>>,
 ) -> impl IntoResponse {
     tracing::info!(
-        "Processing authenticated consensus proposal from user {} on node {} (owns_node: {})",
-        auth_user.user_id, auth_user.node_id, auth_user.user_owns_node
+        "Processing authenticated consensus proposal from node {}",
+        auth_node.node_id
     );
-    
+
     // Process transactions through consensus (already authenticated)
-    match crate::consensus::functions::consensus_middleware(&app_state, transactions, auth_user.user_id).await {
+    match crate::consensus::functions::consensus_middleware(&app_state, transactions).await {
         Ok(()) => StatusCode::OK,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }

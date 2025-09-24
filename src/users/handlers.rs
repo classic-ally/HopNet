@@ -1,4 +1,4 @@
-use crate::{db::{DatabaseError, users::insert_user}, handlers::{HandlerResult, TransactionHandler}, types::User};
+use crate::{db::{DatabaseError, users::insert_user}, handlers::{HandlerResult, TransactionHandler}, types::User, consensus::types::Transaction};
 use crate::AppState;
 
 pub struct InsertUserHandler;
@@ -6,8 +6,8 @@ pub struct InsertUserHandler;
 impl TransactionHandler for InsertUserHandler {
     fn name(&self) -> &'static str { "insert_user" }
 
-    fn process(&self, state: &AppState, payload: &[u8], execute: bool) -> HandlerResult {
-        match bincode::serde::decode_from_slice::<User, _>(payload, bincode::config::standard()) {
+    fn process(&self, state: &AppState, tx: &Transaction, execute: bool) -> HandlerResult {
+        match bincode::serde::decode_from_slice::<User, _>(&tx.rpc.payload, bincode::config::standard()) {
             Ok((user_data, _)) => {
                 // Insert the user into the database with execute flag
                 insert_user(state.db_pool.get(), user_data, execute)?;

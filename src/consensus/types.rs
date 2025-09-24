@@ -8,7 +8,8 @@ use bincode::serde::encode_to_vec;
 use ed25519_dalek::Signature;
 use bincode::config;
 use blake3::Hasher;
-use crate::consensus::functions::validate_transaction;
+use rayon::prelude::*;
+use crate::consensus::functions::process_transactions;
 
 #[derive(Debug)]
 pub enum VoteError {
@@ -32,6 +33,7 @@ pub enum CertificateError {
 pub enum BlockError {
     EncodingError,
     DatabaseError,
+    ValidationError,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq)]
@@ -87,8 +89,11 @@ impl Ballot {
     }
 
     pub fn verify_proposal(&self, state: &AppState) -> Result<(), VoteError> {
+        // Get single DB connection for all queries (snapshot consistency + performance)
+        let db_conn = state.db_pool.get().map_err(|_| VoteError::DatabaseError)?;
+
         // Check leader signature is valid and leader is authorized for view
-        let consensus_state = db::get_consensus(state.db_pool.get()).map_err(|_| VoteError::DatabaseError)?;
+        let consensus_state = db::get_consensus_with_conn(&db_conn).map_err(|_| VoteError::DatabaseError)?;
 
         let leader_verifyingkey = consensus_state.leader.pubkey;
         let message = self.data.encode().map_err(|_| VoteError::ProcessingError)?;
@@ -110,6 +115,43 @@ impl Ballot {
                 }
             }
             Err(_) => {return Err(VoteError::BlockError)}
+        }
+
+        // Validate all transaction signatures in parallel
+        if let Some(ref transactions) = self.block.data.transactions {
+            // Batch fetch all pubkeys for signature validation (using shared connection)
+            let node_pubkeys = db::get_all_node_pubkeys(&db_conn)
+                .map_err(|_| VoteError::DatabaseError)?;
+            let user_pubkeys = db::get_all_user_pubkeys(&db_conn)
+                .map_err(|_| VoteError::DatabaseError)?;
+
+            // Parallel signature verification using Rayon
+            transactions.0.par_iter()
+                .try_for_each(|tx| -> Result<(), VoteError> {
+                    // Verify node signature
+                    let node_pubkey = node_pubkeys.get(&tx.submitter.id)
+                        .ok_or_else(|| VoteError::TransactionValidationError(
+                            format!("Unknown node_id: {}", tx.submitter.id)
+                        ))?;
+                    tx.verify_signature(node_pubkey)
+                        .map_err(|_| VoteError::TransactionValidationError(
+                            format!("Invalid node signature for node_id: {}", tx.submitter.id)
+                        ))?;
+
+                    // Verify user signature if present
+                    if let Some(ref user) = tx.user {
+                        let user_pubkey = user_pubkeys.get(&user.id)
+                            .ok_or_else(|| VoteError::TransactionValidationError(
+                                format!("Unknown user_id: {}", user.id)
+                            ))?;
+                        tx.verify_user_signature(user_pubkey)
+                            .map_err(|_| VoteError::TransactionValidationError(
+                                format!("Invalid user signature for user_id: {}", user.id)
+                            ))?;
+                    }
+
+                    Ok(())
+                })?;
         }
 
         // 0. Double certificate check
@@ -171,15 +213,10 @@ impl Ballot {
         // 5. Transaction validation (only for Propose phase)
         // Validate that all transactions can actually succeed before voting
         if self.data.phase == ConsensusPhase::Propose {
-            if let Some(transactions) = &self.block.data.transactions {
-                for tx in transactions.iter() {
-                    if let Err(e) = validate_transaction(tx, state) {
-                        let error_msg = format!("Transaction '{}' failed validation: {:?}", tx.function, e);
-                        tracing::warn!("Refusing to vote for ballot - {}", error_msg);
-                        return Err(VoteError::TransactionValidationError(error_msg));
-                    }
-                }
-                tracing::debug!("All {} transactions validated successfully before voting", transactions.len());
+            if let Err(e) = process_transactions(&self.block.data.transactions, state, false) {
+                let error_msg = format!("Transaction validation failed: {:?}", e);
+                tracing::warn!("Refusing to vote for ballot - {}", error_msg);
+                return Err(VoteError::TransactionValidationError(error_msg));
             }
         }
 
@@ -633,34 +670,65 @@ impl Block {
     }
     
     pub fn new_tip(
-        app_state: &AppState, 
+        app_state: &AppState,
         transactions: Vec<Transaction>
     ) -> Result<Block, BlockError> {
-        // get the current tip
-        // it is the committed_block
-        match db::get_consensus(app_state.db_pool.get()) {
-            Ok(consensus_state) => {
-                let height = consensus_state.committed_block.data.height + 1;
-                let view = consensus_state.view;
-                tracing::info!(
-                    "Creating new block at height {} for view {}",
-                    height, view
-                );
-                let tip_data = BlockData {
-                    height,
-                    view_number: view,
-                    parent_hash: Some(consensus_state.committed_block.block_hash),
-                    transactions: Some(Transactions(transactions))
-                };
-                let new_block = Block::new(tip_data)?;
-                // add it to DB and set prepared_block_hash atomically
-                match db::insert_block(app_state.db_pool.get(), &new_block, true) {
-                    Ok(()) => Ok(new_block),
-                    Err(_) => Err(BlockError::DatabaseError)
-                }
-            }
-            Err(_) => Err(BlockError::DatabaseError)
+        // Get single DB connection for all queries (snapshot consistency + performance)
+        let mut db_conn = app_state.db_pool.get().map_err(|_| BlockError::DatabaseError)?;
+
+        // Validate all transaction signatures before creating block (leader validation)
+        if !transactions.is_empty() {
+            // Batch fetch all pubkeys for signature validation
+            let node_pubkeys = db::get_all_node_pubkeys(&db_conn)
+                .map_err(|_| BlockError::DatabaseError)?;
+            let user_pubkeys = db::get_all_user_pubkeys(&db_conn)
+                .map_err(|_| BlockError::DatabaseError)?;
+
+            // Parallel signature verification
+            transactions.par_iter()
+                .try_for_each(|tx| -> Result<(), BlockError> {
+                    // Verify node signature
+                    let node_pubkey = node_pubkeys.get(&tx.submitter.id)
+                        .ok_or(BlockError::ValidationError)?;
+                    tx.verify_signature(node_pubkey)
+                        .map_err(|_| BlockError::ValidationError)?;
+
+                    // Verify user signature if present
+                    if let Some(ref user) = tx.user {
+                        let user_pubkey = user_pubkeys.get(&user.id)
+                            .ok_or(BlockError::ValidationError)?;
+                        tx.verify_user_signature(user_pubkey)
+                            .map_err(|_| BlockError::ValidationError)?;
+                    }
+
+                    Ok(())
+                })?;
         }
+
+        // Get the current tip (committed_block)
+        let consensus_state = db::get_consensus_with_conn(&db_conn)
+            .map_err(|_| BlockError::DatabaseError)?;
+
+        let height = consensus_state.committed_block.data.height + 1;
+        let view = consensus_state.view;
+        tracing::info!(
+            "Creating new block at height {} for view {} with {} transactions",
+            height, view, transactions.len()
+        );
+
+        let tip_data = BlockData {
+            height,
+            view_number: view,
+            parent_hash: Some(consensus_state.committed_block.block_hash),
+            transactions: Some(Transactions(transactions))
+        };
+        let new_block = Block::new(tip_data)?;
+
+        // Add it to DB and set prepared_block_hash atomically (using shared connection)
+        db::insert_block_with_conn(&mut db_conn, &new_block, true)
+            .map_err(|_| BlockError::DatabaseError)?;
+
+        Ok(new_block)
     }
 
     pub fn verify(&self) -> Result<(), BlockError> {
@@ -674,11 +742,102 @@ impl Block {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct Transaction {
-    // function the data is passed to
+pub struct RpcCall {
     pub function: String,
-    // data passed into function, with input data type
-    pub payload: Vec<u8>
+    pub payload: Vec<u8>,
+}
+
+impl RpcCall {
+    pub fn encode(&self) -> Result<Vec<u8>, TransactionError> {
+        encode_to_vec(&self, config::standard())
+            .map_err(|_| TransactionError::EncodingError)
+    }
+
+    pub fn sign(&self, private_key: &PrivKey) -> Result<Signature, TransactionError> {
+        let data = &self.encode()?;
+        let signature = private_key.try_sign(&data)
+            .map_err(|_| TransactionError::SigningError)?;
+        Ok(signature)
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SignedIdentity {
+    pub id: i32,
+    pub signature: Signature,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Transaction {
+    pub rpc: RpcCall,
+    pub submitter: SignedIdentity,  // Node that submitted this transaction
+    pub user: Option<SignedIdentity>,  // User who initiated this (if user operation)
+}
+
+impl Transaction {
+    // Create a node-only transaction (automated operations)
+    pub fn new(function: String, payload: Vec<u8>, submitter_id: i32, submitter_key: &PrivKey) -> Result<Self, TransactionError> {
+        let rpc = RpcCall { function, payload };
+        let signature = rpc.sign(submitter_key)?;
+
+        Ok(Transaction {
+            rpc,
+            submitter: SignedIdentity {
+                id: submitter_id,
+                signature,
+            },
+            user: None,
+        })
+    }
+
+    // Create a user-initiated transaction
+    pub fn new_with_user(
+        function: String,
+        payload: Vec<u8>,
+        submitter_id: i32,
+        submitter_key: &PrivKey,
+        user_id: i32,
+        user_key: &PrivKey
+    ) -> Result<Self, TransactionError> {
+        let rpc = RpcCall { function, payload };
+        let submitter_signature = rpc.sign(submitter_key)?;
+        let user_signature = rpc.sign(user_key)?;
+
+        Ok(Transaction {
+            rpc,
+            submitter: SignedIdentity {
+                id: submitter_id,
+                signature: submitter_signature,
+            },
+            user: Some(SignedIdentity {
+                id: user_id,
+                signature: user_signature,
+            }),
+        })
+    }
+
+    pub fn verify_signature(&self, submitter_pubkey: &PubKey) -> Result<(), TransactionError> {
+        let message = self.rpc.encode()?;
+        submitter_pubkey.verify_strict(&message, &self.submitter.signature)
+            .map_err(|_| TransactionError::InvalidSignature)
+    }
+
+    pub fn verify_user_signature(&self, user_pubkey: &PubKey) -> Result<(), TransactionError> {
+        if let Some(user) = &self.user {
+            let message = self.rpc.encode()?;
+            user_pubkey.verify_strict(&message, &user.signature)
+                .map_err(|_| TransactionError::InvalidSignature)
+        } else {
+            Err(TransactionError::InvalidSignature)
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum TransactionError {
+    SigningError,
+    EncodingError,
+    InvalidSignature,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

@@ -439,14 +439,19 @@ pub async fn post_files(
     // Insert the collected inodes into the database via consensus
     match bincode::serde::encode_to_vec(&inodes, bincode::config::standard()) {
         Ok(encoded_inodes) => {
-            let transaction = Transaction {
-                function: "insert_files".to_string(),
-                payload: encoded_inodes,
+            let transaction = match crate::consensus::functions::create_signed_user_transaction(
+                &app_state,
+                "insert_files".to_string(),
+                encoded_inodes,
+                user_id,
+            ) {
+                Ok(tx) => tx,
+                Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
             };
             let transactions = vec![transaction];
 
             // Use consensus middleware to ensure distributed agreement
-            match consensus_middleware(&app_state, transactions, user_id).await {
+            match consensus_middleware(&app_state, transactions).await {
                 Ok(()) => {
                     // Trigger fragment distribution for each uploaded file
                     for data_block_id in uploaded_data_block_ids {
@@ -514,14 +519,19 @@ pub async fn delete_files(
     // Serialize payload for consensus submission
     match bincode::serde::encode_to_vec(&payload, bincode::config::standard()) {
         Ok(encoded_payload) => {
-            let transaction = Transaction {
-                function: "delete_files".to_string(),
-                payload: encoded_payload,
+            let transaction = match crate::consensus::functions::create_signed_user_transaction(
+                &app_state,
+                "delete_files".to_string(),
+                encoded_payload,
+                user_id,
+            ) {
+                Ok(tx) => tx,
+                Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
             };
             let transactions = vec![transaction];
 
             // Use consensus middleware to ensure distributed agreement
-            match consensus_middleware(&app_state, transactions, user_id).await {
+            match consensus_middleware(&app_state, transactions).await {
                 Ok(()) => {
                     tracing::info!("Successfully submitted file deletion to consensus for user {}", user_id);
                     Ok(())
@@ -544,7 +554,7 @@ pub async fn delete_files(
 // Inter-node fragment transfer for distributed storage
 // =============================================================================
 
-use crate::consensus::routes::AuthenticatedUser;
+use crate::consensus::routes::AuthenticatedNode;
 use crate::files::functions::{fetch_and_verify_fragment, fragment_exists_and_valid, MAX_FRAGMENT_SIZE};
 
 /// GET /fragments/{fragment_hash}
@@ -553,7 +563,7 @@ use crate::files::functions::{fetch_and_verify_fragment, fragment_exists_and_val
 pub async fn get_fragment(
     State(app_state): State<AppState>,
     Path(fragment_hash): Path<Blake3Hash>,
-    Extension(auth): Extension<AuthenticatedUser>,
+    Extension(auth): Extension<AuthenticatedNode>,
 ) -> impl IntoResponse {
     // Allow any authenticated user to request fragments (supports roaming users)
     
@@ -591,14 +601,9 @@ pub async fn get_fragment(
 pub async fn post_fragment(
     State(app_state): State<AppState>,
     Path(expected_hash): Path<Blake3Hash>,
-    Extension(auth): Extension<AuthenticatedUser>,
+    Extension(auth): Extension<AuthenticatedNode>,
     body: Body
 ) -> impl IntoResponse {
-    // Only allow node owners to store fragments for inter-node operations
-    if !auth.user_owns_node {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-    
     // Read the request body (fragment data) with size limit matching our fragment chunking
     let fragment_data = match axum::body::to_bytes(body, MAX_FRAGMENT_SIZE + 1024).await { // Add small buffer for headers
         Ok(data) => data.to_vec(),
@@ -680,12 +685,9 @@ pub async fn get_fragments_count(
 pub async fn get_fragment_health(
     State(app_state): State<AppState>,
     Path(fragment_hash): Path<Blake3Hash>,
-    Extension(auth): Extension<AuthenticatedUser>,
+    Extension(auth): Extension<AuthenticatedNode>,
 ) -> impl IntoResponse {
     // Only allow node owners to perform health checks for inter-node operations
-    if !auth.user_owns_node {
-        return StatusCode::FORBIDDEN.into_response();
-    }
     
     // Perform comprehensive health check: existence + disk read + checksum verification
     match fragment_exists_and_valid(&app_state.fragments_dir, &fragment_hash) {
@@ -772,13 +774,10 @@ pub async fn post_cleanup_orphaned_data_blocks(
 /// Used during network rebalancing to distribute fragments to optimal nodes
 pub async fn post_fetch_fragments(
     State(app_state): State<AppState>,
-    Extension(auth): Extension<AuthenticatedUser>,
+    Extension(auth): Extension<AuthenticatedNode>,
     Json(request): Json<FetchFragmentsRequest>
 ) -> impl IntoResponse {
     // Only allow node owners to receive fragment fetch instructions
-    if !auth.user_owns_node {
-        return StatusCode::FORBIDDEN.into_response();
-    }
     
     tracing::info!("Received fragment fetch request for {} fragments", request.fragments.len());
     

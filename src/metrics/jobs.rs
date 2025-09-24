@@ -41,10 +41,14 @@ pub async fn handle_metrics_collection(
                 )))))?;
             
             // Create consensus transaction using existing pattern from routes.rs
-            let tx = Transaction {
-                function: "submit_metrics".to_string(),
-                payload: serialized_metrics,
-            };
+            let tx = crate::consensus::functions::create_signed_transaction(
+                app_state,
+                "submit_metrics".to_string(),
+                serialized_metrics,
+            ).map_err(|_| Error::Failed(Arc::new(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Failed to sign transaction"
+            )))))?;
             
             // Get node ID for consensus submission (consensus_middleware requires user_id)
             let source_node_id = app_state.get_node_id()
@@ -54,7 +58,7 @@ pub async fn handle_metrics_collection(
                 )))))?;
             
             // Submit to consensus using existing middleware (requires Vec<Transaction> and user_id)
-            match consensus_middleware(app_state, vec![tx], source_node_id).await {
+            match consensus_middleware(app_state, vec![tx]).await {
                 Ok(_) => {
                     tracing::info!("Successfully submitted metrics to consensus");
                 }

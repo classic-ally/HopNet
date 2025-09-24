@@ -135,14 +135,19 @@ pub async fn post_nodes(
     // Encode the complete node for consensus transaction
     match bincode::serde::encode_to_vec(&complete_node, config::standard()) {
         Ok(encoded_node) => {
-            let transaction = Transaction {
-                function: "insert_node".to_string(),
-                payload: encoded_node,
+            let transaction = match crate::consensus::functions::create_signed_user_transaction(
+                &app_state,
+                "insert_node".to_string(),
+                encoded_node,
+                uid,
+            ) {
+                Ok(tx) => tx,
+                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
             };
             let transactions = vec![transaction];
 
             // Submit to consensus middleware
-            match consensus_middleware(&app_state, transactions, uid).await {
+            match consensus_middleware(&app_state, transactions).await {
                 Ok(()) => {
                     tracing::info!("Consensus succeeded for node {}, waiting for database commit", complete_node.node_id);
                     

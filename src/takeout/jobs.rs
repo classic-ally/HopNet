@@ -67,10 +67,14 @@ pub async fn handle_takeout_maintenance(
                 }
             };
 
-            transactions.push(Transaction {
-                function: "update_takeout_status".to_string(),
-                payload: encoded_payload,
-            });
+            transactions.push(crate::consensus::functions::create_signed_transaction(
+                app_state,
+                "update_takeout_status".to_string(),
+                encoded_payload,
+            ).map_err(|_| Error::Failed(Arc::new(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Failed to sign transaction"
+            )))))?);
         }
 
         if transactions.is_empty() {
@@ -80,7 +84,7 @@ pub async fn handle_takeout_maintenance(
 
             // Submit all expiration updates in one consensus call
             // This triggers cleanup on owner nodes for all expired takeouts
-            match consensus_middleware(app_state, transactions, user_id).await {
+            match consensus_middleware(app_state, transactions).await {
                 Ok(_) => {
                     tracing::info!("Successfully marked {} takeouts as expired via consensus", expired_takeouts.len());
                 }

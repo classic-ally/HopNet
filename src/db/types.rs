@@ -7,7 +7,8 @@ pub enum DatabaseError {
     ProcessingError,
     InvalidPayload,
     NotFound,
-    ConflictError  // Resource already exists at the specified location/identifier
+    ConflictError,  // Resource already exists at the specified location/identifier
+    AuthorizationError  // User or node not authorized for the operation
 }
 
 use crate::db::{Blake3Hash, PrivKey, User};

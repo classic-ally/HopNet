@@ -372,13 +372,18 @@ pub async fn delete_item(
         }
     };
     
-    let transaction = Transaction {
-        function: "delete_files".to_string(),
-        payload: encoded_payload,
+    let transaction = match crate::consensus::functions::create_signed_user_transaction(
+        &app_state,
+        "delete_files".to_string(),
+        encoded_payload,
+        user_id,
+    ) {
+        Ok(tx) => tx,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
     };
     
     // Use consensus middleware to ensure distributed agreement
-    match consensus_middleware(&app_state, vec![transaction], user_id).await {
+    match consensus_middleware(&app_state, vec![transaction]).await {
         Ok(()) => {
             tracing::info!("Successfully submitted FileProvider deletion to consensus for user {}", user_id);
             StatusCode::OK
@@ -927,12 +932,17 @@ pub async fn modify_item(
     let encoded_payload = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     
-    let transaction = Transaction {
-        function: "modify_item".to_string(),
-        payload: encoded_payload,
+    let transaction = match crate::consensus::functions::create_signed_user_transaction(
+        &app_state,
+        "modify_item".to_string(),
+        encoded_payload,
+        user_id,
+    ) {
+        Ok(tx) => tx,
+        Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
     };
     
-    consensus_middleware(&app_state, vec![transaction], user_id).await
+    consensus_middleware(&app_state, vec![transaction]).await
         .map_err(|e| {
             tracing::error!("Failed to submit modification to consensus for user_id: {} error: {:?}", user_id, e);
             StatusCode::INTERNAL_SERVER_ERROR

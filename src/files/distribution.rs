@@ -295,12 +295,13 @@ async fn submit_placement_update_to_consensus(
     let updates = vec![update];
     let encoded_updates = bincode::serde::encode_to_vec(&updates, bincode::config::standard())?;
     
-    let transaction = Transaction {
-        function: "update_placement_heights".to_string(),
-        payload: encoded_updates,
-    };
+    let transaction = crate::consensus::functions::create_signed_transaction(
+        app_state,
+        "update_placement_heights".to_string(),
+        encoded_updates,
+    ).map_err(|_| DistributionError::Database(crate::db::DatabaseError::LockError))?;
     
-    consensus_middleware(app_state, vec![transaction], source_node_id).await?;
+    consensus_middleware(app_state, vec![transaction]).await?;
     
     tracing::info!("Submitted placement height update to consensus");
     Ok(())

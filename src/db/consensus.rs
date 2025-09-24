@@ -1,12 +1,10 @@
 use super::*;
 use crate::consensus::types::*;
 
-pub fn get_consensus(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+pub fn get_consensus_with_conn(
+    db_lock: &r2d2::PooledConnection<DuckdbConnectionManager>,
 ) -> Result<ConsensusState, DatabaseError> {
-    match db_connection {
-        Ok(db_lock) => {
-            let mut stmt = db_lock.prepare(
+    let mut stmt = db_lock.prepare(
                 "WITH latest_effective AS (
                     SELECT
                         node_id,
@@ -129,10 +127,16 @@ pub fn get_consensus(
                 highest_qc_block,
                 last_timeout_vote_view,
             };
-            
-            return Ok(consensus_state)
-        }
-        Err(_) => {Err(DatabaseError::LockError)}
+
+            Ok(consensus_state)
+}
+
+pub fn get_consensus(
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+) -> Result<ConsensusState, DatabaseError> {
+    match db_connection {
+        Ok(db_lock) => get_consensus_with_conn(&db_lock),
+        Err(_) => Err(DatabaseError::LockError)
     }
 }
 
@@ -253,43 +257,49 @@ pub fn get_validators_elect(
     }
 }
 
+pub fn insert_block_with_conn(
+    db_lock: &mut r2d2::PooledConnection<DuckdbConnectionManager>,
+    block: &Block,
+    set_prepared: bool,
+) -> Result<(), DatabaseError> {
+    let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
+
+    // Insert the block
+    tx.execute(
+        "INSERT INTO blocks (block_hash, height, view_number, parent_hash, transactions) VALUES (?, ?, ?, ?, ?)",
+        params![
+            block.block_hash,
+            block.data.height,
+            block.data.view_number,
+            block.data.parent_hash,
+            block.data.transactions
+        ]
+    ).map_err(|_| DatabaseError::InsertError)?;
+
+    // Optionally set prepared_block_hash to mark consensus in progress
+    if set_prepared {
+        tx.execute(
+            "UPDATE this_node SET prepared_block_hash = ? WHERE internal_id = 1",
+            params![block.block_hash]
+        ).map_err(|_| DatabaseError::InsertError)?;
+
+        tracing::debug!(
+            "Set prepared_block_hash to {:?} (height: {}, view: {})",
+            block.block_hash, block.data.height, block.data.view_number
+        );
+    }
+
+    tx.commit().map_err(|_| DatabaseError::InsertError)?;
+    Ok(())
+}
+
 pub fn insert_block(
     db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     block: &Block,
     set_prepared: bool,
 ) -> Result<(), DatabaseError> {
     match db_connection {
-        Ok(mut db_lock) => {
-            let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
-            
-            // Insert the block
-            tx.execute(
-                "INSERT INTO blocks (block_hash, height, view_number, parent_hash, transactions) VALUES (?, ?, ?, ?, ?)",
-                params![
-                    block.block_hash,
-                    block.data.height,
-                    block.data.view_number,
-                    block.data.parent_hash,
-                    block.data.transactions
-                ]
-            ).map_err(|_| DatabaseError::InsertError)?;
-            
-            // Optionally set prepared_block_hash to mark consensus in progress
-            if set_prepared {
-                tx.execute(
-                    "UPDATE this_node SET prepared_block_hash = ? WHERE internal_id = 1",
-                    params![block.block_hash]
-                ).map_err(|_| DatabaseError::InsertError)?;
-                
-                tracing::debug!(
-                    "Set prepared_block_hash to {:?} (height: {}, view: {})",
-                    block.block_hash, block.data.height, block.data.view_number
-                );
-            }
-            
-            tx.commit().map_err(|_| DatabaseError::InsertError)?;
-            Ok(())
-        }
+        Ok(mut db_lock) => insert_block_with_conn(&mut db_lock, block, set_prepared),
         Err(_) => Err(DatabaseError::LockError)
     }
 }
@@ -470,32 +480,68 @@ pub fn insert_qc(
     }
 }
 
-// Efficient function to get node and user pubkeys for RPC authentication
-// Also returns whether the user owns the node
-pub fn get_node_user_auth_info(
+pub fn get_node_pubkey(
     db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     node_id: i32,
-    user_id: i32,
-) -> Result<(PubKey, PubKey, bool), DatabaseError> {
+) -> Result<PubKey, DatabaseError> {
     match db_connection {
         Ok(db_lock) => {
             let mut stmt = db_lock.prepare(
-                "SELECT n.pubkey as node_pubkey, u.pubkey as user_pubkey, (n.owner = u.user_id) as user_owns_node
-                 FROM nodes n, users u 
-                 WHERE n.node_id = ? AND u.user_id = ?"
+                "SELECT pubkey FROM nodes WHERE node_id = ?"
             ).map_err(|_| DatabaseError::RecallError)?;
 
-            let result = stmt.query_row([node_id, user_id], |row| {
-                let node_pubkey: PubKey = row.get(0)?;
-                let user_pubkey: PubKey = row.get(1)?;
-                let user_owns_node: bool = row.get(2)?;
-                Ok((node_pubkey, user_pubkey, user_owns_node))
+            let node_pubkey: PubKey = stmt.query_row([node_id], |row| {
+                row.get(0)
             }).map_err(|_| DatabaseError::RecallError)?;
-            
-            Ok(result)
+
+            Ok(node_pubkey)
         }
         Err(_) => Err(DatabaseError::LockError)
     }
+}
+
+pub fn get_all_node_pubkeys(
+    db_lock: &r2d2::PooledConnection<DuckdbConnectionManager>,
+) -> Result<std::collections::HashMap<i32, PubKey>, DatabaseError> {
+    let mut stmt = db_lock.prepare(
+        "SELECT node_id, pubkey FROM nodes"
+    ).map_err(|_| DatabaseError::RecallError)?;
+
+    let rows = stmt.query_map([], |row| {
+        let node_id: i32 = row.get(0)?;
+        let pubkey: PubKey = row.get(1)?;
+        Ok((node_id, pubkey))
+    }).map_err(|_| DatabaseError::RecallError)?;
+
+    let mut map = std::collections::HashMap::new();
+    for row in rows {
+        let (node_id, pubkey) = row.map_err(|_| DatabaseError::RecallError)?;
+        map.insert(node_id, pubkey);
+    }
+
+    Ok(map)
+}
+
+pub fn get_all_user_pubkeys(
+    db_lock: &r2d2::PooledConnection<DuckdbConnectionManager>,
+) -> Result<std::collections::HashMap<i32, PubKey>, DatabaseError> {
+    let mut stmt = db_lock.prepare(
+        "SELECT user_id, pubkey FROM users"
+    ).map_err(|_| DatabaseError::RecallError)?;
+
+    let rows = stmt.query_map([], |row| {
+        let user_id: i32 = row.get(0)?;
+        let pubkey: PubKey = row.get(1)?;
+        Ok((user_id, pubkey))
+    }).map_err(|_| DatabaseError::RecallError)?;
+
+    let mut map = std::collections::HashMap::new();
+    for row in rows {
+        let (user_id, pubkey) = row.map_err(|_| DatabaseError::RecallError)?;
+        map.insert(user_id, pubkey);
+    }
+
+    Ok(map)
 }
 
 pub fn get_me(

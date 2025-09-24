@@ -35,7 +35,38 @@ pub enum ConsensusError {
     NetworkError,
 }
 
-pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transaction>, user_id: i32) -> Result<(), ConsensusError> {
+// Create a node-only transaction (for automated operations)
+pub fn create_signed_transaction(
+    app_state: &AppState,
+    function: String,
+    payload: Vec<u8>
+) -> Result<Transaction, ConsensusError> {
+    let node_id = app_state.get_node_id().map_err(|_| ConsensusError::DatabaseError)?;
+    Transaction::new(function, payload, node_id, &app_state.private_key)
+        .map_err(|_| ConsensusError::SigningError)
+}
+
+// Create a user-initiated transaction (for user operations)
+pub fn create_signed_user_transaction(
+    app_state: &AppState,
+    function: String,
+    payload: Vec<u8>,
+    user_id: i32,
+) -> Result<Transaction, ConsensusError> {
+    let node_id = app_state.get_node_id().map_err(|_| ConsensusError::DatabaseError)?;
+    let user_keys = app_state.get_user_keys().map_err(|_| ConsensusError::DatabaseError)?;
+
+    Transaction::new_with_user(
+        function,
+        payload,
+        node_id,
+        &app_state.private_key,
+        user_id,
+        &user_keys.private_key
+    ).map_err(|_| ConsensusError::SigningError)
+}
+
+pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transaction>) -> Result<(), ConsensusError> {
     tracing::debug!("Starting consensus middleware for {} transactions", transactions.len());
     
     let my_node_id = app_state.get_node_id().map_err(|_| ConsensusError::DatabaseError)?;
@@ -55,7 +86,7 @@ pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transa
                 "Not the leader (node {}), forwarding transactions to leader (node {})",
                 my_node_id, initial_consensus_state.leader.node_id
             );
-            return forward_to_leader(initial_consensus_state.leader, transactions, user_id, app_state).await;
+            return forward_to_leader(initial_consensus_state.leader, transactions, app_state).await;
         }
         
         // Wait for any ongoing consensus to complete
@@ -100,7 +131,7 @@ pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transa
                 "Leadership changed during wait, forwarding to new leader (node {})",
                 current_consensus_state.leader.node_id
             );
-            return forward_to_leader(current_consensus_state.leader, transactions, user_id, app_state).await;
+            return forward_to_leader(current_consensus_state.leader, transactions, app_state).await;
         }
         
         // Safe to proceed - same view, propose phase, still leader
@@ -137,7 +168,7 @@ pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transa
         // Broadcast QC2 and wait for enough confirmations
         broadcast_qc(&validators, &validators_elect, qc2).await?;
 
-        process_transactions(&block.data.transactions, app_state);
+        let _ = process_transactions(&block.data.transactions, app_state, true);
 
         return Ok(());
     }
@@ -408,40 +439,31 @@ async fn qc_send(
     }
 }
 
-pub fn process_transactions(transactions: &Option<Transactions>, app_state: &AppState) {
+pub fn process_transactions(transactions: &Option<Transactions>, app_state: &AppState, execute: bool) -> HandlerResult {
     if let Some(transactions) = transactions {
         for tx in transactions.iter() {
-            match process_transaction(tx, app_state) {
+            match process_transaction(tx, app_state, execute) {
                 Ok(_) => {
-                    tracing::debug!("Transaction processed successfully: {}", &tx.function);
+                    tracing::debug!("Transaction {} successfully: {}", if execute { "processed" } else { "validated" }, &tx.rpc.function);
                 }
                 Err(e) => {
-                    tracing::error!("Failed to process transaction {}: {:?}", &tx.function, e);
-                    // Continue processing other transactions even if one fails
+                    if execute {
+                        tracing::error!("Failed to process transaction {}: {:?}", &tx.rpc.function, e);
+                    } else {
+                        return Err(e);
+                    }
                 }
             }
         }
     }
+    Ok(())
 }
 
-fn process_transaction(tx: &Transaction, app_state: &AppState) -> HandlerResult {
-    // look up handler by name
-    if let Some(handler) = DISPATCH_TABLE.get(tx.function.as_str()) {
-        // Execute the transaction (commit to database)
-        handler.process(app_state, &tx.payload, true)
+pub fn process_transaction(tx: &Transaction, app_state: &AppState, execute: bool) -> HandlerResult {
+    if let Some(handler) = DISPATCH_TABLE.get(tx.rpc.function.as_str()) {
+        handler.process(app_state, tx, execute)
     } else {
-        tracing::warn!("No handler found for function: {}", &tx.function);
-        Err(crate::db::DatabaseError::InvalidPayload)
-    }
-}
-
-pub fn validate_transaction(tx: &Transaction, app_state: &AppState) -> HandlerResult {
-    // look up handler by name
-    if let Some(handler) = DISPATCH_TABLE.get(tx.function.as_str()) {
-        // Validate the transaction (dry run without commit)
-        handler.process(app_state, &tx.payload, false)
-    } else {
-        tracing::warn!("No handler found for function: {}", &tx.function);
+        tracing::warn!("No handler found for function: {}", &tx.rpc.function);
         Err(crate::db::DatabaseError::InvalidPayload)
     }
 }
@@ -540,34 +562,29 @@ impl TimeoutVoteCollector {
 async fn forward_to_leader(
     leader: crate::types::Node,
     transactions: Vec<Transaction>,
-    user_id: i32,
     app_state: &AppState
 ) -> Result<(), ConsensusError> {
     let my_node_id = app_state.get_node_id().map_err(|_| ConsensusError::DatabaseError)?;
-    let user_keys = app_state.get_user_keys().map_err(|_| ConsensusError::DatabaseError)?;
-    
+
     // Serialize transactions for signing
     let body = serde_json::to_vec(&transactions).map_err(|_| ConsensusError::SigningError)?;
-    
-    // Sign with both node and user keys
+
+    // Sign with node key
     let node_signature = app_state.private_key.try_sign(&body).map_err(|_| ConsensusError::SigningError)?;
-    let user_signature = user_keys.private_key.try_sign(&body).map_err(|_| ConsensusError::SigningError)?;
-    
+
     // Forward to leader
     let client = reqwest::Client::new();
     let url = format!("http://{}:{}/consensus/propose", leader.ip_address, leader.port);
-    
+
     tracing::info!(
-        "Forwarding {} transactions to leader at {} (user_id: {}, node_id: {})",
-        transactions.len(), &url, user_id, my_node_id
+        "Forwarding {} transactions to leader at {} (node_id: {})",
+        transactions.len(), &url, my_node_id
     );
-    
+
     let response = client
         .post(&url)
         .header("X-Node-ID", my_node_id.to_string())
-        .header("X-User-ID", user_id.to_string())
         .header("X-Node-Signature", hex::encode(node_signature.to_bytes()))
-        .header("X-User-Signature", hex::encode(user_signature.to_bytes()))
         .json(&transactions)
         .send()
         .await

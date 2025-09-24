@@ -263,6 +263,54 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
             COMMENT ON COLUMN metrics.available IS 'Node availability (false if unreachable during measurement)';
             COMMENT ON COLUMN metrics.storage_total_gb IS 'Total storage capacity in gigabytes';
             COMMENT ON COLUMN metrics.storage_used_gb IS 'Used storage capacity in gigabytes';
+
+            -- Attestation system for verifying fragment availability
+            CREATE TABLE attestation_events (
+                tester_id        INTEGER NOT NULL,    -- Who performed the check
+                storer_id        INTEGER NOT NULL,    -- Who was being checked (same as tester for self-checks)
+                consensus_height INTEGER NOT NULL,    -- When the check happened
+                attestation_tier ENUM('database', 'disk', 'remote') NOT NULL,
+                fragments_checked UINTEGER NOT NULL,  -- Total fragments examined
+
+                PRIMARY KEY (tester_id, storer_id, consensus_height),
+                FOREIGN KEY (tester_id) REFERENCES nodes(node_id),
+                FOREIGN KEY (storer_id) REFERENCES nodes(node_id)
+            );
+
+            -- Indexes for efficient attestation history queries
+            CREATE INDEX idx_attestation_tester_history ON attestation_events (tester_id, consensus_height);
+            CREATE INDEX idx_attestation_storer_history ON attestation_events (storer_id, consensus_height);
+            CREATE INDEX idx_attestation_consensus_height ON attestation_events (consensus_height);  -- For height range queries
+
+            CREATE TABLE fragment_inventory (
+                fragment_hash    BLOB NOT NULL,
+                node_id         INTEGER NOT NULL,
+                since_height    INTEGER NOT NULL,     -- Consensus height when storage started
+                until_height    INTEGER,              -- Consensus height when storage ended (NULL = current)
+                removal_reason  ENUM('missing', 'corrupted', 'node_offline'),  -- Why storage ended
+
+                PRIMARY KEY (fragment_hash, node_id, since_height),
+                FOREIGN KEY (node_id) REFERENCES nodes(node_id)
+            );
+
+            -- Indexes for fragment discovery optimization
+            CREATE INDEX idx_fragment_inventory_current ON fragment_inventory (fragment_hash, until_height);  -- Current locations
+            CREATE INDEX idx_fragment_inventory_since_height ON fragment_inventory (since_height);  -- For height range queries
+            CREATE INDEX idx_fragment_inventory_until_height ON fragment_inventory (until_height);  -- For height range queries
+            CREATE INDEX idx_fragment_inventory_node_at_height ON fragment_inventory (node_id, since_height, until_height); -- Node state at time
+            CREATE INDEX idx_fragment_inventory_removal_analysis ON fragment_inventory (removal_reason, until_height);  -- Analyze removal patterns
+
+            -- Add comments for attestation documentation
+            COMMENT ON TABLE attestation_events IS 'Records attestation checks performed on fragment availability across nodes';
+            COMMENT ON COLUMN attestation_events.tester_id IS 'Node ID performing the attestation check';
+            COMMENT ON COLUMN attestation_events.storer_id IS 'Node ID being checked (same as tester for self-attestation)';
+            COMMENT ON COLUMN attestation_events.consensus_height IS 'References blocks.height for when the attestation occurred';
+            COMMENT ON COLUMN attestation_events.attestation_tier IS 'Level of verification: database (fast), disk (medium), remote (thorough)';
+
+            COMMENT ON TABLE fragment_inventory IS 'Tracks which nodes store which fragments over time for optimized discovery';
+            COMMENT ON COLUMN fragment_inventory.since_height IS 'Consensus height when this node started storing this fragment (references blocks.height)';
+            COMMENT ON COLUMN fragment_inventory.until_height IS 'Consensus height when storage ended (NULL means currently stored, references blocks.height)';
+            COMMENT ON COLUMN fragment_inventory.removal_reason IS 'Reason fragment is no longer stored (if applicable)';
         "
     )?;
     Ok(())

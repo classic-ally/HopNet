@@ -1,7 +1,8 @@
 use crate::{
-    db::{DatabaseError, CustomUUID, files::{insert_files, update_placement_heights_batch, PlacementHeightUpdate}, fragments::delete_orphaned_data_blocks_consensus}, 
-    handlers::{HandlerResult, TransactionHandler}, 
-    db::Inode
+    db::{DatabaseError, CustomUUID, files::{insert_files, update_placement_heights_batch, PlacementHeightUpdate}, fragments::delete_orphaned_data_blocks_consensus},
+    handlers::{HandlerResult, TransactionHandler},
+    db::Inode,
+    consensus::types::Transaction
 };
 use crate::AppState;
 use crate::files::functions::fragment_exists_and_valid;
@@ -13,9 +14,30 @@ pub struct InsertFilesHandler;
 impl TransactionHandler for InsertFilesHandler {
     fn name(&self) -> &'static str { "insert_files" }
 
-    fn process(&self, state: &AppState, payload: &[u8], execute: bool) -> HandlerResult {
-        match bincode::serde::decode_from_slice::<Vec<Inode>, _>(payload, bincode::config::standard()) {
+    fn process(&self, state: &AppState, tx: &Transaction, execute: bool) -> HandlerResult {
+        match bincode::serde::decode_from_slice::<Vec<Inode>, _>(&tx.rpc.payload, bincode::config::standard()) {
             Ok((mut inodes, _)) => {
+                // Authorization: verify user owns the files being inserted
+                if let Some(ref user) = tx.user {
+                    for inode in &inodes {
+                        match &inode.owner {
+                            Either::Left(owner_id) => {
+                                if *owner_id != user.id {
+                                    tracing::warn!("Authorization failed: user {} attempted to insert file for user {}", user.id, owner_id);
+                                    return Err(DatabaseError::AuthorizationError);
+                                }
+                            },
+                            Either::Right(_) => {
+                                tracing::error!("Authorization failed: unexpected User object in owner field");
+                                return Err(DatabaseError::AuthorizationError);
+                            }
+                        }
+                    }
+                } else {
+                    tracing::warn!("Authorization failed: insert_files requires user authentication");
+                    return Err(DatabaseError::AuthorizationError);
+                }
+
                 // Preprocess inodes to verify fragments exist locally and update stored_locally flags
                 for inode in &mut inodes {
                     if let Some(Either::Right(data_record)) = &mut inode.data_id {
@@ -61,8 +83,8 @@ pub struct UpdatePlacementHeightsHandler;
 impl TransactionHandler for UpdatePlacementHeightsHandler {
     fn name(&self) -> &'static str { "update_placement_heights" }
 
-    fn process(&self, state: &AppState, payload: &[u8], execute: bool) -> HandlerResult {
-        match bincode::serde::decode_from_slice::<Vec<PlacementHeightUpdate>, _>(payload, bincode::config::standard()) {
+    fn process(&self, state: &AppState, tx: &Transaction, execute: bool) -> HandlerResult {
+        match bincode::serde::decode_from_slice::<Vec<PlacementHeightUpdate>, _>(&tx.rpc.payload, bincode::config::standard()) {
             Ok((updates_data, _)) => {
                 // Update placement heights using the consensus-safe version with execute flag
                 update_placement_heights_batch(state.db_pool.get(), updates_data, execute)?;
@@ -93,8 +115,8 @@ pub struct DeleteOrphanedDataBlocksHandler;
 impl TransactionHandler for DeleteOrphanedDataBlocksHandler {
     fn name(&self) -> &'static str { "delete_orphaned_data_blocks" }
 
-    fn process(&self, state: &AppState, payload: &[u8], execute: bool) -> HandlerResult {
-        match bincode::serde::decode_from_slice::<DeleteOrphanedDataBlocksPayload, _>(payload, bincode::config::standard()) {
+    fn process(&self, state: &AppState, tx: &Transaction, execute: bool) -> HandlerResult {
+        match bincode::serde::decode_from_slice::<DeleteOrphanedDataBlocksPayload, _>(&tx.rpc.payload, bincode::config::standard()) {
             Ok((payload_data, _)) => {
                 let deleted_fragment_hashes = delete_orphaned_data_blocks_consensus(
                     state.db_pool.get(), 
@@ -149,10 +171,21 @@ pub struct ModifyItemHandler;
 impl TransactionHandler for ModifyItemHandler {
     fn name(&self) -> &'static str { "modify_item" }
 
-    fn process(&self, state: &AppState, payload: &[u8], execute: bool) -> HandlerResult {
-        match bincode::serde::decode_from_slice::<ModifyItemPayload, _>(payload, bincode::config::standard()) {
+    fn process(&self, state: &AppState, tx: &Transaction, execute: bool) -> HandlerResult {
+        match bincode::serde::decode_from_slice::<ModifyItemPayload, _>(&tx.rpc.payload, bincode::config::standard()) {
             Ok((mut payload_data, _)) => {
-                tracing::debug!("ModifyItemHandler processing: inode_id={} user_id={} execute={} new_encrypted_path={:?}", 
+                // Authorization: verify user matches authenticated user
+                if let Some(ref user) = tx.user {
+                    if payload_data.user_id != user.id {
+                        tracing::warn!("Authorization failed: user {} attempted to modify item for user {}", user.id, payload_data.user_id);
+                        return Err(DatabaseError::AuthorizationError);
+                    }
+                } else {
+                    tracing::warn!("Authorization failed: modify_item requires user authentication");
+                    return Err(DatabaseError::AuthorizationError);
+                }
+
+                tracing::debug!("ModifyItemHandler processing: inode_id={} user_id={} execute={} new_encrypted_path={:?}",
                     payload_data.inode_id, payload_data.user_id, execute, payload_data.new_encrypted_path);
                 
                 // Validate fragments exist locally and update stored_locally flags (like InsertFilesHandler)
@@ -219,9 +252,20 @@ pub struct DeleteFilesHandler;
 impl TransactionHandler for DeleteFilesHandler {
     fn name(&self) -> &'static str { "delete_files" }
 
-    fn process(&self, state: &AppState, payload: &[u8], execute: bool) -> HandlerResult {
-        match bincode::serde::decode_from_slice::<DeleteFilesPayload, _>(payload, bincode::config::standard()) {
+    fn process(&self, state: &AppState, tx: &Transaction, execute: bool) -> HandlerResult {
+        match bincode::serde::decode_from_slice::<DeleteFilesPayload, _>(&tx.rpc.payload, bincode::config::standard()) {
             Ok((payload_data, _)) => {
+                // Authorization: verify user matches authenticated user
+                if let Some(ref user) = tx.user {
+                    if payload_data.user_id != user.id {
+                        tracing::warn!("Authorization failed: user {} attempted to delete files for user {}", user.id, payload_data.user_id);
+                        return Err(DatabaseError::AuthorizationError);
+                    }
+                } else {
+                    tracing::warn!("Authorization failed: delete_files requires user authentication");
+                    return Err(DatabaseError::AuthorizationError);
+                }
+
                 crate::db::files::delete_files(
                     state.db_pool.get(), 
                     payload_data.encrypted_path, 

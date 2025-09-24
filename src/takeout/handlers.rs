@@ -2,6 +2,7 @@ use crate::{
     db::{DatabaseError, takeout::{self, TakeoutPayload, TakeoutStatusPayload}},
     handlers::{HandlerResult, TransactionHandler},
     AppState,
+    consensus::types::Transaction,
 };
 
 /// Handler for create_takeout consensus transactions
@@ -12,12 +13,28 @@ impl TransactionHandler for CreateTakeoutHandler {
         "create_takeout" 
     }
 
-    fn process(&self, state: &AppState, payload: &[u8], execute: bool) -> HandlerResult {
-        match bincode::serde::decode_from_slice::<TakeoutPayload, _>(payload, bincode::config::standard()) {
+    fn process(&self, state: &AppState, tx: &Transaction, execute: bool) -> HandlerResult {
+        match bincode::serde::decode_from_slice::<TakeoutPayload, _>(&tx.rpc.payload, bincode::config::standard()) {
             Ok((takeout_payload, _)) => {
+                // Authorization: verify user and node match authenticated identities
+                if let Some(ref user) = tx.user {
+                    if takeout_payload.user_id != user.id {
+                        tracing::warn!("Authorization failed: user {} attempted to create takeout for user {}", user.id, takeout_payload.user_id);
+                        return Err(DatabaseError::AuthorizationError);
+                    }
+                } else {
+                    tracing::warn!("Authorization failed: create_takeout requires user authentication");
+                    return Err(DatabaseError::AuthorizationError);
+                }
+
+                if takeout_payload.owner_node_id != tx.submitter.id {
+                    tracing::warn!("Authorization failed: node {} attempted to create takeout owned by node {}", tx.submitter.id, takeout_payload.owner_node_id);
+                    return Err(DatabaseError::AuthorizationError);
+                }
+
                 // Get current node ID
                 let current_node_id = state.get_node_id().map_err(|_| DatabaseError::ProcessingError)?;
-                
+
                 // Process the takeout creation (includes validation)
                 takeout::process_takeout_creation(
                     state,
@@ -45,8 +62,8 @@ impl TransactionHandler for UpdateTakeoutStatusHandler {
         "update_takeout_status" 
     }
 
-    fn process(&self, state: &AppState, payload: &[u8], execute: bool) -> HandlerResult {
-        match bincode::serde::decode_from_slice::<TakeoutStatusPayload, _>(payload, bincode::config::standard()) {
+    fn process(&self, state: &AppState, tx: &Transaction, execute: bool) -> HandlerResult {
+        match bincode::serde::decode_from_slice::<TakeoutStatusPayload, _>(&tx.rpc.payload, bincode::config::standard()) {
             Ok((status_payload, _)) => {
                 // Process the takeout status update (includes validation)
                 takeout::process_takeout_status_update(

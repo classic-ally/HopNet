@@ -131,13 +131,18 @@ async fn post_initiate_takeout(
     };
     
     // Create consensus transaction
-    let transaction = Transaction {
-        function: "create_takeout".to_string(),
-        payload: encoded_payload,
+    let transaction = match crate::consensus::functions::create_signed_user_transaction(
+        &app_state,
+        "create_takeout".to_string(),
+        encoded_payload,
+        user_id,
+    ) {
+        Ok(tx) => tx,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
     };
     
     // Submit to consensus
-    match consensus_middleware(&app_state, vec![transaction], user_id).await {
+    match consensus_middleware(&app_state, vec![transaction]).await {
         Ok(()) => {
             tracing::info!(
                 "Initiated takeout {} for user {} via consensus ({} bytes of data)",
@@ -197,13 +202,17 @@ async fn delete_takeout(
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
     };
 
-    let transaction = Transaction {
-        function: "update_takeout_status".to_string(),
-        payload: encoded_payload,
+    let transaction = match crate::consensus::functions::create_signed_transaction(
+        &app_state,
+        "update_takeout_status".to_string(),
+        encoded_payload,
+    ) {
+        Ok(tx) => tx,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
     };
 
     // Submit cancellation to consensus
-    match consensus_middleware(&app_state, vec![transaction], user_id).await {
+    match consensus_middleware(&app_state, vec![transaction]).await {
         Ok(_) => {
             tracing::info!("Takeout {} cancelled by user {}", takeout_id, user_id);
             StatusCode::OK
@@ -384,13 +393,17 @@ pub async fn execute_takeout_materialization(
     let encoded_payload = bincode::serde::encode_to_vec(&status_payload, bincode::config::standard())
         .map_err(|e| TakeoutMaterializationError::Serialization(format!("Failed to encode status: {:?}", e)))?;
 
-    let transaction = Transaction {
-        function: "update_takeout_status".to_string(),
-        payload: encoded_payload,
+    let transaction = match crate::consensus::functions::create_signed_transaction(
+        &app_state,
+        "update_takeout_status".to_string(),
+        encoded_payload,
+    ) {
+        Ok(tx) => tx,
+        Err(_) => return Err(TakeoutMaterializationError::Consensus("Failed to sign transaction".to_string())),
     };
 
     // Submit status update to consensus
-    consensus_middleware(app_state, vec![transaction], user_id).await
+    consensus_middleware(app_state, vec![transaction]).await
         .map_err(|e| TakeoutMaterializationError::Consensus(format!("Failed to update status: {:?}", e)))?;
 
     // Start folder materialization
@@ -460,13 +473,14 @@ pub async fn execute_takeout_materialization(
     let encoded_ready_payload = bincode::serde::encode_to_vec(ready_payload, bincode::config::standard())
         .map_err(|e| TakeoutMaterializationError::Serialization(format!("Failed to encode ready status: {:?}", e)))?;
 
-    let ready_transaction = Transaction {
-        function: "update_takeout_status".to_string(),
-        payload: encoded_ready_payload,
-    };
+    let ready_transaction = crate::consensus::functions::create_signed_transaction(
+        app_state,
+        "update_takeout_status".to_string(),
+        encoded_ready_payload,
+    ).map_err(|_| TakeoutMaterializationError::Consensus("Failed to sign ready transaction".to_string()))?;
 
     // Submit ready status to consensus
-    consensus_middleware(app_state, vec![ready_transaction], user_id).await
+    consensus_middleware(app_state, vec![ready_transaction]).await
         .map_err(|e| TakeoutMaterializationError::Consensus(format!("Failed to update to ready: {:?}", e)))?;
 
     tracing::info!("Takeout {} marked as ready for download", takeout_id);

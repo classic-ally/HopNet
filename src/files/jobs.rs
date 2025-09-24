@@ -143,10 +143,14 @@ async fn cleanup_orphaned_data_blocks(
             }
         };
         
-        let transaction = Transaction {
-            function: "delete_orphaned_data_blocks".to_string(),
-            payload: serialized_payload,
-        };
+        let transaction = crate::consensus::functions::create_signed_transaction(
+            app_state,
+            "delete_orphaned_data_blocks".to_string(),
+            serialized_payload,
+        ).map_err(|_| Error::Failed(Arc::new(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Failed to sign transaction"
+        )))))?;
         
         // Get user ID for consensus submission
         let user_id = match app_state.get_user_id() {
@@ -158,7 +162,7 @@ async fn cleanup_orphaned_data_blocks(
         };
         
         // Submit to consensus
-        match consensus_middleware(app_state, vec![transaction], user_id).await {
+        match consensus_middleware(app_state, vec![transaction]).await {
             Ok(_) => {
                 tracing::info!("Successfully submitted consensus transaction to delete {} data blocks", data_block_ids.len());
                 total_cleaned += data_block_ids.len();
@@ -519,12 +523,16 @@ pub async fn run_network_rebalancing(
                 }
             };
             
-            let transaction = Transaction {
-                function: "update_placement_heights".to_string(),
+            let transaction = crate::consensus::functions::create_signed_transaction(
+                app_state,
+                "update_placement_heights".to_string(),
                 payload,
-            };
+            ).map_err(|_| Error::Failed(Arc::new(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Failed to sign transaction"
+            )))))?;
             
-            match consensus_middleware(app_state, vec![transaction], user_id).await {
+            match consensus_middleware(app_state, vec![transaction]).await {
                 Ok(_) => {
                     tracing::info!("Successfully updated placement height for data block {}",
                                  data_block_info.data_block_id);

@@ -1,6 +1,6 @@
 use std::net::IpAddr;
 use axum::{extract::{Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Extension, Json};
-use crate::{consensus::routes::AuthenticatedUser, AppState};
+use crate::{consensus::routes::AuthenticatedNode, AppState};
 use crate::db::metrics::{get_metric, get_all_node_metrics};
 use crate::metrics::collector::{collect_all_node_metrics, CollectionError};
 use crate::consensus::functions::consensus_middleware;
@@ -130,7 +130,7 @@ pub async fn get_latency_server() -> impl IntoResponse {
 #[axum::debug_handler]
 pub async fn get_throughput_server(
     State(app_state): State<AppState>,
-    Extension(_auth): Extension<AuthenticatedUser>,
+    Extension(_auth): Extension<AuthenticatedNode>,
 ) -> impl IntoResponse {
     match downloader().await {
         Ok((task_handle, throughput_port)) => {
@@ -185,7 +185,7 @@ pub async fn get_throughput_server(
 pub async fn get_throughput_result(
     State(app_state): State<AppState>,
     Path(session_id): Path<CustomUUID>,
-    Extension(_auth): Extension<AuthenticatedUser>,
+    Extension(_auth): Extension<AuthenticatedNode>,
 ) -> impl IntoResponse {
     let session_id_for_log = session_id.clone();
     match app_state.throughput_result_collector.get_result(session_id).await {
@@ -341,14 +341,18 @@ pub async fn get_metrics_trigger(
     // Submit metrics to consensus for distributed storage
     match bincode::serde::encode_to_vec(&metrics, bincode::config::standard()) {
         Ok(encoded_metrics) => {
-            let transaction = Transaction {
-                function: "submit_metrics".to_string(),
-                payload: encoded_metrics,
+            let transaction = match crate::consensus::functions::create_signed_transaction(
+                &app_state,
+                "submit_metrics".to_string(),
+                encoded_metrics,
+            ) {
+                Ok(tx) => tx,
+                Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to sign transaction"}))),
             };
             let transactions = vec![transaction];
 
             // Use consensus middleware to ensure distributed agreement
-            match consensus_middleware(&app_state, transactions, source_node_id).await {
+            match consensus_middleware(&app_state, transactions).await {
                 Ok(()) => {
                     let available_count = metrics.iter().filter(|m| m.available).count();
                     tracing::info!("Successfully submitted {} metrics to consensus ({} nodes available)", 
