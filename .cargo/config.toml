@@ -1,6 +1,9 @@
 # Cargo configuration for HopNet project
 
 [alias]
+# Make cargo check also validate tests, benchmarks, and examples
+check = "check --all-targets"
+
 # Run FileProvider integration tests with clean output and correct Swift SDK
 test-fileprovider = "test --quiet fileprovider_integration --test fileprovider_integration -- --nocapture"
 

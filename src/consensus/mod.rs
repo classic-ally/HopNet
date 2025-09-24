@@ -8,3 +8,6 @@ pub mod routes;
 pub mod types;
 pub mod functions;
 pub mod jobs;
+
+#[cfg(test)]
+mod tests;

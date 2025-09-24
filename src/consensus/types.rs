@@ -30,6 +30,7 @@ pub enum CertificateError {
     InsufficientVotes,
 }
 
+#[derive(Debug)]
 pub enum BlockError {
     EncodingError,
     DatabaseError,
@@ -373,36 +374,47 @@ impl QuorumCertificate {
         // Get validators for this height
         let validators = db::get_validators(state.db_pool.get(), block.data.height).map_err(|_| CertificateError::DatabaseError)?;
         let num_validators = validators.len();
-        
-        // Check we have enough signatures for quorum (2/3 + 1)
+
+        // Deduplicate voters: collect unique voter replica_ids (excluding proposer)
+        let mut unique_voters: std::collections::HashMap<i32, &VoteSignMessage> = std::collections::HashMap::new();
+        for voter_sig in &*self.voter_signatures {
+            // Skip if this is the proposer trying to vote again (proposer already counted separately)
+            if voter_sig.replica_id == self.proposer_signature.replica_id {
+                continue;
+            }
+            // Insert only first occurrence of each replica_id (deduplicates)
+            unique_voters.entry(voter_sig.replica_id).or_insert(voter_sig);
+        }
+
+        // Check we have enough unique signatures for quorum (2/3 + 1)
         let required_signatures = (num_validators * 2) / 3 + 1;
-        let total_signatures = 1 + self.voter_signatures.len(); // proposer + voters
-        
-        if total_signatures < required_signatures {
+        let total_unique_signatures = 1 + unique_voters.len(); // proposer + unique voters
+
+        if total_unique_signatures < required_signatures {
             tracing::warn!(
-                "QC verification failed: insufficient signatures (got: {}, required: {}, validators: {})",
-                total_signatures, required_signatures, num_validators
+                "QC verification failed: insufficient unique signatures (got: {}, required: {}, validators: {})",
+                total_unique_signatures, required_signatures, num_validators
             );
             return Err(CertificateError::ValidationError);
         }
         
         tracing::debug!(
-            "Verifying QC for view {} phase {:?} with {} signatures from {} validators",
-            self.view_number, self.phase, total_signatures, num_validators
+            "Verifying QC for view {} phase {:?} with {} unique signatures from {} validators",
+            self.view_number, self.phase, total_unique_signatures, num_validators
         );
-        
+
         // Prepare data for batch verification
         let vote_data = VoteSignData::from_block(block.clone(), self.phase.clone());
         let message = vote_data.encode().map_err(|_| CertificateError::ValidationError)?;
-        
-        // Collect all signatures and public keys for batch verification
+
+        // Collect all signatures and public keys for batch verification (using only unique voters)
         let mut signatures = Vec::new();
         let mut public_keys = Vec::new();
         let mut messages = Vec::new();
-        
+
         // Add proposer signature
         signatures.push(self.proposer_signature.signature);
-        
+
         // Find proposer's public key
         let proposer_node = validators.iter()
             .find(|v| v.node_id == self.proposer_signature.replica_id)
@@ -410,11 +422,11 @@ impl QuorumCertificate {
         let proposer_pubkey = proposer_node.pubkey;
         public_keys.push(*proposer_pubkey);
         messages.push(message.as_slice());
-        
-        // Add voter signatures
-        for voter_sig in &*self.voter_signatures {
+
+        // Add unique voter signatures only
+        for voter_sig in unique_voters.values() {
             signatures.push(voter_sig.signature);
-            
+
             // Find voter's public key
             let voter_node = validators.iter()
                 .find(|v| v.node_id == voter_sig.replica_id)
