@@ -571,3 +571,73 @@ pub struct NetworkRebalancingResult {
     pub data_blocks_failed: usize,
     pub total_fragments_migrated: usize,
 }
+
+/// Scheduled job handler for fragment inventory self-check
+/// Runs every 20-30 minutes to ensure node's inventory matches local fragment storage
+pub async fn handle_fragment_inventory_self_check(job: TaskId, ctx: Data<AppState>) -> Result<(), Error> {
+    run_fragment_inventory_self_check(&ctx).await
+}
+
+/// Core self-check logic that can be called from job handler or manual trigger
+pub async fn run_fragment_inventory_self_check(app_state: &AppState) -> Result<(), Error> {
+    // Get node ID
+    let node_id = match app_state.get_node_id() {
+        Ok(id) => id,
+        Err(_) => {
+            tracing::error!("Node ID not initialized, cannot run self-check");
+            return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Node ID not initialized"
+            )))));
+        }
+    };
+
+    // Compute differential between consensus inventory and local fragments
+    let differential = match crate::db::inventory::compute_inventory_differential(
+        app_state.db_pool.get(),
+        node_id,
+    ) {
+        Ok(diff) => diff,
+        Err(e) => {
+            tracing::error!("Failed to compute inventory differential: {:?}", e);
+            return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to compute inventory differential: {:?}", e)
+            )))));
+        }
+    };
+
+    // Create payload for consensus submission
+    let serialized_payload = match bincode::serde::encode_to_vec(&differential, bincode::config::standard()) {
+        Ok(data) => data,
+        Err(e) => {
+            tracing::error!("Failed to serialize self-check differential: {:?}", e);
+            return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to serialize differential: {:?}", e)
+            )))));
+        }
+    };
+
+    // Create signed transaction for consensus
+    let transaction = crate::consensus::functions::create_signed_transaction(
+        app_state,
+        "self_check_fragments".to_string(),
+        serialized_payload,
+    ).map_err(|_| Error::Failed(Arc::new(Box::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "Failed to sign transaction"
+    )))))?;
+
+    // Submit to consensus
+    match consensus_middleware(app_state, vec![transaction]).await {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            tracing::error!("Failed to submit self-check to consensus: {:?}", e);
+            Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to submit to consensus: {:?}", e)
+            )))))
+        }
+    }
+}

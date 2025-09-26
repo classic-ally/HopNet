@@ -19,7 +19,10 @@ When making changes to the codebase:
 # Logging
 - Use tracing for all Rust logging
 - Use INFO levels sparingly to avoid slowdown due to excessive logging
-- macOS debugging with the `log` command requires the use of sudo 
+- macOS debugging with the `log` command requires the use of sudo
+
+# Git Commits
+- Never include your attribution in commits
 
 # Important Instruction Reminders
 Do what has been asked; nothing more, nothing less.

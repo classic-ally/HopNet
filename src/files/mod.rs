@@ -9,6 +9,7 @@ pub mod distribution;
 pub mod discovery;
 pub mod jobs;
 pub mod download;
+pub mod types;
 
 #[cfg(test)]
 mod tests;

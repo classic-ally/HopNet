@@ -264,53 +264,57 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
             COMMENT ON COLUMN metrics.storage_total_gb IS 'Total storage capacity in gigabytes';
             COMMENT ON COLUMN metrics.storage_used_gb IS 'Used storage capacity in gigabytes';
 
-            -- Attestation system for verifying fragment availability
-            CREATE TABLE attestation_events (
-                tester_id        INTEGER NOT NULL,    -- Who performed the check
-                storer_id        INTEGER NOT NULL,    -- Who was being checked (same as tester for self-checks)
-                consensus_height INTEGER NOT NULL,    -- When the check happened
-                attestation_tier ENUM('database', 'disk', 'remote') NOT NULL,
-                fragments_checked UINTEGER NOT NULL,  -- Total fragments examined
+            -- Local staging table for fragment request metrics (before consensus submission)
+            CREATE TABLE pending_fragment_requests (
+                from_node INTEGER NOT NULL,
+                to_node INTEGER NOT NULL,
+                success BOOLEAN NOT NULL,
+                recorded_at_height INTEGER NOT NULL,      -- When request actually occurred
+                batch_upload_height INTEGER,              -- When submitted to consensus (NULL = pending)
 
-                PRIMARY KEY (tester_id, storer_id, consensus_height),
-                FOREIGN KEY (tester_id) REFERENCES nodes(node_id),
-                FOREIGN KEY (storer_id) REFERENCES nodes(node_id)
+                FOREIGN KEY (from_node) REFERENCES nodes(node_id),
+                FOREIGN KEY (to_node) REFERENCES nodes(node_id)
             );
 
-            -- Indexes for efficient attestation history queries
-            CREATE INDEX idx_attestation_tester_history ON attestation_events (tester_id, consensus_height);
-            CREATE INDEX idx_attestation_storer_history ON attestation_events (storer_id, consensus_height);
-            CREATE INDEX idx_attestation_consensus_height ON attestation_events (consensus_height);  -- For height range queries
+            CREATE INDEX idx_pending_requests ON pending_fragment_requests (batch_upload_height, recorded_at_height);
+            CREATE INDEX idx_timing_requests ON pending_fragment_requests (recorded_at_height, from_node, to_node);
+
+            -- Consensus-tracked reputation metrics (aggregated from staging tables)
+            CREATE TABLE fragment_request_metrics (
+                reporting_node INTEGER NOT NULL,    -- Node that reported these metrics
+                from_node INTEGER NOT NULL,         -- Node that requested fragments
+                to_node INTEGER NOT NULL,           -- Node that served fragments
+                consensus_height INTEGER NOT NULL,   -- When metrics were submitted
+                requests_sent INTEGER NOT NULL,
+                requests_succeeded INTEGER NOT NULL,
+
+                PRIMARY KEY (reporting_node, from_node, to_node, consensus_height),
+                FOREIGN KEY (reporting_node) REFERENCES nodes(node_id),
+                FOREIGN KEY (from_node) REFERENCES nodes(node_id),
+                FOREIGN KEY (to_node) REFERENCES nodes(node_id)
+            );
+
+            -- Indexes for reputation queries
+            CREATE INDEX idx_reputation_to_node ON fragment_request_metrics (to_node, consensus_height);
+            CREATE INDEX idx_reputation_from_node ON fragment_request_metrics (from_node, consensus_height);
+            CREATE INDEX idx_reputation_consensus_height ON fragment_request_metrics (consensus_height);
 
             CREATE TABLE fragment_inventory (
-                fragment_hash    BLOB NOT NULL,
-                node_id         INTEGER NOT NULL,
-                since_height    INTEGER NOT NULL,     -- Consensus height when storage started
-                until_height    INTEGER,              -- Consensus height when storage ended (NULL = current)
-                removal_reason  ENUM('missing', 'corrupted', 'node_offline'),  -- Why storage ended
+                fragment_hash           BLOB NOT NULL,
+                node_id                 INTEGER NOT NULL,
+                self_verified_height    INTEGER, -- Once every so often we ensure this verification is actual disk check NOT only DB check.
 
-                PRIMARY KEY (fragment_hash, node_id, since_height),
+                PRIMARY KEY (fragment_hash, node_id),
                 FOREIGN KEY (node_id) REFERENCES nodes(node_id)
             );
 
             -- Indexes for fragment discovery optimization
-            CREATE INDEX idx_fragment_inventory_current ON fragment_inventory (fragment_hash, until_height);  -- Current locations
-            CREATE INDEX idx_fragment_inventory_since_height ON fragment_inventory (since_height);  -- For height range queries
-            CREATE INDEX idx_fragment_inventory_until_height ON fragment_inventory (until_height);  -- For height range queries
-            CREATE INDEX idx_fragment_inventory_node_at_height ON fragment_inventory (node_id, since_height, until_height); -- Node state at time
-            CREATE INDEX idx_fragment_inventory_removal_analysis ON fragment_inventory (removal_reason, until_height);  -- Analyze removal patterns
+            CREATE INDEX idx_fragment_inventory_node ON fragment_inventory (node_id, fragment_hash);  -- Node-specific fragment lookup
+            CREATE INDEX idx_fragment_inventory_height ON fragment_inventory (self_verified_height, node_id);  -- Height-based queries
 
-            -- Add comments for attestation documentation
-            COMMENT ON TABLE attestation_events IS 'Records attestation checks performed on fragment availability across nodes';
-            COMMENT ON COLUMN attestation_events.tester_id IS 'Node ID performing the attestation check';
-            COMMENT ON COLUMN attestation_events.storer_id IS 'Node ID being checked (same as tester for self-attestation)';
-            COMMENT ON COLUMN attestation_events.consensus_height IS 'References blocks.height for when the attestation occurred';
-            COMMENT ON COLUMN attestation_events.attestation_tier IS 'Level of verification: database (fast), disk (medium), remote (thorough)';
-
-            COMMENT ON TABLE fragment_inventory IS 'Tracks which nodes store which fragments over time for optimized discovery';
-            COMMENT ON COLUMN fragment_inventory.since_height IS 'Consensus height when this node started storing this fragment (references blocks.height)';
-            COMMENT ON COLUMN fragment_inventory.until_height IS 'Consensus height when storage ended (NULL means currently stored, references blocks.height)';
-            COMMENT ON COLUMN fragment_inventory.removal_reason IS 'Reason fragment is no longer stored (if applicable)';
+            -- Add comments for fragment inventory documentation
+            COMMENT ON TABLE fragment_inventory IS 'Tracks which nodes store which fragments for distributed discovery and self-attestation';
+            COMMENT ON COLUMN fragment_inventory.self_verified_height IS 'Last consensus height when node verified it actually has this fragment on disk';
         "
     )?;
     Ok(())

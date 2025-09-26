@@ -907,3 +907,48 @@ pub async fn post_rebalance_network(
         }
     }
 }
+
+/// GET /diagnostics/fragment-inventory-differential
+/// Returns the differential between consensus inventory and local fragments
+/// Used for testing and monitoring the self-attestation system
+pub async fn get_fragment_inventory_differential(
+    State(app_state): State<AppState>,
+    Extension(uid): Extension<i32>,
+) -> impl IntoResponse {
+    let node_id = match app_state.get_node_id() {
+        Ok(id) => id,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    match crate::db::inventory::compute_inventory_differential(
+        app_state.db_pool.get(),
+        node_id,
+    ) {
+        Ok(differential) => {
+            tracing::debug!("Fragment inventory differential computed for node {}: {} added, {} removed",
+                          node_id, differential.fragments_added.len(), differential.fragments_removed.len());
+            (StatusCode::OK, Json(differential)).into_response()
+        }
+        Err(e) => {
+            tracing::error!("Failed to compute fragment inventory differential: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// POST /maintenance/fragment-inventory-self-check
+/// Manually trigger fragment inventory self-check and consensus submission
+pub async fn post_fragment_inventory_self_check(
+    State(app_state): State<AppState>,
+    Extension(uid): Extension<i32>,
+) -> impl IntoResponse {
+    tracing::info!("Manual fragment inventory self-check triggered by user {}", uid);
+
+    match super::jobs::run_fragment_inventory_self_check(&app_state).await {
+        Ok(_) => StatusCode::OK.into_response(),
+        Err(e) => {
+            tracing::error!("Manual fragment inventory self-check failed: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}

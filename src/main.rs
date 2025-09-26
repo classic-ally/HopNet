@@ -309,6 +309,22 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 takeout_worker.run().await;
             });
 
+            // Start fragment inventory self-check worker with randomized 20-30 minute schedule
+            let random_second = rand::rng().random_range(5..55);
+            let random_minute = rand::rng().random_range(0..30); // 0-29 minutes offset within each 30-minute window
+            let self_check_cron_expression = format!("{} {}/30 * * * *", random_second, random_minute);
+            let self_check_schedule = apalis_cron::Schedule::from_str(&self_check_cron_expression).unwrap();
+            let self_check_cron_stream = apalis_cron::CronStream::new(self_check_schedule);
+
+            let self_check_worker = WorkerBuilder::new("fragment-inventory-self-check")
+                .data(app_state.clone())
+                .backend(self_check_cron_stream)
+                .build_fn(files::jobs::handle_fragment_inventory_self_check);
+
+            tokio::spawn(async move {
+                self_check_worker.run().await;
+            });
+
             // Protected routes that require authentication
             let protected_routes = Router::new()
                 .route("/users", get(users::routes::get_users))
@@ -323,6 +339,8 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/maintenance/cleanup-orphaned", post(files::routes::post_cleanup_orphaned_data_blocks))
                 .route("/maintenance/rebalance", post(files::routes::post_rebalance_network))
                 .route("/maintenance/takeout", post(takeout::routes::post_takeout_maintenance))
+                .route("/maintenance/fragment-inventory-self-check", post(files::routes::post_fragment_inventory_self_check))
+                .route("/diagnostics/fragment-inventory-differential", get(files::routes::get_fragment_inventory_differential))
                 .route("/validators", get(consensus::routes::get_validators))
                 .route("/metrics", get(metrics::routes::get_metrics))
                 .route("/metrics/trigger", get(metrics::routes::get_metrics_trigger))

@@ -299,3 +299,35 @@ impl TransactionHandler for DeleteFilesHandler {
 inventory::submit! {
     &DeleteFilesHandler as &dyn TransactionHandler
 }
+
+pub struct SelfCheckFragmentsHandler;
+
+impl TransactionHandler for SelfCheckFragmentsHandler {
+    fn name(&self) -> &'static str { "self_check_fragments" }
+
+    fn process(&self, state: &AppState, tx: &Transaction, execute: bool) -> HandlerResult {
+        match bincode::serde::decode_from_slice::<crate::files::types::SelfCheckFragments, _>(&tx.rpc.payload, bincode::config::standard()) {
+            Ok((report, _)) => {
+                // Authorization: verify node can only submit attestations for itself
+                if report.node_id != tx.submitter.id {
+                    tracing::warn!("Authorization failed: node {} attempted to submit self-attestation for node {}", tx.submitter.id, report.node_id);
+                    return Err(DatabaseError::AuthorizationError);
+                }
+
+                // Apply the self-check updates using the inventory module
+                crate::db::inventory::apply_self_check_updates(
+                    state.db_pool.get(),
+                    &report,
+                    execute
+                )?;
+
+                Ok(())
+            },
+            Err(_) => Err(DatabaseError::InvalidPayload),
+        }
+    }
+}
+
+inventory::submit! {
+    &SelfCheckFragmentsHandler as &dyn TransactionHandler
+}

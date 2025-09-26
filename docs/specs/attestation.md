@@ -2,47 +2,37 @@
 
 ## Overview
 
-This RFC defines a multi-tier attestation system for verifying fragment availability in the HopNet distributed storage network. The system provides three levels of verification with increasing cost and security guarantees.
+This RFC defines a dual-approach attestation system for verifying fragment availability in the HopNet distributed storage network. The system combines self-attestation for maintenance with retrieval-based reputation tracking for storage placement decisions.
 
-## Attestation Tiers
+## Attestation Approaches
 
-### Tier 1: Database Check (trust-storer-fast)
+### Self-Attestation (Internal Maintenance)
 
-The fastest attestation method that queries the storing node's local database to check if fragments are marked as stored locally.
+Nodes periodically verify their own fragment storage for data integrity and cleanup.
 
-**Performance**: ~0.1ms per fragment (database lookup only)
-**Security**: Relies on storing node's honesty about database state
+**Tier 1: Database Check**
+- Queries local database to check fragment inventory consistency
+- **Performance**: ~0.1ms per fragment (database lookup only)
+- **Purpose**: Identify database/filesystem inconsistencies for repair
 
-### Tier 2: Disk Verification (trust-storer-full)
+**Tier 2: Disk Verification**
+- Verifies fragments actually exist on filesystem
+- **Performance**: ~5-10ms per fragment (includes disk I/O)
+- **Purpose**: Detect corrupted or missing files, update local state
 
-Verifies that fragments actually exist on the storing node's filesystem, not just marked as locally stored in the database.
+**Security Model**: Self-reporting for maintenance, not proof of storage
 
-**Performance**: ~5-10ms per fragment (includes disk I/O)
-**Security**: Verifies physical file existence, relies on storing node's honesty about file content
+### Retrieval-Based Reputation (Placement Decisions)
 
-### Tier 3: Content Verification (trust-tester)
-
-A separate node, the tester, downloads the fragment from the storing node and verifies the content matches the expected hash.
+Track fragment request success/failure during normal operations to build node reputation scores.
 
 **Flow**:
-1. Tester requests fragment download from storer via existing fragment API
-2. Tester verifies downloaded content matches expected fragment hash
-3. Tester signs attestation report of verification result
+1. During normal downloads/repairs, record each fragment request outcome
+2. Batch submit aggregated metrics to consensus periodically
+3. Use reputation scores for future placement decisions
 
-**Attestation Report**:
-```json
-{
-  "fragment_hash": "blake3_hash",
-  "content_verified": true,
-  "storer_node": 123,
-  "tester_node": 456,
-  "verification_time": "2024-01-23T10:30:00Z",
-  "tester_signature": "ed25519_signature"
-}
-```
-
-**Performance**: ~50-200ms per fragment (network transfer + verification)
-**Security**: Cryptographically verifies fragment content, limited by potential collusion between tester and storer
+**Performance**: Zero additional network traffic (piggybacks on existing operations)
+**Security**: Gaming-resistant since based on real user requests with actual consequences
 
 ## Data Structures
 
@@ -86,37 +76,44 @@ pub enum AttestationResult {
 
 ## Database Design
 
+### Self-Attestation Schema
+
 ```sql
-CREATE TABLE attestation_events (
-    tester_id       INTEGER NOT NULL,    -- Who performed the check
-    storer_id       INTEGER NOT NULL,    -- Who was being checked (same as tester for self-checks)
-    consensus_height INTEGER NOT NULL,   -- When the check happened
-    attestation_tier ENUM('database', 'disk', 'remote') NOT NULL,
-    fragments_checked UINTEGER NOT NULL,  -- Total fragments examined
-
-    PRIMARY KEY (tester_id, storer_id, consensus_height),
-    INDEX idx_tester_history (tester_id, consensus_height),
-    INDEX idx_storer_history (storer_id, consensus_height)
-);
-
 CREATE TABLE fragment_inventory (
-    fragment_hash   BLOB NOT NULL,
-    node_id        INTEGER NOT NULL,
-    since_height   INTEGER NOT NULL,     -- Consensus height when storage started
-    until_height   INTEGER,              -- Consensus height when storage ended (NULL = current)
-    removal_reason  ENUM('missing', 'corrupted', 'node_offline') NULL, -- Why storage ended
+    fragment_hash           BLOB NOT NULL,
+    node_id                 INTEGER NOT NULL,
+    self_verified_height    INTEGER,  -- Last self-attestation check, once every so often we ensure this verification is actual disk check NOT only DB check.
 
-    PRIMARY KEY (fragment_hash, node_id, since_height),
-    INDEX idx_fragment_current (fragment_hash, until_height),  -- Current locations
-    INDEX idx_node_inventory_at_height (node_id, since_height, until_height), -- Node state at time
-    INDEX idx_removal_analysis (removal_reason, until_height)  -- Analyze removal patterns
+    PRIMARY KEY (fragment_hash, node_id),
+    FOREIGN KEY (node_id) REFERENCES nodes(node_id)
+);
+```
+
+### Retrieval-Based Reputation Schema
+
+```sql
+-- Local staging table (per-node)
+CREATE TABLE pending_fragment_requests (
+    from_node INTEGER NOT NULL,
+    to_node INTEGER NOT NULL,
+    success BOOLEAN NOT NULL,
+    recorded_at_height INTEGER NOT NULL,      -- When request actually occurred
+    batch_upload_height INTEGER,              -- When submitted to consensus (NULL = pending)
+
+    INDEX idx_pending (batch_upload_height, recorded_at_height),
+    INDEX idx_timing (recorded_at_height, from_node, to_node)
 );
 
-CREATE TABLE consensus_blocks (
-    height          INTEGER PRIMARY KEY,
-    block_hash      BLOB NOT NULL,
-    timestamp       TIMESTAMP NOT NULL,  -- When block was committed
-    view_number     INTEGER NOT NULL
+-- Consensus-tracked reputation (aggregated from staging)
+CREATE TABLE fragment_request_metrics (
+    reporting_node INTEGER NOT NULL,    -- Node that reported these metrics
+    from_node INTEGER NOT NULL,         -- Node that requested fragments
+    to_node INTEGER NOT NULL,           -- Node that served fragments
+    consensus_height INTEGER NOT NULL,   -- When metrics were submitted
+    requests_sent INTEGER NOT NULL,
+    requests_succeeded INTEGER NOT NULL,
+
+    PRIMARY KEY (reporting_node, from_node, to_node, consensus_height)
 );
 ```
 

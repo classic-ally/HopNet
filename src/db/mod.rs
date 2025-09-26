@@ -19,3 +19,4 @@ pub mod files;
 pub mod fragments;
 pub mod fileprovider;
 pub mod takeout;
+pub mod inventory;

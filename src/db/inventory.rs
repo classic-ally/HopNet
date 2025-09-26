@@ -1,0 +1,215 @@
+use r2d2::PooledConnection;
+use duckdb::DuckdbConnectionManager;
+use tracing::debug;
+use duckdb::{params, Transaction};
+
+use crate::files::types::SelfCheckFragments;
+use crate::types::Blake3Hash;
+use crate::db::DatabaseError;
+
+/// Apply differential fragment inventory updates from a self-check report
+/// Called by consensus middleware when processing SelfCheckFragments transactions
+///
+/// The execute flag controls whether to actually apply changes (true) or just validate (false)
+pub fn apply_self_check_updates(
+    db_connection: Result<PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    report: &SelfCheckFragments,
+    execute: bool,
+) -> Result<(), DatabaseError> {
+    match db_connection {
+        Ok(mut conn) => {
+            // Create a transaction
+            let tx = conn.transaction().map_err(|_| DatabaseError::LockError)?;
+
+            // Verify the previous count matches our current state
+            let current_count = get_node_fragment_count_tx(&tx, report.node_id)?;
+
+            if current_count != report.previous_count {
+                tracing::error!(
+                    "Fragment inventory state mismatch for node {}: expected {} fragments, found {}",
+                    report.node_id,
+                    report.previous_count,
+                    current_count
+                );
+                // Rollback transaction
+                tx.rollback().map_err(|_| DatabaseError::ProcessingError)?;
+                return Err(DatabaseError::ProcessingError);
+            }
+
+            // Apply changes in optimal order to avoid double operations:
+
+            // 1. Remove fragments that no longer exist
+            if !report.fragments_removed.is_empty() {
+                remove_fragments_tx(&tx, report.node_id, &report.fragments_removed)?;
+
+                debug!(
+                    "Removed {} fragments from inventory for node {}",
+                    report.fragments_removed.len(),
+                    report.node_id
+                );
+            }
+
+            // 2. Update self_verified_height for all remaining fragments owned by this node
+            update_verified_height_tx(&tx, report.node_id, report.self_verified_height)?;
+
+            debug!(
+                "Updated self_verified_height to {} for all fragments of node {}",
+                report.self_verified_height,
+                report.node_id
+            );
+
+            // 3. Insert newly discovered fragments (already have correct verified_height)
+            if !report.fragments_added.is_empty() {
+                insert_fragments_tx(&tx, report.node_id, &report.fragments_added, report.self_verified_height)?;
+
+                debug!(
+                    "Added {} fragments to inventory for node {}",
+                    report.fragments_added.len(),
+                    report.node_id
+                );
+            }
+
+            // Commit or rollback based on execute flag
+            if execute {
+                tx.commit().map_err(|_| DatabaseError::ProcessingError)?;
+            } else {
+                // Validation successful, but rollback since we're not executing
+                tx.rollback().map_err(|_| DatabaseError::ProcessingError)?;
+            }
+
+            Ok(())
+        }
+        Err(_) => Err(DatabaseError::LockError),
+    }
+}
+
+/// Get the current fragment count using a transaction
+fn get_node_fragment_count_tx(
+    tx: &Transaction,
+    node_id: i32
+) -> Result<u32, DatabaseError> {
+    let mut stmt = tx
+        .prepare("SELECT COUNT(*) FROM fragment_inventory WHERE node_id = ?")
+        .map_err(|_| DatabaseError::ProcessingError)?;
+
+    let count: i64 = stmt
+        .query_row(params![node_id], |row| row.get(0))
+        .map_err(|_| DatabaseError::RecallError)?;
+
+    Ok(count as u32)
+}
+
+/// Insert fragments into inventory using a transaction
+fn insert_fragments_tx(
+    tx: &Transaction,
+    node_id: i32,
+    fragments: &[Blake3Hash],
+    verified_height: i32,
+) -> Result<(), DatabaseError> {
+    for fragment_hash in fragments {
+        tx.execute(
+            "INSERT INTO fragment_inventory (fragment_hash, node_id, self_verified_height)
+             VALUES (?, ?, ?)",
+            params![fragment_hash, node_id, verified_height]
+        ).map_err(|_| DatabaseError::InsertError)?;
+    }
+
+    Ok(())
+}
+
+/// Remove fragments from inventory using a transaction
+fn remove_fragments_tx(
+    tx: &Transaction,
+    node_id: i32,
+    fragments: &[Blake3Hash],
+) -> Result<(), DatabaseError> {
+    for fragment_hash in fragments {
+        tx.execute(
+            "DELETE FROM fragment_inventory WHERE fragment_hash = ? AND node_id = ?",
+            params![fragment_hash, node_id]
+        ).map_err(|_| DatabaseError::ProcessingError)?;
+    }
+
+    Ok(())
+}
+
+/// Update verified height for all fragments of a node using a transaction
+fn update_verified_height_tx(
+    tx: &Transaction,
+    node_id: i32,
+    verified_height: i32,
+) -> Result<(), DatabaseError> {
+    tx.execute(
+        "UPDATE fragment_inventory
+         SET self_verified_height = ?
+         WHERE node_id = ?",
+        params![verified_height, node_id],
+    ).map_err(|_| DatabaseError::ProcessingError)?;
+
+    Ok(())
+}
+
+/// Compute the differential between inventory and local fragments for a node
+/// Returns a complete SelfCheckFragments struct ready for consensus submission
+/// Uses high-performance EXCEPT queries optimized for DuckDB's columnar architecture
+/// Uses transaction semantics for consistency guarantees in distributed environment
+pub fn compute_inventory_differential(
+    db_connection: Result<PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    node_id: i32,
+) -> Result<SelfCheckFragments, DatabaseError> {
+    match db_connection {
+        Ok(mut conn) => {
+            // Use transaction for consistent snapshot
+            let tx = conn.transaction().map_err(|_| DatabaseError::LockError)?;
+
+            // Get current inventory count and consensus height
+            let previous_count = get_node_fragment_count_tx(&tx, node_id)?;
+            let self_verified_height = crate::db::consensus::get_current_consensus_height(&tx)?;
+
+            // Fragments we have locally but not in inventory (to be added)
+            let mut added_stmt = tx.prepare(
+                "SELECT DISTINCT fragment_hash FROM fragment_hashes WHERE stored_locally = true
+                 EXCEPT
+                 SELECT fragment_hash FROM fragment_inventory WHERE node_id = ?"
+            ).map_err(|_| DatabaseError::ProcessingError)?;
+
+            let fragments_added = added_stmt
+                .query_map(params![node_id], |row| {
+                    let fragment_hash: Blake3Hash = row.get(0)?;
+                    Ok(fragment_hash)
+                })
+                .map_err(|_| DatabaseError::RecallError)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| DatabaseError::RecallError)?;
+
+            // Fragments in inventory but not stored locally (to be removed)
+            let mut removed_stmt = tx.prepare(
+                "SELECT fragment_hash FROM fragment_inventory WHERE node_id = ?
+                 EXCEPT
+                 SELECT DISTINCT fragment_hash FROM fragment_hashes WHERE stored_locally = true"
+            ).map_err(|_| DatabaseError::ProcessingError)?;
+
+            let fragments_removed = removed_stmt
+                .query_map(params![node_id], |row| {
+                    let fragment_hash: Blake3Hash = row.get(0)?;
+                    Ok(fragment_hash)
+                })
+                .map_err(|_| DatabaseError::RecallError)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| DatabaseError::RecallError)?;
+
+            // Rollback read-only transaction
+            tx.rollback().map_err(|_| DatabaseError::ProcessingError)?;
+
+            // Assemble complete SelfCheckFragments struct
+            Ok(SelfCheckFragments {
+                node_id,
+                self_verified_height,
+                previous_count,
+                fragments_added,
+                fragments_removed,
+            })
+        }
+        Err(_) => Err(DatabaseError::LockError),
+    }
+}
