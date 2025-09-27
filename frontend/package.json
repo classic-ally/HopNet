@@ -7,22 +7,35 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "check": "svelte-check --tsconfig ./tsconfig.app.json && tsc -p tsconfig.node.json"
+    "check": "svelte-check --tsconfig ./tsconfig.app.json && tsc -p tsconfig.node.json",
+    "storybook": "storybook dev -p 6006",
+    "build-storybook": "storybook build"
   },
   "devDependencies": {
+    "@chromatic-com/storybook": "^4.1.1",
     "@iconify-json/carbon": "^1.2.9",
+    "@storybook/addon-a11y": "^9.1.8",
+    "@storybook/addon-docs": "^9.1.8",
+    "@storybook/addon-svelte-csf": "^5.0.8",
+    "@storybook/addon-vitest": "^9.1.8",
+    "@storybook/svelte-vite": "^9.1.8",
     "@sveltejs/vite-plugin-svelte": "^5.0.3",
     "@tsconfig/svelte": "^5.0.4",
     "@unocss/preset-icons": "^66.1.3",
     "@unocss/preset-mini": "^66.1.3",
     "@unocss/preset-web-fonts": "^66.1.3",
     "@vincjo/datatables": "^2.5.0",
+    "storybook": "^9.1.8",
     "svelte": "^5.28.1",
     "svelte-check": "^4.1.6",
     "svelte-qrcode": "^1.0.1",
     "typescript": "~5.8.3",
     "unocss": "^66.1.3",
-    "vite": "^6.3.5"
+    "vite": "^6.3.5",
+    "vitest": "^3.2.4",
+    "@vitest/browser": "^3.2.4",
+    "playwright": "^1.55.1",
+    "@vitest/coverage-v8": "^3.2.4"
   },
   "dependencies": {
     "monaco-editor": "^0.53.0",

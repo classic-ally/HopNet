@@ -21,6 +21,7 @@ const themeColors = {
     overlay2: '#9399b2',     // Light borders (active/focus states)
 
     // Text Colors (Semantic Names)
+    text: '#cdd6f4',         // Default text (same as primary)
     primary: '#cdd6f4',      // Main text
     subtitle: '#bac2de',     // Secondary text
     muted: '#a6adc8',        // Muted text
@@ -62,6 +63,9 @@ export default defineConfig({
                 // Custom extractors for dynamic icon props
                 /icon[=:]\s*["'`](i-carbon-[\w-]+)["'`]/g,         // icon="i-carbon-xxx"
                 /\{[\s\S]*?icon\s*:\s*["'`](i-carbon-[\w-]+)["'`]/g,  // { icon: "i-carbon-xxx" }
+
+                // Include Storybook stories
+                /\.stories\.(js|ts|svelte)$/,
             ]
         }
     },
