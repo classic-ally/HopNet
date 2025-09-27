@@ -167,3 +167,28 @@ export function getFileName(fullPath: string): string {
     const segments = fullPath.split('/').filter(segment => segment.length > 0)
     return segments[segments.length - 1] || '/'
 }
+
+/**
+ * Format storage capacity from GB to human readable format with smart units
+ * Keeps display to max 3 characters + unit for clean chart display
+ * @param gb Storage size in GB
+ * @returns Human readable storage capacity (e.g., "900GB", "1.3TB")
+ */
+export function formatStorageCapacity(gb: number): string {
+    if (gb === 0) return '0GB'
+
+    if (gb < 1000) {
+        // Under 1TB: show as GB (e.g., "900GB", "50GB")
+        return `${Math.floor(gb)}GB`
+    } else {
+        // 1TB and above: show as TB with 1 decimal if needed (e.g., "1.3TB", "10TB")
+        const tb = gb / 1000
+        if (tb < 10) {
+            // Under 10TB: show 1 decimal place (e.g., "1.3TB", "9.8TB")
+            return `${(Math.floor(tb * 10) / 10).toFixed(1)}TB`
+        } else {
+            // 10TB and above: show whole TB (e.g., "15TB", "100TB")
+            return `${Math.floor(tb)}TB`
+        }
+    }
+}

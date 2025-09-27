@@ -275,12 +275,22 @@ pub fn get_all_node_metrics(
                             CAST(nm.storage_used_gb AS REAL) / CAST(nm.storage_total_gb AS REAL)
                         ELSE 0.5  -- Conservative default assuming 50% full
                     END as storage_utilization,
-                    -- Storage multiplier: exponential decay (RFC formula)
-                    EXP(-5.0 * CASE 
+                    -- Storage multiplier: 90% threshold with quartic decay
+                    CASE
                         WHEN nm.storage_total_gb IS NOT NULL AND nm.storage_total_gb > 0 THEN
-                            CAST(nm.storage_used_gb AS REAL) / CAST(nm.storage_total_gb AS REAL)
-                        ELSE 0.5
-                    END) as storage_multiplier
+                            CASE
+                                WHEN (CAST(nm.storage_used_gb AS REAL) / CAST(nm.storage_total_gb AS REAL)) <= 0.9 THEN
+                                    1.0  -- No penalty until 90% full
+                                ELSE
+                                    -- Quartic decay in final 10%: (1 - excess)^4
+                                    POWER(
+                                        1.0 - ((CAST(nm.storage_used_gb AS REAL) / CAST(nm.storage_total_gb AS REAL)) - 0.9) / 0.1,
+                                        4.0
+                                    )
+                            END
+                        ELSE
+                            0.5  -- Conservative default for nodes without storage data
+                    END as storage_multiplier
                 FROM nodes n
                 LEFT JOIN node_metrics nm ON n.node_id = nm.node_id
                 CROSS JOIN network_stats ns

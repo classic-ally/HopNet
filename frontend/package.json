@@ -25,6 +25,7 @@
     "vite": "^6.3.5"
   },
   "dependencies": {
-    "monaco-editor": "^0.53.0"
+    "monaco-editor": "^0.53.0",
+    "uplot": "^1.6.32"
   }
 }

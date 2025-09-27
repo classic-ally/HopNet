@@ -952,3 +952,34 @@ pub async fn post_fragment_inventory_self_check(
         }
     }
 }
+
+/// GET /diagnostics/network-resilience
+/// Returns network-wide file resilience statistics for system overview dashboard
+/// Shows distribution of files across fault tolerance levels (cliff chart data)
+pub async fn get_network_resilience_stats(
+    State(app_state): State<AppState>,
+    Extension(uid): Extension<i32>,
+) -> Result<Json<hopnet_common::db::NetworkResilienceStats>, StatusCode> {
+    tracing::info!("Network resilience statistics requested by user {}", uid);
+
+    match crate::db::resilience::compute_network_resilience_stats(app_state.db_pool.get()) {
+        Ok(stats) => {
+            tracing::info!(
+                "Network resilience computed: {} total files ({} unknown, {} unrecoverable, {} critical, {} good, {} excellent, {} exceptional) in {}ms",
+                stats.total_files,
+                stats.unknown.file_count,
+                stats.unrecoverable.file_count,
+                stats.critical.file_count,
+                stats.good.file_count,
+                stats.excellent.file_count,
+                stats.exceptional.file_count,
+                stats.computation_time_ms
+            );
+            Ok(Json(stats))
+        }
+        Err(e) => {
+            tracing::error!("Failed to compute network resilience statistics: {:?}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}

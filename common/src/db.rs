@@ -111,3 +111,79 @@ pub struct FileItem {
     #[typeshare(serialized_as = "String")]
     pub modification_date: Option<DateTime<Utc>>, // From data_id UUIDv7 for files
 }
+
+/// Network resilience statistics for cliff chart display
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[typeshare]
+pub struct NetworkResilienceStats {
+    pub unknown: ResilienceLevel,          // -2: Files without attestation data
+    pub unrecoverable: ResilienceLevel,    // -1: Files that cannot be recovered
+    pub critical: ResilienceLevel,         //  0: No fault tolerance (single point of failure)
+    pub good: ResilienceLevel,             //  1: Can survive 1 node failure
+    pub excellent: ResilienceLevel,        //  2: Can survive 2 node failures
+    pub exceptional: ResilienceLevel,      // 3+: Can survive 3+ node failures
+    pub total_files: u32,
+    #[typeshare(serialized_as = "number")]
+    pub computation_time_ms: u64,
+}
+
+/// Individual resilience level statistics
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[typeshare]
+pub struct ResilienceLevel {
+    pub file_count: u32,
+    pub percentage: f64,
+}
+
+/// Data source for node storage baseline
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[typeshare]
+pub enum NodeSource {
+    System,    // Real system data
+    Modified,  // Modified from system data
+    Added,     // User-added hypothetical node
+}
+
+/// Original values for tracking modifications
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[typeshare]
+pub struct OriginalNodeValues {
+    #[typeshare(serialized_as = "number")]
+    pub storage_total_gb: f64,
+    #[typeshare(serialized_as = "number")]
+    pub baseline_storage_gb: f64,
+}
+
+/// Node storage baseline data for fault tolerance curve generation
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[typeshare]
+pub struct NodeStorageBaseline {
+    pub node_id: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub display_name: String,
+    #[typeshare(serialized_as = "number")]
+    pub storage_total_gb: f64,
+    #[typeshare(serialized_as = "number")]
+    pub baseline_storage_gb: f64,
+    #[serde(default = "default_node_source")]
+    pub source: NodeSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_values: Option<OriginalNodeValues>,
+}
+
+fn default_node_source() -> NodeSource {
+    NodeSource::System
+}
+
+/// Point on the fault tolerance curve showing network resilience vs user data
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[typeshare]
+pub struct FaultToleranceCurvePoint {
+    #[typeshare(serialized_as = "number")]
+    pub user_data_gb: f64,
+    #[typeshare(serialized_as = "number")]
+    pub active_nodes: usize,
+    pub nodes_can_fail: i32,
+    pub participating_nodes: Vec<NodeStorageBaseline>,
+}

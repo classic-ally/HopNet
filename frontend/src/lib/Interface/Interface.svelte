@@ -8,9 +8,11 @@
     import TakeoutHeader from "./TakeoutHeader.svelte";
     import TakeoutTable from "./TakeoutTable.svelte";
     import SidebarItem from "./SidebarItem.svelte";
+    import ResilienceHeader from "../panes/resilience/ResilienceHeader.svelte";
+    import ResiliencePane from "../panes/resilience/ResiliencePane.svelte";
 
     // State to track which sidebar item is selected
-    let selectedItem = "recents"; // Can be "recents", "browse", "account", "nodes", "takeout"
+    let selectedItem = "recents"; // Can be "recents", "browse", "account", "nodes", "takeout", "resilience"
     // State to track if we're in account mode (sticky)
     let inAccountMode = false;
     
@@ -56,6 +58,14 @@
         }
     }
 
+    function handleResilienceClick() {
+        selectedItem = "resilience";
+        // Close sidebar on mobile after selection
+        if (window.innerWidth < 768) {
+            isSidebarOpen = false;
+        }
+    }
+
     function handleAccountBack() {
         // When back is clicked from account, exit account mode and go back to recents
         inAccountMode = false;
@@ -67,6 +77,7 @@
     let canCreateTakeout = false;
     let canDownloadSelected = false;
     let canDeleteSelected = false;
+    let resilienceRef;
     
     function toggleSidebar() {
         isSidebarOpen = !isSidebarOpen;
@@ -111,6 +122,12 @@
                         title="Nodes"
                         selected={selectedItem === "nodes"}
                         onClick={handleNodesClick}
+                    />
+                    <SidebarItem
+                        icon="i-carbon-analytics"
+                        title="Resilience"
+                        selected={selectedItem === "resilience"}
+                        onClick={handleResilienceClick}
                     />
                 {:else}
                     <!-- Default mode: Show Recents and Browse -->
@@ -176,6 +193,26 @@
                 canDeleteSelected={canDeleteSelected}
             />
             <TakeoutTable bind:this={takeoutTableRef} bind:canCreateTakeout bind:canDownloadSelected bind:canDeleteSelected/>
+        {:else if selectedItem === "resilience"}
+            <ResilienceHeader
+                onToggleSidebar={toggleSidebar}
+                onAddNode={() => {
+                    if (resilienceRef && resilienceRef.addTestNode) {
+                        resilienceRef.addTestNode();
+                    }
+                }}
+                onClearNodes={() => {
+                    if (resilienceRef && resilienceRef.clearNodes) {
+                        resilienceRef.clearNodes();
+                    }
+                }}
+                onAnalyze={() => {
+                    if (resilienceRef && resilienceRef.analyzeNetwork) {
+                        resilienceRef.analyzeNetwork();
+                    }
+                }}
+            />
+            <ResiliencePane bind:this={resilienceRef}/>
         {:else if selectedItem === "recents"}
             <!-- Header area -->
             <FileBrowserHeader onToggleSidebar={toggleSidebar}/>

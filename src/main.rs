@@ -29,6 +29,7 @@ mod handlers;
 mod files;
 mod fileprovider;
 mod takeout;
+mod admin;
 
 static ASSETS_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/frontend/dist");
 
@@ -341,11 +342,13 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/maintenance/takeout", post(takeout::routes::post_takeout_maintenance))
                 .route("/maintenance/fragment-inventory-self-check", post(files::routes::post_fragment_inventory_self_check))
                 .route("/diagnostics/fragment-inventory-differential", get(files::routes::get_fragment_inventory_differential))
+                .route("/diagnostics/network-resilience", get(files::routes::get_network_resilience_stats))
                 .route("/validators", get(consensus::routes::get_validators))
                 .route("/metrics", get(metrics::routes::get_metrics))
                 .route("/metrics/trigger", get(metrics::routes::get_metrics_trigger))
                 .route("/metrics/scores", get(metrics::routes::get_placement_scores))
                 .nest("/takeout", takeout::takeout_routes())
+                .nest("/admin", admin::routes::admin_routes())
                 .layer(middleware::from_fn_with_state(app_state.clone(), auth::auth_middleware));
 
             // Routes that accept either JWT (users) or RPC (nodes) authentication

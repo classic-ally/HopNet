@@ -20,3 +20,4 @@ pub mod fragments;
 pub mod fileprovider;
 pub mod takeout;
 pub mod inventory;
+pub mod resilience;

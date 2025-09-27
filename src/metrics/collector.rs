@@ -199,8 +199,7 @@ pub async fn collect_all_node_metrics(
     )?;
     
     if target_nodes.is_empty() {
-        tracing::warn!("No nodes found to measure");
-        return Ok(vec![]);
+        tracing::warn!("No other nodes found to measure (single-node setup) - proceeding with self-test only");
     }
     
     tracing::info!("Measuring metrics for {} nodes at height {}", target_nodes.len(), current_height);
@@ -300,7 +299,37 @@ pub async fn collect_all_node_metrics(
         // Small delay between measurements to be network-friendly
         tokio::time::sleep(TokioDuration::from_millis(500)).await;
     }
-    
+
+    // Add self-test: measure our own storage and submit it
+    tracing::debug!("Performing self-storage test for node {}", source_node_id);
+    let self_storage_result = crate::metrics::routes::calculate_storage_usage(&app_state.fragments_dir).await;
+
+    match self_storage_result {
+        Ok(storage) => {
+            tracing::debug!("Self-storage measurement successful: {}/{} GB", storage.used_gb, storage.total_gb);
+
+            // Create a self-metric (from ourselves to ourselves)
+            let self_metric = Metric {
+                from_node: source_node_id,
+                to_node: source_node_id,  // Self-measurement
+                start_time: measurement_time,
+                rtt_latency: None,        // Not applicable for self-measurement
+                rtt_variance: None,       // Not applicable for self-measurement
+                rtt_jitter: None,         // Not applicable for self-measurement
+                throughput: None,         // Not applicable for self-measurement
+                height: current_height,
+                available: true,          // We're always available to ourselves
+                storage_total_gb: Some(storage.total_gb),
+                storage_used_gb: Some(storage.used_gb),
+            };
+
+            metrics.push(self_metric);
+        }
+        Err(e) => {
+            tracing::warn!("Self-storage measurement failed: {}", e);
+        }
+    }
+
     let total_duration = collection_start.elapsed();
     let available_count = metrics.iter().filter(|m| m.available).count();
     

@@ -7,21 +7,21 @@ import { createLocalFontProcessor } from '@unocss/preset-web-fonts/local'
 import { defineConfig } from 'unocss'
 
 export default defineConfig({
-    safelist: [
-        // File type icons - ensure these are always included even if used in conditional logic
-        'i-carbon-document-blank',   // List view files
-        'i-carbon-document-unknown', // Unknown files (detail)
-        'i-carbon-document',         // Text files (detail)
-        'i-carbon-document-pdf',     // PDF files (detail)
-        'i-carbon-document-configuration', // Code files (detail)
-        'i-carbon-image',           // Image files (detail)
-        'i-carbon-video',           // Video files (detail)
-        'i-carbon-music',           // Audio files (detail)
-        'i-carbon-folder',          // Folders
-        // Navigation icons
-        'i-carbon-search',          // Search toggle button
-        'i-carbon-close'            // Search close button
-    ],
+    content: {
+        filesystem: ['src/**/*.{svelte,ts,js}'],
+        pipeline: {
+            include: [
+                // Default UnoCSS extractors
+                /<[^>]*\s[^>]*>/g,                                  // HTML tags with attributes
+                /[\w\-.:]+(?:\s*=\s*["'`][^"'`]*["'`])?/g,         // Attributes
+                /class[=:]\s*["'`][^"'`]*["'`]/g,                  // class="..." or class: "..."
+
+                // Custom extractors for dynamic icon props
+                /icon[=:]\s*["'`](i-carbon-[\w-]+)["'`]/g,         // icon="i-carbon-xxx"
+                /\{[\s\S]*?icon\s*:\s*["'`](i-carbon-[\w-]+)["'`]/g,  // { icon: "i-carbon-xxx" }
+            ]
+        }
+    },
     presets: [
         presetWebFonts({
             provider: 'google',
