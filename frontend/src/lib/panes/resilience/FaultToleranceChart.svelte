@@ -6,6 +6,8 @@
     import { formatStorageCapacity } from '../../utils/formatters';
 
     export let data: FaultToleranceCurvePoint[] = [];
+    export let onPlanClick: (() => void) | undefined = undefined;
+    export let planButtonText: string = "Plan...";
 
     let chartContainer: HTMLDivElement;
     let chart: uPlot | null = null;
@@ -555,10 +557,13 @@
 <!-- Chart container with themed styling -->
 <div class="bg-surface0 rounded-lg p-4 border border-overlay0">
     <div class="flex items-center justify-between mb-3">
-        <h5 class="text-primary font-medium">Fault Tolerance Curve</h5>
-        <div class="text-sm text-subtitle">
-            {data.length} data points
-        </div>
+        <h4 class="text-lg font-semibold text-primary">Storage Resilience</h4>
+        <button
+            class="text-sm bg-blue text-base px-3 py-1 rounded hover:bg-blue/80"
+            onclick={onPlanClick}
+        >
+            {planButtonText}
+        </button>
     </div>
 
     <!-- Chart container - always present but hidden when not needed -->
@@ -581,10 +586,11 @@
     <!-- Over-capacity state -->
     <div class="text-center py-12" class:hidden={!isOverCapacity(data)}>
         <div class="i-carbon-warning-filled text-3xl mb-3 text-red mx-auto"></div>
-        <h3 class="text-lg font-semibold text-red mb-2">Network Over Capacity</h3>
-        <p class="text-text mb-4">All nodes are using more than 90% of their storage capacity.</p>
+        <h3 class="text-lg font-semibold text-red mb-2">Network Capacity Insufficient</h3>
+        <p class="text-text mb-4">All nodes baseline usage exceeds the 90% operational safety threshold.</p>
         <div class="bg-surface1 rounded-lg p-4 text-left max-w-md mx-auto">
-            <p class="text-sm text-subtitle mb-3"><strong>Impact:</strong> Cannot safely store additional user data</p>
+            <p class="text-sm text-subtitle mb-1"><strong>Single-node setups:</strong> Typical</p>
+            <p class="text-sm text-subtitle mb-3"><strong>Mature deployments:</strong> Requires immediate attention</p>
             <p class="text-sm text-subtitle mb-2"><strong>Recommended actions:</strong></p>
             <ul class="text-sm text-muted space-y-1 ml-4">
                 <li>Add more storage nodes to the network</li>

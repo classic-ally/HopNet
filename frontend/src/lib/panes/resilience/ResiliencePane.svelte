@@ -3,6 +3,7 @@
     import type { NodeStorageBaseline, FaultToleranceCurvePoint, NodeSource } from '../../types';
     import { tokenStore, API_BASE_URL } from '../../stores';
     import FaultToleranceChart from './FaultToleranceChart.svelte';
+    import ConsensusHealthBar from './ConsensusHealthBar.svelte';
 
     // System nodes and working copy for modifications
     let systemNodes: NodeStorageBaseline[] = []; // Immutable system data
@@ -12,6 +13,65 @@
     let curveData: FaultToleranceCurvePoint[] = [];
     let loading = false;
     let error = '';
+
+    // Plan mode state - controls whether Network Configuration is visible
+    let isInPlanMode = false;
+
+    function togglePlanMode() {
+        isInPlanMode = !isInPlanMode;
+    }
+
+    // Consensus test scenarios
+    let consensusScenario = {
+        activeValidators: 5,
+        totalValidators: 5,
+        unavailableValidators: 0,
+        voteOutThreshold: 1,
+        totalNetworkNodes: 20
+    };
+
+    const testScenarios = [
+        {
+            name: "Development (1 validator)",
+            data: { activeValidators: 1, totalValidators: 1, unavailableValidators: 0, voteOutThreshold: 1, totalNetworkNodes: 5 }
+        },
+        {
+            name: "Relaxed - Healthy (5 validators)",
+            data: { activeValidators: 5, totalValidators: 5, unavailableValidators: 0, voteOutThreshold: 1, totalNetworkNodes: 20 }
+        },
+        {
+            name: "Relaxed - Vote-out (5 validators)",
+            data: { activeValidators: 5, totalValidators: 5, unavailableValidators: 1, voteOutThreshold: 1, totalNetworkNodes: 20 }
+        },
+        {
+            name: "Relaxed - Critical (5 validators)",
+            data: { activeValidators: 5, totalValidators: 5, unavailableValidators: 3, voteOutThreshold: 1, totalNetworkNodes: 20 }
+        },
+        {
+            name: "Full BFT - Healthy (7 validators)",
+            data: { activeValidators: 7, totalValidators: 7, unavailableValidators: 0, voteOutThreshold: 1, totalNetworkNodes: 15 }
+        },
+        {
+            name: "Full BFT - Vote-out (7 validators)",
+            data: { activeValidators: 7, totalValidators: 7, unavailableValidators: 1, voteOutThreshold: 1, totalNetworkNodes: 15 }
+        },
+        {
+            name: "Full BFT - Critical (7 validators)",
+            data: { activeValidators: 7, totalValidators: 7, unavailableValidators: 4, voteOutThreshold: 1, totalNetworkNodes: 15 }
+        },
+        {
+            name: "Robust BFT (9 validators)",
+            data: { activeValidators: 9, totalValidators: 9, unavailableValidators: 0, voteOutThreshold: 1, totalNetworkNodes: 20 }
+        },
+        {
+            name: "Enterprise Scale (40 validators)",
+            data: { activeValidators: 40, totalValidators: 40, unavailableValidators: 3, voteOutThreshold: 6, totalNetworkNodes: 100 }
+        }
+    ];
+
+    function setScenario(scenario) {
+        consensusScenario = { ...scenario.data };
+    }
 
     // Load system nodes from backend
     async function loadSystemNodes() {
@@ -147,131 +207,172 @@
     }
 </script>
 
+<!-- Main Grid Layout -->
 <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
-    <!-- Left Panel: Node Configuration -->
-    <div class="border-solid border-1 rounded-lg p-4 border-overlay1">
-        <h4 class="text-lg font-semibold text-primary mb-3">Network Configuration</h4>
+    <!-- Left Panel: Storage Resilience -->
+    <div class="space-y-4">
+        <!-- Storage Resilience Grid -->
+        <div class="grid grid-cols-1 gap-4">
+            <!-- Node Configuration - only show in plan mode -->
+            {#if isInPlanMode}
+                <div class="border-solid border-1 rounded-lg p-4 border-overlay1">
+                    <h4 class="text-lg font-semibold text-primary mb-3">Network Configuration</h4>
 
-        <!-- Node List -->
-        <div class="space-y-3 mb-4">
-            {#each workingNodes as node, index}
-                <div class="bg-surface0 rounded-md p-3">
-                    <div class="flex items-center justify-between mb-2">
-                        <div class="flex items-center gap-2">
-                            <!-- Source indicator -->
-                            {#if node.source === 'System'}
-                                <div class="i-carbon-server text-blue text-sm" title="System node"></div>
-                            {:else if node.source === 'Modified'}
-                                <div class="i-carbon-edit text-orange text-sm" title="Modified from system"></div>
-                            {:else if node.source === 'Added'}
-                                <div class="i-carbon-add text-green text-sm" title="Hypothetical node"></div>
-                            {/if}
-                            <span class="text-primary font-medium">{node.display_name}</span>
-                        </div>
-                        <div class="flex items-center gap-1">
-                            <!-- Reset button for modified nodes -->
-                            {#if node.source === 'Modified'}
-                                <button
-                                    class="text-subtitle hover:bg-surface1 rounded p-1"
-                                    onclick={() => resetNode(index)}
-                                    title="Reset to original values"
-                                >
-                                    <div class="i-carbon-reset text-sm"></div>
-                                </button>
-                            {/if}
-                            <!-- Remove button (only for Added nodes, or allow removal of system nodes) -->
-                            <button
-                                class="text-red hover:bg-surface1 rounded p-1"
-                                onclick={() => removeNode(index)}
-                                title={node.source === 'Added' ? 'Remove hypothetical node' : 'Remove from analysis'}
-                            >
-                                <div class="i-carbon-close text-sm"></div>
-                            </button>
-                        </div>
+                    <!-- Node List -->
+                    <div class="space-y-3 mb-4">
+                        {#each workingNodes as node, index}
+                            <div class="bg-surface0 rounded-md p-3">
+                                <div class="flex items-center justify-between mb-2">
+                                    <div class="flex items-center gap-2">
+                                        <!-- Source indicator -->
+                                        {#if node.source === 'System'}
+                                            <div class="i-carbon-server text-blue text-sm" title="System node"></div>
+                                        {:else if node.source === 'Modified'}
+                                            <div class="i-carbon-edit text-orange text-sm" title="Modified from system"></div>
+                                        {:else if node.source === 'Added'}
+                                            <div class="i-carbon-add text-green text-sm" title="Hypothetical node"></div>
+                                        {/if}
+                                        <span class="text-primary font-medium">{node.display_name}</span>
+                                    </div>
+                                    <div class="flex items-center gap-1">
+                                        <!-- Reset button for modified nodes -->
+                                        {#if node.source === 'Modified'}
+                                            <button
+                                                class="text-subtitle hover:bg-surface1 rounded p-1"
+                                                onclick={() => resetNode(index)}
+                                                title="Reset to original values"
+                                            >
+                                                <div class="i-carbon-reset text-sm"></div>
+                                            </button>
+                                        {/if}
+                                        <!-- Remove button (only for Added nodes, or allow removal of system nodes) -->
+                                        <button
+                                            class="text-red hover:bg-surface1 rounded p-1"
+                                            onclick={() => removeNode(index)}
+                                            title={node.source === 'Added' ? 'Remove hypothetical node' : 'Remove from analysis'}
+                                        >
+                                            <div class="i-carbon-close text-sm"></div>
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <div class="grid grid-cols-2 gap-2">
+                                    <div>
+                                        <label class="text-sm text-subtitle">Total Storage (GB)</label>
+                                        <input
+                                            type="number"
+                                            min="1"
+                                            step="100"
+                                            class="w-full bg-base border border-overlay0 rounded px-2 py-1 text-primary"
+                                            bind:value={node.storage_total_gb}
+                                            oninput={(e) => updateNode(index, 'storage_total_gb', Number(e.target.value))}
+                                        />
+                                    </div>
+                                    <div>
+                                        <label class="text-sm text-subtitle">Baseline Usage (GB)</label>
+                                        <input
+                                            type="number"
+                                            min="0"
+                                            step="10"
+                                            class="w-full bg-base border border-overlay0 rounded px-2 py-1 text-primary"
+                                            bind:value={node.baseline_storage_gb}
+                                            oninput={(e) => updateNode(index, 'baseline_storage_gb', Number(e.target.value))}
+                                        />
+                                    </div>
+                                </div>
+                            </div>
+                        {/each}
+
+                        {#if workingNodes.length === 0}
+                            <div class="text-muted text-center py-8">
+                                <div class="i-carbon-server text-2xl mb-2"></div>
+                                <p>No nodes available</p>
+                                <p class="text-sm">{loading ? 'Loading system data...' : 'Unable to load system nodes'}</p>
+                            </div>
+                        {/if}
                     </div>
 
-                    <div class="grid grid-cols-2 gap-2">
-                        <div>
-                            <label class="text-sm text-subtitle">Total Storage (GB)</label>
-                            <input
-                                type="number"
-                                min="1"
-                                step="100"
-                                class="w-full bg-base border border-overlay0 rounded px-2 py-1 text-primary"
-                                bind:value={node.storage_total_gb}
-                                oninput={(e) => updateNode(index, 'storage_total_gb', Number(e.target.value))}
-                            />
-                        </div>
-                        <div>
-                            <label class="text-sm text-subtitle">Baseline Usage (GB)</label>
-                            <input
-                                type="number"
-                                min="0"
-                                step="10"
-                                class="w-full bg-base border border-overlay0 rounded px-2 py-1 text-primary"
-                                bind:value={node.baseline_storage_gb}
-                                oninput={(e) => updateNode(index, 'baseline_storage_gb', Number(e.target.value))}
-                            />
-                        </div>
+                    <!-- Action Buttons -->
+                    <div class="flex gap-2 mb-4">
+                        <button
+                            class="flex items-center gap-2 bg-green text-base px-3 py-2 rounded hover:bg-green/80"
+                            onclick={addHypotheticalNode}
+                        >
+                            <div class="i-carbon-add text-sm"></div>
+                            Add Hypothetical Node
+                        </button>
+                        <button
+                            class="flex items-center gap-2 bg-blue text-base px-3 py-2 rounded hover:bg-blue/80"
+                            onclick={analyzeNetwork}
+                            disabled={loading}
+                        >
+                            <div class="i-carbon-chart-line text-sm"></div>
+                            Re-analyze
+                        </button>
+                        <button
+                            class="flex items-center gap-2 bg-surface1 text-text px-3 py-2 rounded hover:bg-surface2"
+                            onclick={resetToSystemData}
+                            disabled={loading}
+                        >
+                            <div class="i-carbon-reset text-sm"></div>
+                            Reset to System
+                        </button>
                     </div>
-                </div>
-            {/each}
 
-            {#if workingNodes.length === 0}
-                <div class="text-muted text-center py-8">
-                    <div class="i-carbon-server text-2xl mb-2"></div>
-                    <p>No nodes available</p>
-                    <p class="text-sm">{loading ? 'Loading system data...' : 'Unable to load system nodes'}</p>
+                    <!-- Analysis Status -->
+                    {#if error}
+                        <div class="text-red bg-surface0 border border-red rounded p-3 mb-4">
+                            {error}
+                        </div>
+                    {/if}
+
+                    {#if loading}
+                        <div class="text-blue bg-surface0 border border-blue rounded p-3 mb-4">
+                            Analyzing network...
+                        </div>
+                    {/if}
                 </div>
             {/if}
-        </div>
 
-        <!-- Action Buttons -->
-        <div class="flex gap-2 mb-4">
-            <button
-                class="flex items-center gap-2 bg-green text-base px-3 py-2 rounded hover:bg-green/80"
-                onclick={addHypotheticalNode}
-            >
-                <div class="i-carbon-add text-sm"></div>
-                Add Hypothetical Node
-            </button>
-            <button
-                class="flex items-center gap-2 bg-blue text-base px-3 py-2 rounded hover:bg-blue/80"
-                onclick={analyzeNetwork}
-                disabled={loading}
-            >
-                <div class="i-carbon-chart-line text-sm"></div>
-                Re-analyze
-            </button>
-            <button
-                class="flex items-center gap-2 bg-surface1 text-text px-3 py-2 rounded hover:bg-surface2"
-                onclick={resetToSystemData}
-                disabled={loading}
-            >
-                <div class="i-carbon-reset text-sm"></div>
-                Reset to System
-            </button>
-        </div>
-
-        <!-- Analysis Status -->
-        {#if error}
-            <div class="text-red bg-surface0 border border-red rounded p-3 mb-4">
-                {error}
+            <!-- Fault Tolerance Chart -->
+            <div class="border-solid border-1 rounded-lg border-overlay1">
+                <FaultToleranceChart
+                    data={curveData}
+                    onPlanClick={togglePlanMode}
+                    planButtonText={isInPlanMode ? "Done" : "Plan..."}
+                />
             </div>
-        {/if}
-
-        {#if loading}
-            <div class="text-blue bg-surface0 border border-blue rounded p-3 mb-4">
-                Analyzing network...
-            </div>
-        {/if}
+        </div>
     </div>
 
-    <!-- Right Panel: Fault Tolerance Curve -->
-    <div class="border-solid border-1 rounded-lg p-4 border-overlay1">
-        <h4 class="text-lg font-semibold text-primary mb-3">Fault Tolerance Analysis</h4>
+    <!-- Right Panel: Decision Resilience -->
+    <div class="border-solid border-1 rounded-lg border-overlay1">
+        <!-- Test Scenario Buttons -->
+        <div class="p-3 border-b border-overlay0">
+            <div class="text-xs text-subtitle mb-2">Test Scenarios:</div>
+            <div class="flex flex-wrap gap-2">
+                {#each testScenarios as scenario, index}
+                    <button
+                        class="text-xs px-2 py-1 rounded transition-colors {
+                            JSON.stringify(consensusScenario) === JSON.stringify(scenario.data)
+                                ? 'bg-primary text-base'
+                                : 'bg-surface1 text-subtitle hover:bg-surface2'
+                        }"
+                        onclick={() => setScenario(scenario)}
+                    >
+                        {scenario.name}
+                    </button>
+                {/each}
+            </div>
+        </div>
 
-        <!-- Fault Tolerance Chart -->
-        <FaultToleranceChart data={curveData} />
+        <ConsensusHealthBar
+            activeValidators={consensusScenario.activeValidators}
+            totalValidators={consensusScenario.totalValidators}
+            inTransition={false}
+            unavailableValidators={consensusScenario.unavailableValidators}
+            voteOutThreshold={consensusScenario.voteOutThreshold}
+            totalNetworkNodes={consensusScenario.totalNetworkNodes}
+        />
     </div>
 </div>
