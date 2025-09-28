@@ -1,13 +1,12 @@
 <script lang="ts">
     import { tokenStore } from '../stores';
+    import Button from '../Button.svelte';
     
     export let selected: Boolean;
     export let onClick: () => void;
     export let onBack: () => void;
     
-    function handleLogout(event: MouseEvent) {
-        // Prevent event bubbling to avoid triggering handleContainerClick
-        event.stopPropagation();
+    function handleLogout() {
         tokenStore.set(null);
     }
 
@@ -26,11 +25,7 @@
         }
     }
 
-    function handleBack(event: MouseEvent) {
-        // Prevent event bubbling to avoid triggering handleContainerClick
-        event.stopPropagation();
-        
-        // Handle back action using the provided onBack function
+    function handleBack() {
         if (onBack) {
             onBack();
         }
@@ -50,20 +45,18 @@
     </div>
     {#if selected}
         <div class="flex justify-between gap-1">
-            <button
-                class="text-primary justify-center flex bg-surface1 p-1 border-overlay1 border-solid border-1 rounded-md text-sm items-center gap-1 flex-1 cursor-pointer hover:bg-surface2 hover:border-mauve"
-                on:click={handleBack}
-            >
-                <div class="i-carbon-chevron-left"></div>
-                <p>Back</p>
-            </button>
-            <button
-                class="text-primary justify-center flex bg-surface1 p-1 border-overlay1 border-solid border-1 rounded-md text-sm items-center gap-1 flex-1 cursor-pointer hover:bg-surface2 hover:border-mauve"
-                on:click={handleLogout}
-            >
-                <div class="i-carbon-ibm-engineering-requirements-doors-next"></div>
-                <p>Log out</p>
-            </button>
+            <Button
+                icon="i-carbon-chevron-left"
+                text="Back"
+                onClick={handleBack}
+                className="flex-1"
+            />
+            <Button
+                icon="i-carbon-ibm-engineering-requirements-doors-next"
+                text="Log out"
+                onClick={handleLogout}
+                className="flex-1"
+            />
         </div>
     {/if}
 </div>

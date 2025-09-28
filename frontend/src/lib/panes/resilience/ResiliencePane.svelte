@@ -21,57 +21,15 @@
         isInPlanMode = !isInPlanMode;
     }
 
-    // Consensus test scenarios
+    // Current consensus state (hardcoded to setup mode for now)
     let consensusScenario = {
-        activeValidators: 5,
-        totalValidators: 5,
+        activeValidators: 1,
+        totalValidators: 1,
         unavailableValidators: 0,
-        voteOutThreshold: 1,
-        totalNetworkNodes: 20
+        voteOutThreshold: 2,
+        totalNetworkNodes: 3
     };
 
-    const testScenarios = [
-        {
-            name: "Development (1 validator)",
-            data: { activeValidators: 1, totalValidators: 1, unavailableValidators: 0, voteOutThreshold: 1, totalNetworkNodes: 5 }
-        },
-        {
-            name: "Relaxed - Healthy (5 validators)",
-            data: { activeValidators: 5, totalValidators: 5, unavailableValidators: 0, voteOutThreshold: 1, totalNetworkNodes: 20 }
-        },
-        {
-            name: "Relaxed - Vote-out (5 validators)",
-            data: { activeValidators: 5, totalValidators: 5, unavailableValidators: 1, voteOutThreshold: 1, totalNetworkNodes: 20 }
-        },
-        {
-            name: "Relaxed - Critical (5 validators)",
-            data: { activeValidators: 5, totalValidators: 5, unavailableValidators: 3, voteOutThreshold: 1, totalNetworkNodes: 20 }
-        },
-        {
-            name: "Full BFT - Healthy (7 validators)",
-            data: { activeValidators: 7, totalValidators: 7, unavailableValidators: 0, voteOutThreshold: 1, totalNetworkNodes: 15 }
-        },
-        {
-            name: "Full BFT - Vote-out (7 validators)",
-            data: { activeValidators: 7, totalValidators: 7, unavailableValidators: 1, voteOutThreshold: 1, totalNetworkNodes: 15 }
-        },
-        {
-            name: "Full BFT - Critical (7 validators)",
-            data: { activeValidators: 7, totalValidators: 7, unavailableValidators: 4, voteOutThreshold: 1, totalNetworkNodes: 15 }
-        },
-        {
-            name: "Robust BFT (9 validators)",
-            data: { activeValidators: 9, totalValidators: 9, unavailableValidators: 0, voteOutThreshold: 1, totalNetworkNodes: 20 }
-        },
-        {
-            name: "Enterprise Scale (40 validators)",
-            data: { activeValidators: 40, totalValidators: 40, unavailableValidators: 3, voteOutThreshold: 6, totalNetworkNodes: 100 }
-        }
-    ];
-
-    function setScenario(scenario) {
-        consensusScenario = { ...scenario.data };
-    }
 
     // Load system nodes from backend
     async function loadSystemNodes() {
@@ -347,29 +305,9 @@
 
     <!-- Right Panel: Decision Resilience -->
     <div class="border-solid border-1 rounded-lg border-overlay1">
-        <!-- Test Scenario Buttons -->
-        <div class="p-3 border-b border-overlay0">
-            <div class="text-xs text-subtitle mb-2">Test Scenarios:</div>
-            <div class="flex flex-wrap gap-2">
-                {#each testScenarios as scenario, index}
-                    <button
-                        class="text-xs px-2 py-1 rounded transition-colors {
-                            JSON.stringify(consensusScenario) === JSON.stringify(scenario.data)
-                                ? 'bg-primary text-base'
-                                : 'bg-surface1 text-subtitle hover:bg-surface2'
-                        }"
-                        onclick={() => setScenario(scenario)}
-                    >
-                        {scenario.name}
-                    </button>
-                {/each}
-            </div>
-        </div>
-
         <ConsensusHealthBar
             activeValidators={consensusScenario.activeValidators}
             totalValidators={consensusScenario.totalValidators}
-            inTransition={false}
             unavailableValidators={consensusScenario.unavailableValidators}
             voteOutThreshold={consensusScenario.voteOutThreshold}
             totalNetworkNodes={consensusScenario.totalNetworkNodes}

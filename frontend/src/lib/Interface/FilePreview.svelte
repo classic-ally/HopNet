@@ -1,6 +1,6 @@
 <script lang="ts">
     import { tokenStore, API_BASE_URL } from '../stores'
-    import ModalButton from './ModalButton.svelte'
+    import Button from '../Button.svelte'
     import { onMount } from 'svelte'
     import type { FileItem } from '../types'
     import { InodeType } from '../types'
@@ -300,9 +300,12 @@
                 <h3 class="text-lg font-semibold text-white truncate">{filename}</h3>
             </div>
             <div class="flex gap-2 items-center">
-                <ModalButton onclick={downloadFile} disabled={loading}>
-                    Download
-                </ModalButton>
+                <Button
+                    icon="i-carbon-download"
+                    text="Download"
+                    onClick={downloadFile}
+                    disabled={loading}
+                />
                 <button
                     class="text-muted hover:text-primary transition-colors p-1"
                     onclick={onClose}
@@ -385,17 +388,12 @@
         <!-- Navigation Footer (only show if we have navigation context) -->
         {#if fileList.length > 1 && onNavigate}
             <div class="flex items-center justify-between p-4 border-t border-overlay0">
-                <button
-                    class="flex items-center gap-2 px-3 py-2 rounded-md bg-surface1 border border-overlay1 text-primary hover:bg-surface2 hover:border-mauve transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                    onclick={previousFile}
+                <Button
+                    icon="i-carbon-chevron-left"
+                    text="Previous"
+                    onClick={previousFile}
                     disabled={currentIndex === 0 || fileList.length === 0 || loading}
-                    aria-label="Previous file"
-                >
-                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7" />
-                    </svg>
-                    Previous
-                </button>
+                />
 
                 <div class="text-center">
                     <div class="text-sm text-muted">
@@ -406,17 +404,13 @@
                     </div>
                 </div>
 
-                <button
-                    class="flex items-center gap-2 px-3 py-2 rounded-md bg-surface1 border border-overlay1 text-primary hover:bg-surface2 hover:border-mauve transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                    onclick={nextFile}
-                    disabled={currentIndex >= fileList.length - 1 || fileList.length === 0 || loading || currentIndex >= fileList.length}
-                    aria-label="Next file"
-                >
-                    Next
-                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
-                    </svg>
-                </button>
+                <Button
+                    icon="i-carbon-chevron-right"
+                    text="Next"
+                    onClick={nextFile}
+                    position="right"
+                    disabled={currentIndex >= fileList.length - 1 || fileList.length === 0 || loading}
+                />
             </div>
         {/if}
     </div>

@@ -1,7 +1,7 @@
 <script lang="ts">
     import { createEventDispatcher } from 'svelte';
     import { API_BASE_URL, tokenStore, currentPathStore } from '../stores';
-    import ModalButton from './ModalButton.svelte';
+    import Button from '../Button.svelte';
     
     export let isOpen = false;
     
@@ -156,13 +156,12 @@
         <!-- Footer -->
         <div class="flex items-center justify-between p-4 border-t border-overlay0 min-w-0">
             <p class="text-xs text-muted truncate mr-4 min-w-0 flex-1">Create in: {currentPath}</p>
-            <ModalButton
-                variant="primary"
+            <Button
+                icon="i-carbon-folder-add"
+                text={isCreating ? 'Creating...' : 'Create Folder'}
+                onClick={createFolder}
                 disabled={!validateFolderName(folderName) || isCreating}
-                onclick={createFolder}
-            >
-                {isCreating ? 'Creating...' : 'Create Folder'}
-            </ModalButton>
+            />
         </div>
     </div>
 {/if}

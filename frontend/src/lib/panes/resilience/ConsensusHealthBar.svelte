@@ -1,9 +1,9 @@
 <script lang="ts">
-    import SecurityPropertiesModal from './SecurityPropertiesModal.svelte';
+    import SecurityPropertiesPage from './SecurityPropertiesPage.svelte';
+    import Button from '../../Button.svelte';
 
     export let activeValidators = 1;
     export let totalValidators = 1;
-    export let inTransition = false;
 
     // Proximity thresholds (these would come from backend in real implementation)
     export let unavailableValidators = 0;
@@ -125,13 +125,13 @@
     ];
 </script>
 
-<div class="p-4">
+<div class="p-4 bg-surface0">
     <div class="mb-3">
         <h4 class="text-lg font-semibold text-primary">Decision Resilience</h4>
     </div>
 
     <!-- Top Ladder: Protection Level -->
-    <div class="bg-surface0 rounded-md p-3 mb-3">
+    <div class="bg-base rounded-md p-3 mb-3">
         <div class="flex items-center justify-between mb-2">
             <div class="text-xs text-subtitle font-medium">Protection Level</div>
             <div class="flex items-center gap-1 text-xs {consensusMode.color === 'red' ? 'text-red' : consensusMode.color === 'yellow' ? 'text-yellow' : 'text-green'}">
@@ -198,13 +198,12 @@
         <div class="mt-3 pt-3 border-t border-overlay0">
             <div class="flex items-center justify-between mb-2">
                 <div class="text-xs text-subtitle font-medium">Security Properties</div>
-                <button
-                    class="flex items-center gap-1 text-xs text-mauve hover:text-mauve/80 transition-colors"
-                    on:click={() => showSecurityModal = true}
-                >
-                    <div class="i-carbon-information"></div>
-                    Details
-                </button>
+                <Button
+                    icon="i-carbon-information"
+                    text="Details"
+                    onClick={() => showSecurityModal = true}
+                    className="text-xs text-mauve hover:text-mauve/80"
+                />
             </div>
 
             <div class="text-xs text-text space-y-1">
@@ -223,7 +222,7 @@
     </div>
 
     <!-- Second Ladder: Validator Activity -->
-    <div class="bg-surface0 rounded-md p-3 mb-3">
+    <div class="bg-base rounded-md p-3 mb-3">
         <div class="flex items-center justify-between mb-2">
             <div class="text-xs text-subtitle font-medium">Validator Activity</div>
             <div class="flex items-center gap-1 text-xs">
@@ -324,7 +323,7 @@
     </div>
 
     <!-- Third Ladder: Decision Participation -->
-    <div class="bg-surface0 rounded-md p-3 mb-3">
+    <div class="bg-base rounded-md p-3 mb-3">
         <div class="flex items-center justify-between mb-2">
             <div class="text-xs text-subtitle font-medium">Decision Participation</div>
             <div class="flex items-center gap-1 text-xs">
@@ -388,13 +387,13 @@
 
     <!-- Fault Tolerance Details -->
     <div class="grid grid-cols-2 gap-3 text-sm">
-        <div class="bg-surface0 rounded-md p-2">
+        <div class="bg-base rounded-md p-2">
             <div class="text-subtitle text-xs mb-1">Crash Tolerance</div>
             <div class="font-mono font-semibold {faultTolerance.crashes > 0 ? 'text-primary' : 'text-muted'}">
                 {faultTolerance.crashes} {faultTolerance.crashes === 1 ? 'node' : 'nodes'}
             </div>
         </div>
-        <div class="bg-surface0 rounded-md p-2">
+        <div class="bg-base rounded-md p-2">
             <div class="text-subtitle text-xs mb-1">Anomaly Tolerance</div>
             <div class="font-mono font-semibold {faultTolerance.byzantine > 0 ? 'text-primary' : 'text-muted'}">
                 {faultTolerance.byzantine} {faultTolerance.byzantine === 1 ? 'node' : 'nodes'}
@@ -414,5 +413,17 @@
     </div>
 </div>
 
-<!-- Security Properties Modal -->
-<SecurityPropertiesModal bind:show={showSecurityModal} {activeValidators} />
+<!-- Security Properties Page -->
+{#if showSecurityModal}
+    <div class="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+        <div class="bg-surface0 border border-overlay1 rounded-lg shadow-xl max-w-4xl w-full max-h-[85vh] overflow-hidden relative">
+            <button
+                class="absolute top-4 right-4 text-subtitle hover:text-text transition-colors z-10"
+                on:click={() => showSecurityModal = false}
+            >
+                <div class="i-carbon-close text-lg"></div>
+            </button>
+            <SecurityPropertiesPage {activeValidators} />
+        </div>
+    </div>
+{/if}

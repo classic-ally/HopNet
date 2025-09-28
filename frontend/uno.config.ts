@@ -12,8 +12,9 @@ const themeColors = {
     mantle: '#181825',       // Darker background (sidebars, secondary areas)
     crust: '#11111b',        // Darkest background (deepest elements)
     surface0: '#313244',     // Elevated surfaces (cards, modals)
-    surface1: '#45475a',     // More elevated surfaces (dropdowns, tooltips)
-    surface2: '#585b70',     // Highest elevation surfaces (active states)
+    surface1: '#45475a',     // More elevated surfaces (dropdowns, tooltips, buttons)
+    surface2: '#585b70',     // Hover states and active states
+    surface3: '#6c7086',     // Pressed states (temporary while clicking)
 
     // Border Colors (Semantic Names)
     overlay0: '#6c7086',     // Dark borders (subtle separation)
@@ -44,6 +45,10 @@ const colorSafelist = colorNames.flatMap(color => [
     `bg-${color}`,
     `text-${color}`,
     `border-${color}`,
+    `hover:border-${color}`,
+    `hover:border-${color}/80`,
+    `active:bg-${color}`,
+    `hover:bg-${color}`,
     ...opacities.flatMap(opacity => [
         `bg-${color}/${opacity}`,
         `border-${color}/${opacity}`,

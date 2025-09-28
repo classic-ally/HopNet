@@ -588,7 +588,7 @@
         <div class="i-carbon-warning-filled text-3xl mb-3 text-red mx-auto"></div>
         <h3 class="text-lg font-semibold text-red mb-2">Network Capacity Insufficient</h3>
         <p class="text-text mb-4">All nodes baseline usage exceeds the 90% operational safety threshold.</p>
-        <div class="bg-surface1 rounded-lg p-4 text-left max-w-md mx-auto">
+        <div class="bg-base rounded-lg p-4 text-left max-w-md mx-auto">
             <p class="text-sm text-subtitle mb-1"><strong>Single-node setups:</strong> Typical</p>
             <p class="text-sm text-subtitle mb-3"><strong>Mature deployments:</strong> Requires immediate attention</p>
             <p class="text-sm text-subtitle mb-2"><strong>Recommended actions:</strong></p>

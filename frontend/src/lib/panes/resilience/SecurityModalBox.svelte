@@ -5,19 +5,19 @@
     export let borderColor: string;
     export let textColor: string;
     export let headerIcon: string;
-    export let items: Array<{
-        title: string;
-        subtitles?: string[];
-        icon: string;
+    export let items: ReadonlyArray<{
+        readonly title: string;
+        readonly subtitles?: readonly string[];
+        readonly icon: string;
     }> = [];
-    export let paragraphs: string[] = [];
+    export let paragraphs: readonly string[] = [];
 
     // Use headerBgColor if provided, otherwise fall back to bgColor
     $: actualHeaderBg = headerBgColor || bgColor;
 </script>
 
 <div class="bg-{bgColor} {borderColor ? `border ${borderColor}` : ''} rounded-lg">
-    <div class="bg-{actualHeaderBg} px-4 py-3 {borderColor ? `border-b ${borderColor}` : ''}">
+    <div class="bg-{actualHeaderBg} px-4 py-3 rounded-t-lg {borderColor ? `border-b ${borderColor}` : ''}">
         <h4 class="font-medium text-{textColor} flex items-center gap-2">
             <div class="i-carbon-{headerIcon}"></div>
             {title}

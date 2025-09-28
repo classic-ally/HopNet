@@ -1,7 +1,7 @@
 <script lang="ts">
     import { createEventDispatcher } from 'svelte';
     import { API_BASE_URL, tokenStore, currentPathStore } from '../stores';
-    import ModalButton from './ModalButton.svelte';
+    import Button from '../Button.svelte';
     
     export let isOpen = false;
     
@@ -157,11 +157,13 @@
                 <div class="i-carbon-cloud-upload text-4xl text-muted mx-auto mb-2"></div>
                 <p class="text-subtitle mb-2">Drag and drop files here</p>
                 <p class="text-muted text-sm mb-3">or</p>
-                <ModalButton variant="primary" type="button">
-                    <label for="file-input" class="cursor-pointer">
-                        Choose Files
-                    </label>
-                </ModalButton>
+                <div class="flex justify-center">
+                    <Button
+                        icon="i-carbon-document-add"
+                        text="Choose Files"
+                        onClick={() => document.getElementById('file-input')?.click()}
+                    />
+                </div>
                 <input 
                     id="file-input"
                     type="file" 
@@ -222,13 +224,12 @@
         <!-- Footer -->
         <div class="flex items-center justify-between p-4">
             <p class="text-xs text-muted">Upload path: {currentPath}</p>
-            <ModalButton
-                variant="primary"
+            <Button
+                icon="i-carbon-cloud-upload"
+                text={isUploading ? 'Uploading...' : `Upload ${files.length} file${files.length !== 1 ? 's' : ''}`}
+                onClick={uploadFiles}
                 disabled={files.length === 0 || isUploading}
-                onclick={uploadFiles}
-            >
-                {isUploading ? 'Uploading...' : `Upload ${files.length} file${files.length !== 1 ? 's' : ''}`}
-            </ModalButton>
+            />
         </div>
     </div>
 {/if}
