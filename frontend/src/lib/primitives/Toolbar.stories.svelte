@@ -216,13 +216,13 @@
           Resize window or browser dev tools to trigger compacting. Watch console for debug output.
         </p>
         <p class="text-subtitle text-sm">
-          Compact stages: View Mode(3) → Share(2), Settings(2) → Menu(2) → New Folder(1) → Upload Files(0), Download(0) never compact
+          Debug story with center tabs. Compact stages: View Mode(3) → Share(2), Settings(2) → Menu(2) → New Folder(1) → Upload Files(0), Download(0) never compact
         </p>
 
         <Toolbar
           mode={args.mode}
           leftElements={leftActions}
-          centerElements={centerActions}
+          centerElements={[centerTabs]}
           rightElements={rightActions}
         />
       </div>

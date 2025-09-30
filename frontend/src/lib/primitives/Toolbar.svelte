@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { onMount, afterUpdate } from 'svelte';
+    import { onMount } from 'svelte';
     import Button from '../Button.svelte';
     import Tabs from './Tabs.svelte';
 
@@ -41,10 +41,23 @@
     // Internal state for compacting
     let toolbarContainer: HTMLDivElement;
     let compactedElements = new Set<ToolbarElement>(); // Track which elements are compacted
+    let previousCompactedElements = new Set<ToolbarElement>(); // Track previous state for tab switches
+    let lastElementSignature = ''; // Track element signature to detect actual element changes
     let resizeObserver: ResizeObserver;
     let resizeTimeout: number;
     let isActivelyResizing = false;
     let resizeSettleTimeout: number;
+
+    // Generate stable key for element identification
+    function getElementKey(element: ToolbarElement): string {
+        if (element.type === 'tabs') {
+            // Use the tab keys as identifier since they're stable
+            return `tabs-${element.tabs.map(tab => tab.key).join(',')}`;
+        } else {
+            // For actions, use icon + text
+            return `action-${element.icon}-${element.text}`;
+        }
+    }
 
     // Initialize compact state (start with desktop variants)
     function initializeCompactState() {
@@ -57,10 +70,13 @@
 
         if (element.type === 'action') {
             return compactedElements.has(element) ? 'compact' : 'desktop';
-        } else {
-            // For tabs, compact stage affects the tab display
-            return 'desktop'; // Tabs component handles its own compacting
+        } else if (element.type === 'tabs') {
+            // Use stable key lookup for tabs to preserve state across activeTab changes
+            const elementKey = getElementKey(element);
+            const isCompacted = Array.from(compactedElements).some(el => getElementKey(el) === elementKey);
+            return isCompacted ? 'compact' : 'desktop';
         }
+        return 'desktop';
     }
 
     // Get elements for a specific section (0=left, 1=center, 2=right)
@@ -131,8 +147,64 @@
                 }
 
                 measureContainer.appendChild(buttonElement);
+            } else if (element.type === 'tabs') {
+                // Create a temporary Tabs container
+                const tabsContainer = document.createElement('div');
+                tabsContainer.className = 'flex border border-solid border-overlay1 rounded-md overflow-visible relative z-20 bg-surface0';
+
+                // Determine variant for tabs based on compaction
+                const shouldBeCompacted = compactedStages.includes(element.compactStage);
+                const tabVariant = mode === 'mobile' ? 'mobile' : (shouldBeCompacted ? 'compact' : 'desktop');
+
+                // Create tab buttons
+                element.tabs.forEach((tab, index) => {
+                    const tabWrapper = document.createElement('div');
+                    tabWrapper.className = `-m-px relative ${index === 0 ? 'rounded-l-md' : ''} ${index === element.tabs.length - 1 ? 'rounded-r-md' : ''}`;
+
+                    const tabButton = document.createElement('button');
+
+                    // Apply the same classes as our Tabs component
+                    const isActive = element.activeTab === tab.key;
+                    const colorClass = tab.color === 'mauve' ? 'text-primary' : `text-${tab.color}`;
+
+                    tabButton.className = `transition-all border-b-2 border-solid w-full relative flex items-center justify-center ${
+                        tabVariant === 'desktop' ? 'px-4 py-[3px] text-sm gap-1' : 'p-2.5'
+                    } ${
+                        isActive
+                            ? `${colorClass} border-${tab.color} opacity-100 rounded-md bg-surface2`
+                            : `${colorClass} border-transparent opacity-60 bg-transparent`
+                    }`;
+
+                    // Create content based on variant
+                    if (tabVariant === 'desktop') {
+                        if (tab.icon) {
+                            const icon = document.createElement('div');
+                            icon.className = `${tab.icon} text-lg`;
+                            tabButton.appendChild(icon);
+                        }
+                        const label = document.createElement('span');
+                        label.textContent = tab.label;
+                        tabButton.appendChild(label);
+                    } else {
+                        // Mobile variant
+                        if (tab.icon) {
+                            const icon = document.createElement('div');
+                            icon.className = `${tab.icon} text-2xl`;
+                            tabButton.appendChild(icon);
+                        } else {
+                            const fallback = document.createElement('span');
+                            fallback.className = 'text-xl font-medium';
+                            fallback.textContent = tab.label.charAt(0).toUpperCase();
+                            tabButton.appendChild(fallback);
+                        }
+                    }
+
+                    tabWrapper.appendChild(tabButton);
+                    tabsContainer.appendChild(tabWrapper);
+                });
+
+                measureContainer.appendChild(tabsContainer);
             }
-            // TODO: Handle tabs if needed
         });
 
         document.body.appendChild(measureContainer);
@@ -141,10 +213,6 @@
         return width;
     }
 
-    // Measure natural unconstrained width of a section
-    function measureUnconstrainedSectionWidth(sectionDiv: HTMLElement, sectionIndex: number): number {
-        return measureSectionWithCompaction(sectionDiv, sectionIndex, []); // No compaction applied
-    }
 
     // Progressive compacting algorithm with per-section simulation
     function progressiveCompact() {
@@ -169,7 +237,6 @@
             const totalGaps = 8;
             const availableForContent = containerWidth - totalPadding - totalGaps;
             const allocatedWidth = availableForContent / 3;
-            const sectionName = sectionIndex === 0 ? 'Left' : sectionIndex === 1 ? 'Center' : 'Right';
             const sectionElements = getSectionElements(sectionIndex);
 
             // Get all available compact stages for this section
@@ -186,6 +253,7 @@
             } else {
                 // Test progressive compaction levels
                 let foundSolution = false;
+
                 for (let i = 0; i < compactStages.length && !foundSolution; i++) {
                     const stagesToTest = compactStages.slice(0, i + 1);
                     const simulatedWidth = measureSectionWithCompaction(section, sectionIndex, stagesToTest);
@@ -203,7 +271,7 @@
 
             // Add optimally compacted elements to new set
             sectionElements.forEach(element => {
-                if (element.type === 'action' && optimalCompactionStages.includes(element.compactStage)) {
+                if ((element.type === 'action' || element.type === 'tabs') && optimalCompactionStages.includes(element.compactStage)) {
                     newCompactedElements.add(element);
                 }
             });
@@ -225,29 +293,25 @@
             if (isActivelyResizing) {
                 // During active resize: only apply if new state is more conservative (more compacted)
                 if (newCompactedArray.length >= currentCompactedArray.length) {
+                    previousCompactedElements = new Set(compactedElements);
                     compactedElements = newCompactedElements;
                 }
                 // Block expansion during active resize
             } else {
                 // Normal operation: apply optimal state without bias
+                previousCompactedElements = new Set(compactedElements);
                 compactedElements = newCompactedElements;
             }
         }
     }
 
-    // Handle tab changes
-    function handleTabChange(tabsElement: ToolbarTabs, newTab: string) {
-        if (tabsElement.onTabChange) {
-            tabsElement.onTabChange(newTab);
-        }
-    }
 
     // Setup ResizeObserver
     onMount(() => {
         initializeCompactState();
 
         if (toolbarContainer) {
-            resizeObserver = new ResizeObserver((entries) => {
+            resizeObserver = new ResizeObserver(() => {
                 // Track active resize state for conservative bias
                 isActivelyResizing = true;
                 clearTimeout(resizeSettleTimeout);
@@ -278,9 +342,19 @@
     // Note: Removed afterUpdate() compaction to prevent ResizeObserver loops
     // ResizeObserver handles all necessary re-compaction automatically
 
-    // Re-initialize when elements change
-    $: if (leftElements || centerElements || rightElements) {
-        initializeCompactState();
+    // Re-initialize when element arrays change (but not when activeTab changes)
+    $: {
+        const elementSignature = [
+            leftElements.map(el => getElementKey(el)).join(','),
+            centerElements.map(el => getElementKey(el)).join(','),
+            rightElements.map(el => getElementKey(el)).join(',')
+        ].join('|');
+
+        // Only reinitialize if the actual elements changed, not just activeTab
+        if (elementSignature !== lastElementSignature) {
+            lastElementSignature = elementSignature;
+            initializeCompactState();
+        }
     }
 
     // Ensure Svelte tracks compactedElements changes for reactivity
@@ -310,6 +384,7 @@
                     tabs={element.tabs}
                     bind:activeTab={element.activeTab}
                     centered={false}
+                    variant={getElementVariant(element)}
                 />
             {/if}
         {/each}
@@ -333,6 +408,7 @@
                     tabs={element.tabs}
                     bind:activeTab={element.activeTab}
                     centered={false}
+                    variant={getElementVariant(element)}
                 />
             {/if}
         {/each}
@@ -356,6 +432,7 @@
                     tabs={element.tabs}
                     bind:activeTab={element.activeTab}
                     centered={false}
+                    variant={getElementVariant(element)}
                 />
             {/if}
         {/each}
