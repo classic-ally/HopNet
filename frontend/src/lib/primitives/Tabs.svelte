@@ -10,7 +10,11 @@
   export let centered: boolean = false;
 </script>
 
-<div class="flex {centered ? 'justify-center' : ''} border border-solid border-overlay1 rounded-md overflow-visible relative z-20 bg-surface0">
+<div
+  role="tablist"
+  aria-label="Tab navigation"
+  class="flex {centered ? 'justify-center' : ''} border border-solid border-overlay1 rounded-md overflow-visible relative z-20 bg-surface0"
+>
   {#each tabs as tab, index}
     <div class="-m-px relative {
       index === 0 ? 'rounded-l-md' : ''
