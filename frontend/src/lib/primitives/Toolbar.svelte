@@ -77,7 +77,6 @@
         if (mode === 'mobile') return 'mobile';
 
         if (element.type === 'action') {
-            console.log("is this compacted?", compactedElements.has(element));
             return compactedElements.has(element) ? 'compact' : 'desktop';
         } else if (element.type === 'tabs') {
             // Use stable key lookup for tabs to preserve state across activeTab changes

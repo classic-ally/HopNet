@@ -1,6 +1,6 @@
 <script>
     import AccountSidebarItem from "./AccountSidebarItem.svelte";
-    import BrowsePane from "./BrowsePane.svelte";
+    import BrowsePane from "../panes/files/BrowsePane.svelte";
     import Toolbar from "../primitives/Toolbar.svelte";
     import NodesPane from "../panes/nodes/NodesPane.svelte";
     import TakeoutPane from "../panes/takeout/TakeoutPane.svelte";

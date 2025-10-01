@@ -1,15 +1,15 @@
 <script lang="ts">
     import { TableHandler, ThSort, ThFilter, Th, Datatable } from '@vincjo/datatables'
-    import { tokenStore, API_BASE_URL, currentPathStore, refreshTriggerStore } from '../stores'
+    import { tokenStore, API_BASE_URL, currentPathStore, refreshTriggerStore } from '../../stores'
     import { onMount } from 'svelte'
-    import type { FileItem } from '../types'
-    import { InodeType } from '../types'
-    import { formatFileSize, getFileIcon, formatDateForContainer, getFileName } from '../utils/formatters'
-    import { tableColumns, fileBrowserColumns } from '../utils/tableColumns'
-    import FilePreview from './FilePreview.svelte'
-    import Toolbar from '../primitives/Toolbar.svelte'
-    import type { ToolbarItem } from '../primitives/Toolbar.svelte'
-    import UploadFiles from './UploadFiles.svelte'
+    import type { FileItem } from '../../types'
+    import { InodeType } from '../../types'
+    import { formatFileSize, getFileIcon, formatDateForContainer, getFileName } from '../../utils/formatters'
+    import { tableColumns, fileBrowserColumns } from '../../utils/tableColumns'
+    import FilePreview from '../../Interface/FilePreview.svelte'
+    import Toolbar from '../../primitives/Toolbar.svelte'
+    import type { ToolbarItem } from '../../primitives/Toolbar.svelte'
+    import Upload from './Upload.svelte'
     import CreateFolder from './CreateFolder.svelte'
 
     let files: FileItem[] = []
@@ -281,7 +281,6 @@
     }
 
     function handleFilesUploaded() {
-        showUploadPopover = false;
         refreshTriggerStore.update(n => n + 1);
     }
 
@@ -294,7 +293,6 @@
     }
 
     function handleFolderCreated() {
-        showCreateFolderPopover = false;
         refreshTriggerStore.update(n => n + 1);
     }
 
@@ -538,18 +536,18 @@
     />
 {/if}
 
-<!-- Upload Files Popover -->
-<UploadFiles
-    bind:isOpen={showUploadPopover}
-    on:close={handleUploadClose}
-    on:uploaded={handleFilesUploaded}
+<!-- Upload Modal -->
+<Upload
+    isOpen={showUploadPopover}
+    onClose={handleUploadClose}
+    onUploadComplete={handleFilesUploaded}
 />
 
-<!-- Create Folder Popover -->
+<!-- Create Folder Modal -->
 <CreateFolder
-    bind:isOpen={showCreateFolderPopover}
-    on:close={handleCreateFolderClose}
-    on:created={handleFolderCreated}
+    isOpen={showCreateFolderPopover}
+    onClose={handleCreateFolderClose}
+    onFolderCreated={handleFolderCreated}
 />
 
 <style>
