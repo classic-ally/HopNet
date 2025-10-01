@@ -7,6 +7,10 @@
     import { formatFileSize, getFileIcon, formatDateForContainer, getFileName } from '../utils/formatters'
     import { tableColumns, fileBrowserColumns } from '../utils/tableColumns'
     import FilePreview from './FilePreview.svelte'
+    import Toolbar from '../primitives/Toolbar.svelte'
+    import type { ToolbarItem } from '../primitives/Toolbar.svelte'
+    import UploadFiles from './UploadFiles.svelte'
+    import CreateFolder from './CreateFolder.svelte'
 
     let files: FileItem[] = []
     let loading = true
@@ -18,6 +22,12 @@
     let previewFileIndex = 0
     let fileOnlyList: FileItem[] = []
     let showSearchBar = false
+
+    // Toolbar-related state
+    export let onToggleSidebar: () => void = () => {};
+    let showUploadPopover = false
+    let showCreateFolderPopover = false
+    let selectedFiles: FileItem[] = []
 
     // Subscribe to current path store
     $: currentPath = $currentPathStore
@@ -260,8 +270,124 @@
     $: if ($refreshTriggerStore > 0) {
         fetchFiles(currentPath)
     }
+
+    // Toolbar handlers
+    function handleUploadClick() {
+        showUploadPopover = true;
+    }
+
+    function handleUploadClose() {
+        showUploadPopover = false;
+    }
+
+    function handleFilesUploaded() {
+        showUploadPopover = false;
+        refreshTriggerStore.update(n => n + 1);
+    }
+
+    function handleCreateFolderClick() {
+        showCreateFolderPopover = true;
+    }
+
+    function handleCreateFolderClose() {
+        showCreateFolderPopover = false;
+    }
+
+    function handleFolderCreated() {
+        showCreateFolderPopover = false;
+        refreshTriggerStore.update(n => n + 1);
+    }
+
+    function handleViewModeClick() {
+        console.log('View mode clicked');
+    }
+
+    function handleDownloadClick() {
+        console.log('Download clicked');
+        // TODO: Implement bulk download for selected files
+    }
+
+    function handleDeleteClick() {
+        console.log('Delete clicked');
+        // TODO: Implement bulk delete for selected files
+    }
+
+    function handleShareClick() {
+        console.log('Share clicked');
+        // TODO: Implement sharing for selected files
+    }
+
+    // Reactive toolbar configuration
+    $: leftElements = [
+        {
+            type: 'action' as const,
+            icon: 'i-carbon-list',
+            text: 'View Mode',
+            onClick: handleViewModeClick,
+            compactStage: 3, // First to compact (highest number)
+            tooltip: 'Change view mode'
+        }
+    ] satisfies ToolbarItem[];
+
+    $: centerElements = [
+        {
+            type: 'action' as const,
+            icon: 'i-carbon-cloud-upload',
+            text: 'Upload',
+            onClick: handleUploadClick,
+            compactStage: 2, // Second wave (lower number = more resistant)
+            tooltip: 'Upload files to server'
+        },
+        {
+            type: 'action' as const,
+            icon: 'i-carbon-folder-add',
+            text: 'New Folder',
+            onClick: handleCreateFolderClick,
+            compactStage: 3, // First to compact (highest number)
+            tooltip: 'Create a new folder in the current directory'
+        }
+    ] satisfies ToolbarItem[];
+
+    $: rightElements = [
+        {
+            type: 'action' as const,
+            icon: 'i-carbon-cloud-download',
+            text: 'Download',
+            onClick: handleDownloadClick,
+            compactStage: 2, // Second wave (lower number = more resistant)
+            tooltip: 'Download selected files',
+            disabled: selectedFiles.length === 0
+        },
+        {
+            type: 'action' as const,
+            icon: 'i-carbon-trash-can',
+            text: 'Delete',
+            onClick: handleDeleteClick,
+            compactStage: 2, // Second wave (lower number = more resistant)
+            tooltip: 'Delete selected files',
+            disabled: selectedFiles.length === 0
+        },
+        {
+            type: 'action' as const,
+            icon: 'i-carbon-share',
+            text: 'Share',
+            onClick: handleShareClick,
+            compactStage: 3, // First to compact (highest number)
+            tooltip: 'Share selected files',
+            disabled: selectedFiles.length === 0
+        }
+    ] satisfies ToolbarItem[];
 </script>
 
+<!-- Integrated Toolbar -->
+<Toolbar
+    {leftElements}
+    {centerElements}
+    {rightElements}
+    {onToggleSidebar}
+/>
+
+<!-- Page Title -->
 <div>
     <h3>Browse</h3>
     <p class="text-sm text-muted">{files.length} {files.length === 1 ? 'item' : 'items'} in this folder</p>
@@ -411,6 +537,20 @@
         onNavigate={handlePreviewNavigation}
     />
 {/if}
+
+<!-- Upload Files Popover -->
+<UploadFiles
+    bind:isOpen={showUploadPopover}
+    on:close={handleUploadClose}
+    on:uploaded={handleFilesUploaded}
+/>
+
+<!-- Create Folder Popover -->
+<CreateFolder
+    bind:isOpen={showCreateFolderPopover}
+    on:close={handleCreateFolderClose}
+    on:created={handleFolderCreated}
+/>
 
 <style>
     /* Scrollable table wrapper */

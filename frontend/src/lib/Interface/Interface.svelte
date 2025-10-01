@@ -1,8 +1,8 @@
 <script>
     import AccountSidebarItem from "./AccountSidebarItem.svelte";
     import BrowsePane from "./BrowsePane.svelte";
-    import FileBrowserHeader from "./FileBrowserHeader.svelte";
     import NodeAddPane from "./NodeAddPane.svelte";
+    import Toolbar from "../primitives/Toolbar.svelte";
     import NodesHeader from "./NodesHeader.svelte";
     import NodesTable from "./NodesTable.svelte";
     import TakeoutHeader from "./TakeoutHeader.svelte";
@@ -155,10 +155,8 @@
     <!-- Main content -->
     <div class="p-5 flex flex-col gap-3 w-full bg-base overflow-auto">
         {#if selectedItem === "browse"}
-            <!-- Header area -->
-            <FileBrowserHeader onToggleSidebar={toggleSidebar}/>
-            <!-- Browse pane -->
-            <BrowsePane/>
+            <!-- Browse pane with integrated toolbar -->
+            <BrowsePane onToggleSidebar={toggleSidebar}/>
         {:else if selectedItem === "nodes"}
             <NodesHeader
                 onAddNode={() => {isNodeAddOpen = !isNodeAddOpen}}
@@ -214,10 +212,22 @@
             />
             <ResiliencePane bind:this={resilienceRef}/>
         {:else if selectedItem === "recents"}
-            <!-- Header area -->
-            <FileBrowserHeader onToggleSidebar={toggleSidebar}/>
-            <!-- Body area -->
-            <div class="text-muted">Recent files will be shown here</div>
+            <!-- Minimal toolbar for mobile menu access -->
+            <Toolbar
+                leftElements={[]}
+                centerElements={[]}
+                rightElements={[]}
+                onToggleSidebar={toggleSidebar}
+            />
+
+            <!-- Recents placeholder (TODO: implement RecentsPane) -->
+            <div>
+                <h3>Recent Files</h3>
+                <p class="text-sm text-muted">Your recently accessed files will appear here</p>
+            </div>
+            <div class="text-muted p-4 text-center">
+                No recent files to display
+            </div>
         {:else if selectedItem === "account"}
             <!-- Account management will be shown here -->
             <div class="text-muted">Account settings will be shown here</div>

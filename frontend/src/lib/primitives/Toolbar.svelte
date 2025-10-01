@@ -37,6 +37,7 @@
     export let centerElements: ToolbarElement[] = [];
     export let rightElements: ToolbarElement[] = [];
     export let className: string = '';
+    export let onToggleSidebar: (() => void) | undefined = undefined;
 
     // Internal state for compacting
     let toolbarContainer: HTMLDivElement;
@@ -47,6 +48,12 @@
     let resizeTimeout: number;
     let isActivelyResizing = false;
     let resizeSettleTimeout: number;
+    let isMobile = false;
+
+    // Mobile detection
+    function checkMobile() {
+        isMobile = window.innerWidth < 768;
+    }
 
     // Generate stable key for element identification
     function getElementKey(element: ToolbarElement): string {
@@ -61,7 +68,8 @@
 
     // Initialize compact state (start with desktop variants)
     function initializeCompactState() {
-        compactedElements.clear();
+        // Create a new empty Set to ensure Svelte detects the change
+        compactedElements = new Set();
     }
 
     // Get the variant for an element based on whether it's compacted
@@ -69,6 +77,7 @@
         if (mode === 'mobile') return 'mobile';
 
         if (element.type === 'action') {
+            console.log("is this compacted?", compactedElements.has(element));
             return compactedElements.has(element) ? 'compact' : 'desktop';
         } else if (element.type === 'tabs') {
             // Use stable key lookup for tabs to preserve state across activeTab changes
@@ -82,7 +91,7 @@
     // Get elements for a specific section (0=left, 1=center, 2=right)
     function getSectionElements(sectionIndex: number): ToolbarElement[] {
         switch (sectionIndex) {
-            case 0: return leftElements;
+            case 0: return actualLeftElements;
             case 1: return centerElements;
             case 2: return rightElements;
             default: return [];
@@ -222,7 +231,6 @@
 
         const containerWidth = toolbarContainer.clientWidth;
         const sections = Array.from(toolbarContainer.children) as HTMLElement[];
-
         let anyChanges = false;
         const newCompactedElements = new Set<ToolbarElement>();
 
@@ -251,24 +259,23 @@
             if (noCompactionWidth <= allocatedWidth) {
                 optimalCompactionStages = [];
             } else {
-                // Test progressive compaction levels
-                let foundSolution = false;
+                // Test all compaction levels and find the least compacted state that fits
+                let bestFit: number[] = compactStages; // Default to maximum compaction
 
-                for (let i = 0; i < compactStages.length && !foundSolution; i++) {
-                    const stagesToTest = compactStages.slice(0, i + 1);
+                // Test all possible compaction levels from least to most compacted
+                for (let i = 0; i <= compactStages.length; i++) {
+                    const stagesToTest = compactStages.slice(0, i);
                     const simulatedWidth = measureSectionWithCompaction(section, sectionIndex, stagesToTest);
 
                     if (simulatedWidth <= allocatedWidth) {
-                        optimalCompactionStages = stagesToTest;
-                        foundSolution = true;
+                        // This level fits - since we're going from least to most compacted,
+                        // this is the least compacted solution that works
+                        bestFit = stagesToTest;
+                        break;
                     }
                 }
-
-                if (!foundSolution) {
-                    optimalCompactionStages = compactStages; // Use maximum compaction
-                }
+                optimalCompactionStages = bestFit;
             }
-
             // Add optimally compacted elements to new set
             sectionElements.forEach(element => {
                 if ((element.type === 'action' || element.type === 'tabs') && optimalCompactionStages.includes(element.compactStage)) {
@@ -294,21 +301,41 @@
                 // During active resize: only apply if new state is more conservative (more compacted)
                 if (newCompactedArray.length >= currentCompactedArray.length) {
                     previousCompactedElements = new Set(compactedElements);
-                    compactedElements = newCompactedElements;
+                    // Always create a new Set to ensure Svelte detects the change
+                    compactedElements = new Set(newCompactedElements);
                 }
                 // Block expansion during active resize
             } else {
                 // Normal operation: apply optimal state without bias
                 previousCompactedElements = new Set(compactedElements);
-                compactedElements = newCompactedElements;
+                // Always create a new Set to ensure Svelte detects the change
+                compactedElements = new Set(newCompactedElements);
             }
         }
     }
 
+    // Reactive elements with mobile menu injection
+    $: actualLeftElements = (() => {
+        const elements = [...leftElements];
+        // Inject mobile menu button at the beginning if we have a sidebar toggle and we're mobile
+        if (isMobile && onToggleSidebar) {
+            elements.unshift({
+                type: 'action',
+                icon: 'i-carbon-menu',
+                text: 'Menu',
+                onClick: onToggleSidebar,
+                compactStage: 1, // Last to compact (lowest number = most resistant)
+                tooltip: 'Toggle sidebar'
+            });
+        }
+        return elements;
+    })();
 
     // Setup ResizeObserver
     onMount(() => {
         initializeCompactState();
+        checkMobile();
+        window.addEventListener('resize', checkMobile);
 
         if (toolbarContainer) {
             resizeObserver = new ResizeObserver(() => {
@@ -334,6 +361,7 @@
             if (resizeObserver) {
                 resizeObserver.disconnect();
             }
+            window.removeEventListener('resize', checkMobile);
             clearTimeout(resizeTimeout);
             clearTimeout(resizeSettleTimeout);
         };
@@ -345,7 +373,7 @@
     // Re-initialize when element arrays change (but not when activeTab changes)
     $: {
         const elementSignature = [
-            leftElements.map(el => getElementKey(el)).join(','),
+            actualLeftElements.map(el => getElementKey(el)).join(','),
             centerElements.map(el => getElementKey(el)).join(','),
             rightElements.map(el => getElementKey(el)).join(',')
         ].join('|');
@@ -360,15 +388,19 @@
     // Ensure Svelte tracks compactedElements changes for reactivity
     $: compactedElements && null;
 
+    // Check if toolbar has any content to render
+    $: hasContent = actualLeftElements.length > 0 || centerElements.length > 0 || rightElements.length > 0;
+
 </script>
 
+{#if hasContent}
 <div
     bind:this={toolbarContainer}
     class="grid grid-cols-3 items-center gap-1 p-2 bg-surface0 rounded-lg {className}"
 >
     <!-- Left Section -->
     <div class="flex items-center gap-1 justify-start">
-        {#each leftElements as element}
+        {#each actualLeftElements as element}
             {#if element.type === 'action'}
                 <Button
                     icon={element.icon}
@@ -438,3 +470,4 @@
         {/each}
     </div>
 </div>
+{/if}

@@ -1,4 +1,3 @@
-#!/bin/bash
 set -euo pipefail
 
 # Generate TypeScript types from Rust types
