@@ -1,15 +1,21 @@
 <script lang="ts">
     import { TableHandler, ThSort, Th, Datatable } from '@vincjo/datatables'
-    import { tokenStore, API_BASE_URL } from '../stores'
+    import { tokenStore, API_BASE_URL } from '../../stores'
     import { onMount, tick } from 'svelte'
-    import type { TakeoutRecord, TakeoutStatus } from '../types'
-    import { formatDateResponsive, formatIdResponsive } from '../utils/formatters'
+    import type { TakeoutRecord, TakeoutStatus } from '../../types'
+    import { formatDateResponsive, formatIdResponsive } from '../../utils/formatters'
+    import Toolbar from '../../primitives/Toolbar.svelte'
+    import type { ToolbarItem } from '../../primitives/Toolbar.svelte'
 
+    // Props
+    export let onToggleSidebar: () => void = () => {};
+
+    // State
     let takeouts: TakeoutRecord[] = []
     let loading = true
     let error = ''
     let actionLoading: string | null = null // Track which action is loading
-    let canCreateTakeout = false // Track if user can create new takeout (disabled by default until we check)
+    let canCreateTakeout = false // Track if user can create new takeout
     let containerWidth = 0 // Track container width for responsive rendering
     let containerRef: HTMLElement
     let autoRefreshInterval: number | null = null
@@ -21,6 +27,10 @@
     })
     const search = table.createSearch()
 
+    // Track selections manually for reactivity
+    let selectedIds = []
+
+    // Data fetching
     async function fetchTakeouts(isAutoRefresh = false) {
         try {
             // Don't show loading state for auto-refresh to avoid UI flicker
@@ -88,7 +98,8 @@
         }
     }
 
-    async function initiateTakeout() {
+    // Takeout actions
+    async function handleCreateTakeout() {
         try {
             actionLoading = 'initiate'
             const token = $tokenStore
@@ -191,114 +202,7 @@
         }
     }
 
-    function getStatusColor(status: TakeoutStatus): string {
-        switch (status) {
-            case 'Pending': return 'text-yellow'
-            case 'Materializing': return 'text-blue'
-            case 'Ready': return 'text-green'
-            case 'Expired': return 'text-red'
-            case 'Cancelled': return 'text-red'
-            default: return 'text-muted'
-        }
-    }
-
-
-    function updateContainerWidth() {
-        if (containerRef) {
-            containerWidth = containerRef.clientWidth
-        }
-    }
-
-    // Force table re-render when container width changes
-    $: containerWidth && table.setRows(takeouts)
-
-    // Track selections manually for reactivity
-    let selectedIds = []
-
-    function handleSelection(id: string) {
-        if (!canSelect(takeouts.find(t => t.id === id)?.status || '')) return
-
-        table.select(id)
-        selectedIds = [...table.selected] // Force reactivity by creating new array
-    }
-
-    function canDownload(status: TakeoutStatus): boolean {
-        return status === 'Ready'
-    }
-
-    function canCancel(status: TakeoutStatus): boolean {
-        return status === 'Pending' || status === 'Materializing' || status === 'Ready'
-    }
-
-    function canSelect(status: TakeoutStatus): boolean {
-        return status !== 'Expired' && status !== 'Cancelled'
-    }
-
-    function startAutoRefresh() {
-        // Don't start if already running or if there's an action in progress
-        if (autoRefreshInterval || actionLoading) return
-
-        autoRefreshInterval = setInterval(() => {
-            // Only refresh if no action is in progress
-            if (!actionLoading) {
-                fetchTakeouts(true)
-            }
-        }, AUTO_REFRESH_DELAY)
-    }
-
-    function stopAutoRefresh() {
-        if (autoRefreshInterval) {
-            clearInterval(autoRefreshInterval)
-            autoRefreshInterval = null
-        }
-    }
-
-    // Reactive statement to pause auto-refresh during actions
-    $: if (actionLoading) {
-        stopAutoRefresh()
-    } else if (!autoRefreshInterval) {
-        startAutoRefresh()
-    }
-
-    // Check if any takeouts are in transitional states that need monitoring
-    $: hasActiveOperations = takeouts.some(t =>
-        t.status === 'Pending' || t.status === 'Materializing'
-    )
-
-    onMount(() => {
-        fetchTakeouts()
-        updateContainerWidth()
-        window.addEventListener('resize', updateContainerWidth)
-        startAutoRefresh()
-
-        return () => {
-            window.removeEventListener('resize', updateContainerWidth)
-            stopAutoRefresh()
-        }
-    })
-
-    // Reactive state for button enabling
-    let canDownloadSelected = false
-    let canDeleteSelected = false
-
-    $: canDownloadSelected = selectedIds.length > 0 && selectedIds.some(id => {
-        const takeout = takeouts.find(t => t.id === id)
-        return takeout && canDownload(takeout.status)
-    })
-
-    $: canDeleteSelected = selectedIds.length > 0 && selectedIds.some(id => {
-        const takeout = takeouts.find(t => t.id === id)
-        return takeout && canCancel(takeout.status)
-    })
-
-    // Functions to expose to parent component
-    export { initiateTakeout, canCreateTakeout, canDownloadSelected, canDeleteSelected }
-
-    export function getCanCreateTakeout() {
-        return canCreateTakeout
-    }
-
-    export function downloadSelectedTakeouts() {
+    function handleDownloadSelected() {
         const readyTakeouts = table.selected.filter(id => {
             const takeout = takeouts.find(t => t.id === id)
             return takeout && canDownload(takeout.status)
@@ -313,7 +217,7 @@
         readyTakeouts.forEach(id => downloadTakeout(id))
     }
 
-    export function deleteSelectedTakeouts() {
+    function handleDeleteSelected() {
         const cancellableTakeouts = table.selected.filter(id => {
             const takeout = takeouts.find(t => t.id === id)
             return takeout && canCancel(takeout.status)
@@ -335,12 +239,157 @@
         }
     }
 
+    // Helper functions
+    function getStatusColor(status: TakeoutStatus): string {
+        switch (status) {
+            case 'Pending': return 'text-yellow'
+            case 'Materializing': return 'text-blue'
+            case 'Ready': return 'text-green'
+            case 'Expired': return 'text-red'
+            case 'Cancelled': return 'text-red'
+            default: return 'text-muted'
+        }
+    }
+
+    function updateContainerWidth() {
+        if (containerRef) {
+            containerWidth = containerRef.clientWidth
+        }
+    }
+
+    function handleSelection(id: string) {
+        if (!canSelect(takeouts.find(t => t.id === id)?.status || '')) return
+
+        table.select(id)
+        selectedIds = [...table.selected] // Force reactivity by creating new array
+    }
+
+    function canDownload(status: TakeoutStatus): boolean {
+        return status === 'Ready'
+    }
+
+    function canCancel(status: TakeoutStatus): boolean {
+        return status === 'Pending' || status === 'Materializing' || status === 'Ready'
+    }
+
+    function canSelect(status: TakeoutStatus): boolean {
+        return status !== 'Expired' && status !== 'Cancelled'
+    }
+
+    // Auto-refresh management
+    function startAutoRefresh() {
+        // Don't start if already running or if there's an action in progress
+        if (autoRefreshInterval || actionLoading) return
+
+        autoRefreshInterval = setInterval(() => {
+            // Only refresh if no action is in progress
+            if (!actionLoading) {
+                fetchTakeouts(true)
+            }
+        }, AUTO_REFRESH_DELAY)
+    }
+
+    function stopAutoRefresh() {
+        if (autoRefreshInterval) {
+            clearInterval(autoRefreshInterval)
+            autoRefreshInterval = null
+        }
+    }
+
+    // Reactive statements
+    $: containerWidth && table.setRows(takeouts)
+
+    // Reactive statement to pause auto-refresh during actions
+    $: if (actionLoading) {
+        stopAutoRefresh()
+    } else if (!autoRefreshInterval) {
+        startAutoRefresh()
+    }
+
+    // Check if any takeouts are in transitional states that need monitoring
+    $: hasActiveOperations = takeouts.some(t =>
+        t.status === 'Pending' || t.status === 'Materializing'
+    )
+
+    // Reactive state for button enabling
+    $: canDownloadSelected = selectedIds.length > 0 && selectedIds.some(id => {
+        const takeout = takeouts.find(t => t.id === id)
+        return takeout && canDownload(takeout.status)
+    })
+
+    $: canDeleteSelected = selectedIds.length > 0 && selectedIds.some(id => {
+        const takeout = takeouts.find(t => t.id === id)
+        return takeout && canCancel(takeout.status)
+    })
+
+    // Toolbar configuration
+    $: leftElements = [
+        {
+            type: 'action' as const,
+            icon: 'i-carbon-add',
+            text: 'Create Takeout',
+            onClick: handleCreateTakeout,
+            compactStage: 2,
+            tooltip: canCreateTakeout ? "Create new takeout" : "Cannot create - you already have an active takeout",
+            disabled: !canCreateTakeout || actionLoading === 'initiate'
+        }
+    ] satisfies ToolbarItem[];
+
+    $: rightElements = [
+        {
+            type: 'action' as const,
+            icon: 'i-carbon-cloud-download',
+            text: 'Download',
+            onClick: handleDownloadSelected,
+            compactStage: 2,
+            tooltip: canDownloadSelected ? "Download selected takeouts" : "No ready takeouts selected",
+            disabled: !canDownloadSelected
+        },
+        {
+            type: 'action' as const,
+            icon: 'i-carbon-trash-can',
+            text: 'Delete',
+            onClick: handleDeleteSelected,
+            compactStage: 2,
+            tooltip: canDeleteSelected ? "Delete selected takeouts" : "No cancellable takeouts selected",
+            disabled: !canDeleteSelected
+        }
+    ] satisfies ToolbarItem[];
+
+    // Lifecycle
+    onMount(() => {
+        fetchTakeouts()
+        updateContainerWidth()
+        window.addEventListener('resize', updateContainerWidth)
+        startAutoRefresh()
+
+        return () => {
+            window.removeEventListener('resize', updateContainerWidth)
+            stopAutoRefresh()
+        }
+    })
+
     // Reactive statement to refetch when token changes
     $: if ($tokenStore) {
         fetchTakeouts()
     }
 </script>
 
+<!-- Integrated Toolbar -->
+<Toolbar
+    {leftElements}
+    centerElements={[]}
+    {rightElements}
+    {onToggleSidebar}
+/>
+
+<!-- Page Title -->
+<div>
+    <h3>Data Takeouts</h3>
+    <p class="text-sm text-muted">Export and download your data</p>
+</div>
+
+<!-- Takeouts Table -->
 <div class="border-solid border-1 rounded-lg p-1 border-overlay1" bind:this={containerRef}>
 
     {#if error}
@@ -348,7 +397,7 @@
             {error}
             <button
                 class="ml-2 text-blue underline"
-                onclick={fetchTakeouts}
+                onclick={() => fetchTakeouts()}
             >
                 Retry
             </button>

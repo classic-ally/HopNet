@@ -4,6 +4,11 @@
     import { tokenStore, API_BASE_URL } from '../../stores';
     import FaultToleranceChart from './FaultToleranceChart.svelte';
     import ConsensusHealthBar from './ConsensusHealthBar.svelte';
+    import Toolbar from '../../primitives/Toolbar.svelte';
+    import type { ToolbarItem } from '../../primitives/Toolbar.svelte';
+
+    // Props
+    export let onToggleSidebar: () => void = () => {};
 
     // System nodes and working copy for modifications
     let systemNodes: NodeStorageBaseline[] = []; // Immutable system data
@@ -163,7 +168,52 @@
             workingNodes = workingNodes; // Trigger reactivity
         }
     }
+
+    // Toolbar configuration
+    $: leftElements = [
+        {
+            type: 'action' as const,
+            icon: 'i-carbon-add',
+            text: 'Add Node',
+            onClick: addHypotheticalNode,
+            compactStage: 2,
+            tooltip: 'Add test node'
+        },
+        {
+            type: 'action' as const,
+            icon: 'i-carbon-reset',
+            text: 'Clear Nodes',
+            onClick: resetToSystemData,
+            compactStage: 3,
+            tooltip: 'Clear all nodes'
+        }
+    ] satisfies ToolbarItem[];
+
+    $: rightElements = [
+        {
+            type: 'action' as const,
+            icon: 'i-carbon-analytics',
+            text: 'Analyze',
+            onClick: analyzeNetwork,
+            compactStage: 2,
+            tooltip: 'Analyze network'
+        }
+    ] satisfies ToolbarItem[];
 </script>
+
+<!-- Integrated Toolbar -->
+<Toolbar
+    {leftElements}
+    centerElements={[]}
+    {rightElements}
+    {onToggleSidebar}
+/>
+
+<!-- Page Title -->
+<div>
+    <h3>Network Resilience</h3>
+    <p class="text-sm text-muted">Fault tolerance and capacity planning</p>
+</div>
 
 <!-- Main Grid Layout -->
 <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">

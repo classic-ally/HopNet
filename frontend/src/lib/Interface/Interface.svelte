@@ -1,14 +1,10 @@
 <script>
     import AccountSidebarItem from "./AccountSidebarItem.svelte";
     import BrowsePane from "./BrowsePane.svelte";
-    import NodeAddPane from "./NodeAddPane.svelte";
     import Toolbar from "../primitives/Toolbar.svelte";
-    import NodesHeader from "./NodesHeader.svelte";
-    import NodesTable from "./NodesTable.svelte";
-    import TakeoutHeader from "./TakeoutHeader.svelte";
-    import TakeoutTable from "./TakeoutTable.svelte";
+    import NodesPane from "../panes/nodes/NodesPane.svelte";
+    import TakeoutPane from "../panes/takeout/TakeoutPane.svelte";
     import SidebarItem from "./SidebarItem.svelte";
-    import ResilienceHeader from "../panes/resilience/ResilienceHeader.svelte";
     import ResiliencePane from "../panes/resilience/ResiliencePane.svelte";
 
     // State to track which sidebar item is selected
@@ -158,59 +154,14 @@
             <!-- Browse pane with integrated toolbar -->
             <BrowsePane onToggleSidebar={toggleSidebar}/>
         {:else if selectedItem === "nodes"}
-            <NodesHeader
-                onAddNode={() => {isNodeAddOpen = !isNodeAddOpen}}
-                onToggleSidebar={toggleSidebar}
-            />
-            <NodesTable/>
-            {#if isNodeAddOpen}
-                <NodeAddPane
-                    onBackButton={() => {isNodeAddOpen = !isNodeAddOpen}}
-                />
-            {/if}
+            <!-- Nodes pane with integrated toolbar -->
+            <NodesPane onToggleSidebar={toggleSidebar}/>
         {:else if selectedItem === "takeout"}
-            <TakeoutHeader
-                onToggleSidebar={toggleSidebar}
-                onCreateTakeout={() => {
-                    if (takeoutTableRef && takeoutTableRef.initiateTakeout) {
-                        takeoutTableRef.initiateTakeout();
-                    }
-                }}
-                onDownloadSelected={() => {
-                    if (takeoutTableRef && takeoutTableRef.downloadSelectedTakeouts) {
-                        takeoutTableRef.downloadSelectedTakeouts();
-                    }
-                }}
-                onDeleteSelected={() => {
-                    if (takeoutTableRef && takeoutTableRef.deleteSelectedTakeouts) {
-                        takeoutTableRef.deleteSelectedTakeouts();
-                    }
-                }}
-                canCreate={canCreateTakeout}
-                canDownloadSelected={canDownloadSelected}
-                canDeleteSelected={canDeleteSelected}
-            />
-            <TakeoutTable bind:this={takeoutTableRef} bind:canCreateTakeout bind:canDownloadSelected bind:canDeleteSelected/>
+            <!-- Takeout pane with integrated toolbar -->
+            <TakeoutPane onToggleSidebar={toggleSidebar}/>
         {:else if selectedItem === "resilience"}
-            <ResilienceHeader
-                onToggleSidebar={toggleSidebar}
-                onAddNode={() => {
-                    if (resilienceRef && resilienceRef.addTestNode) {
-                        resilienceRef.addTestNode();
-                    }
-                }}
-                onClearNodes={() => {
-                    if (resilienceRef && resilienceRef.clearNodes) {
-                        resilienceRef.clearNodes();
-                    }
-                }}
-                onAnalyze={() => {
-                    if (resilienceRef && resilienceRef.analyzeNetwork) {
-                        resilienceRef.analyzeNetwork();
-                    }
-                }}
-            />
-            <ResiliencePane bind:this={resilienceRef}/>
+            <!-- Resilience pane with integrated toolbar -->
+            <ResiliencePane onToggleSidebar={toggleSidebar}/>
         {:else if selectedItem === "recents"}
             <!-- Minimal toolbar for mobile menu access -->
             <Toolbar

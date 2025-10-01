@@ -1,7 +1,10 @@
 <script lang="ts">
-    import { TableHandler, ThSort, ThFilter, Th, Datatable } from '@vincjo/datatables'
-    import { tokenStore, API_BASE_URL } from '../stores'
+    import { TableHandler, ThSort, Th, Datatable } from '@vincjo/datatables'
+    import { tokenStore, API_BASE_URL } from '../../stores'
     import { onMount } from 'svelte'
+    import Toolbar from '../../primitives/Toolbar.svelte'
+    import type { ToolbarItem } from '../../primitives/Toolbar.svelte'
+    import NodeAddPane from './NodeAddPane.svelte'
 
     interface Node {
         node_id: number;
@@ -11,9 +14,14 @@
         owner: number;
     }
 
+    // Props
+    export let onToggleSidebar: () => void = () => {};
+
+    // State
     let nodes: Node[] = []
     let loading = true
     let error = ''
+    let isNodeAddOpen = false
 
     const table = new TableHandler(nodes, {
         rowsPerPage: 50,
@@ -21,11 +29,12 @@
     })
     const search = table.createSearch()
 
+    // Node management functions
     async function fetchNodes() {
         try {
             loading = true
             error = ''
-            
+
             const token = $tokenStore
             if (!token) {
                 error = 'No authentication token found'
@@ -56,6 +65,41 @@
         }
     }
 
+    function handleAddNode() {
+        isNodeAddOpen = true;
+    }
+
+    function handleDeleteNode() {
+        // TODO: Implement delete functionality for selected nodes
+        console.log('Delete node clicked');
+    }
+
+    // Toolbar configuration
+    $: selectedCount = table.selected?.length || 0;
+
+    $: leftElements = [
+        {
+            type: 'action' as const,
+            icon: 'i-carbon-add',
+            text: 'Add Node',
+            onClick: handleAddNode,
+            compactStage: 2,
+            tooltip: 'Add a new node to the network'
+        }
+    ] satisfies ToolbarItem[];
+
+    $: rightElements = [
+        {
+            type: 'action' as const,
+            icon: 'i-carbon-trash-can',
+            text: 'Delete',
+            onClick: handleDeleteNode,
+            compactStage: 2,
+            tooltip: selectedCount > 0 ? `Delete ${selectedCount} selected node${selectedCount === 1 ? '' : 's'}` : 'Select nodes to delete',
+            disabled: selectedCount === 0
+        }
+    ] satisfies ToolbarItem[];
+
     onMount(() => {
         fetchNodes()
     })
@@ -66,6 +110,21 @@
     }
 </script>
 
+<!-- Integrated Toolbar -->
+<Toolbar
+    {leftElements}
+    centerElements={[]}
+    {rightElements}
+    {onToggleSidebar}
+/>
+
+<!-- Page Title -->
+<div>
+    <h3>Networked Nodes</h3>
+    <p class="text-sm text-muted">Total nodes: {nodes.length}</p>
+</div>
+
+<!-- Nodes Table -->
 <div class="border-solid border-1 rounded-lg p-1 border-overlay1 max-w-[500px]">
     {#if error}
         <div class="text-red p-2 mb-2 border border-red rounded">
@@ -78,7 +137,7 @@
             </button>
         </div>
     {/if}
-    
+
     <div class="flex gap-1">
     <!-- Search bar -->
     <input
@@ -101,7 +160,7 @@
         {/each}
     </select>
     </div>
-    
+
     {#if loading}
         <div class="text-muted p-4 text-center">
             Loading nodes...
@@ -143,6 +202,13 @@
     {/if}
 </div>
 
+<!-- Node Add Overlay -->
+{#if isNodeAddOpen}
+    <NodeAddPane
+        onBackButton={() => {isNodeAddOpen = false}}
+    />
+{/if}
+
 <style>
     tbody tr:hover {
         background-color: #313244 !important; /* surface0 */
@@ -156,7 +222,7 @@
     :global(aside) {
         color: #bac2de !important; /* subtitle */
     }
-    
+
     :global(td) {
         border: 1px solid #313244 !important; /* surface0 - very subtle borders */
     }
@@ -164,5 +230,4 @@
     :global(th)  {
         border-bottom: 1px solid #313244 !important; /* surface0 - header separator */
     }
-
 </style>
