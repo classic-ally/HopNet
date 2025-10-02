@@ -27,10 +27,10 @@ fn main() {
         println!("cargo:warning=Building frontend for production...");
     }
     
-    // Run npm install if node_modules doesn't exist
+    // Run pnpm install if node_modules doesn't exist
     if !frontend_dir.join("node_modules").exists() {
         println!("cargo:warning=Installing frontend dependencies...");
-        match Command::new("npm")
+        match Command::new("pnpm")
             .args(&["install"])
             .current_dir(&frontend_dir)
             .output() {
@@ -38,20 +38,20 @@ fn main() {
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     let stdout = String::from_utf8_lossy(&output.stdout);
-                    panic!("npm install failed:\nSTDOUT: {}\nSTDERR: {}", stdout, stderr);
+                    panic!("pnpm install failed:\nSTDOUT: {}\nSTDERR: {}", stdout, stderr);
                 }
                 println!("cargo:warning=Frontend dependencies installed successfully");
             }
             Err(e) => {
-                println!("cargo:warning=npm install failed: {} - skipping frontend build", e);
-                println!("cargo:warning=To build frontend, install Node.js/npm or use pre-built dist");
+                println!("cargo:warning=pnpm install failed: {} - skipping frontend build", e);
+                println!("cargo:warning=To build frontend, install pnpm or use pre-built dist");
             }
         }
     }
     
-    // Run npm run build
+    // Run pnpm run build
     println!("cargo:warning=Building frontend with Vite...");
-    match Command::new("npm")
+    match Command::new("pnpm")
         .args(&["run", "build"])
         .current_dir(&frontend_dir)
         .output() {
@@ -59,12 +59,12 @@ fn main() {
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                panic!("npm run build failed:\nSTDOUT: {}\nSTDERR: {}", stdout, stderr);
+                panic!("pnpm run build failed:\nSTDOUT: {}\nSTDERR: {}", stdout, stderr);
             }
         }
         Err(e) => {
-            println!("cargo:warning=npm run build failed: {} - skipping frontend build", e);
-            println!("cargo:warning=To build frontend, install Node.js/npm or use pre-built dist");
+            println!("cargo:warning=pnpm run build failed: {} - skipping frontend build", e);
+            println!("cargo:warning=To build frontend, install pnpm or use pre-built dist");
         }
     }
     

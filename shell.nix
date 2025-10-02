@@ -18,6 +18,7 @@ stdenv.mkDerivation {
 
     # frontend
     pkgs.nodejs_24
+    pkgs.pnpm
   ];
   
   shellHook = ''
