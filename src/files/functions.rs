@@ -383,7 +383,26 @@ async fn perform_concurrent_fragment_discovery(
             missing_fragments.push((*index, *hash, fragment_id.clone(), FragmentType::Recovery));
         }
     }
-    
+
+    // Batch query fragment inventory for all missing fragments
+    let missing_hashes: Vec<Blake3Hash> = missing_fragments.iter()
+        .map(|(_, hash, _, _)| *hash)
+        .collect();
+
+    let mut inventory_map = crate::db::inventory::batch_query_fragment_inventory(
+        app_state.db_pool.get(),
+        &missing_hashes,
+        None, // Use default
+    ).map_err(|_| FileError::DatabaseError)?;
+
+    // Pre-distribute inventory hints - remove from map (avoiding clones) when building queue
+    let missing_fragments: Vec<_> = missing_fragments.into_iter()
+        .map(|(index, hash, fragment_id, fragment_type)| {
+            let inventory_hint = inventory_map.remove(&hash);
+            (index, hash, fragment_id, fragment_type, inventory_hint)
+        })
+        .collect();
+
     // Create work queue for fragments to try
     let work_queue = std::sync::Arc::new(tokio::sync::Mutex::new(missing_fragments));
     let (success_tx, mut success_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -400,10 +419,10 @@ async fn perform_concurrent_fragment_discovery(
         let fragments_dir_clone = fragments_dir.to_string();
         let db_pool = app_state.db_pool.clone();
         let successful_downloads_clone = successful_downloads.clone();
-        
+
         let worker_handle = tokio::spawn(async move {
             tracing::debug!("Worker {} starting fragment discovery", worker_id);
-            
+
             // Keep working until we have enough successful downloads or run out of work
             loop {
                 // Check if we already have enough successful downloads
@@ -411,25 +430,25 @@ async fn perform_concurrent_fragment_discovery(
                     tracing::debug!("Worker {} stopping - enough fragments downloaded", worker_id);
                     break;
                 }
-                
+
                 // Get next fragment to try from work queue
                 let next_work = {
                     let mut queue_lock = queue.lock().await;
                     queue_lock.pop()
                 };
-                
-                let (index, fragment_hash, fragment_id, fragment_type) = match next_work {
+
+                let (index, fragment_hash, fragment_id, fragment_type, inventory_hint) = match next_work {
                     Some(work) => work,
                     None => {
                         tracing::debug!("Worker {} stopping - no more fragments to try", worker_id);
                         break;
                     }
                 };
-                
+
                 tracing::debug!("Worker {} trying fragment {} (type: {:?})", worker_id, fragment_hash.to_hex(), fragment_type);
-                
+
                 // Try to find and fetch the fragment from network
-                match find_fragment(&fragment_hash, fragment_type, &node_metrics_clone, &auth_clone).await {
+                match find_fragment(&fragment_hash, fragment_type, node_metrics_clone.clone(), &auth_clone, inventory_hint).await {
                 Ok(encrypted_data) => {
                         // Store fragment locally
                         if let Err(e) = store_fragment(&fragments_dir_clone, &fragment_hash, encrypted_data) {
@@ -532,7 +551,22 @@ pub async fn fetch_and_cache_fragment(
     app_state: &AppState,
     placement_height: Option<i32>,
     auth: &crate::NodeAuthInfo,
+    inventory_hint: Option<Vec<crate::types::NodeConnectionInfo>>,
 ) -> Result<(), FileError> {
+    // If no hint provided, query inventory for this fragment (best-effort optimization)
+    let inventory_hint = match inventory_hint {
+        Some(hint) => Some(hint),
+        None => {
+            crate::db::inventory::batch_query_fragment_inventory(
+                app_state.db_pool.get(),
+                &[*fragment_hash],
+                None,
+            )
+            .ok()
+            .and_then(|mut map| map.remove(fragment_hash))
+        }
+    };
+
     // Get node metrics for fragment discovery
     let node_metrics = match placement_height {
         Some(height) => crate::db::metrics::get_all_node_metrics(app_state.db_pool.get(), height)
@@ -544,7 +578,7 @@ pub async fn fetch_and_cache_fragment(
     };
 
     // Try to find and fetch the fragment
-    match find_fragment(fragment_hash, FragmentType::Original, &node_metrics, auth).await {
+    match find_fragment(fragment_hash, FragmentType::Original, node_metrics, auth, inventory_hint).await {
         Ok(fragment_data) => {
             // Store fragment locally
             store_fragment(fragments_dir, fragment_hash, fragment_data)?;
@@ -705,7 +739,7 @@ pub async fn reassemble_file(
                         
                         // Try to fetch and cache the fragment immediately
                         if let (Some(app_state), Some(auth)) = (app_state, &auth) {
-                            match fetch_and_cache_fragment(hash, fragments_dir, app_state, consensus_height, auth).await {
+                            match fetch_and_cache_fragment(hash, fragments_dir, app_state, consensus_height, auth, None).await {
                                 Ok(()) => {
                                     // Retry loading the fragment after caching
                                     match fetch_and_verify_fragment(hash, fragments_dir) {
@@ -759,7 +793,7 @@ pub async fn reassemble_file(
                         
                         // Try to fetch and cache the fragment immediately
                         if let (Some(app_state), Some(auth)) = (app_state, &auth) {
-                            match fetch_and_cache_fragment(hash, fragments_dir, app_state, consensus_height, auth).await {
+                            match fetch_and_cache_fragment(hash, fragments_dir, app_state, consensus_height, auth, None).await {
                                 Ok(()) => {
                                     // Retry loading the fragment after caching
                                     match fetch_and_verify_fragment(hash, fragments_dir) {

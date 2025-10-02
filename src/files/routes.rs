@@ -792,26 +792,47 @@ pub async fn post_fetch_fragments(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    
+
+    // Batch query fragment inventory for all requested fragments
+    let all_hashes: Vec<Blake3Hash> = request.fragments.iter()
+        .map(|f| f.fragment_hash)
+        .collect();
+
+    let mut inventory_map = match crate::db::inventory::batch_query_fragment_inventory(
+        app_state.db_pool.get(),
+        &all_hashes,
+        None,  // Use default
+    ) {
+        Ok(map) => map,
+        Err(e) => {
+            tracing::warn!("Fragment inventory query failed, falling back to placement algorithm: {:?}", e);
+            std::collections::HashMap::new()  // Empty map = all lookups return None
+        }
+    };
+
     // Process each fragment
     for fragment_info in &request.fragments {
         let fragment_hash = &fragment_info.fragment_hash;
         let placement_height = fragment_info.placement_height;
-        
+
         // Check if we already have this fragment locally
         if crate::files::functions::fragment_exists_and_valid(&app_state.fragments_dir, fragment_hash) {
             tracing::debug!("Fragment {} already exists locally, skipping", fragment_hash.to_hex());
             successful_fetches += 1;
             continue;
         }
-        
+
+        // Get inventory hint for this fragment
+        let inventory_hint = inventory_map.remove(fragment_hash);
+
         // Fetch and cache the fragment using existing discovery infrastructure with provided placement height
         match crate::files::functions::fetch_and_cache_fragment(
             fragment_hash,
             &app_state.fragments_dir,
             &app_state,
             Some(placement_height),
-            &node_auth
+            &node_auth,
+            inventory_hint,
         ).await {
             Ok(()) => {
                 tracing::info!("Successfully fetched and cached fragment {} (height {})", 

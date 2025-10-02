@@ -1,11 +1,21 @@
 use crate::{
     NodeAuthInfo,
-    types::Blake3Hash,
+    types::{Blake3Hash, NodeConnectionInfo},
     db::metrics::NodeMetrics,
     files::placement::{calculate_rendezvous_distances, calculate_final_placement_scores, FragmentType},
 };
 use ed25519_dalek::Signer;
 // Using tokio tasks and channels for reactive processing
+
+impl From<crate::files::placement::Phase2Candidate> for NodeConnectionInfo {
+    fn from(c: crate::files::placement::Phase2Candidate) -> Self {
+        NodeConnectionInfo {
+            node_id: c.node_id,
+            ip_address: c.ip_address,
+            port: c.port,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum DiscoveryError {
@@ -46,12 +56,10 @@ pub fn get_fragment_placement_candidates(
 /// Try to fetch a fragment from a specific node
 pub async fn try_fetch_from_node(
     fragment_hash: &Blake3Hash,
-    node_id: i32,
-    ip_address: &str,
-    port: i32,
+    node: &NodeConnectionInfo,
     auth: &NodeAuthInfo,
 ) -> Result<Vec<u8>, DiscoveryError> {
-    let url = format!("http://{}:{}/fragments/{}", ip_address, port, fragment_hash.to_hex());
+    let url = format!("http://{}:{}/fragments/{}", node.ip_address, node.port, fragment_hash.to_hex());
     
     // Create HTTP client with timeout
     let client = reqwest::Client::builder()
@@ -92,21 +100,19 @@ pub async fn try_fetch_from_node(
         return Err(DiscoveryError::Network("Fragment hash mismatch".to_string()));
     }
     
-    tracing::debug!("Successfully fetched fragment {} from node {} ({}:{})", 
-                   fragment_hash.to_hex(), node_id, ip_address, port);
-    
+    tracing::debug!("Successfully fetched fragment {} from node {} ({}:{})",
+                   fragment_hash.to_hex(), node.node_id, node.ip_address, node.port);
+
     Ok(fragment_data)
 }
 
 /// Ask a node if it has a fragment (health check only, no data transfer)
 pub async fn try_ask_node_for_fragment(
     fragment_hash: &Blake3Hash,
-    node_id: i32,
-    ip_address: &str,
-    port: i32,
+    node: &NodeConnectionInfo,
     auth: &NodeAuthInfo,
 ) -> Result<bool, DiscoveryError> {
-    let url = format!("http://{}:{}/fragments/{}/health", ip_address, port, fragment_hash.to_hex());
+    let url = format!("http://{}:{}/fragments/{}/health", node.ip_address, node.port, fragment_hash.to_hex());
     
     // Fast timeout for health checks - we want quick responses
     let client = reqwest::Client::builder()
@@ -130,11 +136,11 @@ pub async fn try_ask_node_for_fragment(
         .map_err(|_| DiscoveryError::NotFound)?; // Treat any error as "doesn't have it"
     
     let has_fragment = response.status().is_success();
-    
-    tracing::debug!("Health check for fragment {} on node {} ({}:{}): {}", 
-                   fragment_hash.to_hex(), node_id, ip_address, port, 
+
+    tracing::debug!("Health check for fragment {} on node {} ({}:{}): {}",
+                   fragment_hash.to_hex(), node.node_id, node.ip_address, node.port,
                    if has_fragment { "HAS" } else { "MISSING" });
-    
+
     Ok(has_fragment)
 }
 
@@ -142,68 +148,81 @@ pub async fn try_ask_node_for_fragment(
 pub async fn find_fragment(
     fragment_hash: &Blake3Hash,
     fragment_type: FragmentType,
-    node_metrics: &[NodeMetrics],
+    node_metrics: Vec<NodeMetrics>,
     auth: &NodeAuthInfo,
+    inventory_hint: Option<Vec<NodeConnectionInfo>>,
 ) -> Result<Vec<u8>, DiscoveryError> {
-    // Get deterministic placement candidates in preference order
-    let candidates = get_fragment_placement_candidates(fragment_hash, fragment_type, node_metrics);
-    
+    // Phase 0: Try fragment inventory nodes first (if available)
+    if let Some(inventory_nodes) = inventory_hint {
+        if !inventory_nodes.is_empty() {
+            tracing::debug!("Trying {} inventory nodes for fragment {}",
+                          inventory_nodes.len(), fragment_hash.to_hex());
+
+            if let Ok(data) = try_reactive_discovery_and_fetch(fragment_hash, &inventory_nodes, auth).await {
+                tracing::debug!("Fragment {} found via inventory!", fragment_hash.to_hex());
+                return Ok(data);
+            }
+
+            tracing::debug!("Inventory nodes failed, falling back to placement algorithm");
+        }
+    }
+
+    // Phase 1: Get deterministic placement candidates in preference order
+    let candidates = get_fragment_placement_candidates(fragment_hash, fragment_type, &node_metrics);
+
     if candidates.is_empty() {
         return Err(DiscoveryError::NotFound);
     }
     
     // Phase 2: Try the best candidate immediately
     let best_candidate = &candidates[0];
-    if let Some(best_metrics) = node_metrics.iter().find(|m| m.node_id == best_candidate.node_id) {
-        tracing::debug!("Trying best candidate node {} immediately", best_candidate.node_id);
-        
-        match try_fetch_from_node(
-            fragment_hash,
-            best_candidate.node_id,
-            &best_metrics.ip_address,
-            best_metrics.port,
-            auth,
-        ).await {
-            Ok(data) => {
-                tracing::debug!("Found fragment {} on best candidate {}", fragment_hash.to_hex(), best_candidate.node_id);
-                return Ok(data);
-            }
-            Err(e) => {
-                tracing::debug!("Best candidate {} failed: {:?}", best_candidate.node_id, e);
-            }
+    let best_node_info = NodeConnectionInfo::from(best_candidate.clone());
+    tracing::debug!("Trying best candidate node {} immediately", best_candidate.node_id);
+
+    match try_fetch_from_node(
+        fragment_hash,
+        &best_node_info,
+        auth,
+    ).await {
+        Ok(data) => {
+            tracing::debug!("Found fragment {} on best candidate {}", fragment_hash.to_hex(), best_candidate.node_id);
+            return Ok(data);
+        }
+        Err(e) => {
+            tracing::debug!("Best candidate {} failed: {:?}", best_candidate.node_id, e);
         }
     }
     
     // Phase 3: Reactive discovery on remaining deterministic candidates
     let best_candidate_id = best_candidate.node_id;
-    let remaining_candidates: Vec<_> = candidates.into_iter().skip(1).collect();
-    
+    let remaining_candidates: Vec<NodeConnectionInfo> = candidates.into_iter()
+        .skip(1)
+        .map(NodeConnectionInfo::from)
+        .collect();
+
     if !remaining_candidates.is_empty() {
         tracing::debug!("Trying {} remaining deterministic candidates reactively", remaining_candidates.len());
-        
-        if let Ok(data) = try_reactive_discovery_and_fetch(fragment_hash, &remaining_candidates, node_metrics, auth).await {
+
+        if let Ok(data) = try_reactive_discovery_and_fetch(fragment_hash, &remaining_candidates, auth).await {
             return Ok(data);
         }
     }
     
     // Phase 4: Network-wide gossip as last resort
-    let all_other_nodes: Vec<_> = node_metrics.iter()
+    let gossip_nodes: Vec<NodeConnectionInfo> = node_metrics.into_iter()
         .filter(|m| !remaining_candidates.iter().any(|c| c.node_id == m.node_id))
         .filter(|m| m.node_id != best_candidate_id) // Exclude best candidate too
+        .map(|m| NodeConnectionInfo {
+            node_id: m.node_id,
+            ip_address: m.ip_address,
+            port: m.port,
+        })
         .collect();
-    
-    if !all_other_nodes.is_empty() {
-        tracing::debug!("Trying network-wide gossip across {} nodes", all_other_nodes.len());
-        
-        // Convert to fake candidates for compatibility
-        let gossip_candidates: Vec<_> = all_other_nodes.iter()
-            .map(|m| crate::files::placement::Phase2Candidate {
-                node_id: m.node_id,
-                final_score: 0.0, // Score doesn't matter for gossip
-            })
-            .collect();
-        
-        if let Ok(data) = try_reactive_discovery_and_fetch(fragment_hash, &gossip_candidates, node_metrics, auth).await {
+
+    if !gossip_nodes.is_empty() {
+        tracing::debug!("Trying network-wide gossip across {} nodes", gossip_nodes.len());
+
+        if let Ok(data) = try_reactive_discovery_and_fetch(fragment_hash, &gossip_nodes, auth).await {
             return Ok(data);
         }
     }
@@ -215,58 +234,49 @@ pub async fn find_fragment(
 /// Starts downloads immediately when nodes report having the fragment (no waiting for all health checks)
 async fn try_reactive_discovery_and_fetch(
     fragment_hash: &Blake3Hash,
-    candidates: &[crate::files::placement::Phase2Candidate],
-    node_metrics: &[NodeMetrics],
+    nodes: &[NodeConnectionInfo],
     auth: &NodeAuthInfo,
 ) -> Result<Vec<u8>, DiscoveryError> {
     let (health_tx, mut health_rx) = tokio::sync::mpsc::unbounded_channel();
     let (download_tx, mut download_rx) = tokio::sync::mpsc::unbounded_channel();
-    
-    // Spawn health check tasks for all candidates
-    for candidate in candidates {
-        if let Some(metrics) = node_metrics.iter().find(|m| m.node_id == candidate.node_id) {
-            let tx = health_tx.clone();
-            let fragment_hash = *fragment_hash;
-            let node_id = candidate.node_id;
-            let ip_address = metrics.ip_address.clone();
-            let port = metrics.port;
-            let auth_clone = auth.clone();
-            
-            tokio::spawn(async move {
-                let has_fragment = try_ask_node_for_fragment(
-                    &fragment_hash,
-                    node_id,
-                    &ip_address,
-                    port,
-                    &auth_clone,
-                ).await.unwrap_or(false);
-                
-                if has_fragment {
-                    // Send node info for download
-                    let _ = tx.send((node_id, ip_address, port));
-                }
-            });
-        }
+
+    // Spawn health check tasks for all nodes
+    for node in nodes {
+        let tx = health_tx.clone();
+        let fragment_hash = *fragment_hash;
+        let node_info = node.clone();
+        let auth_clone = auth.clone();
+
+        tokio::spawn(async move {
+            let has_fragment = try_ask_node_for_fragment(
+                &fragment_hash,
+                &node_info,
+                &auth_clone,
+            ).await.unwrap_or(false);
+
+            if has_fragment {
+                // Send node info for download
+                let _ = tx.send(node_info);
+            }
+        });
     }
     drop(health_tx); // Close sender so channel will end when all tasks complete
-    
+
     // Process results as they flow in
     loop {
         tokio::select! {
             // New node found with fragment - start download immediately
-            Some((node_id, ip_address, port)) = health_rx.recv() => {
-                tracing::debug!("Node {} reports having fragment, starting download", node_id);
-                
+            Some(node_info) = health_rx.recv() => {
+                tracing::debug!("Node {} reports having fragment, starting download", node_info.node_id);
+
                 let tx = download_tx.clone();
                 let fragment_hash = *fragment_hash;
                 let auth_clone = auth.clone();
-                
+
                 tokio::spawn(async move {
                     let result = try_fetch_from_node(
                         &fragment_hash,
-                        node_id,
-                        &ip_address,
-                        port,
+                        &node_info,
                         &auth_clone,
                     ).await;
                     let _ = tx.send(result);

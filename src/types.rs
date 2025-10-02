@@ -383,3 +383,12 @@ pub struct Sequence {
     pub name: String,
     pub next_id: i32,
 }
+
+/// Lightweight node connection information
+/// Used for fragment discovery and network operations
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeConnectionInfo {
+    pub node_id: i32,
+    pub ip_address: String,
+    pub port: i32,
+}

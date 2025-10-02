@@ -19,6 +19,8 @@ pub struct Phase1Candidate {
 pub struct Phase2Candidate {
     pub node_id: i32,
     pub final_score: f64,  // Weighted score for placement ranking
+    pub ip_address: String,
+    pub port: i32,
 }
 
 /// Calculate XOR distance between fragment hash and node IDs
@@ -116,6 +118,8 @@ pub fn calculate_final_placement_scores(
             Phase2Candidate {
                 node_id: metrics.node_id,
                 final_score,
+                ip_address: metrics.ip_address,
+                port: metrics.port,
             }
         })
         .collect();
