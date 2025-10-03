@@ -482,6 +482,8 @@ mod tests {
             display_name: "single-node".to_string(),
             storage_total_gb: 1000.0,
             baseline_storage_gb: 100.0,
+            source: hopnet_common::db::NodeSource::System,
+            original_values: None,
         }];
         let curve = generate_fault_tolerance_curve(single_node, 0.9);
         assert_eq!(curve[0].active_nodes, 1);
@@ -507,6 +509,8 @@ mod tests {
                 display_name: format!("Node {}", i),
                 storage_total_gb: 1000.0,
                 baseline_storage_gb: 100.0,
+                source: hopnet_common::db::NodeSource::System,
+                original_values: None,
             })
             .collect();
         let curve = generate_fault_tolerance_curve(ten_nodes, 0.9);
@@ -533,6 +537,8 @@ mod tests {
                 display_name: format!("Node {}", i),
                 storage_total_gb: 1000.0,
                 baseline_storage_gb: 100.0,
+                source: hopnet_common::db::NodeSource::System,
+                original_values: None,
             })
             .collect();
         let curve = generate_fault_tolerance_curve(thirty_nodes, 0.9);
@@ -547,6 +553,8 @@ mod tests {
                 display_name: format!("Node {}", i),
                 storage_total_gb: 1000.0,
                 baseline_storage_gb: 100.0,
+                source: hopnet_common::db::NodeSource::System,
+                original_values: None,
             })
             .collect();
         let curve = generate_fault_tolerance_curve(fifty_nodes, 0.9);
