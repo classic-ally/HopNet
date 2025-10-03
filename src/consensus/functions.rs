@@ -242,9 +242,9 @@ async fn broadcast_and_collect_votes(
 
     let (votes_tx, mut votes_rx) = mpsc::channel::<VoteSignMessage>(100); //100 channel capacity
 
-    // Calculate quorum threshold (2/3 majority + 1)
-    let required_votes = (validators.len() * 2) / 3 + 1;
-    
+    // Calculate quorum threshold (dynamic based on validator count)
+    let required_votes = crate::consensus::types::calculate_quorum_threshold(validators.len());
+
     // Spawn tasks for each validator
     for node in validators.clone() {
         let ballot_clone = ballot.clone();
@@ -320,9 +320,9 @@ async fn broadcast_qc(
 
     let (confirmations_tx, mut confirmations_rx) = mpsc::channel::<()>(100);
 
-    // Calculate quorum threshold (2/3 majority + 1)
-    let required_confirmations = (validators.len() * 2) / 3 + 1;
-    
+    // Calculate quorum threshold (dynamic based on validator count)
+    let required_confirmations = crate::consensus::types::calculate_quorum_threshold(validators.len());
+
     // Spawn tasks for each validator
     for node in validators.clone() {
         let qc_clone = qc.clone();

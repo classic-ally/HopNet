@@ -107,41 +107,66 @@ This refactor migrates from checkpoint-based node synchronization to consensus c
 
 **Why Third**: Independent of bootstrap flow, can be tested with existing nodes falling behind.
 
+**Prerequisite**: Dynamic fault tolerance thresholds must be implemented (relaxed mode for ≤6 validators, BFT mode for 7+).
+
 ### Requirements
+
+#### Dynamic Fault Tolerance Implementation
+- [x] Extract `calculate_quorum_threshold()` helper function to consensus types
+- [x] Function returns simple majority for ≤6 validators, 2/3+1 for 7+ validators
+- [x] Update `QuorumCertificate::verify()` to use dynamic threshold instead of hardcoded 2/3+1
+- [x] Update `TimeoutCertificate::verify()` to use dynamic threshold instead of hardcoded 2/3+1
+- [x] Add constant `BFT_THRESHOLD = 6` for mode transition point
+- [x] Update `TimeoutCertificate::find_majority_timeout_data()` to use dynamic threshold
+- [x] Update `ballot_broadcast()` and `qc_broadcast()` for consistent early termination
+- [x] Add comprehensive test suite (16 tests) covering all validator counts and transitions
+- [x] Add relaxed mode test (5 validators) that proves dynamic switching (would fail if BFT incorrectly applied)
+- [x] Add relaxed mode test (3 validators) documenting intentional 2-of-3 quorum behavior
+
+**Rationale**: Current QC/TC verification uses hardcoded BFT threshold even for small networks. Dynamic thresholds enable 1-node networks to grow naturally and match frontend's intended design (ConsensusHealthBar.svelte).
 
 #### Activation Transaction Type
 - [ ] Create new transaction payload structure for activation requests
-- [ ] Payload must include node ID and current height (proof of catch-up)
+- [ ] Payload must include node ID, current height (proof of catch-up), and requested effective height
+- [ ] Requested effective height ensures deterministic activation (all nodes process same height)
 - [ ] Transaction must be signed by requesting node
 
 #### Activation Handler
 - [ ] Implement handler that processes activation requests
-- [ ] Verify authorization: only the node itself can request its own activation
-- [ ] Verify node is caught up: reported height must be within 1 block of current
-- [ ] Check safety margin: adding this validator must leave buffer of at least 2 validators
-  - Calculate new minimum required validators after adding
-  - Calculate new buffer (total - minimum required)
-  - Reject if buffer would be less than 2
-- [ ] Update validators table to mark node as active at next height
-- [ ] Handle case where node already has pending activation (update height)
+- [ ] Verify authorization: only the node itself can request its own activation (signature check)
+- [ ] Verify node is caught up: reported height must be within 2 views of current (tolerance for validator-elect)
+- [ ] Verify requested activation height is in reasonable future (current+3 to current+10 views)
+- [ ] Verify requested activation height is not already passed (must be > current view)
+- [ ] Non-idempotent: refuse activation if node already active at requested height (prevents spam)
+- [ ] Update validators table with exact requested effective height (deterministic)
+- [ ] **NO safety margin check needed** - mathematical properties of dynamic thresholds ensure adding validators never regresses fault tolerance
+
+**Safety Analysis**: With dynamic thresholds, adding validators:
+- In relaxed mode (1-6): monotonically improves or maintains crash fault tolerance
+- At boundary (6→7): lateral move in crash tolerance + gain Byzantine fault tolerance
+- In BFT mode (7+): buffer ≥ 2 guaranteed by 2/3 threshold math, adding validators always safe
 
 #### Automatic Reactivation After Catch-Up
 - [ ] After successful catch-up in timeout detection job, check if node is inactive
-- [ ] If inactive, automatically submit activation request
+- [ ] If inactive, automatically submit activation request with effective height = current + 3
 - [ ] If activation request fails, retry on next job cycle
-- [ ] Log activation status and safety margin calculations
+- [ ] Log activation status (no safety margin to calculate)
 
 #### Initial Registration with Inactive Status
 - [ ] Modify node insertion logic to mark new validators as inactive initially
+- [ ] Exception: first node during network creation remains active (no catch-up needed)
 - [ ] Node will activate itself after bootstrap completes (Phase 4)
 
 ### Testing Criteria
+- [ ] Test dynamic threshold calculation at boundary (6 validators → simple majority, 7 validators → BFT)
+- [ ] Verify QC/TC verification uses correct threshold for small networks (1-6 validators)
 - [ ] Manually mark existing node as inactive in database
 - [ ] Verify node reactivates itself after next catch-up cycle
-- [ ] Test activation rejection when safety margin would be violated
 - [ ] Stop node for extended period, restart, verify automatic reactivation
-- [ ] Test with multiple nodes requesting activation concurrently
-- [ ] Verify safety margin prevents activating too many nodes at once
+- [ ] Test with multiple nodes requesting activation concurrently (deterministic height processing)
+- [ ] Verify 1-node network can grow to 2, 3, ... 10 nodes without artificial gates
+- [ ] Verify activation window (3 views) allows validator-elect to observe system state
+- [ ] Test idempotency: node attempting re-activation receives error, realizes already active
 
 ---
 
@@ -206,7 +231,6 @@ This refactor migrates from checkpoint-based node synchronization to consensus c
 - [ ] Verify fragment inventory is empty initially, populates after self-check
 - [ ] Test adding node while network is actively processing transactions
 - [ ] Test adding multiple nodes concurrently
-- [ ] Verify safety margin prevents activating too many nodes at once
 - [ ] Long bootstrap test: Create 5000-view chain, add new node, verify success
 - [ ] Test bootstrap failure scenarios (all validators offline, network unreachable)
 - [ ] Verify node activation occurs automatically after bootstrap completes
@@ -225,10 +249,11 @@ This refactor migrates from checkpoint-based node synchronization to consensus c
 - `src/consensus/jobs.rs` - Integration with timeout detection
 
 ### Phase 3
-- `src/consensus/types.rs` - Activation request structure
+- `src/consensus/types.rs` - Dynamic threshold function, activation request structure, QC/TC verification updates
 - `src/handlers.rs` - Activation handler
 - `src/consensus/jobs.rs` - Automatic reactivation
 - `src/db/nodes.rs` - Mark new nodes inactive
+- `src/db/consensus.rs` - Database helper functions (is_node_active, activate_validator)
 
 ### Phase 4
 - `src/types.rs` - Join info structure
@@ -250,9 +275,13 @@ This refactor migrates from checkpoint-based node synchronization to consensus c
 - Can fall back to single-iteration if issues arise
 - Easy to test in isolation
 
-**Phase 3: LOW RISK** - New feature, doesn't break existing functionality
-- Worst case: nodes stay inactive and need manual intervention
-- Can be rolled back independently
+**Phase 3: MEDIUM RISK** - Changes core consensus verification logic + new feature
+- Dynamic threshold implementation touches QC/TC verification (critical consensus path)
+- Must ensure threshold calculation correct at boundary (6→7 validators)
+- Activation signaling is new feature (low risk, can be manually managed if issues)
+- Worst case: QC/TC verification incorrect for small networks (breaks consensus)
+- Extensive testing required for 1-7 validator networks
+- Can be rolled back independently (dynamic thresholds revert to hardcoded 2/3)
 
 **Phase 4: MEDIUM RISK** - Large change but built on solid foundation
 - No fallback once deployed (checkpoint sync removed)
@@ -269,7 +298,7 @@ After completion:
 - [ ] Long catch-ups (1000+ views) complete successfully
 - [ ] State divergence impossible (all nodes process same transactions)
 - [ ] Nodes automatically reactivate after downtime
-- [ ] Safety margin maintained during validator changes
+- [ ] Dynamic fault tolerance: 1-node networks can grow naturally through relaxed→BFT transition
 - [ ] No manual intervention required for node addition
 - [ ] Checkpoint sync code completely removed
 
@@ -278,5 +307,8 @@ After completion:
 If critical issues discovered after deployment:
 - Phase 1: Revert catch-up changes, restore "warn and continue" behavior (temporary - bug still exists)
 - Phase 2: Remove convergence wrapper, use single-iteration catch-up
-- Phase 3: Disable automatic activation requests, manual activation via DB
+- Phase 3:
+  - Revert dynamic threshold changes, restore hardcoded 2/3+1 for QC/TC verification
+  - Disable automatic activation requests, manual activation via DB
+  - Note: reverting thresholds breaks small networks (1-6 validators cannot reach quorum)
 - Phase 4: Cannot easily rollback - would require restoring checkpoint sync code from git history

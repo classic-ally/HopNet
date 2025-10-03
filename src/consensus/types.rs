@@ -11,6 +11,26 @@ use blake3::Hasher;
 use rayon::prelude::*;
 use crate::consensus::functions::process_transactions;
 
+/// BFT threshold for transitioning between relaxed and full BFT modes
+pub const BFT_THRESHOLD: usize = 6;
+
+/// Calculate the required quorum threshold based on validator count
+///
+/// For small networks (≤6 validators): simple majority (n/2 + 1)
+/// For larger networks (7+ validators): BFT threshold (2n/3 + 1)
+///
+/// This function is critical for consensus safety and must produce correct
+/// thresholds at all validator counts, especially at the boundary (6→7).
+pub fn calculate_quorum_threshold(validator_count: usize) -> usize {
+    if validator_count <= BFT_THRESHOLD {
+        // Relaxed mode: simple majority (tolerates f crash faults where n = 2f+1)
+        (validator_count / 2) + 1
+    } else {
+        // Full BFT mode: 2/3 majority (tolerates f Byzantine faults where n = 3f+1)
+        ((validator_count * 2) / 3) + 1
+    }
+}
+
 #[derive(Debug)]
 pub enum VoteError {
     DatabaseError,
@@ -386,8 +406,8 @@ impl QuorumCertificate {
             unique_voters.entry(voter_sig.replica_id).or_insert(voter_sig);
         }
 
-        // Check we have enough unique signatures for quorum (2/3 + 1)
-        let required_signatures = (num_validators * 2) / 3 + 1;
+        // Check we have enough unique signatures for quorum (dynamic threshold)
+        let required_signatures = calculate_quorum_threshold(num_validators);
         let total_unique_signatures = 1 + unique_voters.len(); // proposer + unique voters
 
         if total_unique_signatures < required_signatures {
@@ -555,8 +575,8 @@ impl TimeoutCertificate {
             .map_err(|_| CertificateError::DatabaseError)?;
         let num_validators = validators.len();
         
-        // Check we have enough signatures for quorum (2/3 + 1)
-        let required_signatures = (num_validators * 2) / 3 + 1;
+        // Check we have enough signatures for quorum (dynamic threshold)
+        let required_signatures = calculate_quorum_threshold(num_validators);
         let total_signatures = self.signatures.len();
         
         if total_signatures < required_signatures {
@@ -618,8 +638,8 @@ impl TimeoutCertificate {
             // Get validator count for this specific view
             let validators = db::get_validators(app_state.db_pool.get(), view_number)
                 .map_err(|_| CertificateError::DatabaseError)?;
-            let required_quorum = (validators.len() * 2) / 3 + 1;
-            
+            let required_quorum = calculate_quorum_threshold(validators.len());
+
             // Check if this group has sufficient quorum
             if votes.len() >= required_quorum {
                 valid_groups.push((data_hash, votes));
@@ -951,4 +971,171 @@ pub fn validate_view_completeness(
         view_data.view, target_view
     );
     Err(CatchUpError::ValidationFailed(view_data.view))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_quorum_threshold_single_node() {
+        // 1 node network: need 1 vote (the node itself)
+        assert_eq!(calculate_quorum_threshold(1), 1);
+    }
+
+    #[test]
+    fn test_quorum_threshold_two_nodes() {
+        // 2 nodes: need 2 votes (simple majority)
+        assert_eq!(calculate_quorum_threshold(2), 2);
+    }
+
+    #[test]
+    fn test_quorum_threshold_three_nodes() {
+        // 3 nodes: need 2 votes (simple majority)
+        assert_eq!(calculate_quorum_threshold(3), 2);
+    }
+
+    #[test]
+    fn test_quorum_threshold_four_nodes() {
+        // 4 nodes: need 3 votes (simple majority)
+        assert_eq!(calculate_quorum_threshold(4), 3);
+    }
+
+    #[test]
+    fn test_quorum_threshold_five_nodes() {
+        // 5 nodes: need 3 votes (simple majority)
+        assert_eq!(calculate_quorum_threshold(5), 3);
+    }
+
+    #[test]
+    fn test_quorum_threshold_six_nodes_boundary() {
+        // 6 nodes: last node in relaxed mode, need 4 votes (simple majority)
+        assert_eq!(calculate_quorum_threshold(6), 4);
+    }
+
+    #[test]
+    fn test_quorum_threshold_seven_nodes_bft_transition() {
+        // 7 nodes: first node in BFT mode, need 5 votes (2/3 + 1)
+        // (7 * 2) / 3 + 1 = 14 / 3 + 1 = 4 + 1 = 5
+        assert_eq!(calculate_quorum_threshold(7), 5);
+    }
+
+    #[test]
+    fn test_quorum_threshold_eight_nodes() {
+        // 8 nodes: BFT mode, need 6 votes
+        // (8 * 2) / 3 + 1 = 16 / 3 + 1 = 5 + 1 = 6
+        assert_eq!(calculate_quorum_threshold(8), 6);
+    }
+
+    #[test]
+    fn test_quorum_threshold_nine_nodes() {
+        // 9 nodes: BFT mode, need 7 votes
+        // (9 * 2) / 3 + 1 = 18 / 3 + 1 = 6 + 1 = 7
+        assert_eq!(calculate_quorum_threshold(9), 7);
+    }
+
+    #[test]
+    fn test_quorum_threshold_ten_nodes() {
+        // 10 nodes: BFT mode, need 7 votes
+        // (10 * 2) / 3 + 1 = 20 / 3 + 1 = 6 + 1 = 7
+        assert_eq!(calculate_quorum_threshold(10), 7);
+    }
+
+    #[test]
+    fn test_quorum_threshold_large_network() {
+        // 100 nodes: BFT mode, need 67 votes
+        // (100 * 2) / 3 + 1 = 200 / 3 + 1 = 66 + 1 = 67
+        assert_eq!(calculate_quorum_threshold(100), 67);
+    }
+
+    #[test]
+    fn test_fault_tolerance_progression_no_regression() {
+        // Verify that adding validators never decreases fault tolerance
+        let mut prev_tolerable = 0;
+
+        for n in 1..=20 {
+            let required = calculate_quorum_threshold(n);
+            let tolerable = n - required;
+
+            // Fault tolerance should never decrease
+            assert!(
+                tolerable >= prev_tolerable,
+                "Fault tolerance regressed at n={}: can tolerate {} faults (previous: {})",
+                n, tolerable, prev_tolerable
+            );
+
+            prev_tolerable = tolerable;
+        }
+    }
+
+    #[test]
+    fn test_boundary_transition_maintains_safety() {
+        // At boundary (6→7), verify no regression in fault tolerance
+        let threshold_6 = calculate_quorum_threshold(6);
+        let threshold_7 = calculate_quorum_threshold(7);
+
+        let tolerable_6 = 6 - threshold_6; // 6 - 4 = 2
+        let tolerable_7 = 7 - threshold_7; // 7 - 5 = 2
+
+        assert_eq!(tolerable_6, 2, "6 validators should tolerate 2 faults");
+        assert_eq!(tolerable_7, 2, "7 validators should tolerate 2 faults");
+
+        // No regression at boundary (lateral move)
+        assert_eq!(tolerable_6, tolerable_7, "Boundary transition should maintain fault tolerance");
+    }
+
+    #[test]
+    fn test_relaxed_mode_simple_majority() {
+        // Verify all relaxed mode nodes use simple majority
+        for n in 1..=6 {
+            let threshold = calculate_quorum_threshold(n);
+            let expected = (n / 2) + 1;
+            assert_eq!(
+                threshold, expected,
+                "Node count {} in relaxed mode should use simple majority",
+                n
+            );
+        }
+    }
+
+    #[test]
+    fn test_bft_mode_two_thirds() {
+        // Verify all BFT mode nodes use 2/3 + 1
+        for n in 7..=20 {
+            let threshold = calculate_quorum_threshold(n);
+            let expected = ((n * 2) / 3) + 1;
+            assert_eq!(
+                threshold, expected,
+                "Node count {} in BFT mode should use 2/3 + 1",
+                n
+            );
+        }
+    }
+
+    #[test]
+    fn test_quorum_always_majority() {
+        // Verify that quorum is always more than half
+        for n in 1..=100 {
+            let threshold = calculate_quorum_threshold(n);
+            assert!(
+                threshold > n / 2,
+                "Quorum {} must be more than half of {} validators",
+                threshold, n
+            );
+        }
+    }
+
+    #[test]
+    fn test_bft_buffer_always_sufficient() {
+        // Verify that BFT mode (7+) always has buffer ≥ 2
+        for n in 7..=100 {
+            let threshold = calculate_quorum_threshold(n);
+            let buffer = n - threshold;
+            assert!(
+                buffer >= 2,
+                "BFT mode with {} validators must have buffer ≥ 2, got {}",
+                n, buffer
+            );
+        }
+    }
 }
