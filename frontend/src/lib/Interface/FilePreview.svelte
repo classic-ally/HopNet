@@ -5,7 +5,9 @@
     import type { FileItem } from '../types'
     import { InodeType } from '../types'
     import { getFileName, getFileExtension, getFileIcon } from '../utils/formatters'
-    import MonacoEditor from '../components/MonacoEditor.svelte'
+
+    // Dynamically load MonacoEditor when preview opens
+    let MonacoEditor: any = $state(null)
 
     // Supported preview file types - extensible for future additions
     const SUPPORTED_PREVIEW_TYPES = {
@@ -90,25 +92,32 @@
         return languageMap[extension] || 'plaintext'
     }
 
-    export let file: FileItem
-    export let fileList: FileItem[] = []
-    export let currentIndex: number = 0
-    export let onClose: () => void
-    export let onNavigate: ((newIndex: number) => void) | null = null
+    const {
+        file,
+        fileList = [],
+        currentIndex = 0,
+        onClose,
+        onNavigate = null
+    }: {
+        file: FileItem,
+        fileList?: FileItem[],
+        currentIndex?: number,
+        onClose: () => void,
+        onNavigate?: ((newIndex: number) => void) | null
+    } = $props()
 
-    let loading = true
-    let error = ''
-    let previewUrl: string | null = null
-    let textContent: string | null = null
-    let fileTooLarge = false
-    let suppressClose = false
+    let loading = $state(true)
+    let error = $state('')
+    let previewUrl: string | null = $state(null)
+    let textContent: string | null = $state(null)
+    let fileTooLarge = $state(false)
 
     // Validate that we have a valid file and index
-    $: validFile = file && currentIndex >= 0 && currentIndex < fileList.length
+    const validFile = $derived(file && currentIndex >= 0 && currentIndex < fileList.length)
 
     // Make filename and previewType reactive to file changes
-    $: filename = getFileName(file.path)
-    $: previewType = getPreviewType(filename)
+    const filename = $derived(getFileName(file.path))
+    const previewType = $derived(getPreviewType(filename))
 
     async function fetchFilePreview() {
         try {
@@ -268,13 +277,20 @@
         fileTooLarge = false
     }
 
-    // Reactive statement to refetch preview when file changes
-    $: if (file) {
-        cleanupPreviousPreview()
-        fetchFilePreview()
-    }
+    // Refetch preview when file changes
+    $effect(() => {
+        if (file) {
+            cleanupPreviousPreview()
+            fetchFilePreview()
+        }
+    })
 
     onMount(() => {
+        // Preload MonacoEditor component
+        import('../components/MonacoEditor.svelte').then(monacoModule => {
+            MonacoEditor = monacoModule.default
+        })
+
         document.addEventListener('keydown', handleKeydown)
 
         return () => {
@@ -353,12 +369,19 @@
             {:else if previewType === 'code' && textContent !== null}
                 <!-- Code Preview with Monaco Editor -->
                 <div class="h-full">
-                    <MonacoEditor
-                        value={textContent}
-                        language={getMonacoLanguage(filename)}
-                        theme="catppuccin-mocha"
-                        readOnly={true}
-                    />
+                    {#if MonacoEditor}
+                        <MonacoEditor
+                            value={textContent}
+                            language={getMonacoLanguage(filename)}
+                            theme="catppuccin-mocha"
+                            readOnly={true}
+                        />
+                    {:else}
+                        <!-- Loading Monaco Editor -->
+                        <div class="flex items-center justify-center h-64">
+                            <div class="text-muted">Loading editor...</div>
+                        </div>
+                    {/if}
                 </div>
             {:else if previewType === 'text' && textContent !== null}
                 <!-- Text Preview -->

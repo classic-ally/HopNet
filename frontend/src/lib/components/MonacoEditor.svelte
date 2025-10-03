@@ -2,26 +2,12 @@
     import { onMount, onDestroy } from 'svelte'
     import * as monaco from 'monaco-editor'
 
-    // Import basic language support - these are self-registering
-    import 'monaco-editor/esm/vs/basic-languages/javascript/javascript.contribution.js'
-    import 'monaco-editor/esm/vs/basic-languages/typescript/typescript.contribution.js'
-    import 'monaco-editor/esm/vs/basic-languages/css/css.contribution.js'
-    import 'monaco-editor/esm/vs/basic-languages/html/html.contribution.js'
-    // JSON support is built-in to Monaco, no separate import needed
-    import 'monaco-editor/esm/vs/basic-languages/python/python.contribution.js'
-    import 'monaco-editor/esm/vs/basic-languages/rust/rust.contribution.js'
-    import 'monaco-editor/esm/vs/basic-languages/go/go.contribution.js'
-    import 'monaco-editor/esm/vs/basic-languages/java/java.contribution.js'
-    import 'monaco-editor/esm/vs/basic-languages/cpp/cpp.contribution.js'
-    import 'monaco-editor/esm/vs/basic-languages/csharp/csharp.contribution.js'
-    import 'monaco-editor/esm/vs/basic-languages/php/php.contribution.js'
-    import 'monaco-editor/esm/vs/basic-languages/ruby/ruby.contribution.js'
-    import 'monaco-editor/esm/vs/basic-languages/sql/sql.contribution.js'
-    import 'monaco-editor/esm/vs/basic-languages/xml/xml.contribution.js'
-    import 'monaco-editor/esm/vs/basic-languages/yaml/yaml.contribution.js'
-    import 'monaco-editor/esm/vs/basic-languages/markdown/markdown.contribution.js'
-    import 'monaco-editor/esm/vs/basic-languages/shell/shell.contribution.js'
-    import 'monaco-editor/esm/vs/basic-languages/dockerfile/dockerfile.contribution.js'
+    // We can optimize this in the future to only load the language we want for the file
+    declare global {
+        interface Window {
+            MonacoEnvironment?: monaco.Environment
+        }
+    }
 
     export let value: string = ''
     export let language: string = 'plaintext'
