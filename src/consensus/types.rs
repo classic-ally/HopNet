@@ -906,3 +906,49 @@ pub struct ViewConsensusData {
     pub lock_qc: Option<QuorumCertificate>,
     pub blocks: Vec<Block>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ViewCompletenessState {
+    Complete,    // Has lock QC or TC (view finished, network moved on)
+    InProgress,  // Current view, may be incomplete (propose phase in progress)
+}
+
+/// Validate that view data is complete enough to integrate
+/// Historical views must have lock QC or TC, current view can be incomplete
+pub fn validate_view_completeness(
+    view_data: &ViewConsensusData,
+    target_view: i32,
+) -> Result<ViewCompletenessState, super::functions::CatchUpError> {
+    use super::functions::CatchUpError;
+
+    // Genesis bypass - always trust view 0
+    if view_data.view == 0 {
+        return Ok(ViewCompletenessState::Complete);
+    }
+
+    // Check for lock QC or timeout certificate (view is complete)
+    if view_data.lock_qc.is_some() || view_data.timeout_certificate.is_some() {
+        return Ok(ViewCompletenessState::Complete);
+    }
+
+    // Historical view without QC or TC is invalid
+    if view_data.view < target_view {
+        tracing::warn!(
+            "View {} is incomplete (no lock QC or TC) but is historical (target: {})",
+            view_data.view, target_view
+        );
+        return Err(CatchUpError::ValidationFailed(view_data.view));
+    }
+
+    // Current view can be incomplete (propose phase in progress)
+    if view_data.view == target_view {
+        return Ok(ViewCompletenessState::InProgress);
+    }
+
+    // Future view - shouldn't happen
+    tracing::error!(
+        "View {} is in the future (target: {})",
+        view_data.view, target_view
+    );
+    Err(CatchUpError::ValidationFailed(view_data.view))
+}

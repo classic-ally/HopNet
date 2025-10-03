@@ -523,24 +523,31 @@ async fn integrate_view(
         }
     }
     
+    // Genesis bypass: view 0 QCs inserted without verification (trust coordinator)
+    let is_genesis = view == 0;
+
     // Validate and insert propose QC if present
     if let Some(propose_qc) = &view_data.propose_qc {
         // Find the corresponding block for validation
         if let Some(block) = view_data.blocks.iter().find(|b| b.block_hash == propose_qc.block_hash) {
-            match propose_qc.verify(app_state, block) {
+            // Skip verification for genesis, otherwise verify normally
+            if !is_genesis {
+                propose_qc.verify(app_state, block).map_err(|e| {
+                    tracing::warn!("Invalid propose QC for view {}: {:?}", view, e);
+                    ConsensusError::SigningError
+                })?;
+            }
+
+            match db::insert_qc(app_state.db_pool.get(), propose_qc.clone()) {
                 Ok(_) => {
-                    match db::insert_qc(app_state.db_pool.get(), propose_qc.clone()) {
-                        Ok(_) => {
-                            tracing::debug!("Validated and inserted propose QC for view {}", view);
-                        }
-                        Err(_) => {
-                            tracing::debug!("Propose QC for view {} already exists", view);
-                        }
+                    if is_genesis {
+                        tracing::debug!("Inserted genesis propose QC for view 0 (no verification)");
+                    } else {
+                        tracing::debug!("Validated and inserted propose QC for view {}", view);
                     }
                 }
-                Err(e) => {
-                    tracing::warn!("Invalid propose QC for view {}: {:?}", view, e);
-                    return Err(ConsensusError::SigningError);
+                Err(_) => {
+                    tracing::debug!("Propose QC for view {} already exists", view);
                 }
             }
         } else {
@@ -548,34 +555,38 @@ async fn integrate_view(
             return Err(ConsensusError::BlockError);
         }
     }
-    
+
     // Validate and insert lock QC if present
     if let Some(lock_qc) = &view_data.lock_qc {
         // Find the corresponding block for validation
         if let Some(block) = view_data.blocks.iter().find(|b| b.block_hash == lock_qc.block_hash) {
-            match lock_qc.verify(app_state, block) {
+            // Skip verification for genesis, otherwise verify normally
+            if !is_genesis {
+                lock_qc.verify(app_state, block).map_err(|e| {
+                    tracing::warn!("Invalid lock QC for view {}: {:?}", view, e);
+                    ConsensusError::SigningError
+                })?;
+            }
+
+            match db::insert_qc(app_state.db_pool.get(), lock_qc.clone()) {
                 Ok(_) => {
-                    match db::insert_qc(app_state.db_pool.get(), lock_qc.clone()) {
-                        Ok(_) => {
-                            tracing::debug!("Validated and inserted lock QC for view {}", view);
-                            
-                            // Process transactions if this is a Lock phase QC (same logic as post_qc)
-                            if lock_qc.phase == ConsensusPhase::Lock {
-                                tracing::info!(
-                                    "Lock phase QC committed for view {}, processing transactions",
-                                    lock_qc.view_number
-                                );
-                                let _ = crate::consensus::functions::process_transactions(&block.data.transactions, app_state, true);
-                            }
-                        }
-                        Err(_) => {
-                            tracing::debug!("Lock QC for view {} already exists", view);
-                        }
+                    if is_genesis {
+                        tracing::debug!("Inserted genesis lock QC for view 0 (no verification)");
+                    } else {
+                        tracing::debug!("Validated and inserted lock QC for view {}", view);
+                    }
+
+                    // Process transactions if this is a Lock phase QC (same logic as post_qc)
+                    if lock_qc.phase == ConsensusPhase::Lock {
+                        tracing::info!(
+                            "Lock phase QC committed for view {}, processing transactions",
+                            lock_qc.view_number
+                        );
+                        let _ = crate::consensus::functions::process_transactions(&block.data.transactions, app_state, true);
                     }
                 }
-                Err(e) => {
-                    tracing::warn!("Invalid lock QC for view {}: {:?}", view, e);
-                    return Err(ConsensusError::SigningError);
+                Err(_) => {
+                    tracing::debug!("Lock QC for view {} already exists", view);
                 }
             }
         } else {
@@ -584,22 +595,25 @@ async fn integrate_view(
         }
     }
     
+    // Genesis should never have a timeout certificate
+    if is_genesis && view_data.timeout_certificate.is_some() {
+        tracing::error!("Genesis view 0 has timeout certificate - invalid");
+        return Err(ConsensusError::BlockError);
+    }
+
     // Validate and insert timeout certificate if present (this advances our view)
     if let Some(tc) = &view_data.timeout_certificate {
-        match tc.verify(app_state) {
+        tc.verify(app_state).map_err(|e| {
+            tracing::warn!("Invalid timeout certificate for view {}: {:?}", view, e);
+            ConsensusError::SigningError
+        })?;
+
+        match db::insert_tc(app_state.db_pool.get(), tc.clone()) {
             Ok(_) => {
-                match db::insert_tc(app_state.db_pool.get(), tc.clone()) {
-                    Ok(_) => {
-                        tracing::info!("Validated and applied timeout certificate for view {}, advanced to view {}", view, view + 1);
-                    }
-                    Err(_) => {
-                        tracing::debug!("Timeout certificate for view {} already exists", view);
-                    }
-                }
+                tracing::debug!("Validated and applied timeout certificate for view {}, advanced to view {}", view, view + 1);
             }
-            Err(e) => {
-                tracing::warn!("Invalid timeout certificate for view {}: {:?}", view, e);
-                return Err(ConsensusError::SigningError);
+            Err(_) => {
+                tracing::debug!("Timeout certificate for view {} already exists", view);
             }
         }
     }
@@ -608,70 +622,164 @@ async fn integrate_view(
     Ok(())
 }
 
-/// Perform catch-up from our current view to the target view
-pub async fn perform_catch_up(app_state: &AppState, our_view: i32, target_view: i32) -> Result<(), ConsensusError> {
-    tracing::info!("Starting catch-up: our_view={}, target_view={}", our_view, target_view);
-    
-    // Get available validators to request data from
-    let my_node_id = app_state.get_node_id().map_err(|_| ConsensusError::DatabaseError)?;
-    let validators = db::get_validators(app_state.db_pool.get(), our_view)
-        .map_err(|_| ConsensusError::DatabaseError)?;
-    let other_validators: Vec<_> = validators.into_iter()
-        .filter(|v| v.node_id != my_node_id)
-        .collect();
-    
-    if other_validators.is_empty() {
-        tracing::warn!("No other validators found for catch-up");
-        return Err(ConsensusError::NetworkError);
-    }
-    
-    // Include current view since we might have missed QCs/TCs
-    let views_to_fetch: Vec<i32> = (our_view..=target_view).collect();
-    
-    // Launch parallel fetch tasks for all views
-    let mut fetch_tasks = Vec::new();
-    for view in &views_to_fetch {
-        // Round-robin through validators to distribute load
-        let validator = &other_validators[(*view as usize) % other_validators.len()];
-        let view = *view;
-        let validator = validator.clone();
-        let app_state = app_state.clone();
-        
-        let task = tokio::spawn(async move {
-            fetch_view(view, &validator, &app_state).await
-        });
-        
-        fetch_tasks.push((view, task));
-    }
-    
-    // Process views sequentially as their data becomes available
-    for (expected_view, task) in fetch_tasks {
-        match task.await {
-            Ok(Ok(view_data)) => {
-                tracing::info!("Processing view {} data", expected_view);
-                
-                match integrate_view(expected_view, view_data, app_state).await {
-                    Ok(_) => {
-                        tracing::debug!("Successfully integrated view {}", expected_view);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to integrate view {}: {:?} - continuing with next view", expected_view, e);
-                        // Continue with next view - some integration failures shouldn't stop catch-up
-                    }
-                }
+/// Fetch and validate view data with retry logic and validator rotation
+async fn fetch_and_validate_with_retry(
+    view: i32,
+    target_view: i32,
+    validators: &[crate::types::Node],
+    app_state: &AppState,
+) -> Result<ViewConsensusData, functions::CatchUpError> {
+    use crate::consensus::functions::CatchUpError;
+    use crate::consensus::types::validate_view_completeness;
+    use rand::seq::SliceRandom;
+
+    // Shuffle validators to distribute load randomly
+    let mut shuffled_validators = validators.to_vec();
+    shuffled_validators.shuffle(&mut rand::thread_rng());
+
+    for (attempt, validator) in shuffled_validators.iter().enumerate() {
+        // Attempt to fetch view data
+        let view_data = match fetch_view(view, validator, app_state).await {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::warn!(
+                    "Attempt {}/{} failed to fetch view {} from validator {} ({}:{}): {:?}",
+                    attempt + 1, shuffled_validators.len(), view, validator.node_id, validator.ip_address, validator.port, e
+                );
+                continue;
             }
-            Ok(Err(e)) => {
-                tracing::warn!("Failed to fetch view {} data: {:?} - continuing with next view", expected_view, e);
-                // Continue with next view - some views might be missing data
+        };
+
+        // Validate that received view matches requested view (prevent Byzantine attacks)
+        if view_data.view != view {
+            tracing::warn!(
+                "Attempt {}/{} view mismatch from validator {} ({}:{}): requested view {}, received view {}",
+                attempt + 1, shuffled_validators.len(), validator.node_id, validator.ip_address, validator.port, view, view_data.view
+            );
+            continue;
+        }
+
+        // Validate completeness before returning
+        match validate_view_completeness(&view_data, target_view) {
+            Ok(_) => {
+                tracing::debug!(
+                    "Successfully fetched and validated view {} from validator {} (attempt {}/{})",
+                    view, validator.node_id, attempt + 1, shuffled_validators.len()
+                );
+                return Ok(view_data);
             }
             Err(e) => {
-                tracing::warn!("Fetch task failed for view {}: {:?} - continuing with next view", expected_view, e);
-                // Continue with next view - task panicked or was cancelled
+                tracing::warn!(
+                    "Attempt {}/{} view {} from validator {} failed validation: {:?}",
+                    attempt + 1, shuffled_validators.len(), view, validator.node_id, e
+                );
+                continue;
             }
         }
     }
-    
-    tracing::info!("Catch-up completed: reached view {}", target_view);
+
+    // All validators exhausted
+    tracing::error!("Exhausted all {} validators for view {}", shuffled_validators.len(), view);
+    Err(CatchUpError::NetworkUnavailable)
+}
+
+/// Perform catch-up from our current view to the target view
+pub async fn perform_catch_up(app_state: &AppState, our_view: i32, target_view: i32) -> Result<(), functions::CatchUpError> {
+    use crate::consensus::functions::CatchUpError;
+    use std::sync::Arc;
+
+    tracing::info!("Starting catch-up: our_view={}, target_view={}", our_view, target_view);
+
+    const FETCH_BATCH_SIZE: i32 = 50;
+    let global_target_view = target_view;
+
+    loop {
+        // Re-query database for actual current view (handles incomplete views naturally)
+        let consensus_state = db::get_consensus(app_state.db_pool.get())
+            .map_err(|_| CatchUpError::Database)?;
+        let our_view = consensus_state.view;
+
+        if our_view > global_target_view {
+            break; // Caught up beyond target
+        }
+
+        // Get available validators (refreshed each batch to pick up newly-added validators)
+        let my_node_id = app_state.get_node_id().map_err(|_| CatchUpError::Database)?;
+        let validators = db::get_validators(app_state.db_pool.get(), our_view)
+            .map_err(|_| CatchUpError::Database)?;
+        let other_validators: Vec<_> = validators.into_iter()
+            .filter(|v| v.node_id != my_node_id)
+            .collect();
+
+        if other_validators.is_empty() {
+            tracing::warn!("No other validators found for catch-up at view {}", our_view);
+            return Err(CatchUpError::NetworkUnavailable);
+        }
+
+        // Determine batch range
+        let batch_end = std::cmp::min(our_view + FETCH_BATCH_SIZE - 1, global_target_view);
+        let views_to_fetch: Vec<i32> = (our_view..=batch_end).collect();
+
+        tracing::info!(
+            "Fetching batch: views {} to {} ({} validators available)",
+            our_view, batch_end, other_validators.len()
+        );
+
+        // Wrap validators in Arc for efficient sharing across tasks
+        let validators = Arc::new(other_validators);
+
+        // Launch parallel fetch tasks for this batch
+        let mut fetch_tasks = Vec::new();
+        for view in &views_to_fetch {
+            let view = *view;
+            let validators = Arc::clone(&validators);
+            let app_state = app_state.clone();
+            let target_view = global_target_view;
+
+            let task = tokio::spawn(async move {
+                fetch_and_validate_with_retry(view, target_view, &validators, &app_state).await
+            });
+
+            fetch_tasks.push((view, task));
+        }
+
+        // Process views sequentially as their data becomes available
+        for (expected_view, task) in fetch_tasks {
+            match task.await {
+                Ok(Ok(view_data)) => {
+                    tracing::info!("Processing view {} data", expected_view);
+
+                    match integrate_view(expected_view, view_data, app_state).await {
+                        Ok(_) => {
+                            tracing::debug!("Successfully integrated view {}", expected_view);
+                        }
+                        Err(ConsensusError::DatabaseError) => {
+                            tracing::error!("Database error integrating view {}", expected_view);
+                            return Err(CatchUpError::Database);
+                        }
+                        Err(ConsensusError::SigningError) | Err(ConsensusError::BlockError) => {
+                            tracing::error!("Validation error integrating view {} (invalid QC/TC/block signatures)", expected_view);
+                            return Err(CatchUpError::ValidationFailed(expected_view));
+                        }
+                        Err(e) => {
+                            tracing::error!("Unexpected error integrating view {}: {:?}", expected_view, e);
+                            return Err(CatchUpError::NetworkUnavailable);
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::error!("Failed to fetch view {} after all retries: {:?}", expected_view, e);
+                    return Err(e);
+                }
+                Err(e) => {
+                    tracing::error!("Fetch task panicked for view {}: {:?}", expected_view, e);
+                    return Err(CatchUpError::NetworkUnavailable);
+                }
+            }
+        }
+    }
+
+    tracing::info!("Catch-up completed: reached view {}", global_target_view);
     Ok(())
 }
 

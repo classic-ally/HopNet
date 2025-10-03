@@ -107,36 +107,30 @@ pub fn post_initial_setup(
             let signatures: Vec<VoteSignMessage> = Vec::new();
 
             let genesis_qc_1 = QuorumCertificate::create(
-                &genesis_block, 
-                ConsensusPhase::Propose, 
-                next_node_id, 
-                &privkey, 
+                &genesis_block,
+                ConsensusPhase::Propose,
+                next_node_id,
+                &privkey,
                 signatures.clone()
             ).map_err(|_| DatabaseError::ProcessingError)?;
 
             let genesis_qc_2 = QuorumCertificate::create(
-                &genesis_block, 
-                ConsensusPhase::Lock, 
-                next_node_id, 
-                &privkey, 
+                &genesis_block,
+                ConsensusPhase::Lock,
+                next_node_id,
+                &privkey,
                 signatures
             ).map_err(|_| DatabaseError::ProcessingError)?;
 
+            // Initialize this_node with genesis state (required before QC insertion)
             tx.execute(
-                "INSERT INTO quorum_certificates (view_number, phase, block_hash, proposer_signature, voter_signatures) VALUES (?, ?, ?, ?, ?)",
-                params![genesis_qc_1.view_number, genesis_qc_1.phase, genesis_qc_1.block_hash, genesis_qc_1.proposer_signature, genesis_qc_1.voter_signatures]
+                "INSERT INTO this_node (internal_id, node_id, privkey, current_view, current_phase, committed_block_hash, highest_qc_block_hash, user_privkey) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                params![1, next_node_id, privkey, 0, ConsensusPhase::Propose, genesis_block.block_hash, genesis_block.block_hash, user_privkey]
             ).map_err(|_| DatabaseError::InsertError)?;
 
-            tx.execute(
-                "INSERT INTO quorum_certificates (view_number, phase, block_hash, proposer_signature, voter_signatures) VALUES (?, ?, ?, ?, ?)",
-                params![genesis_qc_2.view_number, genesis_qc_2.phase, genesis_qc_2.block_hash, genesis_qc_2.proposer_signature, genesis_qc_2.voter_signatures]
-            ).map_err(|_| DatabaseError::InsertError)?;
-
-            // also write this node so we know setup is completed
-            tx.execute(
-                "INSERT INTO this_node (internal_id, node_id, privkey, current_view, committed_block_hash, highest_qc_block_hash, user_privkey) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                params![1, next_node_id, privkey, genesis_block.data.view_number + 1, genesis_block.block_hash, genesis_block.block_hash, user_privkey]
-            ).map_err(|_| DatabaseError::InsertError)?;
+            // Use insert_qc_tx to handle QC insertion and state transitions
+            super::consensus::insert_qc_tx(&tx, &genesis_qc_1)?;
+            super::consensus::insert_qc_tx(&tx, &genesis_qc_2)?;
 
             // Commit the transaction
             tx.commit().map_err(|_| DatabaseError::InsertError)?;

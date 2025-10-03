@@ -401,6 +401,51 @@ pub fn insert_tc(
     }
 }
 
+/// Insert QC within an existing transaction (for use in genesis setup and multi-op transactions)
+pub fn insert_qc_tx(
+    tx: &duckdb::Transaction,
+    qc: &QuorumCertificate,
+) -> Result<(), DatabaseError> {
+    // Insert the QC into quorum_certificates table
+    tx.execute(
+        "INSERT INTO quorum_certificates (view_number, phase, block_hash, proposer_signature, voter_signatures) VALUES (?, ?, ?, ?, ?)",
+        params![
+            qc.view_number,
+            qc.phase,
+            qc.block_hash,
+            qc.proposer_signature,
+            qc.voter_signatures,
+        ]
+    ).map_err(|_| DatabaseError::InsertError)?;
+
+    // Update this_node table based on QC's phase and view
+    match qc.phase {
+        ConsensusPhase::Propose => {
+            // If QC phase is propose, change to lock and set prepared_block_hash
+            tx.execute(
+                "UPDATE this_node SET highest_qc_block_hash = ?, current_phase = 'lock', prepared_block_hash = ? WHERE internal_id = 1",
+                params![qc.block_hash, qc.block_hash]
+            ).map_err(|_| DatabaseError::InsertError)?;
+            tracing::info!("Updated consensus state: propose -> lock phase for view {}, set prepared_block_hash", qc.view_number);
+        }
+        ConsensusPhase::Lock => {
+            // If QC phase is lock, change to propose, set current_view to QC view + 1,
+            // commit the block, and clear prepared_block_hash (consensus completed)
+            tx.execute(
+                "UPDATE this_node SET highest_qc_block_hash = ?, committed_block_hash = ?, current_phase = 'propose', current_view = ?, prepared_block_hash = NULL WHERE internal_id = 1",
+                params![qc.block_hash, qc.block_hash, qc.view_number + 1]
+            ).map_err(|_| DatabaseError::InsertError)?;
+            tracing::info!(
+                "Updated consensus state: lock -> propose, view {} -> {}, committed block {:?}, cleared prepared_block_hash",
+                qc.view_number, qc.view_number + 1, qc.block_hash
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Insert QC with retry logic for write-write conflicts (wrapper that manages transactions)
 pub fn insert_qc(
     db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     qc: QuorumCertificate,
@@ -410,46 +455,12 @@ pub fn insert_qc(
             // Retry logic for write-write conflicts
             const MAX_RETRIES: u32 = 3;
             let mut retry_count = 0;
-            
+
             loop {
                 let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
-                
-                // Insert the QC into quorum_certificates table
-                tx.execute(
-                    "INSERT INTO quorum_certificates (view_number, phase, block_hash, proposer_signature, voter_signatures) VALUES (?, ?, ?, ?, ?)",
-                    params![
-                        qc.view_number,
-                        qc.phase,
-                        qc.block_hash,
-                        qc.proposer_signature,
-                        qc.voter_signatures,
-                    ]
-                ).map_err(|_| DatabaseError::InsertError)?;
-                
-                // Update this_node table based on QC's phase and view
-                match qc.phase {
-                    ConsensusPhase::Propose => {
-                        // If QC phase is propose, change to lock and set prepared_block_hash
-                        tx.execute(
-                            "UPDATE this_node SET highest_qc_block_hash = ?, current_phase = 'lock', prepared_block_hash = ? WHERE internal_id = 1",
-                            params![qc.block_hash, qc.block_hash]
-                        ).map_err(|_| DatabaseError::InsertError)?;
-                        tracing::info!("Updated consensus state: propose -> lock phase for view {}, set prepared_block_hash", qc.view_number);
-                    }
-                    ConsensusPhase::Lock => {
-                        // If QC phase is lock, change to propose, set current_view to QC view + 1,
-                        // commit the block, and clear prepared_block_hash (consensus completed)
-                        tx.execute(
-                            "UPDATE this_node SET highest_qc_block_hash = ?, committed_block_hash = ?, current_phase = 'propose', current_view = ?, prepared_block_hash = NULL WHERE internal_id = 1",
-                            params![qc.block_hash, qc.block_hash, qc.view_number + 1]
-                        ).map_err(|_| DatabaseError::InsertError)?;
-                        tracing::info!(
-                            "Updated consensus state: lock -> propose, view {} -> {}, committed block {:?}, cleared prepared_block_hash",
-                            qc.view_number, qc.view_number + 1, qc.block_hash
-                        );
-                    }
-                }
-                
+
+                insert_qc_tx(&tx, &qc)?;
+
                 match tx.commit() {
                     Ok(_) => {
                         return Ok(());

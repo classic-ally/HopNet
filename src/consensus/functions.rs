@@ -35,6 +35,13 @@ pub enum ConsensusError {
     NetworkError,
 }
 
+#[derive(Debug)]
+pub enum CatchUpError {
+    NetworkUnavailable,      // All validators unreachable/failing
+    ValidationFailed(i32),   // View failed validation (for logging)
+    Database,                // Database error
+}
+
 // Create a node-only transaction (for automated operations)
 pub fn create_signed_transaction(
     app_state: &AppState,
