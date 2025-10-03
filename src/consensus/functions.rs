@@ -614,7 +614,16 @@ async fn forward_to_leader(
 
 /// Poll a random subset of validators to get the maximum view in the network
 /// This avoids O(N²) bandwidth while still detecting if we're behind
-pub async fn poll_subset_for_max_view(app_state: &AppState, consensus_state: &ConsensusState) -> Result<i32, ConsensusError> {
+pub async fn poll_subset_for_max_view(
+    app_state: &AppState,
+    consensus_state: &ConsensusState,
+    bootstrap_validators: Option<&[Node]>,
+) -> Result<i32, ConsensusError> {
+    use std::collections::HashSet;
+
+    const MAX_ATTEMPTS: u32 = 3;
+    const SUBSET_SIZE: usize = 5;
+
     // Get our node ID from AppState (avoid DB call)
     let my_node_id = app_state.get_node_id()
         .map_err(|_| ConsensusError::DatabaseError)?;
@@ -622,93 +631,117 @@ pub async fn poll_subset_for_max_view(app_state: &AppState, consensus_state: &Co
         .map_err(|_| ConsensusError::DatabaseError)?;
     let user_keys = app_state.get_user_keys()
         .map_err(|_| ConsensusError::DatabaseError)?;
-    
-    let all_validators = db::get_validators(app_state.db_pool.get(), consensus_state.committed_block.data.height)
+
+    let mut all_validators = db::get_validators(app_state.db_pool.get(), consensus_state.committed_block.data.height)
         .map_err(|_| ConsensusError::DatabaseError)?;
-    
-    // Filter out ourselves and select random subset of up to 3
+
+    // Merge with bootstrap validators, removing duplicates by node_id
+    if let Some(bootstrap) = bootstrap_validators {
+        let existing_ids: HashSet<i32> = all_validators.iter().map(|v| v.node_id).collect();
+        all_validators.extend(
+            bootstrap.iter()
+                .filter(|node| !existing_ids.contains(&node.node_id))
+                .cloned()
+        );
+    }
+
+    // Filter out ourselves
     let other_validators: Vec<Node> = all_validators.into_iter()
         .filter(|v| v.node_id != my_node_id)
         .collect();
-    
+
     if other_validators.is_empty() {
         // We're the only validator, so we're caught up by definition
         return Ok(consensus_state.view);
     }
-    
-    let subset_size = std::cmp::min(3, other_validators.len());
-    let selected_validators: Vec<&Node> = other_validators
-        .choose_multiple(&mut rand::rng(), subset_size)
-        .collect();
-    
-    tracing::debug!("Polling {} validators for max view", selected_validators.len());
-    
-    // Prepare RPC authentication (sign empty body for GET request)
-    let body = b"";
-    let node_signature = app_state.private_key.try_sign(body)
-        .map_err(|_| ConsensusError::SigningError)?;
-    let user_signature = user_keys.private_key.try_sign(body)
-        .map_err(|_| ConsensusError::SigningError)?;
-    
-    let client = Client::new();
-    let mut tasks = Vec::new();
-    
-    // Create parallel requests to all selected validators
-    for validator in selected_validators {
-        let client = client.clone();
-        let url = format!("http://{}:{}/consensus", validator.ip_address, validator.port);
-        let node_id = validator.node_id;
-        let my_node_id = my_node_id;
-        let user_id = user_id;
-        let node_signature = node_signature.clone();
-        let user_signature = user_signature.clone();
-        
-        let task = tokio::spawn(async move {
-            match client.get(&url)
-                .header("X-Node-ID", my_node_id.to_string())
-                .header("X-User-ID", user_id.to_string())
-                .header("X-Node-Signature", hex::encode(node_signature.to_bytes()))
-                .header("X-User-Signature", hex::encode(user_signature.to_bytes()))
-                .timeout(std::time::Duration::from_secs(5))
-                .send()
-                .await
-            {
-                Ok(response) => {
-                    if response.status().is_success() {
-                        match response.json::<ConsensusState>().await {
-                            Ok(their_state) => {
-                                tracing::debug!("Validator {} is at view {}", node_id, their_state.view);
-                                Some(their_state.view)
+
+    // Retry loop for handling unlucky validator selection
+    for attempt in 1..=MAX_ATTEMPTS {
+        let selected_validators: Vec<&Node> = other_validators
+            .choose_multiple(&mut rand::rng(), SUBSET_SIZE)
+            .collect();
+
+        tracing::debug!("Attempt {}/{}: Polling {} validators for max view", attempt, MAX_ATTEMPTS, selected_validators.len());
+
+        // Prepare RPC authentication (sign empty body for GET request)
+        let body = b"";
+        let node_signature = app_state.private_key.try_sign(body)
+            .map_err(|_| ConsensusError::SigningError)?;
+        let user_signature = user_keys.private_key.try_sign(body)
+            .map_err(|_| ConsensusError::SigningError)?;
+
+        let client = Client::new();
+        let mut tasks = Vec::new();
+
+        // Create parallel requests to all selected validators
+        for validator in selected_validators {
+            let client = client.clone();
+            let url = format!("http://{}:{}/consensus", validator.ip_address, validator.port);
+            let node_id = validator.node_id;
+            let my_node_id = my_node_id;
+            let user_id = user_id;
+            let node_signature = node_signature.clone();
+            let user_signature = user_signature.clone();
+
+            let task = tokio::spawn(async move {
+                match client.get(&url)
+                    .header("X-Node-ID", my_node_id.to_string())
+                    .header("X-User-ID", user_id.to_string())
+                    .header("X-Node-Signature", hex::encode(node_signature.to_bytes()))
+                    .header("X-User-Signature", hex::encode(user_signature.to_bytes()))
+                    .timeout(std::time::Duration::from_secs(5))
+                    .send()
+                    .await
+                {
+                    Ok(response) => {
+                        if response.status().is_success() {
+                            match response.json::<ConsensusState>().await {
+                                Ok(their_state) => {
+                                    tracing::debug!("Validator {} is at view {}", node_id, their_state.view);
+                                    Some(their_state.view)
+                                }
+                                Err(e) => {
+                                    tracing::debug!("Failed to parse consensus state from validator {}: {:?}", node_id, e);
+                                    None
+                                }
                             }
-                            Err(e) => {
-                                tracing::warn!("Failed to parse consensus state from validator {}: {:?}", node_id, e);
-                                None
-                            }
+                        } else {
+                            tracing::debug!("Validator {} returned status: {}", node_id, response.status());
+                            None
                         }
-                    } else {
-                        tracing::warn!("Validator {} returned status: {}", node_id, response.status());
+                    }
+                    Err(e) => {
+                        tracing::debug!("Failed to contact validator {} at {}: {:?}", node_id, url, e);
                         None
                     }
                 }
-                Err(e) => {
-                    tracing::warn!("Failed to contact validator {} at {}: {:?}", node_id, url, e);
-                    None
-                }
-            }
-        });
-        
-        tasks.push(task);
-    }
-    
-    // Wait for all requests to complete and find max view
-    let mut max_view = consensus_state.view; // Start with our own view
-    
-    for task in tasks {
-        if let Ok(Some(view)) = task.await {
-            max_view = std::cmp::max(max_view, view);
+            });
+
+            tasks.push(task);
         }
+
+        // Wait for all requests to complete and collect views
+        let mut received_views = Vec::new();
+
+        for task in tasks {
+            if let Ok(Some(view)) = task.await {
+                received_views.push(view);
+            }
+        }
+
+        // If we got at least one response, return the maximum view
+        if !received_views.is_empty() {
+            let max_view = *received_views.iter().max().unwrap();
+            let max_view = std::cmp::max(max_view, consensus_state.view);
+            tracing::debug!("Max view detected: {} (our view: {})", max_view, consensus_state.view);
+            return Ok(max_view);
+        }
+
+        // All validators failed, try again with different subset
+        tracing::debug!("Attempt {}/{}: no successful responses from validators", attempt, MAX_ATTEMPTS);
     }
-    
-    tracing::debug!("Max view detected: {} (our view: {})", max_view, consensus_state.view);
-    Ok(max_view)
+
+    // All retry attempts exhausted
+    tracing::warn!("Failed to poll network height after {} attempts", MAX_ATTEMPTS);
+    Err(ConsensusError::NetworkError)
 }

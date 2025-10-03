@@ -104,7 +104,7 @@ pub async fn post_ballot(
             );
             
             // Use existing catch-up mechanism
-            match perform_catch_up(&app_state, consensus_state.view, ballot.data.view).await {
+            match perform_catch_up(&app_state, consensus_state.view, ballot.data.view, None).await {
                 Ok(()) => {
                     tracing::info!("Successfully caught up to view {}", ballot.data.view);
                 },
@@ -234,7 +234,7 @@ pub async fn post_qc(
             );
             
             // Use existing catch-up mechanism
-            match perform_catch_up(&app_state, consensus_state.view, qc.view_number).await {
+            match perform_catch_up(&app_state, consensus_state.view, qc.view_number, None).await {
                 Ok(()) => {
                     tracing::info!("Successfully caught up to view {}", qc.view_number);
                 },
@@ -430,7 +430,7 @@ pub async fn check_view_status(app_state: &AppState) -> Result<ViewComparison, C
     let our_view = consensus_state.view;
     
     // Poll network for max view (pass consensus_state to avoid duplicate DB call)
-    let max_network_view = functions::poll_subset_for_max_view(app_state, &consensus_state).await?;
+    let max_network_view = functions::poll_subset_for_max_view(app_state, &consensus_state, None).await?;
     
     // Compare and categorize the relationship
     use std::cmp::Ordering;
@@ -683,10 +683,73 @@ async fn fetch_and_validate_with_retry(
     Err(CatchUpError::NetworkUnavailable)
 }
 
+/// Perform catch-up with convergence loop to handle moving target problem
+///
+/// Repeatedly catches up and re-checks network height until converged within tolerance.
+/// This is critical for new node bootstrap where the network may progress significantly
+/// during the initial catch-up from genesis.
+pub async fn perform_catch_up_with_convergence(
+    app_state: &AppState,
+    bootstrap_validators: Option<&[crate::types::Node]>,
+) -> Result<(), functions::CatchUpError> {
+    use crate::consensus::functions::CatchUpError;
+
+    const MAX_CONVERGENCE_ITERATIONS: u32 = 10;
+    const CONVERGENCE_TOLERANCE: i32 = 2;
+
+    for iteration in 1..=MAX_CONVERGENCE_ITERATIONS {
+        // Query fresh consensus state
+        let consensus_state = db::get_consensus(app_state.db_pool.get())
+            .map_err(|_| CatchUpError::Database)?;
+        let our_view = consensus_state.view;
+
+        // Poll network height
+        let network_view = functions::poll_subset_for_max_view(app_state, &consensus_state, bootstrap_validators)
+            .await
+            .map_err(|_| CatchUpError::NetworkUnavailable)?;
+
+        let gap = network_view - our_view;
+
+        // Check if converged
+        if gap <= CONVERGENCE_TOLERANCE {
+            tracing::info!(
+                "Converged after {} iteration(s): within {} view(s) of network (our view: {}, network: {})",
+                iteration, gap, our_view, network_view
+            );
+            return Ok(());
+        }
+
+        // Not converged, perform catch-up iteration
+        tracing::info!(
+            "Catch-up iteration {}/{}: closing gap of {} views (from view {} to {})",
+            iteration, MAX_CONVERGENCE_ITERATIONS, gap, our_view, network_view
+        );
+
+        perform_catch_up(app_state, our_view, network_view, bootstrap_validators).await?;
+    }
+
+    // Failed to converge within max iterations
+    tracing::error!(
+        "Failed to converge after {} iterations - network may be progressing faster than catch-up rate",
+        MAX_CONVERGENCE_ITERATIONS
+    );
+    Err(CatchUpError::NetworkUnavailable)
+}
+
 /// Perform catch-up from our current view to the target view
-pub async fn perform_catch_up(app_state: &AppState, our_view: i32, target_view: i32) -> Result<(), functions::CatchUpError> {
+///
+/// For new nodes bootstrapping from genesis, `bootstrap_validators` provides the initial
+/// set of validators to fetch consensus data from. As catch-up progresses, newly-integrated
+/// validators from the database are merged with bootstrap validators for subsequent batches.
+pub async fn perform_catch_up(
+    app_state: &AppState,
+    our_view: i32,
+    target_view: i32,
+    bootstrap_validators: Option<&[crate::types::Node]>,
+) -> Result<(), functions::CatchUpError> {
     use crate::consensus::functions::CatchUpError;
     use std::sync::Arc;
+    use std::collections::HashSet;
 
     tracing::info!("Starting catch-up: our_view={}, target_view={}", our_view, target_view);
 
@@ -705,14 +768,25 @@ pub async fn perform_catch_up(app_state: &AppState, our_view: i32, target_view: 
 
         // Get available validators (refreshed each batch to pick up newly-added validators)
         let my_node_id = app_state.get_node_id().map_err(|_| CatchUpError::Database)?;
-        let validators = db::get_validators(app_state.db_pool.get(), our_view)
+        let mut validators = db::get_validators(app_state.db_pool.get(), our_view)
             .map_err(|_| CatchUpError::Database)?;
+
+        // Merge with bootstrap validators, removing duplicates by node_id
+        if let Some(bootstrap) = bootstrap_validators {
+            let existing_ids: HashSet<i32> = validators.iter().map(|v| v.node_id).collect();
+            validators.extend(
+                bootstrap.iter()
+                    .filter(|node| !existing_ids.contains(&node.node_id))
+                    .cloned()
+            );
+        }
+
         let other_validators: Vec<_> = validators.into_iter()
             .filter(|v| v.node_id != my_node_id)
             .collect();
 
         if other_validators.is_empty() {
-            tracing::warn!("No other validators found for catch-up at view {}", our_view);
+            tracing::warn!("No validators available for catch-up at view {}", our_view);
             return Err(CatchUpError::NetworkUnavailable);
         }
 
@@ -803,8 +877,8 @@ pub async fn ensure_caught_up_middleware(
             
             if should_catch_up {
                 tracing::info!("Node is {} views behind: our_view={}, max_network_view={} - performing catch-up (strictness: {:?})", views_behind, our_view, max_network_view, strictness);
-                
-                match perform_catch_up(&app_state, our_view, max_network_view).await {
+
+                match perform_catch_up(&app_state, our_view, max_network_view, None).await {
                     Ok(()) => {
                         tracing::info!("Catch-up completed successfully, proceeding with consensus operation");
                         next.run(req).await

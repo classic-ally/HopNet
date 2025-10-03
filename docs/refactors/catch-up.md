@@ -69,27 +69,27 @@ This refactor migrates from checkpoint-based node synchronization to consensus c
 ### Requirements
 
 #### Convergence Loop
-- [ ] Implement wrapper around catch-up that repeats until converged
-- [ ] After each catch-up iteration, re-check network height
-- [ ] If still behind by more than 2 blocks, perform another catch-up iteration
-- [ ] Continue until within convergence tolerance (2 blocks)
-- [ ] Limit to maximum 10 iterations to prevent infinite loops
+- [x] Implement wrapper around catch-up that repeats until converged
+- [x] After each catch-up iteration, re-check network height
+- [x] If still behind by more than 2 blocks, perform another catch-up iteration
+- [x] Continue until within convergence tolerance (2 blocks)
+- [x] Limit to maximum 10 iterations to prevent infinite loops
 
 #### Network Height Polling
-- [ ] Implement function to query multiple validators for their current view
-- [ ] Support both bootstrap validators (for new nodes) and local DB validators (for existing nodes)
-- [ ] Return maximum view reported across sampled validators
-- [ ] Handle validator query failures gracefully (continue with other validators)
+- [x] Implement function to query multiple validators for their current view
+- [x] Support both bootstrap validators (for new nodes) and local DB validators (for existing nodes)
+- [x] Return maximum view reported across sampled validators
+- [x] Handle validator query failures gracefully (continue with other validators)
 
 #### Progress Reporting
-- [ ] Log progress every 100 views during catch-up
-- [ ] Include percentage complete, views remaining, current iteration number
-- [ ] Log when starting new catch-up iteration with updated target
+- [x] Log progress every 100 views during catch-up (batch-level logging every 50 views)
+- [x] Include percentage complete, views remaining, current iteration number
+- [x] Log when starting new catch-up iteration with updated target
 
 #### Integration with Existing Systems
-- [ ] Update timeout detection job to use convergence wrapper
-- [ ] Ensure reactive catch-up (from future ballots) continues to work
-- [ ] Maintain backward compatibility with existing catch-up callers
+- [x] Update timeout detection job to use convergence wrapper
+- [x] Ensure reactive catch-up (from future ballots) continues to work
+- [x] Maintain backward compatibility with existing catch-up callers
 
 ### Testing Criteria
 - [ ] Create 1000-view gap, verify convergence even as network progresses
