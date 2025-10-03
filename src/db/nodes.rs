@@ -392,23 +392,13 @@ pub fn insert_node_consensus(
                 []
             ).map_err(|_| DatabaseError::InsertError)?;
 
-            // Get current block height from committed block to add validator
-            let current_height = tx.query_row(
-                "SELECT height FROM blocks WHERE block_hash = (SELECT committed_block_hash FROM this_node WHERE internal_id = 1)",
-                [],
-                |row| row.get::<_, i32>(0)
-            ).map_err(|_| DatabaseError::RecallError)?;
-
-            // Add the new node as a validator starting from the next block height
-            tx.execute(
-                "INSERT INTO validators (effective_height, node_id, is_active) VALUES (?, ?, ?)",
-                params![current_height + 1, next_id, true]
-            ).map_err(|_| DatabaseError::InsertError)?;
+            // Node is registered but not yet active in validators table
+            // Node will activate itself via activation transaction after catching up
 
             // Commit or rollback based on execute flag
             if execute {
                 tx.commit().map_err(|_| DatabaseError::InsertError)?;
-                tracing::info!("Node {} added to validator set via consensus at height {}", next_id, current_height + 1);
+                tracing::info!("Node {} registered via consensus (inactive, will activate after catch-up)", next_id);
             } else {
                 tx.rollback().map_err(|_| DatabaseError::LockError)?;
                 tracing::debug!("Node {} insertion validated successfully (rolled back)", next_id);

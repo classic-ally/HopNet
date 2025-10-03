@@ -382,18 +382,19 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/rpc/throughput-result/{session_id}", get(metrics::routes::get_throughput_result))
                 .layer(middleware::from_fn_with_state(app_state.clone(), consensus::routes::rpc_auth_middleware));
 
-            // Strict catch-up routes (must be fully caught up)
-            let strict_consensus_routes = Router::new()
+            // Validator routes (active participation - requires active status)
+            let validator_consensus_routes = Router::new()
                 .route("/ballot", post(consensus::routes::post_ballot))
                 .layer(middleware::from_fn_with_state(app_state.clone(), consensus::routes::ensure_caught_up_middleware))
-                .layer(axum::Extension(consensus::routes::CatchUpStrictness::Strict));
+                .layer(axum::Extension(consensus::routes::ConsensusRole::Validator));
 
-            // Lenient catch-up routes (allow 1 view behind)
-            let lenient_consensus_routes = Router::new()
+            // Observer routes (passive observation - no activation required)
+            let observer_consensus_routes = Router::new()
                 .route("/qc", post(consensus::routes::post_qc))
                 .route("/consensus/tc", post(consensus::routes::post_tc))
+                .route("/consensus/timeout_vote", post(consensus::routes::post_timeout_vote))
                 .layer(middleware::from_fn_with_state(app_state.clone(), consensus::routes::ensure_caught_up_middleware))
-                .layer(axum::Extension(consensus::routes::CatchUpStrictness::Lenient));
+                .layer(axum::Extension(consensus::routes::ConsensusRole::Observer));
 
             // Test routes - only available in test mode
             let test_routes = if app_state.test_mode {
@@ -409,8 +410,8 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .merge(protected_routes)
                 .merge(jwt_or_rpc_routes)
                 .merge(rpc_routes)
-                .merge(strict_consensus_routes)
-                .merge(lenient_consensus_routes)
+                .merge(validator_consensus_routes)
+                .merge(observer_consensus_routes)
                 .nest("/integrations/fileprovider", fileprovider_routes)
                 .merge(test_routes)
                 .route("/setup", get(setup::get_setup))
@@ -419,8 +420,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/interfaces", get(interfaces::get_interfaces))
                 .route("/rpc/latency-server", get(metrics::routes::get_latency_server))
                 .route("/rpc/get-remote-latency", get(metrics::routes::get_remote_latency_handler))
-                .route("/login", post(auth::sign_in))
-                .route("/consensus/timeout_vote", post(consensus::routes::post_timeout_vote));
+                .route("/login", post(auth::sign_in));
 
             let app = if cfg!(debug_assertions) {
                 let cors = CorsLayer::new()

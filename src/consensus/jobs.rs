@@ -25,27 +25,30 @@ pub async fn handle_timeout_detection(
     
     let current_view = consensus_state.view;
     let last_observed = app_state.last_observed_view.load(std::sync::atomic::Ordering::SeqCst);
-    
-    // Check if we're caught up with the network before timeout detection
-    use crate::consensus::routes::{check_view_status, ViewComparison, perform_catch_up_with_convergence};
-    match check_view_status(app_state).await {
-        Ok(ViewComparison::Behind { our_view, max_network_view }) => {
-            tracing::info!("Detected behind network: our_view={}, max_network_view={} - triggering catch-up with convergence", our_view, max_network_view);
-            match perform_catch_up_with_convergence(app_state, None).await {
-                Ok(_) => {
-                    tracing::info!("Catch-up completed successfully, skipping timeout detection this cycle");
-                }
-                Err(e) => {
-                    tracing::warn!("Catch-up with convergence failed: {:?} - skipping timeout detection this cycle", e);
-                }
-            }
+
+    // Ensure we're caught up and active before participating in consensus
+    use crate::consensus::routes::{ensure_caught_up_and_active, CatchUpMode, NodeReadiness, SyncStatus};
+    match ensure_caught_up_and_active(app_state, CatchUpMode::Convergence, true, 0).await {
+        Ok(NodeReadiness { sync_status: SyncStatus::CaughtUp, is_active: true }) => {
+            // We're caught up and active, proceed with timeout detection
+            tracing::debug!("Node is caught up and active, proceeding with timeout detection");
+        }
+        Ok(NodeReadiness { is_active: false, .. }) => {
+            // We're inactive (activation request submitted), skip timeout detection
+            tracing::info!("Node is inactive at current height - activation requested, skipping timeout detection this cycle");
             return Ok(());
         }
-        Ok(ViewComparison::CaughtUp { .. }) | Ok(ViewComparison::Ahead { .. }) => {
-            // We're caught up or ahead, proceed with normal timeout detection
+        Ok(NodeReadiness { sync_status, .. }) => {
+            // Should never happen with Convergence mode (always CaughtUp or error)
+            tracing::warn!("Unexpected sync status after convergence: {:?}, skipping timeout detection", sync_status);
+            return Ok(());
         }
         Err(e) => {
-            tracing::warn!("Failed to check view status: {:?} - proceeding with timeout detection", e);
+            tracing::error!("Failed to ensure caught up and active: {:?}", e);
+            return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to ensure caught up and active: {:?}", e)
+            )))));
         }
     }
     

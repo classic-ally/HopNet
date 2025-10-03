@@ -718,3 +718,76 @@ pub fn get_current_consensus_height(tx: &duckdb::Transaction) -> Result<i32, Dat
     
     Ok(current_height)
 }
+
+/// Check if a node is active at a given height
+/// Returns true if the node has an active validator entry effective at or before the given height
+pub fn is_node_active(
+    tx: &duckdb::Transaction,
+    node_id: i32,
+    height: i32,
+) -> Result<bool, DatabaseError> {
+    use duckdb::OptionalExt;
+
+    // Get the most recent validator record at or before this height
+    let is_active: Option<bool> = tx.query_row(
+        "SELECT is_active FROM validators
+         WHERE node_id = ? AND effective_height <= ?
+         ORDER BY effective_height DESC
+         LIMIT 1",
+        params![node_id, height],
+        |row| row.get(0)
+    ).optional().map_err(|_| DatabaseError::RecallError)?;
+
+    // If no record found, node is not active
+    Ok(is_active.unwrap_or(false))
+}
+
+/// Activate a validator at a specific effective height
+/// If the node already has a future activation (after current height), it will be updated
+/// This enables hot-swap operations where validator-elect activation can be moved forward
+pub fn activate_validator(
+    tx: &duckdb::Transaction,
+    node_id: i32,
+    effective_height: i32,
+) -> Result<(), DatabaseError> {
+    use duckdb::OptionalExt;
+
+    let current_height = get_current_consensus_height(tx)?;
+
+    // Check if node already has the NEXT future activation (earliest after current height)
+    let existing_future_activation: Option<i32> = tx.query_row(
+        "SELECT effective_height FROM validators
+         WHERE node_id = ? AND effective_height > ? AND is_active = true
+         ORDER BY effective_height ASC
+         LIMIT 1",
+        params![node_id, current_height],
+        |row| row.get(0)
+    ).optional().map_err(|_| DatabaseError::RecallError)?;
+
+    if let Some(old_height) = existing_future_activation {
+        // UPDATE the existing next activation to new height
+        tx.execute(
+            "UPDATE validators SET effective_height = ?
+             WHERE node_id = ? AND effective_height = ?",
+            params![effective_height, node_id, old_height]
+        ).map_err(|_| DatabaseError::InsertError)?;
+
+        tracing::info!(
+            "Updated activation for node {} from height {} to height {}",
+            node_id, old_height, effective_height
+        );
+    } else {
+        // INSERT new activation record
+        tx.execute(
+            "INSERT INTO validators (effective_height, node_id, is_active) VALUES (?, ?, ?)",
+            params![effective_height, node_id, true]
+        ).map_err(|_| DatabaseError::InsertError)?;
+
+        tracing::info!(
+            "Scheduled activation for node {} at height {}",
+            node_id, effective_height
+        );
+    }
+
+    Ok(())
+}

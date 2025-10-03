@@ -83,49 +83,8 @@ pub async fn post_ballot(
         "Received ballot for view {} phase {:?} block {:?}",
         ballot.data.view, ballot.data.phase, ballot.block.block_hash
     );
-    
-    // Check if this is a future ballot that should trigger catch-up
-    let consensus_state = match db::get_consensus(app_state.db_pool.get()) {
-        Ok(state) => state,
-        Err(crate::db::DatabaseError::LockError) => {
-            tracing::warn!("Database connection pool exhausted during consensus state fetch");
-            return StatusCode::TOO_MANY_REQUESTS.into_response();
-        },
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-    
-    match ballot.data.view.cmp(&consensus_state.view) {
-        Ordering::Greater => {
-            // Future ballot - trigger catch-up using existing mechanism
-            let views_behind = ballot.data.view - consensus_state.view;
-            tracing::info!(
-                "Received future ballot for view {} (current: {}), {} views behind - initiating catch-up", 
-                ballot.data.view, consensus_state.view, views_behind
-            );
-            
-            // Use existing catch-up mechanism
-            match perform_catch_up(&app_state, consensus_state.view, ballot.data.view, None).await {
-                Ok(()) => {
-                    tracing::info!("Successfully caught up to view {}", ballot.data.view);
-                },
-                Err(e) => {
-                    tracing::warn!("Catch-up failed: {:?} - continuing with partial catch-up", e);
-                    // Continue with ballot processing even if catch-up failed partially
-                }
-            }
-            
-            tracing::info!("Catch-up complete, processing original ballot for view {}", ballot.data.view);
-        },
-        Ordering::Less => {
-            tracing::debug!("Received old ballot for view {} (current: {})", ballot.data.view, consensus_state.view);
-            // Continue with normal processing - old ballots might still be valid
-        },
-        Ordering::Equal => {
-            tracing::debug!("Received ballot for current view {}", ballot.data.view);
-            // Continue with normal processing
-        }
-    }
-    
+
+    // Middleware ensures we're caught up and active - just process the ballot
     // validate the ballot proposal
     match ballot.verify_proposal(&app_state) {
         Ok(()) => {
@@ -213,49 +172,8 @@ pub async fn post_qc(
         "Received QC for view {} phase {:?} block {:?}",
         qc.view_number, qc.phase, qc.block_hash
     );
-    
-    // Check if this is a future QC that should trigger catch-up
-    let consensus_state = match db::get_consensus(app_state.db_pool.get()) {
-        Ok(state) => state,
-        Err(crate::db::DatabaseError::LockError) => {
-            tracing::warn!("Database connection pool exhausted during consensus state fetch");
-            return StatusCode::TOO_MANY_REQUESTS;
-        },
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
-    };
-    
-    match qc.view_number.cmp(&consensus_state.view) {
-        Ordering::Greater => {
-            // Future QC - trigger catch-up using existing mechanism
-            let views_behind = qc.view_number - consensus_state.view;
-            tracing::info!(
-                "Received future QC for view {} (current: {}), {} views behind - initiating catch-up", 
-                qc.view_number, consensus_state.view, views_behind
-            );
-            
-            // Use existing catch-up mechanism
-            match perform_catch_up(&app_state, consensus_state.view, qc.view_number, None).await {
-                Ok(()) => {
-                    tracing::info!("Successfully caught up to view {}", qc.view_number);
-                },
-                Err(e) => {
-                    tracing::warn!("Catch-up failed: {:?} - continuing with partial catch-up", e);
-                    // Continue with QC processing even if catch-up failed partially
-                }
-            }
-            
-            tracing::info!("Catch-up complete, processing original QC for view {}", qc.view_number);
-        },
-        Ordering::Less => {
-            tracing::debug!("Received old QC for view {} (current: {})", qc.view_number, consensus_state.view);
-            // Continue with normal processing - old QCs are still valid
-        },
-        Ordering::Equal => {
-            tracing::debug!("Received QC for current view {}", qc.view_number);
-            // Continue with normal processing
-        }
-    }
-    
+
+    // Middleware ensures we're caught up - just process the QC
     // Normal QC processing (existing logic)
     match db::get_block(app_state.db_pool.get(), qc.block_hash) {
         Ok(block) => {
@@ -408,9 +326,28 @@ pub enum ViewComparison {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum CatchUpStrictness {
-    Lenient,  // Allow 1 view behind (normal consensus operations might advance us)
-    Strict,   // Always catch up regardless of gap (timeout scenarios)
+pub enum ConsensusRole {
+    Validator,  // Active participation (voting) - requires active validator status and full sync
+    Observer,   // Passive observation (learning) - just following consensus, can tolerate lag
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum CatchUpMode {
+    SingleShot,    // Fast path for small gaps (active validators receiving messages)
+    Convergence,   // Iterative for large gaps, bootstrap, or extended downtime
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncStatus {
+    CaughtUp,                      // Fully caught up with network
+    WithinTolerance { gap: i32 },  // Slightly behind but within acceptable tolerance
+    Behind { gap: i32 },           // Too far behind, catch-up was needed/failed
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeReadiness {
+    pub sync_status: SyncStatus,
+    pub is_active: bool,
 }
 
 #[derive(Debug)]
@@ -736,6 +673,139 @@ pub async fn perform_catch_up_with_convergence(
     Err(CatchUpError::NetworkUnavailable)
 }
 
+/// Unified entry point: catch up with network and optionally request activation if inactive
+/// Returns node readiness including sync status and activation status
+pub async fn ensure_caught_up_and_active(
+    app_state: &AppState,
+    mode: CatchUpMode,
+    request_activation_if_needed: bool,
+    tolerance_views: i32,
+) -> Result<NodeReadiness, functions::CatchUpError> {
+    use crate::consensus::functions::CatchUpError;
+
+    let mut sync_status = SyncStatus::CaughtUp;
+
+    // Perform appropriate catch-up based on mode
+    match mode {
+        CatchUpMode::SingleShot => {
+            // Fast path: check if behind and perform single catch-up pass
+            match check_view_status(app_state).await {
+                Ok(ViewComparison::Behind { our_view, max_network_view }) => {
+                    let gap = max_network_view - our_view;
+
+                    if gap > tolerance_views {
+                        tracing::info!("Single-shot catch-up: closing gap of {} views (from {} to {})", gap, our_view, max_network_view);
+                        perform_catch_up(app_state, our_view, max_network_view, None).await?;
+                        sync_status = SyncStatus::CaughtUp;
+                    } else {
+                        tracing::debug!("Gap of {} views within tolerance {}, skipping catch-up", gap, tolerance_views);
+                        sync_status = SyncStatus::WithinTolerance { gap };
+                    }
+                }
+                Ok(ViewComparison::CaughtUp { view }) => {
+                    tracing::debug!("Already caught up at view {}", view);
+                    sync_status = SyncStatus::CaughtUp;
+                }
+                Ok(ViewComparison::Ahead { our_view, sampled_max_view }) => {
+                    tracing::debug!("Ahead of sampled validators: our_view={}, sampled_max_view={}", our_view, sampled_max_view);
+                    sync_status = SyncStatus::CaughtUp;
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to check view status during single-shot catch-up: {:?}", e);
+                    return Err(CatchUpError::NetworkUnavailable);
+                }
+            }
+        }
+        CatchUpMode::Convergence => {
+            // Iterative convergence for large gaps or bootstrap (tolerance ignored)
+            perform_catch_up_with_convergence(app_state, None).await?;
+            sync_status = SyncStatus::CaughtUp;
+        }
+    }
+
+    // Check if we're active at current height
+    // Scope database work to ensure transaction is dropped before async calls
+    let (node_id, current_height, is_active) = {
+        let mut conn = app_state.db_pool.get().map_err(|_| CatchUpError::Database)?;
+        let tx = conn.transaction().map_err(|_| CatchUpError::Database)?;
+
+        // Get node ID directly from transaction
+        let node_id: i32 = tx.query_row(
+            "SELECT node_id FROM this_node WHERE internal_id = 1",
+            [],
+            |row| row.get(0)
+        ).map_err(|_| CatchUpError::Database)?;
+
+        let current_height = db::get_current_consensus_height(&tx).map_err(|_| CatchUpError::Database)?;
+        let is_active = db::is_node_active(&tx, node_id, current_height).map_err(|_| CatchUpError::Database)?;
+
+        (node_id, current_height, is_active)
+        // tx and conn automatically dropped here at end of scope
+    };
+
+    // If inactive and caller wants us to request activation
+    if !is_active && request_activation_if_needed {
+        tracing::info!(
+            "Node {} is inactive at height {}, requesting activation",
+            node_id,
+            current_height
+        );
+
+        if let Err(e) = request_activation(app_state, node_id, current_height).await {
+            tracing::warn!("Failed to request activation: {:?}", e);
+            // Don't fail the whole operation - we still caught up
+        }
+    }
+
+    Ok(NodeReadiness {
+        sync_status,
+        is_active,
+    })
+}
+
+/// Request activation for this node at current height + 3
+async fn request_activation(
+    app_state: &AppState,
+    node_id: i32,
+    current_height: i32,
+) -> Result<(), functions::CatchUpError> {
+    use crate::consensus::handlers::ActivationRequest;
+    use crate::consensus::functions::{create_signed_transaction, consensus_middleware, CatchUpError};
+
+    let requested_activation_height = current_height + 3;
+
+    // Create activation request
+    let activation_req = ActivationRequest {
+        node_id,
+        current_height,
+        requested_effective_height: requested_activation_height,
+    };
+
+    // Serialize to payload
+    let payload = bincode::serde::encode_to_vec(&activation_req, bincode::config::standard())
+        .map_err(|_| CatchUpError::NetworkUnavailable)?;
+
+    // Create signed transaction
+    let transaction = create_signed_transaction(
+        app_state,
+        "validator_activation".to_string(),
+        payload,
+    ).map_err(|_| CatchUpError::NetworkUnavailable)?;
+
+    // Submit activation transaction via consensus
+    consensus_middleware(app_state, vec![transaction])
+        .await
+        .map_err(|_| CatchUpError::NetworkUnavailable)?;
+
+    tracing::info!(
+        "Activation request submitted for node {} at height {}",
+        node_id,
+        requested_activation_height
+    );
+
+    Ok(())
+}
+
 /// Perform catch-up from our current view to the target view
 ///
 /// For new nodes bootstrapping from genesis, `bootstrap_validators` provides the initial
@@ -858,53 +928,64 @@ pub async fn perform_catch_up(
 }
 
 /// Ensure we're caught up with the network before participating in consensus
-/// This middleware automatically catches up behind nodes and then allows consensus participation
+/// This middleware automatically catches up behind nodes and checks readiness based on role
 pub async fn ensure_caught_up_middleware(
     State(app_state): State<AppState>,
-    Extension(strictness): Extension<CatchUpStrictness>,
+    Extension(role): Extension<ConsensusRole>,
     req: Request<Body>,
     next: Next,
 ) -> impl IntoResponse {
-    match check_view_status(&app_state).await {
-        Ok(ViewComparison::Behind { our_view, max_network_view }) => {
-            let views_behind = max_network_view - our_view;
-            
-            // Check if we should skip catch-up based on strictness
-            let should_catch_up = match strictness {
-                CatchUpStrictness::Strict => true,  // Always catch up
-                CatchUpStrictness::Lenient => views_behind > 1,  // Only if more than 1 view behind
-            };
-            
-            if should_catch_up {
-                tracing::info!("Node is {} views behind: our_view={}, max_network_view={} - performing catch-up (strictness: {:?})", views_behind, our_view, max_network_view, strictness);
+    // Determine tolerance based on role
+    let tolerance = match role {
+        ConsensusRole::Validator => 0,  // Validators must be fully caught up
+        ConsensusRole::Observer => 1,   // Observers can be 1 view behind
+    };
 
-                match perform_catch_up(&app_state, our_view, max_network_view, None).await {
-                    Ok(()) => {
-                        tracing::info!("Catch-up completed successfully, proceeding with consensus operation");
-                        next.run(req).await
-                    }
-                    Err(e) => {
-                        tracing::error!("Catch-up failed: {:?} - rejecting consensus operation", e);
-                        StatusCode::SERVICE_UNAVAILABLE.into_response()
+    // Ensure caught up and check activation (don't request - timeout job handles that)
+    match ensure_caught_up_and_active(&app_state, CatchUpMode::SingleShot, false, tolerance).await {
+        Ok(NodeReadiness { sync_status, is_active }) => {
+            match role {
+                ConsensusRole::Validator => {
+                    // Validator routes (/ballot): must be caught up AND active
+                    match (sync_status, is_active) {
+                        (SyncStatus::CaughtUp, true) => {
+                            tracing::debug!("Node is caught up and active, processing ballot (validator role)");
+                            next.run(req).await
+                        }
+                        (SyncStatus::CaughtUp, false) => {
+                            tracing::warn!("Node is caught up but inactive - rejecting ballot (validator role requires active status)");
+                            StatusCode::SERVICE_UNAVAILABLE.into_response()
+                        }
+                        (SyncStatus::WithinTolerance { gap }, _) => {
+                            // Should never happen with tolerance=0, but handle defensively
+                            tracing::warn!("Node within tolerance (gap={}) on validator route - rejecting", gap);
+                            StatusCode::SERVICE_UNAVAILABLE.into_response()
+                        }
+                        (SyncStatus::Behind { gap }, _) => {
+                            tracing::warn!("Node is behind by {} views - rejecting ballot (validator role)", gap);
+                            StatusCode::SERVICE_UNAVAILABLE.into_response()
+                        }
                     }
                 }
-            } else {
-                tracing::debug!("Node is {} views behind: our_view={}, max_network_view={} - allowing normal consensus progression (strictness: {:?})", views_behind, our_view, max_network_view, strictness);
-                next.run(req).await
+                ConsensusRole::Observer => {
+                    // Observer routes (/qc, /tc): allow if not too far behind (passive observation)
+                    // Active status doesn't matter - observers don't vote
+                    match sync_status {
+                        SyncStatus::CaughtUp | SyncStatus::WithinTolerance { .. } => {
+                            tracing::debug!("Node synchronized (sync_status={:?}), processing message (observer role)", sync_status);
+                            next.run(req).await
+                        }
+                        SyncStatus::Behind { gap } => {
+                            tracing::warn!("Node is behind by {} views - rejecting message (observer role)", gap);
+                            StatusCode::SERVICE_UNAVAILABLE.into_response()
+                        }
+                    }
+                }
             }
         }
-        Ok(ViewComparison::CaughtUp { view }) => {
-            tracing::debug!("Node is caught up at view {}, proceeding with consensus operation", view);
-            next.run(req).await
-        }
-        Ok(ViewComparison::Ahead { our_view, sampled_max_view }) => {
-            tracing::debug!("Node is ahead of sampled validators: our_view={}, sampled_max_view={} - proceeding", our_view, sampled_max_view);
-            next.run(req).await
-        }
         Err(e) => {
-            tracing::error!("Failed to check view status: {:?} - allowing operation to proceed", e);
-            // On error, allow operation to proceed (fail open for availability)
-            next.run(req).await
+            tracing::error!("Failed to ensure caught up: {:?} - rejecting consensus operation", e);
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
     }
 }
