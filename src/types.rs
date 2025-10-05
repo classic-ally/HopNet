@@ -348,11 +348,11 @@ pub struct Node {
     pub pubkey: PubKey,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct User {
     pub user_id: i32,
     pub username: String,
-    pub password: String,
+    pub password_hash: String,  // Argon2 hash - never store/transmit plaintext
     pub pubkey: PubKey,
     pub x25519_pubkey: crate::db::types::XPubKey
 }
@@ -366,15 +366,38 @@ use argon2::{
 };
 
 impl User {
-    pub fn password_hash(&mut self) -> Result<String, argon2::password_hash::Error> {
+    /// Create a User from plaintext password (hashes automatically)
+    /// Use this at input boundaries (API routes, setup) before consensus
+    /// Takes ownership of plaintext_password to ensure it's consumed and dropped after hashing
+    pub fn new_with_password(
+        user_id: i32,
+        username: String,
+        plaintext_password: String,  // Takes ownership - consumed and dropped after hashing
+        pubkey: PubKey,
+        x25519_pubkey: crate::db::types::XPubKey
+    ) -> Result<Self, argon2::password_hash::Error> {
+        let password_hash = Self::hash_password(&plaintext_password)?;
+        // plaintext_password dropped here - minimizes lifetime in memory
+        Ok(User {
+            user_id,
+            username,
+            password_hash,
+            pubkey,
+            x25519_pubkey,
+        })
+    }
+
+    /// Hash plaintext password using Argon2
+    fn hash_password(plaintext: &str) -> Result<String, argon2::password_hash::Error> {
         let salt = SaltString::generate(&mut OsRng);
         let argon2 = Argon2::default();
-        let password_hash = argon2.hash_password(self.password.as_bytes(), &salt)?.to_string();
-        Ok(password_hash)
+        argon2.hash_password(plaintext.as_bytes(), &salt).map(|h| h.to_string())
     }
-    pub fn verify_password(&mut self, check_password: &[u8]) -> Result<bool, argon2::password_hash::Error> {
-        let parsed_hash = PasswordHash::new(&self.password)?;
-        return Ok(Argon2::default().verify_password(check_password, &parsed_hash).is_ok());
+
+    /// Verify plaintext password against stored hash
+    pub fn verify_password(&self, check_password: &[u8]) -> Result<bool, argon2::password_hash::Error> {
+        let parsed_hash = PasswordHash::new(&self.password_hash)?;
+        Ok(Argon2::default().verify_password(check_password, &parsed_hash).is_ok())
     }
 }
 
@@ -391,4 +414,19 @@ pub struct NodeConnectionInfo {
     pub node_id: i32,
     pub ip_address: String,
     pub port: i32,
+}
+
+/// Bootstrap information sent from coordinator to joining node
+/// Transmitted over HTTP (plaintext) - TLS needed before production use
+///
+/// After receiving this, the joining node:
+/// 1. Initializes this_node table with node_id and user_privkey
+/// 2. Performs catch-up from view 0 using bootstrap_validators
+/// 3. Submits activation request after catching up
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JoinInfo {
+    pub node_id: i32,
+    pub user_id: i32,
+    pub user_privkey: PrivKey,  // TODO: Encrypt before production (requires TLS)
+    pub bootstrap_validators: Vec<Node>,  // Full node info for catch-up
 }

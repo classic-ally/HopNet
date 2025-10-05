@@ -47,13 +47,16 @@ pub async fn post_users (
     Extension(user_id): Extension<i32>,  // Extract user_id from JWT via auth middleware
     Json(payload): Json<UserRequest>
 ) -> impl IntoResponse {
-    // Consensus block generation
-    let user = User {
-        user_id: 0,
-        username: payload.username,
-        password: payload.password,
-        pubkey: payload.pubkey,
-        x25519_pubkey: payload.xpubkey,
+    // Consensus block generation - hash password at input boundary
+    let user = match User::new_with_password(
+        0,
+        payload.username,
+        payload.password,
+        payload.pubkey,
+        payload.xpubkey,
+    ) {
+        Ok(user) => user,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response()
     };
 
     // Encode user with bincode::serde standard config
@@ -66,17 +69,17 @@ pub async fn post_users (
                 user_id,
             ) {
                 Ok(tx) => tx,
-                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
             };
             let transactions = vec![transaction];
 
             // quorum middleware test
             match consensus_middleware(&app_state, transactions).await {
-                Ok(()) => StatusCode::CREATED,
-                Err(_) => StatusCode::INTERNAL_SERVER_ERROR
+                Ok(()) => StatusCode::CREATED.into_response(),
+                Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response()
             }
         }
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response()
     }
     
     

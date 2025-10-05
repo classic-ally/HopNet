@@ -74,13 +74,13 @@ impl MockNetwork {
         let first_node = MockNode::new(0);
         let x25519_pubkey = crate::auth::derive_x25519_pubkey_from_user(&users[0].signing_key);
 
-        let user = crate::types::User {
-            user_id: 0,
-            username: "test_user".to_string(),
-            password: "password".to_string(),
-            pubkey: users[0].verifying_key,
+        let user = crate::types::User::new_with_password(
+            0,
+            "test_user".to_string(),
+            "password".to_string(),
+            users[0].verifying_key,
             x25519_pubkey,
-        };
+        ).expect("Failed to create test user");
 
         let first_db_node = crate::db::Node {
             node_id: 0,
@@ -92,11 +92,9 @@ impl MockNetwork {
         };
 
         crate::db::setup::post_initial_setup(
-            first_node.app_state.db_pool.get(),
+            &first_node.app_state,
             user,
             first_db_node,
-            first_node.verifying_key,
-            first_node.signing_key.clone(),
             users[0].signing_key.clone(),
         ).expect("Failed to run initial setup for first node");
 

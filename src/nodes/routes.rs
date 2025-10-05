@@ -190,51 +190,85 @@ pub async fn post_nodes(
     }
 
     ///////////////
-    // 4. Post-consensus: Dump current state and sync accepted node
+    // 4. Post-consensus: Create JoinInfo and send to joining node
     ///////////////
-    let (dump_tx, dump_rx) = oneshot::channel();
-    let db_conn = app_state.db_pool.get();
-    let user_private_key = app_state.get_user_keys().unwrap().private_key.clone();
-    
-    let db_task = tokio::task::spawn_blocking(move || {
-        tokio::runtime::Handle::current().block_on(async move {
-            nodes::get_sync_dump(db_conn, complete_node, dump_tx, user_private_key).await
-        })
-    });
 
-    // Get sync message from DB thread
-    let db_dump = match dump_rx.await {
-        Ok(data) => data,
+    // Get user's private key to send to joining node
+    let user_private_key = match app_state.get_user_keys() {
+        Ok(keys) => keys.private_key.clone(),
         Err(_) => {
-            tracing::warn!("Database sync dump communication failed");
-            return StatusCode::SERVICE_UNAVAILABLE;
-        },
+            tracing::error!("Failed to get user keys from app state");
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
+    };
+
+    // Get current consensus height
+    let consensus_state = match crate::db::consensus::get_consensus(app_state.db_pool.get()) {
+        Ok(state) => state,
+        Err(e) => {
+            tracing::error!("Failed to get consensus state: {:?}", e);
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
+    };
+
+    // Get all active validators for bootstrap list
+    let bootstrap_validators = match crate::db::consensus::get_validators(
+        app_state.db_pool.get(),
+        consensus_state.committed_block.data.height
+    ) {
+        Ok(validators) => validators,
+        Err(e) => {
+            tracing::error!("Failed to get validators for bootstrap: {:?}", e);
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
+    };
+
+    // Create JoinInfo structure
+    let join_info = crate::types::JoinInfo {
+        node_id: complete_node.node_id,
+        user_id: uid,
+        user_privkey: user_private_key,
+        bootstrap_validators,
     };
 
     ///////////////
-    // 5. Send the PUT of current state to the accepted node
+    // 5. Send JoinInfo to the joining node
     ///////////////
-    tracing::info!("Syncing accepted node at {}", url);
+    tracing::info!(
+        "Sending JoinInfo to joining node {} at {} (bootstrap validators: {})",
+        complete_node.node_id,
+        url,
+        join_info.bootstrap_validators.len()
+    );
+
     match client.put(&url)
-        .json(&db_dump)
+        .json(&join_info)
         .send()
         .await
     {
-        Ok(response) => if response.status() != StatusCode::CREATED {
-            return StatusCode::BAD_GATEWAY
+        Ok(response) => {
+            match response.status() {
+                StatusCode::ACCEPTED => {
+                    tracing::info!(
+                        "Node {} accepted JoinInfo, catch-up running in background",
+                        complete_node.node_id
+                    );
+                    StatusCode::CREATED
+                }
+                status => {
+                    tracing::error!(
+                        "Node {} rejected JoinInfo with status: {}",
+                        complete_node.node_id,
+                        status
+                    );
+                    StatusCode::BAD_GATEWAY
+                }
+            }
         }
-        Err(_) => return StatusCode::GATEWAY_TIMEOUT
-    }
-
-    // Wait for DB task completion
-    match db_task.await {
-        Ok(Ok(())) => StatusCode::CREATED,
-        Ok(Err(crate::db::DatabaseError::LockError)) => {
-            tracing::warn!("Database connection pool exhausted during sync dump");
-            StatusCode::TOO_MANY_REQUESTS
-        },
-        Ok(Err(_)) => StatusCode::INTERNAL_SERVER_ERROR,
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        Err(e) => {
+            tracing::error!("Failed to send JoinInfo to node {}: {:?}", complete_node.node_id, e);
+            StatusCode::GATEWAY_TIMEOUT
+        }
     }
 
 }

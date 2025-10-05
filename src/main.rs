@@ -416,7 +416,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .merge(test_routes)
                 .route("/setup", get(setup::get_setup))
                 .route("/setup", post(setup::post_setup))
-                .route("/setup", put(setup::put_setup))
+                .route("/setup", put(setup::put_join_bootstrap))
                 .route("/interfaces", get(interfaces::get_interfaces))
                 .route("/rpc/latency-server", get(metrics::routes::get_latency_server))
                 .route("/rpc/get-remote-latency", get(metrics::routes::get_remote_latency_handler))

@@ -11,7 +11,7 @@ pub fn get_users(
                 Ok(User {
                     user_id: row.get(0)?,
                     username: row.get(1)?,
-                    password: row.get(2)?,
+                    password_hash: row.get(2)?,
                     pubkey: row.get(3)?,
                     x25519_pubkey: row.get(4)?
                 })
@@ -48,7 +48,7 @@ pub fn get_user_by_username(
                 let user = User {
                     user_id: row.get(0).map_err(|_| DatabaseError::RecallError)?,
                     username: row.get(1).map_err(|_| DatabaseError::RecallError)?,
-                    password: row.get(2).map_err(|_| DatabaseError::RecallError)?,
+                    password_hash: row.get(2).map_err(|_| DatabaseError::RecallError)?,
                     pubkey: row.get(3).map_err(|_| DatabaseError::RecallError)?,
                     x25519_pubkey: row.get(4).map_err(|_| DatabaseError::RecallError)?
                 };
@@ -77,7 +77,7 @@ pub fn get_user_by_userid(
                 let user = User {
                     user_id: row.get(0).map_err(|_| DatabaseError::RecallError)?,
                     username: row.get(1).map_err(|_| DatabaseError::RecallError)?,
-                    password: row.get(2).map_err(|_| DatabaseError::RecallError)?,
+                    password_hash: row.get(2).map_err(|_| DatabaseError::RecallError)?,
                     pubkey: row.get(3).map_err(|_| DatabaseError::RecallError)?,
                     x25519_pubkey: row.get(4).map_err(|_| DatabaseError::RecallError)?
                 };
@@ -90,43 +90,56 @@ pub fn get_user_by_userid(
     }
 }
 
+/// Core user insertion logic - operates within provided transaction for atomicity
+/// Returns the assigned user_id
+/// Password must already be hashed (use User::new_with_password at input boundaries)
+pub fn insert_user_tx(
+    tx: &duckdb::Transaction,
+    user: User,
+) -> Result<i32, DatabaseError> {
+    let next_id = tx.query_row(
+        "SELECT next_id FROM sequences WHERE name = 'users'",
+        [],
+        |row| row.get::<_, i32>(0)
+    ).map_err(|_| DatabaseError::RecallError)?;
+
+    // Password already hashed at input boundary - just store it
+    tx.execute(
+        "INSERT INTO users (user_id, username, password_hash, pubkey, x25519_pubkey) VALUES (?, ?, ?, ?, ?)",
+        params![next_id, user.username, user.password_hash, user.pubkey, user.x25519_pubkey]
+    ).map_err(|_| DatabaseError::InsertError)?;
+
+    // Update the sequence for next user
+    tx.execute(
+        "UPDATE sequences SET next_id = next_id + 1 WHERE name = 'users'",
+        []
+    ).map_err(|_| DatabaseError::InsertError)?;
+
+    Ok(next_id)
+}
+
+/// Wrapper that manages connection and transaction - for backward compatibility
 pub fn insert_user(
     db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
-    mut user: User,
+    user: User,
     execute: bool,
 ) -> Result<(), DatabaseError> {
 
     match db_connection {
         Ok(mut db_lock) => {
             let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
-            let next_id = tx.query_row(
-                "SELECT next_id FROM sequences WHERE name = 'users'",
-                [],
-                |row| row.get::<_, i32>(0)
-            ).map_err(|_| DatabaseError::RecallError)?;
 
-            let password_hash = user.password_hash().map_err(|_| DatabaseError::ProcessingError)?;
+            let user_id = insert_user_tx(&tx, user)?;
 
-            tx.execute(
-                "INSERT INTO users (user_id, username, password_hash, pubkey, x25519_pubkey) VALUES (?, ?, ?, ?, ?)",
-                params![next_id, user.username, password_hash, user.pubkey, user.x25519_pubkey]
-            ).map_err(|_| DatabaseError::InsertError)?;
-            
-            // Update the sequence for next user
-            tx.execute(
-                "UPDATE sequences SET next_id = next_id + 1 WHERE name = 'users'",
-                []
-            ).map_err(|_| DatabaseError::InsertError)?;
-            
             // Commit or rollback based on execute flag
             if execute {
                 tx.commit().map_err(|_| DatabaseError::InsertError)?;
-                tracing::info!("Successfully inserted user {}", next_id);
+                tracing::info!("Successfully inserted user {}", user_id);
             } else {
                 tx.rollback().map_err(|_| DatabaseError::LockError)?;
-                tracing::debug!("User {} insertion validated successfully (rolled back)", next_id);
+                tracing::debug!("User {} insertion validated successfully (rolled back)", user_id);
             }
-            
+
             Ok(())
         },
         Err(_) => Err(DatabaseError::LockError),

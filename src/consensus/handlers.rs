@@ -1,7 +1,14 @@
 use crate::{
-    db::{DatabaseError, consensus::{activate_validator, is_node_active, get_current_consensus_height}},
+    db::{
+        DatabaseError,
+        consensus::{activate_validator, is_node_active, get_current_consensus_height},
+        users::insert_user_tx,
+        nodes::insert_node_tx,
+        setup::initialize_sequences_tx,
+    },
     handlers::{HandlerResult, TransactionHandler},
     consensus::types::Transaction,
+    types::{User, Node},
     AppState,
 };
 use serde::{Deserialize, Serialize};
@@ -128,4 +135,145 @@ impl TransactionHandler for ValidatorActivationHandler {
 
 inventory::submit! {
     &ValidatorActivationHandler as &dyn TransactionHandler
+}
+
+// ============================================================================
+// Genesis Handler - Creates initial network state from genesis transaction
+// ============================================================================
+//
+// The genesis handler initializes a new HopNet network by processing the
+// genesis transaction embedded in the genesis block (height 0). This handler
+// is called in two contexts:
+//
+// 1. Initial network creation (post_initial_setup):
+//    - Creates genesis transaction with initial user and node
+//    - Processes it to initialize sequences and create first validator
+//
+// 2. New node bootstrap (catch-up):
+//    - New nodes replay the genesis transaction from the genesis block
+//    - Builds identical initial state without separate checkpoint sync
+//
+// Security: Genesis handler validates it's only called once (checks sequences
+// table is empty). Attempting to process genesis on initialized database fails.
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct GenesisPayload {
+    pub user: User,
+    pub node: Node,
+}
+
+pub struct InsertGenesisHandler;
+
+impl TransactionHandler for InsertGenesisHandler {
+    fn name(&self) -> &'static str { "insert_genesis" }
+
+    fn process(&self, state: &AppState, tx: &Transaction, execute: bool) -> HandlerResult {
+        tracing::debug!("InsertGenesisHandler: Starting (execute={})", execute);
+
+        // Decode genesis payload
+        let (genesis_data, _) = bincode::serde::decode_from_slice::<GenesisPayload, _>(
+            &tx.rpc.payload,
+            bincode::config::standard()
+        ).map_err(|e| {
+            tracing::error!("InsertGenesisHandler: Failed to decode genesis payload: {:?}", e);
+            DatabaseError::InvalidPayload
+        })?;
+        tracing::debug!("InsertGenesisHandler: Decoded genesis payload");
+
+        // Get database connection and transaction immediately
+        let mut conn = state.db_pool.get().map_err(|e| {
+            tracing::error!("InsertGenesisHandler: Failed to get DB connection: {:?}", e);
+            DatabaseError::LockError
+        })?;
+        tracing::debug!("InsertGenesisHandler: Got DB connection");
+
+        let tx_db = conn.transaction().map_err(|e| {
+            tracing::error!("InsertGenesisHandler: Failed to start transaction: {:?}", e);
+            DatabaseError::LockError
+        })?;
+        tracing::debug!("InsertGenesisHandler: Started transaction");
+
+        // Safety check: Only allow genesis handler at height 0
+        // Check if sequences already exist - if so, genesis already processed
+        // Fail if query fails (don't proceed with unknown database state)
+        tracing::debug!("InsertGenesisHandler: Checking if sequences exist");
+        let existing_sequences: i32 = tx_db.query_row(
+            "SELECT COUNT(*) FROM sequences",
+            [],
+            |row| row.get(0)
+        ).map_err(|e| {
+            tracing::error!("InsertGenesisHandler: Failed to query sequences: {:?}", e);
+            DatabaseError::RecallError
+        })?;
+        tracing::debug!("InsertGenesisHandler: Found {} existing sequences", existing_sequences);
+
+        if existing_sequences > 0 {
+            tracing::error!(
+                "insert_genesis called on already-initialized database (sequences exist: {})",
+                existing_sequences
+            );
+            return Err(DatabaseError::ProcessingError);
+        }
+
+        // === ALL LOGIC OUTSIDE EXECUTE FLAG ===
+        // Genesis has no validation - it's the fiat root of trust
+
+        // 1. Initialize sequences
+        tracing::debug!("InsertGenesisHandler: Initializing sequences");
+        initialize_sequences_tx(&tx_db).map_err(|e| {
+            tracing::error!("InsertGenesisHandler: Failed to initialize sequences: {:?}", e);
+            e
+        })?;
+        tracing::debug!("InsertGenesisHandler: Initialized sequences");
+
+        // 2. Insert user (returns user_id=0)
+        tracing::debug!("InsertGenesisHandler: Inserting user");
+        let user_id = insert_user_tx(&tx_db, genesis_data.user).map_err(|e| {
+            tracing::error!("InsertGenesisHandler: Failed to insert user: {:?}", e);
+            e
+        })?;
+        tracing::debug!("InsertGenesisHandler: Inserted user with id={}", user_id);
+
+        // 3. Insert node (returns node_id=0)
+        tracing::debug!("InsertGenesisHandler: Inserting node");
+        let node_id = insert_node_tx(&tx_db, genesis_data.node).map_err(|e| {
+            tracing::error!("InsertGenesisHandler: Failed to insert node: {:?}", e);
+            e
+        })?;
+        tracing::debug!("InsertGenesisHandler: Inserted node with id={}", node_id);
+
+        // 4. Activate genesis validator (special case - only for genesis)
+        // Uses same activate_validator function as normal activation for consistency
+        tracing::debug!("InsertGenesisHandler: Activating validator");
+        activate_validator(&tx_db, node_id, 0).map_err(|e| {
+            tracing::error!("InsertGenesisHandler: Failed to activate validator: {:?}", e);
+            e
+        })?;
+        tracing::debug!("InsertGenesisHandler: Activated validator");
+
+        // === EXECUTION PHASE ===
+        if execute {
+            tracing::info!(
+                "Genesis initialized: user_id={}, node_id={} (validator active at height 0)",
+                user_id,
+                node_id
+            );
+            tracing::debug!("InsertGenesisHandler: Committing transaction");
+            tx_db.commit().map_err(|e| {
+                tracing::error!("InsertGenesisHandler: Failed to commit transaction: {:?}", e);
+                DatabaseError::InsertError
+            })?;
+            tracing::debug!("InsertGenesisHandler: Committed transaction");
+        } else {
+            // Validation phase - genesis always valid, rollback
+            tracing::debug!("Genesis handler validated successfully (rolled back)");
+        }
+
+        tracing::debug!("InsertGenesisHandler: Completed successfully");
+        Ok(())
+    }
+}
+
+inventory::submit! {
+    &InsertGenesisHandler as &dyn TransactionHandler
 }

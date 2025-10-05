@@ -179,49 +179,58 @@ This refactor migrates from checkpoint-based node synchronization to consensus c
 ### Requirements
 
 #### Node Join Information Structure
-- [ ] Define structure containing all information needed for new node to bootstrap
-- [ ] Must include assigned node ID, user ID, and user keys
-- [ ] Must include current network height at time of registration
-- [ ] Must include list of all current active validators (for fetching catch-up data)
-- [ ] Replaces old checkpoint sync structure entirely
+- [x] Define structure containing all information needed for new node to bootstrap
+- [x] Must include assigned node ID, user ID, and user keys
+- [x] Must include list of all current active validators (for fetching catch-up data)
+- [x] Replaces old checkpoint sync structure entirely
 
 #### Sequences Initialization
-- [ ] Extract sequence initialization into reusable function
-- [ ] Initialize all sequences to 0 (nodes, users)
-- [ ] Use same function for both network creation and node joining
-- [ ] Ensures new nodes start with identical sequence state before transaction replay
+- [x] Extract sequence initialization into reusable function (`initialize_sequences_tx`)
+- [x] Initialize all sequences to 0 (nodes, users)
+- [x] Used in genesis handler for network creation
+- [x] New nodes get sequences via genesis transaction replay (not direct initialization)
 
 #### Database Initialization for New Nodes
-- [ ] Initialize this_node table with node ID, private keys, view 0
-- [ ] Initialize sequences table (both nodes and users to 0)
-- [ ] Do NOT initialize any consensus state (blocks, QCs, validators) - comes from catch-up
-- [ ] Set up connection pool and app state
+- [x] Initialize this_node table with node ID, private keys, view 0 (`initialize_joining_node`)
+- [x] Do NOT initialize sequences table - comes from genesis transaction replay
+- [x] Do NOT initialize any consensus state (blocks, QCs, validators) - comes from catch-up
+- [x] Set up connection pool and app state in `put_join_bootstrap`
 
 #### Bootstrap Catch-Up Process
-- [ ] Perform catch-up with convergence from view 0 to current height
-- [ ] Pass bootstrap validators list to catch-up for data fetching
-- [ ] Genesis block (view 0) inserted without validation (trust coordinator)
-- [ ] All subsequent views validated normally
-- [ ] As catch-up progresses, newly-inserted validators available for querying
+- [x] Perform catch-up with convergence from view 0 to current height
+- [x] Pass bootstrap validators list to catch-up for data fetching
+- [x] Genesis block (view 0) inserted and processed (genesis bypass in `get_current_consensus_height`)
+- [x] All subsequent views validated normally
+- [x] As catch-up progresses, newly-inserted validators available for querying
 
 #### Activation Request After Bootstrap
 - [ ] After catch-up completes, verify node is at current height
 - [ ] Submit activation request transaction
 - [ ] Wait for activation to be processed through consensus
 - [ ] Return success to coordinator
+**Note**: Automatic activation handled by existing timeout detection job, not implemented in Phase 4
 
 #### Coordinator Changes
-- [ ] Keep existing consensus submission for node registration
-- [ ] Keep existing polling for commit confirmation
-- [ ] Replace sync dump generation with join info structure creation
-- [ ] Include all active validators in join info (exhaustive list for redundancy)
-- [ ] Send join info to new node via PUT request
+- [x] Keep existing consensus submission for node registration
+- [x] Keep existing polling for commit confirmation
+- [x] Replace sync dump generation with join info structure creation
+- [x] Include all active validators in join info (exhaustive list for redundancy)
+- [x] Send join info to new node via PUT request
 
 #### Cleanup
-- [ ] Remove old sync dump generation function
-- [ ] Remove old sync setup object structure definition
-- [ ] Remove old join setup database insertion function
-- [ ] Update API route to accept new join info structure
+- [x] Remove old sync dump generation function (`get_sync_dump`)
+- [x] Remove old sync setup object structure definitions (`SyncSetupObject`, `ThisNode`, `Validator`, `TimeoutSyncCertificate`)
+- [x] Remove old join setup database insertion function (`put_join_setup`)
+- [x] Update API route to accept new join info structure (`put_join_bootstrap`)
+
+#### Genesis Handler Implementation (Additional Work)
+- [x] Create `GenesisPayload` structure containing initial user and node
+- [x] Implement `InsertGenesisHandler` transaction handler
+- [x] Refactor `post_initial_setup` to create genesis transaction instead of direct DB inserts
+- [x] Create transaction-based DB functions (`insert_user_tx`, `insert_node_tx`, `initialize_sequences_tx`)
+- [x] Add genesis bypass to `get_current_consensus_height` (returns 0 when `this_node` doesn't exist)
+- [x] Resolve foreign key dependency ordering (block → handler → this_node+QCs)
+- [x] Security: Rename `User.password` to `User.password_hash`, move hashing to input layer
 
 ### Testing Criteria
 - [ ] Add new node to single-node network, verify catches up from genesis
@@ -234,6 +243,111 @@ This refactor migrates from checkpoint-based node synchronization to consensus c
 - [ ] Long bootstrap test: Create 5000-view chain, add new node, verify success
 - [ ] Test bootstrap failure scenarios (all validators offline, network unreachable)
 - [ ] Verify node activation occurs automatically after bootstrap completes
+
+---
+
+## Phase 5: In-Chain Schema Evolution [Future Enhancement]
+
+**Goal**: Enable schema migrations and handler versioning through consensus, allowing deterministic replay across software versions.
+
+**Why Future**: Requires mature blockchain infrastructure from Phases 1-4. Significant complexity with unclear immediate ROI, but becomes critical for long-lived networks spanning multiple software versions.
+
+**When to Implement**: After Phase 4 is stable and network has operated for extended period. Triggered by first need for breaking schema/handler change.
+
+### Problem Statement
+
+**Current Limitation**: Schema exists outside consensus, created by migrations on startup.
+
+**Long-Term Issue**: Network created in HopNet v1 with v1 schema. Upgraded to v2 with different schema. New node joins:
+- Runs migrations → creates v2 schema
+- Catches up from genesis → v1 transactions may fail with v2 schema
+- Cannot deterministically replay history
+
+**Vision**: Schema and handler versions embedded in blockchain. New nodes replay exact execution path of original nodes.
+
+### Requirements
+
+#### Schema as Genesis Data
+- [ ] Add `schema_ddl: Vec<String>` to GenesisPayload structure
+- [ ] Store DDL statements in genesis transaction
+- [ ] Apply schema from genesis during catch-up (before processing transactions)
+- [ ] Skip migration system for consensus-managed tables when schema present
+
+#### Versioned Transaction Handlers
+- [ ] Add `version()` method to TransactionHandler trait
+- [ ] Support multiple handler versions registered simultaneously
+- [ ] Handler naming: `insert_node_v1`, `insert_node_v2`, etc.
+- [ ] Maintain all historical handler versions (cannot delete old code)
+- [ ] Each handler version coupled to specific schema version
+
+#### Schema Migration Transaction Type
+- [ ] Create `SchemaMigrationHandler` for in-chain migrations
+- [ ] Payload contains: DDL statements, target schema version, migration logic
+- [ ] Authorization: requires supermajority consensus (configurable threshold)
+- [ ] Validation: test migration on copy of database before voting
+- [ ] Execute: apply DDL, update schema version metadata
+
+#### Height-Aware Transaction Dispatch
+- [ ] Track schema version at each consensus height
+- [ ] Dispatch transactions to handler version matching height's schema version
+- [ ] Function: `get_schema_version_at_height(height: i32) -> u32`
+- [ ] Function: `get_handler_versioned(name: &str, schema_version: u32) -> Handler`
+- [ ] Metadata table: `schema_versions (effective_height, version, ddl_hash)`
+
+#### Deterministic Replay Infrastructure
+- [ ] Catch-up applies schema from genesis (view 0)
+- [ ] Schema migration transactions update active schema version
+- [ ] Subsequent transactions dispatched to version-appropriate handlers
+- [ ] Audit capability: replay any transaction in original execution context
+
+#### Backward Compatibility
+- [ ] Networks without genesis schema use migration system (Phase 4 compatibility)
+- [ ] GenesisPayload.schema_ddl optional (None = external migrations)
+- [ ] Gradual migration path from Phase 4 to Phase 5
+
+### Testing Criteria
+- [ ] Create v1 network, run for 100 views
+- [ ] Submit schema migration to v2 via consensus
+- [ ] Continue running with v2 for 100 views
+- [ ] New node joins, catches up from genesis
+- [ ] Verify views 0-99 processed with v1 handlers
+- [ ] Verify view 100 applied schema migration
+- [ ] Verify views 101-200 processed with v2 handlers
+- [ ] Verify final state matches existing nodes
+- [ ] Test handler version mismatch rejection
+- [ ] Test unauthorized schema migration rejection
+- [ ] Test failed migration rollback
+
+### Design Considerations
+
+**Benefits**:
+- True deterministic replay across software versions
+- Consensus-approved migrations (network agreement required)
+- Historical audit capability (replay in original context)
+- Single source of truth (entire state derivable from blockchain)
+- Future-proof architecture for long-lived networks
+
+**Tradeoffs**:
+- Significant implementation complexity
+- Cannot delete old handler code (technical debt accumulation)
+- Slower iteration velocity (schema changes require consensus)
+- Testing burden (must test all version combinations)
+- Migration coordination overhead
+
+**Phasing Strategy**:
+- Phase 4 structures genesis handler to accommodate future schema inclusion
+- GenesisPayload.schema_ddl field added but unused initially
+- TransactionHandler.version() method reserved but not yet enforced
+- Enables incremental migration when business case justifies complexity
+
+### Files Modified
+- `src/handlers.rs` - Add version() to TransactionHandler trait
+- `src/consensus/handlers.rs` - Add SchemaMigrationHandler
+- `src/consensus/functions.rs` - Versioned handler dispatch
+- `src/consensus/types.rs` - GenesisPayload.schema_ddl field
+- `src/db/setup.rs` - Schema application from genesis
+- `src/db/migrations.rs` - Conditional migration skipping
+- `src/db/schema.rs` - Schema version tracking metadata (new file)
 
 ---
 
@@ -291,11 +405,20 @@ This refactor migrates from checkpoint-based node synchronization to consensus c
 - Extensive integration testing required
 - Consider testing in staging environment with real network conditions
 
+**Phase 5: HIGH RISK** - Fundamental architectural change (future)
+- Adds significant complexity to transaction processing and dispatch
+- Breaking changes to core abstractions (TransactionHandler trait)
+- Handler versioning creates permanent technical debt (cannot delete old code)
+- Schema migrations via consensus introduce new failure modes
+- Requires comprehensive version compatibility testing matrix
+- Should only implement when business case is clear (multi-year network lifespan)
+- Consider alternatives: hard forks, network regenesis for major upgrades
+
 ---
 
 ## Success Criteria
 
-After completion:
+**Core Refactor (Phases 1-4)** - After completion:
 - [ ] No dual synchronization paths (single source of truth: blockchain)
 - [ ] New nodes can bootstrap from genesis reliably
 - [ ] Long catch-ups (1000+ views) complete successfully
@@ -305,13 +428,30 @@ After completion:
 - [ ] No manual intervention required for node addition
 - [ ] Checkpoint sync code completely removed
 
+**Future Enhancement (Phase 5)** - Optional, implement when needed:
+- [ ] Schema evolution through consensus
+- [ ] Deterministic replay across software versions
+- [ ] Handler versioning infrastructure
+- [ ] Historical transactions executable in original context
+
 ## Rollback Plan
 
 If critical issues discovered after deployment:
-- Phase 1: Revert catch-up changes, restore "warn and continue" behavior (temporary - bug still exists)
-- Phase 2: Remove convergence wrapper, use single-iteration catch-up
-- Phase 3:
-  - Revert dynamic threshold changes, restore hardcoded 2/3+1 for QC/TC verification
-  - Disable automatic activation requests, manual activation via DB
-  - Note: reverting thresholds breaks small networks (1-6 validators cannot reach quorum)
-- Phase 4: Cannot easily rollback - would require restoring checkpoint sync code from git history
+
+**Phase 1**: Revert catch-up changes, restore "warn and continue" behavior (temporary - bug still exists)
+
+**Phase 2**: Remove convergence wrapper, use single-iteration catch-up
+
+**Phase 3**:
+- Revert dynamic threshold changes, restore hardcoded 2/3+1 for QC/TC verification
+- Disable automatic activation requests, manual activation via DB
+- Note: reverting thresholds breaks small networks (1-6 validators cannot reach quorum)
+
+**Phase 4**: Cannot easily rollback - would require restoring checkpoint sync code from git history
+
+**Phase 5**: Extremely difficult to rollback once deployed
+- New nodes have already replayed with versioned handlers
+- Schema migrations are on-chain and irreversible
+- Rollback requires network-wide coordination and potential hard fork
+- Alternative: continue forward with fixes rather than reverting
+- Prevention better than cure: extensive testing before deployment

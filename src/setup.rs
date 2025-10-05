@@ -19,52 +19,8 @@ use crate::{
 use crate::db::{DataRecord, FragmentHash, Inode};
 use crate::types::{Blake3Hash, Node};
 
-#[derive(Serialize, Deserialize, Debug)]
-pub struct ThisNode {
-    pub node_id: i32,
-    pub current_phase: ConsensusPhase,
-    pub current_view: i32,
-    pub prepared_block_hash: Option<Blake3Hash>,
-    pub committed_block_hash: Blake3Hash,
-    pub highest_qc_block_hash: Blake3Hash
-}
-
 // Re-export from common crate for API consistency
 pub use hopnet_common::setup::InitialSetupPayload;
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct SyncSetupObject {
-    pub users: Vec<User>,
-    pub nodes: Vec<Node>,
-    pub sequences: Vec<Sequence>,
-    pub blocks: Vec<Block>,
-    pub validators: Vec<Validator>,
-    pub quorum_certificates: Vec<QuorumCertificate>,
-    pub timeout_certificates: Vec<TimeoutSyncCertificate>,
-    pub data_blocks: Vec<DataRecord>,
-    pub fragment_hashes: Vec<FragmentHash>,
-    pub file_access_entries: Vec<crate::db::types::FileAccess>,
-    pub inodes: Vec<Inode>,
-    pub takeouts: Vec<crate::db::takeout::TakeoutPayload>,
-    pub yournode: ThisNode,
-    pub user_privkey: PrivKey
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct Validator {
-    pub effective_height: i32,
-    pub node_id: i32,
-    pub is_active: bool
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct TimeoutSyncCertificate {
-    pub view_number: i32,
-    pub highest_qc_view: i32,
-    pub highest_qc_phase: ConsensusPhase,
-    pub highest_qc_block_hash: Blake3Hash,
-    pub signatures: VoteSignMessages,
-}
 
 pub async fn get_setup(
     State(app_state): State<AppState>,
@@ -75,100 +31,91 @@ pub async fn get_setup(
     }
 }
 
-// join a network, it's put by another device
-pub async fn put_setup(
+/// New catch-up based join handler - receives JoinInfo and bootstraps via catch-up
+/// Returns immediately (202 ACCEPTED) while catch-up runs in background
+pub async fn put_join_bootstrap(
     State(app_state): State<AppState>,
-    Json(payload): Json<SyncSetupObject>
+    Json(join_info): Json<crate::types::JoinInfo>
 ) -> Result<StatusCode, StatusCode> {
-    tracing::debug!("PUT /setup called - starting node sync process");
-    
-    // Extract user keys from payload
-    let user_private_key = payload.user_privkey.clone();
-    tracing::debug!("Extracted user private key from payload");
-    
-    // Find the corresponding user's public key and user_id
-    // Assuming the user's private key corresponds to the first user in the payload
-    let first_user = payload.users.get(0)
-        .ok_or_else(|| {
-            tracing::error!("No users found in sync payload");
-            StatusCode::BAD_REQUEST
-        })?;
-    let user_public_key = first_user.pubkey;
-    let user_id = first_user.user_id;
-    tracing::debug!("Found first user: id={}, pubkey={}", user_id, user_public_key.to_hex());
-    
+    tracing::info!(
+        "PUT /setup (catch-up based) called - joining as node_id={}, user_id={}",
+        join_info.node_id,
+        join_info.user_id
+    );
+
+    // Derive user public key from private key
+    let user_pub_key = PubKey(join_info.user_privkey.verifying_key());
+
+    // Set up UserKeys in app state
     let user_keys = UserKeys {
-        private_key: user_private_key,
-        public_key: user_public_key,
+        private_key: join_info.user_privkey.clone(),
+        public_key: user_pub_key,
     };
-    
-    // Set user keys and user_id in app state (can only be done once)
+
     app_state.user_keys.set(user_keys)
         .map_err(|_| {
             tracing::error!("Failed to set user keys in app state - already initialized");
             StatusCode::CONFLICT
-        })?; // Already initialized
-    tracing::debug!("Successfully set user keys in app state");
-    
-    app_state.user_id.set(user_id)
-        .map_err(|_| {
-            tracing::error!("Failed to set user_id in app state - already initialized");
-            StatusCode::CONFLICT
-        })?; // Already initialized
-    tracing::debug!("Successfully set user_id={} in app state", user_id);
-    
-    // Set node_id from the payload
-    app_state.node_id.set(payload.yournode.node_id)
-        .map_err(|_| {
-            tracing::error!("Failed to set node_id in app state - already initialized");
-            StatusCode::CONFLICT
-        })?; // Already initialized
-    tracing::debug!("Successfully set node_id={} in app state", payload.yournode.node_id);
-    
+        })?;
+
+    // Set user_id and node_id in app state
+    app_state.user_id.set(join_info.user_id)
+        .map_err(|_| StatusCode::CONFLICT)?;
+
+    app_state.node_id.set(join_info.node_id)
+        .map_err(|_| StatusCode::CONFLICT)?;
+
     // Initialize SIV keys from user private key
-    app_state.initialize_siv_keys().map_err(|e| {
-        tracing::error!("Failed to initialize SIV keys: {:?}", e);
+    app_state.initialize_siv_keys()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Initialize this_node table with identity and keys
+    // Sequences, users, nodes, validators will come from genesis replay
+    setup::initialize_joining_node(
+        app_state.db_pool.get(),
+        join_info.clone(),
+        app_state.private_key.clone(),
+    ).map_err(|e| {
+        tracing::error!("Failed to initialize joining node database: {:?}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    tracing::debug!("Successfully initialized SIV keys");
-    
-    tracing::debug!("Starting database setup with {} users, {} nodes, {} blocks", 
-                   payload.users.len(), payload.nodes.len(), payload.blocks.len());
-    
-    // Capture username before moving payload
-    #[cfg(target_os = "macos")]
-    let username_for_fileprovider = payload.users.first().map(|u| u.username.clone());
-    
-    match setup::put_join_setup(app_state.db_pool.get(), payload, app_state.private_key) {
-        Ok(()) => {
-            tracing::info!("PUT /setup completed successfully - node sync finished");
-            
-            // Register FileProvider domain with macOS using the first user's username
-            // Skip registration in test mode since we test FileProvider functionality directly
-            #[cfg(target_os = "macos")]
-            {
-                if !app_state.test_mode {
-                    if let Some(username) = username_for_fileprovider {
-                        tokio::spawn(async move {
-                            if let Err(e) = crate::fileprovider::domain::register_fileprovider_domain(&username).await {
-                                tracing::warn!("Failed to register FileProvider domain: {}", e);
-                            } else {
-                                tracing::info!("FileProvider domain registration completed");
-                            }
-                        });
-                    }
-                } else {
-                    tracing::info!("Skipping FileProvider domain registration in test mode");
-                }
+
+    // Spawn catch-up as background task
+    let app_state_clone = app_state.clone();
+    let join_info_clone = join_info.clone();
+    tokio::spawn(async move {
+        tracing::info!(
+            "Starting background catch-up from view 0 using {} bootstrap validators",
+            join_info_clone.bootstrap_validators.len()
+        );
+
+        match crate::consensus::routes::perform_catch_up_with_convergence(
+            &app_state_clone,
+            Some(&join_info_clone.bootstrap_validators)
+        ).await {
+            Ok(_) => {
+                tracing::info!(
+                    "Catch-up completed successfully for node {}. Activation will occur automatically on next consensus cycle.",
+                    join_info_clone.node_id
+                );
             }
-            
-            Ok(StatusCode::CREATED)
-        },
-        Err(e) => {
-            tracing::error!("Database setup failed during PUT /setup: {:?}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err(e) => {
+                tracing::error!(
+                    "Catch-up failed for node {}: {:?}. Node will remain inactive.",
+                    join_info_clone.node_id,
+                    e
+                );
+            }
         }
-    }
+    });
+
+    tracing::info!(
+        "Node {} setup initiated, catch-up running in background",
+        join_info.node_id
+    );
+
+    // Return 202 ACCEPTED - request accepted, processing asynchronously
+    Ok(StatusCode::ACCEPTED)
 }
 
 // full setup from scratch
@@ -197,13 +144,13 @@ pub async fn post_setup(
     #[cfg(target_os = "macos")]
     let username_for_fileprovider = payload.username.clone();
     
-    let user = User {
-        user_id: 0, // Will be generated by the database
-        username: payload.username,
-        password: payload.password,
-        pubkey: user_keys.public_key,
+    let user = User::new_with_password(
+        0, // Will be generated by the database
+        payload.username,
+        payload.password,
+        user_keys.public_key,
         x25519_pubkey,
-    };
+    ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let node = Node {
         node_id: 0, // Will be generated by the database
@@ -214,7 +161,7 @@ pub async fn post_setup(
         pubkey: app_state.public_key, // Placeholder, will use app_state.public_key
     };
 
-    match setup::post_initial_setup(app_state.db_pool.get(), user, node, app_state.public_key, app_state.private_key, user_keys.private_key) {
+    match setup::post_initial_setup(&app_state, user, node, user_keys.private_key) {
         Ok((user_id, node_id)) => {
             // Set the generated user_id and node_id in app state
             app_state.user_id.set(user_id)

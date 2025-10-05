@@ -707,16 +707,19 @@ pub fn get_view_consensus_data(
 /// Get the current consensus height (height of the committed block)
 /// This is used consistently across the system for modification tracking
 pub fn get_current_consensus_height(tx: &duckdb::Transaction) -> Result<i32, DatabaseError> {
-    let current_height: i32 = tx.query_row(
+    use duckdb::OptionalExt;
+
+    let current_height: Option<i32> = tx.query_row(
         "SELECT COALESCE(b.height, 0) as committed_height
          FROM this_node t
          LEFT JOIN blocks b ON t.committed_block_hash = b.block_hash
          WHERE t.internal_id = 1",
         [],
         |row| row.get(0)
-    ).map_err(|_| DatabaseError::RecallError)?;
-    
-    Ok(current_height)
+    ).optional().map_err(|_| DatabaseError::RecallError)?;
+
+    // Return 0 if this_node doesn't exist yet (genesis case)
+    Ok(current_height.unwrap_or(0))
 }
 
 /// Check if a node is active at a given height

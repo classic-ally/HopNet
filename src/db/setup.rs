@@ -24,295 +24,254 @@ pub fn get_initial_setup(
     }
 }
 
-pub fn post_initial_setup(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
-    mut user: User,
-    node: Node,
-    pubkey: PubKey,
-    privkey: PrivKey,
-    user_privkey: PrivKey
-) -> Result<(i32, i32), DatabaseError> {
-    match db_connection {
-        Ok(mut db_lock) => {
-            let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
-
-            // initialize counters
-            tx.execute_batch("
-                INSERT INTO sequences (name, next_id) VALUES ('users', 0);
-                INSERT INTO sequences (name, next_id) VALUES ('nodes', 0);
-            ").map_err(|_| DatabaseError::InsertError)?;
-
-            // compute user password
-            let password_hash = user.password_hash().map_err(|_| DatabaseError::ProcessingError)?;
-
-            // derive X25519 public key from user's private key
-            let x25519_pubkey = crate::auth::derive_x25519_pubkey_from_user(&user_privkey);
-
-            // insert the user first
-            let next_user_id = tx.query_row(
-                "SELECT next_id FROM sequences WHERE name = 'users'",
-                [],
-                |row| row.get::<_, i32>(0)
-            ).map_err(|_| DatabaseError::RecallError)?;
-            tx.execute(
-                "INSERT INTO users (user_id, username, password_hash, pubkey, x25519_pubkey) VALUES (?, ?, ?, ?, ?)",
-                params![next_user_id, user.username, password_hash, user.pubkey, x25519_pubkey]
-            ).map_err(|_| DatabaseError::InsertError)?;
-            // Update the sequence for next user
-            tx.execute(
-                "UPDATE sequences SET next_id = next_id + 1 WHERE name = 'users'",
-                []
-            ).map_err(|_| DatabaseError::InsertError)?;
-
-            // insert the node
-            let next_node_id = tx.query_row(
-                "SELECT next_id FROM sequences WHERE name = 'nodes'",
-                [],
-                |row| row.get::<_, i32>(0)
-            ).map_err(|_| DatabaseError::RecallError)?;
-            tx.execute(
-                "INSERT INTO nodes (node_id, name, ip_address, port, owner, pubkey) VALUES (?, ?, ?, ?, ?, ?)",
-                params![next_node_id, node.name, node.ip_address, node.port, next_user_id, pubkey]
-            ).map_err(|_| DatabaseError::InsertError)?;
-
-            // Update sequence
-            tx.execute(
-                "UPDATE sequences SET next_id = next_id + 1 WHERE name = 'nodes'", 
-                []
-            ).map_err(|_| DatabaseError::InsertError)?;
-
-            // create genesis block for database
-            let genesis_block = Block::new(
-                BlockData {
-                    height: 0,
-                    view_number: 0,
-                    parent_hash: None,
-                    transactions: None,
-                }
-            ).map_err(|_| DatabaseError::ProcessingError)?;
-
-            tx.execute(
-                "INSERT INTO blocks (block_hash, height, view_number) VALUES (?, ?, ?)",
-                params![genesis_block.block_hash, genesis_block.data.height, genesis_block.data.view_number]
-            ).map_err(|_| DatabaseError::InsertError)?;
-
-            // mark myself as a validator from view 0
-            tx.execute(
-                "INSERT INTO validators (effective_height, node_id, is_active) VALUES (?, ?, ?)",
-                params![0, next_node_id, true]
-            ).map_err(|_| DatabaseError::InsertError)?;
-
-            // create a quorum certificate for this block such that we always have a chain of QCs
-            // it will validate because at block height zero we are only validator
-            let signatures: Vec<VoteSignMessage> = Vec::new();
-
-            let genesis_qc_1 = QuorumCertificate::create(
-                &genesis_block,
-                ConsensusPhase::Propose,
-                next_node_id,
-                &privkey,
-                signatures.clone()
-            ).map_err(|_| DatabaseError::ProcessingError)?;
-
-            let genesis_qc_2 = QuorumCertificate::create(
-                &genesis_block,
-                ConsensusPhase::Lock,
-                next_node_id,
-                &privkey,
-                signatures
-            ).map_err(|_| DatabaseError::ProcessingError)?;
-
-            // Initialize this_node with genesis state (required before QC insertion)
-            tx.execute(
-                "INSERT INTO this_node (internal_id, node_id, privkey, current_view, current_phase, committed_block_hash, highest_qc_block_hash, user_privkey) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                params![1, next_node_id, privkey, 0, ConsensusPhase::Propose, genesis_block.block_hash, genesis_block.block_hash, user_privkey]
-            ).map_err(|_| DatabaseError::InsertError)?;
-
-            // Use insert_qc_tx to handle QC insertion and state transitions
-            super::consensus::insert_qc_tx(&tx, &genesis_qc_1)?;
-            super::consensus::insert_qc_tx(&tx, &genesis_qc_2)?;
-
-            // Commit the transaction
-            tx.commit().map_err(|_| DatabaseError::InsertError)?;
-            
-            tracing::info!("Successfully completed initial database setup for node {}", next_node_id);
-
-            Ok((next_user_id, next_node_id))
-
-        }
-        Err(_) => Err(DatabaseError::LockError)
-    }
+/// Initialize sequences to 0 - used by genesis block and network creation
+/// Operates within provided transaction for atomicity
+pub fn initialize_sequences_tx(tx: &duckdb::Transaction) -> Result<(), DatabaseError> {
+    tx.execute_batch("
+        INSERT INTO sequences (name, next_id) VALUES ('users', 0);
+        INSERT INTO sequences (name, next_id) VALUES ('nodes', 0);
+    ").map_err(|_| DatabaseError::InsertError)?;
+    Ok(())
 }
 
-pub fn put_join_setup(
+/// Initialize a new HopNet network by creating a genesis block with genesis transaction
+///
+/// This creates the initial network state by:
+/// 1. Creating a genesis transaction containing the initial user and node
+/// 2. Creating a genesis block (height 0) containing this transaction
+/// 3. Processing the transaction through the InsertGenesisHandler (initializes sequences, creates user/node, activates validator)
+/// 4. Creating genesis QCs for the block
+/// 5. Initializing this_node state
+///
+/// This approach ensures the genesis block contains transactions (not empty), allowing new nodes
+/// to bootstrap by replaying the genesis transaction through catch-up rather than requiring
+/// a separate checkpoint synchronization mechanism.
+pub fn post_initial_setup(
+    state: &crate::AppState,
+    user: User,
+    node: Node,
+    user_privkey: PrivKey
+) -> Result<(i32, i32), DatabaseError> {
+    use crate::consensus::handlers::GenesisPayload;
+    use crate::consensus::types::{Transaction, Transactions};
+
+    tracing::debug!("post_initial_setup: Starting genesis setup");
+
+    // Create genesis payload with user and node
+    let genesis_payload = GenesisPayload {
+        user: user.clone(),
+        node: node.clone(),
+    };
+    tracing::debug!("post_initial_setup: Created genesis payload");
+
+    // Encode the payload
+    let payload_bytes = bincode::serde::encode_to_vec(&genesis_payload, bincode::config::standard())
+        .map_err(|e| {
+            tracing::error!("post_initial_setup: Failed to encode genesis payload: {:?}", e);
+            DatabaseError::ProcessingError
+        })?;
+    tracing::debug!("post_initial_setup: Encoded payload ({} bytes)", payload_bytes.len());
+
+    // Create genesis transaction (signed by node)
+    let genesis_tx = Transaction::new(
+        "insert_genesis".to_string(),
+        payload_bytes,
+        0,  // Genesis node_id
+        &state.private_key
+    ).map_err(|e| {
+        tracing::error!("post_initial_setup: Failed to create genesis transaction: {:?}", e);
+        DatabaseError::ProcessingError
+    })?;
+    tracing::debug!("post_initial_setup: Created genesis transaction");
+
+    // Create genesis block with the transaction
+    let genesis_block = Block::new(
+        BlockData {
+            height: 0,
+            view_number: 0,
+            parent_hash: None,
+            transactions: Some(Transactions(vec![genesis_tx.clone()])),
+        }
+    ).map_err(|e| {
+        tracing::error!("post_initial_setup: Failed to create genesis block: {:?}", e);
+        DatabaseError::ProcessingError
+    })?;
+    tracing::debug!("post_initial_setup: Created genesis block with hash {:?}", genesis_block.block_hash);
+
+    // === TRANSACTION 1: Genesis block only ===
+    {
+        let mut conn = state.db_pool.get().map_err(|e| {
+            tracing::error!("post_initial_setup: Failed to get DB connection for block: {:?}", e);
+            DatabaseError::LockError
+        })?;
+        tracing::debug!("post_initial_setup: Got database connection for block");
+
+        let tx_db = conn.transaction().map_err(|e| {
+            tracing::error!("post_initial_setup: Failed to start transaction for block: {:?}", e);
+            DatabaseError::LockError
+        })?;
+        tracing::debug!("post_initial_setup: Started transaction for block");
+
+        // Insert genesis block
+        tx_db.execute(
+            "INSERT INTO blocks (block_hash, height, view_number, transactions) VALUES (?, ?, ?, ?)",
+            params![genesis_block.block_hash, genesis_block.data.height, genesis_block.data.view_number, genesis_block.data.transactions]
+        ).map_err(|e| {
+            tracing::error!("post_initial_setup: Failed to insert genesis block: {:?}", e);
+            DatabaseError::InsertError
+        })?;
+        tracing::debug!("post_initial_setup: Inserted genesis block into database");
+
+        // Commit block
+        tx_db.commit().map_err(|e| {
+            tracing::error!("post_initial_setup: Failed to commit genesis block: {:?}", e);
+            DatabaseError::InsertError
+        })?;
+        tracing::debug!("post_initial_setup: Committed genesis block");
+    }
+
+    // === PROCESS GENESIS TRANSACTION VIA HANDLER ===
+    // Handler can now see committed genesis block
+    // get_current_consensus_height returns 0 (genesis bypass - this_node doesn't exist yet)
+    // This will initialize sequences, insert user/node, activate validator
+    tracing::debug!("post_initial_setup: About to process genesis transaction via handler");
+    crate::consensus::functions::process_transaction(&genesis_tx, state, true).map_err(|e| {
+        tracing::error!("post_initial_setup: Handler failed to process genesis transaction: {:?}", e);
+        e
+    })?;
+    tracing::debug!("post_initial_setup: Handler completed successfully");
+
+    // === TRANSACTION 2: this_node + QCs (atomic) ===
+    // Now node_id=0 exists (created by handler), so this_node foreign key will work
+    {
+        let mut conn = state.db_pool.get().map_err(|e| {
+            tracing::error!("post_initial_setup: Failed to get DB connection for this_node+QCs: {:?}", e);
+            DatabaseError::LockError
+        })?;
+        tracing::debug!("post_initial_setup: Got database connection for this_node+QCs");
+
+        let tx_db = conn.transaction().map_err(|e| {
+            tracing::error!("post_initial_setup: Failed to start transaction for this_node+QCs: {:?}", e);
+            DatabaseError::LockError
+        })?;
+        tracing::debug!("post_initial_setup: Started transaction for this_node+QCs");
+
+        // Initialize this_node with genesis state
+        tracing::debug!("post_initial_setup: Inserting this_node entry");
+        tx_db.execute(
+            "INSERT INTO this_node (internal_id, node_id, privkey, current_view, current_phase, committed_block_hash, highest_qc_block_hash, user_privkey) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            params![1, 0, state.private_key, 0, ConsensusPhase::Propose, genesis_block.block_hash, genesis_block.block_hash, user_privkey]
+        ).map_err(|e| {
+            tracing::error!("post_initial_setup: Failed to insert this_node: {:?}", e);
+            DatabaseError::InsertError
+        })?;
+        tracing::debug!("post_initial_setup: Inserted this_node");
+
+        // Create quorum certificates for genesis block
+        let signatures: Vec<VoteSignMessage> = Vec::new();
+        tracing::debug!("post_initial_setup: Creating genesis QCs");
+
+        let genesis_qc_1 = QuorumCertificate::create(
+            &genesis_block,
+            ConsensusPhase::Propose,
+            0,  // node_id will be 0 for genesis
+            &state.private_key,
+            signatures.clone()
+        ).map_err(|e| {
+            tracing::error!("post_initial_setup: Failed to create genesis propose QC: {:?}", e);
+            DatabaseError::ProcessingError
+        })?;
+        tracing::debug!("post_initial_setup: Created propose QC");
+
+        let genesis_qc_2 = QuorumCertificate::create(
+            &genesis_block,
+            ConsensusPhase::Lock,
+            0,  // node_id will be 0 for genesis
+            &state.private_key,
+            signatures
+        ).map_err(|e| {
+            tracing::error!("post_initial_setup: Failed to create genesis lock QC: {:?}", e);
+            DatabaseError::ProcessingError
+        })?;
+        tracing::debug!("post_initial_setup: Created lock QC");
+
+        // Use insert_qc_tx to handle QC insertion and state transitions
+        tracing::debug!("post_initial_setup: Inserting propose QC");
+        super::consensus::insert_qc_tx(&tx_db, &genesis_qc_1).map_err(|e| {
+            tracing::error!("post_initial_setup: Failed to insert propose QC: {:?}", e);
+            e
+        })?;
+        tracing::debug!("post_initial_setup: Inserted propose QC");
+
+        tracing::debug!("post_initial_setup: Inserting lock QC");
+        super::consensus::insert_qc_tx(&tx_db, &genesis_qc_2).map_err(|e| {
+            tracing::error!("post_initial_setup: Failed to insert lock QC: {:?}", e);
+            e
+        })?;
+        tracing::debug!("post_initial_setup: Inserted lock QC");
+
+        // Commit this_node + QCs atomically
+        tracing::debug!("post_initial_setup: Committing this_node+QCs transaction");
+        tx_db.commit().map_err(|e| {
+            tracing::error!("post_initial_setup: Failed to commit this_node+QCs: {:?}", e);
+            DatabaseError::InsertError
+        })?;
+        tracing::debug!("post_initial_setup: Committed this_node+QCs");
+    }
+
+    tracing::info!("Successfully completed initial database setup for node 0");
+
+    Ok((0, 0))  // Genesis always creates user_id=0, node_id=0
+}
+
+/// Initialize a joining node's database for catch-up based bootstrap
+///
+/// This creates ONLY the this_node table entry with identity and keys.
+/// All other state (sequences, users, nodes, validators, blocks, QCs) comes from
+/// catch-up replay starting at genesis (view 0).
+///
+/// After this initialization, the node should:
+/// 1. Perform catch-up from view 0 to current_height
+/// 2. Submit activation request after catching up
+pub fn initialize_joining_node(
     db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
-    setupobj: crate::setup::SyncSetupObject,
-    privkey: PrivKey
+    join_info: crate::types::JoinInfo,
+    node_privkey: PrivKey,
 ) -> Result<(), DatabaseError> {
     match db_connection {
-        Ok(mut db_lock) => {
-            tracing::debug!("Database connection acquired for put_join_setup");
-            // in this case we need to write the list of nodes and users to the DB
-            let tx = db_lock.transaction().map_err(|e| {
-                tracing::error!("Failed to start transaction for put_join_setup: {:?}", e);
-                DatabaseError::LockError
-            })?;
-            tracing::debug!("Database transaction started successfully");
-
-            tracing::debug!("Inserting {} users", setupobj.users.len());
-            for user in setupobj.users {
-                tx.execute(
-                    "INSERT INTO users (user_id, username, password_hash, pubkey, x25519_pubkey) VALUES (?, ?, ?, ?, ?)",
-                    params![user.user_id, user.username, user.password, user.pubkey, user.x25519_pubkey]
-                ).map_err(|e| {
-                    tracing::error!("Failed to insert user {}: {:?}", user.user_id, e);
-                    DatabaseError::InsertError
-                })?;
-            }
-
-            tracing::debug!("Inserting {} nodes", setupobj.nodes.len());
-            for node in setupobj.nodes {
-                tx.execute(
-                    "INSERT INTO nodes (node_id, name, ip_address, port, owner, pubkey) VALUES (?, ?, ?, ?, ?, ?)",
-                    params![node.node_id, node.name, node.ip_address, node.port, node.owner, node.pubkey]
-                ).map_err(|e| {
-                    tracing::error!("Failed to insert node {} ({}:{}): {:?}", node.node_id, node.ip_address, node.port, e);
-                    DatabaseError::InsertError
-                })?;
-            }
-
-            tracing::debug!("Inserting {} sequences", setupobj.sequences.len());
-            for sequence in setupobj.sequences {
-                tx.execute(
-                    "INSERT INTO sequences (name, next_id) VALUES (?, ?)",
-                    params![sequence.name, sequence.next_id]
-                ).map_err(|_| DatabaseError::InsertError)?;
-            }
-
-            tracing::debug!("Inserting {} blocks", setupobj.blocks.len());
-            for block in setupobj.blocks {
-                tx.execute(
-                    "INSERT INTO blocks (block_hash, height, view_number, parent_hash, transactions) VALUES (?, ?, ?, ?, ?)",
-                    params![
-                        block.block_hash,
-                        block.data.height,
-                        block.data.view_number,
-                        block.data.parent_hash,
-                        block.data.transactions
-                    ]
-                ).map_err(|_| DatabaseError::InsertError)?;
-            }
-
-            tracing::debug!("Inserting {} validators", setupobj.validators.len());
-            for validator in setupobj.validators {
-                tx.execute(
-                    "INSERT INTO validators (effective_height, node_id, is_active) VALUES (?, ?, ?)",
-                    params![validator.effective_height, validator.node_id, validator.is_active]
-                ).map_err(|_| DatabaseError::InsertError)?;
-            }
-
-            tracing::debug!("Inserting {} quorum certificates", setupobj.quorum_certificates.len());
-            for quorum_certificate in setupobj.quorum_certificates {
-                tx.execute(
-                    "INSERT INTO quorum_certificates (view_number, phase, block_hash, proposer_signature, voter_signatures) VALUES (?, ?, ?, ?, ?)", 
-                    params![quorum_certificate.view_number, quorum_certificate.phase, quorum_certificate.block_hash, quorum_certificate.proposer_signature, quorum_certificate.voter_signatures]
-                ).map_err(|_| DatabaseError::InsertError)?;
-            }
-
-            tracing::debug!("Inserting {} timeout certificates", setupobj.timeout_certificates.len());
-            for timeout_certificate in setupobj.timeout_certificates {
-                tx.execute(
-                    "INSERT INTO timeout_certificates (view_number, highest_qc_view, highest_qc_phase, highest_qc_block_hash, signatures) VALUES (?, ?, ?, ?, ?)",
-                    params![timeout_certificate.view_number, timeout_certificate.highest_qc_view, timeout_certificate.highest_qc_phase, timeout_certificate.highest_qc_block_hash, timeout_certificate.signatures]
-                ).map_err(|_| DatabaseError::InsertError)?;
-            }
-
-            tracing::debug!("Inserting {} data blocks", setupobj.data_blocks.len());
-            for data_block in setupobj.data_blocks {
-                tx.execute(
-                    "INSERT INTO data_blocks (id, modified_at, file_hash, fragment_count, added_bytes, placement_height) VALUES (?, ?, ?, ?, ?, ?)",
-                    params![data_block.id, data_block.modified_at, data_block.data.hash, data_block.data.fragments.len() as i32, data_block.data.added_bytes, None::<i32>]
-                ).map_err(|_| DatabaseError::InsertError)?;
-            }
-
-            tracing::debug!("Inserting {} fragment hashes", setupobj.fragment_hashes.len());
-            for fragment_hash in setupobj.fragment_hashes {
-                tx.execute(
-                    "INSERT INTO fragment_hashes (data_block_id, fragment_index, fragment_id, fragment_hash, chunk_type, stored_locally) VALUES (?, ?, ?, ?, ?, FALSE)",
-                    params![fragment_hash.data_block_id, fragment_hash.fragment_index, fragment_hash.fragment_id, fragment_hash.fragment_hash, fragment_hash.chunk_type]
-                ).map_err(|_| DatabaseError::InsertError)?;
-            }
-
-            tracing::debug!("Inserting {} file access entries", setupobj.file_access_entries.len());
-            for file_access in setupobj.file_access_entries {
-                tx.execute(
-                    "INSERT INTO file_access (data_block_id, user_id, ephemeral_pubkey, encrypted_file_key) VALUES (?, ?, ?, ?)",
-                    params![file_access.data_block_id, file_access.user_id, file_access.ephemeral_pubkey, file_access.encrypted_file_key]
-                ).map_err(|_| DatabaseError::InsertError)?;
-            }
-
-            tracing::debug!("Inserting {} inodes", setupobj.inodes.len());
-            for inode in setupobj.inodes {
-                let owner_id = match inode.owner {
-                    either::Either::Left(id) => id,
-                    either::Either::Right(user) => user.user_id,
-                };
-                let data_id = match inode.data_id {
-                    Some(either::Either::Left(uuid)) => Some(uuid),
-                    Some(either::Either::Right(data_record)) => Some(data_record.id),
-                    None => None,
-                };
-                tx.execute(
-                    "INSERT INTO inodes (id, owner_id, path, type, data_id) VALUES (?, ?, ?, ?, ?)",
-                    params![inode.id, owner_id, inode.path, inode.inode_type, data_id]
-                ).map_err(|_| DatabaseError::InsertError)?;
-            }
-
-            tracing::debug!("Inserting {} takeouts", setupobj.takeouts.len());
-            for takeout in setupobj.takeouts {
-                tx.execute(
-                    "INSERT INTO takeouts (id, user_id, owner_node_id, status, expires_at, consensus_height) VALUES (?, ?, ?, ?, ?, ?)",
-                    params![takeout.takeout_id, takeout.user_id, takeout.owner_node_id, takeout.status, takeout.expires_at, takeout.consensus_height]
-                ).map_err(|e| {
-                    tracing::error!("Failed to insert takeout {}: {:?}", takeout.takeout_id, e);
-                    DatabaseError::InsertError
-                })?;
-            }
-            
-            tracing::debug!("Inserting this_node configuration for node_id={}, view={}, phase={:?}", 
-                          setupobj.yournode.node_id, setupobj.yournode.current_view, setupobj.yournode.current_phase);
-            tx.execute(
-                "INSERT INTO this_node (internal_id, node_id, privkey, current_phase, current_view, prepared_block_hash, committed_block_hash, highest_qc_block_hash, user_privkey) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        Ok(db_lock) => {
+            // Initialize this_node with identity and keys
+            // All consensus state starts at view 0, will be populated by catch-up
+            db_lock.execute(
+                "INSERT INTO this_node (internal_id, node_id, privkey, user_privkey, current_view, current_phase, committed_block_hash, highest_qc_block_hash, prepared_block_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     1,
-                    setupobj.yournode.node_id,
-                    privkey,
-                    setupobj.yournode.current_phase,
-                    setupobj.yournode.current_view,
-                    setupobj.yournode.prepared_block_hash,
-                    setupobj.yournode.committed_block_hash,
-                    setupobj.yournode.highest_qc_block_hash,
-                    setupobj.user_privkey
+                    join_info.node_id,
+                    node_privkey,
+                    join_info.user_privkey,
+                    0,  // Start at view 0 for catch-up
+                    ConsensusPhase::Propose,
+                    None::<Blake3Hash>,  // Will be set by genesis catch-up
+                    None::<Blake3Hash>,  // Will be set by genesis catch-up
+                    None::<Blake3Hash>,  // Will be set by genesis catch-up
                 ]
             ).map_err(|e| {
-                tracing::error!("Failed to insert this_node configuration: {:?}", e);
-                tracing::error!("this_node data: internal_id=1, node_id={}, current_view={}, phase={:?}", 
-                              setupobj.yournode.node_id, setupobj.yournode.current_view, setupobj.yournode.current_phase);
+                tracing::error!("Failed to initialize this_node for joining node {}: {:?}", join_info.node_id, e);
                 DatabaseError::InsertError
             })?;
 
-            tracing::info!("Committing join setup transaction");
-            tx.commit().map_err(|e| {
-                tracing::error!("Failed to commit join setup transaction: {:?}", e);
-                DatabaseError::InsertError
-            })?;
-            
-            tracing::info!("Successfully completed put_join_setup");
+            tracing::info!(
+                "Initialized joining node {} (user_id={}) for catch-up from view 0",
+                join_info.node_id,
+                join_info.user_id
+            );
+
             Ok(())
         }
         Err(e) => {
-            tracing::error!("Failed to get database connection for put_join_setup: {:?}", e);
+            tracing::error!("Failed to get database connection for initialize_joining_node: {:?}", e);
             Err(DatabaseError::LockError)
         }
     }
 }
+
