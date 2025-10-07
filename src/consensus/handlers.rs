@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 pub struct ActivationRequest {
     pub node_id: i32,
     pub current_height: i32,              // Proof node is caught up
-    pub requested_effective_height: i32,  // Deterministic activation height
+    // Activation height computed automatically during execution as committed_height + 1
 }
 
 pub struct ValidatorActivationHandler;
@@ -32,14 +32,8 @@ impl TransactionHandler for ValidatorActivationHandler {
             bincode::config::standard()
         ).map_err(|_| DatabaseError::InvalidPayload)?;
 
-        // Get database connection and transaction immediately for validation queries
-        let mut conn = state.db_pool.get().map_err(|_| DatabaseError::LockError)?;
-        let tx_db = conn.transaction().map_err(|_| DatabaseError::LockError)?;
-
-        // === ALL VALIDATION OUTSIDE EXECUTE FLAG ===
-        // This determines whether we vote YES or NO in the propose phase
-
         // Authorization: Only the node itself can request its own activation
+        // This check happens regardless of execute flag (determines vote)
         if activation_req.node_id != tx.submitter.id {
             tracing::warn!(
                 "Authorization failed: node {} attempted to activate node {}",
@@ -49,80 +43,57 @@ impl TransactionHandler for ValidatorActivationHandler {
             return Err(DatabaseError::AuthorizationError);
         }
 
-        // Get current consensus height for validation checks
-        let consensus_height = get_current_consensus_height(&tx_db)?;
+        // Validation phase: checks determine vote (YES/NO) but don't affect execution
+        if !execute {
+            let mut conn = state.db_pool.get().map_err(|_| DatabaseError::LockError)?;
+            let tx_db = conn.transaction().map_err(|_| DatabaseError::LockError)?;
 
-        // Synchronization check: Node must be caught up (within 2 views tolerance)
-        if activation_req.current_height < consensus_height - 2 {
-            tracing::warn!(
-                "Node {} activation failed: not caught up (reported height {}, consensus height {})",
+            // Synchronization check: Node must be caught up (within 10 views tolerance)
+            let consensus_height = get_current_consensus_height(&tx_db)?;
+            if activation_req.current_height < consensus_height - 10 {
+                tracing::warn!(
+                    "Node {} activation failed validation: not caught up (reported height {}, consensus height {})",
+                    activation_req.node_id,
+                    activation_req.current_height,
+                    consensus_height
+                );
+                return Err(DatabaseError::ProcessingError);
+            }
+
+            // Validation passed - vote YES
+            tracing::debug!(
+                "Node {} activation request validated (current_height={}, consensus_height={})",
                 activation_req.node_id,
                 activation_req.current_height,
                 consensus_height
             );
-            return Err(DatabaseError::ProcessingError);
+            return Ok(());
         }
 
-        // Activation window check: Must be in reasonable future (3-10 views ahead)
-        let min_activation = consensus_height + 3;  // Observation period for validator-elect
-        let max_activation = consensus_height + 10; // Reasonable upper bound
-
-        if activation_req.requested_effective_height < min_activation {
-            tracing::warn!(
-                "Node {} activation failed: requested height {} too soon (minimum {})",
-                activation_req.node_id,
-                activation_req.requested_effective_height,
-                min_activation
-            );
-            return Err(DatabaseError::ProcessingError);
-        }
-
-        if activation_req.requested_effective_height > max_activation {
-            tracing::warn!(
-                "Node {} activation failed: requested height {} too far in future (maximum {})",
-                activation_req.node_id,
-                activation_req.requested_effective_height,
-                max_activation
-            );
-            return Err(DatabaseError::ProcessingError);
-        }
-
-        // Not-already-passed check: Requested height must be in the future
-        if activation_req.requested_effective_height <= consensus_height {
-            tracing::warn!(
-                "Node {} activation failed: requested height {} already passed (current {})",
-                activation_req.node_id,
-                activation_req.requested_effective_height,
-                consensus_height
-            );
-            return Err(DatabaseError::ProcessingError);
-        }
-
-        // Check if node is already active at requested height (idempotency check)
-        // This is informational - we allow UPDATE of future activations for hot-swap
-        if is_node_active(&tx_db, activation_req.node_id, activation_req.requested_effective_height)? {
-            tracing::debug!(
-                "Node {} already has activation at or before height {}",
-                activation_req.node_id,
-                activation_req.requested_effective_height
-            );
-        }
-
-        // === VALIDATION COMPLETE - All checks passed, safe to vote YES ===
-
-        // Only perform state changes if in execute mode (lock phase)
+        // Execution phase: always execute if consensus succeeded (≥2/3 voted YES)
+        // This ensures all nodes perform identical state changes regardless of individual validation
         if execute {
+            let mut conn = state.db_pool.get().map_err(|_| DatabaseError::LockError)?;
+            let tx_db = conn.transaction().map_err(|_| DatabaseError::LockError)?;
+
+            // Compute activation height deterministically during execution
+            // All nodes are synchronized to same committed height by Lock QC insertion
+            let committed_height = get_current_consensus_height(&tx_db)?;
+            let effective_height = committed_height + 0;  // Activate immediately.
+
             tracing::info!(
-                "Activating node {} at effective height {}",
+                "Activating node {} at effective height {} (committed_height={}, next_block={})",
                 activation_req.node_id,
-                activation_req.requested_effective_height
+                effective_height,
+                committed_height,
+                committed_height + 1
             );
 
             // Activate the validator (INSERT or UPDATE future activation)
             activate_validator(
                 &tx_db,
                 activation_req.node_id,
-                activation_req.requested_effective_height
+                effective_height
             )?;
 
             // Commit the database transaction

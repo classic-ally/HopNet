@@ -12,6 +12,7 @@ RUN nix-shell --run "echo 'Nix dependencies cached'"
 
 # Copy dependency files for better cargo caching
 COPY Cargo.toml Cargo.lock ./
+COPY common/ common/
 COPY frontend/package*.json frontend/
 COPY frontend/vite.config.ts frontend/
 COPY frontend/index.html frontend/

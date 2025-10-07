@@ -11,6 +11,7 @@ use axum::{
 use crate::db::consensus as db;
 use crate::consensus::functions::ConsensusError;
 use std::cmp::Ordering;
+use serde::Serialize;
 /// CONSENSUS ARCHITECTURE
 /// Key notes:
 /// - Using ed25519 over threshold w/ distributed key generation (e.g. BLS)
@@ -58,6 +59,103 @@ pub async fn get_validators(
     match db::get_validators(app_state.db_pool.get(), height) {
         Ok(nodes) => (StatusCode::OK, Json(nodes)).into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Failed to get validators").into_response(),
+    }
+}
+
+// Debug view state - shows node's perspective on a specific view
+#[derive(Serialize, Debug)]
+pub struct DebugViewState {
+    pub node_id: i32,
+    pub queried_view: i32,
+    pub height_at_view: i32,
+    pub is_active_at_height: bool,
+    pub validators_at_height: Vec<crate::types::Node>,
+    pub leader_for_view: Option<crate::types::Node>,
+}
+
+pub async fn debug_view_state(
+    State(app_state): State<AppState>,
+    Json(view): Json<i32>,
+) -> impl IntoResponse {
+    // Get database connection and transaction
+    let mut conn = match app_state.db_pool.get() {
+        Ok(conn) => conn,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to get DB connection").into_response(),
+    };
+
+    let tx = match conn.transaction() {
+        Ok(tx) => tx,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to start transaction").into_response(),
+    };
+
+    // Get this node's ID
+    let node_id: i32 = match tx.query_row(
+        "SELECT node_id FROM this_node WHERE internal_id = 1",
+        [],
+        |row| row.get(0)
+    ) {
+        Ok(id) => id,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to get node ID").into_response(),
+    };
+
+    // Get height at the queried view using existing function
+    let height_at_view = match db::get_height_at_view_tx(&tx, view) {
+        Ok(h) => h,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to get height at view").into_response(),
+    };
+
+    // Check if this node is active at that height using existing function
+    let is_active = match db::is_node_active(&tx, node_id, height_at_view) {
+        Ok(active) => active,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to check activation status").into_response(),
+    };
+
+    // Get leader for this view at this height using existing function
+    let leader = match db::get_leader_for_view_tx(&tx, view, height_at_view) {
+        Ok(l) => l,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to get leader for view").into_response(),
+    };
+
+    // Drop transaction before calling get_validators (which needs its own connection)
+    drop(tx);
+    drop(conn);
+
+    // Get list of validators at this height using existing function
+    let validators = match db::get_validators(app_state.db_pool.get(), height_at_view) {
+        Ok(vals) => vals,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to get validators").into_response(),
+    };
+
+    let response = DebugViewState {
+        node_id,
+        queried_view: view,
+        height_at_view,
+        is_active_at_height: is_active,
+        validators_at_height: validators,
+        leader_for_view: leader,
+    };
+
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+// View history entry for debugging/monitoring
+#[derive(Serialize, Debug)]
+pub struct ViewHistoryEntry {
+    pub view: i32,
+    pub height: i32,
+    pub has_propose_qc: bool,
+    pub has_lock_qc: bool,
+    pub has_tc: bool,
+    pub block_hash: Option<String>,
+}
+
+// Get consensus history showing view progression
+pub async fn get_consensus_history(
+    State(app_state): State<AppState>,
+) -> impl IntoResponse {
+    match db::get_consensus_history(app_state.db_pool.get()) {
+        Ok(history) => (StatusCode::OK, Json(history)).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Failed to get consensus history").into_response(),
     }
 }
 
@@ -110,11 +208,25 @@ pub async fn post_ballot(
                                 return (StatusCode::OK, Json(signoff)).into_response()
                             },
                             Err(_) => {
-                                tracing::error!(
-                                    "Failed to save block {:?} to database",
-                                    ballot.block.block_hash
-                                );
-                                return (StatusCode::INTERNAL_SERVER_ERROR, "Error adding block to database").into_response()
+                                // Block insertion failed - check if it already exists
+                                match db::get_block(app_state.db_pool.get(), ballot.block.block_hash) {
+                                    Ok(_existing_block) => {
+                                        // Block already exists (duplicate ballot request), return signature anyway
+                                        tracing::debug!(
+                                            "Block {:?} already exists for view {} propose phase, returning signature",
+                                            ballot.block.block_hash, ballot.data.view
+                                        );
+                                        return (StatusCode::OK, Json(signoff)).into_response()
+                                    },
+                                    Err(_) => {
+                                        // Block doesn't exist and couldn't be inserted - real error
+                                        tracing::error!(
+                                            "Failed to save block {:?} to database",
+                                            ballot.block.block_hash
+                                        );
+                                        return (StatusCode::INTERNAL_SERVER_ERROR, "Error adding block to database").into_response()
+                                    }
+                                }
                             },
                         }
                     } else {
@@ -149,8 +261,8 @@ pub async fn post_ballot(
                 super::types::VoteError::InitiatorError => {
                     return (StatusCode::UNAUTHORIZED, "Invalid signature or unauthorized proposer").into_response()
                 },
-                super::types::VoteError::ProgressionError => {
-                    return (StatusCode::CONFLICT, "Proposal conflicts with consensus state").into_response()
+                super::types::VoteError::ProgressionError(kind) => {
+                    return (StatusCode::CONFLICT, format!("Proposal conflicts with consensus state: {:?}", kind)).into_response()
                 },
                 super::types::VoteError::BlockError => {
                     return (StatusCode::BAD_REQUEST, "Invalid block data").into_response()
@@ -202,11 +314,25 @@ pub async fn post_qc(
                             StatusCode::OK
                         },
                         Err(_) => {
-                            tracing::error!(
-                                "Failed to insert QC for view {} phase {:?}",
-                                qc.view_number, qc.phase
-                            );
-                            StatusCode::INTERNAL_SERVER_ERROR
+                            // QC insertion failed - check if it already exists
+                            match db::get_quorum_certificate_by_hash(app_state.db_pool.get(), &qc.view_number, &qc.block_hash, &qc.phase) {
+                                Ok(_existing_qc) => {
+                                    // QC already exists (duplicate broadcast), acknowledge success
+                                    tracing::debug!(
+                                        "QC for view {} phase {:?} already exists, acknowledging",
+                                        qc.view_number, qc.phase
+                                    );
+                                    StatusCode::OK
+                                },
+                                Err(_) => {
+                                    // QC doesn't exist and couldn't be inserted - real error
+                                    tracing::error!(
+                                        "Failed to insert QC for view {} phase {:?}",
+                                        qc.view_number, qc.phase
+                                    );
+                                    StatusCode::INTERNAL_SERVER_ERROR
+                                }
+                            }
                         },
                     }
                 }
@@ -365,9 +491,10 @@ pub async fn check_view_status(app_state: &AppState) -> Result<ViewComparison, C
     let consensus_state = db::get_consensus(app_state.db_pool.get())
         .map_err(|_| ConsensusError::DatabaseError)?;
     let our_view = consensus_state.view;
-    
-    // Poll network for max view (pass consensus_state to avoid duplicate DB call)
-    let max_network_view = functions::poll_subset_for_max_view(app_state, &consensus_state, None).await?;
+    let our_height = consensus_state.committed_block.data.height;
+
+    // Poll network for max view
+    let max_network_view = functions::poll_subset_for_max_view(app_state, our_view, our_height, None).await?;
     
     // Compare and categorize the relationship
     use std::cmp::Ordering;
@@ -632,16 +759,21 @@ pub async fn perform_catch_up_with_convergence(
     use crate::consensus::functions::CatchUpError;
 
     const MAX_CONVERGENCE_ITERATIONS: u32 = 10;
-    const CONVERGENCE_TOLERANCE: i32 = 2;
+    const CONVERGENCE_TOLERANCE: i32 = 1;  // Must be <2 to ensure genesis is always processed
 
     for iteration in 1..=MAX_CONVERGENCE_ITERATIONS {
-        // Query fresh consensus state
-        let consensus_state = db::get_consensus(app_state.db_pool.get())
-            .map_err(|_| CatchUpError::Database)?;
-        let our_view = consensus_state.view;
+        // Query current view and height in a single transaction for consistency
+        // Works even before processing genesis when there are no validators
+        let (our_view, our_height) = {
+            let mut conn = app_state.db_pool.get().map_err(|_| CatchUpError::Database)?;
+            let tx = conn.transaction().map_err(|_| CatchUpError::Database)?;
+            let view = db::get_current_view_tx(&tx).map_err(|_| CatchUpError::Database)?;
+            let height = db::get_current_consensus_height(&tx).map_err(|_| CatchUpError::Database)?;
+            (view, height)
+        };
 
         // Poll network height
-        let network_view = functions::poll_subset_for_max_view(app_state, &consensus_state, bootstrap_validators)
+        let network_view = functions::poll_subset_for_max_view(app_state, our_view, our_height, bootstrap_validators)
             .await
             .map_err(|_| CatchUpError::NetworkUnavailable)?;
 
@@ -680,6 +812,7 @@ pub async fn ensure_caught_up_and_active(
     mode: CatchUpMode,
     request_activation_if_needed: bool,
     tolerance_views: i32,
+    bootstrap_validators: Option<&[crate::types::Node]>,
 ) -> Result<NodeReadiness, functions::CatchUpError> {
     use crate::consensus::functions::CatchUpError;
 
@@ -695,7 +828,7 @@ pub async fn ensure_caught_up_and_active(
 
                     if gap > tolerance_views {
                         tracing::info!("Single-shot catch-up: closing gap of {} views (from {} to {})", gap, our_view, max_network_view);
-                        perform_catch_up(app_state, our_view, max_network_view, None).await?;
+                        perform_catch_up(app_state, our_view, max_network_view, bootstrap_validators).await?;
                         sync_status = SyncStatus::CaughtUp;
                     } else {
                         tracing::debug!("Gap of {} views within tolerance {}, skipping catch-up", gap, tolerance_views);
@@ -718,7 +851,7 @@ pub async fn ensure_caught_up_and_active(
         }
         CatchUpMode::Convergence => {
             // Iterative convergence for large gaps or bootstrap (tolerance ignored)
-            perform_catch_up_with_convergence(app_state, None).await?;
+            perform_catch_up_with_convergence(app_state, bootstrap_validators).await?;
             sync_status = SyncStatus::CaughtUp;
         }
     }
@@ -763,7 +896,7 @@ pub async fn ensure_caught_up_and_active(
     })
 }
 
-/// Request activation for this node at current height + 3
+/// Request activation for this node - effective height computed automatically during execution
 async fn request_activation(
     app_state: &AppState,
     node_id: i32,
@@ -772,13 +905,10 @@ async fn request_activation(
     use crate::consensus::handlers::ActivationRequest;
     use crate::consensus::functions::{create_signed_transaction, consensus_middleware, CatchUpError};
 
-    let requested_activation_height = current_height + 3;
-
-    // Create activation request
+    // Create activation request (effective height computed deterministically during execution)
     let activation_req = ActivationRequest {
         node_id,
         current_height,
-        requested_effective_height: requested_activation_height,
     };
 
     // Serialize to payload
@@ -798,9 +928,8 @@ async fn request_activation(
         .map_err(|_| CatchUpError::NetworkUnavailable)?;
 
     tracing::info!(
-        "Activation request submitted for node {} at height {}",
-        node_id,
-        requested_activation_height
+        "Activation request submitted for node {} (effective height will be computed during execution)",
+        node_id
     );
 
     Ok(())
@@ -827,18 +956,22 @@ pub async fn perform_catch_up(
     let global_target_view = target_view;
 
     loop {
-        // Re-query database for actual current view (handles incomplete views naturally)
-        let consensus_state = db::get_consensus(app_state.db_pool.get())
-            .map_err(|_| CatchUpError::Database)?;
-        let our_view = consensus_state.view;
+        // Re-query database for actual current view and height (handles incomplete views naturally)
+        let (our_view, our_height) = {
+            let mut conn = app_state.db_pool.get().map_err(|_| CatchUpError::Database)?;
+            let tx = conn.transaction().map_err(|_| CatchUpError::Database)?;
+            let view = db::get_current_view_tx(&tx).map_err(|_| CatchUpError::Database)?;
+            let height = db::get_current_consensus_height(&tx).map_err(|_| CatchUpError::Database)?;
+            (view, height)
+        };
 
-        if our_view > global_target_view {
-            break; // Caught up beyond target
+        if our_view >= global_target_view {
+            break; // Caught up to or beyond target
         }
 
         // Get available validators (refreshed each batch to pick up newly-added validators)
         let my_node_id = app_state.get_node_id().map_err(|_| CatchUpError::Database)?;
-        let mut validators = db::get_validators(app_state.db_pool.get(), our_view)
+        let mut validators = db::get_validators(app_state.db_pool.get(), our_height)
             .map_err(|_| CatchUpError::Database)?;
 
         // Merge with bootstrap validators, removing duplicates by node_id
@@ -942,7 +1075,7 @@ pub async fn ensure_caught_up_middleware(
     };
 
     // Ensure caught up and check activation (don't request - timeout job handles that)
-    match ensure_caught_up_and_active(&app_state, CatchUpMode::SingleShot, false, tolerance).await {
+    match ensure_caught_up_and_active(&app_state, CatchUpMode::SingleShot, false, tolerance, None).await {
         Ok(NodeReadiness { sync_status, is_active }) => {
             match role {
                 ConsensusRole::Validator => {

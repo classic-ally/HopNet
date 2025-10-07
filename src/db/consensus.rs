@@ -140,6 +140,189 @@ pub fn get_consensus(
     }
 }
 
+/// Get consensus history showing view progression for debugging
+pub fn get_consensus_history(
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+) -> Result<Vec<crate::consensus::routes::ViewHistoryEntry>, DatabaseError> {
+    use crate::consensus::routes::ViewHistoryEntry;
+
+    match db_connection {
+        Ok(db_lock) => {
+            let mut stmt = db_lock.prepare(
+                "WITH view_range AS (
+                    SELECT unnest(generate_series(0, (SELECT current_view FROM this_node WHERE internal_id = 1))) AS view
+                ),
+                propose_qcs AS (
+                    SELECT view_number FROM quorum_certificates WHERE phase = 'propose'
+                ),
+                lock_qcs AS (
+                    SELECT view_number FROM quorum_certificates WHERE phase = 'lock'
+                ),
+                tcs AS (
+                    SELECT view_number FROM timeout_certificates
+                ),
+                committed_blocks AS (
+                    -- Only blocks that have Lock QCs (committed blocks)
+                    SELECT b.view_number, b.block_hash, b.height
+                    FROM blocks b
+                    JOIN lock_qcs lq ON b.view_number = lq.view_number
+                ),
+                all_blocks AS (
+                    -- All blocks for display (includes uncommitted)
+                    SELECT view_number, block_hash FROM blocks
+                )
+                SELECT
+                    v.view,
+                    COALESCE(
+                        MAX(cb.height) OVER (ORDER BY v.view ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+                        0
+                    ) as height,
+                    pq.view_number IS NOT NULL as has_propose_qc,
+                    lq.view_number IS NOT NULL as has_lock_qc,
+                    tc.view_number IS NOT NULL as has_tc,
+                    ab.block_hash
+                FROM view_range v
+                LEFT JOIN propose_qcs pq ON v.view = pq.view_number
+                LEFT JOIN lock_qcs lq ON v.view = lq.view_number
+                LEFT JOIN tcs tc ON v.view = tc.view_number
+                LEFT JOIN committed_blocks cb ON v.view = cb.view_number
+                LEFT JOIN all_blocks ab ON v.view = ab.view_number
+                ORDER BY v.view"
+            ).map_err(|_| DatabaseError::RecallError)?;
+
+            let mut rows = stmt.query([]).map_err(|_| DatabaseError::RecallError)?;
+            let mut history = Vec::new();
+
+            while let Ok(Some(row)) = rows.next() {
+                let view: i32 = row.get(0).map_err(|_| DatabaseError::RecallError)?;
+                let height: i32 = row.get(1).map_err(|_| DatabaseError::RecallError)?;
+                let has_propose_qc: bool = row.get(2).map_err(|_| DatabaseError::RecallError)?;
+                let has_lock_qc: bool = row.get(3).map_err(|_| DatabaseError::RecallError)?;
+                let has_tc: bool = row.get(4).map_err(|_| DatabaseError::RecallError)?;
+                let block_hash: Option<Blake3Hash> = row.get(5).ok();
+
+                history.push(ViewHistoryEntry {
+                    view,
+                    height,
+                    has_propose_qc,
+                    has_lock_qc,
+                    has_tc,
+                    block_hash: block_hash.map(|h| format!("{:.8}", h)),
+                });
+            }
+
+            Ok(history)
+        }
+        Err(_) => Err(DatabaseError::LockError)
+    }
+}
+
+/// Get current view within a transaction - core logic
+/// Get the leader for a specific view at a given height
+/// Uses same SQL logic as get_consensus_with_conn leader_selection CTE
+pub fn get_leader_for_view_tx(
+    tx: &duckdb::Transaction,
+    view: i32,
+    height: i32,
+) -> Result<Option<Node>, DatabaseError> {
+    let mut stmt = tx.prepare(
+        "
+        WITH latest_effective AS (
+            SELECT
+                node_id,
+                MAX(effective_height) AS max_eff
+            FROM validators
+            WHERE effective_height <= ?
+            GROUP BY node_id
+        ),
+        active_validators AS (
+            SELECT
+                v.node_id,
+                v.is_active,
+                ROW_NUMBER() OVER (ORDER BY v.node_id) as validator_index
+            FROM validators v
+            JOIN latest_effective le
+                ON v.node_id = le.node_id
+                AND v.effective_height = le.max_eff
+            WHERE v.is_active = true
+        ),
+        leader_selection AS (
+            SELECT node_id
+            FROM active_validators
+            WHERE validator_index = (
+                ? % (SELECT COUNT(*) FROM active_validators)
+            ) + 1
+        )
+        SELECT n.node_id, n.name, n.ip_address, n.port, n.owner, n.pubkey
+        FROM leader_selection ls
+        JOIN nodes n ON ls.node_id = n.node_id
+        "
+    ).map_err(|_| DatabaseError::RecallError)?;
+
+    let result = stmt.query_row([height, view], |row| {
+        let node_id: i32 = row.get(0)?;
+        let name: String = row.get(1)?;
+        let ip_address: String = row.get(2)?;
+        let port: i32 = row.get(3)?;
+        let owner: i32 = row.get(4)?;
+        let pubkey: PubKey = row.get(5)?;
+
+        Ok(Node {
+            node_id,
+            name,
+            ip_address,
+            port,
+            owner,
+            pubkey,
+        })
+    });
+
+    match result {
+        Ok(node) => Ok(Some(node)),
+        Err(duckdb::Error::QueryReturnedNoRows) => Ok(None),
+        Err(_) => Err(DatabaseError::RecallError),
+    }
+}
+
+/// Get the highest committed block height at or before a given view
+/// Only counts blocks that have Lock QCs (committed blocks)
+/// This ensures consistency with leader calculation and validator set selection
+pub fn get_height_at_view_tx(tx: &duckdb::Transaction, view: i32) -> Result<i32, DatabaseError> {
+    let height: i32 = tx.query_row(
+        "SELECT COALESCE(MAX(b.height), 0)
+         FROM blocks b
+         JOIN quorum_certificates qc ON b.view_number = qc.view_number
+         WHERE qc.phase = 'lock' AND b.view_number <= ?",
+        [view],
+        |row| row.get(0)
+    ).map_err(|_| DatabaseError::RecallError)?;
+    Ok(height)
+}
+
+pub fn get_current_view_tx(tx: &duckdb::Transaction) -> Result<i32, DatabaseError> {
+    let view: i32 = tx.query_row(
+        "SELECT current_view FROM this_node WHERE internal_id = 1",
+        [],
+        |row| row.get(0)
+    ).map_err(|_| DatabaseError::RecallError)?;
+    Ok(view)
+}
+
+/// Get just the current view from this_node - works even when there are no validators
+/// Used during catch-up for joining nodes before they have validators
+/// Wrapper for backwards compatibility
+pub fn get_current_view(
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+) -> Result<i32, DatabaseError> {
+    match db_connection {
+        Ok(mut db_lock) => {
+            let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
+            get_current_view_tx(&tx)
+        },
+        Err(_) => Err(DatabaseError::LockError)
+    }
+}
+
 pub fn get_validators(
     db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     height: i32,

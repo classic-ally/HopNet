@@ -153,14 +153,18 @@ pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transa
             node_id: my_node_id,
             privkey: app_state.private_key.clone(),
         };
-        
-        let validators = db::get_validators(app_state.db_pool.get(), block.data.height).map_err(|_| ConsensusError::DatabaseError)?
+
+        // Use committed height (parent block) for validator set, not proposed height
+        // This ensures consistency with middleware activation checks and leader calculation
+        let committed_height = current_consensus_state.committed_block.data.height;
+
+        let validators = db::get_validators(app_state.db_pool.get(), committed_height).map_err(|_| ConsensusError::DatabaseError)?
             .iter()
             .filter(|node| node.node_id != me.node_id)
             .cloned()
             .collect();
 
-        let validators_elect = db::get_validators_elect(app_state.db_pool.get(), block.data.height).map_err(|_| ConsensusError::DatabaseError)?
+        let validators_elect = db::get_validators_elect(app_state.db_pool.get(), committed_height).map_err(|_| ConsensusError::DatabaseError)?
             .iter()
             .filter(|node| node.node_id != me.node_id)
             .cloned()
@@ -356,18 +360,19 @@ async fn broadcast_qc(
     
     // Collect confirmations until we have enough for quorum or all tasks complete
     let mut confirmations = 0;
-    let timeout = tokio::time::sleep(std::time::Duration::from_secs(30));
+    let timeout = tokio::time::sleep(std::time::Duration::from_secs(5));
     tokio::pin!(timeout);
-    
+
     loop {
         tokio::select! {
             confirmation_opt = confirmations_rx.recv() => {
                 match confirmation_opt {
                     Some(()) => {
                         confirmations += 1;
-                        
+
                         // Early termination on quorum
                         if confirmations >= required_confirmations {
+                            tracing::debug!("QC broadcast achieved quorum ({}/{})", confirmations, required_confirmations);
                             return Ok(());
                         }
                     }
@@ -383,12 +388,18 @@ async fn broadcast_qc(
             }
         }
     }
-    
+
     // Check if we have enough confirmations after timeout or all tasks complete
     if confirmations >= required_confirmations {
+        tracing::debug!("QC broadcast achieved quorum ({}/{})", confirmations, required_confirmations);
         Ok(())
     } else {
-        Err(ConsensusError::InsufficientVotes)
+        // Don't fail - just log and proceed (ballot round will validate if they have QC)
+        tracing::warn!(
+            "QC broadcast did not achieve quorum ({}/{}) - proceeding anyway (ballot round will validate)",
+            confirmations, required_confirmations
+        );
+        Ok(())
     }
 }
 
@@ -616,7 +627,8 @@ async fn forward_to_leader(
 /// This avoids O(N²) bandwidth while still detecting if we're behind
 pub async fn poll_subset_for_max_view(
     app_state: &AppState,
-    consensus_state: &ConsensusState,
+    our_view: i32,
+    our_height: i32,
     bootstrap_validators: Option<&[Node]>,
 ) -> Result<i32, ConsensusError> {
     use std::collections::HashSet;
@@ -632,7 +644,7 @@ pub async fn poll_subset_for_max_view(
     let user_keys = app_state.get_user_keys()
         .map_err(|_| ConsensusError::DatabaseError)?;
 
-    let mut all_validators = db::get_validators(app_state.db_pool.get(), consensus_state.committed_block.data.height)
+    let mut all_validators = db::get_validators(app_state.db_pool.get(), our_height)
         .map_err(|_| ConsensusError::DatabaseError)?;
 
     // Merge with bootstrap validators, removing duplicates by node_id
@@ -652,7 +664,7 @@ pub async fn poll_subset_for_max_view(
 
     if other_validators.is_empty() {
         // We're the only validator, so we're caught up by definition
-        return Ok(consensus_state.view);
+        return Ok(our_view);
     }
 
     // Retry loop for handling unlucky validator selection
@@ -732,8 +744,8 @@ pub async fn poll_subset_for_max_view(
         // If we got at least one response, return the maximum view
         if !received_views.is_empty() {
             let max_view = *received_views.iter().max().unwrap();
-            let max_view = std::cmp::max(max_view, consensus_state.view);
-            tracing::debug!("Max view detected: {} (our view: {})", max_view, consensus_state.view);
+            let max_view = std::cmp::max(max_view, our_view);
+            tracing::debug!("Max view detected: {} (our view: {})", max_view, our_view);
             return Ok(max_view);
         }
 

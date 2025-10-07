@@ -121,15 +121,15 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
                 -- HotStuff-2 efficiency improvement:
                 -- Block is committed when we're working on a later block
                 -- (Working on block n+1 implies we commit block n)
-                committed_block_hash    BLOB NOT NULL,
+                -- Nullable for joining nodes before genesis processed
+                committed_block_hash    BLOB,
                 -- Safety: track highest QC seen (highest view for ordered execution)
-                highest_qc_block_hash   BLOB NOT NULL,
+                -- Nullable for joining nodes before genesis processed
+                highest_qc_block_hash   BLOB,
 
                 FOREIGN KEY (prepared_block_hash) REFERENCES blocks(block_hash),
                 FOREIGN KEY (committed_block_hash) REFERENCES blocks(block_hash),
-                FOREIGN KEY (highest_qc_block_hash) REFERENCES blocks(block_hash),
-
-                FOREIGN KEY (node_id) REFERENCES nodes(node_id)
+                FOREIGN KEY (highest_qc_block_hash) REFERENCES blocks(block_hash)
             );
 
             CREATE TABLE metrics (

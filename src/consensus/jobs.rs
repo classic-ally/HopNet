@@ -28,7 +28,7 @@ pub async fn handle_timeout_detection(
 
     // Ensure we're caught up and active before participating in consensus
     use crate::consensus::routes::{ensure_caught_up_and_active, CatchUpMode, NodeReadiness, SyncStatus};
-    match ensure_caught_up_and_active(app_state, CatchUpMode::Convergence, true, 0).await {
+    match ensure_caught_up_and_active(app_state, CatchUpMode::Convergence, true, 0, None).await {
         Ok(NodeReadiness { sync_status: SyncStatus::CaughtUp, is_active: true }) => {
             // We're caught up and active, proceed with timeout detection
             tracing::debug!("Node is caught up and active, proceeding with timeout detection");

@@ -32,11 +32,22 @@ pub fn calculate_quorum_threshold(validator_count: usize) -> usize {
 }
 
 #[derive(Debug)]
+pub enum ProgressionErrorKind {
+    LockPhaseQcMismatch,
+    ViewTooOld,
+    ViewMismatch,
+    AlreadyIssuedTimeout,
+    InvalidParent,
+    PreparedBlockConflict,
+    InvalidHeight,
+}
+
+#[derive(Debug)]
 pub enum VoteError {
     DatabaseError,
     InitiatorError,
     ProcessingError,
-    ProgressionError,
+    ProgressionError(ProgressionErrorKind),
     BlockError,
     TransactionValidationError(String),
 }
@@ -180,7 +191,11 @@ impl Ballot {
         if self.data.phase == ConsensusPhase::Lock {
             if self.data.block_hash != consensus_state.highest_qc_block.block_hash {
                 // we're locking a phase we didn't just get phase 1 QC for
-                return Err(VoteError::ProgressionError);
+                tracing::warn!(
+                    "Lock phase ballot rejected: QC mismatch (ballot={:?}, highest_qc={:?})",
+                    self.data.block_hash, consensus_state.highest_qc_block.block_hash
+                );
+                return Err(VoteError::ProgressionError(ProgressionErrorKind::LockPhaseQcMismatch));
             }
             // not checking view number matches original
             // logic: if crash after phase1 issuance, later view leader can request phase2 votes
@@ -189,19 +204,23 @@ impl Ballot {
             // 1. View number progression
             // Reject proposals with views less than or equal to highest QC view seen
             // View number must go up with each successful proposal
-            // One leader cannot make two proposals 
-            return Err(VoteError::ProgressionError);
+            // One leader cannot make two proposals
+            return Err(VoteError::ProgressionError(ProgressionErrorKind::ViewTooOld));
         }
 
         // View must equal our current view
         if self.data.view != consensus_state.view {
-            return Err(VoteError::ProgressionError);
+            tracing::warn!(
+                "Ballot rejected: view mismatch (ballot view={}, our view={})",
+                self.data.view, consensus_state.view
+            );
+            return Err(VoteError::ProgressionError(ProgressionErrorKind::ViewMismatch));
         }
 
         // Check if we've already issued a timeout vote for this view
         if consensus_state.last_timeout_vote_view == self.data.view {
             tracing::warn!("Rejecting ballot for view {} - already issued timeout vote", self.data.view);
-            return Err(VoteError::ProgressionError);
+            return Err(VoteError::ProgressionError(ProgressionErrorKind::AlreadyIssuedTimeout));
         }
 
         // 2. Chain validity check
@@ -209,26 +228,51 @@ impl Ballot {
         match &self.block.data.parent_hash {
             Some(parent_hash) => {
                 if parent_hash != &consensus_state.committed_block.block_hash {
-                    return Err(VoteError::ProgressionError)
+                    tracing::warn!(
+                        "Ballot rejected: invalid parent (expected={:?}, got={:?})",
+                        consensus_state.committed_block.block_hash, parent_hash
+                    );
+                    return Err(VoteError::ProgressionError(ProgressionErrorKind::InvalidParent))
                 }
             }
             None => {
-                return Err(VoteError::ProgressionError)
+                return Err(VoteError::ProgressionError(ProgressionErrorKind::InvalidParent))
             }
         }
 
         // 3. Preparation safety
-        // Blocks in preparation phase should not be replaced by another block at same height
-        if consensus_state.prepared_block.is_some() {
-            if self.data.block_height == consensus_state.prepared_block.unwrap().data.height {
-                return Err(VoteError::ProgressionError)
+        if self.data.phase == ConsensusPhase::Propose {
+            // Propose phase: shouldn't have a prepared block at this height yet
+            if consensus_state.prepared_block.is_some() {
+                if self.data.block_height == consensus_state.prepared_block.unwrap().data.height {
+                    tracing::warn!(
+                        "Ballot rejected: prepared block conflict (height={})",
+                        self.data.block_height
+                    );
+                    return Err(VoteError::ProgressionError(ProgressionErrorKind::PreparedBlockConflict))
+                }
+            }
+        } else if self.data.phase == ConsensusPhase::Lock {
+            // Lock phase: ballot must match the block we prepared
+            if let Some(ref prepared) = consensus_state.prepared_block {
+                if self.data.block_hash != prepared.block_hash {
+                    tracing::warn!(
+                        "Lock phase ballot rejected: block mismatch (ballot={:?}, prepared={:?})",
+                        self.data.block_hash, prepared.block_hash
+                    );
+                    return Err(VoteError::ProgressionError(ProgressionErrorKind::PreparedBlockConflict))
+                }
             }
         }
 
         // 4. Height validation
         // need to increase by 1 height each time
         if self.data.block_height != consensus_state.committed_block.data.height + 1 {
-            return Err(VoteError::ProgressionError)
+            tracing::warn!(
+                "Ballot rejected: invalid height (expected={}, got={})",
+                consensus_state.committed_block.data.height + 1, self.data.block_height
+            );
+            return Err(VoteError::ProgressionError(ProgressionErrorKind::InvalidHeight))
         }
 
         // 5. Transaction validation (only for Propose phase)
@@ -390,9 +434,11 @@ impl QuorumCertificate {
             );
             return Err(CertificateError::ValidationError);
         }
-        
-        // Get validators for this height
-        let validators = db::get_validators(state.db_pool.get(), block.data.height).map_err(|_| CertificateError::DatabaseError)?;
+
+        // Get validators for committed height (parent block), not proposed block height
+        // This ensures consistency with middleware activation checks and leader's validator selection
+        let committed_height = consensus_state.committed_block.data.height;
+        let validators = db::get_validators(state.db_pool.get(), committed_height).map_err(|_| CertificateError::DatabaseError)?;
         let num_validators = validators.len();
 
         // Deduplicate voters: collect unique voter replica_ids (excluding proposer)

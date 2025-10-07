@@ -354,6 +354,8 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             // Routes that accept either JWT (users) or RPC (nodes) authentication
             let jwt_or_rpc_routes = Router::new()
                 .route("/consensus", get(consensus::routes::get_consensus))
+                .route("/consensus/history", get(consensus::routes::get_consensus_history))
+                .route("/consensus/view", post(consensus::routes::debug_view_state))
                 .route("/rpc/storage-server", get(metrics::routes::get_storage_server))
                 .layer(middleware::from_fn_with_state(app_state.clone(), consensus::routes::jwt_or_rpc_auth_middleware));
 
@@ -372,7 +374,6 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
             // RPC routes for inter-node communication with dual signature authentication
             let rpc_routes = Router::new()
-                .route("/consensus/propose", post(consensus::routes::post_propose))
                 .route("/consensus/view/{view}", get(consensus::routes::get_view_consensus_data))
                 .route("/fragments/{fragment_hash}", get(files::routes::get_fragment))
                 .route("/fragments/{fragment_hash}", post(files::routes::post_fragment))
@@ -381,6 +382,14 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/rpc/throughput-server", get(metrics::routes::get_throughput_server))
                 .route("/rpc/throughput-result/{session_id}", get(metrics::routes::get_throughput_result))
                 .layer(middleware::from_fn_with_state(app_state.clone(), consensus::routes::rpc_auth_middleware));
+
+            // Propose route - requires RPC auth + Validator-level validation (caught up + active)
+            // to prevent inactive/stale nodes from incorrectly acting as leader or creating forwarding loops
+            let propose_route = Router::new()
+                .route("/consensus/propose", post(consensus::routes::post_propose))
+                .layer(middleware::from_fn_with_state(app_state.clone(), consensus::routes::rpc_auth_middleware))
+                .layer(middleware::from_fn_with_state(app_state.clone(), consensus::routes::ensure_caught_up_middleware))
+                .layer(axum::Extension(consensus::routes::ConsensusRole::Validator));
 
             // Validator routes (active participation - requires active status)
             let validator_consensus_routes = Router::new()
@@ -410,6 +419,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .merge(protected_routes)
                 .merge(jwt_or_rpc_routes)
                 .merge(rpc_routes)
+                .merge(propose_route)
                 .merge(validator_consensus_routes)
                 .merge(observer_consensus_routes)
                 .nest("/integrations/fileprovider", fileprovider_routes)

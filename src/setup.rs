@@ -89,15 +89,26 @@ pub async fn put_join_bootstrap(
             join_info_clone.bootstrap_validators.len()
         );
 
-        match crate::consensus::routes::perform_catch_up_with_convergence(
+        use crate::consensus::routes::CatchUpMode;
+        match crate::consensus::routes::ensure_caught_up_and_active(
             &app_state_clone,
+            CatchUpMode::Convergence,
+            true,  // request_activation_if_needed
+            0,     // tolerance_views (ignored for Convergence mode)
             Some(&join_info_clone.bootstrap_validators)
         ).await {
-            Ok(_) => {
-                tracing::info!(
-                    "Catch-up completed successfully for node {}. Activation will occur automatically on next consensus cycle.",
-                    join_info_clone.node_id
-                );
+            Ok(readiness) => {
+                if readiness.is_active {
+                    tracing::info!(
+                        "Catch-up and activation completed successfully for node {}",
+                        join_info_clone.node_id
+                    );
+                } else {
+                    tracing::info!(
+                        "Catch-up completed for node {}, activation request submitted",
+                        join_info_clone.node_id
+                    );
+                }
             }
             Err(e) => {
                 tracing::error!(
