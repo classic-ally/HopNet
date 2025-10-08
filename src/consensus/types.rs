@@ -278,11 +278,19 @@ impl Ballot {
         // 5. Transaction validation (only for Propose phase)
         // Validate that all transactions can actually succeed before voting
         if self.data.phase == ConsensusPhase::Propose {
-            if let Err(e) = process_transactions(&self.block.data.transactions, state, false) {
+            // Create validation transaction
+            let mut conn = state.db_pool.get().map_err(|_| VoteError::DatabaseError)?;
+            let db_tx = conn.transaction().map_err(|_| VoteError::DatabaseError)?;
+
+            if let Err(e) = process_transactions(&self.block.data.transactions, state, false, &db_tx) {
                 let error_msg = format!("Transaction validation failed: {:?}", e);
                 tracing::warn!("Refusing to vote for ballot - {}", error_msg);
                 return Err(VoteError::TransactionValidationError(error_msg));
             }
+
+            // Explicitly rollback validation transaction
+            db_tx.rollback().map_err(|_| VoteError::DatabaseError)?;
+            tracing::debug!("Transaction validation passed, changes rolled back");
         }
 
         Ok(())
@@ -452,28 +460,45 @@ impl QuorumCertificate {
             unique_voters.entry(voter_sig.replica_id).or_insert(voter_sig);
         }
 
-        // Check we have enough unique signatures for quorum (dynamic threshold)
-        let required_signatures = calculate_quorum_threshold(num_validators);
-        let total_unique_signatures = 1 + unique_voters.len(); // proposer + unique voters
+        // Filter to only votes from validators (prevents DoS from invalid votes)
+        // Collect valid votes with their corresponding validator nodes
+        let mut valid_voter_pairs: Vec<(&VoteSignMessage, &crate::types::Node)> = Vec::new();
+        let mut invalid_vote_count = 0;
 
-        if total_unique_signatures < required_signatures {
-            tracing::warn!(
-                "QC verification failed: insufficient unique signatures (got: {}, required: {}, validators: {})",
-                total_unique_signatures, required_signatures, num_validators
-            );
-            return Err(CertificateError::ValidationError);
+        for voter_sig in unique_voters.values() {
+            if let Some(voter_node) = validators.iter().find(|v| v.node_id == voter_sig.replica_id) {
+                valid_voter_pairs.push((voter_sig, voter_node));
+            } else {
+                invalid_vote_count += 1;
+                tracing::warn!(
+                    "Ignoring vote from non-validator node {} in QC for view {} phase {:?}",
+                    voter_sig.replica_id, self.view_number, self.phase
+                );
+            }
         }
-        
+
+        // Check we have enough valid signatures for quorum (dynamic threshold)
+        let required_signatures = calculate_quorum_threshold(num_validators);
+        let total_valid_signatures = 1 + valid_voter_pairs.len(); // proposer + valid voters
+
+        if total_valid_signatures < required_signatures {
+            tracing::warn!(
+                "QC verification failed: insufficient valid signatures (got: {}, required: {}, validators: {}, invalid votes filtered: {})",
+                total_valid_signatures, required_signatures, num_validators, invalid_vote_count
+            );
+            return Err(CertificateError::InsufficientVotes);
+        }
+
         tracing::debug!(
-            "Verifying QC for view {} phase {:?} with {} unique signatures from {} validators",
-            self.view_number, self.phase, total_unique_signatures, num_validators
+            "Verifying QC for view {} phase {:?} with {} valid signatures from {} validators (filtered {} invalid votes)",
+            self.view_number, self.phase, total_valid_signatures, num_validators, invalid_vote_count
         );
 
         // Prepare data for batch verification
         let vote_data = VoteSignData::from_block(block.clone(), self.phase.clone());
         let message = vote_data.encode().map_err(|_| CertificateError::ValidationError)?;
 
-        // Collect all signatures and public keys for batch verification (using only unique voters)
+        // Collect all signatures and public keys for batch verification (using only valid voters)
         let mut signatures = Vec::new();
         let mut public_keys = Vec::new();
         let mut messages = Vec::new();
@@ -481,7 +506,7 @@ impl QuorumCertificate {
         // Add proposer signature
         signatures.push(self.proposer_signature.signature);
 
-        // Find proposer's public key
+        // Find proposer's public key (proposer must be a validator)
         let proposer_node = validators.iter()
             .find(|v| v.node_id == self.proposer_signature.replica_id)
             .ok_or(CertificateError::SignerNotFound)?;
@@ -489,16 +514,10 @@ impl QuorumCertificate {
         public_keys.push(*proposer_pubkey);
         messages.push(message.as_slice());
 
-        // Add unique voter signatures only
-        for voter_sig in unique_voters.values() {
+        // Add valid voter signatures only (already filtered to validators)
+        for (voter_sig, voter_node) in valid_voter_pairs {
             signatures.push(voter_sig.signature);
-
-            // Find voter's public key
-            let voter_node = validators.iter()
-                .find(|v| v.node_id == voter_sig.replica_id)
-                .ok_or(CertificateError::SignerNotFound)?;
-            let voter_pubkey = voter_node.pubkey;
-            public_keys.push(*voter_pubkey);
+            public_keys.push(*voter_node.pubkey);
             messages.push(message.as_slice());
         }
         
@@ -616,19 +635,64 @@ impl TimeoutCertificate {
     }
     
     pub fn verify(&self, app_state: &AppState) -> Result<(), CertificateError> {
-        // Get validators for this view
-        let validators = db::get_validators(app_state.db_pool.get(), self.view_number)
+        // Get current consensus state for view validation
+        let consensus_state = db::get_consensus(app_state.db_pool.get())
+            .map_err(|_| CertificateError::DatabaseError)?;
+
+        // Validate view number - only accept current view (prevents out-of-order integration)
+        if self.view_number != consensus_state.view {
+            tracing::warn!(
+                "TC verification failed: invalid view {} (current view: {})",
+                self.view_number, consensus_state.view
+            );
+            return Err(CertificateError::ValidationError);
+        }
+
+        // Get validators for the height at this view (not raw view number)
+        // This ensures correct threshold calculation when view diverges from height
+        let mut conn = app_state.db_pool.get().map_err(|_| CertificateError::DatabaseError)?;
+        let tx = conn.transaction().map_err(|_| CertificateError::DatabaseError)?;
+        let height = db::get_height_at_view_tx(&tx, self.view_number)
+            .map_err(|_| CertificateError::DatabaseError)?;
+        drop(tx); // Release transaction before getting validators
+
+        let validators = db::get_validators(app_state.db_pool.get(), height)
             .map_err(|_| CertificateError::DatabaseError)?;
         let num_validators = validators.len();
-        
-        // Check we have enough signatures for quorum (dynamic threshold)
+
+        // Filter to only votes from validators (prevents DoS from invalid votes)
+        let mut valid_voter_pairs: Vec<(&VoteSignMessage, &crate::types::Node)> = Vec::new();
+        let mut invalid_vote_count = 0;
+
+        for vote_sig in &*self.signatures {
+            if let Some(voter_node) = validators.iter().find(|v| v.node_id == vote_sig.replica_id) {
+                valid_voter_pairs.push((vote_sig, voter_node));
+            } else {
+                invalid_vote_count += 1;
+                tracing::warn!(
+                    "Ignoring timeout vote from non-validator node {} in TC for view {}",
+                    vote_sig.replica_id, self.view_number
+                );
+            }
+        }
+
+        // Check we have enough valid signatures for quorum (dynamic threshold)
         let required_signatures = calculate_quorum_threshold(num_validators);
-        let total_signatures = self.signatures.len();
-        
-        if total_signatures < required_signatures {
+        let total_valid_signatures = valid_voter_pairs.len();
+
+        if total_valid_signatures < required_signatures {
+            tracing::warn!(
+                "TC verification failed: insufficient valid signatures (got: {}, required: {}, validators: {}, invalid votes filtered: {})",
+                total_valid_signatures, required_signatures, num_validators, invalid_vote_count
+            );
             return Err(CertificateError::InsufficientVotes);
         }
-        
+
+        tracing::debug!(
+            "Verifying TC for view {} with {} valid signatures from {} validators (filtered {} invalid votes)",
+            self.view_number, total_valid_signatures, num_validators, invalid_vote_count
+        );
+
         // Verify signatures on timeout data
         let timeout_data = TimeoutSignData {
             view_number: self.view_number,
@@ -637,23 +701,18 @@ impl TimeoutCertificate {
             highest_qc_hash: self.highest_qc.block_hash,
         };
         let message = timeout_data.encode().map_err(|_| CertificateError::ValidationError)?;
-        
-        // Collect signatures and public keys for batch verification
+
+        // Collect signatures and public keys for batch verification (using only valid voters)
         let mut signatures = Vec::new();
         let mut public_keys = Vec::new();
         let mut messages = Vec::new();
-        
-        for vote_sig in &*self.signatures {
+
+        for (vote_sig, voter_node) in valid_voter_pairs {
             signatures.push(vote_sig.signature);
-            
-            // Find voter's public key
-            let voter_node = validators.iter()
-                .find(|v| v.node_id == vote_sig.replica_id)
-                .ok_or(CertificateError::SignerNotFound)?;
             public_keys.push(*voter_node.pubkey);
             messages.push(message.as_slice());
         }
-        
+
         // Perform batch verification
         match ed25519_dalek::verify_batch(&messages, &signatures, &public_keys) {
             Ok(_) => Ok(()),
@@ -681,8 +740,15 @@ impl TimeoutCertificate {
         for (data_hash, votes) in data_counts {
             let view_number = votes[0].data.view_number;
             
-            // Get validator count for this specific view
-            let validators = db::get_validators(app_state.db_pool.get(), view_number)
+            // Get validator count for the height at this view (not raw view number)
+            // This ensures correct threshold calculation when view diverges from height
+            let mut conn = app_state.db_pool.get().map_err(|_| CertificateError::DatabaseError)?;
+            let tx = conn.transaction().map_err(|_| CertificateError::DatabaseError)?;
+            let height = db::get_height_at_view_tx(&tx, view_number)
+                .map_err(|_| CertificateError::DatabaseError)?;
+            drop(tx); // Release transaction before getting validators
+
+            let validators = db::get_validators(app_state.db_pool.get(), height)
                 .map_err(|_| CertificateError::DatabaseError)?;
             let required_quorum = calculate_quorum_threshold(validators.len());
 

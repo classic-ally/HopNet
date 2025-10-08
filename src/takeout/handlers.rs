@@ -9,11 +9,11 @@ use crate::{
 pub struct CreateTakeoutHandler;
 
 impl TransactionHandler for CreateTakeoutHandler {
-    fn name(&self) -> &'static str { 
-        "create_takeout" 
+    fn name(&self) -> &'static str {
+        "create_takeout"
     }
 
-    fn process(&self, state: &AppState, tx: &Transaction, execute: bool) -> HandlerResult {
+    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
         match bincode::serde::decode_from_slice::<TakeoutPayload, _>(&tx.rpc.payload, bincode::config::standard()) {
             Ok((takeout_payload, _)) => {
                 // Authorization: verify user and node match authenticated identities
@@ -35,14 +35,15 @@ impl TransactionHandler for CreateTakeoutHandler {
                 // Get current node ID
                 let current_node_id = state.get_node_id().map_err(|_| DatabaseError::ProcessingError)?;
 
-                // Process the takeout creation (includes validation)
+                // Process the takeout creation using shared transaction
                 takeout::process_takeout_creation(
                     state,
                     &takeout_payload,
                     current_node_id,
                     execute,
+                    db_tx,
                 )?;
-                
+
                 Ok(())
             },
             Err(_) => Err(DatabaseError::InvalidPayload),
@@ -58,20 +59,21 @@ inventory::submit! {
 pub struct UpdateTakeoutStatusHandler;
 
 impl TransactionHandler for UpdateTakeoutStatusHandler {
-    fn name(&self) -> &'static str { 
-        "update_takeout_status" 
+    fn name(&self) -> &'static str {
+        "update_takeout_status"
     }
 
-    fn process(&self, state: &AppState, tx: &Transaction, execute: bool) -> HandlerResult {
+    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
         match bincode::serde::decode_from_slice::<TakeoutStatusPayload, _>(&tx.rpc.payload, bincode::config::standard()) {
             Ok((status_payload, _)) => {
-                // Process the takeout status update (includes validation)
+                // Process the takeout status update using shared transaction
                 takeout::process_takeout_status_update(
                     state,
                     &status_payload,
                     execute,
+                    db_tx,
                 )?;
-                
+
                 Ok(())
             },
             Err(_) => Err(DatabaseError::InvalidPayload),

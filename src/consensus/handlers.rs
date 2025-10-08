@@ -25,7 +25,7 @@ pub struct ValidatorActivationHandler;
 impl TransactionHandler for ValidatorActivationHandler {
     fn name(&self) -> &'static str { "validator_activation" }
 
-    fn process(&self, state: &AppState, tx: &Transaction, execute: bool) -> HandlerResult {
+    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
         // Decode activation request payload
         let (activation_req, _) = bincode::serde::decode_from_slice::<ActivationRequest, _>(
             &tx.rpc.payload,
@@ -45,11 +45,8 @@ impl TransactionHandler for ValidatorActivationHandler {
 
         // Validation phase: checks determine vote (YES/NO) but don't affect execution
         if !execute {
-            let mut conn = state.db_pool.get().map_err(|_| DatabaseError::LockError)?;
-            let tx_db = conn.transaction().map_err(|_| DatabaseError::LockError)?;
-
             // Synchronization check: Node must be caught up (within 10 views tolerance)
-            let consensus_height = get_current_consensus_height(&tx_db)?;
+            let consensus_height = get_current_consensus_height(db_tx)?;
             if activation_req.current_height < consensus_height - 10 {
                 tracing::warn!(
                     "Node {} activation failed validation: not caught up (reported height {}, consensus height {})",
@@ -73,12 +70,9 @@ impl TransactionHandler for ValidatorActivationHandler {
         // Execution phase: always execute if consensus succeeded (≥2/3 voted YES)
         // This ensures all nodes perform identical state changes regardless of individual validation
         if execute {
-            let mut conn = state.db_pool.get().map_err(|_| DatabaseError::LockError)?;
-            let tx_db = conn.transaction().map_err(|_| DatabaseError::LockError)?;
-
             // Compute activation height deterministically during execution
             // All nodes are synchronized to same committed height by Lock QC insertion
-            let committed_height = get_current_consensus_height(&tx_db)?;
+            let committed_height = get_current_consensus_height(db_tx)?;
             let effective_height = committed_height + 0;  // Activate immediately.
 
             tracing::info!(
@@ -91,13 +85,10 @@ impl TransactionHandler for ValidatorActivationHandler {
 
             // Activate the validator (INSERT or UPDATE future activation)
             activate_validator(
-                &tx_db,
+                db_tx,
                 activation_req.node_id,
                 effective_height
             )?;
-
-            // Commit the database transaction
-            tx_db.commit().map_err(|_| DatabaseError::InsertError)?;
         }
 
         Ok(())
@@ -138,7 +129,7 @@ pub struct InsertGenesisHandler;
 impl TransactionHandler for InsertGenesisHandler {
     fn name(&self) -> &'static str { "insert_genesis" }
 
-    fn process(&self, state: &AppState, tx: &Transaction, execute: bool) -> HandlerResult {
+    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
         tracing::debug!("InsertGenesisHandler: Starting (execute={})", execute);
 
         // Decode genesis payload
@@ -151,24 +142,11 @@ impl TransactionHandler for InsertGenesisHandler {
         })?;
         tracing::debug!("InsertGenesisHandler: Decoded genesis payload");
 
-        // Get database connection and transaction immediately
-        let mut conn = state.db_pool.get().map_err(|e| {
-            tracing::error!("InsertGenesisHandler: Failed to get DB connection: {:?}", e);
-            DatabaseError::LockError
-        })?;
-        tracing::debug!("InsertGenesisHandler: Got DB connection");
-
-        let tx_db = conn.transaction().map_err(|e| {
-            tracing::error!("InsertGenesisHandler: Failed to start transaction: {:?}", e);
-            DatabaseError::LockError
-        })?;
-        tracing::debug!("InsertGenesisHandler: Started transaction");
-
         // Safety check: Only allow genesis handler at height 0
         // Check if sequences already exist - if so, genesis already processed
         // Fail if query fails (don't proceed with unknown database state)
         tracing::debug!("InsertGenesisHandler: Checking if sequences exist");
-        let existing_sequences: i32 = tx_db.query_row(
+        let existing_sequences: i32 = db_tx.query_row(
             "SELECT COUNT(*) FROM sequences",
             [],
             |row| row.get(0)
@@ -191,7 +169,7 @@ impl TransactionHandler for InsertGenesisHandler {
 
         // 1. Initialize sequences
         tracing::debug!("InsertGenesisHandler: Initializing sequences");
-        initialize_sequences_tx(&tx_db).map_err(|e| {
+        initialize_sequences_tx(db_tx).map_err(|e| {
             tracing::error!("InsertGenesisHandler: Failed to initialize sequences: {:?}", e);
             e
         })?;
@@ -199,7 +177,7 @@ impl TransactionHandler for InsertGenesisHandler {
 
         // 2. Insert user (returns user_id=0)
         tracing::debug!("InsertGenesisHandler: Inserting user");
-        let user_id = insert_user_tx(&tx_db, genesis_data.user).map_err(|e| {
+        let user_id = insert_user_tx(db_tx, genesis_data.user).map_err(|e| {
             tracing::error!("InsertGenesisHandler: Failed to insert user: {:?}", e);
             e
         })?;
@@ -207,7 +185,7 @@ impl TransactionHandler for InsertGenesisHandler {
 
         // 3. Insert node (returns node_id=0)
         tracing::debug!("InsertGenesisHandler: Inserting node");
-        let node_id = insert_node_tx(&tx_db, genesis_data.node).map_err(|e| {
+        let node_id = insert_node_tx(db_tx, genesis_data.node).map_err(|e| {
             tracing::error!("InsertGenesisHandler: Failed to insert node: {:?}", e);
             e
         })?;
@@ -216,7 +194,7 @@ impl TransactionHandler for InsertGenesisHandler {
         // 4. Activate genesis validator (special case - only for genesis)
         // Uses same activate_validator function as normal activation for consistency
         tracing::debug!("InsertGenesisHandler: Activating validator");
-        activate_validator(&tx_db, node_id, 0).map_err(|e| {
+        activate_validator(db_tx, node_id, 0).map_err(|e| {
             tracing::error!("InsertGenesisHandler: Failed to activate validator: {:?}", e);
             e
         })?;
@@ -229,15 +207,9 @@ impl TransactionHandler for InsertGenesisHandler {
                 user_id,
                 node_id
             );
-            tracing::debug!("InsertGenesisHandler: Committing transaction");
-            tx_db.commit().map_err(|e| {
-                tracing::error!("InsertGenesisHandler: Failed to commit transaction: {:?}", e);
-                DatabaseError::InsertError
-            })?;
-            tracing::debug!("InsertGenesisHandler: Committed transaction");
         } else {
-            // Validation phase - genesis always valid, rollback
-            tracing::debug!("Genesis handler validated successfully (rolled back)");
+            // Validation phase - genesis always valid
+            tracing::debug!("Genesis handler validated successfully");
         }
 
         tracing::debug!("InsertGenesisHandler: Completed successfully");

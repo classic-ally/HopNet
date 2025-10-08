@@ -14,7 +14,7 @@ pub struct InsertFilesHandler;
 impl TransactionHandler for InsertFilesHandler {
     fn name(&self) -> &'static str { "insert_files" }
 
-    fn process(&self, state: &AppState, tx: &Transaction, execute: bool) -> HandlerResult {
+    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
         match bincode::serde::decode_from_slice::<Vec<Inode>, _>(&tx.rpc.payload, bincode::config::standard()) {
             Ok((mut inodes, _)) => {
                 // Authorization: verify user owns the files being inserted
@@ -44,16 +44,16 @@ impl TransactionHandler for InsertFilesHandler {
                         for fragment in &mut data_record.data.fragments {
                             // Check if fragment exists and is valid on this node
                             fragment.stored_locally = fragment_exists_and_valid(
-                                &state.fragments_dir, 
+                                &state.fragments_dir,
                                 &fragment.fragment_hash
                             );
                         }
                     }
                 }
-                
-                // Insert the files into the database with execute flag
-                insert_files(state.db_pool.get(), inodes, execute)?;
-                
+
+                // Insert the files into the database using shared transaction
+                insert_files(db_tx, inodes)?;
+
                 // Signal FileProvider to refresh when files are actually inserted (execute=true)
                 if execute {
                     #[cfg(target_os = "macos")]
@@ -83,11 +83,11 @@ pub struct UpdatePlacementHeightsHandler;
 impl TransactionHandler for UpdatePlacementHeightsHandler {
     fn name(&self) -> &'static str { "update_placement_heights" }
 
-    fn process(&self, state: &AppState, tx: &Transaction, execute: bool) -> HandlerResult {
+    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
         match bincode::serde::decode_from_slice::<Vec<PlacementHeightUpdate>, _>(&tx.rpc.payload, bincode::config::standard()) {
             Ok((updates_data, _)) => {
-                // Update placement heights using the consensus-safe version with execute flag
-                update_placement_heights_batch(state.db_pool.get(), updates_data, execute)?;
+                // Update placement heights using shared transaction
+                update_placement_heights_batch(db_tx, updates_data)?;
                 Ok(())
             },
             Err(_) => Err(DatabaseError::InvalidPayload),
@@ -115,13 +115,12 @@ pub struct DeleteOrphanedDataBlocksHandler;
 impl TransactionHandler for DeleteOrphanedDataBlocksHandler {
     fn name(&self) -> &'static str { "delete_orphaned_data_blocks" }
 
-    fn process(&self, state: &AppState, tx: &Transaction, execute: bool) -> HandlerResult {
+    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
         match bincode::serde::decode_from_slice::<DeleteOrphanedDataBlocksPayload, _>(&tx.rpc.payload, bincode::config::standard()) {
             Ok((payload_data, _)) => {
                 let deleted_fragment_hashes = delete_orphaned_data_blocks_consensus(
-                    state.db_pool.get(), 
-                    payload_data.data_block_ids, 
-                    execute
+                    db_tx,
+                    payload_data.data_block_ids,
                 )?;
                 
                 // If executing, opportunistically delete local fragment files
@@ -171,7 +170,7 @@ pub struct ModifyItemHandler;
 impl TransactionHandler for ModifyItemHandler {
     fn name(&self) -> &'static str { "modify_item" }
 
-    fn process(&self, state: &AppState, tx: &Transaction, execute: bool) -> HandlerResult {
+    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
         match bincode::serde::decode_from_slice::<ModifyItemPayload, _>(&tx.rpc.payload, bincode::config::standard()) {
             Ok((mut payload_data, _)) => {
                 // Authorization: verify user matches authenticated user
@@ -185,40 +184,29 @@ impl TransactionHandler for ModifyItemHandler {
                     return Err(DatabaseError::AuthorizationError);
                 }
 
-                tracing::debug!("ModifyItemHandler processing: inode_id={} user_id={} execute={} new_encrypted_path={:?}",
-                    payload_data.inode_id, payload_data.user_id, execute, payload_data.new_encrypted_path);
-                
+                tracing::debug!("ModifyItemHandler processing: inode_id={} user_id={} new_encrypted_path={:?}",
+                    payload_data.inode_id, payload_data.user_id, payload_data.new_encrypted_path);
+
                 // Validate fragments exist locally and update stored_locally flags (like InsertFilesHandler)
                 if let Some(ref mut data_record) = payload_data.new_data_record {
                     for fragment in &mut data_record.data.fragments {
                         // Check if fragment exists and is valid on this node
                         fragment.stored_locally = fragment_exists_and_valid(
-                            &state.fragments_dir, 
+                            &state.fragments_dir,
                             &fragment.fragment_hash
                         );
                     }
                 }
-                
-                match crate::db::files::modify_item(
-                    state.db_pool.get(),
+
+                crate::db::files::modify_item(
+                    db_tx,
                     payload_data.user_id,
                     payload_data.inode_id.clone(),
                     payload_data.new_encrypted_path.clone(),
                     payload_data.new_data_block_id.clone(),
                     payload_data.new_data_record.clone(),
-                    execute
-                ) {
-                    Ok(()) => {
-                        tracing::debug!("modify_item succeeded for inode_id={} user_id={} execute={}", 
-                            payload_data.inode_id, payload_data.user_id, execute);
-                    },
-                    Err(e) => {
-                        tracing::error!("modify_item failed for inode_id={} user_id={} execute={} error={:?}", 
-                            payload_data.inode_id, payload_data.user_id, execute, e);
-                        return Err(e);
-                    }
-                }
-                
+                )?;
+
                 if execute {
                     tracing::info!("Modified item at path for user {}", payload_data.user_id);
                     
@@ -252,7 +240,7 @@ pub struct DeleteFilesHandler;
 impl TransactionHandler for DeleteFilesHandler {
     fn name(&self) -> &'static str { "delete_files" }
 
-    fn process(&self, state: &AppState, tx: &Transaction, execute: bool) -> HandlerResult {
+    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
         match bincode::serde::decode_from_slice::<DeleteFilesPayload, _>(&tx.rpc.payload, bincode::config::standard()) {
             Ok((payload_data, _)) => {
                 // Authorization: verify user matches authenticated user
@@ -267,10 +255,9 @@ impl TransactionHandler for DeleteFilesHandler {
                 }
 
                 crate::db::files::delete_files(
-                    state.db_pool.get(), 
-                    payload_data.encrypted_path, 
+                    db_tx,
+                    payload_data.encrypted_path,
                     payload_data.user_id,
-                    execute
                 )?;
                 
                 if execute {
@@ -305,7 +292,7 @@ pub struct SelfCheckFragmentsHandler;
 impl TransactionHandler for SelfCheckFragmentsHandler {
     fn name(&self) -> &'static str { "self_check_fragments" }
 
-    fn process(&self, state: &AppState, tx: &Transaction, execute: bool) -> HandlerResult {
+    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
         match bincode::serde::decode_from_slice::<crate::files::types::SelfCheckFragments, _>(&tx.rpc.payload, bincode::config::standard()) {
             Ok((report, _)) => {
                 // Authorization: verify node can only submit attestations for itself
@@ -316,9 +303,8 @@ impl TransactionHandler for SelfCheckFragmentsHandler {
 
                 // Apply the self-check updates using the inventory module
                 crate::db::inventory::apply_self_check_updates(
-                    state.db_pool.get(),
+                    db_tx,
                     &report,
-                    execute
                 )?;
 
                 Ok(())

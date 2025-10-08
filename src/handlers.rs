@@ -12,7 +12,8 @@ pub trait TransactionHandler: Send + Sync {
     // - tx.submitter.id (cryptographically verified node that submitted)
     // - tx.user (optional, cryptographically verified user if present)
     // - tx.rpc.payload (the actual operation payload to decode)
-    fn process(&self, state: &AppState, tx: &Transaction, execute: bool) -> HandlerResult;
+    // - db_tx: shared database transaction for atomicity (all transactions in block use same tx)
+    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult;
 
 }
 

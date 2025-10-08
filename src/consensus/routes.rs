@@ -300,48 +300,82 @@ pub async fn post_qc(
                         "QC verified, inserting into database for view {} phase {:?}",
                         qc.view_number, qc.phase
                     );
-                    
-                    match db::insert_qc(app_state.db_pool.get(), qc.clone()) {
-                        Ok(()) => {
-                            // Process transactions if this is a Lock phase QC
-                            if qc.phase == ConsensusPhase::Lock {
-                                tracing::info!(
-                                    "Lock phase QC committed for view {}, processing transactions",
-                                    qc.view_number
+
+                    // Get database connection and create transaction
+                    let mut conn = match app_state.db_pool.get() {
+                        Ok(conn) => conn,
+                        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                    };
+
+                    let db_tx = match conn.transaction() {
+                        Ok(tx) => tx,
+                        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                    };
+
+                    // Insert QC (updates consensus state)
+                    if let Err(_) = db::insert_qc_tx(&db_tx, &qc) {
+                        // QC insertion failed - check if it already exists
+                        match db::get_quorum_certificate_by_hash(app_state.db_pool.get(), &qc.view_number, &qc.block_hash, &qc.phase) {
+                            Ok(_existing_qc) => {
+                                // QC already exists (duplicate broadcast), acknowledge success
+                                tracing::debug!(
+                                    "QC for view {} phase {:?} already exists, acknowledging",
+                                    qc.view_number, qc.phase
                                 );
-                                let _ = crate::consensus::functions::process_transactions(&block.data.transactions, &app_state, true);
+                                return StatusCode::OK.into_response();
+                            },
+                            Err(_) => {
+                                // QC doesn't exist and couldn't be inserted - real error
+                                tracing::error!(
+                                    "Failed to insert QC for view {} phase {:?}",
+                                    qc.view_number, qc.phase
+                                );
+                                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                             }
-                            StatusCode::OK
-                        },
-                        Err(_) => {
-                            // QC insertion failed - check if it already exists
-                            match db::get_quorum_certificate_by_hash(app_state.db_pool.get(), &qc.view_number, &qc.block_hash, &qc.phase) {
-                                Ok(_existing_qc) => {
-                                    // QC already exists (duplicate broadcast), acknowledge success
-                                    tracing::debug!(
-                                        "QC for view {} phase {:?} already exists, acknowledging",
-                                        qc.view_number, qc.phase
-                                    );
-                                    StatusCode::OK
-                                },
-                                Err(_) => {
-                                    // QC doesn't exist and couldn't be inserted - real error
-                                    tracing::error!(
-                                        "Failed to insert QC for view {} phase {:?}",
-                                        qc.view_number, qc.phase
-                                    );
-                                    StatusCode::INTERNAL_SERVER_ERROR
-                                }
-                            }
-                        },
+                        }
                     }
+
+                    // Process transactions if this is a Lock phase QC (atomically with QC insertion)
+                    if qc.phase == ConsensusPhase::Lock {
+                        tracing::info!(
+                            "Lock phase QC inserted for view {}, processing transactions",
+                            qc.view_number
+                        );
+
+                        if let Err(e) = crate::consensus::functions::process_transactions(&block.data.transactions, &app_state, true, &db_tx) {
+                            tracing::error!(
+                                "Failed to process transactions for view {}: {:?}",
+                                qc.view_number, e
+                            );
+                            // Transaction auto-rolls back, consensus state changes are discarded
+                            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                        }
+                    }
+
+                    // Commit transaction (QC insertion + transaction processing)
+                    if let Err(e) = db_tx.commit() {
+                        tracing::error!(
+                            "Failed to commit QC/transaction processing for view {} phase {:?}: {:?}",
+                            qc.view_number, qc.phase, e
+                        );
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+
+                    tracing::info!(
+                        "Successfully committed QC for view {} phase {:?}{}",
+                        qc.view_number,
+                        qc.phase,
+                        if qc.phase == ConsensusPhase::Lock { " with transaction processing" } else { "" }
+                    );
+
+                    StatusCode::OK.into_response()
                 }
                 Err(e) => {
                     tracing::warn!(
                         "QC verification failed for view {} phase {:?}: {:?}",
                         qc.view_number, qc.phase, e
                     );
-                    StatusCode::UNAUTHORIZED
+                    StatusCode::UNAUTHORIZED.into_response()
                 }
             }
         }
@@ -350,7 +384,7 @@ pub async fn post_qc(
                 "Block {:?} not found for QC verification",
                 qc.block_hash
             );
-            StatusCode::NOT_FOUND
+            StatusCode::NOT_FOUND.into_response()
         }
     }
     
@@ -602,8 +636,15 @@ async fn integrate_view(
                 })?;
             }
 
-            match db::insert_qc(app_state.db_pool.get(), propose_qc.clone()) {
+            // Get database connection and create transaction for Propose QC
+            let mut conn = app_state.db_pool.get().map_err(|_| ConsensusError::DatabaseError)?;
+            let db_tx = conn.transaction().map_err(|_| ConsensusError::DatabaseError)?;
+
+            match db::insert_qc_tx(&db_tx, &propose_qc) {
                 Ok(_) => {
+                    // Commit Propose QC insertion
+                    db_tx.commit().map_err(|_| ConsensusError::DatabaseError)?;
+
                     if is_genesis {
                         tracing::debug!("Inserted genesis propose QC for view 0 (no verification)");
                     } else {
@@ -611,7 +652,16 @@ async fn integrate_view(
                     }
                 }
                 Err(_) => {
-                    tracing::debug!("Propose QC for view {} already exists", view);
+                    // QC insertion failed - check if it already exists
+                    match db::get_quorum_certificate_by_hash(app_state.db_pool.get(), &propose_qc.view_number, &propose_qc.block_hash, &propose_qc.phase) {
+                        Ok(_existing_qc) => {
+                            tracing::debug!("Propose QC for view {} already exists", view);
+                        }
+                        Err(_) => {
+                            tracing::error!("Failed to insert propose QC for view {}", view);
+                            return Err(ConsensusError::DatabaseError);
+                        }
+                    }
                 }
             }
         } else {
@@ -632,25 +682,53 @@ async fn integrate_view(
                 })?;
             }
 
-            match db::insert_qc(app_state.db_pool.get(), lock_qc.clone()) {
+            // Get database connection and create transaction for Lock QC
+            let mut conn = app_state.db_pool.get().map_err(|_| ConsensusError::DatabaseError)?;
+            let db_tx = conn.transaction().map_err(|_| ConsensusError::DatabaseError)?;
+
+            match db::insert_qc_tx(&db_tx, &lock_qc) {
                 Ok(_) => {
+                    // Process transactions if this is a Lock phase QC (atomically with QC insertion)
+                    if lock_qc.phase == ConsensusPhase::Lock {
+                        tracing::info!(
+                            "Lock phase QC inserted for view {}, processing transactions",
+                            lock_qc.view_number
+                        );
+
+                        if let Err(e) = crate::consensus::functions::process_transactions(&block.data.transactions, app_state, true, &db_tx) {
+                            tracing::error!(
+                                "Failed to process transactions for view {}: {:?}",
+                                lock_qc.view_number, e
+                            );
+                            // Transaction auto-rolls back, consensus state changes are discarded
+                            return Err(ConsensusError::DatabaseError);
+                        }
+                    }
+
+                    // Commit transaction (QC insertion + transaction processing)
+                    db_tx.commit().map_err(|_| ConsensusError::DatabaseError)?;
+
                     if is_genesis {
                         tracing::debug!("Inserted genesis lock QC for view 0 (no verification)");
                     } else {
-                        tracing::debug!("Validated and inserted lock QC for view {}", view);
-                    }
-
-                    // Process transactions if this is a Lock phase QC (same logic as post_qc)
-                    if lock_qc.phase == ConsensusPhase::Lock {
                         tracing::info!(
-                            "Lock phase QC committed for view {}, processing transactions",
-                            lock_qc.view_number
+                            "Successfully committed lock QC for view {}{}",
+                            view,
+                            if lock_qc.phase == ConsensusPhase::Lock { " with transaction processing" } else { "" }
                         );
-                        let _ = crate::consensus::functions::process_transactions(&block.data.transactions, app_state, true);
                     }
                 }
                 Err(_) => {
-                    tracing::debug!("Lock QC for view {} already exists", view);
+                    // QC insertion failed - check if it already exists
+                    match db::get_quorum_certificate_by_hash(app_state.db_pool.get(), &lock_qc.view_number, &lock_qc.block_hash, &lock_qc.phase) {
+                        Ok(_existing_qc) => {
+                            tracing::debug!("Lock QC for view {} already exists", view);
+                        }
+                        Err(_) => {
+                            tracing::error!("Failed to insert lock QC for view {}", view);
+                            return Err(ConsensusError::DatabaseError);
+                        }
+                    }
                 }
             }
         } else {
@@ -935,6 +1013,83 @@ async fn request_activation(
     Ok(())
 }
 
+/// Ensure we have all QCs within the current view (intra-view synchronization)
+///
+/// This function addresses a critical gap in view-level synchronization:
+/// - View-level sync only ensures we're at the right view number
+/// - But within a view, we could be missing the Propose QC
+/// - This causes Lock ballot rejection when highest_qc_block doesn't match
+///
+/// Example failure without intra-view sync:
+/// - Node at view 9 (view-level sync ✓)
+/// - But missed Propose ballot → highest_qc_block is from view 8
+/// - Receives Lock ballot for block X (view 9)
+/// - ballot.verify_proposal() checks: X == highest_qc_block.hash? NO
+/// - Ballot rejected with LockPhaseQcMismatch
+///
+/// This function fetches and integrates the current view data to ensure we have
+/// the Propose QC before processing Lock ballots.
+pub async fn ensure_intra_view_synced(
+    app_state: &AppState,
+) -> Result<(), functions::CatchUpError> {
+    use crate::consensus::functions::CatchUpError;
+
+    // Get current consensus state
+    let (current_view, highest_qc_view) = {
+        let conn = app_state.db_pool.get().map_err(|_| CatchUpError::Database)?;
+        let consensus_state = db::get_consensus(Ok(conn)).map_err(|_| CatchUpError::Database)?;
+        (consensus_state.view, consensus_state.highest_qc_block.data.view_number)
+    };
+
+    // Check if we're missing the Propose QC within current view
+    if highest_qc_view < current_view {
+        tracing::debug!(
+            "Intra-view sync required: current_view={}, highest_qc_view={} - fetching Propose QC",
+            current_view,
+            highest_qc_view
+        );
+
+        // Get validators at committed height to fetch from
+        let validators = {
+            let mut conn = app_state.db_pool.get().map_err(|_| CatchUpError::Database)?;
+            let tx = conn.transaction().map_err(|_| CatchUpError::Database)?;
+            let height = db::get_current_consensus_height(&tx).map_err(|_| CatchUpError::Database)?;
+            db::get_validators(Ok(app_state.db_pool.get().map_err(|_| CatchUpError::Database)?), height)
+                .map_err(|_| CatchUpError::Database)?
+        };
+
+        if validators.is_empty() {
+            tracing::error!("No validators available for intra-view sync");
+            return Err(CatchUpError::NetworkUnavailable);
+        }
+
+        // Fetch current view data from validators
+        let view_data = fetch_and_validate_with_retry(
+            current_view,
+            current_view,
+            &validators,
+            app_state
+        ).await?;
+
+        // Integrate the fetched data
+        integrate_view(current_view, view_data, app_state).await
+            .map_err(|_| CatchUpError::ValidationFailed(current_view))?;
+
+        tracing::debug!(
+            "Intra-view sync completed: fetched and integrated view {} data",
+            current_view
+        );
+    } else {
+        tracing::trace!(
+            "Intra-view sync not needed: highest_qc_view={} == current_view={}",
+            highest_qc_view,
+            current_view
+        );
+    }
+
+    Ok(())
+}
+
 /// Perform catch-up from our current view to the target view
 ///
 /// For new nodes bootstrapping from genesis, `bootstrap_validators` provides the initial
@@ -1082,7 +1237,15 @@ pub async fn ensure_caught_up_middleware(
                     // Validator routes (/ballot): must be caught up AND active
                     match (sync_status, is_active) {
                         (SyncStatus::CaughtUp, true) => {
-                            tracing::debug!("Node is caught up and active, processing ballot (validator role)");
+                            tracing::debug!("Node is caught up and active (view-level)");
+
+                            // Ensure intra-view sync (have Propose QC for current view)
+                            if let Err(e) = ensure_intra_view_synced(&app_state).await {
+                                tracing::error!("Intra-view sync failed: {:?} - rejecting request", e);
+                                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                            }
+
+                            tracing::debug!("Intra-view sync complete, processing request");
                             next.run(req).await
                         }
                         (SyncStatus::CaughtUp, false) => {

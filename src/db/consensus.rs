@@ -628,52 +628,6 @@ pub fn insert_qc_tx(
     Ok(())
 }
 
-/// Insert QC with retry logic for write-write conflicts (wrapper that manages transactions)
-pub fn insert_qc(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
-    qc: QuorumCertificate,
-) -> Result<(), DatabaseError> {
-    match db_connection {
-        Ok(mut db_lock) => {
-            // Retry logic for write-write conflicts
-            const MAX_RETRIES: u32 = 3;
-            let mut retry_count = 0;
-
-            loop {
-                let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
-
-                insert_qc_tx(&tx, &qc)?;
-
-                match tx.commit() {
-                    Ok(_) => {
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        let error_msg = format!("{:?}", e);
-                        if error_msg.contains("write-write conflict") && retry_count < MAX_RETRIES - 1 {
-                            retry_count += 1;
-                            let delay_ms = 10 * (2_u64.pow(retry_count - 1)); // Exponential backoff: 10ms, 20ms, 40ms
-                            tracing::warn!(
-                                "Write-write conflict on QC insertion (view: {}, phase: {:?}), retrying in {}ms (attempt {}/{})",
-                                qc.view_number, qc.phase, delay_ms, retry_count + 1, MAX_RETRIES
-                            );
-                            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                            continue;
-                        } else {
-                            tracing::error!(
-                                "Failed to commit QC insertion transaction (view: {}, phase: {:?}) after {} attempts: {:?}",
-                                qc.view_number, qc.phase, retry_count + 1, e
-                            );
-                            return Err(DatabaseError::InsertError);
-                        }
-                    }
-                }
-            }
-        }
-        Err(_) => Err(DatabaseError::LockError)
-    }
-}
-
 pub fn get_node_pubkey(
     db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     node_id: i32,

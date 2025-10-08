@@ -172,14 +172,38 @@ pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transa
 
         // Get QC1 from ballot round
         let qc1 = ballot_round(&block, &me, ConsensusPhase::Propose, &validators, &validators_elect, app_state).await?;
+
+        // Insert QC1 (Propose phase) - separate transaction, no transaction processing needed
+        {
+            let mut conn = app_state.db_pool.get().map_err(|_| ConsensusError::DatabaseError)?;
+            let tx = conn.transaction().map_err(|_| ConsensusError::DatabaseError)?;
+            db::insert_qc_tx(&tx, &qc1).map_err(|_| ConsensusError::DatabaseError)?;
+            tx.commit().map_err(|_| ConsensusError::DatabaseError)?;
+        }
+
         // Broadcast QC1 and wait for enough confirmations
         broadcast_qc(&validators, &validators_elect, qc1).await?;
+
         // Get QC2 from ballot round
         let qc2 = ballot_round(&block, &me, ConsensusPhase::Lock, &validators, &validators_elect, app_state).await?;
+
+        // Insert QC2 (Lock phase) + process transactions atomically
+        {
+            let mut conn = app_state.db_pool.get().map_err(|_| ConsensusError::DatabaseError)?;
+            let db_tx = conn.transaction().map_err(|_| ConsensusError::DatabaseError)?;
+
+            // Insert Lock QC (updates consensus state)
+            db::insert_qc_tx(&db_tx, &qc2).map_err(|_| ConsensusError::DatabaseError)?;
+
+            // Process transactions using same transaction
+            process_transactions(&block.data.transactions, app_state, true, &db_tx).map_err(|_| ConsensusError::DatabaseError)?;
+
+            // Commit both operations atomically
+            db_tx.commit().map_err(|_| ConsensusError::DatabaseError)?;
+        }
+
         // Broadcast QC2 and wait for enough confirmations
         broadcast_qc(&validators, &validators_elect, qc2).await?;
-
-        let _ = process_transactions(&block.data.transactions, app_state, true);
 
         return Ok(());
     }
@@ -223,10 +247,10 @@ async fn ballot_round(
     match qc.verify(&app_state, &block) {
         Ok(_) => {
             tracing::debug!(
-                "QC verification passed, inserting QC for view {} phase {:?}",
+                "QC verification passed for view {} phase {:?}",
                 qc.view_number, qc.phase
             );
-            db::insert_qc(app_state.db_pool.get(), qc.clone()).map_err(|_| ConsensusError::DatabaseError)?;
+            // Don't insert here - let caller handle insertion with proper transaction management
         },
         Err(_) => return Err(ConsensusError::SigningError)
     };
@@ -457,19 +481,20 @@ async fn qc_send(
     }
 }
 
-pub fn process_transactions(transactions: &Option<Transactions>, app_state: &AppState, execute: bool) -> HandlerResult {
+pub fn process_transactions(transactions: &Option<Transactions>, app_state: &AppState, execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
     if let Some(transactions) = transactions {
         for tx in transactions.iter() {
-            match process_transaction(tx, app_state, execute) {
+            match process_transaction(tx, app_state, execute, db_tx) {
                 Ok(_) => {
                     tracing::debug!("Transaction {} successfully: {}", if execute { "processed" } else { "validated" }, &tx.rpc.function);
                 }
                 Err(e) => {
-                    if execute {
-                        tracing::error!("Failed to process transaction {}: {:?}", &tx.rpc.function, e);
-                    } else {
-                        return Err(e);
-                    }
+                    // Both validation and execution phases return error immediately
+                    // Transaction auto-rolls back when db_tx is dropped
+                    tracing::error!("Failed to {} transaction {}: {:?}",
+                                   if execute { "process" } else { "validate" },
+                                   &tx.rpc.function, e);
+                    return Err(e);
                 }
             }
         }
@@ -477,9 +502,9 @@ pub fn process_transactions(transactions: &Option<Transactions>, app_state: &App
     Ok(())
 }
 
-pub fn process_transaction(tx: &Transaction, app_state: &AppState, execute: bool) -> HandlerResult {
+pub fn process_transaction(tx: &Transaction, app_state: &AppState, execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
     if let Some(handler) = DISPATCH_TABLE.get(tx.rpc.function.as_str()) {
-        handler.process(app_state, tx, execute)
+        handler.process(app_state, tx, execute, db_tx)
     } else {
         tracing::warn!("No handler found for function: {}", &tx.rpc.function);
         Err(crate::db::DatabaseError::InvalidPayload)

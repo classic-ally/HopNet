@@ -102,197 +102,140 @@ pub fn get_node_availability_classification(
 /// The execute parameter controls whether to actually delete or just validate
 /// Returns fragment hashes that were deleted (for opportunistic local cleanup)
 pub fn delete_orphaned_data_blocks_consensus(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_tx: &duckdb::Transaction,
     data_block_ids: Vec<CustomUUID>,
-    execute: bool,
 ) -> Result<Vec<crate::db::Blake3Hash>, DatabaseError> {
-    match db_connection {
-        Ok(mut conn) => {
-            if data_block_ids.is_empty() {
-                return Ok(Vec::new());
-            }
-
-            let mut deleted_fragment_hashes = Vec::new();
-            
-            if execute {
-                // Use two-transaction approach to avoid DuckDB foreign key constraint timing issues
-                // Transaction 1: Delete all reference records
-                tracing::debug!("Starting reference deletion transaction");
-                let tx1 = conn.transaction().map_err(|e| {
-                    tracing::error!("Failed to begin reference deletion transaction: {:?}", e);
-                    DatabaseError::LockError
-                })?;
-                
-                // Build parameter placeholders for the IN clause
-                let placeholders: Vec<String> = (0..data_block_ids.len()).map(|_| "?".to_string()).collect();
-                let placeholders_str = placeholders.join(", ");
-                
-                // First collect fragment hashes that are stored locally (for opportunistic cleanup)
-                let select_local_fragments_query = format!(
-                    "SELECT fragment_hash FROM fragment_hashes WHERE data_block_id IN ({}) AND stored_locally = TRUE", 
-                    placeholders_str
-                );
-                let select_params: Vec<&dyn duckdb::ToSql> = data_block_ids.iter()
-                    .map(|id| id as &dyn duckdb::ToSql)
-                    .collect();
-                
-                let mut stmt = tx1.prepare(&select_local_fragments_query).map_err(|e| {
-                    tracing::error!("Failed to prepare local fragment selection query: {:?}", e);
-                    DatabaseError::ProcessingError
-                })?;
-                
-                let fragment_hashes = stmt.query_map(select_params.as_slice(), |row| {
-                    let hash: crate::db::Blake3Hash = row.get(0)?;
-                    Ok(hash)
-                }).map_err(|e| {
-                    tracing::error!("Failed to query local fragment hashes: {:?}", e);
-                    DatabaseError::RecallError
-                })?;
-                
-                for hash_result in fragment_hashes {
-                    deleted_fragment_hashes.push(hash_result.map_err(|_| DatabaseError::ProcessingError)?);
-                }
-                
-                tracing::debug!("Found {} locally stored fragment hashes for deletion", deleted_fragment_hashes.len());
-                
-                // Now delete fragment_hashes records
-                let fragment_query = format!(
-                    "DELETE FROM fragment_hashes WHERE data_block_id IN ({})", 
-                    placeholders_str
-                );
-                let fragment_params: Vec<&dyn duckdb::ToSql> = data_block_ids.iter()
-                    .map(|id| id as &dyn duckdb::ToSql)
-                    .collect();
-                
-                tracing::debug!("Executing fragment deletion query: {}", fragment_query);
-                tracing::debug!("Fragment deletion parameters: {:?}", data_block_ids);
-                
-                let fragments_deleted = tx1.execute(&fragment_query, fragment_params.as_slice())
-                    .map_err(|e| {
-                        tracing::error!("Failed to delete fragment_hashes: {:?}", e);
-                        DatabaseError::ProcessingError
-                    })?;
-                
-                tracing::info!("Deleted {} fragment_hashes records", fragments_deleted);
-                
-                // Then delete file_access records (encrypted file keys)
-                let access_query = format!(
-                    "DELETE FROM file_access WHERE data_block_id IN ({})", 
-                    placeholders_str
-                );
-                let access_params: Vec<&dyn duckdb::ToSql> = data_block_ids.iter()
-                    .map(|id| id as &dyn duckdb::ToSql)
-                    .collect();
-                
-                tracing::debug!("Executing file_access deletion query: {}", access_query);
-                tracing::debug!("File_access deletion parameters: {:?}", data_block_ids);
-                
-                let access_deleted = tx1.execute(&access_query, access_params.as_slice())
-                    .map_err(|e| {
-                        tracing::error!("Failed to delete file_access: {:?}", e);
-                        DatabaseError::ProcessingError
-                    })?;
-                
-                tracing::info!("Deleted {} file_access records", access_deleted);
-                
-                // Commit transaction 1 (reference deletions)
-                tx1.commit().map_err(|e| {
-                    tracing::error!("Failed to commit reference deletion transaction: {:?}", e);
-                    DatabaseError::ProcessingError
-                })?;
-                
-                tracing::debug!("Reference deletion transaction committed successfully");
-                
-                // Transaction 2: Delete data_blocks records
-                tracing::debug!("Starting data_blocks deletion transaction");
-                let tx2 = conn.transaction().map_err(|e| {
-                    tracing::error!("Failed to begin data_blocks deletion transaction: {:?}", e);
-                    DatabaseError::LockError
-                })?;
-                
-                // Then delete data_blocks records
-                let blocks_query = format!(
-                    "DELETE FROM data_blocks WHERE id IN ({})", 
-                    placeholders_str
-                );
-                let block_params: Vec<&dyn duckdb::ToSql> = data_block_ids.iter()
-                    .map(|id| id as &dyn duckdb::ToSql)
-                    .collect();
-                
-                tracing::debug!("Executing data_blocks deletion query: {}", blocks_query);
-                tracing::debug!("Data_blocks deletion parameters: {:?}", data_block_ids);
-                    
-                let blocks_deleted = tx2.execute(&blocks_query, block_params.as_slice())
-                    .map_err(|e| {
-                        tracing::error!("Failed to delete data_blocks: {:?}", e);
-                        DatabaseError::ProcessingError
-                    })?;
-                
-                // Commit transaction 2 (data_blocks deletion)
-                tx2.commit().map_err(|e| {
-                    tracing::error!("Failed to commit data_blocks deletion transaction: {:?}", e);
-                    DatabaseError::ProcessingError
-                })?;
-                
-                tracing::debug!("Data_blocks deletion transaction committed successfully");
-                
-                tracing::info!("Consensus deletion completed: {} data blocks, {} fragments, {} file access entries", 
-                              blocks_deleted, fragments_deleted, access_deleted);
-            } else {
-                // Validation mode - create transaction but roll it back
-                let tx = conn.transaction().map_err(|e| {
-                    tracing::error!("Failed to begin validation transaction: {:?}", e);
-                    DatabaseError::LockError
-                })?;
-                
-                // Additional validation: Check for non-expired takeouts before proceeding
-                // This prevents race conditions between pre-flight check and consensus execution
-                if crate::db::takeout::has_active_takeout_tx(&tx, None)? {
-                    tracing::error!("Validation failed: active takeout(s) in network prevent cleanup");
-                    return Err(DatabaseError::ConflictError);
-                }
-                
-                // Check if the data blocks exist and are truly orphaned
-                for data_block_id in &data_block_ids {
-                    // Verify the data block exists
-                    let exists: bool = tx.query_row(
-                        "SELECT COUNT(*) > 0 FROM data_blocks WHERE id = ?",
-                        duckdb::params![data_block_id],
-                        |row| row.get(0)
-                    ).map_err(|_| DatabaseError::RecallError)?;
-                    
-                    if !exists {
-                        tracing::warn!("Data block {} does not exist, skipping", data_block_id);
-                        continue;
-                    }
-                    
-                    // Verify it's truly orphaned (no inode references)
-                    let has_inodes: bool = tx.query_row(
-                        "SELECT COUNT(*) > 0 FROM inodes WHERE data_id = ?",
-                        duckdb::params![data_block_id],
-                        |row| row.get(0)
-                    ).map_err(|_| DatabaseError::RecallError)?;
-                    
-                    if has_inodes {
-                        tracing::error!("Data block {} is not orphaned, has active inode references", data_block_id);
-                        return Err(DatabaseError::ProcessingError);
-                    }
-                }
-                
-                // Rollback the validation transaction
-                tx.rollback().map_err(|e| {
-                    tracing::error!("Failed to rollback validation transaction: {:?}", e);
-                    DatabaseError::LockError
-                })?;
-                
-                tracing::debug!("Validation passed: {} data blocks are orphaned and can be deleted (rolled back)", 
-                               data_block_ids.len());
-            }
-            
-            Ok(deleted_fragment_hashes)
-        }
-        Err(_) => Err(DatabaseError::LockError),
+    if data_block_ids.is_empty() {
+        return Ok(Vec::new());
     }
+
+    // Validation: Check for non-expired takeouts before proceeding
+    // This prevents race conditions between pre-flight check and consensus execution
+    if crate::db::takeout::has_active_takeout_tx(db_tx, None)? {
+        tracing::error!("Validation failed: active takeout(s) in network prevent cleanup");
+        return Err(DatabaseError::ConflictError);
+    }
+
+    // Validation: Check if the data blocks exist and are truly orphaned
+    for data_block_id in &data_block_ids {
+        // Verify the data block exists
+        let exists: bool = db_tx.query_row(
+            "SELECT COUNT(*) > 0 FROM data_blocks WHERE id = ?",
+            duckdb::params![data_block_id],
+            |row| row.get(0)
+        ).map_err(|_| DatabaseError::RecallError)?;
+
+        if !exists {
+            tracing::warn!("Data block {} does not exist, skipping", data_block_id);
+            continue;
+        }
+
+        // Verify it's truly orphaned (no inode references)
+        let has_inodes: bool = db_tx.query_row(
+            "SELECT COUNT(*) > 0 FROM inodes WHERE data_id = ?",
+            duckdb::params![data_block_id],
+            |row| row.get(0)
+        ).map_err(|_| DatabaseError::RecallError)?;
+
+        if has_inodes {
+            tracing::error!("Data block {} is not orphaned, has active inode references", data_block_id);
+            return Err(DatabaseError::ProcessingError);
+        }
+    }
+
+    // Build parameter placeholders for the IN clause
+    let placeholders: Vec<String> = (0..data_block_ids.len()).map(|_| "?".to_string()).collect();
+    let placeholders_str = placeholders.join(", ");
+
+    // First collect fragment hashes that are stored locally (for opportunistic cleanup)
+    let select_local_fragments_query = format!(
+        "SELECT fragment_hash FROM fragment_hashes WHERE data_block_id IN ({}) AND stored_locally = TRUE",
+        placeholders_str
+    );
+    let select_params: Vec<&dyn duckdb::ToSql> = data_block_ids.iter()
+        .map(|id| id as &dyn duckdb::ToSql)
+        .collect();
+
+    let mut stmt = db_tx.prepare(&select_local_fragments_query).map_err(|e| {
+        tracing::error!("Failed to prepare local fragment selection query: {:?}", e);
+        DatabaseError::ProcessingError
+    })?;
+
+    let fragment_hashes = stmt.query_map(select_params.as_slice(), |row| {
+        let hash: crate::db::Blake3Hash = row.get(0)?;
+        Ok(hash)
+    }).map_err(|e| {
+        tracing::error!("Failed to query local fragment hashes: {:?}", e);
+        DatabaseError::RecallError
+    })?;
+
+    let mut deleted_fragment_hashes = Vec::new();
+    for hash_result in fragment_hashes {
+        deleted_fragment_hashes.push(hash_result.map_err(|_| DatabaseError::ProcessingError)?);
+    }
+
+    tracing::debug!("Found {} locally stored fragment hashes for deletion", deleted_fragment_hashes.len());
+
+    // Delete child records first (foreign key constraints)
+    // 1. Delete fragment_hashes records
+    let fragment_query = format!(
+        "DELETE FROM fragment_hashes WHERE data_block_id IN ({})",
+        placeholders_str
+    );
+    let fragment_params: Vec<&dyn duckdb::ToSql> = data_block_ids.iter()
+        .map(|id| id as &dyn duckdb::ToSql)
+        .collect();
+
+    tracing::debug!("Executing fragment deletion query: {}", fragment_query);
+
+    let fragments_deleted = db_tx.execute(&fragment_query, fragment_params.as_slice())
+        .map_err(|e| {
+            tracing::error!("Failed to delete fragment_hashes: {:?}", e);
+            DatabaseError::ProcessingError
+        })?;
+
+    tracing::info!("Deleted {} fragment_hashes records", fragments_deleted);
+
+    // 2. Delete file_access records (encrypted file keys)
+    let access_query = format!(
+        "DELETE FROM file_access WHERE data_block_id IN ({})",
+        placeholders_str
+    );
+    let access_params: Vec<&dyn duckdb::ToSql> = data_block_ids.iter()
+        .map(|id| id as &dyn duckdb::ToSql)
+        .collect();
+
+    tracing::debug!("Executing file_access deletion query: {}", access_query);
+
+    let access_deleted = db_tx.execute(&access_query, access_params.as_slice())
+        .map_err(|e| {
+            tracing::error!("Failed to delete file_access: {:?}", e);
+            DatabaseError::ProcessingError
+        })?;
+
+    tracing::info!("Deleted {} file_access records", access_deleted);
+
+    // 3. Finally delete data_blocks records (parent records)
+    let blocks_query = format!(
+        "DELETE FROM data_blocks WHERE id IN ({})",
+        placeholders_str
+    );
+    let block_params: Vec<&dyn duckdb::ToSql> = data_block_ids.iter()
+        .map(|id| id as &dyn duckdb::ToSql)
+        .collect();
+
+    tracing::debug!("Executing data_blocks deletion query: {}", blocks_query);
+
+    let blocks_deleted = db_tx.execute(&blocks_query, block_params.as_slice())
+        .map_err(|e| {
+            tracing::error!("Failed to delete data_blocks: {:?}", e);
+            DatabaseError::ProcessingError
+        })?;
+
+    tracing::info!("Consensus deletion completed: {} data blocks, {} fragments, {} file access entries",
+                  blocks_deleted, fragments_deleted, access_deleted);
+
+    Ok(deleted_fragment_hashes)
 }
 
 /// Get data blocks that need rebalancing (distributed before a certain height)

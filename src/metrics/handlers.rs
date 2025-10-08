@@ -6,7 +6,7 @@ pub struct SubmitMetricsHandler;
 impl TransactionHandler for SubmitMetricsHandler {
     fn name(&self) -> &'static str { "submit_metrics" }
 
-    fn process(&self, state: &AppState, tx: &Transaction, execute: bool) -> HandlerResult {
+    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
         match bincode::serde::decode_from_slice::<Vec<Metric>, _>(&tx.rpc.payload, bincode::config::standard()) {
             Ok((metrics_data, _)) => {
                 // Authorization: verify all metrics are from the submitting node
@@ -17,8 +17,8 @@ impl TransactionHandler for SubmitMetricsHandler {
                     }
                 }
 
-                // Insert the metrics batch using the consensus-safe version with execute flag
-                insert_metrics_batch(state.db_pool.get(), metrics_data, execute)?;
+                // Insert the metrics batch using shared transaction
+                insert_metrics_batch(db_tx, metrics_data)?;
                 Ok(())
             },
             Err(_) => Err(DatabaseError::InvalidPayload),

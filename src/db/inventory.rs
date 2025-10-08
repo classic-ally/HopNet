@@ -13,75 +13,56 @@ use crate::db::DatabaseError;
 ///
 /// The execute flag controls whether to actually apply changes (true) or just validate (false)
 pub fn apply_self_check_updates(
-    db_connection: Result<PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_tx: &duckdb::Transaction,
     report: &SelfCheckFragments,
-    execute: bool,
 ) -> Result<(), DatabaseError> {
-    match db_connection {
-        Ok(mut conn) => {
-            // Create a transaction
-            let tx = conn.transaction().map_err(|_| DatabaseError::LockError)?;
+    // Verify the previous count matches our current state
+    let current_count = get_node_fragment_count_tx(db_tx, report.node_id)?;
 
-            // Verify the previous count matches our current state
-            let current_count = get_node_fragment_count_tx(&tx, report.node_id)?;
-
-            if current_count != report.previous_count {
-                tracing::error!(
-                    "Fragment inventory state mismatch for node {}: expected {} fragments, found {}",
-                    report.node_id,
-                    report.previous_count,
-                    current_count
-                );
-                // Rollback transaction
-                tx.rollback().map_err(|_| DatabaseError::ProcessingError)?;
-                return Err(DatabaseError::ProcessingError);
-            }
-
-            // Apply changes in optimal order to avoid double operations:
-
-            // 1. Remove fragments that no longer exist
-            if !report.fragments_removed.is_empty() {
-                remove_fragments_tx(&tx, report.node_id, &report.fragments_removed)?;
-
-                debug!(
-                    "Removed {} fragments from inventory for node {}",
-                    report.fragments_removed.len(),
-                    report.node_id
-                );
-            }
-
-            // 2. Update self_verified_height for all remaining fragments owned by this node
-            update_verified_height_tx(&tx, report.node_id, report.self_verified_height)?;
-
-            debug!(
-                "Updated self_verified_height to {} for all fragments of node {}",
-                report.self_verified_height,
-                report.node_id
-            );
-
-            // 3. Insert newly discovered fragments (already have correct verified_height)
-            if !report.fragments_added.is_empty() {
-                insert_fragments_tx(&tx, report.node_id, &report.fragments_added, report.self_verified_height)?;
-
-                debug!(
-                    "Added {} fragments to inventory for node {}",
-                    report.fragments_added.len(),
-                    report.node_id
-                );
-            }
-
-            // Commit or rollback based on execute flag
-            if execute {
-                tx.commit().map_err(|_| DatabaseError::ProcessingError)?;
-            } else {
-                // Validation successful, but rollback since we're not executing
-                tx.rollback().map_err(|_| DatabaseError::ProcessingError)?;
-            }
-
-            Ok(())
-        }
-        Err(_) => Err(DatabaseError::LockError),
+    if current_count != report.previous_count {
+        tracing::error!(
+            "Fragment inventory state mismatch for node {}: expected {} fragments, found {}",
+            report.node_id,
+            report.previous_count,
+            current_count
+        );
+        return Err(DatabaseError::ProcessingError);
     }
+
+    // Apply changes in optimal order to avoid double operations:
+
+    // 1. Remove fragments that no longer exist
+    if !report.fragments_removed.is_empty() {
+        remove_fragments_tx(db_tx, report.node_id, &report.fragments_removed)?;
+
+        debug!(
+            "Removed {} fragments from inventory for node {}",
+            report.fragments_removed.len(),
+            report.node_id
+        );
+    }
+
+    // 2. Update self_verified_height for all remaining fragments owned by this node
+    update_verified_height_tx(db_tx, report.node_id, report.self_verified_height)?;
+
+    debug!(
+        "Updated self_verified_height to {} for all fragments of node {}",
+        report.self_verified_height,
+        report.node_id
+    );
+
+    // 3. Insert newly discovered fragments (already have correct verified_height)
+    if !report.fragments_added.is_empty() {
+        insert_fragments_tx(db_tx, report.node_id, &report.fragments_added, report.self_verified_height)?;
+
+        debug!(
+            "Added {} fragments to inventory for node {}",
+            report.fragments_added.len(),
+            report.node_id
+        );
+    }
+
+    Ok(())
 }
 
 /// Get the current fragment count using a transaction

@@ -93,130 +93,104 @@ impl TakeoutPayload {
     }
 }
 
-/// Process a takeout creation from consensus (all nodes run this)
+/// Process a takeout creation using a shared transaction (for consensus transaction processing)
 /// - Owner node: Creates temporary inode snapshot table
 /// - Other nodes: Just records the takeout
-/// - execute=false: Validation phase with rollback
-/// - execute=true: Actually commits the changes and triggers async materialization if owner
+/// - execute flag: Handler context manages commit/rollback
 pub fn process_takeout_creation(
     state: &crate::AppState,
     payload: &TakeoutPayload,
     current_node_id: i32,
     execute: bool,
+    db_tx: &duckdb::Transaction,
 ) -> Result<(), DatabaseError> {
-    let db_connection = state.db_pool.get();
-    match db_connection {
-        Ok(mut db_lock) => {
-            tracing::debug!("Processing takeout creation for user_id: {} (execute={})", payload.user_id, execute);
-            
-            // Start transaction for atomic operation
-            let tx = db_lock.transaction().map_err(|e| {
-                tracing::error!("Failed to start transaction for takeout creation: {:?}", e);
-                DatabaseError::LockError
-            })?;
-            
-            // Check if user already has an active takeout (validation for all nodes)
-            if has_active_takeout_tx(&tx, Some(payload.user_id))? {
-                tracing::debug!("User {} already has an active takeout", payload.user_id);
-                return Err(DatabaseError::ConflictError);
-            }
-            
-            // Insert the takeout record (all nodes do this)
-            tx.execute(
-                "INSERT INTO takeouts (id, user_id, owner_node_id, status, expires_at, consensus_height) VALUES (?, ?, ?, ?, ?, ?)",
-                params![
-                    payload.takeout_id,
-                    payload.user_id,
-                    payload.owner_node_id,
-                    payload.status,
-                    payload.expires_at,
-                    payload.consensus_height
-                ]
-            ).map_err(|e| {
-                tracing::error!("Failed to insert takeout record: {:?}", e);
-                DatabaseError::InsertError
-            })?;
-            tracing::debug!("Takeout record inserted successfully");
-            
-            // Only the owner node creates the temporary inode snapshot
-            if current_node_id == payload.owner_node_id {
-                let temp_table_name = format!("takeout_inodes_{}", payload.takeout_id.simple());
-                tracing::debug!("Owner node creating temporary table: {}", temp_table_name);
-                
-                tx.execute_batch(&format!(
-                    "CREATE TABLE IF NOT EXISTS {} (
-                        id UUID NOT NULL,
-                        path VARCHAR NOT NULL,
-                        type ENUM('file', 'folder') NOT NULL,
-                        data_id UUID,
-                        materialization_status ENUM('pending', 'success', 'failed') DEFAULT 'pending',
-                        error_message VARCHAR
-                    )", temp_table_name
-                )).map_err(|e| {
-                    tracing::error!("Failed to create table {}: {:?}", temp_table_name, e);
-                    DatabaseError::InsertError
-                })?;
-                
-                // Populate with user's current inodes
-                let insert_query = format!(
-                    "INSERT INTO {} (id, path, type, data_id, materialization_status)
-                     SELECT id, path, type, data_id, 'pending'
-                     FROM inodes 
-                     WHERE owner_id = ?", temp_table_name
-                );
-                
-                tx.execute(&insert_query, params![payload.user_id]).map_err(|e| {
-                    tracing::error!("Failed to populate temporary table with inodes: {:?}", e);
-                    DatabaseError::InsertError
-                })?;
-                
-                tracing::debug!("Owner node populated temporary table with user inodes");
-            }
-            
-            // Commit or rollback based on execute flag
-            if execute {
-                tx.commit().map_err(|e| {
-                    tracing::error!("Failed to commit takeout creation transaction: {:?}", e);
-                    DatabaseError::InsertError
-                })?;
+    tracing::debug!("Processing takeout creation for user_id: {} (execute={})", payload.user_id, execute);
 
-                tracing::info!(
-                    "Node {} processed takeout {} for user {} (owner: node {})",
-                    current_node_id, payload.takeout_id, payload.user_id, payload.owner_node_id
-                );
-
-                // If this node is the owner, immediately trigger async materialization
-                if current_node_id == payload.owner_node_id {
-                    let state_clone = state.clone();
-                    let takeout_id = payload.takeout_id.clone();
-                    let user_id = payload.user_id;
-
-                    tracing::info!("Owner node triggering immediate materialization for takeout {}", takeout_id);
-
-                    // Spawn async task that doesn't block consensus
-                    tokio::spawn(async move {
-                        if let Err(e) = crate::takeout::routes::execute_takeout_materialization(&state_clone, &takeout_id, user_id).await {
-                            tracing::error!("Failed to trigger materialization for takeout {}: {:?}", takeout_id, e);
-                            // Don't panic - fallback job will catch this later
-                        }
-                    });
-                }
-            } else {
-                // Validation phase - rollback
-                tx.rollback().map_err(|e| {
-                    tracing::error!("Failed to rollback validation transaction: {:?}", e);
-                    DatabaseError::ProcessingError
-                })?;
-                tracing::debug!("Validation phase completed, transaction rolled back");
-            }
-            
-            Ok(())
-        }
-        Err(e) => {
-            tracing::error!("Failed to acquire database connection for takeout creation: {:?}", e);
-            Err(DatabaseError::LockError)
-        }
+    // Check if user already has an active takeout (validation for all nodes)
+    if has_active_takeout_tx(db_tx, Some(payload.user_id))? {
+        tracing::debug!("User {} already has an active takeout", payload.user_id);
+        return Err(DatabaseError::ConflictError);
     }
+
+    // Insert the takeout record (all nodes do this)
+    db_tx.execute(
+        "INSERT INTO takeouts (id, user_id, owner_node_id, status, expires_at, consensus_height) VALUES (?, ?, ?, ?, ?, ?)",
+        params![
+            payload.takeout_id,
+            payload.user_id,
+            payload.owner_node_id,
+            payload.status,
+            payload.expires_at,
+            payload.consensus_height
+        ]
+    ).map_err(|e| {
+        tracing::error!("Failed to insert takeout record: {:?}", e);
+        DatabaseError::InsertError
+    })?;
+    tracing::debug!("Takeout record inserted successfully");
+
+    // Only the owner node creates the temporary inode snapshot
+    if current_node_id == payload.owner_node_id {
+        let temp_table_name = format!("takeout_inodes_{}", payload.takeout_id.simple());
+        tracing::debug!("Owner node creating temporary table: {}", temp_table_name);
+
+        db_tx.execute_batch(&format!(
+            "CREATE TABLE IF NOT EXISTS {} (
+                id UUID NOT NULL,
+                path VARCHAR NOT NULL,
+                type ENUM('file', 'folder') NOT NULL,
+                data_id UUID,
+                materialization_status ENUM('pending', 'success', 'failed') DEFAULT 'pending',
+                error_message VARCHAR
+            )", temp_table_name
+        )).map_err(|e| {
+            tracing::error!("Failed to create table {}: {:?}", temp_table_name, e);
+            DatabaseError::InsertError
+        })?;
+
+        // Populate with user's current inodes
+        let insert_query = format!(
+            "INSERT INTO {} (id, path, type, data_id, materialization_status)
+             SELECT id, path, type, data_id, 'pending'
+             FROM inodes
+             WHERE owner_id = ?", temp_table_name
+        );
+
+        db_tx.execute(&insert_query, params![payload.user_id]).map_err(|e| {
+            tracing::error!("Failed to populate temporary table with inodes: {:?}", e);
+            DatabaseError::InsertError
+        })?;
+
+        tracing::debug!("Owner node populated temporary table with user inodes");
+    }
+
+    // Only trigger async materialization during execution phase
+    if execute && current_node_id == payload.owner_node_id {
+        let state_clone = state.clone();
+        let takeout_id = payload.takeout_id.clone();
+        let user_id = payload.user_id;
+
+        tracing::info!("Owner node will trigger materialization for takeout {} after transaction commit", takeout_id);
+
+        // Spawn async task that doesn't block consensus
+        tokio::spawn(async move {
+            if let Err(e) = crate::takeout::routes::execute_takeout_materialization(&state_clone, &takeout_id, user_id).await {
+                tracing::error!("Failed to trigger materialization for takeout {}: {:?}", takeout_id, e);
+                // Don't panic - fallback job will catch this later
+            }
+        });
+    }
+
+    if execute {
+        tracing::info!(
+            "Node {} processed takeout {} for user {} (owner: node {})",
+            current_node_id, payload.takeout_id, payload.user_id, payload.owner_node_id
+        );
+    } else {
+        tracing::debug!("Validation phase completed for takeout creation");
+    }
+
+    Ok(())
 }
 
 /// Check if there are active takeouts using an existing transaction  
@@ -534,122 +508,94 @@ pub fn materialize_folders(
     }
 }
 
-/// Process a takeout status update from consensus (all nodes run this)
-/// - execute=false: Validation phase with rollback
-/// - execute=true: Actually commits the status change and triggers cleanup if expired
+/// Process a takeout status update using a shared transaction (for consensus transaction processing)
+/// - Handler context manages commit/rollback
 pub fn process_takeout_status_update(
     state: &crate::AppState,
     payload: &TakeoutStatusPayload,
     execute: bool,
+    db_tx: &duckdb::Transaction,
 ) -> Result<(), DatabaseError> {
-    let db_connection = state.db_pool.get();
-    match db_connection {
-        Ok(mut db_lock) => {
-            tracing::debug!("Processing takeout status update for {}: {:?} (execute={})", 
-                           payload.takeout_id, payload.new_status, execute);
-            
-            let tx = db_lock.transaction().map_err(|e| {
-                tracing::error!("Failed to start transaction for status update: {:?}", e);
-                DatabaseError::LockError
-            })?;
-            
-            // Verify the takeout exists (validation for all nodes)
-            let exists: bool = tx.query_row(
-                "SELECT COUNT(*) > 0 FROM takeouts WHERE id = ?",
+    tracing::debug!("Processing takeout status update for {}: {:?} (execute={})",
+                   payload.takeout_id, payload.new_status, execute);
+
+    // Verify the takeout exists (validation for all nodes)
+    let exists: bool = db_tx.query_row(
+        "SELECT COUNT(*) > 0 FROM takeouts WHERE id = ?",
+        params![payload.takeout_id],
+        |row| row.get(0)
+    ).map_err(|e| {
+        tracing::error!("Failed to check takeout existence: {:?}", e);
+        DatabaseError::RecallError
+    })?;
+
+    if !exists {
+        tracing::debug!("Takeout {} does not exist", payload.takeout_id);
+        return Err(DatabaseError::RecallError);
+    }
+
+    // Update the takeout status (all nodes do this)
+    db_tx.execute(
+        "UPDATE takeouts SET status = ? WHERE id = ?",
+        params![payload.new_status, payload.takeout_id]
+    ).map_err(|e| {
+        tracing::error!("Failed to update takeout status: {:?}", e);
+        DatabaseError::ProcessingError
+    })?;
+
+    // Only trigger cleanup during execution phase
+    if execute {
+        tracing::info!("Updated takeout {} status to {:?}", payload.takeout_id, payload.new_status);
+
+        // If status changed to a terminal state (Expired or Cancelled), trigger local cleanup immediately
+        if matches!(payload.new_status, hopnet_common::TakeoutStatus::Expired | hopnet_common::TakeoutStatus::Cancelled) {
+            // Get current node ID to check ownership
+            let current_node_id = match state.get_node_id() {
+                Ok(id) => id,
+                Err(_) => {
+                    tracing::warn!("Node ID not initialized, skipping cleanup trigger");
+                    return Ok(()); // Continue, don't fail consensus
+                }
+            };
+
+            // Get takeout owner using same transaction
+            let owner_node_id: i32 = db_tx.query_row(
+                "SELECT owner_node_id FROM takeouts WHERE id = ?",
                 params![payload.takeout_id],
                 |row| row.get(0)
             ).map_err(|e| {
-                tracing::error!("Failed to check takeout existence: {:?}", e);
+                tracing::error!("Failed to get takeout owner for cleanup: {:?}", e);
                 DatabaseError::RecallError
             })?;
-            
-            if !exists {
-                tracing::debug!("Takeout {} does not exist", payload.takeout_id);
-                return Err(DatabaseError::RecallError);
-            }
-            
-            // Update the takeout status (all nodes do this)
-            tx.execute(
-                "UPDATE takeouts SET status = ? WHERE id = ?",
-                params![payload.new_status, payload.takeout_id]
-            ).map_err(|e| {
-                tracing::error!("Failed to update takeout status: {:?}", e);
-                DatabaseError::ProcessingError
-            })?;
-            
-            // Commit or rollback based on execute flag
-            if execute {
-                tx.commit().map_err(|e| {
-                    tracing::error!("Failed to commit takeout status update: {:?}", e);
-                    DatabaseError::ProcessingError
-                })?;
-                
-                tracing::info!("Updated takeout {} status to {:?}", payload.takeout_id, payload.new_status);
 
-                // If status changed to a terminal state (Expired or Cancelled), trigger local cleanup immediately
-                if matches!(payload.new_status, hopnet_common::TakeoutStatus::Expired | hopnet_common::TakeoutStatus::Cancelled) {
-                    // Get current node ID to check ownership
-                    let current_node_id = match state.get_node_id() {
-                        Ok(id) => id,
-                        Err(_) => {
-                            tracing::warn!("Node ID not initialized, skipping cleanup trigger");
-                            return Ok(()); // Continue, don't fail consensus
-                        }
-                    };
+            // Only trigger cleanup if this node owns the takeout
+            if current_node_id == owner_node_id {
+                let takeout_id = payload.takeout_id.clone();
+                let fragments_dir = state.fragments_dir.clone();
+                let db_pool = state.db_pool.clone();
 
-                    // Query takeout owner with a new transaction (after commit)
-                    let owner_node_id: i32 = match db_lock.transaction()
-                        .and_then(|tx2| tx2.query_row(
-                            "SELECT owner_node_id FROM takeouts WHERE id = ?",
-                            params![payload.takeout_id],
-                            |row| row.get(0)
-                        )) {
-                        Ok(owner_id) => owner_id,
-                        Err(e) => {
-                            tracing::error!("Failed to get takeout owner for cleanup: {:?}", e);
-                            return Ok(()); // Continue, don't fail consensus
-                        }
-                    };
+                tracing::info!("Owner node will trigger cleanup for takeout {} (status: {:?})",
+                              takeout_id, payload.new_status);
 
-                    // Only trigger cleanup if this node owns the takeout
-                    if current_node_id == owner_node_id {
-                        let takeout_id = payload.takeout_id.clone();
-                        let fragments_dir = state.fragments_dir.clone();
-                        let db_pool = state.db_pool.clone();
-
-                        tracing::info!("Owner node triggering cleanup for takeout {} (status: {:?})",
-                                      takeout_id, payload.new_status);
-
-                        // Spawn async task that doesn't block consensus
-                        tokio::spawn(async move {
-                            if let Err(e) = cleanup_expired_takeout_files(&takeout_id, &fragments_dir).await {
-                                tracing::error!("Failed to clean up takeout files {}: {:?}", takeout_id, e);
-                            }
-                            if let Err(e) = cleanup_takeout_table(db_pool.get(), &takeout_id) {
-                                tracing::error!("Failed to clean up takeout table {}: {:?}", takeout_id, e);
-                            }
-                        });
-                    } else {
-                        tracing::debug!("Non-owner node ignoring cleanup for takeout {} owned by node {}",
-                                       payload.takeout_id, owner_node_id);
+                // Spawn async task that doesn't block consensus
+                tokio::spawn(async move {
+                    if let Err(e) = cleanup_expired_takeout_files(&takeout_id, &fragments_dir).await {
+                        tracing::error!("Failed to clean up takeout files {}: {:?}", takeout_id, e);
                     }
-                }
+                    if let Err(e) = cleanup_takeout_table(db_pool.get(), &takeout_id) {
+                        tracing::error!("Failed to clean up takeout table {}: {:?}", takeout_id, e);
+                    }
+                });
             } else {
-                // Validation phase - rollback
-                tx.rollback().map_err(|e| {
-                    tracing::error!("Failed to rollback validation transaction: {:?}", e);
-                    DatabaseError::ProcessingError
-                })?;
-                tracing::debug!("Status update validation phase completed, transaction rolled back");
+                tracing::debug!("Non-owner node ignoring cleanup for takeout {} owned by node {}",
+                               payload.takeout_id, owner_node_id);
             }
-            
-            Ok(())
         }
-        Err(e) => {
-            tracing::error!("Failed to acquire database connection for status update: {:?}", e);
-            Err(DatabaseError::LockError)
-        }
+    } else {
+        tracing::debug!("Status update validation phase completed");
     }
+
+    Ok(())
 }
 
 /// Get a batch of pending files for materialization with offset pagination

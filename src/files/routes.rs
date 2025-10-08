@@ -495,18 +495,24 @@ pub async fn delete_files(
     Query(params): Query<GetQueryParams>
 ) -> Result<(), StatusCode> {
     let enc_path = encrypt_path(params.path, app_state.get_siv_key()?, app_state.get_siv_nonce()?).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    
+
     // Validate that files exist before submitting to consensus
-    match crate::db::files::delete_files(app_state.db_pool.get(), enc_path.clone(), user_id, false) {
-        Ok(_) => {
-            // Files exist, proceed with consensus
-        },
-        Err(DatabaseError::NotFound) => {
-            return Err(StatusCode::NOT_FOUND);
-        },
-        Err(e) => {
-            tracing::error!("Error validating file deletion: {:?}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    {
+        let mut conn = app_state.db_pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let db_tx = conn.transaction().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        match crate::db::files::delete_files(&db_tx, enc_path.clone(), user_id) {
+            Ok(_) => {
+                // Files exist, roll back validation transaction
+                db_tx.rollback().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            },
+            Err(DatabaseError::NotFound) => {
+                return Err(StatusCode::NOT_FOUND);
+            },
+            Err(e) => {
+                tracing::error!("Error validating file deletion: {:?}", e);
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
         }
     }
     

@@ -135,11 +135,27 @@ pub fn post_initial_setup(
     // get_current_consensus_height returns 0 (genesis bypass - this_node doesn't exist yet)
     // This will initialize sequences, insert user/node, activate validator
     tracing::debug!("post_initial_setup: About to process genesis transaction via handler");
-    crate::consensus::functions::process_transaction(&genesis_tx, state, true).map_err(|e| {
-        tracing::error!("post_initial_setup: Handler failed to process genesis transaction: {:?}", e);
-        e
-    })?;
-    tracing::debug!("post_initial_setup: Handler completed successfully");
+    {
+        let mut conn = state.db_pool.get().map_err(|e| {
+            tracing::error!("post_initial_setup: Failed to get DB connection for genesis transaction: {:?}", e);
+            DatabaseError::LockError
+        })?;
+        let genesis_tx_db = conn.transaction().map_err(|e| {
+            tracing::error!("post_initial_setup: Failed to begin transaction for genesis transaction: {:?}", e);
+            DatabaseError::InsertError
+        })?;
+
+        crate::consensus::functions::process_transaction(&genesis_tx, state, true, &genesis_tx_db).map_err(|e| {
+            tracing::error!("post_initial_setup: Handler failed to process genesis transaction: {:?}", e);
+            e
+        })?;
+
+        genesis_tx_db.commit().map_err(|e| {
+            tracing::error!("post_initial_setup: Failed to commit genesis transaction: {:?}", e);
+            DatabaseError::InsertError
+        })?;
+        tracing::debug!("post_initial_setup: Handler completed successfully");
+    }
 
     // === TRANSACTION 2: this_node + QCs (atomic) ===
     // Now node_id=0 exists (created by handler), so this_node foreign key will work

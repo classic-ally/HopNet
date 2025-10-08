@@ -100,52 +100,37 @@ pub fn insert_metric(
     }
 }
 
-/// Insert multiple metrics in a batch transaction for efficiency
+/// Insert multiple metrics using a shared transaction (for consensus transaction processing)
 pub fn insert_metrics_batch(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_tx: &duckdb::Transaction,
     metrics: Vec<Metric>,
-    execute: bool,
 ) -> Result<(), DatabaseError> {
-    match db_connection {
-        Ok(mut db_lock) => {
-            let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
-            
-            let metrics_len = metrics.len();
-            for metric in metrics {
-                let start_time_str = metric.start_time.to_rfc3339();
-                tx.execute(
-                    "INSERT INTO metrics (from_node, to_node, start_time, rtt_latency, rtt_variance, rtt_jitter, throughput, height, available, storage_total_gb, storage_used_gb) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    params![
-                        metric.from_node,
-                        metric.to_node,
-                        start_time_str,
-                        metric.rtt_latency,
-                        metric.rtt_variance,
-                        metric.rtt_jitter,
-                        metric.throughput,
-                        metric.height,
-                        metric.available,
-                        metric.storage_total_gb,
-                        metric.storage_used_gb,
-                    ]
-                ).map_err(|e| {
-                    tracing::error!("Error inserting metric from {} to {}: {:?}", metric.from_node, metric.to_node, e);
-                    DatabaseError::InsertError
-                })?;
-            }
-            
-            if execute {
-                tx.commit().map_err(|_| DatabaseError::InsertError)?;
-                tracing::debug!("Successfully inserted {} metrics in batch", metrics_len);
-            } else {
-                // Validation only - rollback the transaction
-                tx.rollback().map_err(|_| DatabaseError::InsertError)?;
-                tracing::debug!("Validated {} metrics batch (dry run)", metrics_len);
-            }
-            Ok(())
-        }
-        Err(_) => Err(DatabaseError::LockError)
+    let metrics_len = metrics.len();
+    for metric in metrics {
+        let start_time_str = metric.start_time.to_rfc3339();
+        db_tx.execute(
+            "INSERT INTO metrics (from_node, to_node, start_time, rtt_latency, rtt_variance, rtt_jitter, throughput, height, available, storage_total_gb, storage_used_gb) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                metric.from_node,
+                metric.to_node,
+                start_time_str,
+                metric.rtt_latency,
+                metric.rtt_variance,
+                metric.rtt_jitter,
+                metric.throughput,
+                metric.height,
+                metric.available,
+                metric.storage_total_gb,
+                metric.storage_used_gb,
+            ]
+        ).map_err(|e| {
+            tracing::error!("Error inserting metric from {} to {}: {:?}", metric.from_node, metric.to_node, e);
+            DatabaseError::InsertError
+        })?;
     }
+
+    tracing::debug!("Inserted {} metrics using shared transaction", metrics_len);
+    Ok(())
 }
 
 /// Get all network nodes excluding specified node (for metrics collection)

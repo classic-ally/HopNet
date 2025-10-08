@@ -339,21 +339,30 @@ pub async fn delete_item(
     }
     
     // Validate that the item exists and user has access before submitting to consensus
-    match crate::db::files::delete_files(
-        app_state.db_pool.get(), 
-        encrypted_path.clone(), 
-        user_id, 
-        false // execute=false for validation only
-    ) {
-        Ok(_) => {
-            // Item exists and user has access, proceed with consensus
-        },
-        Err(DatabaseError::NotFound) => {
-            return StatusCode::NOT_FOUND;
-        },
-        Err(e) => {
-            tracing::error!("Error validating file deletion: {:?}", e);
-            return StatusCode::INTERNAL_SERVER_ERROR;
+    {
+        let mut conn = match app_state.db_pool.get() {
+            Ok(c) => c,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR
+        };
+        let db_tx = match conn.transaction() {
+            Ok(tx) => tx,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR
+        };
+
+        match crate::db::files::delete_files(&db_tx, encrypted_path.clone(), user_id) {
+            Ok(_) => {
+                // Item exists and user has access, roll back validation transaction
+                if let Err(_) = db_tx.rollback() {
+                    return StatusCode::INTERNAL_SERVER_ERROR;
+                }
+            },
+            Err(DatabaseError::NotFound) => {
+                return StatusCode::NOT_FOUND;
+            },
+            Err(e) => {
+                tracing::error!("Error validating file deletion: {:?}", e);
+                return StatusCode::INTERNAL_SERVER_ERROR;
+            }
         }
     }
     
@@ -896,26 +905,38 @@ pub async fn modify_item(
         (None, None)
     };
     
-    // Validate modification before consensus  
-    tracing::debug!("Validating modify_item for inode_id: {} user_id: {} new_encrypted_path: {:?}", 
+    // Validate modification before consensus
+    tracing::debug!("Validating modify_item for inode_id: {} user_id: {} new_encrypted_path: {:?}",
                    inode_id, user_id, new_encrypted_path);
-    crate::db::files::modify_item(
-        app_state.db_pool.get(),
-        user_id,
-        inode_id.clone(),
-        new_encrypted_path.clone(),
-        new_data_block_id.clone(),
-        new_data_record.clone(),
-        false
-    ).map_err(|e| {
-        tracing::error!("modify_item validation failed for inode_id: {} user_id: {} error: {:?}", inode_id, user_id, e);
-        match e {
-            crate::db::DatabaseError::NotFound => StatusCode::NOT_FOUND,
-            crate::db::DatabaseError::ConflictError => StatusCode::CONFLICT,
-            crate::db::DatabaseError::InvalidPayload => StatusCode::BAD_REQUEST,  // Circular reference, etc.
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
+
+    // Create validation transaction
+    {
+        let mut conn = app_state.db_pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let db_tx = conn.transaction().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        match crate::db::files::modify_item(
+            &db_tx,
+            user_id,
+            inode_id.clone(),
+            new_encrypted_path.clone(),
+            new_data_block_id.clone(),
+            new_data_record.clone(),
+        ) {
+            Ok(_) => {
+                // Validation passed, roll back transaction
+                db_tx.rollback().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            },
+            Err(e) => {
+                tracing::error!("modify_item validation failed for inode_id: {} user_id: {} error: {:?}", inode_id, user_id, e);
+                return Err(match e {
+                    crate::db::DatabaseError::NotFound => StatusCode::NOT_FOUND,
+                    crate::db::DatabaseError::ConflictError => StatusCode::CONFLICT,
+                    crate::db::DatabaseError::InvalidPayload => StatusCode::BAD_REQUEST,  // Circular reference, etc.
+                    _ => StatusCode::INTERNAL_SERVER_ERROR,
+                });
+            }
         }
-    })?;
+    }
     
     tracing::debug!("Submitting modify_item to consensus for inode_id: {} user_id: {}", inode_id, user_id);
     
