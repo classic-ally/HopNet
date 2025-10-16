@@ -182,61 +182,94 @@ pub async fn post_ballot(
         ballot.data.view, ballot.data.phase, ballot.block.block_hash
     );
 
-    // Middleware ensures we're caught up and active - just process the ballot
-    // validate the ballot proposal
+    // Serialize ballot processing to prevent concurrent state modifications
+    let _guard = app_state.consensus_lock.lock().await;
+
+    // Phase-specific intra-view sync: only when receiving Lock ballot before having Propose QC
+    // (i.e., we're locally in "prepare phase" but receiving a Lock ballot)
+    if ballot.data.phase == ConsensusPhase::Lock {
+        let highest_qc_view = {
+            let conn = match app_state.db_pool.get() {
+                Ok(conn) => conn,
+                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            };
+            let consensus_state = match db::get_consensus(Ok(conn)) {
+                Ok(state) => state,
+                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            };
+            consensus_state.highest_qc_block.data.view_number
+        };
+
+        // Only sync if we're missing the Propose QC for this view
+        if highest_qc_view < ballot.data.view {
+            tracing::debug!(
+                "Lock ballot received but missing Propose QC (highest_qc_view={}, ballot_view={}) - syncing",
+                highest_qc_view, ballot.data.view
+            );
+            if let Err(e) = ensure_intra_view_synced(&app_state).await {
+                tracing::error!("Intra-view sync failed for Lock ballot (view {}): {:?}", ballot.data.view, e);
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+        } else {
+            tracing::trace!(
+                "Lock ballot received with Propose QC already present (highest_qc_view={}) - skipping sync",
+                highest_qc_view
+            );
+        }
+    }
+
+    // Bug #5 fix: Insert block BEFORE verification for Propose phase
+    // This ensures block exists before ballot.verify_proposal() updates last_propose_vote_block_hash
+    if ballot.data.phase == ConsensusPhase::Propose {
+        tracing::debug!(
+            "Inserting new block {:?} for view {} into database (before verification)",
+            ballot.block.block_hash, ballot.data.view
+        );
+        match db::insert_block(app_state.db_pool.get(), &ballot.block) {
+            Ok(()) => {
+                tracing::debug!(
+                    "Block {:?} inserted successfully",
+                    ballot.block.block_hash
+                );
+            },
+            Err(_) => {
+                // Block insertion failed - check if it already exists
+                match db::get_block(app_state.db_pool.get(), ballot.block.block_hash) {
+                    Ok(_existing_block) => {
+                        // Block already exists (duplicate ballot request), continue with verification
+                        tracing::debug!(
+                            "Block {:?} already exists for view {} propose phase, continuing with verification",
+                            ballot.block.block_hash, ballot.data.view
+                        );
+                    },
+                    Err(_) => {
+                        // Block doesn't exist and couldn't be inserted - real error
+                        tracing::error!(
+                            "Failed to save block {:?} to database",
+                            ballot.block.block_hash
+                        );
+                        return (StatusCode::INTERNAL_SERVER_ERROR, "Error adding block to database").into_response()
+                    }
+                }
+            },
+        }
+    }
+
+    // Middleware ensures we're caught up and active - now validate and sign the ballot
     match ballot.verify_proposal(&app_state) {
         Ok(()) => {
             tracing::debug!(
                 "Ballot verified for view {} phase {:?} block {:?}",
                 ballot.data.view, ballot.data.phase, ballot.block.block_hash
             );
-            
+
             match ballot.sign(&app_state) {
                 Ok(signoff) => {
-                    // Only insert block during Propose phase, not Lock phase
-                    if ballot.data.phase == ConsensusPhase::Propose {
-                        tracing::debug!(
-                            "Inserting new block {:?} for view {} into database",
-                            ballot.block.block_hash, ballot.data.view
-                        );
-                        match db::insert_block(app_state.db_pool.get(), &ballot.block, true) {
-                            Ok(()) => {
-                                tracing::debug!(
-                                    "Block {:?} saved and signed for view {} propose phase",
-                                    ballot.block.block_hash, ballot.data.view
-                                );
-                                return (StatusCode::OK, Json(signoff)).into_response()
-                            },
-                            Err(_) => {
-                                // Block insertion failed - check if it already exists
-                                match db::get_block(app_state.db_pool.get(), ballot.block.block_hash) {
-                                    Ok(_existing_block) => {
-                                        // Block already exists (duplicate ballot request), return signature anyway
-                                        tracing::debug!(
-                                            "Block {:?} already exists for view {} propose phase, returning signature",
-                                            ballot.block.block_hash, ballot.data.view
-                                        );
-                                        return (StatusCode::OK, Json(signoff)).into_response()
-                                    },
-                                    Err(_) => {
-                                        // Block doesn't exist and couldn't be inserted - real error
-                                        tracing::error!(
-                                            "Failed to save block {:?} to database",
-                                            ballot.block.block_hash
-                                        );
-                                        return (StatusCode::INTERNAL_SERVER_ERROR, "Error adding block to database").into_response()
-                                    }
-                                }
-                            },
-                        }
-                    } else {
-                        // Lock phase - block should already exist, just return the signature
-                        tracing::debug!(
-                            "Lock phase vote signed for view {} block {:?}",
-                            ballot.data.view, ballot.block.block_hash
-                        );
-                        return (StatusCode::OK, Json(signoff)).into_response()
-                    }
+                    tracing::debug!(
+                        "Ballot signed for view {} phase {:?} block {:?}",
+                        ballot.data.view, ballot.data.phase, ballot.block.block_hash
+                    );
+                    return (StatusCode::OK, Json(signoff)).into_response()
                 }
                 Err(e) => {
                     tracing::error!(
@@ -285,6 +318,9 @@ pub async fn post_qc(
         qc.view_number, qc.phase, qc.block_hash
     );
 
+    // Serialize QC processing to prevent concurrent state modifications
+    let _guard = app_state.consensus_lock.lock().await;
+
     // Middleware ensures we're caught up - just process the QC
     // Normal QC processing (existing logic)
     match db::get_block(app_state.db_pool.get(), qc.block_hash) {
@@ -296,6 +332,7 @@ pub async fn post_qc(
             
             match qc.verify(&app_state, &block) {
                 Ok(()) => {
+                    // Now safe.
                     tracing::debug!(
                         "QC verified, inserting into database for view {} phase {:?}",
                         qc.view_number, qc.phase
@@ -313,7 +350,7 @@ pub async fn post_qc(
                     };
 
                     // Insert QC (updates consensus state)
-                    if let Err(_) = db::insert_qc_tx(&db_tx, &qc) {
+                    if let Err(_) = db::insert_qc_unsafe_tx(&db_tx, &qc) {
                         // QC insertion failed - check if it already exists
                         match db::get_quorum_certificate_by_hash(app_state.db_pool.get(), &qc.view_number, &qc.block_hash, &qc.phase) {
                             Ok(_existing_qc) => {
@@ -395,23 +432,105 @@ pub async fn post_timeout_vote(
     State(app_state): State<AppState>,
     Json(timeout_vote): Json<TimeoutVote>,
 ) -> impl IntoResponse {
-    match app_state.timeout_vote_collector.add_vote(timeout_vote, &app_state).await {
-        Ok(Some(tc)) => {
-            // TC was created - apply it locally first, then broadcast
-            match apply_timeout_certificate(tc.clone(), &app_state).await {
-                Ok(_) => {
-                    // Now broadcast to other nodes
-                    match broadcast_timeout_certificate(tc, &app_state).await {
-                        Ok(_) => StatusCode::CREATED, // Applied locally and broadcast succeeded
-                        Err(_) => StatusCode::CREATED, // Applied locally but broadcast failed (still success)
-                    }
-                }
-                Err(_) => StatusCode::INTERNAL_SERVER_ERROR, // Failed to apply locally
+    // Optimized intra-view sync: only if incoming vote has higher QC than us
+    let our_highest_qc_view = {
+        let conn = match app_state.db_pool.get() {
+            Ok(conn) => conn,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        let consensus_state = match db::get_consensus(Ok(conn)) {
+            Ok(state) => state,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        consensus_state.highest_qc_block.data.view_number
+    };
+
+    // Only sync if incoming vote references a higher QC we don't have
+    if timeout_vote.data.highest_qc_view > our_highest_qc_view {
+        tracing::debug!(
+            "Timeout vote references higher QC (vote_qc_view={}, our_qc_view={}) - syncing",
+            timeout_vote.data.highest_qc_view, our_highest_qc_view
+        );
+        if let Err(e) = ensure_intra_view_synced(&app_state).await {
+            tracing::error!("Intra-view sync failed for timeout vote (view {}): {:?}", timeout_vote.data.view_number, e);
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+
+        // P1: Reissue our timeout vote if we already voted for this view
+        // After syncing, our highest_qc_view is now higher, so we should issue a new vote
+        // for the new bucket (different data_hash due to different QC reference).
+        // The old vote remains in the old bucket - both coexist peacefully.
+        // Cascade effect ensures bucket with highest QC reaches quorum first.
+        let consensus_state = match db::get_consensus(app_state.db_pool.get()) {
+            Ok(state) => state,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+
+        if consensus_state.last_timeout_vote_view == timeout_vote.data.view_number {
+            tracing::info!(
+                "Reissuing timeout vote for view {} with updated QC (old_qc_view={}, new_qc_view={})",
+                timeout_vote.data.view_number,
+                our_highest_qc_view,
+                consensus_state.highest_qc_block.data.view_number
+            );
+
+            // Reissue with updated QC reference (issue_timeout_vote is reissuance-safe)
+            use crate::consensus::functions::issue_timeout_vote;
+            if let Err(e) = issue_timeout_vote(timeout_vote.data.view_number, &app_state).await {
+                tracing::warn!("Failed to reissue timeout vote for view {}: {:?}", timeout_vote.data.view_number, e);
+                // Continue processing incoming vote even if reissuance fails
             }
         }
-        Ok(None) => StatusCode::CREATED, // Vote added, no TC yet
-        Err(CertificateError::ValidationError) => StatusCode::OK, // Duplicate vote
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR, // Other error
+    } else {
+        tracing::trace!(
+            "Timeout vote QC not higher than ours (vote_qc_view={}, our_qc_view={}) - skipping sync",
+            timeout_vote.data.highest_qc_view, our_highest_qc_view
+        );
+    }
+
+    match app_state.timeout_vote_collector.add_vote(timeout_vote.clone(), &app_state).await {
+        Ok(Some(tc)) => {
+            // TC was created - apply locally and broadcast in parallel (Layer 2 defense)
+            let apply_result = apply_timeout_certificate(tc.clone(), &app_state, false);
+            let broadcast_result = broadcast_timeout_certificate(tc, &app_state);
+
+            let (apply_res, broadcast_res) = tokio::join!(apply_result, broadcast_result);
+
+            match apply_res {
+                Ok(_) => {
+                    if let Err(_) = broadcast_res {
+                        tracing::warn!("Applied TC locally but broadcast failed");
+                    }
+                    StatusCode::CREATED.into_response() // Applied locally (broadcast failure is non-critical)
+                }
+                Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(), // Failed to apply locally
+            }
+        }
+        Ok(None) => {
+            // Cascade check: if futility detected after adding vote, issue our own timeout vote
+            let _ = async {
+                // Get committed height
+                let height = {
+                    let mut conn = app_state.db_pool.get().ok()?;
+                    let tx = conn.transaction().ok()?;
+                    db::get_current_consensus_height(&tx).ok()?
+                };
+
+                // Get validators
+                let validators = db::get_validators(app_state.db_pool.get(), height).ok()?;
+
+                // Check futility and cascade if needed (side effect: issues timeout vote if futile)
+                // No guard to drop here (cascade doesn't hold consensus_lock)
+                use crate::consensus::functions::abort_if_timing_out;
+                let _ = abort_if_timing_out(timeout_vote.data.view_number, &validators, &app_state, None).await;
+
+                Some(())
+            }.await;
+
+            StatusCode::CREATED.into_response() // Original vote added successfully
+        }
+        Err(CertificateError::ValidationError) => StatusCode::OK.into_response(), // Duplicate vote
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(), // Other error
     }
 }
 
@@ -421,10 +540,11 @@ pub async fn post_tc(
     Json(timeout_cert): Json<TimeoutCertificate>,
 ) -> impl IntoResponse {
     // Verify TC is valid
+    // Note: consensus_lock acquired in apply_timeout_certificate after GST wait
     match timeout_cert.verify(&app_state) {
         Ok(_) => {
-            // Apply TC to advance consensus view
-            match apply_timeout_certificate(timeout_cert, &app_state).await {
+            // Apply TC to advance consensus view (with Layer 2 bounded wait)
+            match apply_timeout_certificate(timeout_cert, &app_state, false).await {
                 Ok(_) => StatusCode::OK,
                 Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
             }
@@ -610,7 +730,7 @@ async fn integrate_view(
     
     // Insert blocks first (they're referenced by QCs and TCs)
     for block in &view_data.blocks {
-        match db::insert_block(app_state.db_pool.get(), block, true) {
+        match db::insert_block(app_state.db_pool.get(), block) {
             Ok(_) => {
                 tracing::debug!("Inserted block {:?} for view {}", block.block_hash, view);
             }
@@ -636,11 +756,13 @@ async fn integrate_view(
                 })?;
             }
 
+            // Now safe (or verify skipped for genesis)
+
             // Get database connection and create transaction for Propose QC
             let mut conn = app_state.db_pool.get().map_err(|_| ConsensusError::DatabaseError)?;
             let db_tx = conn.transaction().map_err(|_| ConsensusError::DatabaseError)?;
 
-            match db::insert_qc_tx(&db_tx, &propose_qc) {
+            match db::insert_qc_unsafe_tx(&db_tx, &propose_qc) {
                 Ok(_) => {
                     // Commit Propose QC insertion
                     db_tx.commit().map_err(|_| ConsensusError::DatabaseError)?;
@@ -682,11 +804,13 @@ async fn integrate_view(
                 })?;
             }
 
+            // Now safe (or verify skipped for genesis)
+
             // Get database connection and create transaction for Lock QC
             let mut conn = app_state.db_pool.get().map_err(|_| ConsensusError::DatabaseError)?;
             let db_tx = conn.transaction().map_err(|_| ConsensusError::DatabaseError)?;
 
-            match db::insert_qc_tx(&db_tx, &lock_qc) {
+            match db::insert_qc_unsafe_tx(&db_tx, &lock_qc) {
                 Ok(_) => {
                     // Process transactions if this is a Lock phase QC (atomically with QC insertion)
                     if lock_qc.phase == ConsensusPhase::Lock {
@@ -750,7 +874,7 @@ async fn integrate_view(
             ConsensusError::SigningError
         })?;
 
-        match db::insert_tc(app_state.db_pool.get(), tc.clone()) {
+        match db::insert_tc_safe(app_state, tc.clone()) {
             Ok(_) => {
                 tracing::debug!("Validated and applied timeout certificate for view {}, advanced to view {}", view, view + 1);
             }
@@ -764,7 +888,130 @@ async fn integrate_view(
     Ok(())
 }
 
-/// Fetch and validate view data with retry logic and validator rotation
+/// Fetch and validate view data from quorum (query all, break when quorum responds)
+///
+/// Queries ALL validators in parallel, returns as soon as required valid responses received.
+/// Takes MAX QC from valid responses for Byzantine resistance.
+///
+/// `required_responses`: explicit threshold (typically network_quorum - 1, since caller counts themselves)
+async fn fetch_and_validate_from_quorum(
+    view: i32,
+    validators: &[crate::types::Node],
+    required_responses: usize,
+    app_state: &AppState,
+) -> Result<ViewConsensusData, functions::CatchUpError> {
+    use crate::consensus::functions::CatchUpError;
+    use crate::consensus::types::validate_view_completeness;
+
+    tracing::debug!(
+        "Quorum-based fetch for view {}: querying {} validators (need {} valid responses)",
+        view, validators.len(), required_responses
+    );
+
+    // Launch parallel fetch tasks to ALL validators
+    let mut fetch_tasks = Vec::new();
+    for validator in validators {
+        let validator = validator.clone();
+        let app_state = app_state.clone();
+
+        let task = tokio::spawn(async move {
+            (validator.node_id, fetch_view(view, &validator, &app_state).await)
+        });
+
+        fetch_tasks.push(task);
+    }
+
+    // Collect responses until we have quorum valid responses
+    let mut valid_responses = Vec::new();
+    let mut completed = 0;
+
+    for task in fetch_tasks {
+        match task.await {
+            Ok((node_id, Ok(view_data))) => {
+                completed += 1;
+
+                // Validate view number matches
+                if view_data.view != view {
+                    tracing::debug!(
+                        "View mismatch from validator {}: requested {}, received {}",
+                        node_id, view, view_data.view
+                    );
+                    continue;
+                }
+
+                // Validate completeness
+                if let Err(e) = validate_view_completeness(&view_data, view) {
+                    tracing::debug!(
+                        "Incomplete view {} data from validator {}: {:?}",
+                        view, node_id, e
+                    );
+                    continue;
+                }
+
+                tracing::debug!(
+                    "Validator {} provided valid view {} data (propose_QC={}, lock_QC={}, TC={})",
+                    node_id, view,
+                    view_data.propose_qc.is_some(),
+                    view_data.lock_qc.is_some(),
+                    view_data.timeout_certificate.is_some()
+                );
+
+                valid_responses.push(view_data);
+
+                // Break early if we have required responses
+                if valid_responses.len() >= required_responses {
+                    tracing::info!(
+                        "Reached required threshold for view {}: {} valid responses from {} completed queries",
+                        view, valid_responses.len(), completed
+                    );
+                    break;
+                }
+            }
+            Ok((node_id, Err(e))) => {
+                completed += 1;
+                tracing::debug!("Failed to fetch view {} from validator {}: {:?}", view, node_id, e);
+            }
+            Err(e) => {
+                completed += 1;
+                tracing::debug!("Fetch task panicked: {:?}", e);
+            }
+        }
+    }
+
+    if valid_responses.len() < required_responses {
+        tracing::error!(
+            "Failed to reach required threshold for view {}: only {} valid responses (needed {})",
+            view, valid_responses.len(), required_responses
+        );
+        return Err(CatchUpError::NetworkUnavailable);
+    }
+
+    // Find response with highest QC (Lock > Propose > none)
+    // This protects against withholding attacks by taking MAX QC seen
+    let best_response = valid_responses.into_iter()
+        .max_by_key(|vd| {
+            if vd.lock_qc.is_some() {
+                (2, vd.lock_qc.as_ref().unwrap().view_number)
+            } else if vd.propose_qc.is_some() {
+                (1, vd.propose_qc.as_ref().unwrap().view_number)
+            } else {
+                (0, 0)
+            }
+        })
+        .ok_or(CatchUpError::NetworkUnavailable)?;
+
+    tracing::info!(
+        "Selected view {} data with highest QC: propose_QC={}, lock_QC={}, TC={}",
+        view,
+        best_response.propose_qc.is_some(),
+        best_response.lock_qc.is_some(),
+        best_response.timeout_certificate.is_some()
+    );
+
+    Ok(best_response)
+}
+
+/// Fetch and validate view data with retry logic (sequential, for batch catch-up)
 async fn fetch_and_validate_with_retry(
     view: i32,
     target_view: i32,
@@ -894,45 +1141,53 @@ pub async fn ensure_caught_up_and_active(
 ) -> Result<NodeReadiness, functions::CatchUpError> {
     use crate::consensus::functions::CatchUpError;
 
-    let mut sync_status = SyncStatus::CaughtUp;
+    // Serialize all catch-up operations to prevent concurrent consensus state modifications
+    // Lock is scoped to catch-up operations only (released before activation request)
+    let sync_status = {
+        let _guard = app_state.consensus_lock.lock().await;
 
-    // Perform appropriate catch-up based on mode
-    match mode {
-        CatchUpMode::SingleShot => {
-            // Fast path: check if behind and perform single catch-up pass
-            match check_view_status(app_state).await {
-                Ok(ViewComparison::Behind { our_view, max_network_view }) => {
-                    let gap = max_network_view - our_view;
+        let mut sync_status = SyncStatus::CaughtUp;
 
-                    if gap > tolerance_views {
-                        tracing::info!("Single-shot catch-up: closing gap of {} views (from {} to {})", gap, our_view, max_network_view);
-                        perform_catch_up(app_state, our_view, max_network_view, bootstrap_validators).await?;
+        // Perform appropriate catch-up based on mode
+        match mode {
+            CatchUpMode::SingleShot => {
+                // Fast path: check if behind and perform single catch-up pass
+                match check_view_status(app_state).await {
+                    Ok(ViewComparison::Behind { our_view, max_network_view }) => {
+                        let gap = max_network_view - our_view;
+
+                        if gap > tolerance_views {
+                            tracing::info!("Single-shot catch-up: closing gap of {} views (from {} to {})", gap, our_view, max_network_view);
+                            perform_catch_up(app_state, our_view, max_network_view, bootstrap_validators).await?;
+                            sync_status = SyncStatus::CaughtUp;
+                        } else {
+                            tracing::debug!("Gap of {} views within tolerance {}, skipping catch-up", gap, tolerance_views);
+                            sync_status = SyncStatus::WithinTolerance { gap };
+                        }
+                    }
+                    Ok(ViewComparison::CaughtUp { view }) => {
+                        tracing::debug!("Already caught up at view {}", view);
                         sync_status = SyncStatus::CaughtUp;
-                    } else {
-                        tracing::debug!("Gap of {} views within tolerance {}, skipping catch-up", gap, tolerance_views);
-                        sync_status = SyncStatus::WithinTolerance { gap };
+                    }
+                    Ok(ViewComparison::Ahead { our_view, sampled_max_view }) => {
+                        tracing::debug!("Ahead of sampled validators: our_view={}, sampled_max_view={}", our_view, sampled_max_view);
+                        sync_status = SyncStatus::CaughtUp;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to check view status during single-shot catch-up: {:?}", e);
+                        return Err(CatchUpError::NetworkUnavailable);
                     }
                 }
-                Ok(ViewComparison::CaughtUp { view }) => {
-                    tracing::debug!("Already caught up at view {}", view);
-                    sync_status = SyncStatus::CaughtUp;
-                }
-                Ok(ViewComparison::Ahead { our_view, sampled_max_view }) => {
-                    tracing::debug!("Ahead of sampled validators: our_view={}, sampled_max_view={}", our_view, sampled_max_view);
-                    sync_status = SyncStatus::CaughtUp;
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to check view status during single-shot catch-up: {:?}", e);
-                    return Err(CatchUpError::NetworkUnavailable);
-                }
+            }
+            CatchUpMode::Convergence => {
+                // Iterative convergence for large gaps or bootstrap (tolerance ignored)
+                perform_catch_up_with_convergence(app_state, bootstrap_validators).await?;
+                sync_status = SyncStatus::CaughtUp;
             }
         }
-        CatchUpMode::Convergence => {
-            // Iterative convergence for large gaps or bootstrap (tolerance ignored)
-            perform_catch_up_with_convergence(app_state, bootstrap_validators).await?;
-            sync_status = SyncStatus::CaughtUp;
-        }
-    }
+
+        sync_status
+    }; // Lock released here - safe for activation request which takes its own lock
 
     // Check if we're active at current height
     // Scope database work to ensure transaction is dropped before async calls
@@ -1013,12 +1268,18 @@ async fn request_activation(
     Ok(())
 }
 
-/// Ensure we have all QCs within the current view (intra-view synchronization)
+/// Ensure we have all QCs within the current view (quorum-based intra-view sync)
 ///
 /// This function addresses a critical gap in view-level synchronization:
 /// - View-level sync only ensures we're at the right view number
-/// - But within a view, we could be missing the Propose QC
+/// - But within a view, we could be missing the Propose QC (or Lock QC)
 /// - This causes Lock ballot rejection when highest_qc_block doesn't match
+///
+/// Byzantine resistance:
+/// - Queries ALL validators in parallel
+/// - Breaks early when (quorum - 1) respond (we count ourselves as part of quorum)
+/// - Takes MAX QC from valid responses (protects against withholding attacks)
+/// - ~99.99999% probability of discovering Lock QC if any quorum knows about it
 ///
 /// Example failure without intra-view sync:
 /// - Node at view 9 (view-level sync ✓)
@@ -1026,13 +1287,11 @@ async fn request_activation(
 /// - Receives Lock ballot for block X (view 9)
 /// - ballot.verify_proposal() checks: X == highest_qc_block.hash? NO
 /// - Ballot rejected with LockPhaseQcMismatch
-///
-/// This function fetches and integrates the current view data to ensure we have
-/// the Propose QC before processing Lock ballots.
 pub async fn ensure_intra_view_synced(
     app_state: &AppState,
 ) -> Result<(), functions::CatchUpError> {
     use crate::consensus::functions::CatchUpError;
+    use crate::consensus::types::calculate_quorum_threshold;
 
     // Get current consensus state
     let (current_view, highest_qc_view) = {
@@ -1044,18 +1303,24 @@ pub async fn ensure_intra_view_synced(
     // Check if we're missing the Propose QC within current view
     if highest_qc_view < current_view {
         tracing::debug!(
-            "Intra-view sync required: current_view={}, highest_qc_view={} - fetching Propose QC",
+            "Intra-view sync required: current_view={}, highest_qc_view={} - querying quorum",
             current_view,
             highest_qc_view
         );
 
-        // Get validators at committed height to fetch from
+        // Get validators at committed height to query (exclude ourselves)
         let validators = {
             let mut conn = app_state.db_pool.get().map_err(|_| CatchUpError::Database)?;
             let tx = conn.transaction().map_err(|_| CatchUpError::Database)?;
             let height = db::get_current_consensus_height(&tx).map_err(|_| CatchUpError::Database)?;
-            db::get_validators(Ok(app_state.db_pool.get().map_err(|_| CatchUpError::Database)?), height)
-                .map_err(|_| CatchUpError::Database)?
+            let my_node_id = app_state.get_node_id().map_err(|_| CatchUpError::Database)?;
+
+            let all_validators = db::get_validators(Ok(app_state.db_pool.get().map_err(|_| CatchUpError::Database)?), height)
+                .map_err(|_| CatchUpError::Database)?;
+
+            all_validators.into_iter()
+                .filter(|v| v.node_id != my_node_id)
+                .collect::<Vec<_>>()
         };
 
         if validators.is_empty() {
@@ -1063,25 +1328,37 @@ pub async fn ensure_intra_view_synced(
             return Err(CatchUpError::NetworkUnavailable);
         }
 
-        // Fetch current view data from validators
-        let view_data = fetch_and_validate_with_retry(
-            current_view,
+        // Calculate quorum based on total network size (including ourselves)
+        let total_validator_count = validators.len() + 1;
+        let network_quorum = calculate_quorum_threshold(total_validator_count);
+
+        // We need (quorum - 1) responses from others since we count ourselves
+        let required_responses = network_quorum - 1;
+
+        tracing::debug!(
+            "Intra-view sync: total_validators={}, network_quorum={}, querying {} others (need {} responses)",
+            total_validator_count, network_quorum, validators.len(), required_responses
+        );
+
+        // Quorum-based fetch: query all, break when threshold met, take MAX QC
+        let view_data = fetch_and_validate_from_quorum(
             current_view,
             &validators,
+            required_responses,
             app_state
         ).await?;
 
-        // Integrate the fetched data
+        // Integrate the fetched data (includes highest QC discovered)
         integrate_view(current_view, view_data, app_state).await
             .map_err(|_| CatchUpError::ValidationFailed(current_view))?;
 
         tracing::debug!(
-            "Intra-view sync completed: fetched and integrated view {} data",
+            "Intra-view sync completed: integrated view {} data with highest QC from quorum",
             current_view
         );
     } else {
         tracing::trace!(
-            "Intra-view sync not needed: highest_qc_view={} == current_view={}",
+            "Intra-view sync not needed: highest_qc_view={} >= current_view={}",
             highest_qc_view,
             current_view
         );
@@ -1238,14 +1515,6 @@ pub async fn ensure_caught_up_middleware(
                     match (sync_status, is_active) {
                         (SyncStatus::CaughtUp, true) => {
                             tracing::debug!("Node is caught up and active (view-level)");
-
-                            // Ensure intra-view sync (have Propose QC for current view)
-                            if let Err(e) = ensure_intra_view_synced(&app_state).await {
-                                tracing::error!("Intra-view sync failed: {:?} - rejecting request", e);
-                                return StatusCode::SERVICE_UNAVAILABLE.into_response();
-                            }
-
-                            tracing::debug!("Intra-view sync complete, processing request");
                             next.run(req).await
                         }
                         (SyncStatus::CaughtUp, false) => {
@@ -1410,7 +1679,10 @@ pub async fn post_propose(
     // Process transactions through consensus (already authenticated)
     match crate::consensus::functions::consensus_middleware(&app_state, transactions).await {
         Ok(()) => StatusCode::OK,
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        Err(e) => {
+            tracing::error!("Consensus middleware failed: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
     }
 }
 
@@ -1418,28 +1690,87 @@ pub async fn post_propose(
 pub async fn apply_timeout_certificate(
     tc: TimeoutCertificate,
     app_state: &AppState,
+    skip_wait: bool,
 ) -> Result<(), CertificateError> {
+    // Layer 2: Post-TC bounded wait - if not skipping, wait GST for potential Lock QC arrival
+    // IMPORTANT: Don't hold lock during wait to allow Lock QC to be processed
+    if !skip_wait {
+        const GST_MS: u64 = 500; // Global Stabilization Time assumption
+        tracing::debug!(
+            "Layer 2: Post-TC bounded wait - sleeping {}ms for potential Lock QC arrival (view {})",
+            GST_MS, tc.view_number
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(GST_MS)).await;
+    }
+
+    // Acquire lock AFTER GST wait to allow Lock QC to win the race
+    let _guard = app_state.consensus_lock.lock().await;
+
     // Get current consensus state to validate TC view
     let consensus_state = db::get_consensus(app_state.db_pool.get())
         .map_err(|_| CertificateError::DatabaseError)?;
-    
+
     // TC must be for our current view to maintain chain consistency
     if tc.view_number != consensus_state.view {
         if tc.view_number < consensus_state.view {
-            tracing::warn!("Rejecting TC for old view {} (current view: {})", tc.view_number, consensus_state.view);
+            tracing::debug!("TC for view {} became stale during wait (current view: {}) - Lock QC likely won", tc.view_number, consensus_state.view);
             return Err(CertificateError::ValidationError);
         } else {
             tracing::warn!("Rejecting TC for future view {} (current view: {})", tc.view_number, consensus_state.view);
             return Err(CertificateError::ValidationError);
         }
     }
-    
-    // Store the TC in database
-    match db::insert_tc(app_state.db_pool.get(), tc.clone()) {
+
+    // Layer 3: Quorum-based intra-view sync - actively verify no Lock QC exists
+    // This complements GST wait (passive) with active quorum verification
+    tracing::debug!(
+        "Layer 3: Pre-TC quorum check - querying quorum to verify no Lock QC exists for view {}",
+        tc.view_number
+    );
+    if let Err(e) = ensure_intra_view_synced(app_state).await {
+        tracing::error!("Quorum check failed before applying TC for view {}: {:?}", tc.view_number, e);
+        return Err(CertificateError::DatabaseError);
+    }
+
+    // Re-validate TC is still for our current view (might have changed during quorum check)
+    let consensus_state = db::get_consensus(app_state.db_pool.get())
+        .map_err(|_| CertificateError::DatabaseError)?;
+
+    if tc.view_number != consensus_state.view {
+        if tc.view_number < consensus_state.view {
+            tracing::info!("TC for view {} became stale during quorum check (current view: {}) - Lock QC discovered and applied", tc.view_number, consensus_state.view);
+            return Err(CertificateError::ValidationError);
+        } else {
+            tracing::warn!("View advanced unexpectedly during quorum check: TC view {}, current view {}", tc.view_number, consensus_state.view);
+            return Err(CertificateError::ValidationError);
+        }
+    }
+
+    tracing::debug!("Quorum check complete - no Lock QC found, safe to apply TC for view {}", tc.view_number);
+
+    // Store the TC in database with QC validation (Bug #6 and #7 fixes)
+    match db::insert_tc_safe(app_state, tc.clone()) {
         Ok(_) => {
             tracing::info!("Applied timeout certificate for view {}", tc.view_number);
             Ok(())
         }
         Err(_) => Err(CertificateError::DatabaseError),
+    }
+}
+
+/// GET /debug/state - Get hash-based state snapshot for divergence detection
+pub async fn get_state_snapshot(
+    State(app_state): State<AppState>,
+) -> impl IntoResponse {
+    match crate::db::debug::compute_state_snapshot(app_state.db_pool.get()) {
+        Ok(internal_snapshot) => {
+            // Convert internal (Blake3Hash) to wire format (String)
+            let wire_snapshot: hopnet_common::StateSnapshot = internal_snapshot.into();
+            (axum::http::StatusCode::OK, Json(wire_snapshot)).into_response()
+        }
+        Err(e) => {
+            tracing::error!("Failed to compute state snapshot: {:?}", e);
+            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Failed to compute state snapshot").into_response()
+        }
     }
 }

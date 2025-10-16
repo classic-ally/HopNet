@@ -6,6 +6,18 @@ use clap::{Parser, Subcommand};
 use serde_json::json;
 use std::collections::HashMap;
 
+mod divergence;
+mod sys;
+
+/// Node information for API calls
+#[derive(Debug, Clone)]
+pub struct NodeInfo {
+    pub node_id: u32,
+    pub ip_address: String,
+    pub port: u32,
+    pub jwt_token: String,
+}
+
 #[derive(Parser)]
 #[command(name = "hopnet-orchestrator")]
 #[command(about = "HopNet Docker Orchestrator for consensus testing")]
@@ -69,28 +81,38 @@ enum Commands {
         #[arg(short, long)]
         view: Option<i32>,
     },
+    /// Check for state divergence across nodes in a mesh
+    Divergence {
+        /// Mesh network ID to examine
+        #[arg(short, long)]
+        mesh_id: u32,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Connect to Docker daemon (or Podman via DOCKER_HOST)
-    let docker = if let Ok(host) = std::env::var("DOCKER_HOST") {
-        Docker::connect_with_unix(&host.strip_prefix("unix://").unwrap_or(&host), 120, bollard::API_DEFAULT_VERSION)?
-    } else {
-        Docker::connect_with_socket_defaults()?
-    };
+    // Auto-detect and connect to container runtime (Docker or Podman)
+    let socket_path = sys::detect_socket_path()?;
+    let docker = Docker::connect_with_unix(
+        &socket_path.strip_prefix("unix://").unwrap_or(&socket_path),
+        120,
+        bollard::API_DEFAULT_VERSION
+    )?;
+
+    // Detect runtime type for adaptive behavior
+    let runtime = sys::detect_runtime(&docker).await?;
     
     match &cli.command {
         Some(Commands::Create { nodes, no_cleanup }) => {
             let mesh_id = get_next_mesh_id(&docker).await?;
             println!("Creating mesh {} with {} nodes", mesh_id, nodes);
-            create_mesh(&docker, mesh_id, *nodes, *no_cleanup).await?;
+            create_mesh(&docker, mesh_id, *nodes, *no_cleanup, runtime).await?;
         }
         Some(Commands::Add { mesh_id, nodes }) => {
             println!("Adding {} node(s) to mesh {}", nodes, mesh_id);
-            add_nodes_to_mesh(&docker, *mesh_id, *nodes).await?;
+            add_nodes_to_mesh(&docker, *mesh_id, *nodes, runtime).await?;
         }
         Some(Commands::Delete { mesh_id, yes }) => {
             delete_mesh(&docker, *mesh_id, *yes).await?;
@@ -99,10 +121,13 @@ async fn main() -> Result<()> {
             cleanup_orphaned_networks(&docker, *yes).await?;
         }
         Some(Commands::Status { mesh_id }) => {
-            show_mesh_status(&docker, *mesh_id).await?;
+            show_mesh_status(&docker, *mesh_id, runtime).await?;
         }
         Some(Commands::History { mesh_id, node, view }) => {
-            show_node_history(&docker, *mesh_id, *node, *view).await?;
+            show_node_history(&docker, *mesh_id, *node, *view, runtime).await?;
+        }
+        Some(Commands::Divergence { mesh_id }) => {
+            divergence::check_divergence(&docker, *mesh_id, runtime).await?;
         }
         Some(Commands::List) | None => {
             list_meshes(&docker).await?;
@@ -216,7 +241,7 @@ async fn list_meshes(docker: &Docker) -> Result<()> {
     Ok(())
 }
 
-async fn create_mesh(docker: &Docker, mesh_id: u32, node_count: u32, no_cleanup: bool) -> Result<()> {
+async fn create_mesh(docker: &Docker, mesh_id: u32, node_count: u32, no_cleanup: bool, runtime: sys::ContainerRuntime) -> Result<()> {
     println!("Creating mesh {} with {} nodes", mesh_id, node_count);
     
     // Create network for the mesh
@@ -233,7 +258,7 @@ async fn create_mesh(docker: &Docker, mesh_id: u32, node_count: u32, no_cleanup:
                 let container_name = format!("hopnet-orchestrator-{}-{}", mesh_id, node_id);
                 println!("Creating HopNet container: {}", container_name);
                 
-                match create_hopnet_container(docker, &container_name, &network_name).await {
+                match create_hopnet_container(docker, &container_name, &network_name, runtime).await {
                     Ok((container_id, ip_address)) => {
                         println!("Successfully created container: {} with IP: {}", container_id, ip_address);
                         containers.push((container_name, container_id, ip_address));
@@ -251,7 +276,7 @@ async fn create_mesh(docker: &Docker, mesh_id: u32, node_count: u32, no_cleanup:
             // Setup node 0 if it exists
             if let Some((container_name, _container_id, ip_address)) = containers.first() {
                 println!("Setting up node 0 at IP: {} (host port: {})", ip_address, 40000 + (mesh_id * 500));
-                if let Err(e) = setup_node_0(mesh_id, &container_name, &ip_address).await {
+                if let Err(e) = setup_node_0(docker, mesh_id, &container_name, &ip_address, runtime).await {
                     println!("Failed to setup node 0: {}", e);
                     
                     if no_cleanup {
@@ -294,7 +319,7 @@ async fn create_mesh(docker: &Docker, mesh_id: u32, node_count: u32, no_cleanup:
                         let node_id = node_index as u32; // node_id starts from 1 for additional nodes
                         println!("Registering node {} ({}) with node 0...", node_id, container_name);
 
-                        if let Err(e) = register_node_with_node_0(mesh_id, node_0_ip, node_id, container_name, node_ip).await {
+                        if let Err(e) = register_node_with_node_0(docker, mesh_id, node_0_ip, node_id, container_name, node_ip, runtime).await {
                             println!("Failed to register node {}: {}", node_id, e);
                             
                             if no_cleanup {
@@ -341,7 +366,7 @@ async fn create_mesh(docker: &Docker, mesh_id: u32, node_count: u32, no_cleanup:
     Ok(())
 }
 
-async fn add_nodes_to_mesh(docker: &Docker, mesh_id: u32, node_count: u32) -> Result<()> {
+async fn add_nodes_to_mesh(docker: &Docker, mesh_id: u32, node_count: u32, runtime: sys::ContainerRuntime) -> Result<()> {
     // Get existing containers to find the next node_id
     let existing_containers = get_mesh_containers(docker, mesh_id).await?;
 
@@ -409,7 +434,7 @@ async fn add_nodes_to_mesh(docker: &Docker, mesh_id: u32, node_count: u32) -> Re
         let container_name = format!("hopnet-orchestrator-{}-{}", mesh_id, node_id);
         println!("Creating container: {}", container_name);
 
-        match create_hopnet_container(docker, &container_name, &network_name).await {
+        match create_hopnet_container(docker, &container_name, &network_name, runtime).await {
             Ok((container_id, ip_address)) => {
                 println!("Successfully created container: {} with IP: {}", container_id, ip_address);
                 new_containers.push((container_name, container_id, ip_address));
@@ -433,7 +458,7 @@ async fn add_nodes_to_mesh(docker: &Docker, mesh_id: u32, node_count: u32) -> Re
 
         println!("Registering node {} ({}) with node 0...", node_id, container_name);
 
-        if let Err(e) = register_node_with_node_0(mesh_id, &node_0_ip, node_id, container_name, node_ip).await {
+        if let Err(e) = register_node_with_node_0(docker, mesh_id, &node_0_ip, node_id, container_name, node_ip, runtime).await {
             println!("Failed to register node {}: {}", node_id, e);
             return Err(anyhow::anyhow!("Node registration failed: {}", e));
         }
@@ -459,8 +484,13 @@ async fn create_hopnet_network(docker: &Docker, network_name: &str) -> Result<St
     Ok(response.id)
 }
 
-async fn create_hopnet_container(docker: &Docker, container_name: &str, network_name: &str) -> Result<(String, String)> {
-    // Extract mesh_id and node_id from container name for port mapping
+async fn create_hopnet_container(
+    docker: &Docker,
+    container_name: &str,
+    network_name: &str,
+    runtime: sys::ContainerRuntime,
+) -> Result<(String, String)> {
+    // Extract mesh_id and node_id from container name
     // container_name format: hopnet-orchestrator-{mesh_id}-{node_id}
     let parts: Vec<&str> = container_name.split('-').collect();
     let (mesh_id, node_id) = if parts.len() >= 4 {
@@ -471,37 +501,49 @@ async fn create_hopnet_container(docker: &Docker, container_name: &str, network_
         (0, 0)
     };
 
-    // Map host port to container port 34633
-    // Formula: 40000 + (mesh_id × 500) + node_id
-    // Supports up to 500 nodes per mesh, 51 meshes (40000-65535)
-    let host_port = 40000 + (mesh_id * 500) + node_id;
-    let mut port_bindings = HashMap::new();
-    port_bindings.insert(
-        "34633/tcp".to_string(),
-        Some(vec![bollard::models::PortBinding {
-            host_ip: Some("0.0.0.0".to_string()),
-            host_port: Some(host_port.to_string()),
-        }])
-    );
+    // Port bindings only needed for Podman (rootless can't access container IPs)
+    let (port_bindings, host_port) = if runtime == sys::ContainerRuntime::Podman {
+        // Find available port with collision detection
+        let port = sys::find_available_port(mesh_id, node_id).await?;
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            "34633/tcp".to_string(),
+            Some(vec![bollard::models::PortBinding {
+                host_ip: Some("0.0.0.0".to_string()),
+                host_port: Some(port.to_string()),
+            }])
+        );
+        (Some(bindings), port)
+    } else {
+        // Docker: no port mapping needed, we access container IPs directly
+        (None, 34633)
+    };
 
     // Network configuration - attach to our custom network
     let mut endpoints_config = HashMap::new();
     endpoints_config.insert(
         network_name.to_string(),
         EndpointSettings {
-            ip_address: None, // Let Docker assign IP
+            ip_address: None, // Let Docker/Podman assign IP
             ..Default::default()
         }
     );
 
+    // Container labels for tracking
+    let mut labels = HashMap::new();
+    labels.insert("hopnet.mesh_id".to_string(), mesh_id.to_string());
+    labels.insert("hopnet.node_id".to_string(), node_id.to_string());
+    labels.insert("hopnet.host_port".to_string(), host_port.to_string());
+
     // Container configuration
     let config = ContainerCreateBody {
         image: Some("hopnet:latest".to_string()),
+        labels: Some(labels),
         networking_config: Some(NetworkingConfig {
             endpoints_config: Some(endpoints_config),
         }),
         host_config: Some(HostConfig {
-            port_bindings: Some(port_bindings),
+            port_bindings,
             ..Default::default()
         }),
         ..Default::default()
@@ -537,11 +579,17 @@ async fn create_hopnet_container(docker: &Docker, container_name: &str, network_
     Ok((container_id, ip_address))
 }
 
-async fn setup_node_0(mesh_id: u32, node_name: &str, ip_address: &str) -> Result<()> {
+async fn setup_node_0(docker: &Docker, mesh_id: u32, node_name: &str, ip_address: &str, runtime: sys::ContainerRuntime) -> Result<()> {
     let client = reqwest::Client::new();
-    // Use localhost with mapped port (node 0 = 40000 + mesh_id * 500)
-    let host_port = 40000 + (mesh_id * 500);
-    let url = format!("http://localhost:{}/setup", host_port);
+
+    // Get runtime-aware connection info for node 0
+    let addresses = get_external_addresses(docker, mesh_id, runtime).await?;
+    let (host, port) = addresses.iter()
+        .find(|(id, _, _)| *id == 0)
+        .map(|(_, h, p)| (h.clone(), *p))
+        .ok_or_else(|| anyhow::anyhow!("Node 0 not found"))?;
+
+    let url = format!("http://{}:{}/setup", host, port);
 
     let setup_data = json!({
         "username": "allison",
@@ -605,10 +653,17 @@ async fn setup_node_0(mesh_id: u32, node_name: &str, ip_address: &str) -> Result
     }
 }
 
-async fn get_jwt_token(mesh_id: u32, node_id: u32) -> Result<String> {
+pub async fn get_jwt_token(docker: &Docker, mesh_id: u32, node_id: u32, runtime: sys::ContainerRuntime) -> Result<String> {
     let client = reqwest::Client::new();
-    let host_port = 40000 + (mesh_id * 500) + node_id;
-    let login_url = format!("http://localhost:{}/login", host_port);
+
+    // Get runtime-aware connection info for this node
+    let addresses = get_external_addresses(docker, mesh_id, runtime).await?;
+    let (host, port) = addresses.iter()
+        .find(|(id, _, _)| *id == node_id)
+        .map(|(_, h, p)| (h.clone(), *p))
+        .ok_or_else(|| anyhow::anyhow!("Node {} not found", node_id))?;
+
+    let login_url = format!("http://{}:{}/login", host, port);
     
     let login_data = json!({
         "username": "allison",
@@ -657,12 +712,18 @@ async fn get_jwt_token(mesh_id: u32, node_id: u32) -> Result<String> {
     }
 }
 
-async fn register_node_with_node_0(mesh_id: u32, node_0_ip: &str, node_id: u32, node_name: &str, node_ip: &str) -> Result<()> {
+async fn register_node_with_node_0(docker: &Docker, mesh_id: u32, node_0_ip: &str, node_id: u32, node_name: &str, node_ip: &str, runtime: sys::ContainerRuntime) -> Result<()> {
     let client = reqwest::Client::new();
 
+    // Get runtime-aware connection info for this node
+    let addresses = get_external_addresses(docker, mesh_id, runtime).await?;
+    let (node_host, node_port) = addresses.iter()
+        .find(|(id, _, _)| *id == node_id)
+        .map(|(_, h, p)| (h.clone(), *p))
+        .ok_or_else(|| anyhow::anyhow!("Node {} not found", node_id))?;
+
     // Step 1: Get the public key from the node's /setup GET route
-    let node_host_port = 40000 + (mesh_id * 500) + node_id;
-    let get_setup_url = format!("http://localhost:{}/setup", node_host_port);
+    let get_setup_url = format!("http://{}:{}/setup", node_host, node_port);
     println!("  Getting public key from: {}", get_setup_url);
     
     let start_time = std::time::Instant::now();
@@ -712,11 +773,14 @@ async fn register_node_with_node_0(mesh_id: u32, node_0_ip: &str, node_id: u32, 
     
     // Step 2: Get JWT token for authentication with node 0 (after node 0 setup is complete)
     println!("  Getting JWT token for node 0 authentication...");
-    let jwt_token = get_jwt_token(mesh_id, 0).await?;  // node 0 has node_id = 0
+    let jwt_token = get_jwt_token(docker, mesh_id, 0, runtime).await?;  // node 0 has node_id = 0
 
     // Step 3: Register the node with node 0 via POST /nodes
-    let node_0_host_port = 40000 + (mesh_id * 500);  // node 0 port
-    let register_url = format!("http://localhost:{}/nodes", node_0_host_port);
+    let (node_0_host, node_0_port) = addresses.iter()
+        .find(|(id, _, _)| *id == 0)
+        .map(|(_, h, p)| (h.clone(), *p))
+        .ok_or_else(|| anyhow::anyhow!("Node 0 not found"))?;
+    let register_url = format!("http://{}:{}/nodes", node_0_host, node_0_port);
     let node_data = json!({
         "node_id": node_id,
         "name": node_name,
@@ -1074,7 +1138,7 @@ async fn cleanup_orphaned_networks(docker: &Docker, skip_confirmation: bool) -> 
     Ok(())
 }
 
-async fn show_mesh_status(docker: &Docker, mesh_id: u32) -> Result<()> {
+async fn show_mesh_status(docker: &Docker, mesh_id: u32, runtime: sys::ContainerRuntime) -> Result<()> {
     println!("Mesh {} Status", mesh_id);
     
     // Get containers for this mesh
@@ -1111,22 +1175,10 @@ async fn show_mesh_status(docker: &Docker, mesh_id: u32) -> Result<()> {
     // Sort by node ID
     node_data.sort_by_key(|(node_id, _)| *node_id);
     
-    // Get node IPs for API calls
+    // Query node statuses
     let mut node_statuses = Vec::new();
-    for (node_id, container) in node_data {
-        let container_id = container.id.as_ref().unwrap();
-        
-        // Get container IP
-        let container_info = docker.inspect_container(container_id, None::<bollard::container::InspectContainerOptions>).await?;
-        let networks = container_info.network_settings.and_then(|ns| ns.networks).unwrap_or_default();
-        
-        let ip_address = networks.values()
-            .find_map(|endpoint| endpoint.ip_address.as_ref())
-            .unwrap_or(&"unknown".to_string())
-            .clone();
-        
-        // Query node status
-        let status = get_node_status(mesh_id, node_id, &ip_address).await;
+    for (node_id, _container) in node_data {
+        let status = get_node_status(docker, mesh_id, node_id, runtime).await;
         node_statuses.push((node_id, status));
     }
     
@@ -1174,12 +1226,15 @@ async fn show_mesh_status(docker: &Docker, mesh_id: u32) -> Result<()> {
     Ok(())
 }
 
-async fn show_node_history(docker: &Docker, mesh_id: u32, node_id: u32, view: Option<i32>) -> Result<()> {
-    // Get JWT token for authentication
-    let jwt_token = get_jwt_token(mesh_id, node_id).await?;
+async fn show_node_history(docker: &Docker, mesh_id: u32, node_id: u32, view: Option<i32>, runtime: sys::ContainerRuntime) -> Result<()> {
+    // Get runtime-aware connection info and JWT token
+    let addresses = get_external_addresses(docker, mesh_id, runtime).await?;
+    let (host, port) = addresses.iter()
+        .find(|(id, _, _)| *id == node_id)
+        .map(|(_, h, p)| (h.clone(), *p))
+        .ok_or_else(|| anyhow::anyhow!("Node {} not found", node_id))?;
 
-    // Calculate host port
-    let host_port = 40000 + (mesh_id * 500) + node_id;
+    let jwt_token = get_jwt_token(docker, mesh_id, node_id, runtime).await?;
     let client = reqwest::Client::new();
 
     // If specific view requested, show detailed view state
@@ -1187,7 +1242,7 @@ async fn show_node_history(docker: &Docker, mesh_id: u32, node_id: u32, view: Op
         println!("Node {} View State for View {} (Mesh {})", node_id, view_number, mesh_id);
         println!("{}", "=".repeat(60));
 
-        let url = format!("http://localhost:{}/consensus/view", host_port);
+        let url = format!("http://{}:{}/consensus/view", host, port);
         let response = client.post(&url)
             .header("Authorization", format!("Bearer {}", jwt_token))
             .json(&view_number)
@@ -1233,7 +1288,7 @@ async fn show_node_history(docker: &Docker, mesh_id: u32, node_id: u32, view: Op
         // Show full history table (existing behavior)
         println!("Node {} Consensus History (Mesh {})", node_id, mesh_id);
 
-        let url = format!("http://localhost:{}/consensus/history", host_port);
+        let url = format!("http://{}:{}/consensus/history", host, port);
         let response = client.get(&url)
             .header("Authorization", format!("Bearer {}", jwt_token))
             .send()
@@ -1280,18 +1335,24 @@ struct NodeStatus {
     phase: String,
 }
 
-async fn get_node_status(mesh_id: u32, node_id: u32, ip_address: &str) -> Result<NodeStatus> {
+async fn get_node_status(docker: &Docker, mesh_id: u32, node_id: u32, runtime: sys::ContainerRuntime) -> Result<NodeStatus> {
     let client = reqwest::Client::new();
 
-    // First get JWT token
-    let jwt_token = match get_jwt_token(mesh_id, node_id).await {
+    // Get runtime-aware connection info
+    let addresses = get_external_addresses(docker, mesh_id, runtime).await?;
+    let (host, port) = addresses.iter()
+        .find(|(id, _, _)| *id == node_id)
+        .map(|(_, h, p)| (h.clone(), *p))
+        .ok_or_else(|| anyhow::anyhow!("Node {} not found", node_id))?;
+
+    // Get JWT token
+    let jwt_token = match get_jwt_token(docker, mesh_id, node_id, runtime).await {
         Ok(token) => token,
         Err(_) => return Err(anyhow::anyhow!("Auth failed")),
     };
 
     // Query consensus state with JWT
-    let host_port = 40000 + (mesh_id * 500) + node_id;
-    let consensus_url = format!("http://localhost:{}/consensus", host_port);
+    let consensus_url = format!("http://{}:{}/consensus", host, port);
     
     match client
         .get(&consensus_url)
@@ -1338,5 +1399,114 @@ async fn get_node_status(mesh_id: u32, node_id: u32, ip_address: &str) -> Result
             }
         }
         Err(_) => Err(anyhow::anyhow!("Connection failed"))
+    }
+}
+
+/// Internal metadata for a node (both internal and external addressing)
+struct NodeMetadata {
+    node_id: u32,
+    container_ip: String,
+    host_port: u16,
+}
+
+/// Extract complete node metadata from containers in a mesh
+async fn get_node_metadata(docker: &Docker, mesh_id: u32) -> Result<Vec<NodeMetadata>> {
+    let containers = get_mesh_containers(docker, mesh_id).await?;
+    let mut metadata: Vec<NodeMetadata> = Vec::new();
+
+    for container in &containers {
+        if let Some(names) = &container.names {
+            for name in names {
+                if name.starts_with("/hopnet-orchestrator-") {
+                    let clean_name = &name[1..];
+                    let parts: Vec<&str> = clean_name.split('-').collect();
+                    if parts.len() >= 4 {
+                        if let Ok(node_id) = parts[3].parse::<u32>() {
+                            let container_id = container.id.as_ref().unwrap();
+                            let container_info = docker.inspect_container(container_id, None::<bollard::container::InspectContainerOptions>).await?;
+
+                            // Extract container IP from networks
+                            let networks = container_info.network_settings.and_then(|ns| ns.networks).unwrap_or_default();
+                            let container_ip = networks.values()
+                                .find_map(|endpoint| endpoint.ip_address.as_ref())
+                                .ok_or_else(|| anyhow::anyhow!("Container IP not found for node {}", node_id))?
+                                .clone();
+
+                            // Extract host port from labels
+                            let labels = container_info.config.and_then(|c| c.labels).unwrap_or_default();
+                            let host_port = labels.get("hopnet.host_port")
+                                .and_then(|p| p.parse::<u16>().ok())
+                                .ok_or_else(|| anyhow::anyhow!("Host port label not found for node {}", node_id))?;
+
+                            metadata.push(NodeMetadata {
+                                node_id,
+                                container_ip,
+                                host_port,
+                            });
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    metadata.sort_by_key(|m| m.node_id);
+    Ok(metadata)
+}
+
+/// Get internal addresses for inter-container communication
+/// Returns (node_id, ip_address, port) - always uses container IPs regardless of runtime
+pub async fn get_internal_addresses(docker: &Docker, mesh_id: u32) -> Result<Vec<(u32, String, u16)>> {
+    Ok(get_node_metadata(docker, mesh_id).await?
+        .into_iter()
+        .map(|m| (m.node_id, m.container_ip, 34633u16))
+        .collect())
+}
+
+/// Get external addresses for host-to-container communication
+/// Returns (node_id, host, port) - adapts based on runtime
+pub async fn get_external_addresses(docker: &Docker, mesh_id: u32, runtime: sys::ContainerRuntime) -> Result<Vec<(u32, String, u16)>> {
+    Ok(get_node_metadata(docker, mesh_id).await?
+        .into_iter()
+        .map(|m| match runtime {
+            sys::ContainerRuntime::Docker => (m.node_id, m.container_ip, 34633),
+            sys::ContainerRuntime::Podman => (m.node_id, "localhost".to_string(), m.host_port),
+        })
+        .collect())
+}
+
+/// Call a HopNet node API with authentication and optional retry
+pub async fn call_node_api(node_info: &NodeInfo, path: &str, retry: bool) -> Result<reqwest::Response> {
+    let url = format!("http://{}:{}{}", node_info.ip_address, node_info.port, path);
+    let client = reqwest::Client::new();
+
+    let make_request = || async {
+        client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", node_info.jwt_token))
+            .send()
+            .await
+    };
+
+    if retry {
+        // Retry logic for idempotent operations
+        let mut attempts = 0;
+        let max_attempts = 3;
+
+        loop {
+            attempts += 1;
+            match make_request().await {
+                Ok(response) => return Ok(response),
+                Err(e) if attempts < max_attempts => {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    } else {
+        // Single attempt for non-idempotent operations
+        Ok(make_request().await?)
     }
 }

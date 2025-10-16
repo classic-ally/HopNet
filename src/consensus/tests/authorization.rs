@@ -44,11 +44,14 @@ mod authorization_tests {
             &user.signing_key,
         ).expect("Failed to create transaction");
 
-        let result = process_transaction(&tx, &app_state, false);
+        let mut conn = app_state.db_pool.get().expect("Failed to get DB connection");
+        let db_tx = conn.transaction().expect("Failed to start transaction");
+        let result = process_transaction(&tx, &app_state, false, &db_tx);
         if let Err(e) = &result {
             assert!(!matches!(e, DatabaseError::AuthorizationError),
                 "insert_files should not fail authorization but got: {:?}", e);
         }
+        let _ = db_tx.rollback();
     }
 
     #[test]
@@ -82,11 +85,14 @@ mod authorization_tests {
             &user.signing_key,
         ).expect("Failed to create transaction");
 
-        let result = process_transaction(&tx, &app_state, false);
+        let mut conn = app_state.db_pool.get().expect("Failed to get DB connection");
+        let db_tx = conn.transaction().expect("Failed to start transaction");
+        let result = process_transaction(&tx, &app_state, false, &db_tx);
         if let Err(e) = &result {
             assert!(!matches!(e, DatabaseError::AuthorizationError),
                 "modify_item should not fail authorization but got: {:?}", e);
         }
+        let _ = db_tx.rollback();
     }
 
     #[test]
@@ -117,11 +123,14 @@ mod authorization_tests {
             &user.signing_key,
         ).expect("Failed to create transaction");
 
-        let result = process_transaction(&tx, &app_state, false);
+        let mut conn = app_state.db_pool.get().expect("Failed to get DB connection");
+        let db_tx = conn.transaction().expect("Failed to start transaction");
+        let result = process_transaction(&tx, &app_state, false, &db_tx);
         if let Err(e) = &result {
             assert!(!matches!(e, DatabaseError::AuthorizationError),
                 "delete_files should not fail authorization but got: {:?}", e);
         }
+        let _ = db_tx.rollback();
     }
 
     #[test]
@@ -157,9 +166,12 @@ mod authorization_tests {
             &user1.signing_key,
         ).expect("Failed to create transaction");
 
-        let result = process_transaction(&tx, &app_state, false);
+        let mut conn = app_state.db_pool.get().expect("Failed to get DB connection");
+        let db_tx = conn.transaction().expect("Failed to start transaction");
+        let result = process_transaction(&tx, &app_state, false, &db_tx);
         assert!(result.is_err(), "Unauthorized user transaction should fail");
         assert!(matches!(result.unwrap_err(), DatabaseError::AuthorizationError));
+        let _ = db_tx.rollback();
     }
 
     #[test]
@@ -194,9 +206,12 @@ mod authorization_tests {
             &user1.signing_key,
         ).expect("Failed to create transaction");
 
-        let result = process_transaction(&tx, &app_state, false);
+        let mut conn = app_state.db_pool.get().expect("Failed to get DB connection");
+        let db_tx = conn.transaction().expect("Failed to start transaction");
+        let result = process_transaction(&tx, &app_state, false, &db_tx);
         assert!(result.is_err(), "Mismatched user ID should fail authorization");
         assert!(matches!(result.unwrap_err(), DatabaseError::AuthorizationError));
+        let _ = db_tx.rollback();
     }
 
     #[test]
@@ -228,9 +243,12 @@ mod authorization_tests {
             &user1.signing_key,
         ).expect("Failed to create transaction");
 
-        let result = process_transaction(&tx, &app_state, false);
+        let mut conn = app_state.db_pool.get().expect("Failed to get DB connection");
+        let db_tx = conn.transaction().expect("Failed to start transaction");
+        let result = process_transaction(&tx, &app_state, false, &db_tx);
         assert!(result.is_err(), "Unauthorized delete should fail");
         assert!(matches!(result.unwrap_err(), DatabaseError::AuthorizationError));
+        let _ = db_tx.rollback();
     }
 
     #[test]
@@ -268,11 +286,14 @@ mod authorization_tests {
             &node.signing_key,
         ).expect("Failed to create transaction");
 
-        let result = process_transaction(&tx, &app_state, false);
+        let mut conn = app_state.db_pool.get().expect("Failed to get DB connection");
+        let db_tx = conn.transaction().expect("Failed to start transaction");
+        let result = process_transaction(&tx, &app_state, false, &db_tx);
         if let Err(e) = &result {
             assert!(!matches!(e, DatabaseError::AuthorizationError),
                 "Should not fail authorization but got: {:?}", e);
         }
+        let _ = db_tx.rollback();
     }
 
     #[test]
@@ -311,9 +332,12 @@ mod authorization_tests {
             &node1.signing_key,
         ).expect("Failed to create transaction");
 
-        let result = process_transaction(&tx, &app_state, false);
+        let mut conn = app_state.db_pool.get().expect("Failed to get DB connection");
+        let db_tx = conn.transaction().expect("Failed to start transaction");
+        let result = process_transaction(&tx, &app_state, false, &db_tx);
         assert!(result.is_err(), "Unauthorized node transaction should fail");
         assert!(matches!(result.unwrap_err(), DatabaseError::AuthorizationError));
+        let _ = db_tx.rollback();
     }
 
     #[test]
@@ -349,11 +373,14 @@ mod authorization_tests {
             &user.signing_key,
         ).expect("Failed to create transaction");
 
-        let result = process_transaction(&tx, &app_state, false);
+        let mut conn = app_state.db_pool.get().expect("Failed to get DB connection");
+        let db_tx = conn.transaction().expect("Failed to start transaction");
+        let result = process_transaction(&tx, &app_state, false, &db_tx);
         if let Err(e) = &result {
             assert!(!matches!(e, DatabaseError::AuthorizationError),
                 "create_takeout should not fail authorization but got: {:?}", e);
         }
+        let _ = db_tx.rollback();
     }
 
     #[test]
@@ -390,9 +417,12 @@ mod authorization_tests {
             &user1.signing_key,
         ).expect("Failed to create transaction");
 
-        let result = process_transaction(&tx, &app_state, false);
+        let mut conn = app_state.db_pool.get().expect("Failed to get DB connection");
+        let db_tx = conn.transaction().expect("Failed to start transaction");
+        let result = process_transaction(&tx, &app_state, false, &db_tx);
         assert!(result.is_err(), "Mismatched user ID should fail authorization");
         assert!(matches!(result.unwrap_err(), DatabaseError::AuthorizationError));
+        let _ = db_tx.rollback();
     }
 
     #[test]
@@ -429,8 +459,11 @@ mod authorization_tests {
             &user.signing_key,
         ).expect("Failed to create transaction");
 
-        let result = process_transaction(&tx, &app_state, false);
+        let mut conn = app_state.db_pool.get().expect("Failed to get DB connection");
+        let db_tx = conn.transaction().expect("Failed to start transaction");
+        let result = process_transaction(&tx, &app_state, false, &db_tx);
         assert!(result.is_err(), "Mismatched node ID should fail authorization");
         assert!(matches!(result.unwrap_err(), DatabaseError::AuthorizationError));
+        let _ = db_tx.rollback();
     }
 }

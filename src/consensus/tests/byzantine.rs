@@ -41,7 +41,7 @@ mod byzantine_tests {
         // Byzantine attack: Include the same signature twice to fake quorum
         let voter_signatures = vec![voter_sig.clone(), voter_sig.clone()];
 
-        let qc = QuorumCertificate::create(
+        let qc = QuorumCertificate::create_unverified(
             &block,
             phase.clone(),
             leader.node_id,
@@ -56,10 +56,13 @@ mod byzantine_tests {
 
         // After deduplication, we have: 1 proposer + 1 unique voter = 2 signatures
         // But we need (4*2)/3 + 1 = 3 signatures
-        // So this should fail with ValidationError due to insufficient unique signatures
+        // So this should fail with InsufficientVotes due to insufficient unique signatures
         assert!(result.is_err(), "QC with duplicate signatures should fail after deduplication");
-        assert!(matches!(result.unwrap_err(), CertificateError::ValidationError),
-            "Should fail with ValidationError due to insufficient unique signatures");
+        if let Err(e) = &result {
+            eprintln!("Actual error: {:?}", e);
+        }
+        assert!(matches!(result.unwrap_err(), CertificateError::InsufficientVotes),
+            "Should fail with InsufficientVotes due to insufficient unique signatures");
     }
 
     #[test]
@@ -103,7 +106,7 @@ mod byzantine_tests {
 
         let voter_signatures = vec![forged_voter_sig, legitimate_voter_sig];
 
-        let qc = QuorumCertificate::create(
+        let qc = QuorumCertificate::create_unverified(
             &block,
             phase.clone(),
             leader.node_id,
@@ -174,7 +177,7 @@ mod byzantine_tests {
 
         let voter_signatures = vec![rogue_voter_sig, legitimate_voter_sig];
 
-        let qc = QuorumCertificate::create(
+        let qc = QuorumCertificate::create_unverified(
             &block,
             phase.clone(),
             leader.node_id,
@@ -183,12 +186,14 @@ mod byzantine_tests {
         ).expect("Failed to create QC");
 
         // Verification should fail - rogue node exists in nodes table but NOT in validators
-        // get_validators() won't return it, so pubkey lookup will fail
+        // get_validators() won't return it, so the rogue vote is filtered out
+        // After filtering: only 2 valid signatures (proposer + 1 legitimate voter)
+        // For 4 validators, need 3 signatures, so this fails with InsufficientVotes
         let result = qc.verify(&leader.app_state, &block);
 
         assert!(result.is_err(), "QC with non-validator vote should fail");
-        assert!(matches!(result.unwrap_err(), CertificateError::SignerNotFound),
-            "Should fail with SignerNotFound because node is not in validator set");
+        assert!(matches!(result.unwrap_err(), CertificateError::InsufficientVotes),
+            "Should fail with InsufficientVotes after filtering out non-validator vote");
     }
 
     #[test]

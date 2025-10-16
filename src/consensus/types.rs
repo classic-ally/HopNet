@@ -3,7 +3,7 @@ use serde::{Serialize, Deserialize};
 use std::ops::Deref;
 use duckdb::{ToSql,types::ToSqlOutput,types::FromSql,types::FromSqlResult,types::ValueRef};
 use crate::db::consensus as db;
-use crate::db::types::extract_enum_string;
+use crate::db::types::{extract_enum_string, MyNode};
 use bincode::serde::encode_to_vec;
 use ed25519_dalek::Signature;
 use bincode::config;
@@ -37,6 +37,7 @@ pub enum ProgressionErrorKind {
     ViewTooOld,
     ViewMismatch,
     AlreadyIssuedTimeout,
+    DoubleVote,
     InvalidParent,
     PreparedBlockConflict,
     InvalidHeight,
@@ -59,6 +60,7 @@ pub enum CertificateError {
     ValidationError,
     SignerNotFound,
     InsufficientVotes,
+    NetworkTimeout,
 }
 
 #[derive(Debug)]
@@ -112,12 +114,53 @@ pub struct Ballot {
 }
 
 impl Ballot {
-    pub fn propose(data: VoteSignData, block: Block, from: VoteSignMessage) -> Ballot {
-        return Ballot {
-            initiator: from,
-            data: data,
-            block: block,
+    pub fn propose(
+        block: Block,
+        phase: ConsensusPhase,
+        me: &MyNode,
+        app_state: &AppState
+    ) -> Result<Ballot, VoteError> {
+        // Create vote data from block and phase
+        let data = VoteSignData::from_block(block.clone(), phase);
+
+        // Create signature (same as follower does in sign())
+        let signature = data.sign(&me.privkey).map_err(|_| VoteError::ProcessingError)?;
+        let initiator = VoteSignMessage {
+            replica_id: me.node_id,
+            signature,
         };
+
+        // Bug #5 fix: Leader double-vote check (only for Propose phase)
+        if data.phase == ConsensusPhase::Propose {
+            let db_conn = app_state.db_pool.get().map_err(|_| VoteError::DatabaseError)?;
+            let consensus_state = db::get_consensus_with_conn(&db_conn)
+                .map_err(|_| VoteError::DatabaseError)?;
+
+            if let Some(last_vote_hash) = consensus_state.last_propose_vote_block_hash {
+                if last_vote_hash != block.block_hash {
+                    tracing::warn!(
+                        "Leader double-vote attempt rejected: already proposed {:?}, rejecting proposal for {:?} in view {}",
+                        last_vote_hash, block.block_hash, data.view
+                    );
+                    return Err(VoteError::ProgressionError(ProgressionErrorKind::DoubleVote));
+                }
+                // Same block = retry allowed
+                tracing::debug!(
+                    "Leader retry detected: already proposed {:?} in view {}, allowing re-proposal",
+                    block.block_hash, data.view
+                );
+            }
+
+            // Record leader's vote
+            db::update_last_propose_vote(app_state.db_pool.get(), block.block_hash)
+                .map_err(|_| VoteError::DatabaseError)?;
+        }
+
+        Ok(Ballot {
+            initiator,
+            data,
+            block,
+        })
     }
 
     pub fn verify_proposal(&self, state: &AppState) -> Result<(), VoteError> {
@@ -223,6 +266,25 @@ impl Ballot {
             return Err(VoteError::ProgressionError(ProgressionErrorKind::AlreadyIssuedTimeout));
         }
 
+        // Bug #5 fix: Check for double-voting in Propose phase
+        if self.data.phase == ConsensusPhase::Propose {
+            if let Some(last_vote_hash) = consensus_state.last_propose_vote_block_hash {
+                if last_vote_hash != self.block.block_hash {
+                    // Different block in same view = double-vote attempt
+                    tracing::warn!(
+                        "Double-vote attempt rejected: already voted for {:?}, rejecting vote for {:?} in view {}",
+                        last_vote_hash, self.block.block_hash, self.data.view
+                    );
+                    return Err(VoteError::ProgressionError(ProgressionErrorKind::DoubleVote));
+                }
+                // Same block = retry allowed (idempotent, will regenerate same signature)
+                tracing::debug!(
+                    "Retry detected: already voted for {:?} in view {}, allowing re-vote",
+                    self.block.block_hash, self.data.view
+                );
+            }
+        }
+
         // 2. Chain validity check
         // Reject proposals that aren't listing tip of chain as parent
         match &self.block.data.parent_hash {
@@ -299,6 +361,13 @@ impl Ballot {
     pub fn sign(&self, app_state: &AppState) -> Result<VoteSignMessage, VoteError> {
         let node_id = app_state.get_node_id().map_err(|_| VoteError::DatabaseError)?;
         let signature = self.data.sign(&app_state.private_key).map_err(|_| VoteError::ProcessingError)?;
+
+        // Bug #5 fix: Record Propose vote after signing to prevent double-voting
+        if self.data.phase == ConsensusPhase::Propose {
+            db::update_last_propose_vote(app_state.db_pool.get(), self.block.block_hash)
+                .map_err(|_| VoteError::DatabaseError)?;
+        }
+
         Ok(VoteSignMessage{
             replica_id: node_id,
             signature: signature
@@ -405,7 +474,36 @@ pub struct QuorumCertificate {
 }
 
 impl QuorumCertificate {
-    pub fn create(
+    /// Create a verified QC (production use - safe by default)
+    pub async fn create(
+        block: &Block,
+        phase: ConsensusPhase,
+        proposer_id: i32,
+        proposer_key: &PrivKey,
+        voter_signatures: Vec<VoteSignMessage>,
+        validators: &Vec<Node>,
+        app_state: &AppState
+    ) -> Result<QuorumCertificate, CertificateError> {
+        // Layer 1: Leader abandonment - check if network is timing out
+        let timeout_count = app_state.timeout_vote_collector.get_vote_count(block.data.view_number).await;
+        let quorum_threshold = calculate_quorum_threshold(validators.len());
+
+        // If timeout votes >= quorum threshold, network is timing out - refuse to create QC
+        if timeout_count >= quorum_threshold {
+            tracing::warn!(
+                "Layer 1: Leader abandonment - refusing to create {:?} QC for view {} ({} timeout votes >= {} threshold)",
+                phase, block.data.view_number, timeout_count, quorum_threshold
+            );
+            return Err(CertificateError::NetworkTimeout);
+        }
+
+        let qc = Self::create_unverified(block, phase, proposer_id, proposer_key, voter_signatures)?;
+        qc.verify(app_state, block)?;
+        Ok(qc)
+    }
+
+    /// Create an unverified QC (genesis/tests only - explicit opt-out)
+    pub fn create_unverified(
         block: &Block,
         phase: ConsensusPhase,
         proposer_id: i32,
@@ -420,13 +518,13 @@ impl QuorumCertificate {
         };
         // cast to VoteSignMessages
         let vsm = VoteSignMessages(voter_signatures);
-        
-        Ok(QuorumCertificate { 
-            view_number: block.data.view_number, 
-            phase: phase, 
-            block_hash: block.block_hash, 
+
+        Ok(QuorumCertificate {
+            view_number: block.data.view_number,
+            phase: phase,
+            block_hash: block.block_hash,
             proposer_signature: proposer_signature_message,
-            voter_signatures: vsm 
+            voter_signatures: vsm
         })
     }
     pub fn verify(&self, state: &AppState, block: &Block) -> Result<(), CertificateError> {
@@ -441,6 +539,32 @@ impl QuorumCertificate {
                 self.view_number, consensus_state.view
             );
             return Err(CertificateError::ValidationError);
+        }
+
+        // Bug #8 fix: Lock QC requires preceding Propose QC
+        // Ensures we don't accept Lock QC for a block we never saw prepared
+        if self.phase == ConsensusPhase::Lock {
+            match db::get_quorum_certificate_by_hash(
+                state.db_pool.get(),
+                &self.view_number,
+                &self.block_hash,
+                &ConsensusPhase::Propose
+            ) {
+                Ok(_) => {
+                    // Propose QC exists, safe to proceed with Lock QC
+                    tracing::debug!(
+                        "Lock QC validation passed: found Propose QC for view {} block {:?}",
+                        self.view_number, self.block_hash
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "Lock QC rejected: missing Propose QC for view {} block {:?}",
+                        self.view_number, self.block_hash
+                    );
+                    return Err(CertificateError::ValidationError);
+                }
+            }
         }
 
         // Get validators for committed height (parent block), not proposed block height
@@ -583,7 +707,7 @@ impl TimeoutSignData {
         TimeoutSignData {
             view_number,
             highest_qc_view: consensus_state.highest_qc_block.data.view_number,
-            highest_qc_phase: consensus_state.phase,
+            highest_qc_phase: consensus_state.highest_qc_phase,
             highest_qc_hash: consensus_state.highest_qc_block.block_hash,
         }
     }
@@ -868,8 +992,8 @@ impl Block {
         };
         let new_block = Block::new(tip_data)?;
 
-        // Add it to DB and set prepared_block_hash atomically (using shared connection)
-        db::insert_block_with_conn(&mut db_conn, &new_block, true)
+        // Add block to DB (prepared_block_hash set later when Propose QC arrives)
+        db::insert_block_with_conn(&mut db_conn, &new_block)
             .map_err(|_| BlockError::DatabaseError)?;
 
         Ok(new_block)
@@ -1027,7 +1151,9 @@ pub struct ConsensusState {
     pub prepared_block: Option<Block>,
     pub committed_block: Block,
     pub highest_qc_block: Block,
+    pub highest_qc_phase: ConsensusPhase,
     pub last_timeout_vote_view: i32,
+    pub last_propose_vote_block_hash: Option<Blake3Hash>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

@@ -187,7 +187,7 @@ pub fn post_initial_setup(
         let signatures: Vec<VoteSignMessage> = Vec::new();
         tracing::debug!("post_initial_setup: Creating genesis QCs");
 
-        let genesis_qc_1 = QuorumCertificate::create(
+        let genesis_qc_1 = QuorumCertificate::create_unverified(
             &genesis_block,
             ConsensusPhase::Propose,
             0,  // node_id will be 0 for genesis
@@ -199,7 +199,7 @@ pub fn post_initial_setup(
         })?;
         tracing::debug!("post_initial_setup: Created propose QC");
 
-        let genesis_qc_2 = QuorumCertificate::create(
+        let genesis_qc_2 = QuorumCertificate::create_unverified(
             &genesis_block,
             ConsensusPhase::Lock,
             0,  // node_id will be 0 for genesis
@@ -211,16 +211,16 @@ pub fn post_initial_setup(
         })?;
         tracing::debug!("post_initial_setup: Created lock QC");
 
-        // Use insert_qc_tx to handle QC insertion and state transitions
+        // Use insert_qc_unsafe_tx to handle QC insertion and state transitions
         tracing::debug!("post_initial_setup: Inserting propose QC");
-        super::consensus::insert_qc_tx(&tx_db, &genesis_qc_1).map_err(|e| {
+        super::consensus::insert_qc_unsafe_tx(&tx_db, &genesis_qc_1).map_err(|e| {
             tracing::error!("post_initial_setup: Failed to insert propose QC: {:?}", e);
             e
         })?;
         tracing::debug!("post_initial_setup: Inserted propose QC");
 
         tracing::debug!("post_initial_setup: Inserting lock QC");
-        super::consensus::insert_qc_tx(&tx_db, &genesis_qc_2).map_err(|e| {
+        super::consensus::insert_qc_unsafe_tx(&tx_db, &genesis_qc_2).map_err(|e| {
             tracing::error!("post_initial_setup: Failed to insert lock QC: {:?}", e);
             e
         })?;

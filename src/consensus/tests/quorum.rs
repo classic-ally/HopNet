@@ -52,7 +52,7 @@ mod quorum_tests {
             .collect();
         let voter_signatures = create_vote_signatures(&all_nodes_except_leader, &block, phase.clone(), 3);
 
-        let qc = QuorumCertificate::create(
+        let qc = QuorumCertificate::create_unverified(
             &block,
             phase.clone(),
             leader.node_id,
@@ -62,7 +62,7 @@ mod quorum_tests {
 
         let result = qc.verify(&leader.app_state, &block);
         assert!(result.is_err(), "QC with 4/7 votes should fail in BFT mode (need 5)");
-        assert!(matches!(result.unwrap_err(), CertificateError::ValidationError));
+        assert!(matches!(result.unwrap_err(), CertificateError::InsufficientVotes));
     }
 
     #[test]
@@ -85,7 +85,7 @@ mod quorum_tests {
             .collect();
         let voter_signatures = create_vote_signatures(&all_nodes_except_leader, &block, phase.clone(), 2);
 
-        let qc = QuorumCertificate::create(
+        let qc = QuorumCertificate::create_unverified(
             &block,
             phase.clone(),
             leader.node_id,
@@ -117,7 +117,7 @@ mod quorum_tests {
             .collect();
         let voter_signatures = create_vote_signatures(&all_nodes_except_leader, &block, phase.clone(), 1);
 
-        let qc = QuorumCertificate::create(
+        let qc = QuorumCertificate::create_unverified(
             &block,
             phase.clone(),
             leader.node_id,
@@ -148,7 +148,7 @@ mod quorum_tests {
             .collect();
         let voter_signatures = create_vote_signatures(&all_nodes_except_leader, &block, phase.clone(), 2);
 
-        let qc = QuorumCertificate::create(
+        let qc = QuorumCertificate::create_unverified(
             &block,
             phase.clone(),
             leader.node_id,
@@ -173,7 +173,7 @@ mod quorum_tests {
 
         let voter_signatures = vec![];
 
-        let qc = QuorumCertificate::create(
+        let qc = QuorumCertificate::create_unverified(
             &block,
             phase,
             leader.node_id,
@@ -183,7 +183,7 @@ mod quorum_tests {
 
         let result = qc.verify(&leader.app_state, &block);
         assert!(result.is_err(), "QC with only proposer should fail");
-        assert!(matches!(result.unwrap_err(), CertificateError::ValidationError));
+        assert!(matches!(result.unwrap_err(), CertificateError::InsufficientVotes));
     }
 
     #[test]
@@ -206,7 +206,7 @@ mod quorum_tests {
             .collect();
         let voter_signatures = create_vote_signatures(&all_nodes_except_leader, &block, phase.clone(), 5);
 
-        let qc = QuorumCertificate::create(
+        let qc = QuorumCertificate::create_unverified(
             &block,
             phase,
             leader.node_id,
@@ -216,7 +216,7 @@ mod quorum_tests {
 
         let result = qc.verify(&leader.app_state, &block);
         assert!(result.is_err(), "QC with 6 signatures should fail when 7 required in BFT mode");
-        assert!(matches!(result.unwrap_err(), CertificateError::ValidationError));
+        assert!(matches!(result.unwrap_err(), CertificateError::InsufficientVotes));
     }
 
     #[test]
@@ -238,7 +238,7 @@ mod quorum_tests {
             .collect();
         let voter_signatures = create_vote_signatures(&all_nodes_except_leader, &block, phase.clone(), 6);
 
-        let qc = QuorumCertificate::create(
+        let qc = QuorumCertificate::create_unverified(
             &block,
             phase,
             leader.node_id,

@@ -33,6 +33,7 @@ pub enum ConsensusError {
     ThreadError,
     ForwardingError,
     NetworkError,
+    NetworkTimeout,  // Network is timing out, leader should abandon
 }
 
 #[derive(Debug)]
@@ -40,6 +41,171 @@ pub enum CatchUpError {
     NetworkUnavailable,      // All validators unreachable/failing
     ValidationFailed(i32),   // View failed validation (for logging)
     Database,                // Database error
+}
+
+/// Check if the network is timing out for a given view
+///
+/// Returns Ok(()) if safe to proceed, Err(ConsensusError::NetworkTimeout) if insufficient nodes available.
+/// This function can be called at multiple points in the consensus pipeline to abort early
+/// when the network has already moved to timeout for this view.
+///
+/// The check is: if (validators.len() - timeout_count) < quorum_threshold, then we cannot
+/// possibly collect enough votes to form a QC, so leader should abandon.
+pub async fn check_leader_abandonment(
+    view: i32,
+    validators: &[Node],
+    app_state: &AppState
+) -> Result<(), ConsensusError> {
+    let timeout_count = app_state.timeout_vote_collector.get_vote_count(view).await;
+    let quorum_threshold = crate::consensus::types::calculate_quorum_threshold(validators.len());
+
+    // Calculate how many nodes are still available to vote (haven't timed out)
+    let available_votes = validators.len().saturating_sub(timeout_count);
+
+    // If we can't possibly get enough votes, abandon
+    if available_votes < quorum_threshold {
+        tracing::warn!(
+            "Leader abandonment: insufficient nodes available for view {} ({} available < {} needed, {} timed out)",
+            view, available_votes, quorum_threshold, timeout_count
+        );
+        return Err(ConsensusError::NetworkTimeout);
+    }
+
+    Ok(())
+}
+
+/// Issue a timeout vote for the given view (unified timeout logic)
+///
+/// Called in four scenarios:
+/// 1. Cron job: view hasn't progressed (natural timeout)
+/// 2. Leader: futility detected before starting work (early abandonment)
+/// 3. Follower: futility detected after receiving timeout vote (cascade)
+/// 4. Reissuance: after syncing to higher QC or periodic resilience
+///
+/// Creates timeout vote from current consensus state (picks up latest QC if synced),
+/// adds to collector, and if TC forms, applies and broadcasts.
+/// Reissuance-safe: calling multiple times with updated QC creates votes for different buckets.
+pub async fn issue_timeout_vote(
+    view: i32,
+    app_state: &AppState,
+) -> Result<(), ConsensusError> {
+    // Get current consensus state (reissuance-safe: picks up latest QC if synced)
+    let consensus_state = db::get_consensus(app_state.db_pool.get())
+        .map_err(|_| ConsensusError::DatabaseError)?;
+
+    tracing::info!("Issuing timeout vote for view {}", view);
+
+    // Create timeout data for this view
+    let timeout_data = TimeoutSignData::from_consensus_state(view, &consensus_state);
+
+    // Get our node_id
+    let my_node_id = app_state.get_node_id().map_err(|_| ConsensusError::DatabaseError)?;
+
+    // Sign the timeout data using AppState's private key
+    let signature = timeout_data.sign(&app_state.private_key)
+        .map_err(|_| ConsensusError::SigningError)?;
+
+    // Create the timeout vote
+    let timeout_vote = TimeoutVote {
+        sender: VoteSignMessage {
+            replica_id: my_node_id,
+            signature,
+        },
+        data: timeout_data,
+    };
+
+    // Mark as issued in DB (critical: prevents duplicate on retry)
+    db::mark_timeout_vote_issued(app_state.db_pool.get(), view)
+        .map_err(|_| ConsensusError::DatabaseError)?;
+
+    // Add to collector (might form TC)
+    match app_state.timeout_vote_collector.add_vote(timeout_vote.clone(), app_state).await {
+        Ok(Some(tc)) => {
+            tracing::info!("Timeout vote for view {} formed TC, applying and broadcasting", view);
+
+            // Apply and broadcast TC (Layer 2 defense pattern from routes.rs)
+            use crate::consensus::routes::{apply_timeout_certificate, broadcast_timeout_certificate};
+            let apply_result = apply_timeout_certificate(tc.clone(), app_state, false);
+            let broadcast_result = broadcast_timeout_certificate(tc, app_state);
+            let (apply_res, broadcast_res) = tokio::join!(apply_result, broadcast_result);
+
+            // Log failures but don't fail the function (TC formed successfully)
+            if let Err(e) = apply_res {
+                tracing::error!("Failed to apply TC for view {}: {:?}", view, e);
+            }
+            if let Err(e) = broadcast_res {
+                tracing::warn!("Failed to broadcast TC for view {}: {:?}", view, e);
+            }
+
+            Ok(())
+        }
+        Ok(None) => {
+            tracing::debug!("Timeout vote for view {} added, broadcasting to peers", view);
+
+            // Broadcast our timeout vote to other validators (fire and forget)
+            // Use committed height, not view (view can diverge from height due to timeouts)
+            let committed_height = consensus_state.committed_block.data.height;
+            let validators = db::get_validators(app_state.db_pool.get(), committed_height)
+                .map_err(|_| ConsensusError::DatabaseError)?
+                .into_iter()
+                .filter(|node| node.node_id != my_node_id)
+                .collect::<Vec<_>>();
+
+            let client = reqwest::Client::new();
+            for validator in validators {
+                let timeout_vote_clone = timeout_vote.clone();
+                let client_clone = client.clone();
+                let url = format!("http://{}:{}/consensus/timeout_vote", validator.ip_address, validator.port);
+
+                tokio::spawn(async move {
+                    if let Err(e) = client_clone.post(&url).json(&timeout_vote_clone).send().await {
+                        tracing::warn!("Failed to send timeout vote to {}: {}", url, e);
+                    }
+                });
+            }
+
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!("Failed to add timeout vote to collector for view {}: {:?}", view, e);
+            Err(ConsensusError::SigningError)
+        }
+    }
+}
+
+/// Check if network is timing out for this view, and if so, issue timeout vote and abort
+///
+/// Combines check_leader_abandonment + issue_timeout_vote pattern for repeated use
+/// throughout consensus pipeline (before block creation, before each ballot round, etc).
+///
+/// Returns Ok(guard) with the guard passed back if safe to proceed.
+/// Returns Err(ConsensusError::NetworkTimeout) if futile (guard is dropped before issuing vote).
+///
+/// The guard threading pattern prevents deadlock: when futility is detected, the guard is
+/// dropped before calling issue_timeout_vote (which may call apply_timeout_certificate that
+/// acquires the lock). In the happy path, the guard is returned to the caller to maintain
+/// lock semantics.
+///
+/// Performance: ~50-100μs in happy path, ~2-10ms first timeout, ~1-5ms subsequent (idempotent)
+pub async fn abort_if_timing_out<'a>(
+    view: i32,
+    validators: &[Node],
+    app_state: &AppState,
+    guard: Option<tokio::sync::MutexGuard<'a, ()>>
+) -> Result<Option<tokio::sync::MutexGuard<'a, ()>>, ConsensusError> {
+    if let Err(ConsensusError::NetworkTimeout) = check_leader_abandonment(view, validators, app_state).await {
+        tracing::warn!("Futility detected for view {}, issuing timeout vote and aborting", view);
+
+        // Drop the guard BEFORE issuing timeout vote (prevents deadlock)
+        // issue_timeout_vote may call apply_timeout_certificate, which tries to acquire the lock
+        drop(guard);
+
+        let _ = issue_timeout_vote(view, app_state).await;
+        return Err(ConsensusError::NetworkTimeout);
+    }
+
+    // Not timing out - return guard back to caller so they can continue holding it
+    Ok(guard)
 }
 
 // Create a node-only transaction (for automated operations)
@@ -75,145 +241,125 @@ pub fn create_signed_user_transaction(
 
 pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transaction>) -> Result<(), ConsensusError> {
     tracing::debug!("Starting consensus middleware for {} transactions", transactions.len());
-    
+
     let my_node_id = app_state.get_node_id().map_err(|_| ConsensusError::DatabaseError)?;
-    
-    // Retry loop to handle view changes during consensus waits
-    const MAX_RETRIES: u32 = 3;
-    const MAX_WAIT_MS: u64 = 5000; // 5 second timeout for waiting
-    const POLL_INTERVAL_MS: u64 = 50; // Poll every 50ms
-    
-    for retry_attempt in 0..MAX_RETRIES {
-        // Check if we are the current leader
-        let initial_consensus_state = db::get_consensus(app_state.db_pool.get()).map_err(|_| ConsensusError::DatabaseError)?;
-        
-        if initial_consensus_state.leader.node_id != my_node_id {
-            // Forward to leader instead of initiating consensus
-            tracing::info!(
-                "Not the leader (node {}), forwarding transactions to leader (node {})",
-                my_node_id, initial_consensus_state.leader.node_id
-            );
-            return forward_to_leader(initial_consensus_state.leader, transactions, app_state).await;
-        }
-        
-        // Wait for any ongoing consensus to complete
-        let initial_view = initial_consensus_state.view;
-        let mut wait_attempts = 0;
-        let max_wait_attempts = MAX_WAIT_MS / POLL_INTERVAL_MS;
-        
-        let mut current_consensus_state = initial_consensus_state;
-        while current_consensus_state.prepared_block.is_some() {
-            if wait_attempts >= max_wait_attempts {
-                tracing::error!(
-                    "Timeout waiting for consensus to complete after {}ms (view: {}, prepared_block: {:?})",
-                    MAX_WAIT_MS, current_consensus_state.view, current_consensus_state.prepared_block
-                );
-                return Err(ConsensusError::TimeoutError);
-            }
-            
-            tracing::debug!(
-                "Consensus in progress for view {} (prepared_block: {:?}), waiting... (attempt {})",
-                current_consensus_state.view, current_consensus_state.prepared_block, wait_attempts + 1
-            );
-            
-            tokio::time::sleep(tokio::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
-            wait_attempts += 1;
-            
-            // Re-check consensus state
-            current_consensus_state = db::get_consensus(app_state.db_pool.get()).map_err(|_| ConsensusError::DatabaseError)?;
-        }
-        
-        // Check if view changed during wait
-        if current_consensus_state.view != initial_view {
-            tracing::debug!(
-                "View changed during wait ({}→{}), retrying consensus (attempt {})",
-                initial_view, current_consensus_state.view, retry_attempt + 1
-            );
-            continue; // Retry with new view
-        }
-        
-        // Check if we're still the leader (leader can change during consensus)
-        if current_consensus_state.leader.node_id != my_node_id {
-            tracing::info!(
-                "Leadership changed during wait, forwarding to new leader (node {})",
-                current_consensus_state.leader.node_id
-            );
-            return forward_to_leader(current_consensus_state.leader, transactions, app_state).await;
-        }
-        
-        // Safe to proceed - same view, propose phase, still leader
+
+    // Acquire consensus lock to prevent concurrent block creation race conditions
+    // Only one consensus operation can proceed at a time
+    let guard = app_state.consensus_lock.lock().await;
+
+    // Check if we are the current leader
+    let consensus_state = db::get_consensus(app_state.db_pool.get()).map_err(|_| ConsensusError::DatabaseError)?;
+
+    if consensus_state.leader.node_id != my_node_id {
+        // Release lock before forwarding (prevents deadlock when waiting for leader's response)
+        drop(guard);
+
+        // Forward to leader instead of initiating consensus
         tracing::info!(
-            "Acting as leader (node {}) for view {}, initiating consensus",
-            my_node_id, current_consensus_state.view
+            "Not the leader (node {}), forwarding transactions to leader (node {})",
+            my_node_id, consensus_state.leader.node_id
         );
-        let block = Block::new_tip(&app_state, transactions).map_err(|_| ConsensusError::BlockError)?;
-        
-        // Construct MyNode from AppState
-        let me = MyNode {
-            node_id: my_node_id,
-            privkey: app_state.private_key.clone(),
-        };
-
-        // Use committed height (parent block) for validator set, not proposed height
-        // This ensures consistency with middleware activation checks and leader calculation
-        let committed_height = current_consensus_state.committed_block.data.height;
-
-        let validators = db::get_validators(app_state.db_pool.get(), committed_height).map_err(|_| ConsensusError::DatabaseError)?
-            .iter()
-            .filter(|node| node.node_id != me.node_id)
-            .cloned()
-            .collect();
-
-        let validators_elect = db::get_validators_elect(app_state.db_pool.get(), committed_height).map_err(|_| ConsensusError::DatabaseError)?
-            .iter()
-            .filter(|node| node.node_id != me.node_id)
-            .cloned()
-            .collect();
-
-        // Get QC1 from ballot round
-        let qc1 = ballot_round(&block, &me, ConsensusPhase::Propose, &validators, &validators_elect, app_state).await?;
-
-        // Insert QC1 (Propose phase) - separate transaction, no transaction processing needed
-        {
-            let mut conn = app_state.db_pool.get().map_err(|_| ConsensusError::DatabaseError)?;
-            let tx = conn.transaction().map_err(|_| ConsensusError::DatabaseError)?;
-            db::insert_qc_tx(&tx, &qc1).map_err(|_| ConsensusError::DatabaseError)?;
-            tx.commit().map_err(|_| ConsensusError::DatabaseError)?;
-        }
-
-        // Broadcast QC1 and wait for enough confirmations
-        broadcast_qc(&validators, &validators_elect, qc1).await?;
-
-        // Get QC2 from ballot round
-        let qc2 = ballot_round(&block, &me, ConsensusPhase::Lock, &validators, &validators_elect, app_state).await?;
-
-        // Insert QC2 (Lock phase) + process transactions atomically
-        {
-            let mut conn = app_state.db_pool.get().map_err(|_| ConsensusError::DatabaseError)?;
-            let db_tx = conn.transaction().map_err(|_| ConsensusError::DatabaseError)?;
-
-            // Insert Lock QC (updates consensus state)
-            db::insert_qc_tx(&db_tx, &qc2).map_err(|_| ConsensusError::DatabaseError)?;
-
-            // Process transactions using same transaction
-            process_transactions(&block.data.transactions, app_state, true, &db_tx).map_err(|_| ConsensusError::DatabaseError)?;
-
-            // Commit both operations atomically
-            db_tx.commit().map_err(|_| ConsensusError::DatabaseError)?;
-        }
-
-        // Broadcast QC2 and wait for enough confirmations
-        broadcast_qc(&validators, &validators_elect, qc2).await?;
-
-        return Ok(());
+        return forward_to_leader(consensus_state.leader, transactions, app_state).await;
     }
-    
-    // If we've exhausted all retries, return an error
-    tracing::error!(
-        "Consensus failed after {} retries due to view changes or timeouts",
-        MAX_RETRIES
+
+    // Check if we've already proposed in this view (double-proposal protection)
+    // last_propose_vote_block_hash is cleared on view transitions (Lock QC or TC)
+    if consensus_state.last_propose_vote_block_hash.is_some() {
+        tracing::warn!(
+            "Already proposed in view {}, rejecting duplicate proposal attempt",
+            consensus_state.view
+        );
+        return Err(ConsensusError::SigningError);
+    }
+
+    // Safe to proceed - we're the leader and haven't proposed yet
+    tracing::info!(
+        "Acting as leader (node {}) for view {}, initiating consensus",
+        my_node_id, consensus_state.view
     );
-    Err(ConsensusError::ThreadError) // Using existing error variant, could add MaxRetriesExceeded later
+
+    // Use committed height (parent block) for validator set, not proposed height
+    // This ensures consistency with middleware activation checks and leader calculation
+    let committed_height = consensus_state.committed_block.data.height;
+    let all_validators = db::get_validators(app_state.db_pool.get(), committed_height)
+        .map_err(|_| ConsensusError::DatabaseError)?;
+
+    // Early abandonment check: if too many nodes have timed out, don't waste resources
+    // Pass the guard, get it back if not timing out (threads through to maintain lock)
+    let guard = abort_if_timing_out(consensus_state.view, &all_validators, app_state, Some(guard))
+        .await?
+        .expect("guard must be Some since we passed Some");
+
+    let block = Block::new_tip(&app_state, transactions).map_err(|_| ConsensusError::BlockError)?;
+
+    // Construct MyNode from AppState
+    let me = MyNode {
+        node_id: my_node_id,
+        privkey: app_state.private_key.clone(),
+    };
+
+    let validators = all_validators
+        .iter()
+        .filter(|node| node.node_id != me.node_id)
+        .cloned()
+        .collect();
+
+    let validators_elect = db::get_validators_elect(app_state.db_pool.get(), committed_height).map_err(|_| ConsensusError::DatabaseError)?
+        .iter()
+        .filter(|node| node.node_id != me.node_id)
+        .cloned()
+        .collect();
+
+    // Get QC1 from ballot round
+    let qc1 = ballot_round(&block, &me, ConsensusPhase::Propose, &validators, &validators_elect, app_state).await?;
+
+    // Commit QC1 locally and broadcast in parallel for faster propagation
+    let qc1_clone = qc1.clone();
+    let app_state_clone = app_state.clone();
+    let commit_qc1 = async move {
+        let mut conn = app_state_clone.db_pool.get().map_err(|_| ConsensusError::DatabaseError)?;
+        let tx = conn.transaction().map_err(|_| ConsensusError::DatabaseError)?;
+        db::insert_qc_unsafe_tx(&tx, &qc1_clone).map_err(|_| ConsensusError::DatabaseError)?;
+        tx.commit().map_err(|_| ConsensusError::DatabaseError)?;
+        Ok::<(), ConsensusError>(())
+    };
+    let broadcast_qc1 = broadcast_qc(&validators, &validators_elect, qc1);
+
+    let (commit_res, broadcast_res) = tokio::join!(commit_qc1, broadcast_qc1);
+    commit_res?;
+    broadcast_res?;
+
+    // Get QC2 from ballot round
+    let qc2 = ballot_round(&block, &me, ConsensusPhase::Lock, &validators, &validators_elect, app_state).await?;
+
+    // Commit QC2 + process transactions locally and broadcast in parallel (Bug #3 Layer 2 defense)
+    // This minimizes window for state divergence: broadcast starts immediately, maximizing
+    // time for Lock QC to arrive at followers before their GST wait expires
+    let qc2_clone = qc2.clone();
+    let block_clone = block.clone();
+    let app_state_clone = app_state.clone();
+    let commit_qc2 = async move {
+        let mut conn = app_state_clone.db_pool.get().map_err(|_| ConsensusError::DatabaseError)?;
+        let db_tx = conn.transaction().map_err(|_| ConsensusError::DatabaseError)?;
+
+        // Insert Lock QC (updates consensus state)
+        db::insert_qc_unsafe_tx(&db_tx, &qc2_clone).map_err(|_| ConsensusError::DatabaseError)?;
+
+        // Process transactions using same transaction
+        process_transactions(&block_clone.data.transactions, &app_state_clone, true, &db_tx).map_err(|_| ConsensusError::DatabaseError)?;
+
+        // Commit both operations atomically
+        db_tx.commit().map_err(|_| ConsensusError::DatabaseError)?;
+        Ok::<(), ConsensusError>(())
+    };
+    let broadcast_qc2 = broadcast_qc(&validators, &validators_elect, qc2);
+
+    let (commit_res, broadcast_res) = tokio::join!(commit_qc2, broadcast_qc2);
+    commit_res?;
+    broadcast_res?;
+
+    Ok(())
 }
 
 async fn ballot_round(
@@ -224,36 +370,27 @@ async fn ballot_round(
     validators_elect: &Vec<Node>,
     app_state: &AppState
 ) -> Result<QuorumCertificate, ConsensusError> {
-    let vote_data = VoteSignData::from_block(block.clone(), phase.clone());
-
-    let my_signature = vote_data.sign(&app_state.private_key).map_err(|_| ConsensusError::SigningError)?;
-    let initiator_signoff = VoteSignMessage {
-        replica_id: me.node_id,
-        signature: my_signature,
-    };
-
-    let ballot_proposal = Ballot::propose(vote_data, block.clone(), initiator_signoff);
+    // Ballot::propose() now handles vote data creation, signature, double-vote check, and vote recording
+    let ballot_proposal = Ballot::propose(block.clone(), phase, me, app_state)
+        .map_err(|_| ConsensusError::SigningError)?;
 
     let voter_signatures = broadcast_and_collect_votes(ballot_proposal, &validators, &validators_elect).await?;
 
+    // create() now includes verification - safe by default
     let qc = QuorumCertificate::create(
         &block,
         phase,
         me.node_id,
         &app_state.private_key,
         voter_signatures,
-    ).map_err(|_| ConsensusError::SigningError)?;
+        &validators,
+        app_state
+    ).await.map_err(|_| ConsensusError::SigningError)?;
 
-    match qc.verify(&app_state, &block) {
-        Ok(_) => {
-            tracing::debug!(
-                "QC verification passed for view {} phase {:?}",
-                qc.view_number, qc.phase
-            );
-            // Don't insert here - let caller handle insertion with proper transaction management
-        },
-        Err(_) => return Err(ConsensusError::SigningError)
-    };
+    tracing::debug!(
+        "QC created and verified for view {} phase {:?}",
+        qc.view_number, qc.phase
+    );
 
     Ok(qc)
 }
@@ -271,7 +408,11 @@ async fn broadcast_and_collect_votes(
     let (votes_tx, mut votes_rx) = mpsc::channel::<VoteSignMessage>(100); //100 channel capacity
 
     // Calculate quorum threshold (dynamic based on validator count)
-    let required_votes = crate::consensus::types::calculate_quorum_threshold(validators.len());
+    // Note: validators list is filtered (excludes leader), but leader has implicit vote in QC
+    // So we need: total_validators = validators.len() + 1, then subtract 1 for leader's implicit vote
+    let total_validators = validators.len() + 1; // +1 for leader
+    let quorum_threshold = crate::consensus::types::calculate_quorum_threshold(total_validators);
+    let required_votes = quorum_threshold.saturating_sub(1); // Leader's vote is implicit in QC creation
 
     // Spawn tasks for each validator
     for node in validators.clone() {
@@ -349,7 +490,11 @@ async fn broadcast_qc(
     let (confirmations_tx, mut confirmations_rx) = mpsc::channel::<()>(100);
 
     // Calculate quorum threshold (dynamic based on validator count)
-    let required_confirmations = crate::consensus::types::calculate_quorum_threshold(validators.len());
+    // Note: validators list is filtered (excludes leader), but leader broadcasts QC after creating it
+    // So we need: total_validators = validators.len() + 1, then subtract 1 for leader who already has it
+    let total_validators = validators.len() + 1; // +1 for leader
+    let quorum_threshold = crate::consensus::types::calculate_quorum_threshold(total_validators);
+    let required_confirmations = quorum_threshold.saturating_sub(1); // Leader already has QC locally
 
     // Spawn tasks for each validator
     for node in validators.clone() {

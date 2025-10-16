@@ -5,6 +5,7 @@ use axum::{
 use jsonwebtoken::{DecodingKey, EncodingKey};
 use tower_serve_static::ServeDir;
 use tower_http::cors::CorsLayer;
+use tower_http::trace::TraceLayer;
 use include_dir::{Dir, include_dir};
 use once_cell::sync::{Lazy, OnceCell};
 use std::sync::Arc;
@@ -82,6 +83,7 @@ pub struct AppState {
     timeout_vote_collector: Arc<consensus::functions::TimeoutVoteCollector>,
     throughput_result_collector: Arc<metrics::functions::ThroughputResultCollector>,
     last_observed_view: Arc<std::sync::atomic::AtomicI32>,
+    consensus_lock: Arc<tokio::sync::Mutex<()>>,
     fileprovider_api_key: String,
     port: u16,
     test_mode: bool,
@@ -212,6 +214,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 timeout_vote_collector: Arc::new(consensus::functions::TimeoutVoteCollector::new()),
                 throughput_result_collector: Arc::new(metrics::functions::ThroughputResultCollector::new()),
                 last_observed_view: Arc::new(std::sync::atomic::AtomicI32::new(-1)),
+                consensus_lock: Arc::new(tokio::sync::Mutex::new(())),
                 fileprovider_api_key: fileprovider_api_key.clone(),
                 port,
                 test_mode: cfg!(debug_assertions), // Enable test routes in debug builds only
@@ -343,6 +346,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/maintenance/fragment-inventory-self-check", post(files::routes::post_fragment_inventory_self_check))
                 .route("/diagnostics/fragment-inventory-differential", get(files::routes::get_fragment_inventory_differential))
                 .route("/diagnostics/network-resilience", get(files::routes::get_network_resilience_stats))
+                .route("/debug/state", get(consensus::routes::get_state_snapshot))
                 .route("/validators", get(consensus::routes::get_validators))
                 .route("/metrics", get(metrics::routes::get_metrics))
                 .route("/metrics/trigger", get(metrics::routes::get_metrics_trigger))
@@ -432,6 +436,18 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/rpc/get-remote-latency", get(metrics::routes::get_remote_latency_handler))
                 .route("/login", post(auth::sign_in));
 
+            // Create trace layer with request IDs
+            let trace_layer = TraceLayer::new_for_http()
+                .make_span_with(|request: &axum::http::Request<_>| {
+                    let id = hopnet_common::CustomUUID::new(None);
+                    tracing::info_span!(
+                        "request",
+                        id = &id.to_string()[28..],
+                        method = %request.method(),
+                        uri = %request.uri(),
+                    )
+                });
+
             let app = if cfg!(debug_assertions) {
                 let cors = CorsLayer::new()
                     .allow_origin("http://localhost:5173".parse::<HeaderValue>().unwrap()) // allow vite dev
@@ -442,9 +458,11 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
                 base_app
                     .layer(cors)
+                    .layer(trace_layer)
                     .with_state(app_state)
             } else {
                 base_app // no CORS in prod
+                    .layer(trace_layer)
                     .with_state(app_state)
             };
 

@@ -40,6 +40,7 @@ pub fn get_consensus_with_conn(
                 )
                 SELECT
                     n.node_id, n.name, n.ip_address, n.port, n.owner, n.pubkey, t.current_view, t.current_phase, t.last_timeout_vote_view,
+                    t.last_propose_vote_block_hash, t.highest_qc_phase,
                     -- Prepared block data (excluding transactions for performance)
                     pb.block_hash AS prepared_hash, pb.height AS prepared_height,
                     pb.view_number AS prepared_view, pb.parent_hash AS prepared_parent,
@@ -68,7 +69,9 @@ pub fn get_consensus_with_conn(
                 let current_view: i32 = row.get(6)?;
                 let current_phase: ConsensusPhase = row.get(7)?;
                 let last_timeout_vote_view: i32 = row.get(8)?;
-                
+                let last_propose_vote_block_hash: Option<Blake3Hash> = row.get(9)?;
+                let highest_qc_phase: Option<ConsensusPhase> = row.get(10)?;
+
                 // Helper function to build block from row data (without transactions)
                 let build_block = |hash_col: usize, height_col: usize, view_col: usize, parent_col: usize| -> Result<Option<Block>, duckdb::Error> {
                     let block_hash: Option<Blake3Hash> = row.get(hash_col)?;
@@ -76,7 +79,7 @@ pub fn get_consensus_with_conn(
                         let height: i32 = row.get(height_col)?;
                         let view_number: i32 = row.get(view_col)?;
                         let parent_hash: Option<Blake3Hash> = row.get(parent_col)?;
-                        
+
                         Ok(Some(Block {
                             block_hash,
                             data: BlockData {
@@ -90,18 +93,18 @@ pub fn get_consensus_with_conn(
                         Ok(None)
                     }
                 };
-                
-                // Build blocks (column indices: prepared=9-12, committed=13-16, highest_qc=17-20)
-                let prepared_block = build_block(9, 10, 11, 12)?;
-                let committed_block = build_block(13, 14, 15, 16)?;
-                let highest_qc_block = build_block(17, 18, 19, 20)?;
-                
+
+                // Build blocks (column indices: prepared=11-14, committed=15-18, highest_qc=19-22)
+                let prepared_block = build_block(11, 12, 13, 14)?;
+                let committed_block = build_block(15, 16, 17, 18)?;
+                let highest_qc_block = build_block(19, 20, 21, 22)?;
+
                 Ok((node_id, name, ip_address, port, owner, pubkey, current_view, current_phase, last_timeout_vote_view,
-                    prepared_block, committed_block, highest_qc_block))
+                    last_propose_vote_block_hash, highest_qc_phase, prepared_block, committed_block, highest_qc_block))
             }).map_err(|_| DatabaseError::RecallError)?;
-            
+
             let (node_id, name, ip_address, port, owner, pubkey, current_view, current_phase, last_timeout_vote_view,
-                 prepared_block, committed_block, highest_qc_block) = result;
+                 last_propose_vote_block_hash, highest_qc_phase, prepared_block, committed_block, highest_qc_block) = result;
             
             let pubkey = pubkey;
             let leader = crate::types::Node {
@@ -113,11 +116,12 @@ pub fn get_consensus_with_conn(
                 pubkey,
             };
             
-            // Since committed_block and highest_qc_block are now always required,
+            // Since committed_block, highest_qc_block, and highest_qc_phase are now always required,
             // we need to ensure they exist in the database
             let committed_block = committed_block.ok_or(DatabaseError::RecallError)?;
             let highest_qc_block = highest_qc_block.ok_or(DatabaseError::RecallError)?;
-            
+            let highest_qc_phase = highest_qc_phase.ok_or(DatabaseError::RecallError)?;
+
             let consensus_state = ConsensusState {
                 leader,
                 view: current_view,
@@ -125,7 +129,9 @@ pub fn get_consensus_with_conn(
                 prepared_block,
                 committed_block,
                 highest_qc_block,
+                highest_qc_phase,
                 last_timeout_vote_view,
+                last_propose_vote_block_hash,
             };
 
             Ok(consensus_state)
@@ -443,11 +449,10 @@ pub fn get_validators_elect(
 pub fn insert_block_with_conn(
     db_lock: &mut r2d2::PooledConnection<DuckdbConnectionManager>,
     block: &Block,
-    set_prepared: bool,
 ) -> Result<(), DatabaseError> {
     let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
 
-    // Insert the block
+    // Insert the block (prepared_block_hash set later by insert_qc_unsafe_tx when Propose QC arrives)
     tx.execute(
         "INSERT INTO blocks (block_hash, height, view_number, parent_hash, transactions) VALUES (?, ?, ?, ?, ?)",
         params![
@@ -459,19 +464,6 @@ pub fn insert_block_with_conn(
         ]
     ).map_err(|_| DatabaseError::InsertError)?;
 
-    // Optionally set prepared_block_hash to mark consensus in progress
-    if set_prepared {
-        tx.execute(
-            "UPDATE this_node SET prepared_block_hash = ? WHERE internal_id = 1",
-            params![block.block_hash]
-        ).map_err(|_| DatabaseError::InsertError)?;
-
-        tracing::debug!(
-            "Set prepared_block_hash to {:?} (height: {}, view: {})",
-            block.block_hash, block.data.height, block.data.view_number
-        );
-    }
-
     tx.commit().map_err(|_| DatabaseError::InsertError)?;
     Ok(())
 }
@@ -479,50 +471,83 @@ pub fn insert_block_with_conn(
 pub fn insert_block(
     db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     block: &Block,
-    set_prepared: bool,
 ) -> Result<(), DatabaseError> {
     match db_connection {
-        Ok(mut db_lock) => insert_block_with_conn(&mut db_lock, block, set_prepared),
+        Ok(mut db_lock) => insert_block_with_conn(&mut db_lock, block),
         Err(_) => Err(DatabaseError::LockError)
     }
 }
 
+/// Get block within an existing transaction (core implementation)
+pub fn get_block_tx(
+    tx: &duckdb::Transaction,
+    block_hash: Blake3Hash,
+) -> Result<Block, DatabaseError> {
+    let mut stmt = tx.prepare(
+        "SELECT block_hash, height, view_number, parent_hash, transactions FROM blocks WHERE block_hash = ?"
+    ).map_err(|_| DatabaseError::RecallError)?;
+
+    let result = stmt.query_row([block_hash], |row| {
+        let block_hash: Blake3Hash = row.get(0)?;
+        let height: i32 = row.get(1)?;
+        let view_number: i32 = row.get(2)?;
+        let parent_hash: Option<Blake3Hash> = row.get(3)?;
+        let transactions: Option<Transactions> = row.get(4)?;
+
+        Ok((block_hash, height, view_number, parent_hash, transactions))
+    }).map_err(|_| DatabaseError::RecallError)?;
+
+    let (block_hash, height, view_number, parent_hash, transactions) = result;
+
+    Ok(Block {
+        block_hash,
+        data: BlockData {
+            height,
+            view_number,
+            parent_hash,
+            transactions,
+        },
+    })
+}
+
+/// Get block (wrapper for backward compatibility)
 pub fn get_block(
     db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     block_hash: Blake3Hash,
 ) -> Result<Block, DatabaseError> {
     match db_connection {
-        Ok(db_lock) => {
-            let mut stmt = db_lock.prepare(
-                "SELECT block_hash, height, view_number, parent_hash, transactions FROM blocks WHERE block_hash = ?"
-            ).map_err(|_| DatabaseError::RecallError)?;
-
-            let result = stmt.query_row([block_hash], |row| {
-                let block_hash: Blake3Hash = row.get(0)?;
-                let height: i32 = row.get(1)?;
-                let view_number: i32 = row.get(2)?;
-                let parent_hash: Option<Blake3Hash> = row.get(3)?;
-                let transactions: Option<Transactions> = row.get(4)?;
-
-                Ok((block_hash, height, view_number, parent_hash, transactions))
-            }).map_err(|_| DatabaseError::RecallError)?;
-
-            let (block_hash, height, view_number, parent_hash, transactions) = result;
-
-            Ok(Block {
-                block_hash,
-                data: BlockData {
-                    height,
-                    view_number,
-                    parent_hash,
-                    transactions,
-                },
-            })
+        Ok(mut db_lock) => {
+            let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
+            get_block_tx(&tx, block_hash)
         }
         Err(_) => Err(DatabaseError::LockError)
     }
 }
 
+/// Get QC by hash within an existing transaction (core implementation)
+pub fn get_quorum_certificate_by_hash_tx(
+    tx: &duckdb::Transaction,
+    view_number: &i32,
+    block_hash: &Blake3Hash,
+    phase: &ConsensusPhase
+) -> Result<QuorumCertificate, DatabaseError> {
+    let mut stmt = tx.prepare(
+        "SELECT view_number, phase, block_hash, proposer_signature, voter_signatures FROM quorum_certificates WHERE view_number = ? AND phase = ? AND block_hash = ?"
+    ).map_err(|_| DatabaseError::RecallError)?;
+
+    let result = stmt.query_row(params![view_number, phase, block_hash], |row| {
+        Ok(QuorumCertificate {
+            view_number: row.get(0)?,
+            phase: row.get(1)?,
+            block_hash: row.get(2)?,
+            proposer_signature: row.get(3)?,
+            voter_signatures: row.get(4)?,
+        })
+    }).map_err(|_| DatabaseError::RecallError)?;
+    Ok(result)
+}
+
+/// Get QC by hash (wrapper for backward compatibility)
 pub fn get_quorum_certificate_by_hash(
     db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     view_number: &i32,
@@ -530,53 +555,106 @@ pub fn get_quorum_certificate_by_hash(
     phase: &ConsensusPhase
 ) -> Result<QuorumCertificate, DatabaseError> {
     match db_connection {
-        Ok(db_lock) => {
-            let mut stmt = db_lock.prepare(
-                "SELECT view_number, phase, block_hash, proposer_signature, voter_signatures FROM quorum_certificates WHERE view_number = ? AND phase = ? AND block_hash = ?"
-            ).map_err(|_| DatabaseError::RecallError)?;
-
-            let result = stmt.query_row(params![view_number, phase, block_hash], |row| {
-                Ok(QuorumCertificate {
-                    view_number: row.get(0)?,
-                    phase: row.get(1)?,
-                    block_hash: row.get(2)?,
-                    proposer_signature: row.get(3)?,
-                    voter_signatures: row.get(4)?,
-                })
-            }).map_err(|_| DatabaseError::RecallError)?;
-            Ok(result)
+        Ok(mut db_lock) => {
+            let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
+            get_quorum_certificate_by_hash_tx(&tx, view_number, block_hash, phase)
         }
         Err(_) => Err(DatabaseError::LockError)
     }
 }
 
-pub fn insert_tc(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+/// Insert TC within an existing transaction (UNSAFE - skips QC validation)
+/// Caller MUST ensure tc.highest_qc has been validated or doesn't need validation
+/// Use cases: insert_tc_safe (after validation), legacy insert_tc (deprecated)
+fn insert_tc_unsafe_tx(
+    tx: &duckdb::Transaction,
+    tc: &TimeoutCertificate,
+) -> Result<(), DatabaseError> {
+    // Insert the TC into timeout_certificates table
+    tx.execute(
+        "INSERT INTO timeout_certificates (view_number, highest_qc_view, highest_qc_phase, highest_qc_block_hash, signatures) VALUES (?, ?, ?, ?, ?)",
+        params![
+            tc.view_number,
+            tc.highest_qc.view_number,
+            tc.highest_qc.phase,
+            tc.highest_qc.block_hash,
+            tc.signatures,
+        ]
+    ).map_err(|_| DatabaseError::InsertError)?;
+
+    // Update consensus state to new view and clear prepared_block_hash + last_propose_vote_block_hash (Bug #6 fix)
+    let new_view = tc.view_number + 1;
+    tx.execute(
+        "UPDATE this_node SET current_view = ?, current_phase = 'propose', prepared_block_hash = NULL, last_propose_vote_block_hash = NULL WHERE internal_id = 1",
+        params![new_view]
+    ).map_err(|_| DatabaseError::InsertError)?;
+
+    Ok(())
+}
+
+/// Safe TC insertion with QC extraction and validation (Bug #6 and #7 fixes)
+pub fn insert_tc_safe(
+    app_state: &crate::AppState,
     tc: TimeoutCertificate,
 ) -> Result<(), DatabaseError> {
-    match db_connection {
+    match app_state.db_pool.get() {
         Ok(mut db_lock) => {
             let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
-            
-            // Insert the TC into timeout_certificates table
-            tx.execute(
-                "INSERT INTO timeout_certificates (view_number, highest_qc_view, highest_qc_phase, highest_qc_block_hash, signatures) VALUES (?, ?, ?, ?, ?)",
-                params![
-                    tc.view_number,
-                    tc.highest_qc.view_number,
-                    tc.highest_qc.phase,
-                    tc.highest_qc.block_hash,
-                    tc.signatures,
-                ]
-            ).map_err(|_| DatabaseError::InsertError)?;
-            
-            // Update consensus state to new view
-            let new_view = tc.view_number + 1;
-            tx.execute(
-                "UPDATE this_node SET current_view = ?, current_phase = 'propose' WHERE internal_id = 1",
-                params![new_view]
-            ).map_err(|_| DatabaseError::InsertError)?;
-            
+
+            // Step 1: Check if we already have the QC
+            match get_quorum_certificate_by_hash_tx(
+                &tx,
+                &tc.highest_qc.view_number,
+                &tc.highest_qc.block_hash,
+                &tc.highest_qc.phase
+            ) {
+                Ok(_existing_qc) => {
+                    // QC exists → block must exist (QC insertion guarantees this)
+                    // Safe to proceed to TC insertion
+                    tracing::debug!(
+                        "TC's QC for view {} already exists, proceeding with TC insertion",
+                        tc.highest_qc.view_number
+                    );
+                }
+                Err(_) => {
+                    // Step 2: QC missing - check if we have block
+                    match get_block_tx(&tx, tc.highest_qc.block_hash) {
+                        Ok(block) => {
+                            // Have block but not QC (received ballot, missed QC)
+                            // Verify QC before inserting
+                            tc.highest_qc.verify(app_state, &block)
+                                .map_err(|e| {
+                                    tracing::warn!(
+                                        "TC's QC verification failed for view {}: {:?}",
+                                        tc.highest_qc.view_number, e
+                                    );
+                                    DatabaseError::ValidationError
+                                })?;
+
+                            // Insert QC (Bug #7 fix - extract and integrate TC's highest_qc)
+                            insert_qc_unsafe_tx(&tx, &tc.highest_qc)?;
+                            tracing::info!(
+                                "Inserted missing QC from TC for view {}",
+                                tc.highest_qc.view_number
+                            );
+                        }
+                        Err(_) => {
+                            // Missing both block and QC - reject TC
+                            // Cannot safely advance view without justification
+                            tracing::warn!(
+                                "TC for view {} references unknown block {:?}, rejecting - catch-up needed",
+                                tc.view_number,
+                                tc.highest_qc.block_hash
+                            );
+                            return Err(DatabaseError::ValidationError);
+                        }
+                    }
+                }
+            }
+
+            // Now safe: QC and block both exist, can advance view
+            insert_tc_unsafe_tx(&tx, &tc)?;
+
             tx.commit().map_err(|_| DatabaseError::InsertError)?;
             Ok(())
         }
@@ -584,8 +662,10 @@ pub fn insert_tc(
     }
 }
 
-/// Insert QC within an existing transaction (for use in genesis setup and multi-op transactions)
-pub fn insert_qc_tx(
+/// Insert QC within an existing transaction (UNSAFE - skips validation)
+/// Caller MUST ensure qc.verify() has been called before using this function
+/// Use cases: genesis setup (trusted), post-verification insertion
+pub fn insert_qc_unsafe_tx(
     tx: &duckdb::Transaction,
     qc: &QuorumCertificate,
 ) -> Result<(), DatabaseError> {
@@ -606,20 +686,20 @@ pub fn insert_qc_tx(
         ConsensusPhase::Propose => {
             // If QC phase is propose, change to lock and set prepared_block_hash
             tx.execute(
-                "UPDATE this_node SET highest_qc_block_hash = ?, current_phase = 'lock', prepared_block_hash = ? WHERE internal_id = 1",
+                "UPDATE this_node SET highest_qc_block_hash = ?, highest_qc_phase = 'propose', current_phase = 'lock', prepared_block_hash = ? WHERE internal_id = 1",
                 params![qc.block_hash, qc.block_hash]
             ).map_err(|_| DatabaseError::InsertError)?;
             tracing::info!("Updated consensus state: propose -> lock phase for view {}, set prepared_block_hash", qc.view_number);
         }
         ConsensusPhase::Lock => {
             // If QC phase is lock, change to propose, set current_view to QC view + 1,
-            // commit the block, and clear prepared_block_hash (consensus completed)
+            // commit the block, and clear prepared_block_hash + last_propose_vote_block_hash (consensus completed)
             tx.execute(
-                "UPDATE this_node SET highest_qc_block_hash = ?, committed_block_hash = ?, current_phase = 'propose', current_view = ?, prepared_block_hash = NULL WHERE internal_id = 1",
+                "UPDATE this_node SET highest_qc_block_hash = ?, highest_qc_phase = 'lock', committed_block_hash = ?, current_phase = 'propose', current_view = ?, prepared_block_hash = NULL, last_propose_vote_block_hash = NULL WHERE internal_id = 1",
                 params![qc.block_hash, qc.block_hash, qc.view_number + 1]
             ).map_err(|_| DatabaseError::InsertError)?;
             tracing::info!(
-                "Updated consensus state: lock -> propose, view {} -> {}, committed block {:?}, cleared prepared_block_hash",
+                "Updated consensus state: lock -> propose, view {} -> {}, committed block {:?}, cleared prepared_block_hash and last_propose_vote_block_hash",
                 qc.view_number, qc.view_number + 1, qc.block_hash
             );
         }
@@ -729,7 +809,24 @@ pub fn mark_timeout_vote_issued(
                 "UPDATE this_node SET last_timeout_vote_view = ? WHERE internal_id = 1",
                 params![view]
             ).map_err(|_| DatabaseError::InsertError)?;
-            
+
+            Ok(())
+        }
+        Err(_) => Err(DatabaseError::LockError)
+    }
+}
+
+pub fn update_last_propose_vote(
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    block_hash: Blake3Hash,
+) -> Result<(), DatabaseError> {
+    match db_connection {
+        Ok(db_lock) => {
+            db_lock.execute(
+                "UPDATE this_node SET last_propose_vote_block_hash = ? WHERE internal_id = 1",
+                params![block_hash]
+            ).map_err(|_| DatabaseError::InsertError)?;
+
             Ok(())
         }
         Err(_) => Err(DatabaseError::LockError)

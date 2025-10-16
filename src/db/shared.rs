@@ -116,6 +116,8 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
                 current_view            INTEGER NOT NULL DEFAULT 0,
                 -- Track last view where we issued a timeout vote to prevent conflicting votes
                 last_timeout_vote_view  INTEGER DEFAULT 0,
+                -- Track last Propose phase vote to prevent double-voting
+                last_propose_vote_block_hash BLOB,
                 -- Block is prepared when it has a QC
                 prepared_block_hash     BLOB,
                 -- HotStuff-2 efficiency improvement:
@@ -126,7 +128,9 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
                 -- Safety: track highest QC seen (highest view for ordered execution)
                 -- Nullable for joining nodes before genesis processed
                 highest_qc_block_hash   BLOB,
+                highest_qc_phase        ENUM('propose', 'lock'),
 
+                FOREIGN KEY (last_propose_vote_block_hash) REFERENCES blocks(block_hash),
                 FOREIGN KEY (prepared_block_hash) REFERENCES blocks(block_hash),
                 FOREIGN KEY (committed_block_hash) REFERENCES blocks(block_hash),
                 FOREIGN KEY (highest_qc_block_hash) REFERENCES blocks(block_hash)

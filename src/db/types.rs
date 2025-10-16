@@ -8,7 +8,8 @@ pub enum DatabaseError {
     InvalidPayload,
     NotFound,
     ConflictError,  // Resource already exists at the specified location/identifier
-    AuthorizationError  // User or node not authorized for the operation
+    AuthorizationError,  // User or node not authorized for the operation
+    ValidationError  // Data validation failed (e.g., cryptographic verification, consistency checks)
 }
 
 use crate::db::{Blake3Hash, PrivKey, User};
