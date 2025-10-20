@@ -172,8 +172,9 @@ pub fn insert_files(
             either::Either::Right(user) => user.user_id,
         };
 
-        // Generate stable UUIDv7 for inode identity
-        let inode_id = crate::db::CustomUUID::new(None);
+        // Use inode ID from consensus payload for distributed consistency
+        // This ensures all nodes have the same ID for the same file
+        let inode_id = inode.id;
 
         // Insert into inodes table
         db_tx.execute(
