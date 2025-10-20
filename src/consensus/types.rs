@@ -114,11 +114,11 @@ pub struct Ballot {
 }
 
 impl Ballot {
-    pub fn propose(
+    pub fn propose<'a>(
         block: Block,
         phase: ConsensusPhase,
         me: &MyNode,
-        app_state: &AppState
+        tx: duckdb::Transaction<'a>
     ) -> Result<Ballot, VoteError> {
         // Create vote data from block and phase
         let data = VoteSignData::from_block(block.clone(), phase);
@@ -132,11 +132,11 @@ impl Ballot {
 
         // Bug #5 fix: Leader double-vote check (only for Propose phase)
         if data.phase == ConsensusPhase::Propose {
-            let db_conn = app_state.db_pool.get().map_err(|_| VoteError::DatabaseError)?;
-            let consensus_state = db::get_consensus_with_conn(&db_conn)
+            // Use the transaction to read last vote (avoids race conditions)
+            let last_vote_hash = db::get_last_propose_vote_tx(&tx)
                 .map_err(|_| VoteError::DatabaseError)?;
 
-            if let Some(last_vote_hash) = consensus_state.last_propose_vote_block_hash {
+            if let Some(last_vote_hash) = last_vote_hash {
                 if last_vote_hash != block.block_hash {
                     tracing::warn!(
                         "Leader double-vote attempt rejected: already proposed {:?}, rejecting proposal for {:?} in view {}",
@@ -151,9 +151,12 @@ impl Ballot {
                 );
             }
 
-            // Record leader's vote
-            db::update_last_propose_vote(app_state.db_pool.get(), block.block_hash)
+            // Record leader's vote in the provided transaction
+            db::update_last_propose_vote_tx(&tx, block.block_hash)
                 .map_err(|_| VoteError::DatabaseError)?;
+
+            // Commit the vote immediately for double-vote protection
+            tx.commit().map_err(|_| VoteError::DatabaseError)?;
         }
 
         Ok(Ballot {

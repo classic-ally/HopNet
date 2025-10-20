@@ -22,6 +22,17 @@ pub fn generate_ed25519_key() -> (SigningKey, VerifyingKey) {
     return (private_key, public_key);
 }
 
+/// Force DuckDB to flush its write-ahead log and clear transaction metadata
+/// Avoids write-write conflicts when performing high-speed state transition updates on singleton table
+/// Uses FORCE CHECKPOINT to wait for any active transactions to complete
+fn checkpoint_connection(conn: &duckdb::Connection) -> Result<(), ConsensusError> {
+    conn.execute_batch("FORCE CHECKPOINT").map_err(|e| {
+        tracing::error!("Failed to force checkpoint connection: {:?}", e);
+        ConsensusError::DatabaseError
+    })?;
+    Ok(())
+}
+
 #[derive (Debug)]
 pub enum ConsensusError {
     InsufficientVotes,
@@ -244,9 +255,11 @@ pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transa
 
     let my_node_id = app_state.get_node_id().map_err(|_| ConsensusError::DatabaseError)?;
 
+    tracing::debug!("Waiting for consensus_lock...");
     // Acquire consensus lock to prevent concurrent block creation race conditions
     // Only one consensus operation can proceed at a time
     let guard = app_state.consensus_lock.lock().await;
+    tracing::debug!("Acquired consensus_lock");
 
     // Check if we are the current leader
     let consensus_state = db::get_consensus(app_state.db_pool.get()).map_err(|_| ConsensusError::DatabaseError)?;
@@ -311,76 +324,118 @@ pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transa
         .cloned()
         .collect();
 
-    // Get QC1 from ballot round
-    let qc1 = ballot_round(&block, &me, ConsensusPhase::Propose, &validators, &validators_elect, app_state).await?;
 
-    // Commit QC1 locally and broadcast in parallel for faster propagation
-    let qc1_clone = qc1.clone();
-    let app_state_clone = app_state.clone();
-    let commit_qc1 = async move {
-        let mut conn = app_state_clone.db_pool.get().map_err(|_| ConsensusError::DatabaseError)?;
+    // Shared connection to ensure no lock contention with users reading on this node
+    let mut conn = app_state.db_pool.get().map_err(|_| ConsensusError::DatabaseError)?;
+
+    // Transaction 1: Record Propose vote and commit immediately (double-vote protection)
+    let ballot_propose = {
         let tx = conn.transaction().map_err(|_| ConsensusError::DatabaseError)?;
-        db::insert_qc_unsafe_tx(&tx, &qc1_clone).map_err(|_| ConsensusError::DatabaseError)?;
-        tx.commit().map_err(|_| ConsensusError::DatabaseError)?;
-        Ok::<(), ConsensusError>(())
-    };
-    let broadcast_qc1 = broadcast_qc(&validators, &validators_elect, qc1);
+        let result = Ballot::propose(block.clone(), ConsensusPhase::Propose, &me, tx)
+            .map_err(|_| ConsensusError::SigningError)?;
+        checkpoint_connection(&conn)?;
+        result
+    }; // tx and conn are dropped here
 
-    let (commit_res, broadcast_res) = tokio::join!(commit_qc1, broadcast_qc1);
-    commit_res?;
-    broadcast_res?;
+    // Async: Collect votes and create Propose QC (no transaction needed)
+    let qc1 = ballot_round(ballot_propose, &validators, &validators_elect, app_state).await?;
 
-    // Get QC2 from ballot round
-    let qc2 = ballot_round(&block, &me, ConsensusPhase::Lock, &validators, &validators_elect, app_state).await?;
+    // Broadcast Propose QC first (fire and forget in background)
+    // This ensures network gets the QC even if we fail to integrate it locally
+    {
+        let validators_clone = validators.clone();
+        let validators_elect_clone = validators_elect.clone();
+        let qc1_clone = qc1.clone();
+        tokio::spawn(async move {
+            if let Err(e) = broadcast_qc(&validators_clone, &validators_elect_clone, qc1_clone).await {
+                tracing::warn!("Failed to broadcast Propose QC: {:?}", e);
+            }
+        });
+    }
 
-    // Commit QC2 + process transactions locally and broadcast in parallel (Bug #3 Layer 2 defense)
-    // This minimizes window for state divergence: broadcast starts immediately, maximizing
-    // time for Lock QC to arrive at followers before their GST wait expires
-    let qc2_clone = qc2.clone();
-    let block_clone = block.clone();
-    let app_state_clone = app_state.clone();
-    let commit_qc2 = async move {
-        let mut conn = app_state_clone.db_pool.get().map_err(|_| ConsensusError::DatabaseError)?;
+    // Transaction 2: Insert Propose QC locally (synchronous, fast)
+    // Get fresh connection for this transaction
+    {
+        let tx = conn.transaction().map_err(|_| ConsensusError::DatabaseError)?;
+        db::insert_qc_unsafe_tx(&tx, &qc1).map_err(|e| {
+            tracing::error!("QC insertion failed: {:?}", e);
+            ConsensusError::DatabaseError
+        })?;
+        tx.commit().map_err(|e| {
+            tracing::error!("Database commit failed for Propose QC in view {}: {:?}", qc1.view_number, e);
+            ConsensusError::DatabaseError
+        })?;
+        checkpoint_connection(&conn)?;
+    } // tx and conn are dropped here
+
+    // Create Lock ballot (no vote recording needed, Lock phase doesn't update last_propose_vote)
+    // Get fresh connection for this transaction
+    let ballot_lock = {
+        let tx = conn.transaction().map_err(|_| ConsensusError::DatabaseError)?;
+        let result = Ballot::propose(block.clone(), ConsensusPhase::Lock, &me, tx)
+            .map_err(|_| ConsensusError::SigningError)?;
+        checkpoint_connection(&conn)?;
+        result
+    }; // tx and conn are dropped here
+
+    // Async: Collect votes and create Lock QC (no transaction needed)
+    let qc2 = ballot_round(ballot_lock, &validators, &validators_elect, app_state).await?;
+
+    // Broadcast Lock QC first (fire and forget in background)
+    // This ensures network gets the QC even if we fail to integrate it locally
+    {
+        let validators_clone = validators.clone();
+        let validators_elect_clone = validators_elect.clone();
+        let qc2_clone = qc2.clone();
+        tokio::spawn(async move {
+            if let Err(e) = broadcast_qc(&validators_clone, &validators_elect_clone, qc2_clone).await {
+                tracing::warn!("Failed to broadcast Lock QC: {:?}", e);
+            }
+        });
+    }
+
+    // Transaction 4: Insert Lock QC + process transactions locally (synchronous, atomic)
+    // Get fresh connection for this transaction
+    {
         let db_tx = conn.transaction().map_err(|_| ConsensusError::DatabaseError)?;
+        db::insert_qc_unsafe_tx(&db_tx, &qc2).map_err(|e| {
+            tracing::error!("QC insertion failed: {:?}", e);
+            ConsensusError::DatabaseError
+        })?;
+        process_transactions(&block.data.transactions, &app_state, true, &db_tx).map_err(|e| {
+            tracing::error!("Transaction processing failed: {:?}", e);
+            ConsensusError::DatabaseError
+        })?;
+        db_tx.commit().map_err(|e| {
+            tracing::error!("Database commit failed for Lock QC + transactions in view {}: {:?}", qc2.view_number, e);
+            ConsensusError::DatabaseError
+        })?;
+        checkpoint_connection(&conn)?;
+    } // db_tx and conn are dropped here
 
-        // Insert Lock QC (updates consensus state)
-        db::insert_qc_unsafe_tx(&db_tx, &qc2_clone).map_err(|_| ConsensusError::DatabaseError)?;
-
-        // Process transactions using same transaction
-        process_transactions(&block_clone.data.transactions, &app_state_clone, true, &db_tx).map_err(|_| ConsensusError::DatabaseError)?;
-
-        // Commit both operations atomically
-        db_tx.commit().map_err(|_| ConsensusError::DatabaseError)?;
-        Ok::<(), ConsensusError>(())
-    };
-    let broadcast_qc2 = broadcast_qc(&validators, &validators_elect, qc2);
-
-    let (commit_res, broadcast_res) = tokio::join!(commit_qc2, broadcast_qc2);
-    commit_res?;
-    broadcast_res?;
-
+    tracing::debug!("Consensus middleware complete, releasing consensus_lock");
     Ok(())
 }
 
 async fn ballot_round(
-    block: &Block,
-    me: &MyNode,
-    phase: ConsensusPhase,
+    ballot: Ballot,
     validators: &Vec<Node>,
     validators_elect: &Vec<Node>,
-    app_state: &AppState
+    app_state: &AppState,
 ) -> Result<QuorumCertificate, ConsensusError> {
-    // Ballot::propose() now handles vote data creation, signature, double-vote check, and vote recording
-    let ballot_proposal = Ballot::propose(block.clone(), phase, me, app_state)
-        .map_err(|_| ConsensusError::SigningError)?;
+    // Extract block and phase for QC creation
+    let block = ballot.block.clone();
+    let phase = ballot.data.phase;
+    let leader_id = ballot.initiator.replica_id;
 
-    let voter_signatures = broadcast_and_collect_votes(ballot_proposal, &validators, &validators_elect).await?;
+    // Broadcast ballot and collect votes from validators
+    let voter_signatures = broadcast_and_collect_votes(ballot, &validators, &validators_elect).await?;
 
     // create() now includes verification - safe by default
     let qc = QuorumCertificate::create(
         &block,
         phase,
-        me.node_id,
+        leader_id,
         &app_state.private_key,
         voter_signatures,
         &validators,

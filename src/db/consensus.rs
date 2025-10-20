@@ -314,6 +314,17 @@ pub fn get_current_view_tx(tx: &duckdb::Transaction) -> Result<i32, DatabaseErro
     Ok(view)
 }
 
+/// Get last propose vote block hash within a transaction
+/// Used for double-vote detection in Ballot::propose
+pub fn get_last_propose_vote_tx(tx: &duckdb::Transaction) -> Result<Option<Blake3Hash>, DatabaseError> {
+    let hash: Option<Blake3Hash> = tx.query_row(
+        "SELECT last_propose_vote_block_hash FROM this_node WHERE internal_id = 1",
+        [],
+        |row| row.get(0)
+    ).map_err(|_| DatabaseError::RecallError)?;
+    Ok(hash)
+}
+
 /// Get just the current view from this_node - works even when there are no validators
 /// Used during catch-up for joining nodes before they have validators
 /// Wrapper for backwards compatibility
@@ -584,10 +595,15 @@ fn insert_tc_unsafe_tx(
 
     // Update consensus state to new view and clear prepared_block_hash + last_propose_vote_block_hash (Bug #6 fix)
     let new_view = tc.view_number + 1;
+    tracing::debug!("[DB WRITE this_node] About to UPDATE for TC in view {} -> {}", tc.view_number, new_view);
     tx.execute(
         "UPDATE this_node SET current_view = ?, current_phase = 'propose', prepared_block_hash = NULL, last_propose_vote_block_hash = NULL WHERE internal_id = 1",
         params![new_view]
-    ).map_err(|_| DatabaseError::InsertError)?;
+    ).map_err(|e| {
+        tracing::error!("[DB WRITE this_node] UPDATE failed for TC: {:?}", e);
+        DatabaseError::InsertError
+    })?;
+    tracing::debug!("[DB WRITE this_node] Updated consensus state for TC view {} -> {}", tc.view_number, new_view);
 
     Ok(())
 }
@@ -685,21 +701,29 @@ pub fn insert_qc_unsafe_tx(
     match qc.phase {
         ConsensusPhase::Propose => {
             // If QC phase is propose, change to lock and set prepared_block_hash
+            tracing::debug!("[DB WRITE this_node] About to UPDATE for Propose QC in view {}", qc.view_number);
             tx.execute(
                 "UPDATE this_node SET highest_qc_block_hash = ?, highest_qc_phase = 'propose', current_phase = 'lock', prepared_block_hash = ? WHERE internal_id = 1",
                 params![qc.block_hash, qc.block_hash]
-            ).map_err(|_| DatabaseError::InsertError)?;
-            tracing::info!("Updated consensus state: propose -> lock phase for view {}, set prepared_block_hash", qc.view_number);
+            ).map_err(|e| {
+                tracing::error!("[DB WRITE this_node] UPDATE failed for Propose QC: {:?}", e);
+                DatabaseError::InsertError
+            })?;
+            tracing::info!("[DB WRITE this_node] Updated consensus state: propose -> lock phase for view {}, set prepared_block_hash", qc.view_number);
         }
         ConsensusPhase::Lock => {
             // If QC phase is lock, change to propose, set current_view to QC view + 1,
             // commit the block, and clear prepared_block_hash + last_propose_vote_block_hash (consensus completed)
+            tracing::debug!("[DB WRITE this_node] About to UPDATE for Lock QC in view {}", qc.view_number);
             tx.execute(
                 "UPDATE this_node SET highest_qc_block_hash = ?, highest_qc_phase = 'lock', committed_block_hash = ?, current_phase = 'propose', current_view = ?, prepared_block_hash = NULL, last_propose_vote_block_hash = NULL WHERE internal_id = 1",
                 params![qc.block_hash, qc.block_hash, qc.view_number + 1]
-            ).map_err(|_| DatabaseError::InsertError)?;
+            ).map_err(|e| {
+                tracing::error!("[DB WRITE this_node] UPDATE failed for Lock QC: {:?}", e);
+                DatabaseError::InsertError
+            })?;
             tracing::info!(
-                "Updated consensus state: lock -> propose, view {} -> {}, committed block {:?}, cleared prepared_block_hash and last_propose_vote_block_hash",
+                "[DB WRITE this_node] Updated consensus state: lock -> propose, view {} -> {}, committed block {:?}, cleared prepared_block_hash and last_propose_vote_block_hash",
                 qc.view_number, qc.view_number + 1, qc.block_hash
             );
         }
@@ -805,10 +829,15 @@ pub fn mark_timeout_vote_issued(
 ) -> Result<(), DatabaseError> {
     match db_connection {
         Ok(db_lock) => {
+            tracing::debug!("[DB WRITE this_node] About to UPDATE for timeout vote in view {}", view);
             db_lock.execute(
                 "UPDATE this_node SET last_timeout_vote_view = ? WHERE internal_id = 1",
                 params![view]
-            ).map_err(|_| DatabaseError::InsertError)?;
+            ).map_err(|e| {
+                tracing::error!("[DB WRITE this_node] UPDATE failed for timeout vote: {:?}", e);
+                DatabaseError::InsertError
+            })?;
+            tracing::debug!("[DB WRITE this_node] Marked timeout vote issued for view {}", view);
 
             Ok(())
         }
@@ -816,17 +845,35 @@ pub fn mark_timeout_vote_issued(
     }
 }
 
+/// Update last_propose_vote within an existing transaction (core implementation)
+/// This allows the update to participate in the same transaction as Lock QC insertion
+pub fn update_last_propose_vote_tx(
+    tx: &duckdb::Transaction,
+    block_hash: Blake3Hash,
+) -> Result<(), DatabaseError> {
+    tracing::debug!("[DB WRITE this_node] About to UPDATE for last_propose_vote with block {:?}", block_hash);
+    tx.execute(
+        "UPDATE this_node SET last_propose_vote_block_hash = ? WHERE internal_id = 1",
+        params![block_hash]
+    ).map_err(|e| {
+        tracing::error!("[DB WRITE this_node] UPDATE failed for last_propose_vote: {:?}", e);
+        DatabaseError::InsertError
+    })?;
+    tracing::debug!("[DB WRITE this_node] Updated last_propose_vote_block_hash to {:?}", block_hash);
+    Ok(())
+}
+
+/// Update last_propose_vote (wrapper for standalone calls)
+/// Creates its own transaction and commits immediately
 pub fn update_last_propose_vote(
     db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     block_hash: Blake3Hash,
 ) -> Result<(), DatabaseError> {
     match db_connection {
-        Ok(db_lock) => {
-            db_lock.execute(
-                "UPDATE this_node SET last_propose_vote_block_hash = ? WHERE internal_id = 1",
-                params![block_hash]
-            ).map_err(|_| DatabaseError::InsertError)?;
-
+        Ok(mut db_lock) => {
+            let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
+            update_last_propose_vote_tx(&tx, block_hash)?;
+            tx.commit().map_err(|_| DatabaseError::InsertError)?;
             Ok(())
         }
         Err(_) => Err(DatabaseError::LockError)
