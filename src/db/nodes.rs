@@ -130,3 +130,38 @@ pub fn insert_node_consensus(
         Err(_) => Err(DatabaseError::LockError),
     }
 }
+
+/// Get all registered nodes as NodeConnectionInfo, excluding specified node
+/// Used for fragment discovery when broadcasting to all nodes
+pub fn get_all_nodes_as_connection_info(
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    exclude_node_id: i32,
+) -> Result<Vec<crate::types::NodeConnectionInfo>, DatabaseError> {
+    match db_connection {
+        Ok(db_lock) => {
+            let mut stmt = db_lock.prepare(
+                "SELECT node_id, ip_address, port FROM nodes WHERE node_id != ?"
+            ).map_err(|_| DatabaseError::RecallError)?;
+
+            let results = stmt.query_map([exclude_node_id], |row| {
+                Ok(crate::types::NodeConnectionInfo {
+                    node_id: row.get(0)?,
+                    ip_address: row.get(1)?,
+                    port: row.get(2)?,
+                })
+            });
+
+            match results {
+                Ok(nodes) => Ok(nodes.collect::<Result<_, _>>().map_err(|_| DatabaseError::ProcessingError)?),
+                Err(e) => {
+                    tracing::error!("Failed to get nodes as connection info: {:?}", e);
+                    Err(DatabaseError::RecordError)
+                }
+            }
+        },
+        Err(e) => {
+            tracing::error!("Failed to get database connection in get_all_nodes_as_connection_info: {:?}", e);
+            Err(DatabaseError::LockError)
+        }
+    }
+}

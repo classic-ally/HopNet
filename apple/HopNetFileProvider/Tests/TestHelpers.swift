@@ -1343,27 +1343,53 @@ public struct TestHelpers {
         return results
     }
     
-    /// Find empty folders
+    /// Find empty folders with retry logic for transient 404 errors
     public static func findEmptyFolders() async throws -> [NSFileProviderItem] {
         let fileProviderExtension = try createTestExtension()
         let rootItems = try await enumerateItems(
             fileProvider: fileProviderExtension,
             containerIdentifier: .rootContainer
         )
-        
+
         var emptyFolders: [NSFileProviderItem] = []
-        
+
         for folder in rootItems.filter({ $0.contentType == .folder }) {
-            let contents = try await enumerateItems(
-                fileProvider: fileProviderExtension,
-                containerIdentifier: folder.itemIdentifier
-            )
-            
-            if contents.isEmpty {
-                emptyFolders.append(folder)
+            // Retry enumeration with exponential backoff to handle transient 404s
+            // from race conditions with folder deletions between tests
+            let maxRetries = 3
+            var succeeded = false
+
+            for attempt in 1...maxRetries {
+                do {
+                    let contents = try await enumerateItems(
+                        fileProvider: fileProviderExtension,
+                        containerIdentifier: folder.itemIdentifier
+                    )
+
+                    if contents.isEmpty {
+                        emptyFolders.append(folder)
+                    }
+                    succeeded = true
+                    break  // Success - exit retry loop
+
+                } catch let error as NSFileProviderError where error.code == .noSuchItem {
+                    // 404 - folder was deleted between root enumeration and this check
+                    if attempt < maxRetries {
+                        // Wait with exponential backoff before retrying
+                        let delayMs = 50 * (1 << (attempt - 1))  // 50ms, 100ms, 200ms
+                        try await Task.sleep(nanoseconds: UInt64(delayMs) * 1_000_000)
+                        print("⚠️  Folder '\(folder.filename)' returned 404, retry \(attempt)/\(maxRetries)")
+                    } else {
+                        // Final attempt failed - skip this folder (it was probably deleted)
+                        print("⚠️  Folder '\(folder.filename)' consistently returns 404, skipping (likely deleted)")
+                    }
+                } catch {
+                    // Other errors should propagate (real bugs)
+                    throw error
+                }
             }
         }
-        
+
         return emptyFolders
     }
     

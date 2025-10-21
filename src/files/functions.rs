@@ -351,21 +351,41 @@ async fn perform_concurrent_fragment_discovery(
     fragments_dir: &str,
     min_needed_fragments: usize,
     app_state: &crate::AppState,
-    consensus_height: i32,
+    consensus_height: Option<i32>,
 ) -> Result<(), FileError> {
     use crate::files::discovery::find_fragment;
     use crate::files::placement::FragmentType;
-    
-    // Get node metrics at consensus height for placement calculations
-    let conn = app_state.db_pool.get()
-        .map_err(|_| FileError::StorageError(io::Error::new(io::ErrorKind::Other, "Database connection failed")))?;
-    
-    let node_metrics = crate::db::metrics::get_all_node_metrics(Ok(conn), consensus_height)
-        .map_err(|_| FileError::StorageError(io::Error::new(io::ErrorKind::Other, "Failed to get node metrics")))?;
-    
+    use either::Either;
+
     // Create authentication info for inter-node requests
     let auth = crate::NodeAuthInfo::from_app_state(app_state)
         .map_err(|_| FileError::StorageError(io::Error::new(io::ErrorKind::Other, "Failed to get auth info")))?;
+
+    // Determine discovery mode based on consensus_height
+    let nodes = match consensus_height {
+        Some(height) => {
+            // Deterministic placement mode: get node metrics at consensus height
+            let conn = app_state.db_pool.get()
+                .map_err(|_| FileError::StorageError(io::Error::new(io::ErrorKind::Other, "Database connection failed")))?;
+
+            let node_metrics = crate::db::metrics::get_all_node_metrics(Ok(conn), height)
+                .map_err(|_| FileError::StorageError(io::Error::new(io::ErrorKind::Other, "Failed to get node metrics")))?;
+
+            Either::Right(node_metrics)
+        }
+        None => {
+            // Gossip-only mode: get all nodes from database
+            tracing::warn!("No consensus height available - using gossip-only fragment discovery");
+
+            let conn = app_state.db_pool.get()
+                .map_err(|_| FileError::StorageError(io::Error::new(io::ErrorKind::Other, "Database connection failed")))?;
+
+            let gossip_nodes = crate::db::nodes::get_all_nodes_as_connection_info(Ok(conn), auth.node_id)
+                .map_err(|_| FileError::StorageError(io::Error::new(io::ErrorKind::Other, "Failed to get nodes for gossip")))?;
+
+            Either::Left(gossip_nodes)
+        }
+    };
     
     // Build list of missing fragments (prioritize originals over recovery)
     let mut missing_fragments = Vec::new();
@@ -414,10 +434,9 @@ async fn perform_concurrent_fragment_discovery(
     for worker_id in 0..min_needed_fragments {
         let tx = success_tx.clone();
         let queue = work_queue.clone();
-        let node_metrics_clone = node_metrics.clone();
+        let nodes_clone = nodes.clone();
         let auth_clone = auth.clone();
         let fragments_dir_clone = fragments_dir.to_string();
-        let db_pool = app_state.db_pool.clone();
         let successful_downloads_clone = successful_downloads.clone();
 
         let worker_handle = tokio::spawn(async move {
@@ -448,7 +467,7 @@ async fn perform_concurrent_fragment_discovery(
                 tracing::debug!("Worker {} trying fragment {} (type: {:?})", worker_id, fragment_hash.to_hex(), fragment_type);
 
                 // Try to find and fetch the fragment from network
-                match find_fragment(&fragment_hash, fragment_type, node_metrics_clone.clone(), &auth_clone, inventory_hint).await {
+                match find_fragment(&fragment_hash, fragment_type, nodes_clone.clone(), &auth_clone, inventory_hint).await {
                 Ok(encrypted_data) => {
                         // Store fragment locally
                         if let Err(e) = store_fragment(&fragments_dir_clone, &fragment_hash, encrypted_data) {
@@ -456,17 +475,11 @@ async fn perform_concurrent_fragment_discovery(
                             let _ = tx.send(Err((index, fragment_type)));
                             continue; // Try next fragment
                         }
-                        
+
                         tracing::info!("Worker {} successfully cached fragment {} from network", worker_id, fragment_hash.to_hex());
-                        
-                        // Update database to mark fragment as stored locally
-                        let conn_result = db_pool.get();
-                        if let Err(e) = crate::db::files::mark_fragment_local_state(conn_result, &fragment_hash, true) {
-                            tracing::error!("Worker {} failed to update database for fragment {}: {:?}", worker_id, fragment_hash.to_hex(), e);
-                            // Continue anyway - fragment is cached on disk
-                        }
-                        
+
                         // Increment successful downloads and report success
+                        // Database update will be handled by the receiver to avoid contention
                         successful_downloads_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let _ = tx.send(Ok((index, fragment_type, fragment_hash)));
                     }
@@ -478,17 +491,36 @@ async fn perform_concurrent_fragment_discovery(
                 }
             }
         });
-        
+
         worker_handles.push(worker_handle);
     }
     
     drop(success_tx); // Close sender so channel ends when all workers complete
-    
+
+    // Get a single database connection for sequential processing
+    let mut db_conn = app_state.db_pool.get()
+        .map_err(|_| FileError::StorageError(io::Error::new(io::ErrorKind::Other, "Database connection failed")))?;
+
     // Collect results and update file_data
+    // Database updates are committed per-fragment to avoid long inconsistency windows
     let mut completed_downloads = 0;
     while let Some(result) = success_rx.recv().await {
         match result {
             Ok((index, fragment_type, fragment_hash)) => {
+                // Update database to mark fragment as stored locally (sequential, with immediate commit)
+                let tx = db_conn.transaction()
+                    .map_err(|_| FileError::StorageError(io::Error::new(io::ErrorKind::Other, "Failed to start transaction")))?;
+
+                if let Err(e) = crate::db::files::mark_fragment_local_state_tx(&tx, &fragment_hash, true) {
+                    tracing::error!("Failed to update database for fragment {}: {:?}", fragment_hash.to_hex(), e);
+                    // Continue anyway - fragment is cached on disk
+                } else {
+                    // Commit immediately so other operations see the updated state
+                    if let Err(e) = tx.commit() {
+                        tracing::error!("Failed to commit fragment state for {}: {:?}", fragment_hash.to_hex(), e);
+                    }
+                }
+
                 // Update the exists_locally flag in file_data
                 match fragment_type {
                     FragmentType::Original => {
@@ -502,23 +534,28 @@ async fn perform_concurrent_fragment_discovery(
                         }
                     }
                 }
-                
+
                 completed_downloads += 1;
                 let total_successful = successful_downloads.load(std::sync::atomic::Ordering::Relaxed);
-                tracing::debug!("Fragment discovery progress: {}/{} min needed, {} total successful", 
+                tracing::debug!("Fragment discovery progress: {}/{} min needed, {} total successful",
                                completed_downloads, min_needed_fragments, total_successful);
+
+                // Exit early once we have enough fragments - no need to wait for stragglers
+                if completed_downloads >= min_needed_fragments {
+                    tracing::debug!("Collected {} fragments (needed {}), stopping collection early",
+                                   completed_downloads, min_needed_fragments);
+                    break;
+                }
             }
             Err((index, fragment_type)) => {
                 tracing::debug!("Failed to download fragment at index {} (type: {:?})", index, fragment_type);
             }
         }
     }
-    
-    // Wait for all worker threads to complete
-    for worker_handle in worker_handles {
-        let _ = worker_handle.await;
-    }
-    
+
+    // Workers will finish in background - no need to block waiting for stragglers
+    // They check successful_downloads atomic counter and stop when enough fragments are collected
+
     // Re-count total available fragments after discovery
     let new_total_local = file_data.original_fragments.values()
         .filter(|(_, _, exists_locally)| *exists_locally)
@@ -553,6 +590,8 @@ pub async fn fetch_and_cache_fragment(
     auth: &crate::NodeAuthInfo,
     inventory_hint: Option<Vec<crate::types::NodeConnectionInfo>>,
 ) -> Result<(), FileError> {
+    use either::Either;
+
     // If no hint provided, query inventory for this fragment (best-effort optimization)
     let inventory_hint = match inventory_hint {
         Some(hint) => Some(hint),
@@ -567,18 +606,27 @@ pub async fn fetch_and_cache_fragment(
         }
     };
 
-    // Get node metrics for fragment discovery
-    let node_metrics = match placement_height {
-        Some(height) => crate::db::metrics::get_all_node_metrics(app_state.db_pool.get(), height)
-            .map_err(|_| FileError::DatabaseError)?,
+    // Determine discovery mode based on placement_height
+    let nodes = match placement_height {
+        Some(height) => {
+            // Deterministic placement mode: get node metrics at consensus height
+            let node_metrics = crate::db::metrics::get_all_node_metrics(app_state.db_pool.get(), height)
+                .map_err(|_| FileError::DatabaseError)?;
+            Either::Right(node_metrics)
+        }
         None => {
-            tracing::warn!("No placement height available for fragment discovery");
-            return Err(FileError::DatabaseError);
+            // Gossip-only mode: get all nodes from database
+            tracing::warn!("No placement height available - using gossip-only fragment discovery");
+
+            let gossip_nodes = crate::db::nodes::get_all_nodes_as_connection_info(app_state.db_pool.get(), auth.node_id)
+                .map_err(|_| FileError::DatabaseError)?;
+
+            Either::Left(gossip_nodes)
         }
     };
 
     // Try to find and fetch the fragment
-    match find_fragment(fragment_hash, FragmentType::Original, node_metrics, auth, inventory_hint).await {
+    match find_fragment(fragment_hash, FragmentType::Original, nodes, auth, inventory_hint).await {
         Ok(fragment_data) => {
             // Store fragment locally
             store_fragment(fragments_dir, fragment_hash, fragment_data)?;
@@ -635,25 +683,28 @@ pub async fn reassemble_file(
         // Use placement_height from file data if available, otherwise use provided consensus_height
         let effective_height = file_data.placement_height.or(consensus_height);
         
+        let needed_fragments = num_original_chunks - total_local_fragments;
+
         if let Some(height) = effective_height {
-            let needed_fragments = num_original_chunks - total_local_fragments;
-            
             tracing::info!(
                 "Need {} more fragments for file reconstruction (have {}/{} needed) at consensus height {}",
                 needed_fragments, total_local_fragments, num_original_chunks, height
             );
-            
-            // Perform concurrent fragment discovery
-            perform_concurrent_fragment_discovery(
-                &mut file_data,
-                fragments_dir,
-                needed_fragments,
-                app_state.unwrap(),
-                height,
-            ).await?;
         } else {
-            tracing::warn!("No consensus height available for distributed fragment discovery");
+            tracing::warn!(
+                "Need {} more fragments for file reconstruction (have {}/{} needed) using gossip-only discovery",
+                needed_fragments, total_local_fragments, num_original_chunks
+            );
         }
+
+        // Perform concurrent fragment discovery (with or without consensus height)
+        perform_concurrent_fragment_discovery(
+            &mut file_data,
+            fragments_dir,
+            needed_fragments,
+            app_state.unwrap(),
+            effective_height,
+        ).await?;
     }
     
     // Check if all original chunks are available locally (fast path)

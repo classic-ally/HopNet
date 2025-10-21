@@ -257,6 +257,151 @@ pub async fn get_file_fragments(
     Ok(response)
 }
 
+/// Build a SelfCheckFragments transaction for fragments being uploaded
+/// Only includes the new fragments from this upload, not a full reconciliation
+/// Filters out fragments already in inventory to avoid PRIMARY KEY violations
+async fn build_upload_attestation(
+    app_state: &AppState,
+    node_id: i32,
+    inodes: &[Inode],
+) -> Result<Option<Transaction>, Box<dyn std::error::Error>> {
+    use std::collections::HashSet;
+    use crate::files::types::SelfCheckFragments;
+
+    // Extract all fragment hashes from inodes being uploaded
+    // Note: stored_locally flag is not yet set at this point (happens in InsertFilesHandler)
+    // but we know these fragments were just written to disk during upload
+    let uploaded_fragments: Vec<Blake3Hash> = inodes
+        .iter()
+        .filter_map(|inode| {
+            if let Some(Right(data_record)) = &inode.data_id {
+                Some(
+                    data_record
+                        .data
+                        .fragments
+                        .iter()
+                        .map(|f| f.fragment_hash.clone())
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                None
+            }
+        })
+        .flatten()
+        .collect();
+
+    if uploaded_fragments.is_empty() {
+        tracing::debug!("No fragments to attest (empty upload or folder-only)");
+        return Ok(None);
+    }
+
+    // Get database connection and create transaction for consistent snapshot
+    let mut db_conn = app_state.db_pool.get()
+        .map_err(|e| format!("Failed to get DB connection: {:?}", e))?;
+
+    let db_tx = db_conn.transaction()
+        .map_err(|e| format!("Failed to create transaction: {:?}", e))?;
+
+    // Query current inventory count (this is our compare-and-swap value)
+    let previous_count: u32 = {
+        let mut stmt = db_tx
+            .prepare("SELECT COUNT(*) FROM fragment_inventory WHERE node_id = ?")
+            .map_err(|e| format!("Failed to prepare count query: {:?}", e))?;
+
+        let count: i64 = stmt
+            .query_row(duckdb::params![node_id], |row| row.get(0))
+            .map_err(|e| format!("Failed to query inventory count: {:?}", e))?;
+
+        count as u32
+    };
+
+    // Filter out fragments already in inventory (avoid PRIMARY KEY violation)
+    let existing_fragments: HashSet<Blake3Hash> = if !uploaded_fragments.is_empty() {
+        let placeholders = uploaded_fragments.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let query = format!(
+            "SELECT fragment_hash FROM fragment_inventory
+             WHERE node_id = ? AND fragment_hash IN ({})",
+            placeholders
+        );
+
+        let mut stmt = db_tx.prepare(&query)
+            .map_err(|e| format!("Failed to prepare duplicate check: {:?}", e))?;
+
+        // Build params: node_id first, then all fragment hashes
+        let mut params: Vec<Box<dyn duckdb::ToSql>> = vec![Box::new(node_id)];
+        for hash in &uploaded_fragments {
+            params.push(Box::new(hash.clone()));
+        }
+        let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
+        let mut rows = stmt.query(param_refs.as_slice())
+            .map_err(|e| format!("Failed to query existing fragments: {:?}", e))?;
+
+        let mut set = HashSet::new();
+        while let Some(row) = rows.next()
+            .map_err(|e| format!("Failed to iterate rows: {:?}", e))? {
+            let hash: Blake3Hash = row.get(0)
+                .map_err(|e| format!("Failed to get hash: {:?}", e))?;
+            set.insert(hash);
+        }
+        set
+    } else {
+        HashSet::new()
+    };
+
+    // Only include truly new fragments
+    let new_fragments: Vec<Blake3Hash> = uploaded_fragments
+        .into_iter()
+        .filter(|h| !existing_fragments.contains(h))
+        .collect();
+
+    if new_fragments.is_empty() {
+        // Rollback read-only transaction
+        db_tx.rollback()
+            .map_err(|e| format!("Failed to rollback transaction: {:?}", e))?;
+        tracing::debug!("All uploaded fragments already in inventory, skipping attestation");
+        return Ok(None);
+    }
+
+    // Get current consensus height for verification timestamp
+    let self_verified_height = crate::db::consensus::get_current_consensus_height(&db_tx)
+        .map_err(|e| format!("Failed to get consensus height: {:?}", e))?;
+
+    // Rollback read-only transaction
+    db_tx.rollback()
+        .map_err(|e| format!("Failed to rollback transaction: {:?}", e))?;
+
+    // Build the differential (only additions, no removals for upload)
+    let attestation = SelfCheckFragments {
+        node_id,
+        self_verified_height,
+        previous_count,
+        fragments_added: new_fragments.clone(),
+        fragments_removed: Vec::new(), // Upload never removes fragments
+    };
+
+    // Serialize and sign
+    let payload = bincode::serde::encode_to_vec(&attestation, bincode::config::standard())
+        .map_err(|e| format!("Failed to serialize attestation: {:?}", e))?;
+
+    let transaction = crate::consensus::functions::create_signed_transaction(
+        app_state,
+        "self_check_fragments".to_string(),
+        payload,
+    )
+    .map_err(|e| format!("Failed to sign attestation: {:?}", e))?;
+
+    tracing::info!(
+        "Built upload attestation: {} new fragments (filtered {} existing), previous_count={}, height={}",
+        new_fragments.len(),
+        existing_fragments.len(),
+        attestation.previous_count,
+        attestation.self_verified_height
+    );
+
+    Ok(Some(transaction))
+}
+
 pub async fn post_files(
     State(app_state): State<AppState>,
     Extension(user_id): Extension<i32>,  // Extract user_id from JWT via auth middleware
@@ -439,7 +584,7 @@ pub async fn post_files(
     // Insert the collected inodes into the database via consensus
     match bincode::serde::encode_to_vec(&inodes, bincode::config::standard()) {
         Ok(encoded_inodes) => {
-            let transaction = match crate::consensus::functions::create_signed_user_transaction(
+            let insert_files_tx = match crate::consensus::functions::create_signed_user_transaction(
                 &app_state,
                 "insert_files".to_string(),
                 encoded_inodes,
@@ -448,7 +593,25 @@ pub async fn post_files(
                 Ok(tx) => tx,
                 Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
             };
-            let transactions = vec![transaction];
+
+            // Build upload attestation for fragments being inserted
+            let mut transactions = vec![insert_files_tx];
+
+            if let Ok(node_id) = app_state.get_node_id() {
+                match build_upload_attestation(&app_state, node_id, &inodes).await {
+                    Ok(Some(attestation_tx)) => {
+                        tracing::debug!("Including fragment attestation in upload consensus batch");
+                        transactions.push(attestation_tx);
+                    }
+                    Ok(None) => {
+                        tracing::debug!("No new fragments to attest (folder-only or all fragments already in inventory)");
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to build upload attestation: {:?}. Continuing with file insert only - periodic self-check will handle attestation", e);
+                        // Continue with just insert_files - eventual consistency via periodic self-check
+                    }
+                }
+            }
 
             // Use consensus middleware to ensure distributed agreement
             match consensus_middleware(&app_state, transactions).await {

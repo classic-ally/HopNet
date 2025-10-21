@@ -715,6 +715,25 @@ pub fn mark_fragment_local_state(
     }
 }
 
+/// Update local storage state for a fragment by its hash (transaction version)
+pub fn mark_fragment_local_state_tx(
+    tx: &Transaction,
+    fragment_hash: &crate::types::Blake3Hash,
+    stored_locally: bool,
+) -> Result<usize, DatabaseError> {
+    let rows_affected = tx.execute(
+        "UPDATE fragment_hashes SET stored_locally = ? WHERE fragment_hash = ?",
+        params![stored_locally, fragment_hash]
+    ).map_err(|e| {
+        tracing::error!("Error updating stored_locally for fragment hash {}: {:?}", fragment_hash, e);
+        DatabaseError::ProcessingError
+    })?;
+
+    let state_text = if stored_locally { "stored locally" } else { "not stored locally" };
+    tracing::debug!("Marked {} fragment records with hash {} as {}", rows_affected, fragment_hash, state_text);
+    Ok(rows_affected)
+}
+
 /// Data about a file ready for distribution
 #[derive(Debug, Clone)]
 pub struct DistributableFileData {

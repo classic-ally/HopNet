@@ -340,18 +340,16 @@ pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transa
     // Async: Collect votes and create Propose QC (no transaction needed)
     let qc1 = ballot_round(ballot_propose, &validators, &validators_elect, app_state).await?;
 
-    // Broadcast Propose QC first (fire and forget in background)
-    // This ensures network gets the QC even if we fail to integrate it locally
-    {
+    // Start broadcasting Propose QC immediately (critical network info even if we fail locally)
+    // Keep JoinHandle so we can await completion before Lock ballot
+    let broadcast_handle = {
         let validators_clone = validators.clone();
         let validators_elect_clone = validators_elect.clone();
         let qc1_clone = qc1.clone();
         tokio::spawn(async move {
-            if let Err(e) = broadcast_qc(&validators_clone, &validators_elect_clone, qc1_clone).await {
-                tracing::warn!("Failed to broadcast Propose QC: {:?}", e);
-            }
-        });
-    }
+            broadcast_qc(&validators_clone, &validators_elect_clone, qc1_clone).await
+        })
+    };
 
     // Transaction 2: Insert Propose QC locally (synchronous, fast)
     // Get fresh connection for this transaction
@@ -367,6 +365,13 @@ pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transa
         })?;
         checkpoint_connection(&conn)?;
     } // tx and conn are dropped here
+
+    // Wait for broadcast to complete before creating Lock ballot
+    // This ensures validators have Propose QC before receiving Lock ballot
+    // Note: broadcast_qc never returns Err (tolerates partial failures), so this only catches task panics
+    if let Err(e) = broadcast_handle.await {
+        tracing::warn!("Propose QC broadcast task panicked: {:?}", e);
+    }
 
     // Create Lock ballot (no vote recording needed, Lock phase doesn't update last_propose_vote)
     // Get fresh connection for this transaction
