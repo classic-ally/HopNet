@@ -65,30 +65,54 @@ pub async fn distribute_fragments_for_upload(
     data_block_id: CustomUUID,
 ) -> Result<(), DistributionError> {
     tracing::info!("Starting fragment distribution for uploaded file {}", data_block_id);
-    
+
+    // Wait for the insert_files consensus transaction to execute and set stored_locally = TRUE
+    // This prevents a race condition where we try to distribute before fragments are marked local
+    const MAX_WAIT_ATTEMPTS: u32 = 20;  // 10 seconds total (20 * 500ms)
+    const POLL_INTERVAL_MS: u64 = 500;
+
+    let mut attempt = 0;
+    let data_block = loop {
+        match get_distributable_file(app_state.db_pool.get(), data_block_id.clone())? {
+            Some(block) => {
+                if attempt > 0 {
+                    tracing::debug!("File {} became distributable after {} attempts ({} ms)",
+                                  data_block_id, attempt, attempt as u64 * POLL_INTERVAL_MS);
+                }
+                break block;
+            }
+            None => {
+                attempt += 1;
+                if attempt >= MAX_WAIT_ATTEMPTS {
+                    tracing::warn!("File {} did not become distributable within {}s - consensus may not have executed yet or file is already distributed",
+                                 data_block_id, (MAX_WAIT_ATTEMPTS as u64 * POLL_INTERVAL_MS) / 1000);
+                    return Ok(());  // Exit gracefully - background job will handle orphans
+                }
+
+                if attempt % 5 == 0 {
+                    tracing::debug!("Waiting for file {} to become distributable (attempt {}/{})",
+                                  data_block_id, attempt, MAX_WAIT_ATTEMPTS);
+                }
+
+                tokio::time::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
+            }
+        }
+    };
+
     // Get current consensus height for deterministic placement
     let consensus_state = consensus::get_consensus(app_state.db_pool.get())?;
     let consensus_height = consensus_state.committed_block.data.height;
-    
-    // Get the file if it needs distribution
-    let data_block = match get_distributable_file(app_state.db_pool.get(), data_block_id.clone())? {
-        Some(block) => block,
-        None => {
-            tracing::debug!("File {} does not need distribution (already distributed or not fully local)", data_block_id);
-            return Ok(());
-        }
-    };
-    
+
     // Distribute all fragments for this file
     distribute_file_fragments(app_state, &data_block, consensus_height).await?;
-    
+
     // Submit placement height update to consensus
     let update = PlacementHeightUpdate {
         data_block_id: data_block.id,
         placement_height: consensus_height,
     };
     submit_placement_update_to_consensus(app_state, update).await?;
-    
+
     tracing::info!("Successfully completed fragment distribution for {}", data_block_id);
     Ok(())
 }
@@ -102,10 +126,14 @@ async fn distribute_file_fragments(
 ) -> Result<(), DistributionError> {
     // Get our node ID to avoid sending fragments to ourselves
     let my_node_id = app_state.get_node_id().map_err(|_| DistributionError::Network("Failed to get node ID".to_string()))?;
-    
+
     // Get all node metrics at the locked consensus height
     let node_metrics = get_all_node_metrics(app_state.db_pool.get(), consensus_height)?;
-        
+
+    tracing::debug!("Fragment distribution using {} nodes at consensus height {}: {:?}",
+                   node_metrics.len(), consensus_height,
+                   node_metrics.iter().map(|m| m.node_id).collect::<Vec<_>>());
+
     // Create lookup map for node connection info to avoid separate DB calls
     let node_connections: std::collections::HashMap<i32, (&str, i32)> = node_metrics
         .iter()

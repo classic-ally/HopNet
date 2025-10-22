@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 mod divergence;
 mod sys;
+mod tests;
 
 /// Node information for API calls
 #[derive(Debug, Clone)]
@@ -87,6 +88,18 @@ enum Commands {
         #[arg(short, long)]
         mesh_id: u32,
     },
+    /// Run integration test on a mesh
+    Test {
+        /// Mesh network ID to test
+        #[arg(short, long)]
+        mesh_id: u32,
+        /// Test name to run
+        #[arg(short, long)]
+        test: Option<String>,
+        /// List all available tests
+        #[arg(short, long)]
+        list: bool,
+    },
 }
 
 #[tokio::main]
@@ -129,11 +142,14 @@ async fn main() -> Result<()> {
         Some(Commands::Divergence { mesh_id }) => {
             divergence::check_divergence(&docker, *mesh_id, runtime).await?;
         }
+        Some(Commands::Test { mesh_id, test, list }) => {
+            tests::handle_test_command(&docker, *mesh_id, test.as_deref(), *list, runtime).await?;
+        }
         Some(Commands::List) | None => {
             list_meshes(&docker).await?;
         }
     }
-    
+
     Ok(())
 }
 

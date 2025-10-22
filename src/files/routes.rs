@@ -10,6 +10,7 @@ use axum::{
 use reed_solomon_simd::ReedSolomonEncoder;
 use reqwest::StatusCode;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::OsRng};
+use rand::RngCore;
 
 use crate::{db::{self, Blake3Hash, Data, DataRecord, DatabaseError, FragmentHash, Inode}, files::functions::{calculate_chunk_padding, calculate_encrypted_chunk_length, calculate_optimal_chunks, encrypt_chunk, encrypt_part, encrypt_path, store_fragment}};
 use hopnet_common::FileItem;
@@ -101,7 +102,11 @@ pub async fn process_uploaded_file(
     if !chunk_buffer.is_empty() {
         tracing::debug!("process_uploaded_file: processing final chunk of {} bytes", chunk_buffer.len());
         full_file_hasher.update(&chunk_buffer);
+        let current_len = chunk_buffer.len();
         chunk_buffer.resize(target_chunk_length, 0);
+        if current_len < target_chunk_length {
+            rand::rng().fill_bytes(&mut chunk_buffer[current_len..]);
+        }
 
         let final_chunk = chunk_buffer;
         let fragment_id = CustomUUID::new(None);
@@ -127,7 +132,8 @@ pub async fn process_uploaded_file(
     // For small files, ensure we have exactly the required number of original chunks
     while output_chunk_metadata.len() < num_original_chunks {
         tracing::debug!("process_uploaded_file: adding empty chunk {} for Reed-Solomon", output_chunk_metadata.len());
-        let empty_chunk = vec![0u8; target_chunk_length];
+        let mut empty_chunk = vec![0u8; target_chunk_length];
+        rand::rng().fill_bytes(&mut empty_chunk);
         let fragment_id = CustomUUID::new(None);
         let encrypted_chunk = encrypt_chunk(empty_chunk, per_file_key, &fragment_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         encoder.add_original_shard(&encrypted_chunk).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -1138,6 +1144,54 @@ pub async fn post_fragment_inventory_self_check(
         Ok(_) => StatusCode::OK.into_response(),
         Err(e) => {
             tracing::error!("Manual fragment inventory self-check failed: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// GET /diagnostics/file-fragments
+/// Returns complete fragment distribution data for a specific file
+/// Shows which nodes have which fragments according to fragment_inventory
+pub async fn get_file_fragment_distribution(
+    State(app_state): State<AppState>,
+    Extension(user_id): Extension<i32>,
+    Query(params): Query<GetQueryParams>,
+) -> impl IntoResponse {
+    // Encrypt path server-side (following existing pattern)
+    let siv_key = match app_state.get_siv_key() {
+        Ok(key) => key,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    let siv_nonce = match app_state.get_siv_nonce() {
+        Ok(nonce) => nonce,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    let encrypted_path = match encrypt_path(params.path, siv_key, siv_nonce).await {
+        Ok(path) => path,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    // Query database for fragment distribution
+    match crate::db::debug::get_file_fragment_distribution(
+        app_state.db_pool.get(),
+        encrypted_path,
+        user_id,
+    ) {
+        Ok(distribution) => {
+            tracing::debug!(
+                "Fragment distribution query for file {}: {} fragments ({} original, {} recovery)",
+                distribution.inode_id,
+                distribution.fragment_count,
+                distribution.original_count,
+                distribution.recovery_count
+            );
+            (StatusCode::OK, Json(distribution)).into_response()
+        }
+        Err(DatabaseError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!("Failed to get file fragment distribution: {:?}", e);
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }

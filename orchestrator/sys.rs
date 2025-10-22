@@ -32,7 +32,7 @@ pub fn detect_socket_path() -> Result<String> {
         // Extract actual file path from unix:// URL
         let file_path = socket_path.strip_prefix("unix://").unwrap_or(&socket_path);
         if std::path::Path::new(file_path).exists() {
-            println!("Auto-detected container runtime socket: {}", socket_path);
+            // println!("Auto-detected container runtime socket: {}", socket_path);
             return Ok(socket_path);
         }
     }
@@ -47,10 +47,10 @@ pub async fn detect_runtime(docker: &Docker) -> Result<ContainerRuntime> {
     // Check version info for "Podman" string
     let version_json = serde_json::to_string(&version)?;
     if version_json.contains("Podman") {
-        println!("Detected Podman runtime");
+        // println!("Detected Podman runtime");
         Ok(ContainerRuntime::Podman)
     } else {
-        println!("Detected Docker runtime");
+        // println!("Detected Docker runtime");
         Ok(ContainerRuntime::Docker)
     }
 }

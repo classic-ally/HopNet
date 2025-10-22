@@ -345,6 +345,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/maintenance/takeout", post(takeout::routes::post_takeout_maintenance))
                 .route("/maintenance/fragment-inventory-self-check", post(files::routes::post_fragment_inventory_self_check))
                 .route("/diagnostics/fragment-inventory-differential", get(files::routes::get_fragment_inventory_differential))
+                .route("/diagnostics/file-fragments", get(files::routes::get_file_fragment_distribution))
                 .route("/diagnostics/network-resilience", get(files::routes::get_network_resilience_stats))
                 .route("/debug/state", get(consensus::routes::get_state_snapshot))
                 .route("/validators", get(consensus::routes::get_validators))

@@ -39,27 +39,29 @@ pub fn calculate_rendezvous_distances(
     fragment_hash: &Blake3Hash,
     node_ids: &[i32],
 ) -> Vec<Phase1Candidate> {
-    // Convert fragment hash to u64 for XOR distance calculation
-    let fragment_key = u64::from_be_bytes([
-        fragment_hash.as_bytes()[0], fragment_hash.as_bytes()[1],
-        fragment_hash.as_bytes()[2], fragment_hash.as_bytes()[3],
-        fragment_hash.as_bytes()[4], fragment_hash.as_bytes()[5],
-        fragment_hash.as_bytes()[6], fragment_hash.as_bytes()[7],
-    ]);
-    
     let mut candidates: Vec<Phase1Candidate> = node_ids
         .iter()
         .map(|&node_id| {
-            // On-demand Blake3 hash of node_id (4 bytes input, ~3-5ns)
+            // Proper rendezvous hashing: hash node_id COMBINED with fragment_hash
+            // This ensures each fragment gets a different "randomized view" of node positions,
+            // preventing systematic bias from static node hash values
+            //
+            // We hash the node_id first to get a full 32-byte hash with high entropy,
+            // then XOR it with fragment_hash, then hash again. This avoids any potential
+            // bias from appending small integers ([0x00, 0x00, 0x00, 0x01]) to the fragment hash.
             let node_hash = blake3::hash(&node_id.to_be_bytes());
-            let node_key_u64 = u64::from_be_bytes([
-                node_hash.as_bytes()[0], node_hash.as_bytes()[1],
-                node_hash.as_bytes()[2], node_hash.as_bytes()[3],
-                node_hash.as_bytes()[4], node_hash.as_bytes()[5],
-                node_hash.as_bytes()[6], node_hash.as_bytes()[7],
+
+            let mut rendezvous_input = Vec::with_capacity(32 + 32);
+            rendezvous_input.extend_from_slice(fragment_hash.as_bytes());
+            rendezvous_input.extend_from_slice(node_hash.as_bytes());
+
+            let rendezvous_hash = blake3::hash(&rendezvous_input);
+            let distance = u64::from_be_bytes([
+                rendezvous_hash.as_bytes()[0], rendezvous_hash.as_bytes()[1],
+                rendezvous_hash.as_bytes()[2], rendezvous_hash.as_bytes()[3],
+                rendezvous_hash.as_bytes()[4], rendezvous_hash.as_bytes()[5],
+                rendezvous_hash.as_bytes()[6], rendezvous_hash.as_bytes()[7],
             ]);
-            
-            let distance = fragment_key ^ node_key_u64;
             
             Phase1Candidate {
                 node_id,
@@ -70,7 +72,11 @@ pub fn calculate_rendezvous_distances(
     
     // Sort by distance (closest first for rendezvous hashing)
     candidates.sort_by_key(|c| c.distance);
-    
+
+    tracing::debug!("Rendezvous distances for fragment {}: {:?}",
+                   fragment_hash.to_hex().chars().take(8).collect::<String>(),
+                   candidates.iter().map(|c| (c.node_id, c.distance)).collect::<Vec<_>>());
+
     candidates
 }
 
