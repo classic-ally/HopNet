@@ -29,6 +29,7 @@ async fn test_fileprovider_integration() -> Result<(), Box<dyn std::error::Error
     // 2. Start backend binary (already built by cargo test)
     println!("🚀 Starting HopNet backend in test mode...");
     let mut backend_process = Command::new("target/debug/hopnet")
+        .env("HOPNET_EPHEMERAL_DB", "1")  // Use in-memory database for testing
         .spawn()
         .expect("Failed to start backend process");
     

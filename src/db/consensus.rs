@@ -826,6 +826,53 @@ pub fn get_me(
     }
 }
 
+/// Startup state loaded from database on node restart
+pub struct StartupState {
+    pub node_id: i32,
+    pub user_id: i32,
+    pub node_privkey: PrivKey,
+    pub user_privkey: PrivKey,
+}
+
+/// Load all necessary state from database for node restart
+/// This includes node_id, user_id, node private key, and user private key
+pub fn get_startup_state(
+    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+) -> Result<StartupState, DatabaseError> {
+    match db_connection {
+        Ok(db_lock) => {
+            // First, get node_id, privkey, and user_privkey from this_node table
+            let mut stmt = db_lock.prepare(
+                "SELECT node_id, privkey, user_privkey FROM this_node"
+            ).map_err(|_| DatabaseError::RecallError)?;
+
+            let (node_id, node_privkey, user_privkey) = stmt.query_row([], |row| {
+                let node_id: i32 = row.get(0)?;
+                let node_privkey: PrivKey = row.get(1)?;
+                let user_privkey: PrivKey = row.get(2)?;
+                Ok((node_id, node_privkey, user_privkey))
+            }).map_err(|_| DatabaseError::RecallError)?;
+
+            // Now get user_id from nodes table
+            let mut stmt = db_lock.prepare(
+                "SELECT owner FROM nodes WHERE node_id = ?"
+            ).map_err(|_| DatabaseError::RecallError)?;
+
+            let user_id: i32 = stmt.query_row([node_id], |row| {
+                row.get(0)
+            }).map_err(|_| DatabaseError::RecallError)?;
+
+            Ok(StartupState {
+                node_id,
+                user_id,
+                node_privkey,
+                user_privkey,
+            })
+        }
+        Err(_) => Err(DatabaseError::LockError)
+    }
+}
+
 pub fn mark_timeout_vote_issued(
     db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     view: i32,

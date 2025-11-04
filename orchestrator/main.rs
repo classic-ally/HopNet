@@ -554,6 +554,34 @@ async fn create_hopnet_container(
     labels.insert("hopnet.node_id".to_string(), node_id.to_string());
     labels.insert("hopnet.host_port".to_string(), host_port.to_string());
 
+    // Create a named volume for persistent storage (matches container naming pattern)
+    let volume_name = format!("hopnet-orchestrator-{}-{}-data", mesh_id, node_id);
+
+    // Create volume if it doesn't exist (idempotent operation)
+    let mut vol_labels = HashMap::new();
+    vol_labels.insert("hopnet.mesh_id".to_string(), mesh_id.to_string());
+    vol_labels.insert("hopnet.node_id".to_string(), node_id.to_string());
+
+    let volume_config = bollard::volume::CreateVolumeOptions {
+        name: volume_name.clone(),
+        driver: "local".to_string(),
+        labels: vol_labels,
+        ..Default::default()
+    };
+
+    match docker.create_volume(volume_config).await {
+        Ok(_) => {
+            tracing::debug!("Created volume: {}", volume_name);
+        }
+        Err(e) => {
+            // Volume might already exist, which is fine
+            tracing::debug!("Volume creation result for {}: {:?}", volume_name, e);
+        }
+    }
+
+    // Mount the volume to /root/.local/share/hopnet for database and fragment storage
+    let binds = vec![format!("{}:/root/.local/share/hopnet", volume_name)];
+
     // Container configuration
     let config = ContainerCreateBody {
         image: Some("hopnet:latest".to_string()),
@@ -563,6 +591,7 @@ async fn create_hopnet_container(
         }),
         host_config: Some(HostConfig {
             port_bindings,
+            binds: Some(binds),
             ..Default::default()
         }),
         ..Default::default()
@@ -938,7 +967,40 @@ async fn delete_mesh(docker: &Docker, mesh_id: u32, skip_confirmation: bool) -> 
             let _ = task.await;
         }
     }
-    
+
+    // Delete volumes for this mesh (in parallel)
+    println!("Removing volumes...");
+    let volumes = docker.list_volumes(None::<bollard::volume::ListVolumesOptions<String>>).await?;
+    if let Some(volume_list) = volumes.volumes {
+        let mesh_volumes: Vec<_> = volume_list.into_iter()
+            .filter(|v| {
+                v.labels.get("hopnet.mesh_id")
+                    .map(|id| id == &mesh_id.to_string())
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        if !mesh_volumes.is_empty() {
+            let mut tasks = Vec::new();
+            for volume in mesh_volumes {
+                let volume_name = volume.name.clone();
+                let docker_clone = docker.clone();
+                let task = tokio::spawn(async move {
+                    println!("  Removing volume: {}", volume_name);
+                    if let Err(e) = docker_clone.remove_volume(&volume_name, None::<bollard::volume::RemoveVolumeOptions>).await {
+                        println!("    Warning: Failed to remove volume {}: {}", volume_name, e);
+                    }
+                });
+                tasks.push(task);
+            }
+
+            // Wait for all volume deletions to complete
+            for task in tasks {
+                let _ = task.await;
+            }
+        }
+    }
+
     // Delete networks (in parallel)
     if !networks.is_empty() {
         println!("Removing networks...");

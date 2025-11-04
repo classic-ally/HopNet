@@ -1,4 +1,45 @@
 use super::*;
+use std::path::Path;
+use std::fs;
+
+/// Get the XDG data directory for storing the database
+pub fn get_database_path() -> String {
+    let data_dir = std::env::var("XDG_DATA_HOME")
+        .unwrap_or_else(|_| format!("{}/.local/share", std::env::var("HOME").unwrap_or_else(|_| ".".to_string())));
+
+    let db_dir = format!("{}/hopnet", data_dir);
+    let db_path = format!("{}/database.db", db_dir);
+    tracing::info!("Using database path: {}", db_path);
+    db_path
+}
+
+/// Check if the database file already exists
+pub fn database_exists(db_path: &str) -> bool {
+    Path::new(db_path).exists()
+}
+
+/// Check if the database schema is initialized by checking for critical tables
+pub fn is_schema_initialized(db: &PooledConnection<DuckdbConnectionManager>) -> Result<bool, DuckdbError> {
+    // Check if the critical 'blocks' table exists
+    let result = db.query_row(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'blocks'",
+        [],
+        |row| row.get::<_, i64>(0)
+    );
+
+    match result {
+        Ok(count) => Ok(count > 0),
+        Err(_) => Ok(false),
+    }
+}
+
+/// Ensure the database directory exists
+pub fn ensure_database_dir(db_path: &str) -> Result<(), std::io::Error> {
+    if let Some(parent) = Path::new(db_path).parent() {
+        fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}
 
 pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), DuckdbError> {
     db.execute_batch(

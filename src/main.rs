@@ -34,7 +34,7 @@ mod admin;
 
 static ASSETS_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/frontend/dist");
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct UserKeys {
     pub private_key: PrivKey,
     pub public_key: PubKey,
@@ -155,8 +155,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let bindurl = format!("0.0.0.0:{}", port);
 
     let (encodingkey, decodingkey) = auth::generate_jwt_key();
-    let (privatekey, publickey) = consensus::functions::generate_ed25519_key();
-    
+
     // Check if FileProvider API key already exists in keychain (release builds only)
     let fileprovider_api_key = {
         #[cfg(all(target_os = "macos", not(debug_assertions)))]
@@ -181,24 +180,90 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // Create database connection pool
-    // Unwrapping since unsuccessful means failed startup anyway
-    let manager = DuckdbConnectionManager::memory().unwrap();
-    let pool = Pool::builder()
-        .max_size(8)         // 8 concurrent connections
-        .min_idle(Some(2))   // Keep 2 connections warm
-        .build(manager).unwrap();
-    
-    // Initialize database schema
+    // Check if ephemeral database mode is requested (for testing)
+    let use_ephemeral_db = std::env::var("HOPNET_EPHEMERAL_DB").is_ok();
+
+    let pool = if use_ephemeral_db {
+        tracing::info!("Using ephemeral in-memory database (HOPNET_EPHEMERAL_DB set)");
+        let manager = DuckdbConnectionManager::memory().unwrap();
+        Pool::builder()
+            .max_size(8)
+            .min_idle(Some(2))
+            .build(manager).unwrap()
+    } else {
+        // Get database path and ensure directory exists
+        let db_path = db::shared::get_database_path();
+        let db_file_exists = db::shared::database_exists(&db_path);
+
+        if !db_file_exists {
+            tracing::info!("Creating new database at {}", db_path);
+            db::shared::ensure_database_dir(&db_path)
+                .expect("Failed to create database directory");
+        } else {
+            tracing::info!("Found existing database file at {}", db_path);
+        }
+
+        // Create database connection pool (file-based)
+        // WAL mode is automatically enabled for file-based DuckDB databases
+        let manager = DuckdbConnectionManager::file(&db_path).unwrap();
+        let pool = Pool::builder()
+            .max_size(8)         // 8 concurrent connections
+            .min_idle(Some(2))   // Keep 2 connections warm
+            .build(manager).unwrap();
+
+        tracing::info!("Database connection pool established (WAL mode enabled by default)");
+        pool
+    };
+
+    // Check if database schema is initialized
     let conn = pool.get().unwrap();
-    match db::shared::initialize(conn) {
+    let schema_initialized = if use_ephemeral_db {
+        false  // Ephemeral database always needs initialization
+    } else {
+        db::shared::is_schema_initialized(&conn)
+            .expect("Failed to check schema status")
+    };
+
+    let init_result = if schema_initialized {
+        tracing::info!("Loading existing database schema");
+        Ok(())
+    } else {
+        tracing::info!("Initializing new database schema");
+        db::shared::initialize(conn)
+    };
+
+    match init_result {
         Ok(()) => {
+            // Try to load existing state from database, or generate new keys if this is a new node
+            let startup_state_opt = match db::consensus::get_startup_state(pool.get()) {
+                Ok(state) => {
+                    tracing::info!("Loaded existing state from database (node_id: {}, user_id: {})",
+                        state.node_id, state.user_id);
+                    Some(state)
+                }
+                Err(db::DatabaseError::RecallError) => {
+                    tracing::info!("No existing state found, generating new Ed25519 key pairs");
+                    None
+                }
+                Err(e) => {
+                    panic!("Failed to check for existing state: {:?}", e);
+                }
+            };
+
+            // Get node keys (either from loaded state or generate new)
+            let (privatekey, publickey) = if let Some(ref state) = startup_state_opt {
+                let pubkey = state.node_privkey.verifying_key();
+                (state.node_privkey.0.clone(), pubkey)
+            } else {
+                consensus::functions::generate_ed25519_key()
+            };
+
             // Initialize fragments directory
             let fragments_dir = files::functions::get_fragments_dir().unwrap_or_else(|_| {
                 eprintln!("Failed to get fragments directory, using current directory");
                 "./hopnet/fragments".to_string()
             });
-            
+
             let app_state = AppState {
                 db_pool: pool,
                 encoding_key: encodingkey,
@@ -219,7 +284,27 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 port,
                 test_mode: cfg!(debug_assertions), // Enable test routes in debug builds only
             };
-            
+
+            // If we loaded state from database, populate the OnceCell fields
+            if let Some(state) = startup_state_opt {
+                let user_pubkey = state.user_privkey.verifying_key();
+
+                app_state.node_id.set(state.node_id)
+                    .expect("Failed to set node_id in AppState");
+                app_state.user_id.set(state.user_id)
+                    .expect("Failed to set user_id in AppState");
+                app_state.user_keys.set(UserKeys {
+                    private_key: state.user_privkey,
+                    public_key: PubKey(user_pubkey),
+                }).expect("Failed to set user_keys in AppState");
+
+                // Initialize SIV keys from user private key
+                app_state.initialize_siv_keys()
+                    .expect("Failed to initialize SIV keys");
+
+                tracing::info!("AppState fully initialized from persisted database");
+            }
+
             tracing::info!("FileProvider API key: {}", fileprovider_api_key);
             
             // Warn about test mode being enabled
