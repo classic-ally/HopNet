@@ -308,7 +308,7 @@ pub fn get_data_blocks_for_rebalancing(
         let fragment_query = "SELECT fragment_hash, chunk_type
              FROM fragment_hashes
              WHERE data_block_id = ?
-             ORDER BY fragment_index";
+             ORDER BY chunk_number";
         
         tracing::debug!("Preparing fragment query for data block {}: {}", data_block_id, fragment_query);
         let mut fragment_stmt = conn.prepare(fragment_query).map_err(|e| {

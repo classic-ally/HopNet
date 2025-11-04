@@ -299,7 +299,8 @@ impl FileAccess {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct FragmentHash {
     pub data_block_id: CustomUUID,
-    pub fragment_index: i32,
+    pub chunk_number: u32,
+    pub local_index: u32,
     pub fragment_id: CustomUUID,        // UUID v7 for chunk identification and nonce derivation
     pub fragment_hash: Blake3Hash,      // Hash of encrypted chunk for storage verification
     pub chunk_type: ChunkType,

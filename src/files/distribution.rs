@@ -127,87 +127,178 @@ async fn distribute_file_fragments(
     // Get our node ID to avoid sending fragments to ourselves
     let my_node_id = app_state.get_node_id().map_err(|_| DistributionError::Network("Failed to get node ID".to_string()))?;
 
+    // Get active validators at consensus height
+    let validators = consensus::get_validators(app_state.db_pool.get(), consensus_height)?;
+
     // Get all node metrics at the locked consensus height
     let node_metrics = get_all_node_metrics(app_state.db_pool.get(), consensus_height)?;
 
-    tracing::debug!("Fragment distribution using {} nodes at consensus height {}: {:?}",
-                   node_metrics.len(), consensus_height,
-                   node_metrics.iter().map(|m| m.node_id).collect::<Vec<_>>());
+    // Select nodes for this file using file-level node selection
+    let selected_nodes = crate::files::placement::select_nodes_for_file(
+        validators,
+        node_metrics,
+        &data_block.file_hash,
+    );
+
+    tracing::debug!("Fragment distribution using {} selected nodes at consensus height {} for file {}",
+                   selected_nodes.len(), consensus_height,
+                   data_block.file_hash.to_hex().chars().take(8).collect::<String>());
 
     // Create lookup map for node connection info to avoid separate DB calls
-    let node_connections: std::collections::HashMap<i32, (&str, i32)> = node_metrics
-        .iter()
-        .map(|m| (m.node_id, (m.ip_address.as_str(), m.port)))
-        .collect();
-    
-    // Memory limit for concurrent processing
-    const MAX_CONCURRENT_FRAGMENTS: usize = 100;
-    
-    // Process fragments in batches to limit memory usage
+    let node_connections: std::sync::Arc<std::collections::HashMap<i32, (String, i32)>> =
+        std::sync::Arc::new(selected_nodes
+            .iter()
+            .map(|n| (n.node_id, (n.ip_address.clone(), n.port)))
+            .collect());
+
+    // Parallel distribution with work queue pattern
+    const NUM_WORKERS: usize = 10;
+    const FAILURE_THRESHOLD_PERCENT: f64 = 10.0;  // Fail if >10% of fragments can't be placed
+
     let total_fragments = data_block.fragment_hashes.len();
-    let mut processed = 0;
-    
-    while processed < total_fragments {
-        let batch_end = (processed + MAX_CONCURRENT_FRAGMENTS).min(total_fragments);
-        let batch = &data_block.fragment_hashes[processed..batch_end];
-        
-        tracing::info!(
-            "Processing fragment batch {}-{} of {}",
-            processed + 1,
-            batch_end,
-            total_fragments
-        );
-        
-        // Process this batch of fragments
-        for (_index, fragment_hash, fragment_type) in batch {
-            // Calculate placement for this fragment using standardized algorithm
-            let scored_candidates = crate::files::discovery::get_fragment_placement_candidates(
-                fragment_hash,
-                *fragment_type,
-                &node_metrics,
-            );
-            
-            // Try to place fragment on nodes in preference order
-            let mut placed = false;
-            for candidate in scored_candidates {
-                // Skip sending to ourselves - keep fragment local if we're the best placement
-                if candidate.node_id == my_node_id {
-                    tracing::debug!("Fragment {} best placed on local node {}, keeping locally", 
-                                   fragment_hash, my_node_id);
-                    // Fragment stays local (stored_locally remains TRUE)
-                    placed = true;
-                    break;
-                }
-                
-                // Send to remote node
-                match send_fragment_to_node(app_state, candidate.node_id, fragment_hash, &node_connections).await {
-                    Ok(()) => {
-                        // Mark fragment as not stored locally since it was sent elsewhere
-                        mark_fragment_local_state(app_state.db_pool.get(), fragment_hash, false)?;
+    tracing::info!("Starting parallel distribution of {} fragments with {} workers",
+                   total_fragments, NUM_WORKERS);
+
+    // Create work queue with all fragments to distribute
+    let work_queue: std::sync::Arc<tokio::sync::Mutex<Vec<(usize, Blake3Hash, crate::files::placement::FragmentType)>>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(
+            data_block.fragment_hashes.clone()
+        ));
+
+    // Channel to report failed fragments
+    let (failure_tx, mut failure_rx) = tokio::sync::mpsc::unbounded_channel();
+    let successful_placements = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    // Spawn workers to distribute fragments
+    let mut worker_handles = Vec::new();
+
+    for worker_id in 0..NUM_WORKERS {
+        let tx = failure_tx.clone();
+        let queue = work_queue.clone();
+        let app_state_clone = app_state.clone();
+        let node_connections_clone = node_connections.clone();
+        let selected_nodes_clone = selected_nodes.clone();
+        let successful_placements_clone = successful_placements.clone();
+
+        let worker_handle = tokio::spawn(async move {
+            tracing::debug!("Worker {} starting fragment distribution", worker_id);
+
+            loop {
+                // Get next fragment to distribute from work queue
+                let next_work = {
+                    let mut queue_lock = queue.lock().await;
+                    queue_lock.pop()
+                };
+
+                let (local_index, fragment_hash, _fragment_type) = match next_work {
+                    Some(work) => work,
+                    None => {
+                        tracing::debug!("Worker {} finished - queue empty", worker_id);
+                        break;
+                    }
+                };
+
+                // Calculate placement using modulo distribution
+                let placement_candidates = crate::files::placement::get_fragment_placement(
+                    local_index as u32,
+                    &selected_nodes_clone,
+                );
+
+                // Try to place fragment on nodes in preference order
+                let mut placed = false;
+                for candidate_node in placement_candidates {
+                    // Skip sending to ourselves - keep fragment local if we're the best placement
+                    if candidate_node.node_id == my_node_id {
+                        tracing::debug!("Fragment {} best placed on local node {}, keeping locally",
+                                       fragment_hash, my_node_id);
                         placed = true;
                         break;
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to send fragment {} to node {}: {:?}",
-                            fragment_hash, candidate.node_id, e
-                        );
-                        // Try next node
+
+                    // Send to remote node
+                    match send_fragment_to_node(&app_state_clone, candidate_node.node_id, &fragment_hash, &node_connections_clone).await {
+                        Ok(()) => {
+                            // Mark fragment as not stored locally since it was sent elsewhere
+                            match mark_fragment_local_state(app_state_clone.db_pool.get(), &fragment_hash, false) {
+                                Ok(_rows) => {
+                                    tracing::debug!("Successfully sent fragment {} to node {}, marked not stored locally",
+                                                  fragment_hash, candidate_node.node_id);
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Failed to mark fragment {} as not local: {:?}, but fragment was sent successfully",
+                                                 fragment_hash, e);
+                                }
+                            }
+                            placed = true;
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                "Worker {} failed to send fragment {} to node {}: {:?}, trying next candidate",
+                                worker_id, fragment_hash, candidate_node.node_id, e
+                            );
+                            // Try next candidate node
+                        }
                     }
                 }
+
+                if placed {
+                    successful_placements_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    // All placement attempts failed - fragment stays local
+                    tracing::warn!("Worker {} failed to place fragment {} on any candidate node, keeping locally",
+                                 worker_id, fragment_hash);
+                    let _ = tx.send(fragment_hash);
+                }
             }
-            
-            if !placed {
-                return Err(DistributionError::FragmentTransfer(
-                    format!("Failed to place fragment {}", fragment_hash)
-                ));
-            }
-        }
-        
-        processed = batch_end;
+
+            tracing::debug!("Worker {} completed", worker_id);
+        });
+
+        worker_handles.push(worker_handle);
     }
-    
-    tracing::info!("Successfully distributed all {} fragments", total_fragments);
+
+    // Drop the sender so the receiver knows when all workers are done
+    drop(failure_tx);
+
+    // Wait for all workers to complete
+    for handle in worker_handles {
+        let _ = handle.await;
+    }
+
+    // Collect all failed fragments
+    let mut failed_fragments = Vec::new();
+    while let Some(fragment_hash) = failure_rx.recv().await {
+        failed_fragments.push(fragment_hash);
+    }
+
+    let successful = successful_placements.load(std::sync::atomic::Ordering::Relaxed);
+    let failure_rate = (failed_fragments.len() as f64 / total_fragments as f64) * 100.0;
+
+    if !failed_fragments.is_empty() {
+        tracing::warn!(
+            "Failed to distribute {} of {} fragments ({:.1}%), fragments remain stored locally",
+            failed_fragments.len(),
+            total_fragments,
+            failure_rate
+        );
+    }
+
+    // Fail only if too many fragments couldn't be distributed
+    if failure_rate > FAILURE_THRESHOLD_PERCENT {
+        return Err(DistributionError::FragmentTransfer(
+            format!(
+                "Fragment distribution failed: {}/{} fragments ({:.1}%) could not be placed (threshold: {:.1}%)",
+                failed_fragments.len(), total_fragments, failure_rate, FAILURE_THRESHOLD_PERCENT
+            )
+        ));
+    }
+
+    tracing::info!(
+        "Successfully distributed {} of {} fragments ({:.1}% success rate)",
+        successful, total_fragments,
+        (successful as f64 / total_fragments as f64) * 100.0
+    );
     Ok(())
 }
 
@@ -216,12 +307,13 @@ async fn send_fragment_to_node(
     app_state: &AppState,
     node_id: i32,
     fragment_hash: &Blake3Hash,
-    node_connections: &std::collections::HashMap<i32, (&str, i32)>,
+    node_connections: &std::collections::HashMap<i32, (String, i32)>,
 ) -> Result<(), DistributionError> {
     // 1. Look up node address from the connections map
     let (ip_address, port) = node_connections.get(&node_id)
         .ok_or_else(|| DistributionError::Network(format!("Node {} not found in connection map", node_id)))?;
-    
+    let ip_address = ip_address.as_str();
+
     // 2. Read fragment from local storage
     let fragment_data = crate::files::functions::fetch_and_verify_fragment(
         fragment_hash, 

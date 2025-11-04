@@ -28,25 +28,26 @@ Byzantine fault-tolerant consensus engine providing network coordination and sta
 - [ ] **ENHANCEMENT**: Atomic consensus lock operation to eliminate race conditions at database level
 - [ ] Node health monitoring and automatic validator management
 
-### 2. File Storage System ([RFC-002](specs/file-storage.md))  
-**Status**: Complete core functionality including distributed downloads with robust fragment discovery
+### 2. File Storage System ([RFC-002](specs/file-storage.md))
+**Status**: Complete core functionality including chunked Reed-Solomon streaming reconstruction
 
-Reed-Solomon encoded file storage with encryption and fragment management.
+Reed-Solomon encoded file storage with encryption, chunked encoding, and fragment management.
 
-- [x] Reed-Solomon encoding with 2:1 redundancy (N original + 2N recovery)
+- [x] **NEW**: Chunked Reed-Solomon encoding (40MB chunks, 10 original + 20 recovery per chunk)
+- [x] **NEW**: Progressive streaming reconstruction with 25x TTFB improvement for large files
+- [x] **NEW**: Per-chunk fast-path and Reed-Solomon reconstruction
+- [x] **NEW**: Chunk-aware database schema (chunk_number, local_index compound primary key)
 - [x] ChaCha20-Poly1305 fragment encryption with per-file keys
 - [x] Blake3 fragment hashing and integrity verification
 - [x] Local fragment storage with 2-level directory structure
-- [x] File reconstruction from available fragments
-- [x] Fast-path reconstruction when all original fragments available
 - [x] Event-driven fragment distribution after upload completion
-- [x] **NEW**: Distributed fragment discovery with accelerated fallback pattern
-- [x] **NEW**: Work queue pattern for efficient concurrent fragment retrieval
-- [x] **NEW**: Database consistency management with automatic state correction
-- [x] **NEW**: Cryptographic authentication for all fragment transfer operations
-- [x] **NEW**: Consensus-based file deletion with user ownership validation and proper error handling
+- [x] Distributed fragment discovery with accelerated fallback pattern
+- [x] Work queue pattern for efficient concurrent fragment retrieval
+- [x] Database consistency management with automatic state correction
+- [x] Cryptographic authentication for all fragment transfer operations
+- [x] Consensus-based file deletion with user ownership validation and proper error handling
 - [ ] Fragment lifecycle management and garbage collection
-- [ ] **NEW**: Automated maintenance reconciliation (route + scheduled job)
+- [ ] Automated maintenance reconciliation (route + scheduled job)
 - [ ] Storage capacity monitoring and quota management
 - [ ] Secure thumbnail generation for encrypted files
 - [ ] Preview data extraction while maintaining encryption
@@ -69,22 +70,23 @@ HTTP-based inter-node communication with authentication and fragment transfer ca
 - [ ] NAT traversal implementation (deprioritized for defined IP infrastructure)
 
 ### 4. Shard Synchronization System ([RFC-004](specs/shard-synchronization.md))
-**Status**: Core distribution, discovery, and manual rebalancing complete, automated recovery pending
+**Status**: Complete modulo placement with chunked RS support, automated recovery pending
 
-Intelligent fragment distribution system optimizing for performance, reliability, and geographic redundancy.
+Intelligent fragment distribution system optimizing for performance, reliability, and even distribution.
 
 - [x] Consensus height-based versioning for deterministic placement
-- [x] Rendezvous hashing algorithm for fragment placement (Phase 1)
-- [x] Metrics-based scoring for optimal node selection (Phase 2)
-- [x] Erasure-code aware placement (separate original vs recovery sets)
+- [x] **NEW**: Modulo placement algorithm (local_index % num_validators) with perfect balance
+- [x] **NEW**: File-level node selection with metrics-based deterministic shuffle
+- [x] **NEW**: Local-index-aware placement ensuring consistent chunk distribution
+- [x] Metrics-based scoring for optimal node selection (40% availability, 30% throughput, 20% latency, 10% stability)
 - [x] Event-driven distribution with consensus integration
 - [x] Self-skip optimization (avoid sending fragments to local node)
 - [x] Retry logic with exponential backoff and connection timeouts
 - [x] Inter-node authentication for secure fragment transfer
 - [x] Fragment discovery protocol for download reconstruction
-- [x] **NEW**: Manual network rebalancing with atomic data block processing
-- [x] **NEW**: Dynamic timeout calculation based on fragment count (1GB/30min transfer rate)
-- [x] **NEW**: Direct node-to-node fragment transfer without intermediary
+- [x] Manual network rebalancing with atomic data block processing
+- [x] Dynamic timeout calculation based on fragment count (1GB/30min transfer rate)
+- [x] Direct node-to-node fragment transfer without intermediary
 - [ ] Background orphan recovery with adaptive thresholds
 - [ ] Node reliability scoring and roaming device detection
 - [ ] Automated background rebalancing and fragment migration
@@ -273,15 +275,20 @@ S3-compatible API layer enabling standard S3 clients and SDKs to interact with H
 - [x] **COMPLETED**: Storage capacity metrics collection (storage_total_gb, storage_used_gb columns)
 - [x] **COMPLETED**: Cross-platform storage metrics endpoint (/rpc/storage-server) with JWT+RPC dual authentication
 
-**Primary**: RFC-004 Shard Synchronization Implementation  
-- ✅ **COMPLETED**: Deterministic fragment placement algorithm using collected node reliability metrics
-  - Two-phase approach: rendezvous hashing for candidates, then metrics-based selection
-  - Storage capacity tracking integration (✅ completed: storage_total_gb, storage_used_gb in metrics)
-  - Performance target: <100ms placement decisions using DuckDB analytical queries with caching
-  - Time-weighted metrics with probationary period for new nodes
-  - Placement scores debugging API (/metrics/scores) with raw metrics and weighted scoring for original/recovery fragments
-- ✅ **COMPLETED**: Fragment discovery and cross-node retrieval workflows with accelerated fallback pattern
-  - Work queue pattern for efficient concurrent fragment retrieval  
+**Primary**: Chunked Reed-Solomon with Modulo Placement (RFC-002 + RFC-004)
+- ✅ **COMPLETED**: Chunked Reed-Solomon encoding with 40MB chunks for streaming optimization
+  - 10 original + 20 recovery fragments per chunk (30 fragments total per chunk)
+  - Progressive streaming reconstruction with 25x TTFB improvement for large files
+  - Per-chunk fast-path and Reed-Solomon reconstruction
+  - Chunk-aware database schema with (data_block_id, chunk_number, local_index) compound key
+- ✅ **COMPLETED**: Modulo placement algorithm with file-level node selection
+  - File-level: Metrics-based deterministic shuffle selects 30 nodes per file
+  - Fragment-level: local_index % num_selected_nodes for primary placement
+  - Metrics weighting: 40% availability, 30% throughput, 20% latency, 10% stability
+  - Perfect balance: ±1 max imbalance across nodes for optimal failure tolerance
+  - Local-index awareness: fragment[0] from all chunks goes to same node
+- ✅ **COMPLETED**: Fragment discovery and cross-node retrieval workflows
+  - Work queue pattern for efficient concurrent fragment retrieval
   - Database consistency management with automatic state correction
   - Ed25519 cryptographic authentication for all fragment requests
   - 3-phase fallback: best candidate → deterministic placement → network-wide gossip
@@ -357,13 +364,13 @@ S3-compatible API layer enabling standard S3 clients and SDKs to interact with H
    - ✅ **Phase 4a (Complete)**: Implemented modifyItem for metadata-only rename/move operations
    - **Phase 4b (Design Complete, Ready for Implementation)**: Content modification with new data blocks approach
    
-### Phase 1C: Basic Distributed Operations
+### Phase 1C: Basic Distributed Operations ✅ **COMPLETED**
 **Goal**: Enable core distributed filesystem functionality
 
-1. **RFC-004 fragment placement and discovery** - Smart fragment distribution
-   - Implement rendezvous hashing for deterministic placement
-   - Add node reliability scoring with basic metrics collection
-   - Enable geographic distribution using RTT clustering + IP geolocation
+1. **RFC-004 fragment placement and discovery** - Smart fragment distribution ✅
+   - ✅ Implemented modulo placement for deterministic, balanced distribution
+   - ✅ Added node reliability scoring with metrics-based selection
+   - ✅ Chunked Reed-Solomon implementation with progressive streaming
    
 2. **RFC-007 maintenance and operations** - Network health and efficiency
    - Implement threshold-based fragment cleanup with UUIDv7 age tracking

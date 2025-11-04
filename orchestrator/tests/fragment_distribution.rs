@@ -1,25 +1,14 @@
 use anyhow::Result;
 use std::time::{Duration, Instant};
 
-use crate::tests::{Check, TestResult, TestScenario};
+use crate::tests::{Check, TestResult, TestScenario, print_and_add_check};
 use crate::tests::files::{
-    upload_file, download_file_from_all_nodes, verify_all_identical,
+    upload_file, download_file_from_all_nodes_with_timeout, verify_all_identical,
     trigger_fragment_inventory_sync_all, wait_for_fragment_distribution,
     verify_fragment_redundancy, get_fragment_distribution,
 };
 use crate::tests::{get_max_view, wait_for_minimum_view};
 use crate::NodeInfo;
-
-/// Helper to print and add a check in real-time
-fn print_and_add_check(result: &mut TestResult, check: Check) {
-    let status = if check.passed { "✅" } else { "❌" };
-    print!("  {} {}", status, check.name);
-    if let Some(detail) = &check.detail {
-        print!(" - {}", detail);
-    }
-    println!();
-    result.add_check(check);
-}
 
 /// Test that fragment distribution algorithm correctly distributes fragments across nodes
 pub struct FragmentDistribution;
@@ -33,7 +22,7 @@ impl TestScenario for FragmentDistribution {
         "Upload a file and verify the fragment distribution algorithm correctly places fragments across nodes with proper redundancy and balance, then verify file retrieval works with distributed fragments"
     }
 
-    async fn run(&self, _mesh_id: u32, nodes: &[NodeInfo]) -> Result<TestResult> {
+    async fn run(&self, _mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
         let start = Instant::now();
         let mut result = TestResult::new();
 
@@ -79,7 +68,7 @@ impl TestScenario for FragmentDistribution {
         };
 
         // Step 2: Upload file to node 0
-        match upload_file(&nodes[0], test_path, &test_filename, &test_contents).await {
+        match upload_file(&nodes[0], test_path, &test_filename, test_contents.clone()).await {
             Ok(_) => {
                 print_and_add_check(&mut result, Check {
                     name: format!("Upload {} to node 0", test_filename),
@@ -265,7 +254,8 @@ impl TestScenario for FragmentDistribution {
         }
 
         // Step 10: Download file from all nodes to verify retrieval works with distributed fragments
-        let downloads = match download_file_from_all_nodes(nodes, &full_path).await {
+        // Use 15-second timeout for small test file (bounded at ~48 seconds with 3 retries)
+        let downloads = match download_file_from_all_nodes_with_timeout(nodes, &full_path, Duration::from_secs(15)).await {
             Ok(data) => {
                 print_and_add_check(&mut result, Check {
                     name: format!("Download {} from all {} nodes (post-distribution)", test_filename, nodes.len()),

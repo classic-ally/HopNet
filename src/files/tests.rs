@@ -2,127 +2,108 @@
 #[cfg(test)]
 mod tests {
     use crate::files::functions::{
-        calculate_optimal_chunks, calculate_padding_and_chunks, 
-        calculate_chunk_padding, calculate_encrypted_chunk_length, 
-        MAX_FRAGMENT_SIZE
+        calculate_chunked_fragments, calculate_padding_and_chunks,
+        MAX_FRAGMENT_SIZE, CHUNK_SIZE, ORIGINAL_FRAGMENTS_PER_CHUNK, RECOVERY_FRAGMENTS_PER_CHUNK
     };
     use rand::prelude::*;
-    
+
     /// Helper function to generate random test data
     fn generate_random_data(size: usize) -> Vec<u8> {
         let mut rng = rand::rng();
         (0..size).map(|_| rng.r#gen::<u8>()).collect()
     }
 
-    /// Test calculate_optimal_chunks function
+    /// Test calculate_chunked_fragments function for Phase 4 chunked Reed-Solomon
     #[test]
-    fn test_calculate_optimal_chunks() {
-        // Test edge cases and common sizes
-        assert_eq!(calculate_optimal_chunks(0), (10, 20));        // Empty file still needs minimum chunks
-        assert_eq!(calculate_optimal_chunks(1), (10, 20));        // 1 byte -> 10 chunks
-        assert_eq!(calculate_optimal_chunks(1024), (10, 20));     // 1KB -> 10 chunks  
-        assert_eq!(calculate_optimal_chunks(1024 * 1024), (10, 20)); // 1MB -> 10 chunks
-        assert_eq!(calculate_optimal_chunks(10 * 1024 * 1024), (10, 20)); // 10MB -> 10 chunks
-        assert_eq!(calculate_optimal_chunks(40 * 1024 * 1024), (10, 20)); // 40MB -> 10 chunks
-        assert_eq!(calculate_optimal_chunks(45 * 1024 * 1024), (12, 24)); // 45MB -> 12 chunks
-        assert_eq!(calculate_optimal_chunks(100 * 1024 * 1024), (25, 50)); // 100MB -> 25 chunks
+    fn test_calculate_chunked_fragments() {
+        // Empty file: special case, no chunks
+        let (num_chunks, total_original, total_recovery) = calculate_chunked_fragments(0);
+        assert_eq!(num_chunks, 0, "Empty file should have 0 chunks (handled separately)");
+        assert_eq!(total_original, 0, "Empty file should have 0 original fragments");
+        assert_eq!(total_recovery, 0, "Empty file should have 0 recovery fragments");
+
+        // 1 byte file: 1 chunk (< 40MB)
+        let (num_chunks, total_original, total_recovery) = calculate_chunked_fragments(1);
+        assert_eq!(num_chunks, 1, "1-byte file should have 1 chunk");
+        assert_eq!(total_original, 10, "Should have 10 original fragments");
+        assert_eq!(total_recovery, 20, "Should have 20 recovery fragments");
+
+        // 1KB file: 1 chunk (< 40MB)
+        let (num_chunks, total_original, total_recovery) = calculate_chunked_fragments(1024);
+        assert_eq!(num_chunks, 1, "1KB file should have 1 chunk");
+        assert_eq!(total_original, 10, "Should have 10 original fragments");
+        assert_eq!(total_recovery, 20, "Should have 20 recovery fragments");
+
+        // 1MB file: 1 chunk (< 40MB)
+        let (num_chunks, total_original, total_recovery) = calculate_chunked_fragments(1024 * 1024);
+        assert_eq!(num_chunks, 1, "1MB file should have 1 chunk");
+        assert_eq!(total_original, 10, "Should have 10 original fragments");
+        assert_eq!(total_recovery, 20, "Should have 20 recovery fragments");
+
+        // 40MB file: exactly 1 chunk
+        let (num_chunks, total_original, total_recovery) = calculate_chunked_fragments(CHUNK_SIZE);
+        assert_eq!(num_chunks, 1, "40MB file should have 1 chunk");
+        assert_eq!(total_original, 10, "Should have 10 original fragments");
+        assert_eq!(total_recovery, 20, "Should have 20 recovery fragments");
+
+        // 45MB file: 2 chunks (chunk 0: 40MB, chunk 1: 5MB)
+        let (num_chunks, total_original, total_recovery) = calculate_chunked_fragments(45 * 1024 * 1024);
+        assert_eq!(num_chunks, 2, "45MB file should have 2 chunks");
+        assert_eq!(total_original, 20, "Should have 20 original fragments (10 per chunk)");
+        assert_eq!(total_recovery, 40, "Should have 40 recovery fragments (20 per chunk)");
+
+        // 100MB file: 3 chunks (40MB + 40MB + 20MB)
+        let (num_chunks, total_original, total_recovery) = calculate_chunked_fragments(100 * 1024 * 1024);
+        assert_eq!(num_chunks, 3, "100MB file should have 3 chunks");
+        assert_eq!(total_original, 30, "Should have 30 original fragments (10 per chunk)");
+        assert_eq!(total_recovery, 60, "Should have 60 recovery fragments (20 per chunk)");
+
+        // 1GB file: 26 chunks (25 × 40MB + 1 × 24MB)
+        let (num_chunks, total_original, total_recovery) = calculate_chunked_fragments(1024 * 1024 * 1024);
+        assert_eq!(num_chunks, 26, "1GB file should have 26 chunks");
+        assert_eq!(total_original, 260, "Should have 260 original fragments (10 per chunk)");
+        assert_eq!(total_recovery, 520, "Should have 520 recovery fragments (20 per chunk)");
+
+        // Verify constants relationship: CHUNK_SIZE should equal MAX_FRAGMENT_SIZE * ORIGINAL_FRAGMENTS_PER_CHUNK
+        assert_eq!(
+            CHUNK_SIZE,
+            MAX_FRAGMENT_SIZE * ORIGINAL_FRAGMENTS_PER_CHUNK,
+            "CHUNK_SIZE must be derived from MAX_FRAGMENT_SIZE × ORIGINAL_FRAGMENTS_PER_CHUNK"
+        );
     }
 
-    /// Test calculate_padding_and_chunks function
+    /// Test calculate_padding_and_chunks function used for splitting chunks into fragments
     #[test]
     fn test_calculate_padding_and_chunks() {
+        // Test with data that divides evenly into even-sized chunks (no padding needed)
+        let test_data = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let (chunks, padding) = calculate_padding_and_chunks(test_data.clone(), 2);
+
+        assert_eq!(chunks.len(), 2, "Should create 2 chunks");
+        assert_eq!(padding, 0, "No padding needed when chunk length is already even");
+        assert_eq!(chunks[0].len(), 6, "Each chunk should have 6 bytes");
+        assert_eq!(chunks[1].len(), 6, "Each chunk should have 6 bytes");
+
+        // Test with uneven division requiring padding for even chunk length
+        // 10 bytes / 2 chunks = 5 bytes each (odd), needs padding to make 6 bytes each
         let test_data = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
         let (chunks, padding) = calculate_padding_and_chunks(test_data.clone(), 2);
-        
+
         assert_eq!(chunks.len(), 2, "Should create 2 chunks");
-        assert_eq!(padding, 0, "No padding needed for even division");
-        
-        // Test with uneven division requiring padding
+        assert_eq!(padding, 2, "Should add 2 bytes of padding to make chunk length even");
+        assert_eq!(chunks[0].len(), 6, "Each chunk should have 6 bytes (5 + padding)");
+        assert_eq!(chunks[1].len(), 6, "Each chunk should have 6 bytes (5 + padding)");
+
+        // Test with data requiring padding for both uneven division AND even chunk length
+        // 5 bytes / 2 chunks = 2.5, rounds up to 3 bytes each (odd)
+        // Must add 3 bytes total padding to make 8 bytes → 4 bytes per chunk (even)
         let test_data = vec![1, 2, 3, 4, 5];
         let (chunks, padding) = calculate_padding_and_chunks(test_data.clone(), 2);
-        
+
         assert_eq!(chunks.len(), 2, "Should create 2 chunks");
-        assert_eq!(padding, 1, "Should add 1 byte of padding");
-        assert_eq!(chunks[0].len(), 3, "First chunk should have 3 bytes");
-        assert_eq!(chunks[1].len(), 3, "Second chunk should have 3 bytes (including padding)");
-    }
-
-    /// Test that chunk sizes never exceed MAX_FRAGMENT_SIZE
-    #[test]
-    fn test_chunk_size_consistency() {
-        // Test various file sizes to ensure chunks stay within bounds
-        let test_sizes = vec![
-            1,                          // 1 byte
-            1024,                       // 1KB
-            1024 * 1024,               // 1MB
-            10 * 1024 * 1024,          // 10MB
-            50 * 1024 * 1024,          // 50MB
-            100 * 1024 * 1024,         // 100MB
-            200 * 1024 * 1024,         // 200MB
-        ];
-        
-        for file_size in test_sizes {
-            let (passes, chunk_size, _num_chunks, expected_max) = test_file_size(file_size);
-            assert!(passes, 
-                "File size {} bytes: chunk size {} exceeds max fragment size {}", 
-                file_size, chunk_size, expected_max);
-        }
-        
-        // Helper function to test a specific file size
-        fn test_file_size(file_size: usize) -> (bool, usize, usize, usize) {
-            let (num_original_chunks, _num_recovery_chunks) = calculate_optimal_chunks(file_size);
-            let needed_padding = calculate_chunk_padding(file_size, num_original_chunks);
-            let chunk_size = (file_size + needed_padding) / num_original_chunks;
-            let encrypted_chunk_size = calculate_encrypted_chunk_length(chunk_size);
-            
-            (encrypted_chunk_size <= MAX_FRAGMENT_SIZE, chunk_size, num_original_chunks, MAX_FRAGMENT_SIZE)
-        }
-    }
-
-    /// Test that files larger than 40MB use optimal chunk counts for stable boundaries
-    #[test]
-    fn test_large_file_chunk_stability() {
-        // Test file sizes around chunk boundaries to ensure stable behavior
-        let boundary_tests = vec![
-            40 * 1024 * 1024,      // Exactly 40MB (should use 10 chunks)
-            41 * 1024 * 1024,      // Just over 40MB (should calculate dynamically)
-            80 * 1024 * 1024,      // 80MB
-            120 * 1024 * 1024,     // 120MB
-        ];
-        
-        for file_size in boundary_tests {
-            let (is_stable, chunk_count, chunk_size, total_with_recovery, expected_max) = test_large_file_stability(file_size);
-            
-            if file_size <= 40 * 1024 * 1024 {
-                assert_eq!(chunk_count, 10, "Files <= 40MB should use minimum 10 chunks");
-            } else {
-                assert!(chunk_count >= 10, "Files > 40MB should use at least 10 chunks");
-                assert!(chunk_count <= file_size / (1024 * 1024), "Chunk count should be reasonable for file size");
-            }
-            
-            assert!(is_stable, 
-                "File size {} MB: chunk size {} should not exceed max fragment size {}", 
-                file_size / (1024 * 1024), chunk_size, expected_max);
-            
-            // Verify 2:1 redundancy ratio
-            assert_eq!(total_with_recovery, chunk_count * 3, 
-                "Should have 1 original + 2 recovery = 3x fragments");
-        }
-        
-        // Helper function to test chunk stability for large files
-        fn test_large_file_stability(file_size: usize) -> (bool, usize, usize, usize, usize) {
-            let (num_original_chunks, num_recovery_chunks) = calculate_optimal_chunks(file_size);
-            let needed_padding = calculate_chunk_padding(file_size, num_original_chunks);
-            let chunk_size = (file_size + needed_padding) / num_original_chunks;
-            let encrypted_chunk_size = calculate_encrypted_chunk_length(chunk_size);
-            let total_fragments = num_original_chunks + num_recovery_chunks;
-            
-            (encrypted_chunk_size <= MAX_FRAGMENT_SIZE, 
-             num_original_chunks, 
-             chunk_size, 
-             total_fragments, 
-             MAX_FRAGMENT_SIZE)
-        }
+        assert_eq!(padding, 3, "Should add 3 bytes of padding to ensure even chunk length");
+        assert_eq!(chunks[0].len(), 4, "Each chunk should have 4 bytes (even length)");
+        assert_eq!(chunks[1].len(), 4, "Each chunk should have 4 bytes (even length)");
     }
 
     /// Test that chunk content is preserved correctly

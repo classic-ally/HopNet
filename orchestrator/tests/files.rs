@@ -2,6 +2,7 @@ use anyhow::Result;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use tokio_stream::StreamExt;
 
 use crate::NodeInfo;
 
@@ -15,24 +16,26 @@ use crate::NodeInfo;
 /// * `node` - The node to upload to
 /// * `path` - The directory path (e.g., "/documents")
 /// * `filename` - The filename (e.g., "report.pdf")
-/// * `contents` - The file contents as bytes
+/// * `contents` - The file contents as bytes (takes ownership to avoid copying)
 pub async fn upload_file(
     node: &NodeInfo,
     path: &str,
     filename: &str,
-    contents: &[u8],
+    contents: Vec<u8>,
 ) -> Result<()> {
     let client = Client::new();
     let url = format!("http://{}:{}/files", node.ip_address, node.port);
 
+    let contents_len = contents.len();
+
+    // Take ownership and move into multipart form without copying
+    let part = reqwest::multipart::Part::bytes(contents)
+        .file_name(filename.to_string());
+
     // Create multipart form with path and file
     let form = reqwest::multipart::Form::new()
         .text("path", path.to_string())
-        .part(
-            format!("file_{}", contents.len()),
-            reqwest::multipart::Part::bytes(contents.to_vec())
-                .file_name(filename.to_string()),
-        );
+        .part(format!("file_{}", contents_len), part);
 
     let response = client
         .post(&url)
@@ -63,25 +66,82 @@ pub async fn upload_file(
 /// # Returns
 /// The file contents as bytes
 pub async fn download_file(node: &NodeInfo, path: &str) -> Result<Vec<u8>> {
-    let client = Client::new();
+    download_file_with_timeout(node, path, std::time::Duration::from_secs(120)).await
+}
 
-    // Strip leading slash if present for URL construction
-    let path_trimmed = path.strip_prefix('/').unwrap_or(path);
-    let url = format!("http://{}:{}/files/{}", node.ip_address, node.port, path_trimmed);
+/// Download a file from a node with configurable timeout and retry logic
+///
+/// # Arguments
+/// * `node` - The node to download from
+/// * `path` - The full file path
+/// * `timeout` - Timeout for the download request
+///
+/// # Returns
+/// File contents as bytes
+pub async fn download_file_with_timeout(
+    node: &NodeInfo,
+    path: &str,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>> {
+    const MAX_RETRIES: u32 = 3;
+    let mut last_error = None;
 
-    let response = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {}", node.jwt_token))
-        .send()
-        .await?;
+    for attempt in 1..=MAX_RETRIES {
+        let client = Client::builder()
+            .timeout(timeout)
+            .build()?;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_else(|_| "No body".to_string());
-        anyhow::bail!("Download failed with status {}: {}", status, body);
+        // Strip leading slash if present for URL construction
+        let path_trimmed = path.strip_prefix('/').unwrap_or(path);
+        let url = format!("http://{}:{}/files/{}", node.ip_address, node.port, path_trimmed);
+
+        match client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", node.jwt_token))
+            .send()
+            .await
+        {
+            Ok(response) => {
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_else(|_| "No body".to_string());
+                    last_error = Some(anyhow::anyhow!(
+                        "Download failed with status {}: {}",
+                        status,
+                        body
+                    ));
+                    if attempt < MAX_RETRIES {
+                        tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64))
+                            .await;
+                        continue;
+                    }
+                } else {
+                    match response.bytes().await {
+                        Ok(bytes) => return Ok(bytes.to_vec()),
+                        Err(e) => {
+                            last_error = Some(anyhow::anyhow!("Failed to read response body: {}", e));
+                            if attempt < MAX_RETRIES {
+                                tokio::time::sleep(std::time::Duration::from_millis(
+                                    500 * attempt as u64,
+                                ))
+                                .await;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                last_error = Some(anyhow::anyhow!("Request failed: {}", e));
+                if attempt < MAX_RETRIES {
+                    tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+                    continue;
+                }
+            }
+        }
     }
 
-    Ok(response.bytes().await?.to_vec())
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Download failed after {} retries", MAX_RETRIES)))
 }
 
 /// Download a file from all nodes in parallel
@@ -96,13 +156,30 @@ pub async fn download_file_from_all_nodes(
     nodes: &[NodeInfo],
     path: &str,
 ) -> Result<Vec<Vec<u8>>> {
+    download_file_from_all_nodes_with_timeout(nodes, path, std::time::Duration::from_secs(120)).await
+}
+
+/// Download a file from all nodes in parallel with configurable timeout
+///
+/// # Arguments
+/// * `nodes` - All nodes to download from
+/// * `path` - The full file path
+/// * `timeout` - Timeout for each download request
+///
+/// # Returns
+/// Vector of file contents from each node (in same order as nodes)
+pub async fn download_file_from_all_nodes_with_timeout(
+    nodes: &[NodeInfo],
+    path: &str,
+    timeout: std::time::Duration,
+) -> Result<Vec<Vec<u8>>> {
     let mut tasks = Vec::new();
 
     for node in nodes {
         let node = node.clone();
         let path = path.to_string();
         let task = tokio::spawn(async move {
-            download_file(&node, &path).await
+            download_file_with_timeout(&node, &path, timeout).await
         });
         tasks.push(task);
     }
@@ -279,7 +356,8 @@ pub async fn delete_file(node: &NodeInfo, path: &str) -> Result<()> {
 /// Fragment information for distribution diagnostic (orchestrator types)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FragmentInfo {
-    pub fragment_index: u32,
+    pub chunk_number: u32,
+    pub local_index: u32,
     pub fragment_id: String,
     pub fragment_hash: String,
     pub chunk_type: String,
@@ -413,8 +491,15 @@ pub async fn wait_for_fragment_distribution(
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
             Err(e) => {
-                // Propagate query errors
-                return Err(e);
+                // For 404 errors, the file metadata may not be queryable yet (especially for large files)
+                // Retry instead of immediately failing
+                let is_404 = e.to_string().contains("404");
+                if is_404 {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                } else {
+                    // Propagate non-404 query errors immediately
+                    return Err(e);
+                }
             }
         }
     }
@@ -516,7 +601,7 @@ pub fn verify_fragment_redundancy(
     for fragment in &distribution.fragments {
         if fragment.nodes_with_fragment.is_empty() {
             all_fragments_stored = false;
-            unstored_fragments.push(fragment.fragment_index);
+            unstored_fragments.push((fragment.chunk_number, fragment.local_index));
         }
     }
     checks.push((
@@ -525,7 +610,7 @@ pub fn verify_fragment_redundancy(
         if all_fragments_stored {
             format!("All {} fragments stored on at least one node", distribution.fragments.len())
         } else {
-            format!("Fragments not stored: {:?}", unstored_fragments)
+            format!("Fragments not stored (chunk_number, local_index): {:?}", unstored_fragments)
         },
     ));
 
@@ -546,27 +631,23 @@ pub fn verify_fragment_redundancy(
     let actual_tolerance = calculate_failure_tolerance(&node_fragment_counts, node_count, 10);
 
     // Calculate maximum possible failure tolerance based on network size
-    // With 30 total fragments needing 10 to recover, theoretical maximum is 20 failures
-    // For smaller networks, calculate based on even distribution:
-    //   - With perfect distribution, each node gets ~30/n fragments
-    //   - Need at least ceil(10 / (30/n)) = ceil(10*n / 30) nodes alive
-    //   - So can tolerate: n - ceil(10*n / 30) failures
+    // With 30 total fragments needing 10 to recover, we can lose up to 20 fragments
+    // For smaller networks, must account for uneven distribution (worst case):
+    //   - With uneven distribution, max fragments per node = ceil(30/n)
+    //   - Can lose up to 20 fragments total (30 - 10 required)
+    //   - Max failures = floor(20 / max_fragments_per_node)
     let max_possible_tolerance = if node_count >= 30 {
         // For 30+ nodes, the theoretical maximum is 20 failures
         // (can lose 20 out of 30 fragments and still have 10)
         20
     } else {
-        // For smaller networks, calculate based on even distribution
-        // Each node would have approximately 30/n fragments
-        // Need at least 10 fragments to survive, so need ceil(10/(30/n)) nodes
-        // Therefore can tolerate: n - ceil(10*n/30) failures
-        let fragments_per_node_ideal = 30.0 / node_count as f64;
-        let nodes_needed = (10.0 / fragments_per_node_ideal).ceil() as usize;
-        if nodes_needed < node_count {
-            node_count - nodes_needed
-        } else {
-            0
-        }
+        // For smaller networks, calculate based on worst-case uneven distribution
+        // Max fragments any single node can have with 30 total fragments
+        let fragments_per_node_max = ((30.0 / node_count as f64).ceil()) as usize;
+        // Can lose up to 20 fragments (30 - 10 required for reconstruction)
+        let max_fragment_losses = 20;
+        // In worst case, we lose nodes with the most fragments first
+        max_fragment_losses / fragments_per_node_max
     };
 
     let balance_check = actual_tolerance >= max_possible_tolerance;

@@ -99,6 +99,9 @@ enum Commands {
         /// List all available tests
         #[arg(short, long)]
         list: bool,
+        /// Optional flags to modify test behavior (e.g., --flags wait-for-distribution)
+        #[arg(long)]
+        flags: Vec<String>,
     },
 }
 
@@ -142,8 +145,8 @@ async fn main() -> Result<()> {
         Some(Commands::Divergence { mesh_id }) => {
             divergence::check_divergence(&docker, *mesh_id, runtime).await?;
         }
-        Some(Commands::Test { mesh_id, test, list }) => {
-            tests::handle_test_command(&docker, *mesh_id, test.as_deref(), *list, runtime).await?;
+        Some(Commands::Test { mesh_id, test, list, flags }) => {
+            tests::handle_test_command(&docker, *mesh_id, test.as_deref(), *list, flags, runtime).await?;
         }
         Some(Commands::List) | None => {
             list_meshes(&docker).await?;

@@ -1,22 +1,11 @@
 use crate::{
     NodeAuthInfo,
     types::{Blake3Hash, NodeConnectionInfo},
-    db::metrics::NodeMetrics,
-    files::placement::{calculate_rendezvous_distances, calculate_final_placement_scores, FragmentType},
+    files::placement::FragmentType,
 };
 use ed25519_dalek::Signer;
 use either::Either;
 // Using tokio tasks and channels for reactive processing
-
-impl From<crate::files::placement::Phase2Candidate> for NodeConnectionInfo {
-    fn from(c: crate::files::placement::Phase2Candidate) -> Self {
-        NodeConnectionInfo {
-            node_id: c.node_id,
-            ip_address: c.ip_address,
-            port: c.port,
-        }
-    }
-}
 
 #[derive(Debug)]
 pub enum DiscoveryError {
@@ -29,29 +18,6 @@ impl From<crate::db::DatabaseError> for DiscoveryError {
     fn from(e: crate::db::DatabaseError) -> Self {
         DiscoveryError::Database(e)
     }
-}
-
-/// Get preference-ordered placement candidates for a fragment
-/// Pure function that reuses exact same placement algorithm as distribution system
-pub fn get_fragment_placement_candidates(
-    fragment_hash: &Blake3Hash,
-    fragment_type: FragmentType,
-    node_metrics: &[NodeMetrics],
-) -> Vec<crate::files::placement::Phase2Candidate> {
-    let node_ids: Vec<i32> = node_metrics.iter().map(|m| m.node_id).collect();
-    
-    // Phase 1: Rendezvous hashing to get candidate pool (top 1/3)
-    let phase1_candidates = calculate_rendezvous_distances(fragment_hash, &node_ids);
-    let candidate_count = (node_ids.len() / 3).max(1);
-    
-    let candidate_metrics: Vec<_> = phase1_candidates
-        .into_iter()
-        .take(candidate_count)
-        .filter_map(|c| node_metrics.iter().find(|m| m.node_id == c.node_id).cloned())
-        .collect();
-    
-    // Phase 2: Apply metrics-based scoring (same as distribution)
-    calculate_final_placement_scores(candidate_metrics, fragment_type)
 }
 
 /// Try to fetch a fragment from a specific node
@@ -145,19 +111,19 @@ pub async fn try_ask_node_for_fragment(
     Ok(has_fragment)
 }
 
-/// Main fragment discovery function with accelerated fallback pattern
+/// Main fragment discovery function with inventory-first pattern
 ///
 /// Accepts either:
-/// - Left(Vec<NodeConnectionInfo>): Gossip-only mode (no deterministic placement)
-/// - Right(Vec<NodeMetrics>): Full discovery with deterministic placement
+/// - Left(Vec<NodeConnectionInfo>): Direct node list for reactive discovery
+/// - Right(Vec<NodeMetrics>): Node metrics (converted to NodeConnectionInfo for discovery)
 pub async fn find_fragment(
     fragment_hash: &Blake3Hash,
-    fragment_type: FragmentType,
-    nodes: Either<Vec<NodeConnectionInfo>, Vec<NodeMetrics>>,
+    _fragment_type: FragmentType,
+    nodes: Either<Vec<NodeConnectionInfo>, Vec<crate::db::metrics::NodeMetrics>>,
     auth: &NodeAuthInfo,
     inventory_hint: Option<Vec<NodeConnectionInfo>>,
 ) -> Result<Vec<u8>, DiscoveryError> {
-    // Phase 0: Try fragment inventory nodes first (if available)
+    // Phase 0: Try fragment inventory nodes first (PRIMARY lookup mechanism)
     if let Some(inventory_nodes) = inventory_hint {
         if !inventory_nodes.is_empty() {
             tracing::debug!("Trying {} inventory nodes for fragment {}",
@@ -168,95 +134,33 @@ pub async fn find_fragment(
                 return Ok(data);
             }
 
-            tracing::debug!("Inventory nodes failed, falling back to placement algorithm");
+            tracing::debug!("Inventory nodes failed, falling back to network-wide search");
         }
     }
 
-    match nodes {
-        Either::Left(gossip_nodes) => {
-            // Gossip-only mode: no deterministic placement, just try all nodes
-            tracing::debug!("Gossip-only discovery mode - trying {} nodes reactively", gossip_nodes.len());
-
-            if !gossip_nodes.is_empty() {
-                if let Ok(data) = try_reactive_discovery_and_fetch(fragment_hash, &gossip_nodes, auth).await {
-                    return Ok(data);
-                }
-            }
-
-            Err(DiscoveryError::NotFound)
-        }
+    // Phase 1: Fallback to reactive discovery across all available nodes
+    let discovery_nodes = match nodes {
+        Either::Left(node_list) => node_list,
         Either::Right(node_metrics) => {
-            // Full discovery mode with deterministic placement
-
-            // Phase 1: Get deterministic placement candidates in preference order
-            let candidates = get_fragment_placement_candidates(fragment_hash, fragment_type, &node_metrics);
-
-            // Track nodes we've already tried for Phase 4 filtering
-            let mut tried_node_ids = Vec::new();
-
-            if !candidates.is_empty() {
-                // Phase 2: Try the best candidate immediately
-                let best_candidate = &candidates[0];
-                let best_node_info = NodeConnectionInfo::from(best_candidate.clone());
-                tracing::debug!("Trying best candidate node {} immediately", best_candidate.node_id);
-
-                match try_fetch_from_node(
-                    fragment_hash,
-                    &best_node_info,
-                    auth,
-                ).await {
-                    Ok(data) => {
-                        tracing::debug!("Found fragment {} on best candidate {}", fragment_hash.to_hex(), best_candidate.node_id);
-                        return Ok(data);
-                    }
-                    Err(e) => {
-                        tracing::debug!("Best candidate {} failed: {:?}", best_candidate.node_id, e);
-                    }
-                }
-
-                tried_node_ids.push(best_candidate.node_id);
-
-                // Phase 3: Reactive discovery on remaining deterministic candidates
-                let remaining_candidates: Vec<NodeConnectionInfo> = candidates.into_iter()
-                    .skip(1)
-                    .map(NodeConnectionInfo::from)
-                    .collect();
-
-                if !remaining_candidates.is_empty() {
-                    tracing::debug!("Trying {} remaining deterministic candidates reactively", remaining_candidates.len());
-
-                    // Track all candidate IDs we're trying
-                    tried_node_ids.extend(remaining_candidates.iter().map(|c| c.node_id));
-
-                    if let Ok(data) = try_reactive_discovery_and_fetch(fragment_hash, &remaining_candidates, auth).await {
-                        return Ok(data);
-                    }
-                }
-            } else {
-                tracing::debug!("No deterministic candidates available - falling back to network-wide gossip");
-            }
-
-            // Phase 4: Network-wide gossip as last resort
-            let gossip_nodes: Vec<NodeConnectionInfo> = node_metrics.into_iter()
-                .filter(|m| !tried_node_ids.contains(&m.node_id))
+            // Convert NodeMetrics to NodeConnectionInfo
+            node_metrics.into_iter()
                 .map(|m| NodeConnectionInfo {
                     node_id: m.node_id,
                     ip_address: m.ip_address,
                     port: m.port,
                 })
-                .collect();
+                .collect()
+        }
+    };
 
-            if !gossip_nodes.is_empty() {
-                tracing::debug!("Trying network-wide gossip across {} nodes", gossip_nodes.len());
-
-                if let Ok(data) = try_reactive_discovery_and_fetch(fragment_hash, &gossip_nodes, auth).await {
-                    return Ok(data);
-                }
-            }
-
-            Err(DiscoveryError::NotFound)
+    if !discovery_nodes.is_empty() {
+        tracing::debug!("Trying reactive discovery across {} nodes", discovery_nodes.len());
+        if let Ok(data) = try_reactive_discovery_and_fetch(fragment_hash, &discovery_nodes, auth).await {
+            return Ok(data);
         }
     }
+
+    Err(DiscoveryError::NotFound)
 }
 
 /// Reactive discovery and fetch: health check + download as nodes respond positively

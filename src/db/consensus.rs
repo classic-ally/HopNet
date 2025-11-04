@@ -392,7 +392,10 @@ pub fn get_validators(
 
             match results {
                 Ok(rows) => {
-                    let nodes: Vec<Node> = rows.collect::<Result<_, _>>().map_err(|_| DatabaseError::ProcessingError)?;
+                    let nodes: Vec<Node> = rows.collect::<Result<_, _>>().map_err(|e| {
+                        tracing::debug!("Error collecting validator rows: {:?}", e);
+                        DatabaseError::ProcessingError
+                    })?;
                     Ok(nodes)
                 }
                 Err(e) => {
@@ -1074,4 +1077,284 @@ pub fn activate_validator(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::DuckdbConnectionManager;
+    use ed25519_dalek::SigningKey;
+    use rand_core::OsRng;
+
+    fn setup_test_db() -> r2d2::Pool<DuckdbConnectionManager> {
+        let manager = DuckdbConnectionManager::memory().unwrap();
+        let pool = r2d2::Pool::builder()
+            .max_size(1)
+            .build(manager)
+            .unwrap();
+
+        crate::db::shared::initialize(pool.get().unwrap()).unwrap();
+        pool
+    }
+
+    fn generate_test_pubkey() -> crate::db::PubKey {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        crate::db::PubKey(signing_key.verifying_key())
+    }
+
+    #[test]
+    fn test_get_validators_empty() {
+        let pool = setup_test_db();
+
+        // Query at height 0 with no validators should return empty list
+        let validators = get_validators(pool.get(), 0).unwrap();
+        assert_eq!(validators.len(), 0);
+    }
+
+    #[test]
+    fn test_get_validators_basic_activation() {
+        let pool = setup_test_db();
+        let conn = pool.get().unwrap();
+
+        let user_pubkey = generate_test_pubkey();
+        let node1_pubkey = generate_test_pubkey();
+        let node2_pubkey = generate_test_pubkey();
+
+        // Insert test user
+        conn.execute(
+            "INSERT INTO users (user_id, username, password_hash, pubkey, x25519_pubkey)
+             VALUES (?, ?, ?, ?, ?)",
+            params![1, "test", "hash", &user_pubkey, &vec![0u8; 32]]
+        ).unwrap();
+
+        // Insert test nodes
+        conn.execute(
+            "INSERT INTO nodes (node_id, name, ip_address, port, owner, pubkey)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            params![1, "node1", "127.0.0.1", 8001, 1, &node1_pubkey]
+        ).unwrap();
+
+        conn.execute(
+            "INSERT INTO nodes (node_id, name, ip_address, port, owner, pubkey)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            params![2, "node2", "127.0.0.2", 8002, 1, &node2_pubkey]
+        ).unwrap();
+
+        // Activate validators at different heights
+        conn.execute(
+            "INSERT INTO validators (effective_height, node_id, is_active) VALUES (10, 1, true)",
+            []
+        ).unwrap();
+
+        conn.execute(
+            "INSERT INTO validators (effective_height, node_id, is_active) VALUES (20, 2, true)",
+            []
+        ).unwrap();
+
+        drop(conn);
+
+        // At height 5: no validators active yet
+        let validators = get_validators(pool.get(), 5).unwrap();
+        assert_eq!(validators.len(), 0);
+
+        // At height 15: only node 1 active
+        let validators = get_validators(pool.get(), 15).unwrap();
+        assert_eq!(validators.len(), 1);
+        assert_eq!(validators[0].node_id, 1);
+        assert_eq!(validators[0].ip_address, "127.0.0.1");
+        assert_eq!(validators[0].port, 8001);
+
+        // At height 25: both nodes active
+        let validators = get_validators(pool.get(), 25).unwrap();
+        assert_eq!(validators.len(), 2);
+        // Results should be ordered by node_id
+        assert_eq!(validators[0].node_id, 1);
+        assert_eq!(validators[1].node_id, 2);
+    }
+
+    #[test]
+    fn test_get_validators_with_deactivation() {
+        let pool = setup_test_db();
+        let conn = pool.get().unwrap();
+
+        let user_pubkey = generate_test_pubkey();
+        let node_pubkey = generate_test_pubkey();
+
+        // Insert test user and node
+        conn.execute(
+            "INSERT INTO users (user_id, username, password_hash, pubkey, x25519_pubkey)
+             VALUES (?, ?, ?, ?, ?)",
+            params![1, "test", "hash", &user_pubkey, &vec![0u8; 32]]
+        ).unwrap();
+
+        conn.execute(
+            "INSERT INTO nodes (node_id, name, ip_address, port, owner, pubkey)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            params![1, "node1", "127.0.0.1", 8001, 1, &node_pubkey]
+        ).unwrap();
+
+        // Activate at height 10, deactivate at height 30
+        conn.execute(
+            "INSERT INTO validators (effective_height, node_id, is_active) VALUES (10, 1, true)",
+            []
+        ).unwrap();
+
+        conn.execute(
+            "INSERT INTO validators (effective_height, node_id, is_active) VALUES (30, 1, false)",
+            []
+        ).unwrap();
+
+        drop(conn);
+
+        // At height 20: active
+        let validators = get_validators(pool.get(), 20).unwrap();
+        assert_eq!(validators.len(), 1);
+        assert_eq!(validators[0].node_id, 1);
+
+        // At height 35: deactivated
+        let validators = get_validators(pool.get(), 35).unwrap();
+        assert_eq!(validators.len(), 0);
+    }
+
+    #[test]
+    fn test_get_validators_reactivation() {
+        let pool = setup_test_db();
+        let conn = pool.get().unwrap();
+
+        let user_pubkey = generate_test_pubkey();
+        let node_pubkey = generate_test_pubkey();
+
+        // Insert test user and node
+        conn.execute(
+            "INSERT INTO users (user_id, username, password_hash, pubkey, x25519_pubkey)
+             VALUES (?, ?, ?, ?, ?)",
+            params![1, "test", "hash", &user_pubkey, &vec![0u8; 32]]
+        ).unwrap();
+
+        conn.execute(
+            "INSERT INTO nodes (node_id, name, ip_address, port, owner, pubkey)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            params![1, "node1", "127.0.0.1", 8001, 1, &node_pubkey]
+        ).unwrap();
+
+        // Activate, deactivate, reactivate
+        conn.execute(
+            "INSERT INTO validators (effective_height, node_id, is_active) VALUES (10, 1, true)",
+            []
+        ).unwrap();
+
+        conn.execute(
+            "INSERT INTO validators (effective_height, node_id, is_active) VALUES (30, 1, false)",
+            []
+        ).unwrap();
+
+        conn.execute(
+            "INSERT INTO validators (effective_height, node_id, is_active) VALUES (50, 1, true)",
+            []
+        ).unwrap();
+
+        drop(conn);
+
+        // At height 20: active (first activation)
+        let validators = get_validators(pool.get(), 20).unwrap();
+        assert_eq!(validators.len(), 1);
+
+        // At height 40: inactive (deactivated)
+        let validators = get_validators(pool.get(), 40).unwrap();
+        assert_eq!(validators.len(), 0);
+
+        // At height 60: active again (reactivated)
+        let validators = get_validators(pool.get(), 60).unwrap();
+        assert_eq!(validators.len(), 1);
+    }
+
+    #[test]
+    fn test_get_validators_multiple_nodes() {
+        let pool = setup_test_db();
+        let conn = pool.get().unwrap();
+
+        let user_pubkey = generate_test_pubkey();
+
+        // Insert test user
+        conn.execute(
+            "INSERT INTO users (user_id, username, password_hash, pubkey, x25519_pubkey)
+             VALUES (?, ?, ?, ?, ?)",
+            params![1, "test", "hash", &user_pubkey, &vec![0u8; 32]]
+        ).unwrap();
+
+        // Insert 5 test nodes
+        for i in 1..=5 {
+            let node_pubkey = generate_test_pubkey();
+            conn.execute(
+                "INSERT INTO nodes (node_id, name, ip_address, port, owner, pubkey)
+                 VALUES (?, ?, ?, ?, ?, ?)",
+                params![i, format!("node{}", i), format!("127.0.0.{}", i), 8000 + i, 1, &node_pubkey]
+            ).unwrap();
+
+            // All activate at height 10
+            conn.execute(
+                "INSERT INTO validators (effective_height, node_id, is_active) VALUES (10, ?, true)",
+                params![i]
+            ).unwrap();
+        }
+
+        // Deactivate nodes 2 and 4 at height 30
+        conn.execute(
+            "INSERT INTO validators (effective_height, node_id, is_active) VALUES (30, 2, false)",
+            []
+        ).unwrap();
+
+        conn.execute(
+            "INSERT INTO validators (effective_height, node_id, is_active) VALUES (30, 4, false)",
+            []
+        ).unwrap();
+
+        drop(conn);
+
+        // At height 20: all 5 nodes active
+        let validators = get_validators(pool.get(), 20).unwrap();
+        assert_eq!(validators.len(), 5);
+
+        // At height 40: only nodes 1, 3, 5 active (2 and 4 deactivated)
+        let validators = get_validators(pool.get(), 40).unwrap();
+        assert_eq!(validators.len(), 3);
+        assert_eq!(validators[0].node_id, 1);
+        assert_eq!(validators[1].node_id, 3);
+        assert_eq!(validators[2].node_id, 5);
+    }
+
+    #[test]
+    fn test_get_validators_query_past_height() {
+        let pool = setup_test_db();
+        let conn = pool.get().unwrap();
+
+        let user_pubkey = generate_test_pubkey();
+        let node_pubkey = generate_test_pubkey();
+
+        // Insert test user and node
+        conn.execute(
+            "INSERT INTO users (user_id, username, password_hash, pubkey, x25519_pubkey)
+             VALUES (?, ?, ?, ?, ?)",
+            params![1, "test", "hash", &user_pubkey, &vec![0u8; 32]]
+        ).unwrap();
+
+        conn.execute(
+            "INSERT INTO nodes (node_id, name, ip_address, port, owner, pubkey)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            params![1, "node1", "127.0.0.1", 8001, 1, &node_pubkey]
+        ).unwrap();
+
+        // Activate at height 10
+        conn.execute(
+            "INSERT INTO validators (effective_height, node_id, is_active) VALUES (10, 1, true)",
+            []
+        ).unwrap();
+
+        drop(conn);
+
+        // Query at height 100 (far in future): should still return node 1 as active
+        let validators = get_validators(pool.get(), 100).unwrap();
+        assert_eq!(validators.len(), 1);
+        assert_eq!(validators[0].node_id, 1);
+    }
 }

@@ -19,7 +19,10 @@ When making changes to the codebase:
 # Logging
 - Use tracing for all Rust logging
 - Use INFO levels sparingly to avoid slowdown due to excessive logging
+
+# Debugging
 - macOS debugging with the `log` command requires the use of sudo
+- tail the last ~10 lines with cargo check to ensure you can see the final result; only if a build fails do you need to get more output.
 
 # Git Commits
 - Never include your attribution in commits

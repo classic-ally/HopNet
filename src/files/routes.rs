@@ -33,6 +33,115 @@ pub struct CleanupQueryParams {
     retention_days: i64,
 }
 
+/// Process a single logical chunk with Reed-Solomon encoding (10 original + 20 recovery)
+/// This is called for each 40MB chunk (or smaller for the last chunk)
+/// Returns the padding bytes added to this chunk
+fn process_logical_chunk(
+    encoder: &mut ReedSolomonEncoder,
+    chunk_data: &[u8],
+    chunk_number: u32,
+    data_block_id: &CustomUUID,
+    per_file_key: &chacha20poly1305::Key,
+    fragments_dir: &str,
+    output_metadata: &mut Vec<FragmentHash>,
+) -> Result<usize, StatusCode> {
+    use crate::files::functions::{ORIGINAL_FRAGMENTS_PER_CHUNK, RECOVERY_FRAGMENTS_PER_CHUNK, calculate_chunk_padding, calculate_padding_and_chunks};
+
+    let chunk_size = chunk_data.len();
+
+    // Calculate padding needed to evenly divide into 10 fragments
+    let padding = calculate_chunk_padding(chunk_size, ORIGINAL_FRAGMENTS_PER_CHUNK);
+    let padded_size = chunk_size + padding;
+    let fragment_size = padded_size / ORIGINAL_FRAGMENTS_PER_CHUNK;
+
+    tracing::debug!("process_logical_chunk: chunk_number={}, size={}, padding={}, fragment_size={}",
+                   chunk_number, chunk_size, padding, fragment_size);
+
+    // Pad and split into 10 equal fragments
+    let mut padded_chunk = chunk_data.to_vec();
+    if padding > 0 {
+        padded_chunk.resize(padded_size, 0);
+        rand::rng().fill_bytes(&mut padded_chunk[chunk_size..]);
+    }
+
+    let (fragment_chunks, _) = calculate_padding_and_chunks(padded_chunk, ORIGINAL_FRAGMENTS_PER_CHUNK);
+
+    // Encrypt each fragment and calculate encrypted size for RS encoder
+    let mut encrypted_fragments = Vec::new();
+    for (local_index, fragment_data) in fragment_chunks.into_iter().enumerate() {
+        let fragment_id = CustomUUID::new(None);
+        let encrypted_fragment = encrypt_chunk(fragment_data, per_file_key, &fragment_id)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        encrypted_fragments.push((fragment_id, encrypted_fragment));
+    }
+
+    // All encrypted fragments should have the same size (RS requirement)
+    let encrypted_fragment_size = encrypted_fragments[0].1.len();
+
+    // Reset Reed-Solomon encoder for this chunk's shard size (reuses tables + workspace)
+    encoder.reset(
+        ORIGINAL_FRAGMENTS_PER_CHUNK,
+        RECOVERY_FRAGMENTS_PER_CHUNK,
+        encrypted_fragment_size
+    ).map_err(|e| {
+        tracing::error!("Reed-Solomon encoder reset failed for chunk {}: {:?}", chunk_number, e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Add encrypted fragments to encoder and store them
+    for (local_index, (fragment_id, encrypted_fragment)) in encrypted_fragments.into_iter().enumerate() {
+        // Calculate hash and add to encoder first (both only need borrows)
+        let fragment_hash = Blake3Hash::new(blake3::hash(&encrypted_fragment));
+        encoder.add_original_shard(&encrypted_fragment)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        // Now move encrypted_fragment to storage (no clone needed)
+        store_fragment(fragments_dir, &fragment_hash, encrypted_fragment)
+            .map_err(|_| StatusCode::INSUFFICIENT_STORAGE)?;
+
+        output_metadata.push(FragmentHash {
+            data_block_id: data_block_id.clone(),
+            chunk_number,
+            local_index: local_index as u32,
+            fragment_id,
+            fragment_hash,
+            chunk_type: crate::db::ChunkType::Original,
+            stored_locally: false,
+        });
+    }
+
+    // Generate recovery fragments
+    let recovery_generator = encoder.encode().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut recovery_iter = recovery_generator.recovery_iter();
+
+    let mut recovery_index = ORIGINAL_FRAGMENTS_PER_CHUNK;
+    while let Some(recovery_fragment) = recovery_iter.next() {
+        let fragment_id = CustomUUID::new(None);
+        let fragment_hash = Blake3Hash::new(blake3::hash(&recovery_fragment));
+
+        store_fragment(fragments_dir, &fragment_hash, recovery_fragment.to_vec())
+            .map_err(|_| StatusCode::INSUFFICIENT_STORAGE)?;
+
+        output_metadata.push(FragmentHash {
+            data_block_id: data_block_id.clone(),
+            chunk_number,
+            local_index: recovery_index as u32,
+            fragment_id,
+            fragment_hash,
+            chunk_type: crate::db::ChunkType::Recovery,
+            stored_locally: false,
+        });
+
+        recovery_index += 1;
+    }
+
+    tracing::debug!("process_logical_chunk: chunk {} complete, created {} fragments (10 original + 20 recovery), padding={} bytes",
+                   chunk_number, output_metadata.len() - (chunk_number as usize * 30), padding);
+
+    Ok(padding)
+}
+
 /// Shared file processing function for both create and modify operations
 /// Handles Reed-Solomon encoding, fragmentation, encryption, and storage
 /// Returns a DataRecord ready for database insertion
@@ -43,142 +152,91 @@ pub async fn process_uploaded_file(
     per_file_key: &chacha20poly1305::Key,
     fragments_dir: &str,
 ) -> Result<DataRecord, StatusCode> {
-    let mut chunk_buffer: Vec<u8> = Vec::new();
-    let mut output_chunk_metadata = Vec::new();
+    use crate::files::functions::{calculate_chunked_fragments, CHUNK_SIZE, ORIGINAL_FRAGMENTS_PER_CHUNK, RECOVERY_FRAGMENTS_PER_CHUNK};
 
-    let (num_original_chunks, num_recovery_chunks) = calculate_optimal_chunks(file_size);
-    let needed_padding = calculate_chunk_padding(file_size, num_original_chunks);
-    let target_chunk_length = (file_size + needed_padding) / num_original_chunks;
-    let encrypted_chunk_length = calculate_encrypted_chunk_length(target_chunk_length);
-    
-    tracing::debug!("process_uploaded_file: file_size={}, num_original_chunks={}, num_recovery_chunks={}", 
-                   file_size, num_original_chunks, num_recovery_chunks);
-    tracing::debug!("process_uploaded_file: needed_padding={}, target_chunk_length={}, encrypted_chunk_length={}", 
-                   needed_padding, target_chunk_length, encrypted_chunk_length);
-    
+    let mut output_chunk_metadata = Vec::new();
     let mut full_file_hasher = blake3::Hasher::new();
 
+    // Calculate chunked Reed-Solomon parameters
+    let (num_chunks, total_original, total_recovery) = calculate_chunked_fragments(file_size);
+
+    tracing::debug!("process_uploaded_file: file_size={}, num_chunks={}, total_original={}, total_recovery={}",
+                   file_size, num_chunks, total_original, total_recovery);
+
+    // Create Reed-Solomon encoder once with max shard size (for 40MB chunk)
+    // Max encrypted fragment size = (40MB / 10 fragments) + 28 bytes encryption overhead
+    let max_fragment_size = (CHUNK_SIZE / ORIGINAL_FRAGMENTS_PER_CHUNK) + 28;
     let mut encoder = ReedSolomonEncoder::new(
-        num_original_chunks,
-        num_recovery_chunks,
-        encrypted_chunk_length
+        ORIGINAL_FRAGMENTS_PER_CHUNK,
+        RECOVERY_FRAGMENTS_PER_CHUNK,
+        max_fragment_size
     ).map_err(|e| {
-        tracing::error!("process_uploaded_file: Reed-Solomon encoder creation failed: {:?}", e);
-        tracing::error!("process_uploaded_file: Parameters - original: {}, recovery: {}, encrypted_length: {}", 
-                       num_original_chunks, num_recovery_chunks, encrypted_chunk_length);
+        tracing::error!("Reed-Solomon encoder creation failed: {:?}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    // Process original chunks
-    while let Some(chunk) = field.chunk().await.map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)? {
-        tracing::debug!("process_uploaded_file: received HTTP chunk of {} bytes", chunk.len());
-        chunk_buffer.extend_from_slice(&chunk);
+    // Stream file data and process each logical 40MB chunk independently
+    let mut logical_chunk_buffer: Vec<u8> = Vec::new();
+    let mut current_chunk_number = 0u32;
+    let mut last_chunk_padding = 0usize;
 
-        while chunk_buffer.len() >= target_chunk_length {
-            let file_chunk = chunk_buffer.drain(..target_chunk_length).collect::<Vec<u8>>();
-            tracing::debug!("process_uploaded_file: processing chunk {} of {} bytes", 
-                   output_chunk_metadata.len(), file_chunk.len());
-            full_file_hasher.update(&file_chunk);
-            
-            let fragment_id = CustomUUID::new(None);
-            let encrypted_chunk = encrypt_chunk(file_chunk, per_file_key, &fragment_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            encoder.add_original_shard(&encrypted_chunk).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            let chunk_hash = Blake3Hash::new(blake3::hash(&encrypted_chunk));
-            store_fragment(fragments_dir, &chunk_hash, encrypted_chunk).map_err(|_| StatusCode::INSUFFICIENT_STORAGE)?;
-            
-            let my_chunk = FragmentHash {
-                data_block_id: dataid.clone(),
-                fragment_index: output_chunk_metadata.len() as i32,
-                fragment_id: fragment_id,
-                fragment_hash: chunk_hash,
-                chunk_type: crate::db::ChunkType::Original,
-                stored_locally: false
-            };
-            output_chunk_metadata.push(my_chunk);
+    // Read HTTP chunks and buffer them into logical chunks
+    while let Some(http_chunk) = field.chunk().await.map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)? {
+        tracing::debug!("process_uploaded_file: received HTTP chunk of {} bytes", http_chunk.len());
+        logical_chunk_buffer.extend_from_slice(&http_chunk);
+        full_file_hasher.update(&http_chunk);
+
+        // Process complete 40MB logical chunks
+        while logical_chunk_buffer.len() >= CHUNK_SIZE {
+            let chunk_data: Vec<u8> = logical_chunk_buffer.drain(..CHUNK_SIZE).collect();
+
+            tracing::debug!("process_uploaded_file: encoding logical chunk {} ({} bytes)",
+                           current_chunk_number, chunk_data.len());
+
+            // Process this chunk with Reed-Solomon encoding (10 original + 20 recovery)
+            last_chunk_padding = process_logical_chunk(
+                &mut encoder,
+                &chunk_data,
+                current_chunk_number,
+                &dataid,
+                per_file_key,
+                fragments_dir,
+                &mut output_chunk_metadata,
+            )?;
+
+            current_chunk_number += 1;
         }
     }
 
-    // Process final chunk with padding
-    if !chunk_buffer.is_empty() {
-        tracing::debug!("process_uploaded_file: processing final chunk of {} bytes", chunk_buffer.len());
-        full_file_hasher.update(&chunk_buffer);
-        let current_len = chunk_buffer.len();
-        chunk_buffer.resize(target_chunk_length, 0);
-        if current_len < target_chunk_length {
-            rand::rng().fill_bytes(&mut chunk_buffer[current_len..]);
-        }
+    // Process final partial chunk (if any remaining data < 40MB)
+    if !logical_chunk_buffer.is_empty() {
+        tracing::debug!("process_uploaded_file: processing final partial chunk {} ({} bytes)",
+                       current_chunk_number, logical_chunk_buffer.len());
 
-        let final_chunk = chunk_buffer;
-        let fragment_id = CustomUUID::new(None);
-        let encrypted_chunk = encrypt_chunk(final_chunk, per_file_key, &fragment_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        encoder.add_original_shard(&encrypted_chunk).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let chunk_hash = Blake3Hash::new(blake3::hash(&encrypted_chunk));
-        store_fragment(fragments_dir, &chunk_hash, encrypted_chunk).map_err(|_| StatusCode::INSUFFICIENT_STORAGE)?;
-        
-        let my_chunk = FragmentHash {
-            data_block_id: dataid.clone(),
-            fragment_index: output_chunk_metadata.len() as i32,
-            fragment_id: fragment_id,
-            fragment_hash: chunk_hash,
-            chunk_type: crate::db::ChunkType::Original,
-            stored_locally: false
-        };
-        output_chunk_metadata.push(my_chunk);
-    }
-    
-    tracing::debug!("process_uploaded_file: processed {} original chunks, need {} total", 
-                   output_chunk_metadata.len(), num_original_chunks);
-
-    // For small files, ensure we have exactly the required number of original chunks
-    while output_chunk_metadata.len() < num_original_chunks {
-        tracing::debug!("process_uploaded_file: adding empty chunk {} for Reed-Solomon", output_chunk_metadata.len());
-        let mut empty_chunk = vec![0u8; target_chunk_length];
-        rand::rng().fill_bytes(&mut empty_chunk);
-        let fragment_id = CustomUUID::new(None);
-        let encrypted_chunk = encrypt_chunk(empty_chunk, per_file_key, &fragment_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        encoder.add_original_shard(&encrypted_chunk).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let chunk_hash = Blake3Hash::new(blake3::hash(&encrypted_chunk));
-        store_fragment(fragments_dir, &chunk_hash, encrypted_chunk).map_err(|_| StatusCode::INSUFFICIENT_STORAGE)?;
-        
-        let my_chunk = FragmentHash {
-            data_block_id: dataid.clone(),
-            fragment_index: output_chunk_metadata.len() as i32,
-            fragment_id: fragment_id,
-            fragment_hash: chunk_hash,
-            chunk_type: crate::db::ChunkType::Original,
-            stored_locally: false
-        };
-        output_chunk_metadata.push(my_chunk);
+        // Process the final chunk (will be < 40MB, gets padded internally)
+        last_chunk_padding = process_logical_chunk(
+            &mut encoder,
+            &logical_chunk_buffer,
+            current_chunk_number,
+            &dataid,
+            per_file_key,
+            fragments_dir,
+            &mut output_chunk_metadata,
+        )?;
     }
 
     // Generate file hash including data_block_id
     full_file_hasher.update(dataid.as_bytes());
     let full_file_hash = Blake3Hash::new(full_file_hasher.finalize());
 
-    // Generate recovery chunks
-    let recovery_generator = encoder.encode().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let mut recovery_iter = recovery_generator.recovery_iter();
-    while let Some(recovery_chunk) = recovery_iter.next() {
-        let fragment_id = CustomUUID::new(None);
-        let chunk_hash = Blake3Hash::new(blake3::hash(&recovery_chunk));
-        store_fragment(fragments_dir, &chunk_hash, recovery_chunk.to_vec()).map_err(|_| StatusCode::INSUFFICIENT_STORAGE)?;
-        
-        let my_chunk = FragmentHash {
-            data_block_id: dataid.clone(),
-            fragment_index: output_chunk_metadata.len() as i32,
-            fragment_id: fragment_id,
-            fragment_hash: chunk_hash,
-            chunk_type: crate::db::ChunkType::Recovery,
-            stored_locally: false
-        };
-        output_chunk_metadata.push(my_chunk);
-    }
+    tracing::debug!("process_uploaded_file: complete - {} chunks, {} fragments, {} bytes padding in last chunk",
+                   num_chunks, output_chunk_metadata.len(), last_chunk_padding);
 
     // Create DataRecord
     let data = Data {
         hash: full_file_hash,
         fragments: output_chunk_metadata,
-        added_bytes: needed_padding as u8
+        added_bytes: last_chunk_padding as u8  // Only padding from last chunk matters
     };
 
     Ok(DataRecord {
@@ -239,25 +297,25 @@ pub async fn get_file_fragments(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     
-    // Use shared file reconstruction logic
-    let file_contents = match crate::files::download::reconstruct_file_for_user(
+    // Use shared file reconstruction logic (returns stream for memory efficiency)
+    let stream = match crate::files::download::reconstruct_file_for_user(
         &app_state,
         enc_path,
         user_id,
         &app_state.fragments_dir,
     ).await {
-        Ok(contents) => contents,
+        Ok(stream) => stream,
         Err(e) => {
             tracing::error!("Error reconstructing file: {:?}", e);
             return Err(StatusCode::from(e));
         }
     };
-    
-    // Build response with proper headers
+
+    // Build streaming response with proper headers
     let response = Response::builder()
         .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{}\"", filename))
         .header(header::CONTENT_TYPE, "application/octet-stream")
-        .body(Body::from(file_contents))
+        .body(Body::from_stream(stream))
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     
     Ok(response)
@@ -780,17 +838,19 @@ pub async fn post_fragment(
     body: Body
 ) -> impl IntoResponse {
     // Read the request body (fragment data) with size limit matching our fragment chunking
-    let fragment_data = match axum::body::to_bytes(body, MAX_FRAGMENT_SIZE + 1024).await { // Add small buffer for headers
+    // Fragments are encrypted, so use encrypted size (4MB + ~16KB encryption overhead)
+    let max_encrypted_size = calculate_encrypted_chunk_length(MAX_FRAGMENT_SIZE);
+    let fragment_data = match axum::body::to_bytes(body, max_encrypted_size + 1024).await { // Add small buffer for headers
         Ok(data) => data.to_vec(),
         Err(e) => {
             tracing::error!("Failed to read fragment data: {:?}", e);
             return StatusCode::BAD_REQUEST.into_response();
         }
     };
-    
-    // Verify fragment size doesn't exceed maximum
-    if fragment_data.len() > MAX_FRAGMENT_SIZE {
-        tracing::warn!("Fragment too large: {} bytes (max: {})", fragment_data.len(), MAX_FRAGMENT_SIZE);
+
+    // Verify fragment size doesn't exceed maximum encrypted size
+    if fragment_data.len() > max_encrypted_size {
+        tracing::warn!("Fragment too large: {} bytes (max encrypted: {})", fragment_data.len(), max_encrypted_size);
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     }
     
@@ -812,17 +872,45 @@ pub async fn post_fragment(
     match store_fragment(&app_state.fragments_dir, &expected_hash, fragment_data) {
         Ok(_) => {
             // Mark the fragment as stored locally in the database
-            match crate::db::files::mark_fragment_local_state(app_state.db_pool.get(), &expected_hash, true) {
-                Ok(rows_affected) => {
-                    tracing::debug!("Successfully stored fragment: {} ({} bytes), updated {} database records", 
-                           expected_hash.to_hex(), fragment_len, rows_affected);
-                }
-                Err(e) => {
-                    tracing::warn!("Fragment stored to disk but failed to update database for {}: {:?}", 
-                          expected_hash.to_hex(), e);
-                    // Continue since fragment is physically stored - database can be updated later
+            // Retry logic: Wait for consensus to propagate fragment_hashes record if needed
+            const MAX_RETRIES: u32 = 10;  // 5 seconds total (10 * 500ms)
+            const RETRY_DELAY_MS: u64 = 500;
+
+            let mut rows_affected = 0;
+            for attempt in 0..MAX_RETRIES {
+                match crate::db::files::mark_fragment_local_state(app_state.db_pool.get(), &expected_hash, true) {
+                    Ok(affected) => {
+                        if affected > 0 {
+                            // Success - database record was updated
+                            rows_affected = affected;
+                            if attempt > 0 {
+                                tracing::debug!("Successfully updated fragment {} after {} retries",
+                                              expected_hash.to_hex(), attempt);
+                            }
+                            break;
+                        } else if attempt < MAX_RETRIES - 1 {
+                            // Record doesn't exist yet - consensus transaction hasn't propagated
+                            // Wait and retry (this is expected during distributed file uploads)
+                            tokio::time::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+                            continue;
+                        } else {
+                            // Last attempt and still 0 rows
+                            tracing::warn!("Fragment {} stored to disk but database record not found after {} retries",
+                                          expected_hash.to_hex(), MAX_RETRIES);
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Fragment stored to disk but failed to update database for {}: {:?}",
+                              expected_hash.to_hex(), e);
+                        break;
+                    }
                 }
             }
+
+            tracing::debug!("Successfully stored fragment: {} ({} bytes), updated {} database records",
+                   expected_hash.to_hex(), fragment_len, rows_affected);
+
             StatusCode::CREATED.into_response()
         }
         Err(e) => {

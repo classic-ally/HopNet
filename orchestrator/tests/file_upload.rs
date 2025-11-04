@@ -1,24 +1,13 @@
 use anyhow::Result;
 use std::time::{Duration, Instant};
 
-use crate::tests::{Check, TestResult, TestScenario};
+use crate::tests::{Check, TestResult, TestScenario, print_and_add_check};
 use crate::tests::files::{
     upload_file, download_file_from_all_nodes, verify_all_identical,
     list_files_from_all_nodes, verify_listings_identical,
 };
 use crate::tests::{get_max_view, wait_for_minimum_view};
 use crate::NodeInfo;
-
-/// Helper to print and add a check in real-time
-fn print_and_add_check(result: &mut TestResult, check: Check) {
-    let status = if check.passed { "✅" } else { "❌" };
-    print!("  {} {}", status, check.name);
-    if let Some(detail) = &check.detail {
-        print!(" - {}", detail);
-    }
-    println!();
-    result.add_check(check);
-}
 
 /// Test that a file uploaded to one node is consistently replicated across all nodes
 pub struct FileUploadConsistency;
@@ -32,7 +21,7 @@ impl TestScenario for FileUploadConsistency {
         "Upload a file to one node and verify it's consistently available across all nodes with identical content, metadata, and on-demand fragment retrieval"
     }
 
-    async fn run(&self, _mesh_id: u32, nodes: &[NodeInfo]) -> Result<TestResult> {
+    async fn run(&self, _mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
         let start = Instant::now();
         let mut result = TestResult::new();
 
@@ -78,7 +67,7 @@ impl TestScenario for FileUploadConsistency {
         };
 
         // Step 2: Upload file to node 0
-        match upload_file(&nodes[0], test_path, &test_filename, &test_contents).await {
+        match upload_file(&nodes[0], test_path, &test_filename, test_contents.clone()).await {
             Ok(_) => {
                 print_and_add_check(&mut result, Check {
                     name: format!("Upload {} to node 0", test_filename),

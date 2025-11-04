@@ -26,6 +26,7 @@ chrono = { version = "0.4.41", features = ["serde"] }
 rand = "0.9.1"
 tokio = { version = "1.45.1", features = ["full"] }
 tokio-util = { version = "0.7.16", features = ["io"] }
+tokio-stream = "0.1.17"
 tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
 reqwest = { version = "0.12.19", features = ["json", "multipart"] }
@@ -53,6 +54,8 @@ reed-solomon-simd = "3.0.1"
 rayon = "1.10.0"
 aes-siv = "0.7.0"
 chacha20poly1305 = { version = "0.10.1", features = ["stream"] }
+async-stream = "0.3.6"
+bytes = "1.10.1"
 apalis = "0.7.2"
 apalis-cron = "0.7.2"
 bollard = "0.19.1"

@@ -386,6 +386,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/rpc/fetch-fragments", post(files::routes::post_fetch_fragments))
                 .route("/rpc/throughput-server", get(metrics::routes::get_throughput_server))
                 .route("/rpc/throughput-result/{session_id}", get(metrics::routes::get_throughput_result))
+                .layer(DefaultBodyLimit::max(files::functions::calculate_encrypted_chunk_length(files::functions::MAX_FRAGMENT_SIZE) + 1024)) // Allow encrypted 4MB fragments (~4.21MB) + headers
                 .layer(middleware::from_fn_with_state(app_state.clone(), consensus::routes::rpc_auth_middleware));
 
             // Propose route - requires RPC auth + Validator-level validation (caught up + active)

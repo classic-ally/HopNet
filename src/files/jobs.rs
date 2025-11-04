@@ -414,38 +414,17 @@ pub async fn run_network_rebalancing(
                       data_block_info.fragments.len(),
                       data_block_info.placement_height);
         
-        // Determine optimal placement for each fragment
-        let mut node_fragments: std::collections::HashMap<i32, Vec<FragmentFetchInstruction>> = 
+        // Phase 3 TODO: Rebalancing disabled temporarily
+        // The new modulo placement requires file_hash + local_index, but rebalancing
+        // only has fragment_hash. Fragment inventory handles discovery, so rebalancing
+        // is not critical. Will be re-implemented in Phase 4 with proper chunk metadata.
+
+        // For now, skip rebalancing for this data block
+        tracing::debug!("Skipping rebalancing for data block {} (Phase 3: requires file_hash + local_index)",
+                       data_block_info.data_block_id);
+
+        let node_fragments: std::collections::HashMap<i32, Vec<FragmentFetchInstruction>> =
             std::collections::HashMap::new();
-        
-        for fragment_info in &data_block_info.fragments {
-            let fragment_type = match fragment_info.chunk_type.as_str() {
-                "original" => crate::files::placement::FragmentType::Original,
-                "recovery" => crate::files::placement::FragmentType::Recovery,
-                _ => {
-                    tracing::error!("Unknown chunk type: {}", fragment_info.chunk_type);
-                    continue;
-                }
-            };
-            
-            let candidates = crate::files::discovery::get_fragment_placement_candidates(
-                &fragment_info.fragment_hash,
-                fragment_type,
-                &node_metrics,
-            );
-            
-            // For now, just use the best candidate
-            // TODO: In future, spread across multiple candidates based on replication factor
-            if let Some(best) = candidates.first() {
-                node_fragments
-                    .entry(best.node_id)
-                    .or_insert_with(Vec::new)
-                    .push(FragmentFetchInstruction {
-                        fragment_hash: fragment_info.fragment_hash.clone(),
-                        placement_height: consensus_height,
-                    });
-            }
-        }
         
         // Send fetch instructions to all nodes in parallel
         let mut fetch_tasks = Vec::new();

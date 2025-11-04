@@ -184,13 +184,14 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
 
             CREATE TABLE fragment_hashes (
                 data_block_id    UUID NOT NULL,
-                fragment_index   INTEGER NOT NULL,
+                chunk_number     UINTEGER NOT NULL,
+                local_index      UINTEGER NOT NULL,
                 fragment_id      UUID NOT NULL,
                 fragment_hash    BLOB NOT NULL,
                 chunk_type       ENUM('original', 'recovery') NOT NULL,
                 stored_locally   BOOLEAN DEFAULT FALSE,
-                
-                PRIMARY KEY (data_block_id, fragment_index),
+
+                PRIMARY KEY (data_block_id, chunk_number, local_index),
                 FOREIGN KEY (data_block_id) REFERENCES data_blocks(id)
             );
 

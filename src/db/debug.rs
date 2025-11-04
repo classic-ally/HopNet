@@ -216,7 +216,8 @@ pub fn compute_state_snapshot(
 /// Fragment information for distribution diagnostic
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FragmentInfo {
-    pub fragment_index: u32,
+    pub chunk_number: u32,
+    pub local_index: u32,
     pub fragment_id: CustomUUID,
     pub fragment_hash: Blake3Hash,
     pub chunk_type: ChunkType,
@@ -269,18 +270,19 @@ pub fn get_file_fragment_distribution(
 
             // Get all fragments for this file with their metadata
             let mut stmt = db_lock.prepare(
-                "SELECT fh.fragment_index, fh.fragment_id, fh.fragment_hash, fh.chunk_type
+                "SELECT fh.chunk_number, fh.local_index, fh.fragment_id, fh.fragment_hash, fh.chunk_type
                  FROM fragment_hashes fh
                  WHERE fh.data_block_id = ?
-                 ORDER BY fh.fragment_index"
+                 ORDER BY fh.chunk_number, fh.local_index"
             ).map_err(|_| DatabaseError::RecallError)?;
 
             let fragment_rows = stmt.query_map(params![data_block_id], |row| {
                 Ok((
-                    row.get::<_, i32>(0)? as u32,  // fragment_index
-                    row.get::<_, CustomUUID>(1)?,  // fragment_id
-                    row.get::<_, Blake3Hash>(2)?,  // fragment_hash
-                    row.get::<_, ChunkType>(3)?,   // chunk_type
+                    row.get::<_, u32>(0)?,         // chunk_number
+                    row.get::<_, u32>(1)?,         // local_index
+                    row.get::<_, CustomUUID>(2)?,  // fragment_id
+                    row.get::<_, Blake3Hash>(3)?,  // fragment_hash
+                    row.get::<_, ChunkType>(4)?,   // chunk_type
                 ))
             }).map_err(|_| DatabaseError::ProcessingError)?;
 
@@ -290,7 +292,7 @@ pub fn get_file_fragment_distribution(
             let mut recovery_count = 0u32;
 
             for row in fragment_rows {
-                let (fragment_index, fragment_id, fragment_hash, chunk_type) =
+                let (chunk_number, local_index, fragment_id, fragment_hash, chunk_type) =
                     row.map_err(|_| DatabaseError::ProcessingError)?;
 
                 // Count original vs recovery fragments
@@ -314,7 +316,8 @@ pub fn get_file_fragment_distribution(
                 .collect();
 
                 fragments.push(FragmentInfo {
-                    fragment_index,
+                    chunk_number,
+                    local_index,
                     fragment_id,
                     fragment_hash,
                     chunk_type,

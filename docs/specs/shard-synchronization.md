@@ -29,58 +29,44 @@ This document outlines the requirements for implementing distributed shard synch
 
 ## Fragment Placement Requirements
 
-### 3. Deterministic Node Selection Strategy
-- **Algorithm Output**: Returns preference-ordered list of 1/3 of total storage nodes for each fragment
-- **Cascading Failure Protection**: 1/3 limit prevents same nodes handling original + recovery fragments during failures
-- **Sequential Retry Logic**: Try first node → second node → third node, etc. until successful or exhausted
-- **Minimum Network Size**: Below 3 nodes, cascading protection unavoidable but system still functional
-- **Preference Ordering**: Based on node reliability metrics, geographic distribution, and user proximity
+### 3. Deterministic Node Selection Strategy [UPDATED: Modulo Placement]
+- **File-Level Selection**: Select 30 nodes per file using metrics-based deterministic shuffle
+- **Fragment-Level Placement**: Use `local_index % num_selected_nodes` for primary placement
+- **Backup Nodes**: Add 2 backup nodes at `(local_index + 1) % N` and `(local_index + 2) % N`
+- **Key Insight**: Use `local_index` (0-29 position within chunk) instead of global fragment index
+  - Ensures fragment[0] from chunk 1 goes to same node as fragment[0] from chunk 0
+  - Creates predictable, evenly-distributed placement patterns across chunks
+  - Crucial for maintaining Reed-Solomon redundancy characteristics
+- **Even Distribution**: Modulo placement guarantees ±1 max imbalance across nodes
+- **Determinism**: Same file_hash always selects same 30 nodes; same local_index always maps to same node
 - **Implementation Details**:
-  - **Phase 1 - Candidate Selection**: Use rendezvous hashing with XOR distance metric
-    - `fragment_key = hash(fragment_hash)`
-    - `distance = fragment_key XOR hash(node_id)` using on-demand Blake3 hashing
-    - Sort nodes by distance, take top 1/3 as candidates
-    - **Hash Calculation Strategy**: On-demand sequential Blake3 hashing implemented for simplicity
-      - Performance: ~3-5ns per node, 100 nodes = ~300-500ns total (well under 100ms target)
-      - Sequential access is cache-friendly and avoids parallelization overhead for small networks
-      - Implementation: `src/files/placement.rs::calculate_rendezvous_distances()` returns Phase1Candidate
-      - Alternative approaches available for future optimization:
-        - Rayon parallel hashing for networks >1000 nodes  
-        - Pre-computed node hash storage in database (BLOB column)
-        - SIMD-optimized bulk XOR distance calculations
-  - **Phase 2 - Metrics-Based Placement**: Apply performance weighting within candidates
-    - **Implementation**: DuckDB analytics + Rust scoring (`src/db/metrics.rs` + `src/files/placement.rs`)
-    - Query metrics at specific consensus height for consistency
-    - Calculate base score from weighted metrics: availability, throughput, latency, geographic diversity
-    - Original fragments: availability (0.4) > throughput (0.3) > latency (0.2) > stability (0.1)
-    - Recovery fragments: availability (0.4) + inverse throughput (0.3) + inverse latency (0.2) + inverse stability (0.1)
-      - Keeps availability positive (need reliable nodes for disaster recovery)
-      - Inverts performance metrics: `(1.0 - metric_score)` for throughput/latency/stability
-      - Achieves load distribution by preferring lower-performance nodes
-      - Storage multiplier prevents placement on nearly-full nodes regardless of score
-    - Apply storage capacity multiplier: `e^(-k * utilization)` where k=5
-      - 50% full: 0.082x multiplier, 70% full: 0.030x, 90% full: 0.011x
-      - Incentivizes balanced storage contribution across all nodes
-    - Final score: `base_score * storage_multiplier`
-    - Try nodes in weighted order until successful placement
-  - **Performance Optimizations**:
-    - Single DuckDB analytical query computes all node scores with time-weighted aggregates
-    - Leverages columnar storage for fast aggregations (~10-50ms for 100 nodes)
-    - Query results cached per consensus height to avoid repeated calculations
-    - All placement logic after initial query runs in-memory on cached data
-  - **New Node Handling**:
-    - Probationary period using trust factor: `(sample_count / 100).min(1.0)`
-    - Blend measured metrics with network statistics (p75 latency, median availability)
-    - Natural progression from conservative to trusted over ~16 hours (100 samples)
-  - **Metric Calculation Details**:
-    - **Availability**: `availability_24h * 0.7 + availability_7d * 0.3` where availability = successful/total pings
-    - **Throughput**: `log(1 + percentile_rank * 9) / log(10) * consistency_factor`
-      - Percentile-based to adapt to network capabilities (no hard thresholds)
-      - Logarithmic scaling for diminishing returns at high throughput
-      - Consistency factor: `1 / (1 + coefficient_of_variation)`
+  - **Phase 1 - File-Level Node Selection**: `select_nodes_for_file(validators, metrics, file_hash) -> Vec<Node>`
+    - Early-exit: If ≤30 validators, return all (no filtering needed)
+    - Filter validators by active status at consensus height
+    - Score using weighted metrics: 40% availability, 30% throughput, 20% latency, 10% stability
+    - Take top 60 candidates (2× for diversity)
+    - Deterministic shuffle using Blake3-based Fisher-Yates with file_hash as seed
+    - Return top 30 nodes after shuffle
+    - **Performance**: ~10-50ms for 100 nodes using DuckDB analytics
+  - **Phase 2 - Fragment Placement**: `get_fragment_placement(local_index, selected_nodes) -> Vec<&Node>`
+    - Primary: `local_index % selected_nodes.len()`
+    - Backup 1: `(local_index + 1) % selected_nodes.len()`
+    - Backup 2: `(local_index + 2) % selected_nodes.len()`
+    - **Performance**: O(1) calculation, deterministic wraparound
+  - **Distribution Properties**:
+    - With 30 nodes: each node gets exactly 1 fragment (perfect balance)
+    - With 10 nodes: each node gets 3 fragments (±0 imbalance)
+    - With 9 nodes: max 4 fragments per node, min 3 (±1 imbalance)
+    - Failure tolerance: `floor(20 / max_fragments_per_node)` node failures tolerated
+  - **Metric Calculation**:
+    - **Availability**: `availability_24h * 0.7 + availability_7d * 0.3`
+    - **Throughput**: Percentile-based ranking with logarithmic scaling
     - **Latency**: `1 / (1 + normalized_latency)` with exponential time decay
     - **Stability**: `1 / (1 + latency_variance_7d)` to prefer predictable nodes
-    - **Geographic diversity**: Achieved implicitly through inverse performance scoring for recovery fragments
+  - **New Node Handling**:
+    - Probationary period using trust factor: `(sample_count / 100).min(1.0)`
+    - Blend measured metrics with network statistics
+    - Natural progression from conservative to trusted over ~16 hours
 
 ### 4. Erasure-Code Aware Placement
 - **Requirement**: Different erasure code sets (original vs recovery fragments) must prefer different node sets
@@ -275,9 +261,9 @@ This document outlines the requirements for implementing distributed shard synch
 - [x] **COMPLETED**: Integrate throughput measurement using existing infrastructure
 - [x] **COMPLETED**: Storage capacity metrics collection (storage_total_gb, storage_used_gb columns)
 - [x] **COMPLETED**: Cross-platform storage metrics endpoint (/rpc/storage-server) with dual authentication
-- [x] **COMPLETED**: Rendezvous hashing placement algorithm with on-demand Blake3 hashing
-- [x] **COMPLETED**: Two-phase placement: Phase1Candidate (XOR distance) → Phase2Candidate (final scoring)
-- [x] **COMPLETED**: Erasure-code aware placement logic with fragment-type-specific scoring
+- [x] **COMPLETED**: Modulo placement algorithm with file-level node selection
+- [x] **COMPLETED**: Two-phase placement: File-level metrics-based selection → Fragment-level modulo mapping
+- [x] **COMPLETED**: Local-index-aware placement ensuring consistent chunk distribution across files
 - [x] **COMPLETED**: Placement scores debugging API (/metrics/scores) with raw metrics and weighted scoring
 - [x] Database schema extensions for height tracking (placement_height column added)
 - [x] Integration with fragment transfer protocols (RFC-003 complete)

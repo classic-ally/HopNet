@@ -13,6 +13,8 @@ pub mod files;
 // Test implementations
 mod file_upload;
 mod fragment_distribution;
+mod multi_size_files;
+mod performance;
 
 /// Represents the result of a test scenario execution
 #[derive(Debug)]
@@ -49,21 +51,38 @@ pub struct Check {
     pub detail: Option<String>,
 }
 
+/// Helper to print and add a check in real-time (shared across all tests)
+pub fn print_and_add_check(result: &mut TestResult, check: Check) {
+    let status = if check.passed { "✅" } else { "❌" };
+    print!("  {} {}", status, check.name);
+    if let Some(detail) = &check.detail {
+        print!(" - {}", detail);
+    }
+    println!();
+    result.add_check(check);
+}
+
 /// Test scenario trait - all tests must implement this
 pub trait TestScenario: Send + Sync {
     fn name(&self) -> &'static str;
     fn description(&self) -> &'static str;
-    async fn run(&self, mesh_id: u32, nodes: &[NodeInfo]) -> Result<TestResult>;
+    async fn run(&self, mesh_id: u32, nodes: &[NodeInfo], flags: &[String]) -> Result<TestResult>;
 }
 
 /// Run a test by name
-pub async fn run_test_by_name(mesh_id: u32, name: &str, nodes: &[NodeInfo]) -> Result<TestResult> {
+pub async fn run_test_by_name(mesh_id: u32, name: &str, nodes: &[NodeInfo], flags: &[String]) -> Result<TestResult> {
     match name {
         "file-upload-consistency" => {
-            file_upload::FileUploadConsistency.run(mesh_id, nodes).await
+            file_upload::FileUploadConsistency.run(mesh_id, nodes, flags).await
         }
         "fragment-distribution" => {
-            fragment_distribution::FragmentDistribution.run(mesh_id, nodes).await
+            fragment_distribution::FragmentDistribution.run(mesh_id, nodes, flags).await
+        }
+        "chunked-streaming-performance" => {
+            performance::ChunkedStreamingPerformance.run(mesh_id, nodes, flags).await
+        }
+        "multi-size-file-consistency" => {
+            multi_size_files::MultiSizeFileConsistency.run(mesh_id, nodes, flags).await
         }
         _ => Err(anyhow::anyhow!("Unknown test: {}", name)),
     }
@@ -74,6 +93,8 @@ pub fn list_test_names() -> Vec<&'static str> {
     vec![
         "file-upload-consistency",
         "fragment-distribution",
+        "multi-size-file-consistency",
+        "chunked-streaming-performance",
     ]
 }
 
@@ -203,6 +224,7 @@ pub async fn handle_test_command(
     mesh_id: u32,
     test: Option<&str>,
     list: bool,
+    flags: &[String],
     runtime: crate::sys::ContainerRuntime,
 ) -> Result<()> {
     // Handle --list flag
@@ -223,6 +245,9 @@ pub async fn handle_test_command(
     let test_name = test.ok_or_else(|| anyhow::anyhow!("No test specified. Use --test <name> or --list"))?;
 
     println!("Running test '{}' on mesh {}", test_name, mesh_id);
+    if !flags.is_empty() {
+        println!("Flags: {}", flags.join(", "));
+    }
 
     // Get node metadata for all nodes in the mesh
     let addresses = crate::get_external_addresses(docker, mesh_id, runtime).await?;
@@ -262,7 +287,7 @@ pub async fn handle_test_command(
     println!("Successfully authenticated with all {} nodes", nodes.len());
 
     // Run the test
-    let result = run_test_by_name(mesh_id, test_name, &nodes).await?;
+    let result = run_test_by_name(mesh_id, test_name, &nodes, flags).await?;
 
     // Display test result summary
     println!("\n{}", "=".repeat(60));

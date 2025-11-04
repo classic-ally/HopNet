@@ -41,21 +41,37 @@ impl From<FileReconstructionError> for StatusCode {
 }
 
 /// Reconstruct a file with proper key decryption and access control
+/// Returns a stream of file chunks for memory-efficient downloads
 /// This is the shared logic used by both download routes and takeout materialization
 pub async fn reconstruct_file_for_user(
     app_state: &crate::AppState,
     encrypted_path: String,
     user_id: i32,
     fragments_dir: &str,
-) -> Result<Vec<u8>, FileReconstructionError> {
+) -> Result<std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<bytes::Bytes, functions::FileError>> + Send>>, FileReconstructionError> {
     // Get file access data from database
     let file_access_data = files::get_file_fragments(app_state.db_pool.get(), encrypted_path.clone(), user_id)?;
 
+    // Handle empty files (no fragments, no encryption)
+    let file_data = match file_access_data.file_reassembly_data {
+        None => {
+            // Empty file case - return empty stream
+            tracing::debug!("Downloading empty file: {}", encrypted_path);
+            return Ok(Box::pin(async_stream::try_stream! {
+                // Type hint for empty stream (never executed)
+                if false {
+                    yield bytes::Bytes::new();
+                }
+            }));
+        }
+        Some(data) => data,
+    };
+
     // Extract placement_height before moving file_data
-    let placement_height = file_access_data.file_reassembly_data.placement_height;
-    
+    let placement_height = file_data.placement_height;
+
     // Decrypt the per-file key if user has access
-    let mut file_data = file_access_data.file_reassembly_data;
+    let mut file_data = file_data;
     if let Some(file_access_entry) = file_access_data.file_access_entry {
         // Get user's private key from app_state
         let user_private_key = match app_state.user_keys.get() {
@@ -85,14 +101,14 @@ pub async fn reconstruct_file_for_user(
         return Err(FileReconstructionError::Forbidden);
     }
     
-    // Reassemble the file from fragments with distributed discovery support
-    let file_contents = functions::reassemble_file(
-        fragments_dir,
+    // Return streaming reconstruction (yields 40MB chunks as they're reconstructed)
+    let stream = functions::reconstruct_file_chunked(
+        fragments_dir.to_string(),
         file_data,
-        Some(app_state),
+        Some(app_state.clone()),
         placement_height
-    ).await?;
-    
-    tracing::debug!("Successfully reconstructed file {} ({} bytes)", encrypted_path, file_contents.len());
-    Ok(file_contents)
+    );
+
+    tracing::debug!("Starting streaming reconstruction for file {}", encrypted_path);
+    Ok(Box::pin(stream))
 }

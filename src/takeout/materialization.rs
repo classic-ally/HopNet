@@ -37,13 +37,14 @@ pub async fn materialize_single_file(
     };
 
     // Use shared file reconstruction logic
-    let file_content = match reconstruct_file_for_user(
+    // Get streaming reconstruction (memory-efficient for large files)
+    let mut stream = match reconstruct_file_for_user(
         app_state,
         encrypted_path.clone(),
         user_id,
         fragments_dir,
     ).await {
-        Ok(content) => content,
+        Ok(stream) => stream,
         Err(e) => {
             tracing::error!("Failed to reconstruct file {} (data_id: {}): {:?}", encrypted_path, data_id, e);
             let error_msg = match e {
@@ -56,26 +57,54 @@ pub async fn materialize_single_file(
         }
     };
 
-    // Write file to staging directory
+    // Write file to staging directory (chunk-by-chunk streaming)
     let full_staging_path = format!("{}/{}", staging_dir, decrypted_path.trim_start_matches('/'));
 
     // Ensure parent directory exists
     if let Some(parent) = std::path::Path::new(&full_staging_path).parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
             tracing::error!("Failed to create parent directory for {}: {:?}", full_staging_path, e);
             return (file_id, MaterializationStatus::Failed, Some(format!("Parent directory creation failed: {}", e)));
         }
     }
 
-    // Write the file content
-    match std::fs::write(&full_staging_path, &file_content) {
-        Ok(_) => {
-            tracing::debug!("Materialized file: {} ({} bytes)", full_staging_path, file_content.len());
-            (file_id, MaterializationStatus::Success, None)
-        }
+    // Open file for writing
+    let mut file = match tokio::fs::File::create(&full_staging_path).await {
+        Ok(f) => f,
         Err(e) => {
-            tracing::error!("Failed to write file {}: {:?}", full_staging_path, e);
-            (file_id, MaterializationStatus::Failed, Some(format!("File write failed: {}", e)))
+            tracing::error!("Failed to create file {}: {:?}", full_staging_path, e);
+            return (file_id, MaterializationStatus::Failed, Some(format!("File creation failed: {}", e)));
         }
+    };
+
+    // Write chunks as they arrive from the stream
+    use tokio::io::AsyncWriteExt;
+    use tokio_stream::StreamExt;
+
+    let mut total_bytes = 0;
+    while let Some(chunk_result) = stream.next().await {
+        let chunk = match chunk_result {
+            Ok(chunk) => chunk,
+            Err(e) => {
+                tracing::error!("Stream error while reconstructing {}: {:?}", full_staging_path, e);
+                return (file_id, MaterializationStatus::Failed, Some("Stream reconstruction error".to_string()));
+            }
+        };
+
+        if let Err(e) = file.write_all(&chunk).await {
+            tracing::error!("Failed to write chunk to {}: {:?}", full_staging_path, e);
+            return (file_id, MaterializationStatus::Failed, Some(format!("Chunk write failed: {}", e)));
+        }
+
+        total_bytes += chunk.len();
     }
+
+    // Ensure all data is flushed to disk
+    if let Err(e) = file.sync_all().await {
+        tracing::error!("Failed to sync file {}: {:?}", full_staging_path, e);
+        return (file_id, MaterializationStatus::Failed, Some(format!("File sync failed: {}", e)));
+    }
+
+    tracing::debug!("Materialized file: {} ({} bytes)", full_staging_path, total_bytes);
+    (file_id, MaterializationStatus::Success, None)
 }
