@@ -22,5 +22,6 @@ stdenv.mkDerivation {
   ];
   
   shellHook = ''
+    export HOPNET_EPHEMERAL_DB=1
   '';
 }

@@ -15,9 +15,9 @@
     "active": true,
     "targets": "all",
     "icon": [
-      "icons/icon.png"
+      "icons/icon.icns"
     ],
-    "resources": [],
+    "resources": ["icons/icon.png"],
     "externalBin": [],
     "copyright": "",
     "category": "DeveloperTool",

@@ -476,7 +476,7 @@ pub async fn post_timeout_vote(
 
             // Reissue with updated QC reference (issue_timeout_vote is reissuance-safe)
             use crate::consensus::functions::issue_timeout_vote;
-            if let Err(e) = issue_timeout_vote(timeout_vote.data.view_number, &app_state).await {
+            if let Err(e) = issue_timeout_vote(timeout_vote.data.view_number, &app_state, None).await {
                 tracing::warn!("Failed to reissue timeout vote for view {}: {:?}", timeout_vote.data.view_number, e);
                 // Continue processing incoming vote even if reissuance fails
             }
@@ -491,7 +491,7 @@ pub async fn post_timeout_vote(
     match app_state.timeout_vote_collector.add_vote(timeout_vote.clone(), &app_state).await {
         Ok(Some(tc)) => {
             // TC was created - apply locally and broadcast in parallel (Layer 2 defense)
-            let apply_result = apply_timeout_certificate(tc.clone(), &app_state, false);
+            let apply_result = apply_timeout_certificate(tc.clone(), &app_state, false, None);
             let broadcast_result = broadcast_timeout_certificate(tc, &app_state);
 
             let (apply_res, broadcast_res) = tokio::join!(apply_result, broadcast_result);
@@ -544,7 +544,7 @@ pub async fn post_tc(
     match timeout_cert.verify(&app_state) {
         Ok(_) => {
             // Apply TC to advance consensus view (with Layer 2 bounded wait)
-            match apply_timeout_certificate(timeout_cert, &app_state, false).await {
+            match apply_timeout_certificate(timeout_cert, &app_state, false, None).await {
                 Ok(_) => StatusCode::OK,
                 Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
             }
@@ -1324,8 +1324,10 @@ pub async fn ensure_intra_view_synced(
         };
 
         if validators.is_empty() {
-            tracing::error!("No validators available for intra-view sync");
-            return Err(CatchUpError::NetworkUnavailable);
+            // Single-node network: no other validators to sync with
+            // This is valid - we are the only validator and source of truth
+            tracing::debug!("Single-node network detected, skipping intra-view sync");
+            return Ok(());
         }
 
         // Calculate quorum based on total network size (including ourselves)
@@ -1691,9 +1693,11 @@ pub async fn apply_timeout_certificate(
     tc: TimeoutCertificate,
     app_state: &AppState,
     skip_wait: bool,
+    guard: Option<tokio::sync::MutexGuard<'_, ()>>,
 ) -> Result<(), CertificateError> {
     // Layer 2: Post-TC bounded wait - if not skipping, wait GST for potential Lock QC arrival
-    // IMPORTANT: Don't hold lock during wait to allow Lock QC to be processed
+    // IMPORTANT: For validator path (no guard), don't hold lock during wait to allow Lock QC to be processed
+    // For leader path (with guard), hold lock through wait to synchronize with validators' GST
     if !skip_wait {
         const GST_MS: u64 = 500; // Global Stabilization Time assumption
         tracing::debug!(
@@ -1703,8 +1707,11 @@ pub async fn apply_timeout_certificate(
         tokio::time::sleep(tokio::time::Duration::from_millis(GST_MS)).await;
     }
 
-    // Acquire lock AFTER GST wait to allow Lock QC to win the race
-    let _guard = app_state.consensus_lock.lock().await;
+    // Use provided guard or acquire lock AFTER GST wait
+    let _guard = match guard {
+        Some(g) => g,
+        None => app_state.consensus_lock.lock().await,
+    };
 
     // Get current consensus state to validate TC view
     let consensus_state = db::get_consensus(app_state.db_pool.get())

@@ -9,6 +9,10 @@ swift_file = "apple/HopNetFileProvider/Sources/HopNetFileProviderExtension/Gener
 # Use camelCase for Swift property names
 rename_all = "camelCase"
 
+# Swift type substitutions
+[swift.type_mappings]
+"u64" = "UInt64"
+
 [typescript]
 # Output directory for generated TypeScript files
 typescript_file = "frontend/src/lib/types.ts"
@@ -17,6 +21,7 @@ typescript_file = "frontend/src/lib/types.ts"
 [typescript.type_mappings]
 "DateTime<chrono::Utc>" = "string"
 "chrono::DateTime<chrono::Utc>" = "string"
+"u64" = "number"
 
 # Optional: Specify which Rust crates to process
 [[targets]]

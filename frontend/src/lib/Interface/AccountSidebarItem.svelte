@@ -40,7 +40,7 @@
     tabindex="0"
 >
     <div class="flex gap-2 items-center">
-        <img src="/vite.svg" class="w-6 h-6" alt="User profile"/>
+        <div class="i-carbon-user w-6 h-6" alt="User profile"></div>
         <h3>allison</h3>
     </div>
     {#if selected}

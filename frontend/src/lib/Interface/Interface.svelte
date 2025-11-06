@@ -6,9 +6,10 @@
     import TakeoutPane from "../panes/takeout/TakeoutPane.svelte";
     import SidebarItem from "./SidebarItem.svelte";
     import ResiliencePane from "../panes/resilience/ResiliencePane.svelte";
+    import MaintenancePane from "../panes/maintenance/MaintenancePane.svelte";
 
     // State to track which sidebar item is selected
-    let selectedItem = "recents"; // Can be "recents", "browse", "account", "nodes", "takeout", "resilience"
+    let selectedItem = "browse"; // Can be "recents", "browse", "account", "nodes", "takeout", "resilience", "maintenance"
     // State to track if we're in account mode (sticky)
     let inAccountMode = false;
     
@@ -56,6 +57,14 @@
 
     function handleResilienceClick() {
         selectedItem = "resilience";
+        // Close sidebar on mobile after selection
+        if (window.innerWidth < 768) {
+            isSidebarOpen = false;
+        }
+    }
+
+    function handleMaintenanceClick() {
+        selectedItem = "maintenance";
         // Close sidebar on mobile after selection
         if (window.innerWidth < 768) {
             isSidebarOpen = false;
@@ -125,6 +134,12 @@
                         selected={selectedItem === "resilience"}
                         onClick={handleResilienceClick}
                     />
+                    <SidebarItem
+                        icon="i-carbon-clean"
+                        title="Maintenance"
+                        selected={selectedItem === "maintenance"}
+                        onClick={handleMaintenanceClick}
+                    />
                 {:else}
                     <!-- Default mode: Show Recents and Browse -->
                     <SidebarItem
@@ -162,6 +177,9 @@
         {:else if selectedItem === "resilience"}
             <!-- Resilience pane with integrated toolbar -->
             <ResiliencePane onToggleSidebar={toggleSidebar}/>
+        {:else if selectedItem === "maintenance"}
+            <!-- Maintenance pane with integrated toolbar -->
+            <MaintenancePane onToggleSidebar={toggleSidebar}/>
         {:else if selectedItem === "recents"}
             <!-- Minimal toolbar for mobile menu access -->
             <Toolbar

@@ -51,8 +51,8 @@ pub fn get_node_availability_classification(
             // First try to get network average
             let network_mean = conn.prepare(
                 "SELECT AVG(CAST(available AS DOUBLE)) as network_mean
-                 FROM metrics 
-                 WHERE timestamp > NOW() - INTERVAL ? DAY"
+                 FROM metrics
+                 WHERE timestamp > CAST(NOW() AS TIMESTAMP) - INTERVAL ? DAY"
             ).and_then(|mut stmt| {
                 stmt.query_row(duckdb::params![days], |row| {
                     let mean: Option<f64> = row.get(0)?;
@@ -63,8 +63,8 @@ pub fn get_node_availability_classification(
             // Then try to get node availability
             let node_availability = conn.prepare(
                 "SELECT AVG(CAST(available AS DOUBLE)) as node_availability
-                 FROM metrics 
-                 WHERE node_id = ? AND timestamp > NOW() - INTERVAL ? DAY"
+                 FROM metrics
+                 WHERE node_id = ? AND timestamp > CAST(NOW() AS TIMESTAMP) - INTERVAL ? DAY"
             ).and_then(|mut stmt| {
                 stmt.query_row(duckdb::params![node_id, days], |row| {
                     let avail: Option<f64> = row.get(0)?;

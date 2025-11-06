@@ -1,6 +1,6 @@
 <script lang="ts">
     import { TableHandler, ThSort, ThFilter, Th, Datatable } from '@vincjo/datatables'
-    import { tokenStore, API_BASE_URL, currentPathStore, refreshTriggerStore } from '../../stores'
+    import { tokenStore, API_BASE_URL, currentPathStore, refreshTriggerStore, authenticatedFetch } from '../../stores'
     import { onMount } from 'svelte'
     import type { FileItem } from '../../types'
     import { InodeType } from '../../types'
@@ -11,6 +11,7 @@
     import type { ToolbarItem } from '../../primitives/Toolbar.svelte'
     import Upload from './Upload.svelte'
     import CreateFolder from './CreateFolder.svelte'
+    import ConfirmDelete from './ConfirmDelete.svelte'
 
     let files: FileItem[] = []
     let loading = true
@@ -27,7 +28,13 @@
     export let onToggleSidebar: () => void = () => {};
     let showUploadPopover = false
     let showCreateFolderPopover = false
+    let showConfirmDelete = false
     let selectedFiles: FileItem[] = []
+    let lastClickedIndex: number = -1
+    let isShiftPressed = false
+    let isDeleting = false
+    let deleteError = ''
+    let deleteSuccess = ''
 
     // Subscribe to current path store
     $: currentPath = $currentPathStore
@@ -54,20 +61,13 @@
         try {
             loading = true
             error = ''
-            
-            const token = $tokenStore
-            if (!token) {
-                error = 'No authentication token found'
-                return
-            }
 
             const url = new URL(`${API_BASE_URL}/files`)
             url.searchParams.append('path', path)
 
-            const response = await fetch(url.toString(), {
+            const response = await authenticatedFetch(url.toString(), {
                 method: 'GET',
                 headers: {
-                    'Authorization': `Bearer ${token}`,
                     'Content-Type': 'application/json',
                 },
             })
@@ -90,13 +90,51 @@
         }
     }
 
-    async function handleItemClick(item: FileItem) {
+    function handleItemClick(item: FileItem, event: MouseEvent) {
+        const itemIndex = table.rows.findIndex(row => row.path === item.path)
+
+        if (event.shiftKey && lastClickedIndex !== -1) {
+            // Shift+click: range select
+            event.preventDefault() // Prevent text selection
+            const start = Math.min(lastClickedIndex, itemIndex)
+            const end = Math.max(lastClickedIndex, itemIndex)
+            const rangeItems = table.rows.slice(start, end + 1)
+
+            // Add all items in range to selection if they're not already selected
+            selectedFiles = [...new Set([...selectedFiles, ...rangeItems])]
+        } else if (event.metaKey || event.ctrlKey) {
+            // Cmd/Ctrl+click: toggle individual selection
+            const isSelected = selectedFiles.some(f => f.path === item.path)
+            if (isSelected) {
+                selectedFiles = selectedFiles.filter(f => f.path !== item.path)
+            } else {
+                selectedFiles = [...selectedFiles, item]
+            }
+            lastClickedIndex = itemIndex
+        } else {
+            // Regular click: single select (replace selection)
+            const isSelected = selectedFiles.length === 1 && selectedFiles[0].path === item.path
+            if (isSelected) {
+                // Deselect if clicking the only selected item
+                selectedFiles = []
+                lastClickedIndex = -1
+            } else {
+                selectedFiles = [item]
+                lastClickedIndex = itemIndex
+            }
+        }
+    }
+
+    async function handleItemDoubleClick(item: FileItem) {
         if (item.inode_type === InodeType.Folder) {
             // Navigate into the folder
             pathHistory.push(currentPath)
             // Clear search when navigating to a new folder
             search.value = ''
             search.set()
+            // Clear selection when navigating
+            selectedFiles = []
+            lastClickedIndex = -1
             fetchFiles(item.path)
         } else if (item.inode_type === InodeType.File) {
             // Find the index of this file in the file-only list (respects sorting/filtering)
@@ -112,31 +150,22 @@
 
     async function downloadFile(item: FileItem) {
         try {
-            const token = $tokenStore
-            if (!token) {
-                error = 'No authentication token found'
-                return
-            }
-
             // Extract the path part after the first slash for the API call
             // Convert "/folder/file.txt" to "folder/file.txt"
             let apiPath = item.path
             if (apiPath.startsWith('/')) {
                 apiPath = apiPath.substring(1)
             }
-            
-            const response = await fetch(`${API_BASE_URL}/files/${apiPath}`, {
+
+            const response = await authenticatedFetch(`${API_BASE_URL}/files/${apiPath}`, {
                 method: 'GET',
-                headers: {
-                    'Authorization': `Bearer ${token}`,
-                },
             })
 
             if (response.ok) {
                 // Get the filename from the response headers or extract from path
                 const contentDisposition = response.headers.get('Content-Disposition')
                 let filename = getFileName(item.path)
-                
+
                 // Try to extract filename from Content-Disposition header if present
                 if (contentDisposition) {
                     const match = contentDisposition.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/)
@@ -172,6 +201,9 @@
             // Clear search when navigating
             search.value = ''
             search.set()
+            // Clear selection when navigating
+            selectedFiles = []
+            lastClickedIndex = -1
             fetchFiles(previousPath)
         }
     }
@@ -186,6 +218,9 @@
             // Clear search when navigating
             search.value = ''
             search.set()
+            // Clear selection when navigating
+            selectedFiles = []
+            lastClickedIndex = -1
             fetchFiles(parentPath)
         }
     }
@@ -195,6 +230,9 @@
         // Clear search when navigating
         search.value = ''
         search.set()
+        // Clear selection when navigating
+        selectedFiles = []
+        lastClickedIndex = -1
         fetchFiles('/')
     }
 
@@ -213,6 +251,9 @@
             // Clear search when navigating
             search.value = ''
             search.set()
+            // Clear selection when navigating
+            selectedFiles = []
+            lastClickedIndex = -1
             fetchFiles(targetPath)
         }
     }
@@ -259,6 +300,26 @@
 
     onMount(() => {
         fetchFiles()
+
+        // Track shift key state for preventing text selection
+        const handleKeyDown = (e: KeyboardEvent) => {
+            if (e.key === 'Shift') {
+                isShiftPressed = true
+            }
+        }
+        const handleKeyUp = (e: KeyboardEvent) => {
+            if (e.key === 'Shift') {
+                isShiftPressed = false
+            }
+        }
+
+        window.addEventListener('keydown', handleKeyDown)
+        window.addEventListener('keyup', handleKeyUp)
+
+        return () => {
+            window.removeEventListener('keydown', handleKeyDown)
+            window.removeEventListener('keyup', handleKeyUp)
+        }
     })
 
     // Reactive statement to refetch when token changes
@@ -292,8 +353,21 @@
         showCreateFolderPopover = false;
     }
 
-    function handleFolderCreated() {
-        refreshTriggerStore.update(n => n + 1);
+    async function handleFolderCreated() {
+        // Poll for the new folder to appear (consensus delay)
+        const maxAttempts = 10;
+        const pollInterval = 500;
+
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+            await new Promise(resolve => setTimeout(resolve, pollInterval));
+            await fetchFiles(currentPath);
+
+            // If we've fetched at least once and have some files, break early
+            // (The folder should appear after consensus processes)
+            if (attempt > 0) {
+                break; // One retry is usually enough
+            }
+        }
     }
 
     function handleViewModeClick() {
@@ -306,8 +380,82 @@
     }
 
     function handleDeleteClick() {
-        console.log('Delete clicked');
-        // TODO: Implement bulk delete for selected files
+        if (selectedFiles.length > 0) {
+            showConfirmDelete = true;
+        }
+    }
+
+    function handleDeleteCancel() {
+        showConfirmDelete = false;
+    }
+
+    async function handleDeleteConfirm() {
+        showConfirmDelete = false;
+        isDeleting = true;
+        deleteError = '';
+        deleteSuccess = '';
+
+        const filesToDelete = [...selectedFiles];
+        let successCount = 0;
+        let failCount = 0;
+
+        try {
+            // Delete each file
+            const errors: string[] = [];
+            for (const file of filesToDelete) {
+                try {
+                    const url = new URL(`${API_BASE_URL}/files`);
+                    url.searchParams.append('path', file.path);
+
+                    const response = await authenticatedFetch(url.toString(), {
+                        method: 'DELETE',
+                    });
+
+                    if (response.ok) {
+                        successCount++;
+                    } else {
+                        failCount++;
+                        const errorText = await response.text().catch(() => 'No error details');
+                        const errorMsg = `${file.path}: ${response.status} ${response.statusText} - ${errorText}`;
+                        console.error(`Failed to delete ${file.path}:`, response.status, errorText);
+                        errors.push(errorMsg);
+                    }
+                } catch (err) {
+                    failCount++;
+                    const errorMsg = `${file.path}: ${err instanceof Error ? err.message : 'Unknown error'}`;
+                    console.error(`Error deleting ${file.path}:`, err);
+                    errors.push(errorMsg);
+                }
+            }
+
+            // Show result message
+            if (successCount > 0 && failCount === 0) {
+                deleteSuccess = `Successfully deleted ${successCount} ${successCount === 1 ? 'item' : 'items'}`;
+            } else if (successCount > 0 && failCount > 0) {
+                deleteError = `Deleted ${successCount} items, but ${failCount} failed:\n${errors.join('\n')}`;
+            } else {
+                deleteError = `Failed to delete ${failCount} ${failCount === 1 ? 'item' : 'items'}:\n${errors.join('\n')}`;
+            }
+
+            // Clear selection and refresh file list
+            selectedFiles = [];
+            lastClickedIndex = -1;
+
+            // Wait a moment for the user to see the message
+            await new Promise(resolve => setTimeout(resolve, 1500));
+
+            // Refresh the file list
+            await fetchFiles(currentPath);
+
+            // Clear messages after refresh
+            deleteSuccess = '';
+            deleteError = '';
+        } catch (err) {
+            deleteError = `Delete error: ${err instanceof Error ? err.message : 'Unknown error'}`;
+            console.error('Error during deletion:', err);
+        } finally {
+            isDeleting = false;
+        }
     }
 
     function handleShareClick() {
@@ -315,8 +463,8 @@
         // TODO: Implement sharing for selected files
     }
 
-    // Reactive toolbar configuration
-    $: leftElements = [
+    // Toolbar configuration - stable references to avoid resize recalculation
+    const leftElements: ToolbarItem[] = [
         {
             type: 'action' as const,
             icon: 'i-carbon-list',
@@ -325,9 +473,9 @@
             compactStage: 3, // First to compact (highest number)
             tooltip: 'Change view mode'
         }
-    ] satisfies ToolbarItem[];
+    ];
 
-    $: centerElements = [
+    const centerElements: ToolbarItem[] = [
         {
             type: 'action' as const,
             icon: 'i-carbon-cloud-upload',
@@ -344,9 +492,9 @@
             compactStage: 3, // First to compact (highest number)
             tooltip: 'Create a new folder in the current directory'
         }
-    ] satisfies ToolbarItem[];
+    ];
 
-    $: rightElements = [
+    const rightElements: ToolbarItem[] = [
         {
             type: 'action' as const,
             icon: 'i-carbon-cloud-download',
@@ -354,7 +502,7 @@
             onClick: handleDownloadClick,
             compactStage: 2, // Second wave (lower number = more resistant)
             tooltip: 'Download selected files',
-            disabled: selectedFiles.length === 0
+            disabled: false
         },
         {
             type: 'action' as const,
@@ -363,7 +511,7 @@
             onClick: handleDeleteClick,
             compactStage: 2, // Second wave (lower number = more resistant)
             tooltip: 'Delete selected files',
-            disabled: selectedFiles.length === 0
+            disabled: false
         },
         {
             type: 'action' as const,
@@ -372,9 +520,17 @@
             onClick: handleShareClick,
             compactStage: 3, // First to compact (highest number)
             tooltip: 'Share selected files',
-            disabled: selectedFiles.length === 0
+            disabled: false
         }
-    ] satisfies ToolbarItem[];
+    ];
+
+    // Update disabled state without creating new references
+    $: {
+        const hasSelection = selectedFiles.length > 0;
+        rightElements[0].disabled = !hasSelection; // Download
+        rightElements[1].disabled = !hasSelection; // Delete
+        rightElements[2].disabled = !hasSelection; // Share
+    }
 </script>
 
 <!-- Integrated Toolbar -->
@@ -401,6 +557,24 @@
             >
                 Retry
             </button>
+        </div>
+    {/if}
+
+    {#if deleteSuccess}
+        <div class="text-green p-2 mb-2 border border-green rounded bg-green/10">
+            {deleteSuccess}
+        </div>
+    {/if}
+
+    {#if deleteError}
+        <div class="text-red p-2 mb-2 border border-red rounded bg-red/10 whitespace-pre-wrap font-mono text-xs max-h-40 overflow-y-auto">
+            {deleteError}
+        </div>
+    {/if}
+
+    {#if isDeleting}
+        <div class="text-mauve p-2 mb-2 border border-mauve rounded bg-mauve/10">
+            Deleting files...
         </div>
     {/if}
     
@@ -483,13 +657,15 @@
                         <ThSort {table} field="modification_date">Modified</ThSort>
                     </tr>
                 </thead>
-                <tbody>
+                <tbody class="{isShiftPressed ? 'no-select' : ''}">
                     {#each table.rows as row}
                         {@const createdFormats = formatDateForContainer(row.creation_date)}
                         {@const modFormats = row.modification_date ? formatDateForContainer(row.modification_date) : null}
+                        {@const isSelected = selectedFiles.some(f => f.path === row.path)}
                         <tr
-                            class="text-left cursor-pointer hover:bg-surface0"
-                            onclick={() => handleItemClick(row)}
+                            class="text-left cursor-pointer hover:bg-surface0 {isSelected ? 'bg-mauve/20 selected-row' : ''}"
+                            onclick={(e) => handleItemClick(row, e)}
+                            ondblclick={() => handleItemDoubleClick(row)}
                         >
                             <td class="w-8">
                                 <div class="{getFileIcon(row.inode_type === InodeType.Folder ? 'Folder' : 'File', getFileName(row.path), 'list')} w-4 h-4 text-muted"></div>
@@ -550,6 +726,14 @@
     onFolderCreated={handleFolderCreated}
 />
 
+<!-- Confirm Delete Modal -->
+<ConfirmDelete
+    isOpen={showConfirmDelete}
+    items={selectedFiles}
+    onClose={handleDeleteCancel}
+    onConfirm={handleDeleteConfirm}
+/>
+
 <style>
     /* Scrollable table wrapper */
     .table-wrapper {
@@ -603,8 +787,25 @@
         padding: 4px 4px !important;
     }
 
+    /* Prevent text selection only when shift is pressed */
+    tbody.no-select tr {
+        user-select: none;
+        -webkit-user-select: none;
+        -moz-user-select: none;
+        -ms-user-select: none;
+    }
+
     tbody tr:hover {
         background-color: #313244 !important; /* surface0 */
+    }
+
+    /* Selected row styling */
+    .selected-row {
+        background-color: rgba(203, 166, 247, 0.2) !important; /* mauve/20 */
+    }
+
+    .selected-row:hover {
+        background-color: rgba(203, 166, 247, 0.3) !important; /* mauve/30 - slightly stronger on hover */
     }
 
     :global(footer) {

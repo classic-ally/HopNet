@@ -79,12 +79,14 @@
                 throw new Error(`Folder creation failed: ${response.status} ${response.statusText}`);
             }
 
-            // Clear form and close modal after successful creation
+            // Clear form and trigger refresh
+            folderName = '';
+            onFolderCreated();
+
+            // Close modal after a brief delay to show success
             setTimeout(() => {
-                folderName = '';
-                onFolderCreated();
                 handleClose();
-            }, 500);
+            }, 300);
 
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : 'Folder creation failed';
@@ -122,11 +124,10 @@
     {#snippet content()}
         <!-- Folder Name Input -->
         <div class="space-y-2">
-            <label for="folder-name" class="block text-sm font-medium text-subtitle">
+            <div class="block text-sm font-medium text-subtitle">
                 Folder Name
-            </label>
+            </div>
             <TextInput
-                id="folder-name"
                 value={folderName}
                 placeholder="Enter folder name"
                 disabled={isCreating}

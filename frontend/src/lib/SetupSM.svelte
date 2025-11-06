@@ -87,7 +87,10 @@
           />
       {/if}
       {#if joinQR}
-          <JoinQr />
+          <JoinQr
+            name={computername}
+            ip_address={ip}
+          />
       {/if}
       {#if confirmSelections}
             <ConfirmPane

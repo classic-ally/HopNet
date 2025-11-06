@@ -200,9 +200,9 @@ pub fn get_all_node_metrics(
                     SELECT 
                         m.to_node as node_id,
                         -- 24-hour metrics
-                        COUNT(CASE WHEN m.start_time >= (CURRENT_TIMESTAMP AT TIME ZONE 'UTC' - INTERVAL 24 HOUR) THEN 1 END) as sample_count_24h,
-                        AVG(CASE WHEN m.available AND m.start_time >= (CURRENT_TIMESTAMP AT TIME ZONE 'UTC' - INTERVAL 24 HOUR) THEN 1.0 ELSE 0.0 END) as availability_24h,
-                        AVG(CASE WHEN m.start_time >= (CURRENT_TIMESTAMP AT TIME ZONE 'UTC' - INTERVAL 24 HOUR) THEN m.rtt_latency END) as avg_latency_24h,
+                        COUNT(CASE WHEN m.start_time >= (CAST(CURRENT_TIMESTAMP AS TIMESTAMP) - INTERVAL 24 HOUR) THEN 1 END) as sample_count_24h,
+                        AVG(CASE WHEN m.available AND m.start_time >= (CAST(CURRENT_TIMESTAMP AS TIMESTAMP) - INTERVAL 24 HOUR) THEN 1.0 ELSE 0.0 END) as availability_24h,
+                        AVG(CASE WHEN m.start_time >= (CAST(CURRENT_TIMESTAMP AS TIMESTAMP) - INTERVAL 24 HOUR) THEN m.rtt_latency END) as avg_latency_24h,
                         -- 7-day metrics
                         COUNT(*) as sample_count_7d,
                         AVG(CASE WHEN m.available THEN 1.0 ELSE 0.0 END) as availability_7d,
@@ -214,7 +214,7 @@ pub fn get_all_node_metrics(
                         MAX(m.storage_used_gb) as storage_used_gb
                     FROM metrics m
                     WHERE m.height <= ?
-                      AND m.start_time >= (CURRENT_TIMESTAMP AT TIME ZONE 'UTC' - INTERVAL 7 DAY)
+                      AND m.start_time >= (CAST(CURRENT_TIMESTAMP AS TIMESTAMP) - INTERVAL 7 DAY)
                     GROUP BY m.to_node
                 ),
                 -- Calculate network-wide fallback statistics per RFC requirements

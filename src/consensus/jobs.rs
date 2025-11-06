@@ -70,7 +70,7 @@ pub async fn handle_timeout_detection(
             // Reissue with current (potentially updated) QC
             // issue_timeout_vote is reissuance-safe: creates vote from current consensus state
             use crate::consensus::functions::issue_timeout_vote;
-            match issue_timeout_vote(current_view, app_state).await {
+            match issue_timeout_vote(current_view, app_state, None).await {
                 Ok(_) => {
                     tracing::info!("Successfully reissued timeout vote for view {} (proactive convergence + message loss resilience)", current_view);
                 }
@@ -84,7 +84,7 @@ pub async fn handle_timeout_detection(
             tracing::info!("View {} has not progressed since last check, issuing timeout vote", current_view);
 
             use crate::consensus::functions::issue_timeout_vote;
-            match issue_timeout_vote(current_view, app_state).await {
+            match issue_timeout_vote(current_view, app_state, None).await {
                 Ok(_) => {
                     tracing::debug!("Successfully issued timeout vote for view {}", current_view);
                 }

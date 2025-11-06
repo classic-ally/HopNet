@@ -620,3 +620,314 @@ pub async fn run_fragment_inventory_self_check(app_state: &AppState) -> Result<(
         }
     }
 }
+
+// =============================================================================
+// ORPHANED FRAGMENT CLEANUP
+// Filesystem garbage collection for fragments not in database
+// =============================================================================
+
+/// Result of scanning filesystem for orphaned fragments
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OrphanedFragmentScan {
+    pub scanned_at: i64,  // Unix timestamp
+    pub total_fragments: usize,
+    pub orphaned_fragments: Vec<crate::db::Blake3Hash>,
+    pub total_bytes: u64,
+}
+
+/// Result of cleaning up orphaned fragments
+#[derive(Debug, serde::Serialize)]
+pub struct OrphanedFragmentCleanupResult {
+    pub deleted_count: usize,
+    pub failed_count: usize,
+    pub bytes_freed: u64,
+}
+
+/// Scan filesystem for fragments that don't exist in database
+/// Only considers fragments older than grace_period_hours to avoid race conditions
+pub async fn run_orphaned_fragments_scan(
+    app_state: &AppState,
+    grace_period_hours: i64,
+) -> Result<OrphanedFragmentScan, Error> {
+    use std::time::SystemTime;
+    use std::fs;
+    use std::path::Path;
+
+    tracing::info!("Starting orphaned fragments scan (grace period: {} hours)", grace_period_hours);
+
+    let fragments_dir = &app_state.fragments_dir;
+    let grace_period_secs = grace_period_hours * 3600;
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|_| Error::Failed(Arc::new(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Failed to get current time"
+        )))))?
+        .as_secs();
+
+    let cutoff_time = now - grace_period_secs as u64;
+
+    // Walk directory structure to collect all fragment hashes on disk
+    let mut disk_fragments: Vec<(crate::db::Blake3Hash, u64, u64)> = Vec::new(); // (hash, size, mtime)
+
+    // Fragments are stored in 2-level directory structure: fragments_dir/AB/CD/ABCD...hash
+    let fragments_path = Path::new(fragments_dir);
+
+    if !fragments_path.exists() {
+        tracing::warn!("Fragments directory does not exist: {}", fragments_dir);
+        return Ok(OrphanedFragmentScan {
+            scanned_at: now as i64,
+            total_fragments: 0,
+            orphaned_fragments: Vec::new(),
+            total_bytes: 0,
+        });
+    }
+
+    // Iterate through first-level directories (00-ff)
+    for first_level_entry in fs::read_dir(fragments_path)
+        .map_err(|e| Error::Failed(Arc::new(Box::new(e))))?
+    {
+        let first_level_entry = first_level_entry
+            .map_err(|e| Error::Failed(Arc::new(Box::new(e))))?;
+
+        if !first_level_entry.file_type()
+            .map_err(|e| Error::Failed(Arc::new(Box::new(e))))?
+            .is_dir()
+        {
+            continue;
+        }
+
+        // Iterate through second-level directories (00-ff)
+        for second_level_entry in fs::read_dir(first_level_entry.path())
+            .map_err(|e| Error::Failed(Arc::new(Box::new(e))))?
+        {
+            let second_level_entry = second_level_entry
+                .map_err(|e| Error::Failed(Arc::new(Box::new(e))))?;
+
+            if !second_level_entry.file_type()
+                .map_err(|e| Error::Failed(Arc::new(Box::new(e))))?
+                .is_dir()
+            {
+                continue;
+            }
+
+            // Iterate through fragment files
+            for file_entry in fs::read_dir(second_level_entry.path())
+                .map_err(|e| Error::Failed(Arc::new(Box::new(e))))?
+            {
+                let file_entry = file_entry
+                    .map_err(|e| Error::Failed(Arc::new(Box::new(e))))?;
+
+                let metadata = file_entry.metadata()
+                    .map_err(|e| Error::Failed(Arc::new(Box::new(e))))?;
+
+                if !metadata.is_file() {
+                    continue;
+                }
+
+                // Get modification time
+                let mtime = metadata.modified()
+                    .map_err(|e| Error::Failed(Arc::new(Box::new(e))))?
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map_err(|_| Error::Failed(Arc::new(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "Invalid file modification time"
+                    )))))?
+                    .as_secs();
+
+                // Only consider files older than grace period
+                if mtime >= cutoff_time {
+                    continue;
+                }
+
+                // Parse filename as Blake3 hash (64 hex characters)
+                let filename = file_entry.file_name();
+                let filename_str = filename.to_string_lossy();
+
+                if filename_str.len() != 64 {
+                    tracing::warn!("Unexpected fragment filename: {}", filename_str);
+                    continue;
+                }
+
+                // Parse hex to Blake3Hash
+                match hex::decode(&*filename_str) {
+                    Ok(bytes) if bytes.len() == 32 => {
+                        let mut array = [0u8; 32];
+                        array.copy_from_slice(&bytes);
+                        let hash = crate::db::Blake3Hash::from_bytes(array);
+                        disk_fragments.push((hash, metadata.len(), mtime));
+                    }
+                    _ => {
+                        tracing::warn!("Invalid fragment hash filename: {}", filename_str);
+                        continue;
+                    }
+                }
+            }
+        }
+    }
+
+    tracing::info!("Found {} fragments on disk (older than {} hours)", disk_fragments.len(), grace_period_hours);
+
+    if disk_fragments.is_empty() {
+        return Ok(OrphanedFragmentScan {
+            scanned_at: now as i64,
+            total_fragments: 0,
+            orphaned_fragments: Vec::new(),
+            total_bytes: 0,
+        });
+    }
+
+    // Check which fragments exist in database (batch query for efficiency)
+    let db_conn = app_state.db_pool.get()
+        .map_err(|e| Error::Failed(Arc::new(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Failed to get database connection: {:?}", e)
+        )))))?;
+    let batch_size = 1000;
+    let mut orphaned_fragments = Vec::new();
+    let mut total_bytes = 0u64;
+
+    for chunk in disk_fragments.chunks(batch_size) {
+        let hashes: Vec<crate::db::Blake3Hash> = chunk.iter().map(|(h, _, _)| *h).collect();
+
+        // Build parameterized query to check which hashes exist in fragment_hashes table
+        let placeholders = hashes.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let query = format!(
+            "SELECT fragment_hash FROM fragment_hashes WHERE fragment_hash IN ({})",
+            placeholders
+        );
+
+        let mut stmt = db_conn.prepare(&query)
+            .map_err(|e| Error::Failed(Arc::new(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Database query failed: {:?}", e)
+            )))))?;
+
+        // Execute query with hash parameters
+        let mut params: Vec<Box<dyn duckdb::ToSql>> = Vec::new();
+        for hash in &hashes {
+            params.push(Box::new(*hash));
+        }
+        let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
+        let mut rows = stmt.query(param_refs.as_slice())
+            .map_err(|e| Error::Failed(Arc::new(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Database query execution failed: {:?}", e)
+            )))))?;
+
+        // Collect hashes that exist in database
+        let mut db_hashes = std::collections::HashSet::new();
+        while let Some(row) = rows.next()
+            .map_err(|e| Error::Failed(Arc::new(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to read query results: {:?}", e)
+            )))))?
+        {
+            let hash: crate::db::Blake3Hash = row.get(0)
+                .map_err(|e| Error::Failed(Arc::new(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to parse hash from row: {:?}", e)
+                )))))?;
+            db_hashes.insert(hash);
+        }
+
+        // Find orphaned fragments (on disk but not in database)
+        for (hash, size, _mtime) in chunk {
+            if !db_hashes.contains(hash) {
+                orphaned_fragments.push(*hash);
+                total_bytes += size;
+            }
+        }
+    }
+
+    tracing::info!("Scan complete: {} orphaned fragments found ({} bytes)",
+                  orphaned_fragments.len(), total_bytes);
+
+    let scan_result = OrphanedFragmentScan {
+        scanned_at: now as i64,
+        total_fragments: disk_fragments.len(),
+        orphaned_fragments,
+        total_bytes,
+    };
+
+    // Store scan result in app state
+    *app_state.orphaned_fragment_scan.lock().unwrap() = Some(scan_result.clone());
+
+    Ok(scan_result)
+}
+
+/// Delete orphaned fragments based on previous scan
+/// Validates scan exists and isn't stale (> 1 hour old)
+pub async fn run_orphaned_fragments_cleanup(
+    app_state: &AppState,
+) -> Result<OrphanedFragmentCleanupResult, Error> {
+    use std::time::SystemTime;
+
+    tracing::info!("Starting orphaned fragments cleanup");
+
+    // Get and clear scan from state (take ownership)
+    let scan = {
+        let mut scan_lock = app_state.orphaned_fragment_scan.lock().unwrap();
+        scan_lock.take()
+    };
+
+    let scan = scan.ok_or_else(|| {
+        Error::Failed(Arc::new(Box::new(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "No scan results available. Run GET /maintenance/orphaned-fragments first"
+        ))))
+    })?;
+
+    // Validate scan isn't stale (> 1 hour old)
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|_| Error::Failed(Arc::new(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Failed to get current time"
+        )))))?
+        .as_secs() as i64;
+
+    let scan_age_seconds = now - scan.scanned_at;
+    if scan_age_seconds > 3600 {
+        return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Scan is stale ({} seconds old). Run a new scan first", scan_age_seconds)
+        )))));
+    }
+
+    tracing::info!("Deleting {} orphaned fragments", scan.orphaned_fragments.len());
+
+    let mut deleted_count = 0;
+    let mut failed_count = 0;
+    let mut bytes_freed = 0u64;
+
+    // Delete each orphaned fragment
+    for fragment_hash in &scan.orphaned_fragments {
+        match crate::files::functions::delete_fragment(&app_state.fragments_dir, fragment_hash) {
+            Ok(_) => {
+                deleted_count += 1;
+                // Calculate approximate size (we don't store individual sizes, use average)
+                let avg_size = if scan.orphaned_fragments.len() > 0 {
+                    scan.total_bytes / scan.orphaned_fragments.len() as u64
+                } else {
+                    0
+                };
+                bytes_freed += avg_size;
+            }
+            Err(e) => {
+                tracing::warn!("Failed to delete fragment {}: {:?}", fragment_hash.to_hex(), e);
+                failed_count += 1;
+            }
+        }
+    }
+
+    tracing::info!("Cleanup complete: {} deleted, {} failed, {} bytes freed",
+                  deleted_count, failed_count, bytes_freed);
+
+    Ok(OrphanedFragmentCleanupResult {
+        deleted_count,
+        failed_count,
+        bytes_freed,
+    })
+}

@@ -10,9 +10,26 @@ EXTENSION_NAME="HopNetFileProviderExtension"
 
 echo "🔨 Stage 1: Building Swift FileProvider extension..."
 
-# Build the Swift package
+# Use real Xcode SDK path (not Nix's)
+XCODE_SDK="/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+
+if [ ! -d "$XCODE_SDK" ]; then
+    echo "❌ Xcode SDK not found at: $XCODE_SDK"
+    echo "Please ensure Xcode is installed and run: xcode-select --install"
+    exit 1
+fi
+
+echo "📍 Using Xcode SDK: $XCODE_SDK"
+
+# Build the Swift package with clean environment
 cd "$SWIFT_PROJECT_DIR"
-swift build --configuration release
+env -i \
+    HOME="$HOME" \
+    USER="$USER" \
+    PATH="/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin" \
+    SDKROOT="$XCODE_SDK" \
+    DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer" \
+    swift build --configuration release
 
 # Verify the built binary exists
 SWIFT_BINARY="$SWIFT_PROJECT_DIR/.build/release/$EXTENSION_NAME"

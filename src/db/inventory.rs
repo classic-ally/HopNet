@@ -19,14 +19,40 @@ pub fn apply_self_check_updates(
     // Verify the previous count matches our current state
     let current_count = get_node_fragment_count_tx(db_tx, report.node_id)?;
 
-    if current_count != report.previous_count {
-        tracing::error!(
-            "Fragment inventory state mismatch for node {}: expected {} fragments, found {}",
-            report.node_id,
-            report.previous_count,
-            current_count
-        );
-        return Err(DatabaseError::ProcessingError);
+    // For operations that only add fragments (upload attestations), we can tolerate
+    // the count being higher due to concurrent additions from other uploads.
+    // For operations that remove fragments (periodic self-checks), we need exact match
+    // to ensure we're removing the right things.
+    if report.fragments_removed.is_empty() {
+        // Addition-only operation: allow count to be equal or higher
+        if current_count < report.previous_count {
+            tracing::error!(
+                "Fragment inventory count decreased unexpectedly for node {}: expected >= {}, found {}",
+                report.node_id,
+                report.previous_count,
+                current_count
+            );
+            return Err(DatabaseError::ProcessingError);
+        }
+        if current_count > report.previous_count {
+            tracing::debug!(
+                "Fragment inventory count increased due to concurrent operations for node {}: expected {}, found {} (this is OK for addition-only operations)",
+                report.node_id,
+                report.previous_count,
+                current_count
+            );
+        }
+    } else {
+        // Removal operation: require exact match for safety
+        if current_count != report.previous_count {
+            tracing::error!(
+                "Fragment inventory state mismatch for node {} (removal operation requires exact count): expected {} fragments, found {}",
+                report.node_id,
+                report.previous_count,
+                current_count
+            );
+            return Err(DatabaseError::ProcessingError);
+        }
     }
 
     // Apply changes in optimal order to avoid double operations:

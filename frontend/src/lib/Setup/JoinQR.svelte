@@ -1,13 +1,58 @@
 <script lang="ts">
+    import { onMount } from 'svelte';
     import EntryRow from "../EntryRow.svelte";
     import SetupPane from "../SetupPane.svelte";
     import QrCode from "svelte-qrcode";
-    
+    import { API_BASE_URL, BACKEND_PORT } from '../stores';
+
+    // Props from previous setup page
+    export let name: string;
+    export let ip_address: string;
+
     let manualInfoExpanded = false;
-    
+    let pubkey: string = '';
+    let loading = true;
+    let error = '';
+
+    // Connection info object for QR code
+    $: connectionInfo = {
+        name,
+        ip_address,
+        port: BACKEND_PORT,
+        pubkey
+    };
+
+    // JSON string for QR code
+    $: qrValue = JSON.stringify(connectionInfo);
+
     function toggleManualInfo() {
         manualInfoExpanded = !manualInfoExpanded;
     }
+
+    async function fetchPubkey() {
+        try {
+            const response = await fetch(`${API_BASE_URL}/setup`);
+
+            // The /setup endpoint returns (status_code, pubkey)
+            // Status is 404 if not setup, 200 if setup
+            // But the pubkey is in the response body regardless of status
+            if (response.status === 404 || response.ok) {
+                const pubkeyData = await response.json();
+                pubkey = pubkeyData;
+                loading = false;
+            } else {
+                error = 'Failed to fetch public key';
+                loading = false;
+            }
+        } catch (err) {
+            error = `Network error: ${err instanceof Error ? err.message : 'Unknown error'}`;
+            loading = false;
+        }
+    }
+
+    onMount(() => {
+        fetchPubkey();
+    });
 </script>
 
 <SetupPane
@@ -15,36 +60,50 @@
     body="Scan the QR with a mobile device in the network."
 >
     {#snippet features()}
-        <div class="flex gap-3 items-center">
-            <div class="max-w-[100px]">
-                <QrCode size=100 value="https://github.com/" />
+        {#if loading}
+            <div class="text-muted">Loading connection information...</div>
+        {:else if error}
+            <div class="text-red">{error}</div>
+        {:else}
+            <div class="flex gap-3 items-center">
+                <div class="max-w-[100px]">
+                    <QrCode size=100 value={qrValue} />
+                </div>
+                <div class="flex flex-col gap-3">
+                    <h2>Waiting for connections...</h2>
+                    <button
+                        class="flex items-center gap-2 transition-colors cursor-pointer bg-surface0 text-primary p-2 border-overlay1 border border-solid rounded-md hover:bg-surface1 hover:border-mauve"
+                        on:click={toggleManualInfo}
+                    >
+                        <span class="text-sm">
+                            {manualInfoExpanded ? '▼' : '▶'}
+                        </span>
+                        <p>Show manual connection info</p>
+                    </button>
+                </div>
             </div>
-            <div class="flex flex-col gap-3">
-                <h2>Waiting for connections...</h2>
-                <button
-                    class="flex items-center gap-2 transition-colors cursor-pointer bg-surface0 text-primary p-2 border-overlay1 border border-solid rounded-md hover:bg-surface1 hover:border-mauve"
-                    on:click={toggleManualInfo}
-                >
-                    <span class="text-sm">
-                        {manualInfoExpanded ? '▼' : '▶'}
-                    </span>
-                    <p>Show manual connection info</p>
-                </button>
-            </div>
-        </div>
             {#if manualInfoExpanded}
                 <div class="space-y-2 animate-in slide-in-from-top-2 duration-200 gap-2 flex flex-col">
                     <div class="flex gap-2 items-center">
-                        <p class="text-muted flex-grow">IP</p>
-                        <p class="text-white text-xs font-mono">192.168.1.100</p>
+                        <p class="text-muted flex-grow">Name</p>
+                        <p class="text-white text-xs font-mono">{name}</p>
+                    </div>
+                    <div class="flex gap-2 items-center">
+                        <p class="text-muted flex-grow">IP Address</p>
+                        <p class="text-white text-xs font-mono">{ip_address}</p>
+                    </div>
+                    <div class="flex gap-2 items-center">
+                        <p class="text-muted flex-grow">Port</p>
+                        <p class="text-white text-xs font-mono">{BACKEND_PORT}</p>
                     </div>
                     <div>
-                        <p class="text-muted">Public key</p>
-                        <p class="text-white text-xs whitespace-normal break-all font-mono">ssh-rsa AAAAB3NzaC1yc2EAAAABJQAAAQB/nAmOjTmezNUDKYvEeIRf2YnwM9/uUG1d0BYsc8/tRtx+RGi7N2lUbp728MXGwdnL9od4cItzky/zVdLZE2cycOa18xBK9cOWmcKS0A8FYBxEQWJ/q9YVUgZbFKfYGaGQxsER+A0w/fX8ALuk78ktP31K69LcQgxIsl7rNzxsoOQKJ/CIxOGMMxczYTiEoLvQhapFQMs3FL96didKr/QbrfB1WT6s3838SEaXfgZvLef1YB2xmfhbT9OXFE3FXvh2UPBfN+ffE7iiayQf/2XR+8j4N4bW30DiPtOQLGUrH1y5X/rpNZNlWW2+jGIxqZtgWg7lTy3mXy5x836Sj/6L</p>
+                        <p class="text-muted">Public Key</p>
+                        <p class="text-white text-xs whitespace-normal break-all font-mono">{pubkey}</p>
                     </div>
                     <p class="text-muted">You can use this information in the Nodes page of another desktop device to manually initiate pairing.</p>
                 </div>
             {/if}
+        {/if}
 
     {/snippet}
 

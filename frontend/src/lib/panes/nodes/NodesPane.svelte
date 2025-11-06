@@ -69,6 +69,11 @@
         isNodeAddOpen = true;
     }
 
+    function handleNodeAdded() {
+        // Refresh the nodes list after a node is added
+        fetchNodes();
+    }
+
     function handleDeleteNode() {
         // TODO: Implement delete functionality for selected nodes
         console.log('Delete node clicked');
@@ -203,11 +208,11 @@
 </div>
 
 <!-- Node Add Overlay -->
-{#if isNodeAddOpen}
-    <NodeAddPane
-        onBackButton={() => {isNodeAddOpen = false}}
-    />
-{/if}
+<NodeAddPane
+    isOpen={isNodeAddOpen}
+    onClose={() => {isNodeAddOpen = false}}
+    onNodeAdded={handleNodeAdded}
+/>
 
 <style>
     tbody tr:hover {

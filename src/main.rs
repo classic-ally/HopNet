@@ -10,7 +10,7 @@ use include_dir::{Dir, include_dir};
 use once_cell::sync::{Lazy, OnceCell};
 use std::sync::Arc;
 use std::collections::HashMap;
-use duckdb::DuckdbConnectionManager;
+use duckdb::{Config, DuckdbConnectionManager};
 use r2d2::Pool;
 use apalis::prelude::*;
 use std::str::FromStr;
@@ -87,6 +87,7 @@ pub struct AppState {
     fileprovider_api_key: String,
     port: u16,
     test_mode: bool,
+    orphaned_fragment_scan: Arc<std::sync::Mutex<Option<files::jobs::OrphanedFragmentScan>>>,
 }
 
 impl AppState {
@@ -183,12 +184,18 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // Check if ephemeral database mode is requested (for testing)
     let use_ephemeral_db = std::env::var("HOPNET_EPHEMERAL_DB").is_ok();
 
+    // Create DuckDB config with extension autoloading disabled
+    // We manually load signed extensions from the bundle instead
+    let config = Config::default()
+        .enable_autoload_extension(false)
+        .expect("Failed to disable autoload extensions");
+
     let pool = if use_ephemeral_db {
         tracing::info!("Using ephemeral in-memory database (HOPNET_EPHEMERAL_DB set)");
-        let manager = DuckdbConnectionManager::memory().unwrap();
+        let manager = DuckdbConnectionManager::memory_with_flags(config).unwrap();
         Pool::builder()
             .max_size(8)
-            .min_idle(Some(2))
+            .min_idle(Some(0))  // Don't keep idle connections - prevents stale reads after checkpoint
             .build(manager).unwrap()
     } else {
         // Get database path and ensure directory exists
@@ -205,13 +212,14 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
         // Create database connection pool (file-based)
         // WAL mode is automatically enabled for file-based DuckDB databases
-        let manager = DuckdbConnectionManager::file(&db_path).unwrap();
+        // Config disables extension autoloading to prevent macOS code signing issues
+        let manager = DuckdbConnectionManager::file_with_flags(&db_path, config).unwrap();
         let pool = Pool::builder()
             .max_size(8)         // 8 concurrent connections
-            .min_idle(Some(2))   // Keep 2 connections warm
+            .min_idle(Some(0))   // Don't keep idle connections - prevents stale reads after checkpoint
             .build(manager).unwrap();
 
-        tracing::info!("Database connection pool established (WAL mode enabled by default)");
+        tracing::info!("Database connection pool established (WAL mode enabled, extension autoloading disabled)");
         pool
     };
 
@@ -283,6 +291,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 fileprovider_api_key: fileprovider_api_key.clone(),
                 port,
                 test_mode: cfg!(debug_assertions), // Enable test routes in debug builds only
+                orphaned_fragment_scan: Arc::new(std::sync::Mutex::new(None)),
             };
 
             // If we loaded state from database, populate the OnceCell fields
@@ -429,6 +438,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/maintenance/rebalance", post(files::routes::post_rebalance_network))
                 .route("/maintenance/takeout", post(takeout::routes::post_takeout_maintenance))
                 .route("/maintenance/fragment-inventory-self-check", post(files::routes::post_fragment_inventory_self_check))
+                .route("/maintenance/orphaned-fragments", get(files::routes::get_orphaned_fragments_scan).delete(files::routes::delete_orphaned_fragments))
                 .route("/diagnostics/fragment-inventory-differential", get(files::routes::get_fragment_inventory_differential))
                 .route("/diagnostics/file-fragments", get(files::routes::get_file_fragment_distribution))
                 .route("/diagnostics/network-resilience", get(files::routes::get_network_resilience_stats))
@@ -655,10 +665,13 @@ async fn run_with_gui() -> Result<(), Box<dyn std::error::Error>> {
             // Create tray icon with proper error handling
             let mut tray_builder = TrayIconBuilder::with_id("main_tray")
                 .menu(&menu);
-            
-            // Set icon if available
-            if let Some(icon) = app.default_window_icon() {
-                tray_builder = tray_builder.icon(icon.clone());
+
+            // Load tray icon from icon.png (different from app icon)
+            if let Some(resource_path) = app.path().resource_dir().ok() {
+                let tray_icon_path = resource_path.join("icons/icon.png");
+                if let Ok(icon) = tauri::image::Image::from_path(&tray_icon_path) {
+                    tray_builder = tray_builder.icon(icon);
+                }
             }
             
             let toggle_item_ref = toggle_item.clone();

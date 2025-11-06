@@ -25,7 +25,7 @@ pub fn generate_ed25519_key() -> (SigningKey, VerifyingKey) {
 /// Force DuckDB to flush its write-ahead log and clear transaction metadata
 /// Avoids write-write conflicts when performing high-speed state transition updates on singleton table
 /// Uses FORCE CHECKPOINT to wait for any active transactions to complete
-fn checkpoint_connection(conn: &duckdb::Connection) -> Result<(), ConsensusError> {
+pub fn checkpoint_connection(conn: &duckdb::Connection) -> Result<(), ConsensusError> {
     conn.execute_batch("FORCE CHECKPOINT").map_err(|e| {
         tracing::error!("Failed to force checkpoint connection: {:?}", e);
         ConsensusError::DatabaseError
@@ -99,6 +99,7 @@ pub async fn check_leader_abandonment(
 pub async fn issue_timeout_vote(
     view: i32,
     app_state: &AppState,
+    guard: Option<tokio::sync::MutexGuard<'_, ()>>,
 ) -> Result<(), ConsensusError> {
     // Get current consensus state (reissuance-safe: picks up latest QC if synced)
     let consensus_state = db::get_consensus(app_state.db_pool.get())
@@ -136,7 +137,7 @@ pub async fn issue_timeout_vote(
 
             // Apply and broadcast TC (Layer 2 defense pattern from routes.rs)
             use crate::consensus::routes::{apply_timeout_certificate, broadcast_timeout_certificate};
-            let apply_result = apply_timeout_certificate(tc.clone(), app_state, false);
+            let apply_result = apply_timeout_certificate(tc.clone(), app_state, false, guard);
             let broadcast_result = broadcast_timeout_certificate(tc, app_state);
             let (apply_res, broadcast_res) = tokio::join!(apply_result, broadcast_result);
 
@@ -207,11 +208,10 @@ pub async fn abort_if_timing_out<'a>(
     if let Err(ConsensusError::NetworkTimeout) = check_leader_abandonment(view, validators, app_state).await {
         tracing::warn!("Futility detected for view {}, issuing timeout vote and aborting", view);
 
-        // Drop the guard BEFORE issuing timeout vote (prevents deadlock)
-        // issue_timeout_vote may call apply_timeout_certificate, which tries to acquire the lock
-        drop(guard);
-
-        let _ = issue_timeout_vote(view, app_state).await;
+        // Pass guard through to issue_timeout_vote (may be Some or None)
+        // If Some: held through GST wait to prevent race conditions
+        // If None: acquired after GST wait to allow Lock QC to win
+        let _ = issue_timeout_vote(view, app_state, guard).await;
         return Err(ConsensusError::NetworkTimeout);
     }
 
@@ -338,7 +338,17 @@ pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transa
     }; // tx and conn are dropped here
 
     // Async: Collect votes and create Propose QC (no transaction needed)
-    let qc1 = ballot_round(ballot_propose, &validators, &validators_elect, app_state).await?;
+    // If ballot round fails, issue timeout vote to advance the view
+    let qc1 = match ballot_round(ballot_propose, &validators, &validators_elect, app_state).await {
+        Ok(qc) => qc,
+        Err(e) => {
+            let view = consensus_state.view;
+            tracing::warn!("Propose ballot round failed in view {}, issuing timeout vote", view);
+            // Pass guard through to hold lock during GST wait and prevent race
+            let _ = issue_timeout_vote(view, app_state, Some(guard)).await;
+            return Err(e);
+        }
+    };
 
     // Start broadcasting Propose QC immediately (critical network info even if we fail locally)
     // Keep JoinHandle so we can await completion before Lock ballot
@@ -384,7 +394,17 @@ pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transa
     }; // tx and conn are dropped here
 
     // Async: Collect votes and create Lock QC (no transaction needed)
-    let qc2 = ballot_round(ballot_lock, &validators, &validators_elect, app_state).await?;
+    // If ballot round fails, issue timeout vote to advance the view
+    let qc2 = match ballot_round(ballot_lock, &validators, &validators_elect, app_state).await {
+        Ok(qc) => qc,
+        Err(e) => {
+            let view = consensus_state.view;
+            tracing::warn!("Lock ballot round failed in view {}, issuing timeout vote", view);
+            // Pass guard through to hold lock during GST wait and prevent race
+            let _ = issue_timeout_vote(view, app_state, Some(guard)).await;
+            return Err(e);
+        }
+    };
 
     // Broadcast Lock QC first (fire and forget in background)
     // This ensures network gets the QC even if we fail to integrate it locally

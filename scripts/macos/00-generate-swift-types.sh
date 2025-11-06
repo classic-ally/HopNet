@@ -33,6 +33,7 @@ mkdir -p "$OUTPUT_DIR"
 # Generate Swift types
 echo "🔄 Running typeshare..."
 "$TYPESHARE" \
+    --config-file "$PROJECT_ROOT/typeshare.toml" \
     --lang swift \
     --output-file "$OUTPUT_FILE" \
     "$COMMON_SRC"
@@ -41,10 +42,22 @@ if [ $? -eq 0 ]; then
     echo "✅ Swift types generated successfully"
     echo "📄 Output: $OUTPUT_FILE"
 
-    # Remove TakeoutRecord from Swift types (not needed for FileProvider)
-    echo "🔧 Removing TakeoutRecord from Swift types..."
-    sed -i '' '/^\/\/\/ Takeout record for user data export requests$/,/^}$/d' "$OUTPUT_FILE"
-    echo "✅ TakeoutRecord removed from Swift types"
+    # Post-process Swift types
+    echo "🔧 Post-processing Swift types..."
+
+    # Remove TakeoutRecord (not needed for FileProvider)
+    if grep -q "TakeoutRecord" "$OUTPUT_FILE"; then
+        perl -i -ne 'print unless /^\/\/\/ Takeout record for user data export requests$/ .. /^}$/' "$OUTPUT_FILE"
+        echo "  ✓ Removed TakeoutRecord"
+    fi
+
+    # Replace 'number' type with 'UInt64' (typeshare's 'number' is for TypeScript)
+    if grep -q ": number" "$OUTPUT_FILE"; then
+        perl -i -pe 's/: number/: UInt64/g' "$OUTPUT_FILE"
+        echo "  ✓ Replaced 'number' type with 'UInt64'"
+    fi
+
+    echo "✅ Swift types post-processed"
 else
     echo "❌ Failed to generate Swift types"
     exit 1
