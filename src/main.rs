@@ -29,6 +29,7 @@ mod types;
 mod handlers;
 mod files;
 mod fileprovider;
+mod documentprovider;
 mod takeout;
 mod admin;
 
@@ -524,6 +525,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .merge(validator_consensus_routes)
                 .merge(observer_consensus_routes)
                 .nest("/integrations/fileprovider", fileprovider_routes)
+                .nest("/integrations/documentprovider", documentprovider::routes::router(app_state.clone()))
                 .merge(test_routes)
                 .route("/setup", get(setup::get_setup))
                 .route("/setup", post(setup::post_setup))

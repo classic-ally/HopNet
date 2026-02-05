@@ -2332,6 +2332,7 @@ dependencies = [
  "include_dir",
  "inventory",
  "jsonwebtoken",
+ "mime_guess",
  "network-interface",
  "objc2 0.6.2",
  "objc2-file-provider",

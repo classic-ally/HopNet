@@ -1,6 +1,7 @@
 // HopNet Common Types Library
 pub mod db;
 pub mod fileprovider;
+pub mod documentprovider;
 pub mod setup;
 pub mod debug;
 

@@ -18,6 +18,7 @@ pub mod nodes;
 pub mod files;
 pub mod fragments;
 pub mod fileprovider;
+pub mod documentprovider;
 pub mod takeout;
 pub mod inventory;
 pub mod resilience;

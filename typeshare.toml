@@ -32,3 +32,16 @@ input_path = "common/src/"
 [[targets]]
 target = "typescript"
 input_path = "common/src/"
+
+[[targets]]
+target = "kotlin"
+input_path = "common/src/"
+
+[kotlin]
+kotlin_file = "android/HopNetStorageProvider/app/src/main/java/app/hopnet/storage/generated/HopNetTypes.kt"
+package = "app.hopnet.storage.generated"
+
+[kotlin.type_mappings]
+"u64" = "Long"
+"i64" = "Long"
+"i32" = "Int"
