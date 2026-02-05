@@ -1,5 +1,6 @@
 // HopNet Common Types Library
 pub mod db;
+pub mod devices;
 pub mod fileprovider;
 pub mod documentprovider;
 pub mod setup;
@@ -11,5 +12,6 @@ pub mod db_impl;
 
 // Re-export commonly used types at the top level
 pub use db::{InodeType, TakeoutStatus, TakeoutRecord, CustomUUID, FileItem};
+pub use devices::{RegisterDeviceRequest, RegisterDeviceResponse, DeviceInfo};
 pub use fileprovider::{HealthStatus, HealthResponse, FileProviderItem, EnumerateResponse, DeleteItemRequest, ChangesResponse, ChangesQuery};
 pub use debug::{StateSnapshot, TableHashInfo};

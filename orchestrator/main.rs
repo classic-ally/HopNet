@@ -520,8 +520,9 @@ async fn create_hopnet_container(
         (0, 0)
     };
 
-    // Port bindings only needed for Podman (rootless can't access container IPs)
-    let (port_bindings, host_port) = if runtime == sys::ContainerRuntime::Podman {
+    // Port bindings needed for Podman and Docker on macOS (can't access container IPs directly)
+    let needs_port_binding = runtime == sys::ContainerRuntime::Podman || cfg!(target_os = "macos");
+    let (port_bindings, host_port) = if needs_port_binding {
         // Find available port with collision detection
         let port = sys::find_available_port(mesh_id, node_id).await?;
         let mut bindings = HashMap::new();
@@ -534,7 +535,7 @@ async fn create_hopnet_container(
         );
         (Some(bindings), port)
     } else {
-        // Docker: no port mapping needed, we access container IPs directly
+        // Docker on Linux: no port mapping needed, we access container IPs directly
         (None, 34633)
     };
 
@@ -1548,11 +1549,16 @@ pub async fn get_internal_addresses(docker: &Docker, mesh_id: u32) -> Result<Vec
 /// Get external addresses for host-to-container communication
 /// Returns (node_id, host, port) - adapts based on runtime
 pub async fn get_external_addresses(docker: &Docker, mesh_id: u32, runtime: sys::ContainerRuntime) -> Result<Vec<(u32, String, u16)>> {
+    // On macOS, always use localhost with host port (can't access container IPs directly)
+    let use_host_port = runtime == sys::ContainerRuntime::Podman || cfg!(target_os = "macos");
     Ok(get_node_metadata(docker, mesh_id).await?
         .into_iter()
-        .map(|m| match runtime {
-            sys::ContainerRuntime::Docker => (m.node_id, m.container_ip, 34633),
-            sys::ContainerRuntime::Podman => (m.node_id, "localhost".to_string(), m.host_port),
+        .map(|m| {
+            if use_host_port {
+                (m.node_id, "localhost".to_string(), m.host_port)
+            } else {
+                (m.node_id, m.container_ip, 34633)
+            }
         })
         .collect())
 }

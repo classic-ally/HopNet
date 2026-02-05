@@ -16,8 +16,10 @@ pub struct DocumentProviderItem {
     /// MIME type ("vnd.android.document/directory" for folders, or actual MIME for files)
     pub mime_type: String,
     /// File size in bytes (0 for folders)
+    #[typeshare(serialized_as = "number")]
     pub size: i64,
     /// Last modified timestamp (epoch milliseconds)
+    #[typeshare(serialized_as = "number")]
     pub last_modified: i64,
     /// Parent folder ID (None for root-level items)
     pub parent_id: Option<CustomUUID>,

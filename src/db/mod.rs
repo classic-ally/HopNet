@@ -20,6 +20,7 @@ pub mod fragments;
 pub mod fileprovider;
 pub mod documentprovider;
 pub mod takeout;
+pub mod devices;
 pub mod inventory;
 pub mod resilience;
 pub mod debug;

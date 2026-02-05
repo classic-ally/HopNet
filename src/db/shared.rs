@@ -358,6 +358,18 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
             CREATE INDEX idx_fragment_inventory_node ON fragment_inventory (node_id, fragment_hash);  -- Node-specific fragment lookup
             CREATE INDEX idx_fragment_inventory_height ON fragment_inventory (self_verified_height, node_id);  -- Height-based queries
 
+            -- Device tokens for OS integration authentication (consensus-replicated)
+            -- API key format: {token_id}.{secret} - only hash of secret is stored
+            -- Device name is SIV-encrypted with user's key (privacy from other nodes)
+            CREATE TABLE device_tokens (
+                id                      UUID PRIMARY KEY,   -- UUIDv7 encodes creation time
+                user_id                 INTEGER NOT NULL,
+                api_key_hash            BLOB NOT NULL,      -- Blake3 hash of secret portion
+                encrypted_device_name   TEXT NOT NULL,      -- SIV-encrypted, hex-encoded
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            );
+            CREATE INDEX idx_device_tokens_user_id ON device_tokens(user_id);
+
             -- Add comments for fragment inventory documentation
             COMMENT ON TABLE fragment_inventory IS 'Tracks which nodes store which fragments for distributed discovery and self-attestation';
             COMMENT ON COLUMN fragment_inventory.self_verified_height IS 'Last consensus height when node verified it actually has this fragment on disk';

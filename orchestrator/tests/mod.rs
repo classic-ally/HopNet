@@ -16,6 +16,7 @@ mod fragment_distribution;
 mod multi_size_files;
 mod performance;
 mod persistence;
+mod device_tokens;
 
 /// Represents the result of a test scenario execution
 #[derive(Debug)]
@@ -88,6 +89,9 @@ pub async fn run_test_by_name(mesh_id: u32, name: &str, nodes: &[NodeInfo], flag
         "restart-persistence" => {
             persistence::RestartPersistence.run(mesh_id, nodes, flags).await
         }
+        "device-token-consistency" => {
+            device_tokens::DeviceTokenConsistency.run(mesh_id, nodes, flags).await
+        }
         _ => Err(anyhow::anyhow!("Unknown test: {}", name)),
     }
 }
@@ -100,6 +104,7 @@ pub fn list_test_names() -> Vec<&'static str> {
         "multi-size-file-consistency",
         "chunked-streaming-performance",
         "restart-persistence",
+        "device-token-consistency",
     ]
 }
 

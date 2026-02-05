@@ -2,12 +2,112 @@ use aes_siv::{siv::Aes256Siv, Key, Nonce};
 use duckdb::params;
 use r2d2::PooledConnection;
 
-use crate::db::{CustomUUID, DuckdbConnectionManager};
+use crate::db::{CustomUUID, CustomDateTime, DuckdbConnectionManager};
 use hopnet_common::db::InodeType;
 use crate::files::functions::decrypt_path;
 use hopnet_common::documentprovider::DocumentProviderItem;
 
 use super::DatabaseError;
+
+/// Get a single item by inode_id, returning a DocumentProviderItem
+/// Uses a self-join to get parent_id in a single query
+pub fn get_item(
+    db_lock: &PooledConnection<DuckdbConnectionManager>,
+    inode_id: &CustomUUID,
+    user_id: i32,
+    siv_key: &Key<Aes256Siv>,
+    siv_nonce: &Nonce,
+) -> Result<DocumentProviderItem, DatabaseError> {
+    let query = r#"
+        SELECT
+            i.id,
+            i.type,
+            i.path,
+            db.file_size,
+            COALESCE(
+                uuid_extract_timestamp(i.data_id),
+                uuid_extract_timestamp(i.id)
+            ) as last_modified,
+            parent.id as parent_id
+        FROM inodes i
+        LEFT JOIN data_blocks db ON i.data_id = db.id
+        LEFT JOIN inodes parent ON
+            parent.path = regexp_extract(i.path, '^(.+)/[^/]+$', 1)
+            AND parent.owner_id = i.owner_id
+        WHERE i.id = ? AND i.owner_id = ?
+        LIMIT 1
+    "#;
+
+    let mut stmt = db_lock.prepare(query).map_err(|_| DatabaseError::ProcessingError)?;
+
+    let (id, item_type, encrypted_path, file_size, last_modified, parent_id): (
+        CustomUUID,
+        InodeType,
+        String,
+        Option<i64>,
+        CustomDateTime,
+        Option<CustomUUID>,
+    ) = stmt
+        .query_row(params![inode_id, user_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
+        })
+        .map_err(|e| match e {
+            duckdb::Error::QueryReturnedNoRows => DatabaseError::NotFound,
+            _ => DatabaseError::RecallError,
+        })?;
+
+    // Decrypt path to get filename
+    let decrypted_path = decrypt_path(encrypted_path, siv_key, siv_nonce)
+        .map_err(|_| DatabaseError::ProcessingError)?;
+    let name = decrypted_path
+        .split('/')
+        .last()
+        .unwrap_or(&decrypted_path)
+        .to_string();
+
+    // Derive MIME type from filename
+    let mime_type = match item_type {
+        InodeType::Folder => "vnd.android.document/directory".to_string(),
+        InodeType::File => mime_guess::from_path(&name)
+            .first()
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| "application/octet-stream".to_string()),
+    };
+
+    Ok(DocumentProviderItem {
+        id,
+        name,
+        mime_type,
+        size: file_size.unwrap_or(0),
+        last_modified: last_modified.timestamp_millis(),
+        parent_id,
+    })
+}
+
+/// Get minimal metadata needed for file download: encrypted_path and type
+/// Single table query, no joins - optimized for download hot path
+pub fn get_download_metadata(
+    db_lock: &PooledConnection<DuckdbConnectionManager>,
+    inode_id: &CustomUUID,
+    user_id: i32,
+) -> Result<(String, InodeType), DatabaseError> {
+    let query = r#"
+        SELECT path, type
+        FROM inodes
+        WHERE id = ? AND owner_id = ?
+        LIMIT 1
+    "#;
+
+    let mut stmt = db_lock.prepare(query).map_err(|_| DatabaseError::ProcessingError)?;
+
+    stmt.query_row(params![inode_id, user_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, InodeType>(1)?))
+    })
+    .map_err(|e| match e {
+        duckdb::Error::QueryReturnedNoRows => DatabaseError::NotFound,
+        _ => DatabaseError::RecallError,
+    })
+}
 
 /// Get encrypted path for a given inode_id
 /// Takes an existing db lock to allow combining with other operations

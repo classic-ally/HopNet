@@ -4,12 +4,13 @@
     import Toolbar from "../primitives/Toolbar.svelte";
     import NodesPane from "../panes/nodes/NodesPane.svelte";
     import TakeoutPane from "../panes/takeout/TakeoutPane.svelte";
+    import DevicesPane from "../panes/devices/DevicesPane.svelte";
     import SidebarItem from "./SidebarItem.svelte";
     import ResiliencePane from "../panes/resilience/ResiliencePane.svelte";
     import MaintenancePane from "../panes/maintenance/MaintenancePane.svelte";
 
     // State to track which sidebar item is selected
-    let selectedItem = "browse"; // Can be "recents", "browse", "account", "nodes", "takeout", "resilience", "maintenance"
+    let selectedItem = "browse"; // Can be "recents", "browse", "account", "nodes", "takeout", "devices", "resilience", "maintenance"
     // State to track if we're in account mode (sticky)
     let inAccountMode = false;
     
@@ -71,6 +72,14 @@
         }
     }
 
+    function handleDevicesClick() {
+        selectedItem = "devices";
+        // Close sidebar on mobile after selection
+        if (window.innerWidth < 768) {
+            isSidebarOpen = false;
+        }
+    }
+
     function handleAccountBack() {
         // When back is clicked from account, exit account mode and go back to recents
         inAccountMode = false;
@@ -121,6 +130,12 @@
                         title="Takeouts"
                         selected={selectedItem === "takeout"}
                         onClick={handleTakeoutClick}
+                    />
+                    <SidebarItem
+                        icon="i-carbon-phone"
+                        title="Devices"
+                        selected={selectedItem === "devices"}
+                        onClick={handleDevicesClick}
                     />
                     <SidebarItem
                         icon="i-carbon-ibm-vsi-on-vpc-for-regulated-industries"
@@ -174,6 +189,9 @@
         {:else if selectedItem === "takeout"}
             <!-- Takeout pane with integrated toolbar -->
             <TakeoutPane onToggleSidebar={toggleSidebar}/>
+        {:else if selectedItem === "devices"}
+            <!-- Devices pane with integrated toolbar -->
+            <DevicesPane onToggleSidebar={toggleSidebar}/>
         {:else if selectedItem === "resilience"}
             <!-- Resilience pane with integrated toolbar -->
             <ResiliencePane onToggleSidebar={toggleSidebar}/>

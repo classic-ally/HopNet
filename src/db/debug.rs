@@ -34,6 +34,7 @@ const CONSENSUS_TABLES: &[&str] = &[
     "fragment_request_metrics",
     "metrics",
     "fragment_inventory",
+    "device_tokens",
 ];
 
 /// Internal state snapshot with rich types (Blake3Hash)

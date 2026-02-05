@@ -464,6 +464,7 @@ pub fn create_test_app_state_with_keys(signing_key: crate::db::PrivKey, verifyin
         fileprovider_api_key: "test_api_key".to_string(),
         port: 3000,
         test_mode: true,
+        orphaned_fragment_scan: Arc::new(std::sync::Mutex::new(None)),
     }
 }
 

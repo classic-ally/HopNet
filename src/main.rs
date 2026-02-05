@@ -32,6 +32,7 @@ mod fileprovider;
 mod documentprovider;
 mod takeout;
 mod admin;
+mod devices;
 
 static ASSETS_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/frontend/dist");
 
@@ -526,6 +527,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .merge(observer_consensus_routes)
                 .nest("/integrations/fileprovider", fileprovider_routes)
                 .nest("/integrations/documentprovider", documentprovider::routes::router(app_state.clone()))
+                .nest("/devices", devices::routes::router(app_state.clone()))
                 .merge(test_routes)
                 .route("/setup", get(setup::get_setup))
                 .route("/setup", post(setup::post_setup))
