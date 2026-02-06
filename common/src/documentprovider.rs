@@ -32,3 +32,25 @@ pub struct DocumentProviderItem {
 pub struct DocumentProviderEnumerateResponse {
     pub items: Vec<DocumentProviderItem>,
 }
+
+/// Request body for modify (rename/move) operation
+#[derive(Debug, Deserialize, Serialize)]
+#[typeshare]
+#[serde(rename_all = "camelCase")]
+pub struct ModifyDocumentProviderRequest {
+    /// Inode UUID to modify
+    pub id: String,
+    /// New filename (for rename operation)
+    pub name: Option<String>,
+    /// New parent UUID or "root" (for move operation)
+    pub parent_id: Option<String>,
+}
+
+/// Response for modify operation
+#[derive(Debug, Deserialize, Serialize)]
+#[typeshare]
+#[serde(rename_all = "camelCase")]
+pub struct ModifyDocumentProviderResponse {
+    /// The identifier after modification (unchanged since inode ID is stable)
+    pub new_identifier: String,
+}

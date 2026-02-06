@@ -278,6 +278,33 @@ pub fn decrypt_part(
     }
 }
 
+/// Construct an encrypted path from parent path and filename segment.
+///
+/// Handles the edge cases around slash separators:
+/// - encrypt_part() returns segments with leading "/" (e.g., "/abc123")
+/// - Extracted segments from existing paths don't have leading "/" (e.g., "abc123")
+/// - Root level paths need a leading "/"
+///
+/// # Arguments
+/// * `parent_path` - The encrypted parent directory path (empty string for root)
+/// * `filename_segment` - The encrypted filename (may or may not have leading "/")
+pub fn build_encrypted_path(parent_path: &str, filename_segment: &str) -> String {
+    if parent_path.is_empty() {
+        // Root level - ensure leading slash
+        if filename_segment.starts_with('/') {
+            filename_segment.to_string()
+        } else {
+            format!("/{}", filename_segment)
+        }
+    } else if filename_segment.starts_with('/') {
+        // Segment from encrypt_part already has slash - concatenate directly
+        format!("{}{}", parent_path, filename_segment)
+    } else {
+        // Extracted segment without slash - add separator
+        format!("{}/{}", parent_path, filename_segment)
+    }
+}
+
 /// Get the XDG data directory for storing fragments
 pub fn get_fragments_dir() -> Result<String, FileError> {
     let data_dir = std::env::var("XDG_DATA_HOME")

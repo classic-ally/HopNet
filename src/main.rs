@@ -227,6 +227,12 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
     // Check if database schema is initialized
     let conn = pool.get().unwrap();
+
+    // Install and load JSON extension (needed for state snapshot queries)
+    // Extension autoloading is disabled to prevent macOS code signing issues
+    conn.execute_batch("INSTALL json; LOAD json;")
+        .expect("Failed to load JSON extension");
+
     let schema_initialized = if use_ephemeral_db {
         false  // Ephemeral database always needs initialization
     } else {

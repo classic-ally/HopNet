@@ -8,7 +8,7 @@ use serde::Deserialize;
 
 use crate::AppState;
 use crate::db::{self, DatabaseError};
-use crate::files::functions::encrypt_path;
+use crate::files::functions::{build_encrypted_path, encrypt_path};
 use crate::consensus::{functions::consensus_middleware, types::Transaction};
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
 use rand_core::OsRng;
@@ -872,26 +872,10 @@ pub async fn modify_item(
         };
         
         // Concatenate parent path + filename segment with proper slash handling
-        tracing::debug!("modify_item: Path construction - parent_empty: {}, filename_starts_with_slash: {}", 
+        tracing::debug!("modify_item: Path construction - parent_empty: {}, filename_starts_with_slash: {}",
                        parent_encrypted_path.is_empty(), filename_encrypted_segment.starts_with('/'));
-        let new_path = if parent_encrypted_path.is_empty() {
-            // Root level - need to add leading slash to match enumeration pattern (like post_files does)
-            tracing::debug!("modify_item: Root level path construction");
-            if filename_encrypted_segment.starts_with('/') {
-                filename_encrypted_segment.clone()
-            } else {
-                format!("/{}", filename_encrypted_segment)
-            }
-        } else if filename_encrypted_segment.starts_with('/') {
-            // Encrypted segment already has slash (from encrypt_part)
-            tracing::debug!("modify_item: Direct concatenation (filename has slash)");
-            format!("{}{}", parent_encrypted_path, &filename_encrypted_segment)  
-        } else {
-            // Extracted segment without slash - need to add one
-            tracing::debug!("modify_item: Adding slash between parent and filename");
-            format!("{}/{}", parent_encrypted_path, &filename_encrypted_segment)
-        };
-        tracing::debug!("modify_item: Constructed new_path='{}' from parent='{}' + filename='{}'", 
+        let new_path = build_encrypted_path(&parent_encrypted_path, &filename_encrypted_segment);
+        tracing::debug!("modify_item: Constructed new_path='{}' from parent='{}' + filename='{}'",
                        new_path, parent_encrypted_path, &filename_encrypted_segment);
         Some(new_path)
     } else {

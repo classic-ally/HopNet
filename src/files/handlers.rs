@@ -254,12 +254,18 @@ impl TransactionHandler for DeleteFilesHandler {
                     return Err(DatabaseError::AuthorizationError);
                 }
 
-                crate::db::files::delete_files(
+                // Idempotent delete: NotFound is not an error (file may already be deleted,
+                // or validation snapshot may not see recent moves/renames)
+                match crate::db::files::delete_files(
                     db_tx,
                     payload_data.encrypted_path,
                     payload_data.user_id,
-                )?;
-                
+                ) {
+                    Ok(()) => {},
+                    Err(DatabaseError::NotFound) => {}, // Idempotent: already deleted or not found
+                    Err(e) => return Err(e),
+                }
+
                 if execute {
                     tracing::info!("Deleted files at path for user {}", payload_data.user_id);
                     
@@ -273,8 +279,6 @@ impl TransactionHandler for DeleteFilesHandler {
                             }
                         });
                     }
-                } else {
-                    tracing::debug!("Validation passed: files exist for deletion for user {}", payload_data.user_id);
                 }
                 Ok(())
             },
