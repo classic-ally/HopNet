@@ -18,6 +18,7 @@ unused_variables = "allow"
 default = ["headless"]
 gui = ["tauri", "tauri-build", "cocoa"]
 headless = []
+skip-frontend = []  # Skip frontend build (for orchestrator-only builds)
 
 [dependencies]
 hopnet-common = { path = "common", features = ["database"] }

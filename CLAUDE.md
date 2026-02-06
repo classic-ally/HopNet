@@ -1,3 +1,18 @@
+# Orchestrator Infrastructure
+
+HopNet includes a Docker-based orchestrator for testing mesh networks. The following Claude infrastructure is available:
+
+**Agents:**
+- `orchestrator-runner` (haiku) - Executes orchestrator commands (create mesh, run tests, check divergence). Returns structured results with SUCCESS, FAILURE, or NEEDS_DEBUG status.
+- `orchestrator-debugger` (sonnet) - Investigates failures. Analyzes container logs, consensus history, and divergence patterns to identify root causes.
+
+**Skill:**
+- `orchestrator-reference` - Command syntax, available tests, and workflow documentation. Loaded automatically by both agents.
+
+**Workflow:**
+- When invoking `orchestrator-runner`, include mesh context: which mesh to use (if any exists), whether to reuse or create fresh, and any state requirements.
+- When `orchestrator-runner` returns `NEEDS_DEBUG`, automatically invoke `orchestrator-debugger` with the failure context to investigate.
+
 # Documentation Management
 - ALWAYS check docs/system-overview.md for current project status and priorities
 - When making code changes that affect system status, update progress indicators in:

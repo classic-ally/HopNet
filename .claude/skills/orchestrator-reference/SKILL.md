@@ -1,0 +1,179 @@
+---
+name: orchestrator-reference
+description: Reference documentation for the HopNet orchestrator. Covers command syntax, available tests, workflows, and diagnostics.
+user-invocable: false
+---
+
+# HopNet Orchestrator Reference
+
+The orchestrator is a Docker/Podman-based tool for testing and managing Byzantine fault-tolerant consensus networks.
+
+## Location & Invocation
+
+- **Source**: `orchestrator/main.rs`
+- **Binary**: Defined in `Cargo.toml` as `[[bin]] name = "orchestrator"`
+
+```bash
+# Build the orchestrator (always do this first to get latest)
+# Use --features skip-frontend for faster builds (skips frontend compilation)
+cargo build --release --bin orchestrator --features skip-frontend
+
+# Run commands
+./target/release/orchestrator <command>
+```
+
+## Command Reference
+
+### Mesh Management
+
+| Command | Syntax | Description |
+|---------|--------|-------------|
+| **create** | `orchestrator create --nodes N [--no-cleanup]` | Create new mesh with N nodes. `--no-cleanup` keeps containers on failure for debugging. |
+| **add** | `orchestrator add --mesh-id M --nodes N` | Add N nodes to existing mesh M |
+| **list** | `orchestrator list` | List all active meshes with node counts |
+| **delete** | `orchestrator delete --mesh-id M [-y]` | Delete mesh M and all resources. `-y` skips confirmation. |
+| **cleanup** | `orchestrator cleanup [-y]` | Remove orphaned networks from deleted meshes |
+
+### Diagnostics
+
+| Command | Syntax | Description |
+|---------|--------|-------------|
+| **status** | `orchestrator status --mesh-id M` | View consensus state (view, phase, role) across all nodes |
+| **divergence** | `orchestrator divergence --mesh-id M` | Detect state inconsistencies between nodes |
+| **history** | `orchestrator history --mesh-id M --node N [--view V]` | Query consensus history for a specific node. Optional `--view` for detailed state at that view. |
+
+### Testing
+
+| Command | Syntax | Description |
+|---------|--------|-------------|
+| **test** | `orchestrator test --mesh-id M --test NAME [--flags ...]` | Run named integration test |
+| **test list** | `orchestrator test --list` | List all available tests |
+
+## Available Integration Tests
+
+| Test Name | Description |
+|-----------|-------------|
+| `file-upload-consistency` | Files uploaded to one node are retrievable from all nodes |
+| `fragment-distribution` | Fragments are properly distributed across mesh after upload |
+| `multi-size-file-consistency` | Various file sizes (small, medium, large) work correctly |
+| `chunked-streaming-performance` | Streaming performance with chunked RS encoding |
+| `restart-persistence` | Data survives node restarts |
+| `device-token-consistency` | Device token management across nodes |
+| `documentprovider-write-consistency` | Document provider write APIs (upload, rename, move, delete) |
+
+## Common Workflows
+
+### Development Workflow
+
+When testing code changes against the orchestrator:
+
+```bash
+# 1. Build the HopNet Docker image (if source changed)
+docker build -t hopnet:latest .
+
+# 2. Build orchestrator (skip-frontend for faster builds)
+cargo build --release --bin orchestrator --features skip-frontend
+
+# 3. Create a test mesh
+./target/release/orchestrator create --nodes 3
+
+# 4. Run tests against the mesh
+./target/release/orchestrator test --mesh-id 0 --test file-upload-consistency
+
+# 5. Check for state divergence
+./target/release/orchestrator divergence --mesh-id 0
+
+# 6. Clean up when done
+./target/release/orchestrator delete --mesh-id 0 -y
+```
+
+### Testing Workflow
+
+Full test suite against a mesh:
+
+```bash
+# Build orchestrator first (skip-frontend for faster builds)
+cargo build --release --bin orchestrator --features skip-frontend
+
+# Create mesh
+./target/release/orchestrator create --nodes 3
+
+# Run multiple tests
+./target/release/orchestrator test --mesh-id 0 --test file-upload-consistency
+./target/release/orchestrator test --mesh-id 0 --test fragment-distribution
+./target/release/orchestrator test --mesh-id 0 --test multi-size-file-consistency
+
+# Check overall health
+./target/release/orchestrator divergence --mesh-id 0
+
+# Cleanup
+./target/release/orchestrator delete --mesh-id 0 -y
+```
+
+### Diagnostics Workflow
+
+When debugging consensus or state issues:
+
+```bash
+# 1. Check current consensus state across nodes
+./target/release/orchestrator status --mesh-id 0
+
+# 2. Look for state divergence
+./target/release/orchestrator divergence --mesh-id 0
+
+# 3. Inspect specific node's history
+./target/release/orchestrator history --mesh-id 0 --node 0
+
+# 4. Check state at specific view
+./target/release/orchestrator history --mesh-id 0 --node 0 --view 5
+```
+
+### Debugging Failed Tests
+
+When `--no-cleanup` is used on create, containers remain for inspection:
+
+```bash
+# Create mesh that won't auto-cleanup on failure
+./target/release/orchestrator create --nodes 3 --no-cleanup
+
+# If test fails, containers remain running
+# Check container logs
+docker logs hopnet-orchestrator-0-0
+
+# Inspect container state
+docker exec -it hopnet-orchestrator-0-0 /bin/sh
+
+# Manual cleanup when done
+./target/release/orchestrator delete --mesh-id 0 -y
+```
+
+## Understanding Output
+
+### Status Output
+- **LEADER**: Node leading current consensus view
+- **FOLLOWER**: Node following the leader
+- **View**: Current consensus view number (higher = more recent)
+- **Phase**: Consensus phase (Propose, Lock, Commit, etc.)
+
+### Divergence Output
+- **Consensus**: All nodes at same view with same state hash
+- **Divergence**: Different hashes at same view (consensus broken - bug)
+- **Catch-up**: Nodes at lower views (normal during sync)
+
+### Test Results
+- **PASSED**: All checks succeeded
+- **FAILED**: One or more checks failed
+- Check details show exactly what passed/failed
+
+## Container Naming Convention
+
+- **Networks**: `hopnet-orchestrator-{mesh_id}-0`
+- **Containers**: `hopnet-orchestrator-{mesh_id}-{node_id}`
+- **Volumes**: `hopnet-orchestrator-{mesh_id}-{node_id}-data`
+
+## Port Mapping
+
+- Internal port: `34633`
+- Host port (macOS/Podman): `40000 + (mesh_id * 500) + node_id`
+  - Mesh 0: ports 40000-40499
+  - Mesh 1: ports 40500-40999

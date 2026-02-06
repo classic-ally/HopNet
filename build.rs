@@ -6,18 +6,25 @@ fn main() {
     // Handle Tauri build if GUI feature is enabled
     #[cfg(feature = "gui")]
     tauri_build::build();
-    
-    // Frontend build (always runs)
+
+    // Skip frontend build if skip-frontend feature is enabled (for orchestrator-only builds)
+    #[cfg(feature = "skip-frontend")]
+    {
+        println!("cargo:warning=skip-frontend feature enabled - skipping frontend build");
+        return;
+    }
+
+    // Frontend build (always runs unless skip-frontend is set)
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let frontend_dir = Path::new(&manifest_dir).join("frontend");
-    
+
     // Tell cargo to rerun if frontend files change
     println!("cargo:rerun-if-changed=frontend/src");
     println!("cargo:rerun-if-changed=frontend/package.json");
     println!("cargo:rerun-if-changed=frontend/package-lock.json");
     println!("cargo:rerun-if-changed=frontend/vite.config.ts");
     println!("cargo:rerun-if-changed=frontend/tsconfig.json");
-    
+
     // Check if we're in release mode
     let profile = env::var("PROFILE").unwrap_or_default();
     let is_release = profile == "release";
