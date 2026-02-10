@@ -81,12 +81,17 @@ async fn handle_stream(
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
     _peer_node_id: i32,
-    _app_state: AppState,
+    app_state: AppState,
 ) -> Result<(), IrohError> {
     let request: IrohRequest = recv_message(&mut recv).await?;
 
     let response = match request {
         IrohRequest::Ping { nonce } => IrohResponse::Pong { nonce },
+        IrohRequest::FragmentHealthCheck(req) => {
+            IrohResponse::FragmentHealthResult(
+                crate::files::rpc::handle_fragment_health_check(req, &app_state.fragments_dir)
+            )
+        }
     };
 
     send_message(&mut send, &response).await?;

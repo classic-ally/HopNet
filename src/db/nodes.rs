@@ -140,7 +140,7 @@ pub fn get_all_nodes_as_connection_info(
     match db_connection {
         Ok(db_lock) => {
             let mut stmt = db_lock.prepare(
-                "SELECT node_id, ip_address, port FROM nodes WHERE node_id != ?"
+                "SELECT node_id, ip_address, port, pubkey FROM nodes WHERE node_id != ?"
             ).map_err(|_| DatabaseError::RecallError)?;
 
             let results = stmt.query_map([exclude_node_id], |row| {
@@ -148,6 +148,7 @@ pub fn get_all_nodes_as_connection_info(
                     node_id: row.get(0)?,
                     ip_address: row.get(1)?,
                     port: row.get(2)?,
+                    pubkey: row.get(3)?,
                 })
             });
 

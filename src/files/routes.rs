@@ -796,6 +796,7 @@ pub async fn delete_files(
 
 use crate::consensus::routes::AuthenticatedNode;
 use crate::files::functions::{fetch_and_verify_fragment, fragment_exists_and_valid, MAX_FRAGMENT_SIZE};
+use crate::types::Node;
 
 /// GET /fragments/{fragment_hash}
 /// Retrieve a fragment by its Blake3 hash from local storage
@@ -945,52 +946,6 @@ pub async fn get_fragments_count(
         Err(e) => {
             tracing::error!("Failed to get local fragment count: {:?}", e);
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
-    }
-}
-
-/// GET /fragments/{fragment_hash}/health
-/// Health check endpoint that verifies fragment exists and has correct checksum
-/// Used by background monitoring jobs to verify fragment integrity across the network
-pub async fn get_fragment_health(
-    State(app_state): State<AppState>,
-    Path(fragment_hash): Path<Blake3Hash>,
-    Extension(auth): Extension<AuthenticatedNode>,
-) -> impl IntoResponse {
-    // Only allow node owners to perform health checks for inter-node operations
-    
-    // Perform comprehensive health check: existence + disk read + checksum verification
-    match fragment_exists_and_valid(&app_state.fragments_dir, &fragment_hash) {
-        true => {
-            // Double-check by actually reading and verifying the fragment
-            match fetch_and_verify_fragment(&fragment_hash, &app_state.fragments_dir) {
-                Ok(_) => {
-                    tracing::debug!("Fragment health check passed: {}", fragment_hash.to_hex());
-                    
-                    #[derive(Serialize)]
-                    struct HealthResponse {
-                fragment_hash: String,
-                status: String,
-                verified: bool,
-                    }
-                    
-                    let response = HealthResponse {
-                fragment_hash: fragment_hash.to_hex(),
-                status: "healthy".to_string(),
-                verified: true,
-                    };
-                    
-                    (StatusCode::OK, Json(response)).into_response()
-                }
-                Err(e) => {
-                    tracing::warn!("Fragment health check failed for {}: {:?}", fragment_hash.to_hex(), e);
-                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                }
-            }
-        }
-        false => {
-            tracing::debug!("Fragment health check failed - not found: {}", fragment_hash.to_hex());
-            StatusCode::NOT_FOUND.into_response()
         }
     }
 }

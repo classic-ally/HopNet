@@ -244,9 +244,9 @@ pub fn batch_query_fragment_inventory(
             // Build parameterized query with window function to limit nodes per fragment
             let placeholders = fragment_hashes.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
             let query = format!(
-                "SELECT fragment_hash, node_id, ip_address, port
+                "SELECT fragment_hash, node_id, ip_address, port, pubkey
                  FROM (
-                     SELECT fi.fragment_hash, fi.node_id, n.ip_address, n.port,
+                     SELECT fi.fragment_hash, fi.node_id, n.ip_address, n.port, n.pubkey,
                             ROW_NUMBER() OVER (PARTITION BY fi.fragment_hash
                                                ORDER BY fi.self_verified_height DESC) as rn
                      FROM fragment_inventory fi
@@ -273,6 +273,7 @@ pub fn batch_query_fragment_inventory(
                     node_id: row.get(1).map_err(|_| DatabaseError::RecallError)?,
                     ip_address: row.get(2).map_err(|_| DatabaseError::RecallError)?,
                     port: row.get(3).map_err(|_| DatabaseError::RecallError)?,
+                    pubkey: row.get(4).map_err(|_| DatabaseError::RecallError)?,
                 };
 
                 result.entry(fragment_hash).or_insert_with(Vec::new).push(node_info);

@@ -559,6 +559,7 @@ async fn perform_concurrent_fragment_discovery(
         let queue = work_queue.clone();
         let nodes_clone = nodes.clone();
         let auth_clone = auth.clone();
+        let iroh_transport_clone = app_state.iroh_transport.clone();
         let fragments_dir_clone = fragments_dir.to_string();
         let successful_downloads_clone = successful_downloads.clone();
 
@@ -590,7 +591,7 @@ async fn perform_concurrent_fragment_discovery(
                 tracing::debug!("Worker {} trying fragment {} (type: {:?})", worker_id, fragment_hash.to_hex(), fragment_type);
 
                 // Try to find and fetch the fragment from network
-                match find_fragment(&fragment_hash, fragment_type, nodes_clone.clone(), &auth_clone, inventory_hint).await {
+                match find_fragment(&fragment_hash, fragment_type, nodes_clone.clone(), &auth_clone, &iroh_transport_clone, inventory_hint).await {
                 Ok(encrypted_data) => {
                         // Store fragment locally
                         if let Err(e) = store_fragment(&fragments_dir_clone, &fragment_hash, encrypted_data) {
@@ -738,7 +739,7 @@ pub async fn fetch_and_cache_fragment(
     };
 
     // Try to find and fetch the fragment
-    match find_fragment(fragment_hash, FragmentType::Original, nodes, auth, inventory_hint).await {
+    match find_fragment(fragment_hash, FragmentType::Original, nodes, auth, &app_state.iroh_transport, inventory_hint).await {
         Ok(fragment_data) => {
             // Store fragment locally
             store_fragment(fragments_dir, fragment_hash, fragment_data)?;

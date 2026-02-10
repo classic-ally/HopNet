@@ -15,6 +15,7 @@ mod device_tokens;
 mod documentprovider_write;
 mod file_upload;
 mod fragment_distribution;
+mod fragment_health_check;
 mod iroh_ping;
 mod iroh_reject_unknown;
 mod multi_size_files;
@@ -83,6 +84,9 @@ pub async fn run_test_by_name(mesh_id: u32, name: &str, nodes: &[NodeInfo], flag
         "fragment-distribution" => {
             fragment_distribution::FragmentDistribution.run(mesh_id, nodes, flags).await
         }
+        "fragment-health-check" => {
+            fragment_health_check::FragmentHealthCheck.run(mesh_id, nodes, flags).await
+        }
         "chunked-streaming-performance" => {
             performance::ChunkedStreamingPerformance.run(mesh_id, nodes, flags).await
         }
@@ -113,6 +117,7 @@ pub fn list_test_names() -> Vec<&'static str> {
     vec![
         "file-upload-consistency",
         "fragment-distribution",
+        "fragment-health-check",
         "multi-size-file-consistency",
         "chunked-streaming-performance",
         "restart-persistence",

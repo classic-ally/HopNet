@@ -306,7 +306,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 consensus_lock: Arc::new(tokio::sync::Mutex::new(())),
                 fileprovider_api_key: fileprovider_api_key.clone(),
                 port,
-                test_mode: cfg!(debug_assertions), // Enable test routes in debug builds only
+                test_mode: cfg!(debug_assertions) || std::env::var("HOPNET_TEST_MODE").is_ok(),
                 orphaned_fragment_scan: Arc::new(std::sync::Mutex::new(None)),
                 iroh_transport: iroh_transport.clone(),
             };
@@ -504,7 +504,6 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/consensus/view/{view}", get(consensus::routes::get_view_consensus_data))
                 .route("/fragments/{fragment_hash}", get(files::routes::get_fragment))
                 .route("/fragments/{fragment_hash}", post(files::routes::post_fragment))
-                .route("/fragments/{fragment_hash}/health", get(files::routes::get_fragment_health))
                 .route("/rpc/fetch-fragments", post(files::routes::post_fetch_fragments))
                 .route("/rpc/throughput-server", get(metrics::routes::get_throughput_server))
                 .route("/rpc/throughput-result/{session_id}", get(metrics::routes::get_throughput_result))
@@ -538,6 +537,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 Router::new()
                     .route("/integrations/fileprovider/test", get(fileprovider::routes::get_test))
                     .route("/integrations/fileprovider/test/signals", get(fileprovider::routes::get_test_signals))
+                    .route("/test/fragment-health-check/{fragment_hash}", get(files::test_routes::get_fragment_health_check))
             } else {
                 Router::new() // Empty router when not in test mode
             };

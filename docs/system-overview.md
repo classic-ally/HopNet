@@ -53,9 +53,9 @@ Reed-Solomon encoded file storage with encryption, chunked encoding, and fragmen
 - [ ] Preview data extraction while maintaining encryption
 
 ### 3. Node Communication System ([RFC-003](specs/node-communication.md))
-**Status**: Fragment transfer endpoints complete, NAT traversal pending
+**Status**: Iroh transport active for health checks, HTTP migration ongoing ([migration plan](refactors/iroh-migration.md))
 
-HTTP-based inter-node communication with authentication and fragment transfer capabilities.
+HTTP-based inter-node communication with iroh (QUIC/TLS) transport migration in progress.
 
 - [x] HTTP API with RESTful endpoints for consensus operations
 - [x] Dual Ed25519 signature authentication (node + user signatures)
@@ -65,9 +65,11 @@ HTTP-based inter-node communication with authentication and fragment transfer ca
 - [x] Node discovery and network membership management
 - [x] Fragment transfer protocols and endpoints (GET/POST /fragments/{hash}, health checks)
 - [x] Bandwidth monitoring and quality-of-service metrics (latency + throughput measurement complete)
-- [ ] Connection pooling and performance optimization
+- [x] Iroh transport layer with peer validation and connection caching
+- [x] Fragment health checks over iroh (Phase 2 complete)
+- [~] Consensus messages over iroh (Phase 3)
+- [ ] Fragment data transfer over iroh (Phase 4)
 - [ ] Network topology awareness and geographic information
-- [ ] NAT traversal implementation (deprioritized for defined IP infrastructure)
 
 ### 4. Shard Synchronization System ([RFC-004](specs/shard-synchronization.md))
 **Status**: Complete modulo placement with chunked RS support, automated recovery pending

@@ -587,6 +587,7 @@ async fn create_hopnet_container(
     let config = ContainerCreateBody {
         image: Some("hopnet:latest".to_string()),
         labels: Some(labels),
+        env: Some(vec!["HOPNET_TEST_MODE=1".to_string()]),
         networking_config: Some(NetworkingConfig {
             endpoints_config: Some(endpoints_config),
         }),

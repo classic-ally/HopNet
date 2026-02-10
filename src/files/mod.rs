@@ -2,6 +2,8 @@ use crate::AppState;
 use crate::db::files as db;
 
 pub mod routes;
+pub mod test_routes;
+pub mod rpc;
 pub mod functions;
 pub mod handlers;
 pub mod placement;

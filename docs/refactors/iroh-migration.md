@@ -90,22 +90,41 @@ Two-tier error categorization matching HTTP semantics:
 ---
 
 ## Phase 2: Fragment Health Checks
-**Status:** [ ] Not Started
+**Status:** [x] Complete
 
 ### Overview
 
-Migrate fragment health checks to iroh - first real message type. Low-risk (read-only), validates the migration pattern.
+Migrated fragment health checks from HTTP to iroh — first real domain message type. Validates the migration pattern for subsequent phases.
+
+### Architecture
+
+- `src/files/rpc.rs` — Domain RPC module: request/response types, server handler, client caller
+- `src/net/protocol.rs` — Thin dispatch enum wrapping `files::rpc` types
+- `src/net/handler.rs` — Dispatches to `files::rpc::handle_fragment_health_check()`
+- `src/net/transport.rs` — Generic `request()` method for RPC lifecycle
+- `src/files/discovery.rs` — Health checks over iroh, data fetch stays HTTP (Phase 4)
+
+Pattern: each module owns `rpc.rs` (inter-node) alongside `routes.rs` (HTTP API). Transport provides the `request()` primitive; domain modules build typed RPCs on top.
 
 ### Changes
 
-- Add `FragmentHealthCheck` / `FragmentHealthResponse` to protocol enums
-- Update fragment discovery to use iroh instead of HTTP for health checks
-- Remove HTTP `/fragments/{hash}/health` endpoint (or keep as fallback initially)
+- Added `FragmentHealthCheck` / `FragmentHealthResult` to protocol enums
+- Added `IrohTransport::request()` generic RPC method (open_bi/send/finish/recv)
+- Created `src/files/rpc.rs` with server handler and client caller
+- Updated `src/files/discovery.rs` to use iroh for health checks
+- Added `pubkey: PubKey` to `NodeConnectionInfo` and `NodeMetrics`
+- Fixed `Blake3Hash` serde to use raw bytes for binary formats (bincode)
+- HTTP `/fragments/{hash}/health` endpoint preserved (other consumers may use it)
 
 ### Checklist
 
-- [ ] Add protocol variants for fragment health
-- [ ] Update `src/files/discovery.rs` to use iroh transport
+- [x] Fix `Blake3Hash` serde for efficient wire encoding
+- [x] Add `pubkey` to `NodeConnectionInfo` and `NodeMetrics`, update SQL queries
+- [x] Add protocol variants for fragment health
+- [x] Create `src/files/rpc.rs` with handler and client
+- [x] Add `IrohTransport::request()` generic RPC method
+- [x] Update `src/files/discovery.rs` to use iroh transport
+- [x] Thread `IrohTransport` through `find_fragment` callers in `functions.rs`
 - [ ] Run `fragment-distribution` test to validate
 
 **Validation:**

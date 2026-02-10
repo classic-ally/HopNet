@@ -66,8 +66,11 @@ impl Serialize for Blake3Hash {
     where
         S: Serializer,
     {
-        // Serialize as hex string for JSON compatibility
-        serializer.serialize_str(&self.to_hex())
+        if serializer.is_human_readable() {
+            serializer.serialize_str(&self.to_hex())
+        } else {
+            serializer.serialize_bytes(self.0.as_bytes())
+        }
     }
 }
 
@@ -76,18 +79,40 @@ impl<'de> Deserialize<'de> for Blake3Hash {
     where
         D: Deserializer<'de>,
     {
-        use serde::de::Error;
-        
-        let hex_str = String::deserialize(deserializer)?;
-        let bytes = hex::decode(&hex_str).map_err(D::Error::custom)?;
-        
-        if bytes.len() != 32 {
-            return Err(D::Error::custom("Blake3 hash must be exactly 32 bytes"));
+        use serde::de::{Error, Visitor};
+        use std::fmt;
+
+        struct Blake3HashVisitor;
+
+        impl<'de> Visitor<'de> for Blake3HashVisitor {
+            type Value = Blake3Hash;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a hex string or binary data representing a Blake3 hash")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where E: Error {
+                let bytes = hex::decode(value).map_err(E::custom)?;
+                self.visit_bytes(&bytes)
+            }
+
+            fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
+            where E: Error {
+                if value.len() != 32 {
+                    return Err(E::custom("Blake3 hash must be exactly 32 bytes"));
+                }
+                let mut array = [0u8; 32];
+                array.copy_from_slice(value);
+                Ok(Blake3Hash::from_bytes(array))
+            }
         }
-        
-        let mut array = [0u8; 32];
-        array.copy_from_slice(&bytes);
-        Ok(Blake3Hash::from_bytes(array))
+
+        if deserializer.is_human_readable() {
+            deserializer.deserialize_str(Blake3HashVisitor)
+        } else {
+            deserializer.deserialize_bytes(Blake3HashVisitor)
+        }
     }
 }
 
@@ -428,6 +453,7 @@ pub struct NodeConnectionInfo {
     pub node_id: i32,
     pub ip_address: String,
     pub port: i32,
+    pub pubkey: PubKey,
 }
 
 /// Bootstrap information sent from coordinator to joining node

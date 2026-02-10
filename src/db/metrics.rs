@@ -174,6 +174,7 @@ pub struct NodeMetrics {
     pub node_id: i32,
     pub ip_address: String,
     pub port: i32,
+    pub pubkey: crate::types::PubKey,
     pub sample_count_7d: u32,
     pub trust_factor: f64,
     pub availability_score: f64,      // Time-weighted: 24h * 0.7 + 7d * 0.3
@@ -228,10 +229,11 @@ pub fn get_all_node_metrics(
                     FROM node_metrics
                     WHERE storage_total_gb > 0
                 )
-                SELECT 
+                SELECT
                     n.node_id,
                     n.ip_address,
                     n.port,
+                    n.pubkey,
                     COALESCE(nm.sample_count_7d, 0) as sample_count_7d,
                     -- Trust factor: gradual confidence building for new nodes
                     LEAST(CAST(COALESCE(nm.sample_count_7d, 0) AS REAL) / 100.0, 1.0) as trust_factor,
@@ -294,6 +296,7 @@ pub fn get_all_node_metrics(
                     node_id: row.get("node_id")?,
                     ip_address: row.get("ip_address")?,
                     port: row.get("port")?,
+                    pubkey: row.get("pubkey")?,
                     sample_count_7d: row.get::<_, i64>("sample_count_7d")? as u32,
                     trust_factor: row.get("trust_factor")?,
                     availability_score: row.get("availability_score")?,

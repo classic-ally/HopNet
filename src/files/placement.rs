@@ -256,6 +256,7 @@ mod tests {
                 node_id: i as i32,
                 ip_address: format!("127.0.0.{}", i),
                 port: 8000 + i as i32,
+                pubkey: generate_test_pubkey(),
                 sample_count_7d: 100,
                 trust_factor: 1.0,
                 availability_score: 0.9 + (i as f64 * 0.01),

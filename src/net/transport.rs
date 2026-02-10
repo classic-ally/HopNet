@@ -4,7 +4,7 @@ use iroh::endpoint::{AfterHandshakeOutcome, EndpointHooks};
 use r2d2::Pool;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 
@@ -16,6 +16,10 @@ pub const HOPNET_ALPN: &[u8] = b"hopnet/1.0";
 
 /// Maximum message size (8MB) - prevents allocation attacks from malicious peers
 const MAX_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
+
+/// Timeout for establishing a new connection (relay discovery + QUIC handshake).
+/// Generous enough for relay/holepunch but prevents indefinite hangs.
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ============================================================================
 // Error Types
@@ -236,8 +240,9 @@ impl IrohTransport {
         &self.endpoint
     }
 
-    /// Get or establish a connection to a peer
-    /// Uses cached connection if available
+    /// Get or establish a connection to a peer.
+    /// Uses cached connection if available. Connection establishment is bounded
+    /// by CONNECTION_TIMEOUT to prevent indefinite hangs when a peer is unreachable.
     pub async fn get_connection(&self, node_id: i32, peer_node_id: PublicKey) -> Result<Connection, IrohError> {
         // Check cache first
         {
@@ -249,11 +254,16 @@ impl IrohTransport {
             }
         }
 
-        // Establish new connection
-        let conn = self.endpoint
-            .connect(peer_node_id, HOPNET_ALPN)
-            .await
-            .map_err(|e| IrohError::Transport(TransportError::ConnectionFailed(e.to_string())))?;
+        // Establish new connection with timeout
+        let conn = tokio::time::timeout(
+            CONNECTION_TIMEOUT,
+            self.endpoint.connect(peer_node_id, HOPNET_ALPN),
+        )
+        .await
+        .map_err(|_| IrohError::Transport(TransportError::ConnectionFailed(
+            format!("connection to node {} timed out after {:?}", node_id, CONNECTION_TIMEOUT),
+        )))?
+        .map_err(|e| IrohError::Transport(TransportError::ConnectionFailed(e.to_string())))?;
 
         // Cache it
         {
@@ -267,18 +277,10 @@ impl IrohTransport {
     /// Send a ping to a peer and wait for pong
     /// Returns round-trip time in nanoseconds
     pub async fn ping(&self, node_id: i32, peer_node_id: PublicKey) -> Result<u64, IrohError> {
-        let conn = self.get_connection(node_id, peer_node_id).await?;
         let start = Instant::now();
-
-        let (mut send, mut recv) = conn.open_bi().await
-            .map_err(|e| IrohError::Transport(TransportError::StreamFailed(e.to_string())))?;
-
         let nonce = rand::random::<u64>();
-        send_message(&mut send, &IrohRequest::Ping { nonce }).await?;
-        send.finish()
-            .map_err(|e| IrohError::Transport(TransportError::StreamFailed(e.to_string())))?;
 
-        let response: IrohResponse = recv_message(&mut recv).await?;
+        let response = self.request(node_id, peer_node_id, &IrohRequest::Ping { nonce }, Duration::from_secs(5)).await?;
 
         match response {
             IrohResponse::Pong { nonce: got } if got == nonce => {
@@ -294,7 +296,35 @@ impl IrohTransport {
             IrohResponse::Error { message } => {
                 Err(IrohError::Protocol(ProtocolError::PeerError(message)))
             }
+            other => {
+                Err(IrohError::Protocol(ProtocolError::MalformedResponse(
+                    format!("unexpected response to Ping: {:?}", other),
+                )))
+            }
         }
+    }
+
+    /// Send a request and receive a response on a new bidirectional stream.
+    /// Handles the open_bi/send/finish/recv lifecycle so callers don't repeat it.
+    ///
+    /// Connection establishment is outside the timeout budget (bounded separately by
+    /// CONNECTION_TIMEOUT). The `timeout` parameter covers only stream I/O — opening
+    /// the stream, sending the request, and receiving the response.
+    pub async fn request(&self, node_id: i32, peer_node_id: PublicKey, req: &IrohRequest, timeout: Duration) -> Result<IrohResponse, IrohError> {
+        let conn = self.get_connection(node_id, peer_node_id).await?;
+
+        tokio::time::timeout(timeout, async {
+            let (mut send, mut recv) = conn.open_bi().await
+                .map_err(|e| IrohError::Transport(TransportError::StreamFailed(e.to_string())))?;
+
+            send_message(&mut send, req).await?;
+            send.finish()
+                .map_err(|e| IrohError::Transport(TransportError::StreamFailed(e.to_string())))?;
+
+            recv_message(&mut recv).await
+        })
+        .await
+        .map_err(|_| IrohError::Transport(TransportError::Timeout))?
     }
 
     /// Remove a connection from the cache (e.g., on error)
