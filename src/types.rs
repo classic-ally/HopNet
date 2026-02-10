@@ -302,10 +302,24 @@ impl PubKey {
     pub fn to_hex(&self) -> String {
         hex::encode(self.0.to_bytes())
     }
+
+    /// Convert to iroh NodeId (PublicKey)
+    /// Both use the same 32-byte Ed25519 key format
+    pub fn to_iroh_node_id(&self) -> iroh::PublicKey {
+        iroh::PublicKey::from_bytes(&self.0.to_bytes()).expect("valid ed25519 key")
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PrivKey(pub SigningKey);
+
+impl PrivKey {
+    /// Convert to iroh SecretKey
+    /// Both use the same 32-byte Ed25519 key format
+    pub fn to_iroh_secret_key(&self) -> iroh::SecretKey {
+        iroh::SecretKey::from_bytes(&self.0.to_bytes())
+    }
+}
 
 impl Deref for PrivKey {
     type Target = SigningKey;

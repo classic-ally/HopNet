@@ -11,13 +11,15 @@ pub use crate::NodeInfo;
 pub mod files;
 
 // Test implementations
+mod device_tokens;
+mod documentprovider_write;
 mod file_upload;
 mod fragment_distribution;
+mod iroh_ping;
+mod iroh_reject_unknown;
 mod multi_size_files;
 mod performance;
 mod persistence;
-mod device_tokens;
-mod documentprovider_write;
 
 /// Represents the result of a test scenario execution
 #[derive(Debug)]
@@ -96,6 +98,12 @@ pub async fn run_test_by_name(mesh_id: u32, name: &str, nodes: &[NodeInfo], flag
         "documentprovider-write-consistency" => {
             documentprovider_write::DocumentProviderWriteConsistency.run(mesh_id, nodes, flags).await
         }
+        "iroh-ping" => {
+            iroh_ping::IrohPing.run(mesh_id, nodes, flags).await
+        }
+        "iroh-reject-unknown" => {
+            iroh_reject_unknown::IrohRejectUnknown.run(mesh_id, nodes, flags).await
+        }
         _ => Err(anyhow::anyhow!("Unknown test: {}", name)),
     }
 }
@@ -110,6 +118,8 @@ pub fn list_test_names() -> Vec<&'static str> {
         "restart-persistence",
         "device-token-consistency",
         "documentprovider-write-consistency",
+        "iroh-ping",
+        "iroh-reject-unknown",
     ]
 }
 

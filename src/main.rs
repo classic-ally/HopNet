@@ -33,6 +33,7 @@ mod documentprovider;
 mod takeout;
 mod admin;
 mod devices;
+mod net;
 
 static ASSETS_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/frontend/dist");
 
@@ -90,6 +91,7 @@ pub struct AppState {
     port: u16,
     test_mode: bool,
     orphaned_fragment_scan: Arc<std::sync::Mutex<Option<files::jobs::OrphanedFragmentScan>>>,
+    iroh_transport: net::IrohTransport,
 }
 
 impl AppState {
@@ -280,6 +282,12 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 "./hopnet/fragments".to_string()
             });
 
+            // Create iroh transport
+            let iroh_secret = PrivKey(privatekey.clone()).to_iroh_secret_key();
+            let iroh_transport = net::IrohTransport::new(iroh_secret, pool.clone()).await
+                .expect("Failed to create iroh transport");
+            tracing::info!("iroh endpoint ready, node_id: {}", iroh_transport.node_id());
+
             let app_state = AppState {
                 db_pool: pool,
                 encoding_key: encodingkey,
@@ -300,6 +308,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 port,
                 test_mode: cfg!(debug_assertions), // Enable test routes in debug builds only
                 orphaned_fragment_scan: Arc::new(std::sync::Mutex::new(None)),
+                iroh_transport: iroh_transport.clone(),
             };
 
             // If we loaded state from database, populate the OnceCell fields
@@ -431,6 +440,15 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 self_check_worker.run().await;
             });
 
+            // Start iroh accept loop for incoming connections
+            {
+                let endpoint = iroh_transport.endpoint().clone();
+                let app_state_clone = app_state.clone();
+                tokio::spawn(async move {
+                    net::handler::handle_incoming_connections(endpoint, app_state_clone).await;
+                });
+            }
+
             // Protected routes that require authentication
             let protected_routes = Router::new()
                 .route("/users", get(users::routes::get_users))
@@ -451,6 +469,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/diagnostics/file-fragments", get(files::routes::get_file_fragment_distribution))
                 .route("/diagnostics/network-resilience", get(files::routes::get_network_resilience_stats))
                 .route("/debug/state", get(consensus::routes::get_state_snapshot))
+                .route("/debug/iroh-ping", get(net::routes::debug_iroh_ping))
                 .route("/validators", get(consensus::routes::get_validators))
                 .route("/metrics", get(metrics::routes::get_metrics))
                 .route("/metrics/trigger", get(metrics::routes::get_metrics_trigger))

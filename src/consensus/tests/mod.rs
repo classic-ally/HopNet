@@ -445,6 +445,11 @@ pub fn create_test_app_state_with_keys(signing_key: crate::db::PrivKey, verifyin
     let encoding_key = EncodingKey::from_secret(jwt_secret);
     let decoding_key = DecodingKey::from_secret(jwt_secret);
 
+    let iroh_secret = signing_key.to_iroh_secret_key();
+    let iroh_transport = tokio::runtime::Runtime::new().unwrap()
+        .block_on(crate::net::IrohTransport::new(iroh_secret, pool.clone()))
+        .expect("test iroh transport");
+
     AppState {
         db_pool: pool,
         encoding_key,
@@ -465,6 +470,7 @@ pub fn create_test_app_state_with_keys(signing_key: crate::db::PrivKey, verifyin
         port: 3000,
         test_mode: true,
         orphaned_fragment_scan: Arc::new(std::sync::Mutex::new(None)),
+        iroh_transport,
     }
 }
 

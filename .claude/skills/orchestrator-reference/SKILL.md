@@ -60,6 +60,8 @@ cargo build --release --bin orchestrator --features skip-frontend
 | `restart-persistence` | Data survives node restarts |
 | `device-token-consistency` | Device token management across nodes |
 | `documentprovider-write-consistency` | Document provider write APIs (upload, rename, move, delete) |
+| `iroh-ping` | Verify iroh transport connectivity between all nodes in the mesh |
+| `iroh-reject-unknown` | Verify unknown peers are rejected before path registration (no IP leak) |
 
 ## Common Workflows
 
