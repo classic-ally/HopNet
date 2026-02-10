@@ -359,8 +359,9 @@ pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transa
         let validators_clone = validators.clone();
         let validators_elect_clone = validators_elect.clone();
         let qc1_clone = qc1.clone();
+        let app_state = app_state.clone();
         tokio::spawn(async move {
-            broadcast_qc(&validators_clone, &validators_elect_clone, qc1_clone).await
+            broadcast_qc(&validators_clone, &validators_elect_clone, qc1_clone, &app_state).await
         })
     };
 
@@ -415,8 +416,9 @@ pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transa
         let validators_clone = validators.clone();
         let validators_elect_clone = validators_elect.clone();
         let qc2_clone = qc2.clone();
+        let app_state = app_state.clone();
         tokio::spawn(async move {
-            if let Err(e) = broadcast_qc(&validators_clone, &validators_elect_clone, qc2_clone).await {
+            if let Err(e) = broadcast_qc(&validators_clone, &validators_elect_clone, qc2_clone, &app_state).await {
                 tracing::warn!("Failed to broadcast Lock QC: {:?}", e);
             }
         });
@@ -563,7 +565,8 @@ async fn broadcast_and_collect_votes(
 async fn broadcast_qc(
     validators: &Vec<Node>,
     validators_elect: &Vec<Node>,
-    qc: QuorumCertificate
+    qc: QuorumCertificate,
+    app_state: &AppState,
 ) -> Result<(), ConsensusError> {
     // Handle single validator case (no other nodes to broadcast to)
     if validators.is_empty() {
@@ -580,36 +583,47 @@ async fn broadcast_qc(
     let required_confirmations = quorum_threshold.saturating_sub(1); // Leader already has QC locally
 
     // Spawn tasks for each validator
+    let transport = &app_state.iroh_transport;
     for node in validators.clone() {
         let qc_clone = qc.clone();
         let confirmations_tx_clone = confirmations_tx.clone();
-        
+        let transport = transport.clone();
+        let iroh_node_id = node.pubkey.to_iroh_node_id();
+        let node_id = node.node_id;
+
         tokio::spawn(async move {
-            // Send QC and notify on success
-            match qc_send(qc_clone, &node).await {
+            match super::rpc::broadcast_qc_to_peer(
+                &transport, node_id, iroh_node_id, &qc_clone,
+            ).await {
                 Ok(()) => {
                     let _ = confirmations_tx_clone.send(()).await;
                 }
                 Err(e) => {
-                    tracing::debug!("Failed to send QC to node: {:?}", &e);
-                    // Don't send confirmation on failure
+                    tracing::debug!("Failed to send QC to node {}: {:?}", node_id, e);
                 }
             }
         });
     }
-    
+
     // NON-CRITICAL PATH: Inform validators elect (fire-and-forget, don't wait)
     for node in validators_elect.clone() {
         let qc_clone = qc.clone();
+        let transport = transport.clone();
+        let iroh_node_id = node.pubkey.to_iroh_node_id();
+        let node_id = node.node_id;
+
         tokio::spawn(async move {
-            // Best effort delivery - don't care about result
-            let _ = qc_send(qc_clone, &node).await;
+            if let Err(e) = super::rpc::broadcast_qc_to_peer(
+                &transport, node_id, iroh_node_id, &qc_clone,
+            ).await {
+                tracing::debug!("Failed to send QC to elect node {}: {:?}", node_id, e);
+            }
         });
     }
-    
+
     // Drop the original sender so the channel closes when all tasks complete
     drop(confirmations_tx);
-    
+
     // Collect confirmations until we have enough for quorum or all tasks complete
     let mut confirmations = 0;
     let timeout = tokio::time::sleep(std::time::Duration::from_secs(5));
@@ -681,33 +695,6 @@ async fn ballot_send(
     }
 }
 
-async fn qc_send(
-    qc: QuorumCertificate,
-    node: &Node,
-) -> Result<(), ConsensusError> {
-    let client = Client::new();
-    let url = format!("http://{}:{}/qc", node.ip_address, node.port);
-    match client.post(url)
-        .json(&qc)
-        .send()
-        .await
-    {
-        Ok(response) => {
-            tracing::debug!("Received response from validator");
-            if response.status().is_success() {
-                tracing::debug!("Validator response OK");
-                Ok(())
-            } else {
-                tracing::warn!("Validator returned error status: {}", response.status());
-                return Err(ConsensusError::MalformedReply)
-            }
-        }
-        Err(e) => {
-            tracing::warn!("Failed to reach validator: {:?}", e);
-            return Err(ConsensusError::TimeoutError)
-        }
-    }
-}
 
 pub fn process_transactions(transactions: &Option<Transactions>, app_state: &AppState, execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
     if let Some(transactions) = transactions {

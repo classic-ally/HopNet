@@ -17,6 +17,8 @@ pub enum IrohRequest {
     TimeoutVoteBroadcast(consensus_rpc::TimeoutVoteBroadcastRequest),
     /// Broadcast timeout certificate
     TcBroadcast(consensus_rpc::TcBroadcastRequest),
+    /// Broadcast quorum certificate
+    QcBroadcast(consensus_rpc::QcBroadcastRequest),
 }
 
 /// Response envelope for all iroh communication
@@ -34,6 +36,8 @@ pub enum IrohResponse {
     TimeoutVoteBroadcastResponse(consensus_rpc::TimeoutVoteBroadcastResponse),
     /// Ack for TC broadcast
     TcBroadcastResponse(consensus_rpc::TcBroadcastResponse),
+    /// Ack for QC broadcast
+    QcBroadcastResponse(consensus_rpc::QcBroadcastResponse),
     /// Error response
     Error { message: String },
 }

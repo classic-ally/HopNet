@@ -104,6 +104,9 @@ async fn handle_stream(
         IrohRequest::TcBroadcast(req) => {
             crate::consensus::rpc::handle_tc_broadcast(req, &app_state).await
         }
+        IrohRequest::QcBroadcast(req) => {
+            crate::consensus::rpc::handle_qc_broadcast(req, &app_state).await
+        }
     };
 
     send_message(&mut send, &response).await?;

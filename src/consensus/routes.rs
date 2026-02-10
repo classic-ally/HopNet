@@ -308,11 +308,15 @@ pub async fn post_ballot(
     }
 }
 
-// route to accept qcs and operate on them
-pub async fn post_qc(
-    State(app_state): State<AppState>,
-    Json(qc): Json<QuorumCertificate>
-) -> impl IntoResponse {
+/// Core logic for processing an incoming QC.
+/// Called by the iroh handler in `consensus::rpc`.
+/// Duplicate QCs (already in DB) are acked as Ok(()).
+/// Verification failures return Err — the leader uses acks for quorum tracking,
+/// so only genuinely applied QCs should count.
+pub async fn process_incoming_qc(
+    qc: QuorumCertificate,
+    app_state: &AppState,
+) -> Result<(), ConsensusError> {
     tracing::debug!(
         "Received QC for view {} phase {:?} block {:?}",
         qc.view_number, qc.phase, qc.block_hash
@@ -321,110 +325,84 @@ pub async fn post_qc(
     // Serialize QC processing to prevent concurrent state modifications
     let _guard = app_state.consensus_lock.lock().await;
 
-    // Middleware ensures we're caught up - just process the QC
-    // Normal QC processing (existing logic)
-    match db::get_block(app_state.db_pool.get(), qc.block_hash) {
-        Ok(block) => {
-            tracing::debug!(
-                "Found block {:?} for QC verification",
-                qc.block_hash
-            );
-            
-            match qc.verify(&app_state, &block) {
-                Ok(()) => {
-                    // Now safe.
-                    tracing::debug!(
-                        "QC verified, inserting into database for view {} phase {:?}",
-                        qc.view_number, qc.phase
-                    );
-
-                    // Get database connection and create transaction
-                    let mut conn = match app_state.db_pool.get() {
-                        Ok(conn) => conn,
-                        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                    };
-
-                    let db_tx = match conn.transaction() {
-                        Ok(tx) => tx,
-                        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                    };
-
-                    // Insert QC (updates consensus state)
-                    if let Err(_) = db::insert_qc_unsafe_tx(&db_tx, &qc) {
-                        // QC insertion failed - check if it already exists
-                        match db::get_quorum_certificate_by_hash(app_state.db_pool.get(), &qc.view_number, &qc.block_hash, &qc.phase) {
-                            Ok(_existing_qc) => {
-                                // QC already exists (duplicate broadcast), acknowledge success
-                                tracing::debug!(
-                                    "QC for view {} phase {:?} already exists, acknowledging",
-                                    qc.view_number, qc.phase
-                                );
-                                return StatusCode::OK.into_response();
-                            },
-                            Err(_) => {
-                                // QC doesn't exist and couldn't be inserted - real error
-                                tracing::error!(
-                                    "Failed to insert QC for view {} phase {:?}",
-                                    qc.view_number, qc.phase
-                                );
-                                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                            }
-                        }
-                    }
-
-                    // Process transactions if this is a Lock phase QC (atomically with QC insertion)
-                    if qc.phase == ConsensusPhase::Lock {
-                        tracing::info!(
-                            "Lock phase QC inserted for view {}, processing transactions",
-                            qc.view_number
-                        );
-
-                        if let Err(e) = crate::consensus::functions::process_transactions(&block.data.transactions, &app_state, true, &db_tx) {
-                            tracing::error!(
-                                "Failed to process transactions for view {}: {:?}",
-                                qc.view_number, e
-                            );
-                            // Transaction auto-rolls back, consensus state changes are discarded
-                            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                        }
-                    }
-
-                    // Commit transaction (QC insertion + transaction processing)
-                    if let Err(e) = db_tx.commit() {
-                        tracing::error!(
-                            "Failed to commit QC/transaction processing for view {} phase {:?}: {:?}",
-                            qc.view_number, qc.phase, e
-                        );
-                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                    }
-
-                    tracing::info!(
-                        "Successfully committed QC for view {} phase {:?}{}",
-                        qc.view_number,
-                        qc.phase,
-                        if qc.phase == ConsensusPhase::Lock { " with transaction processing" } else { "" }
-                    );
-
-                    StatusCode::OK.into_response()
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "QC verification failed for view {} phase {:?}: {:?}",
-                        qc.view_number, qc.phase, e
-                    );
-                    StatusCode::UNAUTHORIZED.into_response()
-                }
-            }
-        }
+    let block = match db::get_block(app_state.db_pool.get(), qc.block_hash) {
+        Ok(block) => block,
         Err(_) => {
             tracing::warn!(
                 "Block {:?} not found for QC verification",
                 qc.block_hash
             );
-            StatusCode::NOT_FOUND.into_response()
+            return Err(ConsensusError::BlockError);
+        }
+    };
+
+    if let Err(e) = qc.verify(&app_state, &block) {
+        tracing::warn!(
+            "QC verification failed for view {} phase {:?}: {:?}",
+            qc.view_number, qc.phase, e
+        );
+        return Err(ConsensusError::SigningError);
+    }
+
+    // Get database connection and create transaction
+    let mut conn = app_state.db_pool.get().map_err(|_| ConsensusError::DatabaseError)?;
+    let db_tx = conn.transaction().map_err(|_| ConsensusError::DatabaseError)?;
+
+    // Insert QC (updates consensus state)
+    if let Err(_) = db::insert_qc_unsafe_tx(&db_tx, &qc) {
+        // QC insertion failed - check if it already exists
+        match db::get_quorum_certificate_by_hash(app_state.db_pool.get(), &qc.view_number, &qc.block_hash, &qc.phase) {
+            Ok(_existing_qc) => {
+                // QC already exists (duplicate broadcast), acknowledge success
+                tracing::debug!(
+                    "QC for view {} phase {:?} already exists, acknowledging",
+                    qc.view_number, qc.phase
+                );
+                return Ok(());
+            },
+            Err(_) => {
+                tracing::error!(
+                    "Failed to insert QC for view {} phase {:?}",
+                    qc.view_number, qc.phase
+                );
+                return Err(ConsensusError::DatabaseError);
+            }
         }
     }
-    
+
+    // Process transactions if this is a Lock phase QC (atomically with QC insertion)
+    if qc.phase == ConsensusPhase::Lock {
+        tracing::info!(
+            "Lock phase QC inserted for view {}, processing transactions",
+            qc.view_number
+        );
+
+        if let Err(e) = crate::consensus::functions::process_transactions(&block.data.transactions, &app_state, true, &db_tx) {
+            tracing::error!(
+                "Failed to process transactions for view {}: {:?}",
+                qc.view_number, e
+            );
+            return Err(ConsensusError::DatabaseError);
+        }
+    }
+
+    // Commit transaction (QC insertion + transaction processing)
+    db_tx.commit().map_err(|e| {
+        tracing::error!(
+            "Failed to commit QC/transaction processing for view {} phase {:?}: {:?}",
+            qc.view_number, qc.phase, e
+        );
+        ConsensusError::DatabaseError
+    })?;
+
+    tracing::info!(
+        "Successfully committed QC for view {} phase {:?}{}",
+        qc.view_number,
+        qc.phase,
+        if qc.phase == ConsensusPhase::Lock { " with transaction processing" } else { "" }
+    );
+
+    Ok(())
 }
 
 /// Core logic for processing an incoming timeout vote.

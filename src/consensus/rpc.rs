@@ -5,7 +5,7 @@ use crate::net::protocol::{IrohRequest, IrohResponse};
 use crate::net::transport::ProtocolError;
 use crate::AppState;
 use crate::db::consensus as db;
-use super::types::{TimeoutVote, TimeoutCertificate};
+use super::types::{TimeoutVote, TimeoutCertificate, QuorumCertificate};
 
 // ============================================================================
 // View Data Fetch (catch-up)
@@ -226,6 +226,56 @@ pub async fn broadcast_tc(
 }
 
 // ============================================================================
+// QC Broadcast
+// ============================================================================
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct QcBroadcastRequest {
+    pub qc: QuorumCertificate,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct QcBroadcastResponse {}
+
+/// Server: process an incoming quorum certificate.
+pub async fn handle_qc_broadcast(
+    req: QcBroadcastRequest,
+    app_state: &AppState,
+) -> IrohResponse {
+    match super::routes::process_incoming_qc(req.qc, app_state).await {
+        Ok(()) => IrohResponse::QcBroadcastResponse(QcBroadcastResponse {}),
+        Err(e) => IrohResponse::Error {
+            message: format!("QC processing failed: {:?}", e),
+        },
+    }
+}
+
+/// Client: broadcast a quorum certificate to a remote peer.
+pub async fn broadcast_qc_to_peer(
+    transport: &IrohTransport,
+    node_id: i32,
+    peer_node_id: iroh::PublicKey,
+    qc: &QuorumCertificate,
+) -> Result<(), IrohError> {
+    let req = IrohRequest::QcBroadcast(QcBroadcastRequest {
+        qc: qc.clone(),
+    });
+    let response = transport.request(node_id, peer_node_id, &req, BROADCAST_TIMEOUT).await?;
+
+    match response {
+        IrohResponse::QcBroadcastResponse(_) => Ok(()),
+        IrohResponse::Error { message } => {
+            Err(IrohError::Protocol(ProtocolError::PeerError(message)))
+        }
+        other => {
+            Err(IrohError::Protocol(ProtocolError::MalformedResponse(
+                format!("unexpected response to QcBroadcast: {:?}", other),
+            )))
+        }
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -315,5 +365,30 @@ mod tests {
 
         assert_eq!(decoded.tc.view_number, 10);
         assert_eq!(decoded.tc.highest_qc.view_number, 9);
+    }
+
+    #[test]
+    fn qc_broadcast_request_bincode_roundtrip() {
+        use crate::consensus::types::{VoteSignMessage, VoteSignMessages, ConsensusPhase};
+
+        let req = QcBroadcastRequest {
+            qc: QuorumCertificate {
+                view_number: 7,
+                block_hash: crate::types::Blake3Hash::from_bytes([1u8; 32]),
+                phase: ConsensusPhase::Lock,
+                proposer_signature: VoteSignMessage {
+                    replica_id: 2,
+                    signature: ed25519_dalek::Signature::from_bytes(&[0u8; 64]),
+                },
+                voter_signatures: VoteSignMessages(vec![]),
+            },
+        };
+        let encoded = bincode::serde::encode_to_vec(&req, bincode::config::standard()).unwrap();
+        let (decoded, _): (QcBroadcastRequest, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+
+        assert_eq!(decoded.qc.view_number, 7);
+        assert_eq!(decoded.qc.phase, ConsensusPhase::Lock);
+        assert_eq!(decoded.qc.proposer_signature.replica_id, 2);
     }
 }

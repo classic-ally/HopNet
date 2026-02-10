@@ -166,15 +166,17 @@ HTTP endpoints (`GET /consensus`, `GET /consensus/view/{view}`) preserved for ex
 - **Message ordering**: Consensus assumes certain ordering guarantees
 - **Warm connections**: Pool should be warm before consensus starts
 - **Broadcast patterns**: Some messages go to all validators in parallel
+- **Catch-up dispatch**: HTTP middleware ran `ensure_caught_up_and_active` before consensus handlers. Iroh handlers currently skip this. Need a single catch-up check in `handler.rs` before dispatching consensus messages (per-type tolerance: Validator=0, Observer=1), rather than re-adding it inside each handler. Critical for ballot route (tolerance=0, requires active status). Affects timeout vote future-view handling too — receiving a vote for a future view should trigger catch-up.
 
 ### Checklist
 
 - [x] View sync over iroh
 - [x] Timeout vote over iroh
 - [x] TC broadcast over iroh
-- [ ] QC broadcast over iroh
+- [x] QC broadcast over iroh
 - [ ] Ballot submission over iroh
 - [ ] Transaction forwarding over iroh
+- [ ] Iroh-level catch-up dispatch (replace per-handler middleware)
 
 **After each migration:** Run full test suite, verify divergence = 0
 
