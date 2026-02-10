@@ -674,41 +674,17 @@ async fn fetch_view(
     validator: &crate::types::Node,
     app_state: &AppState,
 ) -> Result<ViewConsensusData, ConsensusError> {
-    let my_node_id = app_state.get_node_id().map_err(|_| ConsensusError::DatabaseError)?;
-
-    // Sign empty body for GET request authentication
-    let body = b"";
-    let node_signature = app_state.private_key.try_sign(body).map_err(|_| ConsensusError::SigningError)?;
-
-    let client = reqwest::Client::new();
-    let url = format!("http://{}:{}/consensus/view/{}", validator.ip_address, validator.port, view);
+    let iroh_node_id = validator.pubkey.to_iroh_node_id();
 
     tracing::debug!("Fetching view {} data from validator {}", view, validator.node_id);
 
-    let response = client
-        .get(&url)
-        .header("X-Node-ID", my_node_id.to_string())
-        .header("X-Node-Signature", hex::encode(node_signature.to_bytes()))
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
-        .map_err(|e| {
-            tracing::warn!("Network error fetching view {} from validator {}: {:?}", view, validator.node_id, e);
-            ConsensusError::NetworkError
-        })?;
-    
-    if !response.status().is_success() {
-        tracing::warn!("Failed to fetch view {} data from validator {}: status {}", 
-            view, validator.node_id, response.status());
-        return Err(ConsensusError::NetworkError);
-    }
-    
-    let view_data: ViewConsensusData = response.json().await
-        .map_err(|e| {
-            tracing::warn!("Failed to parse view {} data from validator {}: {:?}", view, validator.node_id, e);
-            ConsensusError::NetworkError
-        })?;
-    
+    let view_data = super::rpc::fetch_view_data(
+        &app_state.iroh_transport, validator.node_id, iroh_node_id, view,
+    ).await.map_err(|e| {
+        tracing::warn!("Failed to fetch view {} from validator {}: {:?}", view, validator.node_id, e);
+        ConsensusError::NetworkError
+    })?;
+
     tracing::debug!("Successfully fetched view {} data: TC={}, propose_QC={}, lock_QC={}, blocks={}",
         view,
         view_data.timeout_certificate.is_some(),
@@ -716,7 +692,7 @@ async fn fetch_view(
         view_data.lock_qc.is_some(),
         view_data.blocks.len()
     );
-    
+
     Ok(view_data)
 }
 

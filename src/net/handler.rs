@@ -88,9 +88,15 @@ async fn handle_stream(
     let response = match request {
         IrohRequest::Ping { nonce } => IrohResponse::Pong { nonce },
         IrohRequest::FragmentHealthCheck(req) => {
-            IrohResponse::FragmentHealthResult(
+            IrohResponse::FragmentHealthCheckResponse(
                 crate::files::rpc::handle_fragment_health_check(req, &app_state.fragments_dir)
             )
+        }
+        IrohRequest::ViewDataFetch(req) => {
+            crate::consensus::rpc::handle_view_data_request(req, &app_state)
+        }
+        IrohRequest::ViewPoll(_) => {
+            crate::consensus::rpc::handle_view_poll_request(&app_state)
         }
     };
 

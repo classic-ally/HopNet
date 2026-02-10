@@ -134,7 +134,7 @@ Pattern: each module owns `rpc.rs` (inter-node) alongside `routes.rs` (HTTP API)
 ---
 
 ## Phase 3: Consensus Messages
-**Status:** [ ] Not Started
+**Status:** [~] In Progress
 
 ### Overview
 
@@ -149,6 +149,17 @@ Migrate consensus messages one at a time, ordered by risk. Test after each migra
 5. **Ballot submission** (`/ballot`) - Core voting, requires response
 6. **Transaction forwarding** (`/consensus/propose`) - Leader forwarding
 
+### Phase 3a: View Sync
+
+- `src/consensus/rpc.rs` — Domain RPC module: request/response types, server handlers, client callers
+- `src/net/protocol.rs` — `ViewDataFetch`/`ViewPoll` request variants, `ViewDataFetchResponse`/`ViewPollResponse` response variants
+- `src/net/handler.rs` — Dispatches to `consensus::rpc` handlers
+- `src/consensus/routes.rs` — `fetch_view()` uses iroh instead of HTTP
+- `src/consensus/functions.rs` — `poll_subset_for_max_view()` uses iroh instead of HTTP
+
+View poll sends only the view number (not the full `ConsensusState`), reducing wire overhead.
+HTTP endpoints (`GET /consensus`, `GET /consensus/view/{view}`) preserved for external consumers.
+
 ### Key Concerns
 
 - **Connection failures mid-round**: Need graceful degradation, not panics
@@ -158,7 +169,7 @@ Migrate consensus messages one at a time, ordered by risk. Test after each migra
 
 ### Checklist
 
-- [ ] View sync over iroh
+- [x] View sync over iroh
 - [ ] Timeout vote over iroh
 - [ ] TC broadcast over iroh
 - [ ] QC broadcast over iroh

@@ -42,7 +42,7 @@ pub async fn check_fragment_health(
     let response = transport.request(node_id, peer_node_id, &req, HEALTH_CHECK_TIMEOUT).await?;
 
     match response {
-        IrohResponse::FragmentHealthResult(result) => Ok(result.healthy),
+        IrohResponse::FragmentHealthCheckResponse(result) => Ok(result.healthy),
         IrohResponse::Error { message } => {
             Err(IrohError::Protocol(ProtocolError::PeerError(message)))
         }

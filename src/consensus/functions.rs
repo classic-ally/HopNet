@@ -886,12 +886,7 @@ pub async fn poll_subset_for_max_view(
     const MAX_ATTEMPTS: u32 = 3;
     const SUBSET_SIZE: usize = 5;
 
-    // Get our node ID from AppState (avoid DB call)
     let my_node_id = app_state.get_node_id()
-        .map_err(|_| ConsensusError::DatabaseError)?;
-    let user_id = app_state.get_user_id()
-        .map_err(|_| ConsensusError::DatabaseError)?;
-    let user_keys = app_state.get_user_keys()
         .map_err(|_| ConsensusError::DatabaseError)?;
 
     let mut all_validators = db::get_validators(app_state.db_pool.get(), our_height)
@@ -917,6 +912,8 @@ pub async fn poll_subset_for_max_view(
         return Ok(our_view);
     }
 
+    let transport = &app_state.iroh_transport;
+
     // Retry loop for handling unlucky validator selection
     for attempt in 1..=MAX_ATTEMPTS {
         let selected_validators: Vec<&Node> = other_validators
@@ -925,55 +922,21 @@ pub async fn poll_subset_for_max_view(
 
         tracing::debug!("Attempt {}/{}: Polling {} validators for max view", attempt, MAX_ATTEMPTS, selected_validators.len());
 
-        // Prepare RPC authentication (sign empty body for GET request)
-        let body = b"";
-        let node_signature = app_state.private_key.try_sign(body)
-            .map_err(|_| ConsensusError::SigningError)?;
-        let user_signature = user_keys.private_key.try_sign(body)
-            .map_err(|_| ConsensusError::SigningError)?;
-
-        let client = Client::new();
         let mut tasks = Vec::new();
 
-        // Create parallel requests to all selected validators
         for validator in selected_validators {
-            let client = client.clone();
-            let url = format!("http://{}:{}/consensus", validator.ip_address, validator.port);
+            let transport = transport.clone();
             let node_id = validator.node_id;
-            let my_node_id = my_node_id;
-            let user_id = user_id;
-            let node_signature = node_signature.clone();
-            let user_signature = user_signature.clone();
+            let iroh_node_id = validator.pubkey.to_iroh_node_id();
 
             let task = tokio::spawn(async move {
-                match client.get(&url)
-                    .header("X-Node-ID", my_node_id.to_string())
-                    .header("X-User-ID", user_id.to_string())
-                    .header("X-Node-Signature", hex::encode(node_signature.to_bytes()))
-                    .header("X-User-Signature", hex::encode(user_signature.to_bytes()))
-                    .timeout(std::time::Duration::from_secs(5))
-                    .send()
-                    .await
-                {
-                    Ok(response) => {
-                        if response.status().is_success() {
-                            match response.json::<ConsensusState>().await {
-                                Ok(their_state) => {
-                                    tracing::debug!("Validator {} is at view {}", node_id, their_state.view);
-                                    Some(their_state.view)
-                                }
-                                Err(e) => {
-                                    tracing::debug!("Failed to parse consensus state from validator {}: {:?}", node_id, e);
-                                    None
-                                }
-                            }
-                        } else {
-                            tracing::debug!("Validator {} returned status: {}", node_id, response.status());
-                            None
-                        }
+                match super::rpc::poll_view(&transport, node_id, iroh_node_id).await {
+                    Ok(view) => {
+                        tracing::debug!("Validator {} is at view {}", node_id, view);
+                        Some(view)
                     }
                     Err(e) => {
-                        tracing::debug!("Failed to contact validator {} at {}: {:?}", node_id, url, e);
+                        tracing::debug!("Failed to poll validator {}: {:?}", node_id, e);
                         None
                     }
                 }

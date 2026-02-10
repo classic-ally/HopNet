@@ -5,6 +5,7 @@ pub use crate::{
 };
 
 pub mod routes;
+pub mod rpc;
 pub mod types;
 pub mod functions;
 pub mod jobs;
