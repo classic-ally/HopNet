@@ -98,6 +98,12 @@ async fn handle_stream(
         IrohRequest::ViewPoll(_) => {
             crate::consensus::rpc::handle_view_poll_request(&app_state)
         }
+        IrohRequest::TimeoutVoteBroadcast(req) => {
+            crate::consensus::rpc::handle_timeout_vote_broadcast(req, &app_state).await
+        }
+        IrohRequest::TcBroadcast(req) => {
+            crate::consensus::rpc::handle_tc_broadcast(req, &app_state).await
+        }
     };
 
     send_message(&mut send, &response).await?;

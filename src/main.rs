@@ -521,14 +521,12 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             // Validator routes (active participation - requires active status)
             let validator_consensus_routes = Router::new()
                 .route("/ballot", post(consensus::routes::post_ballot))
-                .route("/consensus/timeout_vote", post(consensus::routes::post_timeout_vote))
                 .layer(middleware::from_fn_with_state(app_state.clone(), consensus::routes::ensure_caught_up_middleware))
                 .layer(axum::Extension(consensus::routes::ConsensusRole::Validator));
 
             // Observer routes (passive observation - no activation required)
             let observer_consensus_routes = Router::new()
                 .route("/qc", post(consensus::routes::post_qc))
-                .route("/consensus/tc", post(consensus::routes::post_tc))
                 .layer(middleware::from_fn_with_state(app_state.clone(), consensus::routes::ensure_caught_up_middleware))
                 .layer(axum::Extension(consensus::routes::ConsensusRole::Observer));
 

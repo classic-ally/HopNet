@@ -170,8 +170,8 @@ HTTP endpoints (`GET /consensus`, `GET /consensus/view/{view}`) preserved for ex
 ### Checklist
 
 - [x] View sync over iroh
-- [ ] Timeout vote over iroh
-- [ ] TC broadcast over iroh
+- [x] Timeout vote over iroh
+- [x] TC broadcast over iroh
 - [ ] QC broadcast over iroh
 - [ ] Ballot submission over iroh
 - [ ] Transaction forwarding over iroh

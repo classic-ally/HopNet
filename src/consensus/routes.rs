@@ -427,21 +427,16 @@ pub async fn post_qc(
     
 }
 
-// route to receive timeout votes for distributed TC generation
-pub async fn post_timeout_vote(
-    State(app_state): State<AppState>,
-    Json(timeout_vote): Json<TimeoutVote>,
-) -> impl IntoResponse {
+/// Core logic for processing an incoming timeout vote.
+/// Called by the iroh handler in `consensus::rpc`.
+pub async fn process_incoming_timeout_vote(
+    timeout_vote: TimeoutVote,
+    app_state: &AppState,
+) -> Result<(), ConsensusError> {
     // Optimized intra-view sync: only if incoming vote has higher QC than us
     let our_highest_qc_view = {
-        let conn = match app_state.db_pool.get() {
-            Ok(conn) => conn,
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        };
-        let consensus_state = match db::get_consensus(Ok(conn)) {
-            Ok(state) => state,
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        };
+        let conn = app_state.db_pool.get().map_err(|_| ConsensusError::DatabaseError)?;
+        let consensus_state = db::get_consensus(Ok(conn)).map_err(|_| ConsensusError::DatabaseError)?;
         consensus_state.highest_qc_block.data.view_number
     };
 
@@ -451,9 +446,9 @@ pub async fn post_timeout_vote(
             "Timeout vote references higher QC (vote_qc_view={}, our_qc_view={}) - syncing",
             timeout_vote.data.highest_qc_view, our_highest_qc_view
         );
-        if let Err(e) = ensure_intra_view_synced(&app_state).await {
+        if let Err(e) = ensure_intra_view_synced(app_state).await {
             tracing::error!("Intra-view sync failed for timeout vote (view {}): {:?}", timeout_vote.data.view_number, e);
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            return Err(ConsensusError::NetworkError);
         }
 
         // P1: Reissue our timeout vote if we already voted for this view
@@ -461,10 +456,8 @@ pub async fn post_timeout_vote(
         // for the new bucket (different data_hash due to different QC reference).
         // The old vote remains in the old bucket - both coexist peacefully.
         // Cascade effect ensures bucket with highest QC reaches quorum first.
-        let consensus_state = match db::get_consensus(app_state.db_pool.get()) {
-            Ok(state) => state,
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        };
+        let consensus_state = db::get_consensus(app_state.db_pool.get())
+            .map_err(|_| ConsensusError::DatabaseError)?;
 
         if consensus_state.last_timeout_vote_view == timeout_vote.data.view_number {
             tracing::info!(
@@ -476,7 +469,7 @@ pub async fn post_timeout_vote(
 
             // Reissue with updated QC reference (issue_timeout_vote is reissuance-safe)
             use crate::consensus::functions::issue_timeout_vote;
-            if let Err(e) = issue_timeout_vote(timeout_vote.data.view_number, &app_state, None).await {
+            if let Err(e) = issue_timeout_vote(timeout_vote.data.view_number, app_state, None).await {
                 tracing::warn!("Failed to reissue timeout vote for view {}: {:?}", timeout_vote.data.view_number, e);
                 // Continue processing incoming vote even if reissuance fails
             }
@@ -488,23 +481,21 @@ pub async fn post_timeout_vote(
         );
     }
 
-    match app_state.timeout_vote_collector.add_vote(timeout_vote.clone(), &app_state).await {
+    match app_state.timeout_vote_collector.add_vote(timeout_vote.clone(), app_state).await {
         Ok(Some(tc)) => {
             // TC was created - apply locally and broadcast in parallel (Layer 2 defense)
-            let apply_result = apply_timeout_certificate(tc.clone(), &app_state, false, None);
-            let broadcast_result = broadcast_timeout_certificate(tc, &app_state);
+            let apply_result = apply_timeout_certificate(tc.clone(), app_state, false, None);
+            let broadcast_result = broadcast_timeout_certificate(tc, app_state);
 
             let (apply_res, broadcast_res) = tokio::join!(apply_result, broadcast_result);
 
-            match apply_res {
-                Ok(_) => {
-                    if let Err(_) = broadcast_res {
-                        tracing::warn!("Applied TC locally but broadcast failed");
-                    }
-                    StatusCode::CREATED.into_response() // Applied locally (broadcast failure is non-critical)
-                }
-                Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(), // Failed to apply locally
+            if let Err(_) = &apply_res {
+                return Err(ConsensusError::DatabaseError);
             }
+            if let Err(_) = broadcast_res {
+                tracing::warn!("Applied TC locally but broadcast failed");
+            }
+            Ok(())
         }
         Ok(None) => {
             // Cascade check: if futility detected after adding vote, issue our own timeout vote
@@ -522,34 +513,15 @@ pub async fn post_timeout_vote(
                 // Check futility and cascade if needed (side effect: issues timeout vote if futile)
                 // No guard to drop here (cascade doesn't hold consensus_lock)
                 use crate::consensus::functions::abort_if_timing_out;
-                let _ = abort_if_timing_out(timeout_vote.data.view_number, &validators, &app_state, None).await;
+                let _ = abort_if_timing_out(timeout_vote.data.view_number, &validators, app_state, None).await;
 
                 Some(())
             }.await;
 
-            StatusCode::CREATED.into_response() // Original vote added successfully
+            Ok(())
         }
-        Err(CertificateError::ValidationError) => StatusCode::OK.into_response(), // Duplicate vote
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(), // Other error
-    }
-}
-
-// route to receive timeout certificates from other nodes
-pub async fn post_tc(
-    State(app_state): State<AppState>,
-    Json(timeout_cert): Json<TimeoutCertificate>,
-) -> impl IntoResponse {
-    // Verify TC is valid
-    // Note: consensus_lock acquired in apply_timeout_certificate after GST wait
-    match timeout_cert.verify(&app_state) {
-        Ok(_) => {
-            // Apply TC to advance consensus view (with Layer 2 bounded wait)
-            match apply_timeout_certificate(timeout_cert, &app_state, false, None).await {
-                Ok(_) => StatusCode::OK,
-                Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            }
-        }
-        Err(_) => StatusCode::BAD_REQUEST, // Invalid TC
+        Err(CertificateError::ValidationError) => Ok(()), // Duplicate vote
+        Err(_) => Err(ConsensusError::DatabaseError),
     }
 }
 
@@ -565,36 +537,32 @@ pub async fn broadcast_timeout_certificate(
         .into_iter()
         .filter(|node| node.node_id != me.node_id)
         .collect::<Vec<_>>();
-    
+
     // Broadcast TC to all other validators
-    let client = reqwest::Client::new();
+    let transport = &app_state.iroh_transport;
     let mut broadcast_tasks = Vec::new();
-    
+
     for validator in validators {
         let tc_clone = tc.clone();
-        let client_clone = client.clone();
-        let url = format!("http://{}:{}/consensus/tc", validator.ip_address, validator.port);
-        
+        let transport = transport.clone();
+        let iroh_node_id = validator.pubkey.to_iroh_node_id();
+        let node_id = validator.node_id;
+
         let task = tokio::spawn(async move {
-            client_clone
-                .post(&url)
-                .json(&tc_clone)
-                .send()
-                .await
+            super::rpc::broadcast_tc(&transport, node_id, iroh_node_id, &tc_clone).await
         });
         broadcast_tasks.push(task);
     }
-    
+
     // Wait for all broadcasts (but don't fail if some fail)
     for task in broadcast_tasks {
         if let Ok(result) = task.await {
             if let Err(e) = result {
-                tracing::debug!("Failed to broadcast TC to validator: {}", e);
-                // Continue with other broadcasts
+                tracing::debug!("Failed to broadcast TC to node: {:?}", e);
             }
         }
     }
-    
+
     Ok(())
 }
 

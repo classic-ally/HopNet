@@ -62,6 +62,7 @@ cargo build --release --bin orchestrator --features skip-frontend
 | `documentprovider-write-consistency` | Document provider write APIs (upload, rename, move, delete) |
 | `iroh-ping` | Verify iroh transport connectivity between all nodes in the mesh |
 | `iroh-reject-unknown` | Verify unknown peers are rejected before path registration (no IP leak) |
+| `timeout-progression` | Verify timeout votes broadcast over iroh, form TC, and advance view when leader is down |
 
 ## Common Workflows
 
@@ -71,6 +72,9 @@ When testing code changes against the orchestrator:
 
 ```bash
 # 1. Build the HopNet Docker image (if source changed)
+# IMPORTANT: Only use --no-cache when Cargo.toml dependencies changed
+# (cargo cache mounts can serve stale crates). For source-only changes,
+# plain `docker build` is sufficient and much faster.
 docker build -t hopnet:latest .
 
 # 2. Build orchestrator (skip-frontend for faster builds)

@@ -53,7 +53,7 @@ Reed-Solomon encoded file storage with encryption, chunked encoding, and fragmen
 - [ ] Preview data extraction while maintaining encryption
 
 ### 3. Node Communication System ([RFC-003](specs/node-communication.md))
-**Status**: Iroh transport active for health checks and view sync, HTTP migration ongoing ([migration plan](refactors/iroh-migration.md))
+**Status**: Iroh transport active for health checks, view sync, timeout votes, and TC broadcast; HTTP migration ongoing ([migration plan](refactors/iroh-migration.md))
 
 HTTP-based inter-node communication with iroh (QUIC/TLS) transport migration in progress.
 

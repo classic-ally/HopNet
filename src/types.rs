@@ -9,7 +9,7 @@ use hex;
 
 /// A wrapper around blake3::Hash that implements bincode's Encode and Decode traits
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
-pub struct Blake3Hash(blake3::Hash);
+pub struct Blake3Hash(pub blake3::Hash);
 
 impl Blake3Hash {
     /// Create a new Blake3Hash from a blake3::Hash

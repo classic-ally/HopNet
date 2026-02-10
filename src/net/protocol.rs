@@ -13,6 +13,10 @@ pub enum IrohRequest {
     ViewDataFetch(consensus_rpc::ViewDataRequest),
     /// Poll for current view number (sync detection)
     ViewPoll(consensus_rpc::ViewPollRequest),
+    /// Broadcast timeout vote
+    TimeoutVoteBroadcast(consensus_rpc::TimeoutVoteBroadcastRequest),
+    /// Broadcast timeout certificate
+    TcBroadcast(consensus_rpc::TcBroadcastRequest),
 }
 
 /// Response envelope for all iroh communication
@@ -26,6 +30,10 @@ pub enum IrohResponse {
     ViewDataFetchResponse(consensus_rpc::ViewDataResponse),
     /// Current view number
     ViewPollResponse(consensus_rpc::ViewPollResponse),
+    /// Ack for timeout vote broadcast
+    TimeoutVoteBroadcastResponse(consensus_rpc::TimeoutVoteBroadcastResponse),
+    /// Ack for TC broadcast
+    TcBroadcastResponse(consensus_rpc::TcBroadcastResponse),
     /// Error response
     Error { message: String },
 }

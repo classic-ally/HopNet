@@ -20,7 +20,8 @@ mod iroh_ping;
 mod iroh_reject_unknown;
 mod multi_size_files;
 mod performance;
-mod persistence;
+pub(crate) mod persistence;
+mod timeout_progression;
 
 /// Represents the result of a test scenario execution
 #[derive(Debug)]
@@ -108,6 +109,9 @@ pub async fn run_test_by_name(mesh_id: u32, name: &str, nodes: &[NodeInfo], flag
         "iroh-reject-unknown" => {
             iroh_reject_unknown::IrohRejectUnknown.run(mesh_id, nodes, flags).await
         }
+        "timeout-progression" => {
+            timeout_progression::TimeoutProgression.run(mesh_id, nodes, flags).await
+        }
         _ => Err(anyhow::anyhow!("Unknown test: {}", name)),
     }
 }
@@ -125,6 +129,7 @@ pub fn list_test_names() -> Vec<&'static str> {
         "documentprovider-write-consistency",
         "iroh-ping",
         "iroh-reject-unknown",
+        "timeout-progression",
     ]
 }
 

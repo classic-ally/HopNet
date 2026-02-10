@@ -163,15 +163,18 @@ pub async fn issue_timeout_vote(
                 .filter(|node| node.node_id != my_node_id)
                 .collect::<Vec<_>>();
 
-            let client = reqwest::Client::new();
+            let transport = app_state.iroh_transport.clone();
             for validator in validators {
+                let transport = transport.clone();
                 let timeout_vote_clone = timeout_vote.clone();
-                let client_clone = client.clone();
-                let url = format!("http://{}:{}/consensus/timeout_vote", validator.ip_address, validator.port);
+                let iroh_node_id = validator.pubkey.to_iroh_node_id();
+                let node_id = validator.node_id;
 
                 tokio::spawn(async move {
-                    if let Err(e) = client_clone.post(&url).json(&timeout_vote_clone).send().await {
-                        tracing::warn!("Failed to send timeout vote to {}: {}", url, e);
+                    if let Err(e) = super::rpc::broadcast_timeout_vote(
+                        &transport, node_id, iroh_node_id, &timeout_vote_clone,
+                    ).await {
+                        tracing::warn!("Failed to send timeout vote to node {}: {:?}", node_id, e);
                     }
                 });
             }

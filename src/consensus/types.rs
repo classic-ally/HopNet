@@ -407,7 +407,7 @@ pub struct VoteSignMessage {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct VoteSignMessages(Vec<VoteSignMessage>);
+pub struct VoteSignMessages(pub Vec<VoteSignMessage>);
 
 impl ToSql for VoteSignMessage {
     fn to_sql(&self) -> Result<ToSqlOutput<'_>, duckdb::Error> {
@@ -687,7 +687,7 @@ impl QuorumCertificate {
 }
 
 // Timeout data structures following VoteSignMessage/Ballot pattern
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TimeoutSignData {
     pub view_number: i32,
     pub highest_qc_view: i32,
@@ -716,7 +716,7 @@ impl TimeoutSignData {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TimeoutVote {
     // sender of the timeout vote (like Ballot.initiator)
     pub sender: VoteSignMessage,
