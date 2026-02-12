@@ -21,6 +21,8 @@ pub enum IrohRequest {
     QcBroadcast(consensus_rpc::QcBroadcastRequest),
     /// Submit ballot for voting (returns signed vote)
     BallotSubmission(consensus_rpc::BallotRequest),
+    /// Forward transactions to leader for consensus
+    TransactionForward(consensus_rpc::TransactionForwardRequest),
 }
 
 /// Response envelope for all iroh communication
@@ -42,6 +44,8 @@ pub enum IrohResponse {
     QcBroadcastResponse(consensus_rpc::QcBroadcastResponse),
     /// Ballot vote response (signed vote)
     BallotSubmissionResponse(consensus_rpc::BallotResponse),
+    /// Ack for transaction forward
+    TransactionForwardResponse(consensus_rpc::TransactionForwardResponse),
     /// Error response
     Error { message: String },
 }
@@ -56,6 +60,7 @@ impl IrohRequest {
             IrohRequest::TimeoutVoteBroadcast(req) => Some(req.timeout_vote.data.view_number),
             IrohRequest::TcBroadcast(req) => Some(req.tc.view_number),
             IrohRequest::QcBroadcast(req) => Some(req.qc.view_number),
+            IrohRequest::TransactionForward(req) => Some(req.view),
             _ => None, // Ping, FragmentHealthCheck, ViewDataFetch, ViewPoll
         }
     }

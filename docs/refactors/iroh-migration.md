@@ -134,7 +134,7 @@ Pattern: each module owns `rpc.rs` (inter-node) alongside `routes.rs` (HTTP API)
 ---
 
 ## Phase 3: Consensus Messages
-**Status:** [~] In Progress
+**Status:** [x] Complete
 
 ### Overview
 
@@ -175,7 +175,7 @@ HTTP endpoints (`GET /consensus`, `GET /consensus/view/{view}`) preserved for ex
 - [x] TC broadcast over iroh
 - [x] QC broadcast over iroh
 - [x] Ballot submission over iroh
-- [ ] Transaction forwarding over iroh
+- [x] Transaction forwarding over iroh
 - [x] Message-driven catch-up dispatch (replaces HTTP middleware)
 
 **After each migration:** Run full test suite, verify divergence = 0

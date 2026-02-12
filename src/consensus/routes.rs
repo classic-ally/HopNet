@@ -32,7 +32,7 @@ use serde::Serialize;
 
 
 use crate::AppState;
-use axum::middleware::{self, Next};
+use axum::middleware::Next;
 use axum::http::Request;
 use axum::body::Body;
 
@@ -499,12 +499,6 @@ pub enum ViewComparison {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum ConsensusRole {
-    Validator,  // Active participation (voting) - requires active validator status and full sync
-    Observer,   // Passive observation (learning) - just following consensus, can tolerate lag
-}
-
-#[derive(Debug, Clone, Copy)]
 pub enum CatchUpMode {
     SingleShot,    // Fast path for small gaps (active validators receiving messages)
     Convergence,   // Iterative for large gaps, bootstrap, or extended downtime
@@ -521,12 +515,6 @@ pub enum SyncStatus {
 pub struct NodeReadiness {
     pub sync_status: SyncStatus,
     pub is_active: bool,
-}
-
-#[derive(Debug)]
-pub struct CatchUpNeeded {
-    pub our_view: i32,
-    pub target_view: i32,
 }
 
 /// Check if we're caught up with the network by polling a subset of validators
@@ -1363,69 +1351,6 @@ pub async fn perform_catch_up(
     Ok(())
 }
 
-/// Ensure we're caught up with the network before participating in consensus
-/// This middleware automatically catches up behind nodes and checks readiness based on role
-pub async fn ensure_caught_up_middleware(
-    State(app_state): State<AppState>,
-    Extension(role): Extension<ConsensusRole>,
-    req: Request<Body>,
-    next: Next,
-) -> impl IntoResponse {
-    // Determine tolerance based on role
-    let tolerance = match role {
-        ConsensusRole::Validator => 0,  // Validators must be fully caught up
-        ConsensusRole::Observer => 1,   // Observers can be 1 view behind
-    };
-
-    // Ensure caught up and check activation (don't request - timeout job handles that)
-    match ensure_caught_up_and_active(&app_state, CatchUpMode::SingleShot, false, tolerance, None).await {
-        Ok(NodeReadiness { sync_status, is_active }) => {
-            match role {
-                ConsensusRole::Validator => {
-                    // Validator routes (/ballot): must be caught up AND active
-                    match (sync_status, is_active) {
-                        (SyncStatus::CaughtUp, true) => {
-                            tracing::debug!("Node is caught up and active (view-level)");
-                            next.run(req).await
-                        }
-                        (SyncStatus::CaughtUp, false) => {
-                            tracing::warn!("Node is caught up but inactive - rejecting ballot (validator role requires active status)");
-                            StatusCode::SERVICE_UNAVAILABLE.into_response()
-                        }
-                        (SyncStatus::WithinTolerance { gap }, _) => {
-                            // Should never happen with tolerance=0, but handle defensively
-                            tracing::warn!("Node within tolerance (gap={}) on validator route - rejecting", gap);
-                            StatusCode::SERVICE_UNAVAILABLE.into_response()
-                        }
-                        (SyncStatus::Behind { gap }, _) => {
-                            tracing::warn!("Node is behind by {} views - rejecting ballot (validator role)", gap);
-                            StatusCode::SERVICE_UNAVAILABLE.into_response()
-                        }
-                    }
-                }
-                ConsensusRole::Observer => {
-                    // Observer routes (/qc, /tc): allow if not too far behind (passive observation)
-                    // Active status doesn't matter - observers don't vote
-                    match sync_status {
-                        SyncStatus::CaughtUp | SyncStatus::WithinTolerance { .. } => {
-                            tracing::debug!("Node synchronized (sync_status={:?}), processing message (observer role)", sync_status);
-                            next.run(req).await
-                        }
-                        SyncStatus::Behind { gap } => {
-                            tracing::warn!("Node is behind by {} views - rejecting message (observer role)", gap);
-                            StatusCode::SERVICE_UNAVAILABLE.into_response()
-                        }
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            tracing::error!("Failed to ensure caught up: {:?} - rejecting consensus operation", e);
-            StatusCode::SERVICE_UNAVAILABLE.into_response()
-        }
-    }
-}
-
 // Combined middleware that accepts either JWT auth (for users) or RPC auth (for nodes)
 pub async fn jwt_or_rpc_auth_middleware(
     State(app_state): State<AppState>,
@@ -1532,27 +1457,6 @@ pub async fn rpc_auth_middleware(
         _ => {
             tracing::warn!("Missing required RPC headers: X-Node-ID, X-Node-Signature");
             StatusCode::UNAUTHORIZED.into_response()
-        }
-    }
-}
-
-// Route for non-leaders to forward transactions to the leader (pre-authenticated by middleware)
-pub async fn post_propose(
-    State(app_state): State<AppState>,
-    axum::Extension(auth_node): axum::Extension<AuthenticatedNode>,
-    Json(transactions): Json<Vec<Transaction>>,
-) -> impl IntoResponse {
-    tracing::info!(
-        "Processing authenticated consensus proposal from node {}",
-        auth_node.node_id
-    );
-
-    // Process transactions through consensus (already authenticated)
-    match crate::consensus::functions::consensus_middleware(&app_state, transactions).await {
-        Ok(()) => StatusCode::OK,
-        Err(e) => {
-            tracing::error!("Consensus middleware failed: {:?}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
         }
     }
 }

@@ -510,14 +510,6 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .layer(DefaultBodyLimit::max(files::functions::calculate_encrypted_chunk_length(files::functions::MAX_FRAGMENT_SIZE) + 1024)) // Allow encrypted 4MB fragments (~4.21MB) + headers
                 .layer(middleware::from_fn_with_state(app_state.clone(), consensus::routes::rpc_auth_middleware));
 
-            // Propose route - requires RPC auth + Validator-level validation (caught up + active)
-            // to prevent inactive/stale nodes from incorrectly acting as leader or creating forwarding loops
-            let propose_route = Router::new()
-                .route("/consensus/propose", post(consensus::routes::post_propose))
-                .layer(middleware::from_fn_with_state(app_state.clone(), consensus::routes::rpc_auth_middleware))
-                .layer(middleware::from_fn_with_state(app_state.clone(), consensus::routes::ensure_caught_up_middleware))
-                .layer(axum::Extension(consensus::routes::ConsensusRole::Validator));
-
             // Test routes - only available in test mode
             let test_routes = if app_state.test_mode {
                 Router::new()
@@ -533,7 +525,6 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .merge(protected_routes)
                 .merge(jwt_or_rpc_routes)
                 .merge(rpc_routes)
-                .merge(propose_route)
                 .nest("/integrations/fileprovider", fileprovider_routes)
                 .nest("/integrations/documentprovider", documentprovider::routes::router(app_state.clone()))
                 .nest("/devices", devices::routes::router(app_state.clone()))

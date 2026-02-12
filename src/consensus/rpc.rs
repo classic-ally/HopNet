@@ -332,6 +332,64 @@ pub async fn submit_ballot_to_peer(
 }
 
 // ============================================================================
+// Transaction Forward
+// ============================================================================
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct TransactionForwardRequest {
+    pub transactions: Vec<super::types::Transaction>,
+    pub view: i32,  // Forwarder's current view — catch-up hint, not a gate
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct TransactionForwardResponse {}
+
+/// Server: process forwarded transactions through consensus.
+/// The handler's message-driven catch-up already ran before dispatch,
+/// so we just call consensus_middleware directly (same as the old post_propose).
+pub async fn handle_transaction_forward(
+    req: TransactionForwardRequest,
+    app_state: &AppState,
+) -> IrohResponse {
+    match super::functions::consensus_middleware(app_state, req.transactions).await {
+        Ok(()) => IrohResponse::TransactionForwardResponse(TransactionForwardResponse {}),
+        Err(e) => IrohResponse::Error {
+            message: format!("transaction forward failed: {:?}", e),
+        },
+    }
+}
+
+/// Leader runs full consensus round (2 ballot rounds × 30s max each) before responding.
+const TRANSACTION_FORWARD_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Client: forward transactions to the leader node.
+pub async fn forward_transactions_to_leader(
+    transport: &IrohTransport,
+    node_id: i32,
+    peer_node_id: iroh::PublicKey,
+    transactions: Vec<super::types::Transaction>,
+    view: i32,
+) -> Result<(), IrohError> {
+    let req = IrohRequest::TransactionForward(TransactionForwardRequest {
+        transactions,
+        view,
+    });
+    let response = transport.request(node_id, peer_node_id, &req, TRANSACTION_FORWARD_TIMEOUT).await?;
+
+    match response {
+        IrohResponse::TransactionForwardResponse(_) => Ok(()),
+        IrohResponse::Error { message } => {
+            Err(IrohError::Protocol(ProtocolError::PeerError(message)))
+        }
+        other => {
+            Err(IrohError::Protocol(ProtocolError::MalformedResponse(
+                format!("unexpected response to TransactionForward: {:?}", other),
+            )))
+        }
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -496,5 +554,25 @@ mod tests {
         assert_eq!(decoded.qc.view_number, 7);
         assert_eq!(decoded.qc.phase, ConsensusPhase::Lock);
         assert_eq!(decoded.qc.proposer_signature.replica_id, 2);
+    }
+
+    #[test]
+    fn transaction_forward_request_bincode_roundtrip() {
+        let req = TransactionForwardRequest {
+            transactions: vec![],
+            view: 15,
+        };
+        let encoded = bincode::serde::encode_to_vec(&req, bincode::config::standard()).unwrap();
+        let (decoded, _): (TransactionForwardRequest, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+
+        assert_eq!(decoded.view, 15);
+        assert!(decoded.transactions.is_empty());
+
+        // Also test response roundtrip
+        let resp = TransactionForwardResponse {};
+        let encoded = bincode::serde::encode_to_vec(&resp, bincode::config::standard()).unwrap();
+        let (_, _): (TransactionForwardResponse, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
     }
 }

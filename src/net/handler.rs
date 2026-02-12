@@ -181,6 +181,9 @@ async fn handle_stream(
         IrohRequest::BallotSubmission(req) => {
             crate::consensus::rpc::handle_ballot_request(req, &app_state).await
         }
+        IrohRequest::TransactionForward(req) => {
+            crate::consensus::rpc::handle_transaction_forward(req, &app_state).await
+        }
     };
 
     send_message(&mut send, &response).await?;

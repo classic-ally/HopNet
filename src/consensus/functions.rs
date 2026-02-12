@@ -1,7 +1,6 @@
 use super::*;
 
 use crate::{db::consensus as db, handlers::HandlerResult};
-use reqwest::Client;
 use crate::db::MyNode;
 use crate::types::Node;
 use crate::DISPATCH_TABLE;
@@ -275,7 +274,7 @@ pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transa
             "Not the leader (node {}), forwarding transactions to leader (node {})",
             my_node_id, consensus_state.leader.node_id
         );
-        return forward_to_leader(consensus_state.leader, transactions, app_state).await;
+        return forward_to_leader(consensus_state.leader, transactions, consensus_state.view, app_state).await;
     }
 
     // Check if we've already proposed in this view (double-proposal protection)
@@ -810,47 +809,29 @@ impl TimeoutVoteCollector {
 async fn forward_to_leader(
     leader: crate::types::Node,
     transactions: Vec<Transaction>,
+    view: i32,
     app_state: &AppState
 ) -> Result<(), ConsensusError> {
-    let my_node_id = app_state.get_node_id().map_err(|_| ConsensusError::DatabaseError)?;
-
-    // Serialize transactions for signing
-    let body = serde_json::to_vec(&transactions).map_err(|_| ConsensusError::SigningError)?;
-
-    // Sign with node key
-    let node_signature = app_state.private_key.try_sign(&body).map_err(|_| ConsensusError::SigningError)?;
-
-    // Forward to leader
-    let client = reqwest::Client::new();
-    let url = format!("http://{}:{}/consensus/propose", leader.ip_address, leader.port);
+    let leader_iroh_id = leader.pubkey.to_iroh_node_id();
 
     tracing::info!(
-        "Forwarding {} transactions to leader at {} (node_id: {})",
-        transactions.len(), &url, my_node_id
+        "Forwarding {} transactions to leader node {} over iroh (our view: {})",
+        transactions.len(), leader.node_id, view
     );
 
-    let response = client
-        .post(&url)
-        .header("X-Node-ID", my_node_id.to_string())
-        .header("X-Node-Signature", hex::encode(node_signature.to_bytes()))
-        .json(&transactions)
-        .send()
-        .await
-        .map_err(|_| ConsensusError::NetworkError)?;
-    
-    match response.status() {
-        reqwest::StatusCode::OK | reqwest::StatusCode::CREATED => {
-            tracing::debug!("Leader successfully processed {} transactions", transactions.len());
-            Ok(())
+    super::rpc::forward_transactions_to_leader(
+        &app_state.iroh_transport,
+        leader.node_id,
+        leader_iroh_id,
+        transactions,
+        view,
+    ).await.map_err(|e| {
+        tracing::warn!("Failed to forward transactions to leader: {:?}", e);
+        match e {
+            crate::net::IrohError::Protocol(_) => ConsensusError::ForwardingError,
+            _ => ConsensusError::NetworkError,
         }
-        _ => {
-            tracing::warn!(
-                "Leader rejected transactions with status: {}",
-                response.status()
-            );
-            Err(ConsensusError::ForwardingError)
-        }
-    }
+    })
 }
 
 /// Poll a random subset of validators to get the maximum view in the network
