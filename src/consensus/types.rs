@@ -101,7 +101,7 @@ impl FromSql for ConsensusPhase {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Ballot {
     // initiator of the vote, must be leader
     pub initiator: VoteSignMessage,
@@ -378,7 +378,7 @@ impl Ballot {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct VoteSignData {
     pub block_hash: Blake3Hash,
     pub block_height: i32,

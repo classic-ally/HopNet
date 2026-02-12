@@ -166,7 +166,7 @@ HTTP endpoints (`GET /consensus`, `GET /consensus/view/{view}`) preserved for ex
 - **Message ordering**: Consensus assumes certain ordering guarantees
 - **Warm connections**: Pool should be warm before consensus starts
 - **Broadcast patterns**: Some messages go to all validators in parallel
-- **Catch-up dispatch**: HTTP middleware ran `ensure_caught_up_and_active` before consensus handlers. Iroh handlers currently skip this. Need a single catch-up check in `handler.rs` before dispatching consensus messages (per-type tolerance: Validator=0, Observer=1), rather than re-adding it inside each handler. Critical for ballot route (tolerance=0, requires active status). Affects timeout vote future-view handling too — receiving a vote for a future view should trigger catch-up.
+- **Catch-up dispatch**: Message-driven catch-up in `handler.rs` replaces the old HTTP middleware. Before dispatching any consensus message, extracts the message's view via `IrohRequest::consensus_view()`. If ahead of ours, performs cross-view catch-up. For Lock-phase ballots, also triggers intra-view sync if missing the Propose QC. Uses lightweight `get_consensus_progress()` (one join, two integers) instead of full `get_consensus()`. Zero overhead on the happy path.
 
 ### Checklist
 
@@ -174,9 +174,9 @@ HTTP endpoints (`GET /consensus`, `GET /consensus/view/{view}`) preserved for ex
 - [x] Timeout vote over iroh
 - [x] TC broadcast over iroh
 - [x] QC broadcast over iroh
-- [ ] Ballot submission over iroh
+- [x] Ballot submission over iroh
 - [ ] Transaction forwarding over iroh
-- [ ] Iroh-level catch-up dispatch (replace per-handler middleware)
+- [x] Message-driven catch-up dispatch (replaces HTTP middleware)
 
 **After each migration:** Run full test suite, verify divergence = 0
 
@@ -184,6 +184,46 @@ HTTP endpoints (`GET /consensus`, `GET /consensus/view/{view}`) preserved for ex
 - All existing integration tests pass
 - `device-token-consistency` passes
 - `documentprovider-write-consistency` passes
+
+---
+
+## Phase 3f: Consensus Barrier Testing Infrastructure
+**Status:** [ ] Not Started
+
+### Overview
+
+Add conditional barriers at key consensus stages to enable controlled-timing tests for edge cases that are impossible to reproduce on the happy path. The full consensus pipeline must be on iroh first (transaction forwarding included) so barriers give end-to-end coverage.
+
+### Motivation
+
+Consensus safety is the hardest invariant to verify. Existing integration tests validate the happy path, but dangerous bugs hide in edge cases: missed phases, partial sync, stale state, race conditions between QC/TC application. These scenarios require controlled timing to reproduce — the system is designed to process consensus rounds as fast as possible, leaving no natural window to inject failures.
+
+### Design
+
+Conditional `tokio::sync::Notify` barriers in `AppState`, activated only when `test_mode` is true (zero overhead in production):
+
+- `before_ballot_dispatch` — hold a node before it processes an incoming ballot
+- `after_propose_qc_broadcast` — hold after Propose QC is sent but before Lock ballot
+- `before_tc_application` — hold before timeout certificate advances the view
+
+Orchestrator tests control the flow: hold a barrier on one node, let other nodes progress, release and verify catch-up/sync behavior.
+
+### Test Scenarios
+
+- **Intra-view sync**: hold node through Propose phase, release during Lock phase, verify it fetches missing Propose QC before processing Lock ballot
+- **Cross-view catch-up**: hold node through entire view(s), release, verify message-driven catch-up fires and node rejoins
+- **TC/QC race conditions**: hold before TC application, inject a late Lock QC, verify Layer 2 GST wait + quorum check prevents safety violation
+- **Cascade timeout propagation**: hold one node, let others timeout, release and verify cascade
+
+### Checklist
+
+- [ ] Add `ConsensusBarriers` struct to `AppState`
+- [ ] Insert barrier points at consensus stage boundaries
+- [ ] Orchestrator test: intra-view sync (Lock ballot without Propose QC)
+- [ ] Orchestrator test: cross-view catch-up (node paused for full view)
+- [ ] Orchestrator test: TC/QC race condition
+
+**Validation:** All barrier tests pass, existing tests unaffected (barriers are no-ops when not held)
 
 ---
 

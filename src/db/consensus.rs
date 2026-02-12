@@ -340,6 +340,22 @@ pub fn get_current_view(
     }
 }
 
+/// Lightweight consensus progress: current view + highest QC view.
+/// Used for message-driven catch-up decisions in the iroh handler.
+/// Much cheaper than get_consensus() (one join, two integers, no CTEs).
+pub fn get_consensus_progress(
+    conn: &r2d2::PooledConnection<DuckdbConnectionManager>,
+) -> Result<(i32, i32), DatabaseError> {
+    conn.query_row(
+        "SELECT t.current_view, hb.view_number
+         FROM this_node t
+         JOIN blocks hb ON hb.block_hash = t.highest_qc_block_hash
+         WHERE t.internal_id = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?))
+    ).map_err(|_| DatabaseError::RecallError)
+}
+
 pub fn get_validators(
     db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     height: i32,

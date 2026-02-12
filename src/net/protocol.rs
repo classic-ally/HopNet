@@ -19,6 +19,8 @@ pub enum IrohRequest {
     TcBroadcast(consensus_rpc::TcBroadcastRequest),
     /// Broadcast quorum certificate
     QcBroadcast(consensus_rpc::QcBroadcastRequest),
+    /// Submit ballot for voting (returns signed vote)
+    BallotSubmission(consensus_rpc::BallotRequest),
 }
 
 /// Response envelope for all iroh communication
@@ -38,6 +40,23 @@ pub enum IrohResponse {
     TcBroadcastResponse(consensus_rpc::TcBroadcastResponse),
     /// Ack for QC broadcast
     QcBroadcastResponse(consensus_rpc::QcBroadcastResponse),
+    /// Ballot vote response (signed vote)
+    BallotSubmissionResponse(consensus_rpc::BallotResponse),
     /// Error response
     Error { message: String },
+}
+
+impl IrohRequest {
+    /// Extract the consensus view from a consensus message, if applicable.
+    /// Used for message-driven catch-up: if the message's view is ahead of ours,
+    /// we catch up before dispatching.
+    pub fn consensus_view(&self) -> Option<i32> {
+        match self {
+            IrohRequest::BallotSubmission(req) => Some(req.ballot.data.view),
+            IrohRequest::TimeoutVoteBroadcast(req) => Some(req.timeout_vote.data.view_number),
+            IrohRequest::TcBroadcast(req) => Some(req.tc.view_number),
+            IrohRequest::QcBroadcast(req) => Some(req.qc.view_number),
+            _ => None, // Ping, FragmentHealthCheck, ViewDataFetch, ViewPoll
+        }
+    }
 }

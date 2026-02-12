@@ -172,11 +172,14 @@ pub async fn get_view_consensus_data(
     }
 }
 
-// route to accept ballots and operate on them
-pub async fn post_ballot(
-    State(app_state): State<AppState>,
-    Json(ballot): Json<Ballot>
-) -> impl IntoResponse {
+/// Core logic for processing an incoming ballot.
+/// Called by the iroh handler in `consensus::rpc`.
+/// Catch-up (cross-view and intra-view) is handled by the handler before dispatch.
+/// Returns the signed vote on success.
+pub async fn process_incoming_ballot(
+    ballot: Ballot,
+    app_state: &AppState,
+) -> Result<VoteSignMessage, ConsensusError> {
     tracing::debug!(
         "Received ballot for view {} phase {:?} block {:?}",
         ballot.data.view, ballot.data.phase, ballot.block.block_hash
@@ -184,39 +187,6 @@ pub async fn post_ballot(
 
     // Serialize ballot processing to prevent concurrent state modifications
     let _guard = app_state.consensus_lock.lock().await;
-
-    // Phase-specific intra-view sync: only when receiving Lock ballot before having Propose QC
-    // (i.e., we're locally in "prepare phase" but receiving a Lock ballot)
-    if ballot.data.phase == ConsensusPhase::Lock {
-        let highest_qc_view = {
-            let conn = match app_state.db_pool.get() {
-                Ok(conn) => conn,
-                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-            };
-            let consensus_state = match db::get_consensus(Ok(conn)) {
-                Ok(state) => state,
-                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-            };
-            consensus_state.highest_qc_block.data.view_number
-        };
-
-        // Only sync if we're missing the Propose QC for this view
-        if highest_qc_view < ballot.data.view {
-            tracing::debug!(
-                "Lock ballot received but missing Propose QC (highest_qc_view={}, ballot_view={}) - syncing",
-                highest_qc_view, ballot.data.view
-            );
-            if let Err(e) = ensure_intra_view_synced(&app_state).await {
-                tracing::error!("Intra-view sync failed for Lock ballot (view {}): {:?}", ballot.data.view, e);
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
-            }
-        } else {
-            tracing::trace!(
-                "Lock ballot received with Propose QC already present (highest_qc_view={}) - skipping sync",
-                highest_qc_view
-            );
-        }
-    }
 
     // Bug #5 fix: Insert block BEFORE verification for Propose phase
     // This ensures block exists before ballot.verify_proposal() updates last_propose_vote_block_hash
@@ -248,64 +218,41 @@ pub async fn post_ballot(
                             "Failed to save block {:?} to database",
                             ballot.block.block_hash
                         );
-                        return (StatusCode::INTERNAL_SERVER_ERROR, "Error adding block to database").into_response()
+                        return Err(ConsensusError::DatabaseError);
                     }
                 }
             },
         }
     }
 
-    // Middleware ensures we're caught up and active - now validate and sign the ballot
-    match ballot.verify_proposal(&app_state) {
-        Ok(()) => {
-            tracing::debug!(
-                "Ballot verified for view {} phase {:?} block {:?}",
-                ballot.data.view, ballot.data.phase, ballot.block.block_hash
-            );
+    // Validate and sign the ballot
+    ballot.verify_proposal(app_state).map_err(|e| {
+        tracing::warn!(
+            "Ballot rejected for view {} phase {:?}: {:?}",
+            ballot.data.view, ballot.data.phase, e
+        );
+        ConsensusError::SigningError
+    })?;
 
-            match ballot.sign(&app_state) {
-                Ok(signoff) => {
-                    tracing::debug!(
-                        "Ballot signed for view {} phase {:?} block {:?}",
-                        ballot.data.view, ballot.data.phase, ballot.block.block_hash
-                    );
-                    return (StatusCode::OK, Json(signoff)).into_response()
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "Failed to sign ballot for view {} phase {:?}: {:?}",
-                        ballot.data.view, ballot.data.phase, e
-                    );
-                    return (StatusCode::INTERNAL_SERVER_ERROR, "Error signing ballot").into_response()
-                },
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                "Ballot rejected for view {} phase {:?}: {:?}",
-                ballot.data.view, ballot.data.phase, e
-            );
-            
-            // Provide detailed feedback for transaction validation errors
-            match e {
-                super::types::VoteError::TransactionValidationError(details) => {
-                    return (StatusCode::BAD_REQUEST, format!("Transaction validation failed: {}", details)).into_response()
-                },
-                super::types::VoteError::InitiatorError => {
-                    return (StatusCode::UNAUTHORIZED, "Invalid signature or unauthorized proposer").into_response()
-                },
-                super::types::VoteError::ProgressionError(kind) => {
-                    return (StatusCode::CONFLICT, format!("Proposal conflicts with consensus state: {:?}", kind)).into_response()
-                },
-                super::types::VoteError::BlockError => {
-                    return (StatusCode::BAD_REQUEST, "Invalid block data").into_response()
-                },
-                _ => {
-                    return (StatusCode::UNAUTHORIZED, "Ballot rejected").into_response()
-                }
-            }
-        },
-    }
+    tracing::debug!(
+        "Ballot verified for view {} phase {:?} block {:?}",
+        ballot.data.view, ballot.data.phase, ballot.block.block_hash
+    );
+
+    let signoff = ballot.sign(app_state).map_err(|e| {
+        tracing::error!(
+            "Failed to sign ballot for view {} phase {:?}: {:?}",
+            ballot.data.view, ballot.data.phase, e
+        );
+        ConsensusError::SigningError
+    })?;
+
+    tracing::debug!(
+        "Ballot signed for view {} phase {:?} block {:?}",
+        ballot.data.view, ballot.data.phase, ballot.block.block_hash
+    );
+
+    Ok(signoff)
 }
 
 /// Core logic for processing an incoming QC.

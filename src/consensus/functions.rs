@@ -2,7 +2,6 @@ use super::*;
 
 use crate::{db::consensus as db, handlers::HandlerResult};
 use reqwest::Client;
-use serde_json::Value;
 use crate::db::MyNode;
 use crate::types::Node;
 use crate::DISPATCH_TABLE;
@@ -459,7 +458,7 @@ async fn ballot_round(
     let leader_id = ballot.initiator.replica_id;
 
     // Broadcast ballot and collect votes from validators
-    let voter_signatures = broadcast_and_collect_votes(ballot, &validators, &validators_elect).await?;
+    let voter_signatures = broadcast_and_collect_votes(ballot, validators, validators_elect, app_state).await?;
 
     // create() now includes verification - safe by default
     let qc = QuorumCertificate::create(
@@ -484,13 +483,14 @@ async fn broadcast_and_collect_votes(
     ballot: Ballot,
     validators: &Vec<Node>,
     validators_elect: &Vec<Node>,
+    app_state: &AppState,
 ) -> Result<Vec<VoteSignMessage>, ConsensusError> {
     // Handle single validator case (no other nodes to vote)
     if validators.is_empty() {
         return Ok(Vec::new());
     }
 
-    let (votes_tx, mut votes_rx) = mpsc::channel::<VoteSignMessage>(100); //100 channel capacity
+    let (votes_tx, mut votes_rx) = mpsc::channel::<VoteSignMessage>(100);
 
     // Calculate quorum threshold (dynamic based on validator count)
     // Note: validators list is filtered (excludes leader), but leader has implicit vote in QC
@@ -499,43 +499,60 @@ async fn broadcast_and_collect_votes(
     let quorum_threshold = crate::consensus::types::calculate_quorum_threshold(total_validators);
     let required_votes = quorum_threshold.saturating_sub(1); // Leader's vote is implicit in QC creation
 
-    // Spawn tasks for each validator
+    // Spawn tasks for each validator (quorum-tracked)
+    let transport = &app_state.iroh_transport;
     for node in validators.clone() {
         let ballot_clone = ballot.clone();
         let votes_tx_clone = votes_tx.clone();
-        
+        let transport = transport.clone();
+        let iroh_node_id = node.pubkey.to_iroh_node_id();
+        let node_id = node.node_id;
+
         tokio::spawn(async move {
-            // Ignore errors from individual nodes - they'll just timeout or fail
-            let _ = ballot_send(ballot_clone, &node, votes_tx_clone).await;
+            match super::rpc::submit_ballot_to_peer(
+                &transport, node_id, iroh_node_id, &ballot_clone,
+            ).await {
+                Ok(vote) => {
+                    let _ = votes_tx_clone.send(vote).await;
+                }
+                Err(e) => {
+                    tracing::debug!("Failed to submit ballot to node {}: {:?}", node_id, e);
+                }
+            }
         });
     }
-    
+
     // NON-CRITICAL PATH: Inform validators elect (fire-and-forget, don't collect votes)
     for node in validators_elect.clone() {
         let ballot_clone = ballot.clone();
+        let transport = transport.clone();
+        let iroh_node_id = node.pubkey.to_iroh_node_id();
+        let node_id = node.node_id;
+
         tokio::spawn(async move {
-            // Create a dummy channel that we never read from
-            let (dummy_votes_tx, _dummy_votes_rx) = mpsc::channel::<VoteSignMessage>(1);
-            // Best effort delivery - don't care about result or votes
-            let _ = ballot_send(ballot_clone, &node, dummy_votes_tx).await;
+            if let Err(e) = super::rpc::submit_ballot_to_peer(
+                &transport, node_id, iroh_node_id, &ballot_clone,
+            ).await {
+                tracing::debug!("Failed to send ballot to elect node {}: {:?}", node_id, e);
+            }
         });
     }
-    
+
     // Drop the original sender so the channel closes when all tasks complete
     drop(votes_tx);
-    
+
     // Collect votes until we have enough for quorum or all tasks complete
     let mut voter_signatures = Vec::new();
     let timeout = tokio::time::sleep(std::time::Duration::from_secs(30));
     tokio::pin!(timeout);
-    
+
     loop {
         tokio::select! {
             vote_opt = votes_rx.recv() => {
                 match vote_opt {
                     Some(vote) => {
                         voter_signatures.push(vote);
-                        
+
                         // Early termination on quorum
                         if voter_signatures.len() >= required_votes {
                             return Ok(voter_signatures);
@@ -553,7 +570,7 @@ async fn broadcast_and_collect_votes(
             }
         }
     }
-    
+
     // Check if we have enough votes after timeout or all tasks complete
     if voter_signatures.len() >= required_votes {
         Ok(voter_signatures)
@@ -668,33 +685,6 @@ async fn broadcast_qc(
         Ok(())
     }
 }
-
-async fn ballot_send(
-    ballot: Ballot,
-    node: &Node,
-    votes_tx: mpsc::Sender<VoteSignMessage>,
-) -> Result<(), ConsensusError> {
-    let client = Client::new();
-    let url = format!("http://{}:{}/ballot", node.ip_address, node.port);
-    match client.post(url)
-        .json(&ballot)
-        .send()
-        .await
-    {
-        Ok(response) => {
-            if response.status().is_success() {
-                let result: Value =  response.json().await.map_err(|_| ConsensusError::MalformedReply)?;
-                let vote_sign_msg: VoteSignMessage = serde_json::from_value(result).map_err(|_| ConsensusError::MalformedReply)?;
-                votes_tx.send(vote_sign_msg).await.map_err(|_| ConsensusError::ThreadError)?;
-                Ok(())
-            } else {
-                return Err(ConsensusError::MalformedReply)
-            }
-        }
-        Err(_) => return Err(ConsensusError::TimeoutError)
-    }
-}
-
 
 pub fn process_transactions(transactions: &Option<Transactions>, app_state: &AppState, execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
     if let Some(transactions) = transactions {

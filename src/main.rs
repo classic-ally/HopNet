@@ -518,12 +518,6 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .layer(middleware::from_fn_with_state(app_state.clone(), consensus::routes::ensure_caught_up_middleware))
                 .layer(axum::Extension(consensus::routes::ConsensusRole::Validator));
 
-            // Validator routes (active participation - requires active status)
-            let validator_consensus_routes = Router::new()
-                .route("/ballot", post(consensus::routes::post_ballot))
-                .layer(middleware::from_fn_with_state(app_state.clone(), consensus::routes::ensure_caught_up_middleware))
-                .layer(axum::Extension(consensus::routes::ConsensusRole::Validator));
-
             // Test routes - only available in test mode
             let test_routes = if app_state.test_mode {
                 Router::new()
@@ -540,7 +534,6 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .merge(jwt_or_rpc_routes)
                 .merge(rpc_routes)
                 .merge(propose_route)
-                .merge(validator_consensus_routes)
                 .nest("/integrations/fileprovider", fileprovider_routes)
                 .nest("/integrations/documentprovider", documentprovider::routes::router(app_state.clone()))
                 .nest("/devices", devices::routes::router(app_state.clone()))

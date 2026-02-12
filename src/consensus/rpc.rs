@@ -5,7 +5,7 @@ use crate::net::protocol::{IrohRequest, IrohResponse};
 use crate::net::transport::ProtocolError;
 use crate::AppState;
 use crate::db::consensus as db;
-use super::types::{TimeoutVote, TimeoutCertificate, QuorumCertificate};
+use super::types::{Ballot, VoteSignMessage, TimeoutVote, TimeoutCertificate, QuorumCertificate};
 
 // ============================================================================
 // View Data Fetch (catch-up)
@@ -276,6 +276,62 @@ pub async fn broadcast_qc_to_peer(
 }
 
 // ============================================================================
+// Ballot Submission
+// ============================================================================
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct BallotRequest {
+    pub ballot: Ballot,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct BallotResponse {
+    pub vote: VoteSignMessage,
+}
+
+/// Server: process an incoming ballot and return signed vote.
+pub async fn handle_ballot_request(
+    req: BallotRequest,
+    app_state: &AppState,
+) -> IrohResponse {
+    match super::routes::process_incoming_ballot(req.ballot, app_state).await {
+        Ok(vote) => IrohResponse::BallotSubmissionResponse(BallotResponse { vote }),
+        Err(e) => IrohResponse::Error {
+            message: format!("ballot processing failed: {:?}", e),
+        },
+    }
+}
+
+/// Lock-phase ballots may trigger intra-view sync (network call) and Propose-phase
+/// does block insertion + parallel transaction validation.
+const BALLOT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Client: submit a ballot to a remote peer and return the signed vote.
+pub async fn submit_ballot_to_peer(
+    transport: &IrohTransport,
+    node_id: i32,
+    peer_node_id: iroh::PublicKey,
+    ballot: &Ballot,
+) -> Result<VoteSignMessage, IrohError> {
+    let req = IrohRequest::BallotSubmission(BallotRequest {
+        ballot: ballot.clone(),
+    });
+    let response = transport.request(node_id, peer_node_id, &req, BALLOT_TIMEOUT).await?;
+
+    match response {
+        IrohResponse::BallotSubmissionResponse(result) => Ok(result.vote),
+        IrohResponse::Error { message } => {
+            Err(IrohError::Protocol(ProtocolError::PeerError(message)))
+        }
+        other => {
+            Err(IrohError::Protocol(ProtocolError::MalformedResponse(
+                format!("unexpected response to BallotSubmission: {:?}", other),
+            )))
+        }
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -365,6 +421,56 @@ mod tests {
 
         assert_eq!(decoded.tc.view_number, 10);
         assert_eq!(decoded.tc.highest_qc.view_number, 9);
+    }
+
+    #[test]
+    fn ballot_request_bincode_roundtrip() {
+        use crate::consensus::types::{Ballot, VoteSignMessage, VoteSignData, ConsensusPhase, Block, BlockData};
+
+        let req = BallotRequest {
+            ballot: Ballot {
+                initiator: VoteSignMessage {
+                    replica_id: 1,
+                    signature: ed25519_dalek::Signature::from_bytes(&[0u8; 64]),
+                },
+                data: VoteSignData {
+                    block_hash: crate::types::Blake3Hash::from_bytes([0u8; 32]),
+                    block_height: 5,
+                    view: 10,
+                    phase: ConsensusPhase::Propose,
+                },
+                block: Block {
+                    block_hash: crate::types::Blake3Hash::from_bytes([0u8; 32]),
+                    data: BlockData {
+                        height: 5,
+                        view_number: 10,
+                        parent_hash: None,
+                        transactions: None,
+                    },
+                },
+            },
+        };
+        let encoded = bincode::serde::encode_to_vec(&req, bincode::config::standard()).unwrap();
+        let (decoded, _): (BallotRequest, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+
+        assert_eq!(decoded.ballot.data.view, 10);
+        assert_eq!(decoded.ballot.data.phase, ConsensusPhase::Propose);
+        assert_eq!(decoded.ballot.initiator.replica_id, 1);
+        assert_eq!(decoded.ballot.block.data.height, 5);
+
+        // Also test BallotResponse roundtrip
+        let resp = BallotResponse {
+            vote: VoteSignMessage {
+                replica_id: 3,
+                signature: ed25519_dalek::Signature::from_bytes(&[1u8; 64]),
+            },
+        };
+        let encoded = bincode::serde::encode_to_vec(&resp, bincode::config::standard()).unwrap();
+        let (decoded, _): (BallotResponse, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+
+        assert_eq!(decoded.vote.replica_id, 3);
     }
 
     #[test]
