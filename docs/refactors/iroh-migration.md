@@ -188,7 +188,7 @@ HTTP endpoints (`GET /consensus`, `GET /consensus/view/{view}`) preserved for ex
 ---
 
 ## Phase 3f: Consensus Barrier Testing Infrastructure
-**Status:** [ ] Not Started
+**Status:** [x] Complete
 
 ### Overview
 
@@ -200,11 +200,13 @@ Consensus safety is the hardest invariant to verify. Existing integration tests 
 
 ### Design
 
-Conditional `tokio::sync::Notify` barriers in `AppState`, activated only when `test_mode` is true (zero overhead in production):
+Conditional `AtomicBool` + `tokio::sync::Notify` barriers in `AppState`, activated only when `test_mode` is true (zero overhead in production):
 
 - `before_ballot_dispatch` — hold a node before it processes an incoming ballot
 - `after_propose_qc_broadcast` — hold after Propose QC is sent but before Lock ballot
+- `before_tc_gst_wait` — hold before TC enters GST wait (before lock acquisition)
 - `before_tc_application` — hold before timeout certificate advances the view
+- `before_lock_qc_broadcast` — hold after Lock QC is formed but before broadcast/DB write
 
 Orchestrator tests control the flow: hold a barrier on one node, let other nodes progress, release and verify catch-up/sync behavior.
 
@@ -212,16 +214,19 @@ Orchestrator tests control the flow: hold a barrier on one node, let other nodes
 
 - **Intra-view sync**: hold node through Propose phase, release during Lock phase, verify it fetches missing Propose QC before processing Lock ballot
 - **Cross-view catch-up**: hold node through entire view(s), release, verify message-driven catch-up fires and node rejoins
-- **TC/QC race conditions**: hold before TC application, inject a late Lock QC, verify Layer 2 GST wait + quorum check prevents safety violation
+- **Lock QC vs TC safety (Scenario A)**: hold Lock QC broadcast + TC GST wait, let TC form on followers, release Lock QC first → Lock QC wins, TC rejected by Layer 2 staleness check
+- **TC commits before Lock QC (Scenario B)**: hold only Lock QC broadcast, let TC fully commit on followers, then release Lock QC → diagnostic test for metadata divergence
 - **Cascade timeout propagation**: hold one node, let others timeout, release and verify cascade
 
 ### Checklist
 
-- [ ] Add `ConsensusBarriers` struct to `AppState`
-- [ ] Insert barrier points at consensus stage boundaries
-- [ ] Orchestrator test: intra-view sync (Lock ballot without Propose QC)
-- [ ] Orchestrator test: cross-view catch-up (node paused for full view)
-- [ ] Orchestrator test: TC/QC race condition
+- [x] Add `ConsensusBarriers` struct to `AppState`
+- [x] Insert barrier points at consensus stage boundaries (5 barriers)
+- [x] Orchestrator test: barrier basic (hold/release between Propose and Lock)
+- [x] Orchestrator test: cross-view catch-up (node paused for full view)
+- [x] Orchestrator test: Lock QC vs TC race (Scenario A — Lock QC wins)
+- [x] Orchestrator test: TC-late diagnostic (Scenario B — TC commits first)
+- [x] Run and verify all barrier tests on orchestrator mesh
 
 **Validation:** All barrier tests pass, existing tests unaffected (barriers are no-ops when not held)
 

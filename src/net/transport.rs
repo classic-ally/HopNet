@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
+use tracing::Instrument;
 
 use super::protocol::{IrohRequest, IrohResponse};
 use crate::types::PubKey;
@@ -97,19 +98,43 @@ impl std::error::Error for IrohError {}
 // Wire Format Helpers
 // ============================================================================
 
-/// Send a length-prefixed bincode message
-pub(super) async fn send_message<T: serde::Serialize>(
+/// Encode a bincode message to bytes (without writing to stream)
+pub(super) fn encode_message<T: serde::Serialize>(msg: &T) -> Result<Vec<u8>, IrohError> {
+    bincode::serde::encode_to_vec(msg, bincode::config::standard())
+        .map_err(|e| IrohError::Protocol(ProtocolError::MalformedResponse(e.to_string())))
+}
+
+/// Send length-prefixed raw bytes on a stream
+pub(super) async fn send_raw(
     stream: &mut iroh::endpoint::SendStream,
-    msg: &T,
+    bytes: &[u8],
 ) -> Result<(), IrohError> {
-    let bytes = bincode::serde::encode_to_vec(msg, bincode::config::standard())
-        .map_err(|e| IrohError::Protocol(ProtocolError::MalformedResponse(e.to_string())))?;
     let len = bytes.len() as u32;
     stream.write_all(&len.to_le_bytes()).await
         .map_err(|e| IrohError::Transport(TransportError::StreamFailed(e.to_string())))?;
     stream.write_all(&bytes).await
         .map_err(|e| IrohError::Transport(TransportError::StreamFailed(e.to_string())))?;
     Ok(())
+}
+
+/// Send a length-prefixed bincode message
+pub(super) async fn send_message<T: serde::Serialize>(
+    stream: &mut iroh::endpoint::SendStream,
+    msg: &T,
+) -> Result<(), IrohError> {
+    let bytes = encode_message(msg)?;
+    send_raw(stream, &bytes).await
+}
+
+/// Send a request with request_id prefix: [8-byte id LE][4-byte len LE][bincode]
+async fn send_request(
+    stream: &mut iroh::endpoint::SendStream,
+    request_id: u64,
+    req: &IrohRequest,
+) -> Result<(), IrohError> {
+    stream.write_all(&request_id.to_le_bytes()).await
+        .map_err(|e| IrohError::Transport(TransportError::StreamFailed(e.to_string())))?;
+    send_message(stream, req).await
 }
 
 /// Receive a length-prefixed bincode message
@@ -305,19 +330,44 @@ impl IrohTransport {
     }
 
     /// Send a request and receive a response on a new bidirectional stream.
-    /// Handles the open_bi/send/finish/recv lifecycle so callers don't repeat it.
+    /// Handles the full connection lifecycle: uses cached connection first, and if the
+    /// stream fails or times out (zombie connection), evicts the cache and retries once
+    /// with a fresh connection before failing the caller.
+    ///
+    /// Each logical request gets a random `request_id` that is reused across retries,
+    /// allowing the receiver to deduplicate retried requests.
     ///
     /// Connection establishment is outside the timeout budget (bounded separately by
     /// CONNECTION_TIMEOUT). The `timeout` parameter covers only stream I/O — opening
     /// the stream, sending the request, and receiving the response.
     pub async fn request(&self, node_id: i32, peer_node_id: PublicKey, req: &IrohRequest, timeout: Duration) -> Result<IrohResponse, IrohError> {
-        let conn = self.get_connection(node_id, peer_node_id).await?;
+        let request_id: u64 = rand::random();
+        let span = tracing::debug_span!("rpc_req", id = %format!("{:016x}", request_id), to = node_id);
+        async {
+            let conn = self.get_connection(node_id, peer_node_id).await?;
 
+            match Self::try_request(&conn, request_id, req, timeout).await {
+                Ok(response) => Ok(response),
+                Err(e) if e.is_retryable() => {
+                    // Transport error (timeout or stream failure) — connection may be zombie.
+                    // Evict and retry once with a fresh connection, reusing the same request_id
+                    // so the receiver can deduplicate.
+                    self.remove_connection(node_id).await;
+                    let conn = self.get_connection(node_id, peer_node_id).await?;
+                    Self::try_request(&conn, request_id, req, timeout).await
+                }
+                Err(e) => Err(e),
+            }
+        }.instrument(span).await
+    }
+
+    /// Attempt a single request on an existing connection.
+    async fn try_request(conn: &Connection, request_id: u64, req: &IrohRequest, timeout: Duration) -> Result<IrohResponse, IrohError> {
         tokio::time::timeout(timeout, async {
             let (mut send, mut recv) = conn.open_bi().await
                 .map_err(|e| IrohError::Transport(TransportError::StreamFailed(e.to_string())))?;
 
-            send_message(&mut send, req).await?;
+            send_request(&mut send, request_id, req).await?;
             send.finish()
                 .map_err(|e| IrohError::Transport(TransportError::StreamFailed(e.to_string())))?;
 
@@ -328,7 +378,7 @@ impl IrohTransport {
     }
 
     /// Remove a connection from the cache (e.g., on error)
-    pub async fn remove_connection(&self, node_id: i32) {
+    async fn remove_connection(&self, node_id: i32) {
         let mut connections = self.connections.write().await;
         connections.remove(&node_id);
     }

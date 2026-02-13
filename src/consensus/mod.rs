@@ -4,6 +4,7 @@ pub use crate::{
     types::*,
 };
 
+pub mod barriers;
 pub mod routes;
 pub mod rpc;
 pub mod types;

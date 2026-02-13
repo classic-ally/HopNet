@@ -22,6 +22,7 @@ mod multi_size_files;
 mod performance;
 pub(crate) mod persistence;
 mod timeout_progression;
+mod consensus_barriers;
 
 /// Represents the result of a test scenario execution
 #[derive(Debug)]
@@ -112,6 +113,18 @@ pub async fn run_test_by_name(mesh_id: u32, name: &str, nodes: &[NodeInfo], flag
         "timeout-progression" => {
             timeout_progression::TimeoutProgression.run(mesh_id, nodes, flags).await
         }
+        "consensus-barrier-basic" => {
+            consensus_barriers::ConsensusBarrierBasic.run(mesh_id, nodes, flags).await
+        }
+        "consensus-barrier-missed-ballot" => {
+            consensus_barriers::ConsensusBarrierMissedBallot.run(mesh_id, nodes, flags).await
+        }
+        "consensus-barrier-tc-qc-race" => {
+            consensus_barriers::ConsensusBarrierTcQcRace.run(mesh_id, nodes, flags).await
+        }
+        "consensus-barrier-tc-late" => {
+            consensus_barriers::ConsensusBarrierTcLate.run(mesh_id, nodes, flags).await
+        }
         _ => Err(anyhow::anyhow!("Unknown test: {}", name)),
     }
 }
@@ -130,6 +143,10 @@ pub fn list_test_names() -> Vec<&'static str> {
         "iroh-ping",
         "iroh-reject-unknown",
         "timeout-progression",
+        "consensus-barrier-basic",
+        "consensus-barrier-missed-ballot",
+        "consensus-barrier-tc-qc-race",
+        "consensus-barrier-tc-late",
     ]
 }
 

@@ -68,6 +68,7 @@ HTTP-based inter-node communication with iroh (QUIC/TLS) transport migration —
 - [x] Iroh transport layer with peer validation and connection caching
 - [x] Fragment health checks over iroh (Phase 2 complete)
 - [x] Consensus messages over iroh (Phase 3 complete)
+- [x] Consensus barrier testing infrastructure (Phase 3f complete)
 - [ ] Fragment data transfer over iroh (Phase 4)
 - [ ] Network topology awareness and geographic information
 

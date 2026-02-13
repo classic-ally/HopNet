@@ -141,14 +141,20 @@ pub fn insert_files(
                         None::<i32>,  // placement_height is NULL initially, set during fragment placement
                         data_record.file_size
                     ]
-                ).map_err(|_| DatabaseError::InsertError)?;
+                ).map_err(|e| {
+                    tracing::error!("Failed to insert data_block: id={} hash={:?} error={:?}", data_id, data.hash, e);
+                    DatabaseError::InsertError
+                })?;
 
                 // Insert fragment hashes into fragment_hashes table
                 for fragment in &data.fragments {
                     db_tx.execute(
                         "INSERT INTO fragment_hashes (data_block_id, chunk_number, local_index, fragment_id, fragment_hash, chunk_type, stored_locally) VALUES (?, ?, ?, ?, ?, ?, ?)",
                         params![fragment.data_block_id, fragment.chunk_number, fragment.local_index, fragment.fragment_id, fragment.fragment_hash, fragment.chunk_type, fragment.stored_locally]
-                    ).map_err(|_| DatabaseError::InsertError)?;
+                    ).map_err(|e| {
+                        tracing::error!("Failed to insert fragment_hash: data_block_id={} fragment_id={} error={:?}", fragment.data_block_id, fragment.fragment_id, e);
+                        DatabaseError::InsertError
+                    })?;
                 }
 
                 // Insert file access entries if present
@@ -157,7 +163,10 @@ pub fn insert_files(
                         db_tx.execute(
                             "INSERT INTO file_access (data_block_id, user_id, ephemeral_pubkey, encrypted_file_key) VALUES (?, ?, ?, ?)",
                             params![access_entry.data_block_id, access_entry.user_id, access_entry.ephemeral_pubkey, access_entry.encrypted_file_key]
-                        ).map_err(|_| DatabaseError::InsertError)?;
+                        ).map_err(|e| {
+                            tracing::error!("Failed to insert file_access: data_block_id={} user_id={} error={:?}", access_entry.data_block_id, access_entry.user_id, e);
+                            DatabaseError::InsertError
+                        })?;
                     }
                 }
 
@@ -186,7 +195,10 @@ pub fn insert_files(
                 inode.inode_type,
                 data_id
             ]
-        ).map_err(|_| DatabaseError::InsertError)?;
+        ).map_err(|e| {
+            tracing::error!("Failed to insert inode: id={} owner_id={} path={:?} type={:?} error={:?}", inode_id, owner_id, inode.path, inode.inode_type, e);
+            DatabaseError::InsertError
+        })?;
 
         // Log modification for FileProvider change tracking
         // New items have None as old_parent_id (didn't exist before)
@@ -289,7 +301,10 @@ fn insert_parent_directories(
                 owner_id,
                 parent_path
             ]
-        ).map_err(|_| DatabaseError::InsertError)?;
+        ).map_err(|e| {
+            tracing::error!("Failed to insert parent directory: owner_id={} path={:?} error={:?}", owner_id, parent_path, e);
+            DatabaseError::InsertError
+        })?;
     }
     
     Ok(())

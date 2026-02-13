@@ -92,6 +92,8 @@ pub struct AppState {
     test_mode: bool,
     orphaned_fragment_scan: Arc<std::sync::Mutex<Option<files::jobs::OrphanedFragmentScan>>>,
     iroh_transport: net::IrohTransport,
+    consensus_barriers: Arc<consensus::barriers::ConsensusBarriers>,
+    dedup_cache: Arc<net::DedupCache>,
 }
 
 impl AppState {
@@ -309,6 +311,8 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 test_mode: cfg!(debug_assertions) || std::env::var("HOPNET_TEST_MODE").is_ok(),
                 orphaned_fragment_scan: Arc::new(std::sync::Mutex::new(None)),
                 iroh_transport: iroh_transport.clone(),
+                consensus_barriers: Arc::new(consensus::barriers::ConsensusBarriers::new()),
+                dedup_cache: Arc::new(net::DedupCache::default()),
             };
 
             // If we loaded state from database, populate the OnceCell fields
@@ -516,6 +520,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                     .route("/integrations/fileprovider/test", get(fileprovider::routes::get_test))
                     .route("/integrations/fileprovider/test/signals", get(fileprovider::routes::get_test_signals))
                     .route("/test/fragment-health-check/{fragment_hash}", get(files::test_routes::get_fragment_health_check))
+                    .nest("/test", consensus::barriers::test_routes())
             } else {
                 Router::new() // Empty router when not in test mode
             };
@@ -542,7 +547,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .make_span_with(|request: &axum::http::Request<_>| {
                     let id = hopnet_common::CustomUUID::new(None);
                     tracing::info_span!(
-                        "request",
+                        "api_req",
                         id = &id.to_string()[28..],
                         method = %request.method(),
                         uri = %request.uri(),

@@ -471,6 +471,8 @@ pub fn create_test_app_state_with_keys(signing_key: crate::db::PrivKey, verifyin
         test_mode: true,
         orphaned_fragment_scan: Arc::new(std::sync::Mutex::new(None)),
         iroh_transport,
+        consensus_barriers: Arc::new(crate::consensus::barriers::ConsensusBarriers::new()),
+        dedup_cache: Arc::new(crate::net::DedupCache::default()),
     }
 }
 

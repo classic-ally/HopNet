@@ -1468,6 +1468,12 @@ pub async fn apply_timeout_certificate(
     skip_wait: bool,
     guard: Option<tokio::sync::MutexGuard<'_, ()>>,
 ) -> Result<(), CertificateError> {
+    if app_state.test_mode {
+        app_state.consensus_barriers.wait(
+            crate::consensus::barriers::names::BEFORE_TC_GST_WAIT
+        ).await;
+    }
+
     // Layer 2: Post-TC bounded wait - if not skipping, wait GST for potential Lock QC arrival
     // IMPORTANT: For validator path (no guard), don't hold lock during wait to allow Lock QC to be processed
     // For leader path (with guard), hold lock through wait to synchronize with validators' GST
@@ -1527,6 +1533,12 @@ pub async fn apply_timeout_certificate(
     }
 
     tracing::debug!("Quorum check complete - no Lock QC found, safe to apply TC for view {}", tc.view_number);
+
+    if app_state.test_mode {
+        app_state.consensus_barriers.wait(
+            crate::consensus::barriers::names::BEFORE_TC_APPLICATION
+        ).await;
+    }
 
     // Store the TC in database with QC validation (Bug #6 and #7 fixes)
     match db::insert_tc_safe(app_state, tc.clone()) {

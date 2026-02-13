@@ -385,6 +385,12 @@ pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transa
         tracing::warn!("Propose QC broadcast task panicked: {:?}", e);
     }
 
+    if app_state.test_mode {
+        app_state.consensus_barriers.wait(
+            super::barriers::names::AFTER_PROPOSE_QC_BROADCAST
+        ).await;
+    }
+
     // Create Lock ballot (no vote recording needed, Lock phase doesn't update last_propose_vote)
     // Get fresh connection for this transaction
     let ballot_lock = {
@@ -407,6 +413,12 @@ pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transa
             return Err(e);
         }
     };
+
+    if app_state.test_mode {
+        app_state.consensus_barriers.wait(
+            super::barriers::names::BEFORE_LOCK_QC_BROADCAST
+        ).await;
+    }
 
     // Broadcast Lock QC first (fire and forget in background)
     // This ensures network gets the QC even if we fail to integrate it locally

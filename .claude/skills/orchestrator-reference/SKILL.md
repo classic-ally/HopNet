@@ -63,6 +63,10 @@ cargo build --release --bin orchestrator --features skip-frontend
 | `iroh-ping` | Verify iroh transport connectivity between all nodes in the mesh |
 | `iroh-reject-unknown` | Verify unknown peers are rejected before path registration (no IP leak) |
 | `timeout-progression` | Verify timeout votes broadcast over iroh, form TC, and advance view when leader is down |
+| `consensus-barrier-basic` | Hold leader between Propose and Lock phases, verify barrier mechanism and QC propagation |
+| `consensus-barrier-missed-ballot` | Hold follower's ballot dispatch, let consensus proceed without it, verify message-driven catch-up |
+| `consensus-barrier-tc-qc-race` | Lock QC arrives while TC is pending — verify Lock QC wins and TC is rejected (safety property) |
+| `consensus-barrier-tc-late` | Diagnostic: TC commits before Lock QC arrives — check for metadata divergence |
 
 ## Common Workflows
 
@@ -152,6 +156,28 @@ docker exec -it hopnet-orchestrator-0-0 /bin/sh
 # Manual cleanup when done
 ./target/release/orchestrator delete --mesh-id 0 -y
 ```
+
+### Cross-Node Request Tracing
+
+HopNet uses two tracing span types for end-to-end request correlation:
+
+- **`api_req{id, method, uri}`** — HTTP API requests from users. The `id` is a truncated UUID.
+- **`rpc_req{id, to/from}`** — Iroh RPC calls between nodes. The `id` is a 16-hex-char request ID shared between sender (`to=<node_id>`) and receiver (`from=<node_id>`).
+
+When an HTTP request triggers inter-node communication (e.g., file upload → transaction forward), `rpc_req` spans nest inside the `api_req` span on the sender. On the receiving node, the same `rpc_req` ID appears at the top level. This enables cross-node tracing:
+
+```bash
+# 1. Find the HTTP request on the originating node
+docker logs hopnet-orchestrator-0-0 --timestamps 2>&1 | grep "api_req.*POST.*files"
+
+# 2. Find rpc_req IDs spawned by that HTTP request (nested spans)
+docker logs hopnet-orchestrator-0-0 --timestamps 2>&1 | grep "rpc_req.*<id-from-step-1>"
+
+# 3. Trace the same rpc_req ID on the receiving node
+docker logs hopnet-orchestrator-0-1 --timestamps 2>&1 | grep "rpc_req{id=<hex-id>}"
+```
+
+The `rpc_req` ID is also used for request-level deduplication — retried requests reuse the same ID, so the receiver can coalesce duplicates.
 
 ## Understanding Output
 

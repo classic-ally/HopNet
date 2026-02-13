@@ -1,7 +1,12 @@
+use std::sync::Arc;
+use std::time::Duration;
+
 use iroh::Endpoint;
+use tokio::io::AsyncReadExt;
+use tracing::Instrument;
 
 use super::protocol::{IrohRequest, IrohResponse};
-use super::transport::{recv_message, send_message, IrohError, TransportError, ProtocolError};
+use super::transport::{recv_message, encode_message, send_raw, IrohError, TransportError, ProtocolError};
 use crate::AppState;
 use crate::types::PubKey;
 use crate::db::consensus as db;
@@ -148,47 +153,84 @@ async fn ensure_caught_up_for_message(
 async fn handle_stream(
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
-    _peer_node_id: i32,
+    peer_node_id: i32,
     app_state: AppState,
 ) -> Result<(), IrohError> {
-    let request: IrohRequest = recv_message(&mut recv).await?;
-
-    // Message-driven catch-up for consensus messages
-    ensure_caught_up_for_message(&request, &app_state).await?;
-
-    let response = match request {
-        IrohRequest::Ping { nonce } => IrohResponse::Pong { nonce },
-        IrohRequest::FragmentHealthCheck(req) => {
-            IrohResponse::FragmentHealthCheckResponse(
-                crate::files::rpc::handle_fragment_health_check(req, &app_state.fragments_dir)
-            )
-        }
-        IrohRequest::ViewDataFetch(req) => {
-            crate::consensus::rpc::handle_view_data_request(req, &app_state)
-        }
-        IrohRequest::ViewPoll(_) => {
-            crate::consensus::rpc::handle_view_poll_request(&app_state)
-        }
-        IrohRequest::TimeoutVoteBroadcast(req) => {
-            crate::consensus::rpc::handle_timeout_vote_broadcast(req, &app_state).await
-        }
-        IrohRequest::TcBroadcast(req) => {
-            crate::consensus::rpc::handle_tc_broadcast(req, &app_state).await
-        }
-        IrohRequest::QcBroadcast(req) => {
-            crate::consensus::rpc::handle_qc_broadcast(req, &app_state).await
-        }
-        IrohRequest::BallotSubmission(req) => {
-            crate::consensus::rpc::handle_ballot_request(req, &app_state).await
-        }
-        IrohRequest::TransactionForward(req) => {
-            crate::consensus::rpc::handle_transaction_forward(req, &app_state).await
-        }
-    };
-
-    send_message(&mut send, &response).await?;
-    send.finish()
+    // Read request_id prefix (8 bytes)
+    let mut id_buf = [0u8; 8];
+    recv.read_exact(&mut id_buf).await
         .map_err(|e| IrohError::Transport(TransportError::StreamFailed(e.to_string())))?;
+    let request_id = u64::from_le_bytes(id_buf);
 
-    Ok(())
+    let span = tracing::debug_span!("rpc_req", id = %format!("{:016x}", request_id), from = peer_node_id);
+    async {
+        // Get or create OnceCell for this request_id
+        let cell = {
+            let mut cache = app_state.dedup_cache.lock().unwrap();
+            cache.entry(request_id).or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())).clone()
+        };
+
+        // Schedule cleanup after TTL (runs regardless of success/failure below).
+        // This only removes the HashMap entry — any caller already holding an Arc<OnceCell>
+        // is unaffected and will still get the result when processing completes.
+        let cache = app_state.dedup_cache.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(300)).await;
+            cache.lock().unwrap().remove(&request_id);
+        });
+
+        // First caller processes; duplicates wait for the same result
+        let response_bytes = cell.get_or_try_init(|| async {
+            let request: IrohRequest = recv_message(&mut recv).await?;
+
+            ensure_caught_up_for_message(&request, &app_state).await?;
+
+            if app_state.test_mode {
+                if let IrohRequest::BallotSubmission(_) = &request {
+                    app_state.consensus_barriers.wait(
+                        crate::consensus::barriers::names::BEFORE_BALLOT_DISPATCH
+                    ).await;
+                }
+            }
+
+            let response = match request {
+                IrohRequest::Ping { nonce } => IrohResponse::Pong { nonce },
+                IrohRequest::FragmentHealthCheck(req) => {
+                    IrohResponse::FragmentHealthCheckResponse(
+                        crate::files::rpc::handle_fragment_health_check(req, &app_state.fragments_dir)
+                    )
+                }
+                IrohRequest::ViewDataFetch(req) => {
+                    crate::consensus::rpc::handle_view_data_request(req, &app_state)
+                }
+                IrohRequest::ViewPoll(_) => {
+                    crate::consensus::rpc::handle_view_poll_request(&app_state)
+                }
+                IrohRequest::TimeoutVoteBroadcast(req) => {
+                    crate::consensus::rpc::handle_timeout_vote_broadcast(req, &app_state).await
+                }
+                IrohRequest::TcBroadcast(req) => {
+                    crate::consensus::rpc::handle_tc_broadcast(req, &app_state).await
+                }
+                IrohRequest::QcBroadcast(req) => {
+                    crate::consensus::rpc::handle_qc_broadcast(req, &app_state).await
+                }
+                IrohRequest::BallotSubmission(req) => {
+                    crate::consensus::rpc::handle_ballot_request(req, &app_state).await
+                }
+                IrohRequest::TransactionForward(req) => {
+                    crate::consensus::rpc::handle_transaction_forward(req, &app_state).await
+                }
+            };
+
+            encode_message(&response)
+        }).await?;
+
+        // Send cached/computed response bytes
+        send_raw(&mut send, response_bytes).await?;
+        send.finish()
+            .map_err(|e| IrohError::Transport(TransportError::StreamFailed(e.to_string())))?;
+
+        Ok(())
+    }.instrument(span).await
 }
