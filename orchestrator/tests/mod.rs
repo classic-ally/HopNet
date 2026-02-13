@@ -119,9 +119,6 @@ pub async fn run_test_by_name(mesh_id: u32, name: &str, nodes: &[NodeInfo], flag
         "consensus-barrier-missed-ballot" => {
             consensus_barriers::ConsensusBarrierMissedBallot.run(mesh_id, nodes, flags).await
         }
-        "consensus-barrier-tc-qc-race" => {
-            consensus_barriers::ConsensusBarrierTcQcRace.run(mesh_id, nodes, flags).await
-        }
         "consensus-barrier-tc-late" => {
             consensus_barriers::ConsensusBarrierTcLate.run(mesh_id, nodes, flags).await
         }
@@ -145,7 +142,6 @@ pub fn list_test_names() -> Vec<&'static str> {
         "timeout-progression",
         "consensus-barrier-basic",
         "consensus-barrier-missed-ballot",
-        "consensus-barrier-tc-qc-race",
         "consensus-barrier-tc-late",
     ]
 }

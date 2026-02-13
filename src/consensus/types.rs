@@ -720,9 +720,22 @@ impl TimeoutSignData {
 pub struct TimeoutVote {
     // sender of the timeout vote (like Ballot.initiator)
     pub sender: VoteSignMessage,
-    
+
     // timeout vote contents (like Ballot.data)
     pub data: TimeoutSignData,
+
+    // Lock vote evidence: if this voter voted Lock for the same view,
+    // carries the leader's and voter's Lock-phase signatures for QC reconstruction
+    pub lock_vote_evidence: Option<LockVoteEvidence>,
+}
+
+/// Evidence that a voter participated in a Lock ballot for this view.
+/// Carries independently-verifiable signatures (not covered by timeout signature).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct LockVoteEvidence {
+    pub vote_data: VoteSignData,              // Lock phase (block_hash, height, view, phase=Lock)
+    pub proposer_signature: VoteSignMessage,  // Leader's signature from Lock ballot
+    pub voter_signature: VoteSignMessage,     // This voter's Lock ballot response
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -730,6 +743,14 @@ pub struct TimeoutCertificate {
     pub view_number: i32,           // View that timed out
     pub highest_qc: QuorumCertificate,
     pub signatures: VoteSignMessages,
+}
+
+/// Result of timeout vote collection: either a TC (normal path) or a
+/// reconstructed Lock QC (safety fix when Lock evidence reaches quorum).
+#[derive(Debug, Clone)]
+pub enum TimeoutResolution {
+    TC(TimeoutCertificate),
+    LockQC(QuorumCertificate),
 }
 
 impl TimeoutCertificate {

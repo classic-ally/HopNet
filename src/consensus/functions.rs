@@ -115,6 +115,15 @@ pub async fn issue_timeout_vote(
     let signature = timeout_data.sign(&app_state.private_key)
         .map_err(|_| ConsensusError::SigningError)?;
 
+    // Check if we have Lock evidence for this view (for Lock QC reconstruction)
+    let lock_evidence = {
+        let ev = app_state.lock_vote_evidence.lock().unwrap();
+        match &*ev {
+            Some(ev) if ev.vote_data.view == view => Some(ev.clone()),
+            _ => None,
+        }
+    };
+
     // Create the timeout vote
     let timeout_vote = TimeoutVote {
         sender: VoteSignMessage {
@@ -122,15 +131,16 @@ pub async fn issue_timeout_vote(
             signature,
         },
         data: timeout_data,
+        lock_vote_evidence: lock_evidence,
     };
 
     // Mark as issued in DB (critical: prevents duplicate on retry)
     db::mark_timeout_vote_issued(app_state.db_pool.get(), view)
         .map_err(|_| ConsensusError::DatabaseError)?;
 
-    // Add to collector (might form TC)
+    // Add to collector (might form TC or reconstruct Lock QC)
     match app_state.timeout_vote_collector.add_vote(timeout_vote.clone(), app_state).await {
-        Ok(Some(tc)) => {
+        Ok(Some(TimeoutResolution::TC(tc))) => {
             tracing::info!("Timeout vote for view {} formed TC, applying and broadcasting", view);
 
             // Apply and broadcast TC (Layer 2 defense pattern from routes.rs)
@@ -146,6 +156,30 @@ pub async fn issue_timeout_vote(
             if let Err(e) = broadcast_res {
                 tracing::warn!("Failed to broadcast TC for view {}: {:?}", view, e);
             }
+
+            Ok(())
+        }
+        Ok(Some(TimeoutResolution::LockQC(qc))) => {
+            tracing::info!(
+                "Timeout vote for view {} reconstructed Lock QC for block {:?}, applying and broadcasting",
+                view, qc.block_hash
+            );
+
+            // Apply the reconstructed Lock QC while holding the guard (prevents TC race)
+            use crate::consensus::routes::{process_incoming_qc_with_guard, broadcast_quorum_certificate};
+            let qc_clone = qc.clone();
+            if let Err(e) = process_incoming_qc_with_guard(qc_clone, app_state, guard).await {
+                tracing::error!("Failed to apply reconstructed Lock QC for view {}: {:?}", view, e);
+                return Err(ConsensusError::DatabaseError);
+            }
+
+            // Broadcast to all validators (fire and forget)
+            let app_state_clone = app_state.clone();
+            tokio::spawn(async move {
+                if let Err(e) = broadcast_quorum_certificate(qc, &app_state_clone).await {
+                    tracing::warn!("Failed to broadcast reconstructed Lock QC: {:?}", e);
+                }
+            });
 
             Ok(())
         }
@@ -590,7 +624,7 @@ async fn broadcast_and_collect_votes(
     }
 }
 
-async fn broadcast_qc(
+pub(crate) async fn broadcast_qc(
     validators: &Vec<Node>,
     validators_elect: &Vec<Node>,
     qc: QuorumCertificate,
@@ -727,6 +761,94 @@ pub fn process_transaction(tx: &Transaction, app_state: &AppState, execute: bool
     }
 }
 
+/// Try to reconstruct a Lock QC from Lock vote evidence carried in timeout votes.
+///
+/// If enough timeout voters carried Lock evidence (proposer_sig + voter_sig) to form
+/// a quorum, we can reconstruct the Lock QC and commit the block — preventing the fork
+/// that would occur if a TC were applied instead.
+fn try_reconstruct_lock_qc(
+    timeout_votes: &[TimeoutVote],
+    app_state: &AppState,
+) -> Option<QuorumCertificate> {
+    // Collect all Lock evidence from timeout votes
+    let evidence: Vec<&LockVoteEvidence> = timeout_votes.iter()
+        .filter_map(|v| v.lock_vote_evidence.as_ref())
+        .collect();
+
+    if evidence.is_empty() {
+        return None;
+    }
+
+    // Verify all evidence agrees on the same vote_data (same block, view, phase)
+    let first = &evidence[0];
+    if !evidence.iter().all(|e| {
+        e.vote_data.block_hash == first.vote_data.block_hash
+            && e.vote_data.view == first.vote_data.view
+            && e.vote_data.phase == first.vote_data.phase
+            && e.vote_data.block_height == first.vote_data.block_height
+    }) {
+        tracing::warn!("Lock evidence disagrees on vote_data, cannot reconstruct Lock QC");
+        return None;
+    }
+
+    // Extract proposer signature (same across all evidence — leader's sig)
+    let proposer_signature = first.proposer_signature.clone();
+
+    // Collect unique voter signatures (dedup by replica_id)
+    let mut seen_voters = std::collections::HashSet::new();
+    let mut voter_signatures = Vec::new();
+    for ev in &evidence {
+        if seen_voters.insert(ev.voter_signature.replica_id) {
+            voter_signatures.push(ev.voter_signature.clone());
+        }
+    }
+
+    // Check quorum: proposer (1) + unique voters >= quorum
+    let committed_height = {
+        let consensus_state = db::get_consensus(app_state.db_pool.get()).ok()?;
+        consensus_state.committed_block.data.height
+    };
+    let validators = db::get_validators(app_state.db_pool.get(), committed_height).ok()?;
+    let quorum = crate::consensus::types::calculate_quorum_threshold(validators.len());
+
+    let total_sigs = 1 + voter_signatures.len(); // proposer + voters
+    if total_sigs < quorum {
+        tracing::debug!(
+            "Lock evidence insufficient for QC: {} sigs < {} quorum",
+            total_sigs, quorum
+        );
+        return None;
+    }
+
+    // Construct the Lock QC
+    let lock_qc = QuorumCertificate {
+        view_number: first.vote_data.view,
+        phase: ConsensusPhase::Lock,
+        block_hash: first.vote_data.block_hash,
+        proposer_signature,
+        voter_signatures: VoteSignMessages(voter_signatures),
+    };
+
+    // Verify the reconstructed QC cryptographically
+    let block = db::get_block(app_state.db_pool.get(), lock_qc.block_hash).ok()?;
+    match lock_qc.verify(app_state, &block) {
+        Ok(()) => {
+            tracing::info!(
+                "Reconstructed Lock QC from timeout vote evidence for view {} block {:?}",
+                lock_qc.view_number, lock_qc.block_hash
+            );
+            Some(lock_qc)
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Reconstructed Lock QC failed verification for view {}: {:?} — falling back to TC",
+                first.vote_data.view, e
+            );
+            None
+        }
+    }
+}
+
 // Timeout Vote Collection for distributed TC generation
 pub struct TimeoutVoteCollector {
     // Map: view_number -> HashMap<timeout_data_hash, Vec<TimeoutVote>>
@@ -740,46 +862,52 @@ impl TimeoutVoteCollector {
         }
     }
     
-    pub async fn add_vote(&self, vote: TimeoutVote, app_state: &AppState) -> Result<Option<TimeoutCertificate>, CertificateError> {
+    pub async fn add_vote(&self, vote: TimeoutVote, app_state: &AppState) -> Result<Option<TimeoutResolution>, CertificateError> {
         // Poll current consensus state for cleanup
         let consensus_state = db::get_consensus(app_state.db_pool.get())
             .map_err(|_| CertificateError::DatabaseError)?;
         let current_view = consensus_state.view;
-        
+
         // Clean up old votes
         self.cleanup_old_votes(current_view).await;
-        
+
         // Only reject timeout votes for old views (nodes might be ahead of us)
         if vote.data.view_number < current_view {
             tracing::debug!("Ignoring timeout vote for old view {} (current view: {})", vote.data.view_number, current_view);
             return Err(CertificateError::ValidationError);
         }
-        
+
         // Verify the timeout vote signature
         self.verify_timeout_vote(&vote, app_state)?;
-        
+
         // Add vote to pending collection
         let mut pending = self.pending_votes.lock().await;
         let view_votes = pending.entry(vote.data.view_number).or_insert_with(HashMap::new);
-        
+
         // Group by timeout data hash
         let data_hash = vote.data.encode().map_err(|_| CertificateError::ValidationError)?;
         let data_votes = view_votes.entry(data_hash).or_insert_with(Vec::new);
-        
+
         // Check for duplicate vote from same replica BEFORE adding
         if data_votes.iter().any(|v| v.sender.replica_id == vote.sender.replica_id) {
             return Err(CertificateError::ValidationError); // Duplicate vote
         }
-        
+
         // Add vote to collection
         data_votes.push(vote);
-        
+
         // Always try to create TC - let it decide if there's quorum
         let timeout_votes = data_votes.clone();
         drop(pending); // Release lock before TC creation
-        
+
+        // Try Lock QC reconstruction first (safety priority over TC)
+        if let Some(lock_qc) = try_reconstruct_lock_qc(&timeout_votes, app_state) {
+            return Ok(Some(TimeoutResolution::LockQC(lock_qc)));
+        }
+
+        // Fall through to normal TC creation
         match TimeoutCertificate::create(timeout_votes, app_state) {
-            Ok(tc) => Ok(Some(tc)),
+            Ok(tc) => Ok(Some(TimeoutResolution::TC(tc))),
             Err(CertificateError::InsufficientVotes) => Ok(None), // Not enough votes yet
             Err(e) => Err(e), // Real error
         }

@@ -443,6 +443,7 @@ mod tests {
                     highest_qc_phase: ConsensusPhase::Propose,
                     highest_qc_hash: crate::types::Blake3Hash::from_bytes([0u8; 32]),
                 },
+                lock_vote_evidence: None,
             },
         };
         let encoded = bincode::serde::encode_to_vec(&req, bincode::config::standard()).unwrap();

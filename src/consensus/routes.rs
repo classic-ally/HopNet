@@ -247,6 +247,15 @@ pub async fn process_incoming_ballot(
         ConsensusError::SigningError
     })?;
 
+    // Store Lock evidence for potential Lock QC reconstruction via timeout votes
+    if ballot.data.phase == ConsensusPhase::Lock {
+        *app_state.lock_vote_evidence.lock().unwrap() = Some(LockVoteEvidence {
+            vote_data: ballot.data.clone(),
+            proposer_signature: ballot.initiator.clone(),
+            voter_signature: signoff.clone(),
+        });
+    }
+
     tracing::debug!(
         "Ballot signed for view {} phase {:?} block {:?}",
         ballot.data.view, ballot.data.phase, ballot.block.block_hash
@@ -264,13 +273,26 @@ pub async fn process_incoming_qc(
     qc: QuorumCertificate,
     app_state: &AppState,
 ) -> Result<(), ConsensusError> {
+    process_incoming_qc_with_guard(qc, app_state, None).await
+}
+
+/// Core QC processing logic. Accepts an optional guard to avoid deadlock when
+/// the caller already holds consensus_lock (e.g. Lock QC reconstruction path).
+pub async fn process_incoming_qc_with_guard(
+    qc: QuorumCertificate,
+    app_state: &AppState,
+    guard: Option<tokio::sync::MutexGuard<'_, ()>>,
+) -> Result<(), ConsensusError> {
     tracing::debug!(
         "Received QC for view {} phase {:?} block {:?}",
         qc.view_number, qc.phase, qc.block_hash
     );
 
-    // Serialize QC processing to prevent concurrent state modifications
-    let _guard = app_state.consensus_lock.lock().await;
+    // Use provided guard or acquire lock
+    let _guard = match guard {
+        Some(g) => g,
+        None => app_state.consensus_lock.lock().await,
+    };
 
     let block = match db::get_block(app_state.db_pool.get(), qc.block_hash) {
         Ok(block) => block,
@@ -407,7 +429,7 @@ pub async fn process_incoming_timeout_vote(
     }
 
     match app_state.timeout_vote_collector.add_vote(timeout_vote.clone(), app_state).await {
-        Ok(Some(tc)) => {
+        Ok(Some(TimeoutResolution::TC(tc))) => {
             // TC was created - apply locally and broadcast in parallel (Layer 2 defense)
             let apply_result = apply_timeout_certificate(tc.clone(), app_state, false, None);
             let broadcast_result = broadcast_timeout_certificate(tc, app_state);
@@ -420,6 +442,29 @@ pub async fn process_incoming_timeout_vote(
             if let Err(_) = broadcast_res {
                 tracing::warn!("Applied TC locally but broadcast failed");
             }
+            Ok(())
+        }
+        Ok(Some(TimeoutResolution::LockQC(qc))) => {
+            tracing::info!(
+                "Timeout vote collector reconstructed Lock QC for view {} block {:?}",
+                qc.view_number, qc.block_hash
+            );
+
+            // Apply the reconstructed Lock QC (no guard held in follower path)
+            let qc_clone = qc.clone();
+            if let Err(e) = process_incoming_qc(qc_clone, app_state).await {
+                tracing::error!("Failed to apply reconstructed Lock QC: {:?}", e);
+                return Err(ConsensusError::DatabaseError);
+            }
+
+            // Broadcast to all validators (fire and forget)
+            let app_state_clone = app_state.clone();
+            tokio::spawn(async move {
+                if let Err(e) = broadcast_quorum_certificate(qc, &app_state_clone).await {
+                    tracing::warn!("Failed to broadcast reconstructed Lock QC: {:?}", e);
+                }
+            });
+
             Ok(())
         }
         Ok(None) => {
@@ -489,6 +534,32 @@ pub async fn broadcast_timeout_certificate(
     }
 
     Ok(())
+}
+
+// Helper function to broadcast a quorum certificate to all validators (fire and forget)
+pub async fn broadcast_quorum_certificate(
+    qc: QuorumCertificate,
+    app_state: &AppState,
+) -> Result<(), ConsensusError> {
+    let consensus_state = db::get_consensus(app_state.db_pool.get())
+        .map_err(|_| ConsensusError::DatabaseError)?;
+    let committed_height = consensus_state.committed_block.data.height;
+    let my_node_id = app_state.get_node_id().map_err(|_| ConsensusError::DatabaseError)?;
+
+    let validators: Vec<_> = db::get_validators(app_state.db_pool.get(), committed_height)
+        .map_err(|_| ConsensusError::DatabaseError)?
+        .into_iter()
+        .filter(|n| n.node_id != my_node_id)
+        .collect();
+    let validators_elect: Vec<_> = db::get_validators_elect(app_state.db_pool.get(), committed_height)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|n| n.node_id != my_node_id)
+        .collect();
+
+    crate::consensus::functions::broadcast_qc(&validators, &validators_elect, qc, app_state)
+        .await
+        .map_err(|_| ConsensusError::DatabaseError)
 }
 
 #[derive(Debug)]

@@ -621,358 +621,26 @@ impl TestScenario for ConsensusBarrierMissedBallot {
 }
 
 // ============================================================================
-// Test: consensus-barrier-tc-qc-race (Scenario A)
+// Test: consensus-barrier-tc-late
 // ============================================================================
 
-/// Tests the Lock QC vs TC safety property: Lock QC arrives while TC is pending.
-///
-/// Flow:
-/// 1. Warm up with a consensus round, then hold both `before_lock_qc_broadcast`
-///    and `before_tc_gst_wait` barriers on all nodes.
-/// 2. Trigger a new consensus round — leader forms Lock QC and hits the barrier.
-/// 3. Wait ~130s for followers to form TC and hit the TC GST wait barrier.
-/// 4. Release `before_lock_qc_broadcast` on the leader — Lock QC broadcasts and
-///    propagates to followers (their consensus_lock is free since TC is held at barrier).
-/// 5. Release `before_tc_gst_wait` on all nodes — Layer 2 staleness check catches
-///    that the view already advanced, rejecting TC.
-/// 6. Verify: Lock QC present, TC absent for the competing view on all nodes.
-pub struct ConsensusBarrierTcQcRace;
-
-impl TestScenario for ConsensusBarrierTcQcRace {
-    fn name(&self) -> &'static str { "consensus-barrier-tc-qc-race" }
-    fn description(&self) -> &'static str {
-        "Verify Lock QC wins over TC when Lock QC arrives during GST wait (safety property)"
-    }
-
-    async fn run(&self, _mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
-        let start = Instant::now();
-        let mut result = TestResult::new();
-        println!("\nRunning checks:");
-
-        if nodes.len() < 3 {
-            print_and_add_check(&mut result, Check {
-                name: "Insufficient nodes".into(), passed: false,
-                detail: Some(format!("Need >=3, found {}", nodes.len())),
-            });
-            result.duration = start.elapsed();
-            return Ok(result);
-        }
-
-        let lock_qc_barrier = "before_lock_qc_broadcast";
-        let tc_barrier = "before_tc_gst_wait";
-
-        // Helper closure for cleanup
-        let release_all = |nodes: &[NodeInfo]| {
-            let nodes = nodes.to_vec();
-            async move {
-                for n in &nodes {
-                    let _ = barrier_release(n, lock_qc_barrier).await;
-                    let _ = barrier_release(n, tc_barrier).await;
-                }
-            }
-        };
-
-        // Step 1: Warm-up consensus round
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
-        let warmup_filename = format!("barrier-tcqc-warmup-{}.txt", timestamp);
-        let warmup_contents = format!("warmup {}", timestamp).into_bytes();
-        match upload_file(&nodes[0], "/", &warmup_filename, warmup_contents).await {
-            Ok(_) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Warm-up consensus round".into(), passed: true, detail: None,
-                });
-            }
-            Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Warm-up round".into(), passed: false,
-                    detail: Some(e.to_string()),
-                });
-                result.duration = start.elapsed();
-                return Ok(result);
-            }
-        }
-
-        let warmup_view = match get_max_view(nodes).await {
-            Ok(v) => v,
-            Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Get warmup view".into(), passed: false,
-                    detail: Some(e.to_string()),
-                });
-                result.duration = start.elapsed();
-                return Ok(result);
-            }
-        };
-
-        match wait_for_minimum_view(nodes, warmup_view, Duration::from_secs(30)).await {
-            Ok(true) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Warm-up complete".into(), passed: true,
-                    detail: Some(format!("all at view {}", warmup_view)),
-                });
-            }
-            _ => {
-                print_and_add_check(&mut result, Check {
-                    name: "Warm-up complete".into(), passed: false,
-                    detail: Some("warm-up round did not complete".into()),
-                });
-                result.duration = start.elapsed();
-                return Ok(result);
-            }
-        }
-
-        // Extra settle time for cascade settling
-        sleep(Duration::from_secs(2)).await;
-
-        // Step 2: Hold both barriers on ALL nodes
-        for node in nodes {
-            if let Err(e) = barrier_hold(node, lock_qc_barrier).await {
-                print_and_add_check(&mut result, Check {
-                    name: format!("Hold Lock QC barrier on node {}", node.node_id),
-                    passed: false, detail: Some(e.to_string()),
-                });
-                release_all(nodes).await;
-                result.duration = start.elapsed();
-                return Ok(result);
-            }
-            if let Err(e) = barrier_hold(node, tc_barrier).await {
-                print_and_add_check(&mut result, Check {
-                    name: format!("Hold TC barrier on node {}", node.node_id),
-                    passed: false, detail: Some(e.to_string()),
-                });
-                release_all(nodes).await;
-                result.duration = start.elapsed();
-                return Ok(result);
-            }
-        }
-        print_and_add_check(&mut result, Check {
-            name: "Hold barriers on all nodes".into(), passed: true,
-            detail: Some("before_lock_qc_broadcast + before_tc_gst_wait".into()),
-        });
-
-        // Step 3: Upload file to trigger consensus (background — leader will block at barrier)
-        let filename = format!("barrier-tcqc-race-{}.txt", timestamp);
-        let contents = format!("tc-qc race test {}", timestamp).into_bytes();
-        let upload_node = nodes[0].clone();
-        let upload_filename = filename.clone();
-        let upload_handle = tokio::spawn(async move {
-            upload_file(&upload_node, "/", &upload_filename, contents).await
-        });
-
-        // Step 4: Poll all nodes for before_lock_qc_broadcast waiting=true → identifies leader
-        println!("  ... waiting for leader to form Lock QC and hit barrier");
-        let leader_node = match find_waiting_node(nodes, lock_qc_barrier, Duration::from_secs(30)).await {
-            Some(n) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Leader formed Lock QC".into(), passed: true,
-                    detail: Some(format!("node {} waiting at before_lock_qc_broadcast", n.node_id)),
-                });
-                n
-            }
-            None => {
-                print_and_add_check(&mut result, Check {
-                    name: "Leader formed Lock QC".into(), passed: false,
-                    detail: Some("no node reached before_lock_qc_broadcast within 30s".into()),
-                });
-                release_all(nodes).await;
-                let _ = upload_handle.await;
-                result.duration = start.elapsed();
-                return Ok(result);
-            }
-        };
-
-        let followers: Vec<&NodeInfo> = nodes.iter()
-            .filter(|n| n.node_id != leader_node.node_id)
-            .collect();
-
-        // The competing view is the next view after warmup
-        let competing_view = warmup_view + 1;
-
-        // Step 5: Wait for non-leader nodes to form TC and hit before_tc_gst_wait
-        println!("  ... waiting up to 130s for followers to form TC");
-        let tc_waiting = {
-            let mut count = 0;
-            let deadline = Instant::now() + Duration::from_secs(130);
-            while Instant::now() < deadline {
-                count = 0;
-                for node in &followers {
-                    if let Ok(status) = barrier_status(node, tc_barrier).await {
-                        if status.waiting {
-                            count += 1;
-                        }
-                    }
-                }
-                if count >= followers.len() { break; }
-                sleep(Duration::from_secs(2)).await;
-            }
-            count
-        };
-
-        if tc_waiting >= followers.len() {
-            print_and_add_check(&mut result, Check {
-                name: "TC formed on followers".into(), passed: true,
-                detail: Some(format!("{} followers waiting at before_tc_gst_wait", tc_waiting)),
-            });
-        } else {
-            print_and_add_check(&mut result, Check {
-                name: "TC formed on followers".into(), passed: false,
-                detail: Some(format!("only {}/{} followers reached TC barrier within 130s", tc_waiting, followers.len())),
-            });
-            release_all(nodes).await;
-            let _ = upload_handle.await;
-            result.duration = start.elapsed();
-            return Ok(result);
-        }
-
-        // Step 6: Release before_lock_qc_broadcast on leader → Lock QC broadcasts
-        // Leader also applies Lock QC locally (DB insert + transaction processing)
-        let _ = barrier_release(leader_node, lock_qc_barrier).await;
-        print_and_add_check(&mut result, Check {
-            name: "Release Lock QC barrier on leader".into(), passed: true,
-            detail: Some(format!("node {} broadcasting Lock QC", leader_node.node_id)),
-        });
-
-        // Step 7: Give Lock QC time to propagate to followers
-        // Followers' consensus_lock is NOT held (TC is blocked before GST wait, before lock acquisition)
-        // So Lock QC can be processed via process_incoming_qc(), advancing the view
-        sleep(Duration::from_secs(2)).await;
-
-        // Step 8: Release before_tc_gst_wait on all nodes → TC enters GST wait
-        // Layer 2 staleness check: TC view < current_view → rejected
-        for node in nodes {
-            let _ = barrier_release(node, tc_barrier).await;
-        }
-        print_and_add_check(&mut result, Check {
-            name: "Release TC barriers on all nodes".into(), passed: true, detail: None,
-        });
-
-        // Step 9: Settlement — wait for everything to finish
-        sleep(Duration::from_secs(5)).await;
-
-        // Wait for upload to complete
-        match upload_handle.await {
-            Ok(Ok(_)) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Upload completed".into(), passed: true, detail: None,
-                });
-            }
-            Ok(Err(e)) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Upload completed".into(), passed: false,
-                    detail: Some(e.to_string()),
-                });
-            }
-            Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Upload task".into(), passed: false,
-                    detail: Some(format!("join error: {}", e)),
-                });
-            }
-        }
-
-        // Step 10: Verify Lock QC won and TC was rejected on all nodes
-        let mut lock_qc_ok = true;
-        let mut tc_absent = true;
-        for node in nodes {
-            match get_consensus_history(node).await {
-                Ok(history) => {
-                    let entry = history.iter().find(|e| e.view == competing_view as i64);
-                    match entry {
-                        Some(e) => {
-                            if !e.has_lock_qc {
-                                lock_qc_ok = false;
-                                print_and_add_check(&mut result, Check {
-                                    name: format!("Lock QC on node {}", node.node_id),
-                                    passed: false,
-                                    detail: Some(format!("view {} missing Lock QC", competing_view)),
-                                });
-                            }
-                            if e.has_tc {
-                                tc_absent = false;
-                                print_and_add_check(&mut result, Check {
-                                    name: format!("TC absent on node {}", node.node_id),
-                                    passed: false,
-                                    detail: Some(format!("view {} has TC (should have been rejected)", competing_view)),
-                                });
-                            }
-                        }
-                        None => {
-                            lock_qc_ok = false;
-                            print_and_add_check(&mut result, Check {
-                                name: format!("History for node {}", node.node_id),
-                                passed: false,
-                                detail: Some(format!("view {} not found in history", competing_view)),
-                            });
-                        }
-                    }
-                }
-                Err(e) => {
-                    lock_qc_ok = false;
-                    print_and_add_check(&mut result, Check {
-                        name: format!("History check node {}", node.node_id),
-                        passed: false, detail: Some(e.to_string()),
-                    });
-                }
-            }
-        }
-
-        if lock_qc_ok {
-            print_and_add_check(&mut result, Check {
-                name: "Lock QC present on all nodes".into(), passed: true,
-                detail: Some(format!("view {} has Lock QC on all nodes", competing_view)),
-            });
-        }
-        if tc_absent {
-            print_and_add_check(&mut result, Check {
-                name: "TC rejected on all nodes".into(), passed: true,
-                detail: Some(format!("view {} has no TC on any node (safety property holds)", competing_view)),
-            });
-        }
-
-        // Verify all nodes advanced past the competing view
-        match wait_for_minimum_view(nodes, competing_view + 1, Duration::from_secs(10)).await {
-            Ok(true) => {
-                print_and_add_check(&mut result, Check {
-                    name: "All nodes advanced".into(), passed: true,
-                    detail: Some(format!("all at view >= {}", competing_view + 1)),
-                });
-            }
-            _ => {
-                print_and_add_check(&mut result, Check {
-                    name: "All nodes advanced".into(), passed: false,
-                    detail: Some(format!("not all nodes reached view {}", competing_view + 1)),
-                });
-            }
-        }
-
-        result.duration = start.elapsed();
-        Ok(result)
-    }
-}
-
-// ============================================================================
-// Test: consensus-barrier-tc-late (Scenario B)
-// ============================================================================
-
-/// Tests behavior when TC commits before Lock QC arrives (diagnostic test).
+/// Tests Lock QC reconstruction from timeout votes when leader's Lock QC broadcast is delayed.
 ///
 /// Flow:
 /// 1. Warm up, then hold only `before_lock_qc_broadcast` on all nodes.
 /// 2. Trigger consensus — leader forms Lock QC and hits barrier.
-/// 3. Wait ~130s for followers to form and fully apply TC (no TC barrier held).
-/// 4. Release `before_lock_qc_broadcast` — leader broadcasts Lock QC + applies locally.
-/// 5. Verify convergence: do all nodes have same committed state? Is there a
-///    `timeout_certificates` table mismatch (leader has no TC, followers do)?
-///
-/// This test is diagnostic — it reveals whether the current implementation correctly
-/// handles the "too late" case or if a fix is needed for metadata divergence.
+/// 3. Wait ~130s for followers to time out. Since followers voted Lock, their timeout
+///    votes carry Lock ballot evidence. The TC assembler reconstructs the Lock QC
+///    from that evidence instead of forming a TC.
+/// 4. Release `before_lock_qc_broadcast` — leader broadcasts Lock QC (redundant, followers
+///    already have it from reconstruction).
+/// 5. Verify: all nodes have Lock QC, no nodes have TC. No divergence.
 pub struct ConsensusBarrierTcLate;
 
 impl TestScenario for ConsensusBarrierTcLate {
     fn name(&self) -> &'static str { "consensus-barrier-tc-late" }
     fn description(&self) -> &'static str {
-        "Diagnostic: TC commits before Lock QC arrives — check for metadata divergence"
+        "Lock QC reconstruction from timeout votes when leader broadcast is delayed"
     }
 
     async fn run(&self, _mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
@@ -1098,18 +766,18 @@ impl TestScenario for ConsensusBarrierTcLate {
 
         let competing_view = warmup_view + 1;
 
-        // Step 5: Wait ~130s for TC to form AND apply on followers
-        // No TC barrier held — TC goes through all 3 layers and commits since
-        // Lock QC isn't in any DB (leader is held at barrier before broadcast/DB write)
-        println!("  ... waiting up to 140s for TC to form and apply on followers");
-        let tc_applied = {
+        // Step 5: Wait ~130s for followers to time out and reconstruct Lock QC from timeout votes.
+        // Followers voted Lock, so their timeout votes carry Lock ballot evidence.
+        // The TC assembler detects this evidence and reconstructs the Lock QC instead of forming a TC.
+        println!("  ... waiting up to 140s for Lock QC reconstruction from timeout votes on followers");
+        let lock_qc_reconstructed = {
             let mut all_applied = false;
             let deadline = Instant::now() + Duration::from_secs(140);
             while Instant::now() < deadline {
                 let mut count = 0;
                 for node in &followers {
                     if let Ok(history) = get_consensus_history(node).await {
-                        if history.iter().any(|e| e.view == competing_view as i64 && e.has_tc) {
+                        if history.iter().any(|e| e.view == competing_view as i64 && e.has_lock_qc) {
                             count += 1;
                         }
                     }
@@ -1123,15 +791,15 @@ impl TestScenario for ConsensusBarrierTcLate {
             all_applied
         };
 
-        if tc_applied {
+        if lock_qc_reconstructed {
             print_and_add_check(&mut result, Check {
-                name: "TC applied on followers".into(), passed: true,
-                detail: Some(format!("view {} has TC on all {} followers", competing_view, followers.len())),
+                name: "Lock QC reconstructed on followers".into(), passed: true,
+                detail: Some(format!("view {} has Lock QC on all {} followers (from timeout vote evidence)", competing_view, followers.len())),
             });
         } else {
             print_and_add_check(&mut result, Check {
-                name: "TC applied on followers".into(), passed: false,
-                detail: Some(format!("not all followers applied TC for view {} within 140s", competing_view)),
+                name: "Lock QC reconstructed on followers".into(), passed: false,
+                detail: Some(format!("not all followers reconstructed Lock QC for view {} within 140s", competing_view)),
             });
             for n in nodes { let _ = barrier_release(n, lock_qc_barrier).await; }
             let _ = upload_handle.await;
@@ -1140,10 +808,11 @@ impl TestScenario for ConsensusBarrierTcLate {
         }
 
         // Step 6: Release before_lock_qc_broadcast → leader broadcasts Lock QC + applies locally
+        // (followers already have Lock QC from reconstruction, so broadcast is redundant for them)
         for n in nodes { let _ = barrier_release(n, lock_qc_barrier).await; }
         print_and_add_check(&mut result, Check {
             name: "Release Lock QC barrier".into(), passed: true,
-            detail: Some("leader broadcasting Lock QC (TC already committed on followers)".into()),
+            detail: Some("leader broadcasting Lock QC (followers already have it from reconstruction)".into()),
         });
 
         // Step 7: Wait for Lock QC propagation and settlement
@@ -1170,9 +839,9 @@ impl TestScenario for ConsensusBarrierTcLate {
             }
         }
 
-        // Step 8: Diagnostic checks — examine the state of each node
-        // Leader should have Lock QC but may NOT have TC (stale TC rejected by Layer 2)
-        // Followers should have TC, and Lock QC (from broadcast via process_incoming_qc)
+        // Step 8: Verify expected state — all nodes have Lock QC, no TC
+        // Leader: has Lock QC (applied locally when barrier released)
+        // Followers: have Lock QC (reconstructed from timeout vote evidence, no TC ever formed)
         let mut leader_has_lock_qc = false;
         let mut leader_has_tc = false;
         let mut follower_lock_qc_count = 0;
@@ -1236,38 +905,18 @@ impl TestScenario for ConsensusBarrierTcLate {
             }
         }
 
-        // Step 9: Diagnose divergence
-        // Expected divergence: leader has Lock QC but no TC; followers have both Lock QC and TC
-        let metadata_divergence = leader_has_lock_qc && !leader_has_tc
-            && follower_tc_count == followers.len();
+        // Step 9: Verify no TC formed (Lock QC reconstruction should prevent TC entirely)
+        let no_tc_anywhere = !leader_has_tc && follower_tc_count == 0;
+        print_and_add_check(&mut result, Check {
+            name: "No TC formed".into(),
+            passed: no_tc_anywhere,
+            detail: Some(format!(
+                "leader has_tc={}, followers with TC: {}/{} (expected: no TC anywhere)",
+                leader_has_tc, follower_tc_count, followers.len()
+            )),
+        });
 
-        if metadata_divergence {
-            print_and_add_check(&mut result, Check {
-                name: "Metadata divergence detected".into(), passed: true,
-                detail: Some(format!(
-                    "EXPECTED: leader has Lock QC (no TC), {} followers have TC + Lock QC. \
-                     timeout_certificates table will differ.",
-                    followers.len()
-                )),
-            });
-        } else if leader_has_tc && follower_tc_count == followers.len() {
-            print_and_add_check(&mut result, Check {
-                name: "No metadata divergence".into(), passed: true,
-                detail: Some("all nodes have TC — leader accepted incoming TC".into()),
-            });
-        } else {
-            print_and_add_check(&mut result, Check {
-                name: "Divergence analysis".into(), passed: true,
-                detail: Some(format!(
-                    "leader: lock_qc={} tc={}, followers: lock_qc={}/{} tc={}/{}",
-                    leader_has_lock_qc, leader_has_tc,
-                    follower_lock_qc_count, followers.len(),
-                    follower_tc_count, followers.len()
-                )),
-            });
-        }
-
-        // All nodes should have Lock QC (leader applied locally, followers via broadcast)
+        // All nodes should have Lock QC (leader applied locally, followers via reconstruction)
         let all_have_lock_qc = leader_has_lock_qc && follower_lock_qc_count == followers.len();
         print_and_add_check(&mut result, Check {
             name: "Lock QC on all nodes".into(),

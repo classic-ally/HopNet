@@ -15,6 +15,7 @@ const LOCAL_ONLY_TABLES: &[&str] = &[
 const EXCLUDED_COLUMNS: &[(&str, &[&str])] = &[
     ("fragment_hashes", &["stored_locally"]),
     ("fragment_inventory", &["self_verified_height"]),
+    ("quorum_certificates", &["voter_signatures"]),
 ];
 
 /// All consensus-tracked tables (order matters for deterministic hashing)

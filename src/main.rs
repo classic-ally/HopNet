@@ -94,6 +94,7 @@ pub struct AppState {
     iroh_transport: net::IrohTransport,
     consensus_barriers: Arc<consensus::barriers::ConsensusBarriers>,
     dedup_cache: Arc<net::DedupCache>,
+    lock_vote_evidence: Arc<std::sync::Mutex<Option<consensus::types::LockVoteEvidence>>>,
 }
 
 impl AppState {
@@ -313,6 +314,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 iroh_transport: iroh_transport.clone(),
                 consensus_barriers: Arc::new(consensus::barriers::ConsensusBarriers::new()),
                 dedup_cache: Arc::new(net::DedupCache::default()),
+                lock_vote_evidence: Arc::new(std::sync::Mutex::new(None)),
             };
 
             // If we loaded state from database, populate the OnceCell fields

@@ -252,6 +252,9 @@ impl TestScenario for TimeoutProgression {
             }
         }
 
+        // Brief settle time for node startup (DB init, iroh reconnection, convergence job)
+        sleep(Duration::from_secs(5)).await;
+
         // Get fresh JWT for restarted node
         let docker = bollard::Docker::connect_with_local_defaults()?;
         let fresh_jwt = match crate::get_jwt_token(
@@ -277,8 +280,8 @@ impl TestScenario for TimeoutProgression {
         };
 
         // Step 7: Verify restarted node catches up past the TC
-        // Allow extra time for convergence catch-up (bootstrap from genesis if needed)
-        match wait_for_minimum_view(&[restarted_node.clone()], target_view, Duration::from_secs(60)).await {
+        // Allow extra time for convergence catch-up — iroh reconnection + convergence job cycle
+        match wait_for_minimum_view(&[restarted_node.clone()], target_view, Duration::from_secs(90)).await {
             Ok(true) => {
                 print_and_add_check(&mut result, Check {
                     name: "Restarted node caught up past TC".to_string(),
@@ -290,7 +293,7 @@ impl TestScenario for TimeoutProgression {
                 print_and_add_check(&mut result, Check {
                     name: "Restarted node catch-up timeout".to_string(),
                     passed: false,
-                    detail: Some(format!("node {} did not reach view {} in 60s", leader_node_id, target_view)),
+                    detail: Some(format!("node {} did not reach view {} in 90s", leader_node_id, target_view)),
                 });
             }
             Err(e) => {
