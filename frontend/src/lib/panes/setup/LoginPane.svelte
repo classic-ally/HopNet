@@ -1,11 +1,12 @@
 <script lang="ts">
     import Button from '../../Button.svelte';
     import EntryRow from '../../EntryRow.svelte';
+    import PassphraseInput from './PassphraseInput.svelte';
     import SetupPane from '../../SetupPane.svelte';
     import { tokenStore, API_BASE_URL } from '../../stores';
 
     export let username = '';
-    export let password = '';
+    export let passphrase = '';
     let rememberMe = false;
     let loading = false;
     let errorMessage = '';
@@ -21,7 +22,7 @@
                 },
                 body: JSON.stringify({
                     username,
-                    password,
+                    passphrase,
                     remember_me: rememberMe,
                 }),
             });
@@ -30,7 +31,7 @@
                 const data = await response.json();
                 tokenStore.set(data.token);
             } else if (response.status === 401) {
-                errorMessage = 'Invalid username or password';
+                errorMessage = 'Invalid username or passphrase';
             } else if (response.status === 503) {
                 errorMessage = 'Node not initialized';
             } else {
@@ -55,12 +56,7 @@
             password={false}
             bind:value={username}
         />
-        <EntryRow
-            icon="i-carbon-password"
-            title="Password"
-            password={true}
-            bind:value={password}
-        />
+        <PassphraseInput bind:value={passphrase} />
         <label class="flex items-center gap-2 text-sm text-overlay1 mt-2 cursor-pointer select-none">
             <input type="checkbox" bind:checked={rememberMe} class="accent-mauve" />
             Remember me for 24 hours

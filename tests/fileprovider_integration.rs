@@ -488,21 +488,20 @@ async fn setup_backend(backend_url: &str) -> Result<(), Box<dyn std::error::Erro
     // Use the actual InitialSetupPayload struct for type safety
     let setup_payload = InitialSetupPayload {
         username: "testuser".to_string(),
-        password: "testpass".to_string(),
         node_name: "testnode".to_string(),
     };
-    
+
     let response = client
         .post(&setup_url)
         .json(&setup_payload)
         .send()
         .await?;
-    
+
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await?;
         return Err(format!("Setup failed with status {}: {}", status, body).into());
     }
-    
+
     Ok(())
 }

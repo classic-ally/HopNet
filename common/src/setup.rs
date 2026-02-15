@@ -7,6 +7,12 @@ use typeshare::typeshare;
 #[typeshare]
 pub struct InitialSetupPayload {
     pub username: String,
-    pub password: String,
     pub node_name: String,
+}
+
+/// Response containing a server-generated passphrase
+#[derive(Debug, Serialize)]
+#[typeshare]
+pub struct PassphraseResponse {
+    pub passphrase: String,
 }

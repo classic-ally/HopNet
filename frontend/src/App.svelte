@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import Setup from './lib/SetupSM.svelte';
+  import Setup from './lib/panes/setup/SetupSM.svelte';
   import LoginPane from './lib/panes/setup/LoginPane.svelte';
   import BackendError from './lib/BackendError.svelte';
   import { tokenStore, API_BASE_URL } from './lib/stores';
@@ -8,7 +8,7 @@
 
   let currentComponent: 'setup' | 'operation' | 'error' = 'setup';
   let username = '';
-  let password = '';
+  let passphrase = '';
 
   // Reactive statement to get token value from store
   $: token = $tokenStore;
@@ -48,7 +48,7 @@
       {#if token}
         <Interface />
       {:else}
-        <LoginPane bind:username bind:password/>
+        <LoginPane bind:username bind:passphrase/>
       {/if}
     {:else if currentComponent === 'error'}
       <BackendError/>

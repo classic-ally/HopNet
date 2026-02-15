@@ -10,9 +10,9 @@
         control: 'text',
         description: 'Pre-filled username'
       },
-      password: {
+      passphrase: {
         control: 'text',
-        description: 'Pre-filled password'
+        description: 'Pre-filled passphrase'
       }
     }
   });
@@ -26,6 +26,6 @@
   </div>
 {/snippet}
 
-<Story name="Default" {template} args={{ username: '', password: '' }} />
+<Story name="Default" {template} args={{ username: '', passphrase: '' }} />
 
-<Story name="Pre-filled" {template} args={{ username: 'alice', password: 'hunter2' }} />
+<Story name="Pre-filled" {template} args={{ username: 'alice', passphrase: 'abacus dolphin railway prewar reunion crystal sabotage gravitate' }} />

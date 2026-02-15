@@ -1,8 +1,8 @@
 <script lang="ts">
     import { onMount } from 'svelte';
-    import SetupPane from "../SetupPane.svelte";
+    import SetupPane from "../../SetupPane.svelte";
     import QrCode from "svelte-qrcode";
-    import { API_BASE_URL } from '../stores';
+    import { API_BASE_URL } from '../../stores';
 
     // Props from previous setup page
     export let name: string;

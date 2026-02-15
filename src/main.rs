@@ -33,6 +33,7 @@ mod takeout;
 mod admin;
 mod devices;
 mod net;
+mod passphrase;
 
 static ASSETS_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/frontend/dist");
 

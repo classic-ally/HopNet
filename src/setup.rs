@@ -123,7 +123,9 @@ pub async fn process_join_info(
 pub async fn post_setup(
     State(app_state): State<AppState>,
     Json(payload): Json<InitialSetupPayload>
-) -> Result<StatusCode, StatusCode> {
+) -> Result<(StatusCode, Json<hopnet_common::setup::PassphraseResponse>), StatusCode> {
+
+    let passphrase = crate::passphrase::generate_passphrase();
 
     let (user_priv_key, user_pub_key) = generate_ed25519_key();
 
@@ -135,9 +137,18 @@ pub async fn post_setup(
     // Construct User and Node from the simplified payload
     let x25519_pubkey = crate::auth::derive_x25519_pubkey_from_user(&user_keys.private_key);
 
-    // Wrap the user private key with the password
-    let (encrypted_privkey, key_salt) = crate::auth::wrap_user_privkey(&user_keys.private_key, &payload.password)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // Wrap the user private key with the passphrase (3-5s Argon2id)
+    let passphrase_clone = passphrase.clone();
+    let privkey_clone = user_keys.private_key.clone();
+    let wrap_result = tokio::task::spawn_blocking(move || {
+        crate::auth::wrap_user_privkey(&privkey_clone, &passphrase_clone)
+            .map_err(|e| e.to_string())
+    }).await;
+
+    let (encrypted_privkey, key_salt) = match wrap_result {
+        Ok(Ok(result)) => result,
+        _ => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+    };
 
     // Capture username before moving payload fields
     #[cfg(target_os = "macos")]
@@ -196,7 +207,7 @@ pub async fn post_setup(
                 }
             }
 
-            Ok(StatusCode::CREATED)
+            Ok((StatusCode::CREATED, Json(hopnet_common::setup::PassphraseResponse { passphrase })))
         },
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR)
     }

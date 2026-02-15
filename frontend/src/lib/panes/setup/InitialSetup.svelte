@@ -1,7 +1,7 @@
 <script lang="ts">
-  import Button from './Button.svelte'
+  import Button from '../../Button.svelte'
   import FeatureItem from './FeatureItem.svelte'
-  import SetupPane from './SetupPane.svelte';
+  import SetupPane from '../../SetupPane.svelte';
 
   export let onCreateNetwork: () => void;
   export let onJoinNetwork: () => void;

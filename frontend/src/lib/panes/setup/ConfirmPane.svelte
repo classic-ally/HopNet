@@ -1,15 +1,14 @@
 <script lang="ts">
-    import SetupPane from './SetupPane.svelte';
-    import Button from "./Button.svelte";
-    import EntryRow from './EntryRow.svelte';
-    import { API_BASE_URL } from './stores';
+    import SetupPane from '../../SetupPane.svelte';
+    import Button from "../../Button.svelte";
+    import EntryRow from '../../EntryRow.svelte';
+    import { API_BASE_URL } from '../../stores';
 
     export let username: string;
-    export let password: string;
     export let computername: string;
 
     export let onBackButton: () => void;
-    export let onSetupComplete: () => void;
+    export let onSetupComplete: (passphrase: string) => void;
 
     let isLoading = false;
     let errorMessage = '';
@@ -17,12 +16,10 @@
     const onSave = async () => {
         isLoading = true;
         errorMessage = '';
-        
+
         try {
-            // Create the setup payload matching the backend InitialSetupPayload structure
             const setupData = {
                 username: username,
-                password: password, // Will be hashed on backend
                 node_name: computername,
             };
 
@@ -35,10 +32,9 @@
             });
 
             if (response.ok) {
+                const data = await response.json();
                 console.log('Setup completed successfully');
-                onSetupComplete();
-                // Reload the page to trigger the setup check in App.svelte
-                window.location.reload();
+                onSetupComplete(data.passphrase);
             } else {
                 throw new Error(`Setup failed with status: ${response.status}`);
             }

@@ -1,12 +1,11 @@
 <script lang="ts">
-    import Button from "./Button.svelte";
-    import EntryRow from "./EntryRow.svelte";
-    import SetupPane from "./SetupPane.svelte";
+    import Button from "../../Button.svelte";
+    import EntryRow from "../../EntryRow.svelte";
+    import SetupPane from "../../SetupPane.svelte";
 
     export let onBackButton: () => void;
     export let onForwardButton: () => void;
     export let username = '';
-    export let password = '';
 </script>
 
 <SetupPane
@@ -19,12 +18,6 @@
             title="Username"
             password={false}
             bind:value={username}
-        />
-        <EntryRow
-            icon="i-carbon-password"
-            title="Password"
-            password={true}
-            bind:value={password}
         />
     {/snippet}
 

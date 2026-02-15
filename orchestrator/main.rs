@@ -5,6 +5,8 @@ use bollard::models::{ContainerCreateBody, HostConfig, NetworkingConfig, Endpoin
 use clap::{Parser, Subcommand};
 use serde_json::json;
 use std::collections::HashMap;
+use bollard::exec::StartExecResults;
+use tokio_stream::StreamExt;
 
 mod divergence;
 mod sys;
@@ -295,42 +297,47 @@ async fn create_mesh(docker: &Docker, mesh_id: u32, node_count: u32, no_cleanup:
             // Setup node 0 if it exists
             if let Some((container_name, _container_id, ip_address)) = containers.first() {
                 println!("Setting up node 0 at IP: {} (host port: {})", ip_address, 40000 + (mesh_id * 500));
-                if let Err(e) = setup_node_0(docker, mesh_id, &container_name, runtime).await {
-                    println!("Failed to setup node 0: {}", e);
-                    
-                    if no_cleanup {
-                        println!("Skipping cleanup (--no-cleanup flag set). Containers and network left running for inspection.");
-                        println!("Network: {}", network_name);
-                        for (name, container_id, ip) in &containers {
-                            println!("Container: {} (ID: {}, IP: {})", name, container_id, ip);
-                        }
-                    } else {
-                        println!("Cleaning up mesh {} due to setup failure...", mesh_id);
-                        
-                        // Cleanup containers (in parallel)
-                        let mut tasks = Vec::new();
-                        for (name, container_id, _) in containers {
-                            let docker_clone = docker.clone();
-                            let task = tokio::spawn(async move {
-                                println!("  Stopping and removing container: {}", name);
-                                let _ = docker_clone.stop_container(&container_id, None::<bollard::container::StopContainerOptions>).await;
-                                let _ = docker_clone.remove_container(&container_id, None::<bollard::container::RemoveContainerOptions>).await;
-                            });
-                            tasks.push(task);
-                        }
-                        // Wait for all cleanup tasks to complete
-                        for task in tasks {
-                            let _ = task.await;
-                        }
-                        
-                        // Cleanup network
-                        println!("  Removing network: {}", network_name);
-                        let _ = docker.remove_network(&network_id).await;
+                match setup_node_0(docker, mesh_id, &container_name, runtime).await {
+                    Ok(passphrase) => {
+                        store_mesh_passphrase(docker, mesh_id, &passphrase).await?;
                     }
-                    
-                    return Err(anyhow::anyhow!("Mesh creation failed due to setup API failure"));
+                    Err(e) => {
+                        println!("Failed to setup node 0: {}", e);
+
+                        if no_cleanup {
+                            println!("Skipping cleanup (--no-cleanup flag set). Containers and network left running for inspection.");
+                            println!("Network: {}", network_name);
+                            for (name, container_id, ip) in &containers {
+                                println!("Container: {} (ID: {}, IP: {})", name, container_id, ip);
+                            }
+                        } else {
+                            println!("Cleaning up mesh {} due to setup failure...", mesh_id);
+
+                            // Cleanup containers (in parallel)
+                            let mut tasks = Vec::new();
+                            for (name, container_id, _) in containers {
+                                let docker_clone = docker.clone();
+                                let task = tokio::spawn(async move {
+                                    println!("  Stopping and removing container: {}", name);
+                                    let _ = docker_clone.stop_container(&container_id, None::<bollard::container::StopContainerOptions>).await;
+                                    let _ = docker_clone.remove_container(&container_id, None::<bollard::container::RemoveContainerOptions>).await;
+                                });
+                                tasks.push(task);
+                            }
+                            // Wait for all cleanup tasks to complete
+                            for task in tasks {
+                                let _ = task.await;
+                            }
+
+                            // Cleanup network
+                            println!("  Removing network: {}", network_name);
+                            let _ = docker.remove_network(&network_id).await;
+                        }
+
+                        return Err(anyhow::anyhow!("Mesh creation failed due to setup API failure"));
+                    }
                 }
-                
+
                 // Register additional nodes (1, 2, 3...) with node 0
                 if containers.len() > 1 {
                     for (node_index, (container_name, _container_id, _node_ip)) in containers.iter().enumerate().skip(1) {
@@ -339,7 +346,7 @@ async fn create_mesh(docker: &Docker, mesh_id: u32, node_count: u32, no_cleanup:
 
                         if let Err(e) = register_node_with_node_0(docker, mesh_id, node_id, container_name, runtime).await {
                             println!("Failed to register node {}: {}", node_id, e);
-                            
+
                             if no_cleanup {
                                 println!("Skipping cleanup (--no-cleanup flag set). Containers and network left running for inspection.");
                                 println!("Network: {}", network_name);
@@ -348,7 +355,7 @@ async fn create_mesh(docker: &Docker, mesh_id: u32, node_count: u32, no_cleanup:
                                 }
                             } else {
                                 println!("Cleaning up mesh {} due to node registration failure...", mesh_id);
-                                
+
                                 // Cleanup containers (in parallel)
                                 let mut tasks = Vec::new();
                                 for (name, container_id, _) in containers {
@@ -364,12 +371,12 @@ async fn create_mesh(docker: &Docker, mesh_id: u32, node_count: u32, no_cleanup:
                                 for task in tasks {
                                     let _ = task.await;
                                 }
-                                
+
                                 // Cleanup network
                                 println!("  Removing network: {}", network_name);
                                 let _ = docker.remove_network(&network_id).await;
                             }
-                            
+
                             return Err(anyhow::anyhow!("Mesh creation failed due to node registration failure"));
                         }
                     }
@@ -606,7 +613,7 @@ async fn create_hopnet_container(
     Ok((container_id, ip_address))
 }
 
-async fn setup_node_0(docker: &Docker, mesh_id: u32, node_name: &str, runtime: sys::ContainerRuntime) -> Result<()> {
+async fn setup_node_0(docker: &Docker, mesh_id: u32, node_name: &str, runtime: sys::ContainerRuntime) -> Result<String> {
     let client = reqwest::Client::new();
 
     // Get runtime-aware connection info for node 0
@@ -620,24 +627,23 @@ async fn setup_node_0(docker: &Docker, mesh_id: u32, node_name: &str, runtime: s
 
     let setup_data = json!({
         "username": "allison",
-        "password": "testing",
         "node_name": node_name,
     });
-    
+
     println!("Calling setup API at: {}", url);
     println!("Setup data: {}", setup_data);
-    
+
     let start_time = std::time::Instant::now();
     let timeout_duration = std::time::Duration::from_secs(30);
     let retry_interval = std::time::Duration::from_millis(500); // 500ms between retries
-    
+
     loop {
         if start_time.elapsed() > timeout_duration {
             return Err(anyhow::anyhow!("Setup API call timed out after 30 seconds"));
         }
-        
+
         println!("Attempting setup API call... (elapsed: {:.1}s)", start_time.elapsed().as_secs_f32());
-        
+
         match client
             .post(&url)
             .json(&setup_data)
@@ -648,11 +654,18 @@ async fn setup_node_0(docker: &Docker, mesh_id: u32, node_name: &str, runtime: s
             Ok(response) => {
                 let status = response.status();
                 let response_text = response.text().await.unwrap_or_else(|_| "No response body".to_string());
-                
+
                 if status == reqwest::StatusCode::CREATED {
                     println!("Node setup successful: {} Created", status);
                     println!("Response: {}", response_text);
-                    return Ok(());
+                    // Parse passphrase from JSON response
+                    let body: serde_json::Value = serde_json::from_str(&response_text)
+                        .map_err(|e| anyhow::anyhow!("Failed to parse setup response: {}", e))?;
+                    let passphrase = body.get("passphrase")
+                        .and_then(|p| p.as_str())
+                        .ok_or_else(|| anyhow::anyhow!("No passphrase in setup response"))?
+                        .to_string();
+                    return Ok(passphrase);
                 } else if status.is_server_error() || status.is_client_error() {
                     println!("Setup failed with status: {} - {}", status, response_text);
                     if start_time.elapsed() + retry_interval > timeout_duration {
@@ -672,7 +685,7 @@ async fn setup_node_0(docker: &Docker, mesh_id: u32, node_name: &str, runtime: s
                 }
             }
         }
-        
+
         // Wait before retrying
         tokio::time::sleep(retry_interval).await;
     }
@@ -690,9 +703,11 @@ pub async fn get_jwt_token(docker: &Docker, mesh_id: u32, node_id: u32, runtime:
 
     let login_url = format!("http://{}:{}/login", host, port);
     
+    let passphrase = load_mesh_passphrase(docker, mesh_id).await?;
+
     let login_data = json!({
         "username": "allison",
-        "password": "testing"
+        "passphrase": passphrase
     });
     
     let start_time = std::time::Instant::now();
@@ -1537,6 +1552,55 @@ pub async fn get_external_addresses(docker: &Docker, mesh_id: u32, runtime: sys:
             }
         })
         .collect())
+}
+
+const PASSPHRASE_PATH: &str = "/root/.local/share/hopnet/.passphrase";
+
+/// Store a mesh passphrase inside node 0's container volume.
+async fn store_mesh_passphrase(docker: &Docker, mesh_id: u32, passphrase: &str) -> Result<()> {
+    let container_name = format!("hopnet-orchestrator-{}-0", mesh_id);
+    let write_cmd = format!("echo '{}' > {}", passphrase, PASSPHRASE_PATH);
+    let exec_config = bollard::exec::CreateExecOptions::<String> {
+        cmd: Some(vec!["sh".into(), "-c".into(), write_cmd]),
+        attach_stdout: Some(false),
+        attach_stderr: Some(false),
+        ..Default::default()
+    };
+    let exec = docker.create_exec(&container_name, exec_config).await?;
+    let start_opts = bollard::exec::StartExecOptions { detach: true, ..Default::default() };
+    docker.start_exec(&exec.id, Some(start_opts)).await?;
+    // Brief pause to ensure the file is written before any subsequent read
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    Ok(())
+}
+
+/// Load the mesh passphrase from node 0's container volume.
+async fn load_mesh_passphrase(docker: &Docker, mesh_id: u32) -> Result<String> {
+    let container_name = format!("hopnet-orchestrator-{}-0", mesh_id);
+    let exec_config = bollard::exec::CreateExecOptions::<String> {
+        cmd: Some(vec!["cat".into(), PASSPHRASE_PATH.into()]),
+        attach_stdout: Some(true),
+        attach_stderr: Some(true),
+        ..Default::default()
+    };
+    let exec = docker.create_exec(&container_name, exec_config).await?;
+    let start_opts = bollard::exec::StartExecOptions { detach: false, ..Default::default() };
+    match docker.start_exec(&exec.id, Some(start_opts)).await? {
+        StartExecResults::Attached { mut output, .. } => {
+            let mut result = String::new();
+            while let Some(Ok(msg)) = output.next().await {
+                result.push_str(&msg.to_string());
+            }
+            let passphrase = result.trim().to_string();
+            if passphrase.is_empty() {
+                return Err(anyhow::anyhow!("No passphrase found in container for mesh {} (run setup first)", mesh_id));
+            }
+            Ok(passphrase)
+        }
+        StartExecResults::Detached => {
+            Err(anyhow::anyhow!("Unexpected detached exec result"))
+        }
+    }
 }
 
 /// Call a HopNet node API with authentication and optional retry

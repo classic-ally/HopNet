@@ -31,7 +31,6 @@ pub async fn get_users(
 #[derive(Serialize, Deserialize)]
 pub struct UserRequest {
     username: String,
-    password: String,
 }
 
 pub async fn post_users (
@@ -45,11 +44,14 @@ pub async fn post_users (
     let pubkey = PubKey(user_pub_key);
     let x25519_pubkey = crate::auth::derive_x25519_pubkey_from_user(&privkey);
 
-    // Wrap the user private key with the password (3-5s Argon2id)
-    let password = payload.password;
+    // Generate passphrase server-side
+    let passphrase = crate::passphrase::generate_passphrase();
+
+    // Wrap the user private key with the passphrase (3-5s Argon2id)
+    let passphrase_clone = passphrase.clone();
     let privkey_clone = privkey.clone();
     let wrap_result = tokio::task::spawn_blocking(move || {
-        crate::auth::wrap_user_privkey(&privkey_clone, &password)
+        crate::auth::wrap_user_privkey(&privkey_clone, &passphrase_clone)
             .map_err(|e| e.to_string())
     }).await;
 
@@ -82,7 +84,7 @@ pub async fn post_users (
             let transactions = vec![transaction];
 
             match consensus_middleware(&app_state, transactions).await {
-                Ok(()) => StatusCode::CREATED.into_response(),
+                Ok(()) => (StatusCode::CREATED, Json(hopnet_common::setup::PassphraseResponse { passphrase })).into_response(),
                 Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response()
             }
         }

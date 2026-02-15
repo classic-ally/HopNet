@@ -42,7 +42,7 @@ This accepts a trust tradeoff: the node sees the password and holds the unwrappe
 
 The `encrypted_privkey` blob is replicated to every node via consensus. Any node operator can extract it and attempt offline brute-force with zero rate-limiting or detection. The KDF parameters (Argon2id, 1 GiB memory, 3 iterations) constrain attackers to roughly 50-100 guesses/sec on serious GPU hardware — but weak user-chosen passwords still fall in minutes regardless of KDF strength.
 
-The mitigation is mandatory server-generated passphrases (Phase 1e): 7 words from the EFF large wordlist (~90 bits entropy). At 100 guesses/sec, exhausting 90 bits takes ~400 billion years. This eliminates the weak-password attack class entirely. Users treat the passphrase as a recovery phrase — on GUI devices with auto-login (Phase 1d), they rarely type it. On headless/roaming nodes, it's the primary authentication method.
+The mitigation is mandatory server-generated passphrases (Phase 1e): 8 words from the EFF large wordlist (~103.4 bits classical entropy / ~51.7 bits post-Grover). At 100 guesses/sec, exhausting 103 bits takes ~3.2 × 10²³ years. This eliminates the weak-password attack class entirely. Users treat the passphrase as a recovery phrase — on GUI devices with auto-login (Phase 1d), they rarely type it. On headless/roaming nodes, it's the primary authentication method.
 
 ### Device-forwarded crypto for untrusted roaming (Phase 2, future)
 
@@ -133,17 +133,17 @@ Remove `OnceCell`, rework join flow, add GUI auto-login, add logout endpoint.
 **Validation:** `cargo check` clean. Orchestrator tests pass without OnceCell. GUI auto-login works. Join flow works without user key transfer.
 
 ### Phase 1e: Generated Passphrase Migration
-**Status:** [ ] Not Started
+**Status:** [x] Complete
 
 Replace user-chosen passwords with mandatory server-generated passphrases. The `encrypted_privkey` blob is replicated to all nodes via consensus, making every node operator a potential offline attacker. Even with 1 GiB Argon2id, weak user-chosen passwords fall in minutes. Mandatory generation eliminates this class of vulnerability entirely.
 
-1. [ ] **Passphrase generation endpoint**: Server generates 7-word passphrases from the EFF large wordlist (7776 words, ~90 bits entropy). Bundle the wordlist as a static asset in Rust. The `/setup` and user creation endpoints generate the passphrase, perform hashing and key wrapping server-side, and return the passphrase to the frontend for display.
-2. [ ] **Setup flow UX**: Genesis setup presents the generated passphrase with a "write this down" confirmation page. After the user clicks "I've written it down", a second page asks them to enter 3 randomly-selected words by position ("Enter word #2", "Enter word #5", "Enter word #7"). Frontend validates locally against the passphrase received from the server. Setup only completes after successful verification.
-3. [ ] **User creation UX**: Same write-down-and-verify flow for new users created via the admin interface. The creating admin sees the passphrase to transmit out-of-band to the new user.
-4. [ ] **Login UX**: Login form accepts the passphrase as a space-separated string. Normalize whitespace and case on input. On GUI devices with auto-login (Phase 1d), users rarely type this — it functions as a recovery phrase.
-5. [ ] **Remove password choice**: Remove free-text password input from setup and user creation. The key wrapping KDF uses the generated passphrase. (`password_hash` column and `verify_password()` were already removed in Phase 1b — the Argon2id key unwrap is the sole authentication mechanism.)
+1. [x] **Passphrase generation module**: Server generates 8-word passphrases from the EFF large wordlist (7776 words, ~103.4 bits classical entropy / ~51.7 bits post-Grover). The wordlist is embedded as a `const` array in `src/passphrase.rs`. `normalize_passphrase()` lowercases and collapses whitespace for login tolerance. The `/setup` and user creation endpoints generate the passphrase, perform key wrapping server-side, and return the passphrase in a `PassphraseResponse` JSON body.
+2. [x] **Setup flow UX**: Genesis setup presents the generated passphrase with a "write this down" confirmation page (`PassphraseDisplay`). After the user clicks "I've written it down", a verification page (`PassphraseVerify`) asks them to enter 3 randomly-selected words by position. Frontend validates locally against the passphrase received from the server. Page reloads only after successful verification.
+3. [x] **User creation endpoint**: `POST /users` generates passphrase server-side and returns it in the response body. The creating admin sees the passphrase to transmit out-of-band to the new user.
+4. [x] **Login UX**: Login form accepts the passphrase as a space-separated string in a visible text field. Input is normalized (case-insensitive, whitespace-tolerant). On GUI devices with auto-login (Phase 1d), users rarely type this — it functions as a recovery phrase.
+5. [x] **Remove password choice**: Removed free-text password input from setup and user creation. `InitialSetupPayload` no longer contains `password`. `SignInData.password` renamed to `SignInData.passphrase`. `UserRequest` no longer contains `password`. Key wrapping uses the generated passphrase. `post_setup` now uses `spawn_blocking` for Argon2id (fixes latent bug where 3-5s Argon2id blocked tokio).
 
-**Validation:** Setup generates and confirms passphrase. Login accepts passphrase. Orchestrator tests updated for generated passphrases.
+**Validation:** `cargo check` clean. Passphrase generation and normalization unit tests pass. Auth wrap/unwrap round-trip tests pass with generated passphrases. Orchestrator updated to parse and store passphrases from setup response.
 
 ### Phase 1f: Orchestrator Validation
 **Status:** [ ] Not Started

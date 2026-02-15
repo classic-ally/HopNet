@@ -43,7 +43,7 @@ struct Claims {
 #[derive(Serialize, Deserialize)]
 pub struct SignInData {
     pub username: String,
-    pub password: String,
+    pub passphrase: String,
     pub remember_me: Option<bool>,
 }
 
@@ -162,12 +162,12 @@ pub async fn sign_in(
         .ok_or(AuthError { message: "Invalid credentials".into(), status_code: StatusCode::UNAUTHORIZED })?;
 
     // Unwrap private key — this IS the authentication (3-5s, 1 GiB Argon2id)
-    // If the password is wrong, ChaCha20-Poly1305 decryption fails
+    // If the passphrase is wrong, ChaCha20-Poly1305 decryption fails
     let encrypted_privkey = db_user.encrypted_privkey.clone();
     let key_salt = db_user.key_salt.clone();
-    let password = user_data.password;
+    let passphrase = crate::passphrase::normalize_passphrase(&user_data.passphrase);
     let privkey = tokio::task::spawn_blocking(move || {
-        unwrap_user_privkey(&encrypted_privkey, &key_salt, &password)
+        unwrap_user_privkey(&encrypted_privkey, &key_salt, &passphrase)
             .map_err(|e| e.to_string())
     }).await
         .map_err(|_| AuthError { message: "Internal error".into(), status_code: StatusCode::INTERNAL_SERVER_ERROR })?
@@ -431,6 +431,34 @@ mod tests {
         let result = unwrap_user_privkey(&encrypted, &salt, "wrong-password");
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_wrap_unwrap_with_generated_passphrase() {
+        let signing_key = SigningKey::from_bytes(&[42u8; 32]);
+        let privkey = PrivKey(signing_key);
+        let passphrase = crate::passphrase::generate_passphrase();
+
+        let (encrypted, salt) = wrap_user_privkey(&privkey, &passphrase).unwrap();
+        let recovered = unwrap_user_privkey(&encrypted, &salt, &passphrase).unwrap();
+
+        assert_eq!(privkey.0.to_bytes(), recovered.0.to_bytes());
+    }
+
+    #[test]
+    fn test_wrap_unwrap_with_normalized_passphrase() {
+        let signing_key = SigningKey::from_bytes(&[42u8; 32]);
+        let privkey = PrivKey(signing_key);
+        let passphrase = crate::passphrase::generate_passphrase();
+
+        let (encrypted, salt) = wrap_user_privkey(&privkey, &passphrase).unwrap();
+
+        // Mangle passphrase: uppercase + extra spaces
+        let mangled = passphrase.to_uppercase().replace(' ', "   ");
+        let normalized = crate::passphrase::normalize_passphrase(&mangled);
+        let recovered = unwrap_user_privkey(&encrypted, &salt, &normalized).unwrap();
+
+        assert_eq!(privkey.0.to_bytes(), recovered.0.to_bytes());
     }
 
     #[test]

@@ -2,6 +2,7 @@
 <!-- Transition Logic:
  1. InitialSetup, user chooses create or join
  2. Creation flow, user chooses forward or backwards
+ 3. After setup POST, passphrase display → verify → reload
 -->
 
 <script lang="ts">
@@ -9,7 +10,9 @@
     import ConfirmPane from "./ConfirmPane.svelte";
     import CreateNetwork from "./CreateNetwork.svelte";
     import InitialSetup from "./InitialSetup.svelte";
-    import JoinQr from "./Setup/JoinQR.svelte";
+    import JoinQr from "./JoinQR.svelte";
+    import PassphraseDisplay from "./PassphraseDisplay.svelte";
+    import PassphraseVerify from "./PassphraseVerify.svelte";
     let initialSetup = true;
 
     // pane 1
@@ -23,10 +26,14 @@
     // pane 3
     let confirmSelections = false;
 
+    // pane 4 - passphrase flow
+    let passphraseDisplay = false;
+    let passphraseVerify = false;
+
     // State variables for user data
     let username = '';
-    let password = '';
     let computername = '';
+    let passphrase = '';
 
 </script>
 
@@ -46,7 +53,6 @@
       {#if createNetwork}
         <CreateNetwork
           bind:username
-          bind:password
           onBackButton={() => {
             initialSetup = true;
             createNetwork = false;
@@ -91,14 +97,32 @@
       {#if confirmSelections}
             <ConfirmPane
               username={username}
-              password={password}
               computername={computername}
               onBackButton={() => {
                 configureDevice = true;
                 confirmSelections = false;
               }}
-              onSetupComplete={() => {
-                // Setup completed, page will reload automatically
+              onSetupComplete={(pp) => {
+                passphrase = pp;
+                confirmSelections = false;
+                passphraseDisplay = true;
+              }}
+            />
+      {/if}
+      {#if passphraseDisplay}
+            <PassphraseDisplay
+              passphrase={passphrase}
+              onContinue={() => {
+                passphraseDisplay = false;
+                passphraseVerify = true;
+              }}
+            />
+      {/if}
+      {#if passphraseVerify}
+            <PassphraseVerify
+              passphrase={passphrase}
+              onVerified={() => {
+                window.location.reload();
               }}
             />
       {/if}

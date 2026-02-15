@@ -1,7 +1,7 @@
 <script lang="ts">
-    import Button from "./Button.svelte";
-    import EntryRow from "./EntryRow.svelte";
-    import SetupPane from "./SetupPane.svelte";
+    import Button from "../../Button.svelte";
+    import EntryRow from "../../EntryRow.svelte";
+    import SetupPane from "../../SetupPane.svelte";
 
     export let onBackButton: () => void;
     export let onForwardButton: () => void;
