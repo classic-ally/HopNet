@@ -1,13 +1,11 @@
 <script lang="ts">
     import { onMount } from 'svelte';
-    import EntryRow from "../EntryRow.svelte";
     import SetupPane from "../SetupPane.svelte";
     import QrCode from "svelte-qrcode";
-    import { API_BASE_URL, BACKEND_PORT } from '../stores';
+    import { API_BASE_URL } from '../stores';
 
     // Props from previous setup page
     export let name: string;
-    export let ip_address: string;
 
     let manualInfoExpanded = false;
     let pubkey: string = '';
@@ -17,8 +15,6 @@
     // Connection info object for QR code
     $: connectionInfo = {
         name,
-        ip_address,
-        port: BACKEND_PORT,
         pubkey
     };
 
@@ -87,14 +83,6 @@
                     <div class="flex gap-2 items-center">
                         <p class="text-muted flex-grow">Name</p>
                         <p class="text-white text-xs font-mono">{name}</p>
-                    </div>
-                    <div class="flex gap-2 items-center">
-                        <p class="text-muted flex-grow">IP Address</p>
-                        <p class="text-white text-xs font-mono">{ip_address}</p>
-                    </div>
-                    <div class="flex gap-2 items-center">
-                        <p class="text-muted flex-grow">Port</p>
-                        <p class="text-white text-xs font-mono">{BACKEND_PORT}</p>
                     </div>
                     <div>
                         <p class="text-muted">Public Key</p>

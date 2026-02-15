@@ -229,6 +229,23 @@ async fn handle_stream(
                 IrohRequest::FragmentStore(req) => {
                     crate::files::rpc::handle_fragment_store(req, &app_state).await
                 }
+                IrohRequest::LatencyPing(req) => {
+                    IrohResponse::LatencyPong(
+                        crate::metrics::rpc::handle_latency_ping(req)
+                    )
+                }
+                IrohRequest::ThroughputUpload(_) => {
+                    IrohResponse::ThroughputAck(crate::metrics::rpc::ThroughputAckResponse)
+                }
+                IrohRequest::StorageQuery(_) => {
+                    crate::metrics::rpc::handle_storage_query(&app_state).await
+                }
+                IrohRequest::JoinDeliver(req) => {
+                    match crate::setup::process_join_info(&app_state, req.join_info).await {
+                        Ok(()) => IrohResponse::JoinAck(crate::setup::JoinAckResponse { success: true }),
+                        Err(e) => IrohResponse::Error { message: format!("join failed: {}", e) },
+                    }
+                }
             };
 
             encode_message(&response)

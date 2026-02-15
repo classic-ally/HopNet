@@ -381,8 +381,6 @@ impl FromSql for PrivKey {
 pub struct Node {
     pub node_id: i32,
     pub name: String,
-    pub ip_address: String,
-    pub port: i32,
     pub owner: i32, // userid corresponding to owner
     pub pubkey: PubKey,
 }
@@ -451,8 +449,6 @@ pub struct Sequence {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConnectionInfo {
     pub node_id: i32,
-    pub ip_address: String,
-    pub port: i32,
     pub pubkey: PubKey,
 }
 

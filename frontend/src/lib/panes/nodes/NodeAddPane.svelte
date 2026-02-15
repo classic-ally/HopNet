@@ -20,8 +20,6 @@
     }: NodeAddProps = $props();
 
     let name = $state('');
-    let ip = $state('');
-    let port = $state('');
     let publicKey = $state('');
     let isAdding = $state(false);
     let addError = $state('');
@@ -49,17 +47,7 @@
 
     function validateInputs(): boolean {
         if (!name.trim()) return false;
-        if (!ip.trim()) return false;
-        if (!port.trim()) return false;
         if (!publicKey.trim()) return false;
-
-        // Basic IP validation (could be enhanced)
-        const ipPattern = /^(\d{1,3}\.){3}\d{1,3}$/;
-        if (!ipPattern.test(ip)) return false;
-
-        // Port validation
-        const portNum = parseInt(port);
-        if (isNaN(portNum) || portNum < 1 || portNum > 65535) return false;
 
         // Public key validation (should be hex string)
         if (!/^[0-9a-fA-F]+$/.test(publicKey.trim())) return false;
@@ -69,8 +57,6 @@
 
     function handleClose() {
         name = '';
-        ip = '';
-        port = '';
         publicKey = '';
         addError = '';
         onClose();
@@ -97,10 +83,7 @@
 
         try {
             const nodeData = {
-                node_id: 0, // Will be assigned by backend
                 name: name.trim(),
-                ip_address: ip.trim(),
-                port: parseInt(port),
                 owner: userId,
                 pubkey: publicKey.trim()
             };
@@ -153,34 +136,6 @@
                 disabled={isAdding}
                 onkeydown={handleKeydown}
                 oninput={(e: Event) => name = (e.target as HTMLInputElement).value}
-            />
-        </div>
-
-        <!-- IP Address Input -->
-        <div class="space-y-2">
-            <div class="block text-sm font-medium text-subtitle">
-                IP Address
-            </div>
-            <TextInput
-                value={ip}
-                placeholder="e.g., 192.168.1.100"
-                disabled={isAdding}
-                onkeydown={handleKeydown}
-                oninput={(e: Event) => ip = (e.target as HTMLInputElement).value}
-            />
-        </div>
-
-        <!-- Port Input -->
-        <div class="space-y-2">
-            <div class="block text-sm font-medium text-subtitle">
-                Port
-            </div>
-            <TextInput
-                value={port}
-                placeholder="e.g., 34633"
-                disabled={isAdding}
-                onkeydown={handleKeydown}
-                oninput={(e: Event) => port = (e.target as HTMLInputElement).value}
             />
         </div>
 

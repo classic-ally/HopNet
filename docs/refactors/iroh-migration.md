@@ -250,18 +250,20 @@ Buffered request-response fragment transfers over iroh (fragments ~4MB, within 8
 ---
 
 ## Phase 5: Deprecate HTTP Inter-Node
-**Status:** [ ] Not Started
+**Status:** [x] Complete
 
-Remove HTTP for node-to-node communication:
+Removed HTTP for node-to-node communication and eliminated IP address/port from the data model:
 
-- [ ] Remove HTTP inter-node routes
-- [ ] Remove `reqwest` client creation for inter-node calls
-- [ ] Keep HTTP for client-facing APIs (or migrate later)
-- [ ] Update orchestrator container networking (iroh handles NAT)
+- [x] Phase 5a: Remove dead HTTP inter-node routes (view sync, fragment fetch/store, fetch-fragments)
+- [x] Phase 5b: Migrate metrics (latency, throughput, storage) from HTTP+TCP to iroh RPC
+- [x] Phase 5c: Migrate node bootstrap from HTTP to iroh (push model preserved, setup-mode PeerValidator bypass)
+- [x] Phase 5d: Remove `ip_address` and `port` from DB schema, `Node` struct, `NodeConnectionInfo`, `NodeMetrics`, `Phase2Candidate`, all SQL queries
+- [x] Phase 5e: Replace `reqwest::StatusCode` with `axum::http::StatusCode` in main crate, update documentation
 
 **Validation:**
-- Full test suite passes
-- No HTTP inter-node traffic in logs
+- `cargo check` passes on all workspace members
+- No `ip_address` references remain in source code
+- `reqwest` only used in integration test HTTP client (legitimate use)
 
 ---
 

@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use crate::files::rpc as files_rpc;
 use crate::consensus::rpc as consensus_rpc;
+use crate::metrics::rpc as metrics_rpc;
+use crate::setup;
 
 /// Request envelope for all iroh communication
 #[derive(Serialize, Deserialize, Debug)]
@@ -27,6 +29,14 @@ pub enum IrohRequest {
     FragmentFetch(files_rpc::FragmentFetchRequest),
     /// Store a fragment on a remote node
     FragmentStore(files_rpc::FragmentStoreRequest),
+    /// Latency ping (echo timestamp back for RTT measurement)
+    LatencyPing(metrics_rpc::LatencyPingRequest),
+    /// Upload throughput data chunk (server acks, client measures speed)
+    ThroughputUpload(metrics_rpc::ThroughputUploadRequest),
+    /// Query remote node's storage usage
+    StorageQuery(metrics_rpc::StorageQueryRequest),
+    /// Deliver JoinInfo to a joining node (coordinator → new node)
+    JoinDeliver(setup::JoinDeliverRequest),
 }
 
 /// Response envelope for all iroh communication
@@ -54,6 +64,14 @@ pub enum IrohResponse {
     FragmentFetchResponse(files_rpc::FragmentFetchResponse),
     /// Fragment store result
     FragmentStoreResponse(files_rpc::FragmentStoreResponse),
+    /// Latency pong (echoed timestamp)
+    LatencyPong(metrics_rpc::LatencyPongResponse),
+    /// Ack for throughput upload chunk
+    ThroughputAck(metrics_rpc::ThroughputAckResponse),
+    /// Storage query result
+    StorageResult(metrics_rpc::StorageResultResponse),
+    /// Ack for JoinDeliver
+    JoinAck(setup::JoinAckResponse),
     /// Error response
     Error { message: String },
 }
@@ -69,7 +87,7 @@ impl IrohRequest {
             IrohRequest::TcBroadcast(req) => Some(req.tc.view_number),
             IrohRequest::QcBroadcast(req) => Some(req.qc.view_number),
             IrohRequest::TransactionForward(req) => Some(req.view),
-            _ => None, // Ping, FragmentHealthCheck, FragmentFetch, FragmentStore, ViewDataFetch, ViewPoll
+            _ => None, // Ping, Fragment*, ViewDataFetch, ViewPoll, Latency*, Throughput*, StorageQuery
         }
     }
 }

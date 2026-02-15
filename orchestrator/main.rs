@@ -295,7 +295,7 @@ async fn create_mesh(docker: &Docker, mesh_id: u32, node_count: u32, no_cleanup:
             // Setup node 0 if it exists
             if let Some((container_name, _container_id, ip_address)) = containers.first() {
                 println!("Setting up node 0 at IP: {} (host port: {})", ip_address, 40000 + (mesh_id * 500));
-                if let Err(e) = setup_node_0(docker, mesh_id, &container_name, &ip_address, runtime).await {
+                if let Err(e) = setup_node_0(docker, mesh_id, &container_name, runtime).await {
                     println!("Failed to setup node 0: {}", e);
                     
                     if no_cleanup {
@@ -333,12 +333,11 @@ async fn create_mesh(docker: &Docker, mesh_id: u32, node_count: u32, no_cleanup:
                 
                 // Register additional nodes (1, 2, 3...) with node 0
                 if containers.len() > 1 {
-                    let node_0_ip = ip_address;
-                    for (node_index, (container_name, _container_id, node_ip)) in containers.iter().enumerate().skip(1) {
+                    for (node_index, (container_name, _container_id, _node_ip)) in containers.iter().enumerate().skip(1) {
                         let node_id = node_index as u32; // node_id starts from 1 for additional nodes
                         println!("Registering node {} ({}) with node 0...", node_id, container_name);
 
-                        if let Err(e) = register_node_with_node_0(docker, mesh_id, node_0_ip, node_id, container_name, node_ip, runtime).await {
+                        if let Err(e) = register_node_with_node_0(docker, mesh_id, node_id, container_name, runtime).await {
                             println!("Failed to register node {}: {}", node_id, e);
                             
                             if no_cleanup {
@@ -423,28 +422,6 @@ async fn add_nodes_to_mesh(docker: &Docker, mesh_id: u32, node_count: u32, runti
         return Err(anyhow::anyhow!("Network for mesh {} not found", mesh_id));
     }
 
-    // Get node 0's IP address (needed for registration)
-    let node_0_ip = {
-        let node_0_container = existing_containers.iter()
-            .find(|c| {
-                c.names.as_ref().map_or(false, |names| {
-                    names.iter().any(|n| n.ends_with("-0"))
-                })
-            })
-            .ok_or_else(|| anyhow::anyhow!("Node 0 not found in mesh {}", mesh_id))?;
-
-        let container_id = node_0_container.id.as_ref().unwrap();
-        let container_info = docker.inspect_container(container_id, None::<bollard::container::InspectContainerOptions>).await?;
-
-        container_info.network_settings
-            .and_then(|ns| ns.networks)
-            .and_then(|networks| networks.get(&network_name).cloned())
-            .and_then(|endpoint| endpoint.ip_address)
-            .ok_or_else(|| anyhow::anyhow!("Could not get node 0 IP address"))?
-    };
-
-    println!("Node 0 IP address: {}", node_0_ip);
-
     // Create new containers
     let mut new_containers: Vec<(String, String, String)> = Vec::new(); // (name, id, ip)
 
@@ -470,14 +447,14 @@ async fn add_nodes_to_mesh(docker: &Docker, mesh_id: u32, node_count: u32, runti
     tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
     // Register new nodes with node 0 (triggers catch-up based bootstrap)
-    for (container_name, _container_id, node_ip) in &new_containers {
+    for (container_name, _container_id, _node_ip) in &new_containers {
         // Extract node_id from container name
         let parts: Vec<&str> = container_name.split('-').collect();
         let node_id: u32 = parts[3].parse().unwrap();
 
         println!("Registering node {} ({}) with node 0...", node_id, container_name);
 
-        if let Err(e) = register_node_with_node_0(docker, mesh_id, &node_0_ip, node_id, container_name, node_ip, runtime).await {
+        if let Err(e) = register_node_with_node_0(docker, mesh_id, node_id, container_name, runtime).await {
             println!("Failed to register node {}: {}", node_id, e);
             return Err(anyhow::anyhow!("Node registration failed: {}", e));
         }
@@ -629,7 +606,7 @@ async fn create_hopnet_container(
     Ok((container_id, ip_address))
 }
 
-async fn setup_node_0(docker: &Docker, mesh_id: u32, node_name: &str, ip_address: &str, runtime: sys::ContainerRuntime) -> Result<()> {
+async fn setup_node_0(docker: &Docker, mesh_id: u32, node_name: &str, runtime: sys::ContainerRuntime) -> Result<()> {
     let client = reqwest::Client::new();
 
     // Get runtime-aware connection info for node 0
@@ -645,8 +622,6 @@ async fn setup_node_0(docker: &Docker, mesh_id: u32, node_name: &str, ip_address
         "username": "allison",
         "password": "testing",
         "node_name": node_name,
-        "ip_address": ip_address,  // Container still uses its internal IP for node-to-node communication
-        "port": 34633
     });
     
     println!("Calling setup API at: {}", url);
@@ -762,7 +737,7 @@ pub async fn get_jwt_token(docker: &Docker, mesh_id: u32, node_id: u32, runtime:
     }
 }
 
-async fn register_node_with_node_0(docker: &Docker, mesh_id: u32, node_0_ip: &str, node_id: u32, node_name: &str, node_ip: &str, runtime: sys::ContainerRuntime) -> Result<()> {
+async fn register_node_with_node_0(docker: &Docker, mesh_id: u32, node_id: u32, node_name: &str, runtime: sys::ContainerRuntime) -> Result<()> {
     let client = reqwest::Client::new();
 
     // Get runtime-aware connection info for this node
@@ -782,7 +757,7 @@ async fn register_node_with_node_0(docker: &Docker, mesh_id: u32, node_0_ip: &st
     
     let pub_key = loop {
         if start_time.elapsed() > timeout_duration {
-            return Err(anyhow::anyhow!("Failed to retrieve public key from node {} after 15 seconds", node_ip));
+            return Err(anyhow::anyhow!("Failed to retrieve public key from node {} after 15 seconds", node_id));
         }
         
         match client.get(&get_setup_url).timeout(tokio::time::Duration::from_secs(3)).send().await {
@@ -815,7 +790,7 @@ async fn register_node_with_node_0(docker: &Docker, mesh_id: u32, node_0_ip: &st
         }
         
         if start_time.elapsed() + retry_interval > timeout_duration {
-            return Err(anyhow::anyhow!("Failed to retrieve public key from node {} after retries", node_ip));
+            return Err(anyhow::anyhow!("Failed to retrieve public key from node {} after retries", node_id));
         }
         
         tokio::time::sleep(retry_interval).await;
@@ -832,10 +807,7 @@ async fn register_node_with_node_0(docker: &Docker, mesh_id: u32, node_0_ip: &st
         .ok_or_else(|| anyhow::anyhow!("Node 0 not found"))?;
     let register_url = format!("http://{}:{}/nodes", node_0_host, node_0_port);
     let node_data = json!({
-        "node_id": node_id,
         "name": node_name,
-        "ip_address": node_ip,
-        "port": 34633,
         "owner": 0,
         "pubkey": pub_key
     });
@@ -844,19 +816,19 @@ async fn register_node_with_node_0(docker: &Docker, mesh_id: u32, node_0_ip: &st
     println!("  Node data: {}", node_data);
     
     let start_time = std::time::Instant::now();
-    let timeout_duration = std::time::Duration::from_secs(15);
-    let retry_interval = std::time::Duration::from_millis(500);
-    
+    let timeout_duration = std::time::Duration::from_secs(30);
+    let retry_interval = std::time::Duration::from_secs(2);
+
     loop {
         if start_time.elapsed() > timeout_duration {
-            return Err(anyhow::anyhow!("Node registration timed out after 15 seconds"));
+            return Err(anyhow::anyhow!("Node registration timed out after 30 seconds"));
         }
-        
+
         match client
             .post(&register_url)
             .header("Authorization", format!("Bearer {}", jwt_token))
             .json(&node_data)
-            .timeout(tokio::time::Duration::from_secs(3))
+            .timeout(tokio::time::Duration::from_secs(10))
             .send()
             .await
         {
@@ -868,8 +840,10 @@ async fn register_node_with_node_0(docker: &Docker, mesh_id: u32, node_0_ip: &st
                     println!("  Node registration successful: {} Created", status);
                     println!("  Response: {}", response_text);
                     return Ok(());
+                } else if status == reqwest::StatusCode::GATEWAY_TIMEOUT {
+                    // 504 means iroh ping timed out — node discovery may still be in progress
+                    println!("  Registration returned 504 (iroh discovery pending, retrying...)");
                 } else {
-                    // Don't retry on HTTP error responses - the request was received and processed
                     println!("  Registration failed with status: {} - {}", status, response_text);
                     return Err(anyhow::anyhow!("Node registration failed with status: {} - {}", status, response_text));
                 }
@@ -881,7 +855,7 @@ async fn register_node_with_node_0(docker: &Docker, mesh_id: u32, node_0_ip: &st
                 }
             }
         }
-        
+
         tokio::time::sleep(retry_interval).await;
     }
 }

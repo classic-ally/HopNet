@@ -9,8 +9,6 @@
     interface Node {
         node_id: number;
         name: string;
-        ip_address: string;
-        port: number;
         owner: number;
     }
 
@@ -177,7 +175,6 @@
                     <tr class="text-subtitle">
                         <Th></Th>
                         <ThSort {table} field="name">Name</ThSort>
-                        <Th>IP</Th>
                         <ThSort {table} field="owner">Owner</ThSort>
                     </tr>
                 </thead>
@@ -191,12 +188,11 @@
                                 >
                             </td>
                             <td class="">{row.name}</td>
-                            <td class="">{row.ip_address}</td>
                             <td class="">{row.owner}</td>
                         </tr>
                     {:else}
                         <tr>
-                            <td colspan="4" class="text-center text-muted p-4">
+                            <td colspan="3" class="text-center text-muted p-4">
                                 No nodes found
                             </td>
                         </tr>

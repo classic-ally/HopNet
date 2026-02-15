@@ -4,16 +4,9 @@
     import EntryRow from './EntryRow.svelte';
     import { API_BASE_URL } from './stores';
 
-    interface Props {
-        username?: string;
-        computername?: string;
-        ip?: string;
-    }
-
     export let username: string;
     export let password: string;
     export let computername: string;
-    export let ip: string;
 
     export let onBackButton: () => void;
     export let onSetupComplete: () => void;
@@ -26,13 +19,11 @@
         errorMessage = '';
         
         try {
-            // Create the simplified setup payload matching the backend InitialSetupPayload structure
+            // Create the setup payload matching the backend InitialSetupPayload structure
             const setupData = {
                 username: username,
                 password: password, // Will be hashed on backend
                 node_name: computername,
-                ip_address: ip,
-                port: 34632 // Default port from main.rs
             };
 
             const response = await fetch(`${API_BASE_URL}/setup`, {
@@ -77,13 +68,6 @@
             title="Device name"
             password={false}
             value={computername}
-            readonly={true}
-        />
-        <EntryRow
-            icon="i-carbon-plug"
-            title="IP Address"
-            password={false}
-            value={ip}
             readonly={true}
         />
     {/snippet}

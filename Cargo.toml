@@ -38,7 +38,6 @@ include_dir = "0.7.4"
 tower-http = { version = "0.6.6", features = ["cors", "trace"] }
 duckdb = { version = "1.4.1", features = ["bundled", "r2d2"] }
 r2d2 = "0.8.10"
-network-interface = { version = "2.0.1", features = ["serde"] }
 argon2 = {version = "0.5.3", features = ["std"] }
 jsonwebtoken = "9.3.1"
 ed25519-dalek = { version = "2.1.1", features = ["rand_core", "batch", "serde"] }

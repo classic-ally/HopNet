@@ -16,8 +16,6 @@ pub struct IrohRejectUnknown;
 struct Node {
     node_id: i32,
     name: String,
-    ip_address: String,
-    port: i32,
     owner: i32,
     pubkey: String, // Hex-encoded Ed25519 public key
 }

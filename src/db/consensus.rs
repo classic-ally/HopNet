@@ -39,7 +39,7 @@ pub fn get_consensus_with_conn(
                     ) + 1
                 )
                 SELECT
-                    n.node_id, n.name, n.ip_address, n.port, n.owner, n.pubkey, t.current_view, t.current_phase, t.last_timeout_vote_view,
+                    n.node_id, n.name, n.owner, n.pubkey, t.current_view, t.current_phase, t.last_timeout_vote_view,
                     t.last_propose_vote_block_hash, t.highest_qc_phase,
                     -- Prepared block data (excluding transactions for performance)
                     pb.block_hash AS prepared_hash, pb.height AS prepared_height,
@@ -59,18 +59,16 @@ pub fn get_consensus_with_conn(
             ).map_err(|_| DatabaseError::RecallError)?;
             
             let result = stmt.query_row([], |row| {
-                // Leader node data
+                // Leader node data (columns: node_id, name, owner, pubkey, current_view, ...)
                 let node_id: i32 = row.get(0)?;
                 let name: String = row.get(1)?;
-                let ip_address: String = row.get(2)?;
-                let port: i32 = row.get(3)?;
-                let owner: i32 = row.get(4)?;
-                let pubkey: PubKey = row.get(5)?;
-                let current_view: i32 = row.get(6)?;
-                let current_phase: ConsensusPhase = row.get(7)?;
-                let last_timeout_vote_view: i32 = row.get(8)?;
-                let last_propose_vote_block_hash: Option<Blake3Hash> = row.get(9)?;
-                let highest_qc_phase: Option<ConsensusPhase> = row.get(10)?;
+                let owner: i32 = row.get(2)?;
+                let pubkey: PubKey = row.get(3)?;
+                let current_view: i32 = row.get(4)?;
+                let current_phase: ConsensusPhase = row.get(5)?;
+                let last_timeout_vote_view: i32 = row.get(6)?;
+                let last_propose_vote_block_hash: Option<Blake3Hash> = row.get(7)?;
+                let highest_qc_phase: Option<ConsensusPhase> = row.get(8)?;
 
                 // Helper function to build block from row data (without transactions)
                 let build_block = |hash_col: usize, height_col: usize, view_col: usize, parent_col: usize| -> Result<Option<Block>, duckdb::Error> {
@@ -94,24 +92,21 @@ pub fn get_consensus_with_conn(
                     }
                 };
 
-                // Build blocks (column indices: prepared=11-14, committed=15-18, highest_qc=19-22)
-                let prepared_block = build_block(11, 12, 13, 14)?;
-                let committed_block = build_block(15, 16, 17, 18)?;
-                let highest_qc_block = build_block(19, 20, 21, 22)?;
+                // Build blocks (column indices: prepared=9-12, committed=13-16, highest_qc=17-20)
+                let prepared_block = build_block(9, 10, 11, 12)?;
+                let committed_block = build_block(13, 14, 15, 16)?;
+                let highest_qc_block = build_block(17, 18, 19, 20)?;
 
-                Ok((node_id, name, ip_address, port, owner, pubkey, current_view, current_phase, last_timeout_vote_view,
+                Ok((node_id, name, owner, pubkey, current_view, current_phase, last_timeout_vote_view,
                     last_propose_vote_block_hash, highest_qc_phase, prepared_block, committed_block, highest_qc_block))
             }).map_err(|_| DatabaseError::RecallError)?;
 
-            let (node_id, name, ip_address, port, owner, pubkey, current_view, current_phase, last_timeout_vote_view,
+            let (node_id, name, owner, pubkey, current_view, current_phase, last_timeout_vote_view,
                  last_propose_vote_block_hash, highest_qc_phase, prepared_block, committed_block, highest_qc_block) = result;
-            
-            let pubkey = pubkey;
+
             let leader = crate::types::Node {
                 node_id,
                 name,
-                ip_address,
-                port,
                 owner,
                 pubkey,
             };
@@ -259,27 +254,18 @@ pub fn get_leader_for_view_tx(
                 ? % (SELECT COUNT(*) FROM active_validators)
             ) + 1
         )
-        SELECT n.node_id, n.name, n.ip_address, n.port, n.owner, n.pubkey
+        SELECT n.node_id, n.name, n.owner, n.pubkey
         FROM leader_selection ls
         JOIN nodes n ON ls.node_id = n.node_id
         "
     ).map_err(|_| DatabaseError::RecallError)?;
 
     let result = stmt.query_row([height, view], |row| {
-        let node_id: i32 = row.get(0)?;
-        let name: String = row.get(1)?;
-        let ip_address: String = row.get(2)?;
-        let port: i32 = row.get(3)?;
-        let owner: i32 = row.get(4)?;
-        let pubkey: PubKey = row.get(5)?;
-
         Ok(Node {
-            node_id,
-            name,
-            ip_address,
-            port,
-            owner,
-            pubkey,
+            node_id: row.get(0)?,
+            name: row.get(1)?,
+            owner: row.get(2)?,
+            pubkey: row.get(3)?,
         })
     });
 
@@ -382,27 +368,18 @@ pub fn get_validators(
                         AND v.effective_height = le.max_eff
                     WHERE v.is_active = true
                 )
-                SELECT n.node_id, n.name, n.ip_address, n.port, n.owner, n.pubkey
+                SELECT n.node_id, n.name, n.owner, n.pubkey
                 FROM active_validators av
                 JOIN nodes n ON av.node_id = n.node_id;
                 "
             ).map_err(|_| DatabaseError::RecallError)?;
-            
-            let results = stmt.query_map([height], |row| {
-                let node_id: i32 = row.get(0)?;
-                let name: String = row.get(1)?;
-                let ip_address: String = row.get(2)?;
-                let port: i32 = row.get(3)?;
-                let owner: i32 = row.get(4)?;
-                let pubkey: PubKey = row.get(5)?;
 
+            let results = stmt.query_map([height], |row| {
                 Ok(Node {
-                    node_id,
-                    name,
-                    ip_address,
-                    port,
-                    owner,
-                    pubkey,
+                    node_id: row.get(0)?,
+                    name: row.get(1)?,
+                    owner: row.get(2)?,
+                    pubkey: row.get(3)?,
                 })
             });
 
@@ -437,27 +414,18 @@ pub fn get_validators_elect(
                     FROM validators
                     WHERE effective_height > ? AND is_active = true
                 )
-                SELECT n.node_id, n.name, n.ip_address, n.port, n.owner, n.pubkey
+                SELECT n.node_id, n.name, n.owner, n.pubkey
                 FROM validators_elect ve
                 JOIN nodes n ON ve.node_id = n.node_id;
                 "
             ).map_err(|_| DatabaseError::RecallError)?;
-            
-            let results = stmt.query_map([current_height], |row| {
-                let node_id: i32 = row.get(0)?;
-                let name: String = row.get(1)?;
-                let ip_address: String = row.get(2)?;
-                let port: i32 = row.get(3)?;
-                let owner: i32 = row.get(4)?;
-                let pubkey: PubKey = row.get(5)?;
 
+            let results = stmt.query_map([current_height], |row| {
                 Ok(Node {
-                    node_id,
-                    name,
-                    ip_address,
-                    port,
-                    owner,
-                    pubkey,
+                    node_id: row.get(0)?,
+                    name: row.get(1)?,
+                    owner: row.get(2)?,
+                    pubkey: row.get(3)?,
                 })
             });
 
@@ -1192,15 +1160,15 @@ mod tests {
 
         // Insert test nodes
         conn.execute(
-            "INSERT INTO nodes (node_id, name, ip_address, port, owner, pubkey)
-             VALUES (?, ?, ?, ?, ?, ?)",
-            params![1, "node1", "127.0.0.1", 8001, 1, &node1_pubkey]
+            "INSERT INTO nodes (node_id, name, owner, pubkey)
+             VALUES (?, ?, ?, ?)",
+            params![1, "node1", 1, &node1_pubkey]
         ).unwrap();
 
         conn.execute(
-            "INSERT INTO nodes (node_id, name, ip_address, port, owner, pubkey)
-             VALUES (?, ?, ?, ?, ?, ?)",
-            params![2, "node2", "127.0.0.2", 8002, 1, &node2_pubkey]
+            "INSERT INTO nodes (node_id, name, owner, pubkey)
+             VALUES (?, ?, ?, ?)",
+            params![2, "node2", 1, &node2_pubkey]
         ).unwrap();
 
         // Activate validators at different heights
@@ -1224,9 +1192,6 @@ mod tests {
         let validators = get_validators(pool.get(), 15).unwrap();
         assert_eq!(validators.len(), 1);
         assert_eq!(validators[0].node_id, 1);
-        assert_eq!(validators[0].ip_address, "127.0.0.1");
-        assert_eq!(validators[0].port, 8001);
-
         // At height 25: both nodes active
         let validators = get_validators(pool.get(), 25).unwrap();
         assert_eq!(validators.len(), 2);
@@ -1251,9 +1216,9 @@ mod tests {
         ).unwrap();
 
         conn.execute(
-            "INSERT INTO nodes (node_id, name, ip_address, port, owner, pubkey)
-             VALUES (?, ?, ?, ?, ?, ?)",
-            params![1, "node1", "127.0.0.1", 8001, 1, &node_pubkey]
+            "INSERT INTO nodes (node_id, name, owner, pubkey)
+             VALUES (?, ?, ?, ?)",
+            params![1, "node1", 1, &node_pubkey]
         ).unwrap();
 
         // Activate at height 10, deactivate at height 30
@@ -1295,9 +1260,9 @@ mod tests {
         ).unwrap();
 
         conn.execute(
-            "INSERT INTO nodes (node_id, name, ip_address, port, owner, pubkey)
-             VALUES (?, ?, ?, ?, ?, ?)",
-            params![1, "node1", "127.0.0.1", 8001, 1, &node_pubkey]
+            "INSERT INTO nodes (node_id, name, owner, pubkey)
+             VALUES (?, ?, ?, ?)",
+            params![1, "node1", 1, &node_pubkey]
         ).unwrap();
 
         // Activate, deactivate, reactivate
@@ -1349,9 +1314,9 @@ mod tests {
         for i in 1..=5 {
             let node_pubkey = generate_test_pubkey();
             conn.execute(
-                "INSERT INTO nodes (node_id, name, ip_address, port, owner, pubkey)
-                 VALUES (?, ?, ?, ?, ?, ?)",
-                params![i, format!("node{}", i), format!("127.0.0.{}", i), 8000 + i, 1, &node_pubkey]
+                "INSERT INTO nodes (node_id, name, owner, pubkey)
+                 VALUES (?, ?, ?, ?)",
+                params![i, format!("node{}", i), 1, &node_pubkey]
             ).unwrap();
 
             // All activate at height 10
@@ -1402,9 +1367,9 @@ mod tests {
         ).unwrap();
 
         conn.execute(
-            "INSERT INTO nodes (node_id, name, ip_address, port, owner, pubkey)
-             VALUES (?, ?, ?, ?, ?, ?)",
-            params![1, "node1", "127.0.0.1", 8001, 1, &node_pubkey]
+            "INSERT INTO nodes (node_id, name, owner, pubkey)
+             VALUES (?, ?, ?, ?)",
+            params![1, "node1", 1, &node_pubkey]
         ).unwrap();
 
         // Activate at height 10

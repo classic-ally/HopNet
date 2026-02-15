@@ -2821,7 +2821,6 @@ dependencies = [
  "iroh",
  "jsonwebtoken",
  "mime_guess",
- "network-interface",
  "objc2 0.6.2",
  "objc2-file-provider",
  "objc2-foundation 0.3.1",
@@ -4290,19 +4289,6 @@ dependencies = [
  "windows 0.62.2",
  "windows-result 0.4.1",
  "wmi",
-]
-
-[[package]]
-name = "network-interface"
-version = "2.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07709a6d4eba90ab10ec170a0530b3aafc81cb8a2d380e4423ae41fc55fe5745"
-dependencies = [
- "cc",
- "libc",
- "serde",
- "thiserror 2.0.16",
- "winapi",
 ]
 
 [[package]]

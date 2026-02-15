@@ -106,8 +106,6 @@ pub async fn find_fragment(
             node_metrics.into_iter()
                 .map(|m| NodeConnectionInfo {
                     node_id: m.node_id,
-                    ip_address: m.ip_address,
-                    port: m.port,
                     pubkey: m.pubkey,
                 })
                 .collect()

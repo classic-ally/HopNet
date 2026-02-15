@@ -4,6 +4,7 @@ use iroh::endpoint::{AfterHandshakeOutcome, EndpointHooks};
 use r2d2::Pool;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
@@ -167,6 +168,7 @@ pub(super) async fn recv_message<T: serde::de::DeserializeOwned>(
 /// preventing IP address disclosure via holepunching to unauthorized nodes.
 struct PeerValidator {
     db_pool: Pool<DuckdbConnectionManager>,
+    setup_complete: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for PeerValidator {
@@ -187,6 +189,13 @@ impl EndpointHooks for PeerValidator {
             // are initiated intentionally by our application to known peers, and TLS
             // certificates prevent impersonation.
             if side == iroh::endpoint::Side::Client {
+                return AfterHandshakeOutcome::Accept;
+            }
+
+            // Setup mode: allow all incoming connections before this node has been
+            // initialized (received JoinInfo or completed genesis setup). The window
+            // is brief and the JoinInfo itself requires the user's private key.
+            if !self.setup_complete.load(Ordering::Relaxed) {
                 return AfterHandshakeOutcome::Accept;
             }
 
@@ -236,15 +245,21 @@ pub struct IrohTransport {
     endpoint: Endpoint,
     /// Connection cache keyed by node_id
     connections: Arc<RwLock<HashMap<i32, Connection>>>,
+    /// Whether this node has completed setup (genesis or JoinInfo received).
+    /// Shared with PeerValidator — when false, all incoming connections are allowed.
+    setup_complete: Arc<AtomicBool>,
 }
 
 impl IrohTransport {
-    /// Create a new IrohTransport with the given secret key and database pool
-    pub async fn new(secret_key: SecretKey, db_pool: Pool<DuckdbConnectionManager>) -> Result<Self, IrohError> {
+    /// Create a new IrohTransport with the given secret key and database pool.
+    /// `is_setup_complete` should be true if this node already has persisted state (restart),
+    /// false if this is a fresh node waiting for genesis setup or JoinInfo.
+    pub async fn new(secret_key: SecretKey, db_pool: Pool<DuckdbConnectionManager>, is_setup_complete: bool) -> Result<Self, IrohError> {
+        let setup_complete = Arc::new(AtomicBool::new(is_setup_complete));
         let endpoint = Endpoint::builder()
             .secret_key(secret_key)
             .alpns(vec![HOPNET_ALPN.to_vec()])
-            .hooks(PeerValidator { db_pool })
+            .hooks(PeerValidator { db_pool, setup_complete: setup_complete.clone() })
             .bind()
             .await
             .map_err(|e| IrohError::Transport(TransportError::ConnectionFailed(e.to_string())))?;
@@ -252,7 +267,14 @@ impl IrohTransport {
         Ok(Self {
             endpoint,
             connections: Arc::new(RwLock::new(HashMap::new())),
+            setup_complete,
         })
+    }
+
+    /// Mark this node's setup as complete. After this call, the PeerValidator
+    /// switches to strict mode and rejects unknown peers.
+    pub fn mark_setup_complete(&self) {
+        self.setup_complete.store(true, Ordering::Relaxed);
     }
 
     /// Get the node ID (public key) for this endpoint

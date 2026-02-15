@@ -1,16 +1,14 @@
 use super::*;
 
 use axum::{
-    extract::{State, Path},
+    extract::State,
     response::IntoResponse,
     http::StatusCode,
     Json,
-    Extension
 };
 
 use crate::db::consensus as db;
 use crate::consensus::functions::ConsensusError;
-use std::cmp::Ordering;
 use serde::Serialize;
 /// CONSENSUS ARCHITECTURE
 /// Key notes:
@@ -156,19 +154,6 @@ pub async fn get_consensus_history(
     match db::get_consensus_history(app_state.db_pool.get()) {
         Ok(history) => (StatusCode::OK, Json(history)).into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Failed to get consensus history").into_response(),
-    }
-}
-
-// route to get all consensus data for a specific view (RPC-protected for inter-node catch-up)
-pub async fn get_view_consensus_data(
-    State(app_state): State<AppState>,
-    Path(view): Path<i32>,
-    Extension(auth): Extension<AuthenticatedNode>,
-) -> impl IntoResponse {
-    
-    match db::get_view_consensus_data(app_state.db_pool.get(), view) {
-        Ok(view_data) => (StatusCode::OK, Json(view_data)).into_response(),
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Failed to get view consensus data").into_response(),
     }
 }
 
@@ -960,8 +945,8 @@ async fn fetch_and_validate_with_retry(
             Ok(data) => data,
             Err(e) => {
                 tracing::warn!(
-                    "Attempt {}/{} failed to fetch view {} from validator {} ({}:{}): {:?}",
-                    attempt + 1, shuffled_validators.len(), view, validator.node_id, validator.ip_address, validator.port, e
+                    "Attempt {}/{} failed to fetch view {} from validator {}: {:?}",
+                    attempt + 1, shuffled_validators.len(), view, validator.node_id, e
                 );
                 continue;
             }
@@ -970,8 +955,8 @@ async fn fetch_and_validate_with_retry(
         // Validate that received view matches requested view (prevent Byzantine attacks)
         if view_data.view != view {
             tracing::warn!(
-                "Attempt {}/{} view mismatch from validator {} ({}:{}): requested view {}, received view {}",
-                attempt + 1, shuffled_validators.len(), validator.node_id, validator.ip_address, validator.port, view, view_data.view
+                "Attempt {}/{} view mismatch from validator {}: requested view {}, received view {}",
+                attempt + 1, shuffled_validators.len(), validator.node_id, view, view_data.view
             );
             continue;
         }

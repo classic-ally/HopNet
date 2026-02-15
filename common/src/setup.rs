@@ -9,6 +9,4 @@ pub struct InitialSetupPayload {
     pub username: String,
     pub password: String,
     pub node_name: String,
-    pub ip_address: String,
-    pub port: i32,
 }

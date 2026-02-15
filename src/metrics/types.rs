@@ -16,34 +16,6 @@ pub struct Metric {
     pub storage_used_gb: Option<u32>,   // Used storage capacity in GB
 }
 
-#[derive(Deserialize)]
-pub struct RemoteLatencyQuery {
-    pub ip: String,
-}
-
-// response for remote latency
-#[derive(Serialize)]
-pub struct LatencyResponse {
-    pub address: String,
-    pub average_rtt: f64,
-    pub variance: f64,
-    pub jitter: f64,
-}
-
-// error response
-#[derive(Serialize)]
-pub struct ErrorResponse {
-    pub error: String,
-}
-
-// unified response wrapper
-#[derive(Serialize)]
-#[serde(untagged)]
-pub enum LatencyResponseWrapper {
-    Success(LatencyResponse),
-    Error(ErrorResponse),
-}
-
 // response for storage metrics
 #[derive(Serialize, Deserialize)]
 pub struct StorageResponse {

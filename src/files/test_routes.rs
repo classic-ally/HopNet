@@ -3,7 +3,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use reqwest::StatusCode;
+use axum::http::StatusCode;
 use serde::Serialize;
 
 use crate::AppState;

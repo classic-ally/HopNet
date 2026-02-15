@@ -490,8 +490,6 @@ async fn setup_backend(backend_url: &str) -> Result<(), Box<dyn std::error::Erro
         username: "testuser".to_string(),
         password: "testpass".to_string(),
         node_name: "testnode".to_string(),
-        ip_address: "127.0.0.1".to_string(),
-        port: 34634,  // Use test port
     };
     
     let response = client

@@ -8,11 +8,11 @@ use axum::{
     body::Body
 };
 use reed_solomon_simd::ReedSolomonEncoder;
-use reqwest::StatusCode;
+use axum::http::StatusCode;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::OsRng};
 use rand::RngCore;
 
-use crate::{db::{self, Blake3Hash, Data, DataRecord, DatabaseError, FragmentHash, Inode}, files::functions::{calculate_chunk_padding, calculate_encrypted_chunk_length, calculate_optimal_chunks, encrypt_chunk, encrypt_part, encrypt_path, store_fragment}};
+use crate::{db::{self, Blake3Hash, Data, DataRecord, DatabaseError, FragmentHash, Inode}, files::functions::{calculate_chunk_padding, encrypt_chunk, encrypt_part, encrypt_path, store_fragment}};
 use hopnet_common::FileItem;
 use serde::{Deserialize, Serialize};
 
@@ -789,146 +789,7 @@ pub async fn delete_files(
     }
 }
 
-// =============================================================================
-// FRAGMENT TRANSFER ENDPOINTS (RFC-003)
-// Inter-node fragment transfer for distributed storage
-// =============================================================================
-
-use crate::consensus::routes::AuthenticatedNode;
-use crate::files::functions::{fetch_and_verify_fragment, fragment_exists_and_valid, MAX_FRAGMENT_SIZE};
-use crate::types::Node;
-
-/// GET /fragments/{fragment_hash}
-/// Retrieve a fragment by its Blake3 hash from local storage
-/// Used by other nodes to fetch missing fragments during file reconstruction
-pub async fn get_fragment(
-    State(app_state): State<AppState>,
-    Path(fragment_hash): Path<Blake3Hash>,
-    Extension(auth): Extension<AuthenticatedNode>,
-) -> impl IntoResponse {
-    // Allow any authenticated user to request fragments (supports roaming users)
-    
-    // Check if we have this fragment locally and verify it's valid
-    if !fragment_exists_and_valid(&app_state.fragments_dir, &fragment_hash) {
-        tracing::debug!("Fragment not found locally: {}", fragment_hash.to_hex());
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    
-    // Fetch and verify the fragment from local storage
-    match fetch_and_verify_fragment(&fragment_hash, &app_state.fragments_dir) {
-        Ok(fragment_data) => {
-            tracing::debug!("Successfully served fragment: {} ({} bytes)", fragment_hash.to_hex(), fragment_data.len());
-            
-            // Return the raw fragment bytes with appropriate content type
-            Response::builder()
-                .status(StatusCode::OK)
-                .header("Content-Type", "application/octet-stream")
-                .header("Content-Length", fragment_data.len().to_string())
-                .header("X-Fragment-Hash", fragment_hash.to_hex())
-                .body(Body::from(fragment_data))
-                .unwrap()
-                .into_response()
-        }
-        Err(e) => {
-            tracing::error!("Failed to fetch fragment {}: {:?}", fragment_hash.to_hex(), e);
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
-    }
-}
-
-/// POST /fragments/{fragment_hash}
-/// Store a fragment received from another node
-/// Used during upload synchronization and background fragment replication
-pub async fn post_fragment(
-    State(app_state): State<AppState>,
-    Path(expected_hash): Path<Blake3Hash>,
-    Extension(auth): Extension<AuthenticatedNode>,
-    body: Body
-) -> impl IntoResponse {
-    // Read the request body (fragment data) with size limit matching our fragment chunking
-    // Fragments are encrypted, so use encrypted size (4MB + ~16KB encryption overhead)
-    let max_encrypted_size = calculate_encrypted_chunk_length(MAX_FRAGMENT_SIZE);
-    let fragment_data = match axum::body::to_bytes(body, max_encrypted_size + 1024).await { // Add small buffer for headers
-        Ok(data) => data.to_vec(),
-        Err(e) => {
-            tracing::error!("Failed to read fragment data: {:?}", e);
-            return StatusCode::BAD_REQUEST.into_response();
-        }
-    };
-
-    // Verify fragment size doesn't exceed maximum encrypted size
-    if fragment_data.len() > max_encrypted_size {
-        tracing::warn!("Fragment too large: {} bytes (max encrypted: {})", fragment_data.len(), max_encrypted_size);
-        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
-    }
-    
-    // Verify the fragment hash matches the provided hash
-    let actual_hash = Blake3Hash::new(blake3::hash(&fragment_data));
-    if actual_hash != expected_hash {
-        tracing::warn!("Fragment hash mismatch: expected {}, got {}", expected_hash.to_hex(), actual_hash.to_hex());
-        return StatusCode::BAD_REQUEST.into_response();
-    }
-    
-    // Check if we already have this fragment to avoid redundant storage
-    if fragment_exists_and_valid(&app_state.fragments_dir, &expected_hash) {
-        tracing::debug!("Fragment already exists locally: {}", expected_hash.to_hex());
-        return StatusCode::OK.into_response(); // Already have it, that's fine
-    }
-    
-    // Store the fragment to local storage
-    let fragment_len = fragment_data.len(); // Get length before moving data
-    match store_fragment(&app_state.fragments_dir, &expected_hash, fragment_data) {
-        Ok(_) => {
-            // Mark the fragment as stored locally in the database
-            // Retry logic: Wait for consensus to propagate fragment_hashes record if needed
-            const MAX_RETRIES: u32 = 10;  // 5 seconds total (10 * 500ms)
-            const RETRY_DELAY_MS: u64 = 500;
-
-            let mut rows_affected = 0;
-            for attempt in 0..MAX_RETRIES {
-                match crate::db::files::mark_fragment_local_state(app_state.db_pool.get(), &expected_hash, true) {
-                    Ok(affected) => {
-                        if affected > 0 {
-                            // Success - database record was updated
-                            rows_affected = affected;
-                            if attempt > 0 {
-                                tracing::debug!("Successfully updated fragment {} after {} retries",
-                                              expected_hash.to_hex(), attempt);
-                            }
-                            break;
-                        } else if attempt < MAX_RETRIES - 1 {
-                            // Record doesn't exist yet - consensus transaction hasn't propagated
-                            // Wait and retry (this is expected during distributed file uploads)
-                            tokio::time::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS)).await;
-                            continue;
-                        } else {
-                            // Last attempt and still 0 rows
-                            tracing::warn!("Fragment {} stored to disk but database record not found after {} retries",
-                                          expected_hash.to_hex(), MAX_RETRIES);
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Fragment stored to disk but failed to update database for {}: {:?}",
-                              expected_hash.to_hex(), e);
-                        break;
-                    }
-                }
-            }
-
-            tracing::debug!("Successfully stored fragment: {} ({} bytes), updated {} database records",
-                   expected_hash.to_hex(), fragment_len, rows_affected);
-
-            StatusCode::CREATED.into_response()
-        }
-        Err(e) => {
-            tracing::error!("Failed to store fragment {}: {:?}", expected_hash.to_hex(), e);
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
-    }
-}
-
-/// GET /fragments  
+/// GET /fragments
 /// Get count of fragments stored locally on this node
 pub async fn get_fragments_count(
     State(app_state): State<AppState>,
@@ -992,106 +853,6 @@ pub async fn post_cleanup_orphaned_data_blocks(
             (StatusCode::INTERNAL_SERVER_ERROR, Json(response)).into_response()
         }
     }
-}
-
-/// POST /rpc/fetch-fragments
-/// RPC endpoint for rebalancing - instructs node to fetch specific fragments
-/// Used during network rebalancing to distribute fragments to optimal nodes
-pub async fn post_fetch_fragments(
-    State(app_state): State<AppState>,
-    Extension(auth): Extension<AuthenticatedNode>,
-    Json(request): Json<FetchFragmentsRequest>
-) -> impl IntoResponse {
-    // Only allow node owners to receive fragment fetch instructions
-    
-    tracing::info!("Received fragment fetch request for {} fragments", request.fragments.len());
-    
-    let mut successful_fetches = 0;
-    let mut failed_fetches = Vec::new();
-    
-    // Batch query fragment inventory for all requested fragments
-    let all_hashes: Vec<Blake3Hash> = request.fragments.iter()
-        .map(|f| f.fragment_hash)
-        .collect();
-
-    let mut inventory_map = match crate::db::inventory::batch_query_fragment_inventory(
-        app_state.db_pool.get(),
-        &all_hashes,
-        None,  // Use default
-    ) {
-        Ok(map) => map,
-        Err(e) => {
-            tracing::warn!("Fragment inventory query failed, falling back to placement algorithm: {:?}", e);
-            std::collections::HashMap::new()  // Empty map = all lookups return None
-        }
-    };
-
-    // Process each fragment
-    for fragment_info in &request.fragments {
-        let fragment_hash = &fragment_info.fragment_hash;
-        let placement_height = fragment_info.placement_height;
-
-        // Check if we already have this fragment locally
-        if crate::files::functions::fragment_exists_and_valid(&app_state.fragments_dir, fragment_hash) {
-            tracing::debug!("Fragment {} already exists locally, skipping", fragment_hash.to_hex());
-            successful_fetches += 1;
-            continue;
-        }
-
-        // Get inventory hint for this fragment
-        let inventory_hint = inventory_map.remove(fragment_hash);
-
-        // Fetch and cache the fragment using existing discovery infrastructure with provided placement height
-        match crate::files::functions::fetch_and_cache_fragment(
-            fragment_hash,
-            &app_state.fragments_dir,
-            &app_state,
-            Some(placement_height),
-            inventory_hint,
-        ).await {
-            Ok(()) => {
-                tracing::info!("Successfully fetched and cached fragment {} (height {})", 
-                     fragment_hash.to_hex(), placement_height);
-                successful_fetches += 1;
-            }
-            Err(e) => {
-                tracing::error!("Failed to fetch fragment {} (height {}): {:?}", 
-                      fragment_hash.to_hex(), placement_height, e);
-                failed_fetches.push(fragment_hash.to_hex());
-            }
-        }
-    }
-    
-    let response = FetchFragmentsResponse {
-        status: if failed_fetches.is_empty() { "success".to_string() } else { "partial".to_string() },
-        successful_fetches,
-        failed_fetches,
-        total_requested: request.fragments.len(),
-    };
-    
-    tracing::info!("Fragment fetch completed: {}/{} successful", 
-                  successful_fetches, request.fragments.len());
-    
-    (StatusCode::OK, Json(response)).into_response()
-}
-
-#[derive(Deserialize, Serialize)]
-pub struct FetchFragmentsRequest {
-    pub fragments: Vec<FragmentFetchInfo>,
-}
-
-#[derive(Deserialize, Serialize)]
-pub struct FragmentFetchInfo {
-    pub fragment_hash: Blake3Hash,
-    pub placement_height: i32,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct FetchFragmentsResponse {
-    pub status: String,
-    pub successful_fetches: usize,
-    pub failed_fetches: Vec<String>,
-    pub total_requested: usize,
 }
 
 /// POST /maintenance/rebalance

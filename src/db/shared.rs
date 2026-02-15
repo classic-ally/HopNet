@@ -62,21 +62,15 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
             CREATE TABLE nodes (
                 node_id         INTEGER PRIMARY KEY,
                 name            VARCHAR NOT NULL,
-                ip_address      VARCHAR NOT NULL,
-                port            INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
                 owner           INTEGER NOT NULL,
                 pubkey          BLOB NOT NULL,
-
-                -- CONSTRAINT enables indexed lookup of these
-                CONSTRAINT unique_endpoint UNIQUE (ip_address, port),
 
                 FOREIGN KEY (owner) REFERENCES users(user_id)
             );
 
-            -- Common query patterns: 
+            -- Common query patterns:
             -- 1. user owns what nodes?
             CREATE INDEX idx_nodes_owner ON nodes(owner);
-            -- 2. what node is this IP? (enabled by CONSTRAINT)
 
             -- Consensus architecture
             CREATE TABLE blocks (

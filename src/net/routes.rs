@@ -54,7 +54,7 @@ pub async fn debug_iroh_ping(
             }
         };
 
-        let mut stmt = match conn.prepare("SELECT node_id, name, ip_address, port, owner, pubkey FROM nodes") {
+        let mut stmt = match conn.prepare("SELECT node_id, name, owner, pubkey FROM nodes") {
             Ok(s) => s,
             Err(e) => {
                 return (
@@ -78,10 +78,8 @@ pub async fn debug_iroh_ping(
             Ok(Node {
                 node_id: row.get(0)?,
                 name: row.get(1)?,
-                ip_address: row.get(2)?,
-                port: row.get(3)?,
-                owner: row.get(4)?,
-                pubkey: row.get(5)?,
+                owner: row.get(2)?,
+                pubkey: row.get(3)?,
             })
         }) {
             Ok(rows) => rows.filter_map(|r| r.ok()).collect(),

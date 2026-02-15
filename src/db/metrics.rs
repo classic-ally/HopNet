@@ -141,20 +141,18 @@ pub fn get_nodes_to_measure(
     match db_connection {
         Ok(db_lock) => {
             let mut stmt = db_lock.prepare(
-                "SELECT node_id, name, ip_address, port, owner, pubkey
+                "SELECT node_id, name, owner, pubkey
                 FROM nodes
                 WHERE node_id != ?
                 ORDER BY node_id"
             ).map_err(|_| DatabaseError::RecallError)?;
-            
+
             let nodes = stmt.query_map([exclude_node_id], |row| {
                 Ok(crate::types::Node {
                     node_id: row.get(0)?,
                     name: row.get(1)?,
-                    ip_address: row.get(2)?,
-                    port: row.get(3)?,
-                    owner: row.get(4)?,
-                    pubkey: row.get(5)?,
+                    owner: row.get(2)?,
+                    pubkey: row.get(3)?,
                 })
             }).map_err(|_| DatabaseError::RecallError)?
             .collect::<Result<Vec<crate::types::Node>, _>>()
@@ -172,8 +170,6 @@ pub fn get_nodes_to_measure(
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct NodeMetrics {
     pub node_id: i32,
-    pub ip_address: String,
-    pub port: i32,
     pub pubkey: crate::types::PubKey,
     pub sample_count_7d: u32,
     pub trust_factor: f64,
@@ -231,8 +227,6 @@ pub fn get_all_node_metrics(
                 )
                 SELECT
                     n.node_id,
-                    n.ip_address,
-                    n.port,
                     n.pubkey,
                     COALESCE(nm.sample_count_7d, 0) as sample_count_7d,
                     -- Trust factor: gradual confidence building for new nodes
@@ -294,8 +288,6 @@ pub fn get_all_node_metrics(
             let metrics = stmt.query_map(&params, |row| {
                 Ok(NodeMetrics {
                     node_id: row.get("node_id")?,
-                    ip_address: row.get("ip_address")?,
-                    port: row.get("port")?,
                     pubkey: row.get("pubkey")?,
                     sample_count_7d: row.get::<_, i64>("sample_count_7d")? as u32,
                     trust_factor: row.get("trust_factor")?,

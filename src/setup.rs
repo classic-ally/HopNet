@@ -1,26 +1,36 @@
 use axum::{
-    extract::State, 
+    extract::State,
     response::IntoResponse,
     http::StatusCode,
     Json
 };
-use serde::{Serialize,Deserialize};
+use serde::{Serialize, Deserialize};
 use crate::consensus::functions::generate_ed25519_key;
 use crate::{PubKey, PrivKey, UserKeys};
 
-use crate::consensus::types::{ConsensusPhase, Block, VoteSignMessages};
-use crate::consensus::QuorumCertificate;
-use crate::db::Sequence;
 use crate::AppState;
 use crate::{
     db::setup,
     db::User,
 };
-use crate::db::{DataRecord, FragmentHash, Inode};
-use crate::types::{Blake3Hash, Node};
+use crate::types::Node;
 
 // Re-export from common crate for API consistency
 pub use hopnet_common::setup::InitialSetupPayload;
+
+// ============================================================================
+// JoinDeliver RPC types (used by coordinator → joining node over iroh)
+// ============================================================================
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct JoinDeliverRequest {
+    pub join_info: crate::types::JoinInfo,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct JoinAckResponse {
+    pub success: bool,
+}
 
 pub async fn get_setup(
     State(app_state): State<AppState>,
@@ -31,14 +41,14 @@ pub async fn get_setup(
     }
 }
 
-/// New catch-up based join handler - receives JoinInfo and bootstraps via catch-up
-/// Returns immediately (202 ACCEPTED) while catch-up runs in background
-pub async fn put_join_bootstrap(
-    State(app_state): State<AppState>,
-    Json(join_info): Json<crate::types::JoinInfo>
-) -> Result<StatusCode, StatusCode> {
+/// Process JoinInfo received from the coordinator (called from iroh handler).
+/// Initializes app state, database, marks setup complete, and spawns catch-up.
+pub async fn process_join_info(
+    app_state: &AppState,
+    join_info: crate::types::JoinInfo,
+) -> Result<(), String> {
     tracing::info!(
-        "PUT /setup (catch-up based) called - joining as node_id={}, user_id={}",
+        "Processing JoinInfo - joining as node_id={}, user_id={}",
         join_info.node_id,
         join_info.user_id
     );
@@ -53,21 +63,18 @@ pub async fn put_join_bootstrap(
     };
 
     app_state.user_keys.set(user_keys)
-        .map_err(|_| {
-            tracing::error!("Failed to set user keys in app state - already initialized");
-            StatusCode::CONFLICT
-        })?;
+        .map_err(|_| "Failed to set user keys - already initialized".to_string())?;
 
     // Set user_id and node_id in app state
     app_state.user_id.set(join_info.user_id)
-        .map_err(|_| StatusCode::CONFLICT)?;
+        .map_err(|_| "Failed to set user_id - already initialized".to_string())?;
 
     app_state.node_id.set(join_info.node_id)
-        .map_err(|_| StatusCode::CONFLICT)?;
+        .map_err(|_| "Failed to set node_id - already initialized".to_string())?;
 
     // Initialize SIV keys from user private key
     app_state.initialize_siv_keys()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| "Failed to initialize SIV keys".to_string())?;
 
     // Initialize this_node table with identity and keys
     // Sequences, users, nodes, validators will come from genesis replay
@@ -75,10 +82,10 @@ pub async fn put_join_bootstrap(
         app_state.db_pool.get(),
         join_info.clone(),
         app_state.private_key.clone(),
-    ).map_err(|e| {
-        tracing::error!("Failed to initialize joining node database: {:?}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    ).map_err(|e| format!("Failed to initialize joining node database: {:?}", e))?;
+
+    // Mark setup complete — PeerValidator switches to strict mode
+    app_state.iroh_transport.mark_setup_complete();
 
     // Spawn catch-up as background task
     let app_state_clone = app_state.clone();
@@ -125,27 +132,26 @@ pub async fn put_join_bootstrap(
         join_info.node_id
     );
 
-    // Return 202 ACCEPTED - request accepted, processing asynchronously
-    Ok(StatusCode::ACCEPTED)
+    Ok(())
 }
 
-// full setup from scratch
+// full setup from scratch (genesis node)
 pub async fn post_setup(
     State(app_state): State<AppState>,
     Json(payload): Json<InitialSetupPayload>
 ) -> Result<StatusCode, StatusCode> {
 
     let (user_priv_key, user_pub_key) = generate_ed25519_key();
-    
+
     let user_keys = UserKeys {
         private_key: PrivKey(user_priv_key),
         public_key: PubKey(user_pub_key),
     };
-    
+
     // Set user keys in app state (can only be done once)
     app_state.user_keys.set(user_keys.clone())
         .map_err(|_| StatusCode::CONFLICT)?; // Already initialized
-    
+
     // Initialize SIV keys from user private key
     app_state.initialize_siv_keys()?;
 
@@ -154,7 +160,7 @@ pub async fn post_setup(
     // Capture username before moving payload fields
     #[cfg(target_os = "macos")]
     let username_for_fileprovider = payload.username.clone();
-    
+
     let user = User::new_with_password(
         0, // Will be generated by the database
         payload.username,
@@ -166,10 +172,8 @@ pub async fn post_setup(
     let node = Node {
         node_id: 0, // Will be generated by the database
         name: payload.node_name,
-        ip_address: payload.ip_address,
-        port: payload.port,
         owner: 0, // Will be set to the generated user_id
-        pubkey: app_state.public_key, // Placeholder, will use app_state.public_key
+        pubkey: app_state.public_key,
     };
 
     match setup::post_initial_setup(&app_state, user, node, user_keys.private_key) {
@@ -179,7 +183,10 @@ pub async fn post_setup(
                 .map_err(|_| StatusCode::CONFLICT)?; // Already initialized
             app_state.node_id.set(node_id)
                 .map_err(|_| StatusCode::CONFLICT)?; // Already initialized
-            
+
+            // Mark setup complete — PeerValidator switches to strict mode
+            app_state.iroh_transport.mark_setup_complete();
+
             // Register FileProvider domain with macOS using the setup username
             // Skip registration in test mode since we test FileProvider functionality directly
             #[cfg(target_os = "macos")]
@@ -197,7 +204,7 @@ pub async fn post_setup(
                     tracing::info!("Skipping FileProvider domain registration in test mode");
                 }
             }
-            
+
             Ok(StatusCode::CREATED)
         },
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR)

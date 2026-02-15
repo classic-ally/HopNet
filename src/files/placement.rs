@@ -154,8 +154,6 @@ pub fn get_fragment_placement(local_index: u32, selected_nodes: &[Node]) -> Vec<
 pub struct Phase2Candidate {
     pub node_id: i32,
     pub final_score: f64,  // Weighted score for placement ranking
-    pub ip_address: String,
-    pub port: i32,
 }
 
 /// RFC-004 scoring weights: availability, throughput, latency, stability
@@ -202,8 +200,6 @@ pub fn calculate_final_placement_scores(
             Phase2Candidate {
                 node_id: metrics.node_id,
                 final_score,
-                ip_address: metrics.ip_address,
-                port: metrics.port,
             }
         })
         .collect();
@@ -242,8 +238,6 @@ mod tests {
             .map(|i| Node {
                 node_id: i as i32,
                 name: format!("node{}", i),
-                ip_address: format!("127.0.0.{}", i),
-                port: 8000 + i as i32,
                 owner: 1,
                 pubkey: generate_test_pubkey(),
             })
@@ -254,8 +248,6 @@ mod tests {
         (1..=count)
             .map(|i| NodeMetrics {
                 node_id: i as i32,
-                ip_address: format!("127.0.0.{}", i),
-                port: 8000 + i as i32,
                 pubkey: generate_test_pubkey(),
                 sample_count_7d: 100,
                 trust_factor: 1.0,
@@ -320,8 +312,6 @@ mod tests {
         assert_eq!(selected1.len(), selected2.len());
         for (n1, n2) in selected1.iter().zip(selected2.iter()) {
             assert_eq!(n1.node_id, n2.node_id);
-            assert_eq!(n1.ip_address, n2.ip_address);
-            assert_eq!(n1.port, n2.port);
         }
     }
 

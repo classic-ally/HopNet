@@ -53,23 +53,20 @@ Reed-Solomon encoded file storage with encryption, chunked encoding, and fragmen
 - [ ] Preview data extraction while maintaining encryption
 
 ### 3. Node Communication System ([RFC-003](specs/node-communication.md))
-**Status**: Iroh transport active for all inter-node communication; HTTP endpoints retained for Phase 5 removal ([migration plan](refactors/iroh-migration.md))
+**Status**: Iroh transport complete — all inter-node communication uses iroh (QUIC/TLS). IP addresses removed from data model.
 
-HTTP-based inter-node communication with iroh (QUIC/TLS) transport migration — all inter-node traffic now uses iroh.
+Pubkey-based peer-to-peer communication over iroh (QUIC/TLS). Nodes are addressed by Ed25519 public key, not IP address.
 
-- [x] HTTP API with RESTful endpoints for consensus operations
+- [x] HTTP API with RESTful endpoints for admin/client operations
 - [x] Dual Ed25519 signature authentication (node + user signatures)
-- [x] Node registry with IP addresses and public keys
+- [x] Node registry with public keys (pubkey-based addressing)
 - [x] Request routing (non-leaders forward to current leader)
-- [x] Basic RTT latency measurement between nodes
-- [x] Node discovery and network membership management
-- [x] Fragment transfer protocols and endpoints (GET/POST /fragments/{hash}, health checks)
-- [x] Bandwidth monitoring and quality-of-service metrics (latency + throughput measurement complete)
 - [x] Iroh transport layer with peer validation and connection caching
-- [x] Fragment health checks over iroh (Phase 2 complete)
 - [x] Consensus messages over iroh (Phase 3 complete)
-- [x] Consensus barrier testing infrastructure (Phase 3f complete)
 - [x] Fragment data transfer over iroh (Phase 4 complete)
+- [x] Metrics measurement over iroh RPC (Phase 5b complete)
+- [x] Node bootstrap over iroh with setup-mode PeerValidator bypass (Phase 5c complete)
+- [x] IP address and port removed from schema, structs, and all queries (Phase 5d complete)
 - [ ] Network topology awareness and geographic information
 
 ### 4. Shard Synchronization System ([RFC-004](specs/shard-synchronization.md))

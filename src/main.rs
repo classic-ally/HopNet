@@ -1,6 +1,6 @@
 use aes_siv::{siv::Aes256Siv, Key, Nonce};
 use axum::{
-    extract::DefaultBodyLimit, http::{HeaderValue, Method, StatusCode}, middleware, routing::{get,post,put,patch,delete}, serve, Router
+    extract::DefaultBodyLimit, http::{HeaderValue, Method, StatusCode}, middleware, routing::{get,post,patch,delete}, serve, Router
 };
 use jsonwebtoken::{DecodingKey, EncodingKey};
 use tower_serve_static::ServeDir;
@@ -22,7 +22,6 @@ mod setup;
 mod users;
 mod metrics;
 mod db;
-mod interfaces;
 mod auth;
 mod consensus;
 mod types;
@@ -43,33 +42,6 @@ pub struct UserKeys {
     pub public_key: PubKey,
 }
 
-/// Authentication info for inter-node requests
-/// Populated once and reused to avoid repeated AppState getter calls
-#[derive(Clone)]
-pub struct NodeAuthInfo {
-    pub node_id: i32,
-    pub user_id: i32,
-    pub user_keys: UserKeys,
-    pub node_private_key: PrivKey,
-}
-
-impl NodeAuthInfo {
-    /// Extract authentication info from AppState once for reuse
-    pub fn from_app_state(app_state: &AppState) -> Result<Self, StatusCode> {
-        let node_id = app_state.get_node_id()?;
-        let user_id = app_state.get_user_id()?;
-        let user_keys = app_state.get_user_keys()?.clone();
-        let node_private_key = app_state.private_key.clone();
-        
-        Ok(NodeAuthInfo {
-            node_id,
-            user_id,
-            user_keys,
-            node_private_key,
-        })
-    }
-}
-
 #[derive(Clone)]
 pub struct AppState {
     db_pool: Pool<DuckdbConnectionManager>,
@@ -84,7 +56,6 @@ pub struct AppState {
     siv_nonce: Arc<OnceCell<Nonce>>,
     fragments_dir: String,
     timeout_vote_collector: Arc<consensus::functions::TimeoutVoteCollector>,
-    throughput_result_collector: Arc<metrics::functions::ThroughputResultCollector>,
     last_observed_view: Arc<std::sync::atomic::AtomicI32>,
     consensus_lock: Arc<tokio::sync::Mutex<()>>,
     fileprovider_api_key: String,
@@ -284,10 +255,12 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("Failed to get fragments directory, using current directory");
                 "./hopnet/fragments".to_string()
             });
+            std::fs::create_dir_all(&fragments_dir)
+                .expect("Failed to create fragments directory");
 
             // Create iroh transport
             let iroh_secret = PrivKey(privatekey.clone()).to_iroh_secret_key();
-            let iroh_transport = net::IrohTransport::new(iroh_secret, pool.clone()).await
+            let iroh_transport = net::IrohTransport::new(iroh_secret, pool.clone(), startup_state_opt.is_some()).await
                 .expect("Failed to create iroh transport");
             tracing::info!("iroh endpoint ready, node_id: {}", iroh_transport.node_id());
 
@@ -304,7 +277,6 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 siv_nonce: Arc::new(OnceCell::new()),
                 fragments_dir,
                 timeout_vote_collector: Arc::new(consensus::functions::TimeoutVoteCollector::new()),
-                throughput_result_collector: Arc::new(metrics::functions::ThroughputResultCollector::new()),
                 last_observed_view: Arc::new(std::sync::atomic::AtomicI32::new(-1)),
                 consensus_lock: Arc::new(tokio::sync::Mutex::new(())),
                 fileprovider_api_key: fileprovider_api_key.clone(),
@@ -489,7 +461,6 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/consensus", get(consensus::routes::get_consensus))
                 .route("/consensus/history", get(consensus::routes::get_consensus_history))
                 .route("/consensus/view", post(consensus::routes::debug_view_state))
-                .route("/rpc/storage-server", get(metrics::routes::get_storage_server))
                 .layer(middleware::from_fn_with_state(app_state.clone(), consensus::routes::jwt_or_rpc_auth_middleware));
 
             // FileProvider routes with scoped authentication (all routes require auth)
@@ -504,17 +475,6 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/modify", patch(fileprovider::routes::modify_item))
                 .layer(DefaultBodyLimit::max(5000*1_000_000)) // 5GB limit for file uploads
                 .layer(middleware::from_fn_with_state(app_state.clone(), fileprovider::auth::fileprovider_auth_middleware));
-
-            // RPC routes for inter-node communication with dual signature authentication
-            let rpc_routes = Router::new()
-                .route("/consensus/view/{view}", get(consensus::routes::get_view_consensus_data))
-                .route("/fragments/{fragment_hash}", get(files::routes::get_fragment))
-                .route("/fragments/{fragment_hash}", post(files::routes::post_fragment))
-                .route("/rpc/fetch-fragments", post(files::routes::post_fetch_fragments))
-                .route("/rpc/throughput-server", get(metrics::routes::get_throughput_server))
-                .route("/rpc/throughput-result/{session_id}", get(metrics::routes::get_throughput_result))
-                .layer(DefaultBodyLimit::max(files::functions::calculate_encrypted_chunk_length(files::functions::MAX_FRAGMENT_SIZE) + 1024)) // Allow encrypted 4MB fragments (~4.21MB) + headers
-                .layer(middleware::from_fn_with_state(app_state.clone(), consensus::routes::rpc_auth_middleware));
 
             // Test routes - only available in test mode
             let test_routes = if app_state.test_mode {
@@ -531,17 +491,12 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .fallback_service(admin_service) // routes we don't have get sent to vite frontend
                 .merge(protected_routes)
                 .merge(jwt_or_rpc_routes)
-                .merge(rpc_routes)
                 .nest("/integrations/fileprovider", fileprovider_routes)
                 .nest("/integrations/documentprovider", documentprovider::routes::router(app_state.clone()))
                 .nest("/devices", devices::routes::router(app_state.clone()))
                 .merge(test_routes)
                 .route("/setup", get(setup::get_setup))
                 .route("/setup", post(setup::post_setup))
-                .route("/setup", put(setup::put_join_bootstrap))
-                .route("/interfaces", get(interfaces::get_interfaces))
-                .route("/rpc/latency-server", get(metrics::routes::get_latency_server))
-                .route("/rpc/get-remote-latency", get(metrics::routes::get_remote_latency_handler))
                 .route("/login", post(auth::sign_in));
 
             // Create trace layer with request IDs

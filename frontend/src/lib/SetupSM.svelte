@@ -27,7 +27,6 @@
     let username = '';
     let password = '';
     let computername = '';
-    let ip = '';
 
 </script>
 
@@ -61,7 +60,6 @@
       {#if joinNetwork}
           <ConfigureDevice
             bind:computername
-            bind:ip
             onBackButton={() => {
               initialSetup = true;
               joinNetwork = false;
@@ -75,7 +73,6 @@
       {#if configureDevice}
           <ConfigureDevice
             bind:computername
-            bind:ip
             onBackButton={() => {
               createNetwork = true;
               configureDevice = false;
@@ -89,7 +86,6 @@
       {#if joinQR}
           <JoinQr
             name={computername}
-            ip_address={ip}
           />
       {/if}
       {#if confirmSelections}
@@ -97,7 +93,6 @@
               username={username}
               password={password}
               computername={computername}
-              ip={ip}
               onBackButton={() => {
                 configureDevice = true;
                 confirmSelections = false;

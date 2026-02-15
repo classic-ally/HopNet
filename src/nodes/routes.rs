@@ -2,25 +2,34 @@ use std::time::Duration;
 
 use axum::{
     Extension,
-    extract::State, 
+    extract::State,
     response::IntoResponse,
     http::StatusCode,
     Json
 };
-use reqwest::Client;
-use tokio::sync::oneshot;
 use bincode::config;
+use serde::Deserialize;
 
 use crate::db::{PubKey, DatabaseError};
 use crate::{
     consensus::{
-        functions::consensus_middleware, 
+        functions::consensus_middleware,
         types::Transaction
     },
     db::nodes,
     types::Node
 };
 use crate::AppState;
+use crate::net::protocol::{IrohRequest, IrohResponse};
+use crate::setup::{JoinDeliverRequest, JoinAckResponse};
+
+/// API payload for adding a new node (no ip/port needed — iroh uses pubkey-based addressing)
+#[derive(Deserialize)]
+pub struct NodeRegistration {
+    pub name: String,
+    pub owner: i32,
+    pub pubkey: PubKey,
+}
 
 pub async fn get_nodes(
     State(app_state): State<AppState>
@@ -36,75 +45,46 @@ pub async fn get_nodes(
 pub async fn post_nodes(
     State(app_state): State<AppState>,
     Extension(uid): Extension<i32>,
-    Json(payload): Json<Node>,
+    Json(payload): Json<NodeRegistration>,
 ) -> impl IntoResponse {
-
-    // OVERALL LOGIC FLOW
-    // 1. Check, can we ping other server? Is it already setup?     | MAIN THREAD
-    // 2. Get the current DB state, dump into vecs                  | DB THREAD
-    // 3. Compute next node, append to node vec                     | DB THREAD
-    // 4. Send our sync message to main thread                      | DB THREAD -> MAIN THREAD
-    // 5. Send the PUT of state to the new client                   | MAIN THREAD
-    // 6. If PUT succeeds, send OK message to DB thread             | MAIN THREAD -> DB THREAD
-    // 7. Write DB to disk                                          | DB THREAD, terminates
-    // 8. Ok()                                                      | MAIN THREAD
-
-    ///////////////
-    // 0. Boilerplate (check perms)
-    ///////////////
 
     // check if uid matches requester
     if uid != payload.owner {
         return StatusCode::FORBIDDEN
     }
 
-    // check if the app state user keys are set up
-    // (our node needs to be set up)
+    // check if the app state user keys are set up (our node needs to be set up)
     let Ok(_) = app_state.get_user_keys() else {
         return StatusCode::NOT_ACCEPTABLE
     };
 
     ///////////////
-    // 1. Check, can we ping other server? Is it already setup?
+    // 1. Verify new node is reachable via iroh (replaces HTTP ping check).
+    //    The iroh connection proves reachability AND pubkey ownership via TLS handshake.
     ///////////////
-    let client = Client::new();
-    let timeout_duration = Duration::from_secs(10);
-    let url = format!("http://{}:{}/setup", payload.ip_address, payload.port);
-    match client.get(&url)
-        .timeout(timeout_duration)
-        .send()
-        .await
-    {
-        Ok(response) => {
-            if response.status() != StatusCode::NOT_FOUND {
-                return StatusCode::BAD_GATEWAY
+    let peer_iroh_id = payload.pubkey.to_iroh_node_id();
+
+    // Retry ping with backoff — iroh discovery (pkarr DNS) can take time for new nodes
+    let mut ping_ok = false;
+    for attempt in 0..6 {
+        match app_state.iroh_transport.ping(-1, peer_iroh_id).await {
+            Ok(_rtt) => {
+                tracing::info!("Successfully pinged new node via iroh (pubkey verified by TLS)");
+                ping_ok = true;
+                break;
             }
-            
-            // Extract the response text (hex-encoded pubkey)
-            match response.text().await {
-                Ok(response_pubkey_str) => {
-                    // Parse the hex string response (it's a JSON string containing hex)
-                    match serde_json::from_str::<String>(&response_pubkey_str) {
-                        Ok(hex_str) => {
-                            // Convert hex string to PubKey
-                            match PubKey::from_hex(&hex_str) {
-                                Ok(response_pubkey) => {
-                                    // Compare with the payload pubkey
-                                    if response_pubkey.0 != *payload.pubkey {
-                                        // Pubkey mismatch - the node's actual pubkey doesn't match what was claimed
-                                        return StatusCode::UNAUTHORIZED
-                                    }
-                                }
-                                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR
-                            }
-                        }
-                        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR
-                    }
+            Err(e) => {
+                if attempt < 5 {
+                    tracing::warn!("Ping attempt {} failed (retrying): {}", attempt + 1, e);
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                } else {
+                    tracing::error!("Failed to reach new node via iroh after {} attempts: {}", attempt + 1, e);
                 }
-                Err(_) => return StatusCode::BAD_GATEWAY
             }
         }
-        Err(_) => return StatusCode::GATEWAY_TIMEOUT
+    }
+    if !ping_ok {
+        return StatusCode::GATEWAY_TIMEOUT;
     }
 
     ///////////////
@@ -122,16 +102,14 @@ pub async fn post_nodes(
     let complete_node = Node {
         node_id: next_node_id,
         name: payload.name.clone(),
-        ip_address: payload.ip_address.clone(),
-        port: payload.port,
         owner: payload.owner,
         pubkey: payload.pubkey,
     };
 
     ///////////////
-    // 3. Submit node addition to consensus FIRST
+    // 3. Submit node addition to consensus
     ///////////////
-    
+
     // Encode the complete node for consensus transaction
     match bincode::serde::encode_to_vec(&complete_node, config::standard()) {
         Ok(encoded_node) => {
@@ -150,17 +128,17 @@ pub async fn post_nodes(
             match consensus_middleware(&app_state, transactions).await {
                 Ok(()) => {
                     tracing::info!("Consensus succeeded for node {}, waiting for database commit", complete_node.node_id);
-                    
+
                     // Poll database to confirm node was committed before proceeding to sync
                     let mut attempts = 0;
                     const MAX_ATTEMPTS: u32 = 50; // 5 seconds max wait
                     const POLL_INTERVAL_MS: u64 = 100;
-                    
+
                     loop {
                         match nodes::node_exists(app_state.db_pool.get(), complete_node.node_id) {
                             Ok(true) => {
                                 tracing::info!("Node {} confirmed in database after {} attempts", complete_node.node_id, attempts);
-                                break; // Node is registered, proceed to sync
+                                break;
                             },
                             Ok(false) => {
                                 attempts += 1;
@@ -184,13 +162,12 @@ pub async fn post_nodes(
             }
         },
         Err(_) => {
-            // Encoding failed
             return StatusCode::INTERNAL_SERVER_ERROR;
         }
     }
 
     ///////////////
-    // 4. Post-consensus: Create JoinInfo and send to joining node
+    // 4. Post-consensus: Create JoinInfo and send to joining node via iroh
     ///////////////
 
     // Get user's private key to send to joining node
@@ -232,41 +209,38 @@ pub async fn post_nodes(
     };
 
     ///////////////
-    // 5. Send JoinInfo to the joining node
+    // 5. Send JoinInfo to the joining node via iroh
     ///////////////
     tracing::info!(
-        "Sending JoinInfo to joining node {} at {} (bootstrap validators: {})",
+        "Sending JoinInfo to joining node {} via iroh (bootstrap validators: {})",
         complete_node.node_id,
-        url,
         join_info.bootstrap_validators.len()
     );
 
-    match client.put(&url)
-        .json(&join_info)
-        .send()
-        .await
-    {
-        Ok(response) => {
-            match response.status() {
-                StatusCode::ACCEPTED => {
-                    tracing::info!(
-                        "Node {} accepted JoinInfo, catch-up running in background",
-                        complete_node.node_id
-                    );
-                    StatusCode::CREATED
-                }
-                status => {
-                    tracing::error!(
-                        "Node {} rejected JoinInfo with status: {}",
-                        complete_node.node_id,
-                        status
-                    );
-                    StatusCode::BAD_GATEWAY
-                }
-            }
+    let req = IrohRequest::JoinDeliver(JoinDeliverRequest { join_info });
+    match app_state.iroh_transport.request(
+        complete_node.node_id,
+        peer_iroh_id,
+        &req,
+        Duration::from_secs(30),
+    ).await {
+        Ok(IrohResponse::JoinAck(ack)) if ack.success => {
+            tracing::info!(
+                "Node {} accepted JoinInfo, catch-up running in background",
+                complete_node.node_id
+            );
+            StatusCode::CREATED
+        }
+        Ok(IrohResponse::Error { message }) => {
+            tracing::error!("Node {} rejected JoinInfo: {}", complete_node.node_id, message);
+            StatusCode::BAD_GATEWAY
+        }
+        Ok(other) => {
+            tracing::error!("Unexpected response from node {}: {:?}", complete_node.node_id, other);
+            StatusCode::BAD_GATEWAY
         }
         Err(e) => {
-            tracing::error!("Failed to send JoinInfo to node {}: {:?}", complete_node.node_id, e);
+            tracing::error!("Failed to send JoinInfo to node {}: {}", complete_node.node_id, e);
             StatusCode::GATEWAY_TIMEOUT
         }
     }

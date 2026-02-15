@@ -18,6 +18,7 @@ mod fragment_distribution;
 mod fragment_health_check;
 mod iroh_ping;
 mod iroh_reject_unknown;
+mod metrics;
 mod multi_size_files;
 mod performance;
 pub(crate) mod persistence;
@@ -122,6 +123,9 @@ pub async fn run_test_by_name(mesh_id: u32, name: &str, nodes: &[NodeInfo], flag
         "consensus-barrier-tc-late" => {
             consensus_barriers::ConsensusBarrierTcLate.run(mesh_id, nodes, flags).await
         }
+        "metrics-collection" => {
+            metrics::MetricsCollection.run(mesh_id, nodes, flags).await
+        }
         _ => Err(anyhow::anyhow!("Unknown test: {}", name)),
     }
 }
@@ -143,6 +147,7 @@ pub fn list_test_names() -> Vec<&'static str> {
         "consensus-barrier-basic",
         "consensus-barrier-missed-ballot",
         "consensus-barrier-tc-late",
+        "metrics-collection",
     ]
 }
 

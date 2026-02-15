@@ -86,8 +86,6 @@ impl MockNetwork {
         let first_db_node = crate::db::Node {
             node_id: 0,
             name: "node_0".to_string(),
-            ip_address: "127.0.0.0".to_string(),
-            port: 3000,
             owner: 0,
             pubkey: first_node.verifying_key,
         };
@@ -114,8 +112,6 @@ impl MockNetwork {
             let joining_node_info = crate::db::Node {
                 node_id: i as i32,
                 name: format!("node_{}", i),
-                ip_address: format!("127.0.0.{}", i),
-                port: 3000 + i as i32,
                 owner: 0,
                 pubkey: joining_node.verifying_key,
             };
@@ -126,8 +122,8 @@ impl MockNetwork {
                     .expect("Failed to get existing node DB");
 
                 existing_node_db.execute(
-                    "INSERT INTO nodes (node_id, name, ip_address, port, owner, pubkey) VALUES (?, ?, ?, ?, ?, ?)",
-                    duckdb::params![i as i32, format!("node_{}", i), format!("127.0.0.{}", i), 3000 + i as i32, 0, joining_node.verifying_key]
+                    "INSERT INTO nodes (node_id, name, owner, pubkey) VALUES (?, ?, ?, ?)",
+                    duckdb::params![i as i32, format!("node_{}", i), 0, joining_node.verifying_key]
                 ).expect("Failed to insert joining node into existing node");
 
                 existing_node_db.execute(
@@ -206,23 +202,21 @@ impl MockNetwork {
 
         // Copy nodes
         eprintln!("sync_node_state: Copying nodes...");
-        source_db.prepare("SELECT node_id, name, ip_address, port, owner, pubkey FROM nodes")
+        source_db.prepare("SELECT node_id, name, owner, pubkey FROM nodes")
             .and_then(|mut stmt| {
                 let rows = stmt.query_map([], |row| {
                     Ok((
                         row.get::<_, i32>(0)?,
                         row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, i32>(3)?,
-                        row.get::<_, i32>(4)?,
-                        row.get::<_, crate::db::PubKey>(5)?
+                        row.get::<_, i32>(2)?,
+                        row.get::<_, crate::db::PubKey>(3)?
                     ))
                 })?;
                 for row in rows {
-                    let (node_id, name, ip_address, port, owner, pubkey) = row?;
+                    let (node_id, name, owner, pubkey) = row?;
                     dest_db.execute(
-                        "INSERT INTO nodes (node_id, name, ip_address, port, owner, pubkey) VALUES (?, ?, ?, ?, ?, ?)",
-                        duckdb::params![node_id, name, ip_address, port, owner, pubkey]
+                        "INSERT INTO nodes (node_id, name, owner, pubkey) VALUES (?, ?, ?, ?)",
+                        duckdb::params![node_id, name, owner, pubkey]
                     )?;
                 }
                 Ok(())
@@ -447,7 +441,7 @@ pub fn create_test_app_state_with_keys(signing_key: crate::db::PrivKey, verifyin
 
     let iroh_secret = signing_key.to_iroh_secret_key();
     let iroh_transport = tokio::runtime::Runtime::new().unwrap()
-        .block_on(crate::net::IrohTransport::new(iroh_secret, pool.clone()))
+        .block_on(crate::net::IrohTransport::new(iroh_secret, pool.clone(), true))
         .expect("test iroh transport");
 
     AppState {
@@ -463,7 +457,6 @@ pub fn create_test_app_state_with_keys(signing_key: crate::db::PrivKey, verifyin
         siv_nonce: Arc::new(OnceCell::new()),
         fragments_dir: "/tmp/test_fragments".to_string(),
         timeout_vote_collector: Arc::new(crate::consensus::functions::TimeoutVoteCollector::new()),
-        throughput_result_collector: Arc::new(crate::metrics::functions::ThroughputResultCollector::new()),
         last_observed_view: Arc::new(std::sync::atomic::AtomicI32::new(0)),
         consensus_lock: Arc::new(tokio::sync::Mutex::new(())),
         fileprovider_api_key: "test_api_key".to_string(),

@@ -141,12 +141,10 @@ mod byzantine_tests {
         for node in &network.nodes {
             let db = node.app_state.db_pool.get().expect("Failed to get DB");
             db.execute(
-                "INSERT INTO nodes (node_id, name, ip_address, port, owner, pubkey) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO nodes (node_id, name, owner, pubkey) VALUES (?, ?, ?, ?)",
                 duckdb::params![
                     rogue_node.node_id,
                     format!("rogue_node_{}", rogue_node.node_id),
-                    "127.0.0.99",
-                    9999,
                     0,
                     rogue_node.verifying_key
                 ]
