@@ -221,6 +221,14 @@ async fn handle_stream(
                 IrohRequest::TransactionForward(req) => {
                     crate::consensus::rpc::handle_transaction_forward(req, &app_state).await
                 }
+                IrohRequest::FragmentFetch(req) => {
+                    IrohResponse::FragmentFetchResponse(
+                        crate::files::rpc::handle_fragment_fetch(req, &app_state.fragments_dir)
+                    )
+                }
+                IrohRequest::FragmentStore(req) => {
+                    crate::files::rpc::handle_fragment_store(req, &app_state).await
+                }
             };
 
             encode_message(&response)

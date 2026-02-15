@@ -23,6 +23,10 @@ pub enum IrohRequest {
     BallotSubmission(consensus_rpc::BallotRequest),
     /// Forward transactions to leader for consensus
     TransactionForward(consensus_rpc::TransactionForwardRequest),
+    /// Fetch a fragment from a remote node
+    FragmentFetch(files_rpc::FragmentFetchRequest),
+    /// Store a fragment on a remote node
+    FragmentStore(files_rpc::FragmentStoreRequest),
 }
 
 /// Response envelope for all iroh communication
@@ -46,6 +50,10 @@ pub enum IrohResponse {
     BallotSubmissionResponse(consensus_rpc::BallotResponse),
     /// Ack for transaction forward
     TransactionForwardResponse(consensus_rpc::TransactionForwardResponse),
+    /// Fragment fetch result
+    FragmentFetchResponse(files_rpc::FragmentFetchResponse),
+    /// Fragment store result
+    FragmentStoreResponse(files_rpc::FragmentStoreResponse),
     /// Error response
     Error { message: String },
 }
@@ -61,7 +69,7 @@ impl IrohRequest {
             IrohRequest::TcBroadcast(req) => Some(req.tc.view_number),
             IrohRequest::QcBroadcast(req) => Some(req.qc.view_number),
             IrohRequest::TransactionForward(req) => Some(req.view),
-            _ => None, // Ping, FragmentHealthCheck, ViewDataFetch, ViewPoll
+            _ => None, // Ping, FragmentHealthCheck, FragmentFetch, FragmentStore, ViewDataFetch, ViewPoll
         }
     }
 }

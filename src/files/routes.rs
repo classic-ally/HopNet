@@ -1009,15 +1009,6 @@ pub async fn post_fetch_fragments(
     let mut successful_fetches = 0;
     let mut failed_fetches = Vec::new();
     
-    // Create node auth info for fragment discovery
-    let node_auth = match crate::NodeAuthInfo::from_app_state(&app_state) {
-        Ok(auth_info) => auth_info,
-        Err(_) => {
-            tracing::error!("Failed to create node auth info for fragment discovery");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-
     // Batch query fragment inventory for all requested fragments
     let all_hashes: Vec<Blake3Hash> = request.fragments.iter()
         .map(|f| f.fragment_hash)
@@ -1056,7 +1047,6 @@ pub async fn post_fetch_fragments(
             &app_state.fragments_dir,
             &app_state,
             Some(placement_height),
-            &node_auth,
             inventory_hint,
         ).await {
             Ok(()) => {

@@ -6,14 +6,11 @@ use crate::{
     types::Blake3Hash,
     db::types::CustomUUID,
 };
-use ed25519_dalek::Signer;
-use reqwest::StatusCode;
 
 #[derive(Debug)]
 pub enum DistributionError {
     Database(DatabaseError),
     Consensus(ConsensusError),
-    Configuration(StatusCode),
     Network(String),
     FragmentTransfer(String),
     Encoding(bincode::error::EncodeError),
@@ -24,7 +21,6 @@ impl std::fmt::Display for DistributionError {
         match self {
             DistributionError::Database(e) => write!(f, "Database error: {:?}", e),
             DistributionError::Consensus(e) => write!(f, "Consensus error: {:?}", e),
-            DistributionError::Configuration(e) => write!(f, "Configuration error: {:?}", e),
             DistributionError::Network(e) => write!(f, "Network error: {}", e),
             DistributionError::FragmentTransfer(e) => write!(f, "Fragment transfer error: {}", e),
             DistributionError::Encoding(e) => write!(f, "Encoding error: {:?}", e),
@@ -43,12 +39,6 @@ impl From<DatabaseError> for DistributionError {
 impl From<ConsensusError> for DistributionError {
     fn from(e: ConsensusError) -> Self {
         DistributionError::Consensus(e)
-    }
-}
-
-impl From<StatusCode> for DistributionError {
-    fn from(e: StatusCode) -> Self {
-        DistributionError::Configuration(e)
     }
 }
 
@@ -144,11 +134,11 @@ async fn distribute_file_fragments(
                    selected_nodes.len(), consensus_height,
                    data_block.file_hash.to_hex().chars().take(8).collect::<String>());
 
-    // Create lookup map for node connection info to avoid separate DB calls
-    let node_connections: std::sync::Arc<std::collections::HashMap<i32, (String, i32)>> =
+    // Create lookup map for node pubkeys (iroh transport addresses)
+    let node_pubkeys: std::sync::Arc<std::collections::HashMap<i32, iroh::PublicKey>> =
         std::sync::Arc::new(selected_nodes
             .iter()
-            .map(|n| (n.node_id, (n.ip_address.clone(), n.port)))
+            .map(|n| (n.node_id, n.pubkey.to_iroh_node_id()))
             .collect());
 
     // Parallel distribution with work queue pattern
@@ -176,7 +166,7 @@ async fn distribute_file_fragments(
         let tx = failure_tx.clone();
         let queue = work_queue.clone();
         let app_state_clone = app_state.clone();
-        let node_connections_clone = node_connections.clone();
+        let node_pubkeys_clone = node_pubkeys.clone();
         let selected_nodes_clone = selected_nodes.clone();
         let successful_placements_clone = successful_placements.clone();
 
@@ -215,8 +205,15 @@ async fn distribute_file_fragments(
                         break;
                     }
 
-                    // Send to remote node
-                    match send_fragment_to_node(&app_state_clone, candidate_node.node_id, &fragment_hash, &node_connections_clone).await {
+                    // Send to remote node via iroh
+                    let peer_node_id = match node_pubkeys_clone.get(&candidate_node.node_id) {
+                        Some(pk) => *pk,
+                        None => {
+                            tracing::warn!("No pubkey for node {}, skipping", candidate_node.node_id);
+                            continue;
+                        }
+                    };
+                    match send_fragment_to_node(&app_state_clone, candidate_node.node_id, &fragment_hash, peer_node_id).await {
                         Ok(()) => {
                             // Mark fragment as not stored locally since it was sent elsewhere
                             match mark_fragment_local_state(app_state_clone.db_pool.get(), &fragment_hash, false) {
@@ -302,104 +299,65 @@ async fn distribute_file_fragments(
     Ok(())
 }
 
-/// Send a fragment to a specific node with retry logic and timeout
+/// Send a fragment to a specific node over iroh with domain-level retry
 async fn send_fragment_to_node(
     app_state: &AppState,
     node_id: i32,
     fragment_hash: &Blake3Hash,
-    node_connections: &std::collections::HashMap<i32, (String, i32)>,
+    peer_node_id: iroh::PublicKey,
 ) -> Result<(), DistributionError> {
-    // 1. Look up node address from the connections map
-    let (ip_address, port) = node_connections.get(&node_id)
-        .ok_or_else(|| DistributionError::Network(format!("Node {} not found in connection map", node_id)))?;
-    let ip_address = ip_address.as_str();
-
-    // 2. Read fragment from local storage
+    // Read fragment from local storage
     let fragment_data = crate::files::functions::fetch_and_verify_fragment(
-        fragment_hash, 
+        fragment_hash,
         &app_state.fragments_dir
     ).map_err(|e| DistributionError::FragmentTransfer(format!("Failed to read fragment {}: {:?}", fragment_hash, e)))?;
-    
-    // 3. Get node and user credentials for inter-node authentication
-    let my_node_id = app_state.get_node_id().map_err(|_| DistributionError::Network("Failed to get node ID".to_string()))?;
-    let user_keys = app_state.get_user_keys().map_err(|_| DistributionError::Network("Failed to get user keys".to_string()))?;
-    let user_id = app_state.get_user_id().map_err(|_| DistributionError::Network("Failed to get user ID".to_string()))?;
-    
-    // 4. Sign the fragment data with both node and user keys for authentication
-    let node_signature = app_state.private_key.sign(&fragment_data);
-    let user_signature = user_keys.private_key.sign(&fragment_data);
-    
-    // 5. Retry configuration
-    const MAX_RETRIES: u32 = 3;
-    const BASE_DELAY_MS: u64 = 500;
-    const CONNECTION_TIMEOUT_SECONDS: u64 = 5;  // Fast connection establishment
-    const REQUEST_TIMEOUT_SECONDS: u64 = 30;    // Generous upload time
-    
-    let url = format!("http://{}:{}/fragments/{}", ip_address, port, fragment_hash);
-    
-    // 6. Retry loop with exponential backoff
+
+    // 2 domain-level retries with 1s delay for server-side transient errors (IrohResponse::Error).
+    // Transport errors (connection failures, timeouts) propagate directly — the transport layer
+    // already handles zombie-connection retry (1 retry with fresh connection).
+    const MAX_RETRIES: u32 = 2;
+    const RETRY_DELAY_MS: u64 = 1000;
+
     for attempt in 0..MAX_RETRIES {
-        // Create client with split timeouts for each attempt
-        let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(CONNECTION_TIMEOUT_SECONDS))
-            .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECONDS))
-            .build()
-            .map_err(|e| DistributionError::Network(format!("Failed to create HTTP client: {}", e)))?;
-        
-        let response_result = client
-            .post(&url)
-            .header("Content-Type", "application/octet-stream")
-            .header("X-Node-ID", my_node_id.to_string())
-            .header("X-User-ID", user_id.to_string())
-            .header("X-Node-Signature", hex::encode(node_signature.to_bytes()))
-            .header("X-User-Signature", hex::encode(user_signature.to_bytes()))
-            .body(fragment_data.clone())
-            .send()
-            .await;
-        
-        match response_result {
-            Ok(response) => {
-                if response.status().is_success() {
-                    tracing::debug!("Successfully sent fragment {} to node {} ({}:{}) on attempt {}", 
-                                   fragment_hash, node_id, ip_address, port, attempt + 1);
+        match crate::files::rpc::store_fragment_remote(
+            &app_state.iroh_transport,
+            node_id,
+            peer_node_id,
+            *fragment_hash,
+            fragment_data.clone(),
+        ).await {
+            Ok(result) => {
+                if result.success {
+                    tracing::debug!("Successfully sent fragment {} to node {} on attempt {}{}",
+                        fragment_hash, node_id, attempt + 1,
+                        if result.already_existed { " (already existed)" } else { "" });
                     return Ok(());
-                } else if response.status().is_client_error() {
-                    // Don't retry client errors (4xx) - these are permanent failures
-                    return Err(DistributionError::FragmentTransfer(
-                        format!("Fragment transfer failed with permanent error: HTTP {}", response.status())
-                    ));
-                } else {
-                    // Server errors (5xx) are retryable
-                    tracing::warn!("Fragment transfer attempt {} failed with HTTP {}, will retry", 
-                                  attempt + 1, response.status());
                 }
+                // success=false shouldn't happen (errors come via IrohResponse::Error), but handle it
+                tracing::warn!("Fragment store returned success=false for {} on node {}", fragment_hash, node_id);
+            }
+            Err(crate::net::IrohError::Protocol(crate::net::transport::ProtocolError::PeerError(msg))) => {
+                // Server-side error (e.g., hash mismatch, size limit) — retry
+                tracing::warn!("Fragment store attempt {} for {} on node {} failed: {}", attempt + 1, fragment_hash, node_id, msg);
+                if attempt < MAX_RETRIES - 1 {
+                    tokio::time::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+                    continue;
+                }
+                return Err(DistributionError::FragmentTransfer(
+                    format!("Fragment store failed after {} attempts: {}", MAX_RETRIES, msg)
+                ));
             }
             Err(e) => {
-                if e.is_timeout() {
-                    tracing::warn!("Fragment transfer attempt {} timed out ({}s connection + {}s request), will retry", 
-                                  attempt + 1, CONNECTION_TIMEOUT_SECONDS, REQUEST_TIMEOUT_SECONDS);
-                } else if e.is_connect() {
-                    tracing::warn!("Fragment transfer attempt {} failed to connect within {}s, will retry", 
-                                  attempt + 1, CONNECTION_TIMEOUT_SECONDS);
-                } else {
-                    tracing::warn!("Fragment transfer attempt {} failed with network error: {}, will retry", 
-                                  attempt + 1, e);
-                }
+                // Transport error — propagate directly (transport already did zombie retry)
+                return Err(DistributionError::FragmentTransfer(
+                    format!("Transport error sending fragment {} to node {}: {}", fragment_hash, node_id, e)
+                ));
             }
         }
-        
-        // Don't delay after the last attempt
-        if attempt < MAX_RETRIES - 1 {
-            let delay_ms = BASE_DELAY_MS * 2_u64.pow(attempt);
-            tracing::debug!("Waiting {}ms before retry attempt {}", delay_ms, attempt + 2);
-            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-        }
     }
-    
-    // All attempts failed
+
     Err(DistributionError::FragmentTransfer(
-        format!("Failed to send fragment {} to node {} after {} attempts", 
-                fragment_hash, node_id, MAX_RETRIES)
+        format!("Failed to send fragment {} to node {} after {} attempts", fragment_hash, node_id, MAX_RETRIES)
     ))
 }
 
@@ -409,7 +367,8 @@ async fn submit_placement_update_to_consensus(
     app_state: &AppState,
     update: PlacementHeightUpdate,
 ) -> Result<(), DistributionError> {
-    let source_node_id = app_state.get_node_id()?;
+    let _source_node_id = app_state.get_node_id()
+        .map_err(|_| DistributionError::Network("Failed to get node ID".to_string()))?;
     
     // Single update wrapped in vector for consistency with handler
     let updates = vec![update];

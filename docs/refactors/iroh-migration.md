@@ -102,7 +102,7 @@ Migrated fragment health checks from HTTP to iroh — first real domain message 
 - `src/net/protocol.rs` — Thin dispatch enum wrapping `files::rpc` types
 - `src/net/handler.rs` — Dispatches to `files::rpc::handle_fragment_health_check()`
 - `src/net/transport.rs` — Generic `request()` method for RPC lifecycle
-- `src/files/discovery.rs` — Health checks over iroh, data fetch stays HTTP (Phase 4)
+- `src/files/discovery.rs` — Health checks and fragment fetch/store over iroh
 
 Pattern: each module owns `rpc.rs` (inter-node) alongside `routes.rs` (HTTP API). Transport provides the `request()` primitive; domain modules build typed RPCs on top.
 
@@ -233,18 +233,19 @@ Orchestrator tests control the flow: hold a barrier on one node, let other nodes
 ---
 
 ## Phase 4: Fragment Transfers
-**Status:** [ ] Not Started
+**Status:** [x] Complete
 
-Large data streaming over iroh:
+Buffered request-response fragment transfers over iroh (fragments ~4MB, within 8MB MAX_MESSAGE_SIZE):
 
-- [ ] Fragment fetch (`GET /fragments/{hash}`)
-- [ ] Fragment store (`POST /fragments/{hash}`)
-- [ ] Use iroh streaming (no 4MB buffer)
+- [x] Fragment fetch (`FragmentFetch` request/response via iroh, replaces `GET /fragments/{hash}`)
+- [x] Fragment store (`FragmentStore` request/response via iroh, replaces `POST /fragments/{hash}`)
+- [x] `NodeAuthInfo` removed from fetch path (iroh PeerValidator handles auth)
+- [x] Simplified retry: 2 domain retries with 1s delay for protocol errors; transport errors propagate directly
 
 **Validation:**
-- `file-upload-consistency` passes
-- `multi-size-file-consistency` passes
-- `fragment-distribution` passes
+- [x] `file-upload-consistency` passes
+- [x] `multi-size-file-consistency` passes
+- [x] `fragment-distribution` passes
 
 ---
 

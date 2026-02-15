@@ -1,10 +1,8 @@
 use crate::{
-    NodeAuthInfo,
     types::{Blake3Hash, NodeConnectionInfo},
     files::placement::FragmentType,
     net::IrohTransport,
 };
-use ed25519_dalek::Signer;
 use either::Either;
 
 #[derive(Debug)]
@@ -20,55 +18,37 @@ impl From<crate::db::DatabaseError> for DiscoveryError {
     }
 }
 
-/// Try to fetch a fragment from a specific node
+/// Try to fetch a fragment from a specific node over iroh
 pub async fn try_fetch_from_node(
     fragment_hash: &Blake3Hash,
     node: &NodeConnectionInfo,
-    auth: &NodeAuthInfo,
+    iroh_transport: &IrohTransport,
 ) -> Result<Vec<u8>, DiscoveryError> {
-    let url = format!("http://{}:{}/fragments/{}", node.ip_address, node.port, fragment_hash.to_hex());
-    
-    // Create HTTP client with timeout
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .map_err(|e| DiscoveryError::Network(format!("HTTP client error: {}", e)))?;
-    
-    // Sign empty body for GET request authentication (same pattern as metrics collector)
-    let body = b"";
-    let node_signature = auth.node_private_key.sign(body);
-    let user_signature = auth.user_keys.private_key.sign(body);
-    
-    // Make authenticated request with cryptographic signatures
-    let response = client
-        .get(&url)
-        .header("X-Node-ID", auth.node_id.to_string())
-        .header("X-User-ID", auth.user_id.to_string())
-        .header("X-Node-Signature", hex::encode(node_signature.to_bytes()))
-        .header("X-User-Signature", hex::encode(user_signature.to_bytes()))
-        .send()
-        .await
-        .map_err(|e| DiscoveryError::Network(format!("Request failed: {}", e)))?;
-    
-    if !response.status().is_success() {
-        return Err(DiscoveryError::NotFound);
-    }
-    
-    // Get fragment data
-    let fragment_data = response
-        .bytes()
-        .await
-        .map_err(|e| DiscoveryError::Network(format!("Failed to read response: {}", e)))?
-        .to_vec();
-    
-    // Verify fragment hash
+    let iroh_node_id = node.pubkey.to_iroh_node_id();
+
+    let fragment_data = crate::files::rpc::fetch_fragment(
+        iroh_transport,
+        node.node_id,
+        iroh_node_id,
+        *fragment_hash,
+    ).await.map_err(|e| {
+        use crate::net::transport::ProtocolError;
+        match &e {
+            crate::net::IrohError::Protocol(ProtocolError::PeerError(msg)) if msg == "fragment not found" => {
+                DiscoveryError::NotFound
+            }
+            _ => DiscoveryError::Network(e.to_string()),
+        }
+    })?;
+
+    // Defense in depth: verify hash even though server already verified
     let actual_hash = Blake3Hash::new(blake3::hash(&fragment_data));
     if actual_hash != *fragment_hash {
         return Err(DiscoveryError::Network("Fragment hash mismatch".to_string()));
     }
-    
-    tracing::debug!("Successfully fetched fragment {} from node {} ({}:{})",
-                   fragment_hash.to_hex(), node.node_id, node.ip_address, node.port);
+
+    tracing::debug!("Successfully fetched fragment {} from node {} via iroh",
+                   fragment_hash.to_hex(), node.node_id);
 
     Ok(fragment_data)
 }
@@ -101,7 +81,6 @@ pub async fn find_fragment(
     fragment_hash: &Blake3Hash,
     _fragment_type: FragmentType,
     nodes: Either<Vec<NodeConnectionInfo>, Vec<crate::db::metrics::NodeMetrics>>,
-    auth: &NodeAuthInfo,
     iroh_transport: &IrohTransport,
     inventory_hint: Option<Vec<NodeConnectionInfo>>,
 ) -> Result<Vec<u8>, DiscoveryError> {
@@ -111,7 +90,7 @@ pub async fn find_fragment(
             tracing::debug!("Trying {} inventory nodes for fragment {}",
                           inventory_nodes.len(), fragment_hash.to_hex());
 
-            if let Ok(data) = try_reactive_discovery_and_fetch(fragment_hash, &inventory_nodes, auth, iroh_transport).await {
+            if let Ok(data) = try_reactive_discovery_and_fetch(fragment_hash, &inventory_nodes, iroh_transport).await {
                 tracing::debug!("Fragment {} found via inventory!", fragment_hash.to_hex());
                 return Ok(data);
             }
@@ -137,7 +116,7 @@ pub async fn find_fragment(
 
     if !discovery_nodes.is_empty() {
         tracing::debug!("Trying reactive discovery across {} nodes", discovery_nodes.len());
-        if let Ok(data) = try_reactive_discovery_and_fetch(fragment_hash, &discovery_nodes, auth, iroh_transport).await {
+        if let Ok(data) = try_reactive_discovery_and_fetch(fragment_hash, &discovery_nodes, iroh_transport).await {
             return Ok(data);
         }
     }
@@ -145,11 +124,10 @@ pub async fn find_fragment(
     Err(DiscoveryError::NotFound)
 }
 
-/// Reactive discovery and fetch: health check over iroh + download over HTTP as nodes respond
+/// Reactive discovery and fetch: health check over iroh, then fetch over iroh as nodes respond
 async fn try_reactive_discovery_and_fetch(
     fragment_hash: &Blake3Hash,
     nodes: &[NodeConnectionInfo],
-    auth: &NodeAuthInfo,
     iroh_transport: &IrohTransport,
 ) -> Result<Vec<u8>, DiscoveryError> {
     let (health_tx, mut health_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -179,19 +157,19 @@ async fn try_reactive_discovery_and_fetch(
     // Process results as they flow in
     loop {
         tokio::select! {
-            // New node found with fragment - start download immediately (HTTP for now)
+            // New node found with fragment - start download immediately over iroh
             Some(node_info) = health_rx.recv() => {
                 tracing::debug!("Node {} reports having fragment, starting download", node_info.node_id);
 
                 let tx = download_tx.clone();
                 let fragment_hash = *fragment_hash;
-                let auth_clone = auth.clone();
+                let transport = iroh_transport.clone();
 
                 tokio::spawn(async move {
                     let result = try_fetch_from_node(
                         &fragment_hash,
                         &node_info,
-                        &auth_clone,
+                        &transport,
                     ).await;
                     let _ = tx.send(result);
                 });

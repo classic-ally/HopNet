@@ -468,10 +468,6 @@ async fn perform_concurrent_fragment_discovery(
     tracing::debug!("Chunk {}: have {} fragments locally, need {} more",
                    chunk_number, local_count, fragments_needed);
 
-    // Create authentication info for inter-node requests
-    let auth = crate::NodeAuthInfo::from_app_state(app_state)
-        .map_err(|_| FileError::StorageError(io::Error::new(io::ErrorKind::Other, "Failed to get auth info")))?;
-
     // Determine discovery mode based on consensus_height
     let nodes = match consensus_height {
         Some(height) => {
@@ -491,7 +487,9 @@ async fn perform_concurrent_fragment_discovery(
             let conn = app_state.db_pool.get()
                 .map_err(|_| FileError::StorageError(io::Error::new(io::ErrorKind::Other, "Database connection failed")))?;
 
-            let gossip_nodes = crate::db::nodes::get_all_nodes_as_connection_info(Ok(conn), auth.node_id)
+            let my_node_id = app_state.get_node_id()
+                .map_err(|_| FileError::StorageError(io::Error::new(io::ErrorKind::Other, "Failed to get node ID")))?;
+            let gossip_nodes = crate::db::nodes::get_all_nodes_as_connection_info(Ok(conn), my_node_id)
                 .map_err(|_| FileError::StorageError(io::Error::new(io::ErrorKind::Other, "Failed to get nodes for gossip")))?;
 
             Either::Left(gossip_nodes)
@@ -558,7 +556,6 @@ async fn perform_concurrent_fragment_discovery(
         let tx = success_tx.clone();
         let queue = work_queue.clone();
         let nodes_clone = nodes.clone();
-        let auth_clone = auth.clone();
         let iroh_transport_clone = app_state.iroh_transport.clone();
         let fragments_dir_clone = fragments_dir.to_string();
         let successful_downloads_clone = successful_downloads.clone();
@@ -591,7 +588,7 @@ async fn perform_concurrent_fragment_discovery(
                 tracing::debug!("Worker {} trying fragment {} (type: {:?})", worker_id, fragment_hash.to_hex(), fragment_type);
 
                 // Try to find and fetch the fragment from network
-                match find_fragment(&fragment_hash, fragment_type, nodes_clone.clone(), &auth_clone, &iroh_transport_clone, inventory_hint).await {
+                match find_fragment(&fragment_hash, fragment_type, nodes_clone.clone(), &iroh_transport_clone, inventory_hint).await {
                 Ok(encrypted_data) => {
                         // Store fragment locally
                         if let Err(e) = store_fragment(&fragments_dir_clone, &fragment_hash, encrypted_data) {
@@ -700,7 +697,6 @@ pub async fn fetch_and_cache_fragment(
     fragments_dir: &str,
     app_state: &AppState,
     placement_height: Option<i32>,
-    auth: &crate::NodeAuthInfo,
     inventory_hint: Option<Vec<crate::types::NodeConnectionInfo>>,
 ) -> Result<(), FileError> {
     use either::Either;
@@ -731,7 +727,9 @@ pub async fn fetch_and_cache_fragment(
             // Gossip-only mode: get all nodes from database
             tracing::warn!("No placement height available - using gossip-only fragment discovery");
 
-            let gossip_nodes = crate::db::nodes::get_all_nodes_as_connection_info(app_state.db_pool.get(), auth.node_id)
+            let my_node_id = app_state.get_node_id()
+                .map_err(|_| FileError::DatabaseError)?;
+            let gossip_nodes = crate::db::nodes::get_all_nodes_as_connection_info(app_state.db_pool.get(), my_node_id)
                 .map_err(|_| FileError::DatabaseError)?;
 
             Either::Left(gossip_nodes)
@@ -739,7 +737,7 @@ pub async fn fetch_and_cache_fragment(
     };
 
     // Try to find and fetch the fragment
-    match find_fragment(fragment_hash, FragmentType::Original, nodes, auth, &app_state.iroh_transport, inventory_hint).await {
+    match find_fragment(fragment_hash, FragmentType::Original, nodes, &app_state.iroh_transport, inventory_hint).await {
         Ok(fragment_data) => {
             // Store fragment locally
             store_fragment(fragments_dir, fragment_hash, fragment_data)?;
