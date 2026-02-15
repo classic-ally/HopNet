@@ -696,30 +696,31 @@ pub async fn get_jwt_token(docker: &Docker, mesh_id: u32, node_id: u32, runtime:
     });
     
     let start_time = std::time::Instant::now();
-    let timeout_duration = std::time::Duration::from_secs(10);
-    let retry_interval = std::time::Duration::from_millis(500);
-    
+    // Login uses 1 GiB Argon2id key unwrap (3-5s per attempt)
+    let timeout_duration = std::time::Duration::from_secs(30);
+    let retry_interval = std::time::Duration::from_secs(2);
+
     loop {
         if start_time.elapsed() > timeout_duration {
-            return Err(anyhow::anyhow!("Login request timed out after 10 seconds"));
+            return Err(anyhow::anyhow!("Login request timed out after 30 seconds"));
         }
-        
+
         match client
             .post(&login_url)
             .json(&login_data)
-            .timeout(tokio::time::Duration::from_secs(3))
+            .timeout(tokio::time::Duration::from_secs(15))
             .send()
             .await
         {
             Ok(response) => {
                 let status = response.status();
                 if status == reqwest::StatusCode::OK {
-                    match response.text().await {
-                        Ok(token_raw) => {
-                            // Remove quotes if present and trim whitespace
-                            let token = token_raw.trim().trim_matches('"');
-                            if !token.is_empty() {
-                                return Ok(token.to_string());
+                    match response.json::<serde_json::Value>().await {
+                        Ok(body) => {
+                            if let Some(token) = body.get("token").and_then(|t| t.as_str()) {
+                                if !token.is_empty() {
+                                    return Ok(token.to_string());
+                                }
                             }
                         }
                         Err(_) => {}
@@ -728,11 +729,11 @@ pub async fn get_jwt_token(docker: &Docker, mesh_id: u32, node_id: u32, runtime:
             }
             Err(_) => {}
         }
-        
+
         if start_time.elapsed() + retry_interval > timeout_duration {
             return Err(anyhow::anyhow!("Login failed after retries"));
         }
-        
+
         tokio::time::sleep(retry_interval).await;
     }
 }

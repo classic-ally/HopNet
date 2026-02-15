@@ -75,13 +75,16 @@ impl MockNetwork {
         let first_node = MockNode::new(0);
         let x25519_pubkey = crate::auth::derive_x25519_pubkey_from_user(&users[0].signing_key);
 
-        let user = crate::types::User::new_with_password(
+        let (encrypted_privkey, key_salt) = crate::auth::wrap_user_privkey(&users[0].signing_key, "password")
+            .expect("Failed to wrap test user privkey");
+        let user = crate::types::User::new(
             0,
             "test_user".to_string(),
-            "password".to_string(),
             users[0].verifying_key,
             x25519_pubkey,
-        ).expect("Failed to create test user");
+            encrypted_privkey,
+            key_salt,
+        );
 
         let first_db_node = crate::db::Node {
             node_id: 0,
@@ -94,7 +97,6 @@ impl MockNetwork {
             &first_node.app_state,
             user,
             first_db_node,
-            users[0].signing_key.clone(),
         ).expect("Failed to run initial setup for first node");
 
         // Set node_id and user_id in app_state
@@ -174,22 +176,23 @@ impl MockNetwork {
 
         // Copy users
         eprintln!("sync_node_state: Copying users...");
-        source_db.prepare("SELECT user_id, username, password_hash, pubkey, x25519_pubkey FROM users")
+        source_db.prepare("SELECT user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt FROM users")
             .and_then(|mut stmt| {
                 let rows = stmt.query_map([], |row| {
                     Ok((
                         row.get::<_, i32>(0)?,
                         row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, crate::db::PubKey>(3)?,
-                        row.get::<_, Vec<u8>>(4)?
+                        row.get::<_, crate::db::PubKey>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                        row.get::<_, Vec<u8>>(5)?
                     ))
                 })?;
                 for row in rows {
-                    let (user_id, username, password_hash, pubkey, x25519_pubkey) = row?;
+                    let (user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt) = row?;
                     dest_db.execute(
-                        "INSERT INTO users (user_id, username, password_hash, pubkey, x25519_pubkey) VALUES (?, ?, ?, ?, ?)",
-                        duckdb::params![user_id, username, password_hash, pubkey, x25519_pubkey]
+                        "INSERT INTO users (user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt) VALUES (?, ?, ?, ?, ?, ?)",
+                        duckdb::params![user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt]
                     )?;
                 }
                 Ok(())
@@ -357,7 +360,6 @@ impl MockNetwork {
         // Set up this_node table for the joining node
         eprintln!("sync_node_state: Copying this_node state...");
         let (
-            user_privkey,
             current_phase,
             current_view,
             last_timeout_vote_view,
@@ -367,7 +369,6 @@ impl MockNetwork {
             highest_qc,
             highest_qc_phase
         ): (
-            crate::db::PrivKey,
             ConsensusPhase,
             i32,
             Option<i32>,
@@ -377,7 +378,7 @@ impl MockNetwork {
             Option<crate::db::Blake3Hash>,
             Option<ConsensusPhase>
         ) = source_db.query_row(
-            "SELECT user_privkey, current_phase, current_view, last_timeout_vote_view, last_propose_vote_block_hash, prepared_block_hash, committed_block_hash, highest_qc_block_hash, highest_qc_phase FROM this_node WHERE internal_id = 1",
+            "SELECT current_phase, current_view, last_timeout_vote_view, last_propose_vote_block_hash, prepared_block_hash, committed_block_hash, highest_qc_block_hash, highest_qc_phase FROM this_node WHERE internal_id = 1",
             [],
             |row| Ok((
                 row.get(0)?,
@@ -387,8 +388,7 @@ impl MockNetwork {
                 row.get(4)?,
                 row.get(5)?,
                 row.get(6)?,
-                row.get(7)?,
-                row.get(8)?
+                row.get(7)?
             ))
         ).map_err(|e| {
             eprintln!("Failed to read this_node from source: {:?}", e);
@@ -398,11 +398,10 @@ impl MockNetwork {
         // INSERT the this_node row (dest DB only has schema, no data yet)
         // Use joining_node's specific node_id and privkey, but copy consensus state from source
         dest_db.execute(
-            "INSERT INTO this_node (internal_id, node_id, privkey, user_privkey, current_phase, current_view, last_timeout_vote_view, last_propose_vote_block_hash, prepared_block_hash, committed_block_hash, highest_qc_block_hash, highest_qc_phase) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO this_node (internal_id, node_id, privkey, current_phase, current_view, last_timeout_vote_view, last_propose_vote_block_hash, prepared_block_hash, committed_block_hash, highest_qc_block_hash, highest_qc_phase) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             duckdb::params![
                 joining_node.node_id,
                 dest.private_key,  // Use joining node's own private key
-                user_privkey,      // Copy user_privkey from source
                 current_phase,
                 current_view,
                 last_timeout_vote_view,
@@ -467,6 +466,7 @@ pub fn create_test_app_state_with_keys(signing_key: crate::db::PrivKey, verifyin
         consensus_barriers: Arc::new(crate::consensus::barriers::ConsensusBarriers::new()),
         dedup_cache: Arc::new(crate::net::DedupCache::default()),
         lock_vote_evidence: Arc::new(std::sync::Mutex::new(None)),
+        session_store: Arc::new(crate::auth::SessionStore::default()),
     }
 }
 

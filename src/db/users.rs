@@ -11,9 +11,10 @@ pub fn get_users(
                 Ok(User {
                     user_id: row.get(0)?,
                     username: row.get(1)?,
-                    password_hash: row.get(2)?,
-                    pubkey: row.get(3)?,
-                    x25519_pubkey: row.get(4)?
+                    pubkey: row.get(2)?,
+                    x25519_pubkey: row.get(3)?,
+                    encrypted_privkey: row.get(4)?,
+                    key_salt: row.get(5)?,
                 })
             });
 
@@ -48,9 +49,10 @@ pub fn get_user_by_username(
                 let user = User {
                     user_id: row.get(0).map_err(|_| DatabaseError::RecallError)?,
                     username: row.get(1).map_err(|_| DatabaseError::RecallError)?,
-                    password_hash: row.get(2).map_err(|_| DatabaseError::RecallError)?,
-                    pubkey: row.get(3).map_err(|_| DatabaseError::RecallError)?,
-                    x25519_pubkey: row.get(4).map_err(|_| DatabaseError::RecallError)?
+                    pubkey: row.get(2).map_err(|_| DatabaseError::RecallError)?,
+                    x25519_pubkey: row.get(3).map_err(|_| DatabaseError::RecallError)?,
+                    encrypted_privkey: row.get(4).map_err(|_| DatabaseError::RecallError)?,
+                    key_salt: row.get(5).map_err(|_| DatabaseError::RecallError)?,
                 };
                 return Ok(Some(user))
             } else {
@@ -77,9 +79,10 @@ pub fn get_user_by_userid(
                 let user = User {
                     user_id: row.get(0).map_err(|_| DatabaseError::RecallError)?,
                     username: row.get(1).map_err(|_| DatabaseError::RecallError)?,
-                    password_hash: row.get(2).map_err(|_| DatabaseError::RecallError)?,
-                    pubkey: row.get(3).map_err(|_| DatabaseError::RecallError)?,
-                    x25519_pubkey: row.get(4).map_err(|_| DatabaseError::RecallError)?
+                    pubkey: row.get(2).map_err(|_| DatabaseError::RecallError)?,
+                    x25519_pubkey: row.get(3).map_err(|_| DatabaseError::RecallError)?,
+                    encrypted_privkey: row.get(4).map_err(|_| DatabaseError::RecallError)?,
+                    key_salt: row.get(5).map_err(|_| DatabaseError::RecallError)?,
                 };
                 return Ok(Some(user))
             } else {
@@ -92,7 +95,6 @@ pub fn get_user_by_userid(
 
 /// Core user insertion logic - operates within provided transaction for atomicity
 /// Returns the assigned user_id
-/// Password must already be hashed (use User::new_with_password at input boundaries)
 pub fn insert_user_tx(
     tx: &duckdb::Transaction,
     user: User,
@@ -103,10 +105,9 @@ pub fn insert_user_tx(
         |row| row.get::<_, i32>(0)
     ).map_err(|_| DatabaseError::RecallError)?;
 
-    // Password already hashed at input boundary - just store it
     tx.execute(
-        "INSERT INTO users (user_id, username, password_hash, pubkey, x25519_pubkey) VALUES (?, ?, ?, ?, ?)",
-        params![next_id, user.username, user.password_hash, user.pubkey, user.x25519_pubkey]
+        "INSERT INTO users (user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt) VALUES (?, ?, ?, ?, ?, ?)",
+        params![next_id, user.username, user.pubkey, user.x25519_pubkey, user.encrypted_privkey, user.key_salt]
     ).map_err(|_| DatabaseError::InsertError)?;
 
     // Update the sequence for next user

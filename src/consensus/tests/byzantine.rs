@@ -247,13 +247,14 @@ mod byzantine_tests {
             let db = net_node.app_state.db_pool.get().expect("Failed to get DB");
             let x25519_pubkey = crate::auth::derive_x25519_pubkey_from_user(&user1.signing_key);
             db.execute(
-                "INSERT INTO users (user_id, username, password_hash, pubkey, x25519_pubkey) VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO users (user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt) VALUES (?, ?, ?, ?, ?, ?)",
                 duckdb::params![
                     user1.user_id,
                     format!("user_{}", user1.user_id),
-                    "password_hash",
                     user1.verifying_key,
-                    x25519_pubkey
+                    x25519_pubkey,
+                    vec![0u8; 44],  // dummy encrypted_privkey for test
+                    vec![0u8; 16]   // dummy key_salt for test
                 ]
             ).expect("Failed to insert user1");
         }

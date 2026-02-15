@@ -815,7 +815,6 @@ pub struct StartupState {
     pub node_id: i32,
     pub user_id: i32,
     pub node_privkey: PrivKey,
-    pub user_privkey: PrivKey,
 }
 
 /// Load all necessary state from database for node restart
@@ -825,16 +824,15 @@ pub fn get_startup_state(
 ) -> Result<StartupState, DatabaseError> {
     match db_connection {
         Ok(db_lock) => {
-            // First, get node_id, privkey, and user_privkey from this_node table
+            // First, get node_id and privkey from this_node table
             let mut stmt = db_lock.prepare(
-                "SELECT node_id, privkey, user_privkey FROM this_node"
+                "SELECT node_id, privkey FROM this_node"
             ).map_err(|_| DatabaseError::RecallError)?;
 
-            let (node_id, node_privkey, user_privkey) = stmt.query_row([], |row| {
+            let (node_id, node_privkey) = stmt.query_row([], |row| {
                 let node_id: i32 = row.get(0)?;
                 let node_privkey: PrivKey = row.get(1)?;
-                let user_privkey: PrivKey = row.get(2)?;
-                Ok((node_id, node_privkey, user_privkey))
+                Ok((node_id, node_privkey))
             }).map_err(|_| DatabaseError::RecallError)?;
 
             // Now get user_id from nodes table
@@ -850,7 +848,6 @@ pub fn get_startup_state(
                 node_id,
                 user_id,
                 node_privkey,
-                user_privkey,
             })
         }
         Err(_) => Err(DatabaseError::LockError)
@@ -1153,9 +1150,9 @@ mod tests {
 
         // Insert test user
         conn.execute(
-            "INSERT INTO users (user_id, username, password_hash, pubkey, x25519_pubkey)
-             VALUES (?, ?, ?, ?, ?)",
-            params![1, "test", "hash", &user_pubkey, &vec![0u8; 32]]
+            "INSERT INTO users (user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            params![1, "test", &user_pubkey, &vec![0u8; 32], &vec![0u8; 44], &vec![0u8; 16]]
         ).unwrap();
 
         // Insert test nodes
@@ -1210,9 +1207,9 @@ mod tests {
 
         // Insert test user and node
         conn.execute(
-            "INSERT INTO users (user_id, username, password_hash, pubkey, x25519_pubkey)
-             VALUES (?, ?, ?, ?, ?)",
-            params![1, "test", "hash", &user_pubkey, &vec![0u8; 32]]
+            "INSERT INTO users (user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            params![1, "test", &user_pubkey, &vec![0u8; 32], &vec![0u8; 44], &vec![0u8; 16]]
         ).unwrap();
 
         conn.execute(
@@ -1254,9 +1251,9 @@ mod tests {
 
         // Insert test user and node
         conn.execute(
-            "INSERT INTO users (user_id, username, password_hash, pubkey, x25519_pubkey)
-             VALUES (?, ?, ?, ?, ?)",
-            params![1, "test", "hash", &user_pubkey, &vec![0u8; 32]]
+            "INSERT INTO users (user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            params![1, "test", &user_pubkey, &vec![0u8; 32], &vec![0u8; 44], &vec![0u8; 16]]
         ).unwrap();
 
         conn.execute(
@@ -1305,9 +1302,9 @@ mod tests {
 
         // Insert test user
         conn.execute(
-            "INSERT INTO users (user_id, username, password_hash, pubkey, x25519_pubkey)
-             VALUES (?, ?, ?, ?, ?)",
-            params![1, "test", "hash", &user_pubkey, &vec![0u8; 32]]
+            "INSERT INTO users (user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            params![1, "test", &user_pubkey, &vec![0u8; 32], &vec![0u8; 44], &vec![0u8; 16]]
         ).unwrap();
 
         // Insert 5 test nodes
@@ -1361,9 +1358,9 @@ mod tests {
 
         // Insert test user and node
         conn.execute(
-            "INSERT INTO users (user_id, username, password_hash, pubkey, x25519_pubkey)
-             VALUES (?, ?, ?, ?, ?)",
-            params![1, "test", "hash", &user_pubkey, &vec![0u8; 32]]
+            "INSERT INTO users (user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            params![1, "test", &user_pubkey, &vec![0u8; 32], &vec![0u8; 44], &vec![0u8; 16]]
         ).unwrap();
 
         conn.execute(

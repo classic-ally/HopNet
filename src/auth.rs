@@ -14,10 +14,23 @@ use serde::{Serialize, Deserialize};
 use rand::Rng;
 use aes_siv::{siv::Aes256Siv, Key, Nonce};
 use chacha20poly1305::{ChaCha20Poly1305, aead::{Aead, KeyInit}};
+use argon2::{Algorithm, Version, Params, Argon2 as Argon2Raw};
+use std::collections::HashMap;
+use tokio::sync::RwLock;
 
 use crate::db;
 use crate::{AppState, PrivKey};
 use crate::db::types::XPubKey;
+
+#[derive(Clone, Debug)]
+pub struct SessionEntry {
+    pub user_keys: crate::UserKeys,
+    pub siv_key: Key<Aes256Siv>,
+    pub siv_nonce: Nonce,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+pub type SessionStore = RwLock<HashMap<i32, SessionEntry>>;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
@@ -30,6 +43,12 @@ struct Claims {
 pub struct SignInData {
     pub username: String,
     pub password: String,
+    pub remember_me: Option<bool>,
+}
+
+#[derive(Serialize)]
+pub struct SignInResponse {
+    pub token: String,
 }
 
 pub struct AuthError {
@@ -129,20 +148,60 @@ fn encode_jwt(iss: String, uid: String, key: EncodingKey) -> Result<String, Stat
 pub async fn sign_in(
     State(app_state): State<AppState>,
     Json(user_data): Json<SignInData>
-) -> Result<Json<String>, StatusCode> {
-    // get user by username from db
-    match db::users::get_user_by_username(app_state.db_pool.get(), user_data.username) {
-        Ok(Some(mut db_user)) => {
-            // verify user password against hash
-            match db_user.verify_password(user_data.password.as_bytes()) {
-                Ok(true) => return Ok(Json(encode_jwt('1'.to_string(), db_user.user_id.to_string(), app_state.encoding_key)?)), // return a JWT
-                Ok(false) => return Err(StatusCode::UNAUTHORIZED),      // bad password
-                Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR) // some error
-            }
-        }
-        Ok(None) => return Err(StatusCode::UNAUTHORIZED),               // no user exists
-        Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR)         // some error
+) -> Result<Json<SignInResponse>, AuthError> {
+    let remember_me = user_data.remember_me.unwrap_or(false);
+    let duration_hours: i64 = if remember_me { 24 } else { 1 };
+
+    let node_id = app_state.get_node_id()
+        .map_err(|_| AuthError { message: "Node not initialized".into(), status_code: StatusCode::SERVICE_UNAVAILABLE })?;
+
+    // Look up user
+    let db_user = db::users::get_user_by_username(app_state.db_pool.get(), user_data.username)
+        .map_err(|_| AuthError { message: "Database error".into(), status_code: StatusCode::INTERNAL_SERVER_ERROR })?
+        .ok_or(AuthError { message: "Invalid credentials".into(), status_code: StatusCode::UNAUTHORIZED })?;
+
+    // Unwrap private key — this IS the authentication (3-5s, 1 GiB Argon2id)
+    // If the password is wrong, ChaCha20-Poly1305 decryption fails
+    let encrypted_privkey = db_user.encrypted_privkey.clone();
+    let key_salt = db_user.key_salt.clone();
+    let password = user_data.password;
+    let privkey = tokio::task::spawn_blocking(move || {
+        unwrap_user_privkey(&encrypted_privkey, &key_salt, &password)
+            .map_err(|e| e.to_string())
+    }).await
+        .map_err(|_| AuthError { message: "Internal error".into(), status_code: StatusCode::INTERNAL_SERVER_ERROR })?
+        .map_err(|_| AuthError { message: "Invalid credentials".into(), status_code: StatusCode::UNAUTHORIZED })?;
+
+    // Derive all key material
+    let pubkey = crate::db::PubKey(privkey.verifying_key());
+    let (siv_key, siv_nonce) = derive_siv_key_from_user(&privkey, "file_path");
+    let user_keys = crate::UserKeys { private_key: privkey, public_key: pubkey };
+
+    // Build session entry
+    let expires_at = Utc::now() + Duration::hours(duration_hours);
+    let session = SessionEntry { user_keys, siv_key, siv_nonce, expires_at };
+
+    // Insert into session store
+    {
+        let mut store = app_state.session_store.write().await;
+        store.insert(db_user.user_id, session);
     }
+
+    // Encode JWT with matching duration
+    let token = encode_jwt_with_duration(
+        node_id.to_string(), db_user.user_id.to_string(),
+        app_state.encoding_key, duration_hours,
+    )?;
+
+    Ok(Json(SignInResponse { token }))
+}
+
+fn encode_jwt_with_duration(iss: String, uid: String, key: EncodingKey, hours: i64) -> Result<String, AuthError> {
+    let now = Utc::now();
+    let exp = (now + Duration::hours(hours)).timestamp() as usize;
+    let claim = Claims { exp, iss, uid };
+    encode(&Header::default(), &claim, &key)
+        .map_err(|_| AuthError { message: "JWT encoding failed".into(), status_code: StatusCode::INTERNAL_SERVER_ERROR })
 }
 
 /// Derives SIV key and nonce from user's private key using Blake3 key derivation
@@ -203,6 +262,70 @@ pub fn derive_x25519_privkey_from_user(user_privkey: &PrivKey) -> x25519_dalek::
     x25519_dalek::StaticSecret::from(x25519_secret_bytes)
 }
 
+/// Wrap a user private key with a password using Argon2id + ChaCha20-Poly1305.
+/// Returns (nonce || ciphertext, salt).
+pub fn wrap_user_privkey(privkey: &PrivKey, password: &str) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
+    // Generate 16-byte random salt
+    let mut salt = [0u8; 16];
+    let mut rng = rand::rng();
+    rng.fill(&mut salt);
+
+    // Derive 32-byte wrapping key using Argon2id (OWASP-recommended: 47 MiB, 2 iterations, 1 parallelism)
+    let params = Params::new(1_048_576, 3, 1, Some(32))?;
+    let argon2 = Argon2Raw::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut key_bytes = [0u8; 32];
+    argon2.hash_password_into(password.as_bytes(), &salt, &mut key_bytes)
+        .map_err(|e| format!("Argon2 key derivation failed: {}", e))?;
+
+    // Generate 12-byte random nonce
+    let mut nonce_bytes = [0u8; 12];
+    rng.fill(&mut nonce_bytes);
+    let nonce = chacha20poly1305::Nonce::from(nonce_bytes);
+
+    // Encrypt the private key
+    let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&key_bytes));
+    let ciphertext = cipher.encrypt(&nonce, privkey.0.to_bytes().as_slice())
+        .map_err(|e| format!("Encryption failed: {:?}", e))?;
+
+    // Return nonce || ciphertext, and salt
+    let mut encrypted = Vec::with_capacity(12 + ciphertext.len());
+    encrypted.extend_from_slice(&nonce_bytes);
+    encrypted.extend_from_slice(&ciphertext);
+
+    Ok((encrypted, salt.to_vec()))
+}
+
+/// Unwrap a password-wrapped user private key.
+/// encrypted_privkey is nonce (12 bytes) || ciphertext.
+pub fn unwrap_user_privkey(encrypted_privkey: &[u8], key_salt: &[u8], password: &str) -> Result<PrivKey, Box<dyn std::error::Error>> {
+    if encrypted_privkey.len() < 12 {
+        return Err("Encrypted private key too short".into());
+    }
+
+    let (nonce_bytes, ciphertext) = encrypted_privkey.split_at(12);
+    let nonce = chacha20poly1305::Nonce::from_slice(nonce_bytes);
+
+    // Derive wrapping key with same Argon2id parameters
+    let params = Params::new(1_048_576, 3, 1, Some(32))?;
+    let argon2 = Argon2Raw::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut key_bytes = [0u8; 32];
+    argon2.hash_password_into(password.as_bytes(), key_salt, &mut key_bytes)
+        .map_err(|e| format!("Argon2 key derivation failed: {}", e))?;
+
+    // Decrypt
+    let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&key_bytes));
+    let plaintext = cipher.decrypt(nonce, ciphertext)
+        .map_err(|e| format!("Decryption failed: {:?}", e))?;
+
+    if plaintext.len() != 32 {
+        return Err("Decrypted key is not 32 bytes".into());
+    }
+
+    let mut key_arr = [0u8; 32];
+    key_arr.copy_from_slice(&plaintext);
+    Ok(PrivKey(ed25519_dalek::SigningKey::from_bytes(&key_arr)))
+}
+
 /// Decrypt a wrapped per-file key using X25519 ECDH and ChaCha20-Poly1305
 pub fn decrypt_wrapped_file_key(
     file_access: &crate::db::types::FileAccess,
@@ -240,4 +363,50 @@ pub fn decrypt_wrapped_file_key(
     let mut key_bytes = [0u8; 32];
     key_bytes.copy_from_slice(&decrypted_file_key);
     Ok(chacha20poly1305::Key::from(key_bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+
+    #[test]
+    fn test_wrap_unwrap_round_trip() {
+        let signing_key = SigningKey::from_bytes(&[42u8; 32]);
+        let privkey = PrivKey(signing_key);
+        let password = "test-password-123";
+
+        let (encrypted, salt) = wrap_user_privkey(&privkey, password).unwrap();
+        let recovered = unwrap_user_privkey(&encrypted, &salt, password).unwrap();
+
+        assert_eq!(privkey.0.to_bytes(), recovered.0.to_bytes());
+    }
+
+    #[test]
+    fn test_unwrap_wrong_password() {
+        let signing_key = SigningKey::from_bytes(&[42u8; 32]);
+        let privkey = PrivKey(signing_key);
+
+        let (encrypted, salt) = wrap_user_privkey(&privkey, "correct-password").unwrap();
+        let result = unwrap_user_privkey(&encrypted, &salt, "wrong-password");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_unwrap_corrupted_ciphertext() {
+        let signing_key = SigningKey::from_bytes(&[42u8; 32]);
+        let privkey = PrivKey(signing_key);
+        let password = "test-password";
+
+        let (mut encrypted, salt) = wrap_user_privkey(&privkey, password).unwrap();
+
+        // Corrupt a byte in the ciphertext (after the 12-byte nonce)
+        if encrypted.len() > 14 {
+            encrypted[14] ^= 0xff;
+        }
+
+        let result = unwrap_user_privkey(&encrypted, &salt, password);
+        assert!(result.is_err());
+    }
 }

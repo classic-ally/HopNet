@@ -389,52 +389,22 @@ pub struct Node {
 pub struct User {
     pub user_id: i32,
     pub username: String,
-    pub password_hash: String,  // Argon2 hash - never store/transmit plaintext
     pub pubkey: PubKey,
-    pub x25519_pubkey: crate::db::types::XPubKey
+    pub x25519_pubkey: crate::db::types::XPubKey,
+    pub encrypted_privkey: Vec<u8>,  // nonce || ChaCha20-Poly1305 ciphertext
+    pub key_salt: Vec<u8>,           // Argon2 salt
 }
 
-use argon2::{
-    password_hash::{
-        rand_core::OsRng,
-        PasswordHash, PasswordHasher, SaltString
-    },
-    Argon2, PasswordVerifier
-};
-
 impl User {
-    /// Create a User from plaintext password (hashes automatically)
-    /// Use this at input boundaries (API routes, setup) before consensus
-    /// Takes ownership of plaintext_password to ensure it's consumed and dropped after hashing
-    pub fn new_with_password(
+    pub fn new(
         user_id: i32,
         username: String,
-        plaintext_password: String,  // Takes ownership - consumed and dropped after hashing
         pubkey: PubKey,
-        x25519_pubkey: crate::db::types::XPubKey
-    ) -> Result<Self, argon2::password_hash::Error> {
-        let password_hash = Self::hash_password(&plaintext_password)?;
-        // plaintext_password dropped here - minimizes lifetime in memory
-        Ok(User {
-            user_id,
-            username,
-            password_hash,
-            pubkey,
-            x25519_pubkey,
-        })
-    }
-
-    /// Hash plaintext password using Argon2
-    fn hash_password(plaintext: &str) -> Result<String, argon2::password_hash::Error> {
-        let salt = SaltString::generate(&mut OsRng);
-        let argon2 = Argon2::default();
-        argon2.hash_password(plaintext.as_bytes(), &salt).map(|h| h.to_string())
-    }
-
-    /// Verify plaintext password against stored hash
-    pub fn verify_password(&self, check_password: &[u8]) -> Result<bool, argon2::password_hash::Error> {
-        let parsed_hash = PasswordHash::new(&self.password_hash)?;
-        Ok(Argon2::default().verify_password(check_password, &parsed_hash).is_ok())
+        x25519_pubkey: crate::db::types::XPubKey,
+        encrypted_privkey: Vec<u8>,
+        key_salt: Vec<u8>,
+    ) -> User {
+        User { user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt }
     }
 }
 

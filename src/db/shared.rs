@@ -52,9 +52,10 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
             CREATE TABLE users (
                 user_id         INTEGER PRIMARY KEY,
                 username        VARCHAR NOT NULL,
-                password_hash   VARCHAR NOT NULL,
                 pubkey          BLOB NOT NULL,
                 x25519_pubkey   BLOB NOT NULL,  -- 32 bytes X25519 public key for file access
+                encrypted_privkey BLOB NOT NULL, -- nonce || ChaCha20-Poly1305 ciphertext
+                key_salt        BLOB NOT NULL,   -- Argon2 salt
 
                 CONSTRAINT unique_username UNIQUE (username)
             );
@@ -142,7 +143,6 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
                 internal_id             INTEGER PRIMARY KEY DEFAULT 1,
                 node_id                 INTEGER NOT NULL UNIQUE,
                 privkey                 BLOB NOT NULL,
-                user_privkey            BLOB NOT NULL,
 
                 -- Consensus mechanics
                 -- View stored in case of leader change without block written

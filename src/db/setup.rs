@@ -50,7 +50,6 @@ pub fn post_initial_setup(
     state: &crate::AppState,
     user: User,
     node: Node,
-    user_privkey: PrivKey
 ) -> Result<(i32, i32), DatabaseError> {
     use crate::consensus::handlers::GenesisPayload;
     use crate::consensus::types::{Transaction, Transactions};
@@ -175,8 +174,8 @@ pub fn post_initial_setup(
         // Initialize this_node with genesis state
         tracing::debug!("post_initial_setup: Inserting this_node entry");
         tx_db.execute(
-            "INSERT INTO this_node (internal_id, node_id, privkey, current_view, current_phase, committed_block_hash, highest_qc_block_hash, user_privkey) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            params![1, 0, state.private_key, 0, ConsensusPhase::Propose, genesis_block.block_hash, genesis_block.block_hash, user_privkey]
+            "INSERT INTO this_node (internal_id, node_id, privkey, current_view, current_phase, committed_block_hash, highest_qc_block_hash) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            params![1, 0, state.private_key, 0, ConsensusPhase::Propose, genesis_block.block_hash, genesis_block.block_hash]
         ).map_err(|e| {
             tracing::error!("post_initial_setup: Failed to insert this_node: {:?}", e);
             DatabaseError::InsertError
@@ -259,12 +258,11 @@ pub fn initialize_joining_node(
             // Initialize this_node with identity and keys
             // All consensus state starts at view 0, will be populated by catch-up
             db_lock.execute(
-                "INSERT INTO this_node (internal_id, node_id, privkey, user_privkey, current_view, current_phase, committed_block_hash, highest_qc_block_hash, prepared_block_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO this_node (internal_id, node_id, privkey, current_view, current_phase, committed_block_hash, highest_qc_block_hash, prepared_block_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     1,
                     join_info.node_id,
                     node_privkey,
-                    join_info.user_privkey,
                     0,  // Start at view 0 for catch-up
                     ConsensusPhase::Propose,
                     None::<Blake3Hash>,  // Will be set by genesis catch-up

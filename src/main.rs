@@ -15,6 +15,7 @@ use r2d2::Pool;
 use apalis::prelude::*;
 use std::str::FromStr;
 
+use chrono::Utc;
 use crate::{db::{PrivKey, PubKey}, handlers::TransactionHandler};
 
 mod nodes;
@@ -66,6 +67,7 @@ pub struct AppState {
     consensus_barriers: Arc<consensus::barriers::ConsensusBarriers>,
     dedup_cache: Arc<net::DedupCache>,
     lock_vote_evidence: Arc<std::sync::Mutex<Option<consensus::types::LockVoteEvidence>>>,
+    session_store: Arc<auth::SessionStore>,
 }
 
 impl AppState {
@@ -87,6 +89,15 @@ impl AppState {
     
     pub fn get_siv_nonce(&self) -> Result<&Nonce, StatusCode> {
         self.siv_nonce.get().ok_or(StatusCode::PRECONDITION_REQUIRED)
+    }
+
+    pub async fn get_session(&self, user_id: i32) -> Result<auth::SessionEntry, StatusCode> {
+        let store = self.session_store.read().await;
+        match store.get(&user_id) {
+            Some(entry) if entry.expires_at > Utc::now() => Ok(entry.clone()),
+            Some(_) => Err(StatusCode::UNAUTHORIZED),
+            None => Err(StatusCode::PRECONDITION_REQUIRED),
+        }
     }
     
     pub fn initialize_siv_keys(&self) -> Result<(), StatusCode> {
@@ -287,26 +298,19 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 consensus_barriers: Arc::new(consensus::barriers::ConsensusBarriers::new()),
                 dedup_cache: Arc::new(net::DedupCache::default()),
                 lock_vote_evidence: Arc::new(std::sync::Mutex::new(None)),
+                session_store: Arc::new(auth::SessionStore::default()),
             };
 
             // If we loaded state from database, populate the OnceCell fields
             if let Some(state) = startup_state_opt {
-                let user_pubkey = state.user_privkey.verifying_key();
-
                 app_state.node_id.set(state.node_id)
                     .expect("Failed to set node_id in AppState");
                 app_state.user_id.set(state.user_id)
                     .expect("Failed to set user_id in AppState");
-                app_state.user_keys.set(UserKeys {
-                    private_key: state.user_privkey,
-                    public_key: PubKey(user_pubkey),
-                }).expect("Failed to set user_keys in AppState");
 
-                // Initialize SIV keys from user private key
-                app_state.initialize_siv_keys()
-                    .expect("Failed to initialize SIV keys");
-
-                tracing::info!("AppState fully initialized from persisted database");
+                // user_keys and SIV keys are no longer populated at startup —
+                // they require login-based unwrapping (Phase 1b)
+                tracing::info!("AppState initialized from persisted database (user keys require login)");
             }
 
             tracing::info!("FileProvider API key: {}", fileprovider_api_key);
