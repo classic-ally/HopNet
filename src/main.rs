@@ -1,4 +1,3 @@
-use aes_siv::{siv::Aes256Siv, Key, Nonce};
 use axum::{
     extract::DefaultBodyLimit, http::{HeaderValue, Method, StatusCode}, middleware, routing::{get,post,patch,delete}, serve, Router
 };
@@ -37,6 +36,15 @@ mod net;
 
 static ASSETS_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/frontend/dist");
 
+/// Single source of truth for the backend HTTP port.
+const BACKEND_PORT: u16 = 34632;
+
+/// Global AppState accessible to Tauri IPC commands (GUI mode only).
+/// Set by run_server() after AppState creation; read by Tauri commands.
+#[cfg(feature = "gui")]
+static GUI_APP_STATE: Lazy<tokio::sync::RwLock<Option<AppState>>> =
+    Lazy::new(|| tokio::sync::RwLock::new(None));
+
 #[derive(Clone, Debug)]
 pub struct UserKeys {
     pub private_key: PrivKey,
@@ -52,9 +60,6 @@ pub struct AppState {
     public_key: PubKey,
     node_id: Arc<OnceCell<i32>>,
     user_id: Arc<OnceCell<i32>>,
-    user_keys: Arc<OnceCell<UserKeys>>,
-    siv_key: Arc<OnceCell<Key<Aes256Siv>>>,
-    siv_nonce: Arc<OnceCell<Nonce>>,
     fragments_dir: String,
     timeout_vote_collector: Arc<consensus::functions::TimeoutVoteCollector>,
     last_observed_view: Arc<std::sync::atomic::AtomicI32>,
@@ -71,24 +76,12 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn get_user_keys(&self) -> Result<&UserKeys, StatusCode> {
-        self.user_keys.get().ok_or(StatusCode::PRECONDITION_REQUIRED)
-    }
-    
     pub fn get_node_id(&self) -> Result<i32, StatusCode> {
         self.node_id.get().copied().ok_or(StatusCode::PRECONDITION_REQUIRED)
     }
-    
+
     pub fn get_user_id(&self) -> Result<i32, StatusCode> {
         self.user_id.get().copied().ok_or(StatusCode::PRECONDITION_REQUIRED)
-    }
-    
-    pub fn get_siv_key(&self) -> Result<&Key<Aes256Siv>, StatusCode> {
-        self.siv_key.get().ok_or(StatusCode::PRECONDITION_REQUIRED)
-    }
-    
-    pub fn get_siv_nonce(&self) -> Result<&Nonce, StatusCode> {
-        self.siv_nonce.get().ok_or(StatusCode::PRECONDITION_REQUIRED)
     }
 
     pub async fn get_session(&self, user_id: i32) -> Result<auth::SessionEntry, StatusCode> {
@@ -98,16 +91,6 @@ impl AppState {
             Some(_) => Err(StatusCode::UNAUTHORIZED),
             None => Err(StatusCode::PRECONDITION_REQUIRED),
         }
-    }
-    
-    pub fn initialize_siv_keys(&self) -> Result<(), StatusCode> {
-        let user_keys = self.get_user_keys()?;
-        let (siv_key, siv_nonce) = auth::derive_siv_key_from_user(&user_keys.private_key, "file_path");
-        
-        self.siv_key.set(siv_key).map_err(|_| StatusCode::CONFLICT)?;
-        self.siv_nonce.set(siv_nonce).map_err(|_| StatusCode::CONFLICT)?;
-        
-        Ok(())
     }
 }
 
@@ -128,20 +111,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
     let admin_service = ServeDir::new(&ASSETS_DIR);
 
-    // port selection by system and mode
-    let mut port = 34632;
-    let os = std::env::consts::OS;
-    if os == "linux" {
-        port = port + 1;
-        tracing::info!("Running on Linux on port {}", port);
-    }
-    
-    // Use dedicated test port in debug mode to avoid collisions
-    if cfg!(debug_assertions) {
-        port = 34634;
-        tracing::info!("Running in test mode on dedicated port {}", port);
-    }
-
+    let port = BACKEND_PORT;
     let bindurl = format!("0.0.0.0:{}", port);
 
     let (encodingkey, decodingkey) = auth::generate_jwt_key();
@@ -215,11 +185,6 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // Check if database schema is initialized
     let conn = pool.get().unwrap();
 
-    // Install and load JSON extension (needed for state snapshot queries)
-    // Extension autoloading is disabled to prevent macOS code signing issues
-    conn.execute_batch("INSTALL json; LOAD json;")
-        .expect("Failed to load JSON extension");
-
     let schema_initialized = if use_ephemeral_db {
         false  // Ephemeral database always needs initialization
     } else {
@@ -283,9 +248,6 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 public_key: PubKey(publickey),
                 node_id: Arc::new(OnceCell::new()),
                 user_id: Arc::new(OnceCell::new()),
-                user_keys: Arc::new(OnceCell::new()),
-                siv_key: Arc::new(OnceCell::new()),
-                siv_nonce: Arc::new(OnceCell::new()),
                 fragments_dir,
                 timeout_vote_collector: Arc::new(consensus::functions::TimeoutVoteCollector::new()),
                 last_observed_view: Arc::new(std::sync::atomic::AtomicI32::new(-1)),
@@ -308,13 +270,38 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 app_state.user_id.set(state.user_id)
                     .expect("Failed to set user_id in AppState");
 
-                // user_keys and SIV keys are no longer populated at startup —
-                // they require login-based unwrapping (Phase 1b)
                 tracing::info!("AppState initialized from persisted database (user keys require login)");
+
+                // GUI auto-login: load owner session from keychain if available
+                #[cfg(all(target_os = "macos", feature = "gui", not(debug_assertions)))]
+                {
+                    if let Ok((kc_user_id, privkey_bytes)) = fileprovider::keychain::load_session_key(
+                        fileprovider::keychain::KeychainEnvironment::Production,
+                    ) {
+                        if let Ok(key_bytes) = <[u8; 32]>::try_from(privkey_bytes.as_slice()) {
+                            let privkey = db::PrivKey(ed25519_dalek::SigningKey::from_bytes(&key_bytes));
+                            let pubkey = db::PubKey(privkey.verifying_key());
+                            let (siv_key, siv_nonce) = auth::derive_siv_key_from_user(&privkey, "file_path");
+                            let session = auth::SessionEntry {
+                                user_keys: UserKeys { private_key: privkey, public_key: pubkey },
+                                siv_key, siv_nonce,
+                                expires_at: chrono::Utc::now() + chrono::Duration::hours(876000),
+                            };
+                            app_state.session_store.blocking_write().insert(kc_user_id, session);
+                            tracing::info!("Loaded owner session from keychain (auto-login ready)");
+                        }
+                    }
+                }
+            }
+
+            // Publish AppState for Tauri IPC commands (GUI mode)
+            #[cfg(feature = "gui")]
+            {
+                *GUI_APP_STATE.write().await = Some(app_state.clone());
             }
 
             tracing::info!("FileProvider API key: {}", fileprovider_api_key);
-            
+
             // Warn about test mode being enabled
             if cfg!(debug_assertions) {
                 tracing::warn!("⚠️  TEST MODE ENABLED: Test endpoints are exposed and will return API credentials");
@@ -450,7 +437,6 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/diagnostics/fragment-inventory-differential", get(files::routes::get_fragment_inventory_differential))
                 .route("/diagnostics/file-fragments", get(files::routes::get_file_fragment_distribution))
                 .route("/diagnostics/network-resilience", get(files::routes::get_network_resilience_stats))
-                .route("/debug/state", get(consensus::routes::get_state_snapshot))
                 .route("/debug/iroh-ping", get(net::routes::debug_iroh_ping))
                 .route("/validators", get(consensus::routes::get_validators))
                 .route("/metrics", get(metrics::routes::get_metrics))
@@ -458,7 +444,12 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/metrics/scores", get(metrics::routes::get_placement_scores))
                 .nest("/takeout", takeout::takeout_routes())
                 .nest("/admin", admin::routes::admin_routes())
+                .route("/logout", post(auth::sign_out))
                 .layer(middleware::from_fn_with_state(app_state.clone(), auth::auth_middleware));
+
+            // State snapshot endpoint requires DuckDB JSON extension (not codesigned for macOS release)
+            #[cfg(any(not(target_os = "macos"), debug_assertions))]
+            let protected_routes = protected_routes.route("/debug/state", get(consensus::routes::get_state_snapshot));
 
             // Routes that accept either JWT (users) or RPC (nodes) authentication
             let jwt_or_rpc_routes = Router::new()
@@ -556,6 +547,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// Tauri IPC command for GUI auto-login.
+/// Only callable from the Tauri webview — not exposed over HTTP.
+/// Issues a JWT if the node owner has a pre-loaded session (from keychain).
+#[cfg(feature = "gui")]
+#[tauri::command]
+async fn auto_login() -> Result<auth::SignInResponse, String> {
+    let state_guard = GUI_APP_STATE.read().await;
+    let app_state = state_guard.as_ref().ok_or("Server not ready")?;
+
+    let node_id = app_state.get_node_id().map_err(|_| "Node not initialized".to_string())?;
+    let user_id = app_state.get_user_id().map_err(|_| "Node not initialized".to_string())?;
+
+    // Verify owner session exists (pre-loaded from keychain at startup)
+    app_state.get_session(user_id).await.map_err(|_| "No owner session available".to_string())?;
+
+    let token = auth::encode_jwt_with_duration(
+        node_id.to_string(), user_id.to_string(),
+        app_state.encoding_key.clone(), 24,
+    ).map_err(|_| "JWT encoding failed".to_string())?;
+
+    Ok(auth::SignInResponse { token })
+}
+
 #[cfg(feature = "gui")]
 async fn run_with_gui() -> Result<(), Box<dyn std::error::Error>> {
     use tauri::{Manager, menu::{Menu, MenuItem, PredefinedMenuItem}, tray::TrayIconBuilder, TitleBarStyle, WebviewWindowBuilder};
@@ -608,15 +622,12 @@ async fn run_with_gui() -> Result<(), Box<dyn std::error::Error>> {
     // Give the server a moment to start
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
     
-    // Determine the port (same logic as in run_server)
-    let mut port = 34632;
-    if std::env::consts::OS == "linux" {
-        port = 34633;
-    }
+    let port = BACKEND_PORT;
     
     // Create Tauri app
     let context = tauri::generate_context!();
     let app = tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![auto_login])
         .setup(move |app| {
             // Use Accessory policy to never show in dock
             #[cfg(target_os = "macos")]

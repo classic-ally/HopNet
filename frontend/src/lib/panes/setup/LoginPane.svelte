@@ -1,8 +1,8 @@
 <script lang="ts">
-    import Button from './Button.svelte';
-    import EntryRow from './EntryRow.svelte';
-    import SetupPane from './SetupPane.svelte';
-    import { tokenStore, API_BASE_URL } from './stores';
+    import Button from '../../Button.svelte';
+    import EntryRow from '../../EntryRow.svelte';
+    import SetupPane from '../../SetupPane.svelte';
+    import { tokenStore, API_BASE_URL } from '../../stores';
 
     export let username = '';
     export let password = '';

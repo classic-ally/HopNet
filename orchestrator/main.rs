@@ -504,7 +504,7 @@ async fn create_hopnet_container(
         let port = sys::find_available_port(mesh_id, node_id).await?;
         let mut bindings = HashMap::new();
         bindings.insert(
-            "34633/tcp".to_string(),
+            "34632/tcp".to_string(),
             Some(vec![bollard::models::PortBinding {
                 host_ip: Some("0.0.0.0".to_string()),
                 host_port: Some(port.to_string()),
@@ -513,7 +513,7 @@ async fn create_hopnet_container(
         (Some(bindings), port)
     } else {
         // Docker on Linux: no port mapping needed, we access container IPs directly
-        (None, 34633)
+        (None, 34632)
     };
 
     // Network configuration - attach to our custom network
@@ -628,12 +628,12 @@ async fn setup_node_0(docker: &Docker, mesh_id: u32, node_name: &str, runtime: s
     println!("Setup data: {}", setup_data);
     
     let start_time = std::time::Instant::now();
-    let timeout_duration = std::time::Duration::from_secs(15);
+    let timeout_duration = std::time::Duration::from_secs(30);
     let retry_interval = std::time::Duration::from_millis(500); // 500ms between retries
     
     loop {
         if start_time.elapsed() > timeout_duration {
-            return Err(anyhow::anyhow!("Setup API call timed out after 15 seconds"));
+            return Err(anyhow::anyhow!("Setup API call timed out after 30 seconds"));
         }
         
         println!("Attempting setup API call... (elapsed: {:.1}s)", start_time.elapsed().as_secs_f32());
@@ -641,7 +641,7 @@ async fn setup_node_0(docker: &Docker, mesh_id: u32, node_name: &str, runtime: s
         match client
             .post(&url)
             .json(&setup_data)
-            .timeout(tokio::time::Duration::from_secs(3))
+            .timeout(tokio::time::Duration::from_secs(15))
             .send()
             .await
         {
@@ -1518,7 +1518,7 @@ async fn get_node_metadata(docker: &Docker, mesh_id: u32) -> Result<Vec<NodeMeta
 pub async fn get_internal_addresses(docker: &Docker, mesh_id: u32) -> Result<Vec<(u32, String, u16)>> {
     Ok(get_node_metadata(docker, mesh_id).await?
         .into_iter()
-        .map(|m| (m.node_id, m.container_ip, 34633u16))
+        .map(|m| (m.node_id, m.container_ip, 34632u16))
         .collect())
 }
 
@@ -1533,7 +1533,7 @@ pub async fn get_external_addresses(docker: &Docker, mesh_id: u32, runtime: sys:
             if use_host_port {
                 (m.node_id, "localhost".to_string(), m.host_port)
             } else {
-                (m.node_id, m.container_ip, 34633)
+                (m.node_id, m.container_ip, 34632)
             }
         })
         .collect())

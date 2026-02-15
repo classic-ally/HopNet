@@ -6,6 +6,7 @@ use axum::{
     extract::{Request, State},
     response::{Response, IntoResponse},
     body::Body,
+    Extension,
     Json,
     http::StatusCode,
     middleware::Next,
@@ -175,6 +176,11 @@ pub async fn sign_in(
     // Derive all key material
     let pubkey = crate::db::PubKey(privkey.verifying_key());
     let (siv_key, siv_nonce) = derive_siv_key_from_user(&privkey, "file_path");
+
+    // Save bytes before privkey is moved into UserKeys
+    #[cfg(all(target_os = "macos", feature = "gui", not(debug_assertions)))]
+    let privkey_bytes = privkey.0.to_bytes();
+
     let user_keys = crate::UserKeys { private_key: privkey, public_key: pubkey };
 
     // Build session entry
@@ -187,6 +193,20 @@ pub async fn sign_in(
         store.insert(db_user.user_id, session);
     }
 
+    // Store in keychain for auto-login (GUI mode, owner only)
+    #[cfg(all(target_os = "macos", feature = "gui", not(debug_assertions)))]
+    {
+        if let Ok(owner_id) = app_state.get_user_id() {
+            if db_user.user_id == owner_id {
+                let _ = crate::fileprovider::keychain::store_session_key(
+                    crate::fileprovider::keychain::KeychainEnvironment::Production,
+                    db_user.user_id,
+                    &privkey_bytes,
+                );
+            }
+        }
+    }
+
     // Encode JWT with matching duration
     let token = encode_jwt_with_duration(
         node_id.to_string(), db_user.user_id.to_string(),
@@ -196,12 +216,32 @@ pub async fn sign_in(
     Ok(Json(SignInResponse { token }))
 }
 
-fn encode_jwt_with_duration(iss: String, uid: String, key: EncodingKey, hours: i64) -> Result<String, AuthError> {
+pub fn encode_jwt_with_duration(iss: String, uid: String, key: EncodingKey, hours: i64) -> Result<String, AuthError> {
     let now = Utc::now();
     let exp = (now + Duration::hours(hours)).timestamp() as usize;
     let claim = Claims { exp, iss, uid };
     encode(&Header::default(), &claim, &key)
         .map_err(|_| AuthError { message: "JWT encoding failed".into(), status_code: StatusCode::INTERNAL_SERVER_ERROR })
+}
+
+/// Logout endpoint. Removes session from store.
+/// In GUI mode, the owner's keychain-loaded session is preserved (FileProvider depends on it).
+pub async fn sign_out(
+    State(app_state): State<AppState>,
+    Extension(uid): Extension<i32>,
+) -> StatusCode {
+    // In GUI mode, protect the owner's session (loaded from keychain, permanent)
+    #[cfg(feature = "gui")]
+    {
+        if let Ok(owner_id) = app_state.get_user_id() {
+            if uid == owner_id {
+                return StatusCode::OK;
+            }
+        }
+    }
+
+    app_state.session_store.write().await.remove(&uid);
+    StatusCode::OK
 }
 
 /// Derives SIV key and nonce from user's private key using Blake3 key derivation
@@ -270,8 +310,8 @@ pub fn wrap_user_privkey(privkey: &PrivKey, password: &str) -> Result<(Vec<u8>, 
     let mut rng = rand::rng();
     rng.fill(&mut salt);
 
-    // Derive 32-byte wrapping key using Argon2id (OWASP-recommended: 47 MiB, 2 iterations, 1 parallelism)
-    let params = Params::new(1_048_576, 3, 1, Some(32))?;
+    // Derive 32-byte wrapping key using Argon2id (1 GiB memory, 2 iterations, 1 parallelism)
+    let params = Params::new(1_048_576, 2, 1, Some(32))?;
     let argon2 = Argon2Raw::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut key_bytes = [0u8; 32];
     argon2.hash_password_into(password.as_bytes(), &salt, &mut key_bytes)
@@ -306,7 +346,7 @@ pub fn unwrap_user_privkey(encrypted_privkey: &[u8], key_salt: &[u8], password: 
     let nonce = chacha20poly1305::Nonce::from_slice(nonce_bytes);
 
     // Derive wrapping key with same Argon2id parameters
-    let params = Params::new(1_048_576, 3, 1, Some(32))?;
+    let params = Params::new(1_048_576, 2, 1, Some(32))?;
     let argon2 = Argon2Raw::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut key_bytes = [0u8; 32];
     argon2.hash_password_into(password.as_bytes(), key_salt, &mut key_bytes)

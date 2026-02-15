@@ -205,7 +205,7 @@ The `rpc_req` ID is also used for request-level deduplication — retried reques
 
 ## Port Mapping
 
-- Internal port: `34633`
+- Internal port: `34632`
 - Host port (macOS/Podman): `40000 + (mesh_id * 500) + node_id`
   - Mesh 0: ports 40000-40499
   - Mesh 1: ports 40500-40999

@@ -459,7 +459,7 @@ async fn fetch_test_credentials() -> Result<TestResponse, Box<dyn std::error::Er
     
     // Try multiple times as backend might still be starting
     for attempt in 1..=10 {
-        match client.get("http://localhost:34634/integrations/fileprovider/test").send().await {
+        match client.get("http://localhost:34632/integrations/fileprovider/test").send().await {
             Ok(response) => {
                 if response.status().is_success() {
                     let test_response: TestResponse = response.json().await?;

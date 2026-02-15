@@ -1064,7 +1064,7 @@ PARALLEL=4 ./scripts/test-fileprovider.sh
 
 ### D. Test Environment Variables
 
-- `TEST_BACKEND_URL`: Override backend URL (default: http://localhost:34633)
+- `TEST_BACKEND_URL`: Override backend URL (default: http://localhost:34632)
 - `TEST_API_KEY`: Override API key (default: generated per session)
 - `VERBOSE`: Enable verbose test output (set to 1)
 - `DEBUG`: Enable debug logging (set to 1)

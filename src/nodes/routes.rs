@@ -171,9 +171,6 @@ pub async fn post_nodes(
     // 4. Post-consensus: Create JoinInfo and send to joining node via iroh
     ///////////////
 
-    // Get user's private key to send to joining node (from session fetched earlier)
-    let user_private_key = session.user_keys.private_key.clone();
-
     // Get current consensus height
     let consensus_state = match crate::db::consensus::get_consensus(app_state.db_pool.get()) {
         Ok(state) => state,
@@ -199,7 +196,6 @@ pub async fn post_nodes(
     let join_info = crate::types::JoinInfo {
         node_id: complete_node.node_id,
         user_id: uid,
-        user_privkey: user_private_key,
         bootstrap_validators,
     };
 

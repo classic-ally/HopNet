@@ -33,9 +33,10 @@ pub async fn get_enumerate(
     Query(query): Query<EnumerateQuery>,
 ) -> Result<Json<EnumerateResponse>, StatusCode> {
     let user_id = app_state.get_user_id()?;
-    let siv_key = app_state.get_siv_key()?;
-    let siv_nonce = app_state.get_siv_nonce()?;
-    
+    let session = app_state.get_session(user_id).await?;
+    let siv_key = &session.siv_key;
+    let siv_nonce = &session.siv_nonce;
+
     // Handle both parent_path and parent_item_identifier approaches
     let (parent_path, encrypted_parent_path) = if let Some(path) = query.parent_path {
         // Legacy path approach - encrypt the decrypted path
@@ -44,7 +45,7 @@ pub async fn get_enumerate(
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         (path, encrypted)
     } else if let Some(identifier) = query.parent_item_identifier {
-        // New identifier approach 
+        // New identifier approach
         if identifier == "NSFileProviderRootContainerItemIdentifier" {
             let encrypted = encrypt_path("/".to_string(), siv_key, siv_nonce)
                 .await
@@ -54,7 +55,7 @@ pub async fn get_enumerate(
             let inode_id_str = &identifier[5..];
             let inode_id = crate::db::CustomUUID::from_str(inode_id_str)
                 .map_err(|_| StatusCode::BAD_REQUEST)?;
-            
+
             match crate::db::fileprovider::get_item_metadata_by_inode_id(
                 app_state.db_pool.get(),
                 inode_id,
@@ -81,18 +82,18 @@ pub async fn get_enumerate(
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         ("/".to_string(), encrypted)
     };
-    
+
     // Create SQL pattern for direct children only (same as get_files)
     let parent_path_pattern = format!("{}/%", encrypted_parent_path);
-    
+
     // Decode pagination cursor if provided (hex-encoded path)
     let cursor = query.page.as_ref().and_then(|page| {
         hex::decode(page).ok().and_then(|bytes| String::from_utf8(bytes).ok())
     });
-    
+
     const PAGE_SIZE: usize = 100;
     let limit = PAGE_SIZE + 1; // Request one extra to check if there are more pages
-    
+
     match db::fileprovider::get_folder_contents(
         app_state.db_pool.get(),
         user_id,
@@ -214,9 +215,10 @@ pub async fn get_changes(
     Query(query): Query<ChangesQuery>,
 ) -> Result<Json<ChangesResponse>, StatusCode> {
     let user_id = app_state.get_user_id()?;
-    let siv_key = app_state.get_siv_key()?;
-    let siv_nonce = app_state.get_siv_nonce()?;
-    
+    let session = app_state.get_session(user_id).await?;
+    let siv_key = &session.siv_key;
+    let siv_nonce = &session.siv_nonce;
+
     // Encrypt the parent path since FileProvider sends decrypted paths but database stores encrypted paths
     let parent_path = query.parent_path.unwrap_or_else(|| "/".to_string());
     let encrypted_parent_path = encrypt_path(parent_path.clone(), siv_key, siv_nonce)
@@ -275,17 +277,7 @@ pub async fn delete_item(
         Ok(id) => id,
         Err(_) => return StatusCode::UNAUTHORIZED,
     };
-    
-    let siv_key = match app_state.get_siv_key() {
-        Ok(key) => key,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
-    };
-    
-    let siv_nonce = match app_state.get_siv_nonce() {
-        Ok(nonce) => nonce,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
-    };
-    
+
     // Parse the unified item: identifier
     let (encrypted_path, is_folder): (String, bool) = if request.identifier.starts_with("item:") {
         // Extract inode_id from unified identifier
@@ -419,17 +411,14 @@ pub async fn download_file(
         Ok(id) => id,
         Err(_) => return axum::http::StatusCode::UNAUTHORIZED.into_response(),
     };
-    
-    let siv_key = match app_state.get_siv_key() {
-        Ok(key) => key,
-        Err(_) => return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+
+    let session = match app_state.get_session(user_id).await {
+        Ok(s) => s,
+        Err(_) => return axum::http::StatusCode::PRECONDITION_REQUIRED.into_response(),
     };
-    
-    let siv_nonce = match app_state.get_siv_nonce() {
-        Ok(nonce) => nonce,
-        Err(_) => return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-    
+    let siv_key = &session.siv_key;
+    let siv_nonce = &session.siv_nonce;
+
     // Extract inode_id from unified identifier
     let inode_id_str = &query.identifier[5..]; // Skip "item:" prefix
     let inode_id = match crate::db::CustomUUID::from_str(inode_id_str) {
@@ -506,16 +495,10 @@ pub async fn get_item(
         Ok(id) => id,
         Err(_) => return Err(StatusCode::UNAUTHORIZED),
     };
-    
-    let siv_key = match app_state.get_siv_key() {
-        Ok(key) => key,
-        Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
-    };
-    
-    let siv_nonce = match app_state.get_siv_nonce() {
-        Ok(nonce) => nonce,
-        Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
-    };
+
+    let session = app_state.get_session(user_id).await?;
+    let siv_key = &session.siv_key;
+    let siv_nonce = &session.siv_nonce;
 
     // Handle special root container case
     if query.identifier == "NSFileProviderRootContainerItemIdentifier" {
@@ -782,8 +765,9 @@ pub async fn modify_item(
     
     // Build new encrypted path if changes requested using per-segment AES-SIV encryption
     let new_encrypted_path = if new_filename.is_some() || new_parent_item_identifier.is_some() {
-        let siv_key = app_state.get_siv_key().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let siv_nonce = app_state.get_siv_nonce().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let session = app_state.get_session(user_id).await?;
+        let siv_key = &session.siv_key;
+        let siv_nonce = &session.siv_nonce;
         
         // Get current item metadata once (if needed for parent or filename extraction)
         let current_item_metadata = if new_parent_item_identifier.is_none() || new_filename.is_none() {

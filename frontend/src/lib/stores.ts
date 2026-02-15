@@ -59,7 +59,16 @@ tokenStore.subscribe((value) => {
 });
 
 // Helper function to clear authentication and return to login
-export function clearAuth() {
+export async function clearAuth() {
+  const token = localStorage.getItem('jwt');
+  if (token) {
+    try {
+      await fetch(`${API_BASE_URL}/logout`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}` },
+      });
+    } catch (e) { /* best-effort */ }
+  }
   localStorage.removeItem('jwt');
   tokenStore.set(null);
 }

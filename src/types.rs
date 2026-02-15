@@ -422,17 +422,16 @@ pub struct NodeConnectionInfo {
     pub pubkey: PubKey,
 }
 
-/// Bootstrap information sent from coordinator to joining node
-/// Transmitted over HTTP (plaintext) - TLS needed before production use
+/// Bootstrap information sent from coordinator to joining node via iroh.
 ///
 /// After receiving this, the joining node:
-/// 1. Initializes this_node table with node_id and user_privkey
+/// 1. Initializes this_node table with node_id
 /// 2. Performs catch-up from view 0 using bootstrap_validators
 /// 3. Submits activation request after catching up
+/// 4. User logs in via web UI to unwrap their key from consensus-replicated encrypted_privkey
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JoinInfo {
     pub node_id: i32,
     pub user_id: i32,
-    pub user_privkey: PrivKey,  // TODO: Encrypt before production (requires TLS)
     pub bootstrap_validators: Vec<Node>,  // Full node info for catch-up
 }

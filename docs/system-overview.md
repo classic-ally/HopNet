@@ -227,12 +227,10 @@ S3-compatible API layer enabling standard S3 clients and SDKs to interact with H
 
 ## Current Focus
 
-**Active Development**: FileProvider Phase 4b Implementation Ready
-- Design finalized: Create new data blocks for modified content
-- Add stable `inodes.id` (UUIDv7) for unified file/folder identification
-- Reuse existing multipart upload pipeline for content updates
-- Maintain last-write-wins semantics for concurrent modifications
-- Leverage UUIDv7 timestamps for intrinsic creation/modification tracking
+**Active Development**: Multi-User Phase 1e (Generated Passphrase Migration)
+- Phase 1d complete: OnceCell removed, join flow reworked, GUI auto-login via Tauri IPC + macOS Keychain
+- Session store is now the sole source of user key material
+- Next: Replace user-chosen passwords with mandatory server-generated passphrases (~90 bits entropy)
 
 **Recently Completed**: FileProvider Testing Framework with Empty File Support ✅
 - Implemented comprehensive FileProvider integration test suite with Swift test executables and Rust orchestration

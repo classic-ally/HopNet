@@ -53,36 +53,12 @@ pub async fn process_join_info(
         join_info.user_id
     );
 
-    // Derive user public key from private key
-    let user_pub_key = PubKey(join_info.user_privkey.verifying_key());
-
-    // Set up UserKeys in app state
-    let user_keys = UserKeys {
-        private_key: join_info.user_privkey.clone(),
-        public_key: user_pub_key,
-    };
-
-    app_state.user_keys.set(user_keys.clone())
-        .map_err(|_| "Failed to set user keys - already initialized".to_string())?;
-
     // Set user_id and node_id in app state
     app_state.user_id.set(join_info.user_id)
         .map_err(|_| "Failed to set user_id - already initialized".to_string())?;
 
     app_state.node_id.set(join_info.node_id)
         .map_err(|_| "Failed to set node_id - already initialized".to_string())?;
-
-    // Initialize SIV keys from user private key
-    app_state.initialize_siv_keys()
-        .map_err(|_| "Failed to initialize SIV keys".to_string())?;
-
-    // Populate session store for join session (no expiry)
-    let (siv_key, siv_nonce) = crate::auth::derive_siv_key_from_user(&join_info.user_privkey, "file_path");
-    let session = crate::auth::SessionEntry {
-        user_keys: user_keys.clone(), siv_key, siv_nonce,
-        expires_at: chrono::Utc::now() + chrono::Duration::hours(876000),
-    };
-    { app_state.session_store.write().await.insert(join_info.user_id, session); }
 
     // Initialize this_node table with identity and keys
     // Sequences, users, nodes, validators will come from genesis replay
@@ -155,13 +131,6 @@ pub async fn post_setup(
         private_key: PrivKey(user_priv_key),
         public_key: PubKey(user_pub_key),
     };
-
-    // Set user keys in app state (can only be done once)
-    app_state.user_keys.set(user_keys.clone())
-        .map_err(|_| StatusCode::CONFLICT)?; // Already initialized
-
-    // Initialize SIV keys from user private key
-    app_state.initialize_siv_keys()?;
 
     // Construct User and Node from the simplified payload
     let x25519_pubkey = crate::auth::derive_x25519_pubkey_from_user(&user_keys.private_key);

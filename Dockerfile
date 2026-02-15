@@ -38,6 +38,6 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 FROM nixos/nix:latest
 RUN echo "experimental-features = nix-command flakes" >> /etc/nix/nix.conf
 COPY --from=builder /hopnet /usr/local/bin/hopnet
-EXPOSE 34633
+EXPOSE 34632
 ENV RUST_LOG=debug
 CMD ["/usr/local/bin/hopnet"]

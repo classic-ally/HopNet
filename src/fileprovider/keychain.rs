@@ -14,10 +14,14 @@ use tracing::{info, warn, error};
 /// Keychain service names
 const HOPNET_SERVICE: &str = "com.hopnet.desktop.fileprovider";
 const HOPNET_TEST_SERVICE: &str = "com.hopnet.desktop.fileprovider.test";
+const SESSION_SERVICE: &str = "com.hopnet.desktop.session";
+const SESSION_TEST_SERVICE: &str = "com.hopnet.desktop.session.test";
 
 /// Keychain account names
 const API_KEY_ACCOUNT: &str = "api_key";
 const BASE_URL_ACCOUNT: &str = "base_url";
+const SESSION_PRIVKEY_ACCOUNT: &str = "owner_privkey";
+const SESSION_USERID_ACCOUNT: &str = "owner_user_id";
 
 /// Keychain environment configuration
 #[derive(Debug, Clone, Copy)]
@@ -31,6 +35,13 @@ impl KeychainEnvironment {
         match self {
             KeychainEnvironment::Production => HOPNET_SERVICE,
             KeychainEnvironment::Test => HOPNET_TEST_SERVICE,
+        }
+    }
+
+    fn session_service_name(&self) -> &'static str {
+        match self {
+            KeychainEnvironment::Production => SESSION_SERVICE,
+            KeychainEnvironment::Test => SESSION_TEST_SERVICE,
         }
     }
 }
@@ -166,7 +177,69 @@ fn remove_keychain_item(env: KeychainEnvironment, account: &str) -> Result<(), K
     let service = env.service_name();
     let keychain = SecKeychain::default()?;
     let (_password_data, item) = keychain.find_generic_password(service, account)?;
-    
+
     item.delete();
+    Ok(())
+}
+
+// ============================================================================
+// Session key storage (owner auto-login)
+// ============================================================================
+
+/// Store a keychain item with a specific service name and binary data
+#[cfg(target_os = "macos")]
+fn store_keychain_item_with_service(service: &str, account: &str, value: &[u8]) -> Result<(), KeychainError> {
+    let keychain = SecKeychain::default()?;
+    keychain.set_generic_password(service, account, value)
+        .map_err(|e| KeychainError::SecurityFramework(e))
+}
+
+/// Load a keychain item with a specific service name, returning raw bytes
+#[cfg(target_os = "macos")]
+fn load_keychain_item_bytes_with_service(service: &str, account: &str) -> Result<Vec<u8>, KeychainError> {
+    let keychain = SecKeychain::default()?;
+    match keychain.find_generic_password(service, account) {
+        Ok((password_data, _item)) => Ok(password_data.as_ref().to_vec()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Remove a keychain item with a specific service name
+#[cfg(target_os = "macos")]
+fn remove_keychain_item_with_service(service: &str, account: &str) -> Result<(), KeychainError> {
+    let keychain = SecKeychain::default()?;
+    let (_password_data, item) = keychain.find_generic_password(service, account)?;
+    item.delete();
+    Ok(())
+}
+
+/// Store the node owner's session key in keychain for auto-login on restart
+#[cfg(target_os = "macos")]
+pub fn store_session_key(env: KeychainEnvironment, user_id: i32, privkey_bytes: &[u8]) -> Result<(), KeychainError> {
+    let service = env.session_service_name();
+    store_keychain_item_with_service(service, SESSION_PRIVKEY_ACCOUNT, privkey_bytes)?;
+    store_keychain_item_with_service(service, SESSION_USERID_ACCOUNT, &user_id.to_le_bytes())?;
+    Ok(())
+}
+
+/// Load the node owner's session key from keychain for auto-login
+#[cfg(target_os = "macos")]
+pub fn load_session_key(env: KeychainEnvironment) -> Result<(i32, Vec<u8>), KeychainError> {
+    let service = env.session_service_name();
+    let privkey_bytes = load_keychain_item_bytes_with_service(service, SESSION_PRIVKEY_ACCOUNT)?;
+    let userid_bytes = load_keychain_item_bytes_with_service(service, SESSION_USERID_ACCOUNT)?;
+    if userid_bytes.len() != 4 {
+        return Err(KeychainError::InvalidData);
+    }
+    let user_id = i32::from_le_bytes(userid_bytes.try_into().unwrap());
+    Ok((user_id, privkey_bytes))
+}
+
+/// Remove the node owner's session key from keychain (logout)
+#[cfg(target_os = "macos")]
+pub fn remove_session_key(env: KeychainEnvironment) -> Result<(), KeychainError> {
+    let service = env.session_service_name();
+    let _ = remove_keychain_item_with_service(service, SESSION_PRIVKEY_ACCOUNT);
+    let _ = remove_keychain_item_with_service(service, SESSION_USERID_ACCOUNT);
     Ok(())
 }

@@ -120,16 +120,17 @@ Migrated all user-facing `get_siv_key()` / `get_siv_nonce()` / `get_user_keys()`
 **Validation:** `cargo check` clean. Orchestrator tests pass.
 
 ### Phase 1d: Cleanup and New Flows
-**Status:** [ ] Not Started
+**Status:** [x] Complete
 
-Remove `OnceCell`, implement flows that depend on the session store being the sole key source.
+Remove `OnceCell`, rework join flow, add GUI auto-login, add logout endpoint.
 
-1. [ ] **Remove `OnceCell`**: Remove `OnceCell<UserKeys>`, `OnceCell<SivKey>`, `OnceCell<SivNonce>` from `AppState`.
-2. [ ] **Join flow rework**: Remove `user_privkey` from `JoinInfo`. New nodes receive only node credentials (`node_id`, `bootstrap_validators`). After join and catch-up, the user logs in via the web UI to unwrap their key from the on-chain password-wrapped store. Update `this_node` startup restoration path accordingly.
-3. [ ] **GUI auto-login**: In GUI mode, the owner's unwrapped private key is stored in OS-native secure storage (macOS Keychain, etc.) during initial setup. On startup, the node loads this key into the session store with no expiry. The Tauri window obtains a JWT via `invoke('auto_login')` — a Tauri IPC command (not HTTP, so not accessible over the network) that issues a JWT for the owner without a password. JWTs issued via `auto_login` still have a normal expiry for token hygiene, but the frontend transparently calls `invoke('auto_login')` again to renew before expiry — the user never sees a login prompt. The same frontend JWT-expiry detection code handles both paths: web UI shows the login overlay, Tauri silently re-invokes. The session store entry for the owner has no expiry (process lifetime), so renewal always succeeds.
-4. [ ] **Password change flow**: Re-wrap private key with new password-derived key, update `encrypted_privkey` and `key_salt` via consensus.
+1. [x] **Remove `OnceCell`**: Removed `OnceCell<UserKeys>`, `OnceCell<Key<Aes256Siv>>`, `OnceCell<Nonce>` fields and their getters (`get_user_keys`, `get_siv_key`, `get_siv_nonce`, `initialize_siv_keys`) from `AppState`. Migrated 7 FileProvider route handlers (`get_enumerate`, `get_changes`, `delete_item`, `download_file`, `get_item`, `create_item`, `modify_item`) from OnceCell to session store lookups. Removed OnceCell writes from `post_setup` and `process_join_info`.
+2. [x] **Join flow rework**: Removed `user_privkey` from `JoinInfo`. Coordinator no longer sends user private key to joining nodes. After join and catch-up, the user logs in via the web UI to unwrap their key from the consensus-replicated `encrypted_privkey`. Simplified `process_join_info` to only set `node_id`/`user_id` OnceCells and spawn catch-up.
+3. [x] **GUI auto-login**: Owner's unwrapped private key stored in macOS Keychain (`com.hopnet.desktop.session`) on first login. At startup, loaded into session store with permanent expiry. Tauri IPC command `auto_login` (not HTTP — only callable from the Tauri webview) issues a JWT for the owner. Frontend detects Tauri environment via `window.__TAURI__` and calls `invoke('auto_login')`. Global `GUI_APP_STATE` bridges AppState from axum server to Tauri command handlers.
+4. [x] **Logout endpoint**: `POST /logout` (authenticated) removes session from store. In GUI mode, owner's keychain-loaded session is protected from logout (FileProvider depends on it); non-owner sessions can still be cleared. Frontend `clearAuth()` calls `/logout` before clearing localStorage.
+5. [!] **Password change**: Deferred — password-only change without key rotation provides no meaningful security in this architecture. The `encrypted_privkey` blob exists in consensus history on every node, so an attacker who brute-forces the old blob gets the unchanged private key. Password change should be paired with full key rotation (re-key all `file_access` entries + re-encrypt all inode paths), which is a larger feature.
 
-**Validation:** All orchestrator tests pass without OnceCell. GUI auto-login works. Join flow works without user key transfer.
+**Validation:** `cargo check` clean. Orchestrator tests pass without OnceCell. GUI auto-login works. Join flow works without user key transfer.
 
 ### Phase 1e: Generated Passphrase Migration
 **Status:** [ ] Not Started
