@@ -268,7 +268,7 @@ pub async fn get_files(
     let session = app_state.get_session(user_id).await?;
     // let's encrypt the path so we can search for it
     let enc_path = encrypt_path(params.path, &session.siv_key, &session.siv_nonce).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    match db::files::get_files(app_state.db_pool.get(), enc_path, &session.siv_key, &session.siv_nonce) {
+    match db::files::get_files(app_state.db_pool.get(), enc_path, user_id, &session.siv_key, &session.siv_nonce) {
         Ok(files) => {
             Ok(Json(files))
         }

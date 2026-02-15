@@ -79,7 +79,7 @@ Sharing an encrypted file with another user means creating a `FileAccess` entry 
 ---
 
 ## Phase 1: Session-Scoped Key Management
-**Status:** [~] In Progress
+**Status:** [x] Complete
 
 Replace `OnceCell` user key binding with session-aware key management. Support password-wrapped key storage for roaming users. Uses a strangler pattern — the session key store is introduced alongside the existing `OnceCell`, call sites are migrated incrementally, and the `OnceCell` is removed last.
 
@@ -146,14 +146,17 @@ Replace user-chosen passwords with mandatory server-generated passphrases. The `
 **Validation:** `cargo check` clean. Passphrase generation and normalization unit tests pass. Auth wrap/unwrap round-trip tests pass with generated passphrases. Orchestrator updated to parse and store passphrases from setup response.
 
 ### Phase 1f: Orchestrator Validation
-**Status:** [ ] Not Started
+**Status:** [x] Complete
 
-Full multi-user integration tests.
+Full multi-user integration test (`multi-user-isolation`). Exercises: user creation, roaming login, per-user file upload/download, cross-user isolation (SIV path encryption ensures 404), listing isolation, and zero divergence.
 
-- [ ] Create mesh, create second user, roaming user login on non-owner node
-- [ ] File upload/download with correct per-user key isolation
-- [ ] Verify cross-user file inaccessibility
-- [ ] Divergence = 0
+1. [x] `create_user` / `login_user` helpers (POST /users, POST /login)
+2. [x] `try_download_file` non-panicking variant for cross-user 404 checks
+3. [x] `fetch_state_snapshots` for divergence verification
+4. [x] 15-step test flow registered as `multi-user-isolation`
+5. [x] Passing on a live 3-node mesh (15/15 checks, 9.5s, zero divergence)
+
+**Bug fix discovered during validation:** `get_files` in `src/db/files.rs` was missing an `owner_id` filter — when multiple users existed, listing files at `/` returned ALL users' inodes, then failed decrypting paths encrypted with other users' SIV keys (500). Fixed by adding `AND i.owner_id = ?` to the query and threading `user_id` from the route handler.
 
 ---
 

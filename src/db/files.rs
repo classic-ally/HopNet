@@ -32,6 +32,7 @@ fn log_ancestor_modifications(
 pub fn get_files(
     db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     path: String,
+    owner_id: i32,
     key: &Key<Aes256Siv>,
     nonce: &Nonce
 ) -> Result<Vec<FileItem>, DatabaseError> {
@@ -52,7 +53,7 @@ pub fn get_files(
                     END as modification_date
                 FROM inodes i
                 LEFT JOIN data_blocks db ON i.data_id = db.id
-                WHERE i.path LIKE ? AND i.path NOT LIKE ?
+                WHERE i.path LIKE ? AND i.path NOT LIKE ? AND i.owner_id = ?
             "#;
 
             let mut stmt = db_lock.prepare(query).map_err(|_| DatabaseError::RecallError)?;
@@ -60,7 +61,7 @@ pub fn get_files(
             let not_like_path = format!("{}/%", like_path);
             tracing::debug!("Querying files with metadata: like_path: {}, not_like_path: {}", like_path, not_like_path);
 
-            let files = stmt.query_map(params![like_path, not_like_path], |row| {
+            let files = stmt.query_map(params![like_path, not_like_path, owner_id], |row| {
                 let id: CustomUUID = row.get(0)?;
                 let encrypted_path: String = row.get(1)?;
                 let decrypted_path = decrypt_path(encrypted_path, key, nonce)?;

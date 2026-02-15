@@ -24,6 +24,7 @@ mod performance;
 pub(crate) mod persistence;
 mod timeout_progression;
 mod consensus_barriers;
+mod multi_user;
 
 /// Represents the result of a test scenario execution
 #[derive(Debug)]
@@ -126,6 +127,9 @@ pub async fn run_test_by_name(mesh_id: u32, name: &str, nodes: &[NodeInfo], flag
         "metrics-collection" => {
             metrics::MetricsCollection.run(mesh_id, nodes, flags).await
         }
+        "multi-user-isolation" => {
+            multi_user::MultiUserIsolation.run(mesh_id, nodes, flags).await
+        }
         _ => Err(anyhow::anyhow!("Unknown test: {}", name)),
     }
 }
@@ -148,6 +152,7 @@ pub fn list_test_names() -> Vec<&'static str> {
         "consensus-barrier-missed-ballot",
         "consensus-barrier-tc-late",
         "metrics-collection",
+        "multi-user-isolation",
     ]
 }
 
