@@ -75,7 +75,7 @@ pub async fn post_users (
                 "insert_user".to_string(),
                 encoded_user,
                 user_id,
-            ) {
+            ).await {
                 Ok(tx) => tx,
                 Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
             };

@@ -49,10 +49,8 @@ pub async fn get_enumerate(
     Extension(user_id): Extension<i32>,
     Query(query): Query<EnumerateQuery>,
 ) -> Result<Json<DocumentProviderEnumerateResponse>, StatusCode> {
-    // SIV keys derived from user's private key (currently requires server to have keys loaded)
-    // TODO: For true multi-user thin client, need per-user key derivation
-    let siv_key = app_state.get_siv_key()?;
-    let siv_nonce = app_state.get_siv_nonce()?;
+    // SIV keys from per-user session store
+    let session = app_state.get_session(user_id).await?;
 
     // Get db lock once for both operations
     let db_lock = app_state.db_pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -70,7 +68,7 @@ pub async fn get_enumerate(
         }
         None => {
             // Root
-            let path = encrypt_path("/".to_string(), siv_key, siv_nonce)
+            let path = encrypt_path("/".to_string(), &session.siv_key, &session.siv_nonce)
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
             (path, None)
@@ -84,8 +82,8 @@ pub async fn get_enumerate(
         &db_lock,
         user_id,
         &encrypted_parent_path,
-        siv_key,
-        siv_nonce,
+        &session.siv_key,
+        &session.siv_nonce,
         parent_uuid,
     ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -107,8 +105,7 @@ pub async fn get_item(
     Extension(user_id): Extension<i32>,
     Query(query): Query<ItemQuery>,
 ) -> Result<Json<DocumentProviderItem>, StatusCode> {
-    let siv_key = app_state.get_siv_key()?;
-    let siv_nonce = app_state.get_siv_nonce()?;
+    let session = app_state.get_session(user_id).await?;
 
     let inode_id = CustomUUID::from_str(&query.id)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -119,8 +116,8 @@ pub async fn get_item(
         &db_lock,
         &inode_id,
         user_id,
-        siv_key,
-        siv_nonce,
+        &session.siv_key,
+        &session.siv_nonce,
     ).map_err(|e| match e {
         db::DatabaseError::NotFound => StatusCode::NOT_FOUND,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -137,8 +134,7 @@ pub async fn get_download(
     Extension(user_id): Extension<i32>,
     Query(query): Query<ItemQuery>,
 ) -> Result<Response<Body>, StatusCode> {
-    let siv_key = app_state.get_siv_key()?;
-    let siv_nonce = app_state.get_siv_nonce()?;
+    let session = app_state.get_session(user_id).await?;
 
     let inode_id = CustomUUID::from_str(&query.id)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -163,7 +159,7 @@ pub async fn get_download(
         .rsplit('/')
         .next()
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-    let filename = crate::files::functions::decrypt_part(encrypted_filename, siv_key, siv_nonce)
+    let filename = crate::files::functions::decrypt_part(encrypted_filename, &session.siv_key, &session.siv_nonce)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Derive MIME type from filename
@@ -233,7 +229,7 @@ pub async fn delete_item(
         "delete_files".to_string(),
         encoded_payload,
         user_id,
-    ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Submit to consensus
     consensus_middleware(&app_state, vec![transaction]).await
@@ -254,8 +250,7 @@ pub async fn patch_item(
 ) -> Result<Json<ModifyDocumentProviderResponse>, StatusCode> {
     tracing::debug!("patch_item: request={:?} user_id={}", request, user_id);
 
-    let siv_key = app_state.get_siv_key()?;
-    let siv_nonce = app_state.get_siv_nonce()?;
+    let session = app_state.get_session(user_id).await?;
 
     // Parse inode_id from request
     let inode_id = CustomUUID::from_str(&request.id)
@@ -282,7 +277,7 @@ pub async fn patch_item(
         } else {
             ""
         };
-        let encrypted_name = encrypt_part(new_name, siv_key, siv_nonce)
+        let encrypted_name = encrypt_part(new_name, &session.siv_key, &session.siv_nonce)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         build_encrypted_path(parent_path, &encrypted_name)
@@ -339,7 +334,7 @@ pub async fn patch_item(
         "modify_item".to_string(),
         encoded_payload,
         user_id,
-    ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Submit to consensus
     consensus_middleware(&app_state, vec![transaction]).await

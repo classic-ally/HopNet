@@ -53,9 +53,10 @@ pub async fn post_nodes(
         return StatusCode::FORBIDDEN
     }
 
-    // check if the app state user keys are set up (our node needs to be set up)
-    let Ok(_) = app_state.get_user_keys() else {
-        return StatusCode::NOT_ACCEPTABLE
+    // check if the session has user keys (our node needs to be set up)
+    let session = match app_state.get_session(uid).await {
+        Ok(s) => s,
+        Err(_) => return StatusCode::NOT_ACCEPTABLE,
     };
 
     ///////////////
@@ -118,7 +119,7 @@ pub async fn post_nodes(
                 "insert_node".to_string(),
                 encoded_node,
                 uid,
-            ) {
+            ).await {
                 Ok(tx) => tx,
                 Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
             };
@@ -170,14 +171,8 @@ pub async fn post_nodes(
     // 4. Post-consensus: Create JoinInfo and send to joining node via iroh
     ///////////////
 
-    // Get user's private key to send to joining node
-    let user_private_key = match app_state.get_user_keys() {
-        Ok(keys) => keys.private_key.clone(),
-        Err(_) => {
-            tracing::error!("Failed to get user keys from app state");
-            return StatusCode::INTERNAL_SERVER_ERROR;
-        }
-    };
+    // Get user's private key to send to joining node (from session fetched earlier)
+    let user_private_key = session.user_keys.private_key.clone();
 
     // Get current consensus height
     let consensus_state = match crate::db::consensus::get_consensus(app_state.db_pool.get()) {

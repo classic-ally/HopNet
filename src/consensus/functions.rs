@@ -266,14 +266,14 @@ pub fn create_signed_transaction(
 }
 
 // Create a user-initiated transaction (for user operations)
-pub fn create_signed_user_transaction(
+pub async fn create_signed_user_transaction(
     app_state: &AppState,
     function: String,
     payload: Vec<u8>,
     user_id: i32,
 ) -> Result<Transaction, ConsensusError> {
     let node_id = app_state.get_node_id().map_err(|_| ConsensusError::DatabaseError)?;
-    let user_keys = app_state.get_user_keys().map_err(|_| ConsensusError::DatabaseError)?;
+    let session = app_state.get_session(user_id).await.map_err(|_| ConsensusError::DatabaseError)?;
 
     Transaction::new_with_user(
         function,
@@ -281,7 +281,7 @@ pub fn create_signed_user_transaction(
         node_id,
         &app_state.private_key,
         user_id,
-        &user_keys.private_key
+        &session.user_keys.private_key
     ).map_err(|_| ConsensusError::SigningError)
 }
 

@@ -103,14 +103,21 @@ Introduce session key store alongside the existing `OnceCell`. New login flow po
 **Validation:** Login populates session store. New user creation works. Existing orchestrator tests still pass (OnceCell unchanged).
 
 ### Phase 1c: Call Site Migration
-**Status:** [ ] Not Started
+**Status:** [x] Complete
 
-Incrementally migrate `get_siv_key()` / `get_user_keys()` consumers from `OnceCell` to session store lookups. Each module is independently testable. `OnceCell` remains as fallback for unmigrated modules.
+Migrated all user-facing `get_siv_key()` / `get_siv_nonce()` / `get_user_keys()` consumers from `OnceCell` to per-user session store lookups. `create_signed_user_transaction` made async. Sync DB functions (`materialize_folders`, `get_materialized_entries_for_archive`) accept SIV keys as parameters threaded from async callers.
 
-1. [ ] **Migrate `get_siv_key()` / `get_user_keys()` call sites**: Update all consumers to pull from session context — spans `files/routes.rs`, `fileprovider/routes.rs`, `documentprovider/routes.rs`, `devices/routes.rs`, `takeout/materialization.rs`, `db/takeout.rs`, `files/download.rs`, `consensus/functions.rs` (`create_signed_user_transaction`).
-2. [ ] **DocumentProvider migration**: Update DocumentProvider routes to resolve SIV keys from the device token's `user_id` via the session key store, rather than AppState globals.
+1. [x] **`create_signed_user_transaction` → async**: Now resolves user private key from session store. All 10+ callers updated with `.await`.
+2. [x] **`files/routes.rs`**: `get_files`, `get_file_fragments`, `post_files`, `delete_files`, `get_file_fragment_distribution` — all migrated.
+3. [x] **`files/download.rs`**: `reconstruct_file_for_user` — user private key from session store.
+4. [x] **`devices/routes.rs`**: `post_register_device`, `get_devices` — SIV encrypt/decrypt from session.
+5. [x] **`documentprovider/routes.rs`**: All 4 route handlers — SIV keys from session via device token's `user_id`.
+6. [x] **`nodes/routes.rs`**: `post_nodes` — user keys availability check + private key for JoinInfo from session.
+7. [x] **`takeout/materialization.rs`**: `user_id` threaded as parameter (was `get_user_id()`), SIV keys from session.
+8. [x] **`db/takeout.rs`**: `materialize_folders` and `get_materialized_entries_for_archive` accept SIV keys as parameters. `materialize_all_files` accepts `user_id` parameter.
+9. [x] **FileProvider (`fileprovider/routes.rs`)**: `delete_item` and `modify_item` `.await` added for async `create_signed_user_transaction`. Remaining FileProvider routes stay on OnceCell (inherently single-user, Phase 1d).
 
-**Validation:** After each module, existing orchestrator tests pass.
+**Validation:** `cargo check` clean. Orchestrator tests pass.
 
 ### Phase 1d: Cleanup and New Flows
 **Status:** [ ] Not Started

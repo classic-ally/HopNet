@@ -386,7 +386,7 @@ pub async fn delete_item(
         "delete_files".to_string(),
         encoded_payload,
         user_id,
-    ) {
+    ).await {
         Ok(tx) => tx,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
     };
@@ -942,7 +942,7 @@ pub async fn modify_item(
         "modify_item".to_string(),
         encoded_payload,
         user_id,
-    ) {
+    ).await {
         Ok(tx) => tx,
         Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
     };

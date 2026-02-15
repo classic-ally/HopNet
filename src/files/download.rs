@@ -73,17 +73,12 @@ pub async fn reconstruct_file_for_user(
     // Decrypt the per-file key if user has access
     let mut file_data = file_data;
     if let Some(file_access_entry) = file_access_data.file_access_entry {
-        // Get user's private key from app_state
-        let user_private_key = match app_state.user_keys.get() {
-            Some(user_keys) => &user_keys.private_key,
-            None => {
-                tracing::error!("No user keys available in app_state");
-                return Err(FileReconstructionError::InternalError);
-            }
-        };
-        
-        // Derive user's X25519 private key from app_state private key
-        let user_x25519_privkey = crate::auth::derive_x25519_privkey_from_user(user_private_key);
+        // Get user's private key from session store
+        let session = app_state.get_session(user_id).await
+            .map_err(|_| FileReconstructionError::InternalError)?;
+
+        // Derive user's X25519 private key from session private key
+        let user_x25519_privkey = crate::auth::derive_x25519_privkey_from_user(&session.user_keys.private_key);
         
         // Decrypt the wrapped per-file key
         match crate::auth::decrypt_wrapped_file_key(&file_access_entry, &user_x25519_privkey) {

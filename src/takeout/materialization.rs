@@ -10,17 +10,18 @@ pub async fn materialize_single_file(
     encrypted_path: String,
     data_id: CustomUUID,
     fragments_dir: &str,
+    user_id: i32,
 ) -> (CustomUUID, MaterializationStatus, Option<String>) {
     let staging_dir = format!("{}/takeouts/{}/staging/files", fragments_dir, takeout_id.simple());
 
-    // Get SIV key and nonce for path decryption
-    let (siv_key, siv_nonce) = match (app_state.get_siv_key(), app_state.get_siv_nonce()) {
-        (Ok(key), Ok(nonce)) => (key, nonce),
-        _ => return (file_id, MaterializationStatus::Failed, Some("Failed to get encryption keys".to_string())),
+    // Get SIV key and nonce from session store
+    let session = match app_state.get_session(user_id).await {
+        Ok(s) => s,
+        Err(_) => return (file_id, MaterializationStatus::Failed, Some("Failed to get session keys".to_string())),
     };
 
     // Decrypt the path segments
-    let decrypted_path = match crate::files::functions::decrypt_path(encrypted_path.clone(), siv_key, siv_nonce) {
+    let decrypted_path = match crate::files::functions::decrypt_path(encrypted_path.clone(), &session.siv_key, &session.siv_nonce) {
         Ok(path) => path,
         Err(e) => {
             tracing::error!("Failed to decrypt file path {}: {:?}", encrypted_path, e);
@@ -29,12 +30,6 @@ pub async fn materialize_single_file(
     };
 
     tracing::debug!("Materializing file: {} -> {}", encrypted_path, decrypted_path);
-
-    // Get user ID for reconstruction
-    let user_id = match app_state.get_user_id() {
-        Ok(id) => id,
-        Err(_) => return (file_id, MaterializationStatus::Failed, Some("Failed to get user ID".to_string())),
-    };
 
     // Use shared file reconstruction logic
     // Get streaming reconstruction (memory-efficient for large files)

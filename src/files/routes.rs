@@ -262,11 +262,13 @@ pub struct FileFragmentsResponse {
 
 pub async fn get_files(
     State(app_state): State<AppState>,
+    Extension(user_id): Extension<i32>,
     Query(params): Query<GetQueryParams>
 ) -> Result<Json<Vec<FileItem>>, StatusCode> {
+    let session = app_state.get_session(user_id).await?;
     // let's encrypt the path so we can search for it
-    let enc_path = encrypt_path(params.path, app_state.get_siv_key()?, app_state.get_siv_nonce()?).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    match db::files::get_files(app_state.db_pool.get(), enc_path, app_state.get_siv_key()?, app_state.get_siv_nonce()?) {
+    let enc_path = encrypt_path(params.path, &session.siv_key, &session.siv_nonce).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    match db::files::get_files(app_state.db_pool.get(), enc_path, &session.siv_key, &session.siv_nonce) {
         Ok(files) => {
             Ok(Json(files))
         }
@@ -282,18 +284,19 @@ pub async fn get_file_fragments(
     Extension(user_id): Extension<i32>,  // Extract user_id from JWT via auth middleware
     Path(path): Path<String>
 ) -> Result<Response<Body>, StatusCode> {
+    let session = app_state.get_session(user_id).await?;
     // Convert the path: /files/ -> "/" and /files/test -> "/test"
     let file_path = if path.is_empty() {
         "/".to_string()
     } else {
         format!("/{}", path)
     };
-    
+
     // Extract filename from path for Content-Disposition header
     let filename = path.split('/').last().unwrap_or("download");
-    
+
     // Encrypt the path for database lookup
-    let enc_path = encrypt_path(file_path, app_state.get_siv_key()?, app_state.get_siv_nonce()?)
+    let enc_path = encrypt_path(file_path, &session.siv_key, &session.siv_nonce)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     
@@ -471,6 +474,7 @@ pub async fn post_files(
     Extension(user_id): Extension<i32>,  // Extract user_id from JWT via auth middleware
     mut multipart: Multipart
 ) -> Result<(), StatusCode> {
+    let session = app_state.get_session(user_id).await?;
     // Get user from database to access their X25519 public key
     let user = match crate::db::users::get_user_by_userid(app_state.db_pool.get(), user_id) {
         Ok(Some(user)) => user,
@@ -492,7 +496,7 @@ pub async fn post_files(
                 Some("path") => {
                     // Regular path approach
                     let unencrypted_path = part.text().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                    encrypt_path(unencrypted_path, app_state.get_siv_key()?, app_state.get_siv_nonce()?).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                    encrypt_path(unencrypted_path, &session.siv_key, &session.siv_nonce).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
                 },
                 Some("parent_item_identifier") => {
                     // FileProvider approach - need to look up parent path and construct full path
@@ -503,7 +507,7 @@ pub async fn post_files(
                     // Get parent path and return it encrypted
                     if parent_item_identifier == "NSFileProviderRootContainerItemIdentifier" {
                         tracing::debug!("Handling root container case");
-                        encrypt_path("/".to_string(), app_state.get_siv_key()?, app_state.get_siv_nonce()?).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                        encrypt_path("/".to_string(), &session.siv_key, &session.siv_nonce).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
                     } else if parent_item_identifier.starts_with("item:") {
                         // Extract inode_id and look up encrypted path
                         let inode_id_str = &parent_item_identifier[5..];
@@ -548,7 +552,7 @@ pub async fn post_files(
                 let file_size = file_size_str.parse::<usize>().map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
 
                 // encrypt filename - deterministic AES-SIV
-                let filepath = path.clone() + &encrypt_part(&filename, app_state.get_siv_key()?, app_state.get_siv_nonce()?).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                let filepath = path.clone() + &encrypt_part(&filename, &session.siv_key, &session.siv_nonce).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
                 // Generate data block ID before sharding
                 let dataid = CustomUUID::new(None);
@@ -629,7 +633,7 @@ pub async fn post_files(
         let folder_path = if let Some(folder_name) = folder_name {
             // FileProvider approach - concatenate parent path + folder name (same as file creation)
             tracing::debug!("FOLDER CREATION FILEPROVIDER: '{}'", &folder_name);
-            path + &encrypt_part(&folder_name, app_state.get_siv_key()?, app_state.get_siv_nonce()?).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            path + &encrypt_part(&folder_name, &session.siv_key, &session.siv_nonce).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         } else {
             // Old API approach - path already contains the full folder path
             path
@@ -653,7 +657,7 @@ pub async fn post_files(
                 "insert_files".to_string(),
                 encoded_inodes,
                 user_id,
-            ) {
+            ).await {
                 Ok(tx) => tx,
                 Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
             };
@@ -721,7 +725,8 @@ pub async fn delete_files(
     Extension(user_id): Extension<i32>,  // Extract user_id from JWT via auth middleware
     Query(params): Query<GetQueryParams>
 ) -> Result<(), StatusCode> {
-    let enc_path = encrypt_path(params.path, app_state.get_siv_key()?, app_state.get_siv_nonce()?).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let session = app_state.get_session(user_id).await?;
+    let enc_path = encrypt_path(params.path, &session.siv_key, &session.siv_nonce).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Validate that files exist before submitting to consensus
     // IMPORTANT: Use a fresh transaction to avoid snapshot isolation issues
@@ -764,7 +769,7 @@ pub async fn delete_files(
                 "delete_files".to_string(),
                 encoded_payload,
                 user_id,
-            ) {
+            ).await {
                 Ok(tx) => tx,
                 Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
             };
@@ -1046,17 +1051,12 @@ pub async fn get_file_fragment_distribution(
     Query(params): Query<GetQueryParams>,
 ) -> impl IntoResponse {
     // Encrypt path server-side (following existing pattern)
-    let siv_key = match app_state.get_siv_key() {
-        Ok(key) => key,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    let session = match app_state.get_session(user_id).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
     };
 
-    let siv_nonce = match app_state.get_siv_nonce() {
-        Ok(nonce) => nonce,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-
-    let encrypted_path = match encrypt_path(params.path, siv_key, siv_nonce).await {
+    let encrypted_path = match encrypt_path(params.path, &session.siv_key, &session.siv_nonce).await {
         Ok(path) => path,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };

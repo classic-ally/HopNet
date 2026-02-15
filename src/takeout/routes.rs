@@ -136,7 +136,7 @@ async fn post_initiate_takeout(
         "create_takeout".to_string(),
         encoded_payload,
         user_id,
-    ) {
+    ).await {
         Ok(tx) => tx,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
     };
@@ -406,12 +406,17 @@ pub async fn execute_takeout_materialization(
     consensus_middleware(app_state, vec![transaction]).await
         .map_err(|e| TakeoutMaterializationError::Consensus(format!("Failed to update status: {:?}", e)))?;
 
+    // Resolve session for SIV keys (needed by sync folder/archive functions)
+    let session = app_state.get_session(user_id).await
+        .map_err(|_| TakeoutMaterializationError::Consensus("Session not found for user".to_string()))?;
+
     // Start folder materialization
     let folder_result = crate::db::takeout::materialize_folders(
         app_state.db_pool.get(),
-        app_state,
         takeout_id,
         &app_state.fragments_dir,
+        &session.siv_key,
+        &session.siv_nonce,
     ).map_err(|e| TakeoutMaterializationError::Database(e))?;
 
     tracing::info!(
@@ -424,6 +429,7 @@ pub async fn execute_takeout_materialization(
         app_state,
         takeout_id,
         &app_state.fragments_dir,
+        user_id,
     ).await.map_err(|e| TakeoutMaterializationError::Database(e))?;
 
     tracing::info!(
@@ -438,6 +444,8 @@ pub async fn execute_takeout_materialization(
     let archive_entries = crate::db::takeout::get_materialized_entries_for_archive(
         app_state,
         takeout_id,
+        &session.siv_key,
+        &session.siv_nonce,
     ).map_err(|e| TakeoutMaterializationError::Database(e))?;
 
     // Create archive path

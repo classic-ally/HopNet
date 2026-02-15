@@ -392,15 +392,13 @@ pub async fn get_node_available_storage(
 /// Creates directories in staging area and updates materialization status
 pub fn materialize_folders(
     db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
-    app_state: &crate::AppState,
     takeout_id: &CustomUUID,
     fragments_dir: &str,
+    siv_key: &aes_siv::Key<aes_siv::siv::Aes256Siv>,
+    siv_nonce: &aes_siv::Nonce,
 ) -> Result<(u32, u32), DatabaseError> {
     match db_connection {
         Ok(mut db_lock) => {
-            // Get SIV key and nonce for path decryption
-            let siv_key = app_state.get_siv_key().map_err(|_| DatabaseError::ProcessingError)?;
-            let siv_nonce = app_state.get_siv_nonce().map_err(|_| DatabaseError::ProcessingError)?;
             
             let temp_table_name = format!("takeout_inodes_{}", takeout_id.simple());
             tracing::info!("Starting folder materialization for takeout {}", takeout_id);
@@ -686,6 +684,7 @@ pub async fn materialize_all_files(
     app_state: &crate::AppState,
     takeout_id: &CustomUUID,
     fragments_dir: &str,
+    user_id: i32,
 ) -> Result<(u32, u32), DatabaseError> {
     const BATCH_SIZE: usize = 10;
     let mut offset = 0;
@@ -722,6 +721,7 @@ pub async fn materialize_all_files(
                     encrypted_path,
                     data_id,
                     &fragments_dir,
+                    user_id,
                 ).await;
 
                 // Immediately update the database with the result
@@ -779,13 +779,11 @@ pub async fn materialize_all_files(
 pub fn get_materialized_entries_for_archive(
     app_state: &crate::AppState,
     takeout_id: &CustomUUID,
+    siv_key: &aes_siv::Key<aes_siv::siv::Aes256Siv>,
+    siv_nonce: &aes_siv::Nonce,
 ) -> Result<Vec<crate::takeout::archive::ArchiveEntry>, DatabaseError> {
     let mut db_connection = app_state.db_pool.get().map_err(|_| DatabaseError::LockError)?;
     let temp_table_name = format!("takeout_inodes_{}", takeout_id.simple());
-
-    // Get SIV key and nonce for path decryption
-    let siv_key = app_state.get_siv_key().map_err(|_| DatabaseError::ProcessingError)?;
-    let siv_nonce = app_state.get_siv_nonce().map_err(|_| DatabaseError::ProcessingError)?;
 
     let mut entries = Vec::new();
 

@@ -42,9 +42,8 @@ async fn post_register_device(
     let api_key_hash = Blake3Hash::new(blake3::hash(secret_hex.as_bytes()));
 
     // Encrypt device name with user's SIV key
-    let siv_key = app_state.get_siv_key()?;
-    let siv_nonce = app_state.get_siv_nonce()?;
-    let encrypted_device_name = encrypt_part(&request.device_name, siv_key, siv_nonce)
+    let session = app_state.get_session(user_id).await?;
+    let encrypted_device_name = encrypt_part(&request.device_name, &session.siv_key, &session.siv_nonce)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -65,7 +64,7 @@ async fn post_register_device(
         "register_device".to_string(),
         encoded_payload,
         user_id,
-    ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Submit to consensus
     consensus_middleware(&app_state, vec![transaction])
@@ -93,14 +92,13 @@ async fn get_devices(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Get SIV keys for decryption
-    let siv_key = app_state.get_siv_key()?;
-    let siv_nonce = app_state.get_siv_nonce()?;
+    let session = app_state.get_session(user_id).await?;
 
     let mut devices = Vec::with_capacity(records.len());
     for record in records {
         // Decrypt device name (strip leading / from encrypt_part format)
         let encrypted_name = record.encrypted_device_name.trim_start_matches('/');
-        let device_name = decrypt_part(encrypted_name, siv_key, siv_nonce)
+        let device_name = decrypt_part(encrypted_name, &session.siv_key, &session.siv_nonce)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         // Extract timestamp from UUIDv7
@@ -148,7 +146,7 @@ async fn delete_device(
         "revoke_device".to_string(),
         encoded_payload,
         user_id,
-    ) {
+    ).await {
         Ok(tx) => tx,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
     };
