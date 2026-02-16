@@ -31,6 +31,21 @@ pub struct DeclineSharePayload {
     pub user_id: i32,
 }
 
+/// Pre-computed file_access blob update for a pending incoming_share.
+/// The route handler creates these because only it has the decrypted per-file key.
+/// The consensus handler applies them during propagation.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct IncomingShareUpdate {
+    pub incoming_share_id: CustomUUID,
+    pub new_file_access_blob: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct UnsharePayload {
+    pub inode_id: CustomUUID,
+    pub user_id: i32,
+}
+
 // --- API request/response types ---
 
 #[derive(Deserialize)]

@@ -765,6 +765,71 @@ pub fn fragment_exists_and_valid(fragments_dir: &str, fragment_hash: &Blake3Hash
     }
 }
 
+/// Shared content-update preparation for both PATCH /files and FileProvider modify_item.
+/// Handles key generation, file processing, and share propagation.
+/// Returns (data_block_id, DataRecord with file_access + propagation entries, incoming_share_updates, per_file_key).
+/// The caller is responsible for building the final ModifyItemPayload, validation, and consensus submission.
+pub async fn prepare_content_update(
+    app_state: &AppState,
+    user_id: i32,
+    inode_id: &crate::db::CustomUUID,
+    field: axum::extract::multipart::Field<'_>,
+    file_size: usize,
+) -> Result<(crate::db::CustomUUID, crate::db::DataRecord, Option<Vec<crate::shares::types::IncomingShareUpdate>>, chacha20poly1305::Key), axum::http::StatusCode> {
+    use axum::http::StatusCode;
+    use chacha20poly1305::{ChaCha20Poly1305, aead::KeyInit, aead::OsRng as CryptoOsRng};
+
+    // Generate new data block ID and per-file key
+    let dataid = crate::db::CustomUUID::new(None);
+    let per_file_key = ChaCha20Poly1305::generate_key(&mut CryptoOsRng);
+
+    // Create file access entry for the modifier
+    let file_access = crate::db::types::FileAccess::new_for_user(
+        app_state.db_pool.get(), dataid.clone(), user_id, &per_file_key,
+    ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Process uploaded file
+    let mut data_record = if file_size == 0 {
+        crate::db::DataRecord {
+            id: dataid.clone(),
+            modified_at: None,
+            data: crate::db::Data {
+                hash: crate::db::Blake3Hash::new({
+                    let mut hasher = blake3::Hasher::new();
+                    hasher.update(dataid.as_bytes());
+                    hasher.finalize()
+                }),
+                fragments: Vec::new(),
+                added_bytes: 0,
+            },
+            file_access_entries: None,
+            file_size: 0,
+        }
+    } else {
+        super::routes::process_uploaded_file(
+            field, file_size, dataid.clone(), &per_file_key, &app_state.fragments_dir,
+        ).await?
+    };
+    data_record.file_access_entries = Some(vec![file_access]);
+    data_record.file_size = file_size as u64;
+
+    // Build share propagation
+    let conn = app_state.db_pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let (extra_file_access_entries, incoming_share_updates) =
+        super::routes::build_share_propagation(&conn, inode_id, user_id, &dataid, &per_file_key)?;
+    drop(conn);
+
+    if !extra_file_access_entries.is_empty() {
+        if let Some(entries) = data_record.file_access_entries.as_mut() {
+            entries.extend(extra_file_access_entries);
+        } else {
+            data_record.file_access_entries = Some(extra_file_access_entries);
+        }
+    }
+
+    Ok((dataid, data_record, incoming_share_updates, per_file_key))
+}
+
 /// Derive chunk encryption key from per-file key and fragment UUID
 pub fn derive_chunk_key(per_file_key: &chacha20poly1305::Key, fragment_id: &crate::db::CustomUUID) -> chacha20poly1305::Key {
     let mut key_bytes = [0u8; 32];

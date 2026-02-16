@@ -134,6 +134,9 @@ pub async fn run_test_by_name(mesh_id: u32, name: &str, nodes: &[NodeInfo], flag
         "multi-user-sharing" => {
             sharing::MultiUserSharing.run(mesh_id, nodes, flags).await
         }
+        "multi-user-sharing-live-link" => {
+            sharing::MultiUserSharingLiveLink.run(mesh_id, nodes, flags).await
+        }
         _ => Err(anyhow::anyhow!("Unknown test: {}", name)),
     }
 }
@@ -158,6 +161,7 @@ pub fn list_test_names() -> Vec<&'static str> {
         "metrics-collection",
         "multi-user-isolation",
         "multi-user-sharing",
+        "multi-user-sharing-live-link",
     ]
 }
 

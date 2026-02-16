@@ -322,6 +322,7 @@ pub async fn patch_item(
         new_encrypted_path: Some(new_encrypted_path),
         new_data_block_id: None,
         new_data_record: None,
+        incoming_share_updates: None,
     };
 
     // Serialize payload

@@ -163,6 +163,143 @@ pub fn share_exists_for_recipient(
     Ok(exists)
 }
 
+/// Get user_ids of all accepted members sharing a data_block.
+pub fn get_sharers_for_data_block_conn(
+    conn: &duckdb::Connection,
+    data_block_id: &CustomUUID,
+) -> Result<Vec<i32>, DatabaseError> {
+    let mut stmt = conn.prepare(
+        "SELECT user_id FROM shares WHERE data_block_id = ?"
+    ).map_err(|_| DatabaseError::RecallError)?;
+
+    let rows = stmt.query_map(params![data_block_id], |row| {
+        row.get::<_, i32>(0)
+    }).map_err(|_| DatabaseError::ProcessingError)?;
+
+    rows.collect::<Result<Vec<_>, _>>().map_err(|_| DatabaseError::ProcessingError)
+}
+
+pub fn get_sharers_for_data_block(
+    db_tx: &duckdb::Transaction,
+    data_block_id: &CustomUUID,
+) -> Result<Vec<i32>, DatabaseError> {
+    get_sharers_for_data_block_conn(db_tx, data_block_id)
+}
+
+/// Get pending incoming_shares for a data_block.
+pub fn get_incoming_shares_for_data_block_conn(
+    conn: &duckdb::Connection,
+    data_block_id: &CustomUUID,
+) -> Result<Vec<IncomingShareRow>, DatabaseError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, data_block_id, sender_id, recipient_id, file_access, display_ephemeral_pubkey, encrypted_display_name FROM incoming_shares WHERE data_block_id = ?"
+    ).map_err(|_| DatabaseError::RecallError)?;
+
+    let rows = stmt.query_map(params![data_block_id], |row| {
+        Ok(IncomingShareRow {
+            id: row.get(0)?,
+            data_block_id: row.get(1)?,
+            sender_id: row.get(2)?,
+            recipient_id: row.get(3)?,
+            file_access: row.get(4)?,
+            display_ephemeral_pubkey: row.get(5)?,
+            encrypted_display_name: row.get(6)?,
+        })
+    }).map_err(|_| DatabaseError::ProcessingError)?;
+
+    rows.collect::<Result<Vec<_>, _>>().map_err(|_| DatabaseError::ProcessingError)
+}
+
+pub fn get_incoming_shares_for_data_block(
+    db_tx: &duckdb::Transaction,
+    data_block_id: &CustomUUID,
+) -> Result<Vec<IncomingShareRow>, DatabaseError> {
+    get_incoming_shares_for_data_block_conn(db_tx, data_block_id)
+}
+
+/// Batch-update shares table: old_data_block_id → new_data_block_id.
+pub fn update_shares_data_block(
+    db_tx: &duckdb::Transaction,
+    old_data_block_id: &CustomUUID,
+    new_data_block_id: &CustomUUID,
+) -> Result<(), DatabaseError> {
+    db_tx.execute(
+        "UPDATE shares SET data_block_id = ? WHERE data_block_id = ?",
+        params![new_data_block_id, old_data_block_id]
+    ).map_err(|e| {
+        tracing::error!("Failed to update shares data_block {} -> {}: {:?}", old_data_block_id, new_data_block_id, e);
+        DatabaseError::ProcessingError
+    })?;
+    Ok(())
+}
+
+/// Update a single incoming_share's data_block_id and file_access blob.
+pub fn update_incoming_share_data_block(
+    db_tx: &duckdb::Transaction,
+    share_id: &CustomUUID,
+    new_data_block_id: &CustomUUID,
+    new_file_access_blob: &[u8],
+) -> Result<(), DatabaseError> {
+    db_tx.execute(
+        "UPDATE incoming_shares SET data_block_id = ?, file_access = ? WHERE id = ?",
+        params![new_data_block_id, new_file_access_blob.to_vec(), share_id]
+    ).map_err(|e| {
+        tracing::error!("Failed to update incoming_share {} data_block: {:?}", share_id, e);
+        DatabaseError::ProcessingError
+    })?;
+    Ok(())
+}
+
+/// Remove a user from the shares table for a given data_block.
+pub fn remove_user_from_shares(
+    db_tx: &duckdb::Transaction,
+    data_block_id: &CustomUUID,
+    user_id: i32,
+) -> Result<(), DatabaseError> {
+    db_tx.execute(
+        "DELETE FROM shares WHERE data_block_id = ? AND user_id = ?",
+        params![data_block_id, user_id]
+    ).map_err(|e| {
+        tracing::error!("Failed to remove user {} from shares for data_block {}: {:?}", user_id, data_block_id, e);
+        DatabaseError::ProcessingError
+    })?;
+    Ok(())
+}
+
+/// Remove all incoming_shares where sender_id matches and data_block_id matches.
+pub fn remove_sender_incoming_shares(
+    db_tx: &duckdb::Transaction,
+    data_block_id: &CustomUUID,
+    sender_id: i32,
+) -> Result<(), DatabaseError> {
+    db_tx.execute(
+        "DELETE FROM incoming_shares WHERE data_block_id = ? AND sender_id = ?",
+        params![data_block_id, sender_id]
+    ).map_err(|e| {
+        tracing::error!("Failed to remove sender {} incoming_shares for data_block {}: {:?}", sender_id, data_block_id, e);
+        DatabaseError::ProcessingError
+    })?;
+    Ok(())
+}
+
+/// Get data_block_id for a user's inode by inode_id.
+pub fn get_data_block_for_inode(
+    db_tx: &duckdb::Transaction,
+    inode_id: &CustomUUID,
+    user_id: i32,
+) -> Result<Option<CustomUUID>, DatabaseError> {
+    let row = db_tx.query_row(
+        "SELECT data_id FROM inodes WHERE id = ? AND owner_id = ?",
+        params![inode_id, user_id],
+        |row| row.get::<_, Option<CustomUUID>>(0)
+    ).optional().map_err(|_| DatabaseError::RecallError)?;
+
+    match row {
+        Some(data_id) => Ok(data_id),
+        None => Err(DatabaseError::NotFound),
+    }
+}
+
 pub fn get_share_details(
     db_connection: Result<PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     data_block_id: &CustomUUID,

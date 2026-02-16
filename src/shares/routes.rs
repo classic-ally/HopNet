@@ -41,7 +41,7 @@ pub fn router() -> Router<AppState> {
         .route("/incoming/count", get(get_incoming_share_count))
         .route("/incoming/{id}", delete(delete_incoming_share))
         .route("/{id}/accept", post(post_accept_share))
-        .route("/file/{inode_id}", get(get_share_details))
+        .route("/file/{inode_id}", get(get_share_details).delete(delete_unshare))
 }
 
 /// POST /shares — share a file with another user
@@ -350,4 +350,42 @@ pub async fn get_share_details(
     }).collect();
 
     (StatusCode::OK, Json(ShareDetailResponse { users })).into_response()
+}
+
+/// DELETE /shares/file/{inode_id} — unshare (remove self from a shared file, keep current version)
+pub async fn delete_unshare(
+    State(app_state): State<AppState>,
+    Extension(user_id): Extension<i32>,
+    Path(inode_id): Path<String>,
+) -> impl IntoResponse {
+    let inode_uuid = match CustomUUID::from_str(&inode_id) {
+        Ok(id) => id,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+
+    let unshare_payload = UnsharePayload {
+        inode_id: inode_uuid,
+        user_id,
+    };
+
+    let encoded = match bincode::serde::encode_to_vec(&unshare_payload, bincode::config::standard()) {
+        Ok(e) => e,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    let transaction = match crate::consensus::functions::create_signed_user_transaction(
+        &app_state, "unshare".to_string(), encoded, user_id,
+    ).await {
+        Ok(tx) => tx,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    if let Some(err_response) = preflight_check(&app_state, &transaction) {
+        return err_response;
+    }
+
+    match crate::consensus::functions::consensus_middleware(&app_state, vec![transaction]).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }

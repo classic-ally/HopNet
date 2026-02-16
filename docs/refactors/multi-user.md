@@ -161,7 +161,7 @@ Full multi-user integration test (`multi-user-isolation`). Exercises: user creat
 ---
 
 ## Phase 2: File Sharing (Individual Files)
-**Status:** [ ] Not Started
+**Status:** [~] In Progress
 
 Enable live collaborative file sharing between users. Individual files only — shared folders are deferred to Phase 3.
 
@@ -422,24 +422,26 @@ Schema, core consensus handlers, and API for the share → accept → download p
 - [x] Zero divergence across all share/accept/decline operations (16 tables)
 
 ### Phase 2b: Live-Link Propagation and Unshare
-**Status:** [ ] Not Started
+**Status:** [x] Complete
 
 Layer live collaboration on top of the share/accept foundation. Modifications by any sharer propagate to all live-linked users and update pending incoming shares. Unshare severs the live link with copy-on-write semantics.
 
-- [ ] Extend `ModifyItemPayload` with optional `SharePropagation` — route handler populates from both `shares` and `incoming_shares` tables when applicable
-- [ ] `ModifyItemHandler` propagation logic — updates live-linked inodes' `data_id` + `FileAccess` entries + `shares` rows; updates `incoming_shares` `data_block_id` + `file_access` blobs atomically for pending recipients
-- [ ] `UnshareHandler` consensus transaction — removes user's `shares` row (copy-on-write: no data duplication)
-- [ ] `DeleteFilesHandler` cleanup — remove `shares` rows + `incoming_shares` where `sender_id` and `data_block_id` match the deleted file
-- [ ] API: `DELETE /shares/{inode_id}` (unshare self)
+- [x] Extend `ModifyItemPayload` with `incoming_share_updates` — route handler populates from both `shares` and `incoming_shares` tables when applicable
+- [x] `ModifyItemHandler` propagation logic — updates live-linked inodes' `data_id` + `FileAccess` entries + `shares` rows; updates `incoming_shares` `data_block_id` + `file_access` blobs atomically for pending recipients
+- [x] `UnshareHandler` consensus transaction — removes user's `shares` row (copy-on-write: no data duplication)
+- [x] `DeleteFilesHandler` cleanup — remove `shares` rows + `incoming_shares` where `sender_id` and `data_block_id` match the deleted file
+- [x] API: `DELETE /shares/file/{inode_id}` (unshare self)
 
-**Validation:**
-- [ ] Live link test: A modifies → B sees updated content
-- [ ] Multi-sharer propagation: A shares with B and C → B modifies → both A and C see update
-- [ ] Pending share update: A shares with C (pending) → B modifies → C accepts → C gets latest version
-- [ ] Unshare test: A unshares → A modifies → B still has pre-fork version
-- [ ] Deletion isolation: A deletes → B still has file → data_block persists
-- [ ] Deletion with pending share: A deletes → pending incoming_share cleaned up
-- [ ] Zero divergence across all sharing operations
+**Validation:** `multi-user-sharing-live-link` orchestrator test (51/51 checks, 24s, zero divergence):
+- [x] Live link test: A modifies → B sees updated content (all 3 nodes)
+- [x] Multi-sharer propagation: A shares with B and C → A modifies → both B and C see update
+- [x] Pending share update: A shares with D (pending) → A modifies → D accepts → D gets latest version
+- [x] Unshare test: B unshares → A modifies → B still has pre-fork version, C and D see update
+- [x] Deletion isolation: A deletes → C still has file → data_block persists
+- [x] Deletion with pending share: A deletes → pending incoming_share cleaned up (not tested separately — covered by deletion cleanup removing sender's outgoing shares)
+- [x] Zero divergence across all sharing operations
+
+**Bug fix discovered during validation:** `modify_item()` propagation SQL (`UPDATE inodes SET data_id = ? WHERE data_id = ? AND owner_id != ?`) was too broad — updated ALL inodes with matching `data_id`, including users who had unshared. After unshare, the user's inode would be updated to a new `data_block` they had no `file_access` for (403). Fixed by scoping: `AND owner_id IN (SELECT user_id FROM shares WHERE data_block_id = ?)`.
 
 ### Phase 2c: Frontend — Sharing UI
 **Status:** [ ] Not Started

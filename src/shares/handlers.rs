@@ -4,7 +4,7 @@ use crate::consensus::types::Transaction;
 use crate::db::DatabaseError;
 use duckdb::params;
 
-use super::types::{ShareFilePayload, AcceptSharePayload, DeclineSharePayload};
+use super::types::{ShareFilePayload, AcceptSharePayload, DeclineSharePayload, UnsharePayload};
 
 // --- ShareFileHandler ---
 
@@ -202,3 +202,43 @@ impl TransactionHandler for DeclineShareHandler {
 }
 
 inventory::submit! { &DeclineShareHandler as &dyn TransactionHandler }
+
+// --- UnshareHandler ---
+
+pub struct UnshareHandler;
+
+impl TransactionHandler for UnshareHandler {
+    fn name(&self) -> &'static str { "unshare" }
+
+    fn process(&self, _state: &AppState, tx: &Transaction, _execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
+        let (payload, _) = bincode::serde::decode_from_slice::<UnsharePayload, _>(
+            &tx.rpc.payload, bincode::config::standard()
+        ).map_err(|_| DatabaseError::InvalidPayload)?;
+
+        // Authorization: must be the authenticated user
+        let user = tx.user.as_ref().ok_or(DatabaseError::AuthorizationError)?;
+        if user.id != payload.user_id {
+            return Err(DatabaseError::AuthorizationError);
+        }
+
+        // Look up inode → get data_block_id
+        let data_block_id = crate::db::shares::get_data_block_for_inode(db_tx, &payload.inode_id, payload.user_id)?
+            .ok_or(DatabaseError::NotFound)?;
+
+        // Verify user is in shares table for this data_block
+        let sharers = crate::db::shares::get_sharers_for_data_block(db_tx, &data_block_id)?;
+        if !sharers.contains(&payload.user_id) {
+            return Err(DatabaseError::NotFound);
+        }
+
+        // Remove user from shares — they keep their inode and file_access (copy-on-write)
+        crate::db::shares::remove_user_from_shares(db_tx, &data_block_id, payload.user_id)?;
+
+        // Also clean up any pending outgoing shares from this user for this data_block
+        crate::db::shares::remove_sender_incoming_shares(db_tx, &data_block_id, payload.user_id)?;
+
+        Ok(())
+    }
+}
+
+inventory::submit! { &UnshareHandler as &dyn TransactionHandler }

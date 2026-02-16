@@ -245,14 +245,14 @@ pub struct FileAccess {
 
 impl FileAccess {
     /// Create a new FileAccess entry by wrapping the per-file key for the specified user
-    pub fn new_for_user(
-        db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    pub fn new_for_user_with_conn(
+        conn: &duckdb::Connection,
         data_block_id: CustomUUID,
         user_id: i32,
         per_file_key: &chacha20poly1305::Key,
     ) -> Result<Self, DatabaseError> {
         // Look up user from database to get their X25519 public key
-        let user = match crate::db::users::get_user_by_userid(db_connection, user_id) {
+        let user = match crate::db::users::get_user_by_userid_conn(conn, user_id) {
             Ok(Some(user)) => user,
             Ok(None) => return Err(DatabaseError::RecallError), // User not found
             Err(e) => return Err(e),
@@ -293,6 +293,18 @@ impl FileAccess {
             ephemeral_pubkey: XPubKey::from(ephemeral_public),
             encrypted_file_key,
         })
+    }
+
+    pub fn new_for_user(
+        db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+        data_block_id: CustomUUID,
+        user_id: i32,
+        per_file_key: &chacha20poly1305::Key,
+    ) -> Result<Self, DatabaseError> {
+        match db_connection {
+            Ok(db_lock) => Self::new_for_user_with_conn(&db_lock, data_block_id, user_id, per_file_key),
+            Err(_) => Err(DatabaseError::LockError),
+        }
     }
 }
 

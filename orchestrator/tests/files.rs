@@ -54,6 +54,49 @@ pub async fn upload_file(
 }
 
 // ============================================================================
+// File Modify Helpers
+// ============================================================================
+
+/// Modify (update content of) an existing file by inode_id
+///
+/// # Arguments
+/// * `node` - The node to send the update to
+/// * `inode_id` - The inode ID of the file to modify
+/// * `new_contents` - The new file contents as bytes
+pub async fn modify_file(
+    node: &NodeInfo,
+    inode_id: &str,
+    new_contents: Vec<u8>,
+) -> Result<()> {
+    let client = Client::new();
+    let url = format!("http://{}:{}/files", node.ip_address, node.port);
+
+    let contents_len = new_contents.len();
+
+    let part = reqwest::multipart::Part::bytes(new_contents)
+        .file_name("content");
+
+    let form = reqwest::multipart::Form::new()
+        .text("inode_id", inode_id.to_string())
+        .part(format!("file_{}", contents_len), part);
+
+    let response = client
+        .patch(&url)
+        .header("Authorization", format!("Bearer {}", node.jwt_token))
+        .multipart(form)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_else(|_| "No body".to_string());
+        anyhow::bail!("Modify file failed with status {}: {}", status, body);
+    }
+
+    Ok(())
+}
+
+// ============================================================================
 // File Download Helpers
 // ============================================================================
 

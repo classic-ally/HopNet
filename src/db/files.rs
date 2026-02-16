@@ -358,6 +358,23 @@ pub fn delete_files(
 
     tracing::debug!("Logged deletion of {} items (including children and ancestors) at height {}", logged_count, current_height);
 
+    // Phase 2b: Clean up share memberships and pending outgoing shares for deleted files
+    {
+        let mut data_ids_stmt = db_tx.prepare(
+            "SELECT DISTINCT data_id FROM inodes WHERE (path = ? OR path LIKE ?) AND owner_id = ? AND data_id IS NOT NULL"
+        ).map_err(|_| DatabaseError::RecallError)?;
+        let data_ids: Vec<CustomUUID> = data_ids_stmt.query_map(
+            params![path, format!("{}/%", path), user_id],
+            |row| row.get::<_, CustomUUID>(0)
+        ).map_err(|_| DatabaseError::ProcessingError)?
+            .collect::<Result<Vec<_>, _>>().map_err(|_| DatabaseError::ProcessingError)?;
+
+        for data_block_id in &data_ids {
+            crate::db::shares::remove_user_from_shares(db_tx, data_block_id, user_id)?;
+            crate::db::shares::remove_sender_incoming_shares(db_tx, data_block_id, user_id)?;
+        }
+    }
+
     // Delete the file/folder and all its children (only for this user)
     db_tx.execute(
         "DELETE FROM inodes WHERE (path = ? OR path LIKE ?) AND owner_id = ?",
@@ -375,6 +392,7 @@ pub fn modify_item(
     new_encrypted_path: Option<String>,
     new_data_block_id: Option<crate::db::CustomUUID>,
     new_data_record: Option<crate::db::DataRecord>,
+    incoming_share_updates: Option<Vec<crate::shares::types::IncomingShareUpdate>>,
 ) -> Result<(), DatabaseError> {
     // Check if the item exists and get its type and current path using inode_id
     tracing::debug!("modify_item: Querying inodes table for inode_id={} user_id={}", inode_id, user_id);
@@ -456,6 +474,14 @@ pub fn modify_item(
     if let (Some(new_data_id), Some(data_record)) = (new_data_block_id, new_data_record) {
         tracing::debug!("modify_item: Updating content for inode_id={} to new_data_id={}", inode_id, new_data_id);
 
+        // Read old data_id BEFORE updating (needed for share propagation)
+        let old_data_id: Option<CustomUUID> = db_tx.query_row(
+            "SELECT data_id FROM inodes WHERE id = ? AND owner_id = ?",
+            params![inode_id, user_id],
+            |row| row.get::<_, Option<CustomUUID>>(0)
+        ).optional().map_err(|_| DatabaseError::RecallError)?
+            .unwrap_or(None);
+
         // Insert new data_block
         tracing::debug!("modify_item: Inserting data_block with id={} hash={} file_size={} fragment_count={}",
                        data_record.id, data_record.data.hash.to_hex(), data_record.file_size, data_record.data.fragments.len());
@@ -527,6 +553,51 @@ pub fn modify_item(
         tracing::debug!("modify_item: Updated {} inode rows to new data_id={}", rows_updated, new_data_id);
 
         tracing::info!("Updated content for inode_id={} to data_id={}", inode_id, new_data_id);
+
+        // Phase 2b: Share propagation — update other sharers' inodes and share tracking
+        if let Some(old_data) = old_data_id {
+            let sharers = crate::db::shares::get_sharers_for_data_block(db_tx, &old_data)?;
+            if !sharers.is_empty() {
+                tracing::debug!("modify_item: Propagating content update to {} sharers", sharers.len());
+
+                // Update only current sharers' inodes to point to new data block
+                // Must be scoped to shares table members to avoid updating unshared users
+                let propagated = db_tx.execute(
+                    "UPDATE inodes SET data_id = ? WHERE data_id = ? AND owner_id != ? AND owner_id IN (SELECT user_id FROM shares WHERE data_block_id = ?)",
+                    params![new_data_id, old_data, user_id, old_data]
+                ).map_err(|e| {
+                    tracing::error!("modify_item: Failed to propagate data_id to other sharers: {:?}", e);
+                    DatabaseError::ProcessingError
+                })?;
+                tracing::debug!("modify_item: Propagated content update to {} other sharers' inodes", propagated);
+
+                // Log modification for each affected sharer's inode
+                let current_height = crate::db::consensus::get_current_consensus_height(db_tx)?;
+                let mut stmt = db_tx.prepare(
+                    "SELECT id, owner_id, path FROM inodes WHERE data_id = ? AND owner_id != ?"
+                ).map_err(|_| DatabaseError::RecallError)?;
+                let affected: Vec<(CustomUUID, i32, String)> = stmt.query_map(
+                    params![new_data_id, user_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                ).map_err(|_| DatabaseError::ProcessingError)?
+                    .collect::<Result<Vec<_>, _>>().map_err(|_| DatabaseError::ProcessingError)?;
+                for (affected_inode_id, affected_owner_id, affected_path) in &affected {
+                    log_modification(db_tx, affected_inode_id.clone(), *affected_owner_id, None, None, Some(affected_path.as_str()), current_height)?;
+                }
+
+                // Update shares table: all rows from old → new data_block_id
+                crate::db::shares::update_shares_data_block(db_tx, &old_data, &new_data_id)?;
+
+                // Update pending incoming_shares with pre-computed file_access blobs
+                if let Some(ref updates) = incoming_share_updates {
+                    for update in updates {
+                        crate::db::shares::update_incoming_share_data_block(
+                            db_tx, &update.incoming_share_id, &new_data_id, &update.new_file_access_blob,
+                        )?;
+                    }
+                }
+            }
+        }
     }
 
     // Phase 4a: Metadata-only changes don't update modification time

@@ -426,7 +426,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/users", post(users::routes::post_users))
                 .route("/nodes", get(nodes::routes::get_nodes))
                 .route("/nodes", post(nodes::routes::post_nodes))
-                .route("/files", get(files::routes::get_files))
+                .route("/files", get(files::routes::get_files).patch(files::routes::patch_files))
                 .route("/files", post(files::routes::post_files)).layer(DefaultBodyLimit::max(5000*1_000_000))
                 .route("/files", delete(files::routes::delete_files))
                 .route("/files/{*path}", get(files::routes::get_file_fragments))

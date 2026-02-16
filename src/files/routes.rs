@@ -260,6 +260,68 @@ pub struct FileFragmentsResponse {
     pub fragments: Vec<(Blake3Hash, crate::db::ChunkType)>,
 }
 
+/// Build share propagation data for a content update on a shared file.
+/// Returns (extra_file_access_entries, incoming_share_updates).
+/// Called by both PATCH /files and fileprovider modify routes.
+pub fn build_share_propagation(
+    conn: &duckdb::Connection,
+    inode_id: &CustomUUID,
+    user_id: i32,
+    new_data_block_id: &CustomUUID,
+    per_file_key: &chacha20poly1305::Key,
+) -> Result<(Vec<crate::db::types::FileAccess>, Option<Vec<crate::shares::types::IncomingShareUpdate>>), StatusCode> {
+    // Look up the inode's current data_id (old data_block)
+    let inode_info = crate::db::files::get_inode_by_id(conn, inode_id, user_id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let old_data_block_id = match inode_info.0 {
+        Some(id) => id,
+        None => return Ok((vec![], None)), // No data block → no shares to propagate
+    };
+
+    let sharers = crate::db::shares::get_sharers_for_data_block_conn(conn, &old_data_block_id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if sharers.is_empty() {
+        return Ok((vec![], None));
+    }
+
+    // Create FileAccess entries for other accepted sharers
+    let mut extra_file_access_entries = Vec::new();
+    for &sharer_id in &sharers {
+        if sharer_id == user_id { continue; }
+        let fa = crate::db::types::FileAccess::new_for_user_with_conn(
+            conn, new_data_block_id.clone(), sharer_id, per_file_key,
+        ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        extra_file_access_entries.push(fa);
+    }
+
+    // Build IncomingShareUpdate entries for pending shares
+    let pending = crate::db::shares::get_incoming_shares_for_data_block_conn(conn, &old_data_block_id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let incoming_share_updates = if pending.is_empty() {
+        None
+    } else {
+        let mut updates = Vec::new();
+        for incoming in &pending {
+            let fa = crate::db::types::FileAccess::new_for_user_with_conn(
+                conn, new_data_block_id.clone(), incoming.recipient_id, per_file_key,
+            ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let blob = bincode::serde::encode_to_vec(&fa, bincode::config::standard())
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            updates.push(crate::shares::types::IncomingShareUpdate {
+                incoming_share_id: incoming.id.clone(),
+                new_file_access_blob: blob,
+            });
+        }
+        Some(updates)
+    };
+
+    Ok((extra_file_access_entries, incoming_share_updates))
+}
+
 pub async fn get_files(
     State(app_state): State<AppState>,
     Extension(user_id): Extension<i32>,
@@ -792,6 +854,79 @@ pub async fn delete_files(
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
+}
+
+/// PATCH /files — JWT-authenticated content update for an existing file
+pub async fn patch_files(
+    State(app_state): State<AppState>,
+    Extension(user_id): Extension<i32>,
+    mut multipart: Multipart,
+) -> Result<(), StatusCode> {
+    // First field must be inode_id
+    let inode_id = match multipart.next_field().await.map_err(|_| StatusCode::BAD_REQUEST)? {
+        Some(field) if field.name() == Some("inode_id") => {
+            let id_str = field.text().await.map_err(|_| StatusCode::BAD_REQUEST)?;
+            CustomUUID::from_str(&id_str).map_err(|_| StatusCode::BAD_REQUEST)?
+        }
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+
+    // Validate inode exists, belongs to user, and is a file
+    let conn = app_state.db_pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let inode_info = crate::db::files::get_inode_by_id(&conn, &inode_id, user_id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    if inode_info.2 != hopnet_common::InodeType::File {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    drop(conn);
+
+    // Second field must be file_<size>
+    let field = multipart.next_field().await.map_err(|_| StatusCode::BAD_REQUEST)?
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let field_name = field.name().ok_or(StatusCode::BAD_REQUEST)?.to_string();
+    let file_size_str = field_name.strip_prefix("file_").ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+    let file_size = file_size_str.parse::<usize>().map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
+
+    let (dataid, data_record, incoming_share_updates, _per_file_key) =
+        crate::files::functions::prepare_content_update(
+            &app_state, user_id, &inode_id, field, file_size,
+        ).await?;
+
+    // Build, validate, and submit ModifyItemPayload
+    let payload = crate::files::handlers::ModifyItemPayload {
+        user_id,
+        inode_id,
+        new_encrypted_path: None,
+        new_data_block_id: Some(dataid),
+        new_data_record: Some(data_record),
+        incoming_share_updates,
+    };
+
+    {
+        let mut conn = app_state.db_pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let db_tx = conn.transaction().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        crate::db::files::modify_item(
+            &db_tx, payload.user_id, payload.inode_id.clone(),
+            payload.new_encrypted_path.clone(), payload.new_data_block_id.clone(),
+            payload.new_data_record.clone(), None,
+        ).map_err(|e| match e {
+            crate::db::DatabaseError::NotFound => StatusCode::NOT_FOUND,
+            crate::db::DatabaseError::ConflictError => StatusCode::CONFLICT,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        })?;
+        db_tx.rollback().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+
+    let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let transaction = crate::consensus::functions::create_signed_user_transaction(
+        &app_state, "modify_item".to_string(), encoded, user_id,
+    ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    consensus_middleware(&app_state, vec![transaction]).await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(())
 }
 
 /// GET /fragments

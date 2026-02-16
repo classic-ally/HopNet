@@ -10,8 +10,6 @@ use crate::AppState;
 use crate::db::{self, DatabaseError};
 use crate::files::functions::{build_encrypted_path, encrypt_path};
 use crate::consensus::{functions::consensus_middleware, types::Transaction};
-use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
-use rand_core::OsRng;
 use super::types::{HealthResponse, HealthStatus, EnumerateResponse, FileProviderItem};
 use hopnet_common::fileprovider::TestResponse;
 use hopnet_common::fileprovider::{ChangesResponse, ChangesQuery, DeleteItemRequest, DownloadQuery, ItemQuery, ModifyItemResponse};
@@ -620,7 +618,7 @@ pub async fn modify_item(
     let mut identifier: Option<String> = None;
     let mut new_filename: Option<String> = None;
     let mut new_parent_item_identifier: Option<String> = None;
-    let mut content_result: Option<(crate::db::CustomUUID, crate::db::DataRecord)> = None;
+    let mut content_result: Option<(crate::db::CustomUUID, crate::db::DataRecord, Option<Vec<crate::shares::types::IncomingShareUpdate>>, chacha20poly1305::Key)> = None;
     
     // Parse multipart fields
     while let Some(field) = multipart.next_field().await.map_err(|_| StatusCode::BAD_REQUEST)? {
@@ -645,99 +643,34 @@ pub async fn modify_item(
             }
             field_name if field_name.starts_with("file_") => {
                 tracing::debug!("modify_item: Processing file field: {}", field_name);
-                
-                // Phase 4b: Handle content updates - validate BEFORE expensive processing
+
+                // Validate identifier before expensive processing
                 let current_identifier = identifier.as_ref().ok_or(StatusCode::BAD_REQUEST)?;
                 if !current_identifier.starts_with("item:") {
-                    tracing::error!("modify_item: Invalid identifier format: {}", current_identifier);
                     return Err(StatusCode::BAD_REQUEST);
                 }
-                
-                // Extract inode_id and validate it's a file BEFORE doing Reed-Solomon encoding
-                let inode_id_str = &current_identifier[5..]; // Skip "item:" prefix
-                tracing::debug!("modify_item: Extracted inode_id_str: {}", inode_id_str);
+
+                let inode_id_str = &current_identifier[5..];
                 let inode_id = crate::db::CustomUUID::from_str(inode_id_str)
                     .map_err(|_| StatusCode::BAD_REQUEST)?;
-                
-                tracing::debug!("modify_item: Looking up item metadata for inode_id: {}", inode_id);
+
                 let (_, item_type, _, _, _, _) = db::fileprovider::get_item_metadata_by_inode_id(
-                    app_state.db_pool.get(),
-                    inode_id,
-                    user_id,
-                ).map_err(|e| {
-                    tracing::error!("modify_item: Failed to get item metadata: {:?}", e);
-                    StatusCode::NOT_FOUND
-                })?;
-                
-                tracing::debug!("modify_item: Item type: {:?}", item_type);
+                    app_state.db_pool.get(), inode_id.clone(), user_id,
+                ).map_err(|_| StatusCode::NOT_FOUND)?;
+
                 if item_type != hopnet_common::InodeType::File {
-                    tracing::error!("modify_item: Item is not a file, type: {:?}", item_type);
                     return Err(StatusCode::BAD_REQUEST);
                 }
-                
-                // Parse file size from field name (format: file_123456)
+
                 let file_size_str = field_name.strip_prefix("file_").ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
                 let file_size = file_size_str.parse::<usize>().map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
-                tracing::debug!("modify_item: Parsed file size: {} bytes", file_size);
-                
-                // Generate new data block ID
-                let dataid = crate::db::CustomUUID::new(None);
-                
-                // Generate per-file encryption key
-                let per_file_key = chacha20poly1305::ChaCha20Poly1305::generate_key(&mut OsRng);
-                
-                tracing::debug!("modify_item: Creating file access entry for user_id: {}", user_id);
-                // Create file access entry for the authenticated user
-                let file_access = crate::db::types::FileAccess::new_for_user(
-                    app_state.db_pool.get(), 
-                    dataid.clone(), 
-                    user_id, 
-                    &per_file_key
-                ).map_err(|e| {
-                    tracing::error!("modify_item: Failed to create file access: {:?}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?;
-                
-                // Process the uploaded file (skip Reed-Solomon for zero-length files)
-                let mut data_record = if file_size == 0 {
-                    tracing::debug!("modify_item: Creating empty file (size=0) without Reed-Solomon processing");
-                    // For zero-length files, create a minimal DataRecord without calling process_uploaded_file
-                    crate::db::DataRecord {
-                        id: dataid.clone(),
-                        modified_at: None, // Deprecated - timestamps come from UUIDv7
-                        data: crate::db::Data {
-                            hash: crate::db::Blake3Hash::new({
-                                let mut hasher = blake3::Hasher::new();
-                                hasher.update(dataid.as_bytes()); // Include data_block_id for consistency
-                                hasher.finalize()
-                            }),
-                            fragments: Vec::new(), // No fragments for empty files
-                            added_bytes: 0,
-                        },
-                        file_access_entries: None, // Will be set below
-                        file_size: 0,
-                    }
-                } else {
-                    tracing::debug!("modify_item: Starting file processing with Reed-Solomon encoding");
-                    crate::files::routes::process_uploaded_file(
-                        field,
-                        file_size,
-                        dataid.clone(),
-                        &per_file_key,
-                        &app_state.fragments_dir
-                    ).await.map_err(|e| {
-                        tracing::error!("modify_item: File processing failed: {:?}", e);
-                        e
-                    })?
-                };
-                tracing::debug!("modify_item: File processing completed successfully");
-                
-                // Add file access entry and set file size
-                data_record.file_access_entries = Some(vec![file_access]);
-                data_record.file_size = file_size as u64;
-                
-                content_result = Some((dataid, data_record));
-                break; // Stop parsing fields when we hit and process content
+
+                let result = crate::files::functions::prepare_content_update(
+                    &app_state, user_id, &inode_id, field, file_size,
+                ).await?;
+
+                content_result = Some(result);
+                break;
             }
             _ => {
                 // Ignore unknown fields
@@ -867,10 +800,10 @@ pub async fn modify_item(
     };
     
     // Extract content processing results if provided
-    let (new_data_block_id, new_data_record) = if let Some((dataid, data_record)) = content_result {
-        (Some(dataid), Some(data_record))
+    let (new_data_block_id, new_data_record, incoming_share_updates, _content_per_file_key) = if let Some((dataid, data_record, share_updates, per_file_key)) = content_result {
+        (Some(dataid), Some(data_record), share_updates, Some(per_file_key))
     } else {
-        (None, None)
+        (None, None, None, None)
     };
     
     // Validate modification before consensus
@@ -889,6 +822,7 @@ pub async fn modify_item(
             new_encrypted_path.clone(),
             new_data_block_id.clone(),
             new_data_record.clone(),
+            None, // incoming_share_updates not needed for validation
         ) {
             Ok(_) => {
                 // Validation passed, roll back transaction
@@ -907,14 +841,15 @@ pub async fn modify_item(
     }
     
     tracing::debug!("Submitting modify_item to consensus for inode_id: {} user_id: {}", inode_id, user_id);
-    
-    // Create consensus payload for Phase 4a and 4b
+
+    // Create consensus payload
     let payload = crate::files::handlers::ModifyItemPayload {
         user_id,
         inode_id,
         new_encrypted_path: new_encrypted_path.clone(),
         new_data_block_id,
         new_data_record,
+        incoming_share_updates,
     };
     
     // Serialize and submit to consensus

@@ -71,6 +71,7 @@ mod authorization_tests {
             new_encrypted_path: Some("new/path".to_string()),
             new_data_block_id: None,
             new_data_record: None,
+            incoming_share_updates: None,
         };
 
         let payload = bincode::serde::encode_to_vec(&payload_data, bincode::config::standard())
@@ -192,6 +193,7 @@ mod authorization_tests {
             new_encrypted_path: Some("new/path".to_string()),
             new_data_block_id: None,
             new_data_record: None,
+            incoming_share_updates: None,
         };
 
         let payload = bincode::serde::encode_to_vec(&payload_data, bincode::config::standard())

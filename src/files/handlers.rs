@@ -163,6 +163,8 @@ pub struct ModifyItemPayload {
     // Phase 4b: Content update fields
     pub new_data_block_id: Option<crate::db::CustomUUID>,  // New content version
     pub new_data_record: Option<crate::db::DataRecord>,    // Fragment info for new version
+    // Phase 2b: Share propagation — pre-computed updates for pending incoming_shares
+    pub incoming_share_updates: Option<Vec<crate::shares::types::IncomingShareUpdate>>,
 }
 
 pub struct ModifyItemHandler;
@@ -205,6 +207,7 @@ impl TransactionHandler for ModifyItemHandler {
                     payload_data.new_encrypted_path.clone(),
                     payload_data.new_data_block_id.clone(),
                     payload_data.new_data_record.clone(),
+                    payload_data.incoming_share_updates.clone(),
                 )?;
 
                 if execute {

@@ -3,7 +3,7 @@ use reqwest::Client;
 use std::time::{Duration, Instant};
 
 use crate::tests::{Check, TestResult, TestScenario, print_and_add_check};
-use crate::tests::files::{upload_file, download_file, list_files};
+use crate::tests::files::{upload_file, download_file, delete_file, modify_file, list_files};
 use crate::tests::{get_max_view, wait_for_minimum_view};
 use crate::tests::multi_user::{
     create_user, login_user, node_with_token, try_download_file, fetch_state_snapshots,
@@ -135,6 +135,21 @@ async fn get_share_details(node: &NodeInfo, inode_id: &str) -> Result<serde_json
     Ok(response.json().await?)
 }
 
+/// DELETE /shares/file/{inode_id} — unshare (remove self from shared file).
+async fn unshare_file(node: &NodeInfo, inode_id: &str) -> Result<u16> {
+    let client = Client::new();
+    let url = format!("http://{}:{}/shares/file/{}", node.ip_address, node.port, inode_id);
+
+    let response = client
+        .delete(&url)
+        .header("Authorization", format!("Bearer {}", node.jwt_token))
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await?;
+
+    Ok(response.status().as_u16())
+}
+
 /// Login a user on all nodes, returning NodeInfo vec sorted by node_id.
 async fn login_on_all_nodes(
     nodes: &[NodeInfo],
@@ -161,7 +176,81 @@ fn extract_inode_id(listing: &serde_json::Value, filename: &str) -> Option<Strin
 }
 
 // ============================================================================
-// Test
+// Shared test helpers
+// ============================================================================
+
+/// Verify that all nodes return the expected content for a download.
+/// Returns true if all match, false on first mismatch (and adds a failing check).
+async fn verify_download_all_nodes(
+    nodes: &[NodeInfo],
+    path: &str,
+    expected: &[u8],
+    label: &str,
+    result: &mut TestResult,
+) -> bool {
+    for (i, node) in nodes.iter().enumerate() {
+        match download_file(node, path).await {
+            Ok(data) if data == expected => {}
+            Ok(data) => {
+                let actual_str = String::from_utf8_lossy(&data);
+                let expected_str = String::from_utf8_lossy(expected);
+                print_and_add_check(result, Check {
+                    name: format!("{} - node {} content mismatch", label, i),
+                    passed: false,
+                    detail: Some(format!(
+                        "Expected {:?} ({} bytes), got {:?} ({} bytes)",
+                        expected_str, expected.len(), actual_str, data.len()
+                    )),
+                });
+                return false;
+            }
+            Err(e) => {
+                print_and_add_check(result, Check {
+                    name: format!("{} - node {} download failed", label, i),
+                    passed: false,
+                    detail: Some(e.to_string()),
+                });
+                return false;
+            }
+        }
+    }
+    print_and_add_check(result, Check {
+        name: label.to_string(),
+        passed: true,
+        detail: Some(format!("Content matches on all {} nodes", nodes.len())),
+    });
+    true
+}
+
+/// Wait for consensus to reach target_view. Returns true on success, false on timeout.
+async fn wait_for_view(
+    nodes: &[NodeInfo],
+    target_view: u64,
+    label: &str,
+    result: &mut TestResult,
+) -> bool {
+    match wait_for_minimum_view(nodes, target_view, Duration::from_secs(30)).await {
+        Ok(true) => {
+            print_and_add_check(result, Check {
+                name: format!("{} (view >= {})", label, target_view),
+                passed: true,
+                detail: None,
+            });
+            true
+        }
+        _ => {
+            print_and_add_check(result, Check {
+                name: format!("{} timeout", label),
+                passed: false,
+                detail: None,
+            });
+            false
+        }
+    }
+}
+
+// ============================================================================
+// Tests
 // ============================================================================
 
 pub struct MultiUserSharing;
@@ -1026,6 +1115,921 @@ impl TestScenario for MultiUserSharing {
         result.duration = start.elapsed();
         result.details = format!(
             "Multi-user sharing test: share+accept, duplicate prevention, decline flow across {} nodes",
+            nodes.len()
+        );
+
+        Ok(result)
+    }
+}
+
+pub struct MultiUserSharingLiveLink;
+
+impl TestScenario for MultiUserSharingLiveLink {
+    fn name(&self) -> &'static str {
+        "multi-user-sharing-live-link"
+    }
+
+    fn description(&self) -> &'static str {
+        "Live-link propagation, unshare copy-on-write, and delete cleanup across shared files"
+    }
+
+    async fn run(&self, mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
+        let start = Instant::now();
+        let mut result = TestResult::new();
+
+        println!("\nRunning multi-user sharing live-link checks:");
+
+        if nodes.len() < 3 {
+            print_and_add_check(&mut result, Check {
+                name: "Insufficient nodes".to_string(),
+                passed: false,
+                detail: Some(format!("Need >= 3 nodes, got {}", nodes.len())),
+            });
+            result.duration = start.elapsed();
+            return Ok(result);
+        }
+
+        // ── Phase 1: Setup ──────────────────────────────────────────────
+
+        // Step 1: Initial consensus view
+        let mut current_view = match get_max_view(nodes).await {
+            Ok(view) => {
+                print_and_add_check(&mut result, Check {
+                    name: format!("Initial consensus view: {}", view),
+                    passed: true,
+                    detail: None,
+                });
+                view
+            }
+            Err(e) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Failed to get initial view".to_string(),
+                    passed: false,
+                    detail: Some(e.to_string()),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
+        };
+
+        // Step 2: Create user 'bob', wait for consensus, login on all nodes
+        let bob_passphrase = match create_user(&nodes[0], "bob").await {
+            Ok(pp) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Create user 'bob'".to_string(),
+                    passed: true,
+                    detail: None,
+                });
+                pp
+            }
+            Err(e) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Create user 'bob' failed".to_string(),
+                    passed: false,
+                    detail: Some(e.to_string()),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
+        };
+
+        current_view += 1;
+        if !wait_for_view(nodes, current_view, "User bob creation consensus", &mut result).await {
+            result.duration = start.elapsed();
+            return Ok(result);
+        }
+
+        let bob_nodes = match login_on_all_nodes(nodes, "bob", &bob_passphrase).await {
+            Ok(bn) => {
+                print_and_add_check(&mut result, Check {
+                    name: format!("Bob logged in on all {} nodes", bn.len()),
+                    passed: true,
+                    detail: None,
+                });
+                bn
+            }
+            Err(e) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Bob login failed".to_string(),
+                    passed: false,
+                    detail: Some(e.to_string()),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
+        };
+
+        // Step 3: Owner uploads "live-link-test.txt" with content "version-1"
+        let v1 = b"version-1".to_vec();
+        match upload_file(&nodes[0], "/", "live-link-test.txt", v1.clone()).await {
+            Ok(_) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Owner uploads live-link-test.txt (version-1)".to_string(),
+                    passed: true,
+                    detail: None,
+                });
+            }
+            Err(e) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Owner upload failed".to_string(),
+                    passed: false,
+                    detail: Some(e.to_string()),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
+        }
+
+        current_view += 1;
+        if !wait_for_view(nodes, current_view, "Upload consensus", &mut result).await {
+            result.duration = start.elapsed();
+            return Ok(result);
+        }
+
+        // Step 4: Extract owner_inode_id from owner's listing
+        let owner_inode_id = match list_files(&nodes[0], "/").await {
+            Ok(listing) => {
+                match extract_inode_id(&listing, "live-link-test.txt") {
+                    Some(id) => {
+                        print_and_add_check(&mut result, Check {
+                            name: "Got owner inode_id".to_string(),
+                            passed: true,
+                            detail: Some(format!("id: {}...", &id[..8.min(id.len())])),
+                        });
+                        id
+                    }
+                    None => {
+                        print_and_add_check(&mut result, Check {
+                            name: "File not found in owner listing".to_string(),
+                            passed: false,
+                            detail: None,
+                        });
+                        result.duration = start.elapsed();
+                        return Ok(result);
+                    }
+                }
+            }
+            Err(e) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Owner listing failed".to_string(),
+                    passed: false,
+                    detail: Some(e.to_string()),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
+        };
+
+        // Step 5: Owner shares file with bob
+        match share_file(&nodes[0], &owner_inode_id, "bob").await {
+            Ok(200) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Owner shares file with bob".to_string(),
+                    passed: true,
+                    detail: None,
+                });
+            }
+            Ok(status) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Share with bob failed".to_string(),
+                    passed: false,
+                    detail: Some(format!("Expected 200, got {}", status)),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
+            Err(e) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Share with bob request failed".to_string(),
+                    passed: false,
+                    detail: Some(e.to_string()),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
+        }
+
+        current_view += 1;
+        if !wait_for_view(nodes, current_view, "Share consensus", &mut result).await {
+            result.duration = start.elapsed();
+            return Ok(result);
+        }
+
+        // Step 6: Bob accepts share
+        let bob_share_id = match get_incoming_shares(&bob_nodes[0]).await {
+            Ok(shares) if shares.len() == 1 => {
+                shares[0]["id"].as_str().unwrap_or("").to_string()
+            }
+            Ok(shares) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Bob incoming shares unexpected".to_string(),
+                    passed: false,
+                    detail: Some(format!("Expected 1, got {}", shares.len())),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
+            Err(e) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Bob get incoming shares failed".to_string(),
+                    passed: false,
+                    detail: Some(e.to_string()),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
+        };
+
+        match accept_share(&bob_nodes[0], &bob_share_id, "/live-link-test.txt").await {
+            Ok(200) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Bob accepts share".to_string(),
+                    passed: true,
+                    detail: None,
+                });
+            }
+            Ok(status) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Bob accept failed".to_string(),
+                    passed: false,
+                    detail: Some(format!("Expected 200, got {}", status)),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
+            Err(e) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Bob accept request failed".to_string(),
+                    passed: false,
+                    detail: Some(e.to_string()),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
+        }
+
+        current_view += 1;
+        if !wait_for_view(nodes, current_view, "Accept consensus", &mut result).await {
+            result.duration = start.elapsed();
+            return Ok(result);
+        }
+
+        // Step 7: Verify bob can download and content matches version-1
+        if !verify_download_all_nodes(&bob_nodes, "/live-link-test.txt", &v1, "Bob downloads version-1", &mut result).await {
+            result.duration = start.elapsed();
+            return Ok(result);
+        }
+
+        // ── Phase 2: Live-link propagation ──────────────────────────────
+
+        // Step 8: Owner modifies file to version-2
+        let v2 = b"version-2".to_vec();
+        match modify_file(&nodes[0], &owner_inode_id, v2.clone()).await {
+            Ok(_) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Owner modifies file to version-2".to_string(),
+                    passed: true,
+                    detail: None,
+                });
+            }
+            Err(e) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Modify to version-2 failed".to_string(),
+                    passed: false,
+                    detail: Some(e.to_string()),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
+        }
+
+        current_view += 1;
+        if !wait_for_view(nodes, current_view, "Modify v2 consensus", &mut result).await {
+            result.duration = start.elapsed();
+            return Ok(result);
+        }
+
+        // Step 9: Bob downloads from all nodes → version-2
+        if !verify_download_all_nodes(&bob_nodes, "/live-link-test.txt", &v2, "Bob downloads version-2 (live-link)", &mut result).await {
+            result.duration = start.elapsed();
+            return Ok(result);
+        }
+
+        // Step 10: Owner downloads from all nodes → version-2 (sanity)
+        if !verify_download_all_nodes(nodes, "/live-link-test.txt", &v2, "Owner downloads version-2 (sanity)", &mut result).await {
+            result.duration = start.elapsed();
+            return Ok(result);
+        }
+
+        // ── Phase 3: Multi-sharer propagation ───────────────────────────
+
+        // Step 11: Create user 'carol', wait, login
+        let carol_passphrase = match create_user(&nodes[0], "carol").await {
+            Ok(pp) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Create user 'carol'".to_string(),
+                    passed: true,
+                    detail: None,
+                });
+                pp
+            }
+            Err(e) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Create user 'carol' failed".to_string(),
+                    passed: false,
+                    detail: Some(e.to_string()),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
+        };
+
+        current_view += 1;
+        if !wait_for_view(nodes, current_view, "Carol creation consensus", &mut result).await {
+            result.duration = start.elapsed();
+            return Ok(result);
+        }
+
+        let carol_nodes = match login_on_all_nodes(nodes, "carol", &carol_passphrase).await {
+            Ok(cn) => {
+                print_and_add_check(&mut result, Check {
+                    name: format!("Carol logged in on all {} nodes", cn.len()),
+                    passed: true,
+                    detail: None,
+                });
+                cn
+            }
+            Err(e) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Carol login failed".to_string(),
+                    passed: false,
+                    detail: Some(e.to_string()),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
+        };
+
+        // Step 12: Owner shares file with carol
+        match share_file(&nodes[0], &owner_inode_id, "carol").await {
+            Ok(200) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Owner shares file with carol".to_string(),
+                    passed: true,
+                    detail: None,
+                });
+            }
+            Ok(status) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Share with carol failed".to_string(),
+                    passed: false,
+                    detail: Some(format!("Expected 200, got {}", status)),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
+            Err(e) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Share with carol request failed".to_string(),
+                    passed: false,
+                    detail: Some(e.to_string()),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
+        }
+
+        current_view += 1;
+        if !wait_for_view(nodes, current_view, "Share carol consensus", &mut result).await {
+            result.duration = start.elapsed();
+            return Ok(result);
+        }
+
+        // Step 13: Carol accepts share
+        let carol_share_id = match get_incoming_shares(&carol_nodes[0]).await {
+            Ok(shares) if shares.len() == 1 => {
+                shares[0]["id"].as_str().unwrap_or("").to_string()
+            }
+            Ok(shares) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Carol incoming shares unexpected".to_string(),
+                    passed: false,
+                    detail: Some(format!("Expected 1, got {}", shares.len())),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
+            Err(e) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Carol get incoming shares failed".to_string(),
+                    passed: false,
+                    detail: Some(e.to_string()),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
+        };
+
+        match accept_share(&carol_nodes[0], &carol_share_id, "/live-link-test.txt").await {
+            Ok(200) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Carol accepts share".to_string(),
+                    passed: true,
+                    detail: None,
+                });
+            }
+            Ok(status) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Carol accept failed".to_string(),
+                    passed: false,
+                    detail: Some(format!("Expected 200, got {}", status)),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
+            Err(e) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Carol accept request failed".to_string(),
+                    passed: false,
+                    detail: Some(e.to_string()),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
+        }
+
+        current_view += 1;
+        if !wait_for_view(nodes, current_view, "Carol accept consensus", &mut result).await {
+            result.duration = start.elapsed();
+            return Ok(result);
+        }
+
+        // Step 14: Owner modifies → version-3
+        let v3 = b"version-3".to_vec();
+        match modify_file(&nodes[0], &owner_inode_id, v3.clone()).await {
+            Ok(_) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Owner modifies file to version-3".to_string(),
+                    passed: true,
+                    detail: None,
+                });
+            }
+            Err(e) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Modify to version-3 failed".to_string(),
+                    passed: false,
+                    detail: Some(e.to_string()),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
+        }
+
+        current_view += 1;
+        if !wait_for_view(nodes, current_view, "Modify v3 consensus", &mut result).await {
+            result.duration = start.elapsed();
+            return Ok(result);
+        }
+
+        // Step 15: Bob and carol both download → version-3
+        if !verify_download_all_nodes(&bob_nodes, "/live-link-test.txt", &v3, "Bob downloads version-3 (multi-sharer)", &mut result).await {
+            result.duration = start.elapsed();
+            return Ok(result);
+        }
+        if !verify_download_all_nodes(&carol_nodes, "/live-link-test.txt", &v3, "Carol downloads version-3 (multi-sharer)", &mut result).await {
+            result.duration = start.elapsed();
+            return Ok(result);
+        }
+
+        // ── Phase 4: Pending share propagation ──────────────────────────
+
+        // Step 16: Create user 'dave', wait, login
+        let dave_passphrase = match create_user(&nodes[0], "dave").await {
+            Ok(pp) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Create user 'dave'".to_string(),
+                    passed: true,
+                    detail: None,
+                });
+                pp
+            }
+            Err(e) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Create user 'dave' failed".to_string(),
+                    passed: false,
+                    detail: Some(e.to_string()),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
+        };
+
+        current_view += 1;
+        if !wait_for_view(nodes, current_view, "Dave creation consensus", &mut result).await {
+            result.duration = start.elapsed();
+            return Ok(result);
+        }
+
+        let dave_nodes = match login_on_all_nodes(nodes, "dave", &dave_passphrase).await {
+            Ok(dn) => {
+                print_and_add_check(&mut result, Check {
+                    name: format!("Dave logged in on all {} nodes", dn.len()),
+                    passed: true,
+                    detail: None,
+                });
+                dn
+            }
+            Err(e) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Dave login failed".to_string(),
+                    passed: false,
+                    detail: Some(e.to_string()),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
+        };
+
+        // Step 17: Owner shares file with dave (don't accept yet)
+        match share_file(&nodes[0], &owner_inode_id, "dave").await {
+            Ok(200) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Owner shares file with dave (pending)".to_string(),
+                    passed: true,
+                    detail: None,
+                });
+            }
+            Ok(status) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Share with dave failed".to_string(),
+                    passed: false,
+                    detail: Some(format!("Expected 200, got {}", status)),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
+            Err(e) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Share with dave request failed".to_string(),
+                    passed: false,
+                    detail: Some(e.to_string()),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
+        }
+
+        current_view += 1;
+        if !wait_for_view(nodes, current_view, "Share dave consensus", &mut result).await {
+            result.duration = start.elapsed();
+            return Ok(result);
+        }
+
+        // Step 18: Owner modifies → version-4 (while dave's share is still pending)
+        let v4 = b"version-4".to_vec();
+        match modify_file(&nodes[0], &owner_inode_id, v4.clone()).await {
+            Ok(_) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Owner modifies file to version-4 (dave pending)".to_string(),
+                    passed: true,
+                    detail: None,
+                });
+            }
+            Err(e) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Modify to version-4 failed".to_string(),
+                    passed: false,
+                    detail: Some(e.to_string()),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
+        }
+
+        current_view += 1;
+        if !wait_for_view(nodes, current_view, "Modify v4 consensus", &mut result).await {
+            result.duration = start.elapsed();
+            return Ok(result);
+        }
+
+        // Step 19: Dave accepts share
+        let dave_share_id = match get_incoming_shares(&dave_nodes[0]).await {
+            Ok(shares) if shares.len() == 1 => {
+                shares[0]["id"].as_str().unwrap_or("").to_string()
+            }
+            Ok(shares) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Dave incoming shares unexpected".to_string(),
+                    passed: false,
+                    detail: Some(format!("Expected 1, got {}", shares.len())),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
+            Err(e) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Dave get incoming shares failed".to_string(),
+                    passed: false,
+                    detail: Some(e.to_string()),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
+        };
+
+        match accept_share(&dave_nodes[0], &dave_share_id, "/live-link-test.txt").await {
+            Ok(200) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Dave accepts share".to_string(),
+                    passed: true,
+                    detail: None,
+                });
+            }
+            Ok(status) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Dave accept failed".to_string(),
+                    passed: false,
+                    detail: Some(format!("Expected 200, got {}", status)),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
+            Err(e) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Dave accept request failed".to_string(),
+                    passed: false,
+                    detail: Some(e.to_string()),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
+        }
+
+        current_view += 1;
+        if !wait_for_view(nodes, current_view, "Dave accept consensus", &mut result).await {
+            result.duration = start.elapsed();
+            return Ok(result);
+        }
+
+        // Step 20: Dave downloads → version-4 (latest, not version at share-time)
+        if !verify_download_all_nodes(&dave_nodes, "/live-link-test.txt", &v4, "Dave downloads version-4 (pending share propagation)", &mut result).await {
+            result.duration = start.elapsed();
+            return Ok(result);
+        }
+
+        // ── Phase 5: Unshare (copy-on-write) ────────────────────────────
+
+        // Step 21: Bob extracts bob_inode_id from bob's listing
+        let bob_inode_id = match list_files(&bob_nodes[0], "/").await {
+            Ok(listing) => {
+                match extract_inode_id(&listing, "live-link-test.txt") {
+                    Some(id) => {
+                        print_and_add_check(&mut result, Check {
+                            name: "Got bob's inode_id".to_string(),
+                            passed: true,
+                            detail: Some(format!("id: {}...", &id[..8.min(id.len())])),
+                        });
+                        id
+                    }
+                    None => {
+                        print_and_add_check(&mut result, Check {
+                            name: "File not found in bob's listing".to_string(),
+                            passed: false,
+                            detail: None,
+                        });
+                        result.duration = start.elapsed();
+                        return Ok(result);
+                    }
+                }
+            }
+            Err(e) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Bob listing failed".to_string(),
+                    passed: false,
+                    detail: Some(e.to_string()),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
+        };
+
+        // Step 22: Bob unshares
+        match unshare_file(&bob_nodes[0], &bob_inode_id).await {
+            Ok(200) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Bob unshares file".to_string(),
+                    passed: true,
+                    detail: None,
+                });
+            }
+            Ok(status) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Bob unshare failed".to_string(),
+                    passed: false,
+                    detail: Some(format!("Expected 200, got {}", status)),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
+            Err(e) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Bob unshare request failed".to_string(),
+                    passed: false,
+                    detail: Some(e.to_string()),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
+        }
+
+        current_view += 1;
+        if !wait_for_view(nodes, current_view, "Unshare consensus", &mut result).await {
+            result.duration = start.elapsed();
+            return Ok(result);
+        }
+
+        // Step 23: Owner modifies → version-5
+        let v5 = b"version-5".to_vec();
+        match modify_file(&nodes[0], &owner_inode_id, v5.clone()).await {
+            Ok(_) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Owner modifies file to version-5".to_string(),
+                    passed: true,
+                    detail: None,
+                });
+            }
+            Err(e) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Modify to version-5 failed".to_string(),
+                    passed: false,
+                    detail: Some(e.to_string()),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
+        }
+
+        current_view += 1;
+        if !wait_for_view(nodes, current_view, "Modify v5 consensus", &mut result).await {
+            result.duration = start.elapsed();
+            return Ok(result);
+        }
+
+        // Step 24: Bob downloads → still version-4 (frozen at unshare point)
+        if !verify_download_all_nodes(&bob_nodes, "/live-link-test.txt", &v4, "Bob downloads version-4 (frozen after unshare)", &mut result).await {
+            result.duration = start.elapsed();
+            return Ok(result);
+        }
+
+        // Step 25: Carol downloads → version-5 (still live-linked)
+        if !verify_download_all_nodes(&carol_nodes, "/live-link-test.txt", &v5, "Carol downloads version-5 (still live-linked)", &mut result).await {
+            result.duration = start.elapsed();
+            return Ok(result);
+        }
+
+        // Step 26: Dave downloads → version-5 (still live-linked)
+        if !verify_download_all_nodes(&dave_nodes, "/live-link-test.txt", &v5, "Dave downloads version-5 (still live-linked)", &mut result).await {
+            result.duration = start.elapsed();
+            return Ok(result);
+        }
+
+        // ── Phase 6: Delete cleanup ─────────────────────────────────────
+
+        // Step 27: Owner deletes file
+        match delete_file(&nodes[0], "/live-link-test.txt").await {
+            Ok(_) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Owner deletes file".to_string(),
+                    passed: true,
+                    detail: None,
+                });
+            }
+            Err(e) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Owner delete failed".to_string(),
+                    passed: false,
+                    detail: Some(e.to_string()),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
+        }
+
+        current_view += 1;
+        if !wait_for_view(nodes, current_view, "Delete consensus", &mut result).await {
+            result.duration = start.elapsed();
+            return Ok(result);
+        }
+
+        // Step 28: Carol still has the file (own inode, unaffected by owner delete)
+        if !verify_download_all_nodes(&carol_nodes, "/live-link-test.txt", &v5, "Carol downloads version-5 (after owner delete)", &mut result).await {
+            result.duration = start.elapsed();
+            return Ok(result);
+        }
+
+        // Step 29: Owner listing → file gone
+        match list_files(&nodes[0], "/").await {
+            Ok(listing) => {
+                let found = extract_inode_id(&listing, "live-link-test.txt").is_some();
+                print_and_add_check(&mut result, Check {
+                    name: "Owner listing: file gone".to_string(),
+                    passed: !found,
+                    detail: if found { Some("File still in listing".to_string()) } else { None },
+                });
+            }
+            Err(e) => {
+                print_and_add_check(&mut result, Check {
+                    name: "Owner listing check failed".to_string(),
+                    passed: false,
+                    detail: Some(e.to_string()),
+                });
+            }
+        }
+
+        // Step 30: Share details for carol's inode → should not include owner
+        let carol_inode_id = match list_files(&carol_nodes[0], "/").await {
+            Ok(listing) => extract_inode_id(&listing, "live-link-test.txt").unwrap_or_default(),
+            Err(_) => String::new(),
+        };
+        if !carol_inode_id.is_empty() {
+            match get_share_details(&carol_nodes[0], &carol_inode_id).await {
+                Ok(details) => {
+                    let users = details["users"].as_array();
+                    let usernames: Vec<&str> = users
+                        .map(|arr| arr.iter().filter_map(|u| u["username"].as_str()).collect())
+                        .unwrap_or_default();
+                    // Owner should not be in the share details anymore
+                    let owner_present = usernames.iter().any(|u| {
+                        // The owner is the default user (first node's user), check if it's NOT carol/bob/dave
+                        *u != "carol" && *u != "bob" && *u != "dave"
+                    });
+                    print_and_add_check(&mut result, Check {
+                        name: "Carol share details: owner removed".to_string(),
+                        passed: !owner_present,
+                        detail: Some(format!("participants: {:?}", usernames)),
+                    });
+                }
+                Err(e) => {
+                    print_and_add_check(&mut result, Check {
+                        name: "Carol share details check failed".to_string(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    });
+                }
+            }
+        }
+
+        // ── Phase 7: Divergence ─────────────────────────────────────────
+
+        match fetch_state_snapshots(nodes).await {
+            Ok(snapshots) => {
+                match crate::divergence::build_divergence_report(mesh_id, snapshots) {
+                    Ok(report) => {
+                        if report.is_full_consensus() {
+                            print_and_add_check(&mut result, Check {
+                                name: "Zero divergence".to_string(),
+                                passed: true,
+                                detail: Some(format!(
+                                    "{} tables, views {}-{}",
+                                    report.table_reports.len(),
+                                    report.view_range.0,
+                                    report.view_range.1,
+                                )),
+                            });
+                        } else {
+                            let divergent: Vec<_> = report
+                                .divergent_tables()
+                                .iter()
+                                .map(|t| t.table_name.as_str())
+                                .collect();
+                            print_and_add_check(&mut result, Check {
+                                name: "Divergence detected".to_string(),
+                                passed: false,
+                                detail: Some(format!("Divergent tables: {:?}", divergent)),
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        print_and_add_check(&mut result, Check {
+                            name: "Divergence report failed".to_string(),
+                            passed: false,
+                            detail: Some(e.to_string()),
+                        });
+                    }
+                }
+            }
+            Err(e) => {
+                print_and_add_check(&mut result, Check {
+                    name: "State snapshot fetch failed".to_string(),
+                    passed: false,
+                    detail: Some(e.to_string()),
+                });
+            }
+        }
+
+        result.duration = start.elapsed();
+        result.details = format!(
+            "Live-link sharing test: propagation, multi-sharer, pending share, unshare COW, delete cleanup across {} nodes",
             nodes.len()
         );
 

@@ -63,33 +63,38 @@ pub fn get_user_by_username(
     }
 }
 
+pub fn get_user_by_userid_conn(
+    conn: &duckdb::Connection,
+    userid: i32,
+) -> Result<Option<User>, DatabaseError> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM users WHERE user_id = ?"
+    ).map_err(|_| DatabaseError::RecallError)?;
+
+    let mut rows = stmt.query(&[&userid]).map_err(|_| DatabaseError::RecallError)?;
+
+    if let Some(row) = rows.next().map_err(|_| DatabaseError::RecallError)? {
+        let user = User {
+            user_id: row.get(0).map_err(|_| DatabaseError::RecallError)?,
+            username: row.get(1).map_err(|_| DatabaseError::RecallError)?,
+            pubkey: row.get(2).map_err(|_| DatabaseError::RecallError)?,
+            x25519_pubkey: row.get(3).map_err(|_| DatabaseError::RecallError)?,
+            encrypted_privkey: row.get(4).map_err(|_| DatabaseError::RecallError)?,
+            key_salt: row.get(5).map_err(|_| DatabaseError::RecallError)?,
+        };
+        Ok(Some(user))
+    } else {
+        Ok(None)
+    }
+}
+
 pub fn get_user_by_userid(
     db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     userid: i32,
 ) -> Result<Option<User>, DatabaseError> {
     match db_connection {
-        Ok(db_lock) => {
-            let mut stmt = db_lock.prepare(
-                "SELECT * FROM users WHERE user_id = ?"
-            ).map_err(|_|DatabaseError::RecallError)?;
-
-            let mut rows = stmt.query(&[&userid]).map_err(|_|DatabaseError::RecallError)?;
-
-            if let Some(row) = rows.next().map_err(|_| DatabaseError::RecallError)? {
-                let user = User {
-                    user_id: row.get(0).map_err(|_| DatabaseError::RecallError)?,
-                    username: row.get(1).map_err(|_| DatabaseError::RecallError)?,
-                    pubkey: row.get(2).map_err(|_| DatabaseError::RecallError)?,
-                    x25519_pubkey: row.get(3).map_err(|_| DatabaseError::RecallError)?,
-                    encrypted_privkey: row.get(4).map_err(|_| DatabaseError::RecallError)?,
-                    key_salt: row.get(5).map_err(|_| DatabaseError::RecallError)?,
-                };
-                return Ok(Some(user))
-            } else {
-                return Ok(None)
-            }
-        }
-        Err(_) => Err(DatabaseError::LockError)
+        Ok(db_lock) => get_user_by_userid_conn(&db_lock, userid),
+        Err(_) => Err(DatabaseError::LockError),
     }
 }
 
