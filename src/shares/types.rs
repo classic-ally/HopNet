@@ -46,43 +46,12 @@ pub struct UnsharePayload {
     pub user_id: i32,
 }
 
-// --- API request/response types ---
+// --- API request/response types (re-exported from common) ---
 
-#[derive(Deserialize)]
-pub struct ShareRequest {
-    pub inode_id: String,
-    pub recipient_username: String,
-}
-
-#[derive(Deserialize)]
-pub struct AcceptShareRequest {
-    pub placement_path: String,
-}
-
-#[derive(Serialize)]
-pub struct IncomingShareResponse {
-    pub id: String,
-    pub sender_username: String,
-    pub display_name: String,
-    pub created_at: String,
-}
-
-#[derive(Serialize)]
-pub struct ShareCountResponse {
-    pub count: i64,
-}
-
-#[derive(Serialize)]
-pub struct ShareDetailResponse {
-    pub users: Vec<ShareParticipant>,
-}
-
-#[derive(Serialize)]
-pub struct ShareParticipant {
-    pub username: String,
-    pub user_id: i32,
-    pub status: String,
-}
+pub use hopnet_common::shares::{
+    ShareRequest, AcceptShareRequest, IncomingShareResponse,
+    ShareCountResponse, ShareDetailResponse, ShareParticipant,
+};
 
 // --- Display name crypto ---
 

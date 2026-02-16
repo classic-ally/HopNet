@@ -107,7 +107,7 @@ Cross-platform desktop application providing file management and network adminis
 - [ ] Native OS integration (Apple FileProvider, Windows Cloud Files API)
 - [ ] Advanced file operations (multi-select, context menus, drag-drop)
 - [ ] Network health dashboard and metrics visualization
-- [~] Advanced file sharing controls and permissions (Phase 2a+2b backend complete, frontend pending)
+- [x] Advanced file sharing controls and permissions (Phase 2a+2b backend, Phase 2c frontend)
 - [ ] Responsive mobile interface for thin client operations
 
 ### 6. Security & Authentication ([RFC-006](specs/security.md))

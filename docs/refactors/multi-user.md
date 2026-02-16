@@ -161,7 +161,7 @@ Full multi-user integration test (`multi-user-isolation`). Exercises: user creat
 ---
 
 ## Phase 2: File Sharing (Individual Files)
-**Status:** [~] In Progress
+**Status:** [x] Complete
 
 Enable live collaborative file sharing between users. Individual files only — shared folders are deferred to Phase 3.
 
@@ -409,7 +409,7 @@ Schema, core consensus handlers, and API for the share → accept → download p
 - [x] Extend `GET /files` query with `shared_with_count` (subquery on `shares` + `incoming_shares`, excludes self, computed in Rust)
 - [x] API: `POST /shares` (share file), `GET /shares/incoming` (pending shares), `GET /shares/incoming/count` (badge count), `POST /shares/{id}/accept` (accept + place), `DELETE /shares/incoming/{id}` (decline)
 - [x] `GET /shares/file/{inode_id}` — sharing detail view (who has access, with accepted/pending status)
-- [ ] `GET /users` endpoint for recipient discovery (username + display info, no key material exposed)
+- [x] `GET /users` endpoint for recipient discovery (username + display info, no key material exposed)
 - [x] Validation: self-share prevention, duplicate prevention on `(data_block_id, recipient_id)` across both tables
 - [x] `AcceptShareHandler` writes to `modification_log` for FileProvider consistency (new inode in recipient's namespace)
 
@@ -444,16 +444,21 @@ Layer live collaboration on top of the share/accept foundation. Modifications by
 **Bug fix discovered during validation:** `modify_item()` propagation SQL (`UPDATE inodes SET data_id = ? WHERE data_id = ? AND owner_id != ?`) was too broad — updated ALL inodes with matching `data_id`, including users who had unshared. After unshare, the user's inode would be updated to a new `data_block` they had no `file_access` for (403). Fixed by scoping: `AND owner_id IN (SELECT user_id FROM shares WHERE data_block_id = ?)`.
 
 ### Phase 2c: Frontend — Sharing UI
-**Status:** [ ] Not Started
+**Status:** [x] Complete
 
-- [ ] Share button in file browser (context menu or selection toolbar), visible when file selected
-- [ ] Recipient picker dialog (user list from `GET /users`)
-- [ ] Incoming shares notification (bell icon with badge from `GET /shares/incoming/count`)
-- [ ] Incoming shares panel with accept dialog (choose placement path)
-- [ ] Share indicators on files in listing (`shared_with_count > 0` → icon overlay or badge)
-- [ ] "Who has access" detail view with accepted/pending status (from `GET /shares/file/{inode_id}`)
-- [ ] Unshare action (self-removal from share)
-- [ ] Decline action for incoming shares
+- [x] Share button in file browser (toolbar button, visible when file selected) → opens `ShareFileModal`
+- [x] Recipient picker dialog (`ShareFileModal` — searchable user list from `GET /users`, excludes current user)
+- [x] Incoming shares notification (sidebar "Shared With Me" item with badge from `GET /shares/incoming/count`, auto-polled every 30s)
+- [x] Incoming shares panel with accept dialog (`IncomingSharesPane` + `AcceptShareModal` — choose placement path)
+- [x] Share indicators on files in listing (`shared_with_count > 0` → inline badge on filename, clickable)
+- [x] "Who has access" detail view with accepted/pending status (`ShareDetailsModal` from `GET /shares/file/{inode_id}`)
+- [x] Unshare action (self-removal via "Leave Share" button in `ShareDetailsModal`)
+- [x] Decline action for incoming shares (`IncomingSharesList` decline button)
+- [x] Accounts management pane (`AccountsPane` — user list, search/filter/sort, pagination)
+- [x] Add account modal (`AddAccountModal` — creates user via `POST /users`, displays generated passphrase)
+- [x] Passphrase primitives extracted (`PassphraseDisplayContent`, `PassphraseVerifyContent`) for reuse in setup + account creation
+- [x] Shared API types moved to `common` crate (`ShareRequest`, `AcceptShareRequest`, `IncomingShareResponse`, etc.) with typeshare
+- [x] Storybook coverage for all new components
 
 ---
 

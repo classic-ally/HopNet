@@ -5,12 +5,15 @@
     import NodesPane from "../panes/nodes/NodesPane.svelte";
     import TakeoutPane from "../panes/takeout/TakeoutPane.svelte";
     import DevicesPane from "../panes/devices/DevicesPane.svelte";
+    import AccountsPane from "../panes/accounts/AccountsPane.svelte";
     import SidebarItem from "./SidebarItem.svelte";
     import ResiliencePane from "../panes/resilience/ResiliencePane.svelte";
     import MaintenancePane from "../panes/maintenance/MaintenancePane.svelte";
+    import IncomingSharesPane from "../panes/shares/IncomingSharesPane.svelte";
+    import { incomingShareCountStore } from "../stores";
 
     // State to track which sidebar item is selected
-    let selectedItem = "browse"; // Can be "recents", "browse", "account", "nodes", "takeout", "devices", "resilience", "maintenance"
+    let selectedItem = "browse"; // Can be "recents", "browse", "shared", "account", "nodes", "takeout", "devices", "resilience", "maintenance"
     // State to track if we're in account mode (sticky)
     let inAccountMode = false;
     
@@ -28,6 +31,14 @@
 
     function handleBrowseClick() {
         selectedItem = "browse";
+        // Close sidebar on mobile after selection
+        if (window.innerWidth < 768) {
+            isSidebarOpen = false;
+        }
+    }
+
+    function handleSharedClick() {
+        selectedItem = "shared";
         // Close sidebar on mobile after selection
         if (window.innerWidth < 768) {
             isSidebarOpen = false;
@@ -121,7 +132,7 @@
                     <!-- Account mode: Show Account, Takeouts and Nodes -->
                     <SidebarItem
                         icon="i-carbon-user"
-                        title="Account"
+                        title="Accounts"
                         selected={selectedItem === "account"}
                         onClick={handleAccountClick}
                     />
@@ -169,6 +180,13 @@
                         selected={selectedItem === "browse"}
                         onClick={handleBrowseClick}
                     />
+                    <SidebarItem
+                        icon="i-carbon-collaborate"
+                        title="Shared With Me"
+                        selected={selectedItem === "shared"}
+                        onClick={handleSharedClick}
+                        badge={$incomingShareCountStore}
+                    />
                 {/if}
             </div>
             <AccountSidebarItem
@@ -198,6 +216,9 @@
         {:else if selectedItem === "maintenance"}
             <!-- Maintenance pane with integrated toolbar -->
             <MaintenancePane onToggleSidebar={toggleSidebar}/>
+        {:else if selectedItem === "shared"}
+            <!-- Incoming shares pane -->
+            <IncomingSharesPane onToggleSidebar={toggleSidebar}/>
         {:else if selectedItem === "recents"}
             <!-- Minimal toolbar for mobile menu access -->
             <Toolbar
@@ -216,8 +237,7 @@
                 No recent files to display
             </div>
         {:else if selectedItem === "account"}
-            <!-- Account management will be shown here -->
-            <div class="text-muted">Account settings will be shown here</div>
+            <AccountsPane onToggleSidebar={toggleSidebar}/>
         {/if}
     </div>
 </div>

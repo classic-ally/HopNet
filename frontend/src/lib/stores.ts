@@ -11,8 +11,8 @@ export const currentPathStore = writable('/');
 // Refresh trigger store - increment to trigger refresh
 export const refreshTriggerStore = writable(0);
 
-// Helper to parse a JWT and get its expiration time
-function getJwtExpiration(token: string) {
+// Parse JWT payload
+function parseJwtPayload(token: string): any | null {
   try {
     const base64Url = token.split('.')[1];
     const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
@@ -21,12 +21,26 @@ function getJwtExpiration(token: string) {
         return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
       }).join('')
     );
-    const payload = JSON.parse(jsonPayload);
-    return payload.exp; // Expiry time in seconds
+    return JSON.parse(jsonPayload);
   } catch (e) {
-    console.error('Invalid JWT', e);
     return null;
   }
+}
+
+// Get the current user ID from the stored JWT
+export function getCurrentUserId(): number | null {
+  const token = typeof window !== 'undefined' ? localStorage.getItem('jwt') : null;
+  if (!token) return null;
+  const payload = parseJwtPayload(token);
+  if (!payload?.uid) return null;
+  const id = parseInt(payload.uid, 10);
+  return isNaN(id) ? null : id;
+}
+
+// Helper to parse a JWT and get its expiration time
+function getJwtExpiration(token: string) {
+  const payload = parseJwtPayload(token);
+  return payload?.exp ?? null;
 }
 
 // credential storage
@@ -98,3 +112,31 @@ export async function authenticatedFetch(url: string, options: RequestInit = {})
 
   return response;
 }
+
+// Incoming share count store — polled every 30s when authenticated
+export const incomingShareCountStore = writable(0);
+
+let shareCountInterval: ReturnType<typeof setInterval> | null = null;
+
+async function pollShareCount() {
+  try {
+    const response = await authenticatedFetch(`${API_BASE_URL}/shares/incoming/count`);
+    if (response.ok) {
+      const data = await response.json();
+      incomingShareCountStore.set(data.count);
+    }
+  } catch (_) { /* ignore — not logged in or network error */ }
+}
+
+tokenStore.subscribe((token) => {
+  if (shareCountInterval) {
+    clearInterval(shareCountInterval);
+    shareCountInterval = null;
+  }
+  if (token) {
+    pollShareCount();
+    shareCountInterval = setInterval(pollShareCount, 30_000);
+  } else {
+    incomingShareCountStore.set(0);
+  }
+});

@@ -1,6 +1,6 @@
 <script lang="ts">
     import { TableHandler, ThSort, ThFilter, Th, Datatable } from '@vincjo/datatables'
-    import { tokenStore, API_BASE_URL, currentPathStore, refreshTriggerStore, authenticatedFetch } from '../../stores'
+    import { tokenStore, API_BASE_URL, currentPathStore, refreshTriggerStore, authenticatedFetch, getCurrentUserId } from '../../stores'
     import { onMount } from 'svelte'
     import type { FileItem } from '../../types'
     import { InodeType } from '../../types'
@@ -12,6 +12,10 @@
     import Upload from './Upload.svelte'
     import CreateFolder from './CreateFolder.svelte'
     import ConfirmDelete from './ConfirmDelete.svelte'
+    import ShareFileModal from './ShareFileModal.svelte'
+    import ShareDetailsModal from './ShareDetailsModal.svelte'
+    import { fetchUsers, shareFile, fetchShareDetails, unshareFile, type UserInfo } from '../../api/shares'
+    import type { ShareParticipant } from '../../types'
 
     let files: FileItem[] = []
     let loading = true
@@ -35,6 +39,18 @@
     let isDeleting = false
     let deleteError = ''
     let deleteSuccess = ''
+    let showShareModal = false
+    let shareUsers: UserInfo[] = []
+    let shareLoading = false
+    let shareError = ''
+    let shareSuccess = ''
+    let shareFileName = ''
+    let shareInodeId = ''
+    let showShareDetails = false
+    let shareDetailsParticipants: ShareParticipant[] = []
+    let shareDetailsLoading = false
+    let shareDetailsFileName = ''
+    let shareDetailsInodeId = ''
 
     // Subscribe to current path store
     $: currentPath = $currentPathStore
@@ -458,9 +474,94 @@
         }
     }
 
-    function handleShareClick() {
-        console.log('Share clicked');
-        // TODO: Implement sharing for selected files
+    async function handleShareClick() {
+        if (selectedFiles.length === 0) return;
+        const file = selectedFiles[0];
+        if (file.inode_type !== InodeType.File) return;
+
+        shareFileName = getFileName(file.path);
+        shareInodeId = file.id;
+        shareError = '';
+        shareSuccess = '';
+        shareLoading = true;
+        showShareModal = true;
+
+        try {
+            const allUsers = await fetchUsers();
+            const myId = getCurrentUserId();
+            shareUsers = myId != null ? allUsers.filter(u => u.user_id !== myId) : allUsers;
+        } catch (err) {
+            shareError = err instanceof Error ? err.message : 'Failed to load users';
+        } finally {
+            shareLoading = false;
+        }
+    }
+
+    async function handleShareFile(username: string) {
+        shareLoading = true;
+        shareError = '';
+        shareSuccess = '';
+        try {
+            const response = await shareFile(shareInodeId, username);
+            if (response.ok) {
+                shareSuccess = `Shared with ${username}`;
+                setTimeout(() => {
+                    showShareModal = false;
+                    shareSuccess = '';
+                    refreshTriggerStore.update(n => n + 1);
+                }, 1500);
+            } else if (response.status === 409) {
+                shareError = 'Already shared with this user';
+            } else {
+                shareError = `Failed to share: ${response.status} ${response.statusText}`;
+            }
+        } catch (err) {
+            shareError = err instanceof Error ? err.message : 'Failed to share file';
+        } finally {
+            shareLoading = false;
+        }
+    }
+
+    function handleShareClose() {
+        showShareModal = false;
+        shareError = '';
+        shareSuccess = '';
+    }
+
+    async function handleShareIconClick(file: FileItem, event: MouseEvent) {
+        event.stopPropagation();
+        shareDetailsFileName = getFileName(file.path);
+        shareDetailsInodeId = file.id;
+        shareDetailsLoading = true;
+        shareDetailsParticipants = [];
+        showShareDetails = true;
+
+        try {
+            shareDetailsParticipants = await fetchShareDetails(file.id);
+        } catch (err) {
+            console.error('Failed to load share details:', err);
+        } finally {
+            shareDetailsLoading = false;
+        }
+    }
+
+    async function handleUnshare() {
+        shareDetailsLoading = true;
+        try {
+            const response = await unshareFile(shareDetailsInodeId);
+            if (response.ok) {
+                showShareDetails = false;
+                refreshTriggerStore.update(n => n + 1);
+            }
+        } catch (err) {
+            console.error('Failed to unshare:', err);
+        } finally {
+            shareDetailsLoading = false;
+        }
+    }
+
+    function handleShareDetailsClose() {
+        showShareDetails = false;
     }
 
     // Toolbar configuration - stable references to avoid resize recalculation
@@ -670,7 +771,12 @@
                             <td class="w-8">
                                 <div class="{getFileIcon(row.inode_type === InodeType.Folder ? 'Folder' : 'File', getFileName(row.path), 'list')} w-4 h-4 text-muted"></div>
                             </td>
-                            <td>{getFileName(row.path)}</td>
+                            <td>{getFileName(row.path)}{#if row.shared_with_count && row.shared_with_count > 0}<button
+                                        class="share-badge"
+                                        title="Shared with {row.shared_with_count} — click for details"
+                                        aria-label="View sharing details"
+                                        onclick={(e) => handleShareIconClick(row, e)}
+                                    ><span class="i-carbon-share w-3 h-3"></span><span class="share-count">{row.shared_with_count}</span></button>{/if}</td>
                             <td class="text-sm text-muted text-right font-mono">{formatFileSize(row.file_size)}</td>
                             <td class="date-cell text-sm text-muted">
                                 <span class="date-full">{createdFormats.full}</span>
@@ -732,6 +838,29 @@
     items={selectedFiles}
     onClose={handleDeleteCancel}
     onConfirm={handleDeleteConfirm}
+/>
+
+<!-- Share File Modal -->
+<ShareFileModal
+    isOpen={showShareModal}
+    users={shareUsers}
+    fileName={shareFileName}
+    loading={shareLoading}
+    error={shareError}
+    success={shareSuccess}
+    onShare={handleShareFile}
+    onClose={handleShareClose}
+/>
+
+<!-- Share Details Modal -->
+<ShareDetailsModal
+    isOpen={showShareDetails}
+    fileName={shareDetailsFileName}
+    participants={shareDetailsParticipants}
+    currentUserId={getCurrentUserId() ?? 0}
+    loading={shareDetailsLoading}
+    onUnshare={handleUnshare}
+    onClose={handleShareDetailsClose}
 />
 
 <style>
@@ -849,6 +978,30 @@
 
     :global(th) {
         border-bottom: 1px solid #313244 !important; /* surface0 - header separator */
+    }
+
+    /* Inline share badge in name cell */
+    .share-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 2px;
+        margin-left: 8px;
+        color: #cba6f7; /* mauve */
+        background: transparent;
+        border: none;
+        cursor: pointer;
+        vertical-align: middle;
+        padding: 0;
+        font-size: 0.7rem;
+    }
+
+    .share-badge:hover {
+        color: #cdd6f4; /* primary */
+    }
+
+    .share-count {
+        font-size: 0.7rem;
+        line-height: 1;
     }
 
     /* Make folder rows more obviously clickable */

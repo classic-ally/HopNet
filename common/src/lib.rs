@@ -5,6 +5,7 @@ pub mod fileprovider;
 pub mod documentprovider;
 pub mod setup;
 pub mod debug;
+pub mod shares;
 
 // Database implementations (only when database feature is enabled)
 #[cfg(feature = "database")]
@@ -15,3 +16,4 @@ pub use db::{InodeType, TakeoutStatus, TakeoutRecord, CustomUUID, FileItem};
 pub use devices::{RegisterDeviceRequest, RegisterDeviceResponse, DeviceInfo};
 pub use fileprovider::{HealthStatus, HealthResponse, FileProviderItem, EnumerateResponse, DeleteItemRequest, ChangesResponse, ChangesQuery};
 pub use debug::{StateSnapshot, TableHashInfo};
+pub use shares::{ShareRequest, AcceptShareRequest, IncomingShareResponse, ShareCountResponse, ShareDetailResponse, ShareParticipant};
