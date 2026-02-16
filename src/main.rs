@@ -34,6 +34,7 @@ mod admin;
 mod devices;
 mod net;
 mod passphrase;
+mod shares;
 
 static ASSETS_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/frontend/dist");
 
@@ -445,6 +446,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/metrics/scores", get(metrics::routes::get_placement_scores))
                 .nest("/takeout", takeout::takeout_routes())
                 .nest("/admin", admin::routes::admin_routes())
+                .nest("/shares", shares::routes::router())
                 .route("/logout", post(auth::sign_out))
                 .layer(middleware::from_fn_with_state(app_state.clone(), auth::auth_middleware));
 

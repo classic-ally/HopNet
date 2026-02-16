@@ -367,6 +367,31 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
             -- Add comments for fragment inventory documentation
             COMMENT ON TABLE fragment_inventory IS 'Tracks which nodes store which fragments for distributed discovery and self-attestation';
             COMMENT ON COLUMN fragment_inventory.self_verified_height IS 'Last consensus height when node verified it actually has this fragment on disk';
+
+            -- Sharing: pending share invitations
+            CREATE TABLE incoming_shares (
+                id                       UUID PRIMARY KEY,
+                data_block_id            UUID NOT NULL,
+                sender_id                INTEGER NOT NULL,
+                recipient_id             INTEGER NOT NULL,
+                file_access              BLOB NOT NULL,
+                display_ephemeral_pubkey BLOB NOT NULL,
+                encrypted_display_name   BLOB NOT NULL,
+                FOREIGN KEY (data_block_id) REFERENCES data_blocks(id),
+                FOREIGN KEY (sender_id) REFERENCES users(user_id),
+                FOREIGN KEY (recipient_id) REFERENCES users(user_id)
+            );
+            CREATE INDEX idx_incoming_shares_recipient ON incoming_shares(recipient_id);
+            CREATE INDEX idx_incoming_shares_data_block ON incoming_shares(data_block_id);
+
+            -- Sharing: live-link membership
+            CREATE TABLE shares (
+                data_block_id   UUID NOT NULL,
+                user_id         INTEGER NOT NULL,
+                PRIMARY KEY (data_block_id, user_id),
+                FOREIGN KEY (data_block_id) REFERENCES data_blocks(id),
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            );
         "
     )?;
     Ok(())

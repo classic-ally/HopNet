@@ -8,11 +8,11 @@ use crate::tests::{get_max_view, wait_for_minimum_view};
 use crate::NodeInfo;
 
 // ============================================================================
-// Helpers
+// Helpers (pub(crate) so sharing tests can reuse them)
 // ============================================================================
 
 /// Clone a NodeInfo with a different JWT token (to act as a different user).
-fn node_with_token(node: &NodeInfo, token: &str) -> NodeInfo {
+pub(crate) fn node_with_token(node: &NodeInfo, token: &str) -> NodeInfo {
     NodeInfo {
         node_id: node.node_id,
         ip_address: node.ip_address.clone(),
@@ -22,7 +22,7 @@ fn node_with_token(node: &NodeInfo, token: &str) -> NodeInfo {
 }
 
 /// POST /users to create a new user, returns the generated passphrase.
-async fn create_user(node: &NodeInfo, username: &str) -> Result<String> {
+pub(crate) async fn create_user(node: &NodeInfo, username: &str) -> Result<String> {
     let client = Client::new();
     let url = format!("http://{}:{}/users", node.ip_address, node.port);
 
@@ -49,7 +49,7 @@ async fn create_user(node: &NodeInfo, username: &str) -> Result<String> {
 }
 
 /// POST /login to authenticate, returns a JWT token.
-async fn login_user(node: &NodeInfo, username: &str, passphrase: &str) -> Result<String> {
+pub(crate) async fn login_user(node: &NodeInfo, username: &str, passphrase: &str) -> Result<String> {
     let client = Client::new();
     let url = format!("http://{}:{}/login", node.ip_address, node.port);
 
@@ -79,7 +79,7 @@ async fn login_user(node: &NodeInfo, username: &str, passphrase: &str) -> Result
 
 /// Non-panicking download. Returns Ok(Ok(bytes)) on success, Ok(Err(status_code))
 /// on HTTP error. Single attempt, no retry — we expect 404 for cross-user access.
-async fn try_download_file(node: &NodeInfo, path: &str) -> Result<std::result::Result<Vec<u8>, u16>> {
+pub(crate) async fn try_download_file(node: &NodeInfo, path: &str) -> Result<std::result::Result<Vec<u8>, u16>> {
     let client = Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
@@ -102,7 +102,7 @@ async fn try_download_file(node: &NodeInfo, path: &str) -> Result<std::result::R
 }
 
 /// Fetch /debug/state from all nodes in parallel. Returns (node_id, snapshot) pairs.
-async fn fetch_state_snapshots(
+pub(crate) async fn fetch_state_snapshots(
     nodes: &[NodeInfo],
 ) -> Result<Vec<(u32, hopnet_common::StateSnapshot)>> {
     let mut handles = Vec::new();

@@ -50,7 +50,13 @@ pub fn get_files(
                     CASE
                         WHEN i.data_id IS NOT NULL THEN uuid_extract_timestamp(i.data_id)
                         ELSE NULL
-                    END as modification_date
+                    END as modification_date,
+                    COALESCE(
+                        (SELECT COUNT(*) FROM shares s WHERE s.data_block_id = i.data_id AND s.user_id != ?)
+                        +
+                        (SELECT COUNT(*) FROM incoming_shares ist WHERE ist.data_block_id = i.data_id),
+                        0
+                    ) as shared_with_count
                 FROM inodes i
                 LEFT JOIN data_blocks db ON i.data_id = db.id
                 WHERE i.path LIKE ? AND i.path NOT LIKE ? AND i.owner_id = ?
@@ -61,7 +67,7 @@ pub fn get_files(
             let not_like_path = format!("{}/%", like_path);
             tracing::debug!("Querying files with metadata: like_path: {}, not_like_path: {}", like_path, not_like_path);
 
-            let files = stmt.query_map(params![like_path, not_like_path, owner_id], |row| {
+            let files = stmt.query_map(params![owner_id, like_path, not_like_path, owner_id], |row| {
                 let id: CustomUUID = row.get(0)?;
                 let encrypted_path: String = row.get(1)?;
                 let decrypted_path = decrypt_path(encrypted_path, key, nonce)?;
@@ -70,6 +76,7 @@ pub fn get_files(
                 let file_size: Option<u64> = row.get(4)?;
                 let creation_date: CustomDateTime = row.get(5)?;
                 let modification_date: Option<CustomDateTime> = row.get(6)?;
+                let shared_with_count: i64 = row.get(7)?;
 
                 // Convert our internal CustomUUID to common module's CustomUUID
                 let common_uuid = hopnet_common::CustomUUID::from_str(&id.to_string())
@@ -82,6 +89,7 @@ pub fn get_files(
                     file_size,
                     creation_date: *creation_date, // Dereference CustomDateTime to get DateTime<Utc>
                     modification_date: modification_date.map(|dt| *dt), // Dereference if present
+                    shared_with_count: Some(shared_with_count as u32),
                 })
             }).map_err(|_| DatabaseError::ProcessingError)?;
 
@@ -108,7 +116,11 @@ pub fn insert_files(
 
     // STEP 3: Insert missing parent directories first
     if !missing_parents.is_empty() {
-        insert_parent_directories(db_tx, &missing_parents, &inodes)?;
+        let owner_id_for_parents = match &inodes[0].owner {
+            either::Either::Left(user_id) => *user_id,
+            either::Either::Right(user) => user.user_id,
+        };
+        insert_parent_directories(db_tx, &missing_parents, owner_id_for_parents)?;
     }
 
     let inode_count = inodes.len();
@@ -211,7 +223,7 @@ pub fn insert_files(
 }
 
 // Helper function to find missing parent directories
-fn find_missing_parents(
+pub(crate) fn find_missing_parents(
     tx: &Transaction,
     new_paths: &[String]
 ) -> Result<Vec<String>, DatabaseError> {
@@ -279,17 +291,11 @@ fn find_missing_parents(
 }
 
 // Helper function to insert parent directories
-fn insert_parent_directories(
+pub(crate) fn insert_parent_directories(
     tx: &Transaction,
     missing_parents: &[String],
-    inodes: &[Inode]
+    owner_id: i32,
 ) -> Result<(), DatabaseError> {
-    // Get owner_id from the first inode (assuming same owner for batch)
-    let owner_id = match &inodes[0].owner {
-        either::Either::Left(user_id) => *user_id,
-        either::Either::Right(user) => user.user_id,
-    };
-    
     // Insert each missing parent directory
     for parent_path in missing_parents {
         // Generate stable UUIDv7 for folder identity
@@ -908,7 +914,38 @@ pub fn log_modification(
         log_ancestor_modifications(tx, new, owner_id, modification_height)?;
     }
     
-    tracing::debug!("Logged modification for inode_id {} with old_parent_id {:?} at height {}", 
+    tracing::debug!("Logged modification for inode_id {} with old_parent_id {:?} at height {}",
                    inode_id, old_parent_id, modification_height);
     Ok(())
+}
+
+/// Look up an inode by its UUID and owner. Returns (data_id, encrypted_path, inode_type).
+pub fn get_inode_by_id(
+    conn: &duckdb::Connection,
+    inode_id: &CustomUUID,
+    owner_id: i32,
+) -> Result<Option<(Option<CustomUUID>, String, hopnet_common::InodeType)>, DatabaseError> {
+    conn.query_row(
+        "SELECT data_id, path, type FROM inodes WHERE id = ? AND owner_id = ?",
+        params![inode_id, owner_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+    ).optional().map_err(|_| DatabaseError::RecallError)
+}
+
+/// Look up a user's file_access entry for a specific data_block.
+pub fn get_file_access(
+    conn: &duckdb::Connection,
+    data_block_id: &CustomUUID,
+    user_id: i32,
+) -> Result<Option<crate::db::types::FileAccess>, DatabaseError> {
+    conn.query_row(
+        "SELECT data_block_id, user_id, ephemeral_pubkey, encrypted_file_key FROM file_access WHERE data_block_id = ? AND user_id = ?",
+        params![data_block_id, user_id],
+        |row| Ok(crate::db::types::FileAccess {
+            data_block_id: row.get(0)?,
+            user_id: row.get(1)?,
+            ephemeral_pubkey: row.get(2)?,
+            encrypted_file_key: row.get(3)?,
+        })
+    ).optional().map_err(|_| DatabaseError::RecallError)
 }

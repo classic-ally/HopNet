@@ -110,6 +110,8 @@ pub struct FileItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[typeshare(serialized_as = "String")]
     pub modification_date: Option<DateTime<Utc>>, // From data_id UUIDv7 for files
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared_with_count: Option<u32>,
 }
 
 /// Network resilience statistics for cliff chart display

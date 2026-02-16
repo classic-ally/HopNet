@@ -160,33 +160,321 @@ Full multi-user integration test (`multi-user-isolation`). Exercises: user creat
 
 ---
 
-## Phase 2: File Sharing, User Creation, and RBAC
+## Phase 2: File Sharing (Individual Files)
 **Status:** [ ] Not Started
 
-Enable file sharing across users, add the ability to create new users on a live mesh, and introduce role-based governance.
+Enable live collaborative file sharing between users. Individual files only — shared folders are deferred to Phase 3.
 
-### Governance Model
+RBAC/governance is deferred. The `POST /users` endpoint is currently ungated; all users can create other users. This is acceptable for an undeployed cooperative mesh where all users are broadly trusted. Governance gating (`network_admin` role) will be added when needed, and is a low-cost retrofit (additive route guards, not structural changes).
 
-HopNet is designed for cooperative storage — friends pooling their devices. This creates two distinct axes of authority:
+### Design: Accept-and-Place Model
 
-- **Node-level ownership**: Already captured by `nodes.owner`. Each user administers their own node(s) — storage policies, device management, node configuration. This is "I own this hardware."
-- **Network-level governance**: Decisions affecting the whole mesh — admitting new users, approving new nodes, network-wide policy. This is "who joins the co-op."
+Sharing creates an **incoming share** that the recipient explicitly accepts and places in their filesystem:
 
-These are orthogonal. A user who contributes three nodes is admin of all three regardless of their network governance role.
+1. **User A shares a file** → an `incoming_share` record is created with the current `data_block_id`, an encrypted display name (encrypted for B's eyes only), and a pre-computed `FileAccess` entry for User B (ECDH-wrapped per-file key using B's X25519 public key)
+2. **User B sees the pending share** → notification in UI (bell icon or similar), decrypts display name with their X25519 private key
+3. **User B accepts** → chooses where to place the file in their namespace → a new inode is created in B's namespace `(owner_id=B, path=SIV_B(chosen_path), data_id=current_data_block_id)`, encrypted with B's SIV key
 
-For initial implementation, a `network_admin` role on the `users` table (genesis user by default) gates network-level decisions. Longer term, the cooperative model raises the question of whether network governance should require collective agreement — proposals approved by supermajority via the existing consensus mechanism rather than unilateral admin action. This needs deeper design discussion when we reach this phase.
+Both users now have independent inodes pointing to the same `data_block`. Both have `file_access` entries (cryptographic access). Neither is "the owner" in a privileged sense — they are equal accessors to the shared content.
 
-### User Creation
+### Design: Schema
 
-Currently users only exist via genesis. A user creation flow is needed: generate keypair, wrap private key with initial password, store via consensus. The new user receives credentials out-of-band and changes their password on first login. Gated by network governance role.
+Three tables support the sharing system:
 
-### File Sharing
+**`file_access`** (existing, unchanged) — cryptographic access layer. One row per `(data_block_id, user_id)`. Stores the ECDH-wrapped per-file key. Persists as long as the user's inode references the `data_block`.
 
-Sharing an encrypted file means creating a `FileAccess` entry for the target user — wrapping the per-file key with their X25519 public key. The crypto infrastructure exists (`FileAccess::new_for_user()`, `decrypt_wrapped_file_key()`). What's needed: sharing/revocation API endpoints, consensus transaction types for share operations, user discovery (username → X25519 public key), and UI.
+**`incoming_shares`** (new) — pending share invitations not yet accepted by the recipient.
+
+```sql
+incoming_shares (
+    id                       UUID PRIMARY KEY,       -- UUIDv7 (encodes creation timestamp)
+    data_block_id            UUID NOT NULL,           -- current data_block (updated atomically on modify)
+    sender_id                INTEGER NOT NULL,
+    recipient_id             INTEGER NOT NULL,
+    file_access              BLOB NOT NULL,           -- pre-computed FileAccess for recipient (updated on modify)
+    display_ephemeral_pubkey BLOB NOT NULL,           -- X25519 ephemeral key for display_name decryption
+    encrypted_display_name   BLOB NOT NULL,           -- filename encrypted for recipient only
+
+    FOREIGN KEY (data_block_id) REFERENCES data_blocks(id),
+    FOREIGN KEY (sender_id) REFERENCES users(user_id),
+    FOREIGN KEY (recipient_id) REFERENCES users(user_id)
+)
+```
+
+Key design decisions:
+- **References `data_block_id` directly**: Both `shares` and `incoming_shares` use the same lookup pattern (`WHERE data_block_id = ?`). The `data_block_id` changes on every content modification, but the modify path already updates `incoming_shares` on every edit (to re-compute the `file_access` blob), so updating `data_block_id` in the same atomic operation costs nothing. This avoids JOIN-through-inodes indirection.
+- **`file_access` blob + `data_block_id` updated atomically on modify**: When any sharer edits a file with pending incoming shares, the consensus handler updates both fields in the same transaction. The route handler (where the modifier's keys are in session) pre-computes the new `FileAccess` for each pending recipient.
+- **`encrypted_display_name` uses a separate ephemeral key**: Independent from the `FileAccess` ECDH, so it doesn't need updating when the file key changes. Only the recipient can decrypt it. Other node operators see opaque ciphertext.
+- **No `created_at` column**: The UUIDv7 `id` encodes the creation timestamp.
+
+**`shares`** (new) — live-link membership layer. Tracks which users are in a live-link group for a given `data_block`. Only has rows when a file is actively shared between 2+ users. Unshared files have zero rows.
+
+```sql
+shares (
+    data_block_id   UUID NOT NULL,
+    user_id         INTEGER NOT NULL,
+    PRIMARY KEY (data_block_id, user_id),
+    FOREIGN KEY (data_block_id) REFERENCES data_blocks(id),
+    FOREIGN KEY (user_id) REFERENCES users(user_id)
+)
+```
+
+**`file_access` vs `shares` — why two tables**: These serve different purposes with different lifetimes. `file_access` means "you can decrypt this data_block" and persists until the data_block is orphan-cleaned. `shares` means "your inode should track this data_block's evolution" and is removed on unshare. This separation is necessary for copy-on-write unsharing — removing a user's `shares` row stops future propagation without destroying their ability to decrypt the version they already have.
+
+### Design: Live Link Semantics
+
+Shared files maintain a live link — modifications by either user are visible to the other. The `shares` table is the authoritative record of live-link membership. When User A modifies a shared file:
+
+1. New `data_block` is created (new content version)
+2. Route handler checks `shares` for old `data_block_id` → finds live-linked participant list
+3. Route handler checks `incoming_shares` for old `data_block_id` → finds pending recipients
+4. Pre-computes new `FileAccess` entries for all (live-linked participants + pending recipients)
+5. Consensus payload includes: standard modify (A's inode update) + share propagation + pending share updates
+6. Handler: updates A's inode `data_id`; for each live-linked participant: updates their inode `data_id`, inserts `FileAccess`, moves `shares` rows to new `data_block_id`; for each pending recipient: updates `data_block_id` and `file_access` blob in `incoming_shares` atomically
+
+Steps 2–4 happen in the **route handler** (not the consensus handler), because only the modifying user's node has the plaintext file key in session for ECDH wrapping. The consensus handler applies the pre-computed results.
+
+If the file is not shared and has no pending incoming shares, the modification proceeds exactly as today — zero overhead for unshared files.
+
+### Design: Deletion and Cleanup
+
+**Deleting a file**: Removes the deleting user's inode, their `shares` row (if any), and any `incoming_shares` where `sender_id` matches the deleting user and `data_block_id` matches the deleted inode's data. The `data_block` and fragments persist as long as any other user's inode still references them (existing orphan-check in `delete_orphaned_data_blocks_consensus` protects them).
+
+**Deleting a file with pending shares**: The `incoming_shares` rows from the deleting sender are cleaned up in the same consensus transaction. The pending share silently disappears from B's UI — the sender no longer has the file to share.
+
+### Design: Copy-on-Write Unsharing
+
+"Unsharing" severs the live link without duplicating data:
+
+1. Remove the unsharing user's row from `shares` for this `data_block_id`
+2. If only one user remains in `shares`, remove that row too (no longer shared)
+3. The unsharing user's inode and `file_access` entry are **untouched** — they can still read the current version
+4. Next modification by any remaining sharer creates a new `data_block` → `shares` consulted → unshared user is absent → their inode stays on the old version
+5. The old `data_block` persists as long as the unshared user's inode references it (existing orphan-check protects it)
+
+No instant fork. No data duplication. No re-encryption. Divergence happens lazily at the next write.
+
+### Consensus Implications
+
+**Current invariant**: All file-mutating handlers (`InsertFilesHandler`, `ModifyItemHandler`, `DeleteFilesHandler`) enforce `tx.user.id == payload.user_id`. A user can only modify their own inodes.
+
+**Sharing requires a scoped exception** for one operation: live-link propagation. When A modifies a shared file's content, A's transaction must update other participants' inodes (`data_id` pointer).
+
+**Integration surface.** Analysis of all file-mutating paths:
+
+| Path | Shares awareness needed? | Reason |
+|------|-------------------------|--------|
+| `InsertFilesHandler` | No | New files are always unshared |
+| `ModifyItemHandler` (rename/move) | No | Path changes are per-user; `data_id` unchanged |
+| `ModifyItemHandler` (content update) | **Yes** | Propagate new `data_block` to live-linked users + update pending `incoming_shares` |
+| `DeleteFilesHandler` | Yes | Remove `shares` row + clean up `incoming_shares` by `sender_id` + `data_block_id` |
+| `UpdatePlacementHeightsHandler` | No | System operation, no user context |
+| `DeleteOrphanedDataBlocksHandler` | No | Already checks for any inode reference |
+| `SelfCheckFragmentsHandler` | No | Fragment inventory, not file-level |
+| Takeout paths | No | Snapshots user's own inodes (shared files appear in both users' takeouts) |
+
+`ModifyItemHandler` (content updates) carries the main complexity. `DeleteFilesHandler` gets cleanup queries. Everything else is unchanged.
+
+The `ModifyItemPayload` is extended with optional propagation data:
+
+```rust
+pub struct SharePropagation {
+    pub old_data_block_id: CustomUUID,
+    pub participant_access: Vec<FileAccess>,         // for live-linked users (shares table)
+    pub pending_share_updates: Vec<PendingShareUpdate>, // for incoming_shares
+}
+
+pub struct PendingShareUpdate {
+    pub incoming_share_id: CustomUUID,
+    pub updated_file_access: Vec<u8>,                // re-computed FileAccess blob
+}
+```
+
+The handler's authorization for propagation: verify the submitter has a row in `shares` for `old_data_block_id`. The inode update is scoped to users present in `shares`; the `incoming_shares` update is scoped to rows matching `old_data_block_id`. Neither is a blanket "edit anyone's inodes" capability.
+
+### API Design
+
+All share endpoints use inode UUIDs (`FileItem.id`) rather than encrypted paths — the frontend already has these from file listings, and it avoids unnecessary SIV round-trips. The `data_block_id` is an internal detail that route handlers resolve from the inode; the frontend never sees it.
+
+**File listing augmentation**: `GET /files` response extended with `shared_with_count`:
+
+```typescript
+export interface FileItem {
+    id: string;                   // inode UUID (stable, used for share/unshare actions)
+    path: string;                 // encrypted path
+    inode_type: InodeType;
+    file_size: string;
+    creation_date: string;
+    modification_date: string;
+    shared_with_count: number;    // 0 = not shared, 1+ = number of OTHER users sharing
+}
+```
+
+The count includes both accepted shares and pending invitations, computed server-side:
+
+```sql
+(SELECT COUNT(*) FROM shares s WHERE s.data_block_id = i.data_id AND s.user_id != ?)
++
+(SELECT COUNT(*) FROM incoming_shares ist WHERE ist.data_block_id = i.data_id)
+```
+
+No self-exclusion needed on `incoming_shares` — the user can't be a pending recipient for a file they already have an inode for. Both subqueries use `data_block_id` (indexed as PK prefix on `shares`, should be indexed on `incoming_shares`). Computed in Rust for consistency across any future native clients. Unshared files with no rows in either table short-circuit to 0.
+
+**Share a file** — `POST /shares`
+
+```
+Body: { "inode_id": "<uuid>", "recipient_username": "<username>" }
+Response: 200 OK | 404 (file/user not found) | 409 (already shared)
+```
+
+Route handler: look up inode by id + authenticated user_id → get `data_block_id` → decrypt per-file key from sender's session → decrypt filename from SIV path server-side for display name → encrypt display name for recipient (separate ECDH) → create `FileAccess` for recipient → submit `ShareFileHandler` consensus transaction. The display name extraction happens server-side from the sender's SIV context — the frontend is not trusted for it.
+
+Validation: self-share prevention (sender == recipient). Duplicate prevention: check no existing `incoming_shares` or `shares` row for this `(data_block_id, recipient_id)`. Note: post-fork re-sharing is allowed because the data_block_ids differ after copy-on-write divergence.
+
+**List pending shares** — `GET /shares/incoming`
+
+```
+Response: [{
+    "id": "<incoming_share_uuid>",      // UUIDv7, used for accept action
+    "sender_username": "<name>",
+    "display_name": "<decrypted_name>", // server decrypts from recipient's session keys
+    "created_at": "<from_uuidv7>"
+}]
+```
+
+Server decrypts `encrypted_display_name` using the recipient's X25519 private key from session store before returning. A lightweight `GET /shares/incoming/count` can serve badge notifications without the full listing.
+
+**Accept a pending share** — `POST /shares/{id}/accept`
+
+`{id}` is the `incoming_share` UUID from `GET /shares/incoming`.
+
+```
+Body: { "placement_path": "/Documents/shared-doc.pdf" }  // plaintext, server encrypts with SIV
+Response: 200 OK | 404 (share not found/expired) | 409 (path conflict)
+```
+
+Server encrypts `placement_path` with the recipient's SIV key and submits `AcceptShareHandler` consensus transaction. The `data_block_id` comes from the `incoming_shares` row (kept current by the modify path).
+
+**Get sharing details** — `GET /shares/file/{inode_id}`
+
+```
+Response: { "users": [
+    { "username": "<name>", "user_id": N, "status": "accepted" },
+    { "username": "<name>", "user_id": N, "status": "pending" }
+]}
+```
+
+Detail view for "who has access" — fetched on demand when user opens share management for a specific file. Route handler: look up inode → get `data_block_id` → query both `shares` (status: accepted) and `incoming_shares` (status: pending) → resolve usernames.
+
+**Unshare (self-removal only)** — `DELETE /shares/{inode_id}`
+
+`{inode_id}` is the user's own inode UUID (`FileItem.id`).
+
+```
+Response: 200 OK | 404 (not shared)
+```
+
+Route handler: look up inode by id + authenticated user_id → get `data_block_id` → submit `UnshareHandler` consensus transaction → removes user's `shares` row. Copy-on-write: inode and `file_access` untouched, divergence happens at next modification.
+
+**Self-removal only — no "remove others" action.** The `shares` table is a flat membership list with no ownership hierarchy. Removing another participant would be a unilateral governance decision affecting everyone in the share group (e.g., A removing C also stops B's future modifications from reaching C, even though B never chose to stop sharing with C).
+
+To share with a subset, the flow is explicit:
+1. A unshares (leaves the group)
+2. A re-shares with the desired subset (new `incoming_share` invitations from A's current data_block)
+3. Each recipient accepts or declines independently
+4. The old share group continues without A — remaining members keep their live link
+
+This ensures every participant makes their own choice. "Remove others" may be added later with governance (e.g., original inviter has removal rights, or consensus-based removal), but is out of scope for Phase 2.
+
+**Cancel or decline a pending share** — `DELETE /shares/incoming/{id}`
+
+`{id}` is the `incoming_share` UUID. Authorized for both `sender_id` (cancel an invitation you sent) and `recipient_id` (decline an invitation you received).
+
+```
+Response: 200 OK | 404 (share not found)
+```
+
+Removes the `incoming_share` record via consensus. The sender's file and `FileAccess` entries are untouched.
+
+### Phase 2a: Share and Accept Flow
+**Status:** [x] Complete
+
+Schema, core consensus handlers, and API for the share → accept → download path. After this phase, A can share a file with B, B can accept and place it in their filesystem, and B can download the shared content. Live-link propagation is not yet implemented — if A modifies after B accepts, B stays on the version at acceptance time until Phase 2b.
+
+- [x] `incoming_shares` table (schema above) — pending share invitations with encrypted display names
+- [x] `shares` table (schema above) — live-link membership, only populated for actively shared files
+- [x] Encrypted display name ECDH logic — separate ephemeral key for recipient-only decryption
+- [x] `ShareFileHandler` consensus transaction — creates `FileAccess` entry for recipient + `incoming_share` record (with encrypted display name and pre-computed `FileAccess`)
+- [x] `AcceptShareHandler` consensus transaction — creates inode in recipient's namespace (using `data_block_id` from `incoming_shares` row), inserts `shares` rows for both sender and recipient, removes `incoming_share`
+- [x] Extend `GET /files` query with `shared_with_count` (subquery on `shares` + `incoming_shares`, excludes self, computed in Rust)
+- [x] API: `POST /shares` (share file), `GET /shares/incoming` (pending shares), `GET /shares/incoming/count` (badge count), `POST /shares/{id}/accept` (accept + place), `DELETE /shares/incoming/{id}` (decline)
+- [x] `GET /shares/file/{inode_id}` — sharing detail view (who has access, with accepted/pending status)
+- [ ] `GET /users` endpoint for recipient discovery (username + display info, no key material exposed)
+- [x] Validation: self-share prevention, duplicate prevention on `(data_block_id, recipient_id)` across both tables
+- [x] `AcceptShareHandler` writes to `modification_log` for FileProvider consistency (new inode in recipient's namespace)
+
+**Validation:** `multi-user-sharing` orchestrator test (29/29 checks, 12s, zero divergence):
+- [x] Integration test: A uploads → A shares with B → B accepts → B downloads → content matches (all 3 nodes)
+- [x] File listing shows `shared_with_count = 1` after sharing
+- [x] Share details: both participants listed with correct status
+- [x] Decline test: A shares with B → B declines → incoming_share removed, A's file unaffected (404 on download)
+- [x] Duplicate prevention: sharing same file with same user twice returns 409 (preflight check)
+- [x] Zero divergence across all share/accept/decline operations (16 tables)
+
+### Phase 2b: Live-Link Propagation and Unshare
+**Status:** [ ] Not Started
+
+Layer live collaboration on top of the share/accept foundation. Modifications by any sharer propagate to all live-linked users and update pending incoming shares. Unshare severs the live link with copy-on-write semantics.
+
+- [ ] Extend `ModifyItemPayload` with optional `SharePropagation` — route handler populates from both `shares` and `incoming_shares` tables when applicable
+- [ ] `ModifyItemHandler` propagation logic — updates live-linked inodes' `data_id` + `FileAccess` entries + `shares` rows; updates `incoming_shares` `data_block_id` + `file_access` blobs atomically for pending recipients
+- [ ] `UnshareHandler` consensus transaction — removes user's `shares` row (copy-on-write: no data duplication)
+- [ ] `DeleteFilesHandler` cleanup — remove `shares` rows + `incoming_shares` where `sender_id` and `data_block_id` match the deleted file
+- [ ] API: `DELETE /shares/{inode_id}` (unshare self)
+
+**Validation:**
+- [ ] Live link test: A modifies → B sees updated content
+- [ ] Multi-sharer propagation: A shares with B and C → B modifies → both A and C see update
+- [ ] Pending share update: A shares with C (pending) → B modifies → C accepts → C gets latest version
+- [ ] Unshare test: A unshares → A modifies → B still has pre-fork version
+- [ ] Deletion isolation: A deletes → B still has file → data_block persists
+- [ ] Deletion with pending share: A deletes → pending incoming_share cleaned up
+- [ ] Zero divergence across all sharing operations
+
+### Phase 2c: Frontend — Sharing UI
+**Status:** [ ] Not Started
+
+- [ ] Share button in file browser (context menu or selection toolbar), visible when file selected
+- [ ] Recipient picker dialog (user list from `GET /users`)
+- [ ] Incoming shares notification (bell icon with badge from `GET /shares/incoming/count`)
+- [ ] Incoming shares panel with accept dialog (choose placement path)
+- [ ] Share indicators on files in listing (`shared_with_count > 0` → icon overlay or badge)
+- [ ] "Who has access" detail view with accepted/pending status (from `GET /shares/file/{inode_id}`)
+- [ ] Unshare action (self-removal from share)
+- [ ] Decline action for incoming shares
 
 ---
 
-## Phase 3: Device-Forwarded Crypto
+## Phase 3: Shared Folders
+**Status:** [ ] Not Started
+
+Shared folders require solving the SIV path encryption context problem — paths within a folder are encrypted with the owner's SIV key, making cross-user traversal impossible without key sharing or re-encryption.
+
+### Problem
+
+Inode paths are encrypted with per-user SIV keys derived from the user's Ed25519 private key. A shared folder's contents are encrypted with the owner's SIV key. The recipient can't enumerate, navigate, or resolve paths within the shared folder because they don't have the owner's SIV context.
+
+### Possible Approaches (Needs Design)
+
+- **Per-share SIV key**: Generate a new SIV key pair per shared folder. Re-encrypt all paths within under the share key. Both users get the share SIV key (wrapped for each). Requires a `shared_inodes` table or namespace separation. File adds/removes/renames require dual updates.
+- **Mount-point model**: Shared folders live exclusively in a "Shared" UI section with their own SIV context. Clean separation but shared folders can't be placed into a user's own tree.
+- **Inode-id redirection**: Map share boundaries in path traversal so `/my-stuff/shared-folder/nested/file` switches SIV context at the share boundary. Recursive nesting complicates resolution.
+
+Each approach has significant implications for path resolution, query patterns, and the modification log. This needs its own design phase before implementation.
+
+---
+
+## Phase 4: Device-Forwarded Crypto
 **Status:** [ ] Not Started
 
 Eliminate key residency on untrusted nodes by forwarding crypto operations to the user's own device over iroh.
