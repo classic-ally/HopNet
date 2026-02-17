@@ -422,8 +422,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
             // Protected routes that require authentication
             let protected_routes = Router::new()
-                .route("/users", get(users::routes::get_users))
-                .route("/users", post(users::routes::post_users))
+                .nest("/users", users::routes::router())
                 .route("/nodes", get(nodes::routes::get_nodes))
                 .route("/nodes", post(nodes::routes::post_nodes))
                 .route("/files", get(files::routes::get_files).patch(files::routes::patch_files))
@@ -512,7 +511,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             let app = if cfg!(debug_assertions) {
                 let cors = CorsLayer::new()
                     .allow_origin("http://localhost:5173".parse::<HeaderValue>().unwrap()) // allow vite dev
-                    .allow_methods([Method::GET, Method::POST, Method::DELETE])
+                    .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
                     .allow_headers([axum::http::header::CONTENT_TYPE, axum::http::header::AUTHORIZATION])
                     .max_age(std::time::Duration::from_secs(3600))
                     .allow_credentials(false);

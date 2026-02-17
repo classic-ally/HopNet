@@ -393,6 +393,9 @@ pub struct User {
     pub x25519_pubkey: crate::db::types::XPubKey,
     pub encrypted_privkey: Vec<u8>,  // nonce || ChaCha20-Poly1305 ciphertext
     pub key_salt: Vec<u8>,           // Argon2 salt
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
+    pub avatar: Option<Vec<u8>>,
 }
 
 impl User {
@@ -404,7 +407,7 @@ impl User {
         encrypted_privkey: Vec<u8>,
         key_salt: Vec<u8>,
     ) -> User {
-        User { user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt }
+        User { user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt, first_name: None, last_name: None, avatar: None }
     }
 }
 

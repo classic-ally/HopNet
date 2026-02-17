@@ -1,32 +1,182 @@
 use axum::{
-    extract::State,
+    extract::{State, Multipart},
     http::StatusCode,
     response::IntoResponse,
+    routing::{get, post, put},
     Extension,
     Json,
+    Router,
 };
-use bincode::config;
-use serde::{Serialize,Deserialize};
+use serde::{Serialize, Deserialize};
+use base64::Engine;
 
 use crate::{
-    consensus::{
-        functions::consensus_middleware, types::Transaction
-    }, db::{users, PubKey, PrivKey}, types::User, AppState};
+    consensus::functions::consensus_middleware,
+    db::{users, PubKey, PrivKey},
+    types::User,
+    AppState,
+};
+use super::types::UpdateUserProfilePayload;
+use hopnet_common::PublicUserInfo;
+
+pub fn router() -> Router<AppState> {
+    Router::new()
+        .route("/", get(get_users).post(post_users))
+        .route("/me", get(get_me))
+        .route("/me/profile", put(put_profile))
+        .route("/me/avatar", put(put_avatar))
+}
+
+fn user_to_public(u: &User) -> PublicUserInfo {
+    PublicUserInfo {
+        user_id: u.user_id,
+        username: u.username.clone(),
+        first_name: u.first_name.clone(),
+        last_name: u.last_name.clone(),
+        avatar: u.avatar.as_ref().map(|bytes| {
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        }),
+    }
+}
 
 pub async fn get_users(
     State(app_state): State<AppState>,
 ) -> impl IntoResponse {
     match users::get_users(app_state.db_pool.get()) {
         Ok(users) => {
-            (StatusCode::OK, Json(users))
+            let public: Vec<PublicUserInfo> = users.iter().map(user_to_public).collect();
+            (StatusCode::OK, Json(public)).into_response()
         }
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(Vec::<User>::new())
-        ),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
+/// GET /users/me — current user's public profile
+pub async fn get_me(
+    State(app_state): State<AppState>,
+    Extension(user_id): Extension<i32>,
+) -> impl IntoResponse {
+    match users::get_user_by_userid(app_state.db_pool.get(), user_id) {
+        Ok(Some(user)) => (StatusCode::OK, Json(user_to_public(&user))).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ProfileUpdateRequest {
+    pub first_name: Option<Option<String>>,
+    pub last_name: Option<Option<String>>,
+}
+
+/// PUT /users/me/profile — update display name fields
+pub async fn put_profile(
+    State(app_state): State<AppState>,
+    Extension(user_id): Extension<i32>,
+    Json(payload): Json<ProfileUpdateRequest>,
+) -> impl IntoResponse {
+    let update = UpdateUserProfilePayload {
+        user_id,
+        first_name: payload.first_name,
+        last_name: payload.last_name,
+        avatar: None,
+    };
+
+    let encoded = match bincode::serde::encode_to_vec(&update, bincode::config::standard()) {
+        Ok(e) => e,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    let transaction = match crate::consensus::functions::create_signed_user_transaction(
+        &app_state, "update_user_profile".to_string(), encoded, user_id,
+    ).await {
+        Ok(tx) => tx,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    match consensus_middleware(&app_state, vec![transaction]).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// PUT /users/me/avatar — upload and resize avatar image
+pub async fn put_avatar(
+    State(app_state): State<AppState>,
+    Extension(user_id): Extension<i32>,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    // Read image bytes from multipart field
+    let image_bytes = match multipart.next_field().await {
+        Ok(Some(field)) => {
+            match field.bytes().await {
+                Ok(bytes) => bytes,
+                Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+            }
+        }
+        _ => return StatusCode::BAD_REQUEST.into_response(),
+    };
+
+    // Reject if > 15MB input
+    if image_bytes.len() > 15_000_000 {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+
+    tracing::debug!("Avatar upload: input size {} bytes", image_bytes.len());
+
+    // Decode, resize to 256x256, encode to JPEG — blocking work
+    // (image crate only supports lossless WebP which is too large for avatars)
+    let avatar_bytes = match tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+        let img = image::load_from_memory(&image_bytes)
+            .map_err(|e| format!("Invalid image: {}", e))?;
+
+        tracing::debug!("Avatar decoded: {}x{}", img.width(), img.height());
+
+        let resized = img.resize_to_fill(256, 256, image::imageops::FilterType::Lanczos3);
+        // JPEG doesn't support alpha — convert RGBA→RGB
+        let rgb = resized.to_rgb8();
+
+        let mut buf = std::io::Cursor::new(Vec::new());
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 85);
+        encoder.encode(&rgb, rgb.width(), rgb.height(), image::ExtendedColorType::Rgb8)
+            .map_err(|e| format!("JPEG encoding failed: {}", e))?;
+
+        let result = buf.into_inner();
+        tracing::debug!("Avatar JPEG output: {} bytes", result.len());
+        Ok(result)
+    }).await {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(e)) => {
+            tracing::warn!("Avatar processing failed: {}", e);
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    let update = UpdateUserProfilePayload {
+        user_id,
+        first_name: None,
+        last_name: None,
+        avatar: Some(Some(avatar_bytes)),
+    };
+
+    let encoded = match bincode::serde::encode_to_vec(&update, bincode::config::standard()) {
+        Ok(e) => e,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    let transaction = match crate::consensus::functions::create_signed_user_transaction(
+        &app_state, "update_user_profile".to_string(), encoded, user_id,
+    ).await {
+        Ok(tx) => tx,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    match consensus_middleware(&app_state, vec![transaction]).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct UserRequest {
@@ -35,7 +185,7 @@ pub struct UserRequest {
 
 pub async fn post_users (
     State(app_state): State<AppState>,
-    Extension(user_id): Extension<i32>,  // Extract user_id from JWT via auth middleware
+    Extension(user_id): Extension<i32>,
     Json(payload): Json<UserRequest>
 ) -> impl IntoResponse {
     // Server generates all key material

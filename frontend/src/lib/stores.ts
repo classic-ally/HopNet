@@ -113,6 +113,19 @@ export async function authenticatedFetch(url: string, options: RequestInit = {})
   return response;
 }
 
+// Current user profile store — fetched on login, cleared on logout
+import type { UserInfo } from './api/shares';
+export const currentUserStore = writable<UserInfo | null>(null);
+
+export async function refreshCurrentUser() {
+  try {
+    const response = await authenticatedFetch(`${API_BASE_URL}/users/me`);
+    if (response.ok) {
+      currentUserStore.set(await response.json());
+    }
+  } catch (_) { /* ignore */ }
+}
+
 // Incoming share count store — polled every 30s when authenticated
 export const incomingShareCountStore = writable(0);
 
@@ -134,9 +147,11 @@ tokenStore.subscribe((token) => {
     shareCountInterval = null;
   }
   if (token) {
+    refreshCurrentUser();
     pollShareCount();
     shareCountInterval = setInterval(pollShareCount, 30_000);
   } else {
+    currentUserStore.set(null);
     incomingShareCountStore.set(0);
   }
 });

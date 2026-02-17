@@ -1,11 +1,11 @@
 <script lang="ts">
-    import { tokenStore } from '../stores';
+    import { tokenStore, currentUserStore } from '../stores';
     import Button from '../Button.svelte';
-    
+
     export let selected: Boolean;
     export let onClick: () => void;
     export let onBack: () => void;
-    
+
     function handleLogout() {
         tokenStore.set(null);
     }
@@ -30,6 +30,9 @@
             onBack();
         }
     }
+
+    $: displayName = $currentUserStore?.first_name || $currentUserStore?.username || '';
+    $: avatarSrc = $currentUserStore?.avatar ? `data:image/jpeg;base64,${$currentUserStore.avatar}` : null;
 </script>
 
 <div
@@ -40,8 +43,12 @@
     tabindex="0"
 >
     <div class="flex gap-2 items-center">
-        <div class="i-carbon-user w-6 h-6" alt="User profile"></div>
-        <h3>allison</h3>
+        {#if avatarSrc}
+            <img src={avatarSrc} alt="Avatar" class="w-6 h-6 rounded-full object-cover" />
+        {:else}
+            <div class="i-carbon-user w-6 h-6"></div>
+        {/if}
+        <h3>{displayName}</h3>
     </div>
     {#if selected}
         <div class="flex justify-between gap-1">

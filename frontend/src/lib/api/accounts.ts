@@ -6,8 +6,30 @@ export type { UserInfo };
 export async function fetchAccounts(): Promise<UserInfo[]> {
     const response = await authenticatedFetch(`${API_BASE_URL}/users`);
     if (!response.ok) throw new Error(`Failed to fetch users: ${response.status}`);
-    const users = await response.json();
-    return users.map((u: any) => ({ user_id: u.user_id, username: u.username }));
+    return response.json();
+}
+
+export async function fetchCurrentUser(): Promise<UserInfo> {
+    const response = await authenticatedFetch(`${API_BASE_URL}/users/me`);
+    if (!response.ok) throw new Error(`Failed to fetch current user: ${response.status}`);
+    return response.json();
+}
+
+export async function updateProfile(fields: { first_name?: string | null; last_name?: string | null }): Promise<Response> {
+    return authenticatedFetch(`${API_BASE_URL}/users/me/profile`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(fields),
+    });
+}
+
+export async function uploadAvatar(blob: Blob): Promise<Response> {
+    const formData = new FormData();
+    formData.append('avatar', blob);
+    return authenticatedFetch(`${API_BASE_URL}/users/me/avatar`, {
+        method: 'PUT',
+        body: formData,
+    });
 }
 
 export async function createAccount(username: string): Promise<{ passphrase: string }> {

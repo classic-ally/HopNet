@@ -56,6 +56,9 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
                 x25519_pubkey   BLOB NOT NULL,  -- 32 bytes X25519 public key for file access
                 encrypted_privkey BLOB NOT NULL, -- nonce || ChaCha20-Poly1305 ciphertext
                 key_salt        BLOB NOT NULL,   -- Argon2 salt
+                first_name      VARCHAR,         -- optional first name (max 32 chars)
+                last_name       VARCHAR,         -- optional last name (max 32 chars)
+                avatar          BLOB,            -- optional avatar (JPEG, max 128KB)
 
                 CONSTRAINT unique_username UNIQUE (username)
             );

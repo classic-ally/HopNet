@@ -15,6 +15,9 @@ pub fn get_users(
                     x25519_pubkey: row.get(3)?,
                     encrypted_privkey: row.get(4)?,
                     key_salt: row.get(5)?,
+                    first_name: row.get(6)?,
+                    last_name: row.get(7)?,
+                    avatar: row.get(8)?,
                 })
             });
 
@@ -53,6 +56,9 @@ pub fn get_user_by_username(
                     x25519_pubkey: row.get(3).map_err(|_| DatabaseError::RecallError)?,
                     encrypted_privkey: row.get(4).map_err(|_| DatabaseError::RecallError)?,
                     key_salt: row.get(5).map_err(|_| DatabaseError::RecallError)?,
+                    first_name: row.get(6).map_err(|_| DatabaseError::RecallError)?,
+                    last_name: row.get(7).map_err(|_| DatabaseError::RecallError)?,
+                    avatar: row.get(8).map_err(|_| DatabaseError::RecallError)?,
                 };
                 return Ok(Some(user))
             } else {
@@ -81,6 +87,9 @@ pub fn get_user_by_userid_conn(
             x25519_pubkey: row.get(3).map_err(|_| DatabaseError::RecallError)?,
             encrypted_privkey: row.get(4).map_err(|_| DatabaseError::RecallError)?,
             key_salt: row.get(5).map_err(|_| DatabaseError::RecallError)?,
+            first_name: row.get(6).map_err(|_| DatabaseError::RecallError)?,
+            last_name: row.get(7).map_err(|_| DatabaseError::RecallError)?,
+            avatar: row.get(8).map_err(|_| DatabaseError::RecallError)?,
         };
         Ok(Some(user))
     } else {
@@ -122,6 +131,37 @@ pub fn insert_user_tx(
     ).map_err(|_| DatabaseError::InsertError)?;
 
     Ok(next_id)
+}
+
+/// Update user profile fields within a transaction.
+/// For each field: None = no change, Some(None) = clear, Some(Some(v)) = set.
+/// Uses CASE WHEN to distinguish "no change" from "set to NULL".
+pub fn update_user_profile_tx(
+    tx: &duckdb::Transaction,
+    user_id: i32,
+    first_name: Option<Option<&str>>,
+    last_name: Option<Option<&str>>,
+    avatar: Option<Option<&[u8]>>,
+) -> Result<(), DatabaseError> {
+    let fn_changing = first_name.is_some();
+    let fn_val: Option<&str> = first_name.flatten();
+
+    let ln_changing = last_name.is_some();
+    let ln_val: Option<&str> = last_name.flatten();
+
+    let av_changing = avatar.is_some();
+    let av_val: Option<&[u8]> = avatar.flatten();
+
+    tx.execute(
+        "UPDATE users SET \
+            first_name = CASE WHEN ? THEN ? ELSE first_name END, \
+            last_name  = CASE WHEN ? THEN ? ELSE last_name END, \
+            avatar     = CASE WHEN ? THEN ? ELSE avatar END \
+         WHERE user_id = ?",
+        params![fn_changing, fn_val, ln_changing, ln_val, av_changing, av_val, user_id]
+    ).map_err(|_| DatabaseError::InsertError)?;
+
+    Ok(())
 }
 
 /// Wrapper that manages connection and transaction - for backward compatibility

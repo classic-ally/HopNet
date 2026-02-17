@@ -4,13 +4,16 @@ import type { IncomingShareResponse, ShareParticipant, ShareDetailResponse } fro
 export interface UserInfo {
     user_id: number;
     username: string;
+    first_name?: string;
+    last_name?: string;
+    avatar?: string; // base64-encoded WebP
 }
 
 export async function fetchUsers(): Promise<UserInfo[]> {
     const response = await authenticatedFetch(`${API_BASE_URL}/users`);
     if (!response.ok) throw new Error(`Failed to fetch users: ${response.status}`);
     const users = await response.json();
-    return users.map((u: any) => ({ user_id: u.user_id, username: u.username }));
+    return users;
 }
 
 export async function shareFile(inodeId: string, recipientUsername: string): Promise<Response> {
