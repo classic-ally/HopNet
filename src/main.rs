@@ -75,6 +75,8 @@ pub struct AppState {
     dedup_cache: Arc<net::DedupCache>,
     lock_vote_evidence: Arc<std::sync::Mutex<Option<consensus::types::LockVoteEvidence>>>,
     session_store: Arc<auth::SessionStore>,
+    pub consensus_queue: consensus::queue::ConsensusQueue,
+    pub view_changed: Arc<tokio::sync::Notify>,
 }
 
 impl AppState {
@@ -242,6 +244,9 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .expect("Failed to create iroh transport");
             tracing::info!("iroh endpoint ready, node_id: {}", iroh_transport.node_id());
 
+            // Create consensus queue (channel + submit handle)
+            let (consensus_queue, consensus_queue_rx) = consensus::queue::ConsensusQueue::new(pool.clone(), 256);
+
             let app_state = AppState {
                 db_pool: pool,
                 encoding_key: encodingkey,
@@ -263,6 +268,8 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 dedup_cache: Arc::new(net::DedupCache::default()),
                 lock_vote_evidence: Arc::new(std::sync::Mutex::new(None)),
                 session_store: Arc::new(auth::SessionStore::default()),
+                consensus_queue,
+                view_changed: Arc::new(tokio::sync::Notify::new()),
             };
 
             // If we loaded state from database, populate the OnceCell fields
@@ -410,6 +417,14 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             tokio::spawn(async move {
                 self_check_worker.run().await;
             });
+
+            // Spawn consensus queue batch processor
+            {
+                let app_state_clone = app_state.clone();
+                tokio::spawn(async move {
+                    consensus::queue::batch_processor(consensus_queue_rx, app_state_clone).await;
+                });
+            }
 
             // Start iroh accept loop for incoming connections
             {

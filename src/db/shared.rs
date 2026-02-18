@@ -387,6 +387,11 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
             CREATE INDEX idx_incoming_shares_recipient ON incoming_shares(recipient_id);
             CREATE INDEX idx_incoming_shares_data_block ON incoming_shares(data_block_id);
 
+            -- Transaction nonce dedup (prevents stale resubmission after forward timeout)
+            CREATE TABLE committed_tx_nonces (
+                nonce UUID PRIMARY KEY
+            );
+
             -- Sharing: live-link membership
             CREATE TABLE shares (
                 data_block_id   UUID NOT NULL,

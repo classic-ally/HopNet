@@ -356,6 +356,11 @@ pub async fn process_incoming_qc_with_guard(
         if qc.phase == ConsensusPhase::Lock { " with transaction processing" } else { "" }
     );
 
+    // Signal view advancement to the batch processor (Lock QC advances view)
+    if qc.phase == ConsensusPhase::Lock {
+        app_state.view_changed.notify_waiters();
+    }
+
     Ok(())
 }
 
@@ -1149,7 +1154,7 @@ async fn request_activation(
     current_height: i32,
 ) -> Result<(), functions::CatchUpError> {
     use crate::consensus::handlers::ActivationRequest;
-    use crate::consensus::functions::{create_signed_transaction, consensus_middleware, CatchUpError};
+    use crate::consensus::functions::{create_signed_transaction, CatchUpError};
 
     // Create activation request (effective height computed deterministically during execution)
     let activation_req = ActivationRequest {
@@ -1168,8 +1173,8 @@ async fn request_activation(
         payload,
     ).map_err(|_| CatchUpError::NetworkUnavailable)?;
 
-    // Submit activation transaction via consensus
-    consensus_middleware(app_state, vec![transaction])
+    // Submit activation transaction via consensus queue
+    app_state.consensus_queue.submit(transaction)
         .await
         .map_err(|_| CatchUpError::NetworkUnavailable)?;
 
@@ -1600,6 +1605,8 @@ pub async fn apply_timeout_certificate(
     match db::insert_tc_safe(app_state, tc.clone()) {
         Ok(_) => {
             tracing::info!("Applied timeout certificate for view {}", tc.view_number);
+            // Signal view advancement to the batch processor
+            app_state.view_changed.notify_waiters();
             Ok(())
         }
         Err(_) => Err(CertificateError::DatabaseError),

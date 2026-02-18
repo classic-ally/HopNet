@@ -43,6 +43,7 @@ pub enum ConsensusError {
     ForwardingError,
     NetworkError,
     NetworkTimeout,  // Network is timing out, leader should abandon
+    TransactionRejected(String),  // Business logic rejection (permanent)
 }
 
 #[derive(Debug)]
@@ -285,34 +286,27 @@ pub async fn create_signed_user_transaction(
     ).map_err(|_| ConsensusError::SigningError)
 }
 
-pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transaction>) -> Result<(), ConsensusError> {
-    tracing::debug!("Starting consensus middleware for {} transactions", transactions.len());
+/// Run consensus on a pre-validated batch. Called only on the leader, by the batch processor.
+/// This is the leader-only consensus pipeline: acquire lock, create block, run 2-phase ballot,
+/// broadcast QCs, execute transactions.
+pub async fn run_consensus(app_state: &AppState, transactions: Vec<Transaction>) -> Result<(), ConsensusError> {
+    tracing::debug!("Starting run_consensus for {} transactions", transactions.len());
 
     let my_node_id = app_state.get_node_id().map_err(|_| ConsensusError::DatabaseError)?;
 
     tracing::debug!("Waiting for consensus_lock...");
-    // Acquire consensus lock to prevent concurrent block creation race conditions
-    // Only one consensus operation can proceed at a time
     let guard = app_state.consensus_lock.lock().await;
     tracing::debug!("Acquired consensus_lock");
 
-    // Check if we are the current leader
     let consensus_state = db::get_consensus(app_state.db_pool.get()).map_err(|_| ConsensusError::DatabaseError)?;
 
+    // Double-check we're still the leader (may have changed since batch processor checked)
     if consensus_state.leader.node_id != my_node_id {
-        // Release lock before forwarding (prevents deadlock when waiting for leader's response)
-        drop(guard);
-
-        // Forward to leader instead of initiating consensus
-        tracing::info!(
-            "Not the leader (node {}), forwarding transactions to leader (node {})",
-            my_node_id, consensus_state.leader.node_id
-        );
-        return forward_to_leader(consensus_state.leader, transactions, consensus_state.view, app_state).await;
+        tracing::warn!("No longer the leader (node {}), leader is now node {}", my_node_id, consensus_state.leader.node_id);
+        return Err(ConsensusError::ForwardingError);
     }
 
     // Check if we've already proposed in this view (double-proposal protection)
-    // last_propose_vote_block_hash is cleared on view transitions (Lock QC or TC)
     if consensus_state.last_propose_vote_block_hash.is_some() {
         tracing::warn!(
             "Already proposed in view {}, rejecting duplicate proposal attempt",
@@ -321,7 +315,6 @@ pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transa
         return Err(ConsensusError::SigningError);
     }
 
-    // Safe to proceed - we're the leader and haven't proposed yet
     tracing::info!(
         "Acting as leader (node {}) for view {}, initiating consensus",
         my_node_id, consensus_state.view
@@ -341,7 +334,6 @@ pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transa
 
     let block = Block::new_tip(&app_state, transactions).map_err(|_| ConsensusError::BlockError)?;
 
-    // Construct MyNode from AppState
     let me = MyNode {
         node_id: my_node_id,
         privkey: app_state.private_key.clone(),
@@ -359,8 +351,6 @@ pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transa
         .cloned()
         .collect();
 
-
-    // Shared connection to ensure no lock contention with users reading on this node
     let mut conn = app_state.db_pool.get().map_err(|_| ConsensusError::DatabaseError)?;
 
     // Transaction 1: Record Propose vote and commit immediately (double-vote protection)
@@ -487,7 +477,10 @@ pub async fn consensus_middleware(app_state: &AppState, transactions: Vec<Transa
         checkpoint_connection(&conn)?;
     } // db_tx and conn are dropped here
 
-    tracing::debug!("Consensus middleware complete, releasing consensus_lock");
+    // Signal view advancement to the batch processor
+    app_state.view_changed.notify_waiters();
+
+    tracing::debug!("Consensus complete, releasing consensus_lock");
     Ok(())
 }
 
@@ -731,12 +724,59 @@ pub(crate) async fn broadcast_qc(
     }
 }
 
+/// Maximum age for transaction nonces (50 minutes).
+/// Must be strictly less than the nonce cleanup cutoff (1 hour) to ensure that
+/// any transaction whose nonce was cleaned up is also caught by the staleness check.
+/// The 10-minute gap provides clock skew tolerance across nodes.
+const MAX_TRANSACTION_AGE: chrono::TimeDelta = chrono::TimeDelta::minutes(50);
+
 pub fn process_transactions(transactions: &Option<Transactions>, app_state: &AppState, execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
     if let Some(transactions) = transactions {
+        // Validation path (ballot verification): check for replayed or stale transactions.
+        // This runs on every follower before voting, preventing Byzantine leaders from
+        // replaying already-committed transactions or transactions older than the cleanup window.
+        // Skipped during execution (execute=true) because catch-up replays old blocks.
+        if !execute {
+            let now = chrono::Utc::now();
+
+            // Staleness check: reject transactions with nonces older than MAX_TRANSACTION_AGE.
+            // Catches replays of transactions whose nonces were already cleaned up.
+            for tx in transactions.iter() {
+                if let Some(created_at) = tx.nonce.extract_timestamp() {
+                    if now - created_at > MAX_TRANSACTION_AGE {
+                        tracing::warn!(
+                            "Rejecting stale transaction {} (nonce age: {:?}, max: {:?})",
+                            tx.rpc.function, now - created_at, MAX_TRANSACTION_AGE
+                        );
+                        return Err(crate::db::DatabaseError::ProcessingError);
+                    }
+                }
+            }
+
+            // Nonce dedup check: reject blocks containing already-committed nonces.
+            // Prevents Byzantine leader from including the same signed transaction twice.
+            let nonces: Vec<_> = transactions.iter().map(|tx| tx.nonce.clone()).collect();
+            if let Ok(conn) = app_state.db_pool.get() {
+                if let Ok(committed) = crate::db::consensus::check_committed_nonces(&conn, &nonces) {
+                    if !committed.is_empty() {
+                        tracing::warn!(
+                            "Rejecting block with {} already-committed nonce(s) — possible leader replay attack",
+                            committed.len()
+                        );
+                        return Err(crate::db::DatabaseError::ProcessingError);
+                    }
+                }
+            }
+        }
+
+        let mut nonces = Vec::new();
         for tx in transactions.iter() {
             match process_transaction(tx, app_state, execute, db_tx) {
                 Ok(_) => {
                     tracing::debug!("Transaction {} successfully: {}", if execute { "processed" } else { "validated" }, &tx.rpc.function);
+                    if execute {
+                        nonces.push(tx.nonce.clone());
+                    }
                 }
                 Err(e) => {
                     // Both validation and execution phases return error immediately
@@ -747,6 +787,14 @@ pub fn process_transactions(transactions: &Option<Transactions>, app_state: &App
                     return Err(e);
                 }
             }
+        }
+        // Insert nonces atomically with block commit (all nodes do this)
+        if execute && !nonces.is_empty() {
+            crate::db::consensus::insert_tx_nonces_tx(db_tx, &nonces)
+                .map_err(|e| {
+                    tracing::error!("Failed to insert transaction nonces: {:?}", e);
+                    crate::db::DatabaseError::InsertError
+                })?;
         }
     }
     Ok(())
@@ -943,35 +991,6 @@ impl TimeoutVoteCollector {
             .map(|view_votes| view_votes.values().map(|votes| votes.len()).sum())
             .unwrap_or(0)
     }
-}
-
-// Leader forwarding function for non-leader nodes
-async fn forward_to_leader(
-    leader: crate::types::Node,
-    transactions: Vec<Transaction>,
-    view: i32,
-    app_state: &AppState
-) -> Result<(), ConsensusError> {
-    let leader_iroh_id = leader.pubkey.to_iroh_node_id();
-
-    tracing::info!(
-        "Forwarding {} transactions to leader node {} over iroh (our view: {})",
-        transactions.len(), leader.node_id, view
-    );
-
-    super::rpc::forward_transactions_to_leader(
-        &app_state.iroh_transport,
-        leader.node_id,
-        leader_iroh_id,
-        transactions,
-        view,
-    ).await.map_err(|e| {
-        tracing::warn!("Failed to forward transactions to leader: {:?}", e);
-        match e {
-            crate::net::IrohError::Protocol(_) => ConsensusError::ForwardingError,
-            _ => ConsensusError::NetworkError,
-        }
-    })
 }
 
 /// Poll a random subset of validators to get the maximum view in the network

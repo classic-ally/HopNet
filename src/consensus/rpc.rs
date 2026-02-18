@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use crate::net::{IrohError, IrohTransport};
 use crate::net::protocol::{IrohRequest, IrohResponse};
-use crate::net::transport::ProtocolError;
+use crate::net::transport::{ProtocolError, TransportError};
 use crate::AppState;
 use crate::db::consensus as db;
 use super::types::{Ballot, VoteSignMessage, TimeoutVote, TimeoutCertificate, QuorumCertificate};
@@ -341,43 +341,153 @@ pub struct TransactionForwardRequest {
     pub view: i32,  // Forwarder's current view — catch-up hint, not a gate
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-pub struct TransactionForwardResponse {}
+/// Per-transaction result returned by the leader after forwarding.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum TransactionForwardResult {
+    Committed,
+    Rejected { reason: String },
+    /// Transient failure — caller should re-queue for retry after view change
+    Retry { reason: String },
+}
 
-/// Server: process forwarded transactions through consensus.
-/// The handler's message-driven catch-up already ran before dispatch,
-/// so we just call consensus_middleware directly (same as the old post_propose).
+#[derive(Serialize, Deserialize, Debug)]
+pub struct TransactionForwardResponse {
+    pub results: Vec<TransactionForwardResult>,
+}
+
+/// Server: process forwarded transactions by pushing them into the local consensus queue.
+/// The handler's message-driven catch-up already ran before dispatch.
+/// Performs nonce dedup before enqueueing — already-committed transactions get immediate Committed.
 pub async fn handle_transaction_forward(
     req: TransactionForwardRequest,
     app_state: &AppState,
 ) -> IrohResponse {
-    match super::functions::consensus_middleware(app_state, req.transactions).await {
-        Ok(()) => IrohResponse::TransactionForwardResponse(TransactionForwardResponse {}),
-        Err(e) => IrohResponse::Error {
-            message: format!("transaction forward failed: {:?}", e),
-        },
+    // Early nonce dedup: check which transactions were already committed
+    let nonces: Vec<_> = req.transactions.iter().map(|tx| tx.nonce.clone()).collect();
+    let committed_nonces = match app_state.db_pool.get() {
+        Ok(conn) => crate::db::consensus::check_committed_nonces(&conn, &nonces).unwrap_or_default(),
+        Err(_) => std::collections::HashSet::new(),
+    };
+
+    // Separate already-committed from pending transactions
+    let mut results_map: Vec<Option<TransactionForwardResult>> = vec![None; req.transactions.len()];
+    let mut pending_txs = Vec::new();
+    let mut pending_indices = Vec::new();
+
+    for (i, tx) in req.transactions.into_iter().enumerate() {
+        if committed_nonces.contains(&tx.nonce.to_string()) {
+            results_map[i] = Some(TransactionForwardResult::Committed);
+        } else {
+            pending_indices.push(i);
+            pending_txs.push(tx);
+        }
     }
+
+    // Enqueue remaining pending transactions
+    if !pending_txs.is_empty() {
+        let submit_results = app_state.consensus_queue.enqueue_forwarded(pending_txs).await;
+        for (idx, result) in pending_indices.into_iter().zip(submit_results.into_iter()) {
+            results_map[idx] = Some(match result {
+                Ok(()) => TransactionForwardResult::Committed,
+                Err(super::queue::ConsensusSubmitError::Rejected(reason)) => {
+                    TransactionForwardResult::Rejected { reason }
+                }
+                Err(e) => TransactionForwardResult::Retry {
+                    reason: format!("{}", e),
+                },
+            });
+        }
+    }
+
+    let results = results_map.into_iter().map(|r| r.unwrap()).collect();
+    IrohResponse::TransactionForwardResponse(TransactionForwardResponse { results })
 }
 
-/// Leader runs full consensus round (2 ballot rounds × 30s max each) before responding.
-const TRANSACTION_FORWARD_TIMEOUT: Duration = Duration::from_secs(60);
+/// Result from the two-phase forward protocol.
+#[derive(Debug)]
+pub enum ForwardAckResult {
+    /// Leader never received the request (no ACK within timeout)
+    NoAck,
+    /// Leader ACKed and returned final results
+    AckedWithResult(Vec<TransactionForwardResult>),
+    /// Leader ACKed but no final result arrived (connection dropped or secondary timeout)
+    AckedNoResult,
+}
 
-/// Client: forward transactions to the leader node.
-pub async fn forward_transactions_to_leader(
+/// ACK timeout: how long to wait for the immediate ACK from the leader.
+const FORWARD_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+/// Result timeout: how long to wait for the final result after ACK.
+const FORWARD_RESULT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Client: forward transactions to the leader with two-phase ACK protocol.
+///
+/// Phase 1: Send request, wait for immediate ACK (leader received it).
+/// Phase 2: Wait for final result (leader processed it through consensus).
+///
+/// The two-phase protocol lets the forwarder distinguish "leader never got it" (safe to retry)
+/// from "leader has it but hasn't finished" (check nonce table instead of retrying).
+pub async fn forward_transactions_with_ack(
     transport: &IrohTransport,
     node_id: i32,
     peer_node_id: iroh::PublicKey,
     transactions: Vec<super::types::Transaction>,
     view: i32,
-) -> Result<(), IrohError> {
+) -> Result<ForwardAckResult, IrohError> {
     let req = IrohRequest::TransactionForward(TransactionForwardRequest {
         transactions,
         view,
     });
-    let response = transport.request(node_id, peer_node_id, &req, TRANSACTION_FORWARD_TIMEOUT).await?;
 
-    match response {
-        IrohResponse::TransactionForwardResponse(_) => Ok(()),
+    let request_id: u64 = rand::random();
+    let conn = transport.get_connection(node_id, peer_node_id).await?;
+
+    let (mut send, mut recv) = conn.open_bi().await
+        .map_err(|e| IrohError::Transport(TransportError::StreamFailed(e.to_string())))?;
+
+    // Send request with request_id prefix
+    use tokio::io::AsyncWriteExt;
+    send.write_all(&request_id.to_le_bytes()).await
+        .map_err(|e| IrohError::Transport(TransportError::StreamFailed(e.to_string())))?;
+    crate::net::transport::send_message(&mut send, &req).await?;
+    send.finish()
+        .map_err(|e| IrohError::Transport(TransportError::StreamFailed(e.to_string())))?;
+
+    // Phase 1: Wait for ACK or direct response
+    let first_msg: Result<IrohResponse, IrohError> = tokio::time::timeout(
+        FORWARD_ACK_TIMEOUT,
+        crate::net::transport::recv_message(&mut recv),
+    ).await.map_err(|_| IrohError::Transport(TransportError::Timeout))?;
+
+    let first_msg = match first_msg {
+        Ok(msg) => msg,
+        Err(_) => return Ok(ForwardAckResult::NoAck),
+    };
+
+    // Check if first message is ACK or direct result (backward compat)
+    match first_msg {
+        IrohResponse::TransactionForwardAck => {
+            // Got ACK — leader has received and is processing
+            // Phase 2: Wait for final result
+            let result: Result<IrohResponse, IrohError> = tokio::time::timeout(
+                FORWARD_RESULT_TIMEOUT,
+                crate::net::transport::recv_message(&mut recv),
+            ).await.map_err(|_| IrohError::Transport(TransportError::Timeout))?;
+
+            match result {
+                Ok(IrohResponse::TransactionForwardResponse(resp)) => {
+                    Ok(ForwardAckResult::AckedWithResult(resp.results))
+                }
+                Ok(IrohResponse::Error { message }) => {
+                    Err(IrohError::Protocol(ProtocolError::PeerError(message)))
+                }
+                Ok(_) => Ok(ForwardAckResult::AckedNoResult),
+                Err(_) => Ok(ForwardAckResult::AckedNoResult),
+            }
+        }
+        IrohResponse::TransactionForwardResponse(resp) => {
+            // Backward compat: old leader sent direct result without ACK
+            Ok(ForwardAckResult::AckedWithResult(resp.results))
+        }
         IrohResponse::Error { message } => {
             Err(IrohError::Protocol(ProtocolError::PeerError(message)))
         }
@@ -571,9 +681,16 @@ mod tests {
         assert!(decoded.transactions.is_empty());
 
         // Also test response roundtrip
-        let resp = TransactionForwardResponse {};
+        let resp = TransactionForwardResponse {
+            results: vec![
+                TransactionForwardResult::Committed,
+                TransactionForwardResult::Rejected { reason: "test".into() },
+                TransactionForwardResult::Retry { reason: "already proposed".into() },
+            ],
+        };
         let encoded = bincode::serde::encode_to_vec(&resp, bincode::config::standard()).unwrap();
-        let (_, _): (TransactionForwardResponse, _) =
+        let (decoded_resp, _): (TransactionForwardResponse, _) =
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(decoded_resp.results.len(), 3);
     }
 }

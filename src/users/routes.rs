@@ -11,7 +11,6 @@ use serde::{Serialize, Deserialize};
 use base64::Engine;
 
 use crate::{
-    consensus::functions::consensus_middleware,
     db::{users, PubKey, PrivKey},
     types::User,
     AppState,
@@ -94,7 +93,7 @@ pub async fn put_profile(
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
-    match consensus_middleware(&app_state, vec![transaction]).await {
+    match app_state.consensus_queue.submit(transaction).await {
         Ok(()) => StatusCode::OK.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -172,7 +171,7 @@ pub async fn put_avatar(
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
-    match consensus_middleware(&app_state, vec![transaction]).await {
+    match app_state.consensus_queue.submit(transaction).await {
         Ok(()) => StatusCode::OK.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -233,9 +232,11 @@ pub async fn post_users (
             };
             let transactions = vec![transaction];
 
-            match consensus_middleware(&app_state, transactions).await {
-                Ok(()) => (StatusCode::CREATED, Json(hopnet_common::setup::PassphraseResponse { passphrase })).into_response(),
-                Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            let results = app_state.consensus_queue.submit_batch(transactions).await;
+            if results.iter().any(|r| r.is_err()) {
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            } else {
+                (StatusCode::CREATED, Json(hopnet_common::setup::PassphraseResponse { passphrase })).into_response()
             }
         }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response()

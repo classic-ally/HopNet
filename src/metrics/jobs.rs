@@ -5,7 +5,7 @@ use chrono::Utc;
 use std::sync::Arc;
 use crate::AppState;
 use crate::metrics::collector::{collect_all_node_metrics, CollectionError};
-use crate::consensus::{Transaction, functions::consensus_middleware};
+use crate::consensus::Transaction;
 use tokio::time::Duration as TokioDuration;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -50,15 +50,15 @@ pub async fn handle_metrics_collection(
                 "Failed to sign transaction"
             )))))?;
             
-            // Get node ID for consensus submission (consensus_middleware requires user_id)
+            // Get node ID for consensus submission
             let source_node_id = app_state.get_node_id()
                 .map_err(|_| Error::Failed(Arc::new(Box::new(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "Node not properly configured"
                 )))))?;
             
-            // Submit to consensus using existing middleware (requires Vec<Transaction> and user_id)
-            match consensus_middleware(app_state, vec![tx]).await {
+            // Submit to consensus queue
+            match app_state.consensus_queue.submit(tx).await {
                 Ok(_) => {
                     tracing::info!("Successfully submitted metrics to consensus");
                 }

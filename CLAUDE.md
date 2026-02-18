@@ -10,6 +10,7 @@ HopNet includes a Docker-based orchestrator for testing mesh networks. The follo
 - `orchestrator-reference` - Command syntax, available tests, and workflow documentation. Loaded automatically by both agents.
 
 **Workflow:**
+- Use the `orchestrator-reference` skill before invoking any agents and whenever working with the orchestrator to ensure you understand its syntax.
 - When invoking `orchestrator-runner`, include mesh context: which mesh to use (if any exists), whether to reuse or create fresh, and any state requirements.
 - When `orchestrator-runner` returns `NEEDS_DEBUG`, automatically invoke `orchestrator-debugger` with the failure context to investigate.
 

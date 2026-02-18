@@ -13,7 +13,6 @@ use serde::Deserialize;
 use crate::db::{PubKey, DatabaseError};
 use crate::{
     consensus::{
-        functions::consensus_middleware,
         types::Transaction
     },
     db::nodes,
@@ -123,10 +122,8 @@ pub async fn post_nodes(
                 Ok(tx) => tx,
                 Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
             };
-            let transactions = vec![transaction];
-
-            // Submit to consensus middleware
-            match consensus_middleware(&app_state, transactions).await {
+            // Submit to consensus queue
+            match app_state.consensus_queue.submit(transaction).await {
                 Ok(()) => {
                     tracing::info!("Consensus succeeded for node {}, waiting for database commit", complete_node.node_id);
 

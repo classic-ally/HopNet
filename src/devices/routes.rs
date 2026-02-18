@@ -8,7 +8,7 @@ use axum::{
 use rand::Rng;
 use crate::{auth::auth_middleware, AppState};
 use crate::db::{devices::get_devices_for_user, CustomUUID, Blake3Hash};
-use crate::consensus::functions::{create_signed_user_transaction, consensus_middleware};
+use crate::consensus::functions::create_signed_user_transaction;
 use crate::files::functions::{encrypt_part, decrypt_part};
 use super::types::{
     RegisterDeviceRequest, RegisterDeviceResponse, RegisterDevicePayload,
@@ -67,7 +67,7 @@ async fn post_register_device(
     ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Submit to consensus
-    consensus_middleware(&app_state, vec![transaction])
+    app_state.consensus_queue.submit(transaction)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -152,7 +152,7 @@ async fn delete_device(
     };
 
     // Submit to consensus (idempotent - succeeds even if device doesn't exist)
-    match consensus_middleware(&app_state, vec![transaction]).await {
+    match app_state.consensus_queue.submit(transaction).await {
         Ok(_) => StatusCode::OK,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }

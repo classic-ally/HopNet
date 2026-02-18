@@ -2,7 +2,6 @@ use axum::{extract::{Query, State}, http::StatusCode, response::IntoResponse, Js
 use crate::AppState;
 use crate::db::metrics::{get_metric, get_all_node_metrics};
 use crate::metrics::collector::{collect_all_node_metrics, CollectionError};
-use crate::consensus::functions::consensus_middleware;
 use crate::metrics::types::{
     Metric,
     StorageResponse,
@@ -163,10 +162,8 @@ pub async fn get_metrics_trigger(
                 Ok(tx) => tx,
                 Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to sign transaction"}))),
             };
-            let transactions = vec![transaction];
-
-            // Use consensus middleware to ensure distributed agreement
-            match consensus_middleware(&app_state, transactions).await {
+            // Submit to consensus queue
+            match app_state.consensus_queue.submit(transaction).await {
                 Ok(()) => {
                     let available_count = metrics.iter().filter(|m| m.available).count();
                     tracing::info!("Successfully submitted {} metrics to consensus ({} nodes available)",

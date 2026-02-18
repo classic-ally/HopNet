@@ -5,6 +5,7 @@ pub use crate::{
 };
 
 pub mod barriers;
+pub mod queue;
 pub mod routes;
 pub mod rpc;
 pub mod types;

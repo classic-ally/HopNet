@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use super::*;
 use crate::db::CustomUUID;
 use either::Either::{Left, Right};
-use crate::consensus::{functions::consensus_middleware, types::Transaction};
+use crate::consensus::types::Transaction;
 use axum::extract::multipart::Field;
 
 #[derive(Deserialize)]
@@ -743,36 +743,33 @@ pub async fn post_files(
                 }
             }
 
-            // Use consensus middleware to ensure distributed agreement
-            match consensus_middleware(&app_state, transactions).await {
-                Ok(()) => {
-                    // Trigger fragment distribution for each uploaded file
-                    for data_block_id in uploaded_data_block_ids {
-                        tracing::info!("Triggering fragment distribution for uploaded file {}", data_block_id);
-                        
-                        // Spawn distribution task to avoid blocking the upload response
-                        let app_state_clone = app_state.clone();
-                        let data_block_id_clone = data_block_id.clone();
-                        tokio::spawn(async move {
-                            match crate::files::distribution::distribute_fragments_for_upload(&app_state_clone, data_block_id_clone).await {
-                                Ok(()) => {
-                                    tracing::info!("Successfully completed fragment distribution for {}", data_block_id);
-                                }
-                                Err(e) => {
-                                    tracing::error!("Fragment distribution failed for {}: {:?}", data_block_id, e);
-                                    // TODO: Add to orphan recovery queue for retry
-                                }
-                            }
-                        });
-                    }
-                    
-                    return Ok(());
-                },
-                Err(e) => {
-                    tracing::error!("Consensus middleware error: {:?}", e);
-                    return Err(StatusCode::INTERNAL_SERVER_ERROR)
-                }
+            // Use consensus queue to ensure distributed agreement
+            let results = app_state.consensus_queue.submit_batch(transactions).await;
+            if results.iter().any(|r| r.is_err()) {
+                tracing::error!("Failed to submit file upload to consensus");
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
             }
+
+            // Trigger fragment distribution for each uploaded file
+            for data_block_id in uploaded_data_block_ids {
+                tracing::info!("Triggering fragment distribution for uploaded file {}", data_block_id);
+
+                // Spawn distribution task to avoid blocking the upload response
+                let app_state_clone = app_state.clone();
+                let data_block_id_clone = data_block_id.clone();
+                tokio::spawn(async move {
+                    match crate::files::distribution::distribute_fragments_for_upload(&app_state_clone, data_block_id_clone).await {
+                        Ok(()) => {
+                            tracing::info!("Successfully completed fragment distribution for {}", data_block_id);
+                        }
+                        Err(e) => {
+                            tracing::error!("Fragment distribution failed for {}: {:?}", data_block_id, e);
+                        }
+                    }
+                });
+            }
+
+            return Ok(());
         }
         Err(e) => {
             tracing::error!("Bincode encoding error: {:?}", e);
@@ -835,10 +832,8 @@ pub async fn delete_files(
                 Ok(tx) => tx,
                 Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
             };
-            let transactions = vec![transaction];
-
-            // Use consensus middleware to ensure distributed agreement
-            match consensus_middleware(&app_state, transactions).await {
+            // Use consensus queue to ensure distributed agreement
+            match app_state.consensus_queue.submit(transaction).await {
                 Ok(()) => {
                     tracing::info!("Successfully submitted file deletion to consensus for user {}", user_id);
                     Ok(())
@@ -923,7 +918,7 @@ pub async fn patch_files(
     let transaction = crate::consensus::functions::create_signed_user_transaction(
         &app_state, "modify_item".to_string(), encoded, user_id,
     ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    consensus_middleware(&app_state, vec![transaction]).await
+    app_state.consensus_queue.submit(transaction).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(())

@@ -1,4 +1,4 @@
-use crate::{AppState, db::{DatabaseError, CustomUUID, fragments::{find_orphaned_data_blocks, get_node_availability_classification, AvailabilityClass}}, consensus::functions::consensus_middleware};
+use crate::{AppState, db::{DatabaseError, CustomUUID, fragments::{find_orphaned_data_blocks, get_node_availability_classification, AvailabilityClass}}};
 use apalis::prelude::*;
 use chrono::Utc;
 use uuid::{Timestamp, timestamp::context::NoContext};
@@ -160,7 +160,7 @@ async fn cleanup_orphaned_data_blocks(
         };
         
         // Submit to consensus
-        match consensus_middleware(app_state, vec![transaction]).await {
+        match app_state.consensus_queue.submit(transaction).await {
             Ok(_) => {
                 tracing::info!("Successfully submitted consensus transaction to delete {} data blocks", data_block_ids.len());
                 total_cleaned += data_block_ids.len();
@@ -315,7 +315,7 @@ pub async fn run_fragment_inventory_self_check(app_state: &AppState) -> Result<(
     )))))?;
 
     // Submit to consensus
-    match consensus_middleware(app_state, vec![transaction]).await {
+    match app_state.consensus_queue.submit(transaction).await {
         Ok(_) => Ok(()),
         Err(e) => {
             tracing::error!("Failed to submit self-check to consensus: {:?}", e);

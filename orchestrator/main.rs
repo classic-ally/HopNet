@@ -262,6 +262,57 @@ async fn list_meshes(docker: &Docker) -> Result<()> {
     Ok(())
 }
 
+/// Clean up containers, volumes, and network for a mesh after a failure.
+async fn cleanup_mesh_resources(
+    docker: &Docker,
+    mesh_id: u32,
+    containers: Vec<(String, String, String)>,
+    network_id: &str,
+) {
+    // Stop and remove containers in parallel
+    let mut tasks = Vec::new();
+    for (name, container_id, _) in containers {
+        let docker_clone = docker.clone();
+        let task = tokio::spawn(async move {
+            println!("  Stopping and removing container: {}", name);
+            let _ = docker_clone.stop_container(&container_id, None::<bollard::container::StopContainerOptions>).await;
+            let _ = docker_clone.remove_container(&container_id, None::<bollard::container::RemoveContainerOptions>).await;
+        });
+        tasks.push(task);
+    }
+    for task in tasks {
+        let _ = task.await;
+    }
+
+    // Remove volumes
+    if let Ok(volumes) = docker.list_volumes(None::<bollard::volume::ListVolumesOptions<String>>).await {
+        if let Some(volume_list) = volumes.volumes {
+            let mut tasks = Vec::new();
+            for volume in volume_list {
+                let is_mesh_volume = volume.labels.get("hopnet.mesh_id")
+                    .map(|id| id == &mesh_id.to_string())
+                    .unwrap_or(false);
+                if is_mesh_volume {
+                    let volume_name = volume.name.clone();
+                    let docker_clone = docker.clone();
+                    let task = tokio::spawn(async move {
+                        println!("  Removing volume: {}", volume_name);
+                        let _ = docker_clone.remove_volume(&volume_name, None::<bollard::volume::RemoveVolumeOptions>).await;
+                    });
+                    tasks.push(task);
+                }
+            }
+            for task in tasks {
+                let _ = task.await;
+            }
+        }
+    }
+
+    // Remove network
+    println!("  Removing network: {}", network_id);
+    let _ = docker.remove_network(network_id).await;
+}
+
 async fn create_mesh(docker: &Docker, mesh_id: u32, node_count: u32, no_cleanup: bool, runtime: sys::ContainerRuntime) -> Result<()> {
     println!("Creating mesh {} with {} nodes", mesh_id, node_count);
     
@@ -313,25 +364,7 @@ async fn create_mesh(docker: &Docker, mesh_id: u32, node_count: u32, no_cleanup:
                         } else {
                             println!("Cleaning up mesh {} due to setup failure...", mesh_id);
 
-                            // Cleanup containers (in parallel)
-                            let mut tasks = Vec::new();
-                            for (name, container_id, _) in containers {
-                                let docker_clone = docker.clone();
-                                let task = tokio::spawn(async move {
-                                    println!("  Stopping and removing container: {}", name);
-                                    let _ = docker_clone.stop_container(&container_id, None::<bollard::container::StopContainerOptions>).await;
-                                    let _ = docker_clone.remove_container(&container_id, None::<bollard::container::RemoveContainerOptions>).await;
-                                });
-                                tasks.push(task);
-                            }
-                            // Wait for all cleanup tasks to complete
-                            for task in tasks {
-                                let _ = task.await;
-                            }
-
-                            // Cleanup network
-                            println!("  Removing network: {}", network_name);
-                            let _ = docker.remove_network(&network_id).await;
+                            cleanup_mesh_resources(docker, mesh_id, containers, &network_id).await;
                         }
 
                         return Err(anyhow::anyhow!("Mesh creation failed due to setup API failure"));
@@ -355,26 +388,7 @@ async fn create_mesh(docker: &Docker, mesh_id: u32, node_count: u32, no_cleanup:
                                 }
                             } else {
                                 println!("Cleaning up mesh {} due to node registration failure...", mesh_id);
-
-                                // Cleanup containers (in parallel)
-                                let mut tasks = Vec::new();
-                                for (name, container_id, _) in containers {
-                                    let docker_clone = docker.clone();
-                                    let task = tokio::spawn(async move {
-                                        println!("  Stopping and removing container: {}", name);
-                                        let _ = docker_clone.stop_container(&container_id, None::<bollard::container::StopContainerOptions>).await;
-                                        let _ = docker_clone.remove_container(&container_id, None::<bollard::container::RemoveContainerOptions>).await;
-                                    });
-                                    tasks.push(task);
-                                }
-                                // Wait for all cleanup tasks to complete
-                                for task in tasks {
-                                    let _ = task.await;
-                                }
-
-                                // Cleanup network
-                                println!("  Removing network: {}", network_name);
-                                let _ = docker.remove_network(&network_id).await;
+                                cleanup_mesh_resources(docker, mesh_id, containers, &network_id).await;
                             }
 
                             return Err(anyhow::anyhow!("Mesh creation failed due to node registration failure"));

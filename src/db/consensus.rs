@@ -522,6 +522,69 @@ pub fn get_block(
     }
 }
 
+/// Insert transaction nonces inside an existing DB transaction (atomic with block commit).
+/// Called by process_transactions for every committed block on all nodes.
+pub fn insert_tx_nonces_tx(
+    db_tx: &duckdb::Transaction,
+    nonces: &[hopnet_common::CustomUUID],
+) -> Result<(), DatabaseError> {
+    if nonces.is_empty() {
+        return Ok(());
+    }
+    // Build a single INSERT with multiple VALUES rows for O(1) round-trips.
+    // ON CONFLICT DO NOTHING prevents duplicate nonces from crashing the consensus commit.
+    let placeholders: Vec<&str> = vec!["(?)"; nonces.len()];
+    let sql = format!(
+        "INSERT INTO committed_tx_nonces (nonce) VALUES {} ON CONFLICT DO NOTHING",
+        placeholders.join(", ")
+    );
+    let params: Vec<&dyn duckdb::ToSql> = nonces.iter().map(|n| n as &dyn duckdb::ToSql).collect();
+    db_tx.execute(&sql, params.as_slice()).map_err(|e| {
+        tracing::error!("Failed to insert {} transaction nonces: {:?}", nonces.len(), e);
+        DatabaseError::InsertError
+    })?;
+    Ok(())
+}
+
+/// Check which nonces from the given batch are already committed.
+/// Returns the set of nonce strings that exist in committed_tx_nonces.
+pub fn check_committed_nonces(
+    conn: &r2d2::PooledConnection<DuckdbConnectionManager>,
+    nonces: &[hopnet_common::CustomUUID],
+) -> Result<std::collections::HashSet<String>, DatabaseError> {
+    let mut committed = std::collections::HashSet::new();
+    if nonces.is_empty() {
+        return Ok(committed);
+    }
+    // Single query with IN (...) for O(1) round-trips.
+    let placeholders: Vec<&str> = vec!["?"; nonces.len()];
+    let sql = format!(
+        "SELECT nonce FROM committed_tx_nonces WHERE nonce IN ({})",
+        placeholders.join(", ")
+    );
+    let params: Vec<&dyn duckdb::ToSql> = nonces.iter().map(|n| n as &dyn duckdb::ToSql).collect();
+    let mut stmt = conn.prepare(&sql).map_err(|_| DatabaseError::RecallError)?;
+    let mut rows = stmt.query(params.as_slice()).map_err(|_| DatabaseError::RecallError)?;
+    while let Some(row) = rows.next().map_err(|_| DatabaseError::RecallError)? {
+        let nonce_str: String = row.get(0).map_err(|_| DatabaseError::RecallError)?;
+        committed.insert(nonce_str);
+    }
+    Ok(committed)
+}
+
+/// Delete nonces older than the cutoff UUID (UUIDv7 ordering = chronological).
+/// Called inside a consensus transaction for deterministic cleanup across all nodes.
+pub fn cleanup_old_nonces(
+    db_tx: &duckdb::Transaction,
+    cutoff: &hopnet_common::CustomUUID,
+) -> Result<usize, DatabaseError> {
+    let deleted = db_tx.execute(
+        "DELETE FROM committed_tx_nonces WHERE nonce < ?",
+        params![cutoff],
+    ).map_err(|_| DatabaseError::InsertError)?;
+    Ok(deleted)
+}
+
 /// Get QC by hash within an existing transaction (core implementation)
 pub fn get_quorum_certificate_by_hash_tx(
     tx: &duckdb::Transaction,

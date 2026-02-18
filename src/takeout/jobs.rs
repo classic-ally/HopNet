@@ -5,7 +5,7 @@ use chrono::Utc;
 use std::sync::Arc;
 use crate::AppState;
 use crate::db::{CustomUUID, takeout::TakeoutStatusPayload};
-use crate::consensus::{Transaction, functions::consensus_middleware};
+use crate::consensus::Transaction;
 use hopnet_common::TakeoutStatus;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -84,17 +84,16 @@ pub async fn handle_takeout_maintenance(
 
             // Submit all expiration updates in one consensus call
             // This triggers cleanup on owner nodes for all expired takeouts
-            match consensus_middleware(app_state, transactions).await {
-                Ok(_) => {
-                    tracing::info!("Successfully marked {} takeouts as expired via consensus", expired_takeouts.len());
-                }
-                Err(e) => {
-                    tracing::error!("Failed to submit expiration updates to consensus: {:?}", e);
-                    return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Failed to submit expiration updates: {:?}", e)
-                    )))));
-                }
+            let results = app_state.consensus_queue.submit_batch(transactions).await;
+            let failures: Vec<_> = results.iter().filter(|r| r.is_err()).collect();
+            if failures.is_empty() {
+                tracing::info!("Successfully marked {} takeouts as expired via consensus", expired_takeouts.len());
+            } else {
+                tracing::error!("Failed to submit expiration updates to consensus: {} failures", failures.len());
+                return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to submit expiration updates: {} failures", failures.len())
+                )))));
             }
         }
     }

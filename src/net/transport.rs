@@ -100,13 +100,13 @@ impl std::error::Error for IrohError {}
 // ============================================================================
 
 /// Encode a bincode message to bytes (without writing to stream)
-pub(super) fn encode_message<T: serde::Serialize>(msg: &T) -> Result<Vec<u8>, IrohError> {
+pub fn encode_message<T: serde::Serialize>(msg: &T) -> Result<Vec<u8>, IrohError> {
     bincode::serde::encode_to_vec(msg, bincode::config::standard())
         .map_err(|e| IrohError::Protocol(ProtocolError::MalformedResponse(e.to_string())))
 }
 
 /// Send length-prefixed raw bytes on a stream
-pub(super) async fn send_raw(
+pub async fn send_raw(
     stream: &mut iroh::endpoint::SendStream,
     bytes: &[u8],
 ) -> Result<(), IrohError> {
@@ -119,7 +119,7 @@ pub(super) async fn send_raw(
 }
 
 /// Send a length-prefixed bincode message
-pub(super) async fn send_message<T: serde::Serialize>(
+pub async fn send_message<T: serde::Serialize>(
     stream: &mut iroh::endpoint::SendStream,
     msg: &T,
 ) -> Result<(), IrohError> {
@@ -139,7 +139,7 @@ async fn send_request(
 }
 
 /// Receive a length-prefixed bincode message
-pub(super) async fn recv_message<T: serde::de::DeserializeOwned>(
+pub async fn recv_message<T: serde::de::DeserializeOwned>(
     stream: &mut iroh::endpoint::RecvStream,
 ) -> Result<T, IrohError> {
     let mut len_buf = [0u8; 4];
@@ -399,8 +399,8 @@ impl IrohTransport {
         .map_err(|_| IrohError::Transport(TransportError::Timeout))?
     }
 
-    /// Remove a connection from the cache (e.g., on error)
-    async fn remove_connection(&self, node_id: i32) {
+    /// Remove a connection from the cache (e.g., on error or timeout)
+    pub async fn remove_connection(&self, node_id: i32) {
         let mut connections = self.connections.write().await;
         connections.remove(&node_id);
     }

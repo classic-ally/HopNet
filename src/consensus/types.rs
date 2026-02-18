@@ -4,6 +4,7 @@ use std::ops::Deref;
 use duckdb::{ToSql,types::ToSqlOutput,types::FromSql,types::FromSqlResult,types::ValueRef};
 use crate::db::consensus as db;
 use crate::db::types::{extract_enum_string, MyNode};
+use hopnet_common::CustomUUID;
 use bincode::serde::encode_to_vec;
 use ed25519_dalek::Signature;
 use bincode::config;
@@ -1064,6 +1065,7 @@ pub struct Transaction {
     pub rpc: RpcCall,
     pub submitter: SignedIdentity,  // Node that submitted this transaction
     pub user: Option<SignedIdentity>,  // User who initiated this (if user operation)
+    pub nonce: CustomUUID,  // UUIDv7 nonce for dedup (prevents stale resubmission)
 }
 
 impl Transaction {
@@ -1079,6 +1081,7 @@ impl Transaction {
                 signature,
             },
             user: None,
+            nonce: CustomUUID::new(None),
         })
     }
 
@@ -1105,6 +1108,7 @@ impl Transaction {
                 id: user_id,
                 signature: user_signature,
             }),
+            nonce: CustomUUID::new(None),
         })
     }
 

@@ -9,20 +9,8 @@ use crate::AppState;
 use crate::db::CustomUUID;
 use crate::db::DatabaseError;
 use crate::db::types::FileAccess;
-use crate::consensus::types::Transaction;
+use crate::consensus::queue::ConsensusSubmitError;
 use super::types::*;
-
-/// Run the transaction handler with execute=false against current DB state.
-/// Returns the appropriate HTTP error response if validation fails, None if it passes.
-fn preflight_check(app_state: &AppState, transaction: &Transaction) -> Option<axum::response::Response> {
-    let mut conn = app_state.db_pool.get().ok()?;
-    let db_tx = conn.transaction().ok()?;
-    if let Err(e) = crate::consensus::functions::process_transaction(transaction, app_state, false, &db_tx) {
-        Some(database_error_to_status(e).into_response())
-    } else {
-        None
-    }
-}
 
 fn database_error_to_status(e: DatabaseError) -> StatusCode {
     match e {
@@ -154,12 +142,12 @@ pub async fn post_share(
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
-    if let Some(err_response) = preflight_check(&app_state, &transaction) {
-        return err_response;
-    }
-
-    match crate::consensus::functions::consensus_middleware(&app_state, vec![transaction]).await {
+    match app_state.consensus_queue.submit(transaction).await {
         Ok(()) => StatusCode::OK.into_response(),
+        Err(ConsensusSubmitError::Rejected(r)) => {
+            tracing::warn!("Share rejected: {}", r);
+            StatusCode::CONFLICT.into_response()
+        }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -262,12 +250,12 @@ pub async fn post_accept_share(
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
-    if let Some(err_response) = preflight_check(&app_state, &transaction) {
-        return err_response;
-    }
-
-    match crate::consensus::functions::consensus_middleware(&app_state, vec![transaction]).await {
+    match app_state.consensus_queue.submit(transaction).await {
         Ok(()) => StatusCode::OK.into_response(),
+        Err(ConsensusSubmitError::Rejected(r)) => {
+            tracing::warn!("Accept share rejected: {}", r);
+            StatusCode::CONFLICT.into_response()
+        }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -300,12 +288,12 @@ pub async fn delete_incoming_share(
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
-    if let Some(err_response) = preflight_check(&app_state, &transaction) {
-        return err_response;
-    }
-
-    match crate::consensus::functions::consensus_middleware(&app_state, vec![transaction]).await {
+    match app_state.consensus_queue.submit(transaction).await {
         Ok(()) => StatusCode::OK.into_response(),
+        Err(ConsensusSubmitError::Rejected(r)) => {
+            tracing::warn!("Decline share rejected: {}", r);
+            StatusCode::CONFLICT.into_response()
+        }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -380,12 +368,12 @@ pub async fn delete_unshare(
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
-    if let Some(err_response) = preflight_check(&app_state, &transaction) {
-        return err_response;
-    }
-
-    match crate::consensus::functions::consensus_middleware(&app_state, vec![transaction]).await {
+    match app_state.consensus_queue.submit(transaction).await {
         Ok(()) => StatusCode::OK.into_response(),
+        Err(ConsensusSubmitError::Rejected(r)) => {
+            tracing::warn!("Unshare rejected: {}", r);
+            StatusCode::CONFLICT.into_response()
+        }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }

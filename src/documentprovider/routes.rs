@@ -15,7 +15,6 @@ use crate::devices::auth::device_token_auth_middleware;
 use crate::AppState;
 use crate::db::{self, CustomUUID};
 use crate::files::functions::{build_encrypted_path, encrypt_part, encrypt_path};
-use crate::consensus::functions::consensus_middleware;
 use hopnet_common::documentprovider::{
     DocumentProviderEnumerateResponse, DocumentProviderItem, ModifyDocumentProviderRequest,
     ModifyDocumentProviderResponse,
@@ -232,7 +231,7 @@ pub async fn delete_item(
     ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Submit to consensus
-    consensus_middleware(&app_state, vec![transaction]).await
+    app_state.consensus_queue.submit(transaction).await
         .map_err(|e| {
             tracing::error!("Failed to delete item via consensus: {:?}", e);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -338,7 +337,7 @@ pub async fn patch_item(
     ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Submit to consensus
-    consensus_middleware(&app_state, vec![transaction]).await
+    app_state.consensus_queue.submit(transaction).await
         .map_err(|e| {
             tracing::error!("Failed to modify item via consensus: {:?}", e);
             StatusCode::INTERNAL_SERVER_ERROR

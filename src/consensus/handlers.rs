@@ -220,3 +220,32 @@ impl TransactionHandler for InsertGenesisHandler {
 inventory::submit! {
     &InsertGenesisHandler as &dyn TransactionHandler
 }
+
+// ============================================================================
+// Nonce Cleanup Handler - Consensus-tracked cleanup of committed_tx_nonces
+// ============================================================================
+
+pub struct CleanupNoncesHandler;
+
+impl TransactionHandler for CleanupNoncesHandler {
+    fn name(&self) -> &'static str { "system.cleanup_nonces" }
+
+    fn process(&self, _state: &AppState, tx: &Transaction, execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
+        let (cutoff, _) = bincode::serde::decode_from_slice::<hopnet_common::CustomUUID, _>(
+            &tx.rpc.payload,
+            bincode::config::standard()
+        ).map_err(|_| DatabaseError::InvalidPayload)?;
+
+        if !execute {
+            return Ok(());
+        }
+
+        let deleted = crate::db::consensus::cleanup_old_nonces(db_tx, &cutoff)?;
+        tracing::debug!("Cleaned up {} old transaction nonces (cutoff: {})", deleted, cutoff);
+        Ok(())
+    }
+}
+
+inventory::submit! {
+    &CleanupNoncesHandler as &dyn TransactionHandler
+}

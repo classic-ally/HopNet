@@ -443,6 +443,8 @@ pub fn create_test_app_state_with_keys(signing_key: crate::db::PrivKey, verifyin
         .block_on(crate::net::IrohTransport::new(iroh_secret, pool.clone(), true))
         .expect("test iroh transport");
 
+    let (consensus_queue, _consensus_queue_rx) = crate::consensus::queue::ConsensusQueue::new(pool.clone(), 256);
+
     AppState {
         db_pool: pool,
         encoding_key,
@@ -464,6 +466,8 @@ pub fn create_test_app_state_with_keys(signing_key: crate::db::PrivKey, verifyin
         dedup_cache: Arc::new(crate::net::DedupCache::default()),
         lock_vote_evidence: Arc::new(std::sync::Mutex::new(None)),
         session_store: Arc::new(crate::auth::SessionStore::default()),
+        consensus_queue,
+        view_changed: Arc::new(tokio::sync::Notify::new()),
     }
 }
 

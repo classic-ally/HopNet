@@ -9,7 +9,6 @@ use serde::Deserialize;
 use crate::AppState;
 use crate::db::{self, DatabaseError};
 use crate::files::functions::{build_encrypted_path, encrypt_path};
-use crate::consensus::{functions::consensus_middleware, types::Transaction};
 use super::types::{HealthResponse, HealthStatus, EnumerateResponse, FileProviderItem};
 use hopnet_common::fileprovider::TestResponse;
 use hopnet_common::fileprovider::{ChangesResponse, ChangesQuery, DeleteItemRequest, DownloadQuery, ItemQuery, ModifyItemResponse};
@@ -381,8 +380,8 @@ pub async fn delete_item(
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
     };
     
-    // Use consensus middleware to ensure distributed agreement
-    match consensus_middleware(&app_state, vec![transaction]).await {
+    // Submit to consensus queue
+    match app_state.consensus_queue.submit(transaction).await {
         Ok(()) => {
             tracing::info!("Successfully submitted FileProvider deletion to consensus for user {}", user_id);
             StatusCode::OK
@@ -866,7 +865,7 @@ pub async fn modify_item(
         Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
     };
     
-    consensus_middleware(&app_state, vec![transaction]).await
+    app_state.consensus_queue.submit(transaction).await
         .map_err(|e| {
             tracing::error!("Failed to submit modification to consensus for user_id: {} error: {:?}", user_id, e);
             StatusCode::INTERNAL_SERVER_ERROR

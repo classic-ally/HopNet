@@ -164,15 +164,34 @@ async fn handle_stream(
 
     let span = tracing::debug_span!("rpc_req", id = %format!("{:016x}", request_id), from = peer_node_id);
     async {
-        // Get or create OnceCell for this request_id
+        // Read the request outside the OnceCell so we can branch on it
+        let request: IrohRequest = recv_message(&mut recv).await?;
+
+        // Message-driven catch-up (idempotent — safe outside OnceCell)
+        ensure_caught_up_for_message(&request, &app_state).await?;
+
+        // TransactionForward uses two-phase ACK (bypasses OnceCell — nonce table handles dedup)
+        if let IrohRequest::TransactionForward(req) = request {
+            // Phase 1: Send immediate ACK
+            let ack_bytes = encode_message(&IrohResponse::TransactionForwardAck)?;
+            send_raw(&mut send, &ack_bytes).await?;
+
+            // Phase 2: Process and send final result
+            let response = crate::consensus::rpc::handle_transaction_forward(req, &app_state).await;
+            let result_bytes = encode_message(&response)?;
+            send_raw(&mut send, &result_bytes).await?;
+            send.finish()
+                .map_err(|e| IrohError::Transport(TransportError::StreamFailed(e.to_string())))?;
+            return Ok(());
+        }
+
+        // All other requests: existing OnceCell dedup path
         let cell = {
             let mut cache = app_state.dedup_cache.lock().unwrap();
             cache.entry(request_id).or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())).clone()
         };
 
-        // Schedule cleanup after TTL (runs regardless of success/failure below).
-        // This only removes the HashMap entry — any caller already holding an Arc<OnceCell>
-        // is unaffected and will still get the result when processing completes.
+        // Schedule cleanup after TTL
         let cache = app_state.dedup_cache.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(300)).await;
@@ -181,10 +200,6 @@ async fn handle_stream(
 
         // First caller processes; duplicates wait for the same result
         let response_bytes = cell.get_or_try_init(|| async {
-            let request: IrohRequest = recv_message(&mut recv).await?;
-
-            ensure_caught_up_for_message(&request, &app_state).await?;
-
             if app_state.test_mode {
                 if let IrohRequest::BallotSubmission(_) = &request {
                     app_state.consensus_barriers.wait(
@@ -218,9 +233,7 @@ async fn handle_stream(
                 IrohRequest::BallotSubmission(req) => {
                     crate::consensus::rpc::handle_ballot_request(req, &app_state).await
                 }
-                IrohRequest::TransactionForward(req) => {
-                    crate::consensus::rpc::handle_transaction_forward(req, &app_state).await
-                }
+                IrohRequest::TransactionForward(_) => unreachable!("handled above"),
                 IrohRequest::FragmentFetch(req) => {
                     IrohResponse::FragmentFetchResponse(
                         crate::files::rpc::handle_fragment_fetch(req, &app_state.fragments_dir)

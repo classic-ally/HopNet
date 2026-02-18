@@ -1,7 +1,7 @@
 use crate::{
     AppState,
     db::{DatabaseError, files::{PlacementHeightUpdate, get_distributable_file, mark_fragment_local_state, DistributableFileData}, consensus},
-    consensus::{functions::{consensus_middleware, ConsensusError}, types::Transaction},
+    consensus::{queue::ConsensusSubmitError, types::Transaction},
     db::metrics::get_all_node_metrics,
     types::Blake3Hash,
     db::types::CustomUUID,
@@ -10,7 +10,7 @@ use crate::{
 #[derive(Debug)]
 pub enum DistributionError {
     Database(DatabaseError),
-    Consensus(ConsensusError),
+    Consensus(ConsensusSubmitError),
     Network(String),
     FragmentTransfer(String),
     Encoding(bincode::error::EncodeError),
@@ -36,8 +36,8 @@ impl From<DatabaseError> for DistributionError {
     }
 }
 
-impl From<ConsensusError> for DistributionError {
-    fn from(e: ConsensusError) -> Self {
+impl From<ConsensusSubmitError> for DistributionError {
+    fn from(e: ConsensusSubmitError) -> Self {
         DistributionError::Consensus(e)
     }
 }
@@ -380,7 +380,7 @@ async fn submit_placement_update_to_consensus(
         encoded_updates,
     ).map_err(|_| DistributionError::Database(crate::db::DatabaseError::LockError))?;
     
-    consensus_middleware(app_state, vec![transaction]).await?;
+    app_state.consensus_queue.submit(transaction).await?;
     
     tracing::info!("Submitted placement height update to consensus");
     Ok(())

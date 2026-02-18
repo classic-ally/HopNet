@@ -58,7 +58,9 @@ pub enum IrohResponse {
     QcBroadcastResponse(consensus_rpc::QcBroadcastResponse),
     /// Ballot vote response (signed vote)
     BallotSubmissionResponse(consensus_rpc::BallotResponse),
-    /// Ack for transaction forward
+    /// Ack for transaction forward (immediate ACK before processing)
+    TransactionForwardAck,
+    /// Ack for transaction forward (final result after processing)
     TransactionForwardResponse(consensus_rpc::TransactionForwardResponse),
     /// Fragment fetch result
     FragmentFetchResponse(files_rpc::FragmentFetchResponse),

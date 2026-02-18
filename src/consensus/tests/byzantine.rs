@@ -219,6 +219,7 @@ mod byzantine_tests {
                 signature: forged_signature,  // But signed with node1's key
             },
             user: None,
+            nonce: hopnet_common::CustomUUID::new(None),
         };
 
         // Try to create block with forged transaction
@@ -280,6 +281,7 @@ mod byzantine_tests {
                 id: user0.user_id,  // Claims to be user0
                 signature: forged_user_signature,  // But signed with user1's key
             }),
+            nonce: hopnet_common::CustomUUID::new(None),
         };
 
         // Try to create block with forged user signature

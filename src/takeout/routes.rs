@@ -8,7 +8,7 @@ use axum::{
 };
 use crate::{AppState, auth};
 use hopnet_common::{TakeoutRecord, TakeoutStatus};
-use crate::consensus::{functions::consensus_middleware, types::Transaction};
+use crate::consensus::types::Transaction;
 use crate::db::{takeout::{TakeoutPayload, TakeoutStatusPayload}, CustomDateTime, CustomUUID, consensus};
 use chrono::{Duration, Utc};
 use tokio::fs::File;
@@ -142,7 +142,7 @@ async fn post_initiate_takeout(
     };
     
     // Submit to consensus
-    match consensus_middleware(&app_state, vec![transaction]).await {
+    match app_state.consensus_queue.submit(transaction).await {
         Ok(()) => {
             tracing::info!(
                 "Initiated takeout {} for user {} via consensus ({} bytes of data)",
@@ -212,7 +212,7 @@ async fn delete_takeout(
     };
 
     // Submit cancellation to consensus
-    match consensus_middleware(&app_state, vec![transaction]).await {
+    match app_state.consensus_queue.submit(transaction).await {
         Ok(_) => {
             tracing::info!("Takeout {} cancelled by user {}", takeout_id, user_id);
             StatusCode::OK
@@ -403,7 +403,7 @@ pub async fn execute_takeout_materialization(
     };
 
     // Submit status update to consensus
-    consensus_middleware(app_state, vec![transaction]).await
+    app_state.consensus_queue.submit(transaction).await
         .map_err(|e| TakeoutMaterializationError::Consensus(format!("Failed to update status: {:?}", e)))?;
 
     // Resolve session for SIV keys (needed by sync folder/archive functions)
@@ -488,7 +488,7 @@ pub async fn execute_takeout_materialization(
     ).map_err(|_| TakeoutMaterializationError::Consensus("Failed to sign ready transaction".to_string()))?;
 
     // Submit ready status to consensus
-    consensus_middleware(app_state, vec![ready_transaction]).await
+    app_state.consensus_queue.submit(ready_transaction).await
         .map_err(|e| TakeoutMaterializationError::Consensus(format!("Failed to update to ready: {:?}", e)))?;
 
     tracing::info!("Takeout {} marked as ready for download", takeout_id);
