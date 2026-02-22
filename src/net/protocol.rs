@@ -60,6 +60,11 @@ pub enum IrohResponse {
     BallotSubmissionResponse(consensus_rpc::BallotResponse),
     /// Ack for transaction forward (immediate ACK before processing)
     TransactionForwardAck,
+    /// Rejection: this node is not the leader for the current view.
+    /// Includes the handler's view so the forwarder can trigger catch-up.
+    TransactionForwardNotLeader { view: i32 },
+    /// Rejection: consensus lock is held (leader is busy driving a round)
+    TransactionForwardBusy,
     /// Ack for transaction forward (final result after processing)
     TransactionForwardResponse(consensus_rpc::TransactionForwardResponse),
     /// Fragment fetch result

@@ -342,62 +342,105 @@ pub fn get_consensus_progress(
     ).map_err(|_| DatabaseError::RecallError)
 }
 
+pub fn get_validators_with_conn(
+    db_lock: &r2d2::PooledConnection<DuckdbConnectionManager>,
+    height: i32,
+) -> Result<Vec<Node>, DatabaseError> {
+    let mut stmt = db_lock.prepare(
+        "
+        WITH latest_effective AS (
+            SELECT
+                node_id,
+                MAX(effective_height) AS max_eff
+            FROM validators
+            WHERE effective_height <= ?
+            GROUP BY node_id
+        ),
+        active_validators AS (
+            SELECT
+                v.node_id,
+                v.is_active
+            FROM validators v
+            JOIN latest_effective le
+                ON v.node_id = le.node_id
+                AND v.effective_height = le.max_eff
+            WHERE v.is_active = true
+        )
+        SELECT n.node_id, n.name, n.owner, n.pubkey
+        FROM active_validators av
+        JOIN nodes n ON av.node_id = n.node_id;
+        "
+    ).map_err(|_| DatabaseError::RecallError)?;
+
+    let results = stmt.query_map([height], |row| {
+        Ok(Node {
+            node_id: row.get(0)?,
+            name: row.get(1)?,
+            owner: row.get(2)?,
+            pubkey: row.get(3)?,
+        })
+    });
+
+    match results {
+        Ok(rows) => {
+            let nodes: Vec<Node> = rows.collect::<Result<_, _>>().map_err(|e| {
+                tracing::debug!("Error collecting validator rows: {:?}", e);
+                DatabaseError::ProcessingError
+            })?;
+            Ok(nodes)
+        }
+        Err(e) => {
+            tracing::error!("Failed to query validators: {:?}", e);
+            Err(DatabaseError::RecordError)
+        }
+    }
+}
+
 pub fn get_validators(
     db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     height: i32,
 ) -> Result<Vec<Node>, DatabaseError> {
     match db_connection {
-        Ok(db_lock) => {
-            let mut stmt = db_lock.prepare(
-                "
-                WITH latest_effective AS (
-                    SELECT 
-                        node_id,
-                        MAX(effective_height) AS max_eff
-                    FROM validators
-                    WHERE effective_height <= ?
-                    GROUP BY node_id
-                ),
-                active_validators AS (
-                    SELECT 
-                        v.node_id,
-                        v.is_active
-                    FROM validators v
-                    JOIN latest_effective le 
-                        ON v.node_id = le.node_id 
-                        AND v.effective_height = le.max_eff
-                    WHERE v.is_active = true
-                )
-                SELECT n.node_id, n.name, n.owner, n.pubkey
-                FROM active_validators av
-                JOIN nodes n ON av.node_id = n.node_id;
-                "
-            ).map_err(|_| DatabaseError::RecallError)?;
+        Ok(db_lock) => get_validators_with_conn(&db_lock, height),
+        Err(_) => Err(DatabaseError::LockError),
+    }
+}
 
-            let results = stmt.query_map([height], |row| {
-                Ok(Node {
-                    node_id: row.get(0)?,
-                    name: row.get(1)?,
-                    owner: row.get(2)?,
-                    pubkey: row.get(3)?,
-                })
-            });
+pub fn get_validators_elect_with_conn(
+    db_lock: &r2d2::PooledConnection<DuckdbConnectionManager>,
+    current_height: i32,
+) -> Result<Vec<Node>, DatabaseError> {
+    let mut stmt = db_lock.prepare(
+        "
+        WITH validators_elect AS (
+            SELECT DISTINCT node_id
+            FROM validators
+            WHERE effective_height > ? AND is_active = true
+        )
+        SELECT n.node_id, n.name, n.owner, n.pubkey
+        FROM validators_elect ve
+        JOIN nodes n ON ve.node_id = n.node_id;
+        "
+    ).map_err(|_| DatabaseError::RecallError)?;
 
-            match results {
-                Ok(rows) => {
-                    let nodes: Vec<Node> = rows.collect::<Result<_, _>>().map_err(|e| {
-                        tracing::debug!("Error collecting validator rows: {:?}", e);
-                        DatabaseError::ProcessingError
-                    })?;
-                    Ok(nodes)
-                }
-                Err(e) => {
-                    tracing::error!("Failed to query validators: {:?}", e);
-                    Err(DatabaseError::RecordError)
-                }
-            }
-        },
-        Err(_) => {Err(DatabaseError::LockError)}
+    let results = stmt.query_map([current_height], |row| {
+        Ok(Node {
+            node_id: row.get(0)?,
+            name: row.get(1)?,
+            owner: row.get(2)?,
+            pubkey: row.get(3)?,
+        })
+    });
+
+    match results {
+        Ok(rows) => {
+            let nodes: Vec<Node> = rows.collect::<Result<_, _>>().map_err(|_| DatabaseError::ProcessingError)?;
+            Ok(nodes)
+        }
+        Err(e) => {
+            tracing::error!("Failed to query validators elect: {:?}", e);
+            Err(DatabaseError::RecordError)
+        }
     }
 }
 
@@ -406,41 +449,8 @@ pub fn get_validators_elect(
     current_height: i32,
 ) -> Result<Vec<Node>, DatabaseError> {
     match db_connection {
-        Ok(db_lock) => {
-            let mut stmt = db_lock.prepare(
-                "
-                WITH validators_elect AS (
-                    SELECT DISTINCT node_id
-                    FROM validators
-                    WHERE effective_height > ? AND is_active = true
-                )
-                SELECT n.node_id, n.name, n.owner, n.pubkey
-                FROM validators_elect ve
-                JOIN nodes n ON ve.node_id = n.node_id;
-                "
-            ).map_err(|_| DatabaseError::RecallError)?;
-
-            let results = stmt.query_map([current_height], |row| {
-                Ok(Node {
-                    node_id: row.get(0)?,
-                    name: row.get(1)?,
-                    owner: row.get(2)?,
-                    pubkey: row.get(3)?,
-                })
-            });
-
-            match results {
-                Ok(rows) => {
-                    let nodes: Vec<Node> = rows.collect::<Result<_, _>>().map_err(|_| DatabaseError::ProcessingError)?;
-                    Ok(nodes)
-                }
-                Err(e) => {
-                    tracing::error!("Failed to query validators elect: {:?}", e);
-                    Err(DatabaseError::RecordError)
-                }
-            }
-        },
-        Err(_) => {Err(DatabaseError::LockError)}
+        Ok(db_lock) => get_validators_elect_with_conn(&db_lock, current_height),
+        Err(_) => Err(DatabaseError::LockError),
     }
 }
 
@@ -917,25 +927,29 @@ pub fn get_startup_state(
     }
 }
 
+pub fn mark_timeout_vote_issued_with_conn(
+    db_lock: &r2d2::PooledConnection<DuckdbConnectionManager>,
+    view: i32,
+) -> Result<(), DatabaseError> {
+    tracing::debug!("[DB WRITE this_node] About to UPDATE for timeout vote in view {}", view);
+    db_lock.execute(
+        "UPDATE this_node SET last_timeout_vote_view = ? WHERE internal_id = 1",
+        params![view]
+    ).map_err(|e| {
+        tracing::error!("[DB WRITE this_node] UPDATE failed for timeout vote: {:?}", e);
+        DatabaseError::InsertError
+    })?;
+    tracing::debug!("[DB WRITE this_node] Marked timeout vote issued for view {}", view);
+    Ok(())
+}
+
 pub fn mark_timeout_vote_issued(
     db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
     view: i32,
 ) -> Result<(), DatabaseError> {
     match db_connection {
-        Ok(db_lock) => {
-            tracing::debug!("[DB WRITE this_node] About to UPDATE for timeout vote in view {}", view);
-            db_lock.execute(
-                "UPDATE this_node SET last_timeout_vote_view = ? WHERE internal_id = 1",
-                params![view]
-            ).map_err(|e| {
-                tracing::error!("[DB WRITE this_node] UPDATE failed for timeout vote: {:?}", e);
-                DatabaseError::InsertError
-            })?;
-            tracing::debug!("[DB WRITE this_node] Marked timeout vote issued for view {}", view);
-
-            Ok(())
-        }
-        Err(_) => Err(DatabaseError::LockError)
+        Ok(db_lock) => mark_timeout_vote_issued_with_conn(&db_lock, view),
+        Err(_) => Err(DatabaseError::LockError),
     }
 }
 

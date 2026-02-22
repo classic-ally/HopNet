@@ -70,7 +70,14 @@ pub async fn handle_timeout_detection(
             // Reissue with current (potentially updated) QC
             // issue_timeout_vote is reissuance-safe: creates vote from current consensus state
             use crate::consensus::functions::issue_timeout_vote;
-            match issue_timeout_vote(current_view, app_state, None).await {
+            let mut conn = match app_state.db_pool.get() {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!("Failed to get DB connection for timeout vote reissuance: {:?}", e);
+                    return Ok(());
+                }
+            };
+            match issue_timeout_vote(current_view, app_state, None, &mut conn).await {
                 Ok(_) => {
                     tracing::info!("Successfully reissued timeout vote for view {} (proactive convergence + message loss resilience)", current_view);
                 }
@@ -84,7 +91,17 @@ pub async fn handle_timeout_detection(
             tracing::info!("View {} has not progressed since last check, issuing timeout vote", current_view);
 
             use crate::consensus::functions::issue_timeout_vote;
-            match issue_timeout_vote(current_view, app_state, None).await {
+            let mut conn = match app_state.db_pool.get() {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!("Failed to get DB connection for timeout vote: {:?}", e);
+                    return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("DB pool exhausted for timeout vote: {:?}", e)
+                    )))));
+                }
+            };
+            match issue_timeout_vote(current_view, app_state, None, &mut conn).await {
                 Ok(_) => {
                     tracing::debug!("Successfully issued timeout vote for view {}", current_view);
                 }

@@ -14,13 +14,14 @@ Execute orchestrator commands and return concise, actionable summaries. Keep ver
 
 ## Guidelines
 
-1. **Build first** - Run `cargo build --release --bin orchestrator --features skip-frontend` at the start of each invocation to ensure the latest version
+1. **Build first** - Run `cargo build --release --bin orchestrator --features skip-frontend` and `docker build -t hopnet:latest` at the start of each invocation to ensure the latest version of the orchestrator and test container are built
 2. **List meshes** - Always run `./target/release/orchestrator list` first to see current state
 3. **Follow mesh context** - The caller should specify which mesh to use or whether to create fresh. If not specified, prefer reusing existing meshes. However, if an existing mesh appears unhealthy (divergence, crashed nodes, unreachable), try a different mesh or create a fresh one.
 4. **Run commands** using `./target/release/orchestrator <command>` from the project root
 5. **Summarize results** - don't dump raw output unless specifically asked
 6. **Report failures clearly** - include specific error and context for handoff
 7. **Check divergence** after tests to catch issues early
+8. **Keep the mesh alive for debugging** - don't delete the mesh after completion if there are issues
 
 ## Response Format
 

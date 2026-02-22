@@ -172,7 +172,42 @@ async fn handle_stream(
 
         // TransactionForward uses two-phase ACK (bypasses OnceCell — nonce table handles dedup)
         if let IrohRequest::TransactionForward(req) = request {
-            // Phase 1: Send immediate ACK
+            // Validate leader status before ACKing — avoids multi-hop forwarding
+            'reject: {
+                let my_node_id = match app_state.get_node_id() {
+                    Ok(id) => id,
+                    Err(_) => break 'reject,
+                };
+                let conn = match app_state.db_pool.get() {
+                    Ok(c) => c,
+                    Err(_) => break 'reject,
+                };
+                let state = match db::get_consensus_with_conn(&conn) {
+                    Ok(s) => s,
+                    Err(_) => break 'reject,
+                };
+
+                if state.leader.node_id != my_node_id {
+                    let reject = encode_message(
+                        &IrohResponse::TransactionForwardNotLeader { view: state.view }
+                    )?;
+                    send_raw(&mut send, &reject).await?;
+                    send.finish().map_err(|e|
+                        IrohError::Transport(TransportError::StreamFailed(e.to_string()))
+                    )?;
+                    return Ok(());
+                }
+                if app_state.consensus_lock.try_lock().is_err() {
+                    let reject = encode_message(&IrohResponse::TransactionForwardBusy)?;
+                    send_raw(&mut send, &reject).await?;
+                    send.finish().map_err(|e|
+                        IrohError::Transport(TransportError::StreamFailed(e.to_string()))
+                    )?;
+                    return Ok(());
+                }
+            }
+
+            // Phase 1: Send immediate ACK (validated as leader, hasn't proposed)
             let ack_bytes = encode_message(&IrohResponse::TransactionForwardAck)?;
             send_raw(&mut send, &ack_bytes).await?;
 

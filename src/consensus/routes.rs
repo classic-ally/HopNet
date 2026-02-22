@@ -406,7 +406,14 @@ pub async fn process_incoming_timeout_vote(
 
             // Reissue with updated QC reference (issue_timeout_vote is reissuance-safe)
             use crate::consensus::functions::issue_timeout_vote;
-            if let Err(e) = issue_timeout_vote(timeout_vote.data.view_number, app_state, None).await {
+            let mut conn = match app_state.db_pool.get() {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("Failed to get DB connection for timeout vote reissuance: {:?}", e);
+                    return Ok(());
+                }
+            };
+            if let Err(e) = issue_timeout_vote(timeout_vote.data.view_number, app_state, None, &mut conn).await {
                 tracing::warn!("Failed to reissue timeout vote for view {}: {:?}", timeout_vote.data.view_number, e);
                 // Continue processing incoming vote even if reissuance fails
             }
@@ -461,19 +468,19 @@ pub async fn process_incoming_timeout_vote(
             // Cascade check: if futility detected after adding vote, issue our own timeout vote
             let _ = async {
                 // Get committed height
+                let mut conn = app_state.db_pool.get().ok()?;
                 let height = {
-                    let mut conn = app_state.db_pool.get().ok()?;
                     let tx = conn.transaction().ok()?;
                     db::get_current_consensus_height(&tx).ok()?
                 };
 
                 // Get validators
-                let validators = db::get_validators(app_state.db_pool.get(), height).ok()?;
+                let validators = db::get_validators_with_conn(&conn, height).ok()?;
 
                 // Check futility and cascade if needed (side effect: issues timeout vote if futile)
                 // No guard to drop here (cascade doesn't hold consensus_lock)
                 use crate::consensus::functions::abort_if_timing_out;
-                let _ = abort_if_timing_out(timeout_vote.data.view_number, &validators, app_state, None).await;
+                let _ = abort_if_timing_out(timeout_vote.data.view_number, &validators, app_state, None, &mut conn).await;
 
                 Some(())
             }.await;

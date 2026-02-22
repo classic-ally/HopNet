@@ -39,5 +39,5 @@ FROM nixos/nix:latest
 RUN echo "experimental-features = nix-command flakes" >> /etc/nix/nix.conf
 COPY --from=builder /hopnet /usr/local/bin/hopnet
 EXPOSE 34632
-ENV RUST_LOG=debug
+ENV RUST_LOG=warn,hopnet=debug
 CMD ["/usr/local/bin/hopnet"]

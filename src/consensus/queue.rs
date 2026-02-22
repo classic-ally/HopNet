@@ -209,6 +209,7 @@ async fn await_result(rx: oneshot::Receiver<ConsensusResult>) -> Result<(), Cons
 
 const MAX_BATCH_SIZE: usize = 100;
 const RETRY_DELAY_SECS: u64 = 5;
+const BATCH_LINGER_MS: u64 = 100;
 
 /// Outcome from a dispatch attempt, determines how the batch processor gates
 /// before the next drain cycle.
@@ -233,6 +234,10 @@ pub(crate) async fn batch_processor(
     mut rx: mpsc::Receiver<QueuedTransaction>,
     app_state: AppState,
 ) {
+    // Dedicated connection for the batch processor — checked out once, held for lifetime.
+    // Makes consensus throughput independent of pool contention from background tasks.
+    let mut conn = app_state.db_pool.get().expect("batch_processor: failed to check out dedicated connection");
+
     let mut retry_holdback: Vec<QueuedTransaction> = Vec::new();
 
     loop {
@@ -271,7 +276,7 @@ pub(crate) async fn batch_processor(
             }
         };
 
-        let consensus_state = match db::get_consensus(app_state.db_pool.get()) {
+        let consensus_state = match db::get_consensus_with_conn(&conn) {
             Ok(state) => state,
             Err(_) => {
                 for queued in batch {
@@ -288,9 +293,18 @@ pub(crate) async fn batch_processor(
 
         // ── Dispatch ──
         let (holdback, outcome) = if consensus_state.leader.node_id == my_node_id {
-            handle_as_leader(&app_state, batch, &consensus_state).await
+            // Leader: linger to collect forwarded transactions from other nodes
+            let deadline = tokio::time::Instant::now()
+                + std::time::Duration::from_millis(BATCH_LINGER_MS);
+            while batch.len() < MAX_BATCH_SIZE {
+                match tokio::time::timeout_at(deadline, rx.recv()).await {
+                    Ok(Some(queued)) => batch.push(queued),
+                    _ => break,
+                }
+            }
+            handle_as_leader(&app_state, batch, &consensus_state, &mut conn).await
         } else {
-            handle_as_forwarder(&app_state, batch, &consensus_state).await
+            handle_as_forwarder(&app_state, batch, &consensus_state, &mut conn).await
         };
         retry_holdback = holdback;
 
@@ -300,17 +314,18 @@ pub(crate) async fn batch_processor(
                 // View advanced during dispatch — loop back immediately to drain more
             }
             DispatchOutcome::WaitForViewChange => {
-                // Register for notifications BEFORE checking DB (closes race window:
-                // if notify_waiters fires between our DB read and the await, we still see it)
-                let notified = app_state.view_changed.notified();
-                let current_view = db::get_consensus(app_state.db_pool.get())
-                    .map(|s| s.view)
-                    .unwrap_or(pre_dispatch_view);
-                if current_view == pre_dispatch_view {
-                    // View hasn't advanced yet — wait for TC or successful round
+                // Loop until view genuinely advances — notify_waiters() is a broadcast
+                // that can fire from unrelated consensus activity (spurious wakeups).
+                loop {
+                    let notified = app_state.view_changed.notified();
+                    let current_view = db::get_consensus_with_conn(&conn)
+                        .map(|s| s.view)
+                        .unwrap_or(pre_dispatch_view);
+                    if current_view != pre_dispatch_view {
+                        break; // View genuinely advanced
+                    }
                     notified.await;
                 }
-                // else: view already advanced (e.g., catch-up during RPC), proceed immediately
             }
             DispatchOutcome::RetryAfterDelay => {
                 // Network failure — leader unreachable, no view consumed.
@@ -327,6 +342,7 @@ async fn handle_as_leader(
     app_state: &AppState,
     mut batch: Vec<QueuedTransaction>,
     consensus_state: &super::types::ConsensusState,
+    conn: &mut r2d2::PooledConnection<DuckdbConnectionManager>,
 ) -> (Vec<QueuedTransaction>, DispatchOutcome) {
     // Early check: if we've already proposed in this view, return all as retries
     if consensus_state.last_propose_vote_block_hash.is_some() {
@@ -339,12 +355,8 @@ async fn handle_as_leader(
 
     // Nonce dedup: check if any transactions were already committed
     {
-        let conn = match app_state.db_pool.get() {
-            Ok(c) => c,
-            Err(_) => return (batch, DispatchOutcome::RetryAfterDelay),
-        };
         let nonces: Vec<_> = batch.iter().map(|q| q.tx.nonce.clone()).collect();
-        if let Ok(committed) = db::check_committed_nonces(&conn, &nonces) {
+        if let Ok(committed) = db::check_committed_nonces(conn, &nonces) {
             if !committed.is_empty() {
                 let mut i = 0;
                 while i < batch.len() {
@@ -369,14 +381,6 @@ async fn handle_as_leader(
         let mut rejected_indices = Vec::new();
 
         {
-            let mut conn = match app_state.db_pool.get() {
-                Ok(c) => c,
-                Err(_) => {
-                    // Pool exhaustion is transient — return as retries
-                    return (batch, DispatchOutcome::RetryAfterDelay);
-                }
-            };
-
             let db_tx = match conn.transaction() {
                 Ok(tx) => tx,
                 Err(_) => {
@@ -449,7 +453,7 @@ async fn handle_as_leader(
     }
 
     // Run consensus (leader-only path)
-    match super::functions::run_consensus(app_state, transactions).await {
+    match super::functions::run_consensus(app_state, transactions, conn).await {
         Ok(()) => {
             for queued in batch {
                 let _ = queued.notifier.send(ConsensusResult::Committed);
@@ -470,7 +474,18 @@ async fn handle_as_forwarder(
     app_state: &AppState,
     batch: Vec<QueuedTransaction>,
     consensus_state: &super::types::ConsensusState,
+    conn: &mut r2d2::PooledConnection<DuckdbConnectionManager>,
 ) -> (Vec<QueuedTransaction>, DispatchOutcome) {
+    // If we've already voted on a proposal this view, the leader has already proposed —
+    // forwarding would just get a Retry response. Skip the round-trip.
+    if consensus_state.last_propose_vote_block_hash.is_some() {
+        tracing::debug!(
+            "Already voted on proposal in view {}, holding {} transactions for next view",
+            consensus_state.view, batch.len()
+        );
+        return (batch, DispatchOutcome::WaitForViewChange);
+    }
+
     let leader = &consensus_state.leader;
     let leader_iroh_id = leader.pubkey.to_iroh_node_id();
     let view = consensus_state.view;
@@ -499,12 +514,32 @@ async fn handle_as_forwarder(
         }
         Ok(super::rpc::ForwardAckResult::AckedWithResult(results)) => {
             // Got full results — process them
-            process_forward_results(app_state, batch, results, consensus_state)
+            process_forward_results(app_state, batch, results, consensus_state, conn)
         }
         Ok(super::rpc::ForwardAckResult::AckedNoResult) => {
             // Leader ACKed but no final result — check nonce table after view change
             tracing::warn!("Leader node {} ACKed but no result — resolving via nonce table", leader.node_id);
-            resolve_after_timeout(app_state, batch, view).await
+            resolve_after_timeout(app_state, batch, view, conn).await
+        }
+        Ok(super::rpc::ForwardAckResult::NotLeader { view: leader_view }) => {
+            // Our view is stale — the node we sent to is not the leader.
+            // WaitForViewChange will break immediately if catch-up already happened
+            // (triggered by the actual leader's ballot arriving at our RPC handler).
+            // Potentially later we'll want this to be event-driven by the leader_view,
+            // matching the pattern other handlers have when receiving ensure_caught_up_for_message
+            tracing::debug!(
+                "Node {} not leader (at view {}, we're at {}) — waiting for catch-up",
+                leader.node_id, leader_view, view
+            );
+            (batch, DispatchOutcome::WaitForViewChange)
+        }
+        Ok(super::rpc::ForwardAckResult::Busy) => {
+            // Leader's consensus lock is held — wait for next view
+            tracing::debug!(
+                "Leader node {} busy in view {} — waiting for next view",
+                leader.node_id, view
+            );
+            (batch, DispatchOutcome::WaitForViewChange)
         }
         Err(e) => {
             // Network failure — leader unreachable
@@ -520,6 +555,7 @@ fn process_forward_results(
     batch: Vec<QueuedTransaction>,
     results: Vec<super::rpc::TransactionForwardResult>,
     consensus_state: &super::types::ConsensusState,
+    conn: &mut r2d2::PooledConnection<DuckdbConnectionManager>,
 ) -> (Vec<QueuedTransaction>, DispatchOutcome) {
     let leader = &consensus_state.leader;
     let mut retries = Vec::new();
@@ -535,8 +571,8 @@ fn process_forward_results(
                 rejecting_leaders.insert(leader.node_id);
 
                 // Check Byzantine rejection threshold
-                let validator_count = match db::get_validators(
-                    app_state.db_pool.get(),
+                let validator_count = match db::get_validators_with_conn(
+                    conn,
                     consensus_state.committed_block.data.height,
                 ) {
                     Ok(v) => v.len(),
@@ -593,12 +629,13 @@ async fn resolve_after_timeout(
     app_state: &AppState,
     batch: Vec<QueuedTransaction>,
     drain_view: i32,
+    conn: &mut r2d2::PooledConnection<DuckdbConnectionManager>,
 ) -> (Vec<QueuedTransaction>, DispatchOutcome) {
     // Register for notification BEFORE checking DB (closes race window)
     let notified = app_state.view_changed.notified();
 
     // Check if view has already advanced
-    let current_view = db::get_consensus(app_state.db_pool.get())
+    let current_view = db::get_consensus_with_conn(conn)
         .map(|s| s.view)
         .unwrap_or(drain_view);
 
@@ -617,13 +654,8 @@ async fn resolve_after_timeout(
     }
 
     // View advanced — check nonce table for each transaction
-    let conn = match app_state.db_pool.get() {
-        Ok(c) => c,
-        Err(_) => return (batch, DispatchOutcome::RetryAfterDelay),
-    };
-
     let nonces: Vec<_> = batch.iter().map(|q| q.tx.nonce.clone()).collect();
-    let committed_nonces = match db::check_committed_nonces(&conn, &nonces) {
+    let committed_nonces = match db::check_committed_nonces(conn, &nonces) {
         Ok(c) => c,
         Err(_) => return (batch, DispatchOutcome::RetryAfterDelay),
     };

@@ -1,5 +1,6 @@
 use super::*;
 
+use duckdb::DuckdbConnectionManager;
 use crate::{db::consensus as db, handlers::HandlerResult};
 use crate::db::MyNode;
 use crate::types::Node;
@@ -99,9 +100,10 @@ pub async fn issue_timeout_vote(
     view: i32,
     app_state: &AppState,
     guard: Option<tokio::sync::MutexGuard<'_, ()>>,
+    conn: &mut r2d2::PooledConnection<DuckdbConnectionManager>,
 ) -> Result<(), ConsensusError> {
     // Get current consensus state (reissuance-safe: picks up latest QC if synced)
-    let consensus_state = db::get_consensus(app_state.db_pool.get())
+    let consensus_state = db::get_consensus_with_conn(conn)
         .map_err(|_| ConsensusError::DatabaseError)?;
 
     tracing::info!("Issuing timeout vote for view {}", view);
@@ -136,7 +138,7 @@ pub async fn issue_timeout_vote(
     };
 
     // Mark as issued in DB (critical: prevents duplicate on retry)
-    db::mark_timeout_vote_issued(app_state.db_pool.get(), view)
+    db::mark_timeout_vote_issued_with_conn(conn, view)
         .map_err(|_| ConsensusError::DatabaseError)?;
 
     // Add to collector (might form TC or reconstruct Lock QC)
@@ -190,7 +192,7 @@ pub async fn issue_timeout_vote(
             // Broadcast our timeout vote to other validators (fire and forget)
             // Use committed height, not view (view can diverge from height due to timeouts)
             let committed_height = consensus_state.committed_block.data.height;
-            let validators = db::get_validators(app_state.db_pool.get(), committed_height)
+            let validators = db::get_validators_with_conn(conn, committed_height)
                 .map_err(|_| ConsensusError::DatabaseError)?
                 .into_iter()
                 .filter(|node| node.node_id != my_node_id)
@@ -239,7 +241,8 @@ pub async fn abort_if_timing_out<'a>(
     view: i32,
     validators: &[Node],
     app_state: &AppState,
-    guard: Option<tokio::sync::MutexGuard<'a, ()>>
+    guard: Option<tokio::sync::MutexGuard<'a, ()>>,
+    conn: &mut r2d2::PooledConnection<DuckdbConnectionManager>,
 ) -> Result<Option<tokio::sync::MutexGuard<'a, ()>>, ConsensusError> {
     if let Err(ConsensusError::NetworkTimeout) = check_leader_abandonment(view, validators, app_state).await {
         tracing::warn!("Futility detected for view {}, issuing timeout vote and aborting", view);
@@ -247,7 +250,7 @@ pub async fn abort_if_timing_out<'a>(
         // Pass guard through to issue_timeout_vote (may be Some or None)
         // If Some: held through GST wait to prevent race conditions
         // If None: acquired after GST wait to allow Lock QC to win
-        let _ = issue_timeout_vote(view, app_state, guard).await;
+        let _ = issue_timeout_vote(view, app_state, guard, conn).await;
         return Err(ConsensusError::NetworkTimeout);
     }
 
@@ -289,7 +292,7 @@ pub async fn create_signed_user_transaction(
 /// Run consensus on a pre-validated batch. Called only on the leader, by the batch processor.
 /// This is the leader-only consensus pipeline: acquire lock, create block, run 2-phase ballot,
 /// broadcast QCs, execute transactions.
-pub async fn run_consensus(app_state: &AppState, transactions: Vec<Transaction>) -> Result<(), ConsensusError> {
+pub async fn run_consensus(app_state: &AppState, transactions: Vec<Transaction>, conn: &mut r2d2::PooledConnection<DuckdbConnectionManager>) -> Result<(), ConsensusError> {
     tracing::debug!("Starting run_consensus for {} transactions", transactions.len());
 
     let my_node_id = app_state.get_node_id().map_err(|_| ConsensusError::DatabaseError)?;
@@ -298,7 +301,7 @@ pub async fn run_consensus(app_state: &AppState, transactions: Vec<Transaction>)
     let guard = app_state.consensus_lock.lock().await;
     tracing::debug!("Acquired consensus_lock");
 
-    let consensus_state = db::get_consensus(app_state.db_pool.get()).map_err(|_| ConsensusError::DatabaseError)?;
+    let consensus_state = db::get_consensus_with_conn(conn).map_err(|_| ConsensusError::DatabaseError)?;
 
     // Double-check we're still the leader (may have changed since batch processor checked)
     if consensus_state.leader.node_id != my_node_id {
@@ -323,12 +326,12 @@ pub async fn run_consensus(app_state: &AppState, transactions: Vec<Transaction>)
     // Use committed height (parent block) for validator set, not proposed height
     // This ensures consistency with middleware activation checks and leader calculation
     let committed_height = consensus_state.committed_block.data.height;
-    let all_validators = db::get_validators(app_state.db_pool.get(), committed_height)
+    let all_validators = db::get_validators_with_conn(conn, committed_height)
         .map_err(|_| ConsensusError::DatabaseError)?;
 
     // Early abandonment check: if too many nodes have timed out, don't waste resources
     // Pass the guard, get it back if not timing out (threads through to maintain lock)
-    let guard = abort_if_timing_out(consensus_state.view, &all_validators, app_state, Some(guard))
+    let guard = abort_if_timing_out(consensus_state.view, &all_validators, app_state, Some(guard), conn)
         .await?
         .expect("guard must be Some since we passed Some");
 
@@ -345,13 +348,11 @@ pub async fn run_consensus(app_state: &AppState, transactions: Vec<Transaction>)
         .cloned()
         .collect();
 
-    let validators_elect = db::get_validators_elect(app_state.db_pool.get(), committed_height).map_err(|_| ConsensusError::DatabaseError)?
+    let validators_elect = db::get_validators_elect_with_conn(conn, committed_height).map_err(|_| ConsensusError::DatabaseError)?
         .iter()
         .filter(|node| node.node_id != me.node_id)
         .cloned()
         .collect();
-
-    let mut conn = app_state.db_pool.get().map_err(|_| ConsensusError::DatabaseError)?;
 
     // Transaction 1: Record Propose vote and commit immediately (double-vote protection)
     let ballot_propose = {
@@ -370,7 +371,7 @@ pub async fn run_consensus(app_state: &AppState, transactions: Vec<Transaction>)
             let view = consensus_state.view;
             tracing::warn!("Propose ballot round failed in view {}, issuing timeout vote", view);
             // Pass guard through to hold lock during GST wait and prevent race
-            let _ = issue_timeout_vote(view, app_state, Some(guard)).await;
+            let _ = issue_timeout_vote(view, app_state, Some(guard), conn).await;
             return Err(e);
         }
     };
@@ -433,7 +434,7 @@ pub async fn run_consensus(app_state: &AppState, transactions: Vec<Transaction>)
             let view = consensus_state.view;
             tracing::warn!("Lock ballot round failed in view {}, issuing timeout vote", view);
             // Pass guard through to hold lock during GST wait and prevent race
-            let _ = issue_timeout_vote(view, app_state, Some(guard)).await;
+            let _ = issue_timeout_vote(view, app_state, Some(guard), conn).await;
             return Err(e);
         }
     };

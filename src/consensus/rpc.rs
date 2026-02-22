@@ -412,12 +412,18 @@ pub enum ForwardAckResult {
     AckedWithResult(Vec<TransactionForwardResult>),
     /// Leader ACKed but no final result arrived (connection dropped or secondary timeout)
     AckedNoResult,
+    /// Rejection: handler is not the leader (includes handler's view for catch-up)
+    NotLeader { view: i32 },
+    /// Rejection: consensus lock is held (leader is busy)
+    Busy,
 }
 
 /// ACK timeout: how long to wait for the immediate ACK from the leader.
 const FORWARD_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 /// Result timeout: how long to wait for the final result after ACK.
-const FORWARD_RESULT_TIMEOUT: Duration = Duration::from_secs(60);
+/// Consensus completes in 1-3s normally; 15s covers slow rounds without
+/// blocking the batch processor for a full timeout detection cycle.
+const FORWARD_RESULT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Client: forward transactions to the leader with two-phase ACK protocol.
 ///
@@ -463,15 +469,25 @@ pub async fn forward_transactions_with_ack(
         Err(_) => return Ok(ForwardAckResult::NoAck),
     };
 
-    // Check if first message is ACK or direct result (backward compat)
+    // Check if first message is ACK, rejection, or direct result (backward compat)
     match first_msg {
+        IrohResponse::TransactionForwardNotLeader { view } => {
+            Ok(ForwardAckResult::NotLeader { view })
+        }
+        IrohResponse::TransactionForwardBusy => {
+            Ok(ForwardAckResult::Busy)
+        }
         IrohResponse::TransactionForwardAck => {
             // Got ACK — leader has received and is processing
-            // Phase 2: Wait for final result
-            let result: Result<IrohResponse, IrohError> = tokio::time::timeout(
+            // Phase 2: Wait for final result (timeout returns AckedNoResult, not error,
+            // since the leader already has the transactions — caller resolves via nonce table)
+            let result = match tokio::time::timeout(
                 FORWARD_RESULT_TIMEOUT,
                 crate::net::transport::recv_message(&mut recv),
-            ).await.map_err(|_| IrohError::Transport(TransportError::Timeout))?;
+            ).await {
+                Ok(msg) => msg,
+                Err(_) => return Ok(ForwardAckResult::AckedNoResult),
+            };
 
             match result {
                 Ok(IrohResponse::TransactionForwardResponse(resp)) => {

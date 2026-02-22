@@ -245,7 +245,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             tracing::info!("iroh endpoint ready, node_id: {}", iroh_transport.node_id());
 
             // Create consensus queue (channel + submit handle)
-            let (consensus_queue, consensus_queue_rx) = consensus::queue::ConsensusQueue::new(pool.clone(), 256);
+            let (consensus_queue, consensus_queue_rx) = consensus::queue::ConsensusQueue::new(pool.clone(), 300);
 
             let app_state = AppState {
                 db_pool: pool,
