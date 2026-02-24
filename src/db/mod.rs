@@ -1,5 +1,6 @@
 pub use {
-    duckdb::{params, DuckdbConnectionManager, Error as DuckdbError},
+    rusqlite::{params, Error as DuckdbError},
+    r2d2_sqlite::SqliteConnectionManager,
     r2d2::PooledConnection,
     types::*,
     crate::types::*

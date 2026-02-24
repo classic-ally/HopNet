@@ -847,7 +847,7 @@ impl TestScenario for ConsensusQueueThroughput {
             }
 
             round += 1;
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
         print_and_add_check(

@@ -3,7 +3,7 @@ use serde::{Serialize, Deserialize, Deserializer, Serializer};
 use std::ops::Deref;
 use ed25519_dalek::VerifyingKey;
 use bincode::{Encode, Decode};
-use duckdb::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
+use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 pub use ed25519_dalek::{SigningKey,Signer};
 use hex;
 
@@ -178,7 +178,7 @@ impl FromSql for Blake3Hash {
 }
 
 impl ToSql for Blake3Hash {
-    fn to_sql(&self) -> duckdb::Result<ToSqlOutput<'_>> {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
         Ok(ToSqlOutput::from(self.as_bytes()))
     }
 }
@@ -278,10 +278,10 @@ impl Deref for PubKey {
 
 
 impl ToSql for PubKey {
-    fn to_sql(&self) -> duckdb::Result<ToSqlOutput<'_>, duckdb::Error> {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
         match bincode::serde::encode_to_vec(&self, bincode::config::standard()) {
-            Ok(data) => Ok(ToSqlOutput::Owned(duckdb::types::Value::Blob(data))),
-            Err(e) => Err(duckdb::Error::ToSqlConversionFailure(Box::new(e)))
+            Ok(data) => Ok(ToSqlOutput::Owned(rusqlite::types::Value::Blob(data))),
+            Err(e) => Err(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
         }
     }
 }
@@ -292,7 +292,7 @@ impl FromSql for PubKey {
             ValueRef::Blob(b) => {
                 match bincode::serde::decode_from_slice(b, bincode::config::standard()) {
                     Ok((data, _)) => Ok(PubKey(data)),
-                    Err(_) => Err(duckdb::types::FromSqlError::InvalidType)
+                    Err(_) => Err(FromSqlError::InvalidType)
                 }
             }
             _ => Err(FromSqlError::InvalidType),
@@ -355,10 +355,10 @@ impl Deref for PrivKey {
 }
 
 impl ToSql for PrivKey {
-    fn to_sql(&self) -> duckdb::Result<ToSqlOutput<'_>, duckdb::Error> {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
         match bincode::serde::encode_to_vec(&self, bincode::config::standard()) {
-            Ok(data) => Ok(ToSqlOutput::Owned(duckdb::types::Value::Blob(data))),
-            Err(e) => Err(duckdb::Error::ToSqlConversionFailure(Box::new(e)))
+            Ok(data) => Ok(ToSqlOutput::Owned(rusqlite::types::Value::Blob(data))),
+            Err(e) => Err(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
         }
     }
 }
@@ -369,7 +369,7 @@ impl FromSql for PrivKey {
             ValueRef::Blob(b) => {
                 match bincode::serde::decode_from_slice(b, bincode::config::standard()) {
                     Ok((data, _)) => Ok(PrivKey(data)),
-                    Err(_) => Err(duckdb::types::FromSqlError::InvalidType)
+                    Err(_) => Err(FromSqlError::InvalidType)
                 }
             }
             _ => Err(FromSqlError::InvalidType),

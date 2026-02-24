@@ -3,7 +3,7 @@ use crate::consensus::{types::{Block, BlockData, VoteSignMessage}, ConsensusPhas
 use axum::http::StatusCode;
 
 pub fn get_initial_setup(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
 ) -> Result<StatusCode, DatabaseError> {
     match db_connection {
         Ok(db_lock) => {
@@ -26,7 +26,7 @@ pub fn get_initial_setup(
 
 /// Initialize sequences to 0 - used by genesis block and network creation
 /// Operates within provided transaction for atomicity
-pub fn initialize_sequences_tx(tx: &duckdb::Transaction) -> Result<(), DatabaseError> {
+pub fn initialize_sequences_tx(tx: &rusqlite::Transaction) -> Result<(), DatabaseError> {
     tx.execute_batch("
         INSERT INTO sequences (name, next_id) VALUES ('users', 0);
         INSERT INTO sequences (name, next_id) VALUES ('nodes', 0);
@@ -249,7 +249,7 @@ pub fn post_initial_setup(
 /// 1. Perform catch-up from view 0 to current_height
 /// 2. Submit activation request after catching up
 pub fn initialize_joining_node(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     join_info: crate::types::JoinInfo,
     node_privkey: PrivKey,
 ) -> Result<(), DatabaseError> {

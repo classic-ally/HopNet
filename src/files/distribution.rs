@@ -1,6 +1,6 @@
 use crate::{
     AppState,
-    db::{DatabaseError, files::{PlacementHeightUpdate, get_distributable_file, mark_fragment_local_state, DistributableFileData}, consensus},
+    db::{DatabaseError, files::{PlacementHeightUpdate, get_distributable_file, mark_fragments_local_state_batch, DistributableFileData}, consensus},
     consensus::{queue::ConsensusSubmitError, types::Transaction},
     db::metrics::get_all_node_metrics,
     types::Blake3Hash,
@@ -155,8 +155,9 @@ async fn distribute_file_fragments(
             data_block.fragment_hashes.clone()
         ));
 
-    // Channel to report failed fragments
+    // Channels to report failed fragments and remotely-placed fragments
     let (failure_tx, mut failure_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (remote_tx, mut remote_rx) = tokio::sync::mpsc::unbounded_channel::<Blake3Hash>();
     let successful_placements = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     // Spawn workers to distribute fragments
@@ -164,6 +165,7 @@ async fn distribute_file_fragments(
 
     for worker_id in 0..NUM_WORKERS {
         let tx = failure_tx.clone();
+        let remote_placed_tx = remote_tx.clone();
         let queue = work_queue.clone();
         let app_state_clone = app_state.clone();
         let node_pubkeys_clone = node_pubkeys.clone();
@@ -215,17 +217,10 @@ async fn distribute_file_fragments(
                     };
                     match send_fragment_to_node(&app_state_clone, candidate_node.node_id, &fragment_hash, peer_node_id).await {
                         Ok(()) => {
-                            // Mark fragment as not stored locally since it was sent elsewhere
-                            match mark_fragment_local_state(app_state_clone.db_pool.get(), &fragment_hash, false) {
-                                Ok(_rows) => {
-                                    tracing::debug!("Successfully sent fragment {} to node {}, marked not stored locally",
-                                                  fragment_hash, candidate_node.node_id);
-                                }
-                                Err(e) => {
-                                    tracing::warn!("Failed to mark fragment {} as not local: {:?}, but fragment was sent successfully",
-                                                 fragment_hash, e);
-                                }
-                            }
+                            // Collect for batch update after all workers finish
+                            let _ = remote_placed_tx.send(fragment_hash);
+                            tracing::debug!("Successfully sent fragment {} to node {}",
+                                          fragment_hash, candidate_node.node_id);
                             placed = true;
                             break;
                         }
@@ -255,8 +250,9 @@ async fn distribute_file_fragments(
         worker_handles.push(worker_handle);
     }
 
-    // Drop the sender so the receiver knows when all workers are done
+    // Drop the senders so the receivers know when all workers are done
     drop(failure_tx);
+    drop(remote_tx);
 
     // Wait for all workers to complete
     for handle in worker_handles {
@@ -267,6 +263,23 @@ async fn distribute_file_fragments(
     let mut failed_fragments = Vec::new();
     while let Some(fragment_hash) = failure_rx.recv().await {
         failed_fragments.push(fragment_hash);
+    }
+
+    // Batch-update all remotely-placed fragments in a single transaction
+    let mut remotely_placed = Vec::new();
+    while let Some(fragment_hash) = remote_rx.recv().await {
+        remotely_placed.push(fragment_hash);
+    }
+    if !remotely_placed.is_empty() {
+        match mark_fragments_local_state_batch(app_state.db_pool.get(), &remotely_placed, false) {
+            Ok(rows) => {
+                tracing::debug!("Batch-updated {} fragment records as not stored locally", rows);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to batch-update {} fragments as not local: {:?} — fragments were sent successfully, will reconcile on next health check",
+                             remotely_placed.len(), e);
+            }
+        }
     }
 
     let successful = successful_placements.load(std::sync::atomic::Ordering::Relaxed);

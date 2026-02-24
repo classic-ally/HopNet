@@ -23,6 +23,7 @@ pub struct AcceptSharePayload {
     pub recipient_id: i32,
     pub encrypted_path: String,
     pub inode_id: CustomUUID,
+    pub parent_folder_inodes: Vec<(CustomUUID, String)>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

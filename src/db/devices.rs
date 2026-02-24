@@ -1,6 +1,6 @@
-use duckdb::{Transaction, params};
+use rusqlite::{Transaction, params};
 use r2d2::PooledConnection;
-use crate::db::{CustomUUID, DuckdbConnectionManager, DatabaseError, Blake3Hash};
+use crate::db::{CustomUUID, SqliteConnectionManager, DatabaseError, Blake3Hash};
 
 /// Insert device token within a consensus transaction
 pub fn insert_device_token_tx(
@@ -46,7 +46,7 @@ pub struct DeviceTokenRecord {
 
 /// Get device by ID for auth verification (primary key lookup, O(log n))
 pub fn get_device_by_id(
-    db_lock: &PooledConnection<DuckdbConnectionManager>,
+    db_lock: &PooledConnection<SqliteConnectionManager>,
     device_id: &CustomUUID,
 ) -> Result<Option<DeviceTokenRecord>, DatabaseError> {
     let result = db_lock.query_row(
@@ -61,7 +61,7 @@ pub fn get_device_by_id(
 
     match result {
         Ok(record) => Ok(Some(record)),
-        Err(duckdb::Error::QueryReturnedNoRows) => Ok(None),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => {
             tracing::error!("Failed to get device by id: {:?}", e);
             Err(DatabaseError::RecallError)
@@ -78,7 +78,7 @@ pub struct DeviceListRecord {
 /// List devices for a user (for management UI)
 /// Returns encrypted device names - caller must decrypt with user's SIV key
 pub fn get_devices_for_user(
-    db_lock: &PooledConnection<DuckdbConnectionManager>,
+    db_lock: &PooledConnection<SqliteConnectionManager>,
     user_id: i32,
 ) -> Result<Vec<DeviceListRecord>, DatabaseError> {
     let mut stmt = db_lock.prepare(

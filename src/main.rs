@@ -1,40 +1,19 @@
 use axum::{
     extract::DefaultBodyLimit, http::{HeaderValue, Method, StatusCode}, middleware, routing::{get,post,patch,delete}, serve, Router
 };
-use jsonwebtoken::{DecodingKey, EncodingKey};
 use tower_serve_static::ServeDir;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use include_dir::{Dir, include_dir};
 use once_cell::sync::{Lazy, OnceCell};
 use std::sync::Arc;
-use std::collections::HashMap;
-use duckdb::{Config, DuckdbConnectionManager};
+use r2d2_sqlite::SqliteConnectionManager;
 use r2d2::Pool;
 use apalis::prelude::*;
 use std::str::FromStr;
 
-use chrono::Utc;
-use crate::{db::{PrivKey, PubKey}, handlers::TransactionHandler};
-
-mod nodes;
-mod setup;
-mod users;
-mod metrics;
-mod db;
-mod auth;
-mod consensus;
-mod types;
-mod handlers;
-mod files;
-mod fileprovider;
-mod documentprovider;
-mod takeout;
-mod admin;
-mod devices;
-mod net;
-mod passphrase;
-mod shares;
+use hopnet::*;
+use hopnet::db::{PrivKey, PubKey};
 
 static ASSETS_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/frontend/dist");
 
@@ -46,68 +25,6 @@ const BACKEND_PORT: u16 = 34632;
 #[cfg(feature = "gui")]
 static GUI_APP_STATE: Lazy<tokio::sync::RwLock<Option<AppState>>> =
     Lazy::new(|| tokio::sync::RwLock::new(None));
-
-#[derive(Clone, Debug)]
-pub struct UserKeys {
-    pub private_key: PrivKey,
-    pub public_key: PubKey,
-}
-
-#[derive(Clone)]
-pub struct AppState {
-    db_pool: Pool<DuckdbConnectionManager>,
-    encoding_key: EncodingKey,
-    decoding_key: DecodingKey,
-    private_key: PrivKey,
-    public_key: PubKey,
-    node_id: Arc<OnceCell<i32>>,
-    user_id: Arc<OnceCell<i32>>,
-    fragments_dir: String,
-    timeout_vote_collector: Arc<consensus::functions::TimeoutVoteCollector>,
-    last_observed_view: Arc<std::sync::atomic::AtomicI32>,
-    consensus_lock: Arc<tokio::sync::Mutex<()>>,
-    fileprovider_api_key: String,
-    port: u16,
-    test_mode: bool,
-    orphaned_fragment_scan: Arc<std::sync::Mutex<Option<files::jobs::OrphanedFragmentScan>>>,
-    iroh_transport: net::IrohTransport,
-    consensus_barriers: Arc<consensus::barriers::ConsensusBarriers>,
-    dedup_cache: Arc<net::DedupCache>,
-    lock_vote_evidence: Arc<std::sync::Mutex<Option<consensus::types::LockVoteEvidence>>>,
-    session_store: Arc<auth::SessionStore>,
-    pub consensus_queue: consensus::queue::ConsensusQueue,
-    pub view_changed: Arc<tokio::sync::Notify>,
-}
-
-impl AppState {
-    pub fn get_node_id(&self) -> Result<i32, StatusCode> {
-        self.node_id.get().copied().ok_or(StatusCode::PRECONDITION_REQUIRED)
-    }
-
-    pub fn get_user_id(&self) -> Result<i32, StatusCode> {
-        self.user_id.get().copied().ok_or(StatusCode::PRECONDITION_REQUIRED)
-    }
-
-    pub async fn get_session(&self, user_id: i32) -> Result<auth::SessionEntry, StatusCode> {
-        let store = self.session_store.read().await;
-        match store.get(&user_id) {
-            Some(entry) if entry.expires_at > Utc::now() => Ok(entry.clone()),
-            Some(_) => Err(StatusCode::UNAUTHORIZED),
-            None => Err(StatusCode::PRECONDITION_REQUIRED),
-        }
-    }
-}
-
-static DISPATCH_TABLE: Lazy<HashMap<&'static str, &'static dyn TransactionHandler>> = Lazy::new(|| {
-    tracing::debug!("Building dispatch table from registered handlers");
-    let mut table = HashMap::new();
-    // iterate over the globally collected handlers
-    for handler in inventory::iter::<&'static dyn TransactionHandler> {
-        tracing::debug!("Registering handler: {}", handler.name());
-        table.insert(handler.name(), *handler);
-    }
-    table
-});
 
 async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // tracing
@@ -147,18 +64,13 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // Check if ephemeral database mode is requested (for testing)
     let use_ephemeral_db = std::env::var("HOPNET_EPHEMERAL_DB").is_ok();
 
-    // Create DuckDB config with extension autoloading disabled
-    // We manually load signed extensions from the bundle instead
-    let config = Config::default()
-        .enable_autoload_extension(false)
-        .expect("Failed to disable autoload extensions");
-
     let pool = if use_ephemeral_db {
         tracing::info!("Using ephemeral in-memory database (HOPNET_EPHEMERAL_DB set)");
-        let manager = DuckdbConnectionManager::memory_with_flags(config).unwrap();
+        // Use shared-cache URI so all pool connections see the same in-memory DB
+        let manager = SqliteConnectionManager::file("file::memory:?cache=shared");
         Pool::builder()
             .max_size(8)
-            .min_idle(Some(0))  // Don't keep idle connections - prevents stale reads after checkpoint
+            .connection_customizer(Box::new(db::shared::SqliteInitializer))
             .build(manager).unwrap()
     } else {
         // Get database path and ensure directory exists
@@ -173,16 +85,13 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             tracing::info!("Found existing database file at {}", db_path);
         }
 
-        // Create database connection pool (file-based)
-        // WAL mode is automatically enabled for file-based DuckDB databases
-        // Config disables extension autoloading to prevent macOS code signing issues
-        let manager = DuckdbConnectionManager::file_with_flags(&db_path, config).unwrap();
+        let manager = SqliteConnectionManager::file(&db_path);
         let pool = Pool::builder()
-            .max_size(8)         // 8 concurrent connections
-            .min_idle(Some(0))   // Don't keep idle connections - prevents stale reads after checkpoint
+            .max_size(8)
+            .connection_customizer(Box::new(db::shared::SqliteInitializer))
             .build(manager).unwrap();
 
-        tracing::info!("Database connection pool established (WAL mode enabled, extension autoloading disabled)");
+        tracing::info!("Database connection pool established (WAL mode)");
         pool
     };
 

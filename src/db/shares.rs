@@ -1,5 +1,5 @@
 use super::*;
-use duckdb::OptionalExt;
+use rusqlite::OptionalExtension;
 
 /// Raw incoming share row from the database.
 pub struct IncomingShareRow {
@@ -20,7 +20,7 @@ pub struct ShareMember {
 }
 
 pub fn insert_incoming_share(
-    db_tx: &duckdb::Transaction,
+    db_tx: &rusqlite::Transaction,
     id: CustomUUID,
     data_block_id: CustomUUID,
     sender_id: i32,
@@ -40,7 +40,7 @@ pub fn insert_incoming_share(
 }
 
 pub fn get_incoming_shares_for_user(
-    db_connection: Result<PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     recipient_id: i32,
 ) -> Result<Vec<(IncomingShareRow, String)>, DatabaseError> {
     match db_connection {
@@ -75,7 +75,7 @@ pub fn get_incoming_shares_for_user(
 }
 
 pub fn get_incoming_share_count(
-    db_connection: Result<PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     recipient_id: i32,
 ) -> Result<i64, DatabaseError> {
     match db_connection {
@@ -91,7 +91,7 @@ pub fn get_incoming_share_count(
 }
 
 pub fn get_incoming_share_by_id(
-    db_tx: &duckdb::Transaction,
+    db_tx: &rusqlite::Transaction,
     share_id: &CustomUUID,
 ) -> Result<Option<IncomingShareRow>, DatabaseError> {
     db_tx.query_row(
@@ -110,7 +110,7 @@ pub fn get_incoming_share_by_id(
 }
 
 pub fn delete_incoming_share(
-    db_tx: &duckdb::Transaction,
+    db_tx: &rusqlite::Transaction,
     share_id: &CustomUUID,
 ) -> Result<(), DatabaseError> {
     let rows = db_tx.execute(
@@ -128,7 +128,7 @@ pub fn delete_incoming_share(
 }
 
 pub fn insert_share_members(
-    db_tx: &duckdb::Transaction,
+    db_tx: &rusqlite::Transaction,
     data_block_id: CustomUUID,
     user_ids: &[i32],
 ) -> Result<(), DatabaseError> {
@@ -146,7 +146,7 @@ pub fn insert_share_members(
 
 /// Check if a share already exists for this recipient+data_block (across both tables).
 pub fn share_exists_for_recipient(
-    db_tx: &duckdb::Transaction,
+    db_tx: &rusqlite::Transaction,
     data_block_id: &CustomUUID,
     recipient_id: i32,
 ) -> Result<bool, DatabaseError> {
@@ -165,7 +165,7 @@ pub fn share_exists_for_recipient(
 
 /// Get user_ids of all accepted members sharing a data_block.
 pub fn get_sharers_for_data_block_conn(
-    conn: &duckdb::Connection,
+    conn: &rusqlite::Connection,
     data_block_id: &CustomUUID,
 ) -> Result<Vec<i32>, DatabaseError> {
     let mut stmt = conn.prepare(
@@ -180,7 +180,7 @@ pub fn get_sharers_for_data_block_conn(
 }
 
 pub fn get_sharers_for_data_block(
-    db_tx: &duckdb::Transaction,
+    db_tx: &rusqlite::Transaction,
     data_block_id: &CustomUUID,
 ) -> Result<Vec<i32>, DatabaseError> {
     get_sharers_for_data_block_conn(db_tx, data_block_id)
@@ -188,7 +188,7 @@ pub fn get_sharers_for_data_block(
 
 /// Get pending incoming_shares for a data_block.
 pub fn get_incoming_shares_for_data_block_conn(
-    conn: &duckdb::Connection,
+    conn: &rusqlite::Connection,
     data_block_id: &CustomUUID,
 ) -> Result<Vec<IncomingShareRow>, DatabaseError> {
     let mut stmt = conn.prepare(
@@ -211,7 +211,7 @@ pub fn get_incoming_shares_for_data_block_conn(
 }
 
 pub fn get_incoming_shares_for_data_block(
-    db_tx: &duckdb::Transaction,
+    db_tx: &rusqlite::Transaction,
     data_block_id: &CustomUUID,
 ) -> Result<Vec<IncomingShareRow>, DatabaseError> {
     get_incoming_shares_for_data_block_conn(db_tx, data_block_id)
@@ -219,7 +219,7 @@ pub fn get_incoming_shares_for_data_block(
 
 /// Batch-update shares table: old_data_block_id → new_data_block_id.
 pub fn update_shares_data_block(
-    db_tx: &duckdb::Transaction,
+    db_tx: &rusqlite::Transaction,
     old_data_block_id: &CustomUUID,
     new_data_block_id: &CustomUUID,
 ) -> Result<(), DatabaseError> {
@@ -235,7 +235,7 @@ pub fn update_shares_data_block(
 
 /// Update a single incoming_share's data_block_id and file_access blob.
 pub fn update_incoming_share_data_block(
-    db_tx: &duckdb::Transaction,
+    db_tx: &rusqlite::Transaction,
     share_id: &CustomUUID,
     new_data_block_id: &CustomUUID,
     new_file_access_blob: &[u8],
@@ -252,7 +252,7 @@ pub fn update_incoming_share_data_block(
 
 /// Remove a user from the shares table for a given data_block.
 pub fn remove_user_from_shares(
-    db_tx: &duckdb::Transaction,
+    db_tx: &rusqlite::Transaction,
     data_block_id: &CustomUUID,
     user_id: i32,
 ) -> Result<(), DatabaseError> {
@@ -268,7 +268,7 @@ pub fn remove_user_from_shares(
 
 /// Remove all incoming_shares where sender_id matches and data_block_id matches.
 pub fn remove_sender_incoming_shares(
-    db_tx: &duckdb::Transaction,
+    db_tx: &rusqlite::Transaction,
     data_block_id: &CustomUUID,
     sender_id: i32,
 ) -> Result<(), DatabaseError> {
@@ -284,7 +284,7 @@ pub fn remove_sender_incoming_shares(
 
 /// Get data_block_id for a user's inode by inode_id.
 pub fn get_data_block_for_inode(
-    db_tx: &duckdb::Transaction,
+    db_tx: &rusqlite::Transaction,
     inode_id: &CustomUUID,
     user_id: i32,
 ) -> Result<Option<CustomUUID>, DatabaseError> {
@@ -301,7 +301,7 @@ pub fn get_data_block_for_inode(
 }
 
 pub fn get_share_details(
-    db_connection: Result<PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     data_block_id: &CustomUUID,
 ) -> Result<Vec<ShareMember>, DatabaseError> {
     match db_connection {

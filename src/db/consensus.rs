@@ -1,8 +1,9 @@
 use super::*;
+use rusqlite::TransactionBehavior;
 use crate::consensus::types::*;
 
 pub fn get_consensus_with_conn(
-    db_lock: &r2d2::PooledConnection<DuckdbConnectionManager>,
+    db_lock: &r2d2::PooledConnection<SqliteConnectionManager>,
 ) -> Result<ConsensusState, DatabaseError> {
     let mut stmt = db_lock.prepare(
                 "WITH latest_effective AS (
@@ -71,7 +72,7 @@ pub fn get_consensus_with_conn(
                 let highest_qc_phase: Option<ConsensusPhase> = row.get(8)?;
 
                 // Helper function to build block from row data (without transactions)
-                let build_block = |hash_col: usize, height_col: usize, view_col: usize, parent_col: usize| -> Result<Option<Block>, duckdb::Error> {
+                let build_block = |hash_col: usize, height_col: usize, view_col: usize, parent_col: usize| -> Result<Option<Block>, rusqlite::Error> {
                     let block_hash: Option<Blake3Hash> = row.get(hash_col)?;
                     if let Some(block_hash) = block_hash {
                         let height: i32 = row.get(height_col)?;
@@ -133,7 +134,7 @@ pub fn get_consensus_with_conn(
 }
 
 pub fn get_consensus(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
 ) -> Result<ConsensusState, DatabaseError> {
     match db_connection {
         Ok(db_lock) => get_consensus_with_conn(&db_lock),
@@ -143,21 +144,23 @@ pub fn get_consensus(
 
 /// Get consensus history showing view progression for debugging
 pub fn get_consensus_history(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
 ) -> Result<Vec<crate::consensus::routes::ViewHistoryEntry>, DatabaseError> {
     use crate::consensus::routes::ViewHistoryEntry;
 
     match db_connection {
         Ok(db_lock) => {
             let mut stmt = db_lock.prepare(
-                "WITH view_range AS (
-                    SELECT unnest(generate_series(0, (SELECT current_view FROM this_node WHERE internal_id = 1))) AS view
+                "WITH RECURSIVE view_range(view) AS (
+                    SELECT 0
+                    UNION ALL
+                    SELECT view + 1 FROM view_range WHERE view < (SELECT current_view FROM this_node WHERE internal_id = 1)
                 ),
                 propose_qcs AS (
-                    SELECT view_number FROM quorum_certificates WHERE phase = 'propose'
+                    SELECT view_number FROM quorum_certificates WHERE phase = 0
                 ),
                 lock_qcs AS (
-                    SELECT view_number FROM quorum_certificates WHERE phase = 'lock'
+                    SELECT view_number FROM quorum_certificates WHERE phase = 1
                 ),
                 tcs AS (
                     SELECT view_number FROM timeout_certificates
@@ -222,7 +225,7 @@ pub fn get_consensus_history(
 /// Get the leader for a specific view at a given height
 /// Uses same SQL logic as get_consensus_with_conn leader_selection CTE
 pub fn get_leader_for_view_tx(
-    tx: &duckdb::Transaction,
+    tx: &rusqlite::Transaction,
     view: i32,
     height: i32,
 ) -> Result<Option<Node>, DatabaseError> {
@@ -271,7 +274,7 @@ pub fn get_leader_for_view_tx(
 
     match result {
         Ok(node) => Ok(Some(node)),
-        Err(duckdb::Error::QueryReturnedNoRows) => Ok(None),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(_) => Err(DatabaseError::RecallError),
     }
 }
@@ -279,19 +282,19 @@ pub fn get_leader_for_view_tx(
 /// Get the highest committed block height at or before a given view
 /// Only counts blocks that have Lock QCs (committed blocks)
 /// This ensures consistency with leader calculation and validator set selection
-pub fn get_height_at_view_tx(tx: &duckdb::Transaction, view: i32) -> Result<i32, DatabaseError> {
+pub fn get_height_at_view_tx(tx: &rusqlite::Transaction, view: i32) -> Result<i32, DatabaseError> {
     let height: i32 = tx.query_row(
         "SELECT COALESCE(MAX(b.height), 0)
          FROM blocks b
          JOIN quorum_certificates qc ON b.view_number = qc.view_number
-         WHERE qc.phase = 'lock' AND b.view_number <= ?",
+         WHERE qc.phase = 1 AND b.view_number <= ?",
         [view],
         |row| row.get(0)
     ).map_err(|_| DatabaseError::RecallError)?;
     Ok(height)
 }
 
-pub fn get_current_view_tx(tx: &duckdb::Transaction) -> Result<i32, DatabaseError> {
+pub fn get_current_view_tx(tx: &rusqlite::Transaction) -> Result<i32, DatabaseError> {
     let view: i32 = tx.query_row(
         "SELECT current_view FROM this_node WHERE internal_id = 1",
         [],
@@ -302,7 +305,7 @@ pub fn get_current_view_tx(tx: &duckdb::Transaction) -> Result<i32, DatabaseErro
 
 /// Get last propose vote block hash within a transaction
 /// Used for double-vote detection in Ballot::propose
-pub fn get_last_propose_vote_tx(tx: &duckdb::Transaction) -> Result<Option<Blake3Hash>, DatabaseError> {
+pub fn get_last_propose_vote_tx(tx: &rusqlite::Transaction) -> Result<Option<Blake3Hash>, DatabaseError> {
     let hash: Option<Blake3Hash> = tx.query_row(
         "SELECT last_propose_vote_block_hash FROM this_node WHERE internal_id = 1",
         [],
@@ -315,7 +318,7 @@ pub fn get_last_propose_vote_tx(tx: &duckdb::Transaction) -> Result<Option<Blake
 /// Used during catch-up for joining nodes before they have validators
 /// Wrapper for backwards compatibility
 pub fn get_current_view(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
 ) -> Result<i32, DatabaseError> {
     match db_connection {
         Ok(mut db_lock) => {
@@ -330,7 +333,7 @@ pub fn get_current_view(
 /// Used for message-driven catch-up decisions in the iroh handler.
 /// Much cheaper than get_consensus() (one join, two integers, no CTEs).
 pub fn get_consensus_progress(
-    conn: &r2d2::PooledConnection<DuckdbConnectionManager>,
+    conn: &r2d2::PooledConnection<SqliteConnectionManager>,
 ) -> Result<(i32, i32), DatabaseError> {
     conn.query_row(
         "SELECT t.current_view, hb.view_number
@@ -343,7 +346,7 @@ pub fn get_consensus_progress(
 }
 
 pub fn get_validators_with_conn(
-    db_lock: &r2d2::PooledConnection<DuckdbConnectionManager>,
+    db_lock: &r2d2::PooledConnection<SqliteConnectionManager>,
     height: i32,
 ) -> Result<Vec<Node>, DatabaseError> {
     let mut stmt = db_lock.prepare(
@@ -397,7 +400,7 @@ pub fn get_validators_with_conn(
 }
 
 pub fn get_validators(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     height: i32,
 ) -> Result<Vec<Node>, DatabaseError> {
     match db_connection {
@@ -407,7 +410,7 @@ pub fn get_validators(
 }
 
 pub fn get_validators_elect_with_conn(
-    db_lock: &r2d2::PooledConnection<DuckdbConnectionManager>,
+    db_lock: &r2d2::PooledConnection<SqliteConnectionManager>,
     current_height: i32,
 ) -> Result<Vec<Node>, DatabaseError> {
     let mut stmt = db_lock.prepare(
@@ -445,7 +448,7 @@ pub fn get_validators_elect_with_conn(
 }
 
 pub fn get_validators_elect(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     current_height: i32,
 ) -> Result<Vec<Node>, DatabaseError> {
     match db_connection {
@@ -455,10 +458,10 @@ pub fn get_validators_elect(
 }
 
 pub fn insert_block_with_conn(
-    db_lock: &mut r2d2::PooledConnection<DuckdbConnectionManager>,
+    db_lock: &mut r2d2::PooledConnection<SqliteConnectionManager>,
     block: &Block,
 ) -> Result<(), DatabaseError> {
-    let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
+    let tx = db_lock.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| DatabaseError::LockError)?;
 
     // Insert the block (prepared_block_hash set later by insert_qc_unsafe_tx when Propose QC arrives)
     tx.execute(
@@ -477,7 +480,7 @@ pub fn insert_block_with_conn(
 }
 
 pub fn insert_block(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     block: &Block,
 ) -> Result<(), DatabaseError> {
     match db_connection {
@@ -488,7 +491,7 @@ pub fn insert_block(
 
 /// Get block within an existing transaction (core implementation)
 pub fn get_block_tx(
-    tx: &duckdb::Transaction,
+    tx: &rusqlite::Transaction,
     block_hash: Blake3Hash,
 ) -> Result<Block, DatabaseError> {
     let mut stmt = tx.prepare(
@@ -520,7 +523,7 @@ pub fn get_block_tx(
 
 /// Get block (wrapper for backward compatibility)
 pub fn get_block(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     block_hash: Blake3Hash,
 ) -> Result<Block, DatabaseError> {
     match db_connection {
@@ -535,7 +538,7 @@ pub fn get_block(
 /// Insert transaction nonces inside an existing DB transaction (atomic with block commit).
 /// Called by process_transactions for every committed block on all nodes.
 pub fn insert_tx_nonces_tx(
-    db_tx: &duckdb::Transaction,
+    db_tx: &rusqlite::Transaction,
     nonces: &[hopnet_common::CustomUUID],
 ) -> Result<(), DatabaseError> {
     if nonces.is_empty() {
@@ -548,7 +551,7 @@ pub fn insert_tx_nonces_tx(
         "INSERT INTO committed_tx_nonces (nonce) VALUES {} ON CONFLICT DO NOTHING",
         placeholders.join(", ")
     );
-    let params: Vec<&dyn duckdb::ToSql> = nonces.iter().map(|n| n as &dyn duckdb::ToSql).collect();
+    let params: Vec<&dyn rusqlite::ToSql> = nonces.iter().map(|n| n as &dyn rusqlite::ToSql).collect();
     db_tx.execute(&sql, params.as_slice()).map_err(|e| {
         tracing::error!("Failed to insert {} transaction nonces: {:?}", nonces.len(), e);
         DatabaseError::InsertError
@@ -559,7 +562,7 @@ pub fn insert_tx_nonces_tx(
 /// Check which nonces from the given batch are already committed.
 /// Returns the set of nonce strings that exist in committed_tx_nonces.
 pub fn check_committed_nonces(
-    conn: &r2d2::PooledConnection<DuckdbConnectionManager>,
+    conn: &r2d2::PooledConnection<SqliteConnectionManager>,
     nonces: &[hopnet_common::CustomUUID],
 ) -> Result<std::collections::HashSet<String>, DatabaseError> {
     let mut committed = std::collections::HashSet::new();
@@ -572,7 +575,7 @@ pub fn check_committed_nonces(
         "SELECT nonce FROM committed_tx_nonces WHERE nonce IN ({})",
         placeholders.join(", ")
     );
-    let params: Vec<&dyn duckdb::ToSql> = nonces.iter().map(|n| n as &dyn duckdb::ToSql).collect();
+    let params: Vec<&dyn rusqlite::ToSql> = nonces.iter().map(|n| n as &dyn rusqlite::ToSql).collect();
     let mut stmt = conn.prepare(&sql).map_err(|_| DatabaseError::RecallError)?;
     let mut rows = stmt.query(params.as_slice()).map_err(|_| DatabaseError::RecallError)?;
     while let Some(row) = rows.next().map_err(|_| DatabaseError::RecallError)? {
@@ -585,7 +588,7 @@ pub fn check_committed_nonces(
 /// Delete nonces older than the cutoff UUID (UUIDv7 ordering = chronological).
 /// Called inside a consensus transaction for deterministic cleanup across all nodes.
 pub fn cleanup_old_nonces(
-    db_tx: &duckdb::Transaction,
+    db_tx: &rusqlite::Transaction,
     cutoff: &hopnet_common::CustomUUID,
 ) -> Result<usize, DatabaseError> {
     let deleted = db_tx.execute(
@@ -597,7 +600,7 @@ pub fn cleanup_old_nonces(
 
 /// Get QC by hash within an existing transaction (core implementation)
 pub fn get_quorum_certificate_by_hash_tx(
-    tx: &duckdb::Transaction,
+    tx: &rusqlite::Transaction,
     view_number: &i32,
     block_hash: &Blake3Hash,
     phase: &ConsensusPhase
@@ -620,7 +623,7 @@ pub fn get_quorum_certificate_by_hash_tx(
 
 /// Get QC by hash (wrapper for backward compatibility)
 pub fn get_quorum_certificate_by_hash(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     view_number: &i32,
     block_hash: &Blake3Hash,
     phase: &ConsensusPhase
@@ -638,7 +641,7 @@ pub fn get_quorum_certificate_by_hash(
 /// Caller MUST ensure tc.highest_qc has been validated or doesn't need validation
 /// Use cases: insert_tc_safe (after validation), legacy insert_tc (deprecated)
 fn insert_tc_unsafe_tx(
-    tx: &duckdb::Transaction,
+    tx: &rusqlite::Transaction,
     tc: &TimeoutCertificate,
 ) -> Result<(), DatabaseError> {
     // Insert the TC into timeout_certificates table
@@ -657,7 +660,7 @@ fn insert_tc_unsafe_tx(
     let new_view = tc.view_number + 1;
     tracing::debug!("[DB WRITE this_node] About to UPDATE for TC in view {} -> {}", tc.view_number, new_view);
     tx.execute(
-        "UPDATE this_node SET current_view = ?, current_phase = 'propose', prepared_block_hash = NULL, last_propose_vote_block_hash = NULL WHERE internal_id = 1",
+        "UPDATE this_node SET current_view = ?, current_phase = 0, prepared_block_hash = NULL, last_propose_vote_block_hash = NULL WHERE internal_id = 1",
         params![new_view]
     ).map_err(|e| {
         tracing::error!("[DB WRITE this_node] UPDATE failed for TC: {:?}", e);
@@ -675,7 +678,7 @@ pub fn insert_tc_safe(
 ) -> Result<(), DatabaseError> {
     match app_state.db_pool.get() {
         Ok(mut db_lock) => {
-            let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
+            let tx = db_lock.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| DatabaseError::LockError)?;
 
             // Step 1: Check if we already have the QC
             match get_quorum_certificate_by_hash_tx(
@@ -742,7 +745,7 @@ pub fn insert_tc_safe(
 /// Caller MUST ensure qc.verify() has been called before using this function
 /// Use cases: genesis setup (trusted), post-verification insertion
 pub fn insert_qc_unsafe_tx(
-    tx: &duckdb::Transaction,
+    tx: &rusqlite::Transaction,
     qc: &QuorumCertificate,
 ) -> Result<(), DatabaseError> {
     // Insert the QC into quorum_certificates table
@@ -763,7 +766,7 @@ pub fn insert_qc_unsafe_tx(
             // If QC phase is propose, change to lock and set prepared_block_hash
             tracing::debug!("[DB WRITE this_node] About to UPDATE for Propose QC in view {}", qc.view_number);
             tx.execute(
-                "UPDATE this_node SET highest_qc_block_hash = ?, highest_qc_phase = 'propose', current_phase = 'lock', prepared_block_hash = ? WHERE internal_id = 1",
+                "UPDATE this_node SET highest_qc_block_hash = ?, highest_qc_phase = 0, current_phase = 1, prepared_block_hash = ? WHERE internal_id = 1",
                 params![qc.block_hash, qc.block_hash]
             ).map_err(|e| {
                 tracing::error!("[DB WRITE this_node] UPDATE failed for Propose QC: {:?}", e);
@@ -776,7 +779,7 @@ pub fn insert_qc_unsafe_tx(
             // commit the block, and clear prepared_block_hash + last_propose_vote_block_hash (consensus completed)
             tracing::debug!("[DB WRITE this_node] About to UPDATE for Lock QC in view {}", qc.view_number);
             tx.execute(
-                "UPDATE this_node SET highest_qc_block_hash = ?, highest_qc_phase = 'lock', committed_block_hash = ?, current_phase = 'propose', current_view = ?, prepared_block_hash = NULL, last_propose_vote_block_hash = NULL WHERE internal_id = 1",
+                "UPDATE this_node SET highest_qc_block_hash = ?, highest_qc_phase = 1, committed_block_hash = ?, current_phase = 0, current_view = ?, prepared_block_hash = NULL, last_propose_vote_block_hash = NULL WHERE internal_id = 1",
                 params![qc.block_hash, qc.block_hash, qc.view_number + 1]
             ).map_err(|e| {
                 tracing::error!("[DB WRITE this_node] UPDATE failed for Lock QC: {:?}", e);
@@ -793,7 +796,7 @@ pub fn insert_qc_unsafe_tx(
 }
 
 pub fn get_node_pubkey(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     node_id: i32,
 ) -> Result<PubKey, DatabaseError> {
     match db_connection {
@@ -813,7 +816,7 @@ pub fn get_node_pubkey(
 }
 
 pub fn get_all_node_pubkeys(
-    db_lock: &r2d2::PooledConnection<DuckdbConnectionManager>,
+    db_lock: &r2d2::PooledConnection<SqliteConnectionManager>,
 ) -> Result<std::collections::HashMap<i32, PubKey>, DatabaseError> {
     let mut stmt = db_lock.prepare(
         "SELECT node_id, pubkey FROM nodes"
@@ -835,7 +838,7 @@ pub fn get_all_node_pubkeys(
 }
 
 pub fn get_all_user_pubkeys(
-    db_lock: &r2d2::PooledConnection<DuckdbConnectionManager>,
+    db_lock: &r2d2::PooledConnection<SqliteConnectionManager>,
 ) -> Result<std::collections::HashMap<i32, PubKey>, DatabaseError> {
     let mut stmt = db_lock.prepare(
         "SELECT user_id, pubkey FROM users"
@@ -857,7 +860,7 @@ pub fn get_all_user_pubkeys(
 }
 
 pub fn get_me(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
 ) -> Result<MyNode, DatabaseError> {
     match db_connection {
         Ok(db_lock) => {
@@ -893,7 +896,7 @@ pub struct StartupState {
 /// Load all necessary state from database for node restart
 /// This includes node_id, user_id, node private key, and user private key
 pub fn get_startup_state(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
 ) -> Result<StartupState, DatabaseError> {
     match db_connection {
         Ok(db_lock) => {
@@ -928,7 +931,7 @@ pub fn get_startup_state(
 }
 
 pub fn mark_timeout_vote_issued_with_conn(
-    db_lock: &r2d2::PooledConnection<DuckdbConnectionManager>,
+    db_lock: &r2d2::PooledConnection<SqliteConnectionManager>,
     view: i32,
 ) -> Result<(), DatabaseError> {
     tracing::debug!("[DB WRITE this_node] About to UPDATE for timeout vote in view {}", view);
@@ -944,7 +947,7 @@ pub fn mark_timeout_vote_issued_with_conn(
 }
 
 pub fn mark_timeout_vote_issued(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     view: i32,
 ) -> Result<(), DatabaseError> {
     match db_connection {
@@ -956,7 +959,7 @@ pub fn mark_timeout_vote_issued(
 /// Update last_propose_vote within an existing transaction (core implementation)
 /// This allows the update to participate in the same transaction as Lock QC insertion
 pub fn update_last_propose_vote_tx(
-    tx: &duckdb::Transaction,
+    tx: &rusqlite::Transaction,
     block_hash: Blake3Hash,
 ) -> Result<(), DatabaseError> {
     tracing::debug!("[DB WRITE this_node] About to UPDATE for last_propose_vote with block {:?}", block_hash);
@@ -974,12 +977,12 @@ pub fn update_last_propose_vote_tx(
 /// Update last_propose_vote (wrapper for standalone calls)
 /// Creates its own transaction and commits immediately
 pub fn update_last_propose_vote(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     block_hash: Blake3Hash,
 ) -> Result<(), DatabaseError> {
     match db_connection {
         Ok(mut db_lock) => {
-            let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
+            let tx = db_lock.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| DatabaseError::LockError)?;
             update_last_propose_vote_tx(&tx, block_hash)?;
             tx.commit().map_err(|_| DatabaseError::InsertError)?;
             Ok(())
@@ -989,11 +992,11 @@ pub fn update_last_propose_vote(
 }
 
 pub fn get_view_consensus_data(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     view: i32,
 ) -> Result<ViewConsensusData, DatabaseError> {
     use crate::consensus::types::*;
-    use duckdb::OptionalExt;
+    use rusqlite::OptionalExtension;
     
     match db_connection {
         Ok(db_lock) => {
@@ -1095,8 +1098,8 @@ pub fn get_view_consensus_data(
 
 /// Get the current consensus height (height of the committed block)
 /// This is used consistently across the system for modification tracking
-pub fn get_current_consensus_height(tx: &duckdb::Transaction) -> Result<i32, DatabaseError> {
-    use duckdb::OptionalExt;
+pub fn get_current_consensus_height(tx: &rusqlite::Transaction) -> Result<i32, DatabaseError> {
+    use rusqlite::OptionalExtension;
 
     let current_height: Option<i32> = tx.query_row(
         "SELECT COALESCE(b.height, 0) as committed_height
@@ -1114,11 +1117,11 @@ pub fn get_current_consensus_height(tx: &duckdb::Transaction) -> Result<i32, Dat
 /// Check if a node is active at a given height
 /// Returns true if the node has an active validator entry effective at or before the given height
 pub fn is_node_active(
-    tx: &duckdb::Transaction,
+    tx: &rusqlite::Transaction,
     node_id: i32,
     height: i32,
 ) -> Result<bool, DatabaseError> {
-    use duckdb::OptionalExt;
+    use rusqlite::OptionalExtension;
 
     // Get the most recent validator record at or before this height
     let is_active: Option<bool> = tx.query_row(
@@ -1138,11 +1141,11 @@ pub fn is_node_active(
 /// If the node already has a future activation (after current height), it will be updated
 /// This enables hot-swap operations where validator-elect activation can be moved forward
 pub fn activate_validator(
-    tx: &duckdb::Transaction,
+    tx: &rusqlite::Transaction,
     node_id: i32,
     effective_height: i32,
 ) -> Result<(), DatabaseError> {
-    use duckdb::OptionalExt;
+    use rusqlite::OptionalExtension;
 
     let current_height = get_current_consensus_height(tx)?;
 
@@ -1187,14 +1190,15 @@ pub fn activate_validator(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::DuckdbConnectionManager;
+    use crate::db::SqliteConnectionManager;
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
 
-    fn setup_test_db() -> r2d2::Pool<DuckdbConnectionManager> {
-        let manager = DuckdbConnectionManager::memory().unwrap();
+    fn setup_test_db() -> r2d2::Pool<SqliteConnectionManager> {
+        let manager = SqliteConnectionManager::memory();
         let pool = r2d2::Pool::builder()
             .max_size(1)
+            .connection_customizer(Box::new(crate::db::shared::SqliteInitializer))
             .build(manager)
             .unwrap();
 

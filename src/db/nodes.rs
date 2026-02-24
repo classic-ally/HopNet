@@ -8,7 +8,7 @@ use crate::db::{DataRecord, FragmentHash, Inode, Data};
 use either::Either;
 
 pub fn get_nodes(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
 ) -> Result<Vec<Node>, DatabaseError> {
     match db_connection {
         Ok(db_lock) => {
@@ -38,7 +38,7 @@ pub fn get_nodes(
 }
 
 pub fn get_next_node_id(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
 ) -> Result<i32, DatabaseError> {
     match db_connection {
         Ok(db_lock) => {
@@ -54,7 +54,7 @@ pub fn get_next_node_id(
 }
 
 pub fn node_exists(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     node_id: i32,
 ) -> Result<bool, DatabaseError> {
     match db_connection {
@@ -74,7 +74,7 @@ pub fn node_exists(
 /// Returns the assigned node_id
 /// Node is registered but not yet active (no validators table entry)
 pub fn insert_node_tx(
-    tx: &duckdb::Transaction,
+    tx: &rusqlite::Transaction,
     node: Node,
 ) -> Result<i32, DatabaseError> {
     // Get next node ID from sequence
@@ -101,7 +101,7 @@ pub fn insert_node_tx(
 
 /// Wrapper that manages connection and transaction - for backward compatibility
 pub fn insert_node_consensus(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     node: Node,
     execute: bool,
 ) -> Result<(), DatabaseError> {
@@ -132,7 +132,7 @@ pub fn insert_node_consensus(
 /// Get all registered nodes as NodeConnectionInfo, excluding specified node
 /// Used for fragment discovery when broadcasting to all nodes
 pub fn get_all_nodes_as_connection_info(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     exclude_node_id: i32,
 ) -> Result<Vec<crate::types::NodeConnectionInfo>, DatabaseError> {
     match db_connection {

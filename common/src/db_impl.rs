@@ -1,94 +1,65 @@
 // Database-specific implementations for common types
 // Only included by the main binary, not the FileProvider
 
-use duckdb::types::{ToSql, ToSqlOutput, FromSql, FromSqlResult, ValueRef, FromSqlError, EnumType};
-use duckdb::arrow::array::StringArray;
+use rusqlite::types::{ToSql, ToSqlOutput, FromSql, FromSqlResult, ValueRef, FromSqlError};
 use super::{InodeType, TakeoutStatus, CustomUUID};
 use uuid::Uuid;
 
-/// Helper function to extract string value from DuckDB enum
-fn extract_enum_string(enum_type: EnumType<'_>, row_idx: usize) -> Result<String, FromSqlError> {
-    // Get the string values array
-    let dict_values = match enum_type {
-        EnumType::UInt8(dict_array) => dict_array.values(),
-        EnumType::UInt16(dict_array) => dict_array.values(),
-        EnumType::UInt32(dict_array) => dict_array.values(),
-    }
-    .as_any()
-    .downcast_ref::<StringArray>()
-    .ok_or(FromSqlError::InvalidType)?;
-    
-    // Get the dictionary key for this row
-    let dict_key = match enum_type {
-        EnumType::UInt8(dict_array) => dict_array.key(row_idx),
-        EnumType::UInt16(dict_array) => dict_array.key(row_idx),
-        EnumType::UInt32(dict_array) => dict_array.key(row_idx),
-    }
-    .ok_or(FromSqlError::InvalidType)?;
-    
-    // Get the actual string value
-    Ok(dict_values.value(dict_key).to_string())
-}
-
 impl ToSql for InodeType {
-    fn to_sql(&self) -> Result<ToSqlOutput<'_>, duckdb::Error> {
-        let phase_str = match self {
-            InodeType::File => "file",
-            InodeType::Folder => "folder",
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        let v: i32 = match self {
+            InodeType::File => 0,
+            InodeType::Folder => 1,
         };
-        return Ok(phase_str.into())
+        Ok(ToSqlOutput::from(v))
     }
 }
 
 impl FromSql for InodeType {
     fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
-        if let ValueRef::Enum(enum_type, row_idx) = value {
-            let enum_value = extract_enum_string(enum_type, row_idx)?;
-            match enum_value.as_str() {
-                "file" => Ok(InodeType::File),
-                "folder" => Ok(InodeType::Folder),
+        match value {
+            ValueRef::Integer(i) => match i as i32 {
+                0 => Ok(InodeType::File),
+                1 => Ok(InodeType::Folder),
                 _ => Err(FromSqlError::InvalidType),
-            }
-        } else {
-            Err(FromSqlError::InvalidType)
+            },
+            _ => Err(FromSqlError::InvalidType),
         }
     }
 }
 
 impl ToSql for TakeoutStatus {
-    fn to_sql(&self) -> Result<ToSqlOutput<'_>, duckdb::Error> {
-        let status_str = match self {
-            TakeoutStatus::Pending => "pending",
-            TakeoutStatus::Materializing => "materializing",
-            TakeoutStatus::Ready => "ready",
-            TakeoutStatus::Expired => "expired",
-            TakeoutStatus::Cancelled => "cancelled",
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        let v: i32 = match self {
+            TakeoutStatus::Pending => 0,
+            TakeoutStatus::Materializing => 1,
+            TakeoutStatus::Ready => 2,
+            TakeoutStatus::Expired => 3,
+            TakeoutStatus::Cancelled => 4,
         };
-        return Ok(status_str.into())
+        Ok(ToSqlOutput::from(v))
     }
 }
 
 impl FromSql for TakeoutStatus {
     fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
-        if let ValueRef::Enum(enum_type, row_idx) = value {
-            let enum_value = extract_enum_string(enum_type, row_idx)?;
-            match enum_value.as_str() {
-                "pending" => Ok(TakeoutStatus::Pending),
-                "materializing" => Ok(TakeoutStatus::Materializing),
-                "ready" => Ok(TakeoutStatus::Ready),
-                "expired" => Ok(TakeoutStatus::Expired),
-                "cancelled" => Ok(TakeoutStatus::Cancelled),
+        match value {
+            ValueRef::Integer(i) => match i as i32 {
+                0 => Ok(TakeoutStatus::Pending),
+                1 => Ok(TakeoutStatus::Materializing),
+                2 => Ok(TakeoutStatus::Ready),
+                3 => Ok(TakeoutStatus::Expired),
+                4 => Ok(TakeoutStatus::Cancelled),
                 _ => Err(FromSqlError::InvalidType),
-            }
-        } else {
-            Err(FromSqlError::InvalidType)
+            },
+            _ => Err(FromSqlError::InvalidType),
         }
     }
 }
 
 /// Database implementations for CustomUUID
 impl ToSql for CustomUUID {
-    fn to_sql(&self) -> duckdb::Result<ToSqlOutput<'_>> {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
         let insert_string = self.to_string();
         Ok(ToSqlOutput::from(insert_string))
     }

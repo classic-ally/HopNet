@@ -9,6 +9,7 @@ use tokio_stream::StreamExt;
 use crate::tests::{Check, TestResult, TestScenario, print_and_add_check};
 use crate::tests::files::{
     upload_file, wait_for_fragment_distribution, trigger_fragment_inventory_sync_all,
+    get_fragment_distribution,
 };
 use crate::tests::{get_max_view, wait_for_minimum_view};
 use crate::NodeInfo;
@@ -326,20 +327,7 @@ impl TestScenario for ChunkedStreamingPerformance {
                 }
             }
 
-            // Also trigger fragment inventory sync and wait for it
-            let pre_sync_view = match get_max_view(nodes).await {
-                Ok(view) => view,
-                Err(e) => {
-                    print_and_add_check(&mut result, Check {
-                        name: "Failed to get pre-sync view".to_string(),
-                        passed: false,
-                        detail: Some(e.to_string()),
-                    });
-                    result.duration = start.elapsed();
-                    return Ok(result);
-                }
-            };
-
+            // Also trigger fragment inventory sync and wait for settling
             match trigger_fragment_inventory_sync_all(nodes).await {
                 Ok(_) => {
                     print_and_add_check(&mut result, Check {
@@ -359,39 +347,33 @@ impl TestScenario for ChunkedStreamingPerformance {
                 }
             }
 
-            let inventory_target_view = pre_sync_view + nodes.len() as u64;
-            let inventory_timeout = Duration::from_secs(60);
+            let settle_timeout = Duration::from_secs(60);
+            let settle_start = Instant::now();
+            let mut settled = false;
+            while settle_start.elapsed() < settle_timeout {
+                if let Ok(dist) = get_fragment_distribution(&nodes[0], &full_path).await {
+                    if !dist.fragments.is_empty() && dist.fragments.iter().all(|f| !f.nodes_with_fragment.is_empty()) {
+                        settled = true;
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
 
-            match wait_for_minimum_view(nodes, inventory_target_view, inventory_timeout).await {
-                Ok(true) => {
-                    print_and_add_check(&mut result, Check {
-                        name: format!("Fragment inventory synced to view {}", inventory_target_view),
-                        passed: true,
-                        detail: None,
-                    });
-                }
-                Ok(false) => {
-                    print_and_add_check(&mut result, Check {
-                        name: "Fragment inventory sync timeout".to_string(),
-                        passed: false,
-                        detail: Some(format!(
-                            "Nodes did not reach view {} within {}s",
-                            inventory_target_view,
-                            inventory_timeout.as_secs()
-                        )),
-                    });
-                    result.duration = start.elapsed();
-                    return Ok(result);
-                }
-                Err(e) => {
-                    print_and_add_check(&mut result, Check {
-                        name: "Fragment inventory consensus check failed".to_string(),
-                        passed: false,
-                        detail: Some(e.to_string()),
-                    });
-                    result.duration = start.elapsed();
-                    return Ok(result);
-                }
+            if settled {
+                print_and_add_check(&mut result, Check {
+                    name: "Fragment inventory settled".to_string(),
+                    passed: true,
+                    detail: Some(format!("All fragments have inventory data after {:.1}s", settle_start.elapsed().as_secs_f64())),
+                });
+            } else {
+                print_and_add_check(&mut result, Check {
+                    name: "Fragment inventory sync timeout".to_string(),
+                    passed: false,
+                    detail: Some(format!("Not all fragments had inventory data within {}s", settle_timeout.as_secs())),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
             }
         }
 

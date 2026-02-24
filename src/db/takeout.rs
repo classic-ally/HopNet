@@ -1,7 +1,7 @@
 use super::*;
 use crate::db::{CustomUUID, CustomDateTime, consensus};
 use chrono::{DateTime, Duration, Utc};
-use duckdb::{params, OptionalExt, ToSql, types::{ToSqlOutput, FromSql, FromSqlResult, ValueRef}};
+use rusqlite::{params, OptionalExtension, ToSql, types::{ToSqlOutput, FromSql, FromSqlResult, ValueRef}};
 use hopnet_common::{TakeoutStatus, TakeoutRecord, InodeType};
 use serde::{Serialize, Deserialize};
 
@@ -24,28 +24,23 @@ impl std::fmt::Display for MaterializationStatus {
 }
 
 impl ToSql for MaterializationStatus {
-    fn to_sql(&self) -> Result<ToSqlOutput<'_>, duckdb::Error> {
-        let status_str = match self {
-            MaterializationStatus::Pending => "pending",
-            MaterializationStatus::Success => "success",
-            MaterializationStatus::Failed => "failed",
+    fn to_sql(&self) -> Result<ToSqlOutput<'_>, rusqlite::Error> {
+        let val = match self {
+            MaterializationStatus::Pending => 0i32,
+            MaterializationStatus::Success => 1i32,
+            MaterializationStatus::Failed => 2i32,
         };
-        Ok(status_str.into())
+        Ok(val.into())
     }
 }
 
 impl FromSql for MaterializationStatus {
     fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
-        if let ValueRef::Enum(enum_type, row_idx) = value {
-            let enum_value = crate::db::types::extract_enum_string(enum_type, row_idx)?;
-            match enum_value.as_str() {
-                "pending" => Ok(MaterializationStatus::Pending),
-                "success" => Ok(MaterializationStatus::Success),
-                "failed" => Ok(MaterializationStatus::Failed),
-                _ => Err(duckdb::types::FromSqlError::InvalidType),
-            }
-        } else {
-            Err(duckdb::types::FromSqlError::InvalidType)
+        match value.as_i64()? {
+            0 => Ok(MaterializationStatus::Pending),
+            1 => Ok(MaterializationStatus::Success),
+            2 => Ok(MaterializationStatus::Failed),
+            _ => Err(rusqlite::types::FromSqlError::InvalidType),
         }
     }
 }
@@ -102,7 +97,7 @@ pub fn process_takeout_creation(
     payload: &TakeoutPayload,
     current_node_id: i32,
     execute: bool,
-    db_tx: &duckdb::Transaction,
+    db_tx: &rusqlite::Transaction,
 ) -> Result<(), DatabaseError> {
     tracing::debug!("Processing takeout creation for user_id: {} (execute={})", payload.user_id, execute);
 
@@ -136,12 +131,12 @@ pub fn process_takeout_creation(
 
         db_tx.execute_batch(&format!(
             "CREATE TABLE IF NOT EXISTS {} (
-                id UUID NOT NULL,
-                path VARCHAR NOT NULL,
-                type ENUM('file', 'folder') NOT NULL,
-                data_id UUID,
-                materialization_status ENUM('pending', 'success', 'failed') DEFAULT 'pending',
-                error_message VARCHAR
+                id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                type INTEGER NOT NULL CHECK(type IN (0, 1)),
+                data_id TEXT,
+                materialization_status INTEGER DEFAULT 0 CHECK(materialization_status IN (0, 1, 2)),
+                error_message TEXT
             )", temp_table_name
         )).map_err(|e| {
             tracing::error!("Failed to create table {}: {:?}", temp_table_name, e);
@@ -151,7 +146,7 @@ pub fn process_takeout_creation(
         // Populate with user's current inodes
         let insert_query = format!(
             "INSERT INTO {} (id, path, type, data_id, materialization_status)
-             SELECT id, path, type, data_id, 'pending'
+             SELECT id, path, type, data_id, 0
              FROM inodes
              WHERE owner_id = ?", temp_table_name
         );
@@ -196,20 +191,20 @@ pub fn process_takeout_creation(
 /// Check if there are active takeouts using an existing transaction  
 /// If user_id is provided, checks only for that user; otherwise checks all users
 pub fn has_active_takeout_tx(
-    tx: &duckdb::Transaction,
+    tx: &rusqlite::Transaction,
     user_id: Option<i32>,
 ) -> Result<bool, DatabaseError> {
     let count: i32 = match user_id {
         Some(uid) => {
             tx.query_row(
-                "SELECT COUNT(*) FROM takeouts WHERE user_id = ? AND expires_at > CURRENT_TIMESTAMP AND status IN ('pending', 'materializing', 'ready')",
+                "SELECT COUNT(*) FROM takeouts WHERE user_id = ? AND expires_at > CURRENT_TIMESTAMP AND status IN (0, 1, 2)",
                 params![uid],
                 |row| row.get(0)
             ).map_err(|_| DatabaseError::RecallError)?
         },
         None => {
             tx.query_row(
-                "SELECT COUNT(*) FROM takeouts WHERE expires_at > CURRENT_TIMESTAMP AND status IN ('pending', 'materializing', 'ready')",
+                "SELECT COUNT(*) FROM takeouts WHERE expires_at > CURRENT_TIMESTAMP AND status IN (0, 1, 2)",
                 [],
                 |row| row.get(0)
             ).map_err(|_| DatabaseError::RecallError)?
@@ -222,7 +217,7 @@ pub fn has_active_takeout_tx(
 /// Check if there are active takeouts (not expired)
 /// If user_id is provided, checks only for that user; otherwise checks all users
 pub fn has_active_takeout(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     user_id: Option<i32>,
 ) -> Result<bool, DatabaseError> {
     match db_connection {
@@ -236,7 +231,7 @@ pub fn has_active_takeout(
 
 /// Get a specific takeout by ID
 pub fn get_takeout_by_id(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     takeout_id: &CustomUUID,
 ) -> Result<Option<TakeoutPayload>, DatabaseError> {
     match db_connection {
@@ -259,7 +254,7 @@ pub fn get_takeout_by_id(
             
             match result {
                 Ok(takeout) => Ok(Some(takeout)),
-                Err(duckdb::Error::QueryReturnedNoRows) => Ok(None),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
                 Err(_) => Err(DatabaseError::RecallError),
             }
         }
@@ -269,7 +264,7 @@ pub fn get_takeout_by_id(
 
 /// Get all takeouts for a user (including expired/cancelled for history)
 pub fn get_takeouts_by_user(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     user_id: i32,
 ) -> Result<Vec<TakeoutRecord>, DatabaseError> {
     match db_connection {
@@ -321,20 +316,20 @@ pub fn get_takeouts_by_user(
 
 /// Calculate total user data size in bytes  
 pub fn calculate_user_data_size(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     user_id: i32,
 ) -> Result<u64, DatabaseError> {
     match db_connection {
         Ok(db_lock) => {
-            let total_size: Option<u64> = db_lock.query_row(
+            let total_size: Option<i64> = db_lock.query_row(
                 "SELECT COALESCE(SUM(db.file_size), 0) FROM inodes i 
                  INNER JOIN data_blocks db ON i.data_id = db.id 
-                 WHERE i.owner_id = ? AND i.type = 'file'",
+                 WHERE i.owner_id = ? AND i.type = 0",
                 params![user_id],
                 |row| row.get(0)
             ).map_err(|_| DatabaseError::RecallError)?;
             
-            Ok(total_size.unwrap_or(0))
+            Ok(total_size.unwrap_or(0) as u64)
         }
         Err(_) => Err(DatabaseError::LockError)
     }
@@ -344,7 +339,7 @@ pub fn calculate_user_data_size(
 /// Get current node's available storage capacity in bytes
 /// If no recent metrics available, calculates storage directly from filesystem
 pub async fn get_node_available_storage(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     app_state: &crate::AppState,
     node_id: i32,
 ) -> Result<Option<u64>, DatabaseError> {
@@ -391,7 +386,7 @@ pub async fn get_node_available_storage(
 /// Materialize all folder structure for a takeout
 /// Creates directories in staging area and updates materialization status
 pub fn materialize_folders(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     takeout_id: &CustomUUID,
     fragments_dir: &str,
     siv_key: &aes_siv::Key<aes_siv::siv::Aes256Siv>,
@@ -415,30 +410,31 @@ pub fn materialize_folders(
             // Query all folders ordered by path depth (parents before children)
             let query = format!(
                 "SELECT id, path FROM {} 
-                 WHERE type = 'folder' AND materialization_status = 'pending'
+                 WHERE type = 1 AND materialization_status = 0
                  ORDER BY LENGTH(path) - LENGTH(REPLACE(path, '/', ''))", 
                 temp_table_name
             );
             
-            let mut stmt = tx.prepare(&query).map_err(|e| {
-                tracing::error!("Failed to prepare folder query: {:?}", e);
-                DatabaseError::RecallError
-            })?;
-            
-            let folder_iter = stmt.query_map([], |row| {
-                let id: CustomUUID = row.get(0)?;
-                let encrypted_path: String = row.get(1)?;
-                Ok((id, encrypted_path))
-            }).map_err(|e| {
-                tracing::error!("Failed to execute folder query: {:?}", e);
-                DatabaseError::RecallError
-            })?;
-            
+            let folders: Vec<(CustomUUID, String)> = {
+                let mut stmt = tx.prepare(&query).map_err(|e| {
+                    tracing::error!("Failed to prepare folder query: {:?}", e);
+                    DatabaseError::RecallError
+                })?;
+                stmt.query_map([], |row| {
+                    let id: CustomUUID = row.get(0)?;
+                    let encrypted_path: String = row.get(1)?;
+                    Ok((id, encrypted_path))
+                }).map_err(|e| {
+                    tracing::error!("Failed to execute folder query: {:?}", e);
+                    DatabaseError::RecallError
+                })?
+                .collect::<Result<Vec<_>, _>>().map_err(|_| DatabaseError::RecallError)?
+            };
+
             let mut materialized_count = 0;
             let mut failed_count = 0;
-            
-            for folder_result in folder_iter {
-                let (folder_id, encrypted_path) = folder_result.map_err(|_| DatabaseError::RecallError)?;
+
+            for (folder_id, encrypted_path) in folders {
                 
                 // Decrypt the path segments
                 let decrypted_path = match crate::files::functions::decrypt_path(encrypted_path.clone(), siv_key, siv_nonce) {
@@ -448,7 +444,7 @@ pub fn materialize_folders(
                         
                         // Mark folder as failed
                         let update_query = format!(
-                            "UPDATE {} SET materialization_status = 'failed', error_message = ? WHERE id = ?", 
+                            "UPDATE {} SET materialization_status = 2, error_message = ? WHERE id = ?",
                             temp_table_name
                         );
                         let _ = tx.execute(&update_query, params!["Path decryption failed", folder_id]);
@@ -465,7 +461,7 @@ pub fn materialize_folders(
                         
                         // Mark folder as successfully materialized
                         let update_query = format!(
-                            "UPDATE {} SET materialization_status = 'success' WHERE id = ?", 
+                            "UPDATE {} SET materialization_status = 1 WHERE id = ?",
                             temp_table_name
                         );
                         if let Err(e) = tx.execute(&update_query, params![folder_id]) {
@@ -480,7 +476,7 @@ pub fn materialize_folders(
                         
                         // Mark folder as failed
                         let update_query = format!(
-                            "UPDATE {} SET materialization_status = 'failed', error_message = ? WHERE id = ?", 
+                            "UPDATE {} SET materialization_status = 2, error_message = ? WHERE id = ?",
                             temp_table_name
                         );
                         let error_msg = format!("Directory creation failed: {}", e);
@@ -512,7 +508,7 @@ pub fn process_takeout_status_update(
     state: &crate::AppState,
     payload: &TakeoutStatusPayload,
     execute: bool,
-    db_tx: &duckdb::Transaction,
+    db_tx: &rusqlite::Transaction,
 ) -> Result<(), DatabaseError> {
     tracing::debug!("Processing takeout status update for {}: {:?} (execute={})",
                    payload.takeout_id, payload.new_status, execute);
@@ -599,7 +595,7 @@ pub fn process_takeout_status_update(
 /// Get a batch of pending files for materialization with offset pagination
 /// Returns (file_id, encrypted_path, data_id) tuples for processing
 pub fn get_pending_files_batch(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     takeout_id: &CustomUUID,
     batch_size: usize,
     offset: usize,
@@ -611,7 +607,7 @@ pub fn get_pending_files_batch(
             // Query files with consistent ordering for deterministic pagination
             let query = format!(
                 "SELECT id, path, data_id FROM {} 
-                 WHERE type = 'file' AND materialization_status = 'pending' AND data_id IS NOT NULL
+                 WHERE type = 0 AND materialization_status = 0 AND data_id IS NOT NULL
                  ORDER BY path
                  LIMIT {} OFFSET {}", 
                 temp_table_name, batch_size, offset
@@ -651,7 +647,7 @@ pub fn get_pending_files_batch(
 /// Update file materialization status in temporary table using an existing transaction
 /// This prevents spawning additional database connections from the pool
 pub fn update_file_status(
-    tx: &duckdb::Transaction,
+    tx: &rusqlite::Transaction,
     temp_table_name: &str,
     file_id: &CustomUUID,
     status: MaterializationStatus,
@@ -798,7 +794,7 @@ pub fn get_materialized_entries_for_archive(
         DatabaseError::ProcessingError
     })?;
 
-    let entry_rows = stmt.query_map([MaterializationStatus::Success.to_string()], |row| {
+    let entry_rows = stmt.query_map(params![MaterializationStatus::Success], |row| {
         Ok((
             row.get::<_, String>(0)?, // path
             row.get::<_, InodeType>(1)?, // type
@@ -903,7 +899,7 @@ async fn cleanup_expired_takeout_files(
 /// Clean up database table associated with a takeout
 /// This drops the inode snapshot table created during takeout creation
 pub fn cleanup_takeout_table(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     takeout_id: &CustomUUID,
 ) -> Result<(), DatabaseError> {
     match db_connection {
@@ -926,14 +922,14 @@ pub fn cleanup_takeout_table(
 /// Get takeouts that are past their expiry time but not marked as Expired or Cancelled
 /// This finds takeouts network-wide (not just this node's) that need status updates
 pub fn get_expired_takeouts_needing_status_update(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
 ) -> Result<Vec<CustomUUID>, DatabaseError> {
     match db_connection {
         Ok(db_lock) => {
             let mut stmt = db_lock.prepare(
                 "SELECT id FROM takeouts
                  WHERE expires_at < CURRENT_TIMESTAMP
-                 AND status NOT IN ('expired', 'cancelled')
+                 AND status NOT IN (3, 4)
                  ORDER BY expires_at ASC"
             ).map_err(|e| {
                 tracing::error!("Failed to prepare expired takeouts query: {:?}", e);

@@ -231,11 +231,28 @@ pub async fn post_accept_share(
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
+    let parent_folder_inodes: Vec<(CustomUUID, String)> = {
+        let conn = match app_state.db_pool.get() {
+            Ok(c) => c,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        let tx = match conn.unchecked_transaction() {
+            Ok(t) => t,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        let missing = match crate::db::files::find_missing_parents(&tx, &[encrypted_path.clone()]) {
+            Ok(m) => m,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        missing.into_iter().map(|p| (CustomUUID::new(None), p)).collect()
+    };
+
     let accept_payload = AcceptSharePayload {
         incoming_share_id: share_uuid,
         recipient_id: user_id,
         encrypted_path,
         inode_id: CustomUUID::new(None),
+        parent_folder_inodes,
     };
 
     let encoded = match bincode::serde::encode_to_vec(&accept_payload, bincode::config::standard()) {

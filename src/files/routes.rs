@@ -264,7 +264,7 @@ pub struct FileFragmentsResponse {
 /// Returns (extra_file_access_entries, incoming_share_updates).
 /// Called by both PATCH /files and fileprovider modify routes.
 pub fn build_share_propagation(
-    conn: &duckdb::Connection,
+    conn: &rusqlite::Connection,
     inode_id: &CustomUUID,
     user_id: i32,
     new_data_block_id: &CustomUUID,
@@ -438,7 +438,7 @@ async fn build_upload_attestation(
             .map_err(|e| format!("Failed to prepare count query: {:?}", e))?;
 
         let count: i64 = stmt
-            .query_row(duckdb::params![node_id], |row| row.get(0))
+            .query_row(rusqlite::params![node_id], |row| row.get(0))
             .map_err(|e| format!("Failed to query inventory count: {:?}", e))?;
 
         count as u32
@@ -457,11 +457,11 @@ async fn build_upload_attestation(
             .map_err(|e| format!("Failed to prepare duplicate check: {:?}", e))?;
 
         // Build params: node_id first, then all fragment hashes
-        let mut params: Vec<Box<dyn duckdb::ToSql>> = vec![Box::new(node_id)];
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(node_id)];
         for hash in &uploaded_fragments {
             params.push(Box::new(hash.clone()));
         }
-        let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
 
         let mut rows = stmt.query(param_refs.as_slice())
             .map_err(|e| format!("Failed to query existing fragments: {:?}", e))?;
@@ -711,6 +711,24 @@ pub async fn post_files(
         inodes.push(folder_inode);
     }
     
+    // Pre-generate parent folder inodes so every node gets identical folder UUIDs
+    {
+        let paths: Vec<String> = inodes.iter().map(|i| i.path.clone()).collect();
+        let conn = app_state.db_pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let tx = conn.unchecked_transaction().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let missing = crate::db::files::find_missing_parents(&tx, &paths)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        for parent_path in missing.into_iter().rev() {
+            inodes.insert(0, Inode {
+                id: CustomUUID::new(None),
+                owner: Left(user_id),
+                path: parent_path,
+                inode_type: hopnet_common::InodeType::Folder,
+                data_id: None,
+            });
+        }
+    }
+
     // Insert the collected inodes into the database via consensus
     match bincode::serde::encode_to_vec(&inodes, bincode::config::standard()) {
         Ok(encoded_inodes) => {
@@ -796,7 +814,7 @@ pub async fn delete_files(
         // Quick existence check without full transaction to avoid stale snapshot
         let exists: Result<i32, _> = conn.query_row(
             "SELECT COUNT(*) FROM inodes WHERE path = ? AND owner_id = ?",
-            duckdb::params![enc_path.clone(), user_id],
+            rusqlite::params![enc_path.clone(), user_id],
             |row| row.get(0)
         );
 

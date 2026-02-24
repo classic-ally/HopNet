@@ -7,6 +7,7 @@ use axum::{
     Json,
 };
 
+use rusqlite::TransactionBehavior;
 use crate::db::consensus as db;
 use crate::consensus::functions::ConsensusError;
 use serde::Serialize;
@@ -300,7 +301,7 @@ pub async fn process_incoming_qc_with_guard(
 
     // Get database connection and create transaction
     let mut conn = app_state.db_pool.get().map_err(|_| ConsensusError::DatabaseError)?;
-    let db_tx = conn.transaction().map_err(|_| ConsensusError::DatabaseError)?;
+    let db_tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| ConsensusError::DatabaseError)?;
 
     // Insert QC (updates consensus state)
     if let Err(_) = db::insert_qc_unsafe_tx(&db_tx, &qc) {
@@ -685,7 +686,7 @@ async fn integrate_view(
 
             // Get database connection and create transaction for Propose QC
             let mut conn = app_state.db_pool.get().map_err(|_| ConsensusError::DatabaseError)?;
-            let db_tx = conn.transaction().map_err(|_| ConsensusError::DatabaseError)?;
+            let db_tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| ConsensusError::DatabaseError)?;
 
             match db::insert_qc_unsafe_tx(&db_tx, &propose_qc) {
                 Ok(_) => {
@@ -733,7 +734,7 @@ async fn integrate_view(
 
             // Get database connection and create transaction for Lock QC
             let mut conn = app_state.db_pool.get().map_err(|_| ConsensusError::DatabaseError)?;
-            let db_tx = conn.transaction().map_err(|_| ConsensusError::DatabaseError)?;
+            let db_tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| ConsensusError::DatabaseError)?;
 
             match db::insert_qc_unsafe_tx(&db_tx, &lock_qc) {
                 Ok(_) => {
@@ -765,6 +766,11 @@ async fn integrate_view(
                             view,
                             if lock_qc.phase == ConsensusPhase::Lock { " with transaction processing" } else { "" }
                         );
+                    }
+
+                    // Signal view advancement to the batch processor (Lock QC advances view)
+                    if lock_qc.phase == ConsensusPhase::Lock {
+                        app_state.view_changed.notify_waiters();
                     }
                 }
                 Err(_) => {
@@ -802,6 +808,7 @@ async fn integrate_view(
         match db::insert_tc_safe(app_state, tc.clone()) {
             Ok(_) => {
                 tracing::debug!("Validated and applied timeout certificate for view {}, advanced to view {}", view, view + 1);
+                app_state.view_changed.notify_waiters();
             }
             Err(_) => {
                 tracing::debug!("Timeout certificate for view {} already exists", view);

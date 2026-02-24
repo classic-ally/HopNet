@@ -21,36 +21,11 @@ pub struct MyNode {
 use chrono::{DateTime, Utc};
 use either::Either;
 use serde::{Serialize, Deserialize};
-use duckdb::types::{ToSql, ToSqlOutput, FromSql, FromSqlResult, ValueRef, FromSqlError, EnumType};
-use duckdb::arrow::array::StringArray;
+use rusqlite::types::{ToSql, ToSqlOutput, FromSql, FromSqlResult, ValueRef, FromSqlError};
 use x25519_dalek::{PublicKey as X25519PublicKey, EphemeralSecret};
 use chacha20poly1305::{ChaCha20Poly1305, aead::{Aead, OsRng, KeyInit}};
-use duckdb::DuckdbConnectionManager;
+use r2d2_sqlite::SqliteConnectionManager;
 pub use hopnet_common::CustomUUID;
-
-/// Helper function to extract string value from DuckDB enum
-pub fn extract_enum_string(enum_type: EnumType<'_>, row_idx: usize) -> Result<String, FromSqlError> {
-    // Get the string values array
-    let dict_values = match enum_type {
-        EnumType::UInt8(dict_array) => dict_array.values(),
-        EnumType::UInt16(dict_array) => dict_array.values(),
-        EnumType::UInt32(dict_array) => dict_array.values(),
-    }
-    .as_any()
-    .downcast_ref::<StringArray>()
-    .ok_or(FromSqlError::InvalidType)?;
-    
-    // Get the dictionary key for this row
-    let dict_key = match enum_type {
-        EnumType::UInt8(dict_array) => dict_array.key(row_idx),
-        EnumType::UInt16(dict_array) => dict_array.key(row_idx),
-        EnumType::UInt32(dict_array) => dict_array.key(row_idx),
-    }
-    .ok_or(FromSqlError::InvalidType)?;
-    
-    // Get the actual string value
-    Ok(dict_values.value(dict_key).to_string())
-}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CustomDateTime(DateTime<Utc>);
@@ -70,7 +45,7 @@ impl Deref for CustomDateTime {
 }
 
 impl ToSql for CustomDateTime {
-    fn to_sql(&self) -> duckdb::Result<ToSqlOutput<'_>> {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
         Ok(ToSqlOutput::from(self.to_rfc3339()))
     }
 }
@@ -78,6 +53,12 @@ impl ToSql for CustomDateTime {
 impl FromSql for CustomDateTime {
     fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
         match value {
+            ValueRef::Integer(millis) => {
+                // uuid_extract_timestamp returns epoch milliseconds
+                DateTime::from_timestamp_millis(millis)
+                    .map(CustomDateTime)
+                    .ok_or(FromSqlError::InvalidType)
+            }
             ValueRef::Text(str) => {
                 match std::str::from_utf8(str) {
                     Ok(utf_value) => {
@@ -87,22 +68,6 @@ impl FromSql for CustomDateTime {
                         }
                     }
                     Err(_) => Err(FromSqlError::InvalidType)
-                }
-            }
-            ValueRef::Timestamp(unit, value) => {
-                // Convert DuckDB timestamp to DateTime<Utc>
-                // DuckDB timestamps are microseconds since Unix epoch
-                let timestamp_seconds = value as f64 / 1_000_000.0;
-                let seconds = timestamp_seconds.floor() as i64;
-                let nanoseconds = ((timestamp_seconds - seconds as f64) * 1_000_000_000.0) as u32;
-                
-                match DateTime::from_timestamp(seconds, nanoseconds) {
-                    Some(dt) => {
-                        Ok(CustomDateTime(dt))
-                    }
-                    None => {
-                        Err(FromSqlError::InvalidType)
-                    }
                 }
             }
             _ => {
@@ -121,26 +86,24 @@ pub enum ChunkType {
 
 
 impl ToSql for ChunkType {
-    fn to_sql(&self) -> Result<ToSqlOutput<'_>, duckdb::Error> {
-        let chunk_str = match self {
-            ChunkType::Original => "original",
-            ChunkType::Recovery => "recovery",
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        let v: i32 = match self {
+            ChunkType::Original => 0,
+            ChunkType::Recovery => 1,
         };
-        return Ok(chunk_str.into())
+        Ok(ToSqlOutput::from(v))
     }
 }
 
 impl FromSql for ChunkType {
     fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
-        if let ValueRef::Enum(enum_type, row_idx) = value {
-            let enum_value = extract_enum_string(enum_type, row_idx)?;
-            match enum_value.as_str() {
-                "original" => Ok(ChunkType::Original),
-                "recovery" => Ok(ChunkType::Recovery),
+        match value {
+            ValueRef::Integer(i) => match i as i32 {
+                0 => Ok(ChunkType::Original),
+                1 => Ok(ChunkType::Recovery),
                 _ => Err(FromSqlError::InvalidType),
-            }
-        } else {
-            Err(FromSqlError::InvalidType)
+            },
+            _ => Err(FromSqlError::InvalidType),
         }
     }
 }
@@ -214,7 +177,7 @@ impl From<[u8; 32]> for XPubKey {
 }
 
 impl ToSql for XPubKey {
-    fn to_sql(&self) -> duckdb::Result<ToSqlOutput<'_>> {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
         Ok(ToSqlOutput::from(self.as_bytes().to_vec()))
     }
 }
@@ -246,7 +209,7 @@ pub struct FileAccess {
 impl FileAccess {
     /// Create a new FileAccess entry by wrapping the per-file key for the specified user
     pub fn new_for_user_with_conn(
-        conn: &duckdb::Connection,
+        conn: &rusqlite::Connection,
         data_block_id: CustomUUID,
         user_id: i32,
         per_file_key: &chacha20poly1305::Key,
@@ -296,7 +259,7 @@ impl FileAccess {
     }
 
     pub fn new_for_user(
-        db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+        db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
         data_block_id: CustomUUID,
         user_id: i32,
         per_file_key: &chacha20poly1305::Key,

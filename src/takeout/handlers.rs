@@ -13,7 +13,7 @@ impl TransactionHandler for CreateTakeoutHandler {
         "create_takeout"
     }
 
-    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
+    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
         match bincode::serde::decode_from_slice::<TakeoutPayload, _>(&tx.rpc.payload, bincode::config::standard()) {
             Ok((takeout_payload, _)) => {
                 // Authorization: verify user and node match authenticated identities
@@ -63,7 +63,7 @@ impl TransactionHandler for UpdateTakeoutStatusHandler {
         "update_takeout_status"
     }
 
-    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
+    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
         match bincode::serde::decode_from_slice::<TakeoutStatusPayload, _>(&tx.rpc.payload, bincode::config::standard()) {
             Ok((status_payload, _)) => {
                 // Process the takeout status update using shared transaction

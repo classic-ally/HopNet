@@ -1,10 +1,9 @@
 use anyhow::Result;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::time::{Duration, Instant};
 
 use crate::tests::{Check, TestResult, TestScenario, print_and_add_check};
-use crate::tests::{get_max_view, wait_for_minimum_view};
 use crate::NodeInfo;
 
 /// Test that device tokens are consistently replicated and work across all nodes
@@ -39,28 +38,7 @@ impl TestScenario for DeviceTokenConsistency {
             .as_millis();
         let device_name = format!("test-device-{}", timestamp);
 
-        // Step 1: Get initial consensus view
-        let current_max_view = match get_max_view(nodes).await {
-            Ok(view) => {
-                print_and_add_check(&mut result, Check {
-                    name: format!("Initial max view: {}", view),
-                    passed: true,
-                    detail: None,
-                });
-                view
-            }
-            Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Failed to get max view".to_string(),
-                    passed: false,
-                    detail: Some(e.to_string()),
-                });
-                result.duration = start.elapsed();
-                return Ok(result);
-            }
-        };
-
-        // Step 2: Register device on node 0 (using JWT auth)
+        // Step 1: Register device on node 0 (using JWT auth)
         let register_response = match register_device(&client, &nodes[0], &device_name).await {
             Ok(resp) => {
                 print_and_add_check(&mut result, Check {
@@ -81,90 +59,28 @@ impl TestScenario for DeviceTokenConsistency {
             }
         };
 
-        // Step 3: Wait for consensus to propagate
-        let target_view = current_max_view + 1;
-        let consensus_timeout = Duration::from_secs(30);
+        // Step 2: Poll until device token is accepted on ALL nodes
+        let propagation_timeout = Duration::from_secs(60);
+        let poll_interval = Duration::from_secs(2);
+        let propagated = poll_until_token_accepted(&client, nodes, &register_response.api_key, propagation_timeout, poll_interval).await;
 
-        match wait_for_minimum_view(nodes, target_view, consensus_timeout).await {
-            Ok(true) => {
-                print_and_add_check(&mut result, Check {
-                    name: format!("Consensus propagated to view {}", target_view),
-                    passed: true,
-                    detail: None,
-                });
-            }
-            Ok(false) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Consensus propagation timeout".to_string(),
-                    passed: false,
-                    detail: Some(format!("Did not reach view {} within {}s", target_view, consensus_timeout.as_secs())),
-                });
-                result.duration = start.elapsed();
-                return Ok(result);
-            }
-            Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Consensus check failed".to_string(),
-                    passed: false,
-                    detail: Some(e.to_string()),
-                });
-                result.duration = start.elapsed();
-                return Ok(result);
-            }
-        }
-
-        // Step 4: Verify device token works on ALL nodes (via documentprovider/enumerate)
-        let mut all_nodes_accept = true;
-        for (i, node) in nodes.iter().enumerate() {
-            match test_device_token_auth(&client, node, &register_response.api_key).await {
-                Ok(true) => {
-                    // Token accepted
-                }
-                Ok(false) => {
-                    print_and_add_check(&mut result, Check {
-                        name: format!("Node {} rejected valid token", i),
-                        passed: false,
-                        detail: Some("Token should be accepted".to_string()),
-                    });
-                    all_nodes_accept = false;
-                }
-                Err(e) => {
-                    print_and_add_check(&mut result, Check {
-                        name: format!("Node {} auth test failed", i),
-                        passed: false,
-                        detail: Some(e.to_string()),
-                    });
-                    all_nodes_accept = false;
-                }
-            }
-        }
-
-        if all_nodes_accept {
+        if propagated {
             print_and_add_check(&mut result, Check {
                 name: format!("Device token accepted by all {} nodes", nodes.len()),
                 passed: true,
                 detail: None,
             });
         } else {
+            print_and_add_check(&mut result, Check {
+                name: "Device token propagation timeout".to_string(),
+                passed: false,
+                detail: Some(format!("Not all nodes accepted the token within {}s", propagation_timeout.as_secs())),
+            });
             result.duration = start.elapsed();
             return Ok(result);
         }
 
-        // Step 5: Get current view before revocation
-        let pre_revoke_view = match get_max_view(nodes).await {
-            Ok(view) => view,
-            Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Failed to get view before revocation".to_string(),
-                    passed: false,
-                    detail: Some(e.to_string()),
-                });
-                result.duration = start.elapsed();
-                return Ok(result);
-            }
-        };
-
-        // Step 6: Revoke device on node 1 (different node than registration)
+        // Step 3: Revoke device on node 1 (different node than registration)
         let revoke_node = if nodes.len() > 1 { 1 } else { 0 };
         match revoke_device(&client, &nodes[revoke_node], &register_response.device_id).await {
             Ok(_) => {
@@ -185,70 +101,23 @@ impl TestScenario for DeviceTokenConsistency {
             }
         }
 
-        // Step 7: Wait for revocation to propagate
-        let revoke_target_view = pre_revoke_view + 1;
+        // Step 4: Poll until revoked token is rejected on ALL nodes
+        let revoked = poll_until_token_rejected(&client, nodes, &register_response.api_key, propagation_timeout, poll_interval).await;
 
-        match wait_for_minimum_view(nodes, revoke_target_view, consensus_timeout).await {
-            Ok(true) => {
-                print_and_add_check(&mut result, Check {
-                    name: format!("Revocation propagated to view {}", revoke_target_view),
-                    passed: true,
-                    detail: None,
-                });
-            }
-            Ok(false) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Revocation propagation timeout".to_string(),
-                    passed: false,
-                    detail: Some(format!("Did not reach view {}", revoke_target_view)),
-                });
-                result.duration = start.elapsed();
-                return Ok(result);
-            }
-            Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Revocation consensus check failed".to_string(),
-                    passed: false,
-                    detail: Some(e.to_string()),
-                });
-                result.duration = start.elapsed();
-                return Ok(result);
-            }
-        }
-
-        // Step 8: Verify revoked token is rejected on ALL nodes
-        let mut all_nodes_reject = true;
-        for (i, node) in nodes.iter().enumerate() {
-            match test_device_token_auth(&client, node, &register_response.api_key).await {
-                Ok(false) => {
-                    // Token correctly rejected
-                }
-                Ok(true) => {
-                    print_and_add_check(&mut result, Check {
-                        name: format!("Node {} accepted revoked token", i),
-                        passed: false,
-                        detail: Some("Revoked token should be rejected".to_string()),
-                    });
-                    all_nodes_reject = false;
-                }
-                Err(e) => {
-                    // Error could mean rejection, but let's be strict
-                    print_and_add_check(&mut result, Check {
-                        name: format!("Node {} revoked token test error", i),
-                        passed: false,
-                        detail: Some(e.to_string()),
-                    });
-                    all_nodes_reject = false;
-                }
-            }
-        }
-
-        if all_nodes_reject {
+        if revoked {
             print_and_add_check(&mut result, Check {
                 name: format!("Revoked token rejected by all {} nodes", nodes.len()),
                 passed: true,
                 detail: None,
             });
+        } else {
+            print_and_add_check(&mut result, Check {
+                name: "Token revocation propagation timeout".to_string(),
+                passed: false,
+                detail: Some(format!("Not all nodes rejected the token within {}s", propagation_timeout.as_secs())),
+            });
+            result.duration = start.elapsed();
+            return Ok(result);
         }
 
         result.duration = start.elapsed();
@@ -260,6 +129,40 @@ impl TestScenario for DeviceTokenConsistency {
 
         Ok(result)
     }
+}
+
+/// Poll until all nodes accept a device token
+async fn poll_until_token_accepted(client: &Client, nodes: &[NodeInfo], api_key: &str, timeout: Duration, interval: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let mut all_accepted = true;
+        for node in nodes {
+            match test_device_token_auth(client, node, api_key).await {
+                Ok(true) => {}
+                _ => { all_accepted = false; break; }
+            }
+        }
+        if all_accepted { return true; }
+        tokio::time::sleep(interval).await;
+    }
+    false
+}
+
+/// Poll until all nodes reject a device token
+async fn poll_until_token_rejected(client: &Client, nodes: &[NodeInfo], api_key: &str, timeout: Duration, interval: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let mut all_rejected = true;
+        for node in nodes {
+            match test_device_token_auth(client, node, api_key).await {
+                Ok(false) => {}
+                _ => { all_rejected = false; break; }
+            }
+        }
+        if all_rejected { return true; }
+        tokio::time::sleep(interval).await;
+    }
+    false
 }
 
 /// Register a device on a node, returns the device_id and api_key

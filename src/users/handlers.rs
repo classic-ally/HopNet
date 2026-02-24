@@ -7,7 +7,7 @@ pub struct InsertUserHandler;
 impl TransactionHandler for InsertUserHandler {
     fn name(&self) -> &'static str { "insert_user" }
 
-    fn process(&self, _state: &AppState, tx: &Transaction, _execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
+    fn process(&self, _state: &AppState, tx: &Transaction, _execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
         match bincode::serde::decode_from_slice::<User, _>(&tx.rpc.payload, bincode::config::standard()) {
             Ok((user_data, _)) => {
                 insert_user_tx(db_tx, user_data)?;
@@ -27,7 +27,7 @@ pub struct UpdateUserProfileHandler;
 impl TransactionHandler for UpdateUserProfileHandler {
     fn name(&self) -> &'static str { "update_user_profile" }
 
-    fn process(&self, _state: &AppState, tx: &Transaction, _execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
+    fn process(&self, _state: &AppState, tx: &Transaction, _execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
         let (payload, _) = bincode::serde::decode_from_slice::<UpdateUserProfilePayload, _>(
             &tx.rpc.payload, bincode::config::standard()
         ).map_err(|_| DatabaseError::InvalidPayload)?;

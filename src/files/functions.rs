@@ -6,7 +6,6 @@ use chacha20poly1305::{
     aead::stream::{EncryptorBE32, DecryptorBE32},
     ChaCha20Poly1305
 };
-use duckdb::arrow::datatypes::ToByteSlice;
 use rand::Rng;
 use hex;
 use std::fs;
@@ -171,12 +170,9 @@ pub fn calculate_padding_and_chunks(mut file: Vec<u8>, num_chunks: usize) -> (Ve
     (chunks, added_bytes)
 }
 
-impl From<FileError> for duckdb::Error {
+impl From<FileError> for rusqlite::Error {
     fn from(err: FileError) -> Self {
-        duckdb::Error::DuckDBFailure(
-            duckdb::ffi::Error::new(duckdb::ffi::DuckDBError),
-            Some(format!("File operation failed: {:?}", err))
-        )
+        rusqlite::Error::ToSqlConversionFailure(Box::new(err))
     }
 }
 
@@ -266,7 +262,7 @@ pub fn decrypt_part(
     let cipher = Aes256SivAead::new(key);
     match hex::decode(part) {
         Ok(binary) => {
-            match cipher.decrypt(nonce, binary.to_byte_slice()) {
+            match cipher.decrypt(nonce, binary.as_slice()) {
                 Ok(bytes) => {
                     let string = String::from_utf8(bytes).map_err(|_| FileError::EncryptionError)?;
                     Ok(string)
@@ -340,15 +336,23 @@ pub fn create_fragment_path(fragments_dir: &str, fragment_hash: &Blake3Hash) -> 
 pub fn store_fragment(fragments_dir: &str, fragment_hash: &Blake3Hash, data: Vec<u8>) -> Result<(), FileError> {
     let dir_path = create_fragment_path(fragments_dir, fragment_hash)?;
     let full_file_path = format!("{}/{}", dir_path, fragment_hash.to_hex());
-    
+
     // Create directory structure if it doesn't exist
     fs::create_dir_all(&dir_path)
         .map_err(|e| FileError::StorageError(e))?;
-    
-    // Write the fragment data
-    fs::write(&full_file_path, data)
+
+    // Write to temp file then atomic rename to prevent concurrent readers
+    // from seeing partial data (POSIX rename is atomic on the same filesystem)
+    let temp_path = format!("{}.tmp.{:x}", full_file_path, rand::random::<u64>());
+    fs::write(&temp_path, &data)
         .map_err(|e| FileError::StorageError(e))?;
-    
+    fs::rename(&temp_path, &full_file_path)
+        .map_err(|e| {
+            // Clean up temp file on rename failure
+            let _ = fs::remove_file(&temp_path);
+            FileError::StorageError(e)
+        })?;
+
     Ok(())
 }
 

@@ -1,7 +1,8 @@
 use std::collections::HashSet;
 use std::fmt;
-use duckdb::DuckdbConnectionManager;
+use r2d2_sqlite::SqliteConnectionManager;
 use r2d2::Pool;
+use rusqlite::TransactionBehavior;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::AppState;
@@ -45,7 +46,7 @@ enum ConsensusResult {
 }
 
 /// A transaction waiting in the queue.
-pub(crate) struct QueuedTransaction {
+pub struct QueuedTransaction {
     tx: Transaction,
     notifier: oneshot::Sender<ConsensusResult>,
     /// Node IDs of leaders that have explicitly rejected this transaction.
@@ -64,12 +65,12 @@ pub(crate) struct QueuedTransaction {
 #[derive(Clone)]
 pub struct ConsensusQueue {
     sender: mpsc::Sender<QueuedTransaction>,
-    db_pool: Pool<DuckdbConnectionManager>,
+    db_pool: Pool<SqliteConnectionManager>,
 }
 
 impl ConsensusQueue {
     /// Create a new ConsensusQueue. Returns the queue handle and the receiver for the batch processor.
-    pub(crate) fn new(db_pool: Pool<DuckdbConnectionManager>, capacity: usize) -> (Self, mpsc::Receiver<QueuedTransaction>) {
+    pub fn new(db_pool: Pool<SqliteConnectionManager>, capacity: usize) -> (Self, mpsc::Receiver<QueuedTransaction>) {
         let (tx, rx) = mpsc::channel(capacity);
         (ConsensusQueue { sender: tx, db_pool }, rx)
     }
@@ -230,7 +231,7 @@ enum DispatchOutcome {
 /// - ViewAdvanced: no gate — loop back immediately to drain more transactions
 /// - WaitForViewChange: view-aware wait — check DB, only block if view hasn't moved
 /// - RetryAfterDelay: short sleep, then retry (leader was unreachable)
-pub(crate) async fn batch_processor(
+pub async fn batch_processor(
     mut rx: mpsc::Receiver<QueuedTransaction>,
     app_state: AppState,
 ) {
@@ -342,7 +343,7 @@ async fn handle_as_leader(
     app_state: &AppState,
     mut batch: Vec<QueuedTransaction>,
     consensus_state: &super::types::ConsensusState,
-    conn: &mut r2d2::PooledConnection<DuckdbConnectionManager>,
+    conn: &mut r2d2::PooledConnection<SqliteConnectionManager>,
 ) -> (Vec<QueuedTransaction>, DispatchOutcome) {
     // Early check: if we've already proposed in this view, return all as retries
     if consensus_state.last_propose_vote_block_hash.is_some() {
@@ -374,56 +375,61 @@ async fn handle_as_leader(
         }
     }
 
-    // Preflight validation: restart-on-failure loop
-    // Validates each tx in sequence; rejected txs are removed and notified immediately
-    loop {
-        let mut all_valid = true;
-        let mut rejected_indices = Vec::new();
+    // Preflight validation: SAVEPOINT-based single-pass
+    // Each tx validates against cumulative state from prior successful txs in the batch.
+    // SAVEPOINTs allow individual tx rollback within a single transaction, solving
+    // inter-tx dependency resolution that the old restart-on-failure loop could not handle.
+    let rejected_indices = {
+        let db_tx = match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
+            Ok(tx) => tx,
+            Err(_) => {
+                return (batch, DispatchOutcome::RetryAfterDelay);
+            }
+        };
 
-        {
-            let db_tx = match conn.transaction() {
-                Ok(tx) => tx,
-                Err(_) => {
-                    return (batch, DispatchOutcome::RetryAfterDelay);
-                }
-            };
+        let mut rejected = Vec::new();
 
-            for (i, queued) in batch.iter().enumerate() {
-                if let Some(handler) = DISPATCH_TABLE.get(queued.tx.rpc.function.as_str()) {
-                    if let Err(e) = handler.process(app_state, &queued.tx, false, &db_tx) {
+        for (i, queued) in batch.iter().enumerate() {
+            let sp = format!("preflight_{}", i);
+
+            if let Err(e) = db_tx.execute_batch(&format!("SAVEPOINT {}", sp)) {
+                tracing::error!("Failed to create savepoint {}: {:?}", sp, e);
+                rejected.push((i, format!("savepoint error: {:?}", e)));
+                continue;
+            }
+
+            if let Some(handler) = DISPATCH_TABLE.get(queued.tx.rpc.function.as_str()) {
+                match handler.process(app_state, &queued.tx, false, &db_tx) {
+                    Ok(()) => {
+                        // Keep mutations visible for subsequent txs
+                        let _ = db_tx.execute_batch(&format!("RELEASE {}", sp));
+                    }
+                    Err(e) => {
                         tracing::debug!(
                             "Preflight rejected tx {}: {:?} (function: {})",
                             i, e, queued.tx.rpc.function
                         );
-                        rejected_indices.push((i, format!("{:?}", e)));
-                        all_valid = false;
-                        break; // restart from beginning after removing this tx
+                        let _ = db_tx.execute_batch(&format!("ROLLBACK TO {}", sp));
+                        let _ = db_tx.execute_batch(&format!("RELEASE {}", sp));
+                        rejected.push((i, format!("{:?}", e)));
                     }
-                } else {
-                    rejected_indices.push((i, format!("no handler: {}", queued.tx.rpc.function)));
-                    all_valid = false;
-                    break;
                 }
+            } else {
+                let _ = db_tx.execute_batch(&format!("ROLLBACK TO {}", sp));
+                let _ = db_tx.execute_batch(&format!("RELEASE {}", sp));
+                rejected.push((i, format!("no handler: {}", queued.tx.rpc.function)));
             }
-
-            // Always rollback — this was a dry run
-            let _ = db_tx.rollback();
         }
 
-        if !rejected_indices.is_empty() {
-            for (idx, reason) in rejected_indices.into_iter().rev() {
-                let queued = batch.remove(idx);
-                let _ = queued.notifier.send(ConsensusResult::Rejected(reason));
-            }
+        // Transaction auto-rollbacks on drop — this was a dry run
+        rejected
+    };
 
-            if batch.is_empty() {
-                return (Vec::new(), DispatchOutcome::ViewAdvanced);
-            }
-            continue;
-        }
-
-        if all_valid {
-            break;
+    // Remove rejected txs and notify submitters (reverse order to maintain valid indices)
+    if !rejected_indices.is_empty() {
+        for (idx, reason) in rejected_indices.into_iter().rev() {
+            let queued = batch.remove(idx);
+            let _ = queued.notifier.send(ConsensusResult::Rejected(reason));
         }
     }
 
@@ -474,7 +480,7 @@ async fn handle_as_forwarder(
     app_state: &AppState,
     batch: Vec<QueuedTransaction>,
     consensus_state: &super::types::ConsensusState,
-    conn: &mut r2d2::PooledConnection<DuckdbConnectionManager>,
+    conn: &mut r2d2::PooledConnection<SqliteConnectionManager>,
 ) -> (Vec<QueuedTransaction>, DispatchOutcome) {
     // If we've already voted on a proposal this view, the leader has already proposed —
     // forwarding would just get a Retry response. Skip the round-trip.
@@ -503,6 +509,7 @@ async fn handle_as_forwarder(
         leader_iroh_id,
         transactions,
         view,
+        &app_state.view_changed,
     ).await;
 
     match forward_result {
@@ -516,10 +523,18 @@ async fn handle_as_forwarder(
             // Got full results — process them
             process_forward_results(app_state, batch, results, consensus_state, conn)
         }
+        Ok(super::rpc::ForwardAckResult::AckedViewChanged) => {
+            // View advanced before leader result — nonces are committed in local DB.
+            // Synthesize results from nonce table and process through unified codepath.
+            tracing::debug!("Leader node {} ACKed, view changed — resolving via nonce table", leader.node_id);
+            let results = synthesize_results_from_nonces(&batch, conn);
+            process_forward_results(app_state, batch, results, consensus_state, conn)
+        }
         Ok(super::rpc::ForwardAckResult::AckedNoResult) => {
-            // Leader ACKed but no final result — check nonce table after view change
-            tracing::warn!("Leader node {} ACKed but no result — resolving via nonce table", leader.node_id);
-            resolve_after_timeout(app_state, batch, view, conn).await
+            // Safety timeout — view hasn't changed, leader still processing.
+            // Wait for view change; next cycle will resolve via nonce dedup.
+            tracing::debug!("Leader node {} ACKed but safety timeout — waiting for view change", leader.node_id);
+            (batch, DispatchOutcome::WaitForViewChange)
         }
         Ok(super::rpc::ForwardAckResult::NotLeader { view: leader_view }) => {
             // Our view is stale — the node we sent to is not the leader.
@@ -549,13 +564,32 @@ async fn handle_as_forwarder(
     }
 }
 
+/// Synthesize forward results from the nonce table when no leader result is available.
+/// Committed nonces → Committed, uncommitted → Retry.
+fn synthesize_results_from_nonces(
+    batch: &[QueuedTransaction],
+    conn: &r2d2::PooledConnection<SqliteConnectionManager>,
+) -> Vec<super::rpc::TransactionForwardResult> {
+    let nonces: Vec<_> = batch.iter().map(|q| q.tx.nonce.clone()).collect();
+    let committed = db::check_committed_nonces(conn, &nonces).unwrap_or_default();
+    batch.iter().map(|q| {
+        if committed.contains(&q.tx.nonce.to_string()) {
+            super::rpc::TransactionForwardResult::Committed
+        } else {
+            super::rpc::TransactionForwardResult::Retry {
+                reason: "view changed before leader result".into(),
+            }
+        }
+    }).collect()
+}
+
 /// Process per-transaction results from the leader forward response.
 fn process_forward_results(
     app_state: &AppState,
     batch: Vec<QueuedTransaction>,
     results: Vec<super::rpc::TransactionForwardResult>,
     consensus_state: &super::types::ConsensusState,
-    conn: &mut r2d2::PooledConnection<DuckdbConnectionManager>,
+    conn: &mut r2d2::PooledConnection<SqliteConnectionManager>,
 ) -> (Vec<QueuedTransaction>, DispatchOutcome) {
     let leader = &consensus_state.leader;
     let mut retries = Vec::new();
@@ -619,61 +653,6 @@ fn process_forward_results(
     };
 
     (retries, outcome)
-}
-
-/// After receiving an ACK but no final result, wait for a view change then check
-/// the nonce table to see which transactions were committed.
-/// - Committed nonces → notify Committed
-/// - Uncommitted nonces → retry
-async fn resolve_after_timeout(
-    app_state: &AppState,
-    batch: Vec<QueuedTransaction>,
-    drain_view: i32,
-    conn: &mut r2d2::PooledConnection<DuckdbConnectionManager>,
-) -> (Vec<QueuedTransaction>, DispatchOutcome) {
-    // Register for notification BEFORE checking DB (closes race window)
-    let notified = app_state.view_changed.notified();
-
-    // Check if view has already advanced
-    let current_view = db::get_consensus_with_conn(conn)
-        .map(|s| s.view)
-        .unwrap_or(drain_view);
-
-    if current_view == drain_view {
-        // View hasn't advanced yet — wait for it (with secondary timeout)
-        let wait_result = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            notified,
-        ).await;
-
-        if wait_result.is_err() {
-            // Secondary timeout — give up and retry all
-            tracing::warn!("resolve_after_timeout: secondary timeout waiting for view change from view {}", drain_view);
-            return (batch, DispatchOutcome::RetryAfterDelay);
-        }
-    }
-
-    // View advanced — check nonce table for each transaction
-    let nonces: Vec<_> = batch.iter().map(|q| q.tx.nonce.clone()).collect();
-    let committed_nonces = match db::check_committed_nonces(conn, &nonces) {
-        Ok(c) => c,
-        Err(_) => return (batch, DispatchOutcome::RetryAfterDelay),
-    };
-
-    let mut retries = Vec::new();
-    for queued in batch {
-        if committed_nonces.contains(&queued.tx.nonce.to_string()) {
-            let _ = queued.notifier.send(ConsensusResult::Committed);
-        } else {
-            retries.push(queued);
-        }
-    }
-
-    if retries.is_empty() {
-        (Vec::new(), DispatchOutcome::ViewAdvanced)
-    } else {
-        (retries, DispatchOutcome::WaitForViewChange)
-    }
 }
 
 /// Maximum number of Byzantine faults the network can tolerate.

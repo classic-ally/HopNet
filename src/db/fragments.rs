@@ -1,11 +1,11 @@
 use crate::db::{DatabaseError, CustomUUID};
-use duckdb::DuckdbConnectionManager;
+use r2d2_sqlite::SqliteConnectionManager;
 use r2d2;
 
 /// Find orphaned data blocks with no inode references, ordered by age (oldest first)
 /// Returns data block IDs older than the cutoff UUID, limited by batch size
 pub fn find_orphaned_data_blocks(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     cutoff_uuid: &CustomUUID,
     limit: i32,
 ) -> Result<Vec<CustomUUID>, DatabaseError> {
@@ -21,7 +21,7 @@ pub fn find_orphaned_data_blocks(
                  LIMIT ?"
             ).map_err(|_| DatabaseError::RecallError)?;
             
-            let data_blocks = stmt.query_map(duckdb::params![cutoff_uuid, limit], |row| {
+            let data_blocks = stmt.query_map(rusqlite::params![cutoff_uuid, limit], |row| {
                 let data_block_id: CustomUUID = row.get(0)?;
                 Ok(data_block_id)
             }).map_err(|_| DatabaseError::RecallError)?;
@@ -42,7 +42,7 @@ pub enum AvailabilityClass {
 /// Get node's availability and classify it relative to network average
 /// Returns (node_availability, classification)
 pub fn get_node_availability_classification(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     node_id: i32,
     days: i32,
 ) -> Result<(f64, AvailabilityClass), DatabaseError> {
@@ -50,11 +50,11 @@ pub fn get_node_availability_classification(
         Ok(conn) => {
             // First try to get network average
             let network_mean = conn.prepare(
-                "SELECT AVG(CAST(available AS DOUBLE)) as network_mean
+                "SELECT AVG(CAST(available AS REAL)) as network_mean
                  FROM metrics
-                 WHERE timestamp > CAST(NOW() AS TIMESTAMP) - INTERVAL ? DAY"
+                 WHERE start_time > datetime('now', '-' || ? || ' days')"
             ).and_then(|mut stmt| {
-                stmt.query_row(duckdb::params![days], |row| {
+                stmt.query_row(rusqlite::params![days], |row| {
                     let mean: Option<f64> = row.get(0)?;
                     Ok(mean)
                 })
@@ -62,11 +62,11 @@ pub fn get_node_availability_classification(
             
             // Then try to get node availability
             let node_availability = conn.prepare(
-                "SELECT AVG(CAST(available AS DOUBLE)) as node_availability
+                "SELECT AVG(CAST(available AS REAL)) as node_availability
                  FROM metrics
-                 WHERE node_id = ? AND timestamp > CAST(NOW() AS TIMESTAMP) - INTERVAL ? DAY"
+                 WHERE to_node = ? AND start_time > datetime('now', '-' || ? || ' days')"
             ).and_then(|mut stmt| {
-                stmt.query_row(duckdb::params![node_id, days], |row| {
+                stmt.query_row(rusqlite::params![node_id, days], |row| {
                     let avail: Option<f64> = row.get(0)?;
                     Ok(avail)
                 })
@@ -102,7 +102,7 @@ pub fn get_node_availability_classification(
 /// The execute parameter controls whether to actually delete or just validate
 /// Returns fragment hashes that were deleted (for opportunistic local cleanup)
 pub fn delete_orphaned_data_blocks_consensus(
-    db_tx: &duckdb::Transaction,
+    db_tx: &rusqlite::Transaction,
     data_block_ids: Vec<CustomUUID>,
 ) -> Result<Vec<crate::db::Blake3Hash>, DatabaseError> {
     if data_block_ids.is_empty() {
@@ -121,7 +121,7 @@ pub fn delete_orphaned_data_blocks_consensus(
         // Verify the data block exists
         let exists: bool = db_tx.query_row(
             "SELECT COUNT(*) > 0 FROM data_blocks WHERE id = ?",
-            duckdb::params![data_block_id],
+            rusqlite::params![data_block_id],
             |row| row.get(0)
         ).map_err(|_| DatabaseError::RecallError)?;
 
@@ -133,7 +133,7 @@ pub fn delete_orphaned_data_blocks_consensus(
         // Verify it's truly orphaned (no inode references)
         let has_inodes: bool = db_tx.query_row(
             "SELECT COUNT(*) > 0 FROM inodes WHERE data_id = ?",
-            duckdb::params![data_block_id],
+            rusqlite::params![data_block_id],
             |row| row.get(0)
         ).map_err(|_| DatabaseError::RecallError)?;
 
@@ -152,8 +152,8 @@ pub fn delete_orphaned_data_blocks_consensus(
         "SELECT fragment_hash FROM fragment_hashes WHERE data_block_id IN ({}) AND stored_locally = TRUE",
         placeholders_str
     );
-    let select_params: Vec<&dyn duckdb::ToSql> = data_block_ids.iter()
-        .map(|id| id as &dyn duckdb::ToSql)
+    let select_params: Vec<&dyn rusqlite::ToSql> = data_block_ids.iter()
+        .map(|id| id as &dyn rusqlite::ToSql)
         .collect();
 
     let mut stmt = db_tx.prepare(&select_local_fragments_query).map_err(|e| {
@@ -182,8 +182,8 @@ pub fn delete_orphaned_data_blocks_consensus(
         "DELETE FROM fragment_hashes WHERE data_block_id IN ({})",
         placeholders_str
     );
-    let fragment_params: Vec<&dyn duckdb::ToSql> = data_block_ids.iter()
-        .map(|id| id as &dyn duckdb::ToSql)
+    let fragment_params: Vec<&dyn rusqlite::ToSql> = data_block_ids.iter()
+        .map(|id| id as &dyn rusqlite::ToSql)
         .collect();
 
     tracing::debug!("Executing fragment deletion query: {}", fragment_query);
@@ -201,8 +201,8 @@ pub fn delete_orphaned_data_blocks_consensus(
         "DELETE FROM file_access WHERE data_block_id IN ({})",
         placeholders_str
     );
-    let access_params: Vec<&dyn duckdb::ToSql> = data_block_ids.iter()
-        .map(|id| id as &dyn duckdb::ToSql)
+    let access_params: Vec<&dyn rusqlite::ToSql> = data_block_ids.iter()
+        .map(|id| id as &dyn rusqlite::ToSql)
         .collect();
 
     tracing::debug!("Executing file_access deletion query: {}", access_query);
@@ -220,8 +220,8 @@ pub fn delete_orphaned_data_blocks_consensus(
         "DELETE FROM data_blocks WHERE id IN ({})",
         placeholders_str
     );
-    let block_params: Vec<&dyn duckdb::ToSql> = data_block_ids.iter()
-        .map(|id| id as &dyn duckdb::ToSql)
+    let block_params: Vec<&dyn rusqlite::ToSql> = data_block_ids.iter()
+        .map(|id| id as &dyn rusqlite::ToSql)
         .collect();
 
     tracing::debug!("Executing data_blocks deletion query: {}", blocks_query);
@@ -241,7 +241,7 @@ pub fn delete_orphaned_data_blocks_consensus(
 /// Get data blocks that need rebalancing (distributed before a certain height)
 /// Returns data blocks with their fragments, ordered by placement_height (oldest first)
 pub fn get_data_blocks_for_rebalancing(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     max_placement_height: i32,
     limit: i32,
 ) -> Result<Vec<DataBlockRebalanceInfo>, DatabaseError> {
@@ -267,7 +267,7 @@ pub fn get_data_blocks_for_rebalancing(
     })?;
     
     tracing::debug!("Executing query with params: max_placement_height={}, limit={}", max_placement_height, limit);
-    let data_blocks = stmt.query_map(duckdb::params![max_placement_height, limit], |row| {
+    let data_blocks = stmt.query_map(rusqlite::params![max_placement_height, limit], |row| {
         tracing::debug!("Parsing data block row");
         let data_block_id: CustomUUID = row.get(0).map_err(|e| {
             tracing::error!("Failed to get data_block_id from row: {:?}", e);
@@ -317,7 +317,7 @@ pub fn get_data_blocks_for_rebalancing(
         })?;
         
         tracing::debug!("Executing fragment query for data block {}", data_block_id);
-        let fragments = fragment_stmt.query_map(duckdb::params![&data_block_id], |row| {
+        let fragments = fragment_stmt.query_map(rusqlite::params![&data_block_id], |row| {
             let fragment_hash: crate::db::Blake3Hash = row.get(0).map_err(|e| {
                 tracing::error!("Failed to get fragment_hash from row: {:?}", e);
                 e

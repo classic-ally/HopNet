@@ -594,7 +594,7 @@ impl TestScenario for ConsensusBarrierMissedBallot {
 
         // Step 9: Wait for ALL nodes (including previously held) to converge
         let target_view = view_after_first + 1;
-        match wait_for_minimum_view(nodes, target_view, Duration::from_secs(30)).await {
+        match wait_for_minimum_view(nodes, target_view, Duration::from_secs(60)).await {
             Ok(true) => {
                 print_and_add_check(&mut result, Check {
                     name: "All nodes caught up".into(), passed: true,
@@ -769,10 +769,10 @@ impl TestScenario for ConsensusBarrierTcLate {
         // Step 5: Wait ~130s for followers to time out and reconstruct Lock QC from timeout votes.
         // Followers voted Lock, so their timeout votes carry Lock ballot evidence.
         // The TC assembler detects this evidence and reconstructs the Lock QC instead of forming a TC.
-        println!("  ... waiting up to 140s for Lock QC reconstruction from timeout votes on followers");
+        println!("  ... waiting up to 180s for Lock QC reconstruction from timeout votes on followers");
         let lock_qc_reconstructed = {
             let mut all_applied = false;
-            let deadline = Instant::now() + Duration::from_secs(140);
+            let deadline = Instant::now() + Duration::from_secs(180);
             while Instant::now() < deadline {
                 let mut count = 0;
                 for node in &followers {

@@ -25,7 +25,7 @@ pub struct ValidatorActivationHandler;
 impl TransactionHandler for ValidatorActivationHandler {
     fn name(&self) -> &'static str { "validator_activation" }
 
-    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
+    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
         // Decode activation request payload
         let (activation_req, _) = bincode::serde::decode_from_slice::<ActivationRequest, _>(
             &tx.rpc.payload,
@@ -129,7 +129,7 @@ pub struct InsertGenesisHandler;
 impl TransactionHandler for InsertGenesisHandler {
     fn name(&self) -> &'static str { "insert_genesis" }
 
-    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
+    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
         tracing::debug!("InsertGenesisHandler: Starting (execute={})", execute);
 
         // Decode genesis payload
@@ -230,7 +230,7 @@ pub struct CleanupNoncesHandler;
 impl TransactionHandler for CleanupNoncesHandler {
     fn name(&self) -> &'static str { "system.cleanup_nonces" }
 
-    fn process(&self, _state: &AppState, tx: &Transaction, execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
+    fn process(&self, _state: &AppState, tx: &Transaction, execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
         let (cutoff, _) = bincode::serde::decode_from_slice::<hopnet_common::CustomUUID, _>(
             &tx.rpc.payload,
             bincode::config::standard()

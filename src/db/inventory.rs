@@ -1,7 +1,7 @@
 use r2d2::PooledConnection;
-use duckdb::DuckdbConnectionManager;
+use r2d2_sqlite::SqliteConnectionManager;
 use tracing::debug;
-use duckdb::{params, Transaction};
+use rusqlite::{params, Transaction};
 use std::collections::HashMap;
 
 use crate::files::types::SelfCheckFragments;
@@ -13,7 +13,7 @@ use crate::db::DatabaseError;
 ///
 /// The execute flag controls whether to actually apply changes (true) or just validate (false)
 pub fn apply_self_check_updates(
-    db_tx: &duckdb::Transaction,
+    db_tx: &rusqlite::Transaction,
     report: &SelfCheckFragments,
 ) -> Result<(), DatabaseError> {
     // Verify the previous count matches our current state
@@ -162,7 +162,7 @@ fn update_verified_height_tx(
 /// Uses high-performance EXCEPT queries optimized for DuckDB's columnar architecture
 /// Uses transaction semantics for consistency guarantees in distributed environment
 pub fn compute_inventory_differential(
-    db_connection: Result<PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     node_id: i32,
 ) -> Result<SelfCheckFragments, DatabaseError> {
     match db_connection {
@@ -175,39 +175,39 @@ pub fn compute_inventory_differential(
             let self_verified_height = crate::db::consensus::get_current_consensus_height(&tx)?;
 
             // Fragments we have locally but not in inventory (to be added)
-            let mut added_stmt = tx.prepare(
-                "SELECT DISTINCT fragment_hash FROM fragment_hashes WHERE stored_locally = true
-                 EXCEPT
-                 SELECT fragment_hash FROM fragment_inventory WHERE node_id = ?"
-            ).map_err(|_| DatabaseError::ProcessingError)?;
-
-            let fragments_added = added_stmt
-                .query_map(params![node_id], |row| {
+            let fragments_added = {
+                let mut stmt = tx.prepare(
+                    "SELECT DISTINCT fragment_hash FROM fragment_hashes WHERE stored_locally = true
+                     EXCEPT
+                     SELECT fragment_hash FROM fragment_inventory WHERE node_id = ?"
+                ).map_err(|_| DatabaseError::ProcessingError)?;
+                stmt.query_map(params![node_id], |row| {
                     let fragment_hash: Blake3Hash = row.get(0)?;
                     Ok(fragment_hash)
                 })
                 .map_err(|_| DatabaseError::RecallError)?
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| DatabaseError::RecallError)?;
+                .map_err(|_| DatabaseError::RecallError)?
+            };
 
             // Fragments in inventory but not stored locally (to be removed)
-            let mut removed_stmt = tx.prepare(
-                "SELECT fragment_hash FROM fragment_inventory WHERE node_id = ?
-                 EXCEPT
-                 SELECT DISTINCT fragment_hash FROM fragment_hashes WHERE stored_locally = true"
-            ).map_err(|_| DatabaseError::ProcessingError)?;
-
-            let fragments_removed = removed_stmt
-                .query_map(params![node_id], |row| {
+            let fragments_removed = {
+                let mut stmt = tx.prepare(
+                    "SELECT fragment_hash FROM fragment_inventory WHERE node_id = ?
+                     EXCEPT
+                     SELECT DISTINCT fragment_hash FROM fragment_hashes WHERE stored_locally = true"
+                ).map_err(|_| DatabaseError::ProcessingError)?;
+                stmt.query_map(params![node_id], |row| {
                     let fragment_hash: Blake3Hash = row.get(0)?;
                     Ok(fragment_hash)
                 })
                 .map_err(|_| DatabaseError::RecallError)?
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| DatabaseError::RecallError)?;
+                .map_err(|_| DatabaseError::RecallError)?
+            };
 
-            // Rollback read-only transaction
-            tx.rollback().map_err(|_| DatabaseError::ProcessingError)?;
+            // Read-only transaction — auto-rollback on drop
+            drop(tx);
 
             // Assemble complete SelfCheckFragments struct
             Ok(SelfCheckFragments {
@@ -229,7 +229,7 @@ pub fn compute_inventory_differential(
 /// # Parameters
 /// * `max_nodes_per_fragment` - Limit nodes returned per fragment (default: 3 most recent)
 pub fn batch_query_fragment_inventory(
-    db_connection: Result<PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     fragment_hashes: &[Blake3Hash],
     max_nodes_per_fragment: Option<usize>,
 ) -> Result<HashMap<Blake3Hash, Vec<NodeConnectionInfo>>, DatabaseError> {
@@ -261,7 +261,7 @@ pub fn batch_query_fragment_inventory(
 
             // Execute query with all fragment hashes as parameters
             let mut rows = stmt
-                .query(duckdb::params_from_iter(fragment_hashes.iter()))
+                .query(rusqlite::params_from_iter(fragment_hashes.iter()))
                 .map_err(|_| DatabaseError::RecallError)?;
 
             // Group results by fragment hash, constructing NodeConnectionInfo directly

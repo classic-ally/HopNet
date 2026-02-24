@@ -2,7 +2,7 @@ use super::*;
 use crate::types::User;
 
 pub fn get_users(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
 ) -> Result<Vec<User>, DatabaseError> {
     match db_connection {
         Ok(db_lock) => {
@@ -37,7 +37,7 @@ pub fn get_users(
 }
 
 pub fn get_user_by_username(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     username: String,
 ) -> Result<Option<User>, DatabaseError> {
     match db_connection {
@@ -70,7 +70,7 @@ pub fn get_user_by_username(
 }
 
 pub fn get_user_by_userid_conn(
-    conn: &duckdb::Connection,
+    conn: &rusqlite::Connection,
     userid: i32,
 ) -> Result<Option<User>, DatabaseError> {
     let mut stmt = conn.prepare(
@@ -98,7 +98,7 @@ pub fn get_user_by_userid_conn(
 }
 
 pub fn get_user_by_userid(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     userid: i32,
 ) -> Result<Option<User>, DatabaseError> {
     match db_connection {
@@ -110,7 +110,7 @@ pub fn get_user_by_userid(
 /// Core user insertion logic - operates within provided transaction for atomicity
 /// Returns the assigned user_id
 pub fn insert_user_tx(
-    tx: &duckdb::Transaction,
+    tx: &rusqlite::Transaction,
     user: User,
 ) -> Result<i32, DatabaseError> {
     let next_id = tx.query_row(
@@ -137,7 +137,7 @@ pub fn insert_user_tx(
 /// For each field: None = no change, Some(None) = clear, Some(Some(v)) = set.
 /// Uses CASE WHEN to distinguish "no change" from "set to NULL".
 pub fn update_user_profile_tx(
-    tx: &duckdb::Transaction,
+    tx: &rusqlite::Transaction,
     user_id: i32,
     first_name: Option<Option<&str>>,
     last_name: Option<Option<&str>>,
@@ -166,7 +166,7 @@ pub fn update_user_profile_tx(
 
 /// Wrapper that manages connection and transaction - for backward compatibility
 pub fn insert_user(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     user: User,
     execute: bool,
 ) -> Result<(), DatabaseError> {

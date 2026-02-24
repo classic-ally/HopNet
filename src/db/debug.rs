@@ -2,7 +2,7 @@ use super::*;
 use std::collections::HashMap;
 use blake3::Hasher;
 use serde::{Deserialize, Serialize};
-use duckdb::OptionalExt;
+use rusqlite::OptionalExtension;
 
 /// Tables to skip entirely (local-only state)
 const LOCAL_ONLY_TABLES: &[&str] = &[
@@ -86,7 +86,7 @@ fn get_excluded_columns(table_name: &str) -> Vec<&'static str> {
 
 /// Get primary key columns dynamically from schema
 fn get_primary_key_columns(
-    tx: &duckdb::Transaction,
+    tx: &rusqlite::Transaction,
     table_name: &str
 ) -> Result<Vec<String>, DatabaseError> {
     let mut stmt = tx.prepare(&format!("PRAGMA table_info({})", table_name))
@@ -119,23 +119,52 @@ fn get_primary_key_columns(
 }
 
 /// Build SQL query for a table with appropriate exclusions
+/// Uses PRAGMA table_info for dynamic column listing (SQLite has no json_object(*) or EXCLUDE)
 fn build_table_query(
-    tx: &duckdb::Transaction,
+    tx: &rusqlite::Transaction,
     table_name: &str,
     excluded_cols: &[&str]
 ) -> Result<String, DatabaseError> {
     let pk_cols = get_primary_key_columns(tx, table_name)?;
 
-    // Build EXCLUDE clause (empty if no exclusions)
-    let exclude_clause = if !excluded_cols.is_empty() {
-        format!("EXCLUDE ({})", excluded_cols.join(", "))
-    } else {
-        String::new()
-    };
+    // Get all column names and types from PRAGMA table_info
+    let mut stmt = tx.prepare(&format!("PRAGMA table_info({})", table_name))
+        .map_err(|_| DatabaseError::RecallError)?;
+
+    let all_columns: Vec<(String, String)> = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+    }).map_err(|_| DatabaseError::RecallError)?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|_| DatabaseError::RecallError)?;
+
+    // Filter out excluded columns
+    let columns: Vec<&(String, String)> = all_columns.iter()
+        .filter(|(col, _)| !excluded_cols.contains(&col.as_str()))
+        .collect();
+
+    // Build json_object arguments: 'col1', col1, 'col2', col2, ...
+    // BLOB columns must be hex-encoded (SQLite json_object cannot hold BLOBs)
+    let json_args: Vec<String> = columns.iter()
+        .map(|(col, col_type)| {
+            if col_type.eq_ignore_ascii_case("BLOB") {
+                format!("'{}', hex({})", col, col)
+            } else {
+                format!("'{}', {}", col, col)
+            }
+        })
+        .collect();
+    let json_object_expr = format!("json_object({})", json_args.join(", "));
+
+    // Build explicit column list for SELECT
+    let column_list = columns.iter()
+        .map(|(c, _)| c.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
 
     let query = format!(
-        "SELECT COALESCE(json_group_array(json_object(*)), '[]') FROM (SELECT * {} FROM {} ORDER BY {})",
-        exclude_clause,
+        "SELECT COALESCE(json_group_array({}), '[]') FROM (SELECT {} FROM {} ORDER BY {})",
+        json_object_expr,
+        column_list,
         table_name,
         pk_cols.join(", ")
     );
@@ -145,7 +174,7 @@ fn build_table_query(
 
 /// Compute hash for a single table within a transaction
 fn compute_table_hash_tx(
-    tx: &duckdb::Transaction,
+    tx: &rusqlite::Transaction,
     table_name: &str,
 ) -> Result<TableHashInfo, DatabaseError> {
     // Build query with EXCLUDE clause if needed
@@ -181,7 +210,7 @@ fn compute_table_hash_tx(
 /// This ensures consensus_height, committed_view, and all table data
 /// are read from the same database snapshot
 pub fn compute_state_snapshot_tx(
-    tx: &duckdb::Transaction,
+    tx: &rusqlite::Transaction,
 ) -> Result<StateSnapshot, DatabaseError> {
     // Get consensus metadata from same transaction snapshot
     let consensus_height = crate::db::consensus::get_current_consensus_height(tx)?;
@@ -204,7 +233,7 @@ pub fn compute_state_snapshot_tx(
 
 /// Convenience wrapper that manages transaction creation
 pub fn compute_state_snapshot(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
 ) -> Result<StateSnapshot, DatabaseError> {
     match db_connection {
         Ok(mut conn) => {
@@ -243,7 +272,7 @@ pub struct FileFragmentDistribution {
 /// This is a diagnostic function that queries fragment_hashes and fragment_inventory
 /// to show which nodes store which fragments for a given file
 pub fn get_file_fragment_distribution(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     encrypted_path: String,
     user_id: i32,
 ) -> Result<FileFragmentDistribution, DatabaseError> {
@@ -254,7 +283,7 @@ pub fn get_file_fragment_distribution(
                 "SELECT i.id, db.id, db.file_size, db.placement_height, db.fragment_count
                  FROM inodes i
                  JOIN data_blocks db ON i.data_id = db.id
-                 WHERE i.path = ? AND i.owner_id = ? AND i.type = 'file'",
+                 WHERE i.path = ? AND i.owner_id = ? AND i.type = 0",
                 params![encrypted_path, user_id],
                 |row| Ok((
                     row.get(0)?,  // inode_id

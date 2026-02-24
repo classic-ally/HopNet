@@ -1,4 +1,4 @@
-use duckdb::DuckdbConnectionManager;
+use r2d2_sqlite::SqliteConnectionManager;
 use iroh::{endpoint::Connection, Endpoint, PublicKey, SecretKey};
 use iroh::endpoint::{AfterHandshakeOutcome, EndpointHooks};
 use r2d2::Pool;
@@ -167,7 +167,7 @@ pub async fn recv_message<T: serde::de::DeserializeOwned>(
 /// Hook that rejects connections from unknown peers before path registration,
 /// preventing IP address disclosure via holepunching to unauthorized nodes.
 struct PeerValidator {
-    db_pool: Pool<DuckdbConnectionManager>,
+    db_pool: Pool<SqliteConnectionManager>,
     setup_complete: Arc<AtomicBool>,
 }
 
@@ -254,7 +254,7 @@ impl IrohTransport {
     /// Create a new IrohTransport with the given secret key and database pool.
     /// `is_setup_complete` should be true if this node already has persisted state (restart),
     /// false if this is a fresh node waiting for genesis setup or JoinInfo.
-    pub async fn new(secret_key: SecretKey, db_pool: Pool<DuckdbConnectionManager>, is_setup_complete: bool) -> Result<Self, IrohError> {
+    pub async fn new(secret_key: SecretKey, db_pool: Pool<SqliteConnectionManager>, is_setup_complete: bool) -> Result<Self, IrohError> {
         let setup_complete = Arc::new(AtomicBool::new(is_setup_complete));
         let endpoint = Endpoint::builder()
             .secret_key(secret_key)

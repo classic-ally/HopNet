@@ -410,7 +410,9 @@ pub enum ForwardAckResult {
     NoAck,
     /// Leader ACKed and returned final results
     AckedWithResult(Vec<TransactionForwardResult>),
-    /// Leader ACKed but no final result arrived (connection dropped or secondary timeout)
+    /// Leader ACKed, view advanced before result arrived — nonces are committed in local DB
+    AckedViewChanged,
+    /// Leader ACKed but safety timeout fired — view hasn't changed, nonces not committed yet
     AckedNoResult,
     /// Rejection: handler is not the leader (includes handler's view for catch-up)
     NotLeader { view: i32 },
@@ -438,7 +440,11 @@ pub async fn forward_transactions_with_ack(
     peer_node_id: iroh::PublicKey,
     transactions: Vec<super::types::Transaction>,
     view: i32,
+    view_changed: &tokio::sync::Notify,
 ) -> Result<ForwardAckResult, IrohError> {
+    // Capture view change signal BEFORE any network I/O
+    let view_notified = view_changed.notified();
+
     let req = IrohRequest::TransactionForward(TransactionForwardRequest {
         transactions,
         view,
@@ -479,14 +485,16 @@ pub async fn forward_transactions_with_ack(
         }
         IrohResponse::TransactionForwardAck => {
             // Got ACK — leader has received and is processing
-            // Phase 2: Wait for final result (timeout returns AckedNoResult, not error,
-            // since the leader already has the transactions — caller resolves via nonce table)
-            let result = match tokio::time::timeout(
-                FORWARD_RESULT_TIMEOUT,
-                crate::net::transport::recv_message(&mut recv),
-            ).await {
-                Ok(msg) => msg,
-                Err(_) => return Ok(ForwardAckResult::AckedNoResult),
+            // Phase 2: Race result against view change notification.
+            // View advances (Lock QC received, nonces committed) before the leader
+            // finishes processing — resolve via nonce table when view wins.
+            tokio::pin!(view_notified);
+            let result = tokio::select! {
+                msg = crate::net::transport::recv_message(&mut recv) => msg,
+                _ = &mut view_notified => return Ok(ForwardAckResult::AckedViewChanged),
+                _ = tokio::time::sleep(FORWARD_RESULT_TIMEOUT) => {
+                    return Ok(ForwardAckResult::AckedNoResult)
+                }
             };
 
             match result {

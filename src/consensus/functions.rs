@@ -1,6 +1,7 @@
 use super::*;
 
-use duckdb::DuckdbConnectionManager;
+use r2d2_sqlite::SqliteConnectionManager;
+use rusqlite::TransactionBehavior;
 use crate::{db::consensus as db, handlers::HandlerResult};
 use crate::db::MyNode;
 use crate::types::Node;
@@ -21,14 +22,8 @@ pub fn generate_ed25519_key() -> (SigningKey, VerifyingKey) {
     return (private_key, public_key);
 }
 
-/// Force DuckDB to flush its write-ahead log and clear transaction metadata
-/// Avoids write-write conflicts when performing high-speed state transition updates on singleton table
-/// Uses FORCE CHECKPOINT to wait for any active transactions to complete
-pub fn checkpoint_connection(conn: &duckdb::Connection) -> Result<(), ConsensusError> {
-    conn.execute_batch("FORCE CHECKPOINT").map_err(|e| {
-        tracing::error!("Failed to force checkpoint connection: {:?}", e);
-        ConsensusError::DatabaseError
-    })?;
+/// SQLite WAL auto-checkpoints; this is a no-op (was FORCE CHECKPOINT for DuckDB)
+pub fn checkpoint_connection(_conn: &rusqlite::Connection) -> Result<(), ConsensusError> {
     Ok(())
 }
 
@@ -100,7 +95,7 @@ pub async fn issue_timeout_vote(
     view: i32,
     app_state: &AppState,
     guard: Option<tokio::sync::MutexGuard<'_, ()>>,
-    conn: &mut r2d2::PooledConnection<DuckdbConnectionManager>,
+    conn: &mut r2d2::PooledConnection<SqliteConnectionManager>,
 ) -> Result<(), ConsensusError> {
     // Get current consensus state (reissuance-safe: picks up latest QC if synced)
     let consensus_state = db::get_consensus_with_conn(conn)
@@ -242,7 +237,7 @@ pub async fn abort_if_timing_out<'a>(
     validators: &[Node],
     app_state: &AppState,
     guard: Option<tokio::sync::MutexGuard<'a, ()>>,
-    conn: &mut r2d2::PooledConnection<DuckdbConnectionManager>,
+    conn: &mut r2d2::PooledConnection<SqliteConnectionManager>,
 ) -> Result<Option<tokio::sync::MutexGuard<'a, ()>>, ConsensusError> {
     if let Err(ConsensusError::NetworkTimeout) = check_leader_abandonment(view, validators, app_state).await {
         tracing::warn!("Futility detected for view {}, issuing timeout vote and aborting", view);
@@ -292,7 +287,7 @@ pub async fn create_signed_user_transaction(
 /// Run consensus on a pre-validated batch. Called only on the leader, by the batch processor.
 /// This is the leader-only consensus pipeline: acquire lock, create block, run 2-phase ballot,
 /// broadcast QCs, execute transactions.
-pub async fn run_consensus(app_state: &AppState, transactions: Vec<Transaction>, conn: &mut r2d2::PooledConnection<DuckdbConnectionManager>) -> Result<(), ConsensusError> {
+pub async fn run_consensus(app_state: &AppState, transactions: Vec<Transaction>, conn: &mut r2d2::PooledConnection<SqliteConnectionManager>) -> Result<(), ConsensusError> {
     tracing::debug!("Starting run_consensus for {} transactions", transactions.len());
 
     let my_node_id = app_state.get_node_id().map_err(|_| ConsensusError::DatabaseError)?;
@@ -356,7 +351,7 @@ pub async fn run_consensus(app_state: &AppState, transactions: Vec<Transaction>,
 
     // Transaction 1: Record Propose vote and commit immediately (double-vote protection)
     let ballot_propose = {
-        let tx = conn.transaction().map_err(|_| ConsensusError::DatabaseError)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| ConsensusError::DatabaseError)?;
         let result = Ballot::propose(block.clone(), ConsensusPhase::Propose, &me, tx)
             .map_err(|_| ConsensusError::SigningError)?;
         checkpoint_connection(&conn)?;
@@ -391,7 +386,7 @@ pub async fn run_consensus(app_state: &AppState, transactions: Vec<Transaction>,
     // Transaction 2: Insert Propose QC locally (synchronous, fast)
     // Get fresh connection for this transaction
     {
-        let tx = conn.transaction().map_err(|_| ConsensusError::DatabaseError)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| ConsensusError::DatabaseError)?;
         db::insert_qc_unsafe_tx(&tx, &qc1).map_err(|e| {
             tracing::error!("QC insertion failed: {:?}", e);
             ConsensusError::DatabaseError
@@ -419,7 +414,7 @@ pub async fn run_consensus(app_state: &AppState, transactions: Vec<Transaction>,
     // Create Lock ballot (no vote recording needed, Lock phase doesn't update last_propose_vote)
     // Get fresh connection for this transaction
     let ballot_lock = {
-        let tx = conn.transaction().map_err(|_| ConsensusError::DatabaseError)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| ConsensusError::DatabaseError)?;
         let result = Ballot::propose(block.clone(), ConsensusPhase::Lock, &me, tx)
             .map_err(|_| ConsensusError::SigningError)?;
         checkpoint_connection(&conn)?;
@@ -462,7 +457,7 @@ pub async fn run_consensus(app_state: &AppState, transactions: Vec<Transaction>,
     // Transaction 4: Insert Lock QC + process transactions locally (synchronous, atomic)
     // Get fresh connection for this transaction
     {
-        let db_tx = conn.transaction().map_err(|_| ConsensusError::DatabaseError)?;
+        let db_tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| ConsensusError::DatabaseError)?;
         db::insert_qc_unsafe_tx(&db_tx, &qc2).map_err(|e| {
             tracing::error!("QC insertion failed: {:?}", e);
             ConsensusError::DatabaseError
@@ -731,7 +726,7 @@ pub(crate) async fn broadcast_qc(
 /// The 10-minute gap provides clock skew tolerance across nodes.
 const MAX_TRANSACTION_AGE: chrono::TimeDelta = chrono::TimeDelta::minutes(50);
 
-pub fn process_transactions(transactions: &Option<Transactions>, app_state: &AppState, execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
+pub fn process_transactions(transactions: &Option<Transactions>, app_state: &AppState, execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
     if let Some(transactions) = transactions {
         // Validation path (ballot verification): check for replayed or stale transactions.
         // This runs on every follower before voting, preventing Byzantine leaders from
@@ -801,7 +796,7 @@ pub fn process_transactions(transactions: &Option<Transactions>, app_state: &App
     Ok(())
 }
 
-pub fn process_transaction(tx: &Transaction, app_state: &AppState, execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
+pub fn process_transaction(tx: &Transaction, app_state: &AppState, execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
     if let Some(handler) = DISPATCH_TABLE.get(tx.rpc.function.as_str()) {
         handler.process(app_state, tx, execute, db_tx)
     } else {

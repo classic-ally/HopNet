@@ -1,9 +1,9 @@
 use super::*;
 use serde::{Serialize, Deserialize};
 use std::ops::Deref;
-use duckdb::{ToSql,types::ToSqlOutput,types::FromSql,types::FromSqlResult,types::ValueRef};
+use rusqlite::{ToSql,types::ToSqlOutput,types::FromSql,types::FromSqlResult,types::ValueRef,TransactionBehavior};
 use crate::db::consensus as db;
-use crate::db::types::{extract_enum_string, MyNode};
+use crate::db::types::MyNode;
 use hopnet_common::CustomUUID;
 use bincode::serde::encode_to_vec;
 use ed25519_dalek::Signature;
@@ -78,26 +78,24 @@ pub enum ConsensusPhase {
 }
 
 impl ToSql for ConsensusPhase {
-    fn to_sql(&self) -> Result<ToSqlOutput<'_>, duckdb::Error> {
-        let phase_str = match self {
-            ConsensusPhase::Propose => "propose",
-            ConsensusPhase::Lock => "lock",
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        let v: i32 = match self {
+            ConsensusPhase::Propose => 0,
+            ConsensusPhase::Lock => 1,
         };
-        return Ok(phase_str.into())
+        Ok(ToSqlOutput::from(v))
     }
 }
 
 impl FromSql for ConsensusPhase {
     fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
-        if let ValueRef::Enum(enum_type, row_idx) = value {
-            let enum_value = extract_enum_string(enum_type, row_idx)?;
-            match enum_value.as_str() {
-                "propose" => Ok(ConsensusPhase::Propose),
-                "lock" => Ok(ConsensusPhase::Lock),
-                _ => Err(duckdb::types::FromSqlError::InvalidType),
-            }
-        } else {
-            Err(duckdb::types::FromSqlError::InvalidType)
+        match value {
+            ValueRef::Integer(i) => match i as i32 {
+                0 => Ok(ConsensusPhase::Propose),
+                1 => Ok(ConsensusPhase::Lock),
+                _ => Err(rusqlite::types::FromSqlError::InvalidType),
+            },
+            _ => Err(rusqlite::types::FromSqlError::InvalidType),
         }
     }
 }
@@ -119,7 +117,7 @@ impl Ballot {
         block: Block,
         phase: ConsensusPhase,
         me: &MyNode,
-        tx: duckdb::Transaction<'a>
+        tx: rusqlite::Transaction<'a>
     ) -> Result<Ballot, VoteError> {
         // Create vote data from block and phase
         let data = VoteSignData::from_block(block.clone(), phase);
@@ -346,7 +344,7 @@ impl Ballot {
         if self.data.phase == ConsensusPhase::Propose {
             // Create validation transaction
             let mut conn = state.db_pool.get().map_err(|_| VoteError::DatabaseError)?;
-            let db_tx = conn.transaction().map_err(|_| VoteError::DatabaseError)?;
+            let db_tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| VoteError::DatabaseError)?;
 
             if let Err(e) = process_transactions(&self.block.data.transactions, state, false, &db_tx) {
                 let error_msg = format!("Transaction validation failed: {:?}", e);
@@ -411,11 +409,11 @@ pub struct VoteSignMessage {
 pub struct VoteSignMessages(pub Vec<VoteSignMessage>);
 
 impl ToSql for VoteSignMessage {
-    fn to_sql(&self) -> Result<ToSqlOutput<'_>, duckdb::Error> {
+    fn to_sql(&self) -> Result<ToSqlOutput<'_>, rusqlite::Error> {
         // let's turn votesignmessage into Vec<u8>
         match bincode::serde::encode_to_vec(&self, bincode::config::standard()) {
-            Ok(data) => Ok(ToSqlOutput::Owned(duckdb::types::Value::Blob(data))),
-            Err(e) => Err(duckdb::Error::ToSqlConversionFailure(Box::new(e)))
+            Ok(data) => Ok(ToSqlOutput::Owned(rusqlite::types::Value::Blob(data))),
+            Err(e) => Err(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
         }
     }
 }
@@ -426,10 +424,10 @@ impl FromSql for VoteSignMessage {
             ValueRef::Blob(b) => {
                 match bincode::serde::decode_from_slice(b, bincode::config::standard()) {
                     Ok((data, _)) => Ok(data),
-                    Err(_) => Err(duckdb::types::FromSqlError::InvalidType),
+                    Err(_) => Err(rusqlite::types::FromSqlError::InvalidType),
                 }
             }
-            _ => Err(duckdb::types::FromSqlError::InvalidType),
+            _ => Err(rusqlite::types::FromSqlError::InvalidType),
         }
     }
 }
@@ -443,10 +441,10 @@ impl Deref for VoteSignMessages {
 }
 
 impl ToSql for VoteSignMessages {
-    fn to_sql(&self) -> Result<ToSqlOutput<'_>, duckdb::Error> {
+    fn to_sql(&self) -> Result<ToSqlOutput<'_>, rusqlite::Error> {
         match bincode::serde::encode_to_vec(&self, bincode::config::standard()) {
-            Ok(data) => Ok(ToSqlOutput::Owned(duckdb::types::Value::Blob(data))),
-            Err(e) => Err(duckdb::Error::ToSqlConversionFailure(Box::new(e)))
+            Ok(data) => Ok(ToSqlOutput::Owned(rusqlite::types::Value::Blob(data))),
+            Err(e) => Err(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
         }
     }
 }
@@ -457,10 +455,10 @@ impl FromSql for VoteSignMessages {
             ValueRef::Blob(b) => {
                 match bincode::serde::decode_from_slice(b, bincode::config::standard()) {
                     Ok((data, _)) => Ok(data),
-                    Err(_) => Err(duckdb::types::FromSqlError::InvalidType),
+                    Err(_) => Err(rusqlite::types::FromSqlError::InvalidType),
                 }
             }
-            _ => Err(duckdb::types::FromSqlError::InvalidType),
+            _ => Err(rusqlite::types::FromSqlError::InvalidType),
         }
     }
 }
@@ -1148,11 +1146,11 @@ impl Deref for Transactions {
 }
 
 impl ToSql for Transactions {
-    fn to_sql(&self) -> Result<ToSqlOutput<'_>, duckdb::Error> {
+    fn to_sql(&self) -> Result<ToSqlOutput<'_>, rusqlite::Error> {
         // let's turn transactions into Vec<u8>
         match bincode::serde::encode_to_vec(&self, bincode::config::standard()) {
-            Ok(data) => Ok(ToSqlOutput::Owned(duckdb::types::Value::Blob(data))),
-            Err(e) => Err(duckdb::Error::ToSqlConversionFailure(Box::new(e)))
+            Ok(data) => Ok(ToSqlOutput::Owned(rusqlite::types::Value::Blob(data))),
+            Err(e) => Err(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
         }
     }
 }
@@ -1163,10 +1161,10 @@ impl FromSql for Transactions {
             ValueRef::Blob(b) => {
                 match bincode::serde::decode_from_slice(b, bincode::config::standard()) {
                     Ok((data, _)) => Ok(Transactions(data)),
-                    Err(_) => Err(duckdb::types::FromSqlError::InvalidType),
+                    Err(_) => Err(rusqlite::types::FromSqlError::InvalidType),
                 }
             }
-            _ => Err(duckdb::types::FromSqlError::InvalidType),
+            _ => Err(rusqlite::types::FromSqlError::InvalidType),
         }
     }
 }

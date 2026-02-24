@@ -148,21 +148,7 @@ impl TestScenario for FragmentDistribution {
             }
         };
 
-        // Step 5: Get view before triggering fragment inventory sync
-        let pre_sync_view = match get_max_view(nodes).await {
-            Ok(view) => view,
-            Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Failed to get pre-sync view".to_string(),
-                    passed: false,
-                    detail: Some(e.to_string()),
-                });
-                result.duration = start.elapsed();
-                return Ok(result);
-            }
-        };
-
-        // Step 6: Trigger fragment inventory sync on all nodes
+        // Step 5: Trigger fragment inventory sync on all nodes
         match trigger_fragment_inventory_sync_all(nodes).await {
             Ok(_) => {
                 print_and_add_check(&mut result, Check {
@@ -182,41 +168,36 @@ impl TestScenario for FragmentDistribution {
             }
         }
 
-        // Step 7: Wait for fragment inventory transactions to reach consensus
-        // Each node submits one transaction, so we expect nodes.len() additional views
-        let inventory_target_view = pre_sync_view + nodes.len() as u64;
-        let inventory_timeout = Duration::from_secs(60);
+        // Step 6: Wait for inventory to settle by polling fragment distribution
+        // Instead of predicting how many views are needed, poll until all fragments
+        // have at least one node in their inventory (the actual settling condition)
+        let settle_timeout = Duration::from_secs(60);
+        let settle_start = Instant::now();
+        let mut settled = false;
+        while settle_start.elapsed() < settle_timeout {
+            if let Ok(dist) = get_fragment_distribution(&nodes[0], &full_path).await {
+                if !dist.fragments.is_empty() && dist.fragments.iter().all(|f| !f.nodes_with_fragment.is_empty()) {
+                    settled = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
 
-        match wait_for_minimum_view(nodes, inventory_target_view, inventory_timeout).await {
-            Ok(true) => {
-                print_and_add_check(&mut result, Check {
-                    name: format!("Fragment inventory synced to view {}", inventory_target_view),
-                    passed: true,
-                    detail: Some(format!("Waited {} views for {} nodes", nodes.len(), nodes.len())),
-                });
-            }
-            Ok(false) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Fragment inventory sync timeout".to_string(),
-                    passed: false,
-                    detail: Some(format!(
-                        "Nodes did not reach view {} within {}s",
-                        inventory_target_view,
-                        inventory_timeout.as_secs()
-                    )),
-                });
-                result.duration = start.elapsed();
-                return Ok(result);
-            }
-            Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Fragment inventory consensus check failed".to_string(),
-                    passed: false,
-                    detail: Some(e.to_string()),
-                });
-                result.duration = start.elapsed();
-                return Ok(result);
-            }
+        if settled {
+            print_and_add_check(&mut result, Check {
+                name: "Fragment inventory settled".to_string(),
+                passed: true,
+                detail: Some(format!("All fragments have inventory data after {:.1}s", settle_start.elapsed().as_secs_f64())),
+            });
+        } else {
+            print_and_add_check(&mut result, Check {
+                name: "Fragment inventory sync timeout".to_string(),
+                passed: false,
+                detail: Some(format!("Not all fragments had inventory data within {}s", settle_timeout.as_secs())),
+            });
+            result.duration = start.elapsed();
+            return Ok(result);
         }
 
         // Step 8: Re-query fragment distribution after inventory sync

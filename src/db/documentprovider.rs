@@ -1,8 +1,8 @@
 use aes_siv::{siv::Aes256Siv, Key, Nonce};
-use duckdb::params;
+use rusqlite::params;
 use r2d2::PooledConnection;
 
-use crate::db::{CustomUUID, CustomDateTime, DuckdbConnectionManager};
+use crate::db::{CustomUUID, CustomDateTime, SqliteConnectionManager};
 use hopnet_common::db::InodeType;
 use crate::files::functions::decrypt_path;
 use hopnet_common::documentprovider::DocumentProviderItem;
@@ -12,7 +12,7 @@ use super::DatabaseError;
 /// Get a single item by inode_id, returning a DocumentProviderItem
 /// Uses a self-join to get parent_id in a single query
 pub fn get_item(
-    db_lock: &PooledConnection<DuckdbConnectionManager>,
+    db_lock: &PooledConnection<SqliteConnectionManager>,
     inode_id: &CustomUUID,
     user_id: i32,
     siv_key: &Key<Aes256Siv>,
@@ -32,7 +32,7 @@ pub fn get_item(
         FROM inodes i
         LEFT JOIN data_blocks db ON i.data_id = db.id
         LEFT JOIN inodes parent ON
-            parent.path = regexp_extract(i.path, '^(.+)/[^/]+$', 1)
+            parent.path = substr(i.path, 1, length(i.path) - INSTR(reverse(i.path), '/'))
             AND parent.owner_id = i.owner_id
         WHERE i.id = ? AND i.owner_id = ?
         LIMIT 1
@@ -52,7 +52,7 @@ pub fn get_item(
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
         })
         .map_err(|e| match e {
-            duckdb::Error::QueryReturnedNoRows => DatabaseError::NotFound,
+            rusqlite::Error::QueryReturnedNoRows => DatabaseError::NotFound,
             _ => DatabaseError::RecallError,
         })?;
 
@@ -87,7 +87,7 @@ pub fn get_item(
 /// Get minimal metadata needed for file download: encrypted_path and type
 /// Single table query, no joins - optimized for download hot path
 pub fn get_download_metadata(
-    db_lock: &PooledConnection<DuckdbConnectionManager>,
+    db_lock: &PooledConnection<SqliteConnectionManager>,
     inode_id: &CustomUUID,
     user_id: i32,
 ) -> Result<(String, InodeType), DatabaseError> {
@@ -104,7 +104,7 @@ pub fn get_download_metadata(
         Ok((row.get::<_, String>(0)?, row.get::<_, InodeType>(1)?))
     })
     .map_err(|e| match e {
-        duckdb::Error::QueryReturnedNoRows => DatabaseError::NotFound,
+        rusqlite::Error::QueryReturnedNoRows => DatabaseError::NotFound,
         _ => DatabaseError::RecallError,
     })
 }
@@ -112,7 +112,7 @@ pub fn get_download_metadata(
 /// Get encrypted path for a given inode_id
 /// Takes an existing db lock to allow combining with other operations
 pub fn get_path_by_inode_id(
-    db_lock: &PooledConnection<DuckdbConnectionManager>,
+    db_lock: &PooledConnection<SqliteConnectionManager>,
     inode_id: &CustomUUID,
     user_id: i32,
 ) -> Result<String, DatabaseError> {
@@ -129,7 +129,7 @@ pub fn get_path_by_inode_id(
         params![inode_id, user_id],
         |row| row.get(0)
     ).map_err(|e| match e {
-        duckdb::Error::QueryReturnedNoRows => DatabaseError::NotFound,
+        rusqlite::Error::QueryReturnedNoRows => DatabaseError::NotFound,
         _ => DatabaseError::RecallError,
     })?;
 
@@ -139,7 +139,7 @@ pub fn get_path_by_inode_id(
 /// Get children of a folder, returning DocumentProviderItems directly
 /// Takes an existing db lock and encrypted parent path
 pub fn get_children(
-    db_lock: &PooledConnection<DuckdbConnectionManager>,
+    db_lock: &PooledConnection<SqliteConnectionManager>,
     user_id: i32,
     encrypted_parent_path: &str,
     siv_key: &Key<Aes256Siv>,
@@ -167,7 +167,10 @@ pub fn get_children(
     let like_pattern = format!("{}/%", encrypted_parent_path);
     let not_like_pattern = format!("{}/%/%", encrypted_parent_path);
 
-    let mut stmt = db_lock.prepare(query).map_err(|_| DatabaseError::ProcessingError)?;
+    let mut stmt = db_lock.prepare(query).map_err(|e| {
+        tracing::error!("get_children prepare failed: {:?}", e);
+        DatabaseError::ProcessingError
+    })?;
 
     let rows = stmt.query_map(
         params![user_id, like_pattern, not_like_pattern],
@@ -179,12 +182,15 @@ pub fn get_children(
             let last_modified: crate::db::CustomDateTime = row.get(4)?;
 
             // Decrypt path to get filename
-            let decrypted_path = decrypt_path(encrypted_path, siv_key, siv_nonce)
-                .map_err(|_| duckdb::Error::InvalidColumnType(
-                    2,
-                    "path_decryption".to_string(),
-                    duckdb::types::Type::Text,
-                ))?;
+            let decrypted_path = decrypt_path(encrypted_path.clone(), siv_key, siv_nonce)
+                .map_err(|e| {
+                    tracing::error!("get_children path decryption failed for inode {}: {:?} (encrypted_path len={})", id, e, encrypted_path.len());
+                    rusqlite::Error::InvalidColumnType(
+                        2,
+                        "path_decryption".to_string(),
+                        rusqlite::types::Type::Text,
+                    )
+                })?;
             let name = decrypted_path.split('/').last().unwrap_or(&decrypted_path).to_string();
 
             // Derive MIME type from filename
@@ -205,7 +211,13 @@ pub fn get_children(
                 parent_id: parent_id.clone(),
             })
         },
-    ).map_err(|_| DatabaseError::RecallError)?;
+    ).map_err(|e| {
+        tracing::error!("get_children query_map failed: {:?}", e);
+        DatabaseError::RecallError
+    })?;
 
-    rows.collect::<Result<Vec<_>, _>>().map_err(|_| DatabaseError::RecallError)
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| {
+        tracing::error!("get_children row collection failed: {:?}", e);
+        DatabaseError::RecallError
+    })
 }

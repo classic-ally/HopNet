@@ -13,7 +13,7 @@ pub trait TransactionHandler: Send + Sync {
     // - tx.user (optional, cryptographically verified user if present)
     // - tx.rpc.payload (the actual operation payload to decode)
     // - db_tx: shared database transaction for atomicity (all transactions in block use same tx)
-    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult;
+    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult;
 
 }
 

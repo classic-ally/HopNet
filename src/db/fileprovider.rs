@@ -30,7 +30,7 @@ pub struct FileProviderEnumerateResult {
 /// Get folder contents for FileProvider directory enumeration
 /// Returns raw data that FileProvider binary can convert to objc2 types
 pub fn get_folder_contents(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     user_id: i32,
     parent_path_pattern: &str,
     siv_key: &Key<Aes256Siv>,
@@ -53,7 +53,7 @@ pub fn get_folder_contents(
                     uuid_extract_timestamp(i.id) as creation_date,
                     CASE 
                         WHEN i.data_id IS NOT NULL THEN uuid_extract_timestamp(i.data_id)
-                        WHEN i.type = 'folder' THEN (
+                        WHEN i.type = 1 THEN (
                             SELECT MAX(uuid_extract_timestamp(COALESCE(child.data_id, child.id)))
                             FROM inodes child
                             WHERE child.owner_id = i.owner_id
@@ -65,9 +65,9 @@ pub fn get_folder_contents(
                 FROM inodes i
                 LEFT JOIN data_blocks db ON i.data_id = db.id
                 LEFT JOIN inodes parent ON (
-                    parent.owner_id = i.owner_id 
-                    AND parent.type = 'folder'
-                    AND parent.path = substr(i.path, 1, length(i.path) - length(reverse(substr(reverse(i.path), 1, strpos(reverse(i.path), '/') - 1))) - 1)
+                    parent.owner_id = i.owner_id
+                    AND parent.type = 1
+                    AND parent.path = substr(i.path, 1, length(i.path) - length(reverse(substr(reverse(i.path), 1, INSTR(reverse(i.path), '/') - 1))) - 1)
                     AND length(i.path) - length(replace(i.path, '/', '')) > 1
                 )
                 LEFT JOIN (
@@ -96,14 +96,14 @@ pub fn get_folder_contents(
                     let item_type: InodeType = row.get(1)?;  // Direct deserialization using FromSql
                     let encrypted_path: String = row.get(2)?;  // path is VARCHAR in database
                     let parent_item_identifier: String = row.get(3)?;  // Parent identifier from JOIN
-                    let file_size: Option<u64> = row.get(4)?;  // File size from data_blocks (NULL for folders)
+                    let file_size = row.get::<_, Option<i64>>(4)?.map(|v| v as u64);  // File size from data_blocks (NULL for folders)
                     let creation_date: Option<CustomDateTime> = row.get(5)?;  // UUIDv7 timestamp or NULL for folders
                     let content_modification_date: Option<CustomDateTime> = row.get(6)?;  // modified_at from data_blocks
                     let modification_height: Option<i32> = row.get(7)?;  // Consensus height when item was last modified
                     
                     // Decrypt the full path using the same pattern as get_files
                     let decrypted_path = decrypt_path(encrypted_path, siv_key, siv_nonce)
-                        .map_err(|_| duckdb::Error::InvalidColumnType(2, "path_decryption".to_string(), duckdb::types::Type::Text))?;
+                        .map_err(|_| rusqlite::Error::InvalidColumnType(2, "path_decryption".to_string(), rusqlite::types::Type::Text))?;
                     
                     // Extract filename from path (last component after '/')
                     let filename = decrypted_path.split('/').last().unwrap_or(&decrypted_path).to_string();
@@ -152,7 +152,7 @@ pub fn get_folder_contents(
 /// Get folder changes since a given consensus height for FileProvider incremental sync
 /// Returns all folders in the path + files changed since the given consensus height
 pub fn get_folder_changes_since_height(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     user_id: i32,
     encrypted_parent_path: &str,
     since_height: i32,
@@ -182,7 +182,7 @@ pub fn get_folder_changes_since_height(
                     CASE WHEN i.id IS NOT NULL THEN uuid_extract_timestamp(i.id) ELSE NULL END as creation_date,
                     CASE 
                         WHEN i.data_id IS NOT NULL THEN uuid_extract_timestamp(i.data_id)
-                        WHEN i.type = 'folder' THEN (
+                        WHEN i.type = 1 THEN (
                             SELECT MAX(uuid_extract_timestamp(COALESCE(child.data_id, child.id)))
                             FROM inodes child
                             WHERE child.owner_id = i.owner_id
@@ -195,9 +195,9 @@ pub fn get_folder_changes_since_height(
                 LEFT JOIN inodes i ON source.inode_id = i.id
                 LEFT JOIN data_blocks db ON i.data_id = db.id
                 LEFT JOIN inodes parent ON (
-                    parent.owner_id = i.owner_id 
-                    AND parent.type = 'folder'
-                    AND parent.path = substr(i.path, 1, length(i.path) - length(reverse(substr(reverse(i.path), 1, strpos(reverse(i.path), '/') - 1))) - 1)
+                    parent.owner_id = i.owner_id
+                    AND parent.type = 1
+                    AND parent.path = substr(i.path, 1, length(i.path) - length(reverse(substr(reverse(i.path), 1, INSTR(reverse(i.path), '/') - 1))) - 1)
                     AND length(i.path) - length(replace(i.path, '/', '')) > 1
                 )
                 ORDER BY status DESC, i.type DESC, i.path ASC
@@ -212,7 +212,7 @@ pub fn get_folder_changes_since_height(
                 // Specific folder case: items that were or are in this folder
                 let folder_query = base_query.replace("{source_query}", r#"
                     WITH target_folder AS (
-                        SELECT id FROM inodes WHERE owner_id = ? AND path = ? AND type = 'folder'
+                        SELECT id FROM inodes WHERE owner_id = ? AND path = ? AND type = 1
                     ),
                     modified_items AS (
                         SELECT 
@@ -220,9 +220,9 @@ pub fn get_folder_changes_since_height(
                             ml.old_parent_id,
                             -- Get current parent if item exists
                             CASE WHEN i.id IS NOT NULL AND length(i.path) > 2 THEN (
-                                SELECT p.id FROM inodes p 
-                                WHERE p.owner_id = i.owner_id AND p.type = 'folder'
-                                  AND p.path = substr(i.path, 1, length(i.path) - length(reverse(substr(reverse(i.path), 1, strpos(reverse(i.path), '/') - 1))) - 1)
+                                SELECT p.id FROM inodes p
+                                WHERE p.owner_id = i.owner_id AND p.type = 1
+                                  AND p.path = substr(i.path, 1, length(i.path) - length(reverse(substr(reverse(i.path), 1, INSTR(reverse(i.path), '/') - 1))) - 1)
                             ) ELSE NULL END as current_parent_id
                         FROM modification_log ml
                         LEFT JOIN inodes i ON ml.inode_id = i.id AND i.owner_id = ml.owner_id
@@ -242,14 +242,14 @@ pub fn get_folder_changes_since_height(
             let mut stmt = db_lock.prepare(&final_query).map_err(|_| DatabaseError::ProcessingError)?;
             
             // Define the closure once to avoid type mismatch
-            let row_mapper = |row: &duckdb::Row| -> Result<(String, CustomUUID, Option<String>, Option<InodeType>, Option<String>, Option<String>, Option<u64>, Option<CustomDateTime>, Option<CustomDateTime>, Option<i32>), duckdb::Error> {
+            let row_mapper = |row: &rusqlite::Row| -> Result<(String, CustomUUID, Option<String>, Option<InodeType>, Option<String>, Option<String>, Option<u64>, Option<CustomDateTime>, Option<CustomDateTime>, Option<i32>), rusqlite::Error> {
                 let inode_id: CustomUUID = row.get(0)?;
                 let status: String = row.get(1)?;
                 let identifier: Option<String> = row.get(2)?;
                 let item_type: Option<InodeType> = row.get(3)?;
                 let encrypted_path: Option<String> = row.get(4)?;
                 let parent_item_identifier: Option<String> = row.get(5)?;
-                let file_size: Option<u64> = row.get(6)?;
+                let file_size = row.get::<_, Option<i64>>(6)?.map(|v| v as u64);
                 let creation_date: Option<CustomDateTime> = row.get(7)?;
                 let content_modification_date: Option<CustomDateTime> = row.get(8)?;
                 let modification_height: Option<i32> = row.get(9)?;
@@ -328,7 +328,7 @@ pub fn get_folder_changes_since_height(
 /// Get the encrypted path, file size, timestamps, and type for any item by its inode_id
 /// Used by FileProvider get_item endpoint to fetch complete metadata for files and folders
 pub fn get_item_metadata_by_inode_id(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     inode_id: CustomUUID,
     user_id: i32,
 ) -> Result<(String, InodeType, Option<u64>, CustomDateTime, Option<CustomDateTime>, Option<i32>), DatabaseError> {
@@ -342,7 +342,7 @@ pub fn get_item_metadata_by_inode_id(
                     uuid_extract_timestamp(i.id) as creation_date,
                     CASE 
                         WHEN i.data_id IS NOT NULL THEN uuid_extract_timestamp(i.data_id)
-                        WHEN i.type = 'folder' THEN (
+                        WHEN i.type = 1 THEN (
                             SELECT MAX(uuid_extract_timestamp(COALESCE(child.data_id, child.id)))
                             FROM inodes child
                             WHERE child.owner_id = i.owner_id
@@ -372,7 +372,7 @@ pub fn get_item_metadata_by_inode_id(
                 |row| {
                     let path: String = row.get(0)?;
                     let item_type: InodeType = row.get(1)?;
-                    let file_size: Option<u64> = row.get(2)?;  // NULL for folders
+                    let file_size = row.get::<_, Option<i64>>(2)?.map(|v| v as u64);  // NULL for folders
                     let creation_date: CustomDateTime = row.get(3)?;  // UUIDv7 from inode.id (always exists)
                     let content_modification_date: Option<CustomDateTime> = row.get(4)?;  // UUIDv7 from data_id (files only)
                     let modification_height: Option<i32> = row.get(5)?;  // Consensus height when item was last modified
@@ -380,7 +380,7 @@ pub fn get_item_metadata_by_inode_id(
                 }
             ).map_err(|e| {
                 match e {
-                    duckdb::Error::QueryReturnedNoRows => DatabaseError::NotFound,
+                    rusqlite::Error::QueryReturnedNoRows => DatabaseError::NotFound,
                     _ => DatabaseError::RecallError
                 }
             })?;
@@ -397,7 +397,7 @@ pub fn get_item_metadata_by_inode_id(
 /// Get the encrypted path for a file by its data_id
 /// Used by FileProvider delete endpoint to resolve file identifiers
 pub fn get_file_path_by_data_id(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     data_id: CustomUUID,
     user_id: i32,
 ) -> Result<String, DatabaseError> {
@@ -406,7 +406,7 @@ pub fn get_file_path_by_data_id(
             let query = r#"
                 SELECT path
                 FROM inodes
-                WHERE data_id = ? AND owner_id = ? AND type = 'file'
+                WHERE data_id = ? AND owner_id = ? AND type = 0
                 LIMIT 1
             "#;
             
@@ -417,7 +417,7 @@ pub fn get_file_path_by_data_id(
                 |row| row.get(0)
             ).map_err(|e| {
                 match e {
-                    duckdb::Error::QueryReturnedNoRows => DatabaseError::NotFound,
+                    rusqlite::Error::QueryReturnedNoRows => DatabaseError::NotFound,
                     _ => DatabaseError::RecallError
                 }
             })?;
@@ -431,7 +431,7 @@ pub fn get_file_path_by_data_id(
 /// Get inode_id for a given encrypted path and user
 /// Used by FileProvider to convert paths to unified item: identifiers
 pub fn get_inode_id_by_path(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     encrypted_path: &str,
     user_id: i32,
 ) -> Result<CustomUUID, DatabaseError> {
@@ -451,7 +451,7 @@ pub fn get_inode_id_by_path(
                 |row| row.get(0)
             ).map_err(|e| {
                 match e {
-                    duckdb::Error::QueryReturnedNoRows => DatabaseError::NotFound,
+                    rusqlite::Error::QueryReturnedNoRows => DatabaseError::NotFound,
                     _ => DatabaseError::RecallError
                 }
             })?;
@@ -465,7 +465,7 @@ pub fn get_inode_id_by_path(
 /// Check if a folder is empty (has no children)
 /// Used by FileProvider delete endpoint to validate non-recursive folder deletion
 pub fn is_folder_empty(
-    db_connection: Result<r2d2::PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     encrypted_path: &str,
     user_id: i32,
 ) -> Result<bool, DatabaseError> {

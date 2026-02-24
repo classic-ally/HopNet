@@ -125,12 +125,12 @@ impl MockNetwork {
 
                 existing_node_db.execute(
                     "INSERT INTO nodes (node_id, name, owner, pubkey) VALUES (?, ?, ?, ?)",
-                    duckdb::params![i as i32, format!("node_{}", i), 0, joining_node.verifying_key]
+                    rusqlite::params![i as i32, format!("node_{}", i), 0, joining_node.verifying_key]
                 ).expect("Failed to insert joining node into existing node");
 
                 existing_node_db.execute(
                     "INSERT INTO validators (effective_height, node_id, is_active) VALUES (?, ?, ?)",
-                    duckdb::params![0, i as i32, true]
+                    rusqlite::params![0, i as i32, true]
                 ).expect("Failed to insert validator into existing node");
 
                 existing_node_db.execute(
@@ -192,7 +192,7 @@ impl MockNetwork {
                     let (user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt) = row?;
                     dest_db.execute(
                         "INSERT INTO users (user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt) VALUES (?, ?, ?, ?, ?, ?)",
-                        duckdb::params![user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt]
+                        rusqlite::params![user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt]
                     )?;
                 }
                 Ok(())
@@ -219,7 +219,7 @@ impl MockNetwork {
                     let (node_id, name, owner, pubkey) = row?;
                     dest_db.execute(
                         "INSERT INTO nodes (node_id, name, owner, pubkey) VALUES (?, ?, ?, ?)",
-                        duckdb::params![node_id, name, owner, pubkey]
+                        rusqlite::params![node_id, name, owner, pubkey]
                     )?;
                 }
                 Ok(())
@@ -241,7 +241,7 @@ impl MockNetwork {
                     let (name, next_id) = row?;
                     dest_db.execute(
                         "UPDATE sequences SET next_id = ? WHERE name = ?",
-                        duckdb::params![next_id, name]
+                        rusqlite::params![next_id, name]
                     )?;
                 }
                 Ok(())
@@ -262,7 +262,7 @@ impl MockNetwork {
                     let (effective_height, node_id, is_active) = row?;
                     dest_db.execute(
                         "INSERT INTO validators (effective_height, node_id, is_active) VALUES (?, ?, ?)",
-                        duckdb::params![effective_height, node_id, is_active]
+                        rusqlite::params![effective_height, node_id, is_active]
                     )?;
                 }
                 Ok(())
@@ -290,7 +290,7 @@ impl MockNetwork {
                     let (block_hash, height, view_number, parent_hash, transactions) = row?;
                     dest_db.execute(
                         "INSERT INTO blocks (block_hash, height, view_number, parent_hash, transactions) VALUES (?, ?, ?, ?, ?)",
-                        duckdb::params![block_hash, height, view_number, parent_hash, transactions]
+                        rusqlite::params![block_hash, height, view_number, parent_hash, transactions]
                     )?;
                 }
                 Ok(())
@@ -318,7 +318,7 @@ impl MockNetwork {
                     let (view_number, phase, block_hash, proposer_signature, voter_signatures) = row?;
                     dest_db.execute(
                         "INSERT INTO quorum_certificates (view_number, phase, block_hash, proposer_signature, voter_signatures) VALUES (?, ?, ?, ?, ?)",
-                        duckdb::params![view_number, phase, block_hash, proposer_signature, voter_signatures]
+                        rusqlite::params![view_number, phase, block_hash, proposer_signature, voter_signatures]
                     )?;
                 }
                 Ok(())
@@ -346,7 +346,7 @@ impl MockNetwork {
                     let (view_number, signatures, highest_qc_phase, highest_qc_block_hash, highest_qc_view) = row?;
                     dest_db.execute(
                         "INSERT INTO timeout_certificates (view_number, signatures, highest_qc_phase, highest_qc_block_hash, highest_qc_view) VALUES (?, ?, ?, ?, ?)",
-                        duckdb::params![view_number, signatures, highest_qc_phase, highest_qc_block_hash, highest_qc_view]
+                        rusqlite::params![view_number, signatures, highest_qc_phase, highest_qc_block_hash, highest_qc_view]
                     )?;
                 }
                 Ok(())
@@ -399,7 +399,7 @@ impl MockNetwork {
         // Use joining_node's specific node_id and privkey, but copy consensus state from source
         dest_db.execute(
             "INSERT INTO this_node (internal_id, node_id, privkey, current_phase, current_view, last_timeout_vote_view, last_propose_vote_block_hash, prepared_block_hash, committed_block_hash, highest_qc_block_hash, highest_qc_phase) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            duckdb::params![
+            rusqlite::params![
                 joining_node.node_id,
                 dest.private_key,  // Use joining node's own private key
                 current_phase,
@@ -424,13 +424,16 @@ impl MockNetwork {
 
 pub fn create_test_app_state_with_keys(signing_key: crate::db::PrivKey, verifying_key: crate::db::PubKey) -> AppState {
     use r2d2::Pool;
-    use duckdb::DuckdbConnectionManager;
+    use r2d2_sqlite::SqliteConnectionManager;
     use std::sync::Arc;
     use once_cell::sync::OnceCell;
     use jsonwebtoken::{EncodingKey, DecodingKey};
 
-    let manager = DuckdbConnectionManager::memory().unwrap();
-    let pool = Pool::new(manager).unwrap();
+    let manager = SqliteConnectionManager::memory();
+    let pool = Pool::builder()
+        .connection_customizer(Box::new(crate::db::shared::SqliteInitializer))
+        .build(manager)
+        .unwrap();
 
     crate::db::shared::initialize(pool.get().unwrap()).unwrap();
 

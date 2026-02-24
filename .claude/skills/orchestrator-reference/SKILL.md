@@ -55,18 +55,25 @@ cargo build --release --bin orchestrator --features skip-frontend
 |-----------|-------------|
 | `file-upload-consistency` | Files uploaded to one node are retrievable from all nodes |
 | `fragment-distribution` | Fragments are properly distributed across mesh after upload |
+| `fragment-health-check` | Fragment integrity check across the mesh |
 | `multi-size-file-consistency` | Various file sizes (small, medium, large) work correctly |
 | `chunked-streaming-performance` | Streaming performance with chunked RS encoding |
 | `restart-persistence` | Data survives node restarts |
 | `device-token-consistency` | Device token management across nodes |
 | `documentprovider-write-consistency` | Document provider write APIs (upload, rename, move, delete) |
+| `multi-user-isolation` | User data isolation in multi-user scenarios |
+| `multi-user-sharing` | File sharing between users with share acceptance |
+| `multi-user-sharing-live-link` | Live-link propagation for file shares |
+| `metrics-collection` | System metrics collection and validation |
 | `iroh-ping` | Verify iroh transport connectivity between all nodes in the mesh |
 | `iroh-reject-unknown` | Verify unknown peers are rejected before path registration (no IP leak) |
 | `timeout-progression` | Verify timeout votes broadcast over iroh, form TC, and advance view when leader is down |
 | `consensus-barrier-basic` | Hold leader between Propose and Lock phases, verify barrier mechanism and QC propagation |
 | `consensus-barrier-missed-ballot` | Hold follower's ballot dispatch, let consensus proceed without it, verify message-driven catch-up |
-| `consensus-barrier-tc-qc-race` | Lock QC arrives while TC is pending — verify Lock QC wins and TC is rejected (safety property) |
 | `consensus-barrier-tc-late` | Diagnostic: TC commits before Lock QC arrives — check for metadata divergence |
+| `consensus-queue-burst` | 10 concurrent mixed ops at one node, validates batching efficiency and cross-node consistency |
+| `consensus-queue-cross-node` | Two-phase ACK forwarding — operations sent to different nodes concurrently, verifies cross-node coordination |
+| `consensus-queue-throughput` | 30s sustained mixed-operation load, measures ops-per-view throughput (≥80% success rate) |
 
 ## Common Workflows
 

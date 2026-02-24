@@ -19,10 +19,10 @@ pub fn database_exists(db_path: &str) -> bool {
 }
 
 /// Check if the database schema is initialized by checking for critical tables
-pub fn is_schema_initialized(db: &PooledConnection<DuckdbConnectionManager>) -> Result<bool, DuckdbError> {
+pub fn is_schema_initialized(db: &PooledConnection<SqliteConnectionManager>) -> Result<bool, DuckdbError> {
     // Check if the critical 'blocks' table exists
     let result = db.query_row(
-        "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'blocks'",
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'blocks'",
         [],
         |row| row.get::<_, i64>(0)
     );
@@ -41,7 +41,73 @@ pub fn ensure_database_dir(db_path: &str) -> Result<(), std::io::Error> {
     Ok(())
 }
 
-pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), DuckdbError> {
+/// Connection customizer that runs PRAGMAs and registers custom functions on each new connection
+#[derive(Debug)]
+pub struct SqliteInitializer;
+
+impl r2d2::CustomizeConnection<rusqlite::Connection, rusqlite::Error> for SqliteInitializer {
+    fn on_acquire(&self, conn: &mut rusqlite::Connection) -> Result<(), rusqlite::Error> {
+        conn.execute_batch("
+            PRAGMA journal_mode = WAL;
+            PRAGMA foreign_keys = ON;
+            PRAGMA busy_timeout = 5000;
+        ")?;
+        register_custom_functions(conn)?;
+        Ok(())
+    }
+}
+
+/// Register custom SQL functions needed by queries across the codebase
+pub fn register_custom_functions(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    // uuid_extract_timestamp(uuid_text) → INTEGER (NULL-safe: NULL in → NULL out)
+    // Parse UUIDv7 hex, extract 48-bit timestamp, return epoch millis
+    conn.create_scalar_function("uuid_extract_timestamp", 1, rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC, |ctx| {
+        let uuid_str: Option<String> = ctx.get(0)?;
+        match uuid_str {
+            None => Ok(None),
+            Some(s) => {
+                let hex_only: String = s.replace('-', "");
+                if hex_only.len() < 12 {
+                    return Ok(Some(0i64));
+                }
+                match i64::from_str_radix(&hex_only[..12], 16) {
+                    Ok(millis) => Ok(Some(millis)),
+                    Err(_) => Ok(Some(0i64)),
+                }
+            }
+        }
+    })?;
+
+    // reverse(text) → TEXT
+    // String reversal for parent-path extraction patterns
+    conn.create_scalar_function("reverse", 1, rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC, |ctx| {
+        let s: String = ctx.get(0)?;
+        Ok(s.chars().rev().collect::<String>())
+    })?;
+
+    // sqrt(x) → REAL
+    conn.create_scalar_function("sqrt", 1, rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC, |ctx| {
+        let x: f64 = ctx.get(0)?;
+        Ok(x.sqrt())
+    })?;
+
+    // pow(x, y) → REAL
+    conn.create_scalar_function("pow", 2, rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC, |ctx| {
+        let base: f64 = ctx.get(0)?;
+        let exp: f64 = ctx.get(1)?;
+        Ok(base.powf(exp))
+    })?;
+
+    // log10(x) → REAL
+    conn.create_scalar_function("log10", 1, rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC, |ctx| {
+        let x: f64 = ctx.get(0)?;
+        Ok(x.log10())
+    })?;
+
+    Ok(())
+}
+
+pub fn initialize(db: PooledConnection<SqliteConnectionManager>) -> Result<(), DuckdbError> {
     db.execute_batch(
         "
             CREATE TABLE sequences (
@@ -51,13 +117,13 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
 
             CREATE TABLE users (
                 user_id         INTEGER PRIMARY KEY,
-                username        VARCHAR NOT NULL,
+                username        TEXT NOT NULL,
                 pubkey          BLOB NOT NULL,
                 x25519_pubkey   BLOB NOT NULL,  -- 32 bytes X25519 public key for file access
                 encrypted_privkey BLOB NOT NULL, -- nonce || ChaCha20-Poly1305 ciphertext
                 key_salt        BLOB NOT NULL,   -- Argon2 salt
-                first_name      VARCHAR,         -- optional first name (max 32 chars)
-                last_name       VARCHAR,         -- optional last name (max 32 chars)
+                first_name      TEXT,            -- optional first name (max 32 chars)
+                last_name       TEXT,            -- optional last name (max 32 chars)
                 avatar          BLOB,            -- optional avatar (JPEG, max 128KB)
 
                 CONSTRAINT unique_username UNIQUE (username)
@@ -65,7 +131,7 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
 
             CREATE TABLE nodes (
                 node_id         INTEGER PRIMARY KEY,
-                name            VARCHAR NOT NULL,
+                name            TEXT NOT NULL,
                 owner           INTEGER NOT NULL,
                 pubkey          BLOB NOT NULL,
 
@@ -97,7 +163,7 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
 
             CREATE TABLE quorum_certificates (
                 view_number         INTEGER NOT NULL,
-                phase               ENUM('propose', 'lock') NOT NULL,
+                phase               INTEGER NOT NULL CHECK(phase IN (0, 1)),  -- 0=propose, 1=lock
                 block_hash          BLOB NOT NULL,
                 proposer_signature  BLOB NOT NULL,
                 voter_signatures    BLOB,
@@ -112,11 +178,11 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
             CREATE TABLE timeout_certificates (
                 view_number             INTEGER PRIMARY KEY,    -- View that timed out
                 highest_qc_view         INTEGER NOT NULL,       -- QC's view number
-                highest_qc_phase        ENUM('propose', 'lock') NOT NULL,  -- QC's phase
+                highest_qc_phase        INTEGER NOT NULL CHECK(highest_qc_phase IN (0, 1)),  -- 0=propose, 1=lock
                 highest_qc_block_hash   BLOB NOT NULL,          -- QC's block hash
                 signatures              BLOB NOT NULL,          -- Timeout vote signatures
 
-                FOREIGN KEY (highest_qc_view, highest_qc_phase, highest_qc_block_hash) 
+                FOREIGN KEY (highest_qc_view, highest_qc_phase, highest_qc_block_hash)
                     REFERENCES quorum_certificates(view_number, phase, block_hash)
             );
 
@@ -130,7 +196,7 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
             CREATE TABLE validators (
                 effective_height    INTEGER NOT NULL,   -- Height when this validator changes state
                 node_id             INTEGER NOT NULL,
-                is_active           BOOLEAN NOT NULL,
+                is_active           INTEGER NOT NULL,
 
                 PRIMARY KEY (effective_height, node_id),
                 FOREIGN KEY (node_id) REFERENCES nodes(node_id)
@@ -150,7 +216,7 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
                 -- Consensus mechanics
                 -- View stored in case of leader change without block written
                 -- Block height not stored -> always computable
-                current_phase           ENUM('propose', 'lock') NOT NULL DEFAULT 'propose',
+                current_phase           INTEGER NOT NULL DEFAULT 0 CHECK(current_phase IN (0, 1)),  -- 0=propose, 1=lock
                 current_view            INTEGER NOT NULL DEFAULT 0,
                 -- Track last view where we issued a timeout vote to prevent conflicting votes
                 last_timeout_vote_view  INTEGER DEFAULT 0,
@@ -166,7 +232,7 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
                 -- Safety: track highest QC seen (highest view for ordered execution)
                 -- Nullable for joining nodes before genesis processed
                 highest_qc_block_hash   BLOB,
-                highest_qc_phase        ENUM('propose', 'lock'),
+                highest_qc_phase        INTEGER CHECK(highest_qc_phase IN (0, 1)),  -- 0=propose, 1=lock
 
                 FOREIGN KEY (last_propose_vote_block_hash) REFERENCES blocks(block_hash),
                 FOREIGN KEY (prepared_block_hash) REFERENCES blocks(block_hash),
@@ -177,16 +243,16 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
             CREATE TABLE metrics (
                 from_node       INTEGER NOT NULL,
                 to_node         INTEGER NOT NULL,
-                start_time      TIMESTAMP NOT NULL,
+                start_time      TEXT NOT NULL,
                 rtt_latency     REAL,
                 rtt_variance    REAL,
                 rtt_jitter      REAL,
-                throughput      BIGINT,
+                throughput      INTEGER,
                 height          INTEGER NOT NULL,  -- Consensus height for deterministic versioning
-                available       BOOLEAN NOT NULL DEFAULT TRUE, -- Node availability (false if unreachable)
-                storage_total_gb UINTEGER,  -- Total storage capacity in GB
-                storage_used_gb UINTEGER,   -- Used storage capacity in GB
-                
+                available       INTEGER NOT NULL DEFAULT 1, -- Node availability (0 if unreachable)
+                storage_total_gb INTEGER,  -- Total storage capacity in GB
+                storage_used_gb INTEGER,   -- Used storage capacity in GB
+
                 PRIMARY KEY     (from_node, to_node, start_time),
                 FOREIGN KEY (from_node) REFERENCES nodes(node_id),
                 FOREIGN KEY (to_node)   REFERENCES nodes(node_id)
@@ -200,34 +266,34 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
 
             -- File system
             CREATE TABLE data_blocks (
-                id               UUID PRIMARY KEY,
-                modified_at      TIMESTAMP,
+                id               TEXT PRIMARY KEY,
+                modified_at      TEXT,
                 file_hash        BLOB NOT NULL,
                 fragment_count   INTEGER NOT NULL,
-                added_bytes      UTINYINT NOT NULL,
+                added_bytes      INTEGER NOT NULL,
                 placement_height INTEGER,  -- Consensus height when fragment placement was determined
-                file_size        UBIGINT NOT NULL  -- Total size of the file in bytes
+                file_size        INTEGER NOT NULL  -- Total size of the file in bytes (i64, max ~9.2 EB)
             );
 
             CREATE TABLE file_access (
-                data_block_id    UUID NOT NULL,
+                data_block_id    TEXT NOT NULL,
                 user_id          INTEGER NOT NULL,
                 ephemeral_pubkey BLOB NOT NULL,  -- 32 bytes X25519 ephemeral public key
                 encrypted_file_key BLOB NOT NULL, -- 48 bytes (32 + 16 auth tag)
-                
+
                 PRIMARY KEY (data_block_id, user_id),
                 FOREIGN KEY (data_block_id) REFERENCES data_blocks(id),
                 FOREIGN KEY (user_id) REFERENCES users(user_id)
             );
 
             CREATE TABLE fragment_hashes (
-                data_block_id    UUID NOT NULL,
-                chunk_number     UINTEGER NOT NULL,
-                local_index      UINTEGER NOT NULL,
-                fragment_id      UUID NOT NULL,
+                data_block_id    TEXT NOT NULL,
+                chunk_number     INTEGER NOT NULL,
+                local_index      INTEGER NOT NULL,
+                fragment_id      TEXT NOT NULL,
                 fragment_hash    BLOB NOT NULL,
-                chunk_type       ENUM('original', 'recovery') NOT NULL,
-                stored_locally   BOOLEAN DEFAULT FALSE,
+                chunk_type       INTEGER NOT NULL CHECK(chunk_type IN (0, 1)),  -- 0=original, 1=recovery
+                stored_locally   INTEGER DEFAULT 0,
 
                 PRIMARY KEY (data_block_id, chunk_number, local_index),
                 FOREIGN KEY (data_block_id) REFERENCES data_blocks(id)
@@ -238,16 +304,16 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
 
             CREATE TABLE inodes (
                 -- stable identifier for FileProvider (UUIDv7 encodes creation time)
-                id              UUID UNIQUE NOT NULL,
+                id              TEXT UNIQUE NOT NULL,
                 -- owner of this reference
                 owner_id        INTEGER REFERENCES users(user_id) NOT NULL,
                 -- denormalized deterministically encrypted string
                 -- enables fast folder listing queries without need for recursive parent_id
-                path            VARCHAR NOT NULL,
+                path            TEXT NOT NULL,
                 -- type of the inode
-                type            ENUM('file', 'folder') NOT NULL,
+                type            INTEGER NOT NULL CHECK(type IN (0, 1)),  -- 0=file, 1=folder
                 -- FK to the content block
-                data_id         UUID REFERENCES data_blocks(id),
+                data_id         TEXT REFERENCES data_blocks(id),
 
                 PRIMARY KEY     (owner_id, path)
             );
@@ -266,25 +332,25 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
             -- This table tracks all file/folder modifications to support incremental sync in FileProvider
             -- It provides a unified change tracking mechanism for all file system operations
             CREATE TABLE modification_log (
-                inode_id           UUID NOT NULL,     -- Stable inode identifier
+                inode_id           TEXT NOT NULL,     -- Stable inode identifier
                 owner_id           INTEGER NOT NULL,
-                old_parent_id      UUID,              -- Parent folder BEFORE modification (NULL for new items)
+                old_parent_id      TEXT,              -- Parent folder BEFORE modification (NULL for new items)
                 modified_at_height INTEGER NOT NULL,
-                
+
                 PRIMARY KEY (inode_id, modified_at_height),
                 FOREIGN KEY (owner_id) REFERENCES users(user_id)
             );
-            
+
             -- Index for efficient queries: what was modified for user X since height Y?
             CREATE INDEX idx_modification_log_height ON modification_log (owner_id, modified_at_height);
 
             -- User data takeout tracking (consensus-tracked for network-wide coordination)
             CREATE TABLE takeouts (
-                id UUID PRIMARY KEY,
+                id TEXT PRIMARY KEY,
                 user_id INTEGER NOT NULL REFERENCES users(user_id),
                 owner_node_id INTEGER NOT NULL,         -- Node that owns and processes this takeout
-                status ENUM('pending', 'materializing', 'ready', 'expired', 'cancelled') NOT NULL DEFAULT 'pending',
-                expires_at TIMESTAMP NOT NULL,
+                status INTEGER NOT NULL DEFAULT 0 CHECK(status IN (0, 1, 2, 3, 4)),  -- 0=pending, 1=materializing, 2=ready, 3=expired, 4=cancelled
+                expires_at TEXT NOT NULL,
                 consensus_height INTEGER NOT NULL
             );
 
@@ -293,25 +359,11 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
             CREATE INDEX idx_takeouts_expires ON takeouts (expires_at);
             CREATE INDEX idx_takeouts_owner_node ON takeouts (owner_node_id);
 
-            -- Add comments for documentation
-            COMMENT ON TABLE takeouts IS 'Consensus-tracked table for coordinating user data export requests network-wide with 24-hour validity';
-            COMMENT ON COLUMN takeouts.owner_node_id IS 'Node ID that owns this takeout and performs the processing work';
-            COMMENT ON TABLE modification_log IS 'Local-only table for tracking all file modifications to support FileProvider incremental sync (NOT consensus tracked)';
-            COMMENT ON TABLE metrics IS 'Network performance metrics between distributed system nodes';
-            COMMENT ON COLUMN metrics.rtt_latency IS 'Round-trip time latency in milliseconds';
-            COMMENT ON COLUMN metrics.rtt_variance IS 'RTT variance in milliseconds';
-            COMMENT ON COLUMN metrics.rtt_jitter IS 'RTT jitter in milliseconds';
-            COMMENT ON COLUMN metrics.throughput IS 'Network throughput in bytes per second';
-            COMMENT ON COLUMN metrics.height IS 'Consensus height for deterministic versioning';
-            COMMENT ON COLUMN metrics.available IS 'Node availability (false if unreachable during measurement)';
-            COMMENT ON COLUMN metrics.storage_total_gb IS 'Total storage capacity in gigabytes';
-            COMMENT ON COLUMN metrics.storage_used_gb IS 'Used storage capacity in gigabytes';
-
             -- Local staging table for fragment request metrics (before consensus submission)
             CREATE TABLE pending_fragment_requests (
                 from_node INTEGER NOT NULL,
                 to_node INTEGER NOT NULL,
-                success BOOLEAN NOT NULL,
+                success INTEGER NOT NULL,
                 recorded_at_height INTEGER NOT NULL,      -- When request actually occurred
                 batch_upload_height INTEGER,              -- When submitted to consensus (NULL = pending)
 
@@ -358,8 +410,11 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
             -- Device tokens for OS integration authentication (consensus-replicated)
             -- API key format: {token_id}.{secret} - only hash of secret is stored
             -- Device name is SIV-encrypted with user's key (privacy from other nodes)
+            -- Device tokens for OS integration authentication (consensus-replicated)
+            -- API key format: {token_id}.{secret} - only hash of secret is stored
+            -- Device name is SIV-encrypted with user's key (privacy from other nodes)
             CREATE TABLE device_tokens (
-                id                      UUID PRIMARY KEY,   -- UUIDv7 encodes creation time
+                id                      TEXT PRIMARY KEY,   -- UUIDv7 encodes creation time
                 user_id                 INTEGER NOT NULL,
                 api_key_hash            BLOB NOT NULL,      -- Blake3 hash of secret portion
                 encrypted_device_name   TEXT NOT NULL,      -- SIV-encrypted, hex-encoded
@@ -367,14 +422,10 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
             );
             CREATE INDEX idx_device_tokens_user_id ON device_tokens(user_id);
 
-            -- Add comments for fragment inventory documentation
-            COMMENT ON TABLE fragment_inventory IS 'Tracks which nodes store which fragments for distributed discovery and self-attestation';
-            COMMENT ON COLUMN fragment_inventory.self_verified_height IS 'Last consensus height when node verified it actually has this fragment on disk';
-
             -- Sharing: pending share invitations
             CREATE TABLE incoming_shares (
-                id                       UUID PRIMARY KEY,
-                data_block_id            UUID NOT NULL,
+                id                       TEXT PRIMARY KEY,
+                data_block_id            TEXT NOT NULL,
                 sender_id                INTEGER NOT NULL,
                 recipient_id             INTEGER NOT NULL,
                 file_access              BLOB NOT NULL,
@@ -389,12 +440,12 @@ pub fn initialize(db: PooledConnection<DuckdbConnectionManager>) -> Result<(), D
 
             -- Transaction nonce dedup (prevents stale resubmission after forward timeout)
             CREATE TABLE committed_tx_nonces (
-                nonce UUID PRIMARY KEY
+                nonce TEXT PRIMARY KEY
             );
 
             -- Sharing: live-link membership
             CREATE TABLE shares (
-                data_block_id   UUID NOT NULL,
+                data_block_id   TEXT NOT NULL,
                 user_id         INTEGER NOT NULL,
                 PRIMARY KEY (data_block_id, user_id),
                 FOREIGN KEY (data_block_id) REFERENCES data_blocks(id),

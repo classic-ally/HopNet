@@ -6,7 +6,7 @@ pub struct SubmitMetricsHandler;
 impl TransactionHandler for SubmitMetricsHandler {
     fn name(&self) -> &'static str { "submit_metrics" }
 
-    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
+    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
         match bincode::serde::decode_from_slice::<Vec<Metric>, _>(&tx.rpc.payload, bincode::config::standard()) {
             Ok((metrics_data, _)) => {
                 // Authorization: verify all metrics are from the submitting node

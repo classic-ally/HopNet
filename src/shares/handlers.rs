@@ -2,7 +2,7 @@ use crate::handlers::{TransactionHandler, HandlerResult};
 use crate::AppState;
 use crate::consensus::types::Transaction;
 use crate::db::DatabaseError;
-use duckdb::params;
+use rusqlite::params;
 
 use super::types::{ShareFilePayload, AcceptSharePayload, DeclineSharePayload, UnsharePayload};
 
@@ -13,7 +13,7 @@ pub struct ShareFileHandler;
 impl TransactionHandler for ShareFileHandler {
     fn name(&self) -> &'static str { "share_file" }
 
-    fn process(&self, _state: &AppState, tx: &Transaction, _execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
+    fn process(&self, _state: &AppState, tx: &Transaction, _execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
         let (payload, _) = bincode::serde::decode_from_slice::<ShareFilePayload, _>(
             &tx.rpc.payload, bincode::config::standard()
         ).map_err(|_| DatabaseError::InvalidPayload)?;
@@ -73,7 +73,7 @@ pub struct AcceptShareHandler;
 impl TransactionHandler for AcceptShareHandler {
     fn name(&self) -> &'static str { "accept_share" }
 
-    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
+    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
         let (payload, _) = bincode::serde::decode_from_slice::<AcceptSharePayload, _>(
             &tx.rpc.payload, bincode::config::standard()
         ).map_err(|_| DatabaseError::InvalidPayload)?;
@@ -116,15 +116,17 @@ impl TransactionHandler for AcceptShareHandler {
             DatabaseError::InsertError
         })?;
 
-        // 2. Create parent directories for the encrypted path
-        let missing_parents = crate::db::files::find_missing_parents(db_tx, &[payload.encrypted_path.clone()])?;
-        if !missing_parents.is_empty() {
-            crate::db::files::insert_parent_directories(db_tx, &missing_parents, payload.recipient_id)?;
+        // 2. Create parent directories from pre-generated folder inodes
+        for (folder_id, folder_path) in &payload.parent_folder_inodes {
+            db_tx.execute(
+                "INSERT OR IGNORE INTO inodes (id, owner_id, path, type, data_id) VALUES (?, ?, ?, 1, NULL)",
+                rusqlite::params![folder_id, payload.recipient_id, folder_path],
+            ).map_err(|_| DatabaseError::InsertError)?;
         }
 
         // 3. Insert inode in recipient's namespace
         db_tx.execute(
-            "INSERT INTO inodes (id, owner_id, path, type, data_id) VALUES (?, ?, ?, 'file', ?)",
+            "INSERT INTO inodes (id, owner_id, path, type, data_id) VALUES (?, ?, ?, 0, ?)",
             params![payload.inode_id, payload.recipient_id, payload.encrypted_path, incoming_share.data_block_id]
         ).map_err(|e| {
             tracing::error!("Failed to insert inode for share accept: {:?}", e);
@@ -174,7 +176,7 @@ pub struct DeclineShareHandler;
 impl TransactionHandler for DeclineShareHandler {
     fn name(&self) -> &'static str { "decline_share" }
 
-    fn process(&self, _state: &AppState, tx: &Transaction, _execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
+    fn process(&self, _state: &AppState, tx: &Transaction, _execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
         let (payload, _) = bincode::serde::decode_from_slice::<DeclineSharePayload, _>(
             &tx.rpc.payload, bincode::config::standard()
         ).map_err(|_| DatabaseError::InvalidPayload)?;
@@ -210,7 +212,7 @@ pub struct UnshareHandler;
 impl TransactionHandler for UnshareHandler {
     fn name(&self) -> &'static str { "unshare" }
 
-    fn process(&self, _state: &AppState, tx: &Transaction, _execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
+    fn process(&self, _state: &AppState, tx: &Transaction, _execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
         let (payload, _) = bincode::serde::decode_from_slice::<UnsharePayload, _>(
             &tx.rpc.payload, bincode::config::standard()
         ).map_err(|_| DatabaseError::InvalidPayload)?;

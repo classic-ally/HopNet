@@ -213,14 +213,15 @@ pub fn calculate_final_placement_scores(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{DuckdbConnectionManager, PubKey};
+    use crate::db::{SqliteConnectionManager, PubKey};
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
 
-    fn setup_test_db() -> r2d2::Pool<DuckdbConnectionManager> {
-        let manager = DuckdbConnectionManager::memory().unwrap();
+    fn setup_test_db() -> r2d2::Pool<SqliteConnectionManager> {
+        let manager = SqliteConnectionManager::memory();
         let pool = r2d2::Pool::builder()
             .max_size(1)
+            .connection_customizer(Box::new(crate::db::shared::SqliteInitializer))
             .build(manager)
             .unwrap();
 

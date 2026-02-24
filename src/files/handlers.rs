@@ -14,7 +14,7 @@ pub struct InsertFilesHandler;
 impl TransactionHandler for InsertFilesHandler {
     fn name(&self) -> &'static str { "insert_files" }
 
-    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
+    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
         match bincode::serde::decode_from_slice::<Vec<Inode>, _>(&tx.rpc.payload, bincode::config::standard()) {
             Ok((mut inodes, _)) => {
                 // Authorization: verify user owns the files being inserted
@@ -83,7 +83,7 @@ pub struct UpdatePlacementHeightsHandler;
 impl TransactionHandler for UpdatePlacementHeightsHandler {
     fn name(&self) -> &'static str { "update_placement_heights" }
 
-    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
+    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
         match bincode::serde::decode_from_slice::<Vec<PlacementHeightUpdate>, _>(&tx.rpc.payload, bincode::config::standard()) {
             Ok((updates_data, _)) => {
                 // Update placement heights using shared transaction
@@ -115,7 +115,7 @@ pub struct DeleteOrphanedDataBlocksHandler;
 impl TransactionHandler for DeleteOrphanedDataBlocksHandler {
     fn name(&self) -> &'static str { "delete_orphaned_data_blocks" }
 
-    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
+    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
         match bincode::serde::decode_from_slice::<DeleteOrphanedDataBlocksPayload, _>(&tx.rpc.payload, bincode::config::standard()) {
             Ok((payload_data, _)) => {
                 let deleted_fragment_hashes = delete_orphaned_data_blocks_consensus(
@@ -172,7 +172,7 @@ pub struct ModifyItemHandler;
 impl TransactionHandler for ModifyItemHandler {
     fn name(&self) -> &'static str { "modify_item" }
 
-    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
+    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
         match bincode::serde::decode_from_slice::<ModifyItemPayload, _>(&tx.rpc.payload, bincode::config::standard()) {
             Ok((mut payload_data, _)) => {
                 // Authorization: verify user matches authenticated user
@@ -243,7 +243,7 @@ pub struct DeleteFilesHandler;
 impl TransactionHandler for DeleteFilesHandler {
     fn name(&self) -> &'static str { "delete_files" }
 
-    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
+    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
         match bincode::serde::decode_from_slice::<DeleteFilesPayload, _>(&tx.rpc.payload, bincode::config::standard()) {
             Ok((payload_data, _)) => {
                 // Authorization: verify user matches authenticated user
@@ -299,7 +299,7 @@ pub struct SelfCheckFragmentsHandler;
 impl TransactionHandler for SelfCheckFragmentsHandler {
     fn name(&self) -> &'static str { "self_check_fragments" }
 
-    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
+    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
         match bincode::serde::decode_from_slice::<crate::files::types::SelfCheckFragments, _>(&tx.rpc.payload, bincode::config::standard()) {
             Ok((report, _)) => {
                 // Authorization: verify node can only submit attestations for itself

@@ -14,7 +14,7 @@ impl TransactionHandler for RegisterDeviceHandler {
         "register_device"
     }
 
-    fn process(&self, _state: &AppState, tx: &Transaction, _execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
+    fn process(&self, _state: &AppState, tx: &Transaction, _execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
         let (payload, _) = bincode::serde::decode_from_slice::<RegisterDevicePayload, _>(
             &tx.rpc.payload,
             bincode::config::standard()
@@ -58,7 +58,7 @@ impl TransactionHandler for RevokeDeviceHandler {
         "revoke_device"
     }
 
-    fn process(&self, _state: &AppState, tx: &Transaction, _execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
+    fn process(&self, _state: &AppState, tx: &Transaction, _execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
         let (payload, _) = bincode::serde::decode_from_slice::<RevokeDevicePayload, _>(
             &tx.rpc.payload,
             bincode::config::standard()

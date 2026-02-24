@@ -6,7 +6,7 @@ pub struct InsertNodeHandler;
 impl TransactionHandler for InsertNodeHandler {
     fn name(&self) -> &'static str { "insert_node" }
 
-    fn process(&self, _state: &AppState, tx: &Transaction, _execute: bool, db_tx: &duckdb::Transaction) -> HandlerResult {
+    fn process(&self, _state: &AppState, tx: &Transaction, _execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
         match bincode::serde::decode_from_slice::<Node, _>(&tx.rpc.payload, bincode::config::standard()) {
             Ok((node_data, _)) => {
                 // Authorization: verify user owns the node being inserted

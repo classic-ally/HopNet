@@ -142,7 +142,7 @@ mod byzantine_tests {
             let db = node.app_state.db_pool.get().expect("Failed to get DB");
             db.execute(
                 "INSERT INTO nodes (node_id, name, owner, pubkey) VALUES (?, ?, ?, ?)",
-                duckdb::params![
+                rusqlite::params![
                     rogue_node.node_id,
                     format!("rogue_node_{}", rogue_node.node_id),
                     0,
@@ -249,7 +249,7 @@ mod byzantine_tests {
             let x25519_pubkey = crate::auth::derive_x25519_pubkey_from_user(&user1.signing_key);
             db.execute(
                 "INSERT INTO users (user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt) VALUES (?, ?, ?, ?, ?, ?)",
-                duckdb::params![
+                rusqlite::params![
                     user1.user_id,
                     format!("user_{}", user1.user_id),
                     user1.verifying_key,

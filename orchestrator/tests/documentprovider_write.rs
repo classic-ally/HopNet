@@ -4,7 +4,6 @@ use serde::Deserialize;
 use std::time::{Duration, Instant};
 
 use crate::tests::{Check, TestResult, TestScenario, print_and_add_check};
-use crate::tests::{get_max_view, wait_for_minimum_view};
 use crate::NodeInfo;
 
 /// Test that DocumentProvider write APIs work and replicate across all nodes
@@ -34,6 +33,10 @@ struct EnumerateResponse {
     items: Vec<DocumentProviderItem>,
 }
 
+/// Default timeout for polling effect propagation across nodes
+const PROPAGATION_TIMEOUT: Duration = Duration::from_secs(60);
+const POLL_INTERVAL: Duration = Duration::from_secs(2);
+
 impl TestScenario for DocumentProviderWriteConsistency {
     fn name(&self) -> &'static str {
         "documentprovider-write-consistency"
@@ -60,28 +63,7 @@ impl TestScenario for DocumentProviderWriteConsistency {
         let test_content = format!("DocumentProvider test content {}", timestamp);
         let folder_name = format!("dp-folder-{}", timestamp);
 
-        // Step 1: Get initial consensus view
-        let mut current_view = match get_max_view(nodes).await {
-            Ok(view) => {
-                print_and_add_check(&mut result, Check {
-                    name: format!("Initial consensus view: {}", view),
-                    passed: true,
-                    detail: None,
-                });
-                view
-            }
-            Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Failed to get initial view".to_string(),
-                    passed: false,
-                    detail: Some(e.to_string()),
-                });
-                result.duration = start.elapsed();
-                return Ok(result);
-            }
-        };
-
-        // Step 2: Register device on node 0
+        // Step 1: Register device on node 0
         let api_key = match register_device(&client, &nodes[0], &device_name).await {
             Ok(resp) => {
                 print_and_add_check(&mut result, Check {
@@ -102,15 +84,23 @@ impl TestScenario for DocumentProviderWriteConsistency {
             }
         };
 
-        // Wait for device registration to propagate
-        // Get actual view after operation - don't assume +1 increment
-        current_view = get_max_view(nodes).await.unwrap_or(current_view + 1);
-        if !wait_for_consensus(&mut result, nodes, current_view, "device registration").await {
+        // Wait for device registration to propagate — poll until enumerate works on all nodes
+        if !poll_until_enumerate_works(&client, nodes, &api_key, PROPAGATION_TIMEOUT).await {
+            print_and_add_check(&mut result, Check {
+                name: "Device registration propagation timeout".to_string(),
+                passed: false,
+                detail: Some(format!("Not all nodes accepted device token within {}s", PROPAGATION_TIMEOUT.as_secs())),
+            });
             result.duration = start.elapsed();
             return Ok(result);
         }
+        print_and_add_check(&mut result, Check {
+            name: format!("Device token propagated to all {} nodes", nodes.len()),
+            passed: true,
+            detail: None,
+        });
 
-        // Step 3: Upload file via DocumentProvider API on node 0
+        // Step 2: Upload file via DocumentProvider API on node 0
         match upload_file(&client, &nodes[0], &api_key, "root", &test_filename, test_content.as_bytes()).await {
             Ok(_) => {
                 print_and_add_check(&mut result, Check {
@@ -130,23 +120,28 @@ impl TestScenario for DocumentProviderWriteConsistency {
             }
         }
 
-        // Wait for upload to propagate
-        current_view = get_max_view(nodes).await.unwrap_or(current_view + 1);
-        if !wait_for_consensus(&mut result, nodes, current_view, "file upload").await {
-            result.duration = start.elapsed();
-            return Ok(result);
-        }
-
-        // Step 4: Verify file appears on ALL nodes via enumerate
-        let file_id = match verify_file_on_all_nodes(&client, nodes, &api_key, None, &test_filename, &mut result).await {
-            Some(id) => id,
+        // Step 3: Poll until file appears on ALL nodes
+        let file_id = match poll_for_file_on_all_nodes(&client, nodes, &api_key, None, &test_filename, PROPAGATION_TIMEOUT).await {
+            Some(id) => {
+                print_and_add_check(&mut result, Check {
+                    name: format!("File '{}' found on all {} nodes with same ID", test_filename, nodes.len()),
+                    passed: true,
+                    detail: Some(format!("id: {}", id)),
+                });
+                id
+            }
             None => {
+                print_and_add_check(&mut result, Check {
+                    name: format!("File '{}' not found on all nodes", test_filename),
+                    passed: false,
+                    detail: Some(format!("Did not appear within {}s", PROPAGATION_TIMEOUT.as_secs())),
+                });
                 result.duration = start.elapsed();
                 return Ok(result);
             }
         };
 
-        // Step 5: Rename file via PATCH on node 1
+        // Step 4: Rename file via PATCH on node 1
         let renamed_filename = format!("renamed-{}.txt", timestamp);
         let rename_node = if nodes.len() > 1 { 1 } else { 0 };
 
@@ -169,20 +164,27 @@ impl TestScenario for DocumentProviderWriteConsistency {
             }
         }
 
-        // Wait for rename to propagate
-        current_view = get_max_view(nodes).await.unwrap_or(current_view + 1);
-        if !wait_for_consensus(&mut result, nodes, current_view, "rename").await {
-            result.duration = start.elapsed();
-            return Ok(result);
+        // Step 5: Poll until renamed file appears on ALL nodes
+        match poll_for_file_on_all_nodes(&client, nodes, &api_key, None, &renamed_filename, PROPAGATION_TIMEOUT).await {
+            Some(_) => {
+                print_and_add_check(&mut result, Check {
+                    name: format!("Renamed file '{}' found on all {} nodes", renamed_filename, nodes.len()),
+                    passed: true,
+                    detail: None,
+                });
+            }
+            None => {
+                print_and_add_check(&mut result, Check {
+                    name: format!("Renamed file '{}' not found on all nodes", renamed_filename),
+                    passed: false,
+                    detail: Some(format!("Did not appear within {}s", PROPAGATION_TIMEOUT.as_secs())),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
         }
 
-        // Step 6: Verify rename on ALL nodes
-        if verify_file_on_all_nodes(&client, nodes, &api_key, None, &renamed_filename, &mut result).await.is_none() {
-            result.duration = start.elapsed();
-            return Ok(result);
-        }
-
-        // Step 7: Create folder for move test
+        // Step 6: Create folder for move test
         match create_folder(&client, &nodes[0], &api_key, "root", &folder_name).await {
             Ok(_) => {
                 print_and_add_check(&mut result, Check {
@@ -202,17 +204,17 @@ impl TestScenario for DocumentProviderWriteConsistency {
             }
         }
 
-        // Wait for folder creation
-        current_view = get_max_view(nodes).await.unwrap_or(current_view + 1);
-        if !wait_for_consensus(&mut result, nodes, current_view, "folder creation").await {
-            result.duration = start.elapsed();
-            return Ok(result);
-        }
-
-        // Get folder ID
-        let folder_id = match get_item_id(&client, &nodes[0], &api_key, None, &folder_name).await {
-            Ok(Some(id)) => id,
-            Ok(None) => {
+        // Poll until folder appears on node 0 (where we'll query for its ID)
+        let folder_id = match poll_for_file_on_all_nodes(&client, &nodes[0..1], &api_key, None, &folder_name, PROPAGATION_TIMEOUT).await {
+            Some(id) => {
+                print_and_add_check(&mut result, Check {
+                    name: format!("Folder '{}' created", folder_name),
+                    passed: true,
+                    detail: Some(format!("id: {}", id)),
+                });
+                id
+            }
+            None => {
                 print_and_add_check(&mut result, Check {
                     name: "Folder not found after creation".to_string(),
                     passed: false,
@@ -221,18 +223,9 @@ impl TestScenario for DocumentProviderWriteConsistency {
                 result.duration = start.elapsed();
                 return Ok(result);
             }
-            Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Failed to get folder ID".to_string(),
-                    passed: false,
-                    detail: Some(e.to_string()),
-                });
-                result.duration = start.elapsed();
-                return Ok(result);
-            }
         };
 
-        // Step 8: Move file into folder via PATCH on node 2
+        // Step 7: Move file into folder via PATCH on node 2
         let move_node = if nodes.len() > 2 { 2 } else { 0 };
 
         match move_item(&client, &nodes[move_node], &api_key, &file_id, &folder_id).await {
@@ -254,20 +247,27 @@ impl TestScenario for DocumentProviderWriteConsistency {
             }
         }
 
-        // Wait for move to propagate
-        current_view = get_max_view(nodes).await.unwrap_or(current_view + 1);
-        if !wait_for_consensus(&mut result, nodes, current_view, "move").await {
-            result.duration = start.elapsed();
-            return Ok(result);
+        // Step 8: Poll until file appears in folder on ALL nodes
+        match poll_for_file_on_all_nodes(&client, nodes, &api_key, Some(&folder_id), &renamed_filename, PROPAGATION_TIMEOUT).await {
+            Some(_) => {
+                print_and_add_check(&mut result, Check {
+                    name: format!("File found in folder on all {} nodes", nodes.len()),
+                    passed: true,
+                    detail: None,
+                });
+            }
+            None => {
+                print_and_add_check(&mut result, Check {
+                    name: "File not found in folder on all nodes".to_string(),
+                    passed: false,
+                    detail: Some(format!("Did not appear within {}s", PROPAGATION_TIMEOUT.as_secs())),
+                });
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
         }
 
-        // Step 9: Verify file is now in folder on ALL nodes
-        if verify_file_on_all_nodes(&client, nodes, &api_key, Some(&folder_id), &renamed_filename, &mut result).await.is_none() {
-            result.duration = start.elapsed();
-            return Ok(result);
-        }
-
-        // Step 10: Delete file via DELETE on node 0
+        // Step 9: Delete file via DELETE on node 0
         match delete_item(&client, &nodes[0], &api_key, &file_id).await {
             Ok(_) => {
                 print_and_add_check(&mut result, Check {
@@ -287,40 +287,21 @@ impl TestScenario for DocumentProviderWriteConsistency {
             }
         }
 
-        // Wait for deletion to propagate
-        current_view = get_max_view(nodes).await.unwrap_or(current_view + 1);
-        if !wait_for_consensus(&mut result, nodes, current_view, "deletion").await {
+        // Step 10: Poll until file is gone from ALL nodes
+        if poll_until_file_deleted(&client, nodes, &api_key, Some(&folder_id), &renamed_filename, PROPAGATION_TIMEOUT).await {
+            print_and_add_check(&mut result, Check {
+                name: format!("File deleted from all {} nodes", nodes.len()),
+                passed: true,
+                detail: None,
+            });
+        } else {
+            print_and_add_check(&mut result, Check {
+                name: "File still exists on some nodes after deletion".to_string(),
+                passed: false,
+                detail: Some(format!("Did not disappear within {}s", PROPAGATION_TIMEOUT.as_secs())),
+            });
             result.duration = start.elapsed();
             return Ok(result);
-        }
-
-        // Step 11: Verify file is gone from ALL nodes
-        match verify_file_deleted_on_all_nodes(&client, nodes, &api_key, Some(&folder_id), &renamed_filename).await {
-            Ok(true) => {
-                print_and_add_check(&mut result, Check {
-                    name: format!("File deleted from all {} nodes", nodes.len()),
-                    passed: true,
-                    detail: None,
-                });
-            }
-            Ok(false) => {
-                print_and_add_check(&mut result, Check {
-                    name: "File still exists on some nodes after deletion".to_string(),
-                    passed: false,
-                    detail: None,
-                });
-                result.duration = start.elapsed();
-                return Ok(result);
-            }
-            Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Deletion verification failed".to_string(),
-                    passed: false,
-                    detail: Some(e.to_string()),
-                });
-                result.duration = start.elapsed();
-                return Ok(result);
-            }
         }
 
         result.duration = start.elapsed();
@@ -334,39 +315,83 @@ impl TestScenario for DocumentProviderWriteConsistency {
 }
 
 // ============================================================================
-// Helper Functions
+// Polling Helpers
 // ============================================================================
 
-/// Wait for consensus and add check to result
-async fn wait_for_consensus(result: &mut TestResult, nodes: &[NodeInfo], target_view: u64, operation: &str) -> bool {
-    let timeout = Duration::from_secs(30);
-    match wait_for_minimum_view(nodes, target_view, timeout).await {
-        Ok(true) => {
-            print_and_add_check(result, Check {
-                name: format!("Consensus propagated after {} (view {})", operation, target_view),
-                passed: true,
-                detail: None,
-            });
-            true
+/// Poll until enumerate works (device token accepted) on all nodes
+async fn poll_until_enumerate_works(client: &Client, nodes: &[NodeInfo], api_key: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let mut all_ok = true;
+        for node in nodes {
+            match enumerate(client, node, api_key, None).await {
+                Ok(_) => {}
+                _ => { all_ok = false; break; }
+            }
         }
-        Ok(false) => {
-            print_and_add_check(result, Check {
-                name: format!("Consensus timeout after {}", operation),
-                passed: false,
-                detail: Some(format!("Did not reach view {} within {}s", target_view, timeout.as_secs())),
-            });
-            false
-        }
-        Err(e) => {
-            print_and_add_check(result, Check {
-                name: format!("Consensus check failed after {}", operation),
-                passed: false,
-                detail: Some(e.to_string()),
-            });
-            false
-        }
+        if all_ok { return true; }
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
+    false
 }
+
+/// Poll until a file with the given name appears on all nodes, returning its ID
+async fn poll_for_file_on_all_nodes(
+    client: &Client,
+    nodes: &[NodeInfo],
+    api_key: &str,
+    parent_id: Option<&str>,
+    filename: &str,
+    timeout: Duration,
+) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let mut ids: Vec<String> = Vec::new();
+        let mut all_found = true;
+        for node in nodes {
+            match get_item_id(client, node, api_key, parent_id, filename).await {
+                Ok(Some(id)) => ids.push(id),
+                _ => { all_found = false; break; }
+            }
+        }
+        if all_found && !ids.is_empty() {
+            let first = &ids[0];
+            if ids.iter().all(|id| id == first) {
+                return Some(first.clone());
+            }
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    None
+}
+
+/// Poll until a file is deleted from all nodes
+async fn poll_until_file_deleted(
+    client: &Client,
+    nodes: &[NodeInfo],
+    api_key: &str,
+    parent_id: Option<&str>,
+    filename: &str,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let mut all_gone = true;
+        for node in nodes {
+            match get_item_id(client, node, api_key, parent_id, filename).await {
+                Ok(None) => {}
+                _ => { all_gone = false; break; }
+            }
+        }
+        if all_gone { return true; }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    false
+}
+
+// ============================================================================
+// API Helpers
+// ============================================================================
 
 /// Register a device on a node
 async fn register_device(client: &Client, node: &NodeInfo, device_name: &str) -> Result<RegisterDeviceResponse> {
@@ -391,8 +416,6 @@ async fn register_device(client: &Client, node: &NodeInfo, device_name: &str) ->
 }
 
 /// Convert a parent ID to the format expected by the upload endpoint
-/// "root" -> NSFileProviderRootContainerItemIdentifier
-/// UUID -> item:{uuid}
 fn format_parent_item_identifier(parent_id: &str) -> String {
     if parent_id == "root" {
         "NSFileProviderRootContainerItemIdentifier".to_string()
@@ -437,7 +460,7 @@ async fn upload_file(
     Ok(())
 }
 
-/// Create a folder via DocumentProvider API (uses same upload endpoint with no file)
+/// Create a folder via DocumentProvider API
 async fn create_folder(
     client: &Client,
     node: &NodeInfo,
@@ -507,11 +530,6 @@ async fn get_item_id(
     name: &str,
 ) -> Result<Option<String>> {
     let items = enumerate(client, node, api_key, parent_id).await?;
-    tracing::debug!(
-        "Looking for '{}' in {} items on node {}: {:?}",
-        name, items.len(), node.port,
-        items.iter().map(|i| &i.name).collect::<Vec<_>>()
-    );
     Ok(items.into_iter().find(|item| item.name == name).map(|item| item.id))
 }
 
@@ -603,82 +621,4 @@ async fn delete_item(
     }
 
     Ok(())
-}
-
-/// Verify a file exists on all nodes and return its ID
-async fn verify_file_on_all_nodes(
-    client: &Client,
-    nodes: &[NodeInfo],
-    api_key: &str,
-    parent_id: Option<&str>,
-    filename: &str,
-    result: &mut TestResult,
-) -> Option<String> {
-    let mut file_ids: Vec<String> = Vec::new();
-    let mut all_found = true;
-
-    for (i, node) in nodes.iter().enumerate() {
-        match get_item_id(client, node, api_key, parent_id, filename).await {
-            Ok(Some(id)) => {
-                file_ids.push(id);
-            }
-            Ok(None) => {
-                print_and_add_check(result, Check {
-                    name: format!("File '{}' not found on node {}", filename, i),
-                    passed: false,
-                    detail: None,
-                });
-                all_found = false;
-            }
-            Err(e) => {
-                print_and_add_check(result, Check {
-                    name: format!("Enumerate failed on node {}", i),
-                    passed: false,
-                    detail: Some(e.to_string()),
-                });
-                all_found = false;
-            }
-        }
-    }
-
-    if !all_found {
-        return None;
-    }
-
-    // Verify all nodes have the same ID (deterministic)
-    let first_id = &file_ids[0];
-    let all_same = file_ids.iter().all(|id| id == first_id);
-
-    if all_same {
-        print_and_add_check(result, Check {
-            name: format!("File '{}' found on all {} nodes with same ID", filename, nodes.len()),
-            passed: true,
-            detail: Some(format!("id: {}", first_id)),
-        });
-        Some(first_id.clone())
-    } else {
-        print_and_add_check(result, Check {
-            name: "File IDs differ across nodes".to_string(),
-            passed: false,
-            detail: Some(format!("IDs: {:?}", file_ids)),
-        });
-        None
-    }
-}
-
-/// Verify a file is deleted from all nodes
-async fn verify_file_deleted_on_all_nodes(
-    client: &Client,
-    nodes: &[NodeInfo],
-    api_key: &str,
-    parent_id: Option<&str>,
-    filename: &str,
-) -> Result<bool> {
-    for node in nodes {
-        match get_item_id(client, node, api_key, parent_id, filename).await? {
-            Some(_) => return Ok(false), // File still exists
-            None => continue,
-        }
-    }
-    Ok(true) // File not found on any node
 }

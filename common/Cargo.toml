@@ -10,8 +10,8 @@ chrono = { version = "0.4.41", features = ["serde"] }
 uuid = { version = "1.17.0", features = ["serde", "v4", "v7"] }
 
 # Optional database dependencies - only for main binary
-duckdb = { version = "1.4.1", features = ["bundled", "r2d2"], optional = true }
+rusqlite = { version = "0.38", features = ["bundled"], optional = true }
 
 [features]
 default = []
-database = ["duckdb"]
+database = ["rusqlite"]

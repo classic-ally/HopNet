@@ -1,6 +1,6 @@
 use r2d2::PooledConnection;
-use duckdb::DuckdbConnectionManager;
-use duckdb::params;
+use r2d2_sqlite::SqliteConnectionManager;
+use rusqlite::params;
 
 use crate::db::DatabaseError;
 use hopnet_common::db::{NetworkResilienceStats, ResilienceLevel, NodeStorageBaseline, FaultToleranceCurvePoint};
@@ -8,7 +8,7 @@ use hopnet_common::db::{NetworkResilienceStats, ResilienceLevel, NodeStorageBase
 /// Compute network-wide file resilience statistics using OLAP-optimized query
 /// Returns distribution of files across fault tolerance levels
 pub fn compute_network_resilience_stats(
-    db_connection: Result<PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<PooledConnection<SqliteConnectionManager>, r2d2::Error>,
 ) -> Result<NetworkResilienceStats, DatabaseError> {
     let start_time = std::time::Instant::now();
 
@@ -22,7 +22,7 @@ pub fn compute_network_resilience_stats(
                         data_block_id,
                         COUNT(*) as original_chunks
                     FROM fragment_hashes
-                    WHERE chunk_type = 'original'
+                    WHERE chunk_type = 0
                     GROUP BY data_block_id
                 ),
 
@@ -189,7 +189,7 @@ pub fn compute_network_resilience_stats(
 /// Get node storage baselines for fault tolerance curve generation
 /// Returns each node's total capacity and baseline usage for simulation
 pub fn get_node_storage_baselines(
-    db_connection: Result<PooledConnection<DuckdbConnectionManager>, r2d2::Error>,
+    db_connection: Result<PooledConnection<SqliteConnectionManager>, r2d2::Error>,
 ) -> Result<Vec<NodeStorageBaseline>, DatabaseError> {
     let start_time = std::time::Instant::now();
 
@@ -203,7 +203,7 @@ pub fn get_node_storage_baselines(
                         fh.data_block_id,
                         COUNT(*) as original_count
                     FROM fragment_hashes fh
-                    WHERE fh.chunk_type = 'original'
+                    WHERE fh.chunk_type = 0
                     GROUP BY fh.data_block_id
                 ),
 
@@ -211,7 +211,7 @@ pub fn get_node_storage_baselines(
                 node_hopnet_storage AS (
                     SELECT
                         fi.node_id,
-                        SUM((db.file_size::DOUBLE / GREATEST(dboc.original_count, 1)) * 1.1 / (1024.0 * 1024.0 * 1024.0)) as hopnet_storage_gb
+                        SUM((CAST(db.file_size AS REAL) / MAX(dboc.original_count, 1)) * 1.1 / (1024.0 * 1024.0 * 1024.0)) as hopnet_storage_gb
                     FROM fragment_inventory fi
                     JOIN fragment_hashes fh ON fi.fragment_hash = fh.fragment_hash
                     JOIN data_blocks db ON fh.data_block_id = db.id
@@ -221,13 +221,15 @@ pub fn get_node_storage_baselines(
 
                 -- Get latest storage metrics for each node
                 latest_node_metrics AS (
-                    SELECT DISTINCT ON (to_node)
-                        to_node as node_id,
-                        storage_total_gb,
-                        storage_used_gb
-                    FROM metrics
-                    WHERE storage_total_gb > 0
-                    ORDER BY to_node, height DESC, start_time DESC
+                    SELECT node_id, storage_total_gb, storage_used_gb FROM (
+                        SELECT
+                            to_node as node_id,
+                            storage_total_gb,
+                            storage_used_gb,
+                            ROW_NUMBER() OVER (PARTITION BY to_node ORDER BY height DESC, start_time DESC) as rn
+                        FROM metrics
+                        WHERE storage_total_gb > 0
+                    ) WHERE rn = 1
                 )
 
                 SELECT
@@ -236,7 +238,7 @@ pub fn get_node_storage_baselines(
                     COALESCE(n.name, 'Node ' || n.node_id) as display_name,
                     lnm.storage_total_gb,
                     -- Baseline: current usage minus HopNet = x=0 point on curve
-                    GREATEST(0.0, lnm.storage_used_gb - COALESCE(nhs.hopnet_storage_gb, 0.0)) as baseline_storage_gb
+                    MAX(0.0, lnm.storage_used_gb - COALESCE(nhs.hopnet_storage_gb, 0.0)) as baseline_storage_gb
                 FROM nodes n
                 INNER JOIN latest_node_metrics lnm ON n.node_id = lnm.node_id
                 LEFT JOIN node_hopnet_storage nhs ON n.node_id = nhs.node_id

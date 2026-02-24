@@ -510,11 +510,11 @@ pub async fn run_orphaned_fragments_scan(
             )))))?;
 
         // Execute query with hash parameters
-        let mut params: Vec<Box<dyn duckdb::ToSql>> = Vec::new();
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         for hash in &hashes {
             params.push(Box::new(*hash));
         }
-        let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
 
         let mut rows = stmt.query(param_refs.as_slice())
             .map_err(|e| Error::Failed(Arc::new(Box::new(std::io::Error::new(
