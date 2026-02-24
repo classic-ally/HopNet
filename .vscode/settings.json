@@ -1,0 +1,10 @@
+{
+    "files.exclude": {
+        "**/.direnv": true
+    },
+    "files.watcherExclude": {
+        "**/.direnv/**": true,
+        "**/target/**": true,
+        "**/frontend/node_modules/**": true
+    }
+}
