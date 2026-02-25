@@ -12,6 +12,7 @@ pub mod discovery;
 pub mod jobs;
 pub mod download;
 pub mod types;
+pub mod reference_provider;
 
 #[cfg(test)]
 mod tests;

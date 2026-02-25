@@ -1,8 +1,9 @@
 use crate::db::{DatabaseError, CustomUUID};
+use crate::reference_providers::DataBlockReferenceProvider;
 use r2d2_sqlite::SqliteConnectionManager;
 use r2d2;
 
-/// Find orphaned data blocks with no inode references, ordered by age (oldest first)
+/// Find orphaned data blocks with no references from any provider, ordered by age (oldest first)
 /// Returns data block IDs older than the cutoff UUID, limited by batch size
 pub fn find_orphaned_data_blocks(
     db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
@@ -11,21 +12,33 @@ pub fn find_orphaned_data_blocks(
 ) -> Result<Vec<CustomUUID>, DatabaseError> {
     match db_connection {
         Ok(conn) => {
-            let mut stmt = conn.prepare(
+            let mut exclusions: Vec<String> = Vec::new();
+            for provider in inventory::iter::<&'static dyn DataBlockReferenceProvider> {
+                exclusions.push(format!(
+                    "AND db.id NOT IN ({})",
+                    provider.referenced_data_blocks_subquery()
+                ));
+            }
+            let exclusion_clause = exclusions.join("\n                   ");
+
+            let query = format!(
                 "SELECT db.id
                  FROM data_blocks db
-                 LEFT JOIN inodes i ON db.id = i.data_id
-                 WHERE i.data_id IS NULL
-                   AND db.id < ?
+                 WHERE db.id < ?
+                   {}
                  ORDER BY db.id ASC
-                 LIMIT ?"
-            ).map_err(|_| DatabaseError::RecallError)?;
-            
+                 LIMIT ?",
+                exclusion_clause
+            );
+
+            let mut stmt = conn.prepare(&query)
+                .map_err(|_| DatabaseError::RecallError)?;
+
             let data_blocks = stmt.query_map(rusqlite::params![cutoff_uuid, limit], |row| {
                 let data_block_id: CustomUUID = row.get(0)?;
                 Ok(data_block_id)
             }).map_err(|_| DatabaseError::RecallError)?;
-            
+
             data_blocks.collect::<Result<Vec<_>, _>>()
                 .map_err(|_| DatabaseError::RecallError)
         }
@@ -130,16 +143,13 @@ pub fn delete_orphaned_data_blocks_consensus(
             continue;
         }
 
-        // Verify it's truly orphaned (no inode references)
-        let has_inodes: bool = db_tx.query_row(
-            "SELECT COUNT(*) > 0 FROM inodes WHERE data_id = ?",
-            rusqlite::params![data_block_id],
-            |row| row.get(0)
-        ).map_err(|_| DatabaseError::RecallError)?;
-
-        if has_inodes {
-            tracing::error!("Data block {} is not orphaned, has active inode references", data_block_id);
-            return Err(DatabaseError::ProcessingError);
+        // Verify it's truly orphaned (no references from any provider)
+        let data_block_id_str = data_block_id.to_string();
+        for provider in inventory::iter::<&'static dyn DataBlockReferenceProvider> {
+            if provider.references_data_block(db_tx, &data_block_id_str)? {
+                tracing::error!("Data block {} referenced by {} provider", data_block_id, provider.name());
+                return Err(DatabaseError::ProcessingError);
+            }
         }
     }
 

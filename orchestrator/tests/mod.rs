@@ -27,6 +27,7 @@ mod consensus_barriers;
 pub(crate) mod multi_user;
 mod sharing;
 mod consensus_queue;
+mod orphan_cleanup;
 
 /// Represents the result of a test scenario execution
 #[derive(Debug)]
@@ -147,6 +148,9 @@ pub async fn run_test_by_name(mesh_id: u32, name: &str, nodes: &[NodeInfo], flag
         "consensus-queue-throughput" => {
             consensus_queue::ConsensusQueueThroughput.run(mesh_id, nodes, flags).await
         }
+        "orphan-cleanup" => {
+            orphan_cleanup::OrphanCleanup.run(mesh_id, nodes, flags).await
+        }
         _ => Err(anyhow::anyhow!("Unknown test: {}", name)),
     }
 }
@@ -175,6 +179,7 @@ pub fn list_test_names() -> Vec<&'static str> {
         "consensus-queue-burst",
         "consensus-queue-cross-node",
         "consensus-queue-throughput",
+        "orphan-cleanup",
     ]
 }
 

@@ -27,6 +27,7 @@ pub mod devices;
 pub mod net;
 pub mod passphrase;
 pub mod shares;
+pub mod reference_providers;
 
 #[derive(Clone, Debug)]
 pub struct UserKeys {

@@ -9,3 +9,4 @@ apple/HopNetFileProvider/.swiftpm
 apple/HopNetFileProvider/Sources/HopNetFileProviderExtension/Generated/HopNetTypes.swift
 .vscode/launch.json
 frontend/src/lib/types.ts
+result

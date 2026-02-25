@@ -3,3 +3,9 @@ target/
 
 # Frontend node modules
 frontend/node_modules/
+
+# Nix build symlink
+result
+
+# Git history (prevents nix git-aware filtering issues in Docker)
+.git

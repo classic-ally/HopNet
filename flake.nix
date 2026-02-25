@@ -18,6 +18,38 @@
       );
     in
     {
+      packages = forAllSystems (pkgs:
+        let
+          rustPlatform = pkgs.makeRustPlatform {
+            cargo = pkgs.rust-bin.stable.latest.default;
+            rustc = pkgs.rust-bin.stable.latest.default;
+          };
+        in {
+          default = rustPlatform.buildRustPackage {
+            pname = "hopnet";
+            version = "0.1.0";
+            src = ./.;
+
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              outputHashes = {
+                "iroh-0.96.1" = "sha256-+nasc9F8OsegyrdDGN/WsZ4niIZEz7Qe44qPN82sKKU=";
+              };
+            };
+
+            cargoBuildFlags = [ "--bin" "hopnet" ];
+            buildFeatures = [ "skip-frontend" ];
+
+            preBuild = "mkdir -p frontend/dist";
+
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            buildInputs = [ pkgs.openssl ];
+
+            doCheck = false;
+          };
+        }
+      );
+
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           buildInputs = [
