@@ -156,6 +156,10 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             // Create consensus queue (channel + submit handle)
             let (consensus_queue, consensus_queue_rx) = consensus::queue::ConsensusQueue::new(pool.clone(), 300);
 
+            // Create write gate + local-state channel
+            let write_gate = Arc::new(db::write_gate::WriteGate::new());
+            let (local_state_tx, local_state_rx) = tokio::sync::mpsc::channel(1024);
+
             let app_state = AppState {
                 db_pool: pool,
                 encoding_key: encodingkey,
@@ -166,7 +170,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 user_id: Arc::new(OnceCell::new()),
                 fragments_dir,
                 timeout_vote_collector: Arc::new(consensus::functions::TimeoutVoteCollector::new()),
-                last_observed_view: Arc::new(std::sync::atomic::AtomicI32::new(-1)),
+                catch_up_state: Arc::new(hopnet::consensus::catch_up_state::CatchUpState::new()),
                 consensus_lock: Arc::new(tokio::sync::Mutex::new(())),
                 fileprovider_api_key: fileprovider_api_key.clone(),
                 port,
@@ -179,6 +183,8 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 session_store: Arc::new(auth::SessionStore::default()),
                 consensus_queue,
                 view_changed: Arc::new(tokio::sync::Notify::new()),
+                write_gate: write_gate.clone(),
+                local_state_tx,
             };
 
             // If we loaded state from database, populate the OnceCell fields
@@ -262,23 +268,11 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::info!("Skipping FileProvider domain initialization in debug build - testing API endpoints only");
             }
 
-            // Start timeout detection worker with randomized cron schedule (every minute at random second)
-            use rand::Rng;
-            let random_second = rand::rng().random_range(5..55);
-            let cron_expression = format!("{} * * * * *", random_second);
-            let schedule = apalis_cron::Schedule::from_str(&cron_expression).unwrap();
-            let cron_stream = apalis_cron::CronStream::new(schedule);
-            
-            let timeout_worker = WorkerBuilder::new("timeout-detection")
-                .data(app_state.clone())
-                .backend(cron_stream)
-                .build_fn(consensus::jobs::handle_timeout_detection);
-            
-            tokio::spawn(async move {
-                timeout_worker.run().await;
-            });
+            // Start deterministic timeout detector (replaces cron-based detection)
+            tokio::spawn(consensus::jobs::timeout_detector(app_state.clone()));
 
             // Start metrics collection worker with randomized 10-minute schedule
+            use rand::Rng;
             let random_second = rand::rng().random_range(5..55);
             let random_minute = rand::rng().random_range(0..10); // 0-9 minutes offset within each 10-minute window
             let metrics_cron_expression = format!("{} {}/10 * * * *", random_second, random_minute);
@@ -332,6 +326,15 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 let app_state_clone = app_state.clone();
                 tokio::spawn(async move {
                     consensus::queue::batch_processor(consensus_queue_rx, app_state_clone).await;
+                });
+            }
+
+            // Spawn local-state drain task (batches background fragment DB writes)
+            {
+                let db_pool_clone = app_state.db_pool.clone();
+                let write_gate_clone = write_gate;
+                tokio::spawn(async move {
+                    db::write_gate::drain_local_state_queue(local_state_rx, db_pool_clone, write_gate_clone).await;
                 });
             }
 

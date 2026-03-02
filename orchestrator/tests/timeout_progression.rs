@@ -128,9 +128,8 @@ impl TestScenario for TimeoutProgression {
             .collect();
 
         // Step 3: Wait for timeout job to fire and TC to form
-        // Timeout job runs every ~60s at a random second offset. We need two cycles in
-        // the worst case: the first sets last_observed_view, the second detects the view
-        // is stuck and issues the timeout vote. 130s covers two full cycles with margin.
+        // Timeout detector waits exactly 60s after the last view change before issuing
+        // a timeout vote. With some margin for catch-up and TC formation, 130s is safe.
         println!("  ... waiting up to 130s for timeout votes and TC formation");
 
         let target_view = initial_view + 1;

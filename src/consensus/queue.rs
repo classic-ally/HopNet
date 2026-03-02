@@ -380,6 +380,7 @@ async fn handle_as_leader(
     // SAVEPOINTs allow individual tx rollback within a single transaction, solving
     // inter-tx dependency resolution that the old restart-on-failure loop could not handle.
     let rejected_indices = {
+        let _wg = app_state.write_gate.guard();
         let db_tx = match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
             Ok(tx) => tx,
             Err(_) => {

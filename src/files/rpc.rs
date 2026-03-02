@@ -167,31 +167,11 @@ pub async fn handle_fragment_store(req: FragmentStoreRequest, app_state: &AppSta
         };
     }
 
-    // Mark fragment as stored locally in database with retry (same pattern as HTTP post_fragment)
-    const MAX_RETRIES: u32 = 10;
-    const RETRY_DELAY_MS: u64 = 500;
-
-    for attempt in 0..MAX_RETRIES {
-        match crate::db::files::mark_fragment_local_state(app_state.db_pool.get(), &req.fragment_hash, true) {
-            Ok(affected) if affected > 0 => {
-                if attempt > 0 {
-                    tracing::debug!("Updated fragment {} after {} retries", req.fragment_hash.to_hex(), attempt);
-                }
-                break;
-            }
-            Ok(_) if attempt < MAX_RETRIES - 1 => {
-                tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
-            }
-            Ok(_) => {
-                tracing::warn!("Fragment {} stored but DB record not found after {} retries",
-                    req.fragment_hash.to_hex(), MAX_RETRIES);
-            }
-            Err(e) => {
-                tracing::warn!("Fragment stored but failed to update DB for {}: {:?}",
-                    req.fragment_hash.to_hex(), e);
-                break;
-            }
-        }
+    // Queue async DB update (drain task will batch-flush through write gate)
+    if let Err(e) = app_state.local_state_tx.try_send(
+        crate::db::write_gate::LocalStateUpdate::MarkLocal { fragment_hash: req.fragment_hash.clone() }
+    ) {
+        tracing::warn!("Local state queue full, dropping mark-local for {}: {}", req.fragment_hash.to_hex(), e);
     }
 
     IrohResponse::FragmentStoreResponse(FragmentStoreResponse {

@@ -46,7 +46,7 @@ pub struct AppState {
     pub user_id: Arc<OnceCell<i32>>,
     pub fragments_dir: String,
     pub timeout_vote_collector: Arc<consensus::functions::TimeoutVoteCollector>,
-    pub last_observed_view: Arc<std::sync::atomic::AtomicI32>,
+    pub catch_up_state: Arc<consensus::catch_up_state::CatchUpState>,
     pub consensus_lock: Arc<tokio::sync::Mutex<()>>,
     pub fileprovider_api_key: String,
     pub port: u16,
@@ -59,6 +59,8 @@ pub struct AppState {
     pub session_store: Arc<auth::SessionStore>,
     pub consensus_queue: consensus::queue::ConsensusQueue,
     pub view_changed: Arc<tokio::sync::Notify>,
+    pub write_gate: Arc<db::write_gate::WriteGate>,
+    pub local_state_tx: tokio::sync::mpsc::Sender<db::write_gate::LocalStateUpdate>,
 }
 
 impl AppState {

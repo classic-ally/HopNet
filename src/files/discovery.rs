@@ -152,29 +152,47 @@ async fn try_reactive_discovery_and_fetch(
     }
     drop(health_tx);
 
-    // Process results as they flow in
+    // Process results as they flow in.
+    // Track in-flight downloads to detect when all work is exhausted — the original
+    // download_tx keeps the channel alive, so we can't rely on `else` in select!.
+    let mut health_done = false;
+    let mut in_flight = 0usize;
+
     loop {
+        if health_done && in_flight == 0 {
+            break;
+        }
+
         tokio::select! {
             // New node found with fragment - start download immediately over iroh
-            Some(node_info) = health_rx.recv() => {
-                tracing::debug!("Node {} reports having fragment, starting download", node_info.node_id);
+            result = health_rx.recv(), if !health_done => {
+                match result {
+                    Some(node_info) => {
+                        tracing::debug!("Node {} reports having fragment, starting download", node_info.node_id);
 
-                let tx = download_tx.clone();
-                let fragment_hash = *fragment_hash;
-                let transport = iroh_transport.clone();
+                        let tx = download_tx.clone();
+                        let fragment_hash = *fragment_hash;
+                        let transport = iroh_transport.clone();
+                        in_flight += 1;
 
-                tokio::spawn(async move {
-                    let result = try_fetch_from_node(
-                        &fragment_hash,
-                        &node_info,
-                        &transport,
-                    ).await;
-                    let _ = tx.send(result);
-                });
+                        tokio::spawn(async move {
+                            let result = try_fetch_from_node(
+                                &fragment_hash,
+                                &node_info,
+                                &transport,
+                            ).await;
+                            let _ = tx.send(result);
+                        });
+                    }
+                    None => {
+                        health_done = true;
+                    }
+                }
             }
 
             // Download completed
-            Some(download_result) = download_rx.recv() => {
+            Some(download_result) = download_rx.recv(), if in_flight > 0 => {
+                in_flight -= 1;
                 match download_result {
                     Ok(data) => {
                         tracing::debug!("Successfully downloaded fragment {}", fragment_hash.to_hex());
@@ -185,8 +203,6 @@ async fn try_reactive_discovery_and_fetch(
                     }
                 }
             }
-
-            else => break,
         }
     }
 

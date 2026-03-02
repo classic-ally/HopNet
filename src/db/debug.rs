@@ -16,6 +16,7 @@ const EXCLUDED_COLUMNS: &[(&str, &[&str])] = &[
     ("fragment_hashes", &["stored_locally"]),
     ("fragment_inventory", &["self_verified_height"]),
     ("quorum_certificates", &["voter_signatures"]),
+    ("timeout_certificates", &["signatures"]),
 ];
 
 /// All consensus-tracked tables (order matters for deterministic hashing)

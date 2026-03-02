@@ -458,7 +458,7 @@ pub fn create_test_app_state_with_keys(signing_key: crate::db::PrivKey, verifyin
         user_id: Arc::new(OnceCell::new()),
         fragments_dir: "/tmp/test_fragments".to_string(),
         timeout_vote_collector: Arc::new(crate::consensus::functions::TimeoutVoteCollector::new()),
-        last_observed_view: Arc::new(std::sync::atomic::AtomicI32::new(0)),
+        catch_up_state: Arc::new(crate::consensus::catch_up_state::CatchUpState::new()),
         consensus_lock: Arc::new(tokio::sync::Mutex::new(())),
         fileprovider_api_key: "test_api_key".to_string(),
         port: 3000,
@@ -471,6 +471,8 @@ pub fn create_test_app_state_with_keys(signing_key: crate::db::PrivKey, verifyin
         session_store: Arc::new(crate::auth::SessionStore::default()),
         consensus_queue,
         view_changed: Arc::new(tokio::sync::Notify::new()),
+        write_gate: Arc::new(crate::db::write_gate::WriteGate::new()),
+        local_state_tx: tokio::sync::mpsc::channel(1).0,
     }
 }
 

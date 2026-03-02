@@ -351,6 +351,7 @@ pub async fn run_consensus(app_state: &AppState, transactions: Vec<Transaction>,
 
     // Transaction 1: Record Propose vote and commit immediately (double-vote protection)
     let ballot_propose = {
+        let _wg = app_state.write_gate.guard();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| ConsensusError::DatabaseError)?;
         let result = Ballot::propose(block.clone(), ConsensusPhase::Propose, &me, tx)
             .map_err(|_| ConsensusError::SigningError)?;
@@ -386,6 +387,7 @@ pub async fn run_consensus(app_state: &AppState, transactions: Vec<Transaction>,
     // Transaction 2: Insert Propose QC locally (synchronous, fast)
     // Get fresh connection for this transaction
     {
+        let _wg = app_state.write_gate.guard();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| ConsensusError::DatabaseError)?;
         db::insert_qc_unsafe_tx(&tx, &qc1).map_err(|e| {
             tracing::error!("QC insertion failed: {:?}", e);
@@ -414,6 +416,7 @@ pub async fn run_consensus(app_state: &AppState, transactions: Vec<Transaction>,
     // Create Lock ballot (no vote recording needed, Lock phase doesn't update last_propose_vote)
     // Get fresh connection for this transaction
     let ballot_lock = {
+        let _wg = app_state.write_gate.guard();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| ConsensusError::DatabaseError)?;
         let result = Ballot::propose(block.clone(), ConsensusPhase::Lock, &me, tx)
             .map_err(|_| ConsensusError::SigningError)?;
@@ -457,6 +460,7 @@ pub async fn run_consensus(app_state: &AppState, transactions: Vec<Transaction>,
     // Transaction 4: Insert Lock QC + process transactions locally (synchronous, atomic)
     // Get fresh connection for this transaction
     {
+        let _wg = app_state.write_gate.guard();
         let db_tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| ConsensusError::DatabaseError)?;
         db::insert_qc_unsafe_tx(&db_tx, &qc2).map_err(|e| {
             tracing::error!("QC insertion failed: {:?}", e);

@@ -344,6 +344,7 @@ impl Ballot {
         if self.data.phase == ConsensusPhase::Propose {
             // Create validation transaction
             let mut conn = state.db_pool.get().map_err(|_| VoteError::DatabaseError)?;
+            let _wg = state.write_gate.guard();
             let db_tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| VoteError::DatabaseError)?;
 
             if let Err(e) = process_transactions(&self.block.data.transactions, state, false, &db_tx) {
@@ -366,6 +367,7 @@ impl Ballot {
 
         // Bug #5 fix: Record Propose vote after signing to prevent double-voting
         if self.data.phase == ConsensusPhase::Propose {
+            let _wg = app_state.write_gate.guard();
             db::update_last_propose_vote(app_state.db_pool.get(), self.block.block_hash)
                 .map_err(|_| VoteError::DatabaseError)?;
         }
@@ -1016,6 +1018,7 @@ impl Block {
         let new_block = Block::new(tip_data)?;
 
         // Add block to DB (prepared_block_hash set later when Propose QC arrives)
+        let _wg = app_state.write_gate.guard();
         db::insert_block_with_conn(&mut db_conn, &new_block)
             .map_err(|_| BlockError::DatabaseError)?;
 

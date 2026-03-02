@@ -1,6 +1,6 @@
 use crate::{
     AppState,
-    db::{DatabaseError, files::{PlacementHeightUpdate, get_distributable_file, mark_fragments_local_state_batch, DistributableFileData}, consensus},
+    db::{DatabaseError, files::{PlacementHeightUpdate, get_distributable_file, DistributableFileData}, consensus},
     consensus::{queue::ConsensusSubmitError, types::Transaction},
     db::metrics::get_all_node_metrics,
     types::Blake3Hash,
@@ -271,14 +271,10 @@ async fn distribute_file_fragments(
         remotely_placed.push(fragment_hash);
     }
     if !remotely_placed.is_empty() {
-        match mark_fragments_local_state_batch(app_state.db_pool.get(), &remotely_placed, false) {
-            Ok(rows) => {
-                tracing::debug!("Batch-updated {} fragment records as not stored locally", rows);
-            }
-            Err(e) => {
-                tracing::warn!("Failed to batch-update {} fragments as not local: {:?} — fragments were sent successfully, will reconcile on next health check",
-                             remotely_placed.len(), e);
-            }
+        if let Err(e) = app_state.local_state_tx.try_send(
+            crate::db::write_gate::LocalStateUpdate::MarkRemoteBatch { fragment_hashes: remotely_placed }
+        ) {
+            tracing::warn!("Local state queue full, dropping mark-remote batch: {}", e);
         }
     }
 

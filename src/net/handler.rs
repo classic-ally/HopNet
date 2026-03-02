@@ -10,7 +10,6 @@ use super::transport::{recv_message, encode_message, send_raw, IrohError, Transp
 use crate::AppState;
 use crate::types::PubKey;
 use crate::db::consensus as db;
-use crate::consensus::routes::perform_catch_up;
 
 /// Handle incoming iroh connections
 /// This runs in a loop accepting connections from the endpoint
@@ -87,16 +86,13 @@ async fn handle_connection(
 /// Message-driven catch-up for consensus messages.
 ///
 /// Before dispatching any consensus message, check if the message's view is ahead of ours.
-/// If so, catch up to that view. For Lock-phase ballots, also ensure intra-view sync
-/// (we have the Propose QC for the current view).
+/// If so, catch up to that view via CatchUpState (shared in-flight catch-up). For Lock-phase
+/// ballots, also ensure intra-view sync (we have the Propose QC for the current view).
 ///
-/// This replaces the old HTTP middleware (`ensure_caught_up_and_active`) with a cheaper
-/// approach: the incoming message itself tells us where we need to be. Zero overhead on
-/// the happy path (one lightweight DB read).
-///
-/// Lock ordering: catch-up acquires consensus_lock, releases it, then the handler acquires
-/// its own lock. The gap is safe — if the view advances further, the handler re-reads state
-/// and rejects stale messages via its own verification (e.g., verify_proposal() view-match).
+/// Under burst load (100 concurrent streams for the same view), the first message initiates
+/// catch-up and all others attach via watch channel. Zero DB pool checkouts for followers.
+/// For messages at the current view (common case), ensure_view hits the Completed branch
+/// and returns immediately — also zero DB reads.
 async fn ensure_caught_up_for_message(
     request: &IrohRequest,
     app_state: &AppState,
@@ -106,44 +102,26 @@ async fn ensure_caught_up_for_message(
         None => return Ok(()), // Non-consensus message, no catch-up needed
     };
 
-    // Hold one connection for all lightweight reads (avoids pool contention between phases)
-    let conn = app_state.db_pool.get()
-        .map_err(|_| IrohError::Protocol(ProtocolError::PeerError("db pool error".into())))?;
+    // Cross-view catch-up via shared in-flight task
+    app_state.catch_up_state.ensure_view(target_view, app_state).await
+        .map_err(|e| IrohError::Protocol(ProtocolError::PeerError(
+            format!("catch-up failed: {:?}", e)
+        )))?;
 
-    let (our_view, mut highest_qc_view) = db::get_consensus_progress(&conn)
-        .map_err(|_| IrohError::Protocol(ProtocolError::PeerError("db error".into())))?;
-
-    // Cross-view catch-up: message is for a future view
-    if target_view > our_view {
-        tracing::info!("Message-driven catch-up: view {} -> {}", our_view, target_view);
-        let _guard = app_state.consensus_lock.lock().await;
-        // Re-check after acquiring lock (may have caught up while waiting)
-        let (our_view, _) = db::get_consensus_progress(&conn)
-            .map_err(|_| IrohError::Protocol(ProtocolError::PeerError("db error".into())))?;
-        if target_view > our_view {
-            perform_catch_up(app_state, our_view, target_view, None).await
-                .map_err(|e| IrohError::Protocol(ProtocolError::PeerError(
-                    format!("catch-up failed: {:?}", e)
-                )))?;
-        }
-        // State changed — re-read highest_qc_view for intra-view check below
-        (_, highest_qc_view) = db::get_consensus_progress(&conn)
-            .map_err(|_| IrohError::Protocol(ProtocolError::PeerError("db error".into())))?;
-    }
-
-    // Intra-view catch-up: Lock-phase ballot but we're missing the Propose QC for this view
+    // Intra-view catch-up: Lock-phase ballot but we're missing the Propose QC
     if let IrohRequest::BallotSubmission(req) = request {
-        if req.ballot.data.phase == crate::consensus::types::ConsensusPhase::Lock
-            && highest_qc_view < target_view
-        {
-            tracing::debug!(
-                "Lock ballot intra-view sync: highest_qc_view={}, ballot_view={} - syncing",
-                highest_qc_view, target_view
-            );
-            crate::consensus::routes::ensure_intra_view_synced(app_state).await
-                .map_err(|e| IrohError::Protocol(ProtocolError::PeerError(
-                    format!("intra-view sync failed: {:?}", e)
-                )))?;
+        if req.ballot.data.phase == crate::consensus::types::ConsensusPhase::Lock {
+            // Check if we need intra-view sync (one DB read, only for Lock ballots)
+            let conn = app_state.db_pool.get()
+                .map_err(|_| IrohError::Protocol(ProtocolError::PeerError("db pool error".into())))?;
+            let (_, highest_qc_view) = db::get_consensus_progress(&conn)
+                .map_err(|_| IrohError::Protocol(ProtocolError::PeerError("db error".into())))?;
+            if highest_qc_view < target_view {
+                crate::consensus::routes::ensure_intra_view_synced(app_state).await
+                    .map_err(|e| IrohError::Protocol(ProtocolError::PeerError(
+                        format!("intra-view sync failed: {:?}", e)
+                    )))?;
+            }
         }
     }
 

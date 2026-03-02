@@ -804,49 +804,6 @@ pub fn get_distributable_file(
     }
 }
 
-/// Update local storage state for a fragment by its hash
-pub fn mark_fragment_local_state(
-    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
-    fragment_hash: &crate::types::Blake3Hash,
-    stored_locally: bool,
-) -> Result<usize, DatabaseError> {
-    match db_connection {
-        Ok(db_lock) => {
-            let rows_affected = db_lock.execute(
-                "UPDATE fragment_hashes SET stored_locally = ? WHERE fragment_hash = ?",
-                params![stored_locally, fragment_hash]
-            ).map_err(|e| {
-                tracing::error!("Error updating stored_locally for fragment hash {}: {:?}", fragment_hash, e);
-                DatabaseError::ProcessingError
-            })?;
-            
-            let state_text = if stored_locally { "stored locally" } else { "not stored locally" };
-            tracing::debug!("Marked {} fragment records with hash {} as {}", rows_affected, fragment_hash, state_text);
-            Ok(rows_affected)
-        }
-        Err(_) => Err(DatabaseError::LockError)
-    }
-}
-
-/// Update local storage state for a fragment by its hash (transaction version)
-pub fn mark_fragment_local_state_tx(
-    tx: &Transaction,
-    fragment_hash: &crate::types::Blake3Hash,
-    stored_locally: bool,
-) -> Result<usize, DatabaseError> {
-    let rows_affected = tx.execute(
-        "UPDATE fragment_hashes SET stored_locally = ? WHERE fragment_hash = ?",
-        params![stored_locally, fragment_hash]
-    ).map_err(|e| {
-        tracing::error!("Error updating stored_locally for fragment hash {}: {:?}", fragment_hash, e);
-        DatabaseError::ProcessingError
-    })?;
-
-    let state_text = if stored_locally { "stored locally" } else { "not stored locally" };
-    tracing::debug!("Marked {} fragment records with hash {} as {}", rows_affected, fragment_hash, state_text);
-    Ok(rows_affected)
-}
-
 /// Batch-update local storage state for multiple fragments in a single transaction.
 /// Acquires the write lock once instead of once per fragment, avoiding sustained
 /// lock contention with consensus operations.

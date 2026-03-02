@@ -733,7 +733,7 @@ impl TestScenario for ConsensusQueueThroughput {
     }
 
     fn description(&self) -> &'static str {
-        "Sustained mixed-operation load for ~30s. Measures throughput and verifies zero divergence."
+        "High-volume sustained mixed-operation load (~6000 ops). Measures throughput and enforces 100% success with zero divergence."
     }
 
     async fn run(
@@ -790,10 +790,9 @@ impl TestScenario for ConsensusQueueThroughput {
             }
         };
 
-        // ── Load phase: 30 seconds of continuous operations ──────────────
-        // Each submit() blocks up to 120s awaiting consensus commit, so we
-        // pace to ~2 ops per 2s — enough to exercise batching without
-        // overwhelming the drain window.
+        // ── Load phase: 30 seconds of high-volume operations ─────────────
+        // With the WriteGate ensuring consensus priority, we can push
+        // aggressively — ~10ms between rounds yields ~6000 ops in 30s.
         let load_duration = Duration::from_secs(30);
         let load_start = Instant::now();
         let mut set = JoinSet::new();
@@ -847,7 +846,7 @@ impl TestScenario for ConsensusQueueThroughput {
             }
 
             round += 1;
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
         print_and_add_check(
@@ -894,8 +893,8 @@ impl TestScenario for ConsensusQueueThroughput {
         print_and_add_check(
             &mut result,
             Check {
-                name: "Success rate >= 80%".to_string(),
-                passed: success_rate >= 80.0,
+                name: "100% success rate".to_string(),
+                passed: success_count == spawned_count,
                 detail: Some(format!(
                     "{}/{} succeeded ({:.1}%), {} drained of {} spawned",
                     success_count, spawned_count, success_rate, total, spawned_count

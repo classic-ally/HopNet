@@ -622,28 +622,16 @@ async fn perform_concurrent_fragment_discovery(
     
     drop(success_tx); // Close sender so channel ends when all workers complete
 
-    // Get a single database connection for sequential processing
-    let mut db_conn = app_state.db_pool.get()
-        .map_err(|_| FileError::StorageError(io::Error::new(io::ErrorKind::Other, "Database connection failed")))?;
-
     // Collect results and update file_data
-    // Database updates are committed per-fragment to avoid long inconsistency windows
     let mut completed_downloads = 0;
     while let Some(result) = success_rx.recv().await {
         match result {
             Ok((index, fragment_type, fragment_hash)) => {
-                // Update database to mark fragment as stored locally (sequential, with immediate commit)
-                let tx = db_conn.transaction()
-                    .map_err(|_| FileError::StorageError(io::Error::new(io::ErrorKind::Other, "Failed to start transaction")))?;
-
-                if let Err(e) = crate::db::files::mark_fragment_local_state_tx(&tx, &fragment_hash, true) {
-                    tracing::error!("Failed to update database for fragment {}: {:?}", fragment_hash.to_hex(), e);
-                    // Continue anyway - fragment is cached on disk
-                } else {
-                    // Commit immediately so other operations see the updated state
-                    if let Err(e) = tx.commit() {
-                        tracing::error!("Failed to commit fragment state for {}: {:?}", fragment_hash.to_hex(), e);
-                    }
+                // Queue async DB update (drain task will batch-flush through write gate)
+                if let Err(e) = app_state.local_state_tx.try_send(
+                    crate::db::write_gate::LocalStateUpdate::MarkLocal { fragment_hash: fragment_hash.clone() }
+                ) {
+                    tracing::warn!("Local state queue full, dropping mark-local for {}: {}", fragment_hash.to_hex(), e);
                 }
 
                 // Update the exists_locally flag in file_data for the target chunk only
@@ -746,9 +734,11 @@ pub async fn fetch_and_cache_fragment(
             // Store fragment locally
             store_fragment(fragments_dir, fragment_hash, fragment_data)?;
             
-            // Update database to mark as stored locally
-            if let Err(e) = crate::db::files::mark_fragment_local_state(app_state.db_pool.get(), fragment_hash, true) {
-                tracing::warn!("Failed to update database for fragment {}: {:?}", fragment_hash.to_hex(), e);
+            // Queue async DB update (drain task will batch-flush through write gate)
+            if let Err(e) = app_state.local_state_tx.try_send(
+                crate::db::write_gate::LocalStateUpdate::MarkLocal { fragment_hash: fragment_hash.clone() }
+            ) {
+                tracing::warn!("Local state queue full, dropping mark-local for {}: {}", fragment_hash.to_hex(), e);
             }
             
             tracing::debug!("Successfully fetched and cached fragment {}", fragment_hash.to_hex());

@@ -301,6 +301,7 @@ pub async fn process_incoming_qc_with_guard(
 
     // Get database connection and create transaction
     let mut conn = app_state.db_pool.get().map_err(|_| ConsensusError::DatabaseError)?;
+    let _wg = app_state.write_gate.guard();
     let db_tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| ConsensusError::DatabaseError)?;
 
     // Insert QC (updates consensus state)
@@ -686,6 +687,7 @@ async fn integrate_view(
 
             // Get database connection and create transaction for Propose QC
             let mut conn = app_state.db_pool.get().map_err(|_| ConsensusError::DatabaseError)?;
+            let _wg = app_state.write_gate.guard();
             let db_tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| ConsensusError::DatabaseError)?;
 
             match db::insert_qc_unsafe_tx(&db_tx, &propose_qc) {
@@ -734,6 +736,7 @@ async fn integrate_view(
 
             // Get database connection and create transaction for Lock QC
             let mut conn = app_state.db_pool.get().map_err(|_| ConsensusError::DatabaseError)?;
+            let _wg = app_state.write_gate.guard();
             let db_tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| ConsensusError::DatabaseError)?;
 
             match db::insert_qc_unsafe_tx(&db_tx, &lock_qc) {
@@ -1075,6 +1078,11 @@ pub async fn ensure_caught_up_and_active(
 
     // Serialize all catch-up operations to prevent concurrent consensus state modifications
     // Lock is scoped to catch-up operations only (released before activation request)
+    // Bounded by timeout to prevent deadlock during network partitions (the lock is held
+    // across network I/O, so a stalled RPC would otherwise block all consensus_lock users)
+    use std::time::Duration;
+    const CATCH_UP_TIMEOUT: Duration = Duration::from_secs(30);
+
     let sync_status = {
         let _guard = app_state.consensus_lock.lock().await;
 
@@ -1084,36 +1092,52 @@ pub async fn ensure_caught_up_and_active(
         match mode {
             CatchUpMode::SingleShot => {
                 // Fast path: check if behind and perform single catch-up pass
-                match check_view_status(app_state).await {
-                    Ok(ViewComparison::Behind { our_view, max_network_view }) => {
+                match tokio::time::timeout(CATCH_UP_TIMEOUT, check_view_status(app_state)).await {
+                    Ok(Ok(ViewComparison::Behind { our_view, max_network_view })) => {
                         let gap = max_network_view - our_view;
 
                         if gap > tolerance_views {
                             tracing::info!("Single-shot catch-up: closing gap of {} views (from {} to {})", gap, our_view, max_network_view);
-                            perform_catch_up(app_state, our_view, max_network_view, bootstrap_validators).await?;
+                            match tokio::time::timeout(CATCH_UP_TIMEOUT, perform_catch_up(app_state, our_view, max_network_view, bootstrap_validators)).await {
+                                Ok(inner) => inner?,
+                                Err(_) => {
+                                    tracing::warn!("Single-shot catch-up timed out after {}s", CATCH_UP_TIMEOUT.as_secs());
+                                    return Err(CatchUpError::NetworkUnavailable);
+                                }
+                            }
                             sync_status = SyncStatus::CaughtUp;
                         } else {
                             tracing::debug!("Gap of {} views within tolerance {}, skipping catch-up", gap, tolerance_views);
                             sync_status = SyncStatus::WithinTolerance { gap };
                         }
                     }
-                    Ok(ViewComparison::CaughtUp { view }) => {
+                    Ok(Ok(ViewComparison::CaughtUp { view })) => {
                         tracing::debug!("Already caught up at view {}", view);
                         sync_status = SyncStatus::CaughtUp;
                     }
-                    Ok(ViewComparison::Ahead { our_view, sampled_max_view }) => {
+                    Ok(Ok(ViewComparison::Ahead { our_view, sampled_max_view })) => {
                         tracing::debug!("Ahead of sampled validators: our_view={}, sampled_max_view={}", our_view, sampled_max_view);
                         sync_status = SyncStatus::CaughtUp;
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         tracing::warn!("Failed to check view status during single-shot catch-up: {:?}", e);
+                        return Err(CatchUpError::NetworkUnavailable);
+                    }
+                    Err(_) => {
+                        tracing::warn!("View status check timed out after {}s", CATCH_UP_TIMEOUT.as_secs());
                         return Err(CatchUpError::NetworkUnavailable);
                     }
                 }
             }
             CatchUpMode::Convergence => {
                 // Iterative convergence for large gaps or bootstrap (tolerance ignored)
-                perform_catch_up_with_convergence(app_state, bootstrap_validators).await?;
+                match tokio::time::timeout(CATCH_UP_TIMEOUT, perform_catch_up_with_convergence(app_state, bootstrap_validators)).await {
+                    Ok(inner) => inner?,
+                    Err(_) => {
+                        tracing::warn!("Convergence catch-up timed out after {}s", CATCH_UP_TIMEOUT.as_secs());
+                        return Err(CatchUpError::NetworkUnavailable);
+                    }
+                }
                 sync_status = SyncStatus::CaughtUp;
             }
         }

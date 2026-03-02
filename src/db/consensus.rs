@@ -678,6 +678,7 @@ pub fn insert_tc_safe(
 ) -> Result<(), DatabaseError> {
     match app_state.db_pool.get() {
         Ok(mut db_lock) => {
+            let _wg = app_state.write_gate.guard();
             let tx = db_lock.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| DatabaseError::LockError)?;
 
             // Step 1: Check if we already have the QC

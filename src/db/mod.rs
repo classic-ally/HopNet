@@ -26,3 +26,4 @@ pub mod inventory;
 pub mod resilience;
 pub mod debug;
 pub mod shares;
+pub mod write_gate;
