@@ -246,6 +246,19 @@ export const fileBrowserColumns: TableColumnsConfig = {
 }
 
 /**
+ * Configuration for the recents browser table
+ */
+export const recentsBrowserColumns: TableColumnsConfig = {
+  columns: [
+    { id: 'type', selector: 'nth-child(1)', sizing: COLUMN_PRESETS.icon },
+    { id: 'name', selector: 'nth-child(2)', sizing: COLUMN_PRESETS.name },
+    { id: 'location', selector: 'nth-child(3)', sizing: COLUMN_PRESETS.path },
+    { id: 'size', selector: 'nth-child(4)', sizing: COLUMN_PRESETS.size },
+    { id: 'modified', selector: 'nth-child(5)', sizing: COLUMN_PRESETS.date },
+  ]
+}
+
+/**
  * Configuration for the takeout table
  */
 export const takeoutTableColumns: TableColumnsConfig = {

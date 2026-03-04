@@ -29,6 +29,7 @@ mod sharing;
 mod consensus_queue;
 mod orphan_cleanup;
 mod fileprovider_device_token;
+mod recents;
 
 /// Represents the result of a test scenario execution
 #[derive(Debug)]
@@ -158,6 +159,9 @@ pub async fn run_test_by_name(mesh_id: u32, name: &str, nodes: &[NodeInfo], flag
         "fileprovider-device-token-auth" => {
             fileprovider_device_token::FileProviderDeviceTokenAuth.run(mesh_id, nodes, flags).await
         }
+        "recents-ordering" => {
+            recents::RecentsOrdering.run(mesh_id, nodes, flags).await
+        }
         _ => Err(anyhow::anyhow!("Unknown test: {}", name)),
     }
 }
@@ -189,6 +193,7 @@ pub fn list_test_names() -> Vec<&'static str> {
         "orphan-cleanup",
         "device-token-session-bootstrap",
         "fileprovider-device-token-auth",
+        "recents-ordering",
     ]
 }
 

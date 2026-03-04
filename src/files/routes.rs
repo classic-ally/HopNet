@@ -1,11 +1,13 @@
 use axum::{
     extract::{
-        Multipart, Path, Query, State, Extension
+        DefaultBodyLimit, Multipart, Path, Query, State, Extension
     },
     Json,
     response::{Response, IntoResponse},
     http::header,
-    body::Body
+    body::Body,
+    routing::{get, post, delete},
+    Router,
 };
 use reed_solomon_simd::ReedSolomonEncoder;
 use axum::http::StatusCode;
@@ -31,6 +33,14 @@ pub struct GetQueryParams {
 pub struct CleanupQueryParams {
     batch_size: i32,
     retention_days: i64,
+}
+
+pub fn router() -> Router<crate::AppState> {
+    Router::new()
+        .route("/recent", get(get_recent_files))
+        .route("/", get(get_files).patch(patch_files).delete(delete_files).post(post_files))
+        .route("/{*path}", get(get_file_fragments))
+        .layer(DefaultBodyLimit::max(5000 * 1_000_000))
 }
 
 /// Process a single logical chunk with Reed-Solomon encoding (10 original + 20 recovery)
@@ -336,6 +346,27 @@ pub async fn get_files(
         }
         Err(e) => {
             tracing::error!("Error getting files: {:?}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct RecentQueryParams {
+    limit: Option<i32>,
+}
+
+pub async fn get_recent_files(
+    State(app_state): State<AppState>,
+    Extension(user_id): Extension<i32>,
+    Query(params): Query<RecentQueryParams>
+) -> Result<Json<Vec<FileItem>>, StatusCode> {
+    let session = app_state.get_session(user_id).await?;
+    let limit = params.limit.unwrap_or(50);
+    match db::files::get_recent_files(app_state.db_pool.get(), user_id, limit, &session.siv_key, &session.siv_nonce) {
+        Ok(files) => Ok(Json(files)),
+        Err(e) => {
+            tracing::error!("Error getting recent files: {:?}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }

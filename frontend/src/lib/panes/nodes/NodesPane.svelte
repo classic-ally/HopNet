@@ -5,6 +5,8 @@
     import Toolbar from '../../primitives/Toolbar.svelte'
     import type { ToolbarItem } from '../../primitives/Toolbar.svelte'
     import NodeAddPane from './NodeAddPane.svelte'
+    import { fetchUsers } from '../../api/shares'
+    import type { UserInfo } from '../../api/shares'
 
     interface Node {
         node_id: number;
@@ -20,6 +22,7 @@
     let loading = true
     let error = ''
     let isNodeAddOpen = false
+    let usersMap: Map<number, UserInfo> = new Map()
 
     const table = new TableHandler(nodes, {
         rowsPerPage: 50,
@@ -103,8 +106,16 @@
         }
     ] satisfies ToolbarItem[];
 
+    async function loadUsers() {
+        try {
+            const users = await fetchUsers()
+            usersMap = new Map(users.map(u => [u.user_id, u]))
+        } catch (_) { /* best-effort */ }
+    }
+
     onMount(() => {
         fetchNodes()
+        loadUsers()
     })
 
     // Reactive statement to refetch when token changes
@@ -128,7 +139,7 @@
 </div>
 
 <!-- Nodes Table -->
-<div class="border-solid border-1 rounded-lg p-1 border-overlay1 max-w-[500px]">
+<div class="border-solid border-1 rounded-lg p-1 border-overlay1">
     {#if error}
         <div class="text-red p-2 mb-2 border border-red rounded">
             {error}
@@ -180,6 +191,7 @@
                 </thead>
                 <tbody>
                     {#each table.rows as row}
+                        {@const owner = usersMap.get(row.owner)}
                         <tr class="text-left">
                             <td>
                                 <input type="checkbox"
@@ -187,8 +199,17 @@
                                     onclick={()=>table.select(row.node_id)}
                                 >
                             </td>
-                            <td class="">{row.name}</td>
-                            <td class="">{row.owner}</td>
+                            <td>{row.name}</td>
+                            <td>
+                                <div class="flex items-center gap-2">
+                                    {#if owner?.avatar}
+                                        <img src="data:image/jpeg;base64,{owner.avatar}" alt="" class="w-5 h-5 rounded-full object-cover flex-shrink-0" />
+                                    {:else}
+                                        <div class="i-carbon-user w-5 h-5 text-muted flex-shrink-0"></div>
+                                    {/if}
+                                    <span>{owner?.first_name ? `${owner.first_name}${owner.last_name ? ` ${owner.last_name}` : ''}` : owner?.username ?? row.owner}</span>
+                                </div>
+                            </td>
                         </tr>
                     {:else}
                         <tr>

@@ -78,7 +78,7 @@
             loading = true
             error = ''
 
-            const url = new URL(`${API_BASE_URL}/files`)
+            const url = new URL(`${API_BASE_URL}/files`, window.location.origin)
             url.searchParams.append('path', path)
 
             const response = await authenticatedFetch(url.toString(), {
@@ -420,7 +420,7 @@
             const errors: string[] = [];
             for (const file of filesToDelete) {
                 try {
-                    const url = new URL(`${API_BASE_URL}/files`);
+                    const url = new URL(`${API_BASE_URL}/files`, window.location.origin);
                     url.searchParams.append('path', file.path);
 
                     const response = await authenticatedFetch(url.toString(), {

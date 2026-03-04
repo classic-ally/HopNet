@@ -1,7 +1,7 @@
 <script>
     import AccountSidebarItem from "./AccountSidebarItem.svelte";
     import BrowsePane from "../panes/files/BrowsePane.svelte";
-    import Toolbar from "../primitives/Toolbar.svelte";
+    import RecentsPane from "../panes/files/RecentsPane.svelte";
     import NodesPane from "../panes/nodes/NodesPane.svelte";
     import TakeoutPane from "../panes/takeout/TakeoutPane.svelte";
     import DevicesPane from "../panes/devices/DevicesPane.svelte";
@@ -220,22 +220,7 @@
             <!-- Incoming shares pane -->
             <IncomingSharesPane onToggleSidebar={toggleSidebar}/>
         {:else if selectedItem === "recents"}
-            <!-- Minimal toolbar for mobile menu access -->
-            <Toolbar
-                leftElements={[]}
-                centerElements={[]}
-                rightElements={[]}
-                onToggleSidebar={toggleSidebar}
-            />
-
-            <!-- Recents placeholder (TODO: implement RecentsPane) -->
-            <div>
-                <h3>Recent Files</h3>
-                <p class="text-sm text-muted">Your recently accessed files will appear here</p>
-            </div>
-            <div class="text-muted p-4 text-center">
-                No recent files to display
-            </div>
+            <RecentsPane onToggleSidebar={toggleSidebar}/>
         {:else if selectedItem === "account"}
             <AccountsPane onToggleSidebar={toggleSidebar}/>
         {/if}

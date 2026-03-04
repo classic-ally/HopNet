@@ -5,7 +5,6 @@ use bollard::models::{ContainerCreateBody, HostConfig, NetworkingConfig, Endpoin
 use clap::{Parser, Subcommand};
 use serde_json::json;
 use std::collections::HashMap;
-use bollard::exec::StartExecResults;
 use tokio_stream::StreamExt;
 
 mod divergence;
@@ -1571,50 +1570,71 @@ pub async fn get_external_addresses(docker: &Docker, mesh_id: u32, runtime: sys:
 const PASSPHRASE_PATH: &str = "/root/.local/share/hopnet/.passphrase";
 
 /// Store a mesh passphrase inside node 0's container volume.
+/// Uses Docker's tar upload API so the container image doesn't need a shell.
 async fn store_mesh_passphrase(docker: &Docker, mesh_id: u32, passphrase: &str) -> Result<()> {
     let container_name = format!("hopnet-orchestrator-{}-0", mesh_id);
-    let write_cmd = format!("echo '{}' > {}", passphrase, PASSPHRASE_PATH);
-    let exec_config = bollard::exec::CreateExecOptions::<String> {
-        cmd: Some(vec!["sh".into(), "-c".into(), write_cmd]),
-        attach_stdout: Some(false),
-        attach_stderr: Some(false),
-        ..Default::default()
-    };
-    let exec = docker.create_exec(&container_name, exec_config).await?;
-    let start_opts = bollard::exec::StartExecOptions { detach: true, ..Default::default() };
-    docker.start_exec(&exec.id, Some(start_opts)).await?;
-    // Brief pause to ensure the file is written before any subsequent read
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Build an in-memory tar archive containing the passphrase file
+    let mut tar_builder = tar::Builder::new(Vec::new());
+    let passphrase_bytes = passphrase.as_bytes();
+    let mut header = tar::Header::new_gnu();
+    header.set_size(passphrase_bytes.len() as u64);
+    header.set_mode(0o600);
+    header.set_cksum();
+    // The file path inside the tar is relative to the upload destination
+    tar_builder.append_data(&mut header, ".passphrase", passphrase_bytes)?;
+    let tar_bytes = tar_builder.into_inner()?;
+
+    // Extract the parent directory from PASSPHRASE_PATH
+    let parent_dir = std::path::Path::new(PASSPHRASE_PATH)
+        .parent()
+        .map(|p| p.to_str().unwrap_or("/"))
+        .unwrap_or("/");
+
+    docker.upload_to_container(
+        &container_name,
+        Some(bollard::container::UploadToContainerOptions {
+            path: parent_dir,
+            ..Default::default()
+        }),
+        bollard::body_full(bytes::Bytes::from(tar_bytes)),
+    ).await?;
+
     Ok(())
 }
 
 /// Load the mesh passphrase from node 0's container volume.
+/// Uses Docker's tar download API so the container image doesn't need a shell.
 async fn load_mesh_passphrase(docker: &Docker, mesh_id: u32) -> Result<String> {
     let container_name = format!("hopnet-orchestrator-{}-0", mesh_id);
-    let exec_config = bollard::exec::CreateExecOptions::<String> {
-        cmd: Some(vec!["cat".into(), PASSPHRASE_PATH.into()]),
-        attach_stdout: Some(true),
-        attach_stderr: Some(true),
-        ..Default::default()
-    };
-    let exec = docker.create_exec(&container_name, exec_config).await?;
-    let start_opts = bollard::exec::StartExecOptions { detach: false, ..Default::default() };
-    match docker.start_exec(&exec.id, Some(start_opts)).await? {
-        StartExecResults::Attached { mut output, .. } => {
-            let mut result = String::new();
-            while let Some(Ok(msg)) = output.next().await {
-                result.push_str(&msg.to_string());
-            }
-            let passphrase = result.trim().to_string();
-            if passphrase.is_empty() {
-                return Err(anyhow::anyhow!("No passphrase found in container for mesh {} (run setup first)", mesh_id));
-            }
-            Ok(passphrase)
-        }
-        StartExecResults::Detached => {
-            Err(anyhow::anyhow!("Unexpected detached exec result"))
+
+    let stream = docker.download_from_container(
+        &container_name,
+        Some(bollard::container::DownloadFromContainerOptions {
+            path: PASSPHRASE_PATH,
+        }),
+    );
+
+    // Collect the tar stream into bytes
+    let mut tar_bytes = Vec::new();
+    tokio::pin!(stream);
+    while let Some(chunk) = stream.next().await {
+        tar_bytes.extend_from_slice(&chunk?);
+    }
+
+    // Extract the passphrase from the tar archive
+    let mut archive = tar::Archive::new(&tar_bytes[..]);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let mut content = String::new();
+        std::io::Read::read_to_string(&mut entry, &mut content)?;
+        let passphrase = content.trim().to_string();
+        if !passphrase.is_empty() {
+            return Ok(passphrase);
         }
     }
+
+    Err(anyhow::anyhow!("No passphrase found in container for mesh {} (run setup first)", mesh_id))
 }
 
 /// Call a HopNet node API with authentication and optional retry

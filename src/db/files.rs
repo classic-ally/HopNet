@@ -102,6 +102,81 @@ pub fn get_files(
     }
 }
 
+pub fn get_recent_files(
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
+    owner_id: i32,
+    limit: i32,
+    key: &Key<Aes256Siv>,
+    nonce: &Nonce
+) -> Result<Vec<FileItem>, DatabaseError> {
+    match db_connection {
+        Ok(db_lock) => {
+            let query = r#"
+                SELECT
+                    i.id,
+                    i.path,
+                    i.type,
+                    i.data_id,
+                    db.file_size,
+                    uuid_extract_timestamp(i.id) as creation_date,
+                    CASE
+                        WHEN i.data_id IS NOT NULL THEN uuid_extract_timestamp(i.data_id)
+                        ELSE NULL
+                    END as modification_date,
+                    COALESCE(
+                        (SELECT COUNT(*) FROM shares s WHERE s.data_block_id = i.data_id AND s.user_id != ?)
+                        +
+                        (SELECT COUNT(*) FROM incoming_shares ist WHERE ist.data_block_id = i.data_id),
+                        0
+                    ) as shared_with_count
+                FROM (
+                    SELECT inode_id, MAX(modified_at_height) AS max_height
+                    FROM modification_log
+                    WHERE owner_id = ?
+                    GROUP BY inode_id
+                ) ml
+                JOIN inodes i ON i.id = ml.inode_id AND i.owner_id = ? AND i.type = 0
+                LEFT JOIN data_blocks db ON i.data_id = db.id
+                ORDER BY ml.max_height DESC
+                LIMIT ?
+            "#;
+
+            let mut stmt = db_lock.prepare(query).map_err(|_| DatabaseError::RecallError)?;
+
+            let files = stmt.query_map(params![owner_id, owner_id, owner_id, limit], |row| {
+                let id: CustomUUID = row.get(0)?;
+                let encrypted_path: String = row.get(1)?;
+                let decrypted_path = decrypt_path(encrypted_path, key, nonce)?;
+                let inode_type: hopnet_common::InodeType = row.get(2)?;
+                let _data_id: Option<CustomUUID> = row.get(3)?;
+                let file_size = row.get::<_, Option<i64>>(4)?.map(|v| v as u64);
+                let creation_date: CustomDateTime = row.get(5)?;
+                let modification_date: Option<CustomDateTime> = row.get(6)?;
+                let shared_with_count: i64 = row.get(7)?;
+
+                let common_uuid = hopnet_common::CustomUUID::from_str(&id.to_string())
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
+
+                Ok(FileItem {
+                    id: common_uuid,
+                    path: decrypted_path,
+                    inode_type,
+                    file_size,
+                    creation_date: *creation_date,
+                    modification_date: modification_date.map(|dt| *dt),
+                    shared_with_count: Some(shared_with_count as u32),
+                })
+            }).map_err(|_| DatabaseError::ProcessingError)?;
+
+            Ok(files.collect::<Result<Vec<_>, _>>().map_err(|_| DatabaseError::ProcessingError)?)
+        }
+        Err(e) => {
+            tracing::error!("Database connection error in get_recent_files: {:?}", e);
+            Err(DatabaseError::LockError)
+        }
+    }
+}
+
 pub fn insert_files(
     db_tx: &rusqlite::Transaction,
     inodes: Vec<Inode>,
