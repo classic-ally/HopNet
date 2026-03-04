@@ -37,30 +37,6 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
     let (encodingkey, decodingkey) = auth::generate_jwt_key();
 
-    // Check if FileProvider API key already exists in keychain (release builds only)
-    let fileprovider_api_key = {
-        #[cfg(all(target_os = "macos", not(debug_assertions)))]
-        {
-            // Only try to load from keychain in release builds to avoid permission prompts in development/CI
-            match fileprovider::keychain::load_config(fileprovider::keychain::KeychainEnvironment::Production) {
-                Ok(existing_config) => {
-                    tracing::info!("Using existing FileProvider API key from keychain");
-                    existing_config.api_key
-                }
-                Err(e) => {
-                    tracing::info!("No existing FileProvider API key found ({}), generating new one", e);
-                    auth::generate_fileprovider_api_key()
-                }
-            }
-        }
-        #[cfg(any(not(target_os = "macos"), debug_assertions))]
-        {
-            // Always generate fresh API key in debug builds or non-macOS to avoid keychain prompts
-            tracing::info!("Generating fresh FileProvider API key (debug build or non-macOS)");
-            auth::generate_fileprovider_api_key()
-        }
-    };
-
     // Check if ephemeral database mode is requested (for testing)
     let use_ephemeral_db = std::env::var("HOPNET_EPHEMERAL_DB").is_ok();
 
@@ -172,7 +148,6 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 timeout_vote_collector: Arc::new(consensus::functions::TimeoutVoteCollector::new()),
                 catch_up_state: Arc::new(hopnet::consensus::catch_up_state::CatchUpState::new()),
                 consensus_lock: Arc::new(tokio::sync::Mutex::new(())),
-                fileprovider_api_key: fileprovider_api_key.clone(),
                 port,
                 test_mode: cfg!(debug_assertions) || std::env::var("HOPNET_TEST_MODE").is_ok(),
                 orphaned_fragment_scan: Arc::new(std::sync::Mutex::new(None)),
@@ -224,33 +199,10 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 *GUI_APP_STATE.write().await = Some(app_state.clone());
             }
 
-            tracing::info!("FileProvider API key: {}", fileprovider_api_key);
-
             // Warn about test mode being enabled
             if cfg!(debug_assertions) {
                 tracing::warn!("⚠️  TEST MODE ENABLED: Test endpoints are exposed and will return API credentials");
                 tracing::warn!("⚠️  This is a SECURITY RISK in production - test mode is automatically disabled in release builds");
-            }
-
-            // Store FileProvider configuration in keychain for Swift extension (release builds only)
-            #[cfg(all(target_os = "macos", not(debug_assertions)))]
-            {
-                let base_url = format!("http://localhost:{}", port);
-                let keychain_config = fileprovider::keychain::FileProviderConfig::new(
-                    fileprovider_api_key.clone(),
-                    base_url,
-                );
-                
-                if let Err(e) = fileprovider::keychain::store_config(&keychain_config, fileprovider::keychain::KeychainEnvironment::Production) {
-                    tracing::warn!("Failed to store FileProvider configuration in keychain: {}", e);
-                } else {
-                    tracing::info!("FileProvider configuration stored/updated in keychain");
-                }
-            }
-            
-            #[cfg(all(target_os = "macos", debug_assertions))]
-            {
-                tracing::info!("Skipping keychain storage in debug build - use environment variables or run release build for keychain support");
             }
 
             // Initialize FileProvider on startup - only cleans up if app is uninitialized (release builds only)
@@ -387,9 +339,8 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/consensus/view", post(consensus::routes::debug_view_state))
                 .layer(middleware::from_fn_with_state(app_state.clone(), consensus::routes::jwt_or_rpc_auth_middleware));
 
-            // FileProvider routes with scoped authentication (all routes require auth)
+            // FileProvider routes with device token authentication
             let fileprovider_routes = Router::new()
-                .route("/health", get(fileprovider::routes::get_health))
                 .route("/enumerate", get(fileprovider::routes::get_enumerate))
                 .route("/changes", get(fileprovider::routes::get_changes))
                 .route("/delete", delete(fileprovider::routes::delete_item))
@@ -398,7 +349,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/create", post(fileprovider::routes::create_item))
                 .route("/modify", patch(fileprovider::routes::modify_item))
                 .layer(DefaultBodyLimit::max(5000*1_000_000)) // 5GB limit for file uploads
-                .layer(middleware::from_fn_with_state(app_state.clone(), fileprovider::auth::fileprovider_auth_middleware));
+                .layer(middleware::from_fn_with_state(app_state.clone(), devices::auth::device_token_auth_middleware));
 
             // Test routes - only available in test mode
             let test_routes = if app_state.test_mode {
@@ -416,6 +367,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .merge(protected_routes)
                 .merge(jwt_or_rpc_routes)
                 .nest("/integrations/fileprovider", fileprovider_routes)
+                .route("/integrations/fileprovider/health", get(fileprovider::routes::get_health))
                 .nest("/integrations/documentprovider", documentprovider::routes::router(app_state.clone()))
                 .nest("/devices", devices::routes::router(app_state.clone()))
                 .merge(test_routes)

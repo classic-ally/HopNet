@@ -70,12 +70,12 @@ Benefits:
 **FileProvider Extension:**
 - **Language**: Swift (Native implementation for better Apple framework integration)
 - **Communication**: URLSession for HTTP requests
-- **Authentication**: Scoped API key stored in macOS Keychain
+- **Authentication**: Device token stored in macOS Keychain (see [RFC-012](device-token-sessions.md))
 - **Bundle**: Swift Package Manager project compiled into `.appex` bundle
 
 **Main HopNet Application:**
 - **API Routes**: `/integrations/fileprovider/*` endpoints (implemented)
-- **Authentication**: FileProvider-specific API key stored in keychain
+- **Authentication**: Device token authentication via `device_token_auth_middleware` (see [RFC-012](device-token-sessions.md))
 - **File Assembly**: Fragment assembly integrated with download endpoint
 
 ### Stable File Identity (Implemented)
@@ -142,9 +142,10 @@ PUT /integrations/fileprovider/modify
 Body: { identifier, new_filename?, new_parent?, content? }
 Response: 200 OK or error
 
-**Authentication (Implemented):**
-- FileProvider-scoped API key stored in macOS Keychain ✅
-- Extension reads from keychain at initialization ✅
+**Authentication (Implemented — migrated to device tokens in [RFC-012](device-token-sessions.md)):**
+- Device token stored in macOS Keychain ✅
+- Extension reads token from keychain at initialization ✅
+- Authenticated via `device_token_auth_middleware` with session bootstrap ✅
 - Restricted to `/integrations/fileprovider/*` routes only ✅
 
 ## NSFileProviderReplicatedExtension Implementation
@@ -396,7 +397,7 @@ let domain = NSFileProviderDomain::new(
 ### Phase 1: Read Operations (COMPLETED ✅)
 - [x] Core FileProvider extension in Swift
 - [x] HTTP API endpoints in main HopNet process
-- [x] Scoped authentication with API keys via Keychain
+- [x] Scoped authentication via device tokens (migrated from API keys in RFC-012)
 - [x] File enumeration with pagination
 - [x] File metadata retrieval
 - [x] File download with fragment assembly
@@ -591,8 +592,8 @@ fn get_all_ancestor_folders(tx: &Transaction, path: &str, owner_id: i32) -> Resu
 
 ### Authentication Security
 - FileProvider extension never has access to consensus private keys
-- API key scoped to read-only FileProvider operations only
-- Key stored in secure macOS Keychain
+- Device token authentication with per-user session bootstrap (see [RFC-012](device-token-sessions.md))
+- Device token stored in secure macOS Keychain
 - Main HopNet process validates all operations through consensus
 
 ### Process Isolation Benefits

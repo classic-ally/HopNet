@@ -82,25 +82,34 @@ cargo build --release --bin orchestrator --features skip-frontend
 When testing code changes against the orchestrator:
 
 ```bash
-# 1. Build the HopNet Docker image (if source changed)
-# IMPORTANT: Only use --no-cache when Cargo.toml dependencies changed
-# (cargo cache mounts can serve stale crates). For source-only changes,
-# plain `docker build` is sufficient and much faster.
-docker build -t hopnet:latest .
+# 1. Build the HopNet Docker image via nix flake (if source changed)
+# Choose the target matching the Docker host architecture:
+#
+#   macOS (Apple Silicon): use aarch64-linux. macOS cannot build Linux
+#   derivations natively, so this requires the remote builder configured
+#   in /etc/nix/machines (ssh://builder@nixos.orb.local).
+#
+#   Linux x86_64: use x86_64-linux. Builds locally, no remote builder needed.
+#
+nix build .#packages.aarch64-linux.dockerImage   # macOS / Apple Silicon
+# nix build .#packages.x86_64-linux.dockerImage  # Linux x86_64
 
-# 2. Build orchestrator (skip-frontend for faster builds)
+# 2. Load the image into Docker
+docker load < result
+
+# 3. Build orchestrator (skip-frontend for faster builds)
 cargo build --release --bin orchestrator --features skip-frontend
 
-# 3. Create a test mesh
+# 4. Create a test mesh
 ./target/release/orchestrator create --nodes 3
 
-# 4. Run tests against the mesh
+# 5. Run tests against the mesh
 ./target/release/orchestrator test --mesh-id 0 --test file-upload-consistency
 
-# 5. Check for state divergence
+# 6. Check for state divergence
 ./target/release/orchestrator divergence --mesh-id 0
 
-# 6. Clean up when done
+# 7. Clean up when done
 ./target/release/orchestrator delete --mesh-id 0 -y
 ```
 

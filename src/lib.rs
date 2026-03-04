@@ -48,7 +48,6 @@ pub struct AppState {
     pub timeout_vote_collector: Arc<consensus::functions::TimeoutVoteCollector>,
     pub catch_up_state: Arc<consensus::catch_up_state::CatchUpState>,
     pub consensus_lock: Arc<tokio::sync::Mutex<()>>,
-    pub fileprovider_api_key: String,
     pub port: u16,
     pub test_mode: bool,
     pub orphaned_fragment_scan: Arc<std::sync::Mutex<Option<files::jobs::OrphanedFragmentScan>>>,

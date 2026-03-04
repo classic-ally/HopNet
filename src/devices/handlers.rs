@@ -40,6 +40,7 @@ impl TransactionHandler for RegisterDeviceHandler {
             payload.user_id,
             &payload.api_key_hash,
             &payload.encrypted_device_name,
+            &payload.wrapped_user_key,
         )?;
 
         Ok(())

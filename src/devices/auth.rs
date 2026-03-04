@@ -5,8 +5,8 @@ use axum::{
     http::{StatusCode, header},
     middleware::Next,
 };
-use crate::AppState;
-use crate::db::{devices::get_device_by_id, CustomUUID, Blake3Hash};
+use crate::{auth, AppState, UserKeys};
+use crate::db::{self, devices::get_device_by_id, CustomUUID, Blake3Hash};
 
 pub struct DeviceTokenAuthError {
     message: String,
@@ -82,6 +82,41 @@ pub async fn device_token_auth_middleware(
             message: "Invalid device token".to_string(),
             status_code: StatusCode::UNAUTHORIZED,
         });
+    }
+
+    // Bootstrap session if needed (cheap read-lock check first)
+    let needs_session = {
+        let store = app_state.session_store.read().await;
+        match store.get(&device.user_id) {
+            Some(entry) if entry.expires_at > chrono::Utc::now() => false,
+            _ => true,
+        }
+    };
+
+    if needs_session {
+        let secret_bytes = hex::decode(&secret).map_err(|_| DeviceTokenAuthError {
+            message: "Invalid device secret encoding".to_string(),
+            status_code: StatusCode::UNAUTHORIZED,
+        })?;
+
+        let privkey = auth::unwrap_user_key_from_device(&secret_bytes, &device.wrapped_user_key)
+            .map_err(|_| DeviceTokenAuthError {
+                message: "Failed to unwrap device key".to_string(),
+                status_code: StatusCode::UNAUTHORIZED,
+            })?;
+
+        let pubkey = db::PubKey(privkey.verifying_key());
+        let (siv_key, siv_nonce) = auth::derive_siv_key_from_user(&privkey, "file_path");
+        let user_keys = UserKeys { private_key: privkey, public_key: pubkey };
+        let expires_at = chrono::Utc::now() + chrono::Duration::minutes(5);
+        let session = auth::SessionEntry { user_keys, siv_key, siv_nonce, expires_at };
+
+        let mut store = app_state.session_store.write().await;
+        // Re-check under write lock to avoid overwriting a longer-lived session
+        match store.get(&device.user_id) {
+            Some(entry) if entry.expires_at > chrono::Utc::now() => {},
+            _ => { store.insert(device.user_id, session); }
+        }
     }
 
     // Insert user_id into request extensions for downstream handlers

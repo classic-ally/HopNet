@@ -207,6 +207,19 @@ pub async fn post_setup(
                 }
             }
 
+            // Register a FileProvider device token so the extension can authenticate
+            #[cfg(all(target_os = "macos", not(debug_assertions)))]
+            {
+                if !app_state.test_mode {
+                    let app_state_clone = app_state.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = crate::devices::routes::ensure_fileprovider_device_token(&app_state_clone, user_id).await {
+                            tracing::warn!("Failed to register FileProvider device token at setup: {:?}", e);
+                        }
+                    });
+                }
+            }
+
             Ok((StatusCode::CREATED, Json(hopnet_common::setup::PassphraseResponse { passphrase })))
         },
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR)

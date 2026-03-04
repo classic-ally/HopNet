@@ -174,7 +174,7 @@ Consensus-coordinated user data export system enabling portable data extraction 
 Native macOS Finder and iOS Files app integration through Apple's FileProvider framework.
 
 - [x] Swift-based FileProvider extension with native URLSession
-- [x] HTTP API communication with scoped authentication via Keychain
+- [x] HTTP API communication with device token authentication via Keychain ([RFC-012](specs/device-token-sessions.md))
 - [x] Stable file identity using data_block_id for files, hex-encoded encrypted paths for folders
 - [x] Read operations (enumerate, fetch metadata, download files)
 - [x] Delete operations with recursive folder support

@@ -72,13 +72,6 @@ pub fn generate_jwt_key() -> (EncodingKey, DecodingKey) {
     return (encodingkey, decodingkey);
 }
 
-// generate a secure API key for FileProvider, rolled every startup
-pub fn generate_fileprovider_api_key() -> String {
-    let mut rng = rand::rng();
-    let key_bytes: Vec<u8> = (0..32).map(|_| rng.random_range(0..=255)).collect();
-    hex::encode(key_bytes)
-}
-
 // middleware for validation
 pub async fn auth_middleware(
     State(app_state): State<AppState>,
@@ -203,6 +196,10 @@ pub async fn sign_in(
                     db_user.user_id,
                     &privkey_bytes,
                 );
+
+                if let Err(e) = crate::devices::routes::ensure_fileprovider_device_token(&app_state, db_user.user_id).await {
+                    tracing::warn!("Failed to ensure FileProvider device token: {:?}", e);
+                }
             }
         }
     }
@@ -225,12 +222,12 @@ pub fn encode_jwt_with_duration(iss: String, uid: String, key: EncodingKey, hour
 }
 
 /// Logout endpoint. Removes session from store.
-/// In GUI mode, the owner's keychain-loaded session is preserved (FileProvider depends on it).
+/// In GUI mode, the owner's keychain-loaded session is preserved for auto-login.
 pub async fn sign_out(
     State(app_state): State<AppState>,
     Extension(uid): Extension<i32>,
 ) -> StatusCode {
-    // In GUI mode, protect the owner's session (loaded from keychain, permanent)
+    // In GUI mode, protect the owner's session (loaded from keychain for auto-login)
     #[cfg(feature = "gui")]
     {
         if let Ok(owner_id) = app_state.get_user_id() {
@@ -366,6 +363,69 @@ pub fn unwrap_user_privkey(encrypted_privkey: &[u8], key_salt: &[u8], password: 
     Ok(PrivKey(ed25519_dalek::SigningKey::from_bytes(&key_arr)))
 }
 
+/// Wrap a user private key for storage in a device token.
+/// Uses Blake3 key derivation (device secret has 256-bit entropy, no stretching needed)
+/// followed by ChaCha20-Poly1305 encryption.
+/// Returns nonce (12) || ciphertext (48) = 60 bytes.
+pub fn wrap_user_key_for_device(
+    device_secret: &[u8],
+    privkey: &PrivKey,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    // Derive 32-byte wrapping key from device secret using Blake3
+    let mut key_bytes = [0u8; 32];
+    let mut hasher = blake3::Hasher::new_derive_key("hopnet-device-key-wrap-v1");
+    hasher.update(device_secret);
+    hasher.finalize_xof().fill(&mut key_bytes);
+
+    // Encrypt with ChaCha20-Poly1305 using random 12-byte nonce
+    let mut nonce_bytes = [0u8; 12];
+    rand::rng().fill(&mut nonce_bytes);
+    let nonce = chacha20poly1305::Nonce::from(nonce_bytes);
+
+    let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&key_bytes));
+    let ciphertext = cipher.encrypt(&nonce, privkey.0.to_bytes().as_slice())
+        .map_err(|e| format!("Device key wrap encryption failed: {:?}", e))?;
+
+    let mut wrapped = Vec::with_capacity(12 + ciphertext.len());
+    wrapped.extend_from_slice(&nonce_bytes);
+    wrapped.extend_from_slice(&ciphertext);
+
+    Ok(wrapped)
+}
+
+/// Unwrap a user private key from a device token's wrapped blob.
+/// Input: nonce (12) || ciphertext (48) = 60 bytes.
+/// SIV key and nonce are re-derived from the unwrapped privkey via derive_siv_key_from_user.
+pub fn unwrap_user_key_from_device(
+    device_secret: &[u8],
+    wrapped: &[u8],
+) -> Result<PrivKey, Box<dyn std::error::Error>> {
+    if wrapped.len() < 12 {
+        return Err("Wrapped device key too short".into());
+    }
+
+    let (nonce_bytes, ciphertext) = wrapped.split_at(12);
+    let nonce = chacha20poly1305::Nonce::from_slice(nonce_bytes);
+
+    // Derive wrapping key (same Blake3 derivation)
+    let mut key_bytes = [0u8; 32];
+    let mut hasher = blake3::Hasher::new_derive_key("hopnet-device-key-wrap-v1");
+    hasher.update(device_secret);
+    hasher.finalize_xof().fill(&mut key_bytes);
+
+    let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&key_bytes));
+    let plaintext = cipher.decrypt(nonce, ciphertext)
+        .map_err(|e| format!("Device key unwrap decryption failed: {:?}", e))?;
+
+    if plaintext.len() != 32 {
+        return Err(format!("Decrypted device key is {} bytes, expected 32", plaintext.len()).into());
+    }
+
+    let mut key_arr = [0u8; 32];
+    key_arr.copy_from_slice(&plaintext);
+    Ok(PrivKey(ed25519_dalek::SigningKey::from_bytes(&key_arr)))
+}
+
 /// Decrypt a wrapped per-file key using X25519 ECDH and ChaCha20-Poly1305
 pub fn decrypt_wrapped_file_key(
     file_access: &crate::db::types::FileAccess,
@@ -475,6 +535,42 @@ mod tests {
         }
 
         let result = unwrap_user_privkey(&encrypted, &salt, password);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_device_key_wrap_unwrap_round_trip() {
+        let signing_key = SigningKey::from_bytes(&[42u8; 32]);
+        let privkey = PrivKey(signing_key);
+        let secret = [0xABu8; 32];
+
+        let wrapped = wrap_user_key_for_device(&secret, &privkey).unwrap();
+        assert_eq!(wrapped.len(), 60); // 12 nonce + 32 plaintext + 16 tag
+
+        let recovered = unwrap_user_key_from_device(&secret, &wrapped).unwrap();
+        assert_eq!(privkey.0.to_bytes(), recovered.0.to_bytes());
+    }
+
+    #[test]
+    fn test_device_key_unwrap_wrong_secret() {
+        let signing_key = SigningKey::from_bytes(&[42u8; 32]);
+        let privkey = PrivKey(signing_key);
+
+        let wrapped = wrap_user_key_for_device(&[0xAAu8; 32], &privkey).unwrap();
+        let result = unwrap_user_key_from_device(&[0xBBu8; 32], &wrapped);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_device_key_unwrap_corrupted_ciphertext() {
+        let signing_key = SigningKey::from_bytes(&[42u8; 32]);
+        let privkey = PrivKey(signing_key);
+        let secret = [0xCCu8; 32];
+
+        let mut wrapped = wrap_user_key_for_device(&secret, &privkey).unwrap();
+        wrapped[14] ^= 0xff;
+
+        let result = unwrap_user_key_from_device(&secret, &wrapped);
         assert!(result.is_err());
     }
 }

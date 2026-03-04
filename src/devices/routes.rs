@@ -6,7 +6,7 @@ use axum::{
     Extension, Json, Router,
 };
 use rand::Rng;
-use crate::{auth::auth_middleware, AppState};
+use crate::{auth, auth::auth_middleware, AppState};
 use crate::db::{devices::get_devices_for_user, CustomUUID, Blake3Hash};
 use crate::consensus::functions::create_signed_user_transaction;
 use crate::files::functions::{encrypt_part, decrypt_part};
@@ -24,13 +24,12 @@ pub fn router(app_state: AppState) -> Router<AppState> {
         .layer(middleware::from_fn_with_state(app_state, auth_middleware))
 }
 
-/// POST /devices/register
-/// Generates new device token, submits to consensus, returns API key (shown once)
-async fn post_register_device(
-    State(app_state): State<AppState>,
-    Extension(user_id): Extension<i32>,
-    Json(request): Json<RegisterDeviceRequest>,
-) -> Result<Json<RegisterDeviceResponse>, StatusCode> {
+/// Core device registration logic. Returns (device_id, api_key).
+pub async fn register_device_internal(
+    app_state: &AppState,
+    user_id: i32,
+    device_name: &str,
+) -> Result<(CustomUUID, String), StatusCode> {
     // Generate device ID (UUIDv7 for timestamp encoding)
     let device_id = CustomUUID::new(None);
 
@@ -43,8 +42,12 @@ async fn post_register_device(
 
     // Encrypt device name with user's SIV key
     let session = app_state.get_session(user_id).await?;
-    let encrypted_device_name = encrypt_part(&request.device_name, &session.siv_key, &session.siv_nonce)
+    let encrypted_device_name = encrypt_part(device_name, &session.siv_key, &session.siv_nonce)
         .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Wrap user private key for device token session bootstrap
+    let wrapped_user_key = auth::wrap_user_key_for_device(&secret, &session.user_keys.private_key)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Build consensus payload
@@ -53,6 +56,7 @@ async fn post_register_device(
         user_id,
         api_key_hash,
         encrypted_device_name,
+        wrapped_user_key,
     };
 
     let encoded_payload = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
@@ -60,7 +64,7 @@ async fn post_register_device(
 
     // Create signed transaction with user authentication
     let transaction = create_signed_user_transaction(
-        &app_state,
+        app_state,
         "register_device".to_string(),
         encoded_payload,
         user_id,
@@ -74,10 +78,55 @@ async fn post_register_device(
     // Build full API key: {device_id}.{secret}
     let api_key = format!("{}.{}", device_id, secret_hex);
 
-    Ok(Json(RegisterDeviceResponse {
-        device_id,
+    Ok((device_id, api_key))
+}
+
+/// POST /devices/register
+/// Generates new device token, submits to consensus, returns API key (shown once)
+async fn post_register_device(
+    State(app_state): State<AppState>,
+    Extension(user_id): Extension<i32>,
+    Json(request): Json<RegisterDeviceRequest>,
+) -> Result<Json<RegisterDeviceResponse>, StatusCode> {
+    let (device_id, api_key) = register_device_internal(&app_state, user_id, &request.device_name).await?;
+    Ok(Json(RegisterDeviceResponse { device_id, api_key }))
+}
+
+/// Ensure a FileProvider device token exists in the macOS Keychain.
+/// If no valid token exists (or a previous one was revoked), registers a new one.
+#[cfg(target_os = "macos")]
+pub async fn ensure_fileprovider_device_token(
+    app_state: &AppState,
+    user_id: i32,
+) -> Result<(), StatusCode> {
+    use crate::fileprovider::keychain::{self, KeychainEnvironment, FileProviderConfig};
+    use crate::db::devices::get_device_by_id;
+
+    // Check if a valid token already exists in keychain
+    if let Ok(config) = keychain::load_config(KeychainEnvironment::Production) {
+        if let Some(dot_pos) = config.api_key.find('.') {
+            let device_id_str = &config.api_key[..dot_pos];
+            if let Ok(device_id) = CustomUUID::from_str(device_id_str) {
+                let db_lock = app_state.db_pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                if let Ok(Some(_)) = get_device_by_id(&db_lock, &device_id) {
+                    return Ok(()); // Token still valid
+                }
+            }
+        }
+    }
+
+    // Register a new device token
+    let (_device_id, api_key) = register_device_internal(app_state, user_id, "FileProvider").await?;
+
+    // Store in keychain
+    let config = FileProviderConfig::new(
         api_key,
-    }))
+        format!("http://localhost:{}", app_state.port),
+    );
+    keychain::store_config(&config, KeychainEnvironment::Production)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(())
 }
 
 /// GET /devices

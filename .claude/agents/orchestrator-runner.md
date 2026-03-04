@@ -14,7 +14,7 @@ Execute orchestrator commands and return concise, actionable summaries. Keep ver
 
 ## Guidelines
 
-1. **Build first** - Run `cargo build --release --bin orchestrator --features skip-frontend` and `docker build -t hopnet:latest` at the start of each invocation to ensure the latest version of the orchestrator and test container are built
+1. **Build first** - Build the orchestrator with `cargo build --release --bin orchestrator --features skip-frontend`, then build and load the Docker image via the nix flake. Use `nix build .#packages.aarch64-linux.dockerImage && docker load < result` on macOS (Apple Silicon), or `nix build .#packages.x86_64-linux.dockerImage && docker load < result` on Linux x86_64. On macOS, the Linux build is delegated to a remote nix builder — do not attempt to cross-compile locally.
 2. **List meshes** - Always run `./target/release/orchestrator list` first to see current state
 3. **Follow mesh context** - The caller should specify which mesh to use or whether to create fresh. If not specified, prefer reusing existing meshes. However, if an existing mesh appears unhealthy (divergence, crashed nodes, unreachable), try a different mesh or create a fresh one.
 4. **Run commands** using `./target/release/orchestrator <command>` from the project root

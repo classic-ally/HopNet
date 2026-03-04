@@ -11,6 +11,7 @@ pub struct RegisterDevicePayload {
     pub user_id: i32,
     pub api_key_hash: Blake3Hash,           // Blake3 hash of the secret portion
     pub encrypted_device_name: String,      // SIV-encrypted, hex-encoded
+    pub wrapped_user_key: Vec<u8>,          // ChaCha20-Poly1305 wrapped user privkey
 }
 
 /// Payload for RevokeDevice consensus transaction (deletes the token)

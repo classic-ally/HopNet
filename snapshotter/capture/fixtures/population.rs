@@ -430,6 +430,7 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
             0,
             &hash_from_index(200),
             "encrypted_device_0",
+            &[0u8; 60],
         )
         .expect("Failed to insert device token 0");
 
@@ -439,6 +440,7 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
             1,
             &hash_from_index(201),
             "encrypted_device_1",
+            &[0u8; 60],
         )
         .expect("Failed to insert device token 1");
 

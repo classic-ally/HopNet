@@ -28,6 +28,7 @@ pub(crate) mod multi_user;
 mod sharing;
 mod consensus_queue;
 mod orphan_cleanup;
+mod fileprovider_device_token;
 
 /// Represents the result of a test scenario execution
 #[derive(Debug)]
@@ -151,6 +152,12 @@ pub async fn run_test_by_name(mesh_id: u32, name: &str, nodes: &[NodeInfo], flag
         "orphan-cleanup" => {
             orphan_cleanup::OrphanCleanup.run(mesh_id, nodes, flags).await
         }
+        "device-token-session-bootstrap" => {
+            fileprovider_device_token::DeviceTokenSessionBootstrap.run(mesh_id, nodes, flags).await
+        }
+        "fileprovider-device-token-auth" => {
+            fileprovider_device_token::FileProviderDeviceTokenAuth.run(mesh_id, nodes, flags).await
+        }
         _ => Err(anyhow::anyhow!("Unknown test: {}", name)),
     }
 }
@@ -180,6 +187,8 @@ pub fn list_test_names() -> Vec<&'static str> {
         "consensus-queue-cross-node",
         "consensus-queue-throughput",
         "orphan-cleanup",
+        "device-token-session-bootstrap",
+        "fileprovider-device-token-auth",
     ]
 }
 

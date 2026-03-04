@@ -2,7 +2,7 @@ import { writable } from 'svelte/store';
 
 // API Configuration - use injected port from Vite build
 declare const __BACKEND_PORT__: number;
-export const API_BASE_URL = `http://localhost:${__BACKEND_PORT__}`;
+export const API_BASE_URL = (window as any).__TAURI__ ? `http://localhost:${__BACKEND_PORT__}` : '';
 export const BACKEND_PORT = __BACKEND_PORT__;
 
 // Current browse path store

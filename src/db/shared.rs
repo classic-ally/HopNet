@@ -418,6 +418,7 @@ pub fn initialize(db: PooledConnection<SqliteConnectionManager>) -> Result<(), D
                 user_id                 INTEGER NOT NULL,
                 api_key_hash            BLOB NOT NULL,      -- Blake3 hash of secret portion
                 encrypted_device_name   TEXT NOT NULL,      -- SIV-encrypted, hex-encoded
+                wrapped_user_key        BLOB NOT NULL,      -- ChaCha20-Poly1305 wrapped user privkey
                 FOREIGN KEY (user_id) REFERENCES users(user_id)
             );
             CREATE INDEX idx_device_tokens_user_id ON device_tokens(user_id);

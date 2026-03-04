@@ -9,10 +9,11 @@ pub fn insert_device_token_tx(
     user_id: i32,
     api_key_hash: &Blake3Hash,
     encrypted_device_name: &str,
+    wrapped_user_key: &[u8],
 ) -> Result<(), DatabaseError> {
     db_tx.execute(
-        "INSERT INTO device_tokens (id, user_id, api_key_hash, encrypted_device_name) VALUES (?, ?, ?, ?)",
-        params![id, user_id, api_key_hash, encrypted_device_name],
+        "INSERT INTO device_tokens (id, user_id, api_key_hash, encrypted_device_name, wrapped_user_key) VALUES (?, ?, ?, ?, ?)",
+        params![id, user_id, api_key_hash, encrypted_device_name, wrapped_user_key],
     ).map_err(|e| {
         tracing::error!("Failed to insert device token: {:?}", e);
         DatabaseError::InsertError
@@ -42,6 +43,7 @@ pub struct DeviceTokenRecord {
     pub id: CustomUUID,
     pub user_id: i32,
     pub api_key_hash: Blake3Hash,
+    pub wrapped_user_key: Vec<u8>,
 }
 
 /// Get device by ID for auth verification (primary key lookup, O(log n))
@@ -50,12 +52,13 @@ pub fn get_device_by_id(
     device_id: &CustomUUID,
 ) -> Result<Option<DeviceTokenRecord>, DatabaseError> {
     let result = db_lock.query_row(
-        "SELECT id, user_id, api_key_hash FROM device_tokens WHERE id = ?",
+        "SELECT id, user_id, api_key_hash, wrapped_user_key FROM device_tokens WHERE id = ?",
         params![device_id],
         |row| Ok(DeviceTokenRecord {
             id: row.get(0)?,
             user_id: row.get(1)?,
             api_key_hash: row.get(2)?,
+            wrapped_user_key: row.get(3)?,
         }),
     );
 
