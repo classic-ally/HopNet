@@ -26,7 +26,13 @@ async fn test_fileprovider_integration() -> Result<(), Box<dyn std::error::Error
     }
     println!("✅ Confirmed no backend running (TestSetup failed as expected)");
     
-    // 2. Start backend binary (already built by cargo test)
+    // 2. Kill any leftover backend from a previous failed test run
+    let _ = Command::new("sh")
+        .args(&["-c", "lsof -ti :34632 | xargs kill 2>/dev/null"])
+        .output();
+    sleep(Duration::from_millis(500)).await;
+
+    // 3. Start backend binary (already built by cargo test)
     println!("🚀 Starting HopNet backend in test mode...");
     let mut backend_process = Command::new("target/debug/hopnet")
         .env("HOPNET_EPHEMERAL_DB", "1")  // Use in-memory database for testing
@@ -37,45 +43,51 @@ async fn test_fileprovider_integration() -> Result<(), Box<dyn std::error::Error
     let result: Result<(), Box<dyn std::error::Error>> = async {
         // Give backend time to start
         sleep(Duration::from_secs(3)).await;
-        
-        // 4. Fetch test credentials from backend
+
+        // 4. Verify backend health status is NotReady (no setup completed yet)
+        // Note: this check uses Swift which doesn't need test credentials, just the backend URL
+        println!("🔍 Verifying backend health status is NotReady...");
+        unsafe {
+            std::env::set_var("HOPNET_TEST_BACKEND_URL", "http://localhost:34632");
+            std::env::set_var("HOPNET_TEST_API_KEY", "placeholder");
+        }
+        let output = run_swift_command("TestSetup", "expect_not_ready");
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            return Err(format!("TestSetup expect_not_ready failed:\nStdout: {}\nStderr: {}",
+                              stdout, stderr).into());
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        println!("✅ Backend health status validated: {}", stdout.trim());
+
+        // 5. Perform initial setup (must happen before fetching test credentials,
+        //    since the test endpoint requires a user to exist for key wrapping)
+        println!("🔧 Performing initial setup...");
+        setup_backend("http://localhost:34632").await?;
+        println!("✅ Backend setup completed");
+
+        // 6. Fetch test credentials (device token) — requires user from setup
         println!("🔑 Fetching test credentials...");
         let test_response = fetch_test_credentials().await?;
-        println!("✅ Got credentials: API key = {}..., Backend URL = {}", 
+        println!("✅ Got credentials: API key = {}..., Backend URL = {}",
                  &test_response.api_key[..8], test_response.backend_url);
-        
-        // 5. Setup test environment with credentials
+
+        // 7. Setup test environment with credentials
         println!("🔧 Setting up test environment...");
         unsafe {
             std::env::set_var("HOPNET_TEST_API_KEY", &test_response.api_key);
             std::env::set_var("HOPNET_TEST_BACKEND_URL", &test_response.backend_url);
         }
         println!("📝 Set test environment variables");
-        
-        // 6. Verify backend health status is NotReady (no setup completed yet)
-        println!("🔍 Verifying backend health status is NotReady...");
-        let output = run_swift_command("TestSetup", "expect_not_ready");
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            return Err(format!("TestSetup expect_not_ready failed:\nStdout: {}\nStderr: {}", 
-                              stdout, stderr).into());
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        println!("✅ Backend health status validated: {}", stdout.trim());
-        
-        // 7. Perform initial setup to get backend to Ready state
-        println!("🔧 Performing initial setup...");
-        setup_backend(&test_response.backend_url).await?;
-        println!("✅ Backend setup completed");
-        
+
         // 8. Verify backend health status is now Ready
         println!("🔍 Verifying backend health status is now Ready...");
         let output = run_swift_command("TestSetup", "expect_ready");
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
-            return Err(format!("TestSetup expect_ready failed after setup:\nStdout: {}\nStderr: {}", 
+            return Err(format!("TestSetup expect_ready failed after setup:\nStdout: {}\nStderr: {}",
                               stdout, stderr).into());
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -456,8 +468,8 @@ fn run_swift_command(executable: &str, test_case: &str) -> std::process::Output 
 /// Fetch test credentials from the backend test endpoint
 async fn fetch_test_credentials() -> Result<TestResponse, Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
-    
-    // Try multiple times as backend might still be starting
+
+    // Try multiple times as backend might still be starting or setup still propagating
     for attempt in 1..=10 {
         match client.get("http://localhost:34632/integrations/fileprovider/test").send().await {
             Ok(response) => {
@@ -466,6 +478,13 @@ async fn fetch_test_credentials() -> Result<TestResponse, Box<dyn std::error::Er
                     return Ok(test_response);
                 } else if response.status() == 404 {
                     return Err("Test endpoint not available - ensure running in debug mode".into());
+                } else if attempt < 10 {
+                    // Retry on non-success (e.g. 428 while setup propagates through consensus)
+                    println!("⏳ Test endpoint returned {}, retrying... (attempt {}/10)", response.status(), attempt);
+                    sleep(Duration::from_millis(500)).await;
+                    continue;
+                } else {
+                    return Err(format!("Test endpoint returned {} after 10 attempts", response.status()).into());
                 }
             }
             Err(_) if attempt < 10 => {
@@ -476,7 +495,7 @@ async fn fetch_test_credentials() -> Result<TestResponse, Box<dyn std::error::Er
             Err(e) => return Err(e.into()),
         }
     }
-    
+
     Err("Failed to connect to backend after 10 attempts".into())
 }
 

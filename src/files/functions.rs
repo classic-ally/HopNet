@@ -438,6 +438,7 @@ pub struct FileReassemblyData {
 pub struct FileAccessData {
     pub file_reassembly_data: Option<FileReassemblyData>,  // None for empty files (no fragments)
     pub file_access_entry: Option<crate::db::types::FileAccess>,
+    pub file_size: u64,
 }
 
 /// Perform concurrent fragment discovery for a single chunk using work queue pattern with thread reuse
@@ -1098,11 +1099,16 @@ fn reconstruct_single_chunk(
 /// Reconstruct a file using chunked Reed-Solomon with streaming support
 /// Processes chunks sequentially, yielding each 40MB chunk as it's reconstructed
 /// Uses incremental Blake3 hashing for verification without buffering entire file in memory
+///
+/// When `range` is `Some((start, end))` (inclusive byte range), only the chunks covering
+/// that range are reconstructed and boundary chunks are sliced. Hash verification is skipped
+/// for partial content since we can't verify a partial file hash.
 pub fn reconstruct_file_chunked(
     fragments_dir: String,
     mut file_data: FileReassemblyData,
     app_state: Option<crate::AppState>,
     consensus_height: Option<i32>,
+    range: Option<(u64, u64)>,
 ) -> impl tokio_stream::Stream<Item = Result<bytes::Bytes, FileError>> {
     async_stream::try_stream! {
         // Handle empty files
@@ -1111,10 +1117,23 @@ pub fn reconstruct_file_chunked(
         }
 
         let num_chunks = file_data.chunks.len() as u32;
-        let mut hasher = blake3::Hasher::new();
+        let chunk_size = CHUNK_SIZE as u64;
+
+        // Determine which chunks to iterate
+        let (start_chunk, end_chunk, range_start, range_end) = match range {
+            Some((start, end)) => {
+                let sc = (start / chunk_size) as u32;
+                let ec = (end / chunk_size) as u32;
+                (sc, ec.min(num_chunks - 1), start, end)
+            }
+            None => (0, num_chunks - 1, 0u64, u64::MAX),
+        };
+
+        let is_range = range.is_some();
+        let mut hasher = if is_range { None } else { Some(blake3::Hasher::new()) };
 
         // Process chunks in order (streaming with per-chunk discovery for rate-matching)
-        for chunk_number in 0..num_chunks {
+        for chunk_number in start_chunk..=end_chunk {
             // Perform fragment discovery for this chunk if needed (rate-matched to client download speed)
             if let Some(ref state) = app_state {
                 perform_concurrent_fragment_discovery(
@@ -1153,33 +1172,55 @@ pub fn reconstruct_file_chunked(
                 &file_data.per_file_key,
             )?;
 
-            // Remove padding from last chunk before hashing
+            // Remove padding from last chunk before hashing/slicing
             if chunk_number == num_chunks - 1 && file_data.added_bytes > 0 {
                 let final_length = chunk_bytes.len().saturating_sub(file_data.added_bytes as usize);
                 chunk_bytes.truncate(final_length);
             }
 
-            // Update incremental hash
-            hasher.update(&chunk_bytes);
+            if is_range {
+                // Slice boundary chunks for range requests
+                let chunk_start_byte = chunk_number as u64 * chunk_size;
+                let slice_start = if chunk_number == start_chunk {
+                    (range_start - chunk_start_byte) as usize
+                } else {
+                    0
+                };
+                let slice_end = if chunk_number == end_chunk {
+                    ((range_end - chunk_start_byte) as usize + 1).min(chunk_bytes.len())
+                } else {
+                    chunk_bytes.len()
+                };
 
-            // Yield this chunk to the stream (no buffering!)
-            yield bytes::Bytes::from(chunk_bytes);
+                if slice_start < chunk_bytes.len() && slice_start < slice_end {
+                    yield bytes::Bytes::from(chunk_bytes[slice_start..slice_end].to_vec());
+                }
+            } else {
+                // Full download: update incremental hash and yield
+                if let Some(ref mut h) = hasher {
+                    h.update(&chunk_bytes);
+                }
+                yield bytes::Bytes::from(chunk_bytes);
+            }
         }
 
-        // Verify final hash after all chunks processed
-        // Note: Hash includes data_block_id as per upload flow
-        hasher.update(file_data.data_block_id.as_bytes());
-        let computed_hash = Blake3Hash::from(hasher.finalize());
-        if computed_hash != file_data.expected_file_hash {
-            tracing::error!(
-                "Hash mismatch for data_block_id {}: expected {}, got {}",
-                file_data.data_block_id,
-                file_data.expected_file_hash.to_hex(),
-                computed_hash.to_hex()
-            );
-            Err(FileError::HashMismatch)?;
-        }
+        // Verify final hash after all chunks processed (only for full downloads)
+        if let Some(hasher) = hasher {
+            // Note: Hash includes data_block_id as per upload flow
+            let mut hasher = hasher;
+            hasher.update(file_data.data_block_id.as_bytes());
+            let computed_hash = Blake3Hash::from(hasher.finalize());
+            if computed_hash != file_data.expected_file_hash {
+                tracing::error!(
+                    "Hash mismatch for data_block_id {}: expected {}, got {}",
+                    file_data.data_block_id,
+                    file_data.expected_file_hash.to_hex(),
+                    computed_hash.to_hex()
+                );
+                Err(FileError::HashMismatch)?;
+            }
 
-        tracing::info!("File reconstruction complete and verified: {}", file_data.data_block_id);
+            tracing::info!("File reconstruction complete and verified: {}", file_data.data_block_id);
+        }
     }
 }

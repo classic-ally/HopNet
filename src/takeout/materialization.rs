@@ -1,5 +1,5 @@
 use crate::db::{CustomUUID, takeout::MaterializationStatus};
-use crate::files::download::{reconstruct_file_for_user, FileReconstructionError};
+use crate::files::download::{reconstruct_file_stream, FileReconstructionError};
 
 /// Materialize a single file by reconstructing from fragments and writing to staging
 /// Returns (file_id, status, optional_error_message) for database update
@@ -33,7 +33,7 @@ pub async fn materialize_single_file(
 
     // Use shared file reconstruction logic
     // Get streaming reconstruction (memory-efficient for large files)
-    let mut stream = match reconstruct_file_for_user(
+    let mut stream = match reconstruct_file_stream(
         app_state,
         encrypted_path.clone(),
         user_id,

@@ -366,8 +366,20 @@ pub fn delete_files(
     // Log ancestor folder modifications (reusing existing logic)
     log_ancestor_modifications(db_tx, &path, user_id, current_height)?;
 
+    // Verify items exist before attempting deletion (separate from INSERT OR IGNORE
+    // which may report 0 rows if modification_log already has entries at this height)
+    let item_count: i32 = db_tx.query_row(
+        "SELECT COUNT(*) FROM inodes WHERE (path = ? OR path LIKE ?) AND owner_id = ?",
+        params![path, format!("{}/%", path), user_id],
+        |row| row.get(0),
+    ).map_err(|_| DatabaseError::RecallError)?;
+
+    if item_count == 0 {
+        return Err(DatabaseError::NotFound);
+    }
+
     // Log deletion for ALL items that will be deleted (target + children) in a single SQL operation
-    let logged_count = db_tx.execute(
+    db_tx.execute(
         r#"
         INSERT OR IGNORE INTO modification_log (inode_id, owner_id, old_parent_id, modified_at_height)
         SELECT
@@ -390,11 +402,7 @@ pub fn delete_files(
         DatabaseError::ProcessingError
     })?;
 
-    if logged_count == 0 {
-        return Err(DatabaseError::NotFound);
-    }
-
-    tracing::debug!("Logged deletion of {} items (including children and ancestors) at height {}", logged_count, current_height);
+    tracing::debug!("Logged deletion of {} items at height {}", item_count, current_height);
 
     // Phase 2b: Clean up share memberships and pending outgoing shares for deleted files
     {
@@ -680,12 +688,13 @@ pub fn get_file_fragments(
                 return Ok(crate::files::functions::FileAccessData {
                     file_reassembly_data: None,  // No fragments for empty files
                     file_access_entry: None,     // No encryption for empty files
+                    file_size: 0,
                 });
             }
 
             // Non-empty file: query for fragments with reassembly info (now chunk-aware)
             let mut stmt = db_lock.prepare(
-                "SELECT db.id, db.file_hash, db.added_bytes, db.placement_height, fh.chunk_number, fh.local_index, fh.fragment_id, fh.fragment_hash, fh.chunk_type, fh.stored_locally
+                "SELECT db.id, db.file_hash, db.added_bytes, db.placement_height, fh.chunk_number, fh.local_index, fh.fragment_id, fh.fragment_hash, fh.chunk_type, fh.stored_locally, db.file_size
                  FROM inodes i
                  JOIN data_blocks db ON i.data_id = db.id
                  JOIN fragment_hashes fh ON db.id = fh.data_block_id
@@ -704,13 +713,15 @@ pub fn get_file_fragments(
                 let fragment_hash: Blake3Hash = row.get(7)?;
                 let chunk_type: crate::db::ChunkType = row.get(8)?;
                 let stored_locally: bool = row.get(9)?;
-                Ok((data_block_id, file_hash, added_bytes, placement_height, chunk_number, local_index, fragment_id, fragment_hash, chunk_type, stored_locally))
+                let file_size: u64 = row.get::<_, i64>(10).unwrap_or(0) as u64;
+                Ok((data_block_id, file_hash, added_bytes, placement_height, chunk_number, local_index, fragment_id, fragment_hash, chunk_type, stored_locally, file_size))
             }).map_err(|_| DatabaseError::ProcessingError)?;
 
             let mut data_block_id: Option<CustomUUID> = None;
             let mut file_hash: Option<Blake3Hash> = None;
             let mut added_bytes: Option<u8> = None;
             let mut placement_height: Option<i32> = None;
+            let mut db_file_size: u64 = 0;
 
             // Group fragments by chunk_number: chunk_number -> (original_frags, recovery_frags)
             let mut chunks_map: std::collections::HashMap<u32, (
@@ -719,13 +730,14 @@ pub fn get_file_fragments(
             )> = std::collections::HashMap::new();
 
             for row in rows {
-                let (d_block_id, f_hash, a_bytes, p_height, chunk_number, local_index, fragment_id, fragment_hash, chunk_type, stored_locally) = row.map_err(|_| DatabaseError::ProcessingError)?;
+                let (d_block_id, f_hash, a_bytes, p_height, chunk_number, local_index, fragment_id, fragment_hash, chunk_type, stored_locally, f_size) = row.map_err(|_| DatabaseError::ProcessingError)?;
 
                 if data_block_id.is_none() {
                     data_block_id = Some(d_block_id);
                     file_hash = Some(f_hash);
                     added_bytes = Some(a_bytes);
                     placement_height = p_height;
+                    db_file_size = f_size;
                 }
 
                 // Get or create entry for this chunk
@@ -771,6 +783,7 @@ pub fn get_file_fragments(
                     Ok(crate::files::functions::FileAccessData {
                         file_reassembly_data: Some(file_reassembly_data),  // Wrap in Some for non-empty files
                         file_access_entry,
+                        file_size: db_file_size,
                     })
                 },
                 _ => Err(DatabaseError::RecallError), // File not found

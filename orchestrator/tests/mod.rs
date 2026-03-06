@@ -29,6 +29,7 @@ mod sharing;
 mod consensus_queue;
 mod orphan_cleanup;
 mod fileprovider_device_token;
+mod range_download;
 mod recents;
 
 /// Represents the result of a test scenario execution
@@ -162,6 +163,9 @@ pub async fn run_test_by_name(mesh_id: u32, name: &str, nodes: &[NodeInfo], flag
         "recents-ordering" => {
             recents::RecentsOrdering.run(mesh_id, nodes, flags).await
         }
+        "range-download" => {
+            range_download::RangeDownload.run(mesh_id, nodes, flags).await
+        }
         _ => Err(anyhow::anyhow!("Unknown test: {}", name)),
     }
 }
@@ -194,6 +198,7 @@ pub fn list_test_names() -> Vec<&'static str> {
         "device-token-session-bootstrap",
         "fileprovider-device-token-auth",
         "recents-ordering",
+        "range-download",
     ]
 }
 

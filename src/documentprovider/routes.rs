@@ -168,7 +168,7 @@ pub async fn get_download(
         .unwrap_or_else(|| "application/octet-stream".to_string());
 
     // Use shared file reconstruction logic (handles empty files internally)
-    let stream = crate::files::download::reconstruct_file_for_user(
+    let stream = crate::files::download::reconstruct_file_stream(
         &app_state,
         encrypted_path,
         user_id,

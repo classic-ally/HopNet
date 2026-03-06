@@ -1,5 +1,5 @@
 use axum::{
-    extract::{State, Multipart},
+    extract::{DefaultBodyLimit, State, Multipart},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post, put},
@@ -24,6 +24,7 @@ pub fn router() -> Router<AppState> {
         .route("/me", get(get_me))
         .route("/me/profile", put(put_profile))
         .route("/me/avatar", put(put_avatar))
+        .layer(DefaultBodyLimit::max(16_000_000)) // 16MB — matches frontend avatar size check
 }
 
 fn user_to_public(u: &User) -> PublicUserInfo {

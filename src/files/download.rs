@@ -2,6 +2,20 @@ use crate::db::{DatabaseError, files};
 use crate::files::functions;
 use axum::http::StatusCode;
 
+/// Inclusive byte range for partial content requests
+pub struct ByteRange {
+    pub start: u64,
+    pub end: u64,
+}
+
+/// Result of file download preparation (range-aware)
+pub struct FileDownloadInfo {
+    pub stream: std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<bytes::Bytes, functions::FileError>> + Send>>,
+    pub file_size: u64,
+    pub is_partial: bool,
+    pub range: Option<ByteRange>,
+}
+
 #[derive(Debug)]
 pub enum FileReconstructionError {
     NotFound,
@@ -10,6 +24,7 @@ pub enum FileReconstructionError {
     ReassemblyError(functions::FileError),
     KeyDecryptionError,
     InternalError,
+    RangeNotSatisfiable(u64),
 }
 
 impl From<DatabaseError> for FileReconstructionError {
@@ -36,74 +51,140 @@ impl From<FileReconstructionError> for StatusCode {
             FileReconstructionError::ReassemblyError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             FileReconstructionError::KeyDecryptionError => StatusCode::FORBIDDEN,
             FileReconstructionError::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
+            FileReconstructionError::RangeNotSatisfiable(_) => StatusCode::RANGE_NOT_SATISFIABLE,
         }
     }
 }
 
-/// Reconstruct a file with proper key decryption and access control
-/// Returns a stream of file chunks for memory-efficient downloads
-/// This is the shared logic used by both download routes and takeout materialization
-pub async fn reconstruct_file_for_user(
-    app_state: &crate::AppState,
-    encrypted_path: String,
-    user_id: i32,
-    fragments_dir: &str,
-) -> Result<std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<bytes::Bytes, functions::FileError>> + Send>>, FileReconstructionError> {
-    // Get file access data from database
-    let file_access_data = files::get_file_fragments(app_state.db_pool.get(), encrypted_path.clone(), user_id)?;
+enum PreparedFile {
+    Empty,
+    Ready {
+        file_data: functions::FileReassemblyData,
+        file_size: u64,
+        placement_height: Option<i32>,
+    },
+}
 
-    // Handle empty files (no fragments, no encryption)
+/// Shared preparation: DB lookup, empty-file check, key decryption
+async fn prepare_file_data(
+    app_state: &crate::AppState,
+    encrypted_path: &str,
+    user_id: i32,
+) -> Result<PreparedFile, FileReconstructionError> {
+    let file_access_data = files::get_file_fragments(app_state.db_pool.get(), encrypted_path.to_string(), user_id)?;
+    let file_size = file_access_data.file_size;
+
     let file_data = match file_access_data.file_reassembly_data {
         None => {
-            // Empty file case - return empty stream
-            tracing::debug!("Downloading empty file: {}", encrypted_path);
-            return Ok(Box::pin(async_stream::try_stream! {
-                // Type hint for empty stream (never executed)
-                if false {
-                    yield bytes::Bytes::new();
-                }
-            }));
+            tracing::debug!("Empty file: {}", encrypted_path);
+            return Ok(PreparedFile::Empty);
         }
         Some(data) => data,
     };
 
-    // Extract placement_height before moving file_data
     let placement_height = file_data.placement_height;
 
-    // Decrypt the per-file key if user has access
     let mut file_data = file_data;
     if let Some(file_access_entry) = file_access_data.file_access_entry {
-        // Get user's private key from session store
         let session = app_state.get_session(user_id).await
             .map_err(|_| FileReconstructionError::InternalError)?;
-
-        // Derive user's X25519 private key from session private key
         let user_x25519_privkey = crate::auth::derive_x25519_privkey_from_user(&session.user_keys.private_key);
-        
-        // Decrypt the wrapped per-file key
+
         match crate::auth::decrypt_wrapped_file_key(&file_access_entry, &user_x25519_privkey) {
-            Ok(per_file_key) => {
-                file_data.per_file_key = Some(per_file_key);
-            }
+            Ok(per_file_key) => { file_data.per_file_key = Some(per_file_key); }
             Err(e) => {
                 tracing::error!("Failed to decrypt file key for {}: {:?}", encrypted_path, e);
                 return Err(FileReconstructionError::KeyDecryptionError);
             }
         }
     } else {
-        // User doesn't have access to this file
         tracing::warn!("User {} does not have access to file {}", user_id, encrypted_path);
         return Err(FileReconstructionError::Forbidden);
     }
-    
-    // Return streaming reconstruction (yields 40MB chunks as they're reconstructed)
-    let stream = functions::reconstruct_file_chunked(
-        fragments_dir.to_string(),
-        file_data,
-        Some(app_state.clone()),
-        placement_height
-    );
 
-    tracing::debug!("Starting streaming reconstruction for file {}", encrypted_path);
-    Ok(Box::pin(stream))
+    Ok(PreparedFile::Ready { file_data, file_size, placement_height })
+}
+
+fn empty_stream() -> std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<bytes::Bytes, functions::FileError>> + Send>> {
+    Box::pin(async_stream::try_stream! {
+        if false { yield bytes::Bytes::new(); }
+    })
+}
+
+/// Full-file streaming reconstruction (no range support)
+/// Used by takeout materialization and document provider
+pub async fn reconstruct_file_stream(
+    app_state: &crate::AppState,
+    encrypted_path: String,
+    user_id: i32,
+    fragments_dir: &str,
+) -> Result<std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<bytes::Bytes, functions::FileError>> + Send>>, FileReconstructionError> {
+    match prepare_file_data(app_state, &encrypted_path, user_id).await? {
+        PreparedFile::Empty => Ok(empty_stream()),
+        PreparedFile::Ready { file_data, placement_height, .. } => {
+            let stream = functions::reconstruct_file_chunked(
+                fragments_dir.to_string(),
+                file_data,
+                Some(app_state.clone()),
+                placement_height,
+                None,
+            );
+            tracing::debug!("Starting streaming reconstruction for file {}", encrypted_path);
+            Ok(Box::pin(stream))
+        }
+    }
+}
+
+/// Range-aware file reconstruction for the download route
+/// Returns FileDownloadInfo with stream, file_size, and range metadata for building HTTP responses
+pub async fn reconstruct_file_range(
+    app_state: &crate::AppState,
+    encrypted_path: String,
+    user_id: i32,
+    fragments_dir: &str,
+    requested_range: Option<(u64, Option<u64>)>,
+) -> Result<FileDownloadInfo, FileReconstructionError> {
+    match prepare_file_data(app_state, &encrypted_path, user_id).await? {
+        PreparedFile::Empty => {
+            Ok(FileDownloadInfo {
+                stream: empty_stream(),
+                file_size: 0,
+                is_partial: false,
+                range: None,
+            })
+        }
+        PreparedFile::Ready { file_data, file_size, placement_height } => {
+            let resolved_range = match requested_range {
+                Some((start, end_opt)) => {
+                    if start >= file_size {
+                        return Err(FileReconstructionError::RangeNotSatisfiable(file_size));
+                    }
+                    let end = end_opt.unwrap_or(file_size - 1).min(file_size - 1);
+                    Some(ByteRange { start, end })
+                }
+                None => None,
+            };
+
+            let range_tuple = resolved_range.as_ref().map(|r| (r.start, r.end));
+            let is_partial = resolved_range.is_some();
+
+            let stream = functions::reconstruct_file_chunked(
+                fragments_dir.to_string(),
+                file_data,
+                Some(app_state.clone()),
+                placement_height,
+                range_tuple,
+            );
+
+            tracing::debug!("Starting {} reconstruction for file {}",
+                if is_partial { "partial" } else { "full" }, encrypted_path);
+
+            Ok(FileDownloadInfo {
+                stream: Box::pin(stream),
+                file_size,
+                is_partial,
+                range: resolved_range,
+            })
+        }
+    }
 }

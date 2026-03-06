@@ -1,7 +1,7 @@
 <script lang="ts">
     import { tokenStore, API_BASE_URL } from '../stores'
     import Button from '../Button.svelte'
-    import { onMount } from 'svelte'
+    import { onMount, untrack } from 'svelte'
     import type { FileItem } from '../types'
     import { InodeType } from '../types'
     import { getFileName, getFileExtension, getFileIcon } from '../utils/formatters'
@@ -28,14 +28,13 @@
             mimeType: 'text/plain',
             component: 'pre',
             maxSize: 1024 * 1024, // 1MB limit for text files
-        }
-        // Future support could include:
-        // image: {
-        //     extensions: ['jpg', 'jpeg', 'png', 'gif', 'svg', 'webp'],
-        //     mimeType: 'image/*',
-        //     component: 'img',
-        //     maxSize: null,
-        // },
+        },
+        image: {
+            extensions: ['jpg', 'jpeg', 'png', 'gif', 'svg', 'webp'],
+            mimeType: 'image/*',
+            component: 'img',
+            maxSize: null,
+        },
     } as const
 
     type PreviewType = keyof typeof SUPPORTED_PREVIEW_TYPES
@@ -278,11 +277,14 @@
     }
 
     // Refetch preview when file changes
+    // Re-fetch only when the file prop changes — untrack the side effects
+    // to prevent $effect from re-triggering when fetchFilePreview writes to $state vars
     $effect(() => {
-        if (file) {
+        file;  // track only the file prop
+        untrack(() => {
             cleanupPreviousPreview()
             fetchFilePreview()
-        }
+        })
     })
 
     onMount(() => {
@@ -355,6 +357,11 @@
                         class="w-full h-full"
                         title="PDF Preview"
                     />
+                </div>
+            {:else if previewType === 'image' && previewUrl}
+                <!-- Image Preview -->
+                <div class="h-full flex items-center justify-center p-4 overflow-auto">
+                    <img src={previewUrl} alt={filename} class="max-w-full max-h-full object-contain" />
                 </div>
             {:else if (previewType === 'text' || previewType === 'code') && fileTooLarge}
                 <!-- File Too Large Warning -->

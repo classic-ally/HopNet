@@ -730,3 +730,79 @@ pub fn verify_fragment_redundancy(
 
     checks
 }
+
+// ============================================================================
+// Range Download Helpers
+// ============================================================================
+
+/// Response metadata from a download request
+pub struct DownloadHeaders {
+    pub status: u16,
+    pub content_type: Option<String>,
+    pub accept_ranges: Option<String>,
+    pub content_length: Option<u64>,
+    pub content_range: Option<String>,
+}
+
+/// Download a file and return response headers (full download, no Range header)
+pub async fn download_file_headers(node: &NodeInfo, path: &str) -> Result<(Vec<u8>, DownloadHeaders)> {
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()?;
+    let path_trimmed = path.strip_prefix('/').unwrap_or(path);
+    let url = format!("http://{}:{}/files/{}", node.ip_address, node.port, path_trimmed);
+
+    let response = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", node.jwt_token))
+        .send()
+        .await?;
+
+    let headers = DownloadHeaders {
+        status: response.status().as_u16(),
+        content_type: response.headers().get("content-type").and_then(|v| v.to_str().ok()).map(|s| s.to_string()),
+        accept_ranges: response.headers().get("accept-ranges").and_then(|v| v.to_str().ok()).map(|s| s.to_string()),
+        content_length: response.headers().get("content-length").and_then(|v| v.to_str().ok()).and_then(|s| s.parse().ok()),
+        content_range: response.headers().get("content-range").and_then(|v| v.to_str().ok()).map(|s| s.to_string()),
+    };
+
+    let bytes = response.bytes().await?.to_vec();
+    Ok((bytes, headers))
+}
+
+/// Download a file with a Range header and return status, headers, and body bytes
+pub async fn download_file_range(
+    node: &NodeInfo,
+    path: &str,
+    start: u64,
+    end: Option<u64>,
+) -> Result<(Vec<u8>, DownloadHeaders)> {
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()?;
+    let path_trimmed = path.strip_prefix('/').unwrap_or(path);
+    let url = format!("http://{}:{}/files/{}", node.ip_address, node.port, path_trimmed);
+
+    let range_value = match end {
+        Some(e) => format!("bytes={}-{}", start, e),
+        None => format!("bytes={}-", start),
+    };
+
+    let response = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", node.jwt_token))
+        .header("Range", range_value)
+        .send()
+        .await?;
+
+    let headers = DownloadHeaders {
+        status: response.status().as_u16(),
+        content_type: response.headers().get("content-type").and_then(|v| v.to_str().ok()).map(|s| s.to_string()),
+        accept_ranges: response.headers().get("accept-ranges").and_then(|v| v.to_str().ok()).map(|s| s.to_string()),
+        content_length: response.headers().get("content-length").and_then(|v| v.to_str().ok()).and_then(|s| s.parse().ok()),
+        content_range: response.headers().get("content-range").and_then(|v| v.to_str().ok()).map(|s| s.to_string()),
+    };
+
+    let bytes = response.bytes().await?.to_vec();
+    Ok((bytes, headers))
+}

@@ -374,47 +374,85 @@ pub async fn get_recent_files(
 
 pub async fn get_file_fragments(
     State(app_state): State<AppState>,
-    Extension(user_id): Extension<i32>,  // Extract user_id from JWT via auth middleware
-    Path(path): Path<String>
+    Extension(user_id): Extension<i32>,
+    Path(path): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Response<Body>, StatusCode> {
     let session = app_state.get_session(user_id).await?;
-    // Convert the path: /files/ -> "/" and /files/test -> "/test"
     let file_path = if path.is_empty() {
         "/".to_string()
     } else {
         format!("/{}", path)
     };
 
-    // Extract filename from path for Content-Disposition header
     let filename = path.split('/').last().unwrap_or("download");
 
-    // Encrypt the path for database lookup
+    // Parse Range header: supports "bytes=START-END" and "bytes=START-" (single range only)
+    let requested_range = headers.get(header::RANGE).and_then(|val| {
+        let s = val.to_str().ok()?;
+        let s = s.strip_prefix("bytes=")?;
+        // Ignore multi-range (contains comma)
+        if s.contains(',') { return None; }
+        let mut parts = s.splitn(2, '-');
+        let start: u64 = parts.next()?.parse().ok()?;
+        let end: Option<u64> = parts.next().and_then(|e| {
+            if e.is_empty() { None } else { e.parse().ok() }
+        });
+        Some((start, end))
+    });
+
     let enc_path = encrypt_path(file_path, &session.siv_key, &session.siv_nonce)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    
-    // Use shared file reconstruction logic (returns stream for memory efficiency)
-    let stream = match crate::files::download::reconstruct_file_for_user(
+
+    let download_info = match crate::files::download::reconstruct_file_range(
         &app_state,
         enc_path,
         user_id,
         &app_state.fragments_dir,
+        requested_range,
     ).await {
-        Ok(stream) => stream,
+        Ok(info) => info,
+        Err(crate::files::download::FileReconstructionError::RangeNotSatisfiable(file_size)) => {
+            let response = Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header(header::CONTENT_RANGE, format!("bytes */{}", file_size))
+                .body(Body::empty())
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            return Ok(response);
+        }
         Err(e) => {
             tracing::error!("Error reconstructing file: {:?}", e);
             return Err(StatusCode::from(e));
         }
     };
 
-    // Build streaming response with proper headers
-    let response = Response::builder()
-        .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{}\"", filename))
-        .header(header::CONTENT_TYPE, "application/octet-stream")
-        .body(Body::from_stream(stream))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    
-    Ok(response)
+    // Detect MIME type from filename
+    let content_type = mime_guess::from_path(filename)
+        .first_raw()
+        .unwrap_or("application/octet-stream");
+
+    let mut builder = Response::builder()
+        .header(header::CONTENT_DISPOSITION, format!("inline; filename=\"{}\"", filename))
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::ACCEPT_RANGES, "bytes");
+
+    if download_info.is_partial {
+        let range = download_info.range.as_ref().unwrap();
+        let content_length = range.end - range.start + 1;
+        builder = builder
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header(header::CONTENT_LENGTH, content_length)
+            .header(header::CONTENT_RANGE, format!("bytes {}-{}/{}", range.start, range.end, download_info.file_size));
+    } else {
+        builder = builder
+            .status(StatusCode::OK)
+            .header(header::CONTENT_LENGTH, download_info.file_size);
+    }
+
+    builder
+        .body(Body::from_stream(download_info.stream))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 /// Build a SelfCheckFragments transaction for fragments being uploaded

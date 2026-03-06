@@ -498,11 +498,12 @@ pub async fn download_file(
     // Convert to route path format (remove leading slash)
     let route_path = decrypted_path.trim_start_matches('/').to_string();
     
-    // Forward to existing file download route
+    // Forward to existing file download route (no Range header from fileprovider)
     crate::files::routes::get_file_fragments(
         State(app_state),
         axum::extract::Extension(user_id),
         axum::extract::Path(route_path),
+        axum::http::HeaderMap::new(),
     ).await.into_response()
 }
 
