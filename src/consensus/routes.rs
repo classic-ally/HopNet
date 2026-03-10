@@ -959,7 +959,7 @@ async fn fetch_and_validate_with_retry(
 
     // Shuffle validators to distribute load randomly
     let mut shuffled_validators = validators.to_vec();
-    shuffled_validators.shuffle(&mut rand::thread_rng());
+    shuffled_validators.shuffle(&mut rand::rng());
 
     for (attempt, validator) in shuffled_validators.iter().enumerate() {
         // Attempt to fetch view data
@@ -1086,7 +1086,7 @@ pub async fn ensure_caught_up_and_active(
     let sync_status = {
         let _guard = app_state.consensus_lock.lock().await;
 
-        let mut sync_status = SyncStatus::CaughtUp;
+        let sync_status;
 
         // Perform appropriate catch-up based on mode
         match mode {
@@ -1476,7 +1476,7 @@ pub async fn jwt_or_rpc_auth_middleware(
 // RPC middleware for verifying node Ed25519 signatures on inter-node requests
 pub async fn rpc_auth_middleware(
     State(app_state): State<AppState>,
-    mut req: Request<Body>,
+    req: Request<Body>,
     next: Next,
 ) -> impl IntoResponse {
     // Extract required headers

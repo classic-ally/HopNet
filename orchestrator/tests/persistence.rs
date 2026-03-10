@@ -16,10 +16,9 @@ use crate::NodeInfo;
 /// Stop a container by node ID
 pub async fn stop_node(docker: &Docker, mesh_id: u32, node_id: u32) -> Result<()> {
     let containers = docker
-        .list_containers(Some(bollard::container::ListContainersOptions::<String> {
-            all: true,
-            ..Default::default()
-        }))
+        .list_containers(Some(bollard::query_parameters::ListContainersOptionsBuilder::new()
+            .all(true)
+            .build()))
         .await?;
 
     for container in containers {
@@ -29,7 +28,7 @@ pub async fn stop_node(docker: &Docker, mesh_id: u32, node_id: u32) -> Result<()
             {
                 if let Some(id) = &container.id {
                     docker
-                        .stop_container(id, None::<bollard::container::StopContainerOptions>)
+                        .stop_container(id, None::<bollard::query_parameters::StopContainerOptions>)
                         .await?;
                     return Ok(());
                 }
@@ -43,10 +42,9 @@ pub async fn stop_node(docker: &Docker, mesh_id: u32, node_id: u32) -> Result<()
 /// Start a container by node ID
 pub async fn start_node(docker: &Docker, mesh_id: u32, node_id: u32) -> Result<()> {
     let containers = docker
-        .list_containers(Some(bollard::container::ListContainersOptions::<String> {
-            all: true,
-            ..Default::default()
-        }))
+        .list_containers(Some(bollard::query_parameters::ListContainersOptionsBuilder::new()
+            .all(true)
+            .build()))
         .await?;
 
     for container in containers {
@@ -56,7 +54,7 @@ pub async fn start_node(docker: &Docker, mesh_id: u32, node_id: u32) -> Result<(
             {
                 if let Some(id) = &container.id {
                     docker
-                        .start_container(id, None::<bollard::container::StartContainerOptions<String>>)
+                        .start_container(id, None::<bollard::query_parameters::StartContainerOptions>)
                         .await?;
                     return Ok(());
                 }

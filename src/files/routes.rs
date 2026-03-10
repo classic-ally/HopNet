@@ -672,7 +672,7 @@ pub async fn post_files(
     
     tracing::debug!("Final path after ALL path processing: '{}'", path);
     
-    while let Some(mut part) = multipart.next_field().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? {
+    while let Some(part) = multipart.next_field().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? {
         match part.name() {
             Some(field_name) if field_name.starts_with("file_") => {
                 has_files = true;

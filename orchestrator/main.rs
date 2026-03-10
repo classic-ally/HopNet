@@ -159,8 +159,8 @@ async fn main() -> Result<()> {
 
 async fn get_next_mesh_id(docker: &Docker) -> Result<u32> {
     // Get all existing mesh IDs
-    let networks = docker.list_networks(None::<bollard::network::ListNetworksOptions<String>>).await?;
-    
+    let networks = docker.list_networks(None::<bollard::query_parameters::ListNetworksOptions>).await?;
+
     let mut mesh_ids: Vec<u32> = Vec::new();
     
     // Find all hopnet-orchestrator networks and extract mesh IDs
@@ -196,8 +196,8 @@ async fn list_meshes(docker: &Docker) -> Result<()> {
     println!("HopNet Orchestrator - Listing Meshes");
     
     // List all networks that match hopnet-orchestrator-* pattern
-    let networks = docker.list_networks(None::<bollard::network::ListNetworksOptions<String>>).await?;
-    
+    let networks = docker.list_networks(None::<bollard::query_parameters::ListNetworksOptions>).await?;
+
     let mut meshes: HashMap<u32, Vec<String>> = HashMap::new();
     
     // Find hopnet-orchestrator networks and extract mesh IDs
@@ -274,8 +274,8 @@ async fn cleanup_mesh_resources(
         let docker_clone = docker.clone();
         let task = tokio::spawn(async move {
             println!("  Stopping and removing container: {}", name);
-            let _ = docker_clone.stop_container(&container_id, None::<bollard::container::StopContainerOptions>).await;
-            let _ = docker_clone.remove_container(&container_id, None::<bollard::container::RemoveContainerOptions>).await;
+            let _ = docker_clone.stop_container(&container_id, None::<bollard::query_parameters::StopContainerOptions>).await;
+            let _ = docker_clone.remove_container(&container_id, None::<bollard::query_parameters::RemoveContainerOptions>).await;
         });
         tasks.push(task);
     }
@@ -284,7 +284,7 @@ async fn cleanup_mesh_resources(
     }
 
     // Remove volumes
-    if let Ok(volumes) = docker.list_volumes(None::<bollard::volume::ListVolumesOptions<String>>).await {
+    if let Ok(volumes) = docker.list_volumes(None::<bollard::query_parameters::ListVolumesOptions>).await {
         if let Some(volume_list) = volumes.volumes {
             let mut tasks = Vec::new();
             for volume in volume_list {
@@ -296,7 +296,7 @@ async fn cleanup_mesh_resources(
                     let docker_clone = docker.clone();
                     let task = tokio::spawn(async move {
                         println!("  Removing volume: {}", volume_name);
-                        let _ = docker_clone.remove_volume(&volume_name, None::<bollard::volume::RemoveVolumeOptions>).await;
+                        let _ = docker_clone.remove_volume(&volume_name, None::<bollard::query_parameters::RemoveVolumeOptions>).await;
                     });
                     tasks.push(task);
                 }
@@ -488,8 +488,8 @@ async fn add_nodes_to_mesh(docker: &Docker, mesh_id: u32, node_count: u32, runti
 
 async fn create_hopnet_network(docker: &Docker, network_name: &str) -> Result<String> {
     // Use the simple create_network method with just name
-    let options = bollard::network::CreateNetworkOptions {
-        name: network_name,
+    let options = bollard::models::NetworkCreateRequest {
+        name: network_name.to_string(),
         ..Default::default()
     };
     
@@ -560,10 +560,10 @@ async fn create_hopnet_container(
     vol_labels.insert("hopnet.mesh_id".to_string(), mesh_id.to_string());
     vol_labels.insert("hopnet.node_id".to_string(), node_id.to_string());
 
-    let volume_config = bollard::volume::CreateVolumeOptions {
-        name: volume_name.clone(),
-        driver: "local".to_string(),
-        labels: vol_labels,
+    let volume_config = bollard::models::VolumeCreateOptions {
+        name: Some(volume_name.clone()),
+        driver: Some("local".to_string()),
+        labels: Some(vol_labels),
         ..Default::default()
     };
 
@@ -609,11 +609,11 @@ async fn create_hopnet_container(
     
     // Start the container
     docker
-        .start_container(&container_id, None::<bollard::container::StartContainerOptions<String>>)
+        .start_container(&container_id, None::<bollard::query_parameters::StartContainerOptions>)
         .await?;
     
     // Get the container's IP address
-    let container_info = docker.inspect_container(&container_id, None::<bollard::container::InspectContainerOptions>).await?;
+    let container_info = docker.inspect_container(&container_id, None::<bollard::query_parameters::InspectContainerOptions>).await?;
     let ip_address = container_info
         .network_settings
         .and_then(|ns| ns.networks)
@@ -954,12 +954,12 @@ async fn delete_mesh(docker: &Docker, mesh_id: u32, skip_confirmation: bool) -> 
                 let docker_clone = docker.clone();
                 let task = tokio::spawn(async move {
                     println!("  Stopping container: {}", name);
-                    if let Err(e) = docker_clone.stop_container(&id, None::<bollard::container::StopContainerOptions>).await {
+                    if let Err(e) = docker_clone.stop_container(&id, None::<bollard::query_parameters::StopContainerOptions>).await {
                         println!("    Warning: Failed to stop container {}: {}", name, e);
                     }
-                    
+
                     println!("  Removing container: {}", name);
-                    if let Err(e) = docker_clone.remove_container(&id, None::<bollard::container::RemoveContainerOptions>).await {
+                    if let Err(e) = docker_clone.remove_container(&id, None::<bollard::query_parameters::RemoveContainerOptions>).await {
                         println!("    Warning: Failed to remove container {}: {}", name, e);
                     }
                 });
@@ -975,7 +975,7 @@ async fn delete_mesh(docker: &Docker, mesh_id: u32, skip_confirmation: bool) -> 
 
     // Delete volumes for this mesh (in parallel)
     println!("Removing volumes...");
-    let volumes = docker.list_volumes(None::<bollard::volume::ListVolumesOptions<String>>).await?;
+    let volumes = docker.list_volumes(None::<bollard::query_parameters::ListVolumesOptions>).await?;
     if let Some(volume_list) = volumes.volumes {
         let mesh_volumes: Vec<_> = volume_list.into_iter()
             .filter(|v| {
@@ -992,7 +992,7 @@ async fn delete_mesh(docker: &Docker, mesh_id: u32, skip_confirmation: bool) -> 
                 let docker_clone = docker.clone();
                 let task = tokio::spawn(async move {
                     println!("  Removing volume: {}", volume_name);
-                    if let Err(e) = docker_clone.remove_volume(&volume_name, None::<bollard::volume::RemoveVolumeOptions>).await {
+                    if let Err(e) = docker_clone.remove_volume(&volume_name, None::<bollard::query_parameters::RemoveVolumeOptions>).await {
                         println!("    Warning: Failed to remove volume {}: {}", volume_name, e);
                     }
                 });
@@ -1070,7 +1070,7 @@ async fn get_mesh_containers(docker: &Docker, mesh_id: u32) -> Result<Vec<bollar
 }
 
 async fn get_mesh_networks(docker: &Docker, mesh_id: u32) -> Result<Vec<bollard::models::Network>> {
-    let networks = docker.list_networks(None::<bollard::network::ListNetworksOptions<String>>).await?;
+    let networks = docker.list_networks(None::<bollard::query_parameters::ListNetworksOptions>).await?;
     
     let mesh_networks: Vec<_> = networks.into_iter()
         .filter(|network| {
@@ -1095,7 +1095,7 @@ async fn cleanup_orphaned_networks(docker: &Docker, skip_confirmation: bool) -> 
     println!("Scanning for orphaned mesh networks...");
     
     // Get all hopnet-orchestrator networks
-    let networks = docker.list_networks(None::<bollard::network::ListNetworksOptions<String>>).await?;
+    let networks = docker.list_networks(None::<bollard::query_parameters::ListNetworksOptions>).await?;
     let hopnet_networks: Vec<_> = networks.into_iter()
         .filter(|network| {
             if let Some(ref name) = network.name {
@@ -1509,7 +1509,7 @@ async fn get_node_metadata(docker: &Docker, mesh_id: u32) -> Result<Vec<NodeMeta
                     if parts.len() >= 4 {
                         if let Ok(node_id) = parts[3].parse::<u32>() {
                             let container_id = container.id.as_ref().unwrap();
-                            let container_info = docker.inspect_container(container_id, None::<bollard::container::InspectContainerOptions>).await?;
+                            let container_info = docker.inspect_container(container_id, None::<bollard::query_parameters::InspectContainerOptions>).await?;
 
                             // Extract container IP from networks
                             let networks = container_info.network_settings.and_then(|ns| ns.networks).unwrap_or_default();
@@ -1593,10 +1593,9 @@ async fn store_mesh_passphrase(docker: &Docker, mesh_id: u32, passphrase: &str) 
 
     docker.upload_to_container(
         &container_name,
-        Some(bollard::container::UploadToContainerOptions {
-            path: parent_dir,
-            ..Default::default()
-        }),
+        Some(bollard::query_parameters::UploadToContainerOptionsBuilder::new()
+            .path(parent_dir)
+            .build()),
         bollard::body_full(bytes::Bytes::from(tar_bytes)),
     ).await?;
 
@@ -1610,9 +1609,9 @@ async fn load_mesh_passphrase(docker: &Docker, mesh_id: u32) -> Result<String> {
 
     let stream = docker.download_from_container(
         &container_name,
-        Some(bollard::container::DownloadFromContainerOptions {
-            path: PASSPHRASE_PATH,
-        }),
+        Some(bollard::query_parameters::DownloadFromContainerOptionsBuilder::new()
+            .path(PASSPHRASE_PATH)
+            .build()),
     );
 
     // Collect the tar stream into bytes

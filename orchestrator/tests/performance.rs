@@ -24,10 +24,10 @@ async fn monitor_container_memory(
 ) {
     while stop_signal.load(Ordering::Relaxed) == 0 {
         // Get container stats
-        let mut stats_stream = docker.stats(&container_name, Some(bollard::container::StatsOptions {
-            stream: false,
-            one_shot: true,
-        }));
+        let mut stats_stream = docker.stats(&container_name, Some(bollard::query_parameters::StatsOptionsBuilder::new()
+            .stream(false)
+            .one_shot(true)
+            .build()));
 
         if let Some(Ok(stats)) = stats_stream.next().await {
             if let Some(memory_stats) = stats.memory_stats {

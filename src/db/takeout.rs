@@ -778,7 +778,7 @@ pub fn get_materialized_entries_for_archive(
     siv_key: &aes_siv::Key<aes_siv::siv::Aes256Siv>,
     siv_nonce: &aes_siv::Nonce,
 ) -> Result<Vec<crate::takeout::archive::ArchiveEntry>, DatabaseError> {
-    let mut db_connection = app_state.db_pool.get().map_err(|_| DatabaseError::LockError)?;
+    let db_connection = app_state.db_pool.get().map_err(|_| DatabaseError::LockError)?;
     let temp_table_name = format!("takeout_inodes_{}", takeout_id.simple());
 
     let mut entries = Vec::new();
