@@ -18,6 +18,7 @@ pub fn get_users(
                     first_name: row.get(6)?,
                     last_name: row.get(7)?,
                     avatar: row.get(8)?,
+                    onboarding_flags: row.get(9)?,
                 })
             });
 
@@ -59,6 +60,7 @@ pub fn get_user_by_username(
                     first_name: row.get(6).map_err(|_| DatabaseError::RecallError)?,
                     last_name: row.get(7).map_err(|_| DatabaseError::RecallError)?,
                     avatar: row.get(8).map_err(|_| DatabaseError::RecallError)?,
+                    onboarding_flags: row.get(9).map_err(|_| DatabaseError::RecallError)?,
                 };
                 return Ok(Some(user))
             } else {
@@ -90,6 +92,7 @@ pub fn get_user_by_userid_conn(
             first_name: row.get(6).map_err(|_| DatabaseError::RecallError)?,
             last_name: row.get(7).map_err(|_| DatabaseError::RecallError)?,
             avatar: row.get(8).map_err(|_| DatabaseError::RecallError)?,
+            onboarding_flags: row.get(9).map_err(|_| DatabaseError::RecallError)?,
         };
         Ok(Some(user))
     } else {
@@ -164,6 +167,19 @@ pub fn update_user_profile_tx(
     Ok(())
 }
 
+/// Apply onboarding-flag bitfield update within a consensus transaction.
+/// `set_flags` are OR'd in; `clear_flags` are AND-NOT'd. Idempotent.
+pub fn update_user_onboarding_tx(
+    tx: &rusqlite::Transaction,
+    payload: &crate::users::types::UpdateUserOnboardingPayload,
+) -> Result<(), DatabaseError> {
+    tx.execute(
+        "UPDATE users SET onboarding_flags = (onboarding_flags | ?) & ~? WHERE user_id = ?",
+        params![payload.set_flags, payload.clear_flags, payload.user_id],
+    ).map_err(|_| DatabaseError::InsertError)?;
+    Ok(())
+}
+
 /// Wrapper that manages connection and transaction - for backward compatibility
 pub fn insert_user(
     db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
@@ -179,7 +195,7 @@ pub fn insert_user(
 
             // Commit or rollback based on execute flag
             if execute {
-                tx.commit().map_err(|_| DatabaseError::InsertError)?;
+                crate::db::shared::commit_timed(tx).map_err(|_| DatabaseError::InsertError)?;
                 tracing::info!("Successfully inserted user {}", user_id);
             } else {
                 tx.rollback().map_err(|_| DatabaseError::LockError)?;

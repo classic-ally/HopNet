@@ -114,8 +114,8 @@ export async function authenticatedFetch(url: string, options: RequestInit = {})
 }
 
 // Current user profile store — fetched on login, cleared on logout
-import type { UserInfo } from './api/shares';
-export const currentUserStore = writable<UserInfo | null>(null);
+import type { SelfUserInfo } from './types';
+export const currentUserStore = writable<SelfUserInfo | null>(null);
 
 export async function refreshCurrentUser() {
   try {
@@ -141,6 +141,108 @@ async function pollShareCount() {
   } catch (_) { /* ignore — not logged in or network error */ }
 }
 
+// =====================================================================
+// Import status store — 1 Hz poll while subscribed AND status is non-terminal.
+// Drives onboarding banner, write-affordance gating, ImportPane progress UI.
+// Defined BEFORE the tokenStore.subscribe block below so its module-init
+// invocation (when a stored JWT is already present) doesn't TDZ on the
+// importStatusStore reference inside that callback.
+// =====================================================================
+
+import type { ImportRecord, ImportPathCounts, ImportStatus } from './types';
+import { fetchCurrentImport, fetchImportCounts } from './api/import';
+
+export interface ImportStatusState {
+  record: ImportRecord | null;
+  counts: ImportPathCounts | null;  // null on non-owner or no active import
+  loading: boolean;
+}
+
+const IMPORT_POLL_MS = 1000;
+
+function isTerminal(status: ImportStatus | undefined): boolean {
+  return status === 'Completed' || status === 'Failed';
+}
+
+function createImportStatusStore() {
+  const inner = writable<ImportStatusState>({ record: null, counts: null, loading: false });
+  let interval: ReturnType<typeof setInterval> | null = null;
+  let subscriberCount = 0;
+
+  async function tick() {
+    inner.update(s => ({ ...s, loading: true }));
+    try {
+      const record = await fetchCurrentImport();
+      const counts = (record && !isTerminal(record.status)) ? await fetchImportCounts() : null;
+      inner.set({ record, counts, loading: false });
+      // Stop polling if no active import or terminal — single final fetch already done.
+      if (!record || isTerminal(record.status)) {
+        stopPolling();
+      }
+    } catch (_) {
+      inner.update(s => ({ ...s, loading: false }));
+    }
+  }
+
+  function startPolling() {
+    if (interval) return;
+    interval = setInterval(tick, IMPORT_POLL_MS);
+  }
+
+  function stopPolling() {
+    if (interval) {
+      clearInterval(interval);
+      interval = null;
+    }
+  }
+
+  return {
+    subscribe(run: (value: ImportStatusState) => void, invalidate?: any) {
+      subscriberCount++;
+      // Kick a fetch on first subscribe so consumers see fresh state immediately.
+      if (subscriberCount === 1) {
+        tick();
+        startPolling();
+      }
+      const unsub = inner.subscribe(run, invalidate);
+      return () => {
+        subscriberCount--;
+        if (subscriberCount === 0) stopPolling();
+        unsub();
+      };
+    },
+    /// Manual kick — call after upload submit or onboarding flag change to
+    /// pull fresh state without waiting for the next interval tick.
+    refresh: tick,
+    /// Reset to empty + stop polling. Called on logout.
+    reset() {
+      stopPolling();
+      subscriberCount = 0;
+      inner.set({ record: null, counts: null, loading: false });
+    },
+  };
+}
+
+export const importStatusStore = createImportStatusStore();
+
+import { derived, type Readable } from 'svelte/store';
+
+/// True while a non-terminal import is owned by this user. Frontend uses this
+/// to disable write affordances (uploads, share grants, deletes, …) — the
+/// security boundary is the backend `import_gate` middleware that 409s the
+/// same routes; this store is purely UX polish.
+export const writesGatedStore: Readable<boolean> = derived(
+    importStatusStore,
+    ($s) => $s.record?.status === 'Importing' || $s.record?.status === 'Pending',
+);
+
+export const WRITES_GATED_TOOLTIP = 'Disabled while your data import is in progress.';
+
+
+// Token-driven session lifecycle. Runs once at module init for any stored
+// JWT, then on every subsequent token change. Defined here (after
+// importStatusStore) so the cleanup branch can call importStatusStore.reset()
+// without hitting the TDZ.
 tokenStore.subscribe((token) => {
   if (shareCountInterval) {
     clearInterval(shareCountInterval);
@@ -153,5 +255,6 @@ tokenStore.subscribe((token) => {
   } else {
     currentUserStore.set(null);
     incomingShareCountStore.set(0);
+    importStatusStore.reset();
   }
 });

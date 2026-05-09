@@ -343,7 +343,7 @@ pub async fn process_incoming_qc_with_guard(
     }
 
     // Commit transaction (QC insertion + transaction processing)
-    db_tx.commit().map_err(|e| {
+    crate::db::shared::commit_timed(db_tx).map_err(|e| {
         tracing::error!(
             "Failed to commit QC/transaction processing for view {} phase {:?}: {:?}",
             qc.view_number, qc.phase, e
@@ -693,7 +693,7 @@ async fn integrate_view(
             match db::insert_qc_unsafe_tx(&db_tx, &propose_qc) {
                 Ok(_) => {
                     // Commit Propose QC insertion
-                    db_tx.commit().map_err(|_| ConsensusError::DatabaseError)?;
+                    crate::db::shared::commit_timed(db_tx).map_err(|_| ConsensusError::DatabaseError)?;
 
                     if is_genesis {
                         tracing::debug!("Inserted genesis propose QC for view 0 (no verification)");
@@ -759,7 +759,7 @@ async fn integrate_view(
                     }
 
                     // Commit transaction (QC insertion + transaction processing)
-                    db_tx.commit().map_err(|_| ConsensusError::DatabaseError)?;
+                    crate::db::shared::commit_timed(db_tx).map_err(|_| ConsensusError::DatabaseError)?;
 
                     if is_genesis {
                         tracing::debug!("Inserted genesis lock QC for view 0 (no verification)");
@@ -1664,6 +1664,19 @@ pub async fn get_state_snapshot(
         Err(e) => {
             tracing::error!("Failed to compute state snapshot: {:?}", e);
             (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Failed to compute state snapshot").into_response()
+        }
+    }
+}
+
+/// GET /debug/db-stats - SQLite sizing + active pragma snapshot for bench harness
+pub async fn get_db_stats(
+    State(app_state): State<AppState>,
+) -> impl IntoResponse {
+    match crate::db::debug::get_db_stats(app_state.db_pool.get()) {
+        Ok(stats) => (axum::http::StatusCode::OK, Json(stats)).into_response(),
+        Err(e) => {
+            tracing::error!("Failed to get db stats: {:?}", e);
+            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Failed to get db stats").into_response()
         }
     }
 }

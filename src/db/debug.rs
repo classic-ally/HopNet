@@ -269,6 +269,141 @@ pub struct FileFragmentDistribution {
     pub fragments: Vec<FragmentInfo>,
 }
 
+/// Always-on connection-pool / transaction counters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CounterSnapshot {
+    pub txn_commits: u64,
+    pub txn_rollbacks: u64,
+    pub conn_acquires: u64,
+}
+
+/// HDR histogram percentile snapshot of commit latency in microseconds.
+/// Populated only by `commit_timed()` call sites (consensus + hot writes).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LatencySnapshot {
+    pub count: u64,
+    pub p50_us: u64,
+    pub p90_us: u64,
+    pub p99_us: u64,
+    pub p999_us: u64,
+    pub max_us: u64,
+}
+
+/// SQLite sizing + active pragma snapshot + telemetry counters.
+/// Read-only: no checkpoints, no writes. WAL size comes from filesystem stat
+/// to avoid the checkpoint side-effect of `PRAGMA wal_checkpoint`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbStats {
+    pub page_count: i64,
+    pub page_size: i64,
+    pub db_bytes: i64,
+    pub freelist_count: i64,
+    pub wal_bytes: u64,
+    pub journal_mode: String,
+    pub synchronous: String,
+    pub cache_size_raw: i64,
+    pub cache_bytes: i64,
+    pub mmap_size: i64,
+    pub temp_store: String,
+    pub busy_timeout_ms: i64,
+    pub counters: CounterSnapshot,
+    pub commit_latency_us: LatencySnapshot,
+}
+
+pub fn get_db_stats(
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
+) -> Result<DbStats, DatabaseError> {
+    let conn = db_connection.map_err(|_| DatabaseError::LockError)?;
+
+    let q_i64 = |sql: &str| -> Result<i64, DatabaseError> {
+        conn.query_row(sql, [], |r| r.get(0)).map_err(|_| DatabaseError::RecallError)
+    };
+    let q_str = |sql: &str| -> Result<String, DatabaseError> {
+        conn.query_row(sql, [], |r| r.get(0)).map_err(|_| DatabaseError::RecallError)
+    };
+
+    let page_count = q_i64("PRAGMA page_count")?;
+    let page_size = q_i64("PRAGMA page_size")?;
+    let freelist_count = q_i64("PRAGMA freelist_count")?;
+    let journal_mode = q_str("PRAGMA journal_mode")?;
+    let sync_int = q_i64("PRAGMA synchronous")?;
+    let cache_size_raw = q_i64("PRAGMA cache_size")?;
+    let mmap_size = q_i64("PRAGMA mmap_size")?;
+    let temp_store_int = q_i64("PRAGMA temp_store")?;
+    let busy_timeout_ms = q_i64("PRAGMA busy_timeout")?;
+
+    let db_path: Option<String> = conn.query_row(
+        "SELECT file FROM pragma_database_list WHERE name = 'main'",
+        [],
+        |r| r.get(0),
+    ).optional().map_err(|_| DatabaseError::RecallError)?;
+
+    let wal_bytes = db_path
+        .as_deref()
+        .filter(|p| !p.is_empty())
+        .and_then(|p| std::fs::metadata(format!("{}-wal", p)).ok())
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    let synchronous = match sync_int {
+        0 => "OFF",
+        1 => "NORMAL",
+        2 => "FULL",
+        3 => "EXTRA",
+        _ => "UNKNOWN",
+    }.to_string();
+
+    let temp_store = match temp_store_int {
+        0 => "DEFAULT",
+        1 => "FILE",
+        2 => "MEMORY",
+        _ => "UNKNOWN",
+    }.to_string();
+
+    let cache_bytes = if cache_size_raw < 0 {
+        -cache_size_raw * 1024
+    } else {
+        cache_size_raw * page_size
+    };
+
+    let db_bytes = page_count * page_size;
+
+    let counters = CounterSnapshot {
+        txn_commits: crate::db::shared::DB_COUNTERS.txn_commits.load(std::sync::atomic::Ordering::Relaxed),
+        txn_rollbacks: crate::db::shared::DB_COUNTERS.txn_rollbacks.load(std::sync::atomic::Ordering::Relaxed),
+        conn_acquires: crate::db::shared::DB_COUNTERS.conn_acquires.load(std::sync::atomic::Ordering::Relaxed),
+    };
+
+    let commit_latency_us = {
+        let h = crate::db::shared::COMMIT_LATENCY_US.lock();
+        LatencySnapshot {
+            count: h.len(),
+            p50_us: h.value_at_quantile(0.50),
+            p90_us: h.value_at_quantile(0.90),
+            p99_us: h.value_at_quantile(0.99),
+            p999_us: h.value_at_quantile(0.999),
+            max_us: h.max(),
+        }
+    };
+
+    Ok(DbStats {
+        page_count,
+        page_size,
+        db_bytes,
+        freelist_count,
+        wal_bytes,
+        journal_mode,
+        synchronous,
+        cache_size_raw,
+        cache_bytes,
+        mmap_size,
+        temp_store,
+        busy_timeout_ms,
+        counters,
+        commit_latency_us,
+    })
+}
+
 /// Get fragment distribution data for a specific file
 /// This is a diagnostic function that queries fragment_hashes and fragment_inventory
 /// to show which nodes store which fragments for a given file

@@ -2,6 +2,7 @@
     import Button from '../../Button.svelte';
     import Modal from '../../primitives/Modal.svelte';
     import type { ShareParticipant } from '../../types';
+    import { writesGatedStore, WRITES_GATED_TOOLTIP } from '../../stores';
 
     interface ShareDetailsModalProps {
         isOpen?: boolean;
@@ -22,6 +23,8 @@
         onUnshare = () => {},
         onClose = () => {},
     }: ShareDetailsModalProps = $props();
+
+    const gated = $derived($writesGatedStore);
 
     function statusColor(status: string): string {
         switch (status) {
@@ -78,7 +81,8 @@
                     icon="i-carbon-unlink"
                     text="Leave Share"
                     onClick={onUnshare}
-                    disabled={loading}
+                    disabled={loading || gated}
+                    tooltip={gated ? WRITES_GATED_TOOLTIP : 'Leave this share'}
                 />
             </div>
         </div>

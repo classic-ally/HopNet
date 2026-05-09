@@ -13,9 +13,9 @@ pub mod users;
 pub mod db_impl;
 
 // Re-export commonly used types at the top level
-pub use db::{InodeType, TakeoutStatus, TakeoutRecord, CustomUUID, FileItem};
+pub use db::{InodeType, TakeoutStatus, TakeoutRecord, ImportStatus, ImportRecord, ImportPathStatus, ImportPathRow, ImportPathCounts, CustomUUID, FileItem};
 pub use devices::{RegisterDeviceRequest, RegisterDeviceResponse, DeviceInfo};
 pub use fileprovider::{HealthStatus, HealthResponse, FileProviderItem, EnumerateResponse, DeleteItemRequest, ChangesResponse, ChangesQuery};
 pub use debug::{StateSnapshot, TableHashInfo};
 pub use shares::{ShareRequest, AcceptShareRequest, IncomingShareResponse, ShareCountResponse, ShareDetailResponse, ShareParticipant};
-pub use users::PublicUserInfo;
+pub use users::{PublicUserInfo, SelfUserInfo, OnboardingFlags, OnboardingFlag};

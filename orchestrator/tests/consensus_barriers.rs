@@ -15,7 +15,7 @@ use crate::NodeInfo;
 async fn barrier_hold(node: &NodeInfo, barrier_name: &str) -> Result<()> {
     let client = Client::new();
     let url = format!(
-        "http://{}:{}/test/barrier/{}/hold",
+        "http://{}:{}/test/barriers/consensus/{}/hold",
         node.ip_address, node.port, barrier_name
     );
     let resp = client.post(&url)
@@ -32,7 +32,7 @@ async fn barrier_hold(node: &NodeInfo, barrier_name: &str) -> Result<()> {
 async fn barrier_release(node: &NodeInfo, barrier_name: &str) -> Result<()> {
     let client = Client::new();
     let url = format!(
-        "http://{}:{}/test/barrier/{}/release",
+        "http://{}:{}/test/barriers/consensus/{}/release",
         node.ip_address, node.port, barrier_name
     );
     let resp = client.post(&url)
@@ -55,7 +55,7 @@ struct BarrierStatus {
 async fn barrier_status(node: &NodeInfo, barrier_name: &str) -> Result<BarrierStatus> {
     let client = Client::new();
     let url = format!(
-        "http://{}:{}/test/barrier/{}/status",
+        "http://{}:{}/test/barriers/consensus/{}/status",
         node.ip_address, node.port, barrier_name
     );
     let resp = client.get(&url)

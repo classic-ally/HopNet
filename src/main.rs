@@ -45,7 +45,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         // Use shared-cache URI so all pool connections see the same in-memory DB
         let manager = SqliteConnectionManager::file("file::memory:?cache=shared");
         Pool::builder()
-            .max_size(8)
+            .max_size(db::DB_POOL_MAX_SIZE)
             .connection_customizer(Box::new(db::shared::SqliteInitializer))
             .build(manager).unwrap()
     } else {
@@ -63,7 +63,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
         let manager = SqliteConnectionManager::file(&db_path);
         let pool = Pool::builder()
-            .max_size(8)
+            .max_size(db::DB_POOL_MAX_SIZE)
             .connection_customizer(Box::new(db::shared::SqliteInitializer))
             .build(manager).unwrap();
 
@@ -152,10 +152,11 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 test_mode: cfg!(debug_assertions) || std::env::var("HOPNET_TEST_MODE").is_ok(),
                 orphaned_fragment_scan: Arc::new(std::sync::Mutex::new(None)),
                 iroh_transport: iroh_transport.clone(),
-                consensus_barriers: Arc::new(consensus::barriers::ConsensusBarriers::new()),
+                consensus_barriers: Arc::new(consensus::barriers::new()),
                 dedup_cache: Arc::new(net::DedupCache::default()),
                 lock_vote_evidence: Arc::new(std::sync::Mutex::new(None)),
                 session_store: Arc::new(auth::SessionStore::default()),
+                takeout_runtime: Arc::new(takeout::TakeoutRuntime::default()),
                 consensus_queue,
                 view_changed: Arc::new(tokio::sync::Notify::new()),
                 write_gate: write_gate.clone(),
@@ -170,6 +171,14 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                     .expect("Failed to set user_id in AppState");
 
                 tracing::info!("AppState initialized from persisted database (user keys require login)");
+
+                // Scan for stranded imports owned by this node so that on the
+                // next user authentication event the resume hook can finish them.
+                match takeout::jobs::scan_at_startup(&app_state).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!("Import resume registry: {} stranded import(s)", n),
+                    Err(e) => tracing::warn!("Import resume scan failed: {:?}", e),
+                }
 
                 // GUI auto-login: load owner session from keychain if available
                 #[cfg(all(target_os = "macos", feature = "gui", not(debug_assertions)))]
@@ -188,6 +197,9 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                             };
                             app_state.session_store.blocking_write().insert(kc_user_id, session);
                             tracing::info!("Loaded owner session from keychain (auto-login ready)");
+                            tokio::spawn(takeout::jobs::maybe_resume_for_user(
+                                app_state.clone(), kc_user_id,
+                            ));
                         }
                     }
                 }
@@ -304,7 +316,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .nest("/users", users::routes::router())
                 .route("/nodes", get(nodes::routes::get_nodes))
                 .route("/nodes", post(nodes::routes::post_nodes))
-                .nest("/files", files::routes::router())
+                .nest("/files", files::routes::router(app_state.clone()))
                 .route("/fragments", get(files::routes::get_fragments_count))
                 .route("/maintenance/cleanup-orphaned", post(files::routes::post_cleanup_orphaned_data_blocks))
                 .route("/maintenance/rebalance", post(files::routes::post_rebalance_network))
@@ -315,13 +327,14 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/diagnostics/file-fragments", get(files::routes::get_file_fragment_distribution))
                 .route("/diagnostics/network-resilience", get(files::routes::get_network_resilience_stats))
                 .route("/debug/iroh-ping", get(net::routes::debug_iroh_ping))
+                .route("/debug/db-stats", get(consensus::routes::get_db_stats))
                 .route("/validators", get(consensus::routes::get_validators))
                 .route("/metrics", get(metrics::routes::get_metrics))
                 .route("/metrics/trigger", get(metrics::routes::get_metrics_trigger))
                 .route("/metrics/scores", get(metrics::routes::get_placement_scores))
                 .nest("/takeout", takeout::takeout_routes())
                 .nest("/admin", admin::routes::admin_routes())
-                .nest("/shares", shares::routes::router())
+                .nest("/shares", shares::routes::router(app_state.clone()))
                 .route("/logout", post(auth::sign_out))
                 .layer(middleware::from_fn_with_state(app_state.clone(), auth::auth_middleware));
 
@@ -336,15 +349,23 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/consensus/view", post(consensus::routes::debug_view_state))
                 .layer(middleware::from_fn_with_state(app_state.clone(), consensus::routes::jwt_or_rpc_auth_middleware));
 
-            // FileProvider routes with device token authentication
-            let fileprovider_routes = Router::new()
+            // FileProvider routes with device token authentication. Reads bypass
+            // the import gate; writes have the gate applied via a sub-router so
+            // attachment is explicit (no in-middleware method peek).
+            let fileprovider_reads = Router::new()
                 .route("/enumerate", get(fileprovider::routes::get_enumerate))
                 .route("/changes", get(fileprovider::routes::get_changes))
-                .route("/delete", delete(fileprovider::routes::delete_item))
                 .route("/download", get(fileprovider::routes::download_file))
-                .route("/item", get(fileprovider::routes::get_item))
+                .route("/item", get(fileprovider::routes::get_item));
+
+            let fileprovider_writes = Router::new()
+                .route("/delete", delete(fileprovider::routes::delete_item))
                 .route("/create", post(fileprovider::routes::create_item))
                 .route("/modify", patch(fileprovider::routes::modify_item))
+                .layer(middleware::from_fn_with_state(app_state.clone(), takeout::import_gate::import_gate));
+
+            let fileprovider_routes = fileprovider_reads
+                .merge(fileprovider_writes)
                 .layer(DefaultBodyLimit::max(5000*1_000_000)) // 5GB limit for file uploads
                 .layer(middleware::from_fn_with_state(app_state.clone(), devices::auth::device_token_auth_middleware));
 
@@ -354,7 +375,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                     .route("/integrations/fileprovider/test", get(fileprovider::routes::get_test))
                     .route("/integrations/fileprovider/test/signals", get(fileprovider::routes::get_test_signals))
                     .route("/test/fragment-health-check/{fragment_hash}", get(files::test_routes::get_fragment_health_check))
-                    .nest("/test", consensus::barriers::test_routes())
+                    .nest("/test/barriers", barriers::test_routes())
             } else {
                 Router::new() // Empty router when not in test mode
             };

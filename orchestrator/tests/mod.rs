@@ -31,6 +31,11 @@ mod orphan_cleanup;
 mod fileprovider_device_token;
 mod range_download;
 mod recents;
+mod takeout;
+mod import;
+mod post_files_shape;
+mod post_files_mixed;
+mod db_pragma_bench;
 
 /// Represents the result of a test scenario execution
 #[derive(Debug)]
@@ -166,6 +171,54 @@ pub async fn run_test_by_name(mesh_id: u32, name: &str, nodes: &[NodeInfo], flag
         "range-download" => {
             range_download::RangeDownload.run(mesh_id, nodes, flags).await
         }
+        "takeout-happy-path" => {
+            takeout::TakeoutHappyPath.run(mesh_id, nodes, flags).await
+        }
+        "import-create-active-conflict" => {
+            import::ImportCreateActiveConflict.run(mesh_id, nodes, flags).await
+        }
+        "import-upload-happy-path" => {
+            import::ImportUploadHappyPath.run(mesh_id, nodes, flags).await
+        }
+        "import-upload-version-rejected" => {
+            import::ImportUploadVersionRejected.run(mesh_id, nodes, flags).await
+        }
+        "import-upload-missing-manifest" => {
+            import::ImportUploadMissingManifest.run(mesh_id, nodes, flags).await
+        }
+        "import-upload-quota-exceeded" => {
+            import::ImportUploadQuotaExceeded.run(mesh_id, nodes, flags).await
+        }
+        "import-extraction-happy-path" => {
+            import::ImportExtractionHappyPath.run(mesh_id, nodes, flags).await
+        }
+        "import-extraction-hash-mismatch" => {
+            import::ImportExtractionHashMismatch.run(mesh_id, nodes, flags).await
+        }
+        "import-creation-happy-path" => {
+            import::ImportCreationHappyPath.run(mesh_id, nodes, flags).await
+        }
+        "import-creation-mixed-failure" => {
+            import::ImportCreationMixedFailure.run(mesh_id, nodes, flags).await
+        }
+        "import-write-gate" => {
+            import::ImportWriteGate.run(mesh_id, nodes, flags).await
+        }
+        "import-status-counts" => {
+            import::ImportStatusCounts.run(mesh_id, nodes, flags).await
+        }
+        "import-resume-after-restart" => {
+            import::ImportResumeAfterRestart.run(mesh_id, nodes, flags).await
+        }
+        "post-files-consensus-shape" => {
+            post_files_shape::PostFilesConsensusShape.run(mesh_id, nodes, flags).await
+        }
+        "mixed-files-and-folders-one-request" => {
+            post_files_mixed::PostFilesMixedFilesAndParents.run(mesh_id, nodes, flags).await
+        }
+        "db-pragma-bench" => {
+            db_pragma_bench::DbPragmaBench.run(mesh_id, nodes, flags).await
+        }
         _ => Err(anyhow::anyhow!("Unknown test: {}", name)),
     }
 }
@@ -199,6 +252,22 @@ pub fn list_test_names() -> Vec<&'static str> {
         "fileprovider-device-token-auth",
         "recents-ordering",
         "range-download",
+        "takeout-happy-path",
+        "import-create-active-conflict",
+        "import-upload-happy-path",
+        "import-upload-version-rejected",
+        "import-upload-missing-manifest",
+        "import-upload-quota-exceeded",
+        "import-extraction-happy-path",
+        "import-extraction-hash-mismatch",
+        "import-creation-happy-path",
+        "import-creation-mixed-failure",
+        "import-write-gate",
+        "import-status-counts",
+        "import-resume-after-restart",
+        "post-files-consensus-shape",
+        "mixed-files-and-folders-one-request",
+        "db-pragma-bench",
     ]
 }
 

@@ -1,5 +1,6 @@
 import { API_BASE_URL, authenticatedFetch } from '../stores';
 import type { UserInfo } from './shares';
+import type { SelfUserInfo, OnboardingFlag } from '../types';
 
 export type { UserInfo };
 
@@ -9,10 +10,21 @@ export async function fetchAccounts(): Promise<UserInfo[]> {
     return response.json();
 }
 
-export async function fetchCurrentUser(): Promise<UserInfo> {
+export async function fetchCurrentUser(): Promise<SelfUserInfo> {
     const response = await authenticatedFetch(`${API_BASE_URL}/users/me`);
     if (!response.ok) throw new Error(`Failed to fetch current user: ${response.status}`);
     return response.json();
+}
+
+/// PUT /users/me/onboarding — flip the onboarding bitfield. `set` bits are
+/// OR'd in, `clear` bits are AND-NOT'd. Idempotent. Replicated via consensus.
+export async function setOnboardingFlags(set: OnboardingFlag[], clear: OnboardingFlag[]): Promise<void> {
+    const response = await authenticatedFetch(`${API_BASE_URL}/users/me/onboarding`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ set, clear }),
+    });
+    if (!response.ok) throw new Error(`Failed to set onboarding flags: ${response.status}`);
 }
 
 export async function updateProfile(fields: { first_name?: string | null; last_name?: string | null }): Promise<Response> {

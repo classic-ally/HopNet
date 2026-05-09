@@ -396,6 +396,7 @@ pub struct User {
     pub first_name: Option<String>,
     pub last_name: Option<String>,
     pub avatar: Option<Vec<u8>>,
+    pub onboarding_flags: hopnet_common::OnboardingFlags,
 }
 
 impl User {
@@ -407,7 +408,7 @@ impl User {
         encrypted_privkey: Vec<u8>,
         key_salt: Vec<u8>,
     ) -> User {
-        User { user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt, first_name: None, last_name: None, avatar: None }
+        User { user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt, first_name: None, last_name: None, avatar: None, onboarding_flags: hopnet_common::OnboardingFlags::NONE }
     }
 }
 

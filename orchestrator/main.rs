@@ -89,11 +89,16 @@ enum Commands {
         #[arg(short, long)]
         mesh_id: u32,
     },
-    /// Run integration test on a mesh
+    /// Run integration test on a mesh.
+    ///
+    /// If `--mesh-id` is omitted, a fresh mesh is auto-created for this run,
+    /// then deleted on test pass. On test failure the mesh is left up so the
+    /// failing state can be inspected (use `delete --mesh-id <id>` to clean up).
+    /// Use `--keep-on-pass` to retain an auto-created mesh even if the test passes.
     Test {
-        /// Mesh network ID to test
+        /// Mesh network ID to test. If omitted, a fresh mesh is auto-created.
         #[arg(short, long)]
-        mesh_id: u32,
+        mesh_id: Option<u32>,
         /// Test name to run
         #[arg(short, long)]
         test: Option<String>,
@@ -103,6 +108,12 @@ enum Commands {
         /// Optional flags to modify test behavior (e.g., --flags wait-for-distribution)
         #[arg(long)]
         flags: Vec<String>,
+        /// Number of nodes in an auto-created mesh (ignored if --mesh-id supplied).
+        #[arg(long, default_value_t = 3)]
+        auto_nodes: u32,
+        /// Keep an auto-created mesh alive even on test pass (debugging aid).
+        #[arg(long)]
+        keep_on_pass: bool,
     },
 }
 
@@ -146,8 +157,59 @@ async fn main() -> Result<()> {
         Some(Commands::Divergence { mesh_id }) => {
             divergence::check_divergence(&docker, *mesh_id, runtime).await?;
         }
-        Some(Commands::Test { mesh_id, test, list, flags }) => {
-            tests::handle_test_command(&docker, *mesh_id, test.as_deref(), *list, flags, runtime).await?;
+        Some(Commands::Test { mesh_id, test, list, flags, auto_nodes, keep_on_pass }) => {
+            // List path / no-test path doesn't need a mesh; short-circuit.
+            if *list || test.is_none() {
+                tests::handle_test_command(&docker, mesh_id.unwrap_or(0), test.as_deref(), *list, flags, runtime).await?;
+                return Ok(());
+            }
+
+            match mesh_id {
+                Some(id) => {
+                    // Existing behavior: use caller-provided mesh, no auto-cleanup.
+                    tests::handle_test_command(&docker, *id, test.as_deref(), *list, flags, runtime).await?;
+                }
+                None => {
+                    // Auto-managed mesh: create fresh, run test, divergence check, conditionally delete.
+                    // Pass = test passed AND nodes are consistent. Either failure leaves the mesh up.
+                    let auto_mesh_id = get_next_mesh_id(&docker).await?;
+                    println!("Auto-creating mesh {} with {} nodes for test", auto_mesh_id, auto_nodes);
+                    create_mesh(&docker, auto_mesh_id, *auto_nodes, false, runtime).await?;
+
+                    let test_result = tests::handle_test_command(
+                        &docker, auto_mesh_id, test.as_deref(), *list, flags, runtime
+                    ).await;
+
+                    if let Err(e) = &test_result {
+                        eprintln!("\nTest failed; leaving mesh {} up for inspection", auto_mesh_id);
+                        eprintln!("Inspect: orchestrator status --mesh-id {}", auto_mesh_id);
+                        eprintln!("Inspect: orchestrator divergence --mesh-id {}", auto_mesh_id);
+                        eprintln!("Clean up: orchestrator delete --mesh-id {} -y", auto_mesh_id);
+                        return Err(anyhow::anyhow!("Test failed: {}", e));
+                    }
+
+                    // Test passed — verify no divergence before declaring success.
+                    println!("\nTest passed; checking for state divergence across nodes");
+                    let div_result = divergence::check_divergence(&docker, auto_mesh_id, runtime).await;
+
+                    match div_result {
+                        Ok(()) => {
+                            if *keep_on_pass {
+                                println!("\nNo divergence; --keep-on-pass set, leaving mesh {} up", auto_mesh_id);
+                            } else {
+                                println!("\nNo divergence; deleting auto-created mesh {}", auto_mesh_id);
+                                delete_mesh(&docker, auto_mesh_id, true).await?;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("\nTest passed but divergence detected; leaving mesh {} up for inspection", auto_mesh_id);
+                            eprintln!("Inspect: orchestrator divergence --mesh-id {}", auto_mesh_id);
+                            eprintln!("Clean up: orchestrator delete --mesh-id {} -y", auto_mesh_id);
+                            return Err(anyhow::anyhow!("Divergence detected after test: {}", e));
+                        }
+                    }
+                }
+            }
         }
         Some(Commands::List) | None => {
             list_meshes(&docker).await?;
@@ -584,7 +646,17 @@ async fn create_hopnet_container(
     let config = ContainerCreateBody {
         image: Some("hopnet:latest".to_string()),
         labels: Some(labels),
-        env: Some(vec!["HOPNET_TEST_MODE=1".to_string()]),
+        env: Some({
+            let mut e = vec!["HOPNET_TEST_MODE=1".to_string()];
+            // Forward any HOPNET_DB_* tuning env vars from orchestrator process to containers
+            // so bench runs can set pragmas without rebuilding the image.
+            for (k, v) in std::env::vars() {
+                if k.starts_with("HOPNET_DB_") {
+                    e.push(format!("{}={}", k, v));
+                }
+            }
+            e
+        }),
         networking_config: Some(NetworkingConfig {
             endpoints_config: Some(endpoints_config),
         }),

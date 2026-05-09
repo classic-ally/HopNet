@@ -75,3 +75,22 @@
         </Modal>
     {/snippet}
 </Story>
+
+<!-- Modal with back button — multi-step modals route the back affordance
+     through Modal chrome instead of duplicating it in every step's footer. -->
+<Story name="With back button" args={{
+    title: "Step 2 — Profile",
+    onClose: handleModalClose,
+    onBack: () => console.log('Back clicked'),
+}}>
+    {#snippet template(args)}
+        <Modal {...args}>
+            {#snippet content()}
+                <div class="space-y-4">
+                    <p class="text-primary">This step is reached from a parent checklist view.</p>
+                    <p class="text-muted text-sm">The back button in the header (top-left, themed like the close button) returns to the previous view.</p>
+                </div>
+            {/snippet}
+        </Modal>
+    {/snippet}
+</Story>

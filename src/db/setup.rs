@@ -122,7 +122,7 @@ pub fn post_initial_setup(
         tracing::debug!("post_initial_setup: Inserted genesis block into database");
 
         // Commit block
-        tx_db.commit().map_err(|e| {
+        crate::db::shared::commit_timed(tx_db).map_err(|e| {
             tracing::error!("post_initial_setup: Failed to commit genesis block: {:?}", e);
             DatabaseError::InsertError
         })?;
@@ -149,7 +149,7 @@ pub fn post_initial_setup(
             e
         })?;
 
-        genesis_tx_db.commit().map_err(|e| {
+        crate::db::shared::commit_timed(genesis_tx_db).map_err(|e| {
             tracing::error!("post_initial_setup: Failed to commit genesis transaction: {:?}", e);
             DatabaseError::InsertError
         })?;
@@ -227,7 +227,7 @@ pub fn post_initial_setup(
 
         // Commit this_node + QCs atomically
         tracing::debug!("post_initial_setup: Committing this_node+QCs transaction");
-        tx_db.commit().map_err(|e| {
+        crate::db::shared::commit_timed(tx_db).map_err(|e| {
             tracing::error!("post_initial_setup: Failed to commit this_node+QCs: {:?}", e);
             DatabaseError::InsertError
         })?;

@@ -1,6 +1,6 @@
-use crate::{db::{DatabaseError, users::{insert_user_tx, update_user_profile_tx}}, handlers::{HandlerResult, TransactionHandler}, types::User, consensus::types::Transaction};
+use crate::{db::{DatabaseError, users::{insert_user_tx, update_user_profile_tx, update_user_onboarding_tx}}, handlers::{HandlerResult, TransactionHandler}, types::User, consensus::types::Transaction};
 use crate::AppState;
-use super::types::UpdateUserProfilePayload;
+use super::types::{UpdateUserProfilePayload, UpdateUserOnboardingPayload};
 
 pub struct InsertUserHandler;
 
@@ -76,6 +76,37 @@ impl TransactionHandler for UpdateUserProfileHandler {
 
 inventory::submit! {
     &UpdateUserProfileHandler as &dyn TransactionHandler
+}
+
+pub struct UpdateUserOnboardingHandler;
+
+impl TransactionHandler for UpdateUserOnboardingHandler {
+    fn name(&self) -> &'static str { "update_user_onboarding" }
+
+    fn process(&self, _state: &AppState, tx: &Transaction, _execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
+        let (payload, _) = bincode::serde::decode_from_slice::<UpdateUserOnboardingPayload, _>(
+            &tx.rpc.payload, bincode::config::standard()
+        ).map_err(|_| DatabaseError::InvalidPayload)?;
+
+        // Authorization: must be the authenticated user
+        let user = tx.user.as_ref().ok_or(DatabaseError::AuthorizationError)?;
+        if user.id != payload.user_id {
+            return Err(DatabaseError::AuthorizationError);
+        }
+
+        // Validation: user exists
+        db_tx.query_row(
+            "SELECT 1 FROM users WHERE user_id = ?",
+            [payload.user_id], |_| Ok(())
+        ).map_err(|_| DatabaseError::NotFound)?;
+
+        update_user_onboarding_tx(db_tx, &payload)?;
+        Ok(())
+    }
+}
+
+inventory::submit! {
+    &UpdateUserOnboardingHandler as &dyn TransactionHandler
 }
 
 #[cfg(test)]
@@ -158,6 +189,34 @@ mod tests {
             &encoded, bincode::config::standard()
         ).unwrap();
         assert!(decoded.avatar.unwrap().unwrap().len() > 0);
+    }
+
+    #[test]
+    fn test_onboarding_payload_roundtrip() {
+        let payload = UpdateUserOnboardingPayload {
+            user_id: 7,
+            set_flags: hopnet_common::OnboardingFlags::IMPORT_OFFERED
+                | hopnet_common::OnboardingFlags::IMPORT_COMPLETED,
+            clear_flags: hopnet_common::OnboardingFlags::NONE,
+        };
+        let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard()).unwrap();
+        let (decoded, _) = bincode::serde::decode_from_slice::<UpdateUserOnboardingPayload, _>(
+            &encoded, bincode::config::standard()
+        ).unwrap();
+        assert_eq!(decoded.user_id, 7);
+        assert_eq!(decoded.set_flags.raw(), 0b11);
+        assert_eq!(decoded.clear_flags.raw(), 0);
+    }
+
+    #[test]
+    fn test_onboarding_flag_iter_collect() {
+        use hopnet_common::{OnboardingFlag, OnboardingFlags};
+        let flags: OnboardingFlags = vec![OnboardingFlag::ImportOffered, OnboardingFlag::ImportCompleted]
+            .into_iter()
+            .collect();
+        assert_eq!(flags.raw(), 0b11);
+        let empty: OnboardingFlags = std::iter::empty::<OnboardingFlag>().collect();
+        assert_eq!(empty, OnboardingFlags::NONE);
     }
 
     #[test]

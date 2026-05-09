@@ -53,6 +53,42 @@ pub async fn upload_file(
     Ok(())
 }
 
+/// Upload multiple files in a single multipart request to one node.
+///
+/// All files share the same parent path. Each file becomes a `file_<size>` part
+/// alongside one `path` text part. Used to exercise the batched-inode atomicity
+/// of `post_files`.
+pub async fn upload_files_multi(
+    node: &NodeInfo,
+    path: &str,
+    files: Vec<(String, Vec<u8>)>,
+) -> Result<()> {
+    let client = Client::new();
+    let url = format!("http://{}:{}/files", node.ip_address, node.port);
+
+    let mut form = reqwest::multipart::Form::new().text("path", path.to_string());
+    for (filename, contents) in files {
+        let len = contents.len();
+        let part = reqwest::multipart::Part::bytes(contents).file_name(filename);
+        form = form.part(format!("file_{}", len), part);
+    }
+
+    let response = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", node.jwt_token))
+        .multipart(form)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_else(|_| "No body".to_string());
+        anyhow::bail!("Multi-file upload failed with status {}: {}", status, body);
+    }
+
+    Ok(())
+}
+
 // ============================================================================
 // File Modify Helpers
 // ============================================================================

@@ -111,11 +111,22 @@ pub async fn device_token_auth_middleware(
         let expires_at = chrono::Utc::now() + chrono::Duration::minutes(5);
         let session = auth::SessionEntry { user_keys, siv_key, siv_nonce, expires_at };
 
-        let mut store = app_state.session_store.write().await;
-        // Re-check under write lock to avoid overwriting a longer-lived session
-        match store.get(&device.user_id) {
-            Some(entry) if entry.expires_at > chrono::Utc::now() => {},
-            _ => { store.insert(device.user_id, session); }
+        let inserted = {
+            let mut store = app_state.session_store.write().await;
+            // Re-check under write lock to avoid overwriting a longer-lived session
+            match store.get(&device.user_id) {
+                Some(entry) if entry.expires_at > chrono::Utc::now() => false,
+                _ => {
+                    store.insert(device.user_id, session);
+                    true
+                }
+            }
+        };
+        if inserted {
+            tokio::spawn(crate::takeout::jobs::maybe_resume_for_user(
+                app_state.clone(),
+                device.user_id,
+            ));
         }
     }
 

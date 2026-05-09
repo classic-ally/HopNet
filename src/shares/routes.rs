@@ -22,14 +22,23 @@ fn database_error_to_status(e: DatabaseError) -> StatusCode {
     }
 }
 
-pub fn router() -> Router<AppState> {
-    Router::new()
-        .route("/", post(post_share))
+pub fn router(state: AppState) -> Router<AppState> {
+    let reads = Router::new()
         .route("/incoming", get(get_incoming_shares))
         .route("/incoming/count", get(get_incoming_share_count))
+        .route("/file/{inode_id}", get(get_share_details));
+
+    let writes = Router::new()
+        .route("/", post(post_share))
         .route("/incoming/{id}", delete(delete_incoming_share))
         .route("/{id}/accept", post(post_accept_share))
-        .route("/file/{inode_id}", get(get_share_details).delete(delete_unshare))
+        .route("/file/{inode_id}", delete(delete_unshare))
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            crate::takeout::import_gate::import_gate,
+        ));
+
+    reads.merge(writes)
 }
 
 /// POST /shares — share a file with another user
@@ -240,7 +249,7 @@ pub async fn post_accept_share(
             Ok(t) => t,
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         };
-        let missing = match crate::db::files::find_missing_parents(&tx, &[encrypted_path.clone()]) {
+        let missing = match crate::db::files::find_missing_parents(&tx, &[encrypted_path.as_str()]) {
             Ok(m) => m,
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         };

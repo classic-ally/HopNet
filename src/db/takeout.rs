@@ -386,120 +386,113 @@ pub async fn get_node_available_storage(
 /// Materialize all folder structure for a takeout
 /// Creates directories in staging area and updates materialization status
 pub fn materialize_folders(
-    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
+    conn: &mut rusqlite::Connection,
     takeout_id: &CustomUUID,
     fragments_dir: &str,
     siv_key: &aes_siv::Key<aes_siv::siv::Aes256Siv>,
     siv_nonce: &aes_siv::Nonce,
 ) -> Result<(u32, u32), DatabaseError> {
-    match db_connection {
-        Ok(mut db_lock) => {
-            
-            let temp_table_name = format!("takeout_inodes_{}", takeout_id.simple());
-            tracing::info!("Starting folder materialization for takeout {}", takeout_id);
-            
-            // Create staging directory structure
-            let staging_dir = format!("{}/takeouts/{}/staging/files", fragments_dir, takeout_id.simple());
-            std::fs::create_dir_all(&staging_dir).map_err(|e| {
-                tracing::error!("Failed to create staging directory {}: {:?}", staging_dir, e);
-                DatabaseError::ProcessingError
-            })?;
-            
-            let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
-            
-            // Query all folders ordered by path depth (parents before children)
-            let query = format!(
-                "SELECT id, path FROM {} 
-                 WHERE type = 1 AND materialization_status = 0
-                 ORDER BY LENGTH(path) - LENGTH(REPLACE(path, '/', ''))", 
-                temp_table_name
-            );
-            
-            let folders: Vec<(CustomUUID, String)> = {
-                let mut stmt = tx.prepare(&query).map_err(|e| {
-                    tracing::error!("Failed to prepare folder query: {:?}", e);
-                    DatabaseError::RecallError
-                })?;
-                stmt.query_map([], |row| {
-                    let id: CustomUUID = row.get(0)?;
-                    let encrypted_path: String = row.get(1)?;
-                    Ok((id, encrypted_path))
-                }).map_err(|e| {
-                    tracing::error!("Failed to execute folder query: {:?}", e);
-                    DatabaseError::RecallError
-                })?
-                .collect::<Result<Vec<_>, _>>().map_err(|_| DatabaseError::RecallError)?
-            };
+    let temp_table_name = format!("takeout_inodes_{}", takeout_id.simple());
+    tracing::info!("Starting folder materialization for takeout {}", takeout_id);
 
-            let mut materialized_count = 0;
-            let mut failed_count = 0;
+    // Create staging directory structure
+    let staging_dir = format!("{}/takeouts/{}/staging/files", fragments_dir, takeout_id.simple());
+    std::fs::create_dir_all(&staging_dir).map_err(|e| {
+        tracing::error!("Failed to create staging directory {}: {:?}", staging_dir, e);
+        DatabaseError::ProcessingError
+    })?;
 
-            for (folder_id, encrypted_path) in folders {
-                
-                // Decrypt the path segments
-                let decrypted_path = match crate::files::functions::decrypt_path(encrypted_path.clone(), siv_key, siv_nonce) {
-                    Ok(path) => path,
-                    Err(e) => {
-                        tracing::error!("Failed to decrypt path {}: {:?}", encrypted_path, e);
-                        
-                        // Mark folder as failed
-                        let update_query = format!(
-                            "UPDATE {} SET materialization_status = 2, error_message = ? WHERE id = ?",
-                            temp_table_name
-                        );
-                        let _ = tx.execute(&update_query, params!["Path decryption failed", folder_id]);
-                        failed_count += 1;
-                        continue;
-                    }
-                };
-                
-                // Create directory in staging area
-                let full_staging_path = format!("{}/{}", staging_dir, decrypted_path.trim_start_matches('/'));
-                match std::fs::create_dir_all(&full_staging_path) {
-                    Ok(_) => {
-                        tracing::debug!("Created directory: {}", full_staging_path);
-                        
-                        // Mark folder as successfully materialized
-                        let update_query = format!(
-                            "UPDATE {} SET materialization_status = 1 WHERE id = ?",
-                            temp_table_name
-                        );
-                        if let Err(e) = tx.execute(&update_query, params![folder_id]) {
-                            tracing::error!("Failed to update folder status: {:?}", e);
-                            failed_count += 1;
-                        } else {
-                            materialized_count += 1;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to create directory {}: {:?}", full_staging_path, e);
-                        
-                        // Mark folder as failed
-                        let update_query = format!(
-                            "UPDATE {} SET materialization_status = 2, error_message = ? WHERE id = ?",
-                            temp_table_name
-                        );
-                        let error_msg = format!("Directory creation failed: {}", e);
-                        let _ = tx.execute(&update_query, params![error_msg, folder_id]);
-                        failed_count += 1;
-                    }
+    let tx = conn.transaction().map_err(|_| DatabaseError::LockError)?;
+
+    // Query all folders ordered by path depth (parents before children)
+    let query = format!(
+        "SELECT id, path FROM {}
+         WHERE type = 1 AND materialization_status = 0
+         ORDER BY LENGTH(path) - LENGTH(REPLACE(path, '/', ''))",
+        temp_table_name
+    );
+
+    let folders: Vec<(CustomUUID, String)> = {
+        let mut stmt = tx.prepare(&query).map_err(|e| {
+            tracing::error!("Failed to prepare folder query: {:?}", e);
+            DatabaseError::RecallError
+        })?;
+        stmt.query_map([], |row| {
+            let id: CustomUUID = row.get(0)?;
+            let encrypted_path: String = row.get(1)?;
+            Ok((id, encrypted_path))
+        }).map_err(|e| {
+            tracing::error!("Failed to execute folder query: {:?}", e);
+            DatabaseError::RecallError
+        })?
+        .collect::<Result<Vec<_>, _>>().map_err(|_| DatabaseError::RecallError)?
+    };
+
+    let mut materialized_count = 0;
+    let mut failed_count = 0;
+
+    for (folder_id, encrypted_path) in folders {
+        // Decrypt the path segments
+        let decrypted_path = match crate::files::functions::decrypt_path(encrypted_path.clone(), siv_key, siv_nonce) {
+            Ok(path) => path,
+            Err(e) => {
+                tracing::error!("Failed to decrypt path {}: {:?}", encrypted_path, e);
+
+                // Mark folder as failed
+                let update_query = format!(
+                    "UPDATE {} SET materialization_status = 2, error_message = ? WHERE id = ?",
+                    temp_table_name
+                );
+                let _ = tx.execute(&update_query, params!["Path decryption failed", folder_id]);
+                failed_count += 1;
+                continue;
+            }
+        };
+
+        // Create directory in staging area
+        let full_staging_path = format!("{}/{}", staging_dir, decrypted_path.trim_start_matches('/'));
+        match std::fs::create_dir_all(&full_staging_path) {
+            Ok(_) => {
+                tracing::debug!("Created directory: {}", full_staging_path);
+
+                // Mark folder as successfully materialized
+                let update_query = format!(
+                    "UPDATE {} SET materialization_status = 1 WHERE id = ?",
+                    temp_table_name
+                );
+                if let Err(e) = tx.execute(&update_query, params![folder_id]) {
+                    tracing::error!("Failed to update folder status: {:?}", e);
+                    failed_count += 1;
+                } else {
+                    materialized_count += 1;
                 }
             }
-            
-            tx.commit().map_err(|e| {
-                tracing::error!("Failed to commit folder materialization: {:?}", e);
-                DatabaseError::ProcessingError
-            })?;
-            
-            tracing::info!(
-                "Folder materialization completed: {} succeeded, {} failed", 
-                materialized_count, failed_count
-            );
-            
-            Ok((materialized_count, failed_count))
+            Err(e) => {
+                tracing::error!("Failed to create directory {}: {:?}", full_staging_path, e);
+
+                // Mark folder as failed
+                let update_query = format!(
+                    "UPDATE {} SET materialization_status = 2, error_message = ? WHERE id = ?",
+                    temp_table_name
+                );
+                let error_msg = format!("Directory creation failed: {}", e);
+                let _ = tx.execute(&update_query, params![error_msg, folder_id]);
+                failed_count += 1;
+            }
         }
-        Err(_) => Err(DatabaseError::LockError)
     }
+
+    crate::db::shared::commit_timed(tx).map_err(|e| {
+        tracing::error!("Failed to commit folder materialization: {:?}", e);
+        DatabaseError::ProcessingError
+    })?;
+
+    tracing::info!(
+        "Folder materialization completed: {} succeeded, {} failed",
+        materialized_count, failed_count
+    );
+
+    Ok((materialized_count, failed_count))
 }
 
 /// Process a takeout status update using a shared transaction (for consensus transaction processing)
@@ -592,56 +585,57 @@ pub fn process_takeout_status_update(
     Ok(())
 }
 
-/// Get a batch of pending files for materialization with offset pagination
-/// Returns (file_id, encrypted_path, data_id) tuples for processing
-pub fn get_pending_files_batch(
-    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
+/// Warn above this count: in-memory list grows large, consider paginating.
+const PENDING_FILES_WARN_THRESHOLD: usize = 50_000;
+
+/// All pending files for a takeout in one query, ordered by path.
+/// JOIN against `data_blocks` surfaces `file_hash` for integrity check.
+pub fn list_pending_files(
+    conn: &rusqlite::Connection,
     takeout_id: &CustomUUID,
-    batch_size: usize,
-    offset: usize,
-) -> Result<Vec<(CustomUUID, String, CustomUUID)>, DatabaseError> {
-    match db_connection {
-        Ok(db_lock) => {
-            let temp_table_name = format!("takeout_inodes_{}", takeout_id.simple());
-            
-            // Query files with consistent ordering for deterministic pagination
-            let query = format!(
-                "SELECT id, path, data_id FROM {} 
-                 WHERE type = 0 AND materialization_status = 0 AND data_id IS NOT NULL
-                 ORDER BY path
-                 LIMIT {} OFFSET {}", 
-                temp_table_name, batch_size, offset
-            );
-            
-            let mut stmt = db_lock.prepare(&query).map_err(|e| {
-                tracing::error!("Failed to prepare batch file query: {:?}", e);
-                DatabaseError::RecallError
-            })?;
-            
-            let file_iter = stmt.query_map([], |row| {
-                let id: CustomUUID = row.get(0)?;
-                let encrypted_path: String = row.get(1)?;
-                let data_id: CustomUUID = row.get(2)?;
-                Ok((id, encrypted_path, data_id))
-            }).map_err(|e| {
-                tracing::error!("Failed to execute batch file query: {:?}", e);
-                DatabaseError::RecallError
-            })?;
-            
-            let mut files = Vec::new();
-            for file_result in file_iter {
-                files.push(file_result.map_err(|_| DatabaseError::RecallError)?);
-            }
-            
-            tracing::debug!(
-                "Retrieved batch of {} files for takeout {} (offset: {}, requested: {})",
-                files.len(), takeout_id, offset, batch_size
-            );
-            
-            Ok(files)
-        }
-        Err(_) => Err(DatabaseError::LockError)
+) -> Result<Vec<(CustomUUID, String, CustomUUID, crate::types::Blake3Hash)>, DatabaseError> {
+    let temp_table_name = format!("takeout_inodes_{}", takeout_id.simple());
+
+    let query = format!(
+        "SELECT t.id, t.path, t.data_id, d.file_hash
+         FROM {} t
+         JOIN data_blocks d ON t.data_id = d.id
+         WHERE t.type = 0 AND t.materialization_status = 0 AND t.data_id IS NOT NULL
+         ORDER BY t.path",
+        temp_table_name
+    );
+
+    let mut stmt = conn.prepare(&query).map_err(|e| {
+        tracing::error!("Failed to prepare pending files query: {:?}", e);
+        DatabaseError::RecallError
+    })?;
+
+    let file_iter = stmt.query_map([], |row| {
+        let id: CustomUUID = row.get(0)?;
+        let encrypted_path: String = row.get(1)?;
+        let data_id: CustomUUID = row.get(2)?;
+        let file_hash: crate::types::Blake3Hash = row.get(3)?;
+        Ok((id, encrypted_path, data_id, file_hash))
+    }).map_err(|e| {
+        tracing::error!("Failed to execute pending files query: {:?}", e);
+        DatabaseError::RecallError
+    })?;
+
+    let mut files = Vec::new();
+    for file_result in file_iter {
+        files.push(file_result.map_err(|_| DatabaseError::RecallError)?);
     }
+
+    if files.len() > PENDING_FILES_WARN_THRESHOLD {
+        tracing::warn!(
+            "Takeout {} has {} pending files (above {} threshold)",
+            takeout_id, files.len(), PENDING_FILES_WARN_THRESHOLD
+        );
+    } else {
+        tracing::debug!("Listed {} pending files for takeout {}", files.len(), takeout_id);
+    }
+
+    Ok(files)
 }
 
 /// Update file materialization status in temporary table using an existing transaction
@@ -674,111 +668,251 @@ pub fn update_file_status(
     Ok(())
 }
 
-/// Materialize all files for a takeout using batched processing with concurrency control
-/// Processes up to 10 files simultaneously to control memory usage and connection pool strain
+/// Materialize all files for a takeout via streaming pipeline.
+///
+/// Reconstruction workers (CPU + network bound) run with bounded concurrency.
+/// Each worker returns its result; the coordinator applies status updates on
+/// `reserved_conn` so the takeout never competes with itself for pool slots
+/// on the write path. Per-file status is committed individually for durability.
 pub async fn materialize_all_files(
     app_state: &crate::AppState,
+    reserved_conn: &mut rusqlite::Connection,
     takeout_id: &CustomUUID,
     fragments_dir: &str,
     user_id: i32,
 ) -> Result<(u32, u32), DatabaseError> {
-    const BATCH_SIZE: usize = 10;
-    let mut offset = 0;
-    let mut total_materialized = 0;
-    let mut total_failed = 0;
-    
-    tracing::info!("Starting batched file materialization for takeout {}", takeout_id);
-    
-    loop {
-        // Get next batch of files
-        let batch = get_pending_files_batch(app_state.db_pool.get(), takeout_id, BATCH_SIZE, offset)?;
-        if batch.is_empty() {
-            tracing::info!("No more files to process for takeout {}", takeout_id);
-            break;
-        }
-        
-        tracing::debug!("Processing batch of {} files (offset: {})", batch.len(), offset);
-        
-        // Process files in this batch concurrently
-        let batch_handles = batch.into_iter().map(|(file_id, encrypted_path, data_id)| {
-            let app_state = app_state.clone();
-            let takeout_id = takeout_id.clone();
-            let fragments_dir = fragments_dir.to_string();
-            let db_pool = app_state.db_pool.clone();
-            
-            tokio::spawn(async move {
-                let temp_table_name = format!("takeout_inodes_{}", takeout_id.simple());
-
-                // Materialize the file and get the result
-                let (file_id, status, error_msg) = crate::takeout::materialization::materialize_single_file(
-                    &app_state,
-                    &takeout_id,
-                    file_id,
-                    encrypted_path,
-                    data_id,
-                    &fragments_dir,
-                    user_id,
-                ).await;
-
-                // Immediately update the database with the result
-                if let Ok(mut conn) = db_pool.get() {
-                    if let Ok(tx) = conn.transaction() {
-                        if let Err(e) = update_file_status(&tx, &temp_table_name, &file_id, status.clone(), error_msg.as_deref()) {
-                            tracing::error!("Failed to update status for file {}: {:?}", file_id, e);
-                        } else if let Err(e) = tx.commit() {
-                            tracing::error!("Failed to commit status update for file {}: {:?}", file_id, e);
-                        }
-                    }
-                }
-
-                // Return whether the materialization succeeded
-                matches!(status, MaterializationStatus::Success)
-            })
-        }).collect::<Vec<_>>();
-        
-        // Wait for all tasks in the batch to complete
-        let mut batch_materialized = 0;
-        let mut batch_failed = 0;
-        
-        for handle in batch_handles {
-            match handle.await {
-                Ok(true) => batch_materialized += 1,
-                Ok(false) => batch_failed += 1,
-                Err(e) => {
-                    tracing::error!("Task join error during file materialization: {:?}", e);
-                    batch_failed += 1;
-                }
-            }
-        }
-        
-        total_materialized += batch_materialized;
-        total_failed += batch_failed;
-        
-        tracing::info!(
-            "Batch completed: {} succeeded, {} failed. Total: {}/{} succeeded, {}/{} failed",
-            batch_materialized, batch_failed, total_materialized, total_materialized + total_failed,
-            total_failed, total_materialized + total_failed
-        );
-        
-        offset += BATCH_SIZE;
+    let pending = list_pending_files(reserved_conn, takeout_id)?;
+    let total = pending.len();
+    if total == 0 {
+        tracing::info!("No pending files to materialize for takeout {}", takeout_id);
+        return Ok((0, 0));
     }
-    
+
+    let concurrency = crate::db::db_worker_concurrency_budget().max(1).min(total);
+    tracing::info!(
+        "Starting streaming materialization for takeout {}: {} files, concurrency {}",
+        takeout_id, total, concurrency
+    );
+
+    let temp_table_name = format!("takeout_inodes_{}", takeout_id.simple());
+    let mut set: tokio::task::JoinSet<(CustomUUID, MaterializationStatus, Option<String>)> =
+        tokio::task::JoinSet::new();
+    let mut iter = pending.into_iter();
+    let mut total_materialized = 0u32;
+    let mut total_failed = 0u32;
+
+    // Helper to spawn a single reconstruction task
+    let spawn_one = |set: &mut tokio::task::JoinSet<_>,
+                     work: (CustomUUID, String, CustomUUID, crate::types::Blake3Hash)| {
+        let (file_id, encrypted_path, data_id, expected_file_hash) = work;
+        let app_state = app_state.clone();
+        let takeout_id = takeout_id.clone();
+        let fragments_dir = fragments_dir.to_string();
+        set.spawn(async move {
+            crate::takeout::materialization::materialize_single_file(
+                &app_state,
+                &takeout_id,
+                file_id,
+                encrypted_path,
+                data_id,
+                expected_file_hash,
+                &fragments_dir,
+                user_id,
+            ).await
+        });
+    };
+
+    // Prime the pipeline up to the concurrency cap
+    for _ in 0..concurrency {
+        if let Some(work) = iter.next() {
+            spawn_one(&mut set, work);
+        }
+    }
+
+    // Drain results, persist on reserved_conn, replenish the pipeline
+    while let Some(join_result) = set.join_next().await {
+        let (file_id, status, error_msg) = match join_result {
+            Ok(triple) => triple,
+            Err(e) => {
+                tracing::error!("Reconstruction task panicked or was cancelled: {:?}", e);
+                total_failed += 1;
+                if let Some(work) = iter.next() {
+                    spawn_one(&mut set, work);
+                }
+                continue;
+            }
+        };
+
+        let tx = reserved_conn.transaction().map_err(|e| {
+            tracing::error!("Failed to open status-update tx for file {}: {:?}", file_id, e);
+            DatabaseError::ProcessingError
+        })?;
+        if let Err(e) = update_file_status(&tx, &temp_table_name, &file_id, status.clone(), error_msg.as_deref()) {
+            tracing::error!("Failed to update status for file {}: {:?}", file_id, e);
+        } else if let Err(e) = crate::db::shared::commit_timed(tx) {
+            tracing::error!("Failed to commit status update for file {}: {:?}", file_id, e);
+        }
+
+        match status {
+            MaterializationStatus::Success => total_materialized += 1,
+            _ => total_failed += 1,
+        }
+
+        if let Some(work) = iter.next() {
+            spawn_one(&mut set, work);
+        }
+    }
+
     tracing::info!(
         "File materialization completed for takeout {}: {} succeeded, {} failed",
         takeout_id, total_materialized, total_failed
     );
-    
+
     Ok((total_materialized, total_failed))
+}
+
+/// Build the takeout manifest emitted as the first tar entry of an archive.
+/// Reads successfully materialized folders and files, decrypts their paths,
+/// and projects per-file `file_size` + `file_hash` directly from `data_blocks`
+/// so the hash formula stays consistent with `src/files/routes.rs:239`.
+///
+/// Acquires one pool connection and reuses it across all three queries
+/// (username, folders, files). Runs after materialization completes and
+/// before archive assembly — sequential section of `execute_takeout_materialization`
+/// where the concurrent batch tasks have already released their conns.
+pub fn build_takeout_manifest(
+    conn: &rusqlite::Connection,
+    takeout_id: &CustomUUID,
+    user_id: i32,
+    siv_key: &aes_siv::Key<aes_siv::siv::Aes256Siv>,
+    siv_nonce: &aes_siv::Nonce,
+) -> Result<crate::takeout::manifest::TakeoutManifest, DatabaseError> {
+    use crate::takeout::manifest::{
+        TakeoutManifest, TakeoutManifestFile, TakeoutManifestFolder, MANIFEST_VERSION,
+    };
+
+    let temp_table_name = format!("takeout_inodes_{}", takeout_id.simple());
+
+    // Source username — displayed on the import side for diagnostic context.
+    let source_username = match crate::db::users::get_user_by_userid_conn(conn, user_id)? {
+        Some(user) => user.username,
+        None => {
+            tracing::error!("User {} not found when building manifest for takeout {}", user_id, takeout_id);
+            return Err(DatabaseError::RecallError);
+        }
+    };
+
+    // Folders: success-status folder inodes, decrypted, sorted depth-ascending then lex.
+    // Spec § Manifest Format § Ordering requires this so import creates parents first.
+    let folder_query = format!(
+        "SELECT path FROM {} WHERE materialization_status = ? AND type = ?",
+        temp_table_name
+    );
+    let mut folder_stmt = conn.prepare(&folder_query).map_err(|e| {
+        tracing::error!("Failed to prepare manifest folder query: {:?}", e);
+        DatabaseError::ProcessingError
+    })?;
+    let folder_rows = folder_stmt.query_map(
+        params![MaterializationStatus::Success, InodeType::Folder],
+        |row| row.get::<_, String>(0),
+    ).map_err(|e| {
+        tracing::error!("Failed to execute manifest folder query: {:?}", e);
+        DatabaseError::ProcessingError
+    })?;
+
+    let mut folders: Vec<TakeoutManifestFolder> = Vec::new();
+    for row in folder_rows {
+        let encrypted_path = row.map_err(|_| DatabaseError::ProcessingError)?;
+        let decrypted = match crate::files::functions::decrypt_path(encrypted_path, siv_key, siv_nonce) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!("Failed to decrypt folder path for manifest: {:?}", e);
+                continue;
+            }
+        };
+        let trimmed = decrypted.trim_start_matches('/').to_string();
+        folders.push(TakeoutManifestFolder { path: trimmed });
+    }
+    folders.sort_by(|a, b| {
+        let depth_a = a.path.matches('/').count();
+        let depth_b = b.path.matches('/').count();
+        depth_a.cmp(&depth_b).then_with(|| a.path.cmp(&b.path))
+    });
+
+    // Files: success-status file inodes joined to data_blocks for size + hash + source dataid.
+    let file_query = format!(
+        "SELECT t.path, t.data_id, d.file_size, d.file_hash
+         FROM {} t
+         JOIN data_blocks d ON t.data_id = d.id
+         WHERE t.materialization_status = ? AND t.type = ?
+         ORDER BY t.path",
+        temp_table_name
+    );
+    let mut file_stmt = conn.prepare(&file_query).map_err(|e| {
+        tracing::error!("Failed to prepare manifest file query: {:?}", e);
+        DatabaseError::ProcessingError
+    })?;
+    let file_rows = file_stmt.query_map(
+        params![MaterializationStatus::Success, InodeType::File],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, CustomUUID>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, crate::types::Blake3Hash>(3)?,
+            ))
+        },
+    ).map_err(|e| {
+        tracing::error!("Failed to execute manifest file query: {:?}", e);
+        DatabaseError::ProcessingError
+    })?;
+
+    let mut files: Vec<TakeoutManifestFile> = Vec::new();
+    let mut total_bytes: u64 = 0;
+    for row in file_rows {
+        let (encrypted_path, data_id, file_size, file_hash) = row.map_err(|_| DatabaseError::ProcessingError)?;
+        let decrypted = match crate::files::functions::decrypt_path(encrypted_path, siv_key, siv_nonce) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!("Failed to decrypt file path for manifest: {:?}", e);
+                continue;
+            }
+        };
+        let trimmed = decrypted.trim_start_matches('/').to_string();
+        let size = file_size as u64;
+        total_bytes = total_bytes.saturating_add(size);
+        files.push(TakeoutManifestFile {
+            path: trimmed,
+            size,
+            source_data_block_id: data_id,
+            file_hash,
+        });
+    }
+
+    // UUIDv7 encodes creation time — no separate DB query needed for created_at.
+    let created_at = takeout_id.extract_timestamp().unwrap_or_else(Utc::now);
+
+    Ok(TakeoutManifest {
+        version: MANIFEST_VERSION,
+        takeout_id: takeout_id.clone(),
+        created_at,
+        source_username,
+        total_files: files.len() as u64,
+        total_folders: folders.len() as u64,
+        total_bytes,
+        folders,
+        files,
+    })
 }
 
 /// Get list of successfully materialized files and folders for archive creation
 pub fn get_materialized_entries_for_archive(
-    app_state: &crate::AppState,
+    conn: &rusqlite::Connection,
+    fragments_dir: &str,
     takeout_id: &CustomUUID,
     siv_key: &aes_siv::Key<aes_siv::siv::Aes256Siv>,
     siv_nonce: &aes_siv::Nonce,
 ) -> Result<Vec<crate::takeout::archive::ArchiveEntry>, DatabaseError> {
-    let db_connection = app_state.db_pool.get().map_err(|_| DatabaseError::LockError)?;
     let temp_table_name = format!("takeout_inodes_{}", takeout_id.simple());
 
     let mut entries = Vec::new();
@@ -789,7 +923,7 @@ pub fn get_materialized_entries_for_archive(
         temp_table_name
     );
 
-    let mut stmt = db_connection.prepare(&query).map_err(|e| {
+    let mut stmt = conn.prepare(&query).map_err(|e| {
         tracing::error!("Failed to prepare materialized entries query: {:?}", e);
         DatabaseError::ProcessingError
     })?;
@@ -824,10 +958,10 @@ pub fn get_materialized_entries_for_archive(
         let is_folder = inode_type == InodeType::Folder;
         let staging_path = if is_folder {
             format!("{}/takeouts/{}/staging/folders/{}",
-                app_state.fragments_dir, takeout_id.simple(), decrypted_path.trim_start_matches('/'))
+                fragments_dir, takeout_id.simple(), decrypted_path.trim_start_matches('/'))
         } else {
             format!("{}/takeouts/{}/staging/files/{}",
-                app_state.fragments_dir, takeout_id.simple(), decrypted_path.trim_start_matches('/'))
+                fragments_dir, takeout_id.simple(), decrypted_path.trim_start_matches('/'))
         };
 
         // Archive path is the decrypted path without leading slash

@@ -22,6 +22,7 @@ pub fn takeout_routes() -> Router<AppState> {
         .route("/{id}", delete(delete_takeout))
         .route("/{id}/process", post(post_process_takeout))
         .route("/{id}/download", get(get_download_takeout))
+        .nest("/import", crate::takeout::import::import_routes())
 }
 
 /// GET /takeout - Get all takeouts for the authenticated user
@@ -410,9 +411,21 @@ pub async fn execute_takeout_materialization(
     let session = app_state.get_session(user_id).await
         .map_err(|_| TakeoutMaterializationError::Consensus("Session not found for user".to_string()))?;
 
+    // Reserve a coordinator connection for the rest of the takeout pipeline.
+    // Mirrors the consensus_queue::batch_processor pattern. Sequential phases
+    // (folder materialize, archive entries query, manifest build, per-file
+    // status updates) all use this conn, guaranteeing the orchestrator never
+    // fails mid-takeout due to pool contention from other routes.
+    let mut reserved_conn = app_state.db_pool.get()
+        .map_err(|e| TakeoutMaterializationError::Database(crate::db::DatabaseError::LockError))
+        .map_err(|e| {
+            tracing::error!("Failed to acquire reserved coordinator conn for takeout {}: {:?}", takeout_id, e);
+            e
+        })?;
+
     // Start folder materialization
     let folder_result = crate::db::takeout::materialize_folders(
-        app_state.db_pool.get(),
+        &mut reserved_conn,
         takeout_id,
         &app_state.fragments_dir,
         &session.siv_key,
@@ -424,9 +437,10 @@ pub async fn execute_takeout_materialization(
         takeout_id, folder_result.0, folder_result.1
     );
 
-    // Start file materialization
+    // Start file materialization (streaming pipeline; status writes use reserved_conn)
     let file_result = crate::db::takeout::materialize_all_files(
         app_state,
+        &mut reserved_conn,
         takeout_id,
         &app_state.fragments_dir,
         user_id,
@@ -442,11 +456,28 @@ pub async fn execute_takeout_materialization(
 
     // Get list of materialized entries from database
     let archive_entries = crate::db::takeout::get_materialized_entries_for_archive(
-        app_state,
+        &reserved_conn,
+        &app_state.fragments_dir,
         takeout_id,
         &session.siv_key,
         &session.siv_nonce,
     ).map_err(|e| TakeoutMaterializationError::Database(e))?;
+
+    // Build the manifest emitted as the first tar entry.
+    let manifest = crate::db::takeout::build_takeout_manifest(
+        &reserved_conn,
+        takeout_id,
+        user_id,
+        &session.siv_key,
+        &session.siv_nonce,
+    ).map_err(|e| TakeoutMaterializationError::Database(e))?;
+
+    // Reserved conn is no longer needed; release the slot before archive I/O
+    // and the final consensus submit.
+    drop(reserved_conn);
+
+    let manifest_bytes = manifest.to_archive_bytes()
+        .map_err(|e| TakeoutMaterializationError::Serialization(format!("manifest json: {:?}", e)))?;
 
     // Create archive path
     let archive_path = format!("{}/takeouts/{}.tar.gz",
@@ -454,6 +485,7 @@ pub async fn execute_takeout_materialization(
 
     // Create the archive and clean up staging files
     let archive_size = crate::takeout::archive::create_archive(
+        &manifest_bytes,
         archive_entries,
         &archive_path,
         true, // delete_source_files = true for cleanup
@@ -547,3 +579,4 @@ pub async fn post_takeout_maintenance(
         }
     }
 }
+

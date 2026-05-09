@@ -39,6 +39,77 @@ pub struct TakeoutRecord {
     pub consensus_height: i32,
 }
 
+/// Import status — tracks progress of user data ingest
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[typeshare]
+pub enum ImportStatus {
+    Pending,
+    Importing,
+    Completed,
+    Failed,
+}
+
+/// Import record for user data ingest requests
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[typeshare]
+pub struct ImportRecord {
+    pub id: CustomUUID,
+    pub user_id: i32,
+    pub owner_node_id: i32,
+    pub status: ImportStatus,
+    #[typeshare(serialized_as = "String")]
+    pub created_at: DateTime<Utc>,
+}
+
+/// Aggregate counts for a single import's per-path table. Owner-node-local;
+/// surfaced via `GET /takeout/import/status`. Phase 4 frontend uses these for
+/// progress display.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[typeshare]
+pub struct ImportPathCounts {
+    pub total: u32,
+    pub pending: u32,
+    pub imported: u32,
+    pub skipped: u32,
+    pub failed: u32,
+}
+
+/// Per-import path lifecycle status. `Pending` rows wait for 3.5 creation;
+/// `Imported` are committed; `Failed` carries an `error_code`; `Skipped` is
+/// reserved for collisions in future login→import flows.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[typeshare]
+pub enum ImportPathStatus {
+    Pending,
+    Imported,
+    Skipped,
+    Failed,
+}
+
+/// Per-import path row, owner-node-local. Surfaced via the debug
+/// `GET /takeout/import/paths` route in 3.4 for orchestrator observability;
+/// 3.7 supersedes with the aggregate status route. Reuses `InodeType` for the
+/// file/folder discriminator.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[typeshare]
+pub struct ImportPathRow {
+    pub path: String,
+    pub path_type: InodeType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[typeshare(serialized_as = "String")]
+    pub size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_data_block_id: Option<CustomUUID>,
+    pub status: ImportPathStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[typeshare(serialized_as = "String")]
+    pub processed_at: Option<DateTime<Utc>>,
+}
+
 /// Custom UUID wrapper with v7 support and timestamp extraction
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 #[typeshare(serialized_as = "String")]

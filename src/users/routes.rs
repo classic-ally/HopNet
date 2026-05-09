@@ -16,7 +16,8 @@ use crate::{
     AppState,
 };
 use super::types::UpdateUserProfilePayload;
-use hopnet_common::PublicUserInfo;
+use super::helpers::submit_onboarding_update;
+use hopnet_common::{PublicUserInfo, SelfUserInfo, OnboardingFlags, OnboardingFlag};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -24,6 +25,7 @@ pub fn router() -> Router<AppState> {
         .route("/me", get(get_me))
         .route("/me/profile", put(put_profile))
         .route("/me/avatar", put(put_avatar))
+        .route("/me/onboarding", put(put_onboarding))
         .layer(DefaultBodyLimit::max(16_000_000)) // 16MB — matches frontend avatar size check
 }
 
@@ -39,6 +41,19 @@ fn user_to_public(u: &User) -> PublicUserInfo {
     }
 }
 
+fn user_to_self(u: &User) -> SelfUserInfo {
+    SelfUserInfo {
+        user_id: u.user_id,
+        username: u.username.clone(),
+        first_name: u.first_name.clone(),
+        last_name: u.last_name.clone(),
+        avatar: u.avatar.as_ref().map(|bytes| {
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        }),
+        onboarding_flags: u.onboarding_flags.raw(),
+    }
+}
+
 pub async fn get_users(
     State(app_state): State<AppState>,
 ) -> impl IntoResponse {
@@ -51,13 +66,13 @@ pub async fn get_users(
     }
 }
 
-/// GET /users/me — current user's public profile
+/// GET /users/me — current user's self-profile (includes onboarding flags)
 pub async fn get_me(
     State(app_state): State<AppState>,
     Extension(user_id): Extension<i32>,
 ) -> impl IntoResponse {
     match users::get_user_by_userid(app_state.db_pool.get(), user_id) {
-        Ok(Some(user)) => (StatusCode::OK, Json(user_to_public(&user))).into_response(),
+        Ok(Some(user)) => (StatusCode::OK, Json(user_to_self(&user))).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -241,5 +256,31 @@ pub async fn post_users (
             }
         }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    }
+}
+
+/// Body for `PUT /users/me/onboarding`. Typed flag enum prevents stringly-
+/// typed boundary; serde deserialization rejects unknown variants for free.
+#[derive(Serialize, Deserialize)]
+pub struct OnboardingUpdateRequest {
+    pub set: Vec<OnboardingFlag>,
+    pub clear: Vec<OnboardingFlag>,
+}
+
+/// PUT /users/me/onboarding — flip onboarding bitfield. Replicated via consensus.
+pub async fn put_onboarding(
+    State(app_state): State<AppState>,
+    Extension(user_id): Extension<i32>,
+    Json(req): Json<OnboardingUpdateRequest>,
+) -> impl IntoResponse {
+    let set_flags: OnboardingFlags = req.set.into_iter().collect();
+    let clear_flags: OnboardingFlags = req.clear.into_iter().collect();
+
+    match submit_onboarding_update(&app_state, user_id, set_flags, clear_flags).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => {
+            tracing::error!("put_onboarding submit failed for user {}: {}", user_id, e);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }

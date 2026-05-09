@@ -9,6 +9,7 @@ use r2d2_sqlite::SqliteConnectionManager;
 use crate::db::{PrivKey, PubKey};
 use crate::handlers::TransactionHandler;
 
+pub mod barriers;
 pub mod nodes;
 pub mod setup;
 pub mod users;
@@ -52,10 +53,15 @@ pub struct AppState {
     pub test_mode: bool,
     pub orphaned_fragment_scan: Arc<std::sync::Mutex<Option<files::jobs::OrphanedFragmentScan>>>,
     pub iroh_transport: net::IrohTransport,
-    pub consensus_barriers: Arc<consensus::barriers::ConsensusBarriers>,
+    pub consensus_barriers: Arc<barriers::Barriers>,
     pub dedup_cache: Arc<net::DedupCache>,
     pub lock_vote_evidence: Arc<std::sync::Mutex<Option<consensus::types::LockVoteEvidence>>>,
     pub session_store: Arc<auth::SessionStore>,
+    /// Module-owned takeout/import runtime state (resume registry today;
+    /// future Phase 5 worker pool etc.). Single Arc field instead of growing
+    /// AppState's flat list; mirrors the per-module-runtime grouping that
+    /// consensus/net/files will adopt in a follow-up refactor.
+    pub takeout_runtime: Arc<takeout::TakeoutRuntime>,
     pub consensus_queue: consensus::queue::ConsensusQueue,
     pub view_changed: Arc<tokio::sync::Notify>,
     pub write_gate: Arc<db::write_gate::WriteGate>,
