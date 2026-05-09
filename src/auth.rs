@@ -186,6 +186,12 @@ pub async fn sign_in(
         store.insert(db_user.user_id, session);
     }
 
+    // Resume any stranded import owned by this node for this user.
+    tokio::spawn(crate::takeout::jobs::maybe_resume_for_user(
+        app_state.clone(),
+        db_user.user_id,
+    ));
+
     // Store in keychain for auto-login (GUI mode, owner only)
     #[cfg(all(target_os = "macos", feature = "gui", not(debug_assertions)))]
     {

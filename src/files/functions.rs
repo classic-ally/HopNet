@@ -801,8 +801,11 @@ pub async fn prepare_content_update(
             file_size: 0,
         }
     } else {
+        use tokio_stream::StreamExt;
+        use tokio_util::io::StreamReader;
+        let reader = StreamReader::new(field.map(|r| r.map_err(std::io::Error::other)));
         super::routes::process_uploaded_file(
-            field, file_size, dataid.clone(), &per_file_key, &app_state.fragments_dir,
+            reader, file_size, dataid.clone(), &per_file_key, &app_state.fragments_dir,
         ).await?
     };
     data_record.file_access_entries = Some(vec![file_access]);

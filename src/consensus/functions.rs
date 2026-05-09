@@ -393,7 +393,7 @@ pub async fn run_consensus(app_state: &AppState, transactions: Vec<Transaction>,
             tracing::error!("QC insertion failed: {:?}", e);
             ConsensusError::DatabaseError
         })?;
-        tx.commit().map_err(|e| {
+        crate::db::shared::commit_timed(tx).map_err(|e| {
             tracing::error!("Database commit failed for Propose QC in view {}: {:?}", qc1.view_number, e);
             ConsensusError::DatabaseError
         })?;
@@ -470,7 +470,7 @@ pub async fn run_consensus(app_state: &AppState, transactions: Vec<Transaction>,
             tracing::error!("Transaction processing failed: {:?}", e);
             ConsensusError::DatabaseError
         })?;
-        db_tx.commit().map_err(|e| {
+        crate::db::shared::commit_timed(db_tx).map_err(|e| {
             tracing::error!("Database commit failed for Lock QC + transactions in view {}: {:?}", qc2.view_number, e);
             ConsensusError::DatabaseError
         })?;

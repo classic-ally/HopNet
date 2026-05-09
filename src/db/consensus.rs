@@ -475,7 +475,7 @@ pub fn insert_block_with_conn(
         ]
     ).map_err(|_| DatabaseError::InsertError)?;
 
-    tx.commit().map_err(|_| DatabaseError::InsertError)?;
+    crate::db::shared::commit_timed(tx).map_err(|_| DatabaseError::InsertError)?;
     Ok(())
 }
 
@@ -735,7 +735,7 @@ pub fn insert_tc_safe(
             // Now safe: QC and block both exist, can advance view
             insert_tc_unsafe_tx(&tx, &tc)?;
 
-            tx.commit().map_err(|_| DatabaseError::InsertError)?;
+            crate::db::shared::commit_timed(tx).map_err(|_| DatabaseError::InsertError)?;
             Ok(())
         }
         Err(_) => Err(DatabaseError::LockError)
@@ -985,7 +985,7 @@ pub fn update_last_propose_vote(
         Ok(mut db_lock) => {
             let tx = db_lock.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| DatabaseError::LockError)?;
             update_last_propose_vote_tx(&tx, block_hash)?;
-            tx.commit().map_err(|_| DatabaseError::InsertError)?;
+            crate::db::shared::commit_timed(tx).map_err(|_| DatabaseError::InsertError)?;
             Ok(())
         }
         Err(_) => Err(DatabaseError::LockError)

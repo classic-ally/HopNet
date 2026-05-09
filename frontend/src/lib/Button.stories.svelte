@@ -21,7 +21,7 @@
       },
       variant: {
         control: 'radio',
-        options: ['desktop', 'compact', 'mobile'],
+        options: ['desktop', 'compact', 'mobile', 'card'],
         description: 'Display variant for different contexts'
       },
       position: {
@@ -177,5 +177,62 @@
     variant: "compact",
     tooltip: "Create a new folder in the current directory",
     onClick: () => console.log('Creating folder...')
+  }}
+/>
+
+<!-- Card variant — full-width two-row button used by checklists and
+     menu-style entry points. -->
+<Story
+  name="Card — basic"
+  {template}
+  args={{
+    icon: "i-carbon-cloud-upload",
+    text: "Import existing data",
+    subtitle: "Bring in a HopNet takeout archive from a previous installation",
+    variant: "card",
+    onClick: () => console.log('Card clicked!'),
+  }}
+/>
+
+<Story
+  name="Card — with trailing icon + cta"
+  {template}
+  args={{
+    icon: "i-carbon-cloud-upload",
+    text: "Import existing data",
+    subtitle: "Bring in a HopNet takeout archive from a previous installation",
+    variant: "card",
+    trailing: "i-carbon-circle-dash",
+    trailingClass: "text-muted",
+    trailingText: "Start",
+    onClick: () => console.log('Card clicked!'),
+  }}
+/>
+
+<Story
+  name="Card — done state"
+  {template}
+  args={{
+    icon: "i-carbon-cloud-upload",
+    text: "Import existing data",
+    subtitle: "Bring in a HopNet takeout archive from a previous installation",
+    variant: "card",
+    trailing: "i-carbon-checkmark-filled",
+    trailingClass: "text-green",
+    trailingText: "Review",
+    onClick: () => console.log('Card clicked!'),
+  }}
+/>
+
+<Story
+  name="Card — disabled"
+  {template}
+  args={{
+    icon: "i-carbon-cloud-upload",
+    text: "Import existing data",
+    subtitle: "Bring in a HopNet takeout archive from a previous installation",
+    variant: "card",
+    disabled: true,
+    onClick: () => alert('This should not fire!'),
   }}
 />

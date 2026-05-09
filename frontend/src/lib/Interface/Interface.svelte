@@ -1,21 +1,71 @@
 <script>
+    import { onMount } from "svelte";
     import AccountSidebarItem from "./AccountSidebarItem.svelte";
     import BrowsePane from "../panes/files/BrowsePane.svelte";
     import RecentsPane from "../panes/files/RecentsPane.svelte";
     import NodesPane from "../panes/nodes/NodesPane.svelte";
     import TakeoutPane from "../panes/takeout/TakeoutPane.svelte";
+    import WelcomeModal from "../panes/onboarding/WelcomeModal.svelte";
+    import { computeIncompleteSteps } from "../panes/onboarding/steps";
     import DevicesPane from "../panes/devices/DevicesPane.svelte";
     import AccountsPane from "../panes/accounts/AccountsPane.svelte";
     import SidebarItem from "./SidebarItem.svelte";
+    import Banner from "../primitives/Banner.svelte";
     import ResiliencePane from "../panes/resilience/ResiliencePane.svelte";
     import MaintenancePane from "../panes/maintenance/MaintenancePane.svelte";
     import IncomingSharesPane from "../panes/shares/IncomingSharesPane.svelte";
-    import { incomingShareCountStore } from "../stores";
+    import { incomingShareCountStore, importStatusStore, currentUserStore } from "../stores";
 
     // State to track which sidebar item is selected
     let selectedItem = "browse"; // Can be "recents", "browse", "shared", "account", "nodes", "takeout", "devices", "resilience", "maintenance"
     // State to track if we're in account mode (sticky)
     let inAccountMode = false;
+
+    // Welcome / onboarding modal — auto-opens once per Interface mount when
+    // any onboarding step is incomplete; reopens when user clicks the
+    // onboarding banner. Truth source = users.onboarding_flags (replicated
+    // via consensus, so cross-device aware) + importStatusStore for live
+    // import-substate.
+    let showWelcomeModal = false;
+    let welcomeAutoChecked = false;
+    /** @type {string | undefined} */
+    let initialStepFlag = undefined;
+
+    const unsubUser = currentUserStore.subscribe((user) => {
+        if (welcomeAutoChecked || !user) return;
+        welcomeAutoChecked = true;
+        const incomplete = computeIncompleteSteps(user, $importStatusStore);
+        if (incomplete.length > 0) {
+            showWelcomeModal = true;
+            initialStepFlag = undefined; // start at checklist view
+        }
+    });
+
+    onMount(() => {
+        return () => { unsubUser(); };
+    });
+
+    function openWelcomeAtChecklist() {
+        initialStepFlag = undefined;
+        showWelcomeModal = true;
+    }
+
+    function openWelcomeAtImport() {
+        initialStepFlag = 'ImportOffered';
+        showWelcomeModal = true;
+    }
+
+    function closeWelcomeModal() {
+        showWelcomeModal = false;
+    }
+
+    $: importActive = $importStatusStore.record?.status === 'Importing'
+        || $importStatusStore.record?.status === 'Pending';
+
+    $: incompleteCount = $currentUserStore
+        ? computeIncompleteSteps($currentUserStore, $importStatusStore).length
+        : 0;
+    $: showOnboardingBanner = !importActive && incompleteCount > 0;
     
     // State for mobile sidebar toggle
     let isSidebarOpen = false;
@@ -198,6 +248,23 @@
     </div>
     <!-- Main content -->
     <div class="p-5 flex flex-col gap-3 w-full bg-base overflow-auto">
+        {#if importActive}
+            <Banner
+                variant="info"
+                title="Import in progress"
+                subtitle={$importStatusStore.counts
+                    ? `${$importStatusStore.counts.imported + $importStatusStore.counts.skipped + $importStatusStore.counts.failed} of ${$importStatusStore.counts.total} files processed. Uploads paused until it finishes.`
+                    : 'Working on the owner device. Uploads paused until it finishes.'}
+                onClick={openWelcomeAtImport}
+            />
+        {:else if showOnboardingBanner}
+            <Banner
+                variant="info"
+                title="Welcome to HopNet"
+                subtitle="{incompleteCount} setup task{incompleteCount === 1 ? '' : 's'} left. Click to continue."
+                onClick={openWelcomeAtChecklist}
+            />
+        {/if}
         {#if selectedItem === "browse"}
             <!-- Browse pane with integrated toolbar -->
             <BrowsePane onToggleSidebar={toggleSidebar}/>
@@ -226,3 +293,12 @@
         {/if}
     </div>
 </div>
+
+{#if showWelcomeModal && $currentUserStore}
+    <WelcomeModal
+        user={$currentUserStore}
+        importState={$importStatusStore}
+        {initialStepFlag}
+        onClose={closeWelcomeModal}
+    />
+{/if}

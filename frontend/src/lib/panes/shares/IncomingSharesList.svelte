@@ -1,6 +1,7 @@
 <script lang="ts">
     import Button from '../../Button.svelte';
     import type { IncomingShareResponse } from '../../types';
+    import { writesGatedStore, WRITES_GATED_TOOLTIP } from '../../stores';
 
     interface IncomingSharesListProps {
         shares?: IncomingShareResponse[];
@@ -15,6 +16,8 @@
         onAccept = () => {},
         onDecline = () => {},
     }: IncomingSharesListProps = $props();
+
+    const gated = $derived($writesGatedStore);
 
     function formatDate(dateStr: string): string {
         try {
@@ -57,11 +60,15 @@
                         icon="i-carbon-checkmark"
                         text="Accept"
                         onClick={() => onAccept(share)}
+                        disabled={gated}
+                        tooltip={gated ? WRITES_GATED_TOOLTIP : 'Accept share'}
                     />
                     <Button
                         icon="i-carbon-close"
                         text="Decline"
                         onClick={() => onDecline(share)}
+                        disabled={gated}
+                        tooltip={gated ? WRITES_GATED_TOOLTIP : 'Decline share'}
                     />
                 </div>
             </div>

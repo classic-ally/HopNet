@@ -147,11 +147,12 @@ Automated background processes ensuring network health and storage efficiency.
 - [ ] Fragment filesystem cleanup for orphaned files
 - [ ] Job coordination using node ID proximity to minimize duplicate work
 
-### 8. User Data Takeout System ([RFC-010](specs/user-data-takeout.md))
-**Status**: Complete implementation with responsive frontend
+### 8. User Data Takeout & Import System ([RFC-010](specs/user-data-takeout.md))
+**Status**: Takeout complete; Import backend (Phase 3) + Frontend MVP (Phase 4) complete; onboarding architecture in place for future steps.
 
-Consensus-coordinated user data export system enabling portable data extraction from the distributed network.
+Consensus-coordinated user data portability — symmetric export (takeout) and ingest (import) with onboarding-driven UX surfacing.
 
+**Takeout (export):**
 - [x] Consensus-tracked takeout lifecycle management with network-wide coordination
 - [x] Rate limiting with one active takeout per user validation
 - [x] Event-driven file materialization with real-time progress tracking
@@ -160,13 +161,25 @@ Consensus-coordinated user data export system enabling portable data extraction 
 - [x] Automated maintenance jobs with batched consensus operations for expiration handling
 - [x] Complete REST API endpoints (initiate, list, download, delete, can-create status)
 - [x] Responsive frontend interface with selection-based bulk operations
-- [x] Auto-refresh functionality with intelligent pausing during user actions
-- [x] Account mode sidebar integration with proper UI state management
-- [x] TypeScript type generation with DateTime serialization support
-- [ ] **Future**: Incremental exports (changes since last takeout)
-- [ ] **Future**: Selective folder/file export capabilities
-- [ ] **Future**: Multiple archive format support (ZIP, 7z)
-- [ ] **Future**: WebSocket-based real-time progress updates
+
+**Import (ingest):**
+- [x] Multipart upload with manifest validation + quota enforcement (`POST /takeout/import`)
+- [x] Per-file extraction with hash verification + per-row consensus walk (Phase 3.4–3.5)
+- [x] Concurrent-write gate middleware (`import_gate` 409s writes during active import)
+- [x] Aggregate status counts route (`GET /takeout/import/status`); per-path debug route (`GET /takeout/import/paths`)
+- [x] Owner-restart resume — startup scan + auth-event hook re-spawns stranded `Importing` rows (Phase 3.7)
+- [x] Frontend `WelcomeModal` onboarding architecture with pluggable step registry; import as first step
+- [x] Drag-drop upload, 1 Hz status polling, terminal summary card, write-affordance gating across BrowsePane / IncomingShares / ShareDetailsModal
+
+**Onboarding bitfield:**
+- [x] `users.onboarding_flags` u32 bitfield replicated via consensus; `OnboardingFlag` typed enum (`ImportOffered`, `ImportCompleted`); `PUT /users/me/onboarding`
+- [ ] **Future**: Profile setup, recovery passphrase verification, multi-device pairing as additional onboarding steps
+
+**Future enhancements:**
+- [ ] Incremental exports (changes since last takeout)
+- [ ] Selective folder/file export capabilities
+- [ ] Retry-failed-files UI; per-file failure report endpoint
+- [ ] WebSocket-based real-time progress updates
 
 ### 9. Apple FileProvider Integration ([RFC-009](specs/apple-fileprovider.md))
 **Status**: Phase 4b Complete ✅ + Comprehensive Testing Framework ✅ - Full Read/Write Support with Unified Change Tracking

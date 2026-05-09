@@ -2,7 +2,8 @@
 // Only included by the main binary, not the FileProvider
 
 use rusqlite::types::{ToSql, ToSqlOutput, FromSql, FromSqlResult, ValueRef, FromSqlError};
-use super::{InodeType, TakeoutStatus, CustomUUID};
+use super::{InodeType, TakeoutStatus, ImportStatus, ImportPathStatus, CustomUUID};
+use crate::users::OnboardingFlags;
 use uuid::Uuid;
 
 impl ToSql for InodeType {
@@ -57,6 +58,60 @@ impl FromSql for TakeoutStatus {
     }
 }
 
+impl ToSql for ImportStatus {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        let v: i32 = match self {
+            ImportStatus::Pending => 0,
+            ImportStatus::Importing => 1,
+            ImportStatus::Completed => 2,
+            ImportStatus::Failed => 3,
+        };
+        Ok(ToSqlOutput::from(v))
+    }
+}
+
+impl FromSql for ImportStatus {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        match value {
+            ValueRef::Integer(i) => match i as i32 {
+                0 => Ok(ImportStatus::Pending),
+                1 => Ok(ImportStatus::Importing),
+                2 => Ok(ImportStatus::Completed),
+                3 => Ok(ImportStatus::Failed),
+                _ => Err(FromSqlError::InvalidType),
+            },
+            _ => Err(FromSqlError::InvalidType),
+        }
+    }
+}
+
+impl ToSql for ImportPathStatus {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        let v: i32 = match self {
+            ImportPathStatus::Pending => 0,
+            ImportPathStatus::Imported => 1,
+            ImportPathStatus::Skipped => 2,
+            ImportPathStatus::Failed => 3,
+        };
+        Ok(ToSqlOutput::from(v))
+    }
+}
+
+impl FromSql for ImportPathStatus {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        match value {
+            ValueRef::Integer(i) => match i as i32 {
+                0 => Ok(ImportPathStatus::Pending),
+                1 => Ok(ImportPathStatus::Imported),
+                2 => Ok(ImportPathStatus::Skipped),
+                3 => Ok(ImportPathStatus::Failed),
+                _ => Err(FromSqlError::InvalidType),
+            },
+            _ => Err(FromSqlError::InvalidType),
+        }
+    }
+}
+
 /// Database implementations for CustomUUID
 impl ToSql for CustomUUID {
     fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
@@ -83,6 +138,21 @@ impl FromSql for CustomUUID {
                     Err(_) => Err(FromSqlError::InvalidType)
                 }
             }
+            _ => Err(FromSqlError::InvalidType),
+        }
+    }
+}
+
+impl ToSql for OnboardingFlags {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::from(self.0 as i64))
+    }
+}
+
+impl FromSql for OnboardingFlags {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        match value {
+            ValueRef::Integer(i) => Ok(OnboardingFlags(i as u32)),
             _ => Err(FromSqlError::InvalidType),
         }
     }

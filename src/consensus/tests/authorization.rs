@@ -4,8 +4,9 @@ use crate::files::handlers::{ModifyItemPayload, DeleteFilesPayload};
 use crate::metrics::types::Metric;
 use crate::consensus::functions::process_transaction;
 use crate::db::takeout::TakeoutPayload;
+use crate::db::imports::ImportPayload;
 use crate::db::CustomDateTime;
-use hopnet_common::TakeoutStatus;
+use hopnet_common::{TakeoutStatus, ImportStatus};
 use either::Either;
 
 #[cfg(test)]
@@ -447,6 +448,127 @@ mod authorization_tests {
             status: TakeoutStatus::Pending,
             expires_at: CustomDateTime::new(chrono::Utc::now() + chrono::Duration::hours(24)),
             consensus_height: 0,
+        };
+
+        let payload = bincode::serde::encode_to_vec(&payload_data, bincode::config::standard())
+            .expect("Failed to encode payload");
+
+        let tx = Transaction::new_with_user(
+            function,
+            payload,
+            node1.node_id,
+            &node1.signing_key,
+            user.user_id,
+            &user.signing_key,
+        ).expect("Failed to create transaction");
+
+        let mut conn = app_state.db_pool.get().expect("Failed to get DB connection");
+        let db_tx = conn.transaction().expect("Failed to start transaction");
+        let result = process_transaction(&tx, &app_state, false, &db_tx);
+        assert!(result.is_err(), "Mismatched node ID should fail authorization");
+        assert!(matches!(result.unwrap_err(), DatabaseError::AuthorizationError));
+        let _ = db_tx.rollback();
+    }
+
+    #[test]
+    fn test_dual_authorized_create_import() {
+        // tx.user.id == payload.user_id AND tx.submitter.id == payload.owner_node_id
+        // Tests: create_import
+        // Expected: Authorization passes (downstream eligibility check may fail for other reasons,
+        // but we explicitly assert the failure is NOT an AuthorizationError)
+        let app_state = create_test_app_state();
+        let node = MockNode::new(0);
+        let user = MockUser::new(100);
+
+        let function = "create_import".to_string();
+
+        let payload_data = ImportPayload {
+            import_id: crate::db::CustomUUID::new(None),
+            user_id: user.user_id,
+            owner_node_id: node.node_id,
+            status: ImportStatus::Pending,
+        };
+
+        let payload = bincode::serde::encode_to_vec(&payload_data, bincode::config::standard())
+            .expect("Failed to encode payload");
+
+        let tx = Transaction::new_with_user(
+            function,
+            payload,
+            node.node_id,
+            &node.signing_key,
+            user.user_id,
+            &user.signing_key,
+        ).expect("Failed to create transaction");
+
+        let mut conn = app_state.db_pool.get().expect("Failed to get DB connection");
+        let db_tx = conn.transaction().expect("Failed to start transaction");
+        let result = process_transaction(&tx, &app_state, false, &db_tx);
+        if let Err(e) = &result {
+            assert!(!matches!(e, DatabaseError::AuthorizationError),
+                "create_import should not fail authorization but got: {:?}", e);
+        }
+        let _ = db_tx.rollback();
+    }
+
+    #[test]
+    fn test_dual_user_unauthorized_create_import() {
+        // User ID mismatch but node ID matches
+        // tx.user.id != payload.user_id BUT tx.submitter.id == payload.owner_node_id
+        // Tests: create_import
+        // Expected: AuthorizationError
+        let app_state = create_test_app_state();
+        let node = MockNode::new(0);
+        let user1 = MockUser::new(100);
+        let user2_id = 101;
+
+        let function = "create_import".to_string();
+
+        let payload_data = ImportPayload {
+            import_id: crate::db::CustomUUID::new(None),
+            user_id: user2_id,
+            owner_node_id: node.node_id,
+            status: ImportStatus::Pending,
+        };
+
+        let payload = bincode::serde::encode_to_vec(&payload_data, bincode::config::standard())
+            .expect("Failed to encode payload");
+
+        let tx = Transaction::new_with_user(
+            function,
+            payload,
+            node.node_id,
+            &node.signing_key,
+            user1.user_id,
+            &user1.signing_key,
+        ).expect("Failed to create transaction");
+
+        let mut conn = app_state.db_pool.get().expect("Failed to get DB connection");
+        let db_tx = conn.transaction().expect("Failed to start transaction");
+        let result = process_transaction(&tx, &app_state, false, &db_tx);
+        assert!(result.is_err(), "Mismatched user ID should fail authorization");
+        assert!(matches!(result.unwrap_err(), DatabaseError::AuthorizationError));
+        let _ = db_tx.rollback();
+    }
+
+    #[test]
+    fn test_dual_node_unauthorized_create_import() {
+        // Node ID mismatch but user ID matches
+        // tx.user.id == payload.user_id BUT tx.submitter.id != payload.owner_node_id
+        // Tests: create_import
+        // Expected: AuthorizationError
+        let app_state = create_test_app_state();
+        let node1 = MockNode::new(0);
+        let node2_id = 1;
+        let user = MockUser::new(100);
+
+        let function = "create_import".to_string();
+
+        let payload_data = ImportPayload {
+            import_id: crate::db::CustomUUID::new(None),
+            user_id: user.user_id,
+            owner_node_id: node2_id,
+            status: ImportStatus::Pending,
         };
 
         let payload = bincode::serde::encode_to_vec(&payload_data, bincode::config::standard())

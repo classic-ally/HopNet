@@ -3,9 +3,18 @@
 mod tests {
     use crate::files::functions::{
         calculate_chunked_fragments, calculate_padding_and_chunks,
+        FileReassemblyData, reconstruct_file_chunked,
         MAX_FRAGMENT_SIZE, CHUNK_SIZE, ORIGINAL_FRAGMENTS_PER_CHUNK, RECOVERY_FRAGMENTS_PER_CHUNK
     };
+    use crate::files::routes::process_uploaded_file;
+    use crate::db::{Blake3Hash, ChunkType, CustomUUID, SqliteConnectionManager};
+    use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::OsRng as ChaChaOsRng};
     use rand::prelude::*;
+    use rusqlite::params;
+    use std::collections::HashMap;
+    use std::io::Cursor;
+    use tempfile::TempDir;
+    use tokio_stream::StreamExt;
 
     /// Helper function to generate random test data
     fn generate_random_data(size: usize) -> Vec<u8> {
@@ -121,6 +130,160 @@ mod tests {
         // Should match original data (with possible padding at end)
         assert_eq!(&reconstructed[..test_data.len()], test_data.as_slice(), 
             "Original data should be preserved in chunks");
+    }
+
+    fn build_reassembly_data(
+        plaintext_size: usize,
+        data_record: &crate::db::DataRecord,
+        dataid: &CustomUUID,
+        per_file_key: chacha20poly1305::Key,
+    ) -> FileReassemblyData {
+        let _ = plaintext_size;
+        let mut chunks: HashMap<u32, (
+            HashMap<usize, (Blake3Hash, CustomUUID, bool)>,
+            HashMap<usize, (Blake3Hash, CustomUUID, bool)>,
+        )> = HashMap::new();
+
+        for fragment in &data_record.data.fragments {
+            let entry = chunks.entry(fragment.chunk_number).or_insert_with(|| (HashMap::new(), HashMap::new()));
+            let bucket = match fragment.chunk_type {
+                ChunkType::Original => &mut entry.0,
+                ChunkType::Recovery => &mut entry.1,
+            };
+            bucket.insert(
+                fragment.local_index as usize,
+                (fragment.fragment_hash.clone(), fragment.fragment_id.clone(), true),
+            );
+        }
+
+        FileReassemblyData {
+            chunks,
+            added_bytes: data_record.data.added_bytes,
+            expected_file_hash: data_record.data.hash.clone(),
+            data_block_id: dataid.clone(),
+            per_file_key: Some(per_file_key),
+            placement_height: None,
+        }
+    }
+
+    async fn run_round_trip(plaintext: Vec<u8>) {
+        let temp_dir = TempDir::new().unwrap();
+        let fragments_dir = temp_dir.path().to_str().unwrap().to_string();
+        let dataid = CustomUUID::new(None);
+        let per_file_key = ChaCha20Poly1305::generate_key(&mut ChaChaOsRng);
+
+        let source = Cursor::new(plaintext.clone());
+        let data_record = process_uploaded_file(
+            source,
+            plaintext.len(),
+            dataid.clone(),
+            &per_file_key,
+            &fragments_dir,
+        ).await.expect("process_uploaded_file should succeed");
+
+        assert_eq!(data_record.id, dataid, "DataRecord id must equal input dataid");
+        assert_eq!(data_record.file_size, plaintext.len() as u64, "file_size must match plaintext length");
+
+        let reassembly = build_reassembly_data(plaintext.len(), &data_record, &dataid, per_file_key);
+
+        let stream = reconstruct_file_chunked(fragments_dir, reassembly, None, None, None);
+        tokio::pin!(stream);
+
+        let mut reconstructed = Vec::with_capacity(plaintext.len());
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result.expect("reconstruction chunk should succeed");
+            reconstructed.extend_from_slice(&chunk);
+        }
+
+        assert_eq!(reconstructed.len(), plaintext.len(), "reconstructed size must match plaintext");
+        assert_eq!(reconstructed, plaintext, "reconstructed bytes must match plaintext");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_process_uploaded_file_round_trip_small() {
+        let plaintext = generate_random_data(100 * 1024);
+        run_round_trip(plaintext).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_process_uploaded_file_chunk_boundary() {
+        let plaintext = generate_random_data(CHUNK_SIZE);
+        run_round_trip(plaintext).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn test_process_uploaded_file_round_trip_multi_chunk() {
+        let plaintext = generate_random_data(CHUNK_SIZE + 1024);
+        run_round_trip(plaintext).await;
+    }
+
+    fn setup_test_db() -> r2d2::Pool<SqliteConnectionManager> {
+        let manager = SqliteConnectionManager::memory();
+        let pool = r2d2::Pool::builder()
+            .max_size(1)
+            .connection_customizer(Box::new(crate::db::shared::SqliteInitializer))
+            .build(manager)
+            .unwrap();
+        crate::db::shared::initialize(pool.get().unwrap()).unwrap();
+        pool
+    }
+
+    fn insert_dummy_user(conn: &rusqlite::Connection, user_id: i32) {
+        conn.execute(
+            "INSERT INTO users (user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+            params![
+                user_id,
+                format!("user{}", user_id),
+                vec![0u8; 32],
+                vec![0u8; 32],
+                vec![0u8; 32],
+                vec![0u8; 16],
+            ],
+        ).unwrap();
+    }
+
+    fn insert_folder_inode(conn: &rusqlite::Connection, user_id: i32, path: &str) {
+        conn.execute(
+            "INSERT INTO inodes (id, owner_id, path, type, data_id) VALUES (?, ?, ?, 1, NULL)",
+            params![CustomUUID::new(None), user_id, path],
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_find_missing_parents_lexicographic_order() {
+        let pool = setup_test_db();
+        let mut conn = pool.get().unwrap();
+        insert_dummy_user(&conn, 1);
+        let tx = conn.transaction().unwrap();
+
+        let result = crate::db::files::find_missing_parents(&tx, &["x/y/z/file"])
+            .expect("find_missing_parents must succeed");
+
+        assert_eq!(
+            result,
+            vec!["/x".to_string(), "/x/y".to_string(), "/x/y/z".to_string()],
+            "missing parents must be depth-ascending lexicographic"
+        );
+    }
+
+    #[test]
+    fn test_find_missing_parents_partial_existing() {
+        let pool = setup_test_db();
+        let mut conn = pool.get().unwrap();
+        insert_dummy_user(&conn, 1);
+        insert_folder_inode(&conn, 1, "/x");
+        let tx = conn.transaction().unwrap();
+
+        let result = crate::db::files::find_missing_parents(&tx, &["x/y/z/file"])
+            .expect("find_missing_parents must succeed");
+
+        assert_eq!(
+            result,
+            vec!["/x/y".to_string(), "/x/y/z".to_string()],
+            "existing /x must be excluded from missing parents"
+        );
     }
 
     /// Test padding edge cases with odd numbers

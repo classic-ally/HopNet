@@ -46,8 +46,20 @@ cargo build --release --bin orchestrator --features skip-frontend
 
 | Command | Syntax | Description |
 |---------|--------|-------------|
-| **test** | `orchestrator test --mesh-id M --test NAME [--flags ...]` | Run named integration test |
+| **test (auto-managed)** | `orchestrator test --test NAME [--auto-nodes N] [--keep-on-pass] [--flags ...]` | Auto-creates a fresh mesh, runs the test, runs a divergence check on pass, deletes the mesh on **both** test pass and clean divergence. Either failure leaves the mesh up; the mesh id and inspection/cleanup commands are printed. Default `--auto-nodes` is 3. `--keep-on-pass` retains the mesh even on full pass. |
+| **test (caller-managed)** | `orchestrator test --mesh-id M --test NAME [--flags ...]` | Runs against an existing mesh; no auto-cleanup, no auto-divergence-check. Use when running multiple tests against the same mesh, or when reusing a previously-built mesh. |
 | **test list** | `orchestrator test --list` | List all available tests |
+
+**Auto-managed mode flow:**
+
+```
+create mesh (auto-id) → run test → if test fails: leave mesh, exit non-zero
+                       └─ if test passes: run divergence check
+                          ├─ if clean: delete mesh, exit 0 (or keep on --keep-on-pass)
+                          └─ if divergent: leave mesh, exit non-zero
+```
+
+Pass means **test passed AND no divergence**. The mesh is only deleted when the entire pipeline is clean.
 
 ## Available Integration Tests
 
@@ -74,12 +86,27 @@ cargo build --release --bin orchestrator --features skip-frontend
 | `consensus-queue-burst` | 10 concurrent mixed ops at one node, validates batching efficiency and cross-node consistency |
 | `consensus-queue-cross-node` | Two-phase ACK forwarding — operations sent to different nodes concurrently, verifies cross-node coordination |
 | `consensus-queue-throughput` | 30s sustained mixed-operation load, measures ops-per-view throughput (≥80% success rate) |
+| `takeout-happy-path` | Upload files, initiate takeout, wait for Ready, download archive, verify manifest contract and per-file byte+hash match |
+| `import-create-active-conflict` | POST `/takeout/import` creates a Pending row visible on all nodes via consensus; concurrent POSTs (same node or cross-node, same user) are rejected 429 |
+| `import-upload-happy-path` | Valid manifest-only tar.gz upload returns 201 and produces a Pending import row visible on every node |
+| `import-upload-version-rejected` | Manifest with future schema version → 400, no import row created |
+| `import-upload-missing-manifest` | tar.gz whose first entry is not `manifest.json` → 400, no import row created |
+| `import-upload-quota-exceeded` | Manifest claiming `total_bytes` above network capacity → 507, no import row created |
+| `import-extraction-happy-path` | Multi-entry archive (correct hashes): bg extraction flips status to Importing, seeds 5 Pending rows in `import_paths_{id}`, no row marked failed |
+| `import-extraction-hash-mismatch` | Archive whose tar bytes diverge from manifest's `file_hash` for one file: that row marked Failed (`hash_mismatch`); peer rows stay Pending |
+| `import-creation-happy-path` | End-to-end import: extraction + creation walk → status Completed; all path rows Imported; every file queryable on every node |
+| `import-creation-mixed-failure` | One file fails extraction (hash mismatch); creation walk imports survivors; status Completed; corrupted row remains Failed; survivors queryable, corrupted not |
+| `import-write-gate` | POST `/files` returns 409 mid-import for the same user (cross-node enforcement); succeeds after status Completed |
+| `import-status-counts` | `GET /takeout/import/status` returns aggregate counts after mixed-failure import (`imported=4, failed=1, total=5`); non-owner returns 404 |
+| `import-resume-after-restart` | Stop owner mid-import, restart, re-login: status stays Importing pre-login; login hook fires resume; creation walk completes; all files queryable cross-node |
+| `post-files-consensus-shape` | Upload N files in a single POST `/files` request; assert one consensus view advance and all N files visible on every node (tripwire for batching regressions in `post_files`) |
+| `mixed-files-and-folders-one-request` | Upload N files into a deep nested path with no pre-existing parents; assert single view advance and all parents + files visible on every node |
 
 ## Common Workflows
 
-### Development Workflow
+### Development Workflow (one-shot test, recommended)
 
-When testing code changes against the orchestrator:
+Most CI-style usage: auto-managed mode handles mesh creation, divergence check, and cleanup in one command.
 
 ```bash
 # 1. Build the HopNet Docker image via nix flake (if source changed)
@@ -97,42 +124,35 @@ nix build .#packages.aarch64-linux.dockerImage   # macOS / Apple Silicon
 # 2. Load the image into Docker
 docker load < result
 
-# 3. Build orchestrator (skip-frontend for faster builds)
+# 3. Build orchestrator
 cargo build --release --bin orchestrator --features skip-frontend
 
-# 4. Create a test mesh
-./target/release/orchestrator create --nodes 3
-
-# 5. Run tests against the mesh
-./target/release/orchestrator test --mesh-id 0 --test file-upload-consistency
-
-# 6. Check for state divergence
-./target/release/orchestrator divergence --mesh-id 0
-
-# 7. Clean up when done
-./target/release/orchestrator delete --mesh-id 0 -y
+# 4. Run a test (auto-creates mesh, runs divergence check, deletes on full pass)
+./target/release/orchestrator test --test file-upload-consistency
 ```
 
-### Testing Workflow
+On failure (test or divergence), the mesh is left up. Inspection commands are printed; clean up with `delete --mesh-id <id> -y` when done.
 
-Full test suite against a mesh:
+### Testing Workflow (multiple tests against the same mesh)
+
+Caller-managed mode when a mesh should survive across multiple test invocations.
 
 ```bash
-# Build orchestrator first (skip-frontend for faster builds)
+# Build orchestrator first
 cargo build --release --bin orchestrator --features skip-frontend
 
-# Create mesh
+# Create mesh explicitly
 ./target/release/orchestrator create --nodes 3
 
-# Run multiple tests
+# Run multiple tests against the same mesh
 ./target/release/orchestrator test --mesh-id 0 --test file-upload-consistency
 ./target/release/orchestrator test --mesh-id 0 --test fragment-distribution
 ./target/release/orchestrator test --mesh-id 0 --test multi-size-file-consistency
 
-# Check overall health
+# Manual divergence check (auto-managed mode does this automatically)
 ./target/release/orchestrator divergence --mesh-id 0
 
-# Cleanup
+# Cleanup when done
 ./target/release/orchestrator delete --mesh-id 0 -y
 ```
 

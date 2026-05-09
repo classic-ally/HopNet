@@ -7,6 +7,11 @@
         size?: 'sm' | 'md' | 'lg' | 'xl';
         mode?: 'desktop' | 'mobile';
         onClose?: () => void;
+        /// Optional back navigation. When set, a back button mirrors the close
+        /// button in the top-left of the header. Used by multi-step modals
+        /// (e.g. WelcomeModal) so the back affordance lives in the chrome
+        /// rather than a per-page footer.
+        onBack?: () => void;
 
         // Content injection via snippets
         content?: Snippet;
@@ -28,6 +33,7 @@
         size = 'md',
         mode = 'desktop',
         onClose = () => {},
+        onBack = undefined,
         content,
         footer,
         loading = false,
@@ -88,8 +94,20 @@
         aria-labelledby="modal-title"
     >
             <!-- Header -->
-            <div class="flex items-center justify-between p-4 border-b border-overlay0 flex-shrink-0">
-                <h3 id="modal-title" class="text-lg font-semibold text-primary">{title}</h3>
+            <div class="flex items-center justify-between p-4 border-b border-overlay0 flex-shrink-0 gap-2">
+                <div class="flex items-center gap-2 min-w-0">
+                    {#if onBack}
+                        <Button
+                            icon="i-carbon-arrow-left"
+                            text="Back"
+                            variant={closeButtonVariant}
+                            onClick={onBack}
+                            disabled={loading}
+                            tooltip="Back"
+                        />
+                    {/if}
+                    <h3 id="modal-title" class="text-lg font-semibold text-primary truncate">{title}</h3>
+                </div>
                 {#if showCloseButton}
                     <Button
                         icon="i-carbon-close"

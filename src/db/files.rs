@@ -293,7 +293,7 @@ pub fn insert_files(
 // Helper function to find missing parent directories
 pub(crate) fn find_missing_parents(
     tx: &Transaction,
-    new_paths: &[String]
+    new_paths: &[&str]
 ) -> Result<Vec<String>, DatabaseError> {
     if new_paths.is_empty() {
         return Ok(Vec::new());
@@ -925,7 +925,7 @@ pub fn mark_fragments_local_state_batch(
                     total_rows += rows;
                 }
             }
-            tx.commit().map_err(|e| {
+            crate::db::shared::commit_timed(tx).map_err(|e| {
                 tracing::error!("Failed to commit batch fragment update: {:?}", e);
                 DatabaseError::InsertError
             })?;

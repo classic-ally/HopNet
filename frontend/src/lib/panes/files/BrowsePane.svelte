@@ -1,6 +1,6 @@
 <script lang="ts">
     import { TableHandler, ThSort, ThFilter, Th, Datatable } from '@vincjo/datatables'
-    import { tokenStore, API_BASE_URL, currentPathStore, refreshTriggerStore, authenticatedFetch, getCurrentUserId } from '../../stores'
+    import { tokenStore, API_BASE_URL, currentPathStore, refreshTriggerStore, authenticatedFetch, getCurrentUserId, writesGatedStore, WRITES_GATED_TOOLTIP } from '../../stores'
     import { onMount } from 'svelte'
     import type { FileItem } from '../../types'
     import { InodeType } from '../../types'
@@ -625,12 +625,27 @@
         }
     ];
 
-    // Update disabled state without creating new references
+    // Update disabled state without creating new references. Write affordances
+    // (Upload, New Folder, Delete, Share) are also gated when an import is
+    // in progress — backend 409s these same routes, frontend disables the
+    // affordance + swaps tooltip so the user understands why.
     $: {
         const hasSelection = selectedFiles.length > 0;
-        rightElements[0].disabled = !hasSelection; // Download
-        rightElements[1].disabled = !hasSelection; // Delete
-        rightElements[2].disabled = !hasSelection; // Share
+        const gated = $writesGatedStore;
+        const gatedTooltip = WRITES_GATED_TOOLTIP;
+
+        // Center: Upload, New Folder
+        centerElements[0].disabled = gated;
+        centerElements[0].tooltip = gated ? gatedTooltip : 'Upload files to server';
+        centerElements[1].disabled = gated;
+        centerElements[1].tooltip = gated ? gatedTooltip : 'Create a new folder in the current directory';
+
+        // Right: Download (read), Delete (write), Share (write)
+        rightElements[0].disabled = !hasSelection; // Download — not gated
+        rightElements[1].disabled = !hasSelection || gated; // Delete
+        rightElements[1].tooltip = gated ? gatedTooltip : 'Delete selected files';
+        rightElements[2].disabled = !hasSelection || gated; // Share
+        rightElements[2].tooltip = gated ? gatedTooltip : 'Share selected files';
     }
 </script>
 

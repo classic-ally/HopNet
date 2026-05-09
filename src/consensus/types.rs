@@ -155,7 +155,7 @@ impl Ballot {
                 .map_err(|_| VoteError::DatabaseError)?;
 
             // Commit the vote immediately for double-vote protection
-            tx.commit().map_err(|_| VoteError::DatabaseError)?;
+            crate::db::shared::commit_timed(tx).map_err(|_| VoteError::DatabaseError)?;
         }
 
         Ok(Ballot {

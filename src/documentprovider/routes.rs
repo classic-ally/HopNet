@@ -21,15 +21,24 @@ use hopnet_common::documentprovider::{
 };
 use hopnet_common::db::InodeType;
 
-/// Build the DocumentProvider router
+/// Build the DocumentProvider router. Reads bypass the import gate; writes
+/// have the gate applied via a sub-router so attachment is explicit.
 pub fn router(app_state: AppState) -> Router<AppState> {
-    Router::new()
-        // Read routes
+    let reads = Router::new()
         .route("/enumerate", get(get_enumerate))
-        .route("/item", get(get_item).delete(delete_item).patch(patch_item))
-        .route("/download", get(get_download))
-        // Write routes
+        .route("/item", get(get_item))
+        .route("/download", get(get_download));
+
+    let writes = Router::new()
+        .route("/item", delete(delete_item).patch(patch_item))
         .route("/upload", post(post_upload))
+        .layer(middleware::from_fn_with_state(
+            app_state.clone(),
+            crate::takeout::import_gate::import_gate,
+        ));
+
+    reads
+        .merge(writes)
         .layer(middleware::from_fn_with_state(app_state, device_token_auth_middleware))
 }
 

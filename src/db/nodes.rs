@@ -116,7 +116,7 @@ pub fn insert_node_consensus(
 
             // Commit or rollback based on execute flag
             if execute {
-                tx.commit().map_err(|_| DatabaseError::InsertError)?;
+                crate::db::shared::commit_timed(tx).map_err(|_| DatabaseError::InsertError)?;
                 tracing::info!("Node {} registered via consensus (inactive, will activate after catch-up)", node_id);
             } else {
                 tx.rollback().map_err(|_| DatabaseError::LockError)?;

@@ -11,7 +11,6 @@ use axum::{
 };
 use reed_solomon_simd::ReedSolomonEncoder;
 use axum::http::StatusCode;
-use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::OsRng};
 use rand::RngCore;
 
 use crate::{db::{self, Blake3Hash, Data, DataRecord, DatabaseError, FragmentHash, Inode}, files::functions::{calculate_chunk_padding, encrypt_chunk, encrypt_part, encrypt_path, store_fragment}};
@@ -21,8 +20,9 @@ use serde::{Deserialize, Serialize};
 use super::*;
 use crate::db::CustomUUID;
 use either::Either::{Left, Right};
-use crate::consensus::types::Transaction;
-use axum::extract::multipart::Field;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio_stream::StreamExt;
+use tokio_util::io::StreamReader;
 
 #[derive(Deserialize)]
 pub struct GetQueryParams {
@@ -35,11 +35,24 @@ pub struct CleanupQueryParams {
     retention_days: i64,
 }
 
-pub fn router() -> Router<crate::AppState> {
-    Router::new()
+pub fn router(state: crate::AppState) -> Router<crate::AppState> {
+    // Reads bypass the import gate; writes go through it. Splitting into two
+    // sub-routers + `merge` lets us attach `.layer(import_gate)` to the write
+    // router only — gate attachment is explicit, no in-middleware method peek.
+    let reads = Router::new()
         .route("/recent", get(get_recent_files))
-        .route("/", get(get_files).patch(patch_files).delete(delete_files).post(post_files))
-        .route("/{*path}", get(get_file_fragments))
+        .route("/", get(get_files))
+        .route("/{*path}", get(get_file_fragments));
+
+    let writes = Router::new()
+        .route("/", post(post_files).patch(patch_files).delete(delete_files))
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            crate::takeout::import_gate::import_gate,
+        ));
+
+    reads
+        .merge(writes)
         .layer(DefaultBodyLimit::max(5000 * 1_000_000))
 }
 
@@ -155,8 +168,8 @@ fn process_logical_chunk(
 /// Shared file processing function for both create and modify operations
 /// Handles Reed-Solomon encoding, fragmentation, encryption, and storage
 /// Returns a DataRecord ready for database insertion
-pub async fn process_uploaded_file(
-    mut field: Field<'_>,
+pub async fn process_uploaded_file<R: AsyncRead + Unpin>(
+    mut source: R,
     file_size: usize,
     dataid: CustomUUID,
     per_file_key: &chacha20poly1305::Key,
@@ -164,17 +177,16 @@ pub async fn process_uploaded_file(
 ) -> Result<DataRecord, StatusCode> {
     use crate::files::functions::{calculate_chunked_fragments, CHUNK_SIZE, ORIGINAL_FRAGMENTS_PER_CHUNK, RECOVERY_FRAGMENTS_PER_CHUNK};
 
+    const READ_BUF_SIZE: usize = 64 * 1024;
+
     let mut output_chunk_metadata = Vec::new();
     let mut full_file_hasher = blake3::Hasher::new();
 
-    // Calculate chunked Reed-Solomon parameters
     let (num_chunks, total_original, total_recovery) = calculate_chunked_fragments(file_size);
 
     tracing::debug!("process_uploaded_file: file_size={}, num_chunks={}, total_original={}, total_recovery={}",
                    file_size, num_chunks, total_original, total_recovery);
 
-    // Create Reed-Solomon encoder once with max shard size (for 40MB chunk)
-    // Max encrypted fragment size = (40MB / 10 fragments) + 28 bytes encryption overhead
     let max_fragment_size = (CHUNK_SIZE / ORIGINAL_FRAGMENTS_PER_CHUNK) + 28;
     let mut encoder = ReedSolomonEncoder::new(
         ORIGINAL_FRAGMENTS_PER_CHUNK,
@@ -185,25 +197,29 @@ pub async fn process_uploaded_file(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    // Stream file data and process each logical 40MB chunk independently
     let mut logical_chunk_buffer: Vec<u8> = Vec::new();
     let mut current_chunk_number = 0u32;
     let mut last_chunk_padding = 0usize;
+    let mut read_buf = vec![0u8; READ_BUF_SIZE];
 
-    // Read HTTP chunks and buffer them into logical chunks
-    while let Some(http_chunk) = field.chunk().await.map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)? {
-        tracing::debug!("process_uploaded_file: received HTTP chunk of {} bytes", http_chunk.len());
-        logical_chunk_buffer.extend_from_slice(&http_chunk);
-        full_file_hasher.update(&http_chunk);
+    loop {
+        let n = source.read(&mut read_buf).await.map_err(|e| {
+            tracing::error!("process_uploaded_file: read error: {:?}", e);
+            StatusCode::UNPROCESSABLE_ENTITY
+        })?;
+        if n == 0 {
+            break;
+        }
+        let bytes = &read_buf[..n];
+        logical_chunk_buffer.extend_from_slice(bytes);
+        full_file_hasher.update(bytes);
 
-        // Process complete 40MB logical chunks
         while logical_chunk_buffer.len() >= CHUNK_SIZE {
             let chunk_data: Vec<u8> = logical_chunk_buffer.drain(..CHUNK_SIZE).collect();
 
             tracing::debug!("process_uploaded_file: encoding logical chunk {} ({} bytes)",
                            current_chunk_number, chunk_data.len());
 
-            // Process this chunk with Reed-Solomon encoding (10 original + 20 recovery)
             last_chunk_padding = process_logical_chunk(
                 &mut encoder,
                 &chunk_data,
@@ -455,151 +471,6 @@ pub async fn get_file_fragments(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-/// Build a SelfCheckFragments transaction for fragments being uploaded
-/// Only includes the new fragments from this upload, not a full reconciliation
-/// Filters out fragments already in inventory to avoid PRIMARY KEY violations
-async fn build_upload_attestation(
-    app_state: &AppState,
-    node_id: i32,
-    inodes: &[Inode],
-) -> Result<Option<Transaction>, Box<dyn std::error::Error>> {
-    use std::collections::HashSet;
-    use crate::files::types::SelfCheckFragments;
-
-    // Extract all fragment hashes from inodes being uploaded
-    // Note: stored_locally flag is not yet set at this point (happens in InsertFilesHandler)
-    // but we know these fragments were just written to disk during upload
-    let uploaded_fragments: Vec<Blake3Hash> = inodes
-        .iter()
-        .filter_map(|inode| {
-            if let Some(Right(data_record)) = &inode.data_id {
-                Some(
-                    data_record
-                        .data
-                        .fragments
-                        .iter()
-                        .map(|f| f.fragment_hash.clone())
-                        .collect::<Vec<_>>(),
-                )
-            } else {
-                None
-            }
-        })
-        .flatten()
-        .collect();
-
-    if uploaded_fragments.is_empty() {
-        tracing::debug!("No fragments to attest (empty upload or folder-only)");
-        return Ok(None);
-    }
-
-    // Get database connection and create transaction for consistent snapshot
-    let mut db_conn = app_state.db_pool.get()
-        .map_err(|e| format!("Failed to get DB connection: {:?}", e))?;
-
-    let db_tx = db_conn.transaction()
-        .map_err(|e| format!("Failed to create transaction: {:?}", e))?;
-
-    // Query current inventory count (this is our compare-and-swap value)
-    let previous_count: u32 = {
-        let mut stmt = db_tx
-            .prepare("SELECT COUNT(*) FROM fragment_inventory WHERE node_id = ?")
-            .map_err(|e| format!("Failed to prepare count query: {:?}", e))?;
-
-        let count: i64 = stmt
-            .query_row(rusqlite::params![node_id], |row| row.get(0))
-            .map_err(|e| format!("Failed to query inventory count: {:?}", e))?;
-
-        count as u32
-    };
-
-    // Filter out fragments already in inventory (avoid PRIMARY KEY violation)
-    let existing_fragments: HashSet<Blake3Hash> = if !uploaded_fragments.is_empty() {
-        let placeholders = uploaded_fragments.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
-        let query = format!(
-            "SELECT fragment_hash FROM fragment_inventory
-             WHERE node_id = ? AND fragment_hash IN ({})",
-            placeholders
-        );
-
-        let mut stmt = db_tx.prepare(&query)
-            .map_err(|e| format!("Failed to prepare duplicate check: {:?}", e))?;
-
-        // Build params: node_id first, then all fragment hashes
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(node_id)];
-        for hash in &uploaded_fragments {
-            params.push(Box::new(hash.clone()));
-        }
-        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-
-        let mut rows = stmt.query(param_refs.as_slice())
-            .map_err(|e| format!("Failed to query existing fragments: {:?}", e))?;
-
-        let mut set = HashSet::new();
-        while let Some(row) = rows.next()
-            .map_err(|e| format!("Failed to iterate rows: {:?}", e))? {
-            let hash: Blake3Hash = row.get(0)
-                .map_err(|e| format!("Failed to get hash: {:?}", e))?;
-            set.insert(hash);
-        }
-        set
-    } else {
-        HashSet::new()
-    };
-
-    // Only include truly new fragments
-    let new_fragments: Vec<Blake3Hash> = uploaded_fragments
-        .into_iter()
-        .filter(|h| !existing_fragments.contains(h))
-        .collect();
-
-    if new_fragments.is_empty() {
-        // Rollback read-only transaction
-        db_tx.rollback()
-            .map_err(|e| format!("Failed to rollback transaction: {:?}", e))?;
-        tracing::debug!("All uploaded fragments already in inventory, skipping attestation");
-        return Ok(None);
-    }
-
-    // Get current consensus height for verification timestamp
-    let self_verified_height = crate::db::consensus::get_current_consensus_height(&db_tx)
-        .map_err(|e| format!("Failed to get consensus height: {:?}", e))?;
-
-    // Rollback read-only transaction
-    db_tx.rollback()
-        .map_err(|e| format!("Failed to rollback transaction: {:?}", e))?;
-
-    // Build the differential (only additions, no removals for upload)
-    let attestation = SelfCheckFragments {
-        node_id,
-        self_verified_height,
-        previous_count,
-        fragments_added: new_fragments.clone(),
-        fragments_removed: Vec::new(), // Upload never removes fragments
-    };
-
-    // Serialize and sign
-    let payload = bincode::serde::encode_to_vec(&attestation, bincode::config::standard())
-        .map_err(|e| format!("Failed to serialize attestation: {:?}", e))?;
-
-    let transaction = crate::consensus::functions::create_signed_transaction(
-        app_state,
-        "self_check_fragments".to_string(),
-        payload,
-    )
-    .map_err(|e| format!("Failed to sign attestation: {:?}", e))?;
-
-    tracing::info!(
-        "Built upload attestation: {} new fragments (filtered {} existing), previous_count={}, height={}",
-        new_fragments.len(),
-        existing_fragments.len(),
-        attestation.previous_count,
-        attestation.self_verified_height
-    );
-
-    Ok(Some(transaction))
-}
-
 pub async fn post_files(
     State(app_state): State<AppState>,
     Extension(user_id): Extension<i32>,  // Extract user_id from JWT via auth middleware
@@ -676,80 +547,26 @@ pub async fn post_files(
         match part.name() {
             Some(field_name) if field_name.starts_with("file_") => {
                 has_files = true;
-                // instantiate data
                 let filename = part.file_name().map(|s| s.to_string()).ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-                // Parse file size from field name (format: file_123456)
                 let file_size_str = field_name.strip_prefix("file_").ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
                 let file_size = file_size_str.parse::<usize>().map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
 
-                // encrypt filename - deterministic AES-SIV
-                let filepath = path.clone() + &encrypt_part(&filename, &session.siv_key, &session.siv_nonce).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                let reader = StreamReader::new(part.map(|r| r.map_err(std::io::Error::other)));
+                let (inode, dataid) = crate::files::helpers::assemble_file_inode(
+                    &app_state,
+                    &session,
+                    user_id,
+                    &path,
+                    &filename,
+                    reader,
+                    file_size,
+                ).await?;
 
-                // Generate data block ID before sharding
-                let dataid = CustomUUID::new(None);
-                
-                // Generate per-file encryption key
-                let per_file_key = ChaCha20Poly1305::generate_key(&mut OsRng);
-                
-                // Create file access entry for the authenticated user
-                let file_access = crate::db::types::FileAccess::new_for_user(
-                    app_state.db_pool.get(), 
-                    dataid.clone(), 
-                    user_id, 
-                    &per_file_key
-                ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                
-                // Process the uploaded file using shared function
-                let datarecord = if file_size == 0 {
-                    // Empty file - no need for Reed-Solomon processing, create minimal DataRecord
-                    tracing::debug!("Creating empty file (size=0) without Reed-Solomon processing");
-                    None
-                } else {
-                    match process_uploaded_file(
-                        part,
-                        file_size,
-                        dataid.clone(),
-                        &per_file_key,
-                        &app_state.fragments_dir
-                    ).await {
-                        Ok(mut data_record) => {
-                            // Add file access entry and set file size
-                            data_record.file_access_entries = Some(vec![file_access]);
-                            data_record.file_size = file_size as u64;
-                            Some(data_record)
-                        }
-                        Err(status) => return Err(status),
-                    }
-                };
-
-                // assemble inode for database
-                let inode = match datarecord {
-                    Some(data_record) => {
-                        // Track this data block for distribution
-                        uploaded_data_block_ids.push(dataid.clone());
-                        
-                        Inode {
-                            id: CustomUUID::new(None),
-                            owner: Left(user_id),
-                            path: filepath,
-                            inode_type: hopnet_common::InodeType::File,
-                            data_id: Some(Right(data_record))
-                        }
-                    }
-                    None => {
-                        // Empty file - no data record, no access entries needed
-                        Inode {
-                            id: CustomUUID::new(None),
-                            owner: Left(user_id),
-                            path: filepath,
-                            inode_type: hopnet_common::InodeType::File,
-                            data_id: None
-                        }
-                    }
-                };
+                if file_size > 0 {
+                    uploaded_data_block_ids.push(dataid);
+                }
                 inodes.push(inode);
-                
-                    }
+            }
             Some("folder_name") => {
                 folder_name = Some(part.text().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?);
             }
@@ -782,87 +599,34 @@ pub async fn post_files(
     
     // Pre-generate parent folder inodes so every node gets identical folder UUIDs
     {
-        let paths: Vec<String> = inodes.iter().map(|i| i.path.clone()).collect();
         let conn = app_state.db_pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         let tx = conn.unchecked_transaction().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let missing = crate::db::files::find_missing_parents(&tx, &paths)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        for parent_path in missing.into_iter().rev() {
-            inodes.insert(0, Inode {
-                id: CustomUUID::new(None),
-                owner: Left(user_id),
-                path: parent_path,
-                inode_type: hopnet_common::InodeType::Folder,
-                data_id: None,
-            });
-        }
+        crate::files::helpers::prepend_missing_parents(&tx, &mut inodes, user_id)?;
     }
 
-    // Insert the collected inodes into the database via consensus
-    match bincode::serde::encode_to_vec(&inodes, bincode::config::standard()) {
-        Ok(encoded_inodes) => {
-            let insert_files_tx = match crate::consensus::functions::create_signed_user_transaction(
-                &app_state,
-                "insert_files".to_string(),
-                encoded_inodes,
-                user_id,
-            ).await {
-                Ok(tx) => tx,
-                Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
-            };
-
-            // Build upload attestation for fragments being inserted
-            let mut transactions = vec![insert_files_tx];
-
-            if let Ok(node_id) = app_state.get_node_id() {
-                match build_upload_attestation(&app_state, node_id, &inodes).await {
-                    Ok(Some(attestation_tx)) => {
-                        tracing::debug!("Including fragment attestation in upload consensus batch");
-                        transactions.push(attestation_tx);
-                    }
-                    Ok(None) => {
-                        tracing::debug!("No new fragments to attest (folder-only or all fragments already in inventory)");
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to build upload attestation: {:?}. Continuing with file insert only - periodic self-check will handle attestation", e);
-                        // Continue with just insert_files - eventual consistency via periodic self-check
-                    }
-                }
+    // Build upload attestation for fragments being inserted (best-effort —
+    // periodic self-check reconciles if this fails)
+    let attestation = if let Ok(node_id) = app_state.get_node_id() {
+        let conn = app_state.db_pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let tx = conn.unchecked_transaction().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        match crate::files::helpers::build_upload_attestation(&app_state, &tx, node_id, &inodes) {
+            Ok(opt) => opt,
+            Err(e) => {
+                tracing::warn!("Failed to build upload attestation: {}. Continuing with file insert only - periodic self-check will handle attestation", e);
+                None
             }
-
-            // Use consensus queue to ensure distributed agreement
-            let results = app_state.consensus_queue.submit_batch(transactions).await;
-            if results.iter().any(|r| r.is_err()) {
-                tracing::error!("Failed to submit file upload to consensus");
-                return Err(StatusCode::INTERNAL_SERVER_ERROR);
-            }
-
-            // Trigger fragment distribution for each uploaded file
-            for data_block_id in uploaded_data_block_ids {
-                tracing::info!("Triggering fragment distribution for uploaded file {}", data_block_id);
-
-                // Spawn distribution task to avoid blocking the upload response
-                let app_state_clone = app_state.clone();
-                let data_block_id_clone = data_block_id.clone();
-                tokio::spawn(async move {
-                    match crate::files::distribution::distribute_fragments_for_upload(&app_state_clone, data_block_id_clone).await {
-                        Ok(()) => {
-                            tracing::info!("Successfully completed fragment distribution for {}", data_block_id);
-                        }
-                        Err(e) => {
-                            tracing::error!("Fragment distribution failed for {}: {:?}", data_block_id, e);
-                        }
-                    }
-                });
-            }
-
-            return Ok(());
         }
-        Err(e) => {
-            tracing::error!("Bincode encoding error: {:?}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR)
-        }
-    }
+    } else {
+        None
+    };
+
+    crate::files::helpers::submit_inodes(
+        &app_state,
+        user_id,
+        inodes,
+        attestation,
+        uploaded_data_block_ids,
+    ).await
 
 }
 

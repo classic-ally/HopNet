@@ -1,5 +1,6 @@
 use crate::db::{CustomUUID, takeout::MaterializationStatus};
 use crate::files::download::{reconstruct_file_stream, FileReconstructionError};
+use crate::types::Blake3Hash;
 
 /// Materialize a single file by reconstructing from fragments and writing to staging
 /// Returns (file_id, status, optional_error_message) for database update
@@ -9,6 +10,7 @@ pub async fn materialize_single_file(
     file_id: CustomUUID,
     encrypted_path: String,
     data_id: CustomUUID,
+    expected_file_hash: Blake3Hash,
     fragments_dir: &str,
     user_id: i32,
 ) -> (CustomUUID, MaterializationStatus, Option<String>) {
@@ -72,10 +74,12 @@ pub async fn materialize_single_file(
         }
     };
 
-    // Write chunks as they arrive from the stream
+    // Write chunks as they arrive from the stream, hashing plaintext in parallel
+    // for post-reconstruction integrity verification against data_blocks.file_hash.
     use tokio::io::AsyncWriteExt;
     use tokio_stream::StreamExt;
 
+    let mut hasher = blake3::Hasher::new();
     let mut total_bytes = 0;
     while let Some(chunk_result) = stream.next().await {
         let chunk = match chunk_result {
@@ -85,6 +89,8 @@ pub async fn materialize_single_file(
                 return (file_id, MaterializationStatus::Failed, Some("Stream reconstruction error".to_string()));
             }
         };
+
+        hasher.update(&chunk);
 
         if let Err(e) = file.write_all(&chunk).await {
             tracing::error!("Failed to write chunk to {}: {:?}", full_staging_path, e);
@@ -98,6 +104,21 @@ pub async fn materialize_single_file(
     if let Err(e) = file.sync_all().await {
         tracing::error!("Failed to sync file {}: {:?}", full_staging_path, e);
         return (file_id, MaterializationStatus::Failed, Some(format!("File sync failed: {}", e)));
+    }
+
+    // Integrity check: formula must match upload-time hash at src/files/routes.rs:239
+    // (blake3(plaintext || data_id.as_bytes())). Drift on either side = takeouts fail universally.
+    hasher.update(data_id.as_bytes());
+    let computed_hash = Blake3Hash::new(hasher.finalize());
+    if computed_hash != expected_file_hash {
+        tracing::error!(
+            "Integrity check failed for {}: expected {}, got {}",
+            full_staging_path, expected_file_hash, computed_hash
+        );
+        if let Err(e) = tokio::fs::remove_file(&full_staging_path).await {
+            tracing::warn!("Failed to remove corrupted staging file {}: {:?}", full_staging_path, e);
+        }
+        return (file_id, MaterializationStatus::Failed, Some("integrity check failed".to_string()));
     }
 
     tracing::debug!("Materialized file: {} ({} bytes)", full_staging_path, total_bytes);

@@ -36,6 +36,10 @@ When making changes to the codebase:
 - Use tracing for all Rust logging
 - Use INFO levels sparingly to avoid slowdown due to excessive logging
 
+# Database Writes
+- Always use `crate::db::shared::commit_timed(tx)` instead of `tx.commit()`. It records commit latency into the always-on histogram exposed at `GET /debug/db-stats`. Same signature as `Transaction::commit`.
+- Pragma tuning is via `HOPNET_DB_*` env vars (see `src/db/shared.rs::env_pragma_overrides`); orchestrator forwards them to containers automatically.
+
 # Debugging
 - macOS debugging with the `log` command requires the use of sudo
 - tail the last ~10 lines with cargo check to ensure you can see the final result; only if a build fails do you need to get more output.

@@ -1,5 +1,9 @@
 use crate::{
-    db::{DatabaseError, takeout::{self, TakeoutPayload, TakeoutStatusPayload}},
+    db::{
+        DatabaseError,
+        takeout::{self, TakeoutPayload, TakeoutStatusPayload},
+        imports::{self, ImportPayload, ImportStatusPayload},
+    },
     handlers::{HandlerResult, TransactionHandler},
     AppState,
     consensus::types::Transaction,
@@ -83,4 +87,68 @@ impl TransactionHandler for UpdateTakeoutStatusHandler {
 
 inventory::submit! {
     &UpdateTakeoutStatusHandler as &dyn TransactionHandler
+}
+
+/// Handler for `create_import` consensus transactions.
+///
+/// Performs dual authorization (the user signing the transaction matches
+/// `payload.user_id` and the submitting node matches `payload.owner_node_id`)
+/// and delegates to `process_import_creation` for eligibility checks + insertion.
+pub struct CreateImportHandler;
+
+impl TransactionHandler for CreateImportHandler {
+    fn name(&self) -> &'static str { "create_import" }
+
+    fn process(&self, _state: &AppState, tx: &Transaction, execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
+        let (payload, _) = bincode::serde::decode_from_slice::<ImportPayload, _>(&tx.rpc.payload, bincode::config::standard())
+            .map_err(|_| DatabaseError::InvalidPayload)?;
+
+        match &tx.user {
+            Some(user) if user.id == payload.user_id => {}
+            Some(user) => {
+                tracing::warn!(
+                    "Authorization failed: user {} attempted to create import for user {}",
+                    user.id, payload.user_id
+                );
+                return Err(DatabaseError::AuthorizationError);
+            }
+            None => {
+                tracing::warn!("Authorization failed: create_import requires user authentication");
+                return Err(DatabaseError::AuthorizationError);
+            }
+        }
+
+        if payload.owner_node_id != tx.submitter.id {
+            tracing::warn!(
+                "Authorization failed: node {} attempted to create import owned by node {}",
+                tx.submitter.id, payload.owner_node_id
+            );
+            return Err(DatabaseError::AuthorizationError);
+        }
+
+        imports::process_import_creation(&payload, execute, db_tx)
+    }
+}
+
+inventory::submit! {
+    &CreateImportHandler as &dyn TransactionHandler
+}
+
+/// Handler for `update_import_status` consensus transactions.
+/// Single handler covers all status transitions (Pending → Importing → Completed/Failed).
+pub struct UpdateImportStatusHandler;
+
+impl TransactionHandler for UpdateImportStatusHandler {
+    fn name(&self) -> &'static str { "update_import_status" }
+
+    fn process(&self, _state: &AppState, tx: &Transaction, execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
+        let (payload, _) = bincode::serde::decode_from_slice::<ImportStatusPayload, _>(&tx.rpc.payload, bincode::config::standard())
+            .map_err(|_| DatabaseError::InvalidPayload)?;
+
+        imports::process_import_status_update(&payload, execute, db_tx)
+    }
+}
+
+inventory::submit! {
+    &UpdateImportStatusHandler as &dyn TransactionHandler
 }
