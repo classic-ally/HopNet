@@ -38,7 +38,7 @@
 </script>
 
 <div
-    class="sticky top-0 z-30 flex items-center gap-3 px-4 py-2 border-b {variantClasses[variant]} {interactive ? 'cursor-pointer hover:opacity-80' : ''}"
+    class="flex items-center gap-3 px-4 py-2 rounded-lg border shadow-lg {variantClasses[variant]} {interactive ? 'cursor-pointer hover:opacity-80' : ''}"
     role={interactive ? 'button' : undefined}
     tabindex={interactive ? 0 : undefined}
     onclick={onClick}

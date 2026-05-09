@@ -248,7 +248,34 @@
     </div>
     <!-- Main content -->
     <div class="p-5 flex flex-col gap-3 w-full bg-base overflow-auto">
-        {#if importActive}
+        {#if selectedItem === "browse"}
+            <BrowsePane onToggleSidebar={toggleSidebar}/>
+        {:else if selectedItem === "nodes"}
+            <NodesPane onToggleSidebar={toggleSidebar}/>
+        {:else if selectedItem === "takeout"}
+            <TakeoutPane onToggleSidebar={toggleSidebar}/>
+        {:else if selectedItem === "devices"}
+            <DevicesPane onToggleSidebar={toggleSidebar}/>
+        {:else if selectedItem === "resilience"}
+            <ResiliencePane onToggleSidebar={toggleSidebar}/>
+        {:else if selectedItem === "maintenance"}
+            <MaintenancePane onToggleSidebar={toggleSidebar}/>
+        {:else if selectedItem === "shared"}
+            <IncomingSharesPane onToggleSidebar={toggleSidebar}/>
+        {:else if selectedItem === "recents"}
+            <RecentsPane onToggleSidebar={toggleSidebar}/>
+        {:else if selectedItem === "account"}
+            <AccountsPane onToggleSidebar={toggleSidebar}/>
+        {/if}
+    </div>
+</div>
+
+<!-- Floating banner stack. Wide viewports: bottom-right toast, capped width.
+     Narrow (sidebar collapses below md): full-width across the bottom with
+     the same 1.25rem inset as the main content's p-5. -->
+<div class="fixed z-30 flex flex-col gap-2 bottom-5 left-5 right-5 md:left-auto md:max-w-sm pointer-events-none">
+    {#if importActive}
+        <div class="pointer-events-auto">
             <Banner
                 variant="info"
                 title="Import in progress"
@@ -257,41 +284,17 @@
                     : 'Working on the owner device. Uploads paused until it finishes.'}
                 onClick={openWelcomeAtImport}
             />
-        {:else if showOnboardingBanner}
+        </div>
+    {:else if showOnboardingBanner}
+        <div class="pointer-events-auto">
             <Banner
                 variant="info"
                 title="Welcome to HopNet"
                 subtitle="{incompleteCount} setup task{incompleteCount === 1 ? '' : 's'} left. Click to continue."
                 onClick={openWelcomeAtChecklist}
             />
-        {/if}
-        {#if selectedItem === "browse"}
-            <!-- Browse pane with integrated toolbar -->
-            <BrowsePane onToggleSidebar={toggleSidebar}/>
-        {:else if selectedItem === "nodes"}
-            <!-- Nodes pane with integrated toolbar -->
-            <NodesPane onToggleSidebar={toggleSidebar}/>
-        {:else if selectedItem === "takeout"}
-            <!-- Takeout pane with integrated toolbar -->
-            <TakeoutPane onToggleSidebar={toggleSidebar}/>
-        {:else if selectedItem === "devices"}
-            <!-- Devices pane with integrated toolbar -->
-            <DevicesPane onToggleSidebar={toggleSidebar}/>
-        {:else if selectedItem === "resilience"}
-            <!-- Resilience pane with integrated toolbar -->
-            <ResiliencePane onToggleSidebar={toggleSidebar}/>
-        {:else if selectedItem === "maintenance"}
-            <!-- Maintenance pane with integrated toolbar -->
-            <MaintenancePane onToggleSidebar={toggleSidebar}/>
-        {:else if selectedItem === "shared"}
-            <!-- Incoming shares pane -->
-            <IncomingSharesPane onToggleSidebar={toggleSidebar}/>
-        {:else if selectedItem === "recents"}
-            <RecentsPane onToggleSidebar={toggleSidebar}/>
-        {:else if selectedItem === "account"}
-            <AccountsPane onToggleSidebar={toggleSidebar}/>
-        {/if}
-    </div>
+        </div>
+    {/if}
 </div>
 
 {#if showWelcomeModal && $currentUserStore}

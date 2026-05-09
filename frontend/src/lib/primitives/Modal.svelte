@@ -1,6 +1,8 @@
 <script lang="ts">
     import type { Snippet } from 'svelte';
+    import { fade, scale } from 'svelte/transition';
     import Button from '../Button.svelte';
+    import { ANIM_PANE } from './animation';
 
     interface ModalProps {
         title: string;
@@ -82,6 +84,7 @@
     role="button"
     tabindex="-1"
     onkeydown={(e) => e.key === 'Enter' && handleBackdropClick()}
+    transition:fade={ANIM_PANE}
 >
     <!-- Modal Container -->
     <div
@@ -92,6 +95,7 @@
         tabindex="0"
         aria-modal="true"
         aria-labelledby="modal-title"
+        transition:scale={{ ...ANIM_PANE, start: 0.96, opacity: 0 }}
     >
             <!-- Header -->
             <div class="flex items-center justify-between p-4 border-b border-overlay0 flex-shrink-0 gap-2">

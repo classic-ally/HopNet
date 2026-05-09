@@ -6,11 +6,12 @@
     export let onBackButton: () => void;
     export let onForwardButton: () => void;
     export let username = '';
+    export let computername = '';
 </script>
 
 <SetupPane
-    title="Create a User Account"
-    body="This is your shared identity across the network, used for encrypting and delegating access to your files."
+    title="Create a Network"
+    body="Your username is your identity across the network. The device name identifies this computer to the others."
 >
     {#snippet features()}
         <EntryRow
@@ -18,6 +19,12 @@
             title="Username"
             password={false}
             bind:value={username}
+        />
+        <EntryRow
+            icon="i-carbon-devices"
+            title="Device name"
+            password={false}
+            bind:value={computername}
         />
     {/snippet}
 

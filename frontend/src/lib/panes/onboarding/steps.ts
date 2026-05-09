@@ -15,6 +15,7 @@ import type { SelfUserInfo } from '../../types';
 import { OnboardingFlag } from '../../types';
 import type { ImportStatusState } from '../../stores';
 import ImportStep from './ImportStep.svelte';
+import ProfileStep from './ProfileStep.svelte';
 
 export type StepStatus = 'todo' | 'active' | 'done';
 
@@ -35,8 +36,9 @@ export interface OnboardingStep {
 // Kept inline rather than fetched from backend because typeshare doesn't emit
 // associated-const values.
 const FLAG_BITS: Record<OnboardingFlag, number> = {
-    [OnboardingFlag.ImportOffered]:   1 << 0,
-    [OnboardingFlag.ImportCompleted]: 1 << 1,
+    [OnboardingFlag.ImportOffered]:    1 << 0,
+    [OnboardingFlag.ImportCompleted]:  1 << 1,
+    [OnboardingFlag.ProfileCompleted]: 1 << 2,
 };
 
 export function flagBit(flag: OnboardingFlag): number {
@@ -48,6 +50,22 @@ export function hasFlag(user: SelfUserInfo, flag: OnboardingFlag): boolean {
 }
 
 export const STEPS: OnboardingStep[] = [
+    {
+        flag: OnboardingFlag.ProfileCompleted,
+        icon: 'i-carbon-user-profile',
+        title: 'Complete your profile',
+        summary: 'Add a name and avatar so others can recognize you',
+        Component: ProfileStep,
+        statusOf: (user) => {
+            // Done if the user has acked (flag bit) OR observably set any
+            // profile field. Lets a user who fills the form via AccountsPane
+            // skip the onboarding nudge entirely; the explicit flag covers
+            // dismissal-without-filling and "Mark all as done".
+            if (hasFlag(user, OnboardingFlag.ProfileCompleted)) return 'done';
+            if (user.first_name || user.last_name || user.avatar) return 'done';
+            return 'todo';
+        },
+    },
     {
         flag: OnboardingFlag.ImportOffered,
         icon: 'i-carbon-cloud-upload',

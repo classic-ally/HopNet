@@ -3,6 +3,8 @@
     import EntryRow from '../../EntryRow.svelte';
     import PassphraseInput from './PassphraseInput.svelte';
     import SetupPane from '../../SetupPane.svelte';
+    import StatusSpinner from '../../primitives/StatusSpinner.svelte';
+    import { mergeStatusWords, AUTH } from '../../primitives/statusWords';
     import { tokenStore, API_BASE_URL } from '../../stores';
 
     export let username = '';
@@ -10,6 +12,8 @@
     let rememberMe = false;
     let loading = false;
     let errorMessage = '';
+
+    const LOGIN_WORDS = mergeStatusWords(AUTH);
 
     async function handleLogin() {
         loading = true;
@@ -30,6 +34,12 @@
             if (response.ok) {
                 const data = await response.json();
                 tokenStore.set(data.token);
+                // Drop the raw passphrase from component state once we have a
+                // token. Binding propagates the clear back to App.svelte and
+                // resets PassphraseInput's word fields. Doesn't guarantee V8
+                // releases the buffer immediately, but removes the live ref.
+                passphrase = '';
+                username = '';
             } else if (response.status === 401) {
                 errorMessage = 'Invalid username or passphrase';
             } else if (response.status === 503) {
@@ -46,8 +56,10 @@
 </script>
 
 <SetupPane
+    logoSrc="/hopnet-logo.png"
     title="Log in"
     body=""
+    buttonsClass="flex items-center gap-3"
 >
     {#snippet features()}
         <EntryRow
@@ -68,10 +80,13 @@
 
     {#snippet buttons()}
         <Button
-            icon={loading ? 'i-carbon-rotate-360' : 'i-carbon-checkmark'}
-            text={loading ? 'Signing in...' : 'Log in'}
+            icon="i-carbon-checkmark"
+            text="Log in"
             onClick={handleLogin}
             disabled={loading}
         />
+        {#if loading}
+            <StatusSpinner words={LOGIN_WORDS} />
+        {/if}
     {/snippet}
 </SetupPane>

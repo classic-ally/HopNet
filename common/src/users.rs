@@ -43,13 +43,19 @@ pub enum OnboardingFlag {
     ImportOffered,
     /// Import reached terminal `Completed` status.
     ImportCompleted,
+    /// User has either filled out their profile (name/avatar) or explicitly
+    /// dismissed the prompt. Status is also derived from observed profile
+    /// fields, so this bit is the "I've seen this" ack rather than a strict
+    /// has-profile signal.
+    ProfileCompleted,
 }
 
 impl OnboardingFlag {
     pub fn bit(self) -> OnboardingFlags {
         match self {
-            OnboardingFlag::ImportOffered   => OnboardingFlags(1 << 0),
-            OnboardingFlag::ImportCompleted => OnboardingFlags(1 << 1),
+            OnboardingFlag::ImportOffered    => OnboardingFlags(1 << 0),
+            OnboardingFlag::ImportCompleted  => OnboardingFlags(1 << 1),
+            OnboardingFlag::ProfileCompleted => OnboardingFlags(1 << 2),
         }
     }
 }
@@ -65,8 +71,9 @@ pub struct OnboardingFlags(pub u32);
 impl OnboardingFlags {
     pub const NONE: Self = Self(0);
 
-    pub const IMPORT_OFFERED:   Self = Self(1 << 0);
-    pub const IMPORT_COMPLETED: Self = Self(1 << 1);
+    pub const IMPORT_OFFERED:    Self = Self(1 << 0);
+    pub const IMPORT_COMPLETED:  Self = Self(1 << 1);
+    pub const PROFILE_COMPLETED: Self = Self(1 << 2);
 
     pub fn contains(self, other: Self) -> bool {
         (self.0 & other.0) == other.0 && other.0 != 0

@@ -2,9 +2,11 @@
     import { tokenStore, API_BASE_URL } from '../stores'
     import Button from '../Button.svelte'
     import { onMount, untrack } from 'svelte'
+    import { fade, scale } from 'svelte/transition'
     import type { FileItem } from '../types'
     import { InodeType } from '../types'
     import { getFileName, getFileExtension, getFileIcon } from '../utils/formatters'
+    import { ANIM_PANE } from '../primitives/animation'
 
     // Dynamically load MonacoEditor when preview opens
     let MonacoEditor: any = $state(null)
@@ -308,9 +310,13 @@
 <div
     class="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4"
     onmousedown={handleBackdropMouseDown}
+    transition:fade={ANIM_PANE}
 >
     <!-- Modal -->
-    <div class="bg-surface0 border border-overlay1 rounded-lg shadow-xl w-full max-w-4xl h-[90vh] overflow-hidden flex flex-col">
+    <div
+        class="bg-surface0 border border-overlay1 rounded-lg shadow-xl w-full max-w-4xl h-[90vh] overflow-hidden flex flex-col"
+        transition:scale={{ ...ANIM_PANE, start: 0.96, opacity: 0 }}
+    >
         <!-- Header -->
         <div class="flex items-center justify-between p-4 border-b border-overlay0">
             <div class="flex items-center gap-2 flex-1 mr-4 min-w-0">

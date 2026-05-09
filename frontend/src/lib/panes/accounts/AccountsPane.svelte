@@ -1,12 +1,12 @@
 <script lang="ts">
     import { TableHandler, ThSort, Th, Datatable } from '@vincjo/datatables';
-    import { tokenStore, currentUserStore, refreshCurrentUser } from '../../stores';
+    import { tokenStore } from '../../stores';
     import { onMount, tick } from 'svelte';
     import Toolbar from '../../primitives/Toolbar.svelte';
     import type { ToolbarItem } from '../../primitives/Toolbar.svelte';
     import AddAccountModal from './AddAccountModal.svelte';
-    import AvatarCropModal from './AvatarCropModal.svelte';
-    import { fetchAccounts, updateProfile, type UserInfo } from '../../api/accounts';
+    import ProfileEditor from './ProfileEditor.svelte';
+    import { fetchAccounts, type UserInfo } from '../../api/accounts';
 
     // Props
     export let onToggleSidebar: () => void = () => {};
@@ -20,25 +20,12 @@
 
     // Modal state
     let isAddModalOpen = false;
-    let isAvatarModalOpen = false;
-
-    // Profile editing state
-    let editFirstName = '';
-    let editLastName = '';
-    let profileSaving = false;
-    let profileSuccess = '';
 
     const table = new TableHandler(accounts, {
         rowsPerPage: 20,
         selectBy: 'user_id',
     });
     const search = table.createSearch();
-
-    // Sync profile form with current user
-    $: if ($currentUserStore) {
-        editFirstName = $currentUserStore.first_name || '';
-        editLastName = $currentUserStore.last_name || '';
-    }
 
     // Data fetching
     async function loadAccounts() {
@@ -59,32 +46,6 @@
 
     function handleAccountCreated() {
         loadAccounts();
-    }
-
-    async function handleProfileSave() {
-        profileSaving = true;
-        profileSuccess = '';
-        try {
-            const fields: { first_name?: string | null; last_name?: string | null } = {};
-            const current = $currentUserStore;
-            const newFirst = editFirstName.trim() || null;
-            const newLast = editLastName.trim() || null;
-            if (newFirst !== (current?.first_name || null)) fields.first_name = newFirst;
-            if (newLast !== (current?.last_name || null)) fields.last_name = newLast;
-            if (Object.keys(fields).length === 0) {
-                profileSuccess = 'No changes';
-                return;
-            }
-            const response = await updateProfile(fields);
-            if (!response.ok) throw new Error(`Failed: ${response.status}`);
-            await refreshCurrentUser();
-            await loadAccounts();
-            profileSuccess = 'Profile updated';
-        } catch (err) {
-            error = err instanceof Error ? err.message : 'Failed to update profile';
-        } finally {
-            profileSaving = false;
-        }
     }
 
     // Helper functions
@@ -124,8 +85,6 @@
     $: if ($tokenStore) {
         loadAccounts();
     }
-
-    $: avatarSrc = $currentUserStore?.avatar ? `data:image/jpeg;base64,${$currentUserStore.avatar}` : null;
 </script>
 
 <!-- Integrated Toolbar -->
@@ -136,65 +95,9 @@
     {onToggleSidebar}
 />
 
-<!-- My Profile Section -->
-{#if $currentUserStore}
-<div class="border-solid border-1 rounded-lg p-3 border-overlay1 mb-4">
-    <h3 class="mb-2">My Profile</h3>
-    <div class="flex gap-4 items-start">
-        <!-- Avatar -->
-        <div class="flex flex-col items-center gap-1 flex-shrink-0">
-            <button
-                class="w-16 h-16 rounded-full overflow-hidden border-2 border-overlay1 hover:border-mauve transition-colors cursor-pointer bg-surface0 flex items-center justify-center"
-                onclick={() => isAvatarModalOpen = true}
-            >
-                {#if avatarSrc}
-                    <img src={avatarSrc} alt="Avatar" class="w-full h-full object-cover" />
-                {:else}
-                    <div class="i-carbon-user w-8 h-8 text-muted"></div>
-                {/if}
-            </button>
-            <button
-                class="text-xs text-muted hover:text-primary cursor-pointer bg-transparent border-none"
-                onclick={() => isAvatarModalOpen = true}
-            >Change</button>
-        </div>
-        <!-- Name fields -->
-        <div class="flex-1 space-y-2">
-            <div class="text-sm text-muted">{$currentUserStore.username}</div>
-            <div class="flex gap-2">
-                <input
-                    class="flex-1 bg-transparent text-primary border-overlay0 border-2 border-solid rounded-md p-1 text-sm"
-                    type="text"
-                    placeholder="First name"
-                    bind:value={editFirstName}
-                    maxlength={32}
-                    disabled={profileSaving}
-                />
-                <input
-                    class="flex-1 bg-transparent text-primary border-overlay0 border-2 border-solid rounded-md p-1 text-sm"
-                    type="text"
-                    placeholder="Last name"
-                    bind:value={editLastName}
-                    maxlength={32}
-                    disabled={profileSaving}
-                />
-            </div>
-            <div class="flex gap-2 items-center">
-                <button
-                    class="text-sm px-2 py-1 rounded bg-surface0 border border-overlay1 text-primary hover:bg-overlay0 transition-colors disabled:opacity-50"
-                    onclick={handleProfileSave}
-                    disabled={profileSaving}
-                >
-                    {profileSaving ? 'Saving...' : 'Update'}
-                </button>
-                {#if profileSuccess}
-                    <span class="text-sm text-green">{profileSuccess}</span>
-                {/if}
-            </div>
-        </div>
-    </div>
+<div class="mb-4">
+    <ProfileEditor onSaved={loadAccounts} />
 </div>
-{/if}
 
 <!-- Page Title -->
 <div>
@@ -291,12 +194,6 @@
     isOpen={isAddModalOpen}
     onClose={() => isAddModalOpen = false}
     onAccountCreated={handleAccountCreated}
-/>
-
-<!-- Avatar Crop Modal -->
-<AvatarCropModal
-    isOpen={isAvatarModalOpen}
-    onClose={() => isAvatarModalOpen = false}
 />
 
 <style>

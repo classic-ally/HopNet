@@ -2,6 +2,8 @@
     import SetupPane from '../../SetupPane.svelte';
     import Button from "../../Button.svelte";
     import EntryRow from '../../EntryRow.svelte';
+    import StatusSpinner from '../../primitives/StatusSpinner.svelte';
+    import { mergeStatusWords, WHIMSY, GENESIS, AUTH } from '../../primitives/statusWords';
     import { API_BASE_URL } from '../../stores';
 
     export let username: string;
@@ -12,6 +14,8 @@
 
     let isLoading = false;
     let errorMessage = '';
+
+    const SETUP_WORDS = mergeStatusWords(WHIMSY, GENESIS, AUTH);
 
     const onSave = async () => {
         isLoading = true;
@@ -66,6 +70,12 @@
             value={computername}
             readonly={true}
         />
+        {#if isLoading}
+            <StatusSpinner words={SETUP_WORDS} />
+        {/if}
+        {#if errorMessage}
+            <p class="text-red text-sm">{errorMessage}</p>
+        {/if}
     {/snippet}
 
     {#snippet buttons()}
@@ -73,11 +83,13 @@
             icon="i-carbon-chevron-left"
             text="Back"
             onClick={() => {onBackButton()}}
+            disabled={isLoading}
         />
         <Button
             icon="i-carbon-save"
             text="Save"
             onClick={() => {onSave()}}
+            disabled={isLoading}
         />
     {/snippet}
 </SetupPane>
