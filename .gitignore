@@ -14,3 +14,4 @@ dist/
 scripts/macos/.app_bundle_path
 scripts/macos/.env
 android/HopNetStorageProvider/.idea/
+yaak/
