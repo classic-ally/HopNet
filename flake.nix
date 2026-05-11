@@ -123,6 +123,49 @@
               Env = [ "RUST_LOG=warn,hopnet=debug" ];
             };
           };
+        } // pkgs.lib.optionalAttrs (pkgs.stdenv.hostPlatform.system == "aarch64-darwin") {
+          # Signed + notarized .app bundle pulled from Forgejo releases.
+          # CI (.forgejo/workflows/release-macos.yml) produces this artifact;
+          # bump `hopnetDesktopVersion` and `hopnetDesktopSha256` when cutting
+          # a new release.
+          hopnet-desktop =
+            let
+              version = "0.1.0-rc.1";
+              sha256 = "d1e4cb064dc6f09185b31eedb7c994c81d415d4ef6caf4c8d787254b40d4d103";
+            in
+            pkgs.stdenvNoCC.mkDerivation {
+              pname = "hopnet-desktop";
+              inherit version;
+
+              src = pkgs.fetchurl {
+                url = "https://git.bentley.sh/HopNet/HopNet/releases/download/v${version}/HopNet-v${version}-arm64.app.zip";
+                inherit sha256;
+              };
+
+              nativeBuildInputs = [ pkgs.unzip ];
+
+              # Skip default unpackPhase so we control extraction via ditto in
+              # installPhase (preserves macOS resource forks + xattrs).
+              dontUnpack = true;
+
+              installPhase = ''
+                runHook preInstall
+                mkdir -p $out/Applications
+                ${pkgs.unzip}/bin/unzip -q $src -d $out/Applications
+                runHook postInstall
+              '';
+
+              # Don't re-sign — bundle is already Developer ID signed + notarized.
+              dontFixup = true;
+
+              meta = {
+                description = "HopNet macOS desktop app (signed + notarized)";
+                homepage = "https://hopnet.app";
+                license = pkgs.lib.licenses.agpl3Only;
+                platforms = [ "aarch64-darwin" ];
+                sourceProvenance = [ pkgs.lib.sourceTypes.binaryNativeCode ];
+              };
+            };
         }
       );
 
