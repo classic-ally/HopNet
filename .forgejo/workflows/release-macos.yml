@@ -32,7 +32,9 @@ jobs:
           NOTARY_PASSWORD: ${{ secrets.NOTARY_PASSWORD }}
           # SIGNING_IDENTITY optional — script auto-detects from login keychain when unset
           SIGNING_IDENTITY: ${{ secrets.SIGNING_IDENTITY }}
-        run: bash scripts/build-hopnet-macos.sh
+        # nix develop pulls rust, pnpm, pkg-config, openssl etc. from flake devShell.
+        # Apple toolchain (codesign, notarytool, xcodebuild) comes from /usr/bin/xcrun.
+        run: nix develop --command bash scripts/build-hopnet-macos.sh
 
       - name: Read manifest
         id: manifest
