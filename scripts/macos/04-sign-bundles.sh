@@ -80,13 +80,20 @@ else
     exit 1
 fi
 
-# Step 2: Sign the main app with deep signing to include the extension
+# Step 2: Sign the main app with its OWN entitlements (without --deep so the
+# extension's signature is preserved; --deep re-signs nested binaries with the
+# outer entitlements, which would strip fileprovider.testing-mode from the
+# extension).
+#
+# Main app entitlements omit fileprovider.testing-mode + the per-extension
+# application/keychain groups because the main app's bundle ID has no
+# provisioning profile granting them, and AMFI rejects the launch with
+# "No matching profile found" otherwise.
 echo "🔐 Re-signing main app with embedded extension..."
 codesign --force --sign "$SIGNING_IDENTITY" \
     --options runtime \
     --timestamp \
-    --deep \
-    --entitlements "$PROJECT_ROOT/apple/entitlements.plist" \
+    --entitlements "$PROJECT_ROOT/apple/entitlements-app.plist" \
     "$APP_BUNDLE"
 
 # Verify main app signature

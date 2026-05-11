@@ -91,12 +91,15 @@ else
     echo "⚠️  Main binary not found at expected location"
 fi
 
-# Remove orchestrator binary if it was included (we don't want it in the .app)
-ORCHESTRATOR_BINARY="$APP_BUNDLE/Contents/MacOS/orchestrator"
-if [ -f "$ORCHESTRATOR_BINARY" ]; then
-    echo "🗑️  Removing orchestrator binary from app bundle (not needed for distribution)"
-    rm "$ORCHESTRATOR_BINARY"
-fi
+# Remove non-distribution binaries that Tauri may have bundled.
+# These are developer tools and don't belong in the shipped .app.
+for extra in orchestrator snapshotter; do
+    EXTRA_BINARY="$APP_BUNDLE/Contents/MacOS/$extra"
+    if [ -f "$EXTRA_BINARY" ]; then
+        echo "🗑️  Removing $extra binary from app bundle (not needed for distribution)"
+        rm "$EXTRA_BINARY"
+    fi
+done
 
 # Store the app bundle path for next stages
 echo "$APP_BUNDLE" > "$PROJECT_ROOT/scripts/macos/.app_bundle_path"

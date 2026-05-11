@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+        Main HopNet.app entitlements.
+
+        Excludes com.apple.developer.fileprovider.testing-mode (and the
+        per-extension application/keychain groups) because the main app's
+        bundle ID (com.hopnet.desktop) has no provisioning profile that
+        grants those entitlements. With Developer ID Application + notarize
+        distribution, AMFI rejects launch with "No matching profile found"
+        when any unprovisioned entitlement is present.
+
+        The FileProvider extension carries its own entitlements file
+        (apple/entitlements.plist) which keeps the fileprovider keys and
+        is matched by apple/HopNet_Dev.provisionprofile.
+    -->
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+    <key>com.apple.security.network.client</key>
+    <true/>
+    <key>com.apple.security.network.server</key>
+    <true/>
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+    <key>com.apple.security.files.downloads.read-write</key>
+    <true/>
+</dict>
+</plist>
