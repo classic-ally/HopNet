@@ -1,9 +1,10 @@
 import { writable } from 'svelte/store';
 
-// API Configuration - use injected port from Vite build
-declare const __BACKEND_PORT__: number;
-export const API_BASE_URL = (window as any).__TAURI__ ? `http://localhost:${__BACKEND_PORT__}` : '';
-export const BACKEND_PORT = __BACKEND_PORT__;
+// API base is always relative — the webview (Tauri or browser) is served
+// from the same axum origin in every mode, so `fetch('/api/...')` resolves
+// against whichever port the server bound (fixed in headless, kernel-assigned
+// in GUI). Vite dev proxies API routes back to the headless backend.
+export const API_BASE_URL = '';
 
 // Current browse path store
 export const currentPathStore = writable('/');

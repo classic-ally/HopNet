@@ -17,8 +17,15 @@ use hopnet::db::{PrivKey, PubKey};
 
 static ASSETS_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/frontend/dist");
 
-/// Single source of truth for the backend HTTP port.
-const BACKEND_PORT: u16 = 34632;
+/// Default HTTP port for headless mode (browser-served deployments).
+/// GUI mode binds an ephemeral loopback port — see `run_server`.
+const HEADLESS_BACKEND_PORT: u16 = 34632;
+
+/// Actual bound port. Populated by `run_server` after `TcpListener::bind`
+/// returns — needed in GUI mode because we bind `127.0.0.1:0` and let the
+/// kernel pick a free port, so two HopNet processes never clash.
+static ACTUAL_BACKEND_PORT: std::sync::atomic::AtomicU16 =
+    std::sync::atomic::AtomicU16::new(0);
 
 /// Global AppState accessible to Tauri IPC commands (GUI mode only).
 /// Set by run_server() after AppState creation; read by Tauri commands.
@@ -26,14 +33,39 @@ const BACKEND_PORT: u16 = 34632;
 static GUI_APP_STATE: Lazy<tokio::sync::RwLock<Option<AppState>>> =
     Lazy::new(|| tokio::sync::RwLock::new(None));
 
-async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
+/// Run the axum server.
+///
+/// `bind_addr` is the address to bind. Headless: `0.0.0.0:34632` (publicly
+/// reachable). GUI: `127.0.0.1:0` (loopback, kernel-assigned port — prevents
+/// collisions between concurrent HopNet processes).
+async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
     // tracing
     tracing_subscriber::fmt::init();
 
     let admin_service = ServeDir::new(&ASSETS_DIR);
 
-    let port = BACKEND_PORT;
-    let bindurl = format!("0.0.0.0:{}", port);
+    // Bind before anything else. With `127.0.0.1:0` the kernel assigns a
+    // free port; we need to capture the result and thread it into AppState
+    // so things like the FileProvider keychain config point at the correct
+    // loopback URL.
+    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    let port = listener.local_addr()?.port();
+    ACTUAL_BACKEND_PORT.store(port, std::sync::atomic::Ordering::SeqCst);
+    tracing::info!("Server listening on {} (port {})", bind_addr, port);
+
+    // GUI release builds: refresh the FileProvider keychain entry with the
+    // freshly-bound loopback URL. The extension reads `base_url` from the
+    // keychain to find this process, and the port changes every launch.
+    #[cfg(all(target_os = "macos", feature = "gui", not(debug_assertions)))]
+    {
+        use fileprovider::keychain::{self, KeychainEnvironment};
+        if keychain::load_config(KeychainEnvironment::Production).is_ok() {
+            let url = format!("http://127.0.0.1:{}", port);
+            if let Err(e) = keychain::update_base_url(&url, KeychainEnvironment::Production) {
+                tracing::warn!("FileProvider keychain base_url refresh failed: {:?}", e);
+            }
+        }
+    }
 
     let (encodingkey, decodingkey) = auth::generate_jwt_key();
 
@@ -423,8 +455,6 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                     .with_state(app_state)
             };
 
-            let listener = tokio::net::TcpListener::bind(&bindurl).await?;
-            tracing::info!("Server starting on {}", bindurl);
             serve(listener, app).await?;
         }
         Err(error) => return Err(error.into()),
@@ -442,7 +472,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     #[cfg(not(feature = "gui"))]
     {
-        run_server().await
+        run_server(&format!("0.0.0.0:{}", HEADLESS_BACKEND_PORT)).await
     }
 }
 
@@ -511,17 +541,32 @@ async fn run_with_gui() -> Result<(), Box<dyn std::error::Error>> {
         Ok(window)
     }
     
-    // Start the server in a background task
+    // Start the server in a background task. Bind loopback only with an
+    // ephemeral port so multiple HopNet processes can coexist (e.g. dev
+    // `cargo run` alongside the installed .app).
     let server_handle = tokio::spawn(async {
-        if let Err(e) = run_server().await {
+        if let Err(e) = run_server("127.0.0.1:0").await {
             tracing::error!("Server error: {}", e);
         }
     });
-    
-    // Give the server a moment to start
-    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-    
-    let port = BACKEND_PORT;
+
+    // Wait for the listener to publish its kernel-assigned port before
+    // navigating the webview, otherwise the load races the bind and fails.
+    let port = {
+        let mut waited_ms = 0;
+        loop {
+            let p = ACTUAL_BACKEND_PORT.load(std::sync::atomic::Ordering::SeqCst);
+            if p != 0 {
+                break p;
+            }
+            if waited_ms >= 5_000 {
+                return Err("server failed to bind within 5s".into());
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+            waited_ms += 20;
+        }
+    };
+    tracing::info!("Tauri webview loading backend on port {}", port);
     
     // Create Tauri app
     let context = tauri::generate_context!();

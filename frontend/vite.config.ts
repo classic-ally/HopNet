@@ -8,21 +8,21 @@ import { fileURLToPath } from 'node:url';
 import { storybookTest } from '@storybook/addon-vitest/vitest-plugin';
 const dirname = typeof __dirname !== 'undefined' ? __dirname : path.dirname(fileURLToPath(import.meta.url));
 
-// All platforms and modes use the same backend port
-const backendPort = 34632;
+// Dev-server proxy target. The frontend itself uses relative URLs in every
+// mode (Tauri webview, browser served from axum static, and vite dev) — the
+// proxy below only matters for `pnpm dev`, where vite serves the SPA and
+// forwards API routes to a separately-running headless backend.
+const devProxyTarget = 'http://localhost:34632';
 
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [UnoCSS(), svelte()],
-  define: {
-    __BACKEND_PORT__: backendPort
-  },
   server: {
     proxy: {
       // Proxy all API requests to the Rust backend in dev mode.
       // The SPA only serves / (index.html) and /assets/*; everything else is an API route.
       '^/(login|logout|setup|nodes|files|fragments|users|shares|metrics|devices|consensus|takeout|admin|maintenance|diagnostics|debug|validators|integrations|test)': {
-        target: `http://localhost:${backendPort}`,
+        target: devProxyTarget,
         changeOrigin: true,
       }
     }

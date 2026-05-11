@@ -158,6 +158,15 @@ fn load_keychain_item(env: KeychainEnvironment, account: &str) -> Result<String,
     }
 }
 
+/// Update only the stored base URL. Used at GUI startup when the backend
+/// binds an ephemeral loopback port — the FileProvider extension reads
+/// `base_url` from this keychain entry and would otherwise still point at
+/// the previous run's port.
+#[cfg(target_os = "macos")]
+pub fn update_base_url(base_url: &str, env: KeychainEnvironment) -> Result<(), KeychainError> {
+    store_keychain_item(env, BASE_URL_ACCOUNT, base_url)
+}
+
 /// Remove FileProvider configuration from keychain
 #[cfg(target_os = "macos")]
 pub fn remove_config(env: KeychainEnvironment) -> Result<(), KeychainError> {
