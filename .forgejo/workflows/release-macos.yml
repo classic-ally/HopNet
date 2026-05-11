@@ -9,7 +9,7 @@ on:
 
 jobs:
   release:
-    runs-on: [self-hosted, macos-aarch64, xcode]
+    runs-on: aarch64-darwin
     timeout-minutes: 45
 
     steps:
