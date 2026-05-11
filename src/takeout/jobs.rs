@@ -158,57 +158,62 @@ pub async fn scan_at_startup(state: &AppState) -> Result<usize, crate::db::Datab
             return Ok(0);
         }
     };
-    let conn = state
-        .db_pool
-        .get()
-        .map_err(|_| crate::db::DatabaseError::LockError)?;
+    // Inner scope holds the rusqlite Connection + Statement (both `!Send`).
+    // Must be tightly scoped so they're dropped *before* any `.await` below,
+    // otherwise the async generator captures them and the future fails to
+    // satisfy `Send` for tokio::spawn.
+    let to_register: Vec<(i32, CustomUUID)> = {
+        let conn = state
+            .db_pool
+            .get()
+            .map_err(|_| crate::db::DatabaseError::LockError)?;
 
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, user_id, status FROM imports
-             WHERE owner_node_id = ? AND status IN (0, 1)",
-        )
-        .map_err(|_| crate::db::DatabaseError::RecallError)?;
-    let rows = stmt
-        .query_map([self_node], |row| {
-            let id: CustomUUID = row.get(0)?;
-            let user_id: i32 = row.get(1)?;
-            let status: hopnet_common::ImportStatus = row.get(2)?;
-            Ok((id, user_id, status))
-        })
-        .map_err(|_| crate::db::DatabaseError::RecallError)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, user_id, status FROM imports
+                 WHERE owner_node_id = ? AND status IN (0, 1)",
+            )
+            .map_err(|_| crate::db::DatabaseError::RecallError)?;
+        let rows = stmt
+            .query_map([self_node], |row| {
+                let id: CustomUUID = row.get(0)?;
+                let user_id: i32 = row.get(1)?;
+                let status: hopnet_common::ImportStatus = row.get(2)?;
+                Ok((id, user_id, status))
+            })
+            .map_err(|_| crate::db::DatabaseError::RecallError)?;
 
-    let mut to_register: Vec<(i32, CustomUUID)> = Vec::new();
-    for r in rows {
-        let (import_id, user_id, status) =
-            r.map_err(|_| crate::db::DatabaseError::RecallError)?;
-        // Only `Importing` is resumable in v1. `Pending` means extraction
-        // never reached the Importing flip; user must re-upload.
-        if status != hopnet_common::ImportStatus::Importing {
-            tracing::warn!(
-                "Import {} for user {} stranded at {:?}; not resumable in v1",
-                import_id, user_id, status
-            );
-            continue;
-        }
-        let counts = match import_paths::count_paths_by_status(&conn, &import_id) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!("count_paths_by_status failed for {}: {:?}", import_id, e);
+        let mut to_register: Vec<(i32, CustomUUID)> = Vec::new();
+        for r in rows {
+            let (import_id, user_id, status) =
+                r.map_err(|_| crate::db::DatabaseError::RecallError)?;
+            // Only `Importing` is resumable in v1. `Pending` means extraction
+            // never reached the Importing flip; user must re-upload.
+            if status != hopnet_common::ImportStatus::Importing {
+                tracing::warn!(
+                    "Import {} for user {} stranded at {:?}; not resumable in v1",
+                    import_id, user_id, status
+                );
                 continue;
             }
-        };
-        if counts.total == 0 || counts.pending == 0 {
-            tracing::warn!(
-                "Import {} has no pending rows ({} total / {} pending); skipping resume",
-                import_id, counts.total, counts.pending
-            );
-            continue;
+            let counts = match import_paths::count_paths_by_status(&conn, &import_id) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("count_paths_by_status failed for {}: {:?}", import_id, e);
+                    continue;
+                }
+            };
+            if counts.total == 0 || counts.pending == 0 {
+                tracing::warn!(
+                    "Import {} has no pending rows ({} total / {} pending); skipping resume",
+                    import_id, counts.total, counts.pending
+                );
+                continue;
+            }
+            to_register.push((user_id, import_id));
         }
-        to_register.push((user_id, import_id));
-    }
-    drop(stmt);
-    drop(conn);
+        to_register
+    };
 
     let count = to_register.len();
     if count > 0 {
