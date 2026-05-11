@@ -212,9 +212,22 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore]
     async fn test_process_uploaded_file_round_trip_multi_chunk() {
         let plaintext = generate_random_data(CHUNK_SIZE + 1024);
+        run_round_trip(plaintext).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "heavy: 3 chunks (~120 MB plaintext)"]
+    async fn test_process_uploaded_file_round_trip_three_chunks() {
+        let plaintext = generate_random_data(3 * CHUNK_SIZE);
+        run_round_trip(plaintext).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "heavy: 10 chunks (~400 MB plaintext)"]
+    async fn test_process_uploaded_file_round_trip_ten_chunks() {
+        let plaintext = generate_random_data(10 * CHUNK_SIZE);
         run_round_trip(plaintext).await;
     }
 
