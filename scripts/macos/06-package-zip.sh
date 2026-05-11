@@ -36,7 +36,9 @@ echo "📦 Creating distribution zip via ditto..."
 /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$APP_BUNDLE" "$OUT_ZIP"
 
 SHA=$(shasum -a 256 "$OUT_ZIP" | awk '{print $1}')
-SIZE=$(stat -f%z "$OUT_ZIP")
+# Portable byte count — `stat -f%z` (BSD) vs `stat -c %s` (GNU) varies by
+# userland; `nix develop` shadows /usr/bin/stat with GNU coreutils.
+SIZE=$(wc -c < "$OUT_ZIP" | tr -d ' ')
 
 # Manifest for CI consumption (avoids re-parsing in workflow YAML)
 cat > "$DIST_DIR/manifest.json" <<EOF
