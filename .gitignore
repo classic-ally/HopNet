@@ -10,3 +10,6 @@ apple/HopNetFileProvider/Sources/HopNetFileProviderExtension/Generated/HopNetTyp
 .vscode/launch.json
 frontend/src/lib/types.ts
 result
+dist/
+scripts/macos/.app_bundle_path
+scripts/macos/.env

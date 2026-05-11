@@ -1,0 +1,97 @@
+name: Release macOS
+
+# Triggered by tags matching v*. Builds, signs, notarizes, packages, uploads to
+# the corresponding Forgejo release. Runs on the self-hosted macbook runner.
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: [self-hosted, macos-aarch64, xcode]
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # need tags for `git describe`
+
+      - name: Verify Xcode CLT
+        run: |
+          xcode-select -p
+          xcrun --find codesign
+          xcrun --find notarytool
+          xcrun --find stapler
+
+      - name: Build, sign, notarize, package
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          TEAM_ID: ${{ secrets.TEAM_ID }}
+          NOTARY_PASSWORD: ${{ secrets.NOTARY_PASSWORD }}
+          # SIGNING_IDENTITY optional — script auto-detects from login keychain when unset
+          SIGNING_IDENTITY: ${{ secrets.SIGNING_IDENTITY }}
+        run: bash scripts/build-hopnet-macos.sh
+
+      - name: Read manifest
+        id: manifest
+        run: |
+          MANIFEST=dist/manifest.json
+          test -f "$MANIFEST" || { echo "manifest missing"; exit 1; }
+          {
+            echo "filename=$(jq -r .filename $MANIFEST)"
+            echo "path=$(jq -r .path $MANIFEST)"
+            echo "sha256=$(jq -r .sha256 $MANIFEST)"
+            echo "version=$(jq -r .version $MANIFEST)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload to Forgejo release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORGEJO_INSTANCE: https://git.bentley.sh
+        run: |
+          set -euo pipefail
+          REPO="${GITHUB_REPOSITORY}"
+          TAG="${GITHUB_REF_NAME}"
+          ZIP_PATH="${{ steps.manifest.outputs.path }}"
+          ZIP_NAME="${{ steps.manifest.outputs.filename }}"
+          SHA="${{ steps.manifest.outputs.sha256 }}"
+
+          # Look up or create release for this tag
+          RELEASE_ID=$(curl -fsSL \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            "$FORGEJO_INSTANCE/api/v1/repos/$REPO/releases/tags/$TAG" \
+            | jq -r .id 2>/dev/null || true)
+
+          # SemVer pre-release tags (v0.1.0-rc.1, -beta.2, ...) carry a hyphen
+          # in the version segment; stable tags do not.
+          if echo "$TAG" | grep -q -- '-'; then PRERELEASE=true; else PRERELEASE=false; fi
+
+          if [ -z "$RELEASE_ID" ] || [ "$RELEASE_ID" = "null" ]; then
+            echo "Creating release for $TAG (prerelease=$PRERELEASE)"
+            RELEASE_ID=$(curl -fsSL \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Content-Type: application/json" \
+              -X POST \
+              -d "{\"tag_name\":\"$TAG\",\"name\":\"$TAG\",\"draft\":false,\"prerelease\":$PRERELEASE}" \
+              "$FORGEJO_INSTANCE/api/v1/repos/$REPO/releases" \
+              | jq -r .id)
+          fi
+
+          echo "Uploading $ZIP_NAME to release $RELEASE_ID"
+          curl -fsSL \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -F "attachment=@$ZIP_PATH" \
+            "$FORGEJO_INSTANCE/api/v1/repos/$REPO/releases/$RELEASE_ID/assets?name=$ZIP_NAME"
+
+          # Upload sha256 sidecar
+          curl -fsSL \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -F "attachment=@${ZIP_PATH}.sha256" \
+            "$FORGEJO_INSTANCE/api/v1/repos/$REPO/releases/$RELEASE_ID/assets?name=${ZIP_NAME}.sha256"
+
+          echo ""
+          echo "✅ Released $ZIP_NAME"
+          echo "   SHA-256: $SHA"
+          echo "   URL: $FORGEJO_INSTANCE/$REPO/releases/tag/$TAG"

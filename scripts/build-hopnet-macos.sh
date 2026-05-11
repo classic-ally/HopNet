@@ -8,8 +8,28 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 MACOS_SCRIPTS_DIR="$SCRIPT_DIR/macos"
 
-# Configuration
-SIGNING_IDENTITY="${SIGNING_IDENTITY:-"E87DEBE3C741ACD88DDB3E8C04E0FB01723C1EC4"}"
+# Source local .env (gitignored) if present — supplies SIGNING_IDENTITY,
+# APPLE_ID, TEAM_ID, NOTARY_PASSWORD without exporting them globally.
+# See scripts/macos/.env.example for template.
+if [ -f "$MACOS_SCRIPTS_DIR/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . "$MACOS_SCRIPTS_DIR/.env"
+    set +a
+fi
+
+# Auto-detect codesign identity from login keychain when not explicitly set.
+# Picks the first Developer ID Application cert; override via SIGNING_IDENTITY.
+if [ -z "${SIGNING_IDENTITY:-}" ]; then
+    SIGNING_IDENTITY=$(security find-identity -v -p codesigning login.keychain 2>/dev/null \
+        | awk '/Developer ID Application/ {print $2; exit}')
+fi
+if [ -z "${SIGNING_IDENTITY:-}" ]; then
+    echo "❌ No SIGNING_IDENTITY set and no Developer ID Application cert in login keychain."
+    echo "   Either set SIGNING_IDENTITY (or copy scripts/macos/.env.example → .env)"
+    echo "   or import a Developer ID cert into the login keychain."
+    exit 1
+fi
 export SIGNING_IDENTITY
 
 echo "🚀 Building HopNet with Swift FileProvider extension..."
@@ -67,6 +87,21 @@ if [ -x "$MACOS_SCRIPTS_DIR/04-sign-bundles.sh" ]; then
 else
     echo "❌ Stage 4 script not found or not executable"
     exit 1
+fi
+
+# Stages 5+6: notarize + package. Only run when notary creds present
+# (CI sets APPLE_ID/TEAM_ID/NOTARY_PASSWORD; dev builds skip these).
+if [ -n "${APPLE_ID:-}" ] && [ -n "${TEAM_ID:-}" ] && [ -n "${NOTARY_PASSWORD:-}" ]; then
+    echo ""
+    echo "=================================================================================="
+    "$MACOS_SCRIPTS_DIR/05-notarize-staple.sh"
+
+    echo ""
+    echo "=================================================================================="
+    "$MACOS_SCRIPTS_DIR/06-package-zip.sh"
+else
+    echo ""
+    echo "ℹ️  Skipping notarize + package (APPLE_ID/TEAM_ID/NOTARY_PASSWORD not set)"
 fi
 
 # Final verification and cleanup

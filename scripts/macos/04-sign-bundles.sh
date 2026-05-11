@@ -7,8 +7,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
 EXTENSION_NAME="HopNetFileProviderExtension"
 
-# Configuration
-SIGNING_IDENTITY="${SIGNING_IDENTITY:-"E87DEBE3C741ACD88DDB3E8C04E0FB01723C1EC4"}"
+# Source .env if present (when running standalone, not via wrapper)
+if [ -z "${SIGNING_IDENTITY:-}" ] && [ -f "$PROJECT_ROOT/scripts/macos/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . "$PROJECT_ROOT/scripts/macos/.env"
+    set +a
+fi
+
+# Auto-detect from login keychain when still unset
+if [ -z "${SIGNING_IDENTITY:-}" ]; then
+    SIGNING_IDENTITY=$(security find-identity -v -p codesigning login.keychain 2>/dev/null \
+        | awk '/Developer ID Application/ {print $2; exit}')
+fi
+if [ -z "${SIGNING_IDENTITY:-}" ]; then
+    echo "❌ No SIGNING_IDENTITY set and no Developer ID Application cert in login keychain."
+    exit 1
+fi
 
 echo "🔐 Stage 4: Signing extension and main app..."
 
