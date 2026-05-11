@@ -8,8 +8,23 @@ PROJECT_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
 
 echo "🔨 Stage 2: Building main Rust application..."
 
-# Build the main HopNet application (skip DMG creation)
 cd "$PROJECT_ROOT"
+
+# Tauri build expects frontend/dist to exist (tauri.conf.json frontendDist).
+# Locally the dev usually runs `pnpm build` separately; in CI we must do
+# both the typeshare TS generation and the frontend build before cargo tauri.
+if [ ! -d "$PROJECT_ROOT/frontend/dist" ] || [ -n "${CI:-}" ]; then
+    echo "🌐 Generating TypeScript types from Rust..."
+    bash "$PROJECT_ROOT/scripts/generate-typescript-types.sh"
+
+    echo "🌐 Installing + building frontend (pnpm)..."
+    cd "$PROJECT_ROOT/frontend"
+    pnpm install --frozen-lockfile
+    pnpm build
+    cd "$PROJECT_ROOT"
+fi
+
+# Build the main HopNet application (skip DMG creation)
 cargo tauri build --bundles app
 
 # Find the built app bundle
