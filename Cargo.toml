@@ -6,6 +6,9 @@ name = "hopnet"
 version = "0.1.0"
 edition = "2024"
 default-run = "hopnet"
+license = "AGPL-3.0-only"
+repository = "https://git.bentley.sh/HopNet/HopNet"
+description = "Distributed filesystem with Byzantine fault-tolerant consensus and Reed-Solomon erasure coding"
 
 # Suppress warnings for better test output readability during active development
 # TODO: Consider tightening these lints once the codebase stabilizes
