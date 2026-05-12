@@ -323,9 +323,10 @@ impl IrohTransport {
         {
             let connections = self.connections.read().await;
             if let Some(conn) = connections.get(&node_id)
-                && conn.close_reason().is_none() {
-                    return Ok(conn.clone());
-                }
+                && conn.close_reason().is_none()
+            {
+                return Ok(conn.clone());
+            }
         }
 
         // Establish new connection with timeout

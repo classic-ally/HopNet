@@ -229,14 +229,14 @@ impl TestScenario for FragmentDistribution {
         while settle_start.elapsed() < settle_timeout {
             if let Ok(dist) = get_fragment_distribution(&nodes[0], &full_path).await
                 && !dist.fragments.is_empty()
-                    && dist
-                        .fragments
-                        .iter()
-                        .all(|f| !f.nodes_with_fragment.is_empty())
-                {
-                    settled = true;
-                    break;
-                }
+                && dist
+                    .fragments
+                    .iter()
+                    .all(|f| !f.nodes_with_fragment.is_empty())
+            {
+                settled = true;
+                break;
+            }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
 

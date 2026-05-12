@@ -6,7 +6,6 @@ use crate::consensus::functions::create_signed_user_transaction;
 use crate::db::{Blake3Hash, CustomUUID, devices::get_devices_for_user};
 use crate::files::functions::{decrypt_part, encrypt_part};
 use crate::{AppState, auth, auth::auth_middleware};
-use std::str::FromStr;
 use axum::{
     Extension, Json, Router,
     extract::{Path, State},
@@ -15,6 +14,7 @@ use axum::{
     routing::{delete, get, post},
 };
 use rand::Rng;
+use std::str::FromStr;
 
 /// Build the devices management router (JWT-authenticated)
 pub fn router(app_state: AppState) -> Router<AppState> {
@@ -110,18 +110,19 @@ pub async fn ensure_fileprovider_device_token(
 
     // Check if a valid token already exists in keychain
     if let Ok(config) = keychain::load_config(KeychainEnvironment::Production)
-        && let Some(dot_pos) = config.api_key.find('.') {
-            let device_id_str = &config.api_key[..dot_pos];
-            if let Ok(device_id) = CustomUUID::from_str(device_id_str) {
-                let db_lock = app_state
-                    .db_pool
-                    .get()
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                if let Ok(Some(_)) = get_device_by_id(&db_lock, &device_id) {
-                    return Ok(()); // Token still valid
-                }
+        && let Some(dot_pos) = config.api_key.find('.')
+    {
+        let device_id_str = &config.api_key[..dot_pos];
+        if let Ok(device_id) = CustomUUID::from_str(device_id_str) {
+            let db_lock = app_state
+                .db_pool
+                .get()
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            if let Ok(Some(_)) = get_device_by_id(&db_lock, &device_id) {
+                return Ok(()); // Token still valid
             }
         }
+    }
 
     // Register a new device token
     let (_device_id, api_key) =

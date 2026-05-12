@@ -209,11 +209,7 @@ fn build_reassembly_data(
         };
         bucket.insert(
             fragment.local_index as usize,
-            (
-                fragment.fragment_hash,
-                fragment.fragment_id.clone(),
-                true,
-            ),
+            (fragment.fragment_hash, fragment.fragment_id.clone(), true),
         );
     }
 
@@ -331,7 +327,8 @@ fn insert_dummy_user(conn: &rusqlite::Connection, user_id: i32) {
             vec![0u8; 32],
             vec![0u8; 16],
         ],
-    ).unwrap();
+    )
+    .unwrap();
 }
 
 fn insert_folder_inode(conn: &rusqlite::Connection, user_id: i32, path: &str) {

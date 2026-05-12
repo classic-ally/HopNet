@@ -618,7 +618,8 @@ pub async fn post_files(
                         encrypt_path("/".to_string(), &session.siv_key, &session.siv_nonce)
                             .await
                             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-                    } else if let Some(inode_id_str) = parent_item_identifier.strip_prefix("item:") {
+                    } else if let Some(inode_id_str) = parent_item_identifier.strip_prefix("item:")
+                    {
                         // Extract inode_id and look up encrypted path
                         tracing::debug!(
                             "Trying to parse inode_id: '{}' from parent_item_identifier: '{}'",

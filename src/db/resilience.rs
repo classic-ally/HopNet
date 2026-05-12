@@ -424,9 +424,9 @@ pub fn generate_fault_tolerance_curve(
         // Remove all nodes that hit threshold at this failure point
         let failure_threshold = node_available_capacity;
         current_nodes.retain(|node| {
-                let available = node.storage_total_gb * threshold_ratio - node.baseline_storage_gb;
-                available > failure_threshold
-            });
+            let available = node.storage_total_gb * threshold_ratio - node.baseline_storage_gb;
+            available > failure_threshold
+        });
 
         // Add curve point at this failure
         curve.push(FaultToleranceCurvePoint {

@@ -169,9 +169,10 @@ async fn wait_for_import_status(
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(record) = get_current_import(node).await?
-            && record.status == target {
-                return Ok(());
-            }
+            && record.status == target
+        {
+            return Ok(());
+        }
         if Instant::now() >= deadline {
             anyhow::bail!(
                 "Import did not reach status {:?} on node {}:{} within {:?}",
@@ -1016,9 +1017,10 @@ impl TestScenario for ImportExtractionHashMismatch {
             last_rows = get_import_paths(&nodes[0]).await.unwrap_or_default();
             let target = last_rows.iter().find(|r| r.path == target_path);
             if let Some(row) = target
-                && row.status == ImportPathStatus::Failed {
-                    break;
-                }
+                && row.status == ImportPathStatus::Failed
+            {
+                break;
+            }
             if Instant::now() >= deadline {
                 break;
             }
@@ -1575,9 +1577,10 @@ impl TestScenario for ImportWriteGate {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             if let Some(r) = get_current_import(&nodes[1]).await?
-                && r.status == ImportStatus::Completed {
-                    break;
-                }
+                && r.status == ImportStatus::Completed
+            {
+                break;
+            }
             if Instant::now() >= deadline {
                 anyhow::bail!("Completed status didn't reach node[1] within 15s");
             }

@@ -156,7 +156,6 @@ pub fn create_archive(
                     if let Some(parent) = Path::new(&entry.staging_path).parent() {
                         cleanup_empty_directories(parent);
                     }
-                    
                 })
             };
 

@@ -193,9 +193,10 @@ pub(crate) fn staging_dir(state: &AppState, import_id: &CustomUUID) -> PathBuf {
 /// failure cause.
 async fn cleanup_staging(staging: &std::path::Path) {
     if let Err(e) = tokio::fs::remove_dir_all(staging).await
-        && e.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!("Failed to clean staging {}: {:?}", staging.display(), e);
-        }
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!("Failed to clean staging {}: {:?}", staging.display(), e);
+    }
 }
 
 /// Drive the full upload-side pipeline. The session clone lives in this
@@ -592,9 +593,10 @@ pub(crate) async fn run_creation_phase(
     //    since fragments are committed network-wide. Stray staging is
     //    preferable to retracting the terminal flip on cleanup error.
     if let Err(e) = tokio::fs::remove_dir_all(staging).await
-        && e.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!("Staging cleanup for {} failed: {:?}", import_id, e);
-        }
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!("Staging cleanup for {} failed: {:?}", import_id, e);
+    }
 
     tracing::info!(
         "Import {} complete: {} folders + {} files attempted",

@@ -382,17 +382,17 @@ impl TestScenario for OrphanCleanup {
                         && files
                             .iter()
                             .any(|f| f["path"].as_str() == Some(orphan_path.as_str()))
-                        {
-                            all_gone = false;
-                            print_and_add_check(
-                                &mut result,
-                                Check {
-                                    name: format!("Deleted file still in listing on node {}", i),
-                                    passed: false,
-                                    detail: Some(orphan_path.clone()),
-                                },
-                            );
-                        }
+                    {
+                        all_gone = false;
+                        print_and_add_check(
+                            &mut result,
+                            Check {
+                                name: format!("Deleted file still in listing on node {}", i),
+                                passed: false,
+                                detail: Some(orphan_path.clone()),
+                            },
+                        );
+                    }
                 }
                 if all_gone {
                     print_and_add_check(

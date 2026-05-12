@@ -1,6 +1,5 @@
 use crate::db::{self, Blake3Hash, CustomUUID, devices::get_device_by_id};
 use crate::{AppState, UserKeys, auth};
-use std::str::FromStr;
 use axum::{
     body::Body,
     extract::{Request, State},
@@ -8,6 +7,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use std::str::FromStr;
 
 pub struct DeviceTokenAuthError {
     message: String,

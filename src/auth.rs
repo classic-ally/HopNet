@@ -118,26 +118,21 @@ pub async fn auth_middleware(
         Ok(Some(_user)) => {
             // store the user ID in request extensions
             req.extensions_mut().insert(uid);
-            Ok(next.run(req).await)// future can check user perms here
+            Ok(next.run(req).await) // future can check user perms here
         }
-        Ok(None) => {
-            Err(AuthError {
-                message: "User does not exist".to_string(),
-                status_code: StatusCode::UNAUTHORIZED,
-            })
-        }
-        Err(_) => {
-            Err(AuthError {
-                message: "Error checking user database".to_string(),
-                status_code: StatusCode::INTERNAL_SERVER_ERROR,
-            })
-        }
+        Ok(None) => Err(AuthError {
+            message: "User does not exist".to_string(),
+            status_code: StatusCode::UNAUTHORIZED,
+        }),
+        Err(_) => Err(AuthError {
+            message: "Error checking user database".to_string(),
+            status_code: StatusCode::INTERNAL_SERVER_ERROR,
+        }),
     }
 }
 
 fn decode_jwt(jwt_token: String, key: DecodingKey) -> Result<TokenData<Claims>, StatusCode> {
-    decode(&jwt_token, &key, &Validation::default())
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    decode(&jwt_token, &key, &Validation::default()).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 fn encode_jwt(iss: String, uid: String, key: EncodingKey) -> Result<String, StatusCode> {

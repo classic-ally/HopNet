@@ -229,12 +229,12 @@ pub fn get_folder_changes_since_height(
 
             let final_query = if is_root {
                 // Root case: all modifications
-                
+
                 // tracing::debug!("Root query assembled: {}", root_query);
                 base_query.replace("{source_query}", "SELECT DISTINCT ml.inode_id, ml.modified_at_height FROM modification_log ml WHERE ml.owner_id = ? AND ml.modified_at_height > ?")
             } else {
                 // Specific folder case: items that were or are in this folder
-                
+
                 // tracing::debug!("Folder query assembled for path '{}': {}", encrypted_parent_path, folder_query);
                 base_query.replace("{source_query}", r#"
                     WITH target_folder AS (

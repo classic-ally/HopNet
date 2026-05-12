@@ -304,26 +304,27 @@ impl Ballot {
 
         // Bug #5 fix: Check for double-voting in Propose phase
         if self.data.phase == ConsensusPhase::Propose
-            && let Some(last_vote_hash) = consensus_state.last_propose_vote_block_hash {
-                if last_vote_hash != self.block.block_hash {
-                    // Different block in same view = double-vote attempt
-                    tracing::warn!(
-                        "Double-vote attempt rejected: already voted for {:?}, rejecting vote for {:?} in view {}",
-                        last_vote_hash,
-                        self.block.block_hash,
-                        self.data.view
-                    );
-                    return Err(VoteError::ProgressionError(
-                        ProgressionErrorKind::DoubleVote,
-                    ));
-                }
-                // Same block = retry allowed (idempotent, will regenerate same signature)
-                tracing::debug!(
-                    "Retry detected: already voted for {:?} in view {}, allowing re-vote",
+            && let Some(last_vote_hash) = consensus_state.last_propose_vote_block_hash
+        {
+            if last_vote_hash != self.block.block_hash {
+                // Different block in same view = double-vote attempt
+                tracing::warn!(
+                    "Double-vote attempt rejected: already voted for {:?}, rejecting vote for {:?} in view {}",
+                    last_vote_hash,
                     self.block.block_hash,
                     self.data.view
                 );
+                return Err(VoteError::ProgressionError(
+                    ProgressionErrorKind::DoubleVote,
+                ));
             }
+            // Same block = retry allowed (idempotent, will regenerate same signature)
+            tracing::debug!(
+                "Retry detected: already voted for {:?} in view {}, allowing re-vote",
+                self.block.block_hash,
+                self.data.view
+            );
+        }
 
         // 2. Chain validity check
         // Reject proposals that aren't listing tip of chain as parent
@@ -351,28 +352,30 @@ impl Ballot {
         if self.data.phase == ConsensusPhase::Propose {
             // Propose phase: shouldn't have a prepared block at this height yet
             if consensus_state.prepared_block.is_some()
-                && self.data.block_height == consensus_state.prepared_block.unwrap().data.height {
-                    tracing::warn!(
-                        "Ballot rejected: prepared block conflict (height={})",
-                        self.data.block_height
-                    );
-                    return Err(VoteError::ProgressionError(
-                        ProgressionErrorKind::PreparedBlockConflict,
-                    ));
-                }
+                && self.data.block_height == consensus_state.prepared_block.unwrap().data.height
+            {
+                tracing::warn!(
+                    "Ballot rejected: prepared block conflict (height={})",
+                    self.data.block_height
+                );
+                return Err(VoteError::ProgressionError(
+                    ProgressionErrorKind::PreparedBlockConflict,
+                ));
+            }
         } else if self.data.phase == ConsensusPhase::Lock {
             // Lock phase: ballot must match the block we prepared
             if let Some(ref prepared) = consensus_state.prepared_block
-                && self.data.block_hash != prepared.block_hash {
-                    tracing::warn!(
-                        "Lock phase ballot rejected: block mismatch (ballot={:?}, prepared={:?})",
-                        self.data.block_hash,
-                        prepared.block_hash
-                    );
-                    return Err(VoteError::ProgressionError(
-                        ProgressionErrorKind::PreparedBlockConflict,
-                    ));
-                }
+                && self.data.block_hash != prepared.block_hash
+            {
+                tracing::warn!(
+                    "Lock phase ballot rejected: block mismatch (ballot={:?}, prepared={:?})",
+                    self.data.block_hash,
+                    prepared.block_hash
+                );
+                return Err(VoteError::ProgressionError(
+                    ProgressionErrorKind::PreparedBlockConflict,
+                ));
+            }
         }
 
         // 4. Height validation

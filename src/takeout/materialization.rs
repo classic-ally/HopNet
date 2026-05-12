@@ -89,18 +89,19 @@ pub async fn materialize_single_file(
 
     // Ensure parent directory exists
     if let Some(parent) = std::path::Path::new(&full_staging_path).parent()
-        && let Err(e) = tokio::fs::create_dir_all(parent).await {
-            tracing::error!(
-                "Failed to create parent directory for {}: {:?}",
-                full_staging_path,
-                e
-            );
-            return (
-                file_id,
-                MaterializationStatus::Failed,
-                Some(format!("Parent directory creation failed: {}", e)),
-            );
-        }
+        && let Err(e) = tokio::fs::create_dir_all(parent).await
+    {
+        tracing::error!(
+            "Failed to create parent directory for {}: {:?}",
+            full_staging_path,
+            e
+        );
+        return (
+            file_id,
+            MaterializationStatus::Failed,
+            Some(format!("Parent directory creation failed: {}", e)),
+        );
+    }
 
     // Open file for writing
     let mut file = match tokio::fs::File::create(&full_staging_path).await {

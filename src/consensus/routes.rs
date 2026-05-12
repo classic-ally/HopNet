@@ -631,9 +631,10 @@ pub async fn broadcast_timeout_certificate(
     // Wait for all broadcasts (but don't fail if some fail)
     for task in broadcast_tasks {
         if let Ok(result) = task.await
-            && let Err(e) = result {
-                tracing::debug!("Failed to broadcast TC to node: {:?}", e);
-            }
+            && let Err(e) = result
+        {
+            tracing::debug!("Failed to broadcast TC to node: {:?}", e);
+        }
     }
 
     Ok(())
@@ -1793,13 +1794,14 @@ pub async fn jwt_or_rpc_auth_middleware(
     // First try JWT authentication
     if let Some(auth_header) = req.headers().get("Authorization")
         && let Ok(auth_str) = auth_header.to_str()
-            && auth_str.starts_with("Bearer ") {
-                // This looks like JWT auth, let the JWT middleware handle it
-                match crate::auth::auth_middleware(State(app_state), req, next).await {
-                    Ok(response) => return response.into_response(),
-                    Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
-                }
-            }
+        && auth_str.starts_with("Bearer ")
+    {
+        // This looks like JWT auth, let the JWT middleware handle it
+        match crate::auth::auth_middleware(State(app_state), req, next).await {
+            Ok(response) => return response.into_response(),
+            Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+        }
+    }
 
     // If no JWT, try RPC authentication
     rpc_auth_middleware(State(app_state), req, next)

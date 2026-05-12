@@ -103,23 +103,23 @@ pub async fn drain_local_state_queue(
         if !mark_local.is_empty()
             && let Err(e) =
                 super::files::mark_fragments_local_state_batch(db_pool.get(), &mark_local, true)
-            {
-                tracing::warn!(
-                    "Failed to batch-mark {} fragments as local: {:?}",
-                    mark_local.len(),
-                    e
-                );
-            }
+        {
+            tracing::warn!(
+                "Failed to batch-mark {} fragments as local: {:?}",
+                mark_local.len(),
+                e
+            );
+        }
 
         if !mark_remote.is_empty()
             && let Err(e) =
                 super::files::mark_fragments_local_state_batch(db_pool.get(), &mark_remote, false)
-            {
-                tracing::warn!(
-                    "Failed to batch-mark {} fragments as remote: {:?}",
-                    mark_remote.len(),
-                    e
-                );
-            }
+        {
+            tracing::warn!(
+                "Failed to batch-mark {} fragments as remote: {:?}",
+                mark_remote.len(),
+                e
+            );
+        }
     }
 }

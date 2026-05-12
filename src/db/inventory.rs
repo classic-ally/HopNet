@@ -285,10 +285,7 @@ pub fn batch_query_fragment_inventory(
                     pubkey: row.get(2).map_err(|_| DatabaseError::RecallError)?,
                 };
 
-                result
-                    .entry(fragment_hash)
-                    .or_default()
-                    .push(node_info);
+                result.entry(fragment_hash).or_default().push(node_info);
             }
 
             debug!(

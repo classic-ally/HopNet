@@ -187,7 +187,7 @@ pub fn generate_siv_nonce() -> Nonce {
 
     let random_value: u128 = rng.random();
     let random_bytes = random_value.to_be_bytes();
-    
+
     *Nonce::from_slice(&random_bytes)
 }
 
@@ -389,9 +389,7 @@ pub fn fetch_fragment_local(
     let full_file_path = format!("{}/{}", dir_path, fragment_hash.to_hex());
 
     // Read the fragment data using block_in_place to avoid blocking the async executor
-    tokio::task::block_in_place(|| {
-        fs::read(&full_file_path).map_err(FileError::StorageError)
-    })
+    tokio::task::block_in_place(|| fs::read(&full_file_path).map_err(FileError::StorageError))
 }
 
 /// Fetch and verify a fragment from local storage
@@ -453,7 +451,8 @@ pub type FragmentEntry = (Blake3Hash, CustomUUID, bool);
 
 /// Reassembly chunk map: chunk_number → (originals_by_index, recovery_by_index).
 /// Each inner map keys on local_index inside that chunk.
-pub type ReassemblyChunks = HashMap<u32, (HashMap<usize, FragmentEntry>, HashMap<usize, FragmentEntry>)>;
+pub type ReassemblyChunks =
+    HashMap<u32, (HashMap<usize, FragmentEntry>, HashMap<usize, FragmentEntry>)>;
 
 /// Data structure for file reassembly containing organized fragment information
 pub struct FileReassemblyData {
@@ -524,16 +523,12 @@ async fn perform_concurrent_fragment_discovery(
         Some(height) => {
             // Deterministic placement mode: get node metrics at consensus height
             let conn = app_state.db_pool.get().map_err(|_| {
-                FileError::StorageError(io::Error::other(
-                    "Database connection failed",
-                ))
+                FileError::StorageError(io::Error::other("Database connection failed"))
             })?;
 
             let node_metrics =
                 crate::db::metrics::get_all_node_metrics(Ok(conn), height).map_err(|_| {
-                    FileError::StorageError(io::Error::other(
-                        "Failed to get node metrics",
-                    ))
+                    FileError::StorageError(io::Error::other("Failed to get node metrics"))
                 })?;
 
             Either::Right(node_metrics)
@@ -543,23 +538,15 @@ async fn perform_concurrent_fragment_discovery(
             tracing::warn!("No consensus height available - using gossip-only fragment discovery");
 
             let conn = app_state.db_pool.get().map_err(|_| {
-                FileError::StorageError(io::Error::other(
-                    "Database connection failed",
-                ))
+                FileError::StorageError(io::Error::other("Database connection failed"))
             })?;
 
-            let my_node_id = app_state.get_node_id().map_err(|_| {
-                FileError::StorageError(io::Error::other(
-                    "Failed to get node ID",
-                ))
-            })?;
+            let my_node_id = app_state
+                .get_node_id()
+                .map_err(|_| FileError::StorageError(io::Error::other("Failed to get node ID")))?;
             let gossip_nodes =
                 crate::db::nodes::get_all_nodes_as_connection_info(Ok(conn), my_node_id).map_err(
-                    |_| {
-                        FileError::StorageError(io::Error::other(
-                            "Failed to get nodes for gossip",
-                        ))
-                    },
+                    |_| FileError::StorageError(io::Error::other("Failed to get nodes for gossip")),
                 )?;
 
             Either::Left(gossip_nodes)
@@ -741,11 +728,10 @@ async fn perform_concurrent_fragment_discovery(
         match result {
             Ok((index, fragment_type, fragment_hash)) => {
                 // Queue async DB update (drain task will batch-flush through write gate)
-                if let Err(e) = app_state.local_state_tx.try_send(
-                    crate::db::write_gate::LocalStateUpdate::MarkLocal {
-                        fragment_hash,
-                    },
-                ) {
+                if let Err(e) = app_state
+                    .local_state_tx
+                    .try_send(crate::db::write_gate::LocalStateUpdate::MarkLocal { fragment_hash })
+                {
                     tracing::warn!(
                         "Local state queue full, dropping mark-local for {}: {}",
                         fragment_hash.to_hex(),

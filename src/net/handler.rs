@@ -40,8 +40,7 @@ pub async fn handle_incoming_connections(endpoint: Endpoint, app_state: AppState
 fn lookup_node_id(app_state: &AppState, peer_pubkey: &iroh::PublicKey) -> Option<i32> {
     let conn = app_state.db_pool.get().ok()?;
     let pubkey = PubKey(ed25519_dalek::VerifyingKey::from_bytes(peer_pubkey.as_bytes()).ok()?);
-    let pubkey_encoded =
-        bincode::serde::encode_to_vec(pubkey, bincode::config::standard()).ok()?;
+    let pubkey_encoded = bincode::serde::encode_to_vec(pubkey, bincode::config::standard()).ok()?;
     conn.query_row(
         "SELECT node_id FROM nodes WHERE pubkey = ?",
         [pubkey_encoded.as_slice()],
@@ -117,24 +116,26 @@ async fn ensure_caught_up_for_message(
 
     // Intra-view catch-up: Lock-phase ballot but we're missing the Propose QC
     if let IrohRequest::BallotSubmission(req) = request
-        && req.ballot.data.phase == crate::consensus::types::ConsensusPhase::Lock {
-            // Check if we need intra-view sync (one DB read, only for Lock ballots)
-            let conn = app_state.db_pool.get().map_err(|_| {
-                IrohError::Protocol(ProtocolError::PeerError("db pool error".into()))
-            })?;
-            let (_, highest_qc_view) = db::get_consensus_progress(&conn)
-                .map_err(|_| IrohError::Protocol(ProtocolError::PeerError("db error".into())))?;
-            if highest_qc_view < target_view {
-                crate::consensus::routes::ensure_intra_view_synced(app_state)
-                    .await
-                    .map_err(|e| {
-                        IrohError::Protocol(ProtocolError::PeerError(format!(
-                            "intra-view sync failed: {:?}",
-                            e
-                        )))
-                    })?;
-            }
+        && req.ballot.data.phase == crate::consensus::types::ConsensusPhase::Lock
+    {
+        // Check if we need intra-view sync (one DB read, only for Lock ballots)
+        let conn = app_state
+            .db_pool
+            .get()
+            .map_err(|_| IrohError::Protocol(ProtocolError::PeerError("db pool error".into())))?;
+        let (_, highest_qc_view) = db::get_consensus_progress(&conn)
+            .map_err(|_| IrohError::Protocol(ProtocolError::PeerError("db error".into())))?;
+        if highest_qc_view < target_view {
+            crate::consensus::routes::ensure_intra_view_synced(app_state)
+                .await
+                .map_err(|e| {
+                    IrohError::Protocol(ProtocolError::PeerError(format!(
+                        "intra-view sync failed: {:?}",
+                        e
+                    )))
+                })?;
         }
+    }
 
     Ok(())
 }
@@ -231,12 +232,13 @@ async fn handle_stream(
         let response_bytes = cell
             .get_or_try_init(|| async {
                 if app_state.test_mode
-                    && let IrohRequest::BallotSubmission(_) = &request {
-                        app_state
-                            .consensus_barriers
-                            .wait(crate::consensus::barriers::names::BEFORE_BALLOT_DISPATCH)
-                            .await;
-                    }
+                    && let IrohRequest::BallotSubmission(_) = &request
+                {
+                    app_state
+                        .consensus_barriers
+                        .wait(crate::consensus::barriers::names::BEFORE_BALLOT_DISPATCH)
+                        .await;
+                }
 
                 let response = match request {
                     IrohRequest::Ping { nonce } => IrohResponse::Pong { nonce },

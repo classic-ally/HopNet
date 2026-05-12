@@ -132,9 +132,10 @@ async fn cleanup_orphaned_data_blocks(
     // Generate cutoff UUID for retention policy
     let cutoff_uuid = generate_cutoff_uuid(retention_days).map_err(|e| {
         tracing::error!("Failed to generate cutoff UUID: {:?}", e);
-        Error::Failed(Arc::new(Box::new(std::io::Error::other(
-            format!("Failed to generate cutoff UUID: {:?}", e),
-        ))))
+        Error::Failed(Arc::new(Box::new(std::io::Error::other(format!(
+            "Failed to generate cutoff UUID: {:?}",
+            e
+        )))))
     })?;
 
     tracing::info!(
@@ -558,9 +559,10 @@ pub async fn run_orphaned_fragments_scan(
 
     // Check which fragments exist in database (batch query for efficiency)
     let db_conn = app_state.db_pool.get().map_err(|e| {
-        Error::Failed(Arc::new(Box::new(std::io::Error::other(
-            format!("Failed to get database connection: {:?}", e),
-        ))))
+        Error::Failed(Arc::new(Box::new(std::io::Error::other(format!(
+            "Failed to get database connection: {:?}",
+            e
+        )))))
     })?;
     let batch_size = 1000;
     let mut orphaned_fragments = Vec::new();
@@ -577,9 +579,10 @@ pub async fn run_orphaned_fragments_scan(
         );
 
         let mut stmt = db_conn.prepare(&query).map_err(|e| {
-            Error::Failed(Arc::new(Box::new(std::io::Error::other(
-                format!("Database query failed: {:?}", e),
-            ))))
+            Error::Failed(Arc::new(Box::new(std::io::Error::other(format!(
+                "Database query failed: {:?}",
+                e
+            )))))
         })?;
 
         // Execute query with hash parameters
@@ -590,22 +593,25 @@ pub async fn run_orphaned_fragments_scan(
         let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
 
         let mut rows = stmt.query(param_refs.as_slice()).map_err(|e| {
-            Error::Failed(Arc::new(Box::new(std::io::Error::other(
-                format!("Database query execution failed: {:?}", e),
-            ))))
+            Error::Failed(Arc::new(Box::new(std::io::Error::other(format!(
+                "Database query execution failed: {:?}",
+                e
+            )))))
         })?;
 
         // Collect hashes that exist in database
         let mut db_hashes = std::collections::HashSet::new();
         while let Some(row) = rows.next().map_err(|e| {
-            Error::Failed(Arc::new(Box::new(std::io::Error::other(
-                format!("Failed to read query results: {:?}", e),
-            ))))
+            Error::Failed(Arc::new(Box::new(std::io::Error::other(format!(
+                "Failed to read query results: {:?}",
+                e
+            )))))
         })? {
             let hash: crate::db::Blake3Hash = row.get(0).map_err(|e| {
-                Error::Failed(Arc::new(Box::new(std::io::Error::other(
-                    format!("Failed to parse hash from row: {:?}", e),
-                ))))
+                Error::Failed(Arc::new(Box::new(std::io::Error::other(format!(
+                    "Failed to parse hash from row: {:?}",
+                    e
+                )))))
             })?;
             db_hashes.insert(hash);
         }

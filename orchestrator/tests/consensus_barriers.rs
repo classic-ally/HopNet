@@ -84,9 +84,10 @@ async fn wait_for_barrier_waiting(
             return Ok(false);
         }
         if let Ok(status) = barrier_status(node, barrier_name).await
-            && status.waiting {
-                return Ok(true);
-            }
+            && status.waiting
+        {
+            return Ok(true);
+        }
         sleep(Duration::from_millis(250)).await;
     }
 }
@@ -127,9 +128,10 @@ async fn find_waiting_node<'a>(
         }
         for node in nodes {
             if let Ok(status) = barrier_status(node, barrier_name).await
-                && status.waiting {
-                    return Some(node);
-                }
+                && status.waiting
+            {
+                return Some(node);
+            }
         }
         sleep(Duration::from_millis(250)).await;
     }
@@ -646,10 +648,11 @@ impl TestScenario for ConsensusBarrierMissedBallot {
                     continue;
                 }
                 if let Ok(status) = barrier_status(node, barrier_name).await
-                    && status.waiting {
-                        held = Some(node);
-                        break;
-                    }
+                    && status.waiting
+                {
+                    held = Some(node);
+                    break;
+                }
             }
             match held {
                 Some(n) => {
@@ -1046,9 +1049,9 @@ impl TestScenario for ConsensusBarrierTcLate {
                         && history
                             .iter()
                             .any(|e| e.view == competing_view as i64 && e.has_lock_qc)
-                        {
-                            count += 1;
-                        }
+                    {
+                        count += 1;
+                    }
                 }
                 if count >= followers.len() {
                     all_applied = true;

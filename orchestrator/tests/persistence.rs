@@ -26,13 +26,14 @@ pub async fn stop_node(docker: &Docker, mesh_id: u32, node_id: u32) -> Result<()
     for container in containers {
         if let Some(labels) = &container.labels
             && labels.get("hopnet.mesh_id") == Some(&mesh_id.to_string())
-                && labels.get("hopnet.node_id") == Some(&node_id.to_string())
-                && let Some(id) = &container.id {
-                    docker
-                        .stop_container(id, None::<bollard::query_parameters::StopContainerOptions>)
-                        .await?;
-                    return Ok(());
-                }
+            && labels.get("hopnet.node_id") == Some(&node_id.to_string())
+            && let Some(id) = &container.id
+        {
+            docker
+                .stop_container(id, None::<bollard::query_parameters::StopContainerOptions>)
+                .await?;
+            return Ok(());
+        }
     }
 
     Err(anyhow::anyhow!(
@@ -55,16 +56,14 @@ pub async fn start_node(docker: &Docker, mesh_id: u32, node_id: u32) -> Result<(
     for container in containers {
         if let Some(labels) = &container.labels
             && labels.get("hopnet.mesh_id") == Some(&mesh_id.to_string())
-                && labels.get("hopnet.node_id") == Some(&node_id.to_string())
-                && let Some(id) = &container.id {
-                    docker
-                        .start_container(
-                            id,
-                            None::<bollard::query_parameters::StartContainerOptions>,
-                        )
-                        .await?;
-                    return Ok(());
-                }
+            && labels.get("hopnet.node_id") == Some(&node_id.to_string())
+            && let Some(id) = &container.id
+        {
+            docker
+                .start_container(id, None::<bollard::query_parameters::StartContainerOptions>)
+                .await?;
+            return Ok(());
+        }
     }
 
     Err(anyhow::anyhow!(

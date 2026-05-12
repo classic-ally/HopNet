@@ -243,29 +243,35 @@ impl TestScenario for DbPragmaBench {
         let mut payload_bytes = 1024usize;
         for f in flags {
             if let Some(v) = f.strip_prefix("write=")
-                && let Ok(n) = v.parse() {
-                    write_count = n;
-                }
+                && let Ok(n) = v.parse()
+            {
+                write_count = n;
+            }
             if let Some(v) = f.strip_prefix("writers=")
-                && let Ok(n) = v.parse() {
-                    writers = n;
-                }
+                && let Ok(n) = v.parse()
+            {
+                writers = n;
+            }
             if let Some(v) = f.strip_prefix("readers=")
-                && let Ok(n) = v.parse() {
-                    readers = n;
-                }
+                && let Ok(n) = v.parse()
+            {
+                readers = n;
+            }
             if let Some(v) = f.strip_prefix("read=")
-                && let Ok(n) = v.parse() {
-                    read_count = n;
-                }
+                && let Ok(n) = v.parse()
+            {
+                read_count = n;
+            }
             if let Some(v) = f.strip_prefix("mixed_secs=")
-                && let Ok(n) = v.parse() {
-                    mixed_secs = n;
-                }
+                && let Ok(n) = v.parse()
+            {
+                mixed_secs = n;
+            }
             if let Some(v) = f.strip_prefix("payload_bytes=")
-                && let Ok(n) = v.parse() {
-                    payload_bytes = n;
-                }
+                && let Ok(n) = v.parse()
+            {
+                payload_bytes = n;
+            }
         }
         if writers == 0 {
             writers = 1;

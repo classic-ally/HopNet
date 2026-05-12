@@ -378,20 +378,21 @@ async fn handle_as_leader(
     {
         let nonces: Vec<_> = batch.iter().map(|q| q.tx.nonce.clone()).collect();
         if let Ok(committed) = db::check_committed_nonces(conn, &nonces)
-            && !committed.is_empty() {
-                let mut i = 0;
-                while i < batch.len() {
-                    if committed.contains(&batch[i].tx.nonce.to_string()) {
-                        let queued = batch.remove(i);
-                        let _ = queued.notifier.send(ConsensusResult::Committed);
-                    } else {
-                        i += 1;
-                    }
-                }
-                if batch.is_empty() {
-                    return (Vec::new(), DispatchOutcome::ViewAdvanced);
+            && !committed.is_empty()
+        {
+            let mut i = 0;
+            while i < batch.len() {
+                if committed.contains(&batch[i].tx.nonce.to_string()) {
+                    let queued = batch.remove(i);
+                    let _ = queued.notifier.send(ConsensusResult::Committed);
+                } else {
+                    i += 1;
                 }
             }
+            if batch.is_empty() {
+                return (Vec::new(), DispatchOutcome::ViewAdvanced);
+            }
+        }
     }
 
     // Preflight validation: SAVEPOINT-based single-pass

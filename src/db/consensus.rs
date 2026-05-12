@@ -1207,9 +1207,9 @@ pub fn get_view_consensus_data(
                         )
                         .optional()
                         .map_err(|_| DatabaseError::RecallError)?
-                    {
-                        blocks.push(block);
-                    }
+                {
+                    blocks.push(block);
+                }
             }
 
             Ok(ViewConsensusData {

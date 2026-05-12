@@ -78,13 +78,15 @@ impl TransactionHandler for UpdateUserProfileHandler {
 
         // Validation: name fields <= 32 chars
         if let Some(Some(ref name)) = payload.first_name
-            && name.len() > 32 {
-                return Err(DatabaseError::InvalidPayload);
-            }
+            && name.len() > 32
+        {
+            return Err(DatabaseError::InvalidPayload);
+        }
         if let Some(Some(ref name)) = payload.last_name
-            && name.len() > 32 {
-                return Err(DatabaseError::InvalidPayload);
-            }
+            && name.len() > 32
+        {
+            return Err(DatabaseError::InvalidPayload);
+        }
 
         // Validation: avatar <= 128KB
         if let Some(Some(ref bytes)) = payload.avatar {

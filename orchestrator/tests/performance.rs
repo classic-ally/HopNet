@@ -35,33 +35,34 @@ async fn monitor_container_memory(
         );
 
         if let Some(Ok(stats)) = stats_stream.next().await
-            && let Some(memory_stats) = stats.memory_stats {
-                // Calculate working memory by measuring anonymous memory (heap allocations)
-                // anon = anonymous memory (heap, stack, malloc) - this is actual application memory
-                let usage_mb = if let Some(stats_map) = &memory_stats.stats {
-                    let anon = stats_map.get("anon").copied().unwrap_or(0);
-                    anon / 1_000_000 // Convert to MB
-                } else if let Some(usage) = memory_stats.usage {
-                    // Fallback to total usage if stats not available
-                    usage / 1_000_000
-                } else {
-                    0
-                };
+            && let Some(memory_stats) = stats.memory_stats
+        {
+            // Calculate working memory by measuring anonymous memory (heap allocations)
+            // anon = anonymous memory (heap, stack, malloc) - this is actual application memory
+            let usage_mb = if let Some(stats_map) = &memory_stats.stats {
+                let anon = stats_map.get("anon").copied().unwrap_or(0);
+                anon / 1_000_000 // Convert to MB
+            } else if let Some(usage) = memory_stats.usage {
+                // Fallback to total usage if stats not available
+                usage / 1_000_000
+            } else {
+                0
+            };
 
-                // Update peak if current usage is higher
-                let mut current_peak = peak_memory_mb.load(Ordering::Relaxed);
-                while usage_mb > current_peak {
-                    match peak_memory_mb.compare_exchange_weak(
-                        current_peak,
-                        usage_mb,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    ) {
-                        Ok(_) => break,
-                        Err(new_peak) => current_peak = new_peak,
-                    }
+            // Update peak if current usage is higher
+            let mut current_peak = peak_memory_mb.load(Ordering::Relaxed);
+            while usage_mb > current_peak {
+                match peak_memory_mb.compare_exchange_weak(
+                    current_peak,
+                    usage_mb,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(new_peak) => current_peak = new_peak,
                 }
             }
+        }
 
         // Poll every 100ms
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -426,14 +427,14 @@ impl TestScenario for ChunkedStreamingPerformance {
             while settle_start.elapsed() < settle_timeout {
                 if let Ok(dist) = get_fragment_distribution(&nodes[0], &full_path).await
                     && !dist.fragments.is_empty()
-                        && dist
-                            .fragments
-                            .iter()
-                            .all(|f| !f.nodes_with_fragment.is_empty())
-                    {
-                        settled = true;
-                        break;
-                    }
+                    && dist
+                        .fragments
+                        .iter()
+                        .all(|f| !f.nodes_with_fragment.is_empty())
+                {
+                    settled = true;
+                    break;
+                }
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
 

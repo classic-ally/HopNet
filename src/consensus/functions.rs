@@ -410,13 +410,12 @@ pub async fn run_consensus(
         .cloned()
         .collect();
 
-    let validators_elect: Vec<Node> =
-        db::get_validators_elect_with_conn(conn, committed_height)
-            .map_err(|_| ConsensusError::DatabaseError)?
-            .iter()
-            .filter(|node| node.node_id != me.node_id)
-            .cloned()
-            .collect();
+    let validators_elect: Vec<Node> = db::get_validators_elect_with_conn(conn, committed_height)
+        .map_err(|_| ConsensusError::DatabaseError)?
+        .iter()
+        .filter(|node| node.node_id != me.node_id)
+        .cloned()
+        .collect();
 
     // Transaction 1: Record Propose vote and commit immediately (double-vote protection)
     let ballot_propose = {
@@ -869,15 +868,16 @@ pub fn process_transactions(
             // Catches replays of transactions whose nonces were already cleaned up.
             for tx in transactions.iter() {
                 if let Some(created_at) = tx.nonce.extract_timestamp()
-                    && now - created_at > MAX_TRANSACTION_AGE {
-                        tracing::warn!(
-                            "Rejecting stale transaction {} (nonce age: {:?}, max: {:?})",
-                            tx.rpc.function,
-                            now - created_at,
-                            MAX_TRANSACTION_AGE
-                        );
-                        return Err(crate::db::DatabaseError::ProcessingError);
-                    }
+                    && now - created_at > MAX_TRANSACTION_AGE
+                {
+                    tracing::warn!(
+                        "Rejecting stale transaction {} (nonce age: {:?}, max: {:?})",
+                        tx.rpc.function,
+                        now - created_at,
+                        MAX_TRANSACTION_AGE
+                    );
+                    return Err(crate::db::DatabaseError::ProcessingError);
+                }
             }
 
             // Nonce dedup check: reject blocks containing already-committed nonces.
@@ -885,13 +885,14 @@ pub fn process_transactions(
             let nonces: Vec<_> = transactions.iter().map(|tx| tx.nonce.clone()).collect();
             if let Ok(conn) = app_state.db_pool.get()
                 && let Ok(committed) = crate::db::consensus::check_committed_nonces(&conn, &nonces)
-                    && !committed.is_empty() {
-                        tracing::warn!(
-                            "Rejecting block with {} already-committed nonce(s) — possible leader replay attack",
-                            committed.len()
-                        );
-                        return Err(crate::db::DatabaseError::ProcessingError);
-                    }
+                && !committed.is_empty()
+            {
+                tracing::warn!(
+                    "Rejecting block with {} already-committed nonce(s) — possible leader replay attack",
+                    committed.len()
+                );
+                return Err(crate::db::DatabaseError::ProcessingError);
+            }
         }
 
         let mut nonces = Vec::new();
