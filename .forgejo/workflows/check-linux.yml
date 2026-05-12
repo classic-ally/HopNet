@@ -1,0 +1,45 @@
+name: Check (Linux)
+
+# Fast checks on every push + PR: cargo fmt, clippy, check, frontend lint,
+# nix build of the headless hopnet binary. Runs on desktop self-hosted runner.
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  cargo:
+    runs-on: x86_64-linux
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: cargo fmt --check
+        run: nix develop --command cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: nix develop --command cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo check
+        run: nix develop --command cargo check --workspace --all-targets
+
+      - name: cargo test (unit only — skips orchestrator)
+        run: nix develop --command cargo test --workspace --lib --bins
+
+  nix-build:
+    runs-on: x86_64-linux
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: nix build .#default
+        run: nix build .#default --print-build-logs
+
+      - name: Verify headless binary
+        run: |
+          test -x result/bin/hopnet
+          file result/bin/hopnet
