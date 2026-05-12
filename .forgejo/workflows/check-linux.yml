@@ -1,7 +1,12 @@
 name: Check (Linux)
 
-# Fast checks on every push + PR: cargo fmt, clippy, check, frontend lint,
+# Fast checks on every push + same-repo PR: cargo fmt/clippy/test,
 # nix build of the headless hopnet binary. Runs on desktop self-hosted runner.
+#
+# Fork PRs are intentionally skipped at the job level — see the `if:` guard.
+# Forgejo has no first-contributor approval gate yet, so we hard-restrict
+# CI to code we already control. To run CI against a fork's branch, push it
+# into this repo manually (e.g. `git push origin pr/123-review`).
 on:
   push:
     branches: [master]
@@ -9,6 +14,7 @@ on:
 
 jobs:
   cargo:
+    if: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: x86_64-linux
     timeout-minutes: 30
 
@@ -27,13 +33,11 @@ jobs:
       - name: cargo clippy
         run: nix develop --command cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: cargo check
-        run: nix develop --command cargo check --workspace --all-targets
-
       - name: cargo test (unit only — skips orchestrator)
         run: nix develop --command cargo test --workspace --lib --bins
 
   nix-build:
+    if: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: x86_64-linux
     timeout-minutes: 45
 
