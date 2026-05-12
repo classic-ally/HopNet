@@ -28,7 +28,7 @@ async fn test_fileprovider_integration() -> Result<(), Box<dyn std::error::Error
 
     // 2. Kill any leftover backend from a previous failed test run
     let _ = Command::new("sh")
-        .args(&["-c", "lsof -ti :34632 | xargs kill 2>/dev/null"])
+        .args(["-c", "lsof -ti :34632 | xargs kill 2>/dev/null"])
         .output();
     sleep(Duration::from_millis(500)).await;
 
@@ -550,7 +550,7 @@ async fn test_fileprovider_integration() -> Result<(), Box<dyn std::error::Error
 /// Helper function to run Swift test commands with standardized setup
 fn run_swift_command(executable: &str, test_case: &str) -> std::process::Output {
     Command::new("swift")
-        .args(&[
+        .args([
             "run",
             "--package-path", "apple/HopNetFileProvider",
             executable,

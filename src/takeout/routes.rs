@@ -13,6 +13,7 @@ use axum::{
     routing::{delete, get, post},
 };
 use chrono::{Duration, Utc};
+use std::str::FromStr;
 use hopnet_common::{TakeoutRecord, TakeoutStatus};
 use tokio::fs::File;
 use tokio_util::io::ReaderStream;
@@ -378,7 +379,7 @@ async fn get_download_takeout(
     );
 
     // Check if archive file exists
-    if !tokio::fs::metadata(&archive_path).await.is_ok() {
+    if tokio::fs::metadata(&archive_path).await.is_err() {
         tracing::error!("Archive file not found: {}", archive_path);
         return Err(StatusCode::NOT_FOUND);
     }
@@ -461,7 +462,7 @@ pub async fn execute_takeout_materialization(
     })?;
 
     let transaction = match crate::consensus::functions::create_signed_transaction(
-        &app_state,
+        app_state,
         "update_takeout_status".to_string(),
         encoded_payload,
     ) {
@@ -513,7 +514,7 @@ pub async fn execute_takeout_materialization(
         &session.siv_key,
         &session.siv_nonce,
     )
-    .map_err(|e| TakeoutMaterializationError::Database(e))?;
+    .map_err(TakeoutMaterializationError::Database)?;
 
     tracing::info!(
         "Folder materialization for takeout {} completed: {} succeeded, {} failed",
@@ -531,7 +532,7 @@ pub async fn execute_takeout_materialization(
         user_id,
     )
     .await
-    .map_err(|e| TakeoutMaterializationError::Database(e))?;
+    .map_err(TakeoutMaterializationError::Database)?;
 
     tracing::info!(
         "Complete takeout materialization for {} finished: {} folders ({} failed), {} files ({} failed)",
@@ -553,7 +554,7 @@ pub async fn execute_takeout_materialization(
         &session.siv_key,
         &session.siv_nonce,
     )
-    .map_err(|e| TakeoutMaterializationError::Database(e))?;
+    .map_err(TakeoutMaterializationError::Database)?;
 
     // Build the manifest emitted as the first tar entry.
     let manifest = crate::db::takeout::build_takeout_manifest(
@@ -563,7 +564,7 @@ pub async fn execute_takeout_materialization(
         &session.siv_key,
         &session.siv_nonce,
     )
-    .map_err(|e| TakeoutMaterializationError::Database(e))?;
+    .map_err(TakeoutMaterializationError::Database)?;
 
     // Reserved conn is no longer needed; release the slot before archive I/O
     // and the final consensus submit.
@@ -587,7 +588,7 @@ pub async fn execute_takeout_materialization(
         &archive_path,
         true, // delete_source_files = true for cleanup
     )
-    .map_err(|e| TakeoutMaterializationError::Archive(e))?;
+    .map_err(TakeoutMaterializationError::Archive)?;
 
     tracing::info!(
         "Archive created successfully for takeout {}: {} bytes at {}",

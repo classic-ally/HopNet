@@ -20,8 +20,8 @@ pub struct NodeRegistration {
 
 pub async fn get_nodes(State(app_state): State<AppState>) -> impl IntoResponse {
     match nodes::get_nodes(app_state.db_pool.get()) {
-        Ok(nodes) => return (StatusCode::OK, Json(nodes)),
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(Vec::<Node>::new())),
+        Ok(nodes) => (StatusCode::OK, Json(nodes)),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(Vec::<Node>::new())),
     }
 }
 

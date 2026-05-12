@@ -125,7 +125,7 @@ pub fn get_folder_contents(
                         // Extract filename from path (last component after '/')
                         let filename = decrypted_path
                             .split('/')
-                            .last()
+                            .next_back()
                             .unwrap_or(&decrypted_path)
                             .to_string();
 
@@ -229,12 +229,14 @@ pub fn get_folder_changes_since_height(
 
             let final_query = if is_root {
                 // Root case: all modifications
-                let root_query = base_query.replace("{source_query}", "SELECT DISTINCT ml.inode_id, ml.modified_at_height FROM modification_log ml WHERE ml.owner_id = ? AND ml.modified_at_height > ?");
+                
                 // tracing::debug!("Root query assembled: {}", root_query);
-                root_query
+                base_query.replace("{source_query}", "SELECT DISTINCT ml.inode_id, ml.modified_at_height FROM modification_log ml WHERE ml.owner_id = ? AND ml.modified_at_height > ?")
             } else {
                 // Specific folder case: items that were or are in this folder
-                let folder_query = base_query.replace("{source_query}", r#"
+                
+                // tracing::debug!("Folder query assembled for path '{}': {}", encrypted_parent_path, folder_query);
+                base_query.replace("{source_query}", r#"
                     WITH target_folder AS (
                         SELECT id FROM inodes WHERE owner_id = ? AND path = ? AND type = 1
                     ),
@@ -258,31 +260,32 @@ pub fn get_folder_changes_since_height(
                     WHERE (mi.old_parent_id IN (SELECT id FROM target_folder)
                        OR mi.current_parent_id IN (SELECT id FROM target_folder))
                        AND ml.modified_at_height > ?
-                "#);
-                // tracing::debug!("Folder query assembled for path '{}': {}", encrypted_parent_path, folder_query);
-                folder_query
+                "#)
             };
 
             let mut stmt = db_lock
                 .prepare(&final_query)
                 .map_err(|_| DatabaseError::ProcessingError)?;
 
+            // Tuple shape returned by the row mapper for this query:
+            // (status, inode_id, identifier, item_type, encrypted_path,
+            //  parent_item_identifier, file_size, creation_date,
+            //  content_modification_date, modification_height).
+            type EnumerateRow = (
+                String,
+                CustomUUID,
+                Option<String>,
+                Option<InodeType>,
+                Option<String>,
+                Option<String>,
+                Option<u64>,
+                Option<CustomDateTime>,
+                Option<CustomDateTime>,
+                Option<i32>,
+            );
+
             // Define the closure once to avoid type mismatch
-            let row_mapper = |row: &rusqlite::Row| -> Result<
-                (
-                    String,
-                    CustomUUID,
-                    Option<String>,
-                    Option<InodeType>,
-                    Option<String>,
-                    Option<String>,
-                    Option<u64>,
-                    Option<CustomDateTime>,
-                    Option<CustomDateTime>,
-                    Option<i32>,
-                ),
-                rusqlite::Error,
-            > {
+            let row_mapper = |row: &rusqlite::Row| -> Result<EnumerateRow, rusqlite::Error> {
                 let inode_id: CustomUUID = row.get(0)?;
                 let status: String = row.get(1)?;
                 let identifier: Option<String> = row.get(2)?;
@@ -361,7 +364,7 @@ pub fn get_folder_changes_since_height(
 
                     let filename = decrypted_path
                         .split('/')
-                        .last()
+                        .next_back()
                         .unwrap_or(&decrypted_path)
                         .to_string();
 
@@ -412,21 +415,22 @@ pub fn get_folder_changes_since_height(
 
 /// Get the encrypted path, file size, timestamps, and type for any item by its inode_id
 /// Used by FileProvider get_item endpoint to fetch complete metadata for files and folders
+/// Tuple returned by [`get_item_metadata_by_inode_id`]:
+/// `(encrypted_path, item_type, file_size, creation_date, content_modification_date, modification_height)`.
+pub type InodeMetadata = (
+    String,
+    InodeType,
+    Option<u64>,
+    CustomDateTime,
+    Option<CustomDateTime>,
+    Option<i32>,
+);
+
 pub fn get_item_metadata_by_inode_id(
     db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     inode_id: CustomUUID,
     user_id: i32,
-) -> Result<
-    (
-        String,
-        InodeType,
-        Option<u64>,
-        CustomDateTime,
-        Option<CustomDateTime>,
-        Option<i32>,
-    ),
-    DatabaseError,
-> {
+) -> Result<InodeMetadata, DatabaseError> {
     match db_connection {
         Ok(db_lock) => {
             let query = r#"

@@ -4,6 +4,7 @@
 use super::{CustomUUID, ImportPathStatus, ImportStatus, InodeType, TakeoutStatus};
 use crate::users::OnboardingFlags;
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
+use std::str::FromStr;
 use uuid::Uuid;
 
 impl ToSql for InodeType {

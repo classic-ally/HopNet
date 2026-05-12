@@ -391,7 +391,7 @@ pub fn generate_fault_tolerance_curve(
         } else {
             let fragments_per_node = 30.0 / (num_nodes as f64);
             let min_nodes_needed = (10.0 / fragments_per_node).ceil() as i32;
-            ((num_nodes as i32) - min_nodes_needed).max(0).min(20)
+            ((num_nodes as i32) - min_nodes_needed).clamp(0, 20)
         }
     };
 
@@ -423,13 +423,10 @@ pub fn generate_fault_tolerance_curve(
 
         // Remove all nodes that hit threshold at this failure point
         let failure_threshold = node_available_capacity;
-        current_nodes = current_nodes
-            .into_iter()
-            .filter(|node| {
+        current_nodes.retain(|node| {
                 let available = node.storage_total_gb * threshold_ratio - node.baseline_storage_gb;
                 available > failure_threshold
-            })
-            .collect();
+            });
 
         // Add curve point at this failure
         curve.push(FaultToleranceCurvePoint {

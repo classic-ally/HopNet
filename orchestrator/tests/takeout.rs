@@ -235,7 +235,7 @@ impl TestScenario for TakeoutHappyPath {
                     _ => 4096,
                 };
                 let byte = (i % 251) as u8;
-                let contents = std::iter::repeat(byte).take(size).collect::<Vec<u8>>();
+                let contents = std::iter::repeat_n(byte, size).collect::<Vec<u8>>();
                 (filename, contents)
             })
             .collect();

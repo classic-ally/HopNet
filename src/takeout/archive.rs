@@ -151,12 +151,12 @@ pub fn create_archive(
                 std::fs::remove_dir_all(&entry.staging_path)
             } else {
                 // Delete the file
-                std::fs::remove_file(&entry.staging_path).and_then(|_| {
+                std::fs::remove_file(&entry.staging_path).map(|_| {
                     // Try to clean up empty parent directories
                     if let Some(parent) = Path::new(&entry.staging_path).parent() {
                         cleanup_empty_directories(parent);
                     }
-                    Ok(())
+                    
                 })
             };
 
@@ -166,7 +166,7 @@ pub fn create_archive(
             }
         }
 
-        if files_archived % 100 == 0 && files_archived > 0 {
+        if files_archived.is_multiple_of(100) && files_archived > 0 {
             tracing::debug!("Archived {} files so far...", files_archived);
         }
     }

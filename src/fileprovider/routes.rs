@@ -6,6 +6,7 @@ use axum::{
 };
 use rand::Rng;
 use serde::Deserialize;
+use std::str::FromStr;
 
 use super::types::{EnumerateResponse, FileProviderItem, HealthResponse, HealthStatus};
 use crate::AppState;
@@ -51,8 +52,7 @@ pub async fn get_enumerate(
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
             ("/".to_string(), encrypted)
-        } else if identifier.starts_with("item:") {
-            let inode_id_str = &identifier[5..];
+        } else if let Some(inode_id_str) = identifier.strip_prefix("item:") {
             let inode_id = crate::db::CustomUUID::from_str(inode_id_str)
                 .map_err(|_| StatusCode::BAD_REQUEST)?;
 
@@ -388,7 +388,7 @@ pub async fn delete_item(
         match crate::db::files::delete_files(&db_tx, encrypted_path.clone(), user_id) {
             Ok(_) => {
                 // Item exists and user has access, roll back validation transaction
-                if let Err(_) = db_tx.rollback() {
+                if db_tx.rollback().is_err() {
                     return StatusCode::INTERNAL_SERVER_ERROR;
                 }
             }
@@ -493,7 +493,7 @@ pub async fn download_file(
 
     // Decrypt path to get the route path format
     let decrypted_path =
-        match crate::files::functions::decrypt_path(encrypted_path, &siv_key, &siv_nonce) {
+        match crate::files::functions::decrypt_path(encrypted_path, siv_key, siv_nonce) {
             Ok(path) => path,
             Err(_) => return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         };
@@ -508,7 +508,7 @@ pub async fn download_file(
         use axum::response::Response;
 
         // Extract filename from path for Content-Disposition header
-        let filename = decrypted_path.split('/').last().unwrap_or("download");
+        let filename = decrypted_path.split('/').next_back().unwrap_or("download");
 
         return Response::builder()
             .status(axum::http::StatusCode::OK)
@@ -593,7 +593,7 @@ pub async fn get_item(
 
     // Decrypt path to get filename and parent
     let decrypted_path =
-        match crate::files::functions::decrypt_path(encrypted_path.clone(), &siv_key, &siv_nonce) {
+        match crate::files::functions::decrypt_path(encrypted_path.clone(), siv_key, siv_nonce) {
             Ok(path) => path,
             Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
         };
@@ -601,7 +601,7 @@ pub async fn get_item(
     // Extract filename from path
     let filename = decrypted_path
         .split('/')
-        .last()
+        .next_back()
         .unwrap_or("item")
         .to_string();
 
@@ -766,8 +766,8 @@ pub async fn modify_item(
     );
 
     // Parse unified item: identifier to get inode_id (validation already done in multipart processing)
-    let inode_id = if identifier.starts_with("item:") {
-        let inode_id_str = &identifier[5..]; // Skip "item:" prefix
+    let inode_id = if let Some(inode_id_str) = identifier.strip_prefix("item:") {
+        // Skip "item:" prefix
         let parsed_inode_id =
             crate::db::CustomUUID::from_str(inode_id_str).map_err(|_| StatusCode::BAD_REQUEST)?;
 
@@ -828,9 +828,9 @@ pub async fn modify_item(
             if parent_id == "NSFileProviderRootContainerItemIdentifier" {
                 tracing::debug!("modify_item: Parent is root container");
                 "".to_string() // Root has no encrypted path segments
-            } else if parent_id.starts_with("item:") {
+            } else if let Some(parent_inode_id_str) = parent_id.strip_prefix("item:") {
                 // Get parent item metadata
-                let parent_inode_id_str = &parent_id[5..]; // Skip "item:" prefix
+                // Skip "item:" prefix
                 let parent_inode_id = crate::db::CustomUUID::from_str(parent_inode_id_str)
                     .map_err(|_| StatusCode::BAD_REQUEST)?;
 
@@ -877,7 +877,7 @@ pub async fn modify_item(
         let filename_encrypted_segment = if let Some(filename) = new_filename {
             // Encrypt new filename as a segment
             tracing::debug!("modify_item: Encrypting new filename: '{}'", filename);
-            let encrypted = crate::files::functions::encrypt_part(&filename, &siv_key, &siv_nonce)
+            let encrypted = crate::files::functions::encrypt_part(&filename, siv_key, siv_nonce)
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
             tracing::debug!(

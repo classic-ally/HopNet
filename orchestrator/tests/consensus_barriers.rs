@@ -83,11 +83,10 @@ async fn wait_for_barrier_waiting(
         if start.elapsed() > timeout {
             return Ok(false);
         }
-        if let Ok(status) = barrier_status(node, barrier_name).await {
-            if status.waiting {
+        if let Ok(status) = barrier_status(node, barrier_name).await
+            && status.waiting {
                 return Ok(true);
             }
-        }
         sleep(Duration::from_millis(250)).await;
     }
 }
@@ -127,11 +126,10 @@ async fn find_waiting_node<'a>(
             return None;
         }
         for node in nodes {
-            if let Ok(status) = barrier_status(node, barrier_name).await {
-                if status.waiting {
+            if let Ok(status) = barrier_status(node, barrier_name).await
+                && status.waiting {
                     return Some(node);
                 }
-            }
         }
         sleep(Duration::from_millis(250)).await;
     }
@@ -304,16 +302,13 @@ impl TestScenario for ConsensusBarrierBasic {
                 if attempt > 0 {
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
-                match get_consensus_history(follower).await {
-                    Ok(history) => {
-                        has_propose = history
-                            .iter()
-                            .any(|e| e.view == target_view as i64 && e.has_propose_qc);
-                        if has_propose {
-                            break;
-                        }
+                if let Ok(history) = get_consensus_history(follower).await {
+                    has_propose = history
+                        .iter()
+                        .any(|e| e.view == target_view as i64 && e.has_propose_qc);
+                    if has_propose {
+                        break;
                     }
-                    Err(_) => {}
                 }
             }
             if !has_propose {
@@ -650,12 +645,11 @@ impl TestScenario for ConsensusBarrierMissedBallot {
                 if node.node_id == first_follower.node_id {
                     continue;
                 }
-                if let Ok(status) = barrier_status(node, barrier_name).await {
-                    if status.waiting {
+                if let Ok(status) = barrier_status(node, barrier_name).await
+                    && status.waiting {
                         held = Some(node);
                         break;
                     }
-                }
             }
             match held {
                 Some(n) => {
@@ -700,10 +694,7 @@ impl TestScenario for ConsensusBarrierMissedBallot {
             .cloned()
             .collect();
 
-        let view_after_first = match get_max_view(&non_held_nodes).await {
-            Ok(v) => v,
-            Err(_) => 0,
-        };
+        let view_after_first = get_max_view(&non_held_nodes).await.unwrap_or_default();
 
         match wait_for_minimum_view(&non_held_nodes, view_after_first, Duration::from_secs(30))
             .await
@@ -1051,14 +1042,13 @@ impl TestScenario for ConsensusBarrierTcLate {
             while Instant::now() < deadline {
                 let mut count = 0;
                 for node in &followers {
-                    if let Ok(history) = get_consensus_history(node).await {
-                        if history
+                    if let Ok(history) = get_consensus_history(node).await
+                        && history
                             .iter()
                             .any(|e| e.view == competing_view as i64 && e.has_lock_qc)
                         {
                             count += 1;
                         }
-                    }
                 }
                 if count >= followers.len() {
                     all_applied = true;

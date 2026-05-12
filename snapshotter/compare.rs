@@ -26,7 +26,7 @@ fn values_equal(a: &serde_json::Value, b: &serde_json::Value, epsilon: f64) -> b
         (serde_json::Value::Object(a), serde_json::Value::Object(b)) => {
             a.len() == b.len()
                 && a.iter()
-                    .all(|(k, v)| b.get(k).map_or(false, |bv| values_equal(v, bv, epsilon)))
+                    .all(|(k, v)| b.get(k).is_some_and(|bv| values_equal(v, bv, epsilon)))
         }
         _ => a == b,
     }

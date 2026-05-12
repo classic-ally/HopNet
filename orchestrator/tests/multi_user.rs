@@ -480,8 +480,8 @@ impl TestScenario for MultiUserIsolation {
         // ── Step 10: Bob downloads own file from all nodes ──────────────
         {
             let mut all_ok = true;
-            for i in 0..nodes.len() {
-                match download_file(&bob_nodes[i], "/bob-file.txt").await {
+            for (i, bob_node) in bob_nodes.iter().enumerate().take(nodes.len()) {
+                match download_file(bob_node, "/bob-file.txt").await {
                     Ok(data) if data == bob_content => {}
                     Ok(data) => {
                         print_and_add_check(
@@ -531,8 +531,8 @@ impl TestScenario for MultiUserIsolation {
         // ── Step 11: Bob cannot download owner's file ───────────────────
         {
             let mut all_ok = true;
-            for i in 0..nodes.len() {
-                match try_download_file(&bob_nodes[i], "/owner-secret.txt").await {
+            for (i, bob_node) in bob_nodes.iter().enumerate().take(nodes.len()) {
+                match try_download_file(bob_node, "/owner-secret.txt").await {
                     Ok(Err(404)) => {} // expected
                     Ok(Err(status)) => {
                         // other error codes are also acceptable (403, etc.)
@@ -662,8 +662,8 @@ impl TestScenario for MultiUserIsolation {
         // ── Step 13: Bob's listing shows only bob-file.txt ──────────────
         {
             let mut all_ok = true;
-            for i in 0..nodes.len() {
-                match list_files(&bob_nodes[i], "/").await {
+            for (i, bob_node) in bob_nodes.iter().enumerate().take(nodes.len()) {
+                match list_files(bob_node, "/").await {
                     Ok(listing) => {
                         let empty = vec![];
                         let files = listing.as_array().unwrap_or(&empty);

@@ -148,7 +148,7 @@ impl TestScenario for FragmentHealthCheck {
         print_and_add_check(
             &mut result,
             Check {
-                name: format!("Selected fragment for health check"),
+                name: "Selected fragment for health check".to_string(),
                 passed: true,
                 detail: Some(format!(
                     "hash={:.16}... stored on nodes {:?}",

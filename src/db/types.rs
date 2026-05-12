@@ -217,7 +217,7 @@ impl FileAccess {
         };
 
         // Generate ephemeral key pair for this file
-        let ephemeral_secret = EphemeralSecret::random_from_rng(&mut OsRng);
+        let ephemeral_secret = EphemeralSecret::random_from_rng(OsRng);
         let ephemeral_public = X25519PublicKey::from(&ephemeral_secret);
 
         // Perform ECDH with user's X25519 public key

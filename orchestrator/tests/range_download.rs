@@ -144,7 +144,7 @@ impl TestScenario for RangeDownload {
             },
         );
 
-        let range_content_correct = range_bytes == &txt_contents[0..100];
+        let range_content_correct = range_bytes == txt_contents[0..100];
         print_and_add_check(
             &mut result,
             Check {
@@ -255,7 +255,7 @@ impl TestScenario for RangeDownload {
                 .await?;
 
                 let span_ok = span_headers.status == 206
-                    && span_bytes == &big_contents[span_start as usize..=span_end as usize];
+                    && span_bytes == big_contents[span_start as usize..=span_end as usize];
                 print_and_add_check(
                     &mut result,
                     Check {

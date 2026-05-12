@@ -52,7 +52,7 @@ pub fn get_user_by_username(
                 .map_err(|_| DatabaseError::RecallError)?;
 
             let mut rows = stmt
-                .query(&[&username])
+                .query([&username])
                 .map_err(|_| DatabaseError::RecallError)?;
 
             if let Some(row) = rows.next().map_err(|_| DatabaseError::RecallError)? {
@@ -68,9 +68,9 @@ pub fn get_user_by_username(
                     avatar: row.get(8).map_err(|_| DatabaseError::RecallError)?,
                     onboarding_flags: row.get(9).map_err(|_| DatabaseError::RecallError)?,
                 };
-                return Ok(Some(user));
+                Ok(Some(user))
             } else {
-                return Ok(None);
+                Ok(None)
             }
         }
         Err(_) => Err(DatabaseError::LockError),
@@ -86,7 +86,7 @@ pub fn get_user_by_userid_conn(
         .map_err(|_| DatabaseError::RecallError)?;
 
     let mut rows = stmt
-        .query(&[&userid])
+        .query([&userid])
         .map_err(|_| DatabaseError::RecallError)?;
 
     if let Some(row) = rows.next().map_err(|_| DatabaseError::RecallError)? {

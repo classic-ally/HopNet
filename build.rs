@@ -54,7 +54,7 @@ fn main() {
     if !frontend_dir.join("node_modules").exists() {
         println!("cargo:warning=Installing frontend dependencies...");
         match Command::new("pnpm")
-            .args(&["install"])
+            .args(["install"])
             .current_dir(&frontend_dir)
             .output()
         {
@@ -82,7 +82,7 @@ fn main() {
     // Run pnpm run build
     println!("cargo:warning=Building frontend with Vite...");
     match Command::new("pnpm")
-        .args(&["run", "build"])
+        .args(["run", "build"])
         .current_dir(&frontend_dir)
         .output()
     {

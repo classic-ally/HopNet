@@ -182,7 +182,7 @@ impl TestScenario for PostFilesMixedFilesAndParents {
 
         for parent in &parent_paths {
             let parent_listing_path = match parent.rfind('/') {
-                Some(i) if i == 0 => "/".to_string(),
+                Some(0) => "/".to_string(),
                 Some(i) => parent[..i].to_string(),
                 None => "/".to_string(),
             };

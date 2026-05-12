@@ -262,7 +262,7 @@ pub async fn batch_processor(mut rx: mpsc::Receiver<QueuedTransaction>, app_stat
 
     loop {
         // ── Drain: merge held-back retries with new channel items ──
-        let mut batch: Vec<QueuedTransaction> = retry_holdback.drain(..).collect();
+        let mut batch: Vec<QueuedTransaction> = std::mem::take(&mut retry_holdback);
 
         if batch.is_empty() {
             // Nothing held back — block until at least one new tx arrives
@@ -377,8 +377,8 @@ async fn handle_as_leader(
     // Nonce dedup: check if any transactions were already committed
     {
         let nonces: Vec<_> = batch.iter().map(|q| q.tx.nonce.clone()).collect();
-        if let Ok(committed) = db::check_committed_nonces(conn, &nonces) {
-            if !committed.is_empty() {
+        if let Ok(committed) = db::check_committed_nonces(conn, &nonces)
+            && !committed.is_empty() {
                 let mut i = 0;
                 while i < batch.len() {
                     if committed.contains(&batch[i].tx.nonce.to_string()) {
@@ -392,7 +392,6 @@ async fn handle_as_leader(
                     return (Vec::new(), DispatchOutcome::ViewAdvanced);
                 }
             }
-        }
     }
 
     // Preflight validation: SAVEPOINT-based single-pass
@@ -465,7 +464,7 @@ async fn handle_as_leader(
 
     // Inject nonce cleanup transaction every 97 views (prime interval for leader rotation diversity)
     const NONCE_CLEANUP_INTERVAL: u64 = 97;
-    if (consensus_state.view as u64) % NONCE_CLEANUP_INTERVAL == 0 {
+    if (consensus_state.view as u64).is_multiple_of(NONCE_CLEANUP_INTERVAL) {
         let cutoff_ts = (chrono::Utc::now() - chrono::Duration::hours(1)).timestamp() as u64;
         let cutoff = hopnet_common::CustomUUID::new(Some(&uuid::Timestamp::from_unix(
             uuid::NoContext,
@@ -644,7 +643,6 @@ fn process_forward_results(
 ) -> (Vec<QueuedTransaction>, DispatchOutcome) {
     let leader = &consensus_state.leader;
     let mut retries = Vec::new();
-    let mut got_retry = false;
 
     for (queued, result) in batch.into_iter().zip(results.into_iter()) {
         match result {
@@ -681,7 +679,6 @@ fn process_forward_results(
                 }
             }
             super::rpc::TransactionForwardResult::Retry { reason } => {
-                got_retry = true;
                 tracing::debug!(
                     "Transient forward failure from leader node {} (view {}): {}",
                     leader.node_id,
@@ -699,8 +696,6 @@ fn process_forward_results(
 
     let outcome = if retries.is_empty() {
         DispatchOutcome::ViewAdvanced
-    } else if got_retry {
-        DispatchOutcome::WaitForViewChange
     } else {
         DispatchOutcome::WaitForViewChange
     };

@@ -18,9 +18,9 @@ pub fn get_initial_setup(
                 .map_err(|_| DatabaseError::RecallError)?;
 
             if count > 0 {
-                return Ok(StatusCode::OK);
+                Ok(StatusCode::OK)
             } else {
-                return Ok(StatusCode::NOT_FOUND);
+                Ok(StatusCode::NOT_FOUND)
             }
         }
         Err(_) => Err(DatabaseError::LockError),

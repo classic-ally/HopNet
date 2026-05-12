@@ -77,16 +77,14 @@ impl TransactionHandler for UpdateUserProfileHandler {
             .map_err(|_| DatabaseError::NotFound)?;
 
         // Validation: name fields <= 32 chars
-        if let Some(Some(ref name)) = payload.first_name {
-            if name.len() > 32 {
+        if let Some(Some(ref name)) = payload.first_name
+            && name.len() > 32 {
                 return Err(DatabaseError::InvalidPayload);
             }
-        }
-        if let Some(Some(ref name)) = payload.last_name {
-            if name.len() > 32 {
+        if let Some(Some(ref name)) = payload.last_name
+            && name.len() > 32 {
                 return Err(DatabaseError::InvalidPayload);
             }
-        }
 
         // Validation: avatar <= 128KB
         if let Some(Some(ref bytes)) = payload.avatar {
@@ -252,7 +250,7 @@ mod tests {
             bincode::config::standard(),
         )
         .unwrap();
-        assert!(decoded.avatar.unwrap().unwrap().len() > 0);
+        assert!(!decoded.avatar.unwrap().unwrap().is_empty());
     }
 
     #[test]

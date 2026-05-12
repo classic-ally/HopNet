@@ -797,7 +797,7 @@ impl TestScenario for ConsensusQueueThroughput {
             }
 
             // Op 2: alternating between profile update and device registration
-            if round % 2 == 0 {
+            if round.is_multiple_of(2) {
                 let node_idx = ((round + 1) as usize) % node_count;
                 let node = nodes[node_idx].clone();
                 let r = round;

@@ -124,7 +124,7 @@ pub async fn send_raw(
         .await
         .map_err(|e| IrohError::Transport(TransportError::StreamFailed(e.to_string())))?;
     stream
-        .write_all(&bytes)
+        .write_all(bytes)
         .await
         .map_err(|e| IrohError::Transport(TransportError::StreamFailed(e.to_string())))?;
     Ok(())
@@ -196,59 +196,56 @@ impl std::fmt::Debug for PeerValidator {
 }
 
 impl EndpointHooks for PeerValidator {
-    fn before_registration<'a>(
+    async fn before_registration<'a>(
         &'a self,
         remote_id: &'a iroh::EndpointId,
         _alpn: &'a [u8],
         side: iroh::endpoint::Side,
-    ) -> impl std::future::Future<Output = AfterHandshakeOutcome> + Send + 'a {
-        async move {
-            // Only validate incoming (server-side) connections. Outgoing connections
-            // are initiated intentionally by our application to known peers, and TLS
-            // certificates prevent impersonation.
-            if side == iroh::endpoint::Side::Client {
-                return AfterHandshakeOutcome::Accept;
+    ) -> AfterHandshakeOutcome {
+        // Only validate incoming (server-side) connections. Outgoing connections
+        // are initiated intentionally by our application to known peers, and TLS
+        // certificates prevent impersonation.
+        if side == iroh::endpoint::Side::Client {
+            return AfterHandshakeOutcome::Accept;
+        }
+
+        // Setup mode: allow all incoming connections before this node has been
+        // initialized (received JoinInfo or completed genesis setup). The window
+        // is brief and the JoinInfo itself requires the user's private key.
+        if !self.setup_complete.load(Ordering::Relaxed) {
+            return AfterHandshakeOutcome::Accept;
+        }
+
+        // Encode the remote's public key in the same bincode format
+        // used by PubKey::to_sql() so the query matches the DB BLOB.
+        let pubkey = PubKey(
+            ed25519_dalek::VerifyingKey::from_bytes(remote_id.as_bytes())
+                .expect("iroh EndpointId is valid Ed25519"),
+        );
+        let pubkey_encoded = bincode::serde::encode_to_vec(pubkey, bincode::config::standard())
+            .expect("PubKey encoding cannot fail");
+
+        let is_known = match self.db_pool.get() {
+            Ok(conn) => conn
+                .query_row(
+                    "SELECT 1 FROM nodes WHERE pubkey = ?",
+                    [pubkey_encoded.as_slice()],
+                    |_| Ok(()),
+                )
+                .is_ok(),
+            Err(e) => {
+                tracing::error!("failed to get DB connection in peer validator: {}", e);
+                false
             }
+        };
 
-            // Setup mode: allow all incoming connections before this node has been
-            // initialized (received JoinInfo or completed genesis setup). The window
-            // is brief and the JoinInfo itself requires the user's private key.
-            if !self.setup_complete.load(Ordering::Relaxed) {
-                return AfterHandshakeOutcome::Accept;
-            }
-
-            // Encode the remote's public key in the same bincode format
-            // used by PubKey::to_sql() so the query matches the DB BLOB.
-            let pubkey = PubKey(
-                ed25519_dalek::VerifyingKey::from_bytes(remote_id.as_bytes())
-                    .expect("iroh EndpointId is valid Ed25519"),
-            );
-            let pubkey_encoded =
-                bincode::serde::encode_to_vec(&pubkey, bincode::config::standard())
-                    .expect("PubKey encoding cannot fail");
-
-            let is_known = match self.db_pool.get() {
-                Ok(conn) => conn
-                    .query_row(
-                        "SELECT 1 FROM nodes WHERE pubkey = ?",
-                        [pubkey_encoded.as_slice()],
-                        |_| Ok(()),
-                    )
-                    .is_ok(),
-                Err(e) => {
-                    tracing::error!("failed to get DB connection in peer validator: {}", e);
-                    false
-                }
-            };
-
-            if is_known {
-                AfterHandshakeOutcome::Accept
-            } else {
-                tracing::warn!("rejected iroh connection from unknown node: {}", remote_id);
-                AfterHandshakeOutcome::Reject {
-                    error_code: 1u32.into(),
-                    reason: b"unknown node".to_vec(),
-                }
+        if is_known {
+            AfterHandshakeOutcome::Accept
+        } else {
+            tracing::warn!("rejected iroh connection from unknown node: {}", remote_id);
+            AfterHandshakeOutcome::Reject {
+                error_code: 1u32.into(),
+                reason: b"unknown node".to_vec(),
             }
         }
     }
@@ -325,11 +322,10 @@ impl IrohTransport {
         // Check cache first
         {
             let connections = self.connections.read().await;
-            if let Some(conn) = connections.get(&node_id) {
-                if conn.close_reason().is_none() {
+            if let Some(conn) = connections.get(&node_id)
+                && conn.close_reason().is_none() {
                     return Ok(conn.clone());
                 }
-            }
         }
 
         // Establish new connection with timeout
@@ -477,7 +473,7 @@ mod tests {
 
         // What the DB stores (via PubKey::to_sql → bincode encode)
         let db_encoded =
-            bincode::serde::encode_to_vec(&pubkey, bincode::config::standard()).unwrap();
+            bincode::serde::encode_to_vec(pubkey, bincode::config::standard()).unwrap();
 
         // What the PeerValidator hook produces from the iroh EndpointId
         let iroh_secret = iroh::SecretKey::from_bytes(&signing_key.to_bytes());
@@ -486,7 +482,7 @@ mod tests {
             ed25519_dalek::VerifyingKey::from_bytes(iroh_public.as_bytes()).expect("valid Ed25519"),
         );
         let hook_encoded =
-            bincode::serde::encode_to_vec(&hook_pubkey, bincode::config::standard()).unwrap();
+            bincode::serde::encode_to_vec(hook_pubkey, bincode::config::standard()).unwrap();
 
         assert_eq!(
             db_encoded, hook_encoded,
@@ -501,7 +497,7 @@ mod tests {
         let pubkey = PubKey(signing_key.verifying_key());
 
         let raw_bytes = signing_key.verifying_key().to_bytes();
-        let encoded = bincode::serde::encode_to_vec(&pubkey, bincode::config::standard()).unwrap();
+        let encoded = bincode::serde::encode_to_vec(pubkey, bincode::config::standard()).unwrap();
 
         assert_ne!(
             raw_bytes.as_slice(),

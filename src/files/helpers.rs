@@ -207,7 +207,7 @@ fn extract_uploaded_fragment_hashes(inodes: &[Inode]) -> Vec<Blake3Hash> {
                         .data
                         .fragments
                         .iter()
-                        .map(|f| f.fragment_hash.clone())
+                        .map(|f| f.fragment_hash)
                         .collect::<Vec<_>>(),
                 )
             } else {
@@ -249,7 +249,7 @@ fn query_inventory_state(
     let mut stmt = tx.prepare(&query)?;
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(node_id)];
     for hash in candidates {
-        params.push(Box::new(hash.clone()));
+        params.push(Box::new(*hash));
     }
     let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
 

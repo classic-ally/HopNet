@@ -233,7 +233,7 @@ fn store_keychain_item_with_service(
     let keychain = SecKeychain::default()?;
     keychain
         .set_generic_password(service, account, value)
-        .map_err(|e| KeychainError::SecurityFramework(e))
+        .map_err(KeychainError::SecurityFramework)
 }
 
 /// Load a keychain item with a specific service name, returning raw bytes

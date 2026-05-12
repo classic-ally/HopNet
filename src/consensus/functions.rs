@@ -18,7 +18,7 @@ pub fn generate_ed25519_key() -> (SigningKey, VerifyingKey) {
     let private_key = SigningKey::generate(&mut csprng);
     let public_key = private_key.verifying_key();
 
-    return (private_key, public_key);
+    (private_key, public_key)
 }
 
 /// SQLite WAL auto-checkpoints; this is a no-op (was FORCE CHECKPOINT for DuckDB)
@@ -397,25 +397,26 @@ pub async fn run_consensus(
     .await?
     .expect("guard must be Some since we passed Some");
 
-    let block = Block::new_tip(&app_state, transactions).map_err(|_| ConsensusError::BlockError)?;
+    let block = Block::new_tip(app_state, transactions).map_err(|_| ConsensusError::BlockError)?;
 
     let me = MyNode {
         node_id: my_node_id,
         privkey: app_state.private_key.clone(),
     };
 
-    let validators = all_validators
+    let validators: Vec<Node> = all_validators
         .iter()
         .filter(|node| node.node_id != me.node_id)
         .cloned()
         .collect();
 
-    let validators_elect = db::get_validators_elect_with_conn(conn, committed_height)
-        .map_err(|_| ConsensusError::DatabaseError)?
-        .iter()
-        .filter(|node| node.node_id != me.node_id)
-        .cloned()
-        .collect();
+    let validators_elect: Vec<Node> =
+        db::get_validators_elect_with_conn(conn, committed_height)
+            .map_err(|_| ConsensusError::DatabaseError)?
+            .iter()
+            .filter(|node| node.node_id != me.node_id)
+            .cloned()
+            .collect();
 
     // Transaction 1: Record Propose vote and commit immediately (double-vote protection)
     let ballot_propose = {
@@ -425,7 +426,7 @@ pub async fn run_consensus(
             .map_err(|_| ConsensusError::DatabaseError)?;
         let result = Ballot::propose(block.clone(), ConsensusPhase::Propose, &me, tx)
             .map_err(|_| ConsensusError::SigningError)?;
-        checkpoint_connection(&conn)?;
+        checkpoint_connection(conn)?;
         result
     }; // tx and conn are dropped here
 
@@ -482,7 +483,7 @@ pub async fn run_consensus(
             );
             ConsensusError::DatabaseError
         })?;
-        checkpoint_connection(&conn)?;
+        checkpoint_connection(conn)?;
     } // tx and conn are dropped here
 
     // Wait for broadcast to complete before creating Lock ballot
@@ -508,7 +509,7 @@ pub async fn run_consensus(
             .map_err(|_| ConsensusError::DatabaseError)?;
         let result = Ballot::propose(block.clone(), ConsensusPhase::Lock, &me, tx)
             .map_err(|_| ConsensusError::SigningError)?;
-        checkpoint_connection(&conn)?;
+        checkpoint_connection(conn)?;
         result
     }; // tx and conn are dropped here
 
@@ -567,7 +568,7 @@ pub async fn run_consensus(
             tracing::error!("QC insertion failed: {:?}", e);
             ConsensusError::DatabaseError
         })?;
-        process_transactions(&block.data.transactions, &app_state, true, &db_tx).map_err(|e| {
+        process_transactions(&block.data.transactions, app_state, true, &db_tx).map_err(|e| {
             tracing::error!("Transaction processing failed: {:?}", e);
             ConsensusError::DatabaseError
         })?;
@@ -579,7 +580,7 @@ pub async fn run_consensus(
             );
             ConsensusError::DatabaseError
         })?;
-        checkpoint_connection(&conn)?;
+        checkpoint_connection(conn)?;
     } // db_tx and conn are dropped here
 
     // Signal view advancement to the batch processor
@@ -591,8 +592,8 @@ pub async fn run_consensus(
 
 async fn ballot_round(
     ballot: Ballot,
-    validators: &Vec<Node>,
-    validators_elect: &Vec<Node>,
+    validators: &[Node],
+    validators_elect: &[Node],
     app_state: &AppState,
 ) -> Result<QuorumCertificate, ConsensusError> {
     // Extract block and phase for QC creation
@@ -611,7 +612,7 @@ async fn ballot_round(
         leader_id,
         &app_state.private_key,
         voter_signatures,
-        &validators,
+        validators,
         app_state,
     )
     .await
@@ -628,8 +629,8 @@ async fn ballot_round(
 
 async fn broadcast_and_collect_votes(
     ballot: Ballot,
-    validators: &Vec<Node>,
-    validators_elect: &Vec<Node>,
+    validators: &[Node],
+    validators_elect: &[Node],
     app_state: &AppState,
 ) -> Result<Vec<VoteSignMessage>, ConsensusError> {
     // Handle single validator case (no other nodes to vote)
@@ -648,7 +649,7 @@ async fn broadcast_and_collect_votes(
 
     // Spawn tasks for each validator (quorum-tracked)
     let transport = &app_state.iroh_transport;
-    for node in validators.clone() {
+    for node in validators {
         let ballot_clone = ballot.clone();
         let votes_tx_clone = votes_tx.clone();
         let transport = transport.clone();
@@ -675,7 +676,7 @@ async fn broadcast_and_collect_votes(
     }
 
     // NON-CRITICAL PATH: Inform validators elect (fire-and-forget, don't collect votes)
-    for node in validators_elect.clone() {
+    for node in validators_elect {
         let ballot_clone = ballot.clone();
         let transport = transport.clone();
         let iroh_node_id = node.pubkey.to_iroh_node_id();
@@ -733,8 +734,8 @@ async fn broadcast_and_collect_votes(
 }
 
 pub(crate) async fn broadcast_qc(
-    validators: &Vec<Node>,
-    validators_elect: &Vec<Node>,
+    validators: &[Node],
+    validators_elect: &[Node],
     qc: QuorumCertificate,
     app_state: &AppState,
 ) -> Result<(), ConsensusError> {
@@ -754,7 +755,7 @@ pub(crate) async fn broadcast_qc(
 
     // Spawn tasks for each validator
     let transport = &app_state.iroh_transport;
-    for node in validators.clone() {
+    for node in validators {
         let qc_clone = qc.clone();
         let confirmations_tx_clone = confirmations_tx.clone();
         let transport = transport.clone();
@@ -776,7 +777,7 @@ pub(crate) async fn broadcast_qc(
     }
 
     // NON-CRITICAL PATH: Inform validators elect (fire-and-forget, don't wait)
-    for node in validators_elect.clone() {
+    for node in validators_elect {
         let qc_clone = qc.clone();
         let transport = transport.clone();
         let iroh_node_id = node.pubkey.to_iroh_node_id();
@@ -867,8 +868,8 @@ pub fn process_transactions(
             // Staleness check: reject transactions with nonces older than MAX_TRANSACTION_AGE.
             // Catches replays of transactions whose nonces were already cleaned up.
             for tx in transactions.iter() {
-                if let Some(created_at) = tx.nonce.extract_timestamp() {
-                    if now - created_at > MAX_TRANSACTION_AGE {
+                if let Some(created_at) = tx.nonce.extract_timestamp()
+                    && now - created_at > MAX_TRANSACTION_AGE {
                         tracing::warn!(
                             "Rejecting stale transaction {} (nonce age: {:?}, max: {:?})",
                             tx.rpc.function,
@@ -877,24 +878,20 @@ pub fn process_transactions(
                         );
                         return Err(crate::db::DatabaseError::ProcessingError);
                     }
-                }
             }
 
             // Nonce dedup check: reject blocks containing already-committed nonces.
             // Prevents Byzantine leader from including the same signed transaction twice.
             let nonces: Vec<_> = transactions.iter().map(|tx| tx.nonce.clone()).collect();
-            if let Ok(conn) = app_state.db_pool.get() {
-                if let Ok(committed) = crate::db::consensus::check_committed_nonces(&conn, &nonces)
-                {
-                    if !committed.is_empty() {
+            if let Ok(conn) = app_state.db_pool.get()
+                && let Ok(committed) = crate::db::consensus::check_committed_nonces(&conn, &nonces)
+                    && !committed.is_empty() {
                         tracing::warn!(
                             "Rejecting block with {} already-committed nonce(s) — possible leader replay attack",
                             committed.len()
                         );
                         return Err(crate::db::DatabaseError::ProcessingError);
                     }
-                }
-            }
         }
 
         let mut nonces = Vec::new();
@@ -1041,9 +1038,23 @@ fn try_reconstruct_lock_qc(
 }
 
 // Timeout Vote Collection for distributed TC generation
+
+/// Timeout votes bucketed by the data hash they sign over.
+type VotesByDataHash = HashMap<Vec<u8>, Vec<TimeoutVote>>;
+
+/// Pending timeout votes indexed by view number, then by the data hash they
+/// sign over. Guarded by a Mutex so concurrent ballot threads can deposit
+/// votes safely.
+type PendingTimeoutVotes = Mutex<HashMap<i32, VotesByDataHash>>;
+
 pub struct TimeoutVoteCollector {
-    // Map: view_number -> HashMap<timeout_data_hash, Vec<TimeoutVote>>
-    pending_votes: Mutex<HashMap<i32, HashMap<Vec<u8>, Vec<TimeoutVote>>>>,
+    pending_votes: PendingTimeoutVotes,
+}
+
+impl Default for TimeoutVoteCollector {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TimeoutVoteCollector {

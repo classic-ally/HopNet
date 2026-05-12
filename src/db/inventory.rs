@@ -287,7 +287,7 @@ pub fn batch_query_fragment_inventory(
 
                 result
                     .entry(fragment_hash)
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(node_info);
             }
 

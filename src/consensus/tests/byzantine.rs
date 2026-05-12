@@ -34,7 +34,7 @@ mod byzantine_tests {
             .unwrap();
 
         // Create signature from legitimate voter
-        let vote_data = VoteSignData::from_block(block.clone(), phase.clone());
+        let vote_data = VoteSignData::from_block(block.clone(), phase);
         let signature = vote_data
             .sign(&legitimate_voter.signing_key)
             .expect("Failed to sign vote");
@@ -48,7 +48,7 @@ mod byzantine_tests {
 
         let qc = QuorumCertificate::create_unverified(
             &block,
-            phase.clone(),
+            phase,
             leader.node_id,
             &leader.signing_key,
             voter_signatures,
@@ -100,7 +100,7 @@ mod byzantine_tests {
         let attacker_node = &voters[1];
 
         // Create a forged signature: claim it's from victim, but sign with attacker's key
-        let vote_data = VoteSignData::from_block(block.clone(), phase.clone());
+        let vote_data = VoteSignData::from_block(block.clone(), phase);
         let forged_signature = vote_data
             .sign(&attacker_node.signing_key)
             .expect("Failed to sign vote");
@@ -123,7 +123,7 @@ mod byzantine_tests {
 
         let qc = QuorumCertificate::create_unverified(
             &block,
-            phase.clone(),
+            phase,
             leader.node_id,
             &leader.signing_key,
             voter_signatures,
@@ -181,7 +181,7 @@ mod byzantine_tests {
             .unwrap();
 
         // Create signatures
-        let vote_data = VoteSignData::from_block(block.clone(), phase.clone());
+        let vote_data = VoteSignData::from_block(block.clone(), phase);
 
         let rogue_signature = vote_data
             .sign(&rogue_node.signing_key)
@@ -203,7 +203,7 @@ mod byzantine_tests {
 
         let qc = QuorumCertificate::create_unverified(
             &block,
-            phase.clone(),
+            phase,
             leader.node_id,
             &leader.signing_key,
             voter_signatures,

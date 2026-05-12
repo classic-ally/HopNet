@@ -56,9 +56,9 @@ pub struct MockNetwork {
 
 impl MockNetwork {
     pub fn new(num_nodes: usize, num_users: usize) -> Self {
-        let nodes = (0..num_nodes as i32).map(|id| MockNode::new(id)).collect();
+        let nodes = (0..num_nodes as i32).map(MockNode::new).collect();
 
-        let users = (0..num_users as i32).map(|id| MockUser::new(id)).collect();
+        let users = (0..num_users as i32).map(MockUser::new).collect();
 
         Self { nodes, users }
     }
@@ -120,8 +120,8 @@ impl MockNetwork {
             };
 
             // Insert new node info into all existing nodes' databases
-            for j in 0..i {
-                let existing_node_db = nodes[j as usize]
+            for existing_node in &nodes[..i] {
+                let existing_node_db = existing_node
                     .app_state
                     .db_pool
                     .get()
@@ -159,7 +159,7 @@ impl MockNetwork {
                 &joining_node.app_state,
                 &joining_node_info,
             )
-            .expect(&format!("Failed to sync state to node {}", i));
+            .unwrap_or_else(|_| panic!("Failed to sync state to node {}", i));
 
             // Set the node_id and user_id in the app_state (required for Block::new_tip)
             joining_node
@@ -387,6 +387,20 @@ impl MockNetwork {
 
         // Set up this_node table for the joining node
         eprintln!("sync_node_state: Copying this_node state...");
+        // (current_phase, current_view, last_timeout_vote_view,
+        //  last_propose_vote_block_hash, prepared, committed,
+        //  highest_qc, highest_qc_phase)
+        type ThisNodeRow = (
+            ConsensusPhase,
+            i32,
+            Option<i32>,
+            Option<crate::db::Blake3Hash>,
+            Option<crate::db::Blake3Hash>,
+            Option<crate::db::Blake3Hash>,
+            Option<crate::db::Blake3Hash>,
+            Option<ConsensusPhase>,
+        );
+
         let (
             current_phase,
             current_view,
@@ -395,17 +409,8 @@ impl MockNetwork {
             prepared,
             committed,
             highest_qc,
-            highest_qc_phase
-        ): (
-            ConsensusPhase,
-            i32,
-            Option<i32>,
-            Option<crate::db::Blake3Hash>,
-            Option<crate::db::Blake3Hash>,
-            Option<crate::db::Blake3Hash>,
-            Option<crate::db::Blake3Hash>,
-            Option<ConsensusPhase>
-        ) = source_db.query_row(
+            highest_qc_phase,
+        ): ThisNodeRow = source_db.query_row(
             "SELECT current_phase, current_view, last_timeout_vote_view, last_propose_vote_block_hash, prepared_block_hash, committed_block_hash, highest_qc_block_hash, highest_qc_phase FROM this_node WHERE internal_id = 1",
             [],
             |row| Ok((

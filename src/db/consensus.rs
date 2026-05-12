@@ -1171,7 +1171,7 @@ pub fn get_view_consensus_data(
 
             for qc_result in qc_rows {
                 let qc = qc_result.map_err(|_| DatabaseError::RecallError)?;
-                block_hashes.push(qc.block_hash.clone());
+                block_hashes.push(qc.block_hash);
                 match qc.phase {
                     ConsensusPhase::Propose => propose_qc = Some(qc),
                     ConsensusPhase::Lock => lock_qc = Some(qc),
@@ -1180,15 +1180,15 @@ pub fn get_view_consensus_data(
 
             // Add block from timeout certificate if present
             if let Some(ref tc) = timeout_certificate {
-                block_hashes.push(tc.highest_qc.block_hash.clone());
+                block_hashes.push(tc.highest_qc.block_hash);
             }
 
             // Get all referenced blocks (deduplicate hashes)
             let mut blocks = Vec::new();
             let mut seen_hashes = std::collections::HashSet::new();
             for block_hash in block_hashes {
-                if seen_hashes.insert(block_hash.clone()) {
-                    if let Some(block) = db_lock
+                if seen_hashes.insert(block_hash)
+                    && let Some(block) = db_lock
                         .query_row(
                             "SELECT block_hash, height, view_number, parent_hash, transactions
                          FROM blocks WHERE block_hash = ?",
@@ -1210,7 +1210,6 @@ pub fn get_view_consensus_data(
                     {
                         blocks.push(block);
                     }
-                }
             }
 
             Ok(ViewConsensusData {

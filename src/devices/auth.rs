@@ -1,5 +1,6 @@
 use crate::db::{self, Blake3Hash, CustomUUID, devices::get_device_by_id};
 use crate::{AppState, UserKeys, auth};
+use std::str::FromStr;
 use axum::{
     body::Body,
     extract::{Request, State},
@@ -93,6 +94,7 @@ pub async fn device_token_auth_middleware(
     // Bootstrap session if needed (cheap read-lock check first)
     let needs_session = {
         let store = app_state.session_store.read().await;
+        #[allow(clippy::match_like_matches_macro)]
         match store.get(&device.user_id) {
             Some(entry) if entry.expires_at > chrono::Utc::now() => false,
             _ => true,

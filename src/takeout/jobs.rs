@@ -38,8 +38,7 @@ pub async fn handle_takeout_maintenance(
         Ok(takeouts) => takeouts,
         Err(e) => {
             tracing::error!("Failed to get expired takeouts: {:?}", e);
-            return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(Error::Failed(Arc::new(Box::new(std::io::Error::other(
                 format!("Failed to get expired takeouts: {:?}", e),
             )))));
         }
@@ -112,8 +111,7 @@ pub async fn handle_takeout_maintenance(
                     "Failed to submit expiration updates to consensus: {} failures",
                     failures.len()
                 );
-                return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                return Err(Error::Failed(Arc::new(Box::new(std::io::Error::other(
                     format!(
                         "Failed to submit expiration updates: {} failures",
                         failures.len()

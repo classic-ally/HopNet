@@ -338,7 +338,7 @@ pub async fn process_incoming_qc_with_guard(
         }
     };
 
-    if let Err(e) = qc.verify(&app_state, &block) {
+    if let Err(e) = qc.verify(app_state, &block) {
         tracing::warn!(
             "QC verification failed for view {} phase {:?}: {:?}",
             qc.view_number,
@@ -359,7 +359,7 @@ pub async fn process_incoming_qc_with_guard(
         .map_err(|_| ConsensusError::DatabaseError)?;
 
     // Insert QC (updates consensus state)
-    if let Err(_) = db::insert_qc_unsafe_tx(&db_tx, &qc) {
+    if db::insert_qc_unsafe_tx(&db_tx, &qc).is_err() {
         // QC insertion failed - check if it already exists
         match db::get_quorum_certificate_by_hash(
             app_state.db_pool.get(),
@@ -396,7 +396,7 @@ pub async fn process_incoming_qc_with_guard(
 
         if let Err(e) = crate::consensus::functions::process_transactions(
             &block.data.transactions,
-            &app_state,
+            app_state,
             true,
             &db_tx,
         ) {
@@ -531,10 +531,10 @@ pub async fn process_incoming_timeout_vote(
 
             let (apply_res, broadcast_res) = tokio::join!(apply_result, broadcast_result);
 
-            if let Err(_) = &apply_res {
+            if apply_res.is_err() {
                 return Err(ConsensusError::DatabaseError);
             }
-            if let Err(_) = broadcast_res {
+            if broadcast_res.is_err() {
                 tracing::warn!("Applied TC locally but broadcast failed");
             }
             Ok(())
@@ -630,11 +630,10 @@ pub async fn broadcast_timeout_certificate(
 
     // Wait for all broadcasts (but don't fail if some fail)
     for task in broadcast_tasks {
-        if let Ok(result) = task.await {
-            if let Err(e) = result {
+        if let Ok(result) = task.await
+            && let Err(e) = result {
                 tracing::debug!("Failed to broadcast TC to node: {:?}", e);
             }
-        }
     }
 
     Ok(())
@@ -835,7 +834,7 @@ async fn integrate_view(
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|_| ConsensusError::DatabaseError)?;
 
-            match db::insert_qc_unsafe_tx(&db_tx, &propose_qc) {
+            match db::insert_qc_unsafe_tx(&db_tx, propose_qc) {
                 Ok(_) => {
                     // Commit Propose QC insertion
                     crate::db::shared::commit_timed(db_tx)
@@ -899,7 +898,7 @@ async fn integrate_view(
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|_| ConsensusError::DatabaseError)?;
 
-            match db::insert_qc_unsafe_tx(&db_tx, &lock_qc) {
+            match db::insert_qc_unsafe_tx(&db_tx, lock_qc) {
                 Ok(_) => {
                     // Process transactions if this is a Lock phase QC (atomically with QC insertion)
                     if lock_qc.phase == ConsensusPhase::Lock {
@@ -1125,10 +1124,10 @@ async fn fetch_and_validate_from_quorum(
     let best_response = valid_responses
         .into_iter()
         .max_by_key(|vd| {
-            if vd.lock_qc.is_some() {
-                (2, vd.lock_qc.as_ref().unwrap().view_number)
-            } else if vd.propose_qc.is_some() {
-                (1, vd.propose_qc.as_ref().unwrap().view_number)
+            if let Some(qc) = vd.lock_qc.as_ref() {
+                (2, qc.view_number)
+            } else if let Some(qc) = vd.propose_qc.as_ref() {
+                (1, qc.view_number)
             } else {
                 (0, 0)
             }
@@ -1792,17 +1791,15 @@ pub async fn jwt_or_rpc_auth_middleware(
     next: Next,
 ) -> impl IntoResponse {
     // First try JWT authentication
-    if let Some(auth_header) = req.headers().get("Authorization") {
-        if let Ok(auth_str) = auth_header.to_str() {
-            if auth_str.starts_with("Bearer ") {
+    if let Some(auth_header) = req.headers().get("Authorization")
+        && let Ok(auth_str) = auth_header.to_str()
+            && auth_str.starts_with("Bearer ") {
                 // This looks like JWT auth, let the JWT middleware handle it
                 match crate::auth::auth_middleware(State(app_state), req, next).await {
                     Ok(response) => return response.into_response(),
                     Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
                 }
             }
-        }
-    }
 
     // If no JWT, try RPC authentication
     rpc_auth_middleware(State(app_state), req, next)

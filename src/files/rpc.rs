@@ -205,7 +205,7 @@ pub async fn handle_fragment_store(
         app_state
             .local_state_tx
             .try_send(crate::db::write_gate::LocalStateUpdate::MarkLocal {
-                fragment_hash: req.fragment_hash.clone(),
+                fragment_hash: req.fragment_hash,
             })
     {
         tracing::warn!(

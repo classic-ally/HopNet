@@ -303,8 +303,8 @@ impl Ballot {
         }
 
         // Bug #5 fix: Check for double-voting in Propose phase
-        if self.data.phase == ConsensusPhase::Propose {
-            if let Some(last_vote_hash) = consensus_state.last_propose_vote_block_hash {
+        if self.data.phase == ConsensusPhase::Propose
+            && let Some(last_vote_hash) = consensus_state.last_propose_vote_block_hash {
                 if last_vote_hash != self.block.block_hash {
                     // Different block in same view = double-vote attempt
                     tracing::warn!(
@@ -324,7 +324,6 @@ impl Ballot {
                     self.data.view
                 );
             }
-        }
 
         // 2. Chain validity check
         // Reject proposals that aren't listing tip of chain as parent
@@ -351,8 +350,8 @@ impl Ballot {
         // 3. Preparation safety
         if self.data.phase == ConsensusPhase::Propose {
             // Propose phase: shouldn't have a prepared block at this height yet
-            if consensus_state.prepared_block.is_some() {
-                if self.data.block_height == consensus_state.prepared_block.unwrap().data.height {
+            if consensus_state.prepared_block.is_some()
+                && self.data.block_height == consensus_state.prepared_block.unwrap().data.height {
                     tracing::warn!(
                         "Ballot rejected: prepared block conflict (height={})",
                         self.data.block_height
@@ -361,11 +360,10 @@ impl Ballot {
                         ProgressionErrorKind::PreparedBlockConflict,
                     ));
                 }
-            }
         } else if self.data.phase == ConsensusPhase::Lock {
             // Lock phase: ballot must match the block we prepared
-            if let Some(ref prepared) = consensus_state.prepared_block {
-                if self.data.block_hash != prepared.block_hash {
+            if let Some(ref prepared) = consensus_state.prepared_block
+                && self.data.block_hash != prepared.block_hash {
                     tracing::warn!(
                         "Lock phase ballot rejected: block mismatch (ballot={:?}, prepared={:?})",
                         self.data.block_hash,
@@ -375,7 +373,6 @@ impl Ballot {
                         ProgressionErrorKind::PreparedBlockConflict,
                     ));
                 }
-            }
         }
 
         // 4. Height validation
@@ -435,7 +432,7 @@ impl Ballot {
 
         Ok(VoteSignMessage {
             replica_id: node_id,
-            signature: signature,
+            signature,
         })
     }
 }
@@ -450,22 +447,22 @@ pub struct VoteSignData {
 
 impl VoteSignData {
     pub fn encode(&self) -> Result<Vec<u8>, VoteError> {
-        return encode_to_vec(&self, config::standard()).map_err(|_| VoteError::ProcessingError);
+        encode_to_vec(self, config::standard()).map_err(|_| VoteError::ProcessingError)
     }
     pub fn from_block(block: Block, phase: ConsensusPhase) -> VoteSignData {
-        return VoteSignData {
+        VoteSignData {
             block_hash: block.block_hash,
             block_height: block.data.height,
             view: block.data.view_number,
-            phase: phase,
-        };
+            phase,
+        }
     }
     pub fn sign(&self, private_key: &PrivKey) -> Result<Signature, VoteError> {
         let data = &self.encode()?;
         let signature = private_key
-            .try_sign(&data)
+            .try_sign(data)
             .map_err(|_| VoteError::ProcessingError)?;
-        return Ok(signature);
+        Ok(signature)
     }
 }
 
@@ -481,7 +478,7 @@ pub struct VoteSignMessages(pub Vec<VoteSignMessage>);
 impl ToSql for VoteSignMessage {
     fn to_sql(&self) -> Result<ToSqlOutput<'_>, rusqlite::Error> {
         // let's turn votesignmessage into Vec<u8>
-        match bincode::serde::encode_to_vec(&self, bincode::config::standard()) {
+        match bincode::serde::encode_to_vec(self, bincode::config::standard()) {
             Ok(data) => Ok(ToSqlOutput::Owned(rusqlite::types::Value::Blob(data))),
             Err(e) => Err(rusqlite::Error::ToSqlConversionFailure(Box::new(e))),
         }
@@ -512,7 +509,7 @@ impl Deref for VoteSignMessages {
 
 impl ToSql for VoteSignMessages {
     fn to_sql(&self) -> Result<ToSqlOutput<'_>, rusqlite::Error> {
-        match bincode::serde::encode_to_vec(&self, bincode::config::standard()) {
+        match bincode::serde::encode_to_vec(self, bincode::config::standard()) {
             Ok(data) => Ok(ToSqlOutput::Owned(rusqlite::types::Value::Blob(data))),
             Err(e) => Err(rusqlite::Error::ToSqlConversionFailure(Box::new(e))),
         }
@@ -552,7 +549,7 @@ impl QuorumCertificate {
         proposer_id: i32,
         proposer_key: &PrivKey,
         voter_signatures: Vec<VoteSignMessage>,
-        validators: &Vec<Node>,
+        validators: &[Node],
         app_state: &AppState,
     ) -> Result<QuorumCertificate, CertificateError> {
         // Layer 1: Leader abandonment - check if network is timing out
@@ -589,8 +586,8 @@ impl QuorumCertificate {
         voter_signatures: Vec<VoteSignMessage>,
     ) -> Result<QuorumCertificate, CertificateError> {
         // sign off ourselves
-        let proposer_signature = VoteSignData::from_block(block.clone(), phase.clone())
-            .sign(&proposer_key)
+        let proposer_signature = VoteSignData::from_block(block.clone(), phase)
+            .sign(proposer_key)
             .map_err(|_| CertificateError::SigningError)?;
         let proposer_signature_message = VoteSignMessage {
             replica_id: proposer_id,
@@ -601,7 +598,7 @@ impl QuorumCertificate {
 
         Ok(QuorumCertificate {
             view_number: block.data.view_number,
-            phase: phase,
+            phase,
             block_hash: block.block_hash,
             proposer_signature: proposer_signature_message,
             voter_signatures: vsm,
@@ -718,7 +715,7 @@ impl QuorumCertificate {
         );
 
         // Prepare data for batch verification
-        let vote_data = VoteSignData::from_block(block.clone(), self.phase.clone());
+        let vote_data = VoteSignData::from_block(block.clone(), self.phase);
         let message = vote_data
             .encode()
             .map_err(|_| CertificateError::ValidationError)?;
@@ -801,15 +798,15 @@ pub struct TimeoutSignData {
 
 impl TimeoutSignData {
     pub fn encode(&self) -> Result<Vec<u8>, VoteError> {
-        return encode_to_vec(&self, config::standard()).map_err(|_| VoteError::ProcessingError);
+        encode_to_vec(self, config::standard()).map_err(|_| VoteError::ProcessingError)
     }
 
     pub fn sign(&self, private_key: &PrivKey) -> Result<Signature, VoteError> {
         let data = &self.encode()?;
         let signature = private_key
-            .try_sign(&data)
+            .try_sign(data)
             .map_err(|_| VoteError::ProcessingError)?;
-        return Ok(signature);
+        Ok(signature)
     }
 
     pub fn from_consensus_state(
@@ -1077,7 +1074,7 @@ pub struct BlockData {
 
 impl BlockData {
     pub fn encode(&self) -> Result<Vec<u8>, BlockError> {
-        return encode_to_vec(&self, config::standard()).map_err(|_| BlockError::EncodingError);
+        encode_to_vec(self, config::standard()).map_err(|_| BlockError::EncodingError)
     }
 
     pub fn compute_hash(&self) -> Result<Blake3Hash, BlockError> {
@@ -1094,10 +1091,10 @@ impl Block {
         // compute hash over blockdata
         let digest = data.compute_hash()?;
 
-        return Ok(Block {
+        Ok(Block {
             block_hash: digest,
-            data: data,
-        });
+            data,
+        })
     }
 
     pub fn new_tip(
@@ -1189,13 +1186,13 @@ pub struct RpcCall {
 
 impl RpcCall {
     pub fn encode(&self) -> Result<Vec<u8>, TransactionError> {
-        encode_to_vec(&self, config::standard()).map_err(|_| TransactionError::EncodingError)
+        encode_to_vec(self, config::standard()).map_err(|_| TransactionError::EncodingError)
     }
 
     pub fn sign(&self, private_key: &PrivKey) -> Result<Signature, TransactionError> {
         let data = &self.encode()?;
         let signature = private_key
-            .try_sign(&data)
+            .try_sign(data)
             .map_err(|_| TransactionError::SigningError)?;
         Ok(signature)
     }
@@ -1304,7 +1301,7 @@ impl Deref for Transactions {
 impl ToSql for Transactions {
     fn to_sql(&self) -> Result<ToSqlOutput<'_>, rusqlite::Error> {
         // let's turn transactions into Vec<u8>
-        match bincode::serde::encode_to_vec(&self, bincode::config::standard()) {
+        match bincode::serde::encode_to_vec(self, bincode::config::standard()) {
             Ok(data) => Ok(ToSqlOutput::Owned(rusqlite::types::Value::Blob(data))),
             Err(e) => Err(rusqlite::Error::ToSqlConversionFailure(Box::new(e))),
         }

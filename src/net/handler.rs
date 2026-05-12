@@ -41,7 +41,7 @@ fn lookup_node_id(app_state: &AppState, peer_pubkey: &iroh::PublicKey) -> Option
     let conn = app_state.db_pool.get().ok()?;
     let pubkey = PubKey(ed25519_dalek::VerifyingKey::from_bytes(peer_pubkey.as_bytes()).ok()?);
     let pubkey_encoded =
-        bincode::serde::encode_to_vec(&pubkey, bincode::config::standard()).ok()?;
+        bincode::serde::encode_to_vec(pubkey, bincode::config::standard()).ok()?;
     conn.query_row(
         "SELECT node_id FROM nodes WHERE pubkey = ?",
         [pubkey_encoded.as_slice()],
@@ -116,8 +116,8 @@ async fn ensure_caught_up_for_message(
         })?;
 
     // Intra-view catch-up: Lock-phase ballot but we're missing the Propose QC
-    if let IrohRequest::BallotSubmission(req) = request {
-        if req.ballot.data.phase == crate::consensus::types::ConsensusPhase::Lock {
+    if let IrohRequest::BallotSubmission(req) = request
+        && req.ballot.data.phase == crate::consensus::types::ConsensusPhase::Lock {
             // Check if we need intra-view sync (one DB read, only for Lock ballots)
             let conn = app_state.db_pool.get().map_err(|_| {
                 IrohError::Protocol(ProtocolError::PeerError("db pool error".into()))
@@ -135,7 +135,6 @@ async fn ensure_caught_up_for_message(
                     })?;
             }
         }
-    }
 
     Ok(())
 }
@@ -231,14 +230,13 @@ async fn handle_stream(
         // First caller processes; duplicates wait for the same result
         let response_bytes = cell
             .get_or_try_init(|| async {
-                if app_state.test_mode {
-                    if let IrohRequest::BallotSubmission(_) = &request {
+                if app_state.test_mode
+                    && let IrohRequest::BallotSubmission(_) = &request {
                         app_state
                             .consensus_barriers
                             .wait(crate::consensus::barriers::names::BEFORE_BALLOT_DISPATCH)
                             .await;
                     }
-                }
 
                 let response = match request {
                     IrohRequest::Ping { nonce } => IrohResponse::Pong { nonce },

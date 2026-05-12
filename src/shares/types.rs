@@ -65,7 +65,7 @@ pub fn encrypt_display_name(
     plaintext: &str,
     recipient_x25519_pubkey: &XPubKey,
 ) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
-    let ephemeral_secret = x25519_dalek::EphemeralSecret::random_from_rng(&mut OsRng);
+    let ephemeral_secret = x25519_dalek::EphemeralSecret::random_from_rng(OsRng);
     let ephemeral_public = X25519PublicKey::from(&ephemeral_secret);
 
     let shared_secret = ephemeral_secret.diffie_hellman(recipient_x25519_pubkey.as_x25519());

@@ -82,7 +82,7 @@ impl TransactionHandler for ValidatorActivationHandler {
             // Compute activation height deterministically during execution
             // All nodes are synchronized to same committed height by Lock QC insertion
             let committed_height = get_current_consensus_height(db_tx)?;
-            let effective_height = committed_height + 0; // Activate immediately.
+            let effective_height = committed_height; // Activate immediately.
 
             tracing::info!(
                 "Activating node {} at effective height {} (committed_height={}, next_block={})",

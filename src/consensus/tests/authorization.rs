@@ -33,7 +33,7 @@ mod authorization_tests {
             data_id: None,
         };
 
-        let payload = bincode::serde::encode_to_vec(&vec![inode], bincode::config::standard())
+        let payload = bincode::serde::encode_to_vec(vec![inode], bincode::config::standard())
             .expect("Failed to encode payload");
 
         let tx = Transaction::new_with_user(
@@ -177,7 +177,7 @@ mod authorization_tests {
             data_id: None,
         };
 
-        let payload = bincode::serde::encode_to_vec(&vec![inode], bincode::config::standard())
+        let payload = bincode::serde::encode_to_vec(vec![inode], bincode::config::standard())
             .expect("Failed to encode payload");
 
         let tx = Transaction::new_with_user(
@@ -324,7 +324,7 @@ mod authorization_tests {
             storage_used_gb: None,
         };
 
-        let payload = bincode::serde::encode_to_vec(&vec![metric], bincode::config::standard())
+        let payload = bincode::serde::encode_to_vec(vec![metric], bincode::config::standard())
             .expect("Failed to encode payload");
 
         let tx = Transaction::new(function, payload, node.node_id, &node.signing_key)
@@ -372,7 +372,7 @@ mod authorization_tests {
             storage_used_gb: None,
         };
 
-        let payload = bincode::serde::encode_to_vec(&vec![metric], bincode::config::standard())
+        let payload = bincode::serde::encode_to_vec(vec![metric], bincode::config::standard())
             .expect("Failed to encode payload");
 
         let tx = Transaction::new(function, payload, node1.node_id, &node1.signing_key)

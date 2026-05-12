@@ -9,6 +9,7 @@ use axum::{
 };
 use rand::RngCore;
 use reed_solomon_simd::ReedSolomonEncoder;
+use std::str::FromStr;
 
 use crate::{
     db::{self, Blake3Hash, Data, DataRecord, DatabaseError, FragmentHash, Inode},
@@ -161,12 +162,12 @@ fn process_logical_chunk(
     let recovery_generator = encoder
         .encode()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let mut recovery_iter = recovery_generator.recovery_iter();
+    let recovery_iter = recovery_generator.recovery_iter();
 
     let mut recovery_index = ORIGINAL_FRAGMENTS_PER_CHUNK;
-    while let Some(recovery_fragment) = recovery_iter.next() {
+    for recovery_fragment in recovery_iter {
         let fragment_id = CustomUUID::new(None);
-        let fragment_hash = Blake3Hash::new(blake3::hash(&recovery_fragment));
+        let fragment_hash = Blake3Hash::new(blake3::hash(recovery_fragment));
 
         store_fragment(fragments_dir, &fragment_hash, recovery_fragment.to_vec())
             .map_err(|_| StatusCode::INSUFFICIENT_STORAGE)?;
@@ -316,7 +317,7 @@ pub async fn process_uploaded_file<R: AsyncRead + Unpin>(
     Ok(DataRecord {
         id: dataid,
         modified_at: None, // Deprecated - timestamps come from UUIDv7
-        data: data,
+        data,
         file_access_entries: None, // Will be set by caller
         file_size: file_size as u64,
     })
@@ -478,7 +479,7 @@ pub async fn get_file_fragments(
         format!("/{}", path)
     };
 
-    let filename = path.split('/').last().unwrap_or("download");
+    let filename = path.split('/').next_back().unwrap_or("download");
 
     // Parse Range header: supports "bytes=START-END" and "bytes=START-" (single range only)
     let requested_range = headers.get(header::RANGE).and_then(|val| {
@@ -617,9 +618,8 @@ pub async fn post_files(
                         encrypt_path("/".to_string(), &session.siv_key, &session.siv_nonce)
                             .await
                             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-                    } else if parent_item_identifier.starts_with("item:") {
+                    } else if let Some(inode_id_str) = parent_item_identifier.strip_prefix("item:") {
                         // Extract inode_id and look up encrypted path
-                        let inode_id_str = &parent_item_identifier[5..];
                         tracing::debug!(
                             "Trying to parse inode_id: '{}' from parent_item_identifier: '{}'",
                             inode_id_str,

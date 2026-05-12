@@ -34,8 +34,8 @@ async fn monitor_container_memory(
             ),
         );
 
-        if let Some(Ok(stats)) = stats_stream.next().await {
-            if let Some(memory_stats) = stats.memory_stats {
+        if let Some(Ok(stats)) = stats_stream.next().await
+            && let Some(memory_stats) = stats.memory_stats {
                 // Calculate working memory by measuring anonymous memory (heap allocations)
                 // anon = anonymous memory (heap, stack, malloc) - this is actual application memory
                 let usage_mb = if let Some(stats_map) = &memory_stats.stats {
@@ -62,7 +62,6 @@ async fn monitor_container_memory(
                     }
                 }
             }
-        }
 
         // Poll every 100ms
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -369,7 +368,7 @@ impl TestScenario for ChunkedStreamingPerformance {
                     print_and_add_check(
                         &mut result,
                         Check {
-                            name: format!("Fragment distribution completed"),
+                            name: "Fragment distribution completed".to_string(),
                             passed: true,
                             detail: Some(format!(
                                 "{} fragments at height {:?}",
@@ -425,8 +424,8 @@ impl TestScenario for ChunkedStreamingPerformance {
             let settle_start = Instant::now();
             let mut settled = false;
             while settle_start.elapsed() < settle_timeout {
-                if let Ok(dist) = get_fragment_distribution(&nodes[0], &full_path).await {
-                    if !dist.fragments.is_empty()
+                if let Ok(dist) = get_fragment_distribution(&nodes[0], &full_path).await
+                    && !dist.fragments.is_empty()
                         && dist
                             .fragments
                             .iter()
@@ -435,7 +434,6 @@ impl TestScenario for ChunkedStreamingPerformance {
                         settled = true;
                         break;
                     }
-                }
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
 

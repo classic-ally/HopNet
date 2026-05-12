@@ -378,10 +378,10 @@ impl TestScenario for OrphanCleanup {
             Ok(listings) => {
                 let mut all_gone = true;
                 for (i, listing) in listings.iter().enumerate() {
-                    if let Some(files) = listing.as_array() {
-                        if files
+                    if let Some(files) = listing.as_array()
+                        && files
                             .iter()
-                            .any(|f| f["path"].as_str() == Some(&orphan_path.as_str()))
+                            .any(|f| f["path"].as_str() == Some(orphan_path.as_str()))
                         {
                             all_gone = false;
                             print_and_add_check(
@@ -393,7 +393,6 @@ impl TestScenario for OrphanCleanup {
                                 },
                             );
                         }
-                    }
                 }
                 if all_gone {
                     print_and_add_check(

@@ -783,7 +783,7 @@ pub fn verify_fragment_redundancy(
     node_counts.sort_by_key(|(node_id, _)| *node_id);
 
     let distribution_detail = if node_counts.is_empty() {
-        format!("No fragments found in inventory")
+        "No fragments found in inventory".to_string()
     } else {
         let counts_str = node_counts
             .iter()

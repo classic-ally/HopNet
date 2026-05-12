@@ -128,7 +128,7 @@ async fn main() -> Result<()> {
     // Auto-detect and connect to container runtime (Docker or Podman)
     let socket_path = sys::detect_socket_path()?;
     let docker = Docker::connect_with_unix(
-        &socket_path.strip_prefix("unix://").unwrap_or(&socket_path),
+        socket_path.strip_prefix("unix://").unwrap_or(&socket_path),
         120,
         bollard::API_DEFAULT_VERSION,
     )?;
@@ -294,16 +294,14 @@ async fn get_next_mesh_id(docker: &Docker) -> Result<u32> {
 
     // Find all hopnet-orchestrator networks and extract mesh IDs
     for network in &networks {
-        if let Some(ref name) = network.name {
-            if name.starts_with("hopnet-orchestrator-") {
+        if let Some(ref name) = network.name
+            && name.starts_with("hopnet-orchestrator-") {
                 let parts: Vec<&str> = name.split('-').collect();
-                if parts.len() >= 4 {
-                    if let Ok(mesh_id) = parts[2].parse::<u32>() {
+                if parts.len() >= 4
+                    && let Ok(mesh_id) = parts[2].parse::<u32>() {
                         mesh_ids.push(mesh_id);
                     }
-                }
             }
-        }
     }
 
     mesh_ids.sort();
@@ -333,17 +331,15 @@ async fn list_meshes(docker: &Docker) -> Result<()> {
 
     // Find hopnet-orchestrator networks and extract mesh IDs
     for network in &networks {
-        if let Some(ref name) = network.name {
-            if name.starts_with("hopnet-orchestrator-") {
+        if let Some(ref name) = network.name
+            && name.starts_with("hopnet-orchestrator-") {
                 // Parse mesh ID from network name: hopnet-orchestrator-{mesh_id}-{network_space}
                 let parts: Vec<&str> = name.split('-').collect();
-                if parts.len() >= 4 {
-                    if let Ok(mesh_id) = parts[2].parse::<u32>() {
-                        meshes.entry(mesh_id).or_insert_with(Vec::new);
+                if parts.len() >= 4
+                    && let Ok(mesh_id) = parts[2].parse::<u32>() {
+                        meshes.entry(mesh_id).or_default();
                     }
-                }
             }
-        }
     }
 
     // List all containers to count nodes per mesh
@@ -361,14 +357,13 @@ async fn list_meshes(docker: &Docker) -> Result<()> {
                     // Parse mesh ID from container name: /hopnet-orchestrator-{mesh_id}-{node_id}
                     let clean_name = &name[1..]; // Remove leading '/'
                     let parts: Vec<&str> = clean_name.split('-').collect();
-                    if parts.len() >= 4 {
-                        if let Ok(mesh_id) = parts[2].parse::<u32>() {
+                    if parts.len() >= 4
+                        && let Ok(mesh_id) = parts[2].parse::<u32>() {
                             meshes
                                 .entry(mesh_id)
-                                .or_insert_with(Vec::new)
+                                .or_default()
                                 .push(name.clone());
                         }
-                    }
                 }
             }
         }
@@ -381,7 +376,7 @@ async fn list_meshes(docker: &Docker) -> Result<()> {
         );
     } else {
         println!("Active HopNet Meshes:");
-        println!("{:<8} {:<12} {}", "Mesh ID", "Nodes", "Containers");
+        println!("{:<8} {:<12} Containers", "Mesh ID", "Nodes");
         println!("{}", "-".repeat(40));
 
         let mut mesh_ids: Vec<_> = meshes.keys().collect();
@@ -441,8 +436,7 @@ async fn cleanup_mesh_resources(
     if let Ok(volumes) = docker
         .list_volumes(None::<bollard::query_parameters::ListVolumesOptions>)
         .await
-    {
-        if let Some(volume_list) = volumes.volumes {
+        && let Some(volume_list) = volumes.volumes {
             let mut tasks = Vec::new();
             for volume in volume_list {
                 let is_mesh_volume = volume
@@ -469,7 +463,6 @@ async fn cleanup_mesh_resources(
                 let _ = task.await;
             }
         }
-    }
 
     // Remove network
     println!("  Removing network: {}", network_id);
@@ -525,7 +518,7 @@ async fn create_mesh(
                     ip_address,
                     40000 + (mesh_id * 500)
                 );
-                match setup_node_0(docker, mesh_id, &container_name, runtime).await {
+                match setup_node_0(docker, mesh_id, container_name, runtime).await {
                     Ok(passphrase) => {
                         store_mesh_passphrase(docker, mesh_id, &passphrase).await?;
                     }
@@ -634,11 +627,10 @@ async fn add_nodes_to_mesh(
                 if name.starts_with("/hopnet-orchestrator-") {
                     let clean_name = &name[1..];
                     let parts: Vec<&str> = clean_name.split('-').collect();
-                    if parts.len() >= 4 {
-                        if let Ok(node_id) = parts[3].parse::<u32>() {
+                    if parts.len() >= 4
+                        && let Ok(node_id) = parts[3].parse::<u32>() {
                             max_node_id = max_node_id.max(node_id);
                         }
-                    }
                 }
             }
         }
@@ -1008,29 +1000,19 @@ pub async fn get_jwt_token(
             return Err(anyhow::anyhow!("Login request timed out after 30 seconds"));
         }
 
-        match client
+        if let Ok(response) = client
             .post(&login_url)
             .json(&login_data)
             .timeout(tokio::time::Duration::from_secs(15))
             .send()
-            .await
-        {
-            Ok(response) => {
-                let status = response.status();
-                if status == reqwest::StatusCode::OK {
-                    match response.json::<serde_json::Value>().await {
-                        Ok(body) => {
-                            if let Some(token) = body.get("token").and_then(|t| t.as_str()) {
-                                if !token.is_empty() {
-                                    return Ok(token.to_string());
-                                }
-                            }
+            .await {
+            let status = response.status();
+            if status == reqwest::StatusCode::OK
+                && let Ok(body) = response.json::<serde_json::Value>().await
+                    && let Some(token) = body.get("token").and_then(|t| t.as_str())
+                        && !token.is_empty() {
+                            return Ok(token.to_string());
                         }
-                        Err(_) => {}
-                    }
-                }
-            }
-            Err(_) => {}
         }
 
         if start_time.elapsed() + retry_interval > timeout_duration {
@@ -1223,9 +1205,7 @@ async fn delete_mesh(docker: &Docker, mesh_id: u32, skip_confirmation: bool) -> 
                 .map(|name| &name[1..]) // Remove leading '/'
                 .unwrap_or("unnamed");
             let status = container
-                .status
-                .as_ref()
-                .map(|s| s.as_str())
+                .status.as_deref()
                 .unwrap_or("unknown");
             println!("    - {} ({})", name, status);
         }
@@ -1234,9 +1214,7 @@ async fn delete_mesh(docker: &Docker, mesh_id: u32, skip_confirmation: bool) -> 
         println!("  Networks ({}):", networks.len());
         for network in &networks {
             let name = network
-                .name
-                .as_ref()
-                .map(|s| s.as_str())
+                .name.as_deref()
                 .unwrap_or("unnamed");
             println!("    - {}", name);
         }
@@ -1408,11 +1386,10 @@ async fn get_mesh_containers(
                     if name.starts_with("/hopnet-orchestrator-") {
                         let clean_name = &name[1..];
                         let parts: Vec<&str> = clean_name.split('-').collect();
-                        if parts.len() >= 4 {
-                            if let Ok(id) = parts[2].parse::<u32>() {
+                        if parts.len() >= 4
+                            && let Ok(id) = parts[2].parse::<u32>() {
                                 return id == mesh_id;
                             }
-                        }
                     }
                     false
                 })
@@ -1433,16 +1410,14 @@ async fn get_mesh_networks(docker: &Docker, mesh_id: u32) -> Result<Vec<bollard:
     let mesh_networks: Vec<_> = networks
         .into_iter()
         .filter(|network| {
-            if let Some(ref name) = network.name {
-                if name.starts_with("hopnet-orchestrator-") {
+            if let Some(ref name) = network.name
+                && name.starts_with("hopnet-orchestrator-") {
                     let parts: Vec<&str> = name.split('-').collect();
-                    if parts.len() >= 4 {
-                        if let Ok(id) = parts[2].parse::<u32>() {
+                    if parts.len() >= 4
+                        && let Ok(id) = parts[2].parse::<u32>() {
                             return id == mesh_id;
                         }
-                    }
                 }
-            }
             false
         })
         .collect();
@@ -1500,11 +1475,10 @@ async fn cleanup_orphaned_networks(docker: &Docker, skip_confirmation: bool) -> 
                 if name.starts_with("/hopnet-orchestrator-") {
                     let clean_name = &name[1..]; // Remove leading '/'
                     let parts: Vec<&str> = clean_name.split('-').collect();
-                    if parts.len() >= 4 {
-                        if let Ok(mesh_id) = parts[2].parse::<u32>() {
+                    if parts.len() >= 4
+                        && let Ok(mesh_id) = parts[2].parse::<u32>() {
                             *mesh_container_counts.entry(mesh_id).or_insert(0) += 1;
                         }
-                    }
                 }
             }
         }
@@ -1515,14 +1489,13 @@ async fn cleanup_orphaned_networks(docker: &Docker, skip_confirmation: bool) -> 
     for network in &hopnet_networks {
         if let Some(ref name) = network.name {
             let parts: Vec<&str> = name.split('-').collect();
-            if parts.len() >= 4 {
-                if let Ok(mesh_id) = parts[2].parse::<u32>() {
+            if parts.len() >= 4
+                && let Ok(mesh_id) = parts[2].parse::<u32>() {
                     let container_count = mesh_container_counts.get(&mesh_id).unwrap_or(&0);
                     if *container_count == 0 {
                         orphaned_networks.push((mesh_id, network));
                     }
                 }
-            }
         }
     }
 
@@ -1537,7 +1510,7 @@ async fn cleanup_orphaned_networks(docker: &Docker, skip_confirmation: bool) -> 
     for (mesh_id, network) in orphaned_networks {
         orphaned_by_mesh
             .entry(mesh_id)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(network);
     }
 
@@ -1551,9 +1524,7 @@ async fn cleanup_orphaned_networks(docker: &Docker, skip_confirmation: bool) -> 
         println!("  Mesh {} ({} networks):", mesh_id, networks.len());
         for network in networks {
             let name = network
-                .name
-                .as_ref()
-                .map(|s| s.as_str())
+                .name.as_deref()
                 .unwrap_or("unnamed");
             println!("    - {}", name);
             total_networks += 1;
@@ -1587,9 +1558,7 @@ async fn cleanup_orphaned_networks(docker: &Docker, skip_confirmation: bool) -> 
         for network in networks {
             if let Some(ref id) = network.id {
                 let name = network
-                    .name
-                    .as_ref()
-                    .map(|s| s.as_str())
+                    .name.as_deref()
                     .unwrap_or("unnamed");
                 println!("  Removing network: {}", name);
                 match docker.remove_network(id).await {
@@ -1628,8 +1597,8 @@ async fn show_mesh_status(
 
     println!("Found {} node(s):", containers.len());
     println!(
-        "{:<8} {:<12} {:<8} {:<12} {}",
-        "Node ID", "Status", "Role", "View", "Phase"
+        "{:<8} {:<12} {:<8} {:<12} Phase",
+        "Node ID", "Status", "Role", "View"
     );
     println!("{}", "-".repeat(50));
 
@@ -1641,12 +1610,11 @@ async fn show_mesh_status(
                 if name.starts_with("/hopnet-orchestrator-") {
                     let clean_name = &name[1..]; // Remove leading '/'
                     let parts: Vec<&str> = clean_name.split('-').collect();
-                    if parts.len() >= 4 {
-                        if let Ok(node_id) = parts[3].parse::<u32>() {
+                    if parts.len() >= 4
+                        && let Ok(node_id) = parts[3].parse::<u32>() {
                             node_data.push((node_id, container));
                             break;
                         }
-                    }
                 }
             }
         }
@@ -1695,12 +1663,8 @@ async fn show_mesh_status(
             }
             Err(e) => {
                 println!(
-                    "{:<8} {:<12} {:<8} {:<12} {}",
-                    node_id,
-                    "❌ DOWN",
-                    "-",
-                    "-",
-                    format!("Error: {}", e)
+                    "{:<8} {:<12} {:<8} {:<12} Error: {}",
+                    node_id, "❌ DOWN", "-", "-", e
                 );
             }
         }
@@ -1941,8 +1905,8 @@ async fn get_node_metadata(docker: &Docker, mesh_id: u32) -> Result<Vec<NodeMeta
                 if name.starts_with("/hopnet-orchestrator-") {
                     let clean_name = &name[1..];
                     let parts: Vec<&str> = clean_name.split('-').collect();
-                    if parts.len() >= 4 {
-                        if let Ok(node_id) = parts[3].parse::<u32>() {
+                    if parts.len() >= 4
+                        && let Ok(node_id) = parts[3].parse::<u32>() {
                             let container_id = container.id.as_ref().unwrap();
                             let container_info = docker
                                 .inspect_container(
@@ -1986,7 +1950,6 @@ async fn get_node_metadata(docker: &Docker, mesh_id: u32) -> Result<Vec<NodeMeta
                             });
                             break;
                         }
-                    }
                 }
             }
         }

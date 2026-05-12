@@ -282,7 +282,7 @@ pub async fn signal_fileprovider_refresh(
     tracing::debug!("Successfully obtained FileProvider manager: {:?}", manager);
 
     // Signal the working set to trigger enumerateChanges instead of root container
-    let working_set_identifier = unsafe { &*NSFileProviderWorkingSetContainerItemIdentifier };
+    let working_set_identifier = unsafe { NSFileProviderWorkingSetContainerItemIdentifier };
     tracing::debug!(
         "Signaling working set container: {:?}",
         working_set_identifier
@@ -316,7 +316,7 @@ pub async fn signal_fileprovider_refresh(
     );
     unsafe {
         manager.signalEnumeratorForContainerItemIdentifier_completionHandler(
-            &working_set_identifier,
+            working_set_identifier,
             &completion_handler,
         );
     }

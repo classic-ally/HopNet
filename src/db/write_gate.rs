@@ -14,6 +14,12 @@ pub struct WriteGate {
     gate_open: Notify,
 }
 
+impl Default for WriteGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WriteGate {
     pub fn new() -> Self {
         Self {
@@ -94,8 +100,8 @@ pub async fn drain_local_state_queue(
         // Wait for consensus to finish before touching the DB
         write_gate.wait_for_open().await;
 
-        if !mark_local.is_empty() {
-            if let Err(e) =
+        if !mark_local.is_empty()
+            && let Err(e) =
                 super::files::mark_fragments_local_state_batch(db_pool.get(), &mark_local, true)
             {
                 tracing::warn!(
@@ -104,10 +110,9 @@ pub async fn drain_local_state_queue(
                     e
                 );
             }
-        }
 
-        if !mark_remote.is_empty() {
-            if let Err(e) =
+        if !mark_remote.is_empty()
+            && let Err(e) =
                 super::files::mark_fragments_local_state_batch(db_pool.get(), &mark_remote, false)
             {
                 tracing::warn!(
@@ -116,6 +121,5 @@ pub async fn drain_local_state_queue(
                     e
                 );
             }
-        }
     }
 }

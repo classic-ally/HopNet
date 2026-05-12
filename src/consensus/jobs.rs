@@ -39,19 +39,17 @@ pub async fn timeout_detector(app_state: AppState) {
         }
 
         // Ensure caught up and active before issuing timeout vote
-        match ensure_caught_up_and_active(&app_state, CatchUpMode::Convergence, true, 0, None).await
+        if let Ok(NodeReadiness {
+            sync_status: SyncStatus::CaughtUp,
+            is_active: true,
+        }) =
+            ensure_caught_up_and_active(&app_state, CatchUpMode::Convergence, true, 0, None).await
         {
-            Ok(NodeReadiness {
-                sync_status: SyncStatus::CaughtUp,
-                is_active: true,
-            }) => {
-                let mut conn = match app_state.db_pool.get() {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-                let _ = issue_timeout_vote(current_view, &app_state, None, &mut conn).await;
-            }
-            _ => {} // inactive or error — skip, will retry
+            let mut conn = match app_state.db_pool.get() {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let _ = issue_timeout_vote(current_view, &app_state, None, &mut conn).await;
         }
 
         // After voting, wait for either view change or reissue interval

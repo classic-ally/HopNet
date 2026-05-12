@@ -1215,7 +1215,7 @@ pub fn get_expired_takeouts_needing_status_update(
                 })?;
 
             let takeout_rows = stmt
-                .query_map([], |row| Ok(row.get::<_, CustomUUID>(0)?))
+                .query_map([], |row| row.get::<_, CustomUUID>(0))
                 .map_err(|e| {
                     tracing::error!("Failed to execute expired takeouts query: {:?}", e);
                     DatabaseError::ProcessingError

@@ -46,8 +46,11 @@ pub enum IrohResponse {
     Pong { nonce: u64 },
     /// Fragment health check result
     FragmentHealthCheckResponse(files_rpc::FragmentHealthResponse),
-    /// View consensus data for a specific view
-    ViewDataFetchResponse(consensus_rpc::ViewDataResponse),
+    /// View consensus data for a specific view. Boxed because the response
+    /// can carry a full Block + QC + transactions and dwarfs every other
+    /// variant — keeping the IrohResponse enum compact saves ~400 bytes per
+    /// instance across the entire response pipeline.
+    ViewDataFetchResponse(Box<consensus_rpc::ViewDataResponse>),
     /// Current view number
     ViewPollResponse(consensus_rpc::ViewPollResponse),
     /// Ack for timeout vote broadcast

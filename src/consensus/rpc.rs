@@ -24,7 +24,9 @@ pub struct ViewDataResponse {
 /// Server: return consensus data for a specific view.
 pub fn handle_view_data_request(req: ViewDataRequest, app_state: &AppState) -> IrohResponse {
     match db::get_view_consensus_data(app_state.db_pool.get(), req.view) {
-        Ok(view_data) => IrohResponse::ViewDataFetchResponse(ViewDataResponse { view_data }),
+        Ok(view_data) => {
+            IrohResponse::ViewDataFetchResponse(Box::new(ViewDataResponse { view_data }))
+        }
         Err(e) => IrohResponse::Error {
             message: format!("failed to get view {} data: {:?}", req.view, e),
         },

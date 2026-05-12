@@ -6,6 +6,7 @@ use crate::consensus::functions::create_signed_user_transaction;
 use crate::db::{Blake3Hash, CustomUUID, devices::get_devices_for_user};
 use crate::files::functions::{decrypt_part, encrypt_part};
 use crate::{AppState, auth, auth::auth_middleware};
+use std::str::FromStr;
 use axum::{
     Extension, Json, Router,
     extract::{Path, State},
@@ -108,8 +109,8 @@ pub async fn ensure_fileprovider_device_token(
     use crate::fileprovider::keychain::{self, FileProviderConfig, KeychainEnvironment};
 
     // Check if a valid token already exists in keychain
-    if let Ok(config) = keychain::load_config(KeychainEnvironment::Production) {
-        if let Some(dot_pos) = config.api_key.find('.') {
+    if let Ok(config) = keychain::load_config(KeychainEnvironment::Production)
+        && let Some(dot_pos) = config.api_key.find('.') {
             let device_id_str = &config.api_key[..dot_pos];
             if let Ok(device_id) = CustomUUID::from_str(device_id_str) {
                 let db_lock = app_state
@@ -121,7 +122,6 @@ pub async fn ensure_fileprovider_device_token(
                 }
             }
         }
-    }
 
     // Register a new device token
     let (_device_id, api_key) =

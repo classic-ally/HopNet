@@ -26,6 +26,12 @@ enum Action {
     AlreadyCaughtUp,
 }
 
+impl Default for CatchUpState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CatchUpState {
     pub fn new() -> Self {
         Self {

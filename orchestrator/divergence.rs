@@ -267,7 +267,7 @@ fn print_table_divergence(table: &TableDivergenceReport) {
     if current_view_clusters.len() > 1 {
         println!("    ⚠️  DIVERGENCE at view {}:", max_view);
         for (i, cluster) in current_view_clusters.iter().enumerate() {
-            let label = ('A' as u8 + i as u8) as char;
+            let label = (b'A' + i as u8) as char;
             println!(
                 "      View {} Cluster {} ({} nodes): {:?}  hash: {}...",
                 cluster.view,

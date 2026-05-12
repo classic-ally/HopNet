@@ -123,17 +123,6 @@ impl CustomUUID {
         }
     }
 
-    pub fn from_str(uuid_str: &str) -> Result<CustomUUID, uuid::Error> {
-        match Uuid::parse_str(uuid_str) {
-            Ok(uuid) => Ok(CustomUUID(uuid)),
-            Err(e) => Err(e),
-        }
-    }
-
-    pub fn to_string(&self) -> String {
-        self.0.to_string()
-    }
-
     pub fn as_bytes(&self) -> &[u8; 16] {
         self.0.as_bytes()
     }
@@ -162,6 +151,14 @@ impl Deref for CustomUUID {
 impl std::fmt::Display for CustomUUID {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+impl std::str::FromStr for CustomUUID {
+    type Err = uuid::Error;
+
+    fn from_str(uuid_str: &str) -> Result<CustomUUID, uuid::Error> {
+        Uuid::parse_str(uuid_str).map(CustomUUID)
     }
 }
 

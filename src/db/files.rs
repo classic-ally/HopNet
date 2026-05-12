@@ -6,6 +6,7 @@ use hopnet_common::FileItem;
 use crate::files::functions::decrypt_path;
 
 use rusqlite::{OptionalExtension, Transaction};
+use std::str::FromStr;
 
 /// Helper function to log ancestor folder modifications (extracted from log_modification)
 fn log_ancestor_modifications(
@@ -388,7 +389,7 @@ pub(crate) fn find_missing_parents(
         .map_err(|_| DatabaseError::ProcessingError)?;
 
     let rows = stmt
-        .query_map([], |row| Ok(row.get::<_, String>(0)?))
+        .query_map([], |row| row.get::<_, String>(0))
         .map_err(|_| DatabaseError::ProcessingError)?;
 
     let mut missing_parents = Vec::new();
@@ -930,13 +931,8 @@ pub fn get_file_fragments(
             let mut db_file_size: u64 = 0;
 
             // Group fragments by chunk_number: chunk_number -> (original_frags, recovery_frags)
-            let mut chunks_map: std::collections::HashMap<
-                u32,
-                (
-                    std::collections::HashMap<usize, (Blake3Hash, CustomUUID, bool)>, // originals
-                    std::collections::HashMap<usize, (Blake3Hash, CustomUUID, bool)>, // recovery
-                ),
-            > = std::collections::HashMap::new();
+            let mut chunks_map: crate::files::functions::ReassemblyChunks =
+                std::collections::HashMap::new();
 
             for row in rows {
                 let (

@@ -4,6 +4,7 @@ use crate::types::Blake3Hash;
 
 /// Materialize a single file by reconstructing from fragments and writing to staging
 /// Returns (file_id, status, optional_error_message) for database update
+#[allow(clippy::too_many_arguments)] // context + per-file data; struct wrapper deferred
 pub async fn materialize_single_file(
     app_state: &crate::AppState,
     takeout_id: &CustomUUID,
@@ -87,8 +88,8 @@ pub async fn materialize_single_file(
     let full_staging_path = format!("{}/{}", staging_dir, decrypted_path.trim_start_matches('/'));
 
     // Ensure parent directory exists
-    if let Some(parent) = std::path::Path::new(&full_staging_path).parent() {
-        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+    if let Some(parent) = std::path::Path::new(&full_staging_path).parent()
+        && let Err(e) = tokio::fs::create_dir_all(parent).await {
             tracing::error!(
                 "Failed to create parent directory for {}: {:?}",
                 full_staging_path,
@@ -100,7 +101,6 @@ pub async fn materialize_single_file(
                 Some(format!("Parent directory creation failed: {}", e)),
             );
         }
-    }
 
     // Open file for writing
     let mut file = match tokio::fs::File::create(&full_staging_path).await {

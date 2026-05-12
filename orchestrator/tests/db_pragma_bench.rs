@@ -69,7 +69,7 @@ async fn fetch_db_stats(node: &NodeInfo) -> Result<DbStatsClient> {
                     let body = resp.text().await.unwrap_or_default();
                     anyhow::bail!("db-stats returned {}: {}", status, body);
                 }
-                return Ok(resp.json().await.context("decode db-stats")?);
+                return resp.json().await.context("decode db-stats");
             }
             Err(e) => {
                 last_err = Some(anyhow::anyhow!("attempt {}: {}", attempt + 1, e));
@@ -242,36 +242,30 @@ impl TestScenario for DbPragmaBench {
         let mut mixed_secs = 30u64;
         let mut payload_bytes = 1024usize;
         for f in flags {
-            if let Some(v) = f.strip_prefix("write=") {
-                if let Ok(n) = v.parse() {
+            if let Some(v) = f.strip_prefix("write=")
+                && let Ok(n) = v.parse() {
                     write_count = n;
                 }
-            }
-            if let Some(v) = f.strip_prefix("writers=") {
-                if let Ok(n) = v.parse() {
+            if let Some(v) = f.strip_prefix("writers=")
+                && let Ok(n) = v.parse() {
                     writers = n;
                 }
-            }
-            if let Some(v) = f.strip_prefix("readers=") {
-                if let Ok(n) = v.parse() {
+            if let Some(v) = f.strip_prefix("readers=")
+                && let Ok(n) = v.parse() {
                     readers = n;
                 }
-            }
-            if let Some(v) = f.strip_prefix("read=") {
-                if let Ok(n) = v.parse() {
+            if let Some(v) = f.strip_prefix("read=")
+                && let Ok(n) = v.parse() {
                     read_count = n;
                 }
-            }
-            if let Some(v) = f.strip_prefix("mixed_secs=") {
-                if let Ok(n) = v.parse() {
+            if let Some(v) = f.strip_prefix("mixed_secs=")
+                && let Ok(n) = v.parse() {
                     mixed_secs = n;
                 }
-            }
-            if let Some(v) = f.strip_prefix("payload_bytes=") {
-                if let Ok(n) = v.parse() {
+            if let Some(v) = f.strip_prefix("payload_bytes=")
+                && let Ok(n) = v.parse() {
                     payload_bytes = n;
                 }
-            }
         }
         if writers == 0 {
             writers = 1;

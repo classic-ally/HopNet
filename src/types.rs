@@ -289,7 +289,7 @@ impl Deref for PubKey {
 
 impl ToSql for PubKey {
     fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
-        match bincode::serde::encode_to_vec(&self, bincode::config::standard()) {
+        match bincode::serde::encode_to_vec(self, bincode::config::standard()) {
             Ok(data) => Ok(ToSqlOutput::Owned(rusqlite::types::Value::Blob(data))),
             Err(e) => Err(rusqlite::Error::ToSqlConversionFailure(Box::new(e))),
         }
@@ -366,7 +366,7 @@ impl Deref for PrivKey {
 
 impl ToSql for PrivKey {
     fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
-        match bincode::serde::encode_to_vec(&self, bincode::config::standard()) {
+        match bincode::serde::encode_to_vec(self, bincode::config::standard()) {
             Ok(data) => Ok(ToSqlOutput::Owned(rusqlite::types::Value::Blob(data))),
             Err(e) => Err(rusqlite::Error::ToSqlConversionFailure(Box::new(e))),
         }

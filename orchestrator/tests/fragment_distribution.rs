@@ -227,8 +227,8 @@ impl TestScenario for FragmentDistribution {
         let settle_start = Instant::now();
         let mut settled = false;
         while settle_start.elapsed() < settle_timeout {
-            if let Ok(dist) = get_fragment_distribution(&nodes[0], &full_path).await {
-                if !dist.fragments.is_empty()
+            if let Ok(dist) = get_fragment_distribution(&nodes[0], &full_path).await
+                && !dist.fragments.is_empty()
                     && dist
                         .fragments
                         .iter()
@@ -237,7 +237,6 @@ impl TestScenario for FragmentDistribution {
                     settled = true;
                     break;
                 }
-            }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
 
@@ -275,7 +274,7 @@ impl TestScenario for FragmentDistribution {
                 print_and_add_check(
                     &mut result,
                     Check {
-                        name: format!("Re-query fragment distribution after inventory sync"),
+                        name: "Re-query fragment distribution after inventory sync".to_string(),
                         passed: true,
                         detail: Some(format!(
                             "{} fragments ({} original + {} recovery) at height {:?}",

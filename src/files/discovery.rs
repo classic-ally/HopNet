@@ -104,8 +104,8 @@ pub async fn find_fragment(
     inventory_hint: Option<Vec<NodeConnectionInfo>>,
 ) -> Result<Vec<u8>, DiscoveryError> {
     // Phase 0: Try fragment inventory nodes first (PRIMARY lookup mechanism)
-    if let Some(inventory_nodes) = inventory_hint {
-        if !inventory_nodes.is_empty() {
+    if let Some(inventory_nodes) = inventory_hint
+        && !inventory_nodes.is_empty() {
             tracing::debug!(
                 "Trying {} inventory nodes for fragment {}",
                 inventory_nodes.len(),
@@ -122,7 +122,6 @@ pub async fn find_fragment(
 
             tracing::debug!("Inventory nodes failed, falling back to network-wide search");
         }
-    }
 
     // Phase 1: Fallback to reactive discovery across all available nodes
     let discovery_nodes = match nodes {

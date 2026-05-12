@@ -447,7 +447,7 @@ mod tests {
     fn test_get_fragment_placement_imbalance_non_divisible() {
         // With 30 fragments and 7 nodes, distribution should be ±1 fragment
         let nodes = create_test_nodes(7);
-        let mut primary_counts = vec![0; 7];
+        let mut primary_counts = [0; 7];
 
         for local_index in 0..30 {
             let placement = get_fragment_placement(local_index, &nodes);

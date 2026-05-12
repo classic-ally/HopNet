@@ -16,6 +16,7 @@ use axum::routing::get;
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use tokio_stream::StreamExt;
 use tokio_util::io::StreamReader;
 
@@ -191,11 +192,10 @@ pub(crate) fn staging_dir(state: &AppState, import_id: &CustomUUID) -> PathBuf {
 /// errors — leaving stray staging is preferable to masking the original
 /// failure cause.
 async fn cleanup_staging(staging: &std::path::Path) {
-    if let Err(e) = tokio::fs::remove_dir_all(staging).await {
-        if e.kind() != std::io::ErrorKind::NotFound {
+    if let Err(e) = tokio::fs::remove_dir_all(staging).await
+        && e.kind() != std::io::ErrorKind::NotFound {
             tracing::warn!("Failed to clean staging {}: {:?}", staging.display(), e);
         }
-    }
 }
 
 /// Drive the full upload-side pipeline. The session clone lives in this
@@ -591,11 +591,10 @@ pub(crate) async fn run_creation_phase(
     // 4. Remove staging dir; per-file extracted bytes are no longer needed
     //    since fragments are committed network-wide. Stray staging is
     //    preferable to retracting the terminal flip on cleanup error.
-    if let Err(e) = tokio::fs::remove_dir_all(staging).await {
-        if e.kind() != std::io::ErrorKind::NotFound {
+    if let Err(e) = tokio::fs::remove_dir_all(staging).await
+        && e.kind() != std::io::ErrorKind::NotFound {
             tracing::warn!("Staging cleanup for {} failed: {:?}", import_id, e);
         }
-    }
 
     tracing::info!(
         "Import {} complete: {} folders + {} files attempted",
@@ -949,7 +948,7 @@ fn extract_and_hash(
     let computed = Blake3Hash::new(hasher.finalize());
     if computed != manifest_file.file_hash {
         return Err(ExtractFailure::HashMismatch {
-            expected: manifest_file.file_hash.clone(),
+            expected: manifest_file.file_hash,
             computed,
         });
     }

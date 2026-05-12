@@ -325,15 +325,14 @@ async fn distribute_file_fragments(
     while let Some(fragment_hash) = remote_rx.recv().await {
         remotely_placed.push(fragment_hash);
     }
-    if !remotely_placed.is_empty() {
-        if let Err(e) = app_state.local_state_tx.try_send(
+    if !remotely_placed.is_empty()
+        && let Err(e) = app_state.local_state_tx.try_send(
             crate::db::write_gate::LocalStateUpdate::MarkRemoteBatch {
                 fragment_hashes: remotely_placed,
             },
         ) {
             tracing::warn!("Local state queue full, dropping mark-remote batch: {}", e);
         }
-    }
 
     let successful = successful_placements.load(std::sync::atomic::Ordering::Relaxed);
     let failure_rate = (failed_fragments.len() as f64 / total_fragments as f64) * 100.0;

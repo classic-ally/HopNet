@@ -88,7 +88,7 @@ pub fn calculate_chunked_fragments(file_size: usize) -> (usize, usize, usize) {
     }
 
     // Calculate number of logical chunks
-    let num_chunks = (file_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    let num_chunks = file_size.div_ceil(CHUNK_SIZE);
 
     // Each chunk has fixed 10 original + 20 recovery fragments
     let total_original = num_chunks * ORIGINAL_FRAGMENTS_PER_CHUNK;
@@ -104,7 +104,7 @@ pub fn calculate_optimal_chunks(file_size: usize) -> (usize, usize) {
     let min_original_chunks = if file_size == 0 {
         10 // Empty files still need minimum chunks for Reed-Solomon
     } else {
-        (file_size + MAX_FRAGMENT_SIZE - 1) / MAX_FRAGMENT_SIZE
+        file_size.div_ceil(MAX_FRAGMENT_SIZE)
     };
 
     // Ensure at least 10 original chunks for good Reed-Solomon efficiency
@@ -139,7 +139,7 @@ pub fn calculate_chunk_padding(file_size: usize, num_chunks: usize) -> usize {
         remainder += num_chunks;
     }
 
-    return remainder;
+    remainder
 }
 
 /// Calculate padding needed to ensure even chunk sizes
@@ -187,13 +187,13 @@ pub fn generate_siv_nonce() -> Nonce {
 
     let random_value: u128 = rng.random();
     let random_bytes = random_value.to_be_bytes();
-    let nonce = Nonce::from_slice(&random_bytes).clone();
-    return nonce;
+    
+    *Nonce::from_slice(&random_bytes)
 }
 
 pub fn generate_siv_key() -> Key<Aes256Siv> {
     let key: Key<Aes256Siv> = Aes256SivAead::generate_key(&mut OsRng);
-    return key;
+    key
 }
 
 pub async fn encrypt_path(
@@ -206,13 +206,13 @@ pub async fn encrypt_path(
     let split_path = path.split('/').collect::<Vec<&str>>();
     if split_path.len() > 1 {
         for part in split_path {
-            if part.len() != 0 {
-                let encrypted_part = encrypt_part(part, &key, nonce).await?;
+            if !part.is_empty() {
+                let encrypted_part = encrypt_part(part, key, nonce).await?;
                 output_path = output_path + &encrypted_part;
             }
         }
     } else {
-        output_path = output_path + "/";
+        output_path += "/";
     }
 
     tracing::debug!("Encrypted path: {}", output_path);
@@ -225,7 +225,7 @@ pub async fn encrypt_part(
     key: &Key<Aes256Siv>,
     nonce: &Nonce,
 ) -> Result<String, FileError> {
-    let cipher = Aes256SivAead::new(&key);
+    let cipher = Aes256SivAead::new(key);
     let ciphertext = cipher
         .encrypt(nonce, part.as_bytes())
         .map_err(|_| FileError::EncryptionError)?;
@@ -246,13 +246,13 @@ pub fn decrypt_path(
     let split_path = enc_path.split('/').collect::<Vec<&str>>();
     if split_path.len() > 1 {
         for part in split_path {
-            if part.len() != 0 {
-                let decrypted_part = decrypt_part(part, &key, nonce)?;
+            if !part.is_empty() {
+                let decrypted_part = decrypt_part(part, key, nonce)?;
                 output_path = output_path + "/" + &decrypted_part;
             }
         }
     } else {
-        output_path = output_path + "/"
+        output_path += "/"
     }
 
     Ok(output_path)
@@ -347,12 +347,12 @@ pub fn store_fragment(
     let full_file_path = format!("{}/{}", dir_path, fragment_hash.to_hex());
 
     // Create directory structure if it doesn't exist
-    fs::create_dir_all(&dir_path).map_err(|e| FileError::StorageError(e))?;
+    fs::create_dir_all(&dir_path).map_err(FileError::StorageError)?;
 
     // Write to temp file then atomic rename to prevent concurrent readers
     // from seeing partial data (POSIX rename is atomic on the same filesystem)
     let temp_path = format!("{}.tmp.{:x}", full_file_path, rand::random::<u64>());
-    fs::write(&temp_path, &data).map_err(|e| FileError::StorageError(e))?;
+    fs::write(&temp_path, &data).map_err(FileError::StorageError)?;
     fs::rename(&temp_path, &full_file_path).map_err(|e| {
         // Clean up temp file on rename failure
         let _ = fs::remove_file(&temp_path);
@@ -390,7 +390,7 @@ pub fn fetch_fragment_local(
 
     // Read the fragment data using block_in_place to avoid blocking the async executor
     tokio::task::block_in_place(|| {
-        fs::read(&full_file_path).map_err(|e| FileError::StorageError(e))
+        fs::read(&full_file_path).map_err(FileError::StorageError)
     })
 }
 
@@ -448,15 +448,16 @@ fn finalize_file(
     Ok(file)
 }
 
+/// One fragment as observed at reassembly time: (hash, id, stored-locally flag).
+pub type FragmentEntry = (Blake3Hash, CustomUUID, bool);
+
+/// Reassembly chunk map: chunk_number → (originals_by_index, recovery_by_index).
+/// Each inner map keys on local_index inside that chunk.
+pub type ReassemblyChunks = HashMap<u32, (HashMap<usize, FragmentEntry>, HashMap<usize, FragmentEntry>)>;
+
 /// Data structure for file reassembly containing organized fragment information
 pub struct FileReassemblyData {
-    pub chunks: HashMap<
-        u32,
-        (
-            HashMap<usize, (Blake3Hash, CustomUUID, bool)>,
-            HashMap<usize, (Blake3Hash, CustomUUID, bool)>,
-        ),
-    >, // chunk_number -> (originals, recovery)
+    pub chunks: ReassemblyChunks,
     pub added_bytes: u8, // Padding bytes added to last chunk
     pub expected_file_hash: Blake3Hash,
     pub data_block_id: crate::db::CustomUUID, // Needed for hash verification
@@ -523,16 +524,14 @@ async fn perform_concurrent_fragment_discovery(
         Some(height) => {
             // Deterministic placement mode: get node metrics at consensus height
             let conn = app_state.db_pool.get().map_err(|_| {
-                FileError::StorageError(io::Error::new(
-                    io::ErrorKind::Other,
+                FileError::StorageError(io::Error::other(
                     "Database connection failed",
                 ))
             })?;
 
             let node_metrics =
                 crate::db::metrics::get_all_node_metrics(Ok(conn), height).map_err(|_| {
-                    FileError::StorageError(io::Error::new(
-                        io::ErrorKind::Other,
+                    FileError::StorageError(io::Error::other(
                         "Failed to get node metrics",
                     ))
                 })?;
@@ -544,23 +543,20 @@ async fn perform_concurrent_fragment_discovery(
             tracing::warn!("No consensus height available - using gossip-only fragment discovery");
 
             let conn = app_state.db_pool.get().map_err(|_| {
-                FileError::StorageError(io::Error::new(
-                    io::ErrorKind::Other,
+                FileError::StorageError(io::Error::other(
                     "Database connection failed",
                 ))
             })?;
 
             let my_node_id = app_state.get_node_id().map_err(|_| {
-                FileError::StorageError(io::Error::new(
-                    io::ErrorKind::Other,
+                FileError::StorageError(io::Error::other(
                     "Failed to get node ID",
                 ))
             })?;
             let gossip_nodes =
                 crate::db::nodes::get_all_nodes_as_connection_info(Ok(conn), my_node_id).map_err(
                     |_| {
-                        FileError::StorageError(io::Error::new(
-                            io::ErrorKind::Other,
+                        FileError::StorageError(io::Error::other(
                             "Failed to get nodes for gossip",
                         ))
                     },
@@ -747,7 +743,7 @@ async fn perform_concurrent_fragment_discovery(
                 // Queue async DB update (drain task will batch-flush through write gate)
                 if let Err(e) = app_state.local_state_tx.try_send(
                     crate::db::write_gate::LocalStateUpdate::MarkLocal {
-                        fragment_hash: fragment_hash.clone(),
+                        fragment_hash,
                     },
                 ) {
                     tracing::warn!(
@@ -892,7 +888,7 @@ pub async fn fetch_and_cache_fragment(
             // Queue async DB update (drain task will batch-flush through write gate)
             if let Err(e) = app_state.local_state_tx.try_send(
                 crate::db::write_gate::LocalStateUpdate::MarkLocal {
-                    fragment_hash: fragment_hash.clone(),
+                    fragment_hash: *fragment_hash,
                 },
             ) {
                 tracing::warn!(
@@ -921,10 +917,7 @@ pub async fn fetch_and_cache_fragment(
 
 /// Check if a fragment exists on disk and is valid (hash matches)
 pub fn fragment_exists_and_valid(fragments_dir: &str, fragment_hash: &Blake3Hash) -> bool {
-    match fetch_and_verify_fragment(fragment_hash, fragments_dir) {
-        Ok(_) => true,   // Exists and hash matches
-        Err(_) => false, // Missing, unreadable, or corrupted
-    }
+    fetch_and_verify_fragment(fragment_hash, fragments_dir).is_ok()
 }
 
 /// Shared content-update preparation for both PATCH /files and FileProvider modify_item.
@@ -1042,7 +1035,7 @@ pub fn derive_chunk_nonce(fragment_id: &crate::db::CustomUUID) -> [u8; 7] {
 const BUFFER_SIZE: usize = 4096;
 
 pub fn calculate_encrypted_chunk_length(chunk_length: usize) -> usize {
-    chunk_length + (((chunk_length + BUFFER_SIZE - 1) / BUFFER_SIZE) * 16)
+    chunk_length + (chunk_length.div_ceil(BUFFER_SIZE) * 16)
 }
 
 /// Encrypt a chunk using streaming ChaCha20-Poly1305 with true memory efficiency

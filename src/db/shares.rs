@@ -19,6 +19,7 @@ pub struct ShareMember {
     pub status: String,
 }
 
+#[allow(clippy::too_many_arguments)] // 8 share-payload fields; struct wrapper deferred
 pub fn insert_incoming_share(
     db_tx: &rusqlite::Transaction,
     id: CustomUUID,

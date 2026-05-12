@@ -70,7 +70,7 @@ pub fn get_item(
         .map_err(|_| DatabaseError::ProcessingError)?;
     let name = decrypted_path
         .split('/')
-        .last()
+        .next_back()
         .unwrap_or(&decrypted_path)
         .to_string();
 
@@ -203,7 +203,7 @@ pub fn get_children(
                         rusqlite::types::Type::Text,
                     )
                 })?;
-            let name = decrypted_path.split('/').last().unwrap_or(&decrypted_path).to_string();
+            let name = decrypted_path.split('/').next_back().unwrap_or(&decrypted_path).to_string();
 
             // Derive MIME type from filename
             let mime_type = match item_type {

@@ -23,7 +23,7 @@ mod quorum_tests {
             .iter()
             .take(count)
             .map(|validator| {
-                let vote_data = VoteSignData::from_block(block.clone(), phase.clone());
+                let vote_data = VoteSignData::from_block(block.clone(), phase);
                 let signature = vote_data
                     .sign(&validator.signing_key)
                     .expect("Failed to sign vote");
@@ -57,11 +57,11 @@ mod quorum_tests {
             .cloned()
             .collect();
         let voter_signatures =
-            create_vote_signatures(&all_nodes_except_leader, &block, phase.clone(), 3);
+            create_vote_signatures(&all_nodes_except_leader, &block, phase, 3);
 
         let qc = QuorumCertificate::create_unverified(
             &block,
-            phase.clone(),
+            phase,
             leader.node_id,
             &leader.signing_key,
             voter_signatures,
@@ -100,11 +100,11 @@ mod quorum_tests {
             .cloned()
             .collect();
         let voter_signatures =
-            create_vote_signatures(&all_nodes_except_leader, &block, phase.clone(), 2);
+            create_vote_signatures(&all_nodes_except_leader, &block, phase, 2);
 
         let qc = QuorumCertificate::create_unverified(
             &block,
-            phase.clone(),
+            phase,
             leader.node_id,
             &leader.signing_key,
             voter_signatures,
@@ -140,11 +140,11 @@ mod quorum_tests {
             .cloned()
             .collect();
         let voter_signatures =
-            create_vote_signatures(&all_nodes_except_leader, &block, phase.clone(), 1);
+            create_vote_signatures(&all_nodes_except_leader, &block, phase, 1);
 
         let qc = QuorumCertificate::create_unverified(
             &block,
-            phase.clone(),
+            phase,
             leader.node_id,
             &leader.signing_key,
             voter_signatures,
@@ -179,11 +179,11 @@ mod quorum_tests {
             .cloned()
             .collect();
         let voter_signatures =
-            create_vote_signatures(&all_nodes_except_leader, &block, phase.clone(), 2);
+            create_vote_signatures(&all_nodes_except_leader, &block, phase, 2);
 
         let qc = QuorumCertificate::create_unverified(
             &block,
-            phase.clone(),
+            phase,
             leader.node_id,
             &leader.signing_key,
             voter_signatures,
@@ -249,7 +249,7 @@ mod quorum_tests {
             .cloned()
             .collect();
         let voter_signatures =
-            create_vote_signatures(&all_nodes_except_leader, &block, phase.clone(), 5);
+            create_vote_signatures(&all_nodes_except_leader, &block, phase, 5);
 
         let qc = QuorumCertificate::create_unverified(
             &block,
@@ -291,7 +291,7 @@ mod quorum_tests {
             .cloned()
             .collect();
         let voter_signatures =
-            create_vote_signatures(&all_nodes_except_leader, &block, phase.clone(), 6);
+            create_vote_signatures(&all_nodes_except_leader, &block, phase, 6);
 
         let qc = QuorumCertificate::create_unverified(
             &block,

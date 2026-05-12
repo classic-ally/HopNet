@@ -361,7 +361,7 @@ impl TestScenario for TimeoutProgression {
         // Step 7: Verify restarted node catches up past the TC
         // Allow extra time for convergence catch-up — iroh reconnection + convergence job cycle
         match wait_for_minimum_view(
-            &[restarted_node.clone()],
+            std::slice::from_ref(&restarted_node),
             target_view,
             Duration::from_secs(90),
         )

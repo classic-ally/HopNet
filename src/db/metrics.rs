@@ -309,13 +309,13 @@ pub fn get_all_node_metrics(
             // Only consensus height parameter needed now
             let params = [&consensus_height as &dyn rusqlite::ToSql];
 
-            let mut stmt = db_lock.prepare(&query).map_err(|e| {
+            let mut stmt = db_lock.prepare(query).map_err(|e| {
                 tracing::error!("Failed to prepare metrics query: {:?}", e);
                 DatabaseError::RecallError
             })?;
 
             let metrics = stmt
-                .query_map(&params, |row| {
+                .query_map(params, |row| {
                     Ok(NodeMetrics {
                         node_id: row.get("node_id")?,
                         pubkey: row.get("pubkey")?,

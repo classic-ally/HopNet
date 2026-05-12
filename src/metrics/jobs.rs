@@ -75,8 +75,7 @@ pub async fn handle_metrics_collection(
                 }
                 Err(e) => {
                     tracing::error!("Failed to submit metrics to consensus: {:?}", e);
-                    return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    return Err(Error::Failed(Arc::new(Box::new(std::io::Error::other(
                         format!("Consensus submission failed: {:?}", e),
                     )))));
                 }
@@ -84,8 +83,7 @@ pub async fn handle_metrics_collection(
         }
         Err(CollectionError::DatabaseError(db_err)) => {
             tracing::error!("Database error during metrics collection: {:?}", db_err);
-            return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(Error::Failed(Arc::new(Box::new(std::io::Error::other(
                 format!("Database error: {:?}", db_err),
             )))));
         }
