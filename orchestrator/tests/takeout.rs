@@ -5,9 +5,9 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::time::{Duration, Instant};
 
-use crate::tests::{Check, TestResult, TestScenario, print_and_add_check};
-use crate::tests::files::upload_file;
 use crate::NodeInfo;
+use crate::tests::files::upload_file;
+use crate::tests::{Check, TestResult, TestScenario, print_and_add_check};
 
 // ============================================================================
 // Takeout HTTP Helpers
@@ -26,7 +26,10 @@ pub async fn initiate_takeout(node: &NodeInfo) -> Result<()> {
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_else(|_| "No body".to_string());
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "No body".to_string());
         anyhow::bail!("initiate_takeout failed with status {}: {}", status, body);
     }
 
@@ -46,7 +49,10 @@ pub async fn list_takeouts(node: &NodeInfo) -> Result<Vec<TakeoutRecord>> {
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_else(|_| "No body".to_string());
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "No body".to_string());
         anyhow::bail!("list_takeouts failed with status {}: {}", status, body);
     }
 
@@ -55,10 +61,7 @@ pub async fn list_takeouts(node: &NodeInfo) -> Result<Vec<TakeoutRecord>> {
 
 /// Poll /takeout until a takeout reaches Ready status or the timeout elapses.
 /// Returns the takeout ID.
-pub async fn wait_for_takeout_ready(
-    node: &NodeInfo,
-    timeout: Duration,
-) -> Result<String> {
+pub async fn wait_for_takeout_ready(node: &NodeInfo, timeout: Duration) -> Result<String> {
     let deadline = Instant::now() + timeout;
 
     loop {
@@ -72,7 +75,8 @@ pub async fn wait_for_takeout_ready(
             let statuses: Vec<_> = takeouts.iter().map(|t| format!("{:?}", t.status)).collect();
             anyhow::bail!(
                 "Timed out waiting for takeout Ready after {:?}. Last observed statuses: {:?}",
-                timeout, statuses
+                timeout,
+                statuses
             );
         }
 
@@ -98,8 +102,15 @@ pub async fn download_takeout_archive(node: &NodeInfo, takeout_id: &str) -> Resu
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_else(|_| "No body".to_string());
-        anyhow::bail!("download_takeout_archive failed with status {}: {}", status, body);
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "No body".to_string());
+        anyhow::bail!(
+            "download_takeout_archive failed with status {}: {}",
+            status,
+            body
+        );
     }
 
     Ok(response.bytes().await?.to_vec())
@@ -152,14 +163,21 @@ pub fn extract_tar_gz(archive_bytes: &[u8]) -> Result<ExtractedArchive> {
         // Directory entries are tracked in entry_order but contribute no bytes.
     }
 
-    let first = entry_order.first().ok_or_else(|| anyhow::anyhow!("Archive is empty"))?;
+    let first = entry_order
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("Archive is empty"))?;
     if first != hopnet::takeout::manifest::MANIFEST_FILENAME {
-        anyhow::bail!("Expected first archive entry to be manifest.json, got {}", first);
+        anyhow::bail!(
+            "Expected first archive entry to be manifest.json, got {}",
+            first
+        );
     }
 
-    let manifest_raw = manifest_raw.ok_or_else(|| anyhow::anyhow!("Archive missing manifest.json"))?;
-    let manifest: hopnet::takeout::manifest::TakeoutManifest = serde_json::from_slice(&manifest_raw)
-        .map_err(|e| anyhow::anyhow!("Failed to parse manifest.json: {}", e))?;
+    let manifest_raw =
+        manifest_raw.ok_or_else(|| anyhow::anyhow!("Archive missing manifest.json"))?;
+    let manifest: hopnet::takeout::manifest::TakeoutManifest =
+        serde_json::from_slice(&manifest_raw)
+            .map_err(|e| anyhow::anyhow!("Failed to parse manifest.json: {}", e))?;
 
     Ok(ExtractedArchive {
         entry_order,
@@ -186,7 +204,12 @@ impl TestScenario for TakeoutHappyPath {
         "Upload files, initiate takeout, wait for Ready, download archive, verify content byte-matches the originals"
     }
 
-    async fn run(&self, _mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
+    async fn run(
+        &self,
+        _mesh_id: u32,
+        nodes: &[NodeInfo],
+        _flags: &[String],
+    ) -> Result<TestResult> {
         let start = Instant::now();
         let mut result = TestResult::new();
 
@@ -219,17 +242,23 @@ impl TestScenario for TakeoutHappyPath {
 
         for (filename, contents) in &files {
             match upload_file(node, "/", filename, contents.clone()).await {
-                Ok(_) => print_and_add_check(&mut result, Check {
-                    name: format!("Upload {}", filename),
-                    passed: true,
-                    detail: None,
-                }),
+                Ok(_) => print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: format!("Upload {}", filename),
+                        passed: true,
+                        detail: None,
+                    },
+                ),
                 Err(e) => {
-                    print_and_add_check(&mut result, Check {
-                        name: format!("Upload {} failed", filename),
-                        passed: false,
-                        detail: Some(e.to_string()),
-                    });
+                    print_and_add_check(
+                        &mut result,
+                        Check {
+                            name: format!("Upload {} failed", filename),
+                            passed: false,
+                            detail: Some(e.to_string()),
+                        },
+                    );
                     result.duration = start.elapsed();
                     return Ok(result);
                 }
@@ -238,17 +267,23 @@ impl TestScenario for TakeoutHappyPath {
 
         // Step 2: Initiate takeout
         match initiate_takeout(node).await {
-            Ok(_) => print_and_add_check(&mut result, Check {
-                name: "Initiate takeout".to_string(),
-                passed: true,
-                detail: None,
-            }),
+            Ok(_) => print_and_add_check(
+                &mut result,
+                Check {
+                    name: "Initiate takeout".to_string(),
+                    passed: true,
+                    detail: None,
+                },
+            ),
             Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Initiate takeout failed".to_string(),
-                    passed: false,
-                    detail: Some(e.to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Initiate takeout failed".to_string(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
                 result.duration = start.elapsed();
                 return Ok(result);
             }
@@ -257,19 +292,25 @@ impl TestScenario for TakeoutHappyPath {
         // Step 3: Wait for takeout to reach Ready status
         let takeout_id = match wait_for_takeout_ready(node, Duration::from_secs(120)).await {
             Ok(id) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Takeout reached Ready status".to_string(),
-                    passed: true,
-                    detail: Some(id.clone()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Takeout reached Ready status".to_string(),
+                        passed: true,
+                        detail: Some(id.clone()),
+                    },
+                );
                 id
             }
             Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Wait for Ready failed".to_string(),
-                    passed: false,
-                    detail: Some(e.to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Wait for Ready failed".to_string(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
                 result.duration = start.elapsed();
                 return Ok(result);
             }
@@ -278,19 +319,25 @@ impl TestScenario for TakeoutHappyPath {
         // Step 4: Download archive
         let archive_bytes = match download_takeout_archive(node, &takeout_id).await {
             Ok(bytes) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Download archive".to_string(),
-                    passed: true,
-                    detail: Some(format!("{} bytes", bytes.len())),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Download archive".to_string(),
+                        passed: true,
+                        detail: Some(format!("{} bytes", bytes.len())),
+                    },
+                );
                 bytes
             }
             Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Download archive failed".to_string(),
-                    passed: false,
-                    detail: Some(e.to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Download archive failed".to_string(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
                 result.duration = start.elapsed();
                 return Ok(result);
             }
@@ -299,22 +346,30 @@ impl TestScenario for TakeoutHappyPath {
         // Step 5: Decompress, validate manifest-first ordering, parse manifest into typed struct
         let archive = match extract_tar_gz(&archive_bytes) {
             Ok(a) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Decompress archive + manifest first entry".to_string(),
-                    passed: true,
-                    detail: Some(format!(
-                        "{} entries total, {} content files, manifest version {}",
-                        a.entry_order.len(), a.files.len(), a.manifest.version
-                    )),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Decompress archive + manifest first entry".to_string(),
+                        passed: true,
+                        detail: Some(format!(
+                            "{} entries total, {} content files, manifest version {}",
+                            a.entry_order.len(),
+                            a.files.len(),
+                            a.manifest.version
+                        )),
+                    },
+                );
                 a
             }
             Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Decompress archive / manifest validation failed".to_string(),
-                    passed: false,
-                    detail: Some(e.to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Decompress archive / manifest validation failed".to_string(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
                 result.duration = start.elapsed();
                 return Ok(result);
             }
@@ -326,80 +381,104 @@ impl TestScenario for TakeoutHappyPath {
         let expected_total_bytes: u64 = files.iter().map(|(_, c)| c.len() as u64).sum();
         let expected_files_count = files.len() as u64;
 
-        print_and_add_check(&mut result, Check {
-            name: "Manifest version == 1 (spec v1)".to_string(),
-            passed: archive.manifest.version == 1,
-            detail: Some(format!("got version {}", archive.manifest.version)),
-        });
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Manifest version == 1 (spec v1)".to_string(),
+                passed: archive.manifest.version == 1,
+                detail: Some(format!("got version {}", archive.manifest.version)),
+            },
+        );
 
-        print_and_add_check(&mut result, Check {
-            name: "Manifest takeout_id matches downloaded id".to_string(),
-            passed: archive.manifest.takeout_id.to_string() == takeout_id,
-            detail: Some(format!(
-                "manifest={}, downloaded={}",
-                archive.manifest.takeout_id, takeout_id
-            )),
-        });
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Manifest takeout_id matches downloaded id".to_string(),
+                passed: archive.manifest.takeout_id.to_string() == takeout_id,
+                detail: Some(format!(
+                    "manifest={}, downloaded={}",
+                    archive.manifest.takeout_id, takeout_id
+                )),
+            },
+        );
 
-        print_and_add_check(&mut result, Check {
-            name: format!("Manifest total_files == {}", expected_files_count),
-            passed: archive.manifest.total_files == expected_files_count
-                && archive.manifest.files.len() as u64 == expected_files_count,
-            detail: Some(format!(
-                "total_files={}, files.len()={}",
-                archive.manifest.total_files, archive.manifest.files.len()
-            )),
-        });
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: format!("Manifest total_files == {}", expected_files_count),
+                passed: archive.manifest.total_files == expected_files_count
+                    && archive.manifest.files.len() as u64 == expected_files_count,
+                detail: Some(format!(
+                    "total_files={}, files.len()={}",
+                    archive.manifest.total_files,
+                    archive.manifest.files.len()
+                )),
+            },
+        );
 
-        print_and_add_check(&mut result, Check {
-            name: "Manifest total_folders == 0".to_string(),
-            passed: archive.manifest.total_folders == 0
-                && archive.manifest.folders.is_empty(),
-            detail: Some(format!(
-                "total_folders={}, folders.len()={}",
-                archive.manifest.total_folders, archive.manifest.folders.len()
-            )),
-        });
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Manifest total_folders == 0".to_string(),
+                passed: archive.manifest.total_folders == 0 && archive.manifest.folders.is_empty(),
+                detail: Some(format!(
+                    "total_folders={}, folders.len()={}",
+                    archive.manifest.total_folders,
+                    archive.manifest.folders.len()
+                )),
+            },
+        );
 
-        print_and_add_check(&mut result, Check {
-            name: format!("Manifest total_bytes == {}", expected_total_bytes),
-            passed: archive.manifest.total_bytes == expected_total_bytes,
-            detail: Some(format!("total_bytes={}", archive.manifest.total_bytes)),
-        });
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: format!("Manifest total_bytes == {}", expected_total_bytes),
+                passed: archive.manifest.total_bytes == expected_total_bytes,
+                detail: Some(format!("total_bytes={}", archive.manifest.total_bytes)),
+            },
+        );
 
         // Step 7: Per-file verification — manifest entry shape, archive layout, content + hash match
         for (filename, expected_contents) in &files {
             // Find the manifest entry by user-facing path (no `files/` prefix in manifest).
-            let manifest_entry = archive
-                .manifest
-                .files
-                .iter()
-                .find(|f| f.path == *filename);
+            let manifest_entry = archive.manifest.files.iter().find(|f| f.path == *filename);
 
             let manifest_entry = match manifest_entry {
                 Some(e) => e,
                 None => {
-                    print_and_add_check(&mut result, Check {
-                        name: format!("Manifest contains entry for {}", filename),
-                        passed: false,
-                        detail: Some(format!(
-                            "manifest paths: {:?}",
-                            archive.manifest.files.iter().map(|f| &f.path).collect::<Vec<_>>()
-                        )),
-                    });
+                    print_and_add_check(
+                        &mut result,
+                        Check {
+                            name: format!("Manifest contains entry for {}", filename),
+                            passed: false,
+                            detail: Some(format!(
+                                "manifest paths: {:?}",
+                                archive
+                                    .manifest
+                                    .files
+                                    .iter()
+                                    .map(|f| &f.path)
+                                    .collect::<Vec<_>>()
+                            )),
+                        },
+                    );
                     continue;
                 }
             };
 
             // Manifest size matches uploaded size
-            print_and_add_check(&mut result, Check {
-                name: format!("Manifest size matches for {}", filename),
-                passed: manifest_entry.size as usize == expected_contents.len(),
-                detail: Some(format!(
-                    "manifest={}, uploaded={}",
-                    manifest_entry.size, expected_contents.len()
-                )),
-            });
+            print_and_add_check(
+                &mut result,
+                Check {
+                    name: format!("Manifest size matches for {}", filename),
+                    passed: manifest_entry.size as usize == expected_contents.len(),
+                    detail: Some(format!(
+                        "manifest={}, uploaded={}",
+                        manifest_entry.size,
+                        expected_contents.len()
+                    )),
+                },
+            );
 
             // file_hash must equal blake3(plaintext || source_data_block_id_bytes).
             // Reconstructing the formula here catches any drift in the takeout salting logic.
@@ -408,14 +487,17 @@ impl TestScenario for TakeoutHappyPath {
             hasher.update(manifest_entry.source_data_block_id.as_bytes());
             let computed = hasher.finalize();
             let expected_hash_bytes = manifest_entry.file_hash.as_bytes();
-            print_and_add_check(&mut result, Check {
-                name: format!("Manifest file_hash matches reconstructed for {}", filename),
-                passed: computed.as_bytes() == expected_hash_bytes,
-                detail: Some(format!(
-                    "expected hash from manifest: {}",
-                    manifest_entry.file_hash
-                )),
-            });
+            print_and_add_check(
+                &mut result,
+                Check {
+                    name: format!("Manifest file_hash matches reconstructed for {}", filename),
+                    passed: computed.as_bytes() == expected_hash_bytes,
+                    detail: Some(format!(
+                        "expected hash from manifest: {}",
+                        manifest_entry.file_hash
+                    )),
+                },
+            );
 
             // Archive layout: file lives under `files/<path>`, NOT at the root.
             let prefixed_path = format!(
@@ -426,28 +508,35 @@ impl TestScenario for TakeoutHappyPath {
             let archived_bytes = match archive.files.get(&prefixed_path) {
                 Some(b) => b,
                 None => {
-                    print_and_add_check(&mut result, Check {
-                        name: format!("Archive entry under files/ prefix for {}", filename),
-                        passed: false,
-                        detail: Some(format!(
-                            "expected at {}, archive paths: {:?}",
-                            prefixed_path,
-                            archive.files.keys().collect::<Vec<_>>()
-                        )),
-                    });
+                    print_and_add_check(
+                        &mut result,
+                        Check {
+                            name: format!("Archive entry under files/ prefix for {}", filename),
+                            passed: false,
+                            detail: Some(format!(
+                                "expected at {}, archive paths: {:?}",
+                                prefixed_path,
+                                archive.files.keys().collect::<Vec<_>>()
+                            )),
+                        },
+                    );
                     continue;
                 }
             };
 
             // Byte-match between uploaded and archived content
-            print_and_add_check(&mut result, Check {
-                name: format!("Byte-match {}", filename),
-                passed: archived_bytes == expected_contents,
-                detail: Some(format!(
-                    "uploaded {} bytes, archived {} bytes",
-                    expected_contents.len(), archived_bytes.len()
-                )),
-            });
+            print_and_add_check(
+                &mut result,
+                Check {
+                    name: format!("Byte-match {}", filename),
+                    passed: archived_bytes == expected_contents,
+                    detail: Some(format!(
+                        "uploaded {} bytes, archived {} bytes",
+                        expected_contents.len(),
+                        archived_bytes.len()
+                    )),
+                },
+            );
         }
 
         result.duration = start.elapsed();

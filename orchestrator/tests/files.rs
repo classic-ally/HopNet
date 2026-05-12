@@ -29,8 +29,7 @@ pub async fn upload_file(
     let contents_len = contents.len();
 
     // Take ownership and move into multipart form without copying
-    let part = reqwest::multipart::Part::bytes(contents)
-        .file_name(filename.to_string());
+    let part = reqwest::multipart::Part::bytes(contents).file_name(filename.to_string());
 
     // Create multipart form with path and file
     let form = reqwest::multipart::Form::new()
@@ -46,7 +45,10 @@ pub async fn upload_file(
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_else(|_| "No body".to_string());
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "No body".to_string());
         anyhow::bail!("Upload failed with status {}: {}", status, body);
     }
 
@@ -82,7 +84,10 @@ pub async fn upload_files_multi(
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_else(|_| "No body".to_string());
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "No body".to_string());
         anyhow::bail!("Multi-file upload failed with status {}: {}", status, body);
     }
 
@@ -99,18 +104,13 @@ pub async fn upload_files_multi(
 /// * `node` - The node to send the update to
 /// * `inode_id` - The inode ID of the file to modify
 /// * `new_contents` - The new file contents as bytes
-pub async fn modify_file(
-    node: &NodeInfo,
-    inode_id: &str,
-    new_contents: Vec<u8>,
-) -> Result<()> {
+pub async fn modify_file(node: &NodeInfo, inode_id: &str, new_contents: Vec<u8>) -> Result<()> {
     let client = Client::new();
     let url = format!("http://{}:{}/files", node.ip_address, node.port);
 
     let contents_len = new_contents.len();
 
-    let part = reqwest::multipart::Part::bytes(new_contents)
-        .file_name("content");
+    let part = reqwest::multipart::Part::bytes(new_contents).file_name("content");
 
     let form = reqwest::multipart::Form::new()
         .text("inode_id", inode_id.to_string())
@@ -125,7 +125,10 @@ pub async fn modify_file(
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_else(|_| "No body".to_string());
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "No body".to_string());
         anyhow::bail!("Modify file failed with status {}: {}", status, body);
     }
 
@@ -166,13 +169,14 @@ pub async fn download_file_with_timeout(
     let mut last_error = None;
 
     for attempt in 1..=MAX_RETRIES {
-        let client = Client::builder()
-            .timeout(timeout)
-            .build()?;
+        let client = Client::builder().timeout(timeout).build()?;
 
         // Strip leading slash if present for URL construction
         let path_trimmed = path.strip_prefix('/').unwrap_or(path);
-        let url = format!("http://{}:{}/files/{}", node.ip_address, node.port, path_trimmed);
+        let url = format!(
+            "http://{}:{}/files/{}",
+            node.ip_address, node.port, path_trimmed
+        );
 
         match client
             .get(&url)
@@ -183,7 +187,10 @@ pub async fn download_file_with_timeout(
             Ok(response) => {
                 if !response.status().is_success() {
                     let status = response.status();
-                    let body = response.text().await.unwrap_or_else(|_| "No body".to_string());
+                    let body = response
+                        .text()
+                        .await
+                        .unwrap_or_else(|_| "No body".to_string());
                     last_error = Some(anyhow::anyhow!(
                         "Download failed with status {}: {}",
                         status,
@@ -198,7 +205,8 @@ pub async fn download_file_with_timeout(
                     match response.bytes().await {
                         Ok(bytes) => return Ok(bytes.to_vec()),
                         Err(e) => {
-                            last_error = Some(anyhow::anyhow!("Failed to read response body: {}", e));
+                            last_error =
+                                Some(anyhow::anyhow!("Failed to read response body: {}", e));
                             if attempt < MAX_RETRIES {
                                 tokio::time::sleep(std::time::Duration::from_millis(
                                     500 * attempt as u64,
@@ -213,14 +221,16 @@ pub async fn download_file_with_timeout(
             Err(e) => {
                 last_error = Some(anyhow::anyhow!("Request failed: {}", e));
                 if attempt < MAX_RETRIES {
-                    tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64))
+                        .await;
                     continue;
                 }
             }
         }
     }
 
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Download failed after {} retries", MAX_RETRIES)))
+    Err(last_error
+        .unwrap_or_else(|| anyhow::anyhow!("Download failed after {} retries", MAX_RETRIES)))
 }
 
 /// Download a file from all nodes in parallel
@@ -231,11 +241,9 @@ pub async fn download_file_with_timeout(
 ///
 /// # Returns
 /// Vector of file contents from each node (in same order as nodes)
-pub async fn download_file_from_all_nodes(
-    nodes: &[NodeInfo],
-    path: &str,
-) -> Result<Vec<Vec<u8>>> {
-    download_file_from_all_nodes_with_timeout(nodes, path, std::time::Duration::from_secs(120)).await
+pub async fn download_file_from_all_nodes(nodes: &[NodeInfo], path: &str) -> Result<Vec<Vec<u8>>> {
+    download_file_from_all_nodes_with_timeout(nodes, path, std::time::Duration::from_secs(120))
+        .await
 }
 
 /// Download a file from all nodes in parallel with configurable timeout
@@ -257,9 +265,8 @@ pub async fn download_file_from_all_nodes_with_timeout(
     for node in nodes {
         let node = node.clone();
         let path = path.to_string();
-        let task = tokio::spawn(async move {
-            download_file_with_timeout(&node, &path, timeout).await
-        });
+        let task =
+            tokio::spawn(async move { download_file_with_timeout(&node, &path, timeout).await });
         tasks.push(task);
     }
 
@@ -316,7 +323,10 @@ pub fn verify_all_identical(data: &[Vec<u8>]) -> Result<()> {
 /// JSON array of file items
 pub async fn list_files(node: &NodeInfo, path: &str) -> Result<serde_json::Value> {
     let client = Client::new();
-    let url = format!("http://{}:{}/files?path={}", node.ip_address, node.port, path);
+    let url = format!(
+        "http://{}:{}/files?path={}",
+        node.ip_address, node.port, path
+    );
 
     let response = client
         .get(&url)
@@ -326,7 +336,10 @@ pub async fn list_files(node: &NodeInfo, path: &str) -> Result<serde_json::Value
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_else(|_| "No body".to_string());
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "No body".to_string());
         anyhow::bail!("List files failed with status {}: {}", status, body);
     }
 
@@ -350,9 +363,7 @@ pub async fn list_files_from_all_nodes(
     for node in nodes {
         let node = node.clone();
         let path = path.to_string();
-        let task = tokio::spawn(async move {
-            list_files(&node, &path).await
-        });
+        let task = tokio::spawn(async move { list_files(&node, &path).await });
         tasks.push(task);
     }
 
@@ -411,7 +422,10 @@ pub fn verify_listings_identical(listings: &[serde_json::Value]) -> Result<()> {
 /// * `path` - The full file path to delete
 pub async fn delete_file(node: &NodeInfo, path: &str) -> Result<()> {
     let client = Client::new();
-    let url = format!("http://{}:{}/files?path={}", node.ip_address, node.port, path);
+    let url = format!(
+        "http://{}:{}/files?path={}",
+        node.ip_address, node.port, path
+    );
 
     let response = client
         .delete(&url)
@@ -421,7 +435,10 @@ pub async fn delete_file(node: &NodeInfo, path: &str) -> Result<()> {
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_else(|_| "No body".to_string());
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "No body".to_string());
         anyhow::bail!("Delete failed with status {}: {}", status, body);
     }
 
@@ -464,7 +481,10 @@ pub struct FileFragmentDistribution {
 /// This triggers the manual fragment inventory sync via POST /maintenance/fragment-inventory-self-check
 pub async fn trigger_fragment_inventory_sync(node: &NodeInfo) -> Result<()> {
     let client = Client::new();
-    let url = format!("http://{}:{}/maintenance/fragment-inventory-self-check", node.ip_address, node.port);
+    let url = format!(
+        "http://{}:{}/maintenance/fragment-inventory-self-check",
+        node.ip_address, node.port
+    );
 
     let response = client
         .post(&url)
@@ -474,8 +494,15 @@ pub async fn trigger_fragment_inventory_sync(node: &NodeInfo) -> Result<()> {
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_else(|_| "No body".to_string());
-        anyhow::bail!("Fragment inventory sync failed with status {}: {}", status, body);
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "No body".to_string());
+        anyhow::bail!(
+            "Fragment inventory sync failed with status {}: {}",
+            status,
+            body
+        );
     }
 
     Ok(())
@@ -490,15 +517,13 @@ pub async fn trigger_fragment_inventory_sync_all(nodes: &[NodeInfo]) -> Result<(
 
     for node in nodes {
         let node = node.clone();
-        let task = tokio::spawn(async move {
-            trigger_fragment_inventory_sync(&node).await
-        });
+        let task = tokio::spawn(async move { trigger_fragment_inventory_sync(&node).await });
         tasks.push(task);
     }
 
     for task in tasks {
         match task.await {
-            Ok(Ok(())) => {},
+            Ok(Ok(())) => {}
             Ok(Err(e)) => return Err(e),
             Err(e) => return Err(anyhow::anyhow!("Task join failed: {}", e)),
         }
@@ -522,7 +547,9 @@ pub async fn get_fragment_distribution(
     let client = Client::new();
     let url = format!(
         "http://{}:{}/diagnostics/file-fragments?path={}",
-        node.ip_address, node.port, urlencoding::encode(path)
+        node.ip_address,
+        node.port,
+        urlencoding::encode(path)
     );
 
     let response = client
@@ -533,8 +560,15 @@ pub async fn get_fragment_distribution(
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_else(|_| "No body".to_string());
-        anyhow::bail!("Get fragment distribution failed with status {}: {}", status, body);
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "No body".to_string());
+        anyhow::bail!(
+            "Get fragment distribution failed with status {}: {}",
+            status,
+            body
+        );
     }
 
     Ok(response.json().await?)
@@ -609,7 +643,7 @@ fn calculate_failure_tolerance(
         counts.push(0);
     }
 
-    counts.sort_by(|a, b| b.cmp(a));  // Sort descending
+    counts.sort_by(|a, b| b.cmp(a)); // Sort descending
 
     let total: usize = counts.iter().sum();
 
@@ -621,7 +655,11 @@ fn calculate_failure_tolerance(
 
         if remaining < required {
             // Can't survive this many failures
-            return if num_failures > 0 { num_failures - 1 } else { 0 };
+            return if num_failures > 0 {
+                num_failures - 1
+            } else {
+                0
+            };
         }
     }
 
@@ -687,9 +725,15 @@ pub fn verify_fragment_redundancy(
         "All fragments stored".to_string(),
         all_fragments_stored,
         if all_fragments_stored {
-            format!("All {} fragments stored on at least one node", distribution.fragments.len())
+            format!(
+                "All {} fragments stored on at least one node",
+                distribution.fragments.len()
+            )
         } else {
-            format!("Fragments not stored (chunk_number, local_index): {:?}", unstored_fragments)
+            format!(
+                "Fragments not stored (chunk_number, local_index): {:?}",
+                unstored_fragments
+            )
         },
     ));
 
@@ -732,7 +776,8 @@ pub fn verify_fragment_redundancy(
     let balance_check = actual_tolerance >= max_possible_tolerance;
 
     // Create a detailed breakdown of distribution across nodes
-    let mut node_counts: Vec<(i32, usize)> = node_fragment_counts.iter()
+    let mut node_counts: Vec<(i32, usize)> = node_fragment_counts
+        .iter()
         .map(|(&node_id, &count)| (node_id, count))
         .collect();
     node_counts.sort_by_key(|(node_id, _)| *node_id);
@@ -740,7 +785,8 @@ pub fn verify_fragment_redundancy(
     let distribution_detail = if node_counts.is_empty() {
         format!("No fragments found in inventory")
     } else {
-        let counts_str = node_counts.iter()
+        let counts_str = node_counts
+            .iter()
             .map(|(node_id, count)| format!("node_{}={}", node_id, count))
             .collect::<Vec<_>>()
             .join(", ");
@@ -781,12 +827,18 @@ pub struct DownloadHeaders {
 }
 
 /// Download a file and return response headers (full download, no Range header)
-pub async fn download_file_headers(node: &NodeInfo, path: &str) -> Result<(Vec<u8>, DownloadHeaders)> {
+pub async fn download_file_headers(
+    node: &NodeInfo,
+    path: &str,
+) -> Result<(Vec<u8>, DownloadHeaders)> {
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()?;
     let path_trimmed = path.strip_prefix('/').unwrap_or(path);
-    let url = format!("http://{}:{}/files/{}", node.ip_address, node.port, path_trimmed);
+    let url = format!(
+        "http://{}:{}/files/{}",
+        node.ip_address, node.port, path_trimmed
+    );
 
     let response = client
         .get(&url)
@@ -796,10 +848,26 @@ pub async fn download_file_headers(node: &NodeInfo, path: &str) -> Result<(Vec<u
 
     let headers = DownloadHeaders {
         status: response.status().as_u16(),
-        content_type: response.headers().get("content-type").and_then(|v| v.to_str().ok()).map(|s| s.to_string()),
-        accept_ranges: response.headers().get("accept-ranges").and_then(|v| v.to_str().ok()).map(|s| s.to_string()),
-        content_length: response.headers().get("content-length").and_then(|v| v.to_str().ok()).and_then(|s| s.parse().ok()),
-        content_range: response.headers().get("content-range").and_then(|v| v.to_str().ok()).map(|s| s.to_string()),
+        content_type: response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string()),
+        accept_ranges: response
+            .headers()
+            .get("accept-ranges")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string()),
+        content_length: response
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse().ok()),
+        content_range: response
+            .headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string()),
     };
 
     let bytes = response.bytes().await?.to_vec();
@@ -817,7 +885,10 @@ pub async fn download_file_range(
         .timeout(std::time::Duration::from_secs(120))
         .build()?;
     let path_trimmed = path.strip_prefix('/').unwrap_or(path);
-    let url = format!("http://{}:{}/files/{}", node.ip_address, node.port, path_trimmed);
+    let url = format!(
+        "http://{}:{}/files/{}",
+        node.ip_address, node.port, path_trimmed
+    );
 
     let range_value = match end {
         Some(e) => format!("bytes={}-{}", start, e),
@@ -833,10 +904,26 @@ pub async fn download_file_range(
 
     let headers = DownloadHeaders {
         status: response.status().as_u16(),
-        content_type: response.headers().get("content-type").and_then(|v| v.to_str().ok()).map(|s| s.to_string()),
-        accept_ranges: response.headers().get("accept-ranges").and_then(|v| v.to_str().ok()).map(|s| s.to_string()),
-        content_length: response.headers().get("content-length").and_then(|v| v.to_str().ok()).and_then(|s| s.parse().ok()),
-        content_range: response.headers().get("content-range").and_then(|v| v.to_str().ok()).map(|s| s.to_string()),
+        content_type: response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string()),
+        accept_ranges: response
+            .headers()
+            .get("accept-ranges")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string()),
+        content_length: response
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse().ok()),
+        content_range: response
+            .headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string()),
     };
 
     let bytes = response.bytes().await?.to_vec();

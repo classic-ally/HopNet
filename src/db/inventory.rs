@@ -1,12 +1,12 @@
 use r2d2::PooledConnection;
 use r2d2_sqlite::SqliteConnectionManager;
-use tracing::debug;
-use rusqlite::{params, Transaction};
+use rusqlite::{Transaction, params};
 use std::collections::HashMap;
+use tracing::debug;
 
+use crate::db::DatabaseError;
 use crate::files::types::SelfCheckFragments;
 use crate::types::{Blake3Hash, NodeConnectionInfo};
-use crate::db::DatabaseError;
 
 /// Apply differential fragment inventory updates from a self-check report
 /// Called by consensus middleware when processing SelfCheckFragments transactions
@@ -73,13 +73,17 @@ pub fn apply_self_check_updates(
 
     debug!(
         "Updated self_verified_height to {} for all fragments of node {}",
-        report.self_verified_height,
-        report.node_id
+        report.self_verified_height, report.node_id
     );
 
     // 3. Insert newly discovered fragments (already have correct verified_height)
     if !report.fragments_added.is_empty() {
-        insert_fragments_tx(db_tx, report.node_id, &report.fragments_added, report.self_verified_height)?;
+        insert_fragments_tx(
+            db_tx,
+            report.node_id,
+            &report.fragments_added,
+            report.self_verified_height,
+        )?;
 
         debug!(
             "Added {} fragments to inventory for node {}",
@@ -92,10 +96,7 @@ pub fn apply_self_check_updates(
 }
 
 /// Get the current fragment count using a transaction
-fn get_node_fragment_count_tx(
-    tx: &Transaction,
-    node_id: i32
-) -> Result<u32, DatabaseError> {
+fn get_node_fragment_count_tx(tx: &Transaction, node_id: i32) -> Result<u32, DatabaseError> {
     let mut stmt = tx
         .prepare("SELECT COUNT(*) FROM fragment_inventory WHERE node_id = ?")
         .map_err(|_| DatabaseError::ProcessingError)?;
@@ -118,8 +119,9 @@ fn insert_fragments_tx(
         tx.execute(
             "INSERT INTO fragment_inventory (fragment_hash, node_id, self_verified_height)
              VALUES (?, ?, ?)",
-            params![fragment_hash, node_id, verified_height]
-        ).map_err(|_| DatabaseError::InsertError)?;
+            params![fragment_hash, node_id, verified_height],
+        )
+        .map_err(|_| DatabaseError::InsertError)?;
     }
 
     Ok(())
@@ -134,8 +136,9 @@ fn remove_fragments_tx(
     for fragment_hash in fragments {
         tx.execute(
             "DELETE FROM fragment_inventory WHERE fragment_hash = ? AND node_id = ?",
-            params![fragment_hash, node_id]
-        ).map_err(|_| DatabaseError::ProcessingError)?;
+            params![fragment_hash, node_id],
+        )
+        .map_err(|_| DatabaseError::ProcessingError)?;
     }
 
     Ok(())
@@ -152,7 +155,8 @@ fn update_verified_height_tx(
          SET self_verified_height = ?
          WHERE node_id = ?",
         params![verified_height, node_id],
-    ).map_err(|_| DatabaseError::ProcessingError)?;
+    )
+    .map_err(|_| DatabaseError::ProcessingError)?;
 
     Ok(())
 }
@@ -242,7 +246,11 @@ pub fn batch_query_fragment_inventory(
     match db_connection {
         Ok(conn) => {
             // Build parameterized query with window function to limit nodes per fragment
-            let placeholders = fragment_hashes.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            let placeholders = fragment_hashes
+                .iter()
+                .map(|_| "?")
+                .collect::<Vec<_>>()
+                .join(", ");
             let query = format!(
                 "SELECT fragment_hash, node_id, pubkey
                  FROM (
@@ -257,7 +265,9 @@ pub fn batch_query_fragment_inventory(
                 placeholders, max_nodes
             );
 
-            let mut stmt = conn.prepare(&query).map_err(|_| DatabaseError::ProcessingError)?;
+            let mut stmt = conn
+                .prepare(&query)
+                .map_err(|_| DatabaseError::ProcessingError)?;
 
             // Execute query with all fragment hashes as parameters
             let mut rows = stmt
@@ -268,13 +278,17 @@ pub fn batch_query_fragment_inventory(
             let mut result: HashMap<Blake3Hash, Vec<NodeConnectionInfo>> = HashMap::new();
 
             while let Some(row) = rows.next().map_err(|_| DatabaseError::RecallError)? {
-                let fragment_hash: Blake3Hash = row.get(0).map_err(|_| DatabaseError::RecallError)?;
+                let fragment_hash: Blake3Hash =
+                    row.get(0).map_err(|_| DatabaseError::RecallError)?;
                 let node_info = NodeConnectionInfo {
                     node_id: row.get(1).map_err(|_| DatabaseError::RecallError)?,
                     pubkey: row.get(2).map_err(|_| DatabaseError::RecallError)?,
                 };
 
-                result.entry(fragment_hash).or_insert_with(Vec::new).push(node_info);
+                result
+                    .entry(fragment_hash)
+                    .or_insert_with(Vec::new)
+                    .push(node_info);
             }
 
             debug!(

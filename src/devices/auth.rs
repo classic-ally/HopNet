@@ -1,12 +1,12 @@
+use crate::db::{self, Blake3Hash, CustomUUID, devices::get_device_by_id};
+use crate::{AppState, UserKeys, auth};
 use axum::{
-    extract::{Request, State},
-    response::{Response, IntoResponse},
     body::Body,
+    extract::{Request, State},
     http::{StatusCode, header},
     middleware::Next,
+    response::{IntoResponse, Response},
 };
-use crate::{auth, AppState, UserKeys};
-use crate::db::{self, devices::get_device_by_id, CustomUUID, Blake3Hash};
 
 pub struct DeviceTokenAuthError {
     message: String,
@@ -34,20 +34,24 @@ pub async fn device_token_auth_middleware(
             message: "Invalid authorization header".to_string(),
             status_code: StatusCode::BAD_REQUEST,
         })?,
-        None => return Err(DeviceTokenAuthError {
-            message: "Missing authorization header".to_string(),
-            status_code: StatusCode::UNAUTHORIZED,
-        }),
+        None => {
+            return Err(DeviceTokenAuthError {
+                message: "Missing authorization header".to_string(),
+                status_code: StatusCode::UNAUTHORIZED,
+            });
+        }
     };
 
     // Parse Bearer token
     let mut header_parts = auth_header.split_whitespace();
     let token = match (header_parts.next(), header_parts.next()) {
         (Some("Bearer"), Some(token)) => token,
-        _ => return Err(DeviceTokenAuthError {
-            message: "Invalid authorization format. Expected 'Bearer <token>'".to_string(),
-            status_code: StatusCode::BAD_REQUEST,
-        }),
+        _ => {
+            return Err(DeviceTokenAuthError {
+                message: "Invalid authorization format. Expected 'Bearer <token>'".to_string(),
+                status_code: StatusCode::BAD_REQUEST,
+            });
+        }
     };
 
     // Parse token format: {device_id}.{secret}
@@ -69,10 +73,12 @@ pub async fn device_token_auth_middleware(
 
     let device = match device {
         Some(d) => d,
-        None => return Err(DeviceTokenAuthError {
-            message: "Invalid device token".to_string(),
-            status_code: StatusCode::UNAUTHORIZED,
-        }),
+        None => {
+            return Err(DeviceTokenAuthError {
+                message: "Invalid device token".to_string(),
+                status_code: StatusCode::UNAUTHORIZED,
+            });
+        }
     };
 
     // Verify secret hash
@@ -107,9 +113,17 @@ pub async fn device_token_auth_middleware(
 
         let pubkey = db::PubKey(privkey.verifying_key());
         let (siv_key, siv_nonce) = auth::derive_siv_key_from_user(&privkey, "file_path");
-        let user_keys = UserKeys { private_key: privkey, public_key: pubkey };
+        let user_keys = UserKeys {
+            private_key: privkey,
+            public_key: pubkey,
+        };
         let expires_at = chrono::Utc::now() + chrono::Duration::minutes(5);
-        let session = auth::SessionEntry { user_keys, siv_key, siv_nonce, expires_at };
+        let session = auth::SessionEntry {
+            user_keys,
+            siv_key,
+            siv_nonce,
+            expires_at,
+        };
 
         let inserted = {
             let mut store = app_state.session_store.write().await;

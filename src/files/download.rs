@@ -10,7 +10,9 @@ pub struct ByteRange {
 
 /// Result of file download preparation (range-aware)
 pub struct FileDownloadInfo {
-    pub stream: std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<bytes::Bytes, functions::FileError>> + Send>>,
+    pub stream: std::pin::Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<bytes::Bytes, functions::FileError>> + Send>,
+    >,
     pub file_size: u64,
     pub is_partial: bool,
     pub range: Option<ByteRange>,
@@ -71,7 +73,8 @@ async fn prepare_file_data(
     encrypted_path: &str,
     user_id: i32,
 ) -> Result<PreparedFile, FileReconstructionError> {
-    let file_access_data = files::get_file_fragments(app_state.db_pool.get(), encrypted_path.to_string(), user_id)?;
+    let file_access_data =
+        files::get_file_fragments(app_state.db_pool.get(), encrypted_path.to_string(), user_id)?;
     let file_size = file_access_data.file_size;
 
     let file_data = match file_access_data.file_reassembly_data {
@@ -86,26 +89,41 @@ async fn prepare_file_data(
 
     let mut file_data = file_data;
     if let Some(file_access_entry) = file_access_data.file_access_entry {
-        let session = app_state.get_session(user_id).await
+        let session = app_state
+            .get_session(user_id)
+            .await
             .map_err(|_| FileReconstructionError::InternalError)?;
-        let user_x25519_privkey = crate::auth::derive_x25519_privkey_from_user(&session.user_keys.private_key);
+        let user_x25519_privkey =
+            crate::auth::derive_x25519_privkey_from_user(&session.user_keys.private_key);
 
         match crate::auth::decrypt_wrapped_file_key(&file_access_entry, &user_x25519_privkey) {
-            Ok(per_file_key) => { file_data.per_file_key = Some(per_file_key); }
+            Ok(per_file_key) => {
+                file_data.per_file_key = Some(per_file_key);
+            }
             Err(e) => {
                 tracing::error!("Failed to decrypt file key for {}: {:?}", encrypted_path, e);
                 return Err(FileReconstructionError::KeyDecryptionError);
             }
         }
     } else {
-        tracing::warn!("User {} does not have access to file {}", user_id, encrypted_path);
+        tracing::warn!(
+            "User {} does not have access to file {}",
+            user_id,
+            encrypted_path
+        );
         return Err(FileReconstructionError::Forbidden);
     }
 
-    Ok(PreparedFile::Ready { file_data, file_size, placement_height })
+    Ok(PreparedFile::Ready {
+        file_data,
+        file_size,
+        placement_height,
+    })
 }
 
-fn empty_stream() -> std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<bytes::Bytes, functions::FileError>> + Send>> {
+fn empty_stream() -> std::pin::Pin<
+    Box<dyn tokio_stream::Stream<Item = Result<bytes::Bytes, functions::FileError>> + Send>,
+> {
     Box::pin(async_stream::try_stream! {
         if false { yield bytes::Bytes::new(); }
     })
@@ -118,10 +136,19 @@ pub async fn reconstruct_file_stream(
     encrypted_path: String,
     user_id: i32,
     fragments_dir: &str,
-) -> Result<std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<bytes::Bytes, functions::FileError>> + Send>>, FileReconstructionError> {
+) -> Result<
+    std::pin::Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<bytes::Bytes, functions::FileError>> + Send>,
+    >,
+    FileReconstructionError,
+> {
     match prepare_file_data(app_state, &encrypted_path, user_id).await? {
         PreparedFile::Empty => Ok(empty_stream()),
-        PreparedFile::Ready { file_data, placement_height, .. } => {
+        PreparedFile::Ready {
+            file_data,
+            placement_height,
+            ..
+        } => {
             let stream = functions::reconstruct_file_chunked(
                 fragments_dir.to_string(),
                 file_data,
@@ -129,7 +156,10 @@ pub async fn reconstruct_file_stream(
                 placement_height,
                 None,
             );
-            tracing::debug!("Starting streaming reconstruction for file {}", encrypted_path);
+            tracing::debug!(
+                "Starting streaming reconstruction for file {}",
+                encrypted_path
+            );
             Ok(Box::pin(stream))
         }
     }
@@ -145,15 +175,17 @@ pub async fn reconstruct_file_range(
     requested_range: Option<(u64, Option<u64>)>,
 ) -> Result<FileDownloadInfo, FileReconstructionError> {
     match prepare_file_data(app_state, &encrypted_path, user_id).await? {
-        PreparedFile::Empty => {
-            Ok(FileDownloadInfo {
-                stream: empty_stream(),
-                file_size: 0,
-                is_partial: false,
-                range: None,
-            })
-        }
-        PreparedFile::Ready { file_data, file_size, placement_height } => {
+        PreparedFile::Empty => Ok(FileDownloadInfo {
+            stream: empty_stream(),
+            file_size: 0,
+            is_partial: false,
+            range: None,
+        }),
+        PreparedFile::Ready {
+            file_data,
+            file_size,
+            placement_height,
+        } => {
             let resolved_range = match requested_range {
                 Some((start, end_opt)) => {
                     if start >= file_size {
@@ -176,8 +208,11 @@ pub async fn reconstruct_file_range(
                 range_tuple,
             );
 
-            tracing::debug!("Starting {} reconstruction for file {}",
-                if is_partial { "partial" } else { "full" }, encrypted_path);
+            tracing::debug!(
+                "Starting {} reconstruction for file {}",
+                if is_partial { "partial" } else { "full" },
+                encrypted_path
+            );
 
             Ok(FileDownloadInfo {
                 stream: Box::pin(stream),

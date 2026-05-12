@@ -25,7 +25,8 @@ impl TableDivergenceReport {
     /// Check if table is in consensus (all nodes at highest view have same hash)
     pub fn is_consensus(&self) -> bool {
         let max_view = self.clusters.iter().map(|c| c.view).max().unwrap_or(0);
-        let clusters_at_max_view: Vec<_> = self.clusters
+        let clusters_at_max_view: Vec<_> = self
+            .clusters
             .iter()
             .filter(|c| c.view == max_view)
             .collect();
@@ -44,10 +45,7 @@ impl TableDivergenceReport {
     /// Get clusters at lower views (catching up)
     pub fn catching_up_clusters(&self) -> Vec<&TableCluster> {
         let max_view = self.clusters.iter().map(|c| c.view).max().unwrap_or(0);
-        self.clusters
-            .iter()
-            .filter(|c| c.view < max_view)
-            .collect()
+        self.clusters.iter().filter(|c| c.view < max_view).collect()
     }
 
     /// Check if there's true divergence (multiple hashes at same view)
@@ -61,8 +59,8 @@ impl TableDivergenceReport {
 pub struct DivergenceReport {
     pub mesh_id: u32,
     pub total_nodes: usize,
-    pub view_range: (i32, i32),     // (min, max)
-    pub height_range: (i32, i32),   // (min, max)
+    pub view_range: (i32, i32),   // (min, max)
+    pub height_range: (i32, i32), // (min, max)
     pub table_reports: Vec<TableDivergenceReport>,
 }
 
@@ -98,10 +96,7 @@ fn analyze_table(
     for (node_id, snapshot) in node_snapshots {
         if let Some(table_info) = snapshot.table_hashes.get(table_name) {
             let key = (snapshot.committed_view, table_info.hash.clone());
-            view_hash_to_nodes
-                .entry(key)
-                .or_default()
-                .push(*node_id);
+            view_hash_to_nodes.entry(key).or_default().push(*node_id);
             hash_to_info.insert(table_info.hash.clone(), table_info);
         }
     }
@@ -123,7 +118,8 @@ fn analyze_table(
 
     // Sort clusters by view (highest first), then by size (largest first)
     clusters.sort_by(|a, b| {
-        b.view.cmp(&a.view)
+        b.view
+            .cmp(&a.view)
             .then_with(|| b.nodes.len().cmp(&a.nodes.len()))
     });
 
@@ -144,19 +140,23 @@ pub fn build_divergence_report(
     }
 
     // Calculate view and height ranges
-    let views: Vec<i32> = node_snapshots.iter().map(|(_, s)| s.committed_view).collect();
-    let heights: Vec<i32> = node_snapshots.iter().map(|(_, s)| s.consensus_height).collect();
+    let views: Vec<i32> = node_snapshots
+        .iter()
+        .map(|(_, s)| s.committed_view)
+        .collect();
+    let heights: Vec<i32> = node_snapshots
+        .iter()
+        .map(|(_, s)| s.consensus_height)
+        .collect();
 
     let view_range = (*views.iter().min().unwrap(), *views.iter().max().unwrap());
-    let height_range = (*heights.iter().min().unwrap(), *heights.iter().max().unwrap());
+    let height_range = (
+        *heights.iter().min().unwrap(),
+        *heights.iter().max().unwrap(),
+    );
 
     // Get all table names (from first node)
-    let table_names: Vec<String> = node_snapshots[0]
-        .1
-        .table_hashes
-        .keys()
-        .cloned()
-        .collect();
+    let table_names: Vec<String> = node_snapshots[0].1.table_hashes.keys().cloned().collect();
 
     // Analyze each table
     let table_reports: Vec<TableDivergenceReport> = table_names
@@ -177,10 +177,13 @@ pub fn build_divergence_report(
 pub fn print_divergence_report(report: &DivergenceReport) {
     println!("State Divergence Report (Mesh {})", report.mesh_id);
     println!("═══════════════════════════════════════");
-    println!("Nodes: {} (views {}-{}, heights {}-{})",
+    println!(
+        "Nodes: {} (views {}-{}, heights {}-{})",
         report.total_nodes,
-        report.view_range.0, report.view_range.1,
-        report.height_range.0, report.height_range.1
+        report.view_range.0,
+        report.view_range.1,
+        report.height_range.0,
+        report.height_range.1
     );
 
     if report.view_range.0 != report.view_range.1 {
@@ -189,7 +192,10 @@ pub fn print_divergence_report(report: &DivergenceReport) {
     println!();
 
     if report.is_full_consensus() {
-        println!("✅ All nodes in consensus across {} tables", report.table_reports.len());
+        println!(
+            "✅ All nodes in consensus across {} tables",
+            report.table_reports.len()
+        );
         return;
     }
 
@@ -197,14 +203,21 @@ pub fn print_divergence_report(report: &DivergenceReport) {
     let consensus = report.consensus_tables();
 
     // Distinguish true divergence from catch-up
-    let true_divergence: Vec<_> = divergent.iter()
+    let true_divergence: Vec<_> = divergent
+        .iter()
         .filter(|t| t.current_view_clusters().len() > 1)
         .collect();
 
     if !true_divergence.is_empty() {
-        println!("🚨 {} tables with DIVERGENCE at current view\n", true_divergence.len());
+        println!(
+            "🚨 {} tables with DIVERGENCE at current view\n",
+            true_divergence.len()
+        );
     } else {
-        println!("⚙️  {} tables show view spread (nodes catching up)\n", divergent.len());
+        println!(
+            "⚙️  {} tables show view spread (nodes catching up)\n",
+            divergent.len()
+        );
     }
 
     if !consensus.is_empty() {
@@ -220,7 +233,8 @@ pub fn print_divergence_report(report: &DivergenceReport) {
         }
     }
 
-    let catch_up_only: Vec<_> = divergent.iter()
+    let catch_up_only: Vec<_> = divergent
+        .iter()
         .filter(|t| t.current_view_clusters().len() == 1)
         .collect();
 
@@ -243,7 +257,10 @@ fn print_table_divergence(table: &TableDivergenceReport) {
     println!("  {} ({} rows)", table.table_name, row_count);
 
     if !table.clusters[0].excluded_columns.is_empty() {
-        println!("    (excludes: {})", table.clusters[0].excluded_columns.join(", "));
+        println!(
+            "    (excludes: {})",
+            table.clusters[0].excluded_columns.join(", ")
+        );
     }
 
     // Show current view clusters (potential divergence)
@@ -251,7 +268,8 @@ fn print_table_divergence(table: &TableDivergenceReport) {
         println!("    ⚠️  DIVERGENCE at view {}:", max_view);
         for (i, cluster) in current_view_clusters.iter().enumerate() {
             let label = ('A' as u8 + i as u8) as char;
-            println!("      View {} Cluster {} ({} nodes): {:?}  hash: {}...",
+            println!(
+                "      View {} Cluster {} ({} nodes): {:?}  hash: {}...",
                 cluster.view,
                 label,
                 cluster.nodes.len(),
@@ -260,7 +278,8 @@ fn print_table_divergence(table: &TableDivergenceReport) {
             );
         }
     } else if let Some(cluster) = current_view_clusters.first() {
-        println!("    View {} ({} nodes): {:?}  hash: {}...  ✅ Consensus at view {}",
+        println!(
+            "    View {} ({} nodes): {:?}  hash: {}...  ✅ Consensus at view {}",
             cluster.view,
             cluster.nodes.len(),
             cluster.nodes,
@@ -272,7 +291,8 @@ fn print_table_divergence(table: &TableDivergenceReport) {
     // Show catching up nodes
     if !catching_up.is_empty() {
         for cluster in catching_up {
-            println!("    View {} ({} nodes): {:?}  hash: {}...  ⚙️  Catching up",
+            println!(
+                "    View {} ({} nodes): {:?}  hash: {}...  ⚙️  Catching up",
                 cluster.view,
                 cluster.nodes.len(),
                 cluster.nodes,
@@ -285,7 +305,11 @@ fn print_table_divergence(table: &TableDivergenceReport) {
 }
 
 /// Check for state divergence across nodes in a mesh
-pub async fn check_divergence(docker: &Docker, mesh_id: u32, runtime: crate::sys::ContainerRuntime) -> Result<()> {
+pub async fn check_divergence(
+    docker: &Docker,
+    mesh_id: u32,
+    runtime: crate::sys::ContainerRuntime,
+) -> Result<()> {
     println!("Checking state divergence for mesh {}...", mesh_id);
 
     // Get external addresses (runtime-aware: container IPs for Docker, localhost for Podman)
@@ -296,7 +320,10 @@ pub async fn check_divergence(docker: &Docker, mesh_id: u32, runtime: crate::sys
         return Ok(());
     }
 
-    println!("Found {} nodes, fetching JWT tokens...", node_addresses.len());
+    println!(
+        "Found {} nodes, fetching JWT tokens...",
+        node_addresses.len()
+    );
 
     // Build NodeInfo for each node (includes JWT)
     let mut nodes: Vec<crate::NodeInfo> = Vec::new();
@@ -320,7 +347,10 @@ pub async fn check_divergence(docker: &Docker, mesh_id: u32, runtime: crate::sys
         anyhow::bail!("Failed to authenticate with any nodes");
     }
 
-    println!("Authenticated with {} nodes, fetching state snapshots...", nodes.len());
+    println!(
+        "Authenticated with {} nodes, fetching state snapshots...",
+        nodes.len()
+    );
 
     // Fetch state snapshots from all nodes in parallel
     let mut snapshots = Vec::new();
@@ -350,7 +380,10 @@ pub async fn check_divergence(docker: &Docker, mesh_id: u32, runtime: crate::sys
         anyhow::bail!("Failed to fetch any state snapshots");
     }
 
-    println!("Fetched {} snapshots, analyzing divergence...\n", snapshots.len());
+    println!(
+        "Fetched {} snapshots, analyzing divergence...\n",
+        snapshots.len()
+    );
 
     // Build and display divergence report
     let report = build_divergence_report(mesh_id, snapshots)?;

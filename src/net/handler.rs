@@ -6,10 +6,12 @@ use tokio::io::AsyncReadExt;
 use tracing::Instrument;
 
 use super::protocol::{IrohRequest, IrohResponse};
-use super::transport::{recv_message, encode_message, send_raw, IrohError, TransportError, ProtocolError};
+use super::transport::{
+    IrohError, ProtocolError, TransportError, encode_message, recv_message, send_raw,
+};
 use crate::AppState;
-use crate::types::PubKey;
 use crate::db::consensus as db;
+use crate::types::PubKey;
 
 /// Handle incoming iroh connections
 /// This runs in a loop accepting connections from the endpoint
@@ -37,17 +39,15 @@ pub async fn handle_incoming_connections(endpoint: Endpoint, app_state: AppState
 /// was established, so this is just for resolving the node_id for logging/routing.
 fn lookup_node_id(app_state: &AppState, peer_pubkey: &iroh::PublicKey) -> Option<i32> {
     let conn = app_state.db_pool.get().ok()?;
-    let pubkey = PubKey(
-        ed25519_dalek::VerifyingKey::from_bytes(peer_pubkey.as_bytes()).ok()?
-    );
-    let pubkey_encoded = bincode::serde::encode_to_vec(
-        &pubkey, bincode::config::standard()
-    ).ok()?;
+    let pubkey = PubKey(ed25519_dalek::VerifyingKey::from_bytes(peer_pubkey.as_bytes()).ok()?);
+    let pubkey_encoded =
+        bincode::serde::encode_to_vec(&pubkey, bincode::config::standard()).ok()?;
     conn.query_row(
         "SELECT node_id FROM nodes WHERE pubkey = ?",
         [pubkey_encoded.as_slice()],
         |row| row.get(0),
-    ).ok()
+    )
+    .ok()
 }
 
 async fn handle_connection(
@@ -56,7 +56,8 @@ async fn handle_connection(
 ) -> Result<(), IrohError> {
     // Unknown peers are already rejected by the before_registration hook
     // before the connection reaches this point (no holepunching occurs).
-    let conn = incoming.await
+    let conn = incoming
+        .await
         .map_err(|e| IrohError::Transport(TransportError::ConnectionFailed(e.to_string())))?;
     let peer_pubkey = conn.remote_id();
 
@@ -103,24 +104,35 @@ async fn ensure_caught_up_for_message(
     };
 
     // Cross-view catch-up via shared in-flight task
-    app_state.catch_up_state.ensure_view(target_view, app_state).await
-        .map_err(|e| IrohError::Protocol(ProtocolError::PeerError(
-            format!("catch-up failed: {:?}", e)
-        )))?;
+    app_state
+        .catch_up_state
+        .ensure_view(target_view, app_state)
+        .await
+        .map_err(|e| {
+            IrohError::Protocol(ProtocolError::PeerError(format!(
+                "catch-up failed: {:?}",
+                e
+            )))
+        })?;
 
     // Intra-view catch-up: Lock-phase ballot but we're missing the Propose QC
     if let IrohRequest::BallotSubmission(req) = request {
         if req.ballot.data.phase == crate::consensus::types::ConsensusPhase::Lock {
             // Check if we need intra-view sync (one DB read, only for Lock ballots)
-            let conn = app_state.db_pool.get()
-                .map_err(|_| IrohError::Protocol(ProtocolError::PeerError("db pool error".into())))?;
+            let conn = app_state.db_pool.get().map_err(|_| {
+                IrohError::Protocol(ProtocolError::PeerError("db pool error".into()))
+            })?;
             let (_, highest_qc_view) = db::get_consensus_progress(&conn)
                 .map_err(|_| IrohError::Protocol(ProtocolError::PeerError("db error".into())))?;
             if highest_qc_view < target_view {
-                crate::consensus::routes::ensure_intra_view_synced(app_state).await
-                    .map_err(|e| IrohError::Protocol(ProtocolError::PeerError(
-                        format!("intra-view sync failed: {:?}", e)
-                    )))?;
+                crate::consensus::routes::ensure_intra_view_synced(app_state)
+                    .await
+                    .map_err(|e| {
+                        IrohError::Protocol(ProtocolError::PeerError(format!(
+                            "intra-view sync failed: {:?}",
+                            e
+                        )))
+                    })?;
             }
         }
     }
@@ -136,11 +148,13 @@ async fn handle_stream(
 ) -> Result<(), IrohError> {
     // Read request_id prefix (8 bytes)
     let mut id_buf = [0u8; 8];
-    recv.read_exact(&mut id_buf).await
+    recv.read_exact(&mut id_buf)
+        .await
         .map_err(|e| IrohError::Transport(TransportError::StreamFailed(e.to_string())))?;
     let request_id = u64::from_le_bytes(id_buf);
 
-    let span = tracing::debug_span!("rpc_req", id = %format!("{:016x}", request_id), from = peer_node_id);
+    let span =
+        tracing::debug_span!("rpc_req", id = %format!("{:016x}", request_id), from = peer_node_id);
     async {
         // Read the request outside the OnceCell so we can branch on it
         let request: IrohRequest = recv_message(&mut recv).await?;
@@ -166,21 +180,21 @@ async fn handle_stream(
                 };
 
                 if state.leader.node_id != my_node_id {
-                    let reject = encode_message(
-                        &IrohResponse::TransactionForwardNotLeader { view: state.view }
-                    )?;
+                    let reject = encode_message(&IrohResponse::TransactionForwardNotLeader {
+                        view: state.view,
+                    })?;
                     send_raw(&mut send, &reject).await?;
-                    send.finish().map_err(|e|
+                    send.finish().map_err(|e| {
                         IrohError::Transport(TransportError::StreamFailed(e.to_string()))
-                    )?;
+                    })?;
                     return Ok(());
                 }
                 if app_state.consensus_lock.try_lock().is_err() {
                     let reject = encode_message(&IrohResponse::TransactionForwardBusy)?;
                     send_raw(&mut send, &reject).await?;
-                    send.finish().map_err(|e|
+                    send.finish().map_err(|e| {
                         IrohError::Transport(TransportError::StreamFailed(e.to_string()))
-                    )?;
+                    })?;
                     return Ok(());
                 }
             }
@@ -201,7 +215,10 @@ async fn handle_stream(
         // All other requests: existing OnceCell dedup path
         let cell = {
             let mut cache = app_state.dedup_cache.lock().unwrap();
-            cache.entry(request_id).or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())).clone()
+            cache
+                .entry(request_id)
+                .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+                .clone()
         };
 
         // Schedule cleanup after TTL
@@ -212,70 +229,76 @@ async fn handle_stream(
         });
 
         // First caller processes; duplicates wait for the same result
-        let response_bytes = cell.get_or_try_init(|| async {
-            if app_state.test_mode {
-                if let IrohRequest::BallotSubmission(_) = &request {
-                    app_state.consensus_barriers.wait(
-                        crate::consensus::barriers::names::BEFORE_BALLOT_DISPATCH
-                    ).await;
-                }
-            }
-
-            let response = match request {
-                IrohRequest::Ping { nonce } => IrohResponse::Pong { nonce },
-                IrohRequest::FragmentHealthCheck(req) => {
-                    IrohResponse::FragmentHealthCheckResponse(
-                        crate::files::rpc::handle_fragment_health_check(req, &app_state.fragments_dir)
-                    )
-                }
-                IrohRequest::ViewDataFetch(req) => {
-                    crate::consensus::rpc::handle_view_data_request(req, &app_state)
-                }
-                IrohRequest::ViewPoll(_) => {
-                    crate::consensus::rpc::handle_view_poll_request(&app_state)
-                }
-                IrohRequest::TimeoutVoteBroadcast(req) => {
-                    crate::consensus::rpc::handle_timeout_vote_broadcast(req, &app_state).await
-                }
-                IrohRequest::TcBroadcast(req) => {
-                    crate::consensus::rpc::handle_tc_broadcast(req, &app_state).await
-                }
-                IrohRequest::QcBroadcast(req) => {
-                    crate::consensus::rpc::handle_qc_broadcast(req, &app_state).await
-                }
-                IrohRequest::BallotSubmission(req) => {
-                    crate::consensus::rpc::handle_ballot_request(req, &app_state).await
-                }
-                IrohRequest::TransactionForward(_) => unreachable!("handled above"),
-                IrohRequest::FragmentFetch(req) => {
-                    IrohResponse::FragmentFetchResponse(
-                        crate::files::rpc::handle_fragment_fetch(req, &app_state.fragments_dir)
-                    )
-                }
-                IrohRequest::FragmentStore(req) => {
-                    crate::files::rpc::handle_fragment_store(req, &app_state).await
-                }
-                IrohRequest::LatencyPing(req) => {
-                    IrohResponse::LatencyPong(
-                        crate::metrics::rpc::handle_latency_ping(req)
-                    )
-                }
-                IrohRequest::ThroughputUpload(_) => {
-                    IrohResponse::ThroughputAck(crate::metrics::rpc::ThroughputAckResponse)
-                }
-                IrohRequest::StorageQuery(_) => {
-                    crate::metrics::rpc::handle_storage_query(&app_state).await
-                }
-                IrohRequest::JoinDeliver(req) => {
-                    match crate::setup::process_join_info(&app_state, req.join_info).await {
-                        Ok(()) => IrohResponse::JoinAck(crate::setup::JoinAckResponse { success: true }),
-                        Err(e) => IrohResponse::Error { message: format!("join failed: {}", e) },
+        let response_bytes = cell
+            .get_or_try_init(|| async {
+                if app_state.test_mode {
+                    if let IrohRequest::BallotSubmission(_) = &request {
+                        app_state
+                            .consensus_barriers
+                            .wait(crate::consensus::barriers::names::BEFORE_BALLOT_DISPATCH)
+                            .await;
                     }
                 }
-            };
 
-            encode_message(&response)
-        }).await?;
+                let response = match request {
+                    IrohRequest::Ping { nonce } => IrohResponse::Pong { nonce },
+                    IrohRequest::FragmentHealthCheck(req) => {
+                        IrohResponse::FragmentHealthCheckResponse(
+                            crate::files::rpc::handle_fragment_health_check(
+                                req,
+                                &app_state.fragments_dir,
+                            ),
+                        )
+                    }
+                    IrohRequest::ViewDataFetch(req) => {
+                        crate::consensus::rpc::handle_view_data_request(req, &app_state)
+                    }
+                    IrohRequest::ViewPoll(_) => {
+                        crate::consensus::rpc::handle_view_poll_request(&app_state)
+                    }
+                    IrohRequest::TimeoutVoteBroadcast(req) => {
+                        crate::consensus::rpc::handle_timeout_vote_broadcast(req, &app_state).await
+                    }
+                    IrohRequest::TcBroadcast(req) => {
+                        crate::consensus::rpc::handle_tc_broadcast(req, &app_state).await
+                    }
+                    IrohRequest::QcBroadcast(req) => {
+                        crate::consensus::rpc::handle_qc_broadcast(req, &app_state).await
+                    }
+                    IrohRequest::BallotSubmission(req) => {
+                        crate::consensus::rpc::handle_ballot_request(req, &app_state).await
+                    }
+                    IrohRequest::TransactionForward(_) => unreachable!("handled above"),
+                    IrohRequest::FragmentFetch(req) => IrohResponse::FragmentFetchResponse(
+                        crate::files::rpc::handle_fragment_fetch(req, &app_state.fragments_dir),
+                    ),
+                    IrohRequest::FragmentStore(req) => {
+                        crate::files::rpc::handle_fragment_store(req, &app_state).await
+                    }
+                    IrohRequest::LatencyPing(req) => {
+                        IrohResponse::LatencyPong(crate::metrics::rpc::handle_latency_ping(req))
+                    }
+                    IrohRequest::ThroughputUpload(_) => {
+                        IrohResponse::ThroughputAck(crate::metrics::rpc::ThroughputAckResponse)
+                    }
+                    IrohRequest::StorageQuery(_) => {
+                        crate::metrics::rpc::handle_storage_query(&app_state).await
+                    }
+                    IrohRequest::JoinDeliver(req) => {
+                        match crate::setup::process_join_info(&app_state, req.join_info).await {
+                            Ok(()) => IrohResponse::JoinAck(crate::setup::JoinAckResponse {
+                                success: true,
+                            }),
+                            Err(e) => IrohResponse::Error {
+                                message: format!("join failed: {}", e),
+                            },
+                        }
+                    }
+                };
+
+                encode_message(&response)
+            })
+            .await?;
 
         // Send cached/computed response bytes
         send_raw(&mut send, response_bytes).await?;
@@ -283,5 +306,7 @@ async fn handle_stream(
             .map_err(|e| IrohError::Transport(TransportError::StreamFailed(e.to_string())))?;
 
         Ok(())
-    }.instrument(span).await
+    }
+    .instrument(span)
+    .await
 }

@@ -7832,7 +7832,10 @@ mod tests {
     fn test_normalize_passphrase_round_trip() {
         let passphrase = generate_passphrase();
         let normalized = normalize_passphrase(&passphrase);
-        assert_eq!(passphrase, normalized, "Already-normalized passphrase should survive round-trip");
+        assert_eq!(
+            passphrase, normalized,
+            "Already-normalized passphrase should survive round-trip"
+        );
     }
 
     #[test]
@@ -7840,6 +7843,9 @@ mod tests {
         let passphrase = generate_passphrase();
         let mangled = passphrase.to_uppercase().replace(' ', "   ");
         let normalized = normalize_passphrase(&mangled);
-        assert_eq!(normalized, passphrase, "Uppercased + extra-spaced passphrase should normalize to original");
+        assert_eq!(
+            normalized, passphrase,
+            "Uppercased + extra-spaced passphrase should normalize to original"
+        );
     }
 }

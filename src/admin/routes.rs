@@ -1,16 +1,19 @@
+use crate::AppState;
 use axum::{
+    Router,
     extract::{Extension, State},
     http::StatusCode,
     response::Json,
     routing::{get, post},
-    Router,
 };
-use crate::AppState;
 
 pub fn admin_routes() -> Router<AppState> {
     Router::new()
         .route("/system-nodes-baseline", get(get_system_nodes_baseline))
-        .route("/hypothetical-fault-tolerance", post(analyze_hypothetical_fault_tolerance))
+        .route(
+            "/hypothetical-fault-tolerance",
+            post(analyze_hypothetical_fault_tolerance),
+        )
 }
 
 /// POST /admin/hypothetical-fault-tolerance
@@ -23,7 +26,8 @@ async fn analyze_hypothetical_fault_tolerance(
 ) -> Result<Json<Vec<hopnet_common::db::FaultToleranceCurvePoint>>, StatusCode> {
     tracing::info!(
         "Hypothetical fault tolerance analysis requested by user {} for {} nodes",
-        uid, nodes.len()
+        uid,
+        nodes.len()
     );
 
     // Validate input
@@ -33,7 +37,10 @@ async fn analyze_hypothetical_fault_tolerance(
     }
 
     if nodes.len() > 1000 {
-        tracing::warn!("Too many nodes ({}) provided for hypothetical analysis", nodes.len());
+        tracing::warn!(
+            "Too many nodes ({}) provided for hypothetical analysis",
+            nodes.len()
+        );
         return Err(StatusCode::BAD_REQUEST);
     }
 
@@ -45,7 +52,8 @@ async fn analyze_hypothetical_fault_tolerance(
 
     tracing::info!(
         "Generated hypothetical fault tolerance curve with {} points for user {}",
-        curve.len(), uid
+        curve.len(),
+        uid
     );
 
     Ok(Json(curve))
@@ -59,8 +67,8 @@ async fn get_system_nodes_baseline(
     Extension(uid): Extension<i32>,
 ) -> Result<Json<Vec<hopnet_common::db::NodeStorageBaseline>>, StatusCode> {
     // Get current system nodes with their storage information
-    let nodes = crate::db::resilience::get_node_storage_baselines(state.db_pool.get())
-        .map_err(|e| {
+    let nodes =
+        crate::db::resilience::get_node_storage_baselines(state.db_pool.get()).map_err(|e| {
             tracing::error!("Failed to get system nodes baseline: {:?}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;

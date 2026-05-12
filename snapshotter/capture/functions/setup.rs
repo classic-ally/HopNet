@@ -5,7 +5,10 @@ use r2d2_sqlite::SqliteConnectionManager;
 
 use crate::schema::FunctionResult;
 
-pub fn capture(pool: &Pool<SqliteConnectionManager>, results: &mut BTreeMap<String, FunctionResult>) {
+pub fn capture(
+    pool: &Pool<SqliteConnectionManager>,
+    results: &mut BTreeMap<String, FunctionResult>,
+) {
     use hopnet::db::setup;
 
     results.insert("db::setup::get_initial_setup".into(), {

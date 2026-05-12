@@ -1,26 +1,14 @@
 use std::time::Duration;
 
-use axum::{
-    Extension,
-    extract::State,
-    response::IntoResponse,
-    http::StatusCode,
-    Json
-};
+use axum::{Extension, Json, extract::State, http::StatusCode, response::IntoResponse};
 use bincode::config;
 use serde::Deserialize;
 
-use crate::db::{PubKey, DatabaseError};
-use crate::{
-    consensus::{
-        types::Transaction
-    },
-    db::nodes,
-    types::Node
-};
 use crate::AppState;
+use crate::db::{DatabaseError, PubKey};
 use crate::net::protocol::{IrohRequest, IrohResponse};
-use crate::setup::{JoinDeliverRequest, JoinAckResponse};
+use crate::setup::{JoinAckResponse, JoinDeliverRequest};
+use crate::{consensus::types::Transaction, db::nodes, types::Node};
 
 /// API payload for adding a new node (no ip/port needed — iroh uses pubkey-based addressing)
 #[derive(Deserialize)]
@@ -30,15 +18,12 @@ pub struct NodeRegistration {
     pub pubkey: PubKey,
 }
 
-pub async fn get_nodes(
-    State(app_state): State<AppState>
-) -> impl IntoResponse {
+pub async fn get_nodes(State(app_state): State<AppState>) -> impl IntoResponse {
     match nodes::get_nodes(app_state.db_pool.get()) {
         Ok(nodes) => return (StatusCode::OK, Json(nodes)),
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(Vec::<Node>::new())),
     }
 }
-
 
 // route to add a new node
 pub async fn post_nodes(
@@ -46,10 +31,9 @@ pub async fn post_nodes(
     Extension(uid): Extension<i32>,
     Json(payload): Json<NodeRegistration>,
 ) -> impl IntoResponse {
-
     // check if uid matches requester
     if uid != payload.owner {
-        return StatusCode::FORBIDDEN
+        return StatusCode::FORBIDDEN;
     }
 
     // check if the session has user keys (our node needs to be set up)
@@ -78,7 +62,11 @@ pub async fn post_nodes(
                     tracing::warn!("Ping attempt {} failed (retrying): {}", attempt + 1, e);
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 } else {
-                    tracing::error!("Failed to reach new node via iroh after {} attempts: {}", attempt + 1, e);
+                    tracing::error!(
+                        "Failed to reach new node via iroh after {} attempts: {}",
+                        attempt + 1,
+                        e
+                    );
                 }
             }
         }
@@ -95,7 +83,7 @@ pub async fn post_nodes(
         Err(DatabaseError::LockError) => {
             tracing::warn!("Database connection pool exhausted during get_next_node_id");
             return StatusCode::TOO_MANY_REQUESTS;
-        },
+        }
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
     };
 
@@ -118,14 +106,19 @@ pub async fn post_nodes(
                 "insert_node".to_string(),
                 encoded_node,
                 uid,
-            ).await {
+            )
+            .await
+            {
                 Ok(tx) => tx,
                 Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
             };
             // Submit to consensus queue
             match app_state.consensus_queue.submit(transaction).await {
                 Ok(()) => {
-                    tracing::info!("Consensus succeeded for node {}, waiting for database commit", complete_node.node_id);
+                    tracing::info!(
+                        "Consensus succeeded for node {}, waiting for database commit",
+                        complete_node.node_id
+                    );
 
                     // Poll database to confirm node was committed before proceeding to sync
                     let mut attempts = 0;
@@ -135,30 +128,42 @@ pub async fn post_nodes(
                     loop {
                         match nodes::node_exists(app_state.db_pool.get(), complete_node.node_id) {
                             Ok(true) => {
-                                tracing::info!("Node {} confirmed in database after {} attempts", complete_node.node_id, attempts);
+                                tracing::info!(
+                                    "Node {} confirmed in database after {} attempts",
+                                    complete_node.node_id,
+                                    attempts
+                                );
                                 break;
-                            },
+                            }
                             Ok(false) => {
                                 attempts += 1;
                                 if attempts >= MAX_ATTEMPTS {
-                                    tracing::error!("Node {} was not committed to database after {} attempts", complete_node.node_id, MAX_ATTEMPTS);
+                                    tracing::error!(
+                                        "Node {} was not committed to database after {} attempts",
+                                        complete_node.node_id,
+                                        MAX_ATTEMPTS
+                                    );
                                     return StatusCode::INTERNAL_SERVER_ERROR;
                                 }
                                 tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
-                            },
+                            }
                             Err(e) => {
                                 tracing::error!("Database error checking node existence: {:?}", e);
                                 return StatusCode::INTERNAL_SERVER_ERROR;
                             }
                         }
                     }
-                },
+                }
                 Err(e) => {
-                    tracing::error!("Consensus failed for node {}: {:?}", complete_node.node_id, e);
+                    tracing::error!(
+                        "Consensus failed for node {}: {:?}",
+                        complete_node.node_id,
+                        e
+                    );
                     return StatusCode::INTERNAL_SERVER_ERROR;
                 }
             }
-        },
+        }
         Err(_) => {
             return StatusCode::INTERNAL_SERVER_ERROR;
         }
@@ -180,7 +185,7 @@ pub async fn post_nodes(
     // Get all active validators for bootstrap list
     let bootstrap_validators = match crate::db::consensus::get_validators(
         app_state.db_pool.get(),
-        consensus_state.committed_block.data.height
+        consensus_state.committed_block.data.height,
     ) {
         Ok(validators) => validators,
         Err(e) => {
@@ -206,12 +211,16 @@ pub async fn post_nodes(
     );
 
     let req = IrohRequest::JoinDeliver(JoinDeliverRequest { join_info });
-    match app_state.iroh_transport.request(
-        complete_node.node_id,
-        peer_iroh_id,
-        &req,
-        Duration::from_secs(30),
-    ).await {
+    match app_state
+        .iroh_transport
+        .request(
+            complete_node.node_id,
+            peer_iroh_id,
+            &req,
+            Duration::from_secs(30),
+        )
+        .await
+    {
         Ok(IrohResponse::JoinAck(ack)) if ack.success => {
             tracing::info!(
                 "Node {} accepted JoinInfo, catch-up running in background",
@@ -220,17 +229,28 @@ pub async fn post_nodes(
             StatusCode::CREATED
         }
         Ok(IrohResponse::Error { message }) => {
-            tracing::error!("Node {} rejected JoinInfo: {}", complete_node.node_id, message);
+            tracing::error!(
+                "Node {} rejected JoinInfo: {}",
+                complete_node.node_id,
+                message
+            );
             StatusCode::BAD_GATEWAY
         }
         Ok(other) => {
-            tracing::error!("Unexpected response from node {}: {:?}", complete_node.node_id, other);
+            tracing::error!(
+                "Unexpected response from node {}: {:?}",
+                complete_node.node_id,
+                other
+            );
             StatusCode::BAD_GATEWAY
         }
         Err(e) => {
-            tracing::error!("Failed to send JoinInfo to node {}: {}", complete_node.node_id, e);
+            tracing::error!(
+                "Failed to send JoinInfo to node {}: {}",
+                complete_node.node_id,
+                e
+            );
             StatusCode::GATEWAY_TIMEOUT
         }
     }
-
 }

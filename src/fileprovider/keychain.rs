@@ -2,14 +2,14 @@
 //! Stores API key and base URL securely for FileProvider extension access
 
 #[cfg(target_os = "macos")]
+use security_framework::base::Error as SecurityError;
+#[cfg(target_os = "macos")]
 use security_framework::os::macos::keychain::SecKeychain;
 #[cfg(target_os = "macos")]
 use security_framework::os::macos::passwords::find_generic_password;
-#[cfg(target_os = "macos")]
-use security_framework::base::Error as SecurityError;
 use std::error::Error;
 use std::fmt;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 /// Keychain service names
 const HOPNET_SERVICE: &str = "com.hopnet.desktop.fileprovider";
@@ -89,15 +89,21 @@ impl FileProviderConfig {
 
 /// Store FileProvider configuration in the keychain
 #[cfg(target_os = "macos")]
-pub fn store_config(config: &FileProviderConfig, env: KeychainEnvironment) -> Result<(), KeychainError> {
-    info!("Storing FileProvider configuration in keychain (env: {:?})", env);
-    
+pub fn store_config(
+    config: &FileProviderConfig,
+    env: KeychainEnvironment,
+) -> Result<(), KeychainError> {
+    info!(
+        "Storing FileProvider configuration in keychain (env: {:?})",
+        env
+    );
+
     // Store API key
     store_keychain_item(env, API_KEY_ACCOUNT, &config.api_key)?;
-    
+
     // Store base URL
     store_keychain_item(env, BASE_URL_ACCOUNT, &config.base_url)?;
-    
+
     info!("FileProvider configuration stored successfully");
     Ok(())
 }
@@ -105,23 +111,34 @@ pub fn store_config(config: &FileProviderConfig, env: KeychainEnvironment) -> Re
 /// Load FileProvider configuration from the keychain
 #[cfg(target_os = "macos")]
 pub fn load_config(env: KeychainEnvironment) -> Result<FileProviderConfig, KeychainError> {
-    info!("Loading FileProvider configuration from keychain (env: {:?})", env);
-    
+    info!(
+        "Loading FileProvider configuration from keychain (env: {:?})",
+        env
+    );
+
     let api_key = load_keychain_item(env, API_KEY_ACCOUNT)?;
     let base_url = load_keychain_item(env, BASE_URL_ACCOUNT)?;
-    
+
     Ok(FileProviderConfig::new(api_key, base_url))
 }
 
 /// Store a single item in the keychain
 #[cfg(target_os = "macos")]
-fn store_keychain_item(env: KeychainEnvironment, account: &str, value: &str) -> Result<(), KeychainError> {
+fn store_keychain_item(
+    env: KeychainEnvironment,
+    account: &str,
+    value: &str,
+) -> Result<(), KeychainError> {
     let service = env.service_name();
-    tracing::debug!("Storing keychain item: service={}, account={}", service, account);
-    
+    tracing::debug!(
+        "Storing keychain item: service={}, account={}",
+        service,
+        account
+    );
+
     let keychain = SecKeychain::default()?;
     tracing::debug!("Using default keychain");
-    
+
     // Use set_generic_password which handles both create and update
     match keychain.set_generic_password(service, account, value.as_bytes()) {
         Ok(_) => {
@@ -139,20 +156,28 @@ fn store_keychain_item(env: KeychainEnvironment, account: &str, value: &str) -> 
 #[cfg(target_os = "macos")]
 fn load_keychain_item(env: KeychainEnvironment, account: &str) -> Result<String, KeychainError> {
     let service = env.service_name();
-    tracing::debug!("Loading keychain item: service={}, account={}", service, account);
-    
+    tracing::debug!(
+        "Loading keychain item: service={}, account={}",
+        service,
+        account
+    );
+
     let keychain = SecKeychain::default()?;
     tracing::debug!("Using default keychain");
-    
+
     match keychain.find_generic_password(service, account) {
         Ok((password_data, _item)) => {
             tracing::debug!("Successfully loaded keychain item for account: {}", account);
-            
+
             String::from_utf8(password_data.as_ref().to_vec())
                 .map_err(|_| KeychainError::InvalidData)
         }
         Err(e) => {
-            tracing::error!("Failed to load keychain item for account {}: {}", account, e);
+            tracing::error!(
+                "Failed to load keychain item for account {}: {}",
+                account,
+                e
+            );
             Err(e.into())
         }
     }
@@ -170,12 +195,15 @@ pub fn update_base_url(base_url: &str, env: KeychainEnvironment) -> Result<(), K
 /// Remove FileProvider configuration from keychain
 #[cfg(target_os = "macos")]
 pub fn remove_config(env: KeychainEnvironment) -> Result<(), KeychainError> {
-    info!("Removing FileProvider configuration from keychain (env: {:?})", env);
-    
+    info!(
+        "Removing FileProvider configuration from keychain (env: {:?})",
+        env
+    );
+
     // Remove both items, don't fail if they don't exist
     let _ = remove_keychain_item(env, API_KEY_ACCOUNT);
     let _ = remove_keychain_item(env, BASE_URL_ACCOUNT);
-    
+
     info!("FileProvider configuration removed");
     Ok(())
 }
@@ -197,15 +225,23 @@ fn remove_keychain_item(env: KeychainEnvironment, account: &str) -> Result<(), K
 
 /// Store a keychain item with a specific service name and binary data
 #[cfg(target_os = "macos")]
-fn store_keychain_item_with_service(service: &str, account: &str, value: &[u8]) -> Result<(), KeychainError> {
+fn store_keychain_item_with_service(
+    service: &str,
+    account: &str,
+    value: &[u8],
+) -> Result<(), KeychainError> {
     let keychain = SecKeychain::default()?;
-    keychain.set_generic_password(service, account, value)
+    keychain
+        .set_generic_password(service, account, value)
         .map_err(|e| KeychainError::SecurityFramework(e))
 }
 
 /// Load a keychain item with a specific service name, returning raw bytes
 #[cfg(target_os = "macos")]
-fn load_keychain_item_bytes_with_service(service: &str, account: &str) -> Result<Vec<u8>, KeychainError> {
+fn load_keychain_item_bytes_with_service(
+    service: &str,
+    account: &str,
+) -> Result<Vec<u8>, KeychainError> {
     let keychain = SecKeychain::default()?;
     match keychain.find_generic_password(service, account) {
         Ok((password_data, _item)) => Ok(password_data.as_ref().to_vec()),
@@ -224,7 +260,11 @@ fn remove_keychain_item_with_service(service: &str, account: &str) -> Result<(),
 
 /// Store the node owner's session key in keychain for auto-login on restart
 #[cfg(target_os = "macos")]
-pub fn store_session_key(env: KeychainEnvironment, user_id: i32, privkey_bytes: &[u8]) -> Result<(), KeychainError> {
+pub fn store_session_key(
+    env: KeychainEnvironment,
+    user_id: i32,
+    privkey_bytes: &[u8],
+) -> Result<(), KeychainError> {
     let service = env.session_service_name();
     store_keychain_item_with_service(service, SESSION_PRIVKEY_ACCOUNT, privkey_bytes)?;
     store_keychain_item_with_service(service, SESSION_USERID_ACCOUNT, &user_id.to_le_bytes())?;

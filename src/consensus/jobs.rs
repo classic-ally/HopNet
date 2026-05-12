@@ -1,8 +1,10 @@
-use std::time::Duration;
 use crate::AppState;
-use crate::db::consensus as db;
 use crate::consensus::functions::issue_timeout_vote;
-use crate::consensus::routes::{ensure_caught_up_and_active, CatchUpMode, NodeReadiness, SyncStatus};
+use crate::consensus::routes::{
+    CatchUpMode, NodeReadiness, SyncStatus, ensure_caught_up_and_active,
+};
+use crate::db::consensus as db;
+use std::time::Duration;
 
 const TIMEOUT_DURATION: Duration = Duration::from_secs(60);
 const REISSUE_INTERVAL: Duration = Duration::from_secs(60);
@@ -37,8 +39,12 @@ pub async fn timeout_detector(app_state: AppState) {
         }
 
         // Ensure caught up and active before issuing timeout vote
-        match ensure_caught_up_and_active(&app_state, CatchUpMode::Convergence, true, 0, None).await {
-            Ok(NodeReadiness { sync_status: SyncStatus::CaughtUp, is_active: true }) => {
+        match ensure_caught_up_and_active(&app_state, CatchUpMode::Convergence, true, 0, None).await
+        {
+            Ok(NodeReadiness {
+                sync_status: SyncStatus::CaughtUp,
+                is_active: true,
+            }) => {
                 let mut conn = match app_state.db_pool.get() {
                     Ok(c) => c,
                     Err(_) => continue,

@@ -1,18 +1,18 @@
 use anyhow::Result;
 use bollard::Docker;
 use reqwest::Client;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio_stream::StreamExt;
 
-use crate::tests::{Check, TestResult, TestScenario, print_and_add_check};
-use crate::tests::files::{
-    upload_file, wait_for_fragment_distribution, trigger_fragment_inventory_sync_all,
-    get_fragment_distribution,
-};
-use crate::tests::{get_max_view, wait_for_minimum_view};
 use crate::NodeInfo;
+use crate::tests::files::{
+    get_fragment_distribution, trigger_fragment_inventory_sync_all, upload_file,
+    wait_for_fragment_distribution,
+};
+use crate::tests::{Check, TestResult, TestScenario, print_and_add_check};
+use crate::tests::{get_max_view, wait_for_minimum_view};
 
 /// Monitor Docker container memory usage in the background
 /// Returns a handle that tracks peak memory usage in MB
@@ -24,10 +24,15 @@ async fn monitor_container_memory(
 ) {
     while stop_signal.load(Ordering::Relaxed) == 0 {
         // Get container stats
-        let mut stats_stream = docker.stats(&container_name, Some(bollard::query_parameters::StatsOptionsBuilder::new()
-            .stream(false)
-            .one_shot(true)
-            .build()));
+        let mut stats_stream = docker.stats(
+            &container_name,
+            Some(
+                bollard::query_parameters::StatsOptionsBuilder::new()
+                    .stream(false)
+                    .one_shot(true)
+                    .build(),
+            ),
+        );
 
         if let Some(Ok(stats)) = stats_stream.next().await {
             if let Some(memory_stats) = stats.memory_stats {
@@ -81,10 +86,16 @@ fn generate_test_data(size_mb: usize) -> Vec<u8> {
 }
 
 /// Download a file from a specific node and measure Time To First Chunk (TTFC) and total time
-async fn download_file_with_ttfb(node: &NodeInfo, path: &str) -> Result<(Vec<u8>, Duration, Duration)> {
+async fn download_file_with_ttfb(
+    node: &NodeInfo,
+    path: &str,
+) -> Result<(Vec<u8>, Duration, Duration)> {
     let client = Client::new();
     let path_trimmed = path.strip_prefix('/').unwrap_or(path);
-    let url = format!("http://{}:{}/files/{}", node.ip_address, node.port, path_trimmed);
+    let url = format!(
+        "http://{}:{}/files/{}",
+        node.ip_address, node.port, path_trimmed
+    );
 
     let start = Instant::now();
 
@@ -96,7 +107,10 @@ async fn download_file_with_ttfb(node: &NodeInfo, path: &str) -> Result<(Vec<u8>
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_else(|_| "No body".to_string());
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "No body".to_string());
         anyhow::bail!("Download failed with status {}: {}", status, body);
     }
 
@@ -104,8 +118,11 @@ async fn download_file_with_ttfb(node: &NodeInfo, path: &str) -> Result<(Vec<u8>
     let mut data = Vec::new();
     let mut ttfc = None;
 
-    while let Some(chunk) = response.chunk().await
-        .map_err(|e| anyhow::anyhow!("Failed to read chunk: {}", e))? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to read chunk: {}", e))?
+    {
         // Measure TTFC - time to first actual data chunk (not just headers)
         if ttfc.is_none() {
             ttfc = Some(start.elapsed());
@@ -152,11 +169,14 @@ impl TestScenario for ChunkedStreamingPerformance {
         println!("\nRunning checks:");
 
         if nodes.len() < 2 {
-            print_and_add_check(&mut result, Check {
-                name: "Test requires at least 2 nodes".to_string(),
-                passed: false,
-                detail: Some(format!("Only {} node(s) available", nodes.len())),
-            });
+            print_and_add_check(
+                &mut result,
+                Check {
+                    name: "Test requires at least 2 nodes".to_string(),
+                    passed: false,
+                    detail: Some(format!("Only {} node(s) available", nodes.len())),
+                },
+            );
             result.duration = start.elapsed();
             return Ok(result);
         }
@@ -183,27 +203,36 @@ impl TestScenario for ChunkedStreamingPerformance {
         let full_path = format!("{}{}", test_path, test_filename);
 
         // Step 1: Get current consensus view
-        print_and_add_check(&mut result, Check {
-            name: "Get initial consensus view".to_string(),
-            passed: true,
-            detail: None,
-        });
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Get initial consensus view".to_string(),
+                passed: true,
+                detail: None,
+            },
+        );
 
         let current_max_view = match get_max_view(nodes).await {
             Ok(view) => {
-                print_and_add_check(&mut result, Check {
-                    name: format!("Initial max view across nodes: {}", view),
-                    passed: true,
-                    detail: None,
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: format!("Initial max view across nodes: {}", view),
+                        passed: true,
+                        detail: None,
+                    },
+                );
                 view
             }
             Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Failed to get max view".to_string(),
-                    passed: false,
-                    detail: Some(e.to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Failed to get max view".to_string(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
                 result.duration = start.elapsed();
                 return Ok(result);
             }
@@ -223,7 +252,8 @@ impl TestScenario for ChunkedStreamingPerformance {
             let peak_memory = upload_peak_memory.clone();
             let stop_signal = upload_stop_signal.clone();
             tokio::spawn(async move {
-                monitor_container_memory(docker_clone, container_name, peak_memory, stop_signal).await;
+                monitor_container_memory(docker_clone, container_name, peak_memory, stop_signal)
+                    .await;
             })
         };
 
@@ -238,30 +268,46 @@ impl TestScenario for ChunkedStreamingPerformance {
 
                 let peak_mb = upload_peak_memory.load(Ordering::Relaxed);
 
-                print_and_add_check(&mut result, Check {
-                    name: format!("Upload {} ({} MB)", test_filename, test_size_mb),
-                    passed: true,
-                    detail: Some(format!("Completed in {:.2}s", upload_duration.as_secs_f64())),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: format!("Upload {} ({} MB)", test_filename, test_size_mb),
+                        passed: true,
+                        detail: Some(format!(
+                            "Completed in {:.2}s",
+                            upload_duration.as_secs_f64()
+                        )),
+                    },
+                );
 
                 // Check upload memory boundedness (streaming upload with RS encoding)
                 let upload_memory_ok = peak_mb <= 650;
-                print_and_add_check(&mut result, Check {
-                    name: "Upload memory bounded".to_string(),
-                    passed: upload_memory_ok,
-                    detail: Some(format!(
-                        "Peak {} MB (limit: 650 MB) {}",
-                        peak_mb,
-                        if upload_memory_ok { "✓" } else { "✗ Too high!" }
-                    )),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Upload memory bounded".to_string(),
+                        passed: upload_memory_ok,
+                        detail: Some(format!(
+                            "Peak {} MB (limit: 650 MB) {}",
+                            peak_mb,
+                            if upload_memory_ok {
+                                "✓"
+                            } else {
+                                "✗ Too high!"
+                            }
+                        )),
+                    },
+                );
             }
             Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Upload failed".to_string(),
-                    passed: false,
-                    detail: Some(e.to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Upload failed".to_string(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
                 result.duration = start.elapsed();
                 return Ok(result);
             }
@@ -273,27 +319,39 @@ impl TestScenario for ChunkedStreamingPerformance {
 
         match wait_for_minimum_view(nodes, target_view, wait_timeout).await {
             Ok(true) => {
-                print_and_add_check(&mut result, Check {
-                    name: format!("All nodes reached view {}", target_view),
-                    passed: true,
-                    detail: None,
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: format!("All nodes reached view {}", target_view),
+                        passed: true,
+                        detail: None,
+                    },
+                );
             }
             Ok(false) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Timeout waiting for consensus".to_string(),
-                    passed: false,
-                    detail: Some(format!("Not all nodes reached view {} within {:?}", target_view, wait_timeout)),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Timeout waiting for consensus".to_string(),
+                        passed: false,
+                        detail: Some(format!(
+                            "Not all nodes reached view {} within {:?}",
+                            target_view, wait_timeout
+                        )),
+                    },
+                );
                 result.duration = start.elapsed();
                 return Ok(result);
             }
             Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Error waiting for consensus".to_string(),
-                    passed: false,
-                    detail: Some(e.to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Error waiting for consensus".to_string(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
                 result.duration = start.elapsed();
                 return Ok(result);
             }
@@ -305,23 +363,30 @@ impl TestScenario for ChunkedStreamingPerformance {
             println!("  ℹ️  wait-for-distribution flag set, waiting for fragment distribution...");
 
             let distribution_timeout = Duration::from_secs(120);
-            match wait_for_fragment_distribution(&nodes[0], &full_path, distribution_timeout).await {
+            match wait_for_fragment_distribution(&nodes[0], &full_path, distribution_timeout).await
+            {
                 Ok(dist) => {
-                    print_and_add_check(&mut result, Check {
-                        name: format!("Fragment distribution completed"),
-                        passed: true,
-                        detail: Some(format!(
-                            "{} fragments at height {:?}",
-                            dist.fragment_count, dist.placement_height
-                        )),
-                    });
+                    print_and_add_check(
+                        &mut result,
+                        Check {
+                            name: format!("Fragment distribution completed"),
+                            passed: true,
+                            detail: Some(format!(
+                                "{} fragments at height {:?}",
+                                dist.fragment_count, dist.placement_height
+                            )),
+                        },
+                    );
                 }
                 Err(e) => {
-                    print_and_add_check(&mut result, Check {
-                        name: "Fragment distribution timeout or failed".to_string(),
-                        passed: false,
-                        detail: Some(e.to_string()),
-                    });
+                    print_and_add_check(
+                        &mut result,
+                        Check {
+                            name: "Fragment distribution timeout or failed".to_string(),
+                            passed: false,
+                            detail: Some(e.to_string()),
+                        },
+                    );
                     result.duration = start.elapsed();
                     return Ok(result);
                 }
@@ -330,18 +395,27 @@ impl TestScenario for ChunkedStreamingPerformance {
             // Also trigger fragment inventory sync and wait for settling
             match trigger_fragment_inventory_sync_all(nodes).await {
                 Ok(_) => {
-                    print_and_add_check(&mut result, Check {
-                        name: format!("Trigger fragment inventory sync on all {} nodes", nodes.len()),
-                        passed: true,
-                        detail: Some("Ensuring fragments are inventoried".to_string()),
-                    });
+                    print_and_add_check(
+                        &mut result,
+                        Check {
+                            name: format!(
+                                "Trigger fragment inventory sync on all {} nodes",
+                                nodes.len()
+                            ),
+                            passed: true,
+                            detail: Some("Ensuring fragments are inventoried".to_string()),
+                        },
+                    );
                 }
                 Err(e) => {
-                    print_and_add_check(&mut result, Check {
-                        name: "Fragment inventory sync failed".to_string(),
-                        passed: false,
-                        detail: Some(e.to_string()),
-                    });
+                    print_and_add_check(
+                        &mut result,
+                        Check {
+                            name: "Fragment inventory sync failed".to_string(),
+                            passed: false,
+                            detail: Some(e.to_string()),
+                        },
+                    );
                     result.duration = start.elapsed();
                     return Ok(result);
                 }
@@ -352,7 +426,12 @@ impl TestScenario for ChunkedStreamingPerformance {
             let mut settled = false;
             while settle_start.elapsed() < settle_timeout {
                 if let Ok(dist) = get_fragment_distribution(&nodes[0], &full_path).await {
-                    if !dist.fragments.is_empty() && dist.fragments.iter().all(|f| !f.nodes_with_fragment.is_empty()) {
+                    if !dist.fragments.is_empty()
+                        && dist
+                            .fragments
+                            .iter()
+                            .all(|f| !f.nodes_with_fragment.is_empty())
+                    {
                         settled = true;
                         break;
                     }
@@ -361,17 +440,29 @@ impl TestScenario for ChunkedStreamingPerformance {
             }
 
             if settled {
-                print_and_add_check(&mut result, Check {
-                    name: "Fragment inventory settled".to_string(),
-                    passed: true,
-                    detail: Some(format!("All fragments have inventory data after {:.1}s", settle_start.elapsed().as_secs_f64())),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Fragment inventory settled".to_string(),
+                        passed: true,
+                        detail: Some(format!(
+                            "All fragments have inventory data after {:.1}s",
+                            settle_start.elapsed().as_secs_f64()
+                        )),
+                    },
+                );
             } else {
-                print_and_add_check(&mut result, Check {
-                    name: "Fragment inventory sync timeout".to_string(),
-                    passed: false,
-                    detail: Some(format!("Not all fragments had inventory data within {}s", settle_timeout.as_secs())),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Fragment inventory sync timeout".to_string(),
+                        passed: false,
+                        detail: Some(format!(
+                            "Not all fragments had inventory data within {}s",
+                            settle_timeout.as_secs()
+                        )),
+                    },
+                );
                 result.duration = start.elapsed();
                 return Ok(result);
             }
@@ -381,7 +472,10 @@ impl TestScenario for ChunkedStreamingPerformance {
         // This forces distributed fragment reconstruction
         let last_node = &nodes[nodes.len() - 1];
         let last_node_id = nodes.len() - 1;
-        println!("  ℹ️  Downloading from node {} (last) to test distributed reconstruction...", last_node_id);
+        println!(
+            "  ℹ️  Downloading from node {} (last) to test distributed reconstruction...",
+            last_node_id
+        );
 
         // Start memory monitoring for download node (last node)
         let download_peak_memory = Arc::new(AtomicU64::new(0));
@@ -394,7 +488,8 @@ impl TestScenario for ChunkedStreamingPerformance {
             let peak_memory = download_peak_memory.clone();
             let stop_signal = download_stop_signal.clone();
             tokio::spawn(async move {
-                monitor_container_memory(docker_clone, container_name, peak_memory, stop_signal).await;
+                monitor_container_memory(docker_clone, container_name, peak_memory, stop_signal)
+                    .await;
             })
         };
 
@@ -410,45 +505,60 @@ impl TestScenario for ChunkedStreamingPerformance {
                 let downloaded_hash = blake3::hash(&downloaded_data);
                 let content_match = downloaded_hash == expected_hash;
 
-                print_and_add_check(&mut result, Check {
-                    name: format!("Download file from node {} ({} MB)", nodes.len() - 1, test_size_mb),
-                    passed: size_match && content_match,
-                    detail: Some(format!(
-                        "Downloaded {} bytes (expected {}), hash {}",
-                        downloaded_data.len(),
-                        expected_size,
-                        if content_match { "matches" } else { "mismatch!" }
-                    )),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: format!(
+                            "Download file from node {} ({} MB)",
+                            nodes.len() - 1,
+                            test_size_mb
+                        ),
+                        passed: size_match && content_match,
+                        detail: Some(format!(
+                            "Downloaded {} bytes (expected {}), hash {}",
+                            downloaded_data.len(),
+                            expected_size,
+                            if content_match {
+                                "matches"
+                            } else {
+                                "mismatch!"
+                            }
+                        )),
+                    },
+                );
 
                 // Check TTFC is reasonable
                 // With chunked RS (40MB chunks), TTFC should be < 10 seconds even for large files
                 // This is because streaming starts after first chunk is reconstructed
                 let ttfc_passed = ttfc_secs < 10.0;
 
-                print_and_add_check(&mut result, Check {
-                    name: "Time To First Chunk (TTFC)".to_string(),
-                    passed: ttfc_passed,
-                    detail: Some(format!(
-                        "{:.3}s (target: < 10.0s) {}",
-                        ttfc_secs,
-                        if ttfc_passed { "✓" } else { "✗ Too slow!" }
-                    )),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Time To First Chunk (TTFC)".to_string(),
+                        passed: ttfc_passed,
+                        detail: Some(format!(
+                            "{:.3}s (target: < 10.0s) {}",
+                            ttfc_secs,
+                            if ttfc_passed { "✓" } else { "✗ Too slow!" }
+                        )),
+                    },
+                );
 
                 // Calculate throughput
                 let throughput_mbps = (test_size_mb as f64) / total_secs;
 
-                print_and_add_check(&mut result, Check {
-                    name: "Download throughput".to_string(),
-                    passed: true,
-                    detail: Some(format!(
-                        "{:.2} MB/s (total time: {:.2}s for {} MB)",
-                        throughput_mbps,
-                        total_secs,
-                        test_size_mb
-                    )),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Download throughput".to_string(),
+                        passed: true,
+                        detail: Some(format!(
+                            "{:.2} MB/s (total time: {:.2}s for {} MB)",
+                            throughput_mbps, total_secs, test_size_mb
+                        )),
+                    },
+                );
 
                 // Stop download memory monitoring
                 download_stop_signal.store(1, Ordering::Relaxed);
@@ -458,28 +568,47 @@ impl TestScenario for ChunkedStreamingPerformance {
 
                 // Check download memory boundedness (streaming reconstruction with chunked RS)
                 let download_memory_ok = download_peak_mb <= 900;
-                print_and_add_check(&mut result, Check {
-                    name: "Download memory bounded".to_string(),
-                    passed: download_memory_ok,
-                    detail: Some(format!(
-                        "Peak {} MB (limit: 900 MB) {}",
-                        download_peak_mb,
-                        if download_memory_ok { "✓" } else { "✗ Too high!" }
-                    )),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Download memory bounded".to_string(),
+                        passed: download_memory_ok,
+                        detail: Some(format!(
+                            "Peak {} MB (limit: 900 MB) {}",
+                            download_peak_mb,
+                            if download_memory_ok {
+                                "✓"
+                            } else {
+                                "✗ Too high!"
+                            }
+                        )),
+                    },
+                );
 
                 if ttfc_passed {
-                    println!("  💡 TTFC {:.3}s demonstrates chunked streaming is working!", ttfc_secs);
-                    println!("      (Without chunked RS, TTFC would require reconstructing entire {:.1}GB file)", test_size_mb as f64 / 1024.0);
-                    println!("  💡 Throughput: {:.2} MB/s with distributed reconstruction", throughput_mbps);
+                    println!(
+                        "  💡 TTFC {:.3}s demonstrates chunked streaming is working!",
+                        ttfc_secs
+                    );
+                    println!(
+                        "      (Without chunked RS, TTFC would require reconstructing entire {:.1}GB file)",
+                        test_size_mb as f64 / 1024.0
+                    );
+                    println!(
+                        "  💡 Throughput: {:.2} MB/s with distributed reconstruction",
+                        throughput_mbps
+                    );
                 }
             }
             Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Download failed".to_string(),
-                    passed: false,
-                    detail: Some(e.to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Download failed".to_string(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
             }
         }
 

@@ -1,5 +1,5 @@
-use serde::{Serialize, Deserialize};
 use hopnet_common::OnboardingFlags;
+use serde::{Deserialize, Serialize};
 
 /// Consensus payload for updating a user's profile fields.
 /// For each field: None = no change, Some(None) = clear, Some(Some(v)) = set.

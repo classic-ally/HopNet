@@ -1,8 +1,16 @@
-use crate::{AppState, db::{DatabaseError, CustomUUID, fragments::{find_orphaned_data_blocks, get_node_availability_classification, AvailabilityClass}}};
+use crate::{
+    AppState,
+    db::{
+        CustomUUID, DatabaseError,
+        fragments::{
+            AvailabilityClass, find_orphaned_data_blocks, get_node_availability_classification,
+        },
+    },
+};
 use apalis::prelude::*;
 use chrono::Utc;
-use uuid::{Timestamp, timestamp::context::NoContext};
 use std::sync::Arc;
+use uuid::{Timestamp, timestamp::context::NoContext};
 
 #[derive(Debug)]
 pub enum MaintenanceError {
@@ -19,43 +27,64 @@ impl From<DatabaseError> for MaintenanceError {
 
 /// Manual trigger for orphaned data block cleanup  
 /// Initially only supports manual trigger - threshold checking and scheduling to be added later
-pub async fn handle_orphaned_data_block_cleanup(job: TaskId, ctx: Data<AppState>) -> Result<(), Error> {
+pub async fn handle_orphaned_data_block_cleanup(
+    job: TaskId,
+    ctx: Data<AppState>,
+) -> Result<(), Error> {
     // Use default values for scheduled jobs
-    run_orphaned_data_block_cleanup(&ctx, 50, 30).await.map(|_| ())
+    run_orphaned_data_block_cleanup(&ctx, 50, 30)
+        .await
+        .map(|_| ())
 }
 
 /// Core cleanup logic that can be called from job handler or manual trigger
-pub async fn run_orphaned_data_block_cleanup(app_state: &AppState, batch_size: i32, retention_days: i64) -> Result<usize, Error> {
+pub async fn run_orphaned_data_block_cleanup(
+    app_state: &AppState,
+    batch_size: i32,
+    retention_days: i64,
+) -> Result<usize, Error> {
     tracing::info!("Starting orphaned data block cleanup");
-    
+
     // Pre-flight check: Ensure no active takeouts are in progress
     match crate::db::takeout::has_active_takeout(app_state.db_pool.get(), None) {
         Ok(true) => {
             let error_msg = "Cannot run orphaned data cleanup: active takeout(s) in progress. Wait for takeouts to expire or complete before running cleanup.";
             tracing::warn!("{}", error_msg);
-            return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(std::io::ErrorKind::Other, error_msg)))));
+            return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                error_msg,
+            )))));
         }
         Ok(false) => {
             tracing::info!("Pre-flight check passed: no active takeouts found");
         }
         Err(e) => {
-            tracing::error!("Failed to check for active takeouts before cleanup: {:?}", e);
-            return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Failed to check active takeouts")))));
+            tracing::error!(
+                "Failed to check for active takeouts before cleanup: {:?}",
+                e
+            );
+            return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Failed to check active takeouts",
+            )))));
         }
     }
-    
+
     // Get node ID for availability classification
     let node_id = match app_state.get_node_id() {
         Ok(id) => id,
         Err(_) => {
             tracing::error!("Node ID not initialized, cannot run cleanup");
-            return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Node ID not initialized")))));
+            return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Node ID not initialized",
+            )))));
         }
     };
-    
+
     // Get database connection
     let db_connection = app_state.db_pool.get();
-    
+
     // Determine cleanup strategy based on availability
     let (node_availability, availability_class) = match get_node_availability_classification(
         db_connection,
@@ -65,16 +94,19 @@ pub async fn run_orphaned_data_block_cleanup(app_state: &AppState, batch_size: i
         Ok((avail, class)) => (avail, class),
         Err(e) => {
             tracing::error!("Failed to determine node availability: {:?}", e);
-            return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to determine node availability: {:?}", e))))));
+            return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to determine node availability: {:?}", e),
+            )))));
         }
     };
-    
+
     tracing::info!(
-        "Node availability: {:.1}%, classification: {:?}", 
-        node_availability * 100.0, 
+        "Node availability: {:.1}%, classification: {:?}",
+        node_availability * 100.0,
         availability_class
     );
-    
+
     // For now, implement only historical data cleanup (Stage 1 for below-average nodes)
     // Redundant copy cleanup to be implemented later
     match availability_class {
@@ -83,7 +115,9 @@ pub async fn run_orphaned_data_block_cleanup(app_state: &AppState, batch_size: i
             cleanup_orphaned_data_blocks(app_state, node_id, batch_size, retention_days).await
         }
         AvailabilityClass::AboveAverage => {
-            tracing::info!("Above-average availability node: would clean redundant copies first (not implemented yet)");
+            tracing::info!(
+                "Above-average availability node: would clean redundant copies first (not implemented yet)"
+            );
             // TODO: Implement redundant copy cleanup
             // For now, also clean historical data
             cleanup_orphaned_data_blocks(app_state, node_id, batch_size, retention_days).await
@@ -98,92 +132,118 @@ async fn cleanup_orphaned_data_blocks(
     retention_days: i64,
 ) -> Result<usize, Error> {
     let mut total_cleaned = 0;
-    
+
     // Generate cutoff UUID for retention policy
-    let cutoff_uuid = generate_cutoff_uuid(retention_days)
-        .map_err(|e| {
-            tracing::error!("Failed to generate cutoff UUID: {:?}", e);
-            Error::Failed(Arc::new(Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to generate cutoff UUID: {:?}", e)))))
-        })?;
-    
-    tracing::info!("Using {}-day retention policy, batch size: {}, cutoff UUID: {}", retention_days, batch_size, cutoff_uuid);
-    
+    let cutoff_uuid = generate_cutoff_uuid(retention_days).map_err(|e| {
+        tracing::error!("Failed to generate cutoff UUID: {:?}", e);
+        Error::Failed(Arc::new(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Failed to generate cutoff UUID: {:?}", e),
+        ))))
+    })?;
+
+    tracing::info!(
+        "Using {}-day retention policy, batch size: {}, cutoff UUID: {}",
+        retention_days,
+        batch_size,
+        cutoff_uuid
+    );
+
     loop {
         // Get database connection for this batch
         let db_connection = app_state.db_pool.get();
-        
+
         // Find batch of orphaned data blocks
-        let data_block_ids = match find_orphaned_data_blocks(db_connection, &cutoff_uuid, batch_size) {
-            Ok(ids) => ids,
-            Err(e) => {
-                tracing::error!("Failed to find orphaned data blocks: {:?}", e);
-                return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to find orphaned data blocks: {:?}", e))))));
-            }
-        };
-        
+        let data_block_ids =
+            match find_orphaned_data_blocks(db_connection, &cutoff_uuid, batch_size) {
+                Ok(ids) => ids,
+                Err(e) => {
+                    tracing::error!("Failed to find orphaned data blocks: {:?}", e);
+                    return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Failed to find orphaned data blocks: {:?}", e),
+                    )))));
+                }
+            };
+
         if data_block_ids.is_empty() {
             tracing::info!("No more orphaned data blocks to clean");
             break;
         }
-        
-        tracing::info!("Found {} orphaned data blocks in this batch", data_block_ids.len());
-        
+
+        tracing::info!(
+            "Found {} orphaned data blocks in this batch",
+            data_block_ids.len()
+        );
+
         // Submit consensus transaction to delete these data blocks
         let payload = crate::files::handlers::DeleteOrphanedDataBlocksPayload {
             data_block_ids: data_block_ids.clone(),
         };
-        
-        let serialized_payload = match bincode::serde::encode_to_vec(&payload, bincode::config::standard()) {
-            Ok(data) => data,
-            Err(e) => {
-                tracing::error!("Failed to serialize deletion payload: {:?}", e);
-                return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to serialize deletion payload: {:?}", e))))));
-            }
-        };
-        
+
+        let serialized_payload =
+            match bincode::serde::encode_to_vec(&payload, bincode::config::standard()) {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::error!("Failed to serialize deletion payload: {:?}", e);
+                    return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Failed to serialize deletion payload: {:?}", e),
+                    )))));
+                }
+            };
+
         let transaction = crate::consensus::functions::create_signed_transaction(
             app_state,
             "delete_orphaned_data_blocks".to_string(),
             serialized_payload,
-        ).map_err(|_| Error::Failed(Arc::new(Box::new(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "Failed to sign transaction"
-        )))))?;
-        
+        )
+        .map_err(|_| {
+            Error::Failed(Arc::new(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Failed to sign transaction",
+            ))))
+        })?;
+
         // Get user ID for consensus submission
         let user_id = match app_state.get_user_id() {
             Ok(id) => id,
             Err(_) => {
                 tracing::error!("User ID not initialized, cannot submit consensus transaction");
-                return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "User ID not initialized")))));
+                return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "User ID not initialized",
+                )))));
             }
         };
-        
+
         // Submit to consensus
         match app_state.consensus_queue.submit(transaction).await {
             Ok(_) => {
-                tracing::info!("Successfully submitted consensus transaction to delete {} data blocks", data_block_ids.len());
+                tracing::info!(
+                    "Successfully submitted consensus transaction to delete {} data blocks",
+                    data_block_ids.len()
+                );
                 total_cleaned += data_block_ids.len();
             }
             Err(e) => {
                 tracing::error!("Failed to submit consensus transaction: {:?}", e);
-                return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to submit consensus transaction: {:?}", e))))));
+                return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to submit consensus transaction: {:?}", e),
+                )))));
             }
         }
     }
-    
+
     Ok(total_cleaned)
 }
 
 fn generate_cutoff_uuid(retention_days: i64) -> Result<CustomUUID, MaintenanceError> {
     let cutoff_time = Utc::now() - chrono::Duration::days(retention_days);
-    
-    let timestamp = Timestamp::from_unix(
-        NoContext,
-        cutoff_time.timestamp() as u64,
-        0,
-    );
-    
+
+    let timestamp = Timestamp::from_unix(NoContext, cutoff_time.timestamp() as u64, 0);
+
     Ok(CustomUUID::new(Some(&timestamp)))
 }
 
@@ -194,8 +254,11 @@ pub async fn run_network_rebalancing(
     max_data_blocks: i32,
     min_age_heights: i32,
 ) -> Result<NetworkRebalancingResult, Error> {
-    tracing::info!("Starting network rebalancing (max {} data blocks, min age {} heights)",
-                  max_data_blocks, min_age_heights);
+    tracing::info!(
+        "Starting network rebalancing (max {} data blocks, min age {} heights)",
+        max_data_blocks,
+        min_age_heights
+    );
 
     // Get current consensus height
     let consensus_height = match crate::db::consensus::get_consensus(app_state.db_pool.get()) {
@@ -204,14 +267,17 @@ pub async fn run_network_rebalancing(
             tracing::error!("Failed to get consensus state for rebalancing: {:?}", e);
             return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("Failed to get consensus state: {:?}", e)
+                format!("Failed to get consensus state: {:?}", e),
             )))));
         }
     };
 
     let max_placement_height = consensus_height - min_age_heights;
-    tracing::info!("Rebalancing at height {}, looking for data blocks placed before height {}",
-                  consensus_height, max_placement_height);
+    tracing::info!(
+        "Rebalancing at height {}, looking for data blocks placed before height {}",
+        consensus_height,
+        max_placement_height
+    );
 
     // Get data blocks that need rebalancing
     let data_blocks_to_rebalance = match crate::db::fragments::get_data_blocks_for_rebalancing(
@@ -224,13 +290,16 @@ pub async fn run_network_rebalancing(
             tracing::error!("Failed to get data blocks for rebalancing: {:?}", e);
             return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("Failed to get data blocks: {:?}", e)
+                format!("Failed to get data blocks: {:?}", e),
             )))));
         }
     };
 
     let total_data_blocks = data_blocks_to_rebalance.len();
-    tracing::info!("Found {} data blocks to rebalance (currently disabled, requires file_hash + local_index)", total_data_blocks);
+    tracing::info!(
+        "Found {} data blocks to rebalance (currently disabled, requires file_hash + local_index)",
+        total_data_blocks
+    );
 
     // Rebalancing disabled: modulo placement requires file_hash + local_index, but rebalancing
     // only has fragment_hash. Fragment inventory handles discovery, so rebalancing
@@ -259,7 +328,10 @@ pub struct NetworkRebalancingResult {
 
 /// Scheduled job handler for fragment inventory self-check
 /// Runs every 20-30 minutes to ensure node's inventory matches local fragment storage
-pub async fn handle_fragment_inventory_self_check(job: TaskId, ctx: Data<AppState>) -> Result<(), Error> {
+pub async fn handle_fragment_inventory_self_check(
+    job: TaskId,
+    ctx: Data<AppState>,
+) -> Result<(), Error> {
     run_fragment_inventory_self_check(&ctx).await
 }
 
@@ -272,7 +344,7 @@ pub async fn run_fragment_inventory_self_check(app_state: &AppState) -> Result<(
             tracing::error!("Node ID not initialized, cannot run self-check");
             return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                "Node ID not initialized"
+                "Node ID not initialized",
             )))));
         }
     };
@@ -287,32 +359,36 @@ pub async fn run_fragment_inventory_self_check(app_state: &AppState) -> Result<(
             tracing::error!("Failed to compute inventory differential: {:?}", e);
             return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("Failed to compute inventory differential: {:?}", e)
+                format!("Failed to compute inventory differential: {:?}", e),
             )))));
         }
     };
 
     // Create payload for consensus submission
-    let serialized_payload = match bincode::serde::encode_to_vec(&differential, bincode::config::standard()) {
-        Ok(data) => data,
-        Err(e) => {
-            tracing::error!("Failed to serialize self-check differential: {:?}", e);
-            return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to serialize differential: {:?}", e)
-            )))));
-        }
-    };
+    let serialized_payload =
+        match bincode::serde::encode_to_vec(&differential, bincode::config::standard()) {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::error!("Failed to serialize self-check differential: {:?}", e);
+                return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to serialize differential: {:?}", e),
+                )))));
+            }
+        };
 
     // Create signed transaction for consensus
     let transaction = crate::consensus::functions::create_signed_transaction(
         app_state,
         "self_check_fragments".to_string(),
         serialized_payload,
-    ).map_err(|_| Error::Failed(Arc::new(Box::new(std::io::Error::new(
-        std::io::ErrorKind::InvalidInput,
-        "Failed to sign transaction"
-    )))))?;
+    )
+    .map_err(|_| {
+        Error::Failed(Arc::new(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Failed to sign transaction",
+        ))))
+    })?;
 
     // Submit to consensus
     match app_state.consensus_queue.submit(transaction).await {
@@ -321,7 +397,7 @@ pub async fn run_fragment_inventory_self_check(app_state: &AppState) -> Result<(
             tracing::error!("Failed to submit self-check to consensus: {:?}", e);
             Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("Failed to submit to consensus: {:?}", e)
+                format!("Failed to submit to consensus: {:?}", e),
             )))))
         }
     }
@@ -335,7 +411,7 @@ pub async fn run_fragment_inventory_self_check(app_state: &AppState) -> Result<(
 /// Result of scanning filesystem for orphaned fragments
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OrphanedFragmentScan {
-    pub scanned_at: i64,  // Unix timestamp
+    pub scanned_at: i64, // Unix timestamp
     pub total_fragments: usize,
     pub orphaned_fragments: Vec<crate::db::Blake3Hash>,
     pub total_bytes: u64,
@@ -355,20 +431,25 @@ pub async fn run_orphaned_fragments_scan(
     app_state: &AppState,
     grace_period_hours: i64,
 ) -> Result<OrphanedFragmentScan, Error> {
-    use std::time::SystemTime;
     use std::fs;
     use std::path::Path;
+    use std::time::SystemTime;
 
-    tracing::info!("Starting orphaned fragments scan (grace period: {} hours)", grace_period_hours);
+    tracing::info!(
+        "Starting orphaned fragments scan (grace period: {} hours)",
+        grace_period_hours
+    );
 
     let fragments_dir = &app_state.fragments_dir;
     let grace_period_secs = grace_period_hours * 3600;
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map_err(|_| Error::Failed(Arc::new(Box::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "Failed to get current time"
-        )))))?
+        .map_err(|_| {
+            Error::Failed(Arc::new(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Failed to get current time",
+            ))))
+        })?
         .as_secs();
 
     let cutoff_time = now - grace_period_secs as u64;
@@ -390,13 +471,14 @@ pub async fn run_orphaned_fragments_scan(
     }
 
     // Iterate through first-level directories (00-ff)
-    for first_level_entry in fs::read_dir(fragments_path)
-        .map_err(|e| Error::Failed(Arc::new(Box::new(e))))?
+    for first_level_entry in
+        fs::read_dir(fragments_path).map_err(|e| Error::Failed(Arc::new(Box::new(e))))?
     {
-        let first_level_entry = first_level_entry
-            .map_err(|e| Error::Failed(Arc::new(Box::new(e))))?;
+        let first_level_entry =
+            first_level_entry.map_err(|e| Error::Failed(Arc::new(Box::new(e))))?;
 
-        if !first_level_entry.file_type()
+        if !first_level_entry
+            .file_type()
             .map_err(|e| Error::Failed(Arc::new(Box::new(e))))?
             .is_dir()
         {
@@ -407,10 +489,11 @@ pub async fn run_orphaned_fragments_scan(
         for second_level_entry in fs::read_dir(first_level_entry.path())
             .map_err(|e| Error::Failed(Arc::new(Box::new(e))))?
         {
-            let second_level_entry = second_level_entry
-                .map_err(|e| Error::Failed(Arc::new(Box::new(e))))?;
+            let second_level_entry =
+                second_level_entry.map_err(|e| Error::Failed(Arc::new(Box::new(e))))?;
 
-            if !second_level_entry.file_type()
+            if !second_level_entry
+                .file_type()
                 .map_err(|e| Error::Failed(Arc::new(Box::new(e))))?
                 .is_dir()
             {
@@ -421,10 +504,10 @@ pub async fn run_orphaned_fragments_scan(
             for file_entry in fs::read_dir(second_level_entry.path())
                 .map_err(|e| Error::Failed(Arc::new(Box::new(e))))?
             {
-                let file_entry = file_entry
-                    .map_err(|e| Error::Failed(Arc::new(Box::new(e))))?;
+                let file_entry = file_entry.map_err(|e| Error::Failed(Arc::new(Box::new(e))))?;
 
-                let metadata = file_entry.metadata()
+                let metadata = file_entry
+                    .metadata()
                     .map_err(|e| Error::Failed(Arc::new(Box::new(e))))?;
 
                 if !metadata.is_file() {
@@ -432,13 +515,16 @@ pub async fn run_orphaned_fragments_scan(
                 }
 
                 // Get modification time
-                let mtime = metadata.modified()
+                let mtime = metadata
+                    .modified()
                     .map_err(|e| Error::Failed(Arc::new(Box::new(e))))?
                     .duration_since(SystemTime::UNIX_EPOCH)
-                    .map_err(|_| Error::Failed(Arc::new(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "Invalid file modification time"
-                    )))))?
+                    .map_err(|_| {
+                        Error::Failed(Arc::new(Box::new(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "Invalid file modification time",
+                        ))))
+                    })?
                     .as_secs();
 
                 // Only consider files older than grace period
@@ -472,7 +558,11 @@ pub async fn run_orphaned_fragments_scan(
         }
     }
 
-    tracing::info!("Found {} fragments on disk (older than {} hours)", disk_fragments.len(), grace_period_hours);
+    tracing::info!(
+        "Found {} fragments on disk (older than {} hours)",
+        disk_fragments.len(),
+        grace_period_hours
+    );
 
     if disk_fragments.is_empty() {
         return Ok(OrphanedFragmentScan {
@@ -484,11 +574,12 @@ pub async fn run_orphaned_fragments_scan(
     }
 
     // Check which fragments exist in database (batch query for efficiency)
-    let db_conn = app_state.db_pool.get()
-        .map_err(|e| Error::Failed(Arc::new(Box::new(std::io::Error::new(
+    let db_conn = app_state.db_pool.get().map_err(|e| {
+        Error::Failed(Arc::new(Box::new(std::io::Error::new(
             std::io::ErrorKind::Other,
-            format!("Failed to get database connection: {:?}", e)
-        )))))?;
+            format!("Failed to get database connection: {:?}", e),
+        ))))
+    })?;
     let batch_size = 1000;
     let mut orphaned_fragments = Vec::new();
     let mut total_bytes = 0u64;
@@ -503,11 +594,12 @@ pub async fn run_orphaned_fragments_scan(
             placeholders
         );
 
-        let mut stmt = db_conn.prepare(&query)
-            .map_err(|e| Error::Failed(Arc::new(Box::new(std::io::Error::new(
+        let mut stmt = db_conn.prepare(&query).map_err(|e| {
+            Error::Failed(Arc::new(Box::new(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("Database query failed: {:?}", e)
-            )))))?;
+                format!("Database query failed: {:?}", e),
+            ))))
+        })?;
 
         // Execute query with hash parameters
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -516,25 +608,27 @@ pub async fn run_orphaned_fragments_scan(
         }
         let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
 
-        let mut rows = stmt.query(param_refs.as_slice())
-            .map_err(|e| Error::Failed(Arc::new(Box::new(std::io::Error::new(
+        let mut rows = stmt.query(param_refs.as_slice()).map_err(|e| {
+            Error::Failed(Arc::new(Box::new(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("Database query execution failed: {:?}", e)
-            )))))?;
+                format!("Database query execution failed: {:?}", e),
+            ))))
+        })?;
 
         // Collect hashes that exist in database
         let mut db_hashes = std::collections::HashSet::new();
-        while let Some(row) = rows.next()
-            .map_err(|e| Error::Failed(Arc::new(Box::new(std::io::Error::new(
+        while let Some(row) = rows.next().map_err(|e| {
+            Error::Failed(Arc::new(Box::new(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("Failed to read query results: {:?}", e)
-            )))))?
-        {
-            let hash: crate::db::Blake3Hash = row.get(0)
-                .map_err(|e| Error::Failed(Arc::new(Box::new(std::io::Error::new(
+                format!("Failed to read query results: {:?}", e),
+            ))))
+        })? {
+            let hash: crate::db::Blake3Hash = row.get(0).map_err(|e| {
+                Error::Failed(Arc::new(Box::new(std::io::Error::new(
                     std::io::ErrorKind::Other,
-                    format!("Failed to parse hash from row: {:?}", e)
-                )))))?;
+                    format!("Failed to parse hash from row: {:?}", e),
+                ))))
+            })?;
             db_hashes.insert(hash);
         }
 
@@ -547,8 +641,11 @@ pub async fn run_orphaned_fragments_scan(
         }
     }
 
-    tracing::info!("Scan complete: {} orphaned fragments found ({} bytes)",
-                  orphaned_fragments.len(), total_bytes);
+    tracing::info!(
+        "Scan complete: {} orphaned fragments found ({} bytes)",
+        orphaned_fragments.len(),
+        total_bytes
+    );
 
     let scan_result = OrphanedFragmentScan {
         scanned_at: now as i64,
@@ -581,28 +678,36 @@ pub async fn run_orphaned_fragments_cleanup(
     let scan = scan.ok_or_else(|| {
         Error::Failed(Arc::new(Box::new(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "No scan results available. Run GET /maintenance/orphaned-fragments first"
+            "No scan results available. Run GET /maintenance/orphaned-fragments first",
         ))))
     })?;
 
     // Validate scan isn't stale (> 1 hour old)
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map_err(|_| Error::Failed(Arc::new(Box::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "Failed to get current time"
-        )))))?
+        .map_err(|_| {
+            Error::Failed(Arc::new(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Failed to get current time",
+            ))))
+        })?
         .as_secs() as i64;
 
     let scan_age_seconds = now - scan.scanned_at;
     if scan_age_seconds > 3600 {
         return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(
             std::io::ErrorKind::Other,
-            format!("Scan is stale ({} seconds old). Run a new scan first", scan_age_seconds)
+            format!(
+                "Scan is stale ({} seconds old). Run a new scan first",
+                scan_age_seconds
+            ),
         )))));
     }
 
-    tracing::info!("Deleting {} orphaned fragments", scan.orphaned_fragments.len());
+    tracing::info!(
+        "Deleting {} orphaned fragments",
+        scan.orphaned_fragments.len()
+    );
 
     let mut deleted_count = 0;
     let mut failed_count = 0;
@@ -622,14 +727,22 @@ pub async fn run_orphaned_fragments_cleanup(
                 bytes_freed += avg_size;
             }
             Err(e) => {
-                tracing::warn!("Failed to delete fragment {}: {:?}", fragment_hash.to_hex(), e);
+                tracing::warn!(
+                    "Failed to delete fragment {}: {:?}",
+                    fragment_hash.to_hex(),
+                    e
+                );
                 failed_count += 1;
             }
         }
     }
 
-    tracing::info!("Cleanup complete: {} deleted, {} failed, {} bytes freed",
-                  deleted_count, failed_count, bytes_freed);
+    tracing::info!(
+        "Cleanup complete: {} deleted, {} failed, {} bytes freed",
+        deleted_count,
+        failed_count,
+        bytes_freed
+    );
 
     Ok(OrphanedFragmentCleanupResult {
         deleted_count,

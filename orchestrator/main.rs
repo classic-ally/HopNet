@@ -1,7 +1,11 @@
 use anyhow::Result;
 use bollard::Docker;
-use bollard::query_parameters::{ListContainersOptionsBuilder, CreateContainerOptionsBuilder, ListNetworksOptionsBuilder};
-use bollard::models::{ContainerCreateBody, HostConfig, NetworkingConfig, EndpointSettings, NetworkCreateResponse};
+use bollard::models::{
+    ContainerCreateBody, EndpointSettings, HostConfig, NetworkCreateResponse, NetworkingConfig,
+};
+use bollard::query_parameters::{
+    CreateContainerOptionsBuilder, ListContainersOptionsBuilder, ListNetworksOptionsBuilder,
+};
 use clap::{Parser, Subcommand};
 use serde_json::json;
 use std::collections::HashMap;
@@ -126,12 +130,12 @@ async fn main() -> Result<()> {
     let docker = Docker::connect_with_unix(
         &socket_path.strip_prefix("unix://").unwrap_or(&socket_path),
         120,
-        bollard::API_DEFAULT_VERSION
+        bollard::API_DEFAULT_VERSION,
     )?;
 
     // Detect runtime type for adaptive behavior
     let runtime = sys::detect_runtime(&docker).await?;
-    
+
     match &cli.command {
         Some(Commands::Create { nodes, no_cleanup }) => {
             let mesh_id = get_next_mesh_id(&docker).await?;
@@ -151,60 +155,121 @@ async fn main() -> Result<()> {
         Some(Commands::Status { mesh_id }) => {
             show_mesh_status(&docker, *mesh_id, runtime).await?;
         }
-        Some(Commands::History { mesh_id, node, view }) => {
+        Some(Commands::History {
+            mesh_id,
+            node,
+            view,
+        }) => {
             show_node_history(&docker, *mesh_id, *node, *view, runtime).await?;
         }
         Some(Commands::Divergence { mesh_id }) => {
             divergence::check_divergence(&docker, *mesh_id, runtime).await?;
         }
-        Some(Commands::Test { mesh_id, test, list, flags, auto_nodes, keep_on_pass }) => {
+        Some(Commands::Test {
+            mesh_id,
+            test,
+            list,
+            flags,
+            auto_nodes,
+            keep_on_pass,
+        }) => {
             // List path / no-test path doesn't need a mesh; short-circuit.
             if *list || test.is_none() {
-                tests::handle_test_command(&docker, mesh_id.unwrap_or(0), test.as_deref(), *list, flags, runtime).await?;
+                tests::handle_test_command(
+                    &docker,
+                    mesh_id.unwrap_or(0),
+                    test.as_deref(),
+                    *list,
+                    flags,
+                    runtime,
+                )
+                .await?;
                 return Ok(());
             }
 
             match mesh_id {
                 Some(id) => {
                     // Existing behavior: use caller-provided mesh, no auto-cleanup.
-                    tests::handle_test_command(&docker, *id, test.as_deref(), *list, flags, runtime).await?;
+                    tests::handle_test_command(
+                        &docker,
+                        *id,
+                        test.as_deref(),
+                        *list,
+                        flags,
+                        runtime,
+                    )
+                    .await?;
                 }
                 None => {
                     // Auto-managed mesh: create fresh, run test, divergence check, conditionally delete.
                     // Pass = test passed AND nodes are consistent. Either failure leaves the mesh up.
                     let auto_mesh_id = get_next_mesh_id(&docker).await?;
-                    println!("Auto-creating mesh {} with {} nodes for test", auto_mesh_id, auto_nodes);
+                    println!(
+                        "Auto-creating mesh {} with {} nodes for test",
+                        auto_mesh_id, auto_nodes
+                    );
                     create_mesh(&docker, auto_mesh_id, *auto_nodes, false, runtime).await?;
 
                     let test_result = tests::handle_test_command(
-                        &docker, auto_mesh_id, test.as_deref(), *list, flags, runtime
-                    ).await;
+                        &docker,
+                        auto_mesh_id,
+                        test.as_deref(),
+                        *list,
+                        flags,
+                        runtime,
+                    )
+                    .await;
 
                     if let Err(e) = &test_result {
-                        eprintln!("\nTest failed; leaving mesh {} up for inspection", auto_mesh_id);
+                        eprintln!(
+                            "\nTest failed; leaving mesh {} up for inspection",
+                            auto_mesh_id
+                        );
                         eprintln!("Inspect: orchestrator status --mesh-id {}", auto_mesh_id);
-                        eprintln!("Inspect: orchestrator divergence --mesh-id {}", auto_mesh_id);
-                        eprintln!("Clean up: orchestrator delete --mesh-id {} -y", auto_mesh_id);
+                        eprintln!(
+                            "Inspect: orchestrator divergence --mesh-id {}",
+                            auto_mesh_id
+                        );
+                        eprintln!(
+                            "Clean up: orchestrator delete --mesh-id {} -y",
+                            auto_mesh_id
+                        );
                         return Err(anyhow::anyhow!("Test failed: {}", e));
                     }
 
                     // Test passed — verify no divergence before declaring success.
                     println!("\nTest passed; checking for state divergence across nodes");
-                    let div_result = divergence::check_divergence(&docker, auto_mesh_id, runtime).await;
+                    let div_result =
+                        divergence::check_divergence(&docker, auto_mesh_id, runtime).await;
 
                     match div_result {
                         Ok(()) => {
                             if *keep_on_pass {
-                                println!("\nNo divergence; --keep-on-pass set, leaving mesh {} up", auto_mesh_id);
+                                println!(
+                                    "\nNo divergence; --keep-on-pass set, leaving mesh {} up",
+                                    auto_mesh_id
+                                );
                             } else {
-                                println!("\nNo divergence; deleting auto-created mesh {}", auto_mesh_id);
+                                println!(
+                                    "\nNo divergence; deleting auto-created mesh {}",
+                                    auto_mesh_id
+                                );
                                 delete_mesh(&docker, auto_mesh_id, true).await?;
                             }
                         }
                         Err(e) => {
-                            eprintln!("\nTest passed but divergence detected; leaving mesh {} up for inspection", auto_mesh_id);
-                            eprintln!("Inspect: orchestrator divergence --mesh-id {}", auto_mesh_id);
-                            eprintln!("Clean up: orchestrator delete --mesh-id {} -y", auto_mesh_id);
+                            eprintln!(
+                                "\nTest passed but divergence detected; leaving mesh {} up for inspection",
+                                auto_mesh_id
+                            );
+                            eprintln!(
+                                "Inspect: orchestrator divergence --mesh-id {}",
+                                auto_mesh_id
+                            );
+                            eprintln!(
+                                "Clean up: orchestrator delete --mesh-id {} -y",
+                                auto_mesh_id
+                            );
                             return Err(anyhow::anyhow!("Divergence detected after test: {}", e));
                         }
                     }
@@ -221,10 +286,12 @@ async fn main() -> Result<()> {
 
 async fn get_next_mesh_id(docker: &Docker) -> Result<u32> {
     // Get all existing mesh IDs
-    let networks = docker.list_networks(None::<bollard::query_parameters::ListNetworksOptions>).await?;
+    let networks = docker
+        .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
+        .await?;
 
     let mut mesh_ids: Vec<u32> = Vec::new();
-    
+
     // Find all hopnet-orchestrator networks and extract mesh IDs
     for network in &networks {
         if let Some(ref name) = network.name {
@@ -238,9 +305,9 @@ async fn get_next_mesh_id(docker: &Docker) -> Result<u32> {
             }
         }
     }
-    
+
     mesh_ids.sort();
-    
+
     // Find the next available ID (starting from 0)
     let mut next_id = 0;
     for &id in &mesh_ids {
@@ -250,18 +317,20 @@ async fn get_next_mesh_id(docker: &Docker) -> Result<u32> {
             break;
         }
     }
-    
+
     Ok(next_id)
 }
 
 async fn list_meshes(docker: &Docker) -> Result<()> {
     println!("HopNet Orchestrator - Listing Meshes");
-    
+
     // List all networks that match hopnet-orchestrator-* pattern
-    let networks = docker.list_networks(None::<bollard::query_parameters::ListNetworksOptions>).await?;
+    let networks = docker
+        .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
+        .await?;
 
     let mut meshes: HashMap<u32, Vec<String>> = HashMap::new();
-    
+
     // Find hopnet-orchestrator networks and extract mesh IDs
     for network in &networks {
         if let Some(ref name) = network.name {
@@ -276,14 +345,14 @@ async fn list_meshes(docker: &Docker) -> Result<()> {
             }
         }
     }
-    
+
     // List all containers to count nodes per mesh
     let options = ListContainersOptionsBuilder::default()
         .all(false) // Only running containers
         .build();
-    
+
     let containers = docker.list_containers(Some(options)).await?;
-    
+
     // Count containers per mesh
     for container in containers {
         if let Some(names) = &container.names {
@@ -294,32 +363,45 @@ async fn list_meshes(docker: &Docker) -> Result<()> {
                     let parts: Vec<&str> = clean_name.split('-').collect();
                     if parts.len() >= 4 {
                         if let Ok(mesh_id) = parts[2].parse::<u32>() {
-                            meshes.entry(mesh_id).or_insert_with(Vec::new).push(name.clone());
+                            meshes
+                                .entry(mesh_id)
+                                .or_insert_with(Vec::new)
+                                .push(name.clone());
                         }
                     }
                 }
             }
         }
     }
-    
+
     if meshes.is_empty() {
         println!("No HopNet meshes found.");
-        println!("\nTo create a mesh, use: cargo run --bin orchestrator create --mesh-id <ID> --nodes <COUNT>");
+        println!(
+            "\nTo create a mesh, use: cargo run --bin orchestrator create --mesh-id <ID> --nodes <COUNT>"
+        );
     } else {
         println!("Active HopNet Meshes:");
         println!("{:<8} {:<12} {}", "Mesh ID", "Nodes", "Containers");
         println!("{}", "-".repeat(40));
-        
+
         let mut mesh_ids: Vec<_> = meshes.keys().collect();
         mesh_ids.sort();
-        
+
         for &mesh_id in mesh_ids {
             let containers = &meshes[&mesh_id];
-            println!("{:<8} {:<12} {}", mesh_id, containers.len(), 
-                containers.iter().map(|s| &s[1..]).collect::<Vec<_>>().join(", "));
+            println!(
+                "{:<8} {:<12} {}",
+                mesh_id,
+                containers.len(),
+                containers
+                    .iter()
+                    .map(|s| &s[1..])
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
         }
     }
-    
+
     Ok(())
 }
 
@@ -336,8 +418,18 @@ async fn cleanup_mesh_resources(
         let docker_clone = docker.clone();
         let task = tokio::spawn(async move {
             println!("  Stopping and removing container: {}", name);
-            let _ = docker_clone.stop_container(&container_id, None::<bollard::query_parameters::StopContainerOptions>).await;
-            let _ = docker_clone.remove_container(&container_id, None::<bollard::query_parameters::RemoveContainerOptions>).await;
+            let _ = docker_clone
+                .stop_container(
+                    &container_id,
+                    None::<bollard::query_parameters::StopContainerOptions>,
+                )
+                .await;
+            let _ = docker_clone
+                .remove_container(
+                    &container_id,
+                    None::<bollard::query_parameters::RemoveContainerOptions>,
+                )
+                .await;
         });
         tasks.push(task);
     }
@@ -346,11 +438,16 @@ async fn cleanup_mesh_resources(
     }
 
     // Remove volumes
-    if let Ok(volumes) = docker.list_volumes(None::<bollard::query_parameters::ListVolumesOptions>).await {
+    if let Ok(volumes) = docker
+        .list_volumes(None::<bollard::query_parameters::ListVolumesOptions>)
+        .await
+    {
         if let Some(volume_list) = volumes.volumes {
             let mut tasks = Vec::new();
             for volume in volume_list {
-                let is_mesh_volume = volume.labels.get("hopnet.mesh_id")
+                let is_mesh_volume = volume
+                    .labels
+                    .get("hopnet.mesh_id")
                     .map(|id| id == &mesh_id.to_string())
                     .unwrap_or(false);
                 if is_mesh_volume {
@@ -358,7 +455,12 @@ async fn cleanup_mesh_resources(
                     let docker_clone = docker.clone();
                     let task = tokio::spawn(async move {
                         println!("  Removing volume: {}", volume_name);
-                        let _ = docker_clone.remove_volume(&volume_name, None::<bollard::query_parameters::RemoveVolumeOptions>).await;
+                        let _ = docker_clone
+                            .remove_volume(
+                                &volume_name,
+                                None::<bollard::query_parameters::RemoveVolumeOptions>,
+                            )
+                            .await;
                     });
                     tasks.push(task);
                 }
@@ -374,26 +476,36 @@ async fn cleanup_mesh_resources(
     let _ = docker.remove_network(network_id).await;
 }
 
-async fn create_mesh(docker: &Docker, mesh_id: u32, node_count: u32, no_cleanup: bool, runtime: sys::ContainerRuntime) -> Result<()> {
+async fn create_mesh(
+    docker: &Docker,
+    mesh_id: u32,
+    node_count: u32,
+    no_cleanup: bool,
+    runtime: sys::ContainerRuntime,
+) -> Result<()> {
     println!("Creating mesh {} with {} nodes", mesh_id, node_count);
-    
+
     // Create network for the mesh
     let network_name = format!("hopnet-orchestrator-{}-0", mesh_id);
-    
+
     match create_hopnet_network(docker, &network_name).await {
         Ok(network_id) => {
             println!("Successfully created network: {}", network_id);
-            
+
             let mut containers: Vec<(String, String, String)> = Vec::new(); // (container_name, container_id, ip_address)
-            
+
             // Create containers for each node
             for node_id in 0..node_count {
                 let container_name = format!("hopnet-orchestrator-{}-{}", mesh_id, node_id);
                 println!("Creating HopNet container: {}", container_name);
-                
-                match create_hopnet_container(docker, &container_name, &network_name, runtime).await {
+
+                match create_hopnet_container(docker, &container_name, &network_name, runtime).await
+                {
                     Ok((container_id, ip_address)) => {
-                        println!("Successfully created container: {} with IP: {}", container_id, ip_address);
+                        println!(
+                            "Successfully created container: {} with IP: {}",
+                            container_id, ip_address
+                        );
                         containers.push((container_name, container_id, ip_address));
                     }
                     Err(e) => {
@@ -401,14 +513,18 @@ async fn create_mesh(docker: &Docker, mesh_id: u32, node_count: u32, no_cleanup:
                     }
                 }
             }
-            
+
             // Wait a moment for containers to be ready
             println!("Waiting for containers to be ready...");
             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-            
+
             // Setup node 0 if it exists
             if let Some((container_name, _container_id, ip_address)) = containers.first() {
-                println!("Setting up node 0 at IP: {} (host port: {})", ip_address, 40000 + (mesh_id * 500));
+                println!(
+                    "Setting up node 0 at IP: {} (host port: {})",
+                    ip_address,
+                    40000 + (mesh_id * 500)
+                );
                 match setup_node_0(docker, mesh_id, &container_name, runtime).await {
                     Ok(passphrase) => {
                         store_mesh_passphrase(docker, mesh_id, &passphrase).await?;
@@ -417,7 +533,9 @@ async fn create_mesh(docker: &Docker, mesh_id: u32, node_count: u32, no_cleanup:
                         println!("Failed to setup node 0: {}", e);
 
                         if no_cleanup {
-                            println!("Skipping cleanup (--no-cleanup flag set). Containers and network left running for inspection.");
+                            println!(
+                                "Skipping cleanup (--no-cleanup flag set). Containers and network left running for inspection."
+                            );
                             println!("Network: {}", network_name);
                             for (name, container_id, ip) in &containers {
                                 println!("Container: {} (ID: {}, IP: {})", name, container_id, ip);
@@ -428,31 +546,57 @@ async fn create_mesh(docker: &Docker, mesh_id: u32, node_count: u32, no_cleanup:
                             cleanup_mesh_resources(docker, mesh_id, containers, &network_id).await;
                         }
 
-                        return Err(anyhow::anyhow!("Mesh creation failed due to setup API failure"));
+                        return Err(anyhow::anyhow!(
+                            "Mesh creation failed due to setup API failure"
+                        ));
                     }
                 }
 
                 // Register additional nodes (1, 2, 3...) with node 0
                 if containers.len() > 1 {
-                    for (node_index, (container_name, _container_id, _node_ip)) in containers.iter().enumerate().skip(1) {
+                    for (node_index, (container_name, _container_id, _node_ip)) in
+                        containers.iter().enumerate().skip(1)
+                    {
                         let node_id = node_index as u32; // node_id starts from 1 for additional nodes
-                        println!("Registering node {} ({}) with node 0...", node_id, container_name);
+                        println!(
+                            "Registering node {} ({}) with node 0...",
+                            node_id, container_name
+                        );
 
-                        if let Err(e) = register_node_with_node_0(docker, mesh_id, node_id, container_name, runtime).await {
+                        if let Err(e) = register_node_with_node_0(
+                            docker,
+                            mesh_id,
+                            node_id,
+                            container_name,
+                            runtime,
+                        )
+                        .await
+                        {
                             println!("Failed to register node {}: {}", node_id, e);
 
                             if no_cleanup {
-                                println!("Skipping cleanup (--no-cleanup flag set). Containers and network left running for inspection.");
+                                println!(
+                                    "Skipping cleanup (--no-cleanup flag set). Containers and network left running for inspection."
+                                );
                                 println!("Network: {}", network_name);
                                 for (name, container_id, ip) in &containers {
-                                    println!("Container: {} (ID: {}, IP: {})", name, container_id, ip);
+                                    println!(
+                                        "Container: {} (ID: {}, IP: {})",
+                                        name, container_id, ip
+                                    );
                                 }
                             } else {
-                                println!("Cleaning up mesh {} due to node registration failure...", mesh_id);
-                                cleanup_mesh_resources(docker, mesh_id, containers, &network_id).await;
+                                println!(
+                                    "Cleaning up mesh {} due to node registration failure...",
+                                    mesh_id
+                                );
+                                cleanup_mesh_resources(docker, mesh_id, containers, &network_id)
+                                    .await;
                             }
 
-                            return Err(anyhow::anyhow!("Mesh creation failed due to node registration failure"));
+                            return Err(anyhow::anyhow!(
+                                "Mesh creation failed due to node registration failure"
+                            ));
                         }
                     }
                 }
@@ -462,16 +606,24 @@ async fn create_mesh(docker: &Docker, mesh_id: u32, node_count: u32, no_cleanup:
             println!("Failed to create network: {}", e);
         }
     }
-    
+
     Ok(())
 }
 
-async fn add_nodes_to_mesh(docker: &Docker, mesh_id: u32, node_count: u32, runtime: sys::ContainerRuntime) -> Result<()> {
+async fn add_nodes_to_mesh(
+    docker: &Docker,
+    mesh_id: u32,
+    node_count: u32,
+    runtime: sys::ContainerRuntime,
+) -> Result<()> {
     // Get existing containers to find the next node_id
     let existing_containers = get_mesh_containers(docker, mesh_id).await?;
 
     if existing_containers.is_empty() {
-        return Err(anyhow::anyhow!("Mesh {} does not exist. Create it first with 'create --nodes N'", mesh_id));
+        return Err(anyhow::anyhow!(
+            "Mesh {} does not exist. Create it first with 'create --nodes N'",
+            mesh_id
+        ));
     }
 
     // Find the highest existing node_id
@@ -514,7 +666,10 @@ async fn add_nodes_to_mesh(docker: &Docker, mesh_id: u32, node_count: u32, runti
 
         match create_hopnet_container(docker, &container_name, &network_name, runtime).await {
             Ok((container_id, ip_address)) => {
-                println!("Successfully created container: {} with IP: {}", container_id, ip_address);
+                println!(
+                    "Successfully created container: {} with IP: {}",
+                    container_id, ip_address
+                );
                 new_containers.push((container_name, container_id, ip_address));
             }
             Err(e) => {
@@ -534,17 +689,28 @@ async fn add_nodes_to_mesh(docker: &Docker, mesh_id: u32, node_count: u32, runti
         let parts: Vec<&str> = container_name.split('-').collect();
         let node_id: u32 = parts[3].parse().unwrap();
 
-        println!("Registering node {} ({}) with node 0...", node_id, container_name);
+        println!(
+            "Registering node {} ({}) with node 0...",
+            node_id, container_name
+        );
 
-        if let Err(e) = register_node_with_node_0(docker, mesh_id, node_id, container_name, runtime).await {
+        if let Err(e) =
+            register_node_with_node_0(docker, mesh_id, node_id, container_name, runtime).await
+        {
             println!("Failed to register node {}: {}", node_id, e);
             return Err(anyhow::anyhow!("Node registration failed: {}", e));
         }
 
-        println!("Successfully registered node {}. Bootstrap via catch-up initiated.", node_id);
+        println!(
+            "Successfully registered node {}. Bootstrap via catch-up initiated.",
+            node_id
+        );
     }
 
-    println!("Successfully added {} node(s) to mesh {}", node_count, mesh_id);
+    println!(
+        "Successfully added {} node(s) to mesh {}",
+        node_count, mesh_id
+    );
     Ok(())
 }
 
@@ -554,11 +720,11 @@ async fn create_hopnet_network(docker: &Docker, network_name: &str) -> Result<St
         name: network_name.to_string(),
         ..Default::default()
     };
-    
+
     let response: NetworkCreateResponse = docker.create_network(options).await?;
-    
+
     println!("Created network {} with ID: {}", network_name, response.id);
-    
+
     Ok(response.id)
 }
 
@@ -590,7 +756,7 @@ async fn create_hopnet_container(
             Some(vec![bollard::models::PortBinding {
                 host_ip: Some("0.0.0.0".to_string()),
                 host_port: Some(port.to_string()),
-            }])
+            }]),
         );
         (Some(bindings), port)
     } else {
@@ -605,7 +771,7 @@ async fn create_hopnet_container(
         EndpointSettings {
             ip_address: None, // Let Docker/Podman assign IP
             ..Default::default()
-        }
+        },
     );
 
     // Container labels for tracking
@@ -667,43 +833,58 @@ async fn create_hopnet_container(
         }),
         ..Default::default()
     };
-    
+
     // Create container
     let options = CreateContainerOptionsBuilder::default()
         .name(container_name)
         .build();
-    
-    let response = docker
-        .create_container(Some(options), config)
-        .await?;
-    
+
+    let response = docker.create_container(Some(options), config).await?;
+
     let container_id = response.id;
-    
+
     // Start the container
     docker
-        .start_container(&container_id, None::<bollard::query_parameters::StartContainerOptions>)
+        .start_container(
+            &container_id,
+            None::<bollard::query_parameters::StartContainerOptions>,
+        )
         .await?;
-    
+
     // Get the container's IP address
-    let container_info = docker.inspect_container(&container_id, None::<bollard::query_parameters::InspectContainerOptions>).await?;
+    let container_info = docker
+        .inspect_container(
+            &container_id,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await?;
     let ip_address = container_info
         .network_settings
         .and_then(|ns| ns.networks)
         .and_then(|networks| networks.get(network_name).cloned())
         .and_then(|endpoint| endpoint.ip_address)
         .unwrap_or_else(|| "unknown".to_string());
-    
-    println!("Started container {} on network {} with IP {}", container_name, network_name, ip_address);
-    
+
+    println!(
+        "Started container {} on network {} with IP {}",
+        container_name, network_name, ip_address
+    );
+
     Ok((container_id, ip_address))
 }
 
-async fn setup_node_0(docker: &Docker, mesh_id: u32, node_name: &str, runtime: sys::ContainerRuntime) -> Result<String> {
+async fn setup_node_0(
+    docker: &Docker,
+    mesh_id: u32,
+    node_name: &str,
+    runtime: sys::ContainerRuntime,
+) -> Result<String> {
     let client = reqwest::Client::new();
 
     // Get runtime-aware connection info for node 0
     let addresses = get_external_addresses(docker, mesh_id, runtime).await?;
-    let (host, port) = addresses.iter()
+    let (host, port) = addresses
+        .iter()
         .find(|(id, _, _)| *id == 0)
         .map(|(_, h, p)| (h.clone(), *p))
         .ok_or_else(|| anyhow::anyhow!("Node 0 not found"))?;
@@ -727,7 +908,10 @@ async fn setup_node_0(docker: &Docker, mesh_id: u32, node_name: &str, runtime: s
             return Err(anyhow::anyhow!("Setup API call timed out after 30 seconds"));
         }
 
-        println!("Attempting setup API call... (elapsed: {:.1}s)", start_time.elapsed().as_secs_f32());
+        println!(
+            "Attempting setup API call... (elapsed: {:.1}s)",
+            start_time.elapsed().as_secs_f32()
+        );
 
         match client
             .post(&url)
@@ -738,7 +922,10 @@ async fn setup_node_0(docker: &Docker, mesh_id: u32, node_name: &str, runtime: s
         {
             Ok(response) => {
                 let status = response.status();
-                let response_text = response.text().await.unwrap_or_else(|_| "No response body".to_string());
+                let response_text = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "No response body".to_string());
 
                 if status == reqwest::StatusCode::CREATED {
                     println!("Node setup successful: {} Created", status);
@@ -746,7 +933,8 @@ async fn setup_node_0(docker: &Docker, mesh_id: u32, node_name: &str, runtime: s
                     // Parse passphrase from JSON response
                     let body: serde_json::Value = serde_json::from_str(&response_text)
                         .map_err(|e| anyhow::anyhow!("Failed to parse setup response: {}", e))?;
-                    let passphrase = body.get("passphrase")
+                    let passphrase = body
+                        .get("passphrase")
                         .and_then(|p| p.as_str())
                         .ok_or_else(|| anyhow::anyhow!("No passphrase in setup response"))?
                         .to_string();
@@ -754,19 +942,28 @@ async fn setup_node_0(docker: &Docker, mesh_id: u32, node_name: &str, runtime: s
                 } else if status.is_server_error() || status.is_client_error() {
                     println!("Setup failed with status: {} - {}", status, response_text);
                     if start_time.elapsed() + retry_interval > timeout_duration {
-                        return Err(anyhow::anyhow!("Setup API call failed with status: {}", status));
+                        return Err(anyhow::anyhow!(
+                            "Setup API call failed with status: {}",
+                            status
+                        ));
                     }
                 } else {
                     println!("Unexpected status: {} - {}", status, response_text);
                     if start_time.elapsed() + retry_interval > timeout_duration {
-                        return Err(anyhow::anyhow!("Setup API call returned unexpected status: {}", status));
+                        return Err(anyhow::anyhow!(
+                            "Setup API call returned unexpected status: {}",
+                            status
+                        ));
                     }
                 }
             }
             Err(e) => {
                 println!("Setup API request failed: {} (retrying...)", e);
                 if start_time.elapsed() + retry_interval > timeout_duration {
-                    return Err(anyhow::anyhow!("Setup API call failed after retries: {}", e));
+                    return Err(anyhow::anyhow!(
+                        "Setup API call failed after retries: {}",
+                        e
+                    ));
                 }
             }
         }
@@ -776,25 +973,31 @@ async fn setup_node_0(docker: &Docker, mesh_id: u32, node_name: &str, runtime: s
     }
 }
 
-pub async fn get_jwt_token(docker: &Docker, mesh_id: u32, node_id: u32, runtime: sys::ContainerRuntime) -> Result<String> {
+pub async fn get_jwt_token(
+    docker: &Docker,
+    mesh_id: u32,
+    node_id: u32,
+    runtime: sys::ContainerRuntime,
+) -> Result<String> {
     let client = reqwest::Client::new();
 
     // Get runtime-aware connection info for this node
     let addresses = get_external_addresses(docker, mesh_id, runtime).await?;
-    let (host, port) = addresses.iter()
+    let (host, port) = addresses
+        .iter()
         .find(|(id, _, _)| *id == node_id)
         .map(|(_, h, p)| (h.clone(), *p))
         .ok_or_else(|| anyhow::anyhow!("Node {} not found", node_id))?;
 
     let login_url = format!("http://{}:{}/login", host, port);
-    
+
     let passphrase = load_mesh_passphrase(docker, mesh_id).await?;
 
     let login_data = json!({
         "username": "allison",
         "passphrase": passphrase
     });
-    
+
     let start_time = std::time::Instant::now();
     // Login uses 1 GiB Argon2id key unwrap (3-5s per attempt)
     let timeout_duration = std::time::Duration::from_secs(30);
@@ -838,12 +1041,19 @@ pub async fn get_jwt_token(docker: &Docker, mesh_id: u32, node_id: u32, runtime:
     }
 }
 
-async fn register_node_with_node_0(docker: &Docker, mesh_id: u32, node_id: u32, node_name: &str, runtime: sys::ContainerRuntime) -> Result<()> {
+async fn register_node_with_node_0(
+    docker: &Docker,
+    mesh_id: u32,
+    node_id: u32,
+    node_name: &str,
+    runtime: sys::ContainerRuntime,
+) -> Result<()> {
     let client = reqwest::Client::new();
 
     // Get runtime-aware connection info for this node
     let addresses = get_external_addresses(docker, mesh_id, runtime).await?;
-    let (node_host, node_port) = addresses.iter()
+    let (node_host, node_port) = addresses
+        .iter()
         .find(|(id, _, _)| *id == node_id)
         .map(|(_, h, p)| (h.clone(), *p))
         .ok_or_else(|| anyhow::anyhow!("Node {} not found", node_id))?;
@@ -851,17 +1061,25 @@ async fn register_node_with_node_0(docker: &Docker, mesh_id: u32, node_id: u32, 
     // Step 1: Get the public key from the node's /setup GET route
     let get_setup_url = format!("http://{}:{}/setup", node_host, node_port);
     println!("  Getting public key from: {}", get_setup_url);
-    
+
     let start_time = std::time::Instant::now();
     let timeout_duration = std::time::Duration::from_secs(15);
     let retry_interval = std::time::Duration::from_millis(500);
-    
+
     let pub_key = loop {
         if start_time.elapsed() > timeout_duration {
-            return Err(anyhow::anyhow!("Failed to retrieve public key from node {} after 15 seconds", node_id));
+            return Err(anyhow::anyhow!(
+                "Failed to retrieve public key from node {} after 15 seconds",
+                node_id
+            ));
         }
-        
-        match client.get(&get_setup_url).timeout(tokio::time::Duration::from_secs(3)).send().await {
+
+        match client
+            .get(&get_setup_url)
+            .timeout(tokio::time::Duration::from_secs(3))
+            .send()
+            .await
+        {
             Ok(response) => {
                 let status = response.status();
                 if status == reqwest::StatusCode::NOT_FOUND {
@@ -870,7 +1088,8 @@ async fn register_node_with_node_0(docker: &Docker, mesh_id: u32, node_id: u32, 
                         Ok(pubkey_raw) => {
                             // Remove quotes if present and trim whitespace
                             let pubkey = pubkey_raw.trim().trim_matches('"');
-                            if !pubkey.is_empty() && pubkey.len() == 64 { // ed25519 public keys are 64 hex chars
+                            if !pubkey.is_empty() && pubkey.len() == 64 {
+                                // ed25519 public keys are 64 hex chars
                                 println!("  Retrieved public key: {}", pubkey);
                                 break pubkey.to_string();
                             } else {
@@ -889,20 +1108,24 @@ async fn register_node_with_node_0(docker: &Docker, mesh_id: u32, node_id: u32, 
                 println!("  Failed to get setup info: {}, retrying...", e);
             }
         }
-        
+
         if start_time.elapsed() + retry_interval > timeout_duration {
-            return Err(anyhow::anyhow!("Failed to retrieve public key from node {} after retries", node_id));
+            return Err(anyhow::anyhow!(
+                "Failed to retrieve public key from node {} after retries",
+                node_id
+            ));
         }
-        
+
         tokio::time::sleep(retry_interval).await;
     };
-    
+
     // Step 2: Get JWT token for authentication with node 0 (after node 0 setup is complete)
     println!("  Getting JWT token for node 0 authentication...");
-    let jwt_token = get_jwt_token(docker, mesh_id, 0, runtime).await?;  // node 0 has node_id = 0
+    let jwt_token = get_jwt_token(docker, mesh_id, 0, runtime).await?; // node 0 has node_id = 0
 
     // Step 3: Register the node with node 0 via POST /nodes
-    let (node_0_host, node_0_port) = addresses.iter()
+    let (node_0_host, node_0_port) = addresses
+        .iter()
         .find(|(id, _, _)| *id == 0)
         .map(|(_, h, p)| (h.clone(), *p))
         .ok_or_else(|| anyhow::anyhow!("Node 0 not found"))?;
@@ -912,17 +1135,19 @@ async fn register_node_with_node_0(docker: &Docker, mesh_id: u32, node_id: u32, 
         "owner": 0,
         "pubkey": pub_key
     });
-    
+
     println!("  Registering node with node 0 at: {}", register_url);
     println!("  Node data: {}", node_data);
-    
+
     let start_time = std::time::Instant::now();
     let timeout_duration = std::time::Duration::from_secs(30);
     let retry_interval = std::time::Duration::from_secs(2);
 
     loop {
         if start_time.elapsed() > timeout_duration {
-            return Err(anyhow::anyhow!("Node registration timed out after 30 seconds"));
+            return Err(anyhow::anyhow!(
+                "Node registration timed out after 30 seconds"
+            ));
         }
 
         match client
@@ -935,7 +1160,10 @@ async fn register_node_with_node_0(docker: &Docker, mesh_id: u32, node_id: u32, 
         {
             Ok(response) => {
                 let status = response.status();
-                let response_text = response.text().await.unwrap_or_else(|_| "No response body".to_string());
+                let response_text = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "No response body".to_string());
 
                 if status == reqwest::StatusCode::CREATED {
                     println!("  Node registration successful: {} Created", status);
@@ -945,14 +1173,24 @@ async fn register_node_with_node_0(docker: &Docker, mesh_id: u32, node_id: u32, 
                     // 504 means iroh ping timed out — node discovery may still be in progress
                     println!("  Registration returned 504 (iroh discovery pending, retrying...)");
                 } else {
-                    println!("  Registration failed with status: {} - {}", status, response_text);
-                    return Err(anyhow::anyhow!("Node registration failed with status: {} - {}", status, response_text));
+                    println!(
+                        "  Registration failed with status: {} - {}",
+                        status, response_text
+                    );
+                    return Err(anyhow::anyhow!(
+                        "Node registration failed with status: {} - {}",
+                        status,
+                        response_text
+                    ));
                 }
             }
             Err(e) => {
                 println!("  Registration request failed: {} (retrying...)", e);
                 if start_time.elapsed() + retry_interval > timeout_duration {
-                    return Err(anyhow::anyhow!("Node registration failed after retries: {}", e));
+                    return Err(anyhow::anyhow!(
+                        "Node registration failed after retries: {}",
+                        e
+                    ));
                 }
             }
         }
@@ -963,82 +1201,109 @@ async fn register_node_with_node_0(docker: &Docker, mesh_id: u32, node_id: u32, 
 
 async fn delete_mesh(docker: &Docker, mesh_id: u32, skip_confirmation: bool) -> Result<()> {
     println!("Deleting mesh {}", mesh_id);
-    
+
     // Find all containers and networks for this mesh
     let containers = get_mesh_containers(docker, mesh_id).await?;
     let networks = get_mesh_networks(docker, mesh_id).await?;
-    
+
     if containers.is_empty() && networks.is_empty() {
         println!("No mesh found with ID {}", mesh_id);
         return Ok(());
     }
-    
+
     // Show what will be deleted
     println!("Found mesh {} with:", mesh_id);
     if !containers.is_empty() {
         println!("  Containers ({}):", containers.len());
         for container in &containers {
-            let name = container.names.as_ref()
+            let name = container
+                .names
+                .as_ref()
                 .and_then(|names| names.first())
                 .map(|name| &name[1..]) // Remove leading '/'
                 .unwrap_or("unnamed");
-            let status = container.status.as_ref().map(|s| s.as_str()).unwrap_or("unknown");
+            let status = container
+                .status
+                .as_ref()
+                .map(|s| s.as_str())
+                .unwrap_or("unknown");
             println!("    - {} ({})", name, status);
         }
     }
     if !networks.is_empty() {
         println!("  Networks ({}):", networks.len());
         for network in &networks {
-            let name = network.name.as_ref().map(|s| s.as_str()).unwrap_or("unnamed");
+            let name = network
+                .name
+                .as_ref()
+                .map(|s| s.as_str())
+                .unwrap_or("unnamed");
             println!("    - {}", name);
         }
     }
-    
+
     // Confirmation prompt
     if !skip_confirmation {
-        println!("\nThis will permanently delete all containers and networks for mesh {}.", mesh_id);
+        println!(
+            "\nThis will permanently delete all containers and networks for mesh {}.",
+            mesh_id
+        );
         print!("Are you sure? (y/N): ");
         use std::io::{self, Write};
         io::stdout().flush()?;
-        
+
         let mut input = String::new();
         io::stdin().read_line(&mut input)?;
         let input = input.trim().to_lowercase();
-        
+
         if input != "y" && input != "yes" {
             println!("Deletion cancelled.");
             return Ok(());
         }
     }
-    
+
     // Delete containers first (in parallel)
     if !containers.is_empty() {
         println!("Stopping and removing containers...");
-        
+
         let mut tasks = Vec::new();
         for container in containers {
             if let Some(id) = container.id {
-                let name = container.names.as_ref()
+                let name = container
+                    .names
+                    .as_ref()
                     .and_then(|names| names.first())
                     .map(|name| name[1..].to_string()) // Remove leading '/' and own the string
                     .unwrap_or_else(|| "unnamed".to_string());
-                
+
                 let docker_clone = docker.clone();
                 let task = tokio::spawn(async move {
                     println!("  Stopping container: {}", name);
-                    if let Err(e) = docker_clone.stop_container(&id, None::<bollard::query_parameters::StopContainerOptions>).await {
+                    if let Err(e) = docker_clone
+                        .stop_container(
+                            &id,
+                            None::<bollard::query_parameters::StopContainerOptions>,
+                        )
+                        .await
+                    {
                         println!("    Warning: Failed to stop container {}: {}", name, e);
                     }
 
                     println!("  Removing container: {}", name);
-                    if let Err(e) = docker_clone.remove_container(&id, None::<bollard::query_parameters::RemoveContainerOptions>).await {
+                    if let Err(e) = docker_clone
+                        .remove_container(
+                            &id,
+                            None::<bollard::query_parameters::RemoveContainerOptions>,
+                        )
+                        .await
+                    {
                         println!("    Warning: Failed to remove container {}: {}", name, e);
                     }
                 });
                 tasks.push(task);
             }
         }
-        
+
         // Wait for all container deletions to complete
         for task in tasks {
             let _ = task.await;
@@ -1047,11 +1312,15 @@ async fn delete_mesh(docker: &Docker, mesh_id: u32, skip_confirmation: bool) -> 
 
     // Delete volumes for this mesh (in parallel)
     println!("Removing volumes...");
-    let volumes = docker.list_volumes(None::<bollard::query_parameters::ListVolumesOptions>).await?;
+    let volumes = docker
+        .list_volumes(None::<bollard::query_parameters::ListVolumesOptions>)
+        .await?;
     if let Some(volume_list) = volumes.volumes {
-        let mesh_volumes: Vec<_> = volume_list.into_iter()
+        let mesh_volumes: Vec<_> = volume_list
+            .into_iter()
             .filter(|v| {
-                v.labels.get("hopnet.mesh_id")
+                v.labels
+                    .get("hopnet.mesh_id")
                     .map(|id| id == &mesh_id.to_string())
                     .unwrap_or(false)
             })
@@ -1064,8 +1333,17 @@ async fn delete_mesh(docker: &Docker, mesh_id: u32, skip_confirmation: bool) -> 
                 let docker_clone = docker.clone();
                 let task = tokio::spawn(async move {
                     println!("  Removing volume: {}", volume_name);
-                    if let Err(e) = docker_clone.remove_volume(&volume_name, None::<bollard::query_parameters::RemoveVolumeOptions>).await {
-                        println!("    Warning: Failed to remove volume {}: {}", volume_name, e);
+                    if let Err(e) = docker_clone
+                        .remove_volume(
+                            &volume_name,
+                            None::<bollard::query_parameters::RemoveVolumeOptions>,
+                        )
+                        .await
+                    {
+                        println!(
+                            "    Warning: Failed to remove volume {}: {}",
+                            volume_name, e
+                        );
                     }
                 });
                 tasks.push(task);
@@ -1081,14 +1359,16 @@ async fn delete_mesh(docker: &Docker, mesh_id: u32, skip_confirmation: bool) -> 
     // Delete networks (in parallel)
     if !networks.is_empty() {
         println!("Removing networks...");
-        
+
         let mut tasks = Vec::new();
         for network in networks {
             if let Some(id) = network.id {
-                let name = network.name.as_ref()
+                let name = network
+                    .name
+                    .as_ref()
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "unnamed".to_string());
-                
+
                 let docker_clone = docker.clone();
                 let task = tokio::spawn(async move {
                     println!("  Removing network: {}", name);
@@ -1099,25 +1379,29 @@ async fn delete_mesh(docker: &Docker, mesh_id: u32, skip_confirmation: bool) -> 
                 tasks.push(task);
             }
         }
-        
+
         // Wait for all network deletions to complete
         for task in tasks {
             let _ = task.await;
         }
     }
-    
+
     println!("Mesh {} deleted successfully.", mesh_id);
     Ok(())
 }
 
-async fn get_mesh_containers(docker: &Docker, mesh_id: u32) -> Result<Vec<bollard::models::ContainerSummary>> {
+async fn get_mesh_containers(
+    docker: &Docker,
+    mesh_id: u32,
+) -> Result<Vec<bollard::models::ContainerSummary>> {
     let options = ListContainersOptionsBuilder::default()
         .all(true) // Include stopped containers
         .build();
-    
+
     let containers = docker.list_containers(Some(options)).await?;
-    
-    let mesh_containers: Vec<_> = containers.into_iter()
+
+    let mesh_containers: Vec<_> = containers
+        .into_iter()
         .filter(|container| {
             if let Some(names) = &container.names {
                 names.iter().any(|name| {
@@ -1137,14 +1421,17 @@ async fn get_mesh_containers(docker: &Docker, mesh_id: u32) -> Result<Vec<bollar
             }
         })
         .collect();
-    
+
     Ok(mesh_containers)
 }
 
 async fn get_mesh_networks(docker: &Docker, mesh_id: u32) -> Result<Vec<bollard::models::Network>> {
-    let networks = docker.list_networks(None::<bollard::query_parameters::ListNetworksOptions>).await?;
-    
-    let mesh_networks: Vec<_> = networks.into_iter()
+    let networks = docker
+        .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
+        .await?;
+
+    let mesh_networks: Vec<_> = networks
+        .into_iter()
         .filter(|network| {
             if let Some(ref name) = network.name {
                 if name.starts_with("hopnet-orchestrator-") {
@@ -1159,16 +1446,19 @@ async fn get_mesh_networks(docker: &Docker, mesh_id: u32) -> Result<Vec<bollard:
             false
         })
         .collect();
-    
+
     Ok(mesh_networks)
 }
 
 async fn cleanup_orphaned_networks(docker: &Docker, skip_confirmation: bool) -> Result<()> {
     println!("Scanning for orphaned mesh networks...");
-    
+
     // Get all hopnet-orchestrator networks
-    let networks = docker.list_networks(None::<bollard::query_parameters::ListNetworksOptions>).await?;
-    let hopnet_networks: Vec<_> = networks.into_iter()
+    let networks = docker
+        .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
+        .await?;
+    let hopnet_networks: Vec<_> = networks
+        .into_iter()
         .filter(|network| {
             if let Some(ref name) = network.name {
                 name.starts_with("hopnet-orchestrator-")
@@ -1177,29 +1467,33 @@ async fn cleanup_orphaned_networks(docker: &Docker, skip_confirmation: bool) -> 
             }
         })
         .collect();
-    
+
     if hopnet_networks.is_empty() {
         println!("No HopNet networks found.");
         return Ok(());
     }
-    
+
     // Get all hopnet-orchestrator containers
     let options = ListContainersOptionsBuilder::default()
         .all(true) // Include stopped containers
         .build();
     let containers = docker.list_containers(Some(options)).await?;
-    let hopnet_containers: Vec<_> = containers.into_iter()
+    let hopnet_containers: Vec<_> = containers
+        .into_iter()
         .filter(|container| {
             if let Some(names) = &container.names {
-                names.iter().any(|name| name.starts_with("/hopnet-orchestrator-"))
+                names
+                    .iter()
+                    .any(|name| name.starts_with("/hopnet-orchestrator-"))
             } else {
                 false
             }
         })
         .collect();
-    
+
     // Build a map of mesh_id -> container count
-    let mut mesh_container_counts: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    let mut mesh_container_counts: std::collections::HashMap<u32, usize> =
+        std::collections::HashMap::new();
     for container in &hopnet_containers {
         if let Some(names) = &container.names {
             for name in names {
@@ -1215,7 +1509,7 @@ async fn cleanup_orphaned_networks(docker: &Docker, skip_confirmation: bool) -> 
             }
         }
     }
-    
+
     // Find orphaned networks (networks for meshes with 0 containers)
     let mut orphaned_networks = Vec::new();
     for network in &hopnet_networks {
@@ -1231,54 +1525,72 @@ async fn cleanup_orphaned_networks(docker: &Docker, skip_confirmation: bool) -> 
             }
         }
     }
-    
+
     if orphaned_networks.is_empty() {
         println!("No orphaned networks found.");
         return Ok(());
     }
-    
+
     // Group orphaned networks by mesh_id
-    let mut orphaned_by_mesh: std::collections::HashMap<u32, Vec<&bollard::models::Network>> = std::collections::HashMap::new();
+    let mut orphaned_by_mesh: std::collections::HashMap<u32, Vec<&bollard::models::Network>> =
+        std::collections::HashMap::new();
     for (mesh_id, network) in orphaned_networks {
-        orphaned_by_mesh.entry(mesh_id).or_insert_with(Vec::new).push(network);
+        orphaned_by_mesh
+            .entry(mesh_id)
+            .or_insert_with(Vec::new)
+            .push(network);
     }
-    
+
     // Show what will be cleaned up
-    println!("Found orphaned networks for {} mesh(es):", orphaned_by_mesh.len());
+    println!(
+        "Found orphaned networks for {} mesh(es):",
+        orphaned_by_mesh.len()
+    );
     let mut total_networks = 0;
     for (&mesh_id, networks) in &orphaned_by_mesh {
         println!("  Mesh {} ({} networks):", mesh_id, networks.len());
         for network in networks {
-            let name = network.name.as_ref().map(|s| s.as_str()).unwrap_or("unnamed");
+            let name = network
+                .name
+                .as_ref()
+                .map(|s| s.as_str())
+                .unwrap_or("unnamed");
             println!("    - {}", name);
             total_networks += 1;
         }
     }
-    
+
     // Confirmation prompt
     if !skip_confirmation {
-        println!("\nThis will permanently delete {} orphaned network(s).", total_networks);
+        println!(
+            "\nThis will permanently delete {} orphaned network(s).",
+            total_networks
+        );
         print!("Are you sure? (y/N): ");
         use std::io::{self, Write};
         io::stdout().flush()?;
-        
+
         let mut input = String::new();
         io::stdin().read_line(&mut input)?;
         let input = input.trim().to_lowercase();
-        
+
         if input != "y" && input != "yes" {
             println!("Cleanup cancelled.");
             return Ok(());
         }
     }
-    
+
     // Delete orphaned networks
     println!("Removing orphaned networks...");
     let mut deleted_count = 0;
     for networks in orphaned_by_mesh.values() {
         for network in networks {
             if let Some(ref id) = network.id {
-                let name = network.name.as_ref().map(|s| s.as_str()).unwrap_or("unnamed");
+                let name = network
+                    .name
+                    .as_ref()
+                    .map(|s| s.as_str())
+                    .unwrap_or("unnamed");
                 println!("  Removing network: {}", name);
                 match docker.remove_network(id).await {
                     Ok(_) => {
@@ -1291,26 +1603,36 @@ async fn cleanup_orphaned_networks(docker: &Docker, skip_confirmation: bool) -> 
             }
         }
     }
-    
-    println!("Cleanup completed. Removed {} orphaned network(s).", deleted_count);
+
+    println!(
+        "Cleanup completed. Removed {} orphaned network(s).",
+        deleted_count
+    );
     Ok(())
 }
 
-async fn show_mesh_status(docker: &Docker, mesh_id: u32, runtime: sys::ContainerRuntime) -> Result<()> {
+async fn show_mesh_status(
+    docker: &Docker,
+    mesh_id: u32,
+    runtime: sys::ContainerRuntime,
+) -> Result<()> {
     println!("Mesh {} Status", mesh_id);
-    
+
     // Get containers for this mesh
     let containers = get_mesh_containers(docker, mesh_id).await?;
-    
+
     if containers.is_empty() {
         println!("No containers found for mesh {}.", mesh_id);
         return Ok(());
     }
-    
+
     println!("Found {} node(s):", containers.len());
-    println!("{:<8} {:<12} {:<8} {:<12} {}", "Node ID", "Status", "Role", "View", "Phase");
+    println!(
+        "{:<8} {:<12} {:<8} {:<12} {}",
+        "Node ID", "Status", "Role", "View", "Phase"
+    );
     println!("{}", "-".repeat(50));
-    
+
     // Sort containers by node ID
     let mut node_data: Vec<(u32, &bollard::models::ContainerSummary)> = Vec::new();
     for container in &containers {
@@ -1329,19 +1651,20 @@ async fn show_mesh_status(docker: &Docker, mesh_id: u32, runtime: sys::Container
             }
         }
     }
-    
+
     // Sort by node ID
     node_data.sort_by_key(|(node_id, _)| *node_id);
-    
+
     // Query node statuses
     let mut node_statuses = Vec::new();
     for (node_id, _container) in node_data {
         let status = get_node_status(docker, mesh_id, node_id, runtime).await;
         node_statuses.push((node_id, status));
     }
-    
+
     // Find the maximum view across all nodes to determine consensus health
-    let max_view = node_statuses.iter()
+    let max_view = node_statuses
+        .iter()
         .filter_map(|(_, status)| status.as_ref().ok())
         .map(|status| status.view.parse::<u64>().unwrap_or(0))
         .max()
@@ -1360,34 +1683,43 @@ async fn show_mesh_status(docker: &Docker, mesh_id: u32, runtime: sys::Container
                 } else {
                     "❌ DESYNC"
                 };
-                
-                println!("{:<8} {:<12} {:<8} {:<12} {}", 
-                    node_id, 
-                    consensus_status, 
-                    node_status.role, 
-                    node_status.view, 
+
+                println!(
+                    "{:<8} {:<12} {:<8} {:<12} {}",
+                    node_id,
+                    consensus_status,
+                    node_status.role,
+                    node_status.view,
                     node_status.phase
                 );
             }
             Err(e) => {
-                println!("{:<8} {:<12} {:<8} {:<12} {}", 
-                    node_id, 
-                    "❌ DOWN", 
-                    "-", 
-                    "-", 
+                println!(
+                    "{:<8} {:<12} {:<8} {:<12} {}",
+                    node_id,
+                    "❌ DOWN",
+                    "-",
+                    "-",
                     format!("Error: {}", e)
                 );
             }
         }
     }
-    
+
     Ok(())
 }
 
-async fn show_node_history(docker: &Docker, mesh_id: u32, node_id: u32, view: Option<i32>, runtime: sys::ContainerRuntime) -> Result<()> {
+async fn show_node_history(
+    docker: &Docker,
+    mesh_id: u32,
+    node_id: u32,
+    view: Option<i32>,
+    runtime: sys::ContainerRuntime,
+) -> Result<()> {
     // Get runtime-aware connection info and JWT token
     let addresses = get_external_addresses(docker, mesh_id, runtime).await?;
-    let (host, port) = addresses.iter()
+    let (host, port) = addresses
+        .iter()
         .find(|(id, _, _)| *id == node_id)
         .map(|(_, h, p)| (h.clone(), *p))
         .ok_or_else(|| anyhow::anyhow!("Node {} not found", node_id))?;
@@ -1397,11 +1729,15 @@ async fn show_node_history(docker: &Docker, mesh_id: u32, node_id: u32, view: Op
 
     // If specific view requested, show detailed view state
     if let Some(view_number) = view {
-        println!("Node {} View State for View {} (Mesh {})", node_id, view_number, mesh_id);
+        println!(
+            "Node {} View State for View {} (Mesh {})",
+            node_id, view_number, mesh_id
+        );
         println!("{}", "=".repeat(60));
 
         let url = format!("http://{}:{}/consensus/view", host, port);
-        let response = client.post(&url)
+        let response = client
+            .post(&url)
             .header("Authorization", format!("Bearer {}", jwt_token))
             .json(&view_number)
             .send()
@@ -1414,16 +1750,31 @@ async fn show_node_history(docker: &Docker, mesh_id: u32, node_id: u32, view: Op
         let view_state: serde_json::Value = response.json().await?;
 
         // Extract and display view state
-        println!("Queried View:         {}", view_state["queried_view"].as_i64().unwrap_or(0));
-        println!("Height at View:       {}", view_state["height_at_view"].as_i64().unwrap_or(0));
-        println!("Active at Height:     {}", if view_state["is_active_at_height"].as_bool().unwrap_or(false) { "Yes" } else { "No" });
+        println!(
+            "Queried View:         {}",
+            view_state["queried_view"].as_i64().unwrap_or(0)
+        );
+        println!(
+            "Height at View:       {}",
+            view_state["height_at_view"].as_i64().unwrap_or(0)
+        );
+        println!(
+            "Active at Height:     {}",
+            if view_state["is_active_at_height"].as_bool().unwrap_or(false) {
+                "Yes"
+            } else {
+                "No"
+            }
+        );
         println!();
 
         // Display leader
         if let Some(leader) = view_state["leader_for_view"].as_object() {
-            println!("Leader:               Node {} ({})",
+            println!(
+                "Leader:               Node {} ({})",
                 leader["node_id"].as_i64().unwrap_or(0),
-                leader["name"].as_str().unwrap_or("unknown"));
+                leader["name"].as_str().unwrap_or("unknown")
+            );
         } else {
             println!("Leader:               None");
         }
@@ -1434,11 +1785,13 @@ async fn show_node_history(docker: &Docker, mesh_id: u32, node_id: u32, view: Op
             println!("Validators ({}):", validators.len());
             for validator in validators {
                 if let Some(obj) = validator.as_object() {
-                    println!("  • Node {}: {} ({}:{})",
+                    println!(
+                        "  • Node {}: {} ({}:{})",
                         obj["node_id"].as_i64().unwrap_or(0),
                         obj["name"].as_str().unwrap_or("unknown"),
                         obj["ip_address"].as_str().unwrap_or("unknown"),
-                        obj["port"].as_i64().unwrap_or(0));
+                        obj["port"].as_i64().unwrap_or(0)
+                    );
                 }
             }
         }
@@ -1447,7 +1800,8 @@ async fn show_node_history(docker: &Docker, mesh_id: u32, node_id: u32, view: Op
         println!("Node {} Consensus History (Mesh {})", node_id, mesh_id);
 
         let url = format!("http://{}:{}/consensus/history", host, port);
-        let response = client.get(&url)
+        let response = client
+            .get(&url)
             .header("Authorization", format!("Bearer {}", jwt_token))
             .send()
             .await?;
@@ -1459,8 +1813,10 @@ async fn show_node_history(docker: &Docker, mesh_id: u32, node_id: u32, view: Op
         let history: Vec<serde_json::Value> = response.json().await?;
 
         // Print table header
-        println!("{:<6} {:<7} {:<10} {:<7} {:<4} {:<10}",
-            "View", "Height", "ProposeQC", "LockQC", "TC", "Block Hash");
+        println!(
+            "{:<6} {:<7} {:<10} {:<7} {:<4} {:<10}",
+            "View", "Height", "ProposeQC", "LockQC", "TC", "Block Hash"
+        );
         println!("{}", "-".repeat(55));
 
         // Print each row
@@ -1472,7 +1828,8 @@ async fn show_node_history(docker: &Docker, mesh_id: u32, node_id: u32, view: Op
             let has_tc = entry["has_tc"].as_bool().unwrap_or(false);
             let block_hash = entry["block_hash"].as_str().unwrap_or("-");
 
-            println!("{:<6} {:<7} {:<10} {:<7} {:<4} {:<10}",
+            println!(
+                "{:<6} {:<7} {:<10} {:<7} {:<4} {:<10}",
                 view,
                 height,
                 if has_propose_qc { "✓" } else { "-" },
@@ -1493,12 +1850,18 @@ struct NodeStatus {
     phase: String,
 }
 
-async fn get_node_status(docker: &Docker, mesh_id: u32, node_id: u32, runtime: sys::ContainerRuntime) -> Result<NodeStatus> {
+async fn get_node_status(
+    docker: &Docker,
+    mesh_id: u32,
+    node_id: u32,
+    runtime: sys::ContainerRuntime,
+) -> Result<NodeStatus> {
     let client = reqwest::Client::new();
 
     // Get runtime-aware connection info
     let addresses = get_external_addresses(docker, mesh_id, runtime).await?;
-    let (host, port) = addresses.iter()
+    let (host, port) = addresses
+        .iter()
         .find(|(id, _, _)| *id == node_id)
         .map(|(_, h, p)| (h.clone(), *p))
         .ok_or_else(|| anyhow::anyhow!("Node {} not found", node_id))?;
@@ -1511,7 +1874,7 @@ async fn get_node_status(docker: &Docker, mesh_id: u32, node_id: u32, runtime: s
 
     // Query consensus state with JWT
     let consensus_url = format!("http://{}:{}/consensus", host, port);
-    
+
     match client
         .get(&consensus_url)
         .header("Authorization", format!("Bearer {}", jwt_token))
@@ -1529,34 +1892,34 @@ async fn get_node_status(docker: &Docker, mesh_id: u32, node_id: u32, runtime: s
                             .and_then(|l| l.get("node_id"))
                             .and_then(|id| id.as_u64())
                             .unwrap_or(999) as u32;
-                        
+
                         let role = if leader_id == node_id {
                             "LEADER".to_string()
                         } else {
                             "FOLLOWER".to_string()
                         };
-                        
+
                         let view = consensus_data
                             .get("view")
                             .and_then(|v| v.as_u64())
                             .map(|v| v.to_string())
                             .unwrap_or_else(|| "?".to_string());
-                        
+
                         let phase = consensus_data
                             .get("phase")
                             .and_then(|p| p.as_str())
                             .unwrap_or("?")
                             .to_string();
-                        
+
                         Ok(NodeStatus { role, view, phase })
                     }
-                    Err(_) => Err(anyhow::anyhow!("Invalid JSON"))
+                    Err(_) => Err(anyhow::anyhow!("Invalid JSON")),
                 }
             } else {
                 Err(anyhow::anyhow!("HTTP {}", response.status()))
             }
         }
-        Err(_) => Err(anyhow::anyhow!("Connection failed"))
+        Err(_) => Err(anyhow::anyhow!("Connection failed")),
     }
 }
 
@@ -1581,20 +1944,40 @@ async fn get_node_metadata(docker: &Docker, mesh_id: u32) -> Result<Vec<NodeMeta
                     if parts.len() >= 4 {
                         if let Ok(node_id) = parts[3].parse::<u32>() {
                             let container_id = container.id.as_ref().unwrap();
-                            let container_info = docker.inspect_container(container_id, None::<bollard::query_parameters::InspectContainerOptions>).await?;
+                            let container_info = docker
+                                .inspect_container(
+                                    container_id,
+                                    None::<bollard::query_parameters::InspectContainerOptions>,
+                                )
+                                .await?;
 
                             // Extract container IP from networks
-                            let networks = container_info.network_settings.and_then(|ns| ns.networks).unwrap_or_default();
-                            let container_ip = networks.values()
+                            let networks = container_info
+                                .network_settings
+                                .and_then(|ns| ns.networks)
+                                .unwrap_or_default();
+                            let container_ip = networks
+                                .values()
                                 .find_map(|endpoint| endpoint.ip_address.as_ref())
-                                .ok_or_else(|| anyhow::anyhow!("Container IP not found for node {}", node_id))?
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("Container IP not found for node {}", node_id)
+                                })?
                                 .clone();
 
                             // Extract host port from labels
-                            let labels = container_info.config.and_then(|c| c.labels).unwrap_or_default();
-                            let host_port = labels.get("hopnet.host_port")
+                            let labels = container_info
+                                .config
+                                .and_then(|c| c.labels)
+                                .unwrap_or_default();
+                            let host_port = labels
+                                .get("hopnet.host_port")
                                 .and_then(|p| p.parse::<u16>().ok())
-                                .ok_or_else(|| anyhow::anyhow!("Host port label not found for node {}", node_id))?;
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "Host port label not found for node {}",
+                                        node_id
+                                    )
+                                })?;
 
                             metadata.push(NodeMetadata {
                                 node_id,
@@ -1615,8 +1998,12 @@ async fn get_node_metadata(docker: &Docker, mesh_id: u32) -> Result<Vec<NodeMeta
 
 /// Get internal addresses for inter-container communication
 /// Returns (node_id, ip_address, port) - always uses container IPs regardless of runtime
-pub async fn get_internal_addresses(docker: &Docker, mesh_id: u32) -> Result<Vec<(u32, String, u16)>> {
-    Ok(get_node_metadata(docker, mesh_id).await?
+pub async fn get_internal_addresses(
+    docker: &Docker,
+    mesh_id: u32,
+) -> Result<Vec<(u32, String, u16)>> {
+    Ok(get_node_metadata(docker, mesh_id)
+        .await?
         .into_iter()
         .map(|m| (m.node_id, m.container_ip, 34632u16))
         .collect())
@@ -1624,10 +2011,15 @@ pub async fn get_internal_addresses(docker: &Docker, mesh_id: u32) -> Result<Vec
 
 /// Get external addresses for host-to-container communication
 /// Returns (node_id, host, port) - adapts based on runtime
-pub async fn get_external_addresses(docker: &Docker, mesh_id: u32, runtime: sys::ContainerRuntime) -> Result<Vec<(u32, String, u16)>> {
+pub async fn get_external_addresses(
+    docker: &Docker,
+    mesh_id: u32,
+    runtime: sys::ContainerRuntime,
+) -> Result<Vec<(u32, String, u16)>> {
     // On macOS, always use localhost with host port (can't access container IPs directly)
     let use_host_port = runtime == sys::ContainerRuntime::Podman || cfg!(target_os = "macos");
-    Ok(get_node_metadata(docker, mesh_id).await?
+    Ok(get_node_metadata(docker, mesh_id)
+        .await?
         .into_iter()
         .map(|m| {
             if use_host_port {
@@ -1663,13 +2055,17 @@ async fn store_mesh_passphrase(docker: &Docker, mesh_id: u32, passphrase: &str) 
         .map(|p| p.to_str().unwrap_or("/"))
         .unwrap_or("/");
 
-    docker.upload_to_container(
-        &container_name,
-        Some(bollard::query_parameters::UploadToContainerOptionsBuilder::new()
-            .path(parent_dir)
-            .build()),
-        bollard::body_full(bytes::Bytes::from(tar_bytes)),
-    ).await?;
+    docker
+        .upload_to_container(
+            &container_name,
+            Some(
+                bollard::query_parameters::UploadToContainerOptionsBuilder::new()
+                    .path(parent_dir)
+                    .build(),
+            ),
+            bollard::body_full(bytes::Bytes::from(tar_bytes)),
+        )
+        .await?;
 
     Ok(())
 }
@@ -1681,9 +2077,11 @@ async fn load_mesh_passphrase(docker: &Docker, mesh_id: u32) -> Result<String> {
 
     let stream = docker.download_from_container(
         &container_name,
-        Some(bollard::query_parameters::DownloadFromContainerOptionsBuilder::new()
-            .path(PASSPHRASE_PATH)
-            .build()),
+        Some(
+            bollard::query_parameters::DownloadFromContainerOptionsBuilder::new()
+                .path(PASSPHRASE_PATH)
+                .build(),
+        ),
     );
 
     // Collect the tar stream into bytes
@@ -1705,11 +2103,18 @@ async fn load_mesh_passphrase(docker: &Docker, mesh_id: u32) -> Result<String> {
         }
     }
 
-    Err(anyhow::anyhow!("No passphrase found in container for mesh {} (run setup first)", mesh_id))
+    Err(anyhow::anyhow!(
+        "No passphrase found in container for mesh {} (run setup first)",
+        mesh_id
+    ))
 }
 
 /// Call a HopNet node API with authentication and optional retry
-pub async fn call_node_api(node_info: &NodeInfo, path: &str, retry: bool) -> Result<reqwest::Response> {
+pub async fn call_node_api(
+    node_info: &NodeInfo,
+    path: &str,
+    retry: bool,
+) -> Result<reqwest::Response> {
     let url = format!("http://{}:{}{}", node_info.ip_address, node_info.port, path);
     let client = reqwest::Client::new();
 

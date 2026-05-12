@@ -1,10 +1,10 @@
 use anyhow::Result;
 use std::time::{Duration, Instant};
 
-use crate::tests::{Check, TestResult, TestScenario, print_and_add_check};
-use crate::tests::files::{upload_file, modify_file, list_files};
-use crate::tests::{get_max_view, wait_for_minimum_view};
 use crate::NodeInfo;
+use crate::tests::files::{list_files, modify_file, upload_file};
+use crate::tests::{Check, TestResult, TestScenario, print_and_add_check};
+use crate::tests::{get_max_view, wait_for_minimum_view};
 
 /// Test that GET /files/recent returns files ordered by modification height
 pub struct RecentsOrdering;
@@ -18,7 +18,12 @@ impl TestScenario for RecentsOrdering {
         "Upload files, modify one, and verify /files/recent returns correct ordering by modification height with consistent results across all nodes"
     }
 
-    async fn run(&self, _mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
+    async fn run(
+        &self,
+        _mesh_id: u32,
+        nodes: &[NodeInfo],
+        _flags: &[String],
+    ) -> Result<TestResult> {
         let start = Instant::now();
         let mut result = TestResult::new();
 
@@ -39,11 +44,14 @@ impl TestScenario for RecentsOrdering {
         let mut current_view = match get_max_view(nodes).await {
             Ok(view) => view,
             Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Get initial consensus view".to_string(),
-                    passed: false,
-                    detail: Some(e.to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Get initial consensus view".to_string(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
                 result.duration = start.elapsed();
                 return Ok(result);
             }
@@ -53,18 +61,24 @@ impl TestScenario for RecentsOrdering {
             let contents = format!("File {} content v1 ({})", filename, timestamp).into_bytes();
             match upload_file(&nodes[0], "/", filename, contents).await {
                 Ok(_) => {
-                    print_and_add_check(&mut result, Check {
-                        name: format!("Upload file {} ({})", i + 1, filename),
-                        passed: true,
-                        detail: None,
-                    });
+                    print_and_add_check(
+                        &mut result,
+                        Check {
+                            name: format!("Upload file {} ({})", i + 1, filename),
+                            passed: true,
+                            detail: None,
+                        },
+                    );
                 }
                 Err(e) => {
-                    print_and_add_check(&mut result, Check {
-                        name: format!("Upload file {} failed", i + 1),
-                        passed: false,
-                        detail: Some(e.to_string()),
-                    });
+                    print_and_add_check(
+                        &mut result,
+                        Check {
+                            name: format!("Upload file {} failed", i + 1),
+                            passed: false,
+                            detail: Some(e.to_string()),
+                        },
+                    );
                     result.duration = start.elapsed();
                     return Ok(result);
                 }
@@ -74,32 +88,41 @@ impl TestScenario for RecentsOrdering {
             match wait_for_minimum_view(nodes, current_view, Duration::from_secs(30)).await {
                 Ok(true) => {}
                 _ => {
-                    print_and_add_check(&mut result, Check {
-                        name: format!("Consensus after upload {}", i + 1),
-                        passed: false,
-                        detail: Some(format!("Timeout waiting for view {}", current_view)),
-                    });
+                    print_and_add_check(
+                        &mut result,
+                        Check {
+                            name: format!("Consensus after upload {}", i + 1),
+                            passed: false,
+                            detail: Some(format!("Timeout waiting for view {}", current_view)),
+                        },
+                    );
                     result.duration = start.elapsed();
                     return Ok(result);
                 }
             }
         }
 
-        print_and_add_check(&mut result, Check {
-            name: "All 3 files uploaded with consensus".to_string(),
-            passed: true,
-            detail: Some(format!("Current view: {}", current_view)),
-        });
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "All 3 files uploaded with consensus".to_string(),
+                passed: true,
+                detail: Some(format!("Current view: {}", current_view)),
+            },
+        );
 
         // Step 2: Fetch recents and verify initial ordering (gamma > beta > alpha)
         let recents = match list_recent_files(&nodes[0], 50).await {
             Ok(r) => r,
             Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Fetch initial recents".to_string(),
-                    passed: false,
-                    detail: Some(e.to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Fetch initial recents".to_string(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
                 result.duration = start.elapsed();
                 return Ok(result);
             }
@@ -110,11 +133,14 @@ impl TestScenario for RecentsOrdering {
 
         // All 3 files should be present
         let all_present = test_paths.iter().all(|p| recent_paths.contains(p));
-        print_and_add_check(&mut result, Check {
-            name: "All 3 files appear in recents".to_string(),
-            passed: all_present,
-            detail: Some(format!("Found {} total recent files", recent_paths.len())),
-        });
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "All 3 files appear in recents".to_string(),
+                passed: all_present,
+                detail: Some(format!("Found {} total recent files", recent_paths.len())),
+            },
+        );
         if !all_present {
             result.duration = start.elapsed();
             return Ok(result);
@@ -129,24 +155,30 @@ impl TestScenario for RecentsOrdering {
             (Some(g), Some(b), Some(a)) => g < b && b < a,
             _ => false,
         };
-        print_and_add_check(&mut result, Check {
-            name: "Initial ordering: gamma > beta > alpha".to_string(),
-            passed: initial_order_correct,
-            detail: Some(format!(
-                "Positions: gamma={:?}, beta={:?}, alpha={:?}",
-                gamma_pos, beta_pos, alpha_pos
-            )),
-        });
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Initial ordering: gamma > beta > alpha".to_string(),
+                passed: initial_order_correct,
+                detail: Some(format!(
+                    "Positions: gamma={:?}, beta={:?}, alpha={:?}",
+                    gamma_pos, beta_pos, alpha_pos
+                )),
+            },
+        );
 
         // Step 3: Modify alpha (the oldest file) to bump it to the top
         let listing = match list_files(&nodes[0], "/").await {
             Ok(l) => l,
             Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "List files to get inode IDs".to_string(),
-                    passed: false,
-                    detail: Some(e.to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "List files to get inode IDs".to_string(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
                 result.duration = start.elapsed();
                 return Ok(result);
             }
@@ -156,11 +188,14 @@ impl TestScenario for RecentsOrdering {
         let alpha_inode_id = match alpha_inode_id {
             Some(id) => id,
             None => {
-                print_and_add_check(&mut result, Check {
-                    name: "Extract alpha inode ID".to_string(),
-                    passed: false,
-                    detail: Some("Could not find alpha file in listing".to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Extract alpha inode ID".to_string(),
+                        passed: false,
+                        detail: Some("Could not find alpha file in listing".to_string()),
+                    },
+                );
                 result.duration = start.elapsed();
                 return Ok(result);
             }
@@ -169,18 +204,24 @@ impl TestScenario for RecentsOrdering {
         let new_contents = format!("File alpha modified content v2 ({})", timestamp).into_bytes();
         match modify_file(&nodes[0], &alpha_inode_id, new_contents).await {
             Ok(_) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Modify alpha file content".to_string(),
-                    passed: true,
-                    detail: Some(format!("inode_id: {}", alpha_inode_id)),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Modify alpha file content".to_string(),
+                        passed: true,
+                        detail: Some(format!("inode_id: {}", alpha_inode_id)),
+                    },
+                );
             }
             Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Modify alpha file failed".to_string(),
-                    passed: false,
-                    detail: Some(e.to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Modify alpha file failed".to_string(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
                 result.duration = start.elapsed();
                 return Ok(result);
             }
@@ -190,18 +231,24 @@ impl TestScenario for RecentsOrdering {
         current_view += 1;
         match wait_for_minimum_view(nodes, current_view, Duration::from_secs(30)).await {
             Ok(true) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Consensus after modification".to_string(),
-                    passed: true,
-                    detail: Some(format!("View: {}", current_view)),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Consensus after modification".to_string(),
+                        passed: true,
+                        detail: Some(format!("View: {}", current_view)),
+                    },
+                );
             }
             _ => {
-                print_and_add_check(&mut result, Check {
-                    name: "Consensus after modification".to_string(),
-                    passed: false,
-                    detail: Some(format!("Timeout waiting for view {}", current_view)),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Consensus after modification".to_string(),
+                        passed: false,
+                        detail: Some(format!("Timeout waiting for view {}", current_view)),
+                    },
+                );
                 result.duration = start.elapsed();
                 return Ok(result);
             }
@@ -211,11 +258,14 @@ impl TestScenario for RecentsOrdering {
         let recents_after = match list_recent_files(&nodes[0], 50).await {
             Ok(r) => r,
             Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Fetch recents after modification".to_string(),
-                    passed: false,
-                    detail: Some(e.to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Fetch recents after modification".to_string(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
                 result.duration = start.elapsed();
                 return Ok(result);
             }
@@ -230,24 +280,30 @@ impl TestScenario for RecentsOrdering {
             (Some(a), Some(g), Some(b)) => a < g && g < b,
             _ => false,
         };
-        print_and_add_check(&mut result, Check {
-            name: "Modified ordering: alpha > gamma > beta".to_string(),
-            passed: modified_order_correct,
-            detail: Some(format!(
-                "Positions: alpha={:?}, gamma={:?}, beta={:?}",
-                alpha_pos_after, gamma_pos_after, beta_pos_after
-            )),
-        });
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Modified ordering: alpha > gamma > beta".to_string(),
+                passed: modified_order_correct,
+                detail: Some(format!(
+                    "Positions: alpha={:?}, gamma={:?}, beta={:?}",
+                    alpha_pos_after, gamma_pos_after, beta_pos_after
+                )),
+            },
+        );
 
         // Step 5: Test limit parameter
         let recents_limited = match list_recent_files(&nodes[0], 2).await {
             Ok(r) => r,
             Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Fetch recents with limit=2".to_string(),
-                    passed: false,
-                    detail: Some(e.to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Fetch recents with limit=2".to_string(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
                 result.duration = start.elapsed();
                 return Ok(result);
             }
@@ -255,11 +311,14 @@ impl TestScenario for RecentsOrdering {
 
         let limited_count = recents_limited.as_array().map(|a| a.len()).unwrap_or(0);
         let limit_works = limited_count <= 2;
-        print_and_add_check(&mut result, Check {
-            name: "Limit parameter restricts results".to_string(),
-            passed: limit_works,
-            detail: Some(format!("Requested limit=2, got {} results", limited_count)),
-        });
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Limit parameter restricts results".to_string(),
+                passed: limit_works,
+                detail: Some(format!("Requested limit=2, got {} results", limited_count)),
+            },
+        );
 
         // Step 6: Verify consistency across all nodes
         let mut all_consistent = true;
@@ -270,11 +329,14 @@ impl TestScenario for RecentsOrdering {
             let node_recents = match list_recent_files(node, 50).await {
                 Ok(r) => r,
                 Err(e) => {
-                    print_and_add_check(&mut result, Check {
-                        name: format!("Fetch recents from node {}", i),
-                        passed: false,
-                        detail: Some(e.to_string()),
-                    });
+                    print_and_add_check(
+                        &mut result,
+                        Check {
+                            name: format!("Fetch recents from node {}", i),
+                            passed: false,
+                            detail: Some(e.to_string()),
+                        },
+                    );
                     all_consistent = false;
                     continue;
                 }
@@ -283,22 +345,28 @@ impl TestScenario for RecentsOrdering {
             let node_paths = extract_paths(&node_recents);
             if node_paths != reference_paths {
                 all_consistent = false;
-                print_and_add_check(&mut result, Check {
-                    name: format!("Node {} recents mismatch", i),
-                    passed: false,
-                    detail: Some(format!(
-                        "Node 0: {:?}\nNode {}: {:?}",
-                        reference_paths, i, node_paths
-                    )),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: format!("Node {} recents mismatch", i),
+                        passed: false,
+                        detail: Some(format!(
+                            "Node 0: {:?}\nNode {}: {:?}",
+                            reference_paths, i, node_paths
+                        )),
+                    },
+                );
             }
         }
 
-        print_and_add_check(&mut result, Check {
-            name: format!("Recents consistent across all {} nodes", nodes.len()),
-            passed: all_consistent,
-            detail: None,
-        });
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: format!("Recents consistent across all {} nodes", nodes.len()),
+                passed: all_consistent,
+                detail: None,
+            },
+        );
 
         result.duration = start.elapsed();
         result.details = format!(
@@ -331,7 +399,10 @@ async fn list_recent_files(node: &NodeInfo, limit: u32) -> Result<serde_json::Va
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_else(|_| "No body".to_string());
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "No body".to_string());
         anyhow::bail!("List recent files failed with status {}: {}", status, body);
     }
 
@@ -353,7 +424,8 @@ fn extract_paths(recents: &serde_json::Value) -> Vec<String> {
 /// Extract inode ID for a filename from a file listing
 fn extract_inode_id(listing: &serde_json::Value, filename: &str) -> Option<String> {
     let path = format!("/{}", filename);
-    listing.as_array()?
+    listing
+        .as_array()?
         .iter()
         .find(|item| item["path"].as_str() == Some(&path))
         .and_then(|item| item["id"].as_str())

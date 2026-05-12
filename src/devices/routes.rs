@@ -1,19 +1,19 @@
+use super::types::{
+    DeviceInfo, RegisterDevicePayload, RegisterDeviceRequest, RegisterDeviceResponse,
+    RevokeDevicePayload,
+};
+use crate::consensus::functions::create_signed_user_transaction;
+use crate::db::{Blake3Hash, CustomUUID, devices::get_devices_for_user};
+use crate::files::functions::{decrypt_part, encrypt_part};
+use crate::{AppState, auth, auth::auth_middleware};
 use axum::{
+    Extension, Json, Router,
     extract::{Path, State},
     http::StatusCode,
     middleware,
-    routing::{get, post, delete},
-    Extension, Json, Router,
+    routing::{delete, get, post},
 };
 use rand::Rng;
-use crate::{auth, auth::auth_middleware, AppState};
-use crate::db::{devices::get_devices_for_user, CustomUUID, Blake3Hash};
-use crate::consensus::functions::create_signed_user_transaction;
-use crate::files::functions::{encrypt_part, decrypt_part};
-use super::types::{
-    RegisterDeviceRequest, RegisterDeviceResponse, RegisterDevicePayload,
-    RevokeDevicePayload, DeviceInfo,
-};
 
 /// Build the devices management router (JWT-authenticated)
 pub fn router(app_state: AppState) -> Router<AppState> {
@@ -68,10 +68,14 @@ pub async fn register_device_internal(
         "register_device".to_string(),
         encoded_payload,
         user_id,
-    ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    )
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Submit to consensus
-    app_state.consensus_queue.submit(transaction)
+    app_state
+        .consensus_queue
+        .submit(transaction)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -88,7 +92,8 @@ async fn post_register_device(
     Extension(user_id): Extension<i32>,
     Json(request): Json<RegisterDeviceRequest>,
 ) -> Result<Json<RegisterDeviceResponse>, StatusCode> {
-    let (device_id, api_key) = register_device_internal(&app_state, user_id, &request.device_name).await?;
+    let (device_id, api_key) =
+        register_device_internal(&app_state, user_id, &request.device_name).await?;
     Ok(Json(RegisterDeviceResponse { device_id, api_key }))
 }
 
@@ -99,15 +104,18 @@ pub async fn ensure_fileprovider_device_token(
     app_state: &AppState,
     user_id: i32,
 ) -> Result<(), StatusCode> {
-    use crate::fileprovider::keychain::{self, KeychainEnvironment, FileProviderConfig};
     use crate::db::devices::get_device_by_id;
+    use crate::fileprovider::keychain::{self, FileProviderConfig, KeychainEnvironment};
 
     // Check if a valid token already exists in keychain
     if let Ok(config) = keychain::load_config(KeychainEnvironment::Production) {
         if let Some(dot_pos) = config.api_key.find('.') {
             let device_id_str = &config.api_key[..dot_pos];
             if let Ok(device_id) = CustomUUID::from_str(device_id_str) {
-                let db_lock = app_state.db_pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                let db_lock = app_state
+                    .db_pool
+                    .get()
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
                 if let Ok(Some(_)) = get_device_by_id(&db_lock, &device_id) {
                     return Ok(()); // Token still valid
                 }
@@ -116,13 +124,11 @@ pub async fn ensure_fileprovider_device_token(
     }
 
     // Register a new device token
-    let (_device_id, api_key) = register_device_internal(app_state, user_id, "FileProvider").await?;
+    let (_device_id, api_key) =
+        register_device_internal(app_state, user_id, "FileProvider").await?;
 
     // Store in keychain
-    let config = FileProviderConfig::new(
-        api_key,
-        format!("http://localhost:{}", app_state.port),
-    );
+    let config = FileProviderConfig::new(api_key, format!("http://localhost:{}", app_state.port));
     keychain::store_config(&config, KeychainEnvironment::Production)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -135,10 +141,13 @@ async fn get_devices(
     State(app_state): State<AppState>,
     Extension(user_id): Extension<i32>,
 ) -> Result<Json<Vec<DeviceInfo>>, StatusCode> {
-    let db_lock = app_state.db_pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let records = get_devices_for_user(&db_lock, user_id)
+    let db_lock = app_state
+        .db_pool
+        .get()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let records =
+        get_devices_for_user(&db_lock, user_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Get SIV keys for decryption
     let session = app_state.get_session(user_id).await?;
@@ -151,7 +160,9 @@ async fn get_devices(
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         // Extract timestamp from UUIDv7
-        let created_at = record.id.extract_timestamp()
+        let created_at = record
+            .id
+            .extract_timestamp()
             .map(|dt| dt.timestamp())
             .unwrap_or(0);
 
@@ -179,12 +190,10 @@ async fn delete_device(
     };
 
     // Build consensus payload
-    let payload = RevokeDevicePayload {
-        device_id,
-        user_id,
-    };
+    let payload = RevokeDevicePayload { device_id, user_id };
 
-    let encoded_payload = match bincode::serde::encode_to_vec(&payload, bincode::config::standard()) {
+    let encoded_payload = match bincode::serde::encode_to_vec(&payload, bincode::config::standard())
+    {
         Ok(data) => data,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
     };
@@ -195,7 +204,9 @@ async fn delete_device(
         "revoke_device".to_string(),
         encoded_payload,
         user_id,
-    ).await {
+    )
+    .await
+    {
         Ok(tx) => tx,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
     };

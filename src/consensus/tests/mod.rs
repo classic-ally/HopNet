@@ -1,11 +1,11 @@
+use super::*;
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use rand_core::OsRng;
-use super::*;  // Import from parent consensus module
+use rand_core::OsRng; // Import from parent consensus module
 
-mod signatures;
-mod quorum;
 mod authorization;
 mod byzantine;
+mod quorum;
+mod signatures;
 
 #[derive(Clone)]
 pub struct MockNode {
@@ -56,13 +56,9 @@ pub struct MockNetwork {
 
 impl MockNetwork {
     pub fn new(num_nodes: usize, num_users: usize) -> Self {
-        let nodes = (0..num_nodes as i32)
-            .map(|id| MockNode::new(id))
-            .collect();
+        let nodes = (0..num_nodes as i32).map(|id| MockNode::new(id)).collect();
 
-        let users = (0..num_users as i32)
-            .map(|id| MockUser::new(id))
-            .collect();
+        let users = (0..num_users as i32).map(|id| MockUser::new(id)).collect();
 
         Self { nodes, users }
     }
@@ -75,8 +71,9 @@ impl MockNetwork {
         let first_node = MockNode::new(0);
         let x25519_pubkey = crate::auth::derive_x25519_pubkey_from_user(&users[0].signing_key);
 
-        let (encrypted_privkey, key_salt) = crate::auth::wrap_user_privkey(&users[0].signing_key, "password")
-            .expect("Failed to wrap test user privkey");
+        let (encrypted_privkey, key_salt) =
+            crate::auth::wrap_user_privkey(&users[0].signing_key, "password")
+                .expect("Failed to wrap test user privkey");
         let user = crate::types::User::new(
             0,
             "test_user".to_string(),
@@ -93,16 +90,20 @@ impl MockNetwork {
             pubkey: first_node.verifying_key,
         };
 
-        let (user_id, node_id) = crate::db::setup::post_initial_setup(
-            &first_node.app_state,
-            user,
-            first_db_node,
-        ).expect("Failed to run initial setup for first node");
+        let (user_id, node_id) =
+            crate::db::setup::post_initial_setup(&first_node.app_state, user, first_db_node)
+                .expect("Failed to run initial setup for first node");
 
         // Set node_id and user_id in app_state
-        first_node.app_state.node_id.set(node_id)
+        first_node
+            .app_state
+            .node_id
+            .set(node_id)
             .expect("Failed to set node_id");
-        first_node.app_state.user_id.set(user_id)
+        first_node
+            .app_state
+            .user_id
+            .set(user_id)
             .expect("Failed to set user_id");
 
         nodes.push(first_node);
@@ -120,34 +121,56 @@ impl MockNetwork {
 
             // Insert new node info into all existing nodes' databases
             for j in 0..i {
-                let existing_node_db = nodes[j as usize].app_state.db_pool.get()
+                let existing_node_db = nodes[j as usize]
+                    .app_state
+                    .db_pool
+                    .get()
                     .expect("Failed to get existing node DB");
 
-                existing_node_db.execute(
-                    "INSERT INTO nodes (node_id, name, owner, pubkey) VALUES (?, ?, ?, ?)",
-                    rusqlite::params![i as i32, format!("node_{}", i), 0, joining_node.verifying_key]
-                ).expect("Failed to insert joining node into existing node");
+                existing_node_db
+                    .execute(
+                        "INSERT INTO nodes (node_id, name, owner, pubkey) VALUES (?, ?, ?, ?)",
+                        rusqlite::params![
+                            i as i32,
+                            format!("node_{}", i),
+                            0,
+                            joining_node.verifying_key
+                        ],
+                    )
+                    .expect("Failed to insert joining node into existing node");
 
                 existing_node_db.execute(
                     "INSERT INTO validators (effective_height, node_id, is_active) VALUES (?, ?, ?)",
                     rusqlite::params![0, i as i32, true]
                 ).expect("Failed to insert validator into existing node");
 
-                existing_node_db.execute(
-                    "UPDATE sequences SET next_id = next_id + 1 WHERE name = 'nodes'",
-                    []
-                ).expect("Failed to update node sequence");
+                existing_node_db
+                    .execute(
+                        "UPDATE sequences SET next_id = next_id + 1 WHERE name = 'nodes'",
+                        [],
+                    )
+                    .expect("Failed to update node sequence");
             }
 
             // Copy database state from first node to joining node
             eprintln!("setup_with_validators: About to sync state for node {}", i);
-            Self::sync_node_state(&nodes[0].app_state, &joining_node.app_state, &joining_node_info)
-                .expect(&format!("Failed to sync state to node {}", i));
+            Self::sync_node_state(
+                &nodes[0].app_state,
+                &joining_node.app_state,
+                &joining_node_info,
+            )
+            .expect(&format!("Failed to sync state to node {}", i));
 
             // Set the node_id and user_id in the app_state (required for Block::new_tip)
-            joining_node.app_state.node_id.set(i as i32)
+            joining_node
+                .app_state
+                .node_id
+                .set(i as i32)
                 .expect("Failed to set node_id");
-            joining_node.app_state.user_id.set(0)  // All nodes owned by user 0
+            joining_node
+                .app_state
+                .user_id
+                .set(0) // All nodes owned by user 0
                 .expect("Failed to set user_id");
 
             nodes.push(joining_node);
@@ -164,7 +187,10 @@ impl MockNetwork {
     ) -> Result<(), crate::db::DatabaseError> {
         use bincode::serde::{decode_from_slice, encode_to_vec};
 
-        eprintln!("sync_node_state: Starting sync for node {}", joining_node.node_id);
+        eprintln!(
+            "sync_node_state: Starting sync for node {}",
+            joining_node.node_id
+        );
         let source_db = source.db_pool.get().map_err(|e| {
             eprintln!("Failed to get source DB: {:?}", e);
             crate::db::DatabaseError::LockError
@@ -205,21 +231,22 @@ impl MockNetwork {
 
         // Copy nodes
         eprintln!("sync_node_state: Copying nodes...");
-        source_db.prepare("SELECT node_id, name, owner, pubkey FROM nodes")
+        source_db
+            .prepare("SELECT node_id, name, owner, pubkey FROM nodes")
             .and_then(|mut stmt| {
                 let rows = stmt.query_map([], |row| {
                     Ok((
                         row.get::<_, i32>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, i32>(2)?,
-                        row.get::<_, crate::db::PubKey>(3)?
+                        row.get::<_, crate::db::PubKey>(3)?,
                     ))
                 })?;
                 for row in rows {
                     let (node_id, name, owner, pubkey) = row?;
                     dest_db.execute(
                         "INSERT INTO nodes (node_id, name, owner, pubkey) VALUES (?, ?, ?, ?)",
-                        rusqlite::params![node_id, name, owner, pubkey]
+                        rusqlite::params![node_id, name, owner, pubkey],
                     )?;
                 }
                 Ok(())
@@ -232,7 +259,8 @@ impl MockNetwork {
 
         // Copy sequences
         eprintln!("sync_node_state: Copying sequences...");
-        source_db.prepare("SELECT name, next_id FROM sequences")
+        source_db
+            .prepare("SELECT name, next_id FROM sequences")
             .and_then(|mut stmt| {
                 let rows = stmt.query_map([], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?))
@@ -241,7 +269,7 @@ impl MockNetwork {
                     let (name, next_id) = row?;
                     dest_db.execute(
                         "UPDATE sequences SET next_id = ? WHERE name = ?",
-                        rusqlite::params![next_id, name]
+                        rusqlite::params![next_id, name],
                     )?;
                 }
                 Ok(())
@@ -422,12 +450,15 @@ impl MockNetwork {
     }
 }
 
-pub fn create_test_app_state_with_keys(signing_key: crate::db::PrivKey, verifying_key: crate::db::PubKey) -> AppState {
+pub fn create_test_app_state_with_keys(
+    signing_key: crate::db::PrivKey,
+    verifying_key: crate::db::PubKey,
+) -> AppState {
+    use jsonwebtoken::{DecodingKey, EncodingKey};
+    use once_cell::sync::OnceCell;
     use r2d2::Pool;
     use r2d2_sqlite::SqliteConnectionManager;
     use std::sync::Arc;
-    use once_cell::sync::OnceCell;
-    use jsonwebtoken::{EncodingKey, DecodingKey};
 
     let manager = SqliteConnectionManager::memory();
     let pool = Pool::builder()
@@ -442,11 +473,17 @@ pub fn create_test_app_state_with_keys(signing_key: crate::db::PrivKey, verifyin
     let decoding_key = DecodingKey::from_secret(jwt_secret);
 
     let iroh_secret = signing_key.to_iroh_secret_key();
-    let iroh_transport = tokio::runtime::Runtime::new().unwrap()
-        .block_on(crate::net::IrohTransport::new(iroh_secret, pool.clone(), true))
+    let iroh_transport = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(crate::net::IrohTransport::new(
+            iroh_secret,
+            pool.clone(),
+            true,
+        ))
         .expect("test iroh transport");
 
-    let (consensus_queue, _consensus_queue_rx) = crate::consensus::queue::ConsensusQueue::new(pool.clone(), 256);
+    let (consensus_queue, _consensus_queue_rx) =
+        crate::consensus::queue::ConsensusQueue::new(pool.clone(), 256);
 
     AppState {
         db_pool: pool,
@@ -479,5 +516,8 @@ pub fn create_test_app_state_with_keys(signing_key: crate::db::PrivKey, verifyin
 pub fn create_test_app_state() -> AppState {
     let signing_key = SigningKey::generate(&mut OsRng);
     let verifying_key = signing_key.verifying_key();
-    create_test_app_state_with_keys(crate::db::PrivKey(signing_key), crate::db::PubKey(verifying_key))
+    create_test_app_state_with_keys(
+        crate::db::PrivKey(signing_key),
+        crate::db::PubKey(verifying_key),
+    )
 }

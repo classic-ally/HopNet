@@ -4,11 +4,15 @@ use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use serde::Serialize;
 
-use crate::schema::FunctionResult;
-use super::helpers::wrap;
 use super::super::fixtures::FixtureContext;
+use super::helpers::wrap;
+use crate::schema::FunctionResult;
 
-pub fn capture(pool: &Pool<SqliteConnectionManager>, ctx: &FixtureContext, results: &mut BTreeMap<String, FunctionResult>) {
+pub fn capture(
+    pool: &Pool<SqliteConnectionManager>,
+    ctx: &FixtureContext,
+    results: &mut BTreeMap<String, FunctionResult>,
+) {
     use hopnet::db::shares;
 
     // IncomingShareRow doesn't implement Serialize
@@ -37,17 +41,21 @@ pub fn capture(pool: &Pool<SqliteConnectionManager>, ctx: &FixtureContext, resul
                     value: serde_json::to_value(&proxies).unwrap(),
                 }
             }
-            Err(e) => FunctionResult::Error { error_variant: format!("{:?}", e) },
+            Err(e) => FunctionResult::Error {
+                error_variant: format!("{:?}", e),
+            },
         }
     });
 
-    results.insert("db::shares::get_incoming_share_count(user=1)".into(), wrap(|| {
-        shares::get_incoming_share_count(pool.get(), 1)
-    }));
+    results.insert(
+        "db::shares::get_incoming_share_count(user=1)".into(),
+        wrap(|| shares::get_incoming_share_count(pool.get(), 1)),
+    );
 
-    results.insert("db::shares::get_incoming_share_count(user=0)".into(), wrap(|| {
-        shares::get_incoming_share_count(pool.get(), 0)
-    }));
+    results.insert(
+        "db::shares::get_incoming_share_count(user=0)".into(),
+        wrap(|| shares::get_incoming_share_count(pool.get(), 0)),
+    );
 
     // ShareMember doesn't implement Serialize
     if let Some(db_id) = ctx.data_block_ids.first() {
@@ -70,7 +78,9 @@ pub fn capture(pool: &Pool<SqliteConnectionManager>, ctx: &FixtureContext, resul
                         value: serde_json::to_value(&proxies).unwrap(),
                     }
                 }
-                Err(e) => FunctionResult::Error { error_variant: format!("{:?}", e) },
+                Err(e) => FunctionResult::Error {
+                    error_variant: format!("{:?}", e),
+                },
             }
         });
     }

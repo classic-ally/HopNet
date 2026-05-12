@@ -1,14 +1,14 @@
+use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
+use rusqlite::TransactionBehavior;
 use std::collections::HashSet;
 use std::fmt;
-use r2d2_sqlite::SqliteConnectionManager;
-use r2d2::Pool;
-use rusqlite::TransactionBehavior;
 use tokio::sync::{mpsc, oneshot};
 
+use super::types::Transaction;
 use crate::AppState;
 use crate::DISPATCH_TABLE;
 use crate::db::consensus as db;
-use super::types::Transaction;
 
 // ============================================================================
 // Public Types
@@ -70,9 +70,18 @@ pub struct ConsensusQueue {
 
 impl ConsensusQueue {
     /// Create a new ConsensusQueue. Returns the queue handle and the receiver for the batch processor.
-    pub fn new(db_pool: Pool<SqliteConnectionManager>, capacity: usize) -> (Self, mpsc::Receiver<QueuedTransaction>) {
+    pub fn new(
+        db_pool: Pool<SqliteConnectionManager>,
+        capacity: usize,
+    ) -> (Self, mpsc::Receiver<QueuedTransaction>) {
         let (tx, rx) = mpsc::channel(capacity);
-        (ConsensusQueue { sender: tx, db_pool }, rx)
+        (
+            ConsensusQueue {
+                sender: tx,
+                db_pool,
+            },
+            rx,
+        )
     }
 
     /// Submit a single transaction. Pre-validates against committed state first.
@@ -152,10 +161,16 @@ impl ConsensusQueue {
     /// Currently checks that the handler exists in the dispatch table.
     /// Full preflight validation (with execute=true dry-run) happens on the leader.
     fn pre_validate(&self, transaction: &Transaction) -> Result<(), String> {
-        if DISPATCH_TABLE.get(transaction.rpc.function.as_str()).is_some() {
+        if DISPATCH_TABLE
+            .get(transaction.rpc.function.as_str())
+            .is_some()
+        {
             Ok(())
         } else {
-            Err(format!("no handler for function: {}", transaction.rpc.function))
+            Err(format!(
+                "no handler for function: {}",
+                transaction.rpc.function
+            ))
         }
     }
 
@@ -167,9 +182,10 @@ impl ConsensusQueue {
             rejecting_leaders: HashSet::new(),
         };
 
-        self.sender.send(queued).await.map_err(|_| {
-            ConsensusSubmitError::InternalError("queue closed".into())
-        })?;
+        self.sender
+            .send(queued)
+            .await
+            .map_err(|_| ConsensusSubmitError::InternalError("queue closed".into()))?;
 
         await_result(result_rx).await
     }
@@ -185,9 +201,10 @@ impl ConsensusQueue {
             rejecting_leaders: HashSet::new(),
         };
 
-        self.sender.send(queued).await.map_err(|_| {
-            ConsensusSubmitError::InternalError("queue closed".into())
-        })?;
+        self.sender
+            .send(queued)
+            .await
+            .map_err(|_| ConsensusSubmitError::InternalError("queue closed".into()))?;
 
         Ok(((), result_rx))
     }
@@ -199,7 +216,9 @@ async fn await_result(rx: oneshot::Receiver<ConsensusResult>) -> Result<(), Cons
         Ok(Ok(ConsensusResult::Committed)) => Ok(()),
         Ok(Ok(ConsensusResult::Rejected(reason))) => Err(ConsensusSubmitError::Rejected(reason)),
         Ok(Ok(ConsensusResult::Failed(msg))) => Err(ConsensusSubmitError::InternalError(msg)),
-        Ok(Err(_)) => Err(ConsensusSubmitError::InternalError("result channel dropped".into())),
+        Ok(Err(_)) => Err(ConsensusSubmitError::InternalError(
+            "result channel dropped".into(),
+        )),
         Err(_) => Err(ConsensusSubmitError::Timeout),
     }
 }
@@ -231,13 +250,13 @@ enum DispatchOutcome {
 /// - ViewAdvanced: no gate — loop back immediately to drain more transactions
 /// - WaitForViewChange: view-aware wait — check DB, only block if view hasn't moved
 /// - RetryAfterDelay: short sleep, then retry (leader was unreachable)
-pub async fn batch_processor(
-    mut rx: mpsc::Receiver<QueuedTransaction>,
-    app_state: AppState,
-) {
+pub async fn batch_processor(mut rx: mpsc::Receiver<QueuedTransaction>, app_state: AppState) {
     // Dedicated connection for the batch processor — checked out once, held for lifetime.
     // Makes consensus throughput independent of pool contention from background tasks.
-    let mut conn = app_state.db_pool.get().expect("batch_processor: failed to check out dedicated connection");
+    let mut conn = app_state
+        .db_pool
+        .get()
+        .expect("batch_processor: failed to check out dedicated connection");
 
     let mut retry_holdback: Vec<QueuedTransaction> = Vec::new();
 
@@ -268,9 +287,9 @@ pub async fn batch_processor(
             Ok(id) => id,
             Err(_) => {
                 for queued in batch {
-                    let _ = queued.notifier.send(ConsensusResult::Failed(
-                        "node not initialized".into(),
-                    ));
+                    let _ = queued
+                        .notifier
+                        .send(ConsensusResult::Failed("node not initialized".into()));
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 continue;
@@ -295,8 +314,8 @@ pub async fn batch_processor(
         // ── Dispatch ──
         let (holdback, outcome) = if consensus_state.leader.node_id == my_node_id {
             // Leader: linger to collect forwarded transactions from other nodes
-            let deadline = tokio::time::Instant::now()
-                + std::time::Duration::from_millis(BATCH_LINGER_MS);
+            let deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_millis(BATCH_LINGER_MS);
             while batch.len() < MAX_BATCH_SIZE {
                 match tokio::time::timeout_at(deadline, rx.recv()).await {
                     Ok(Some(queued)) => batch.push(queued),
@@ -349,7 +368,8 @@ async fn handle_as_leader(
     if consensus_state.last_propose_vote_block_hash.is_some() {
         tracing::debug!(
             "Already proposed in view {}, holding {} transactions for next view",
-            consensus_state.view, batch.len()
+            consensus_state.view,
+            batch.len()
         );
         return (batch, DispatchOutcome::WaitForViewChange);
     }
@@ -408,7 +428,9 @@ async fn handle_as_leader(
                     Err(e) => {
                         tracing::debug!(
                             "Preflight rejected tx {}: {:?} (function: {})",
-                            i, e, queued.tx.rpc.function
+                            i,
+                            e,
+                            queued.tx.rpc.function
                         );
                         let _ = db_tx.execute_batch(&format!("ROLLBACK TO {}", sp));
                         let _ = db_tx.execute_batch(&format!("RELEASE {}", sp));
@@ -445,11 +467,13 @@ async fn handle_as_leader(
     const NONCE_CLEANUP_INTERVAL: u64 = 97;
     if (consensus_state.view as u64) % NONCE_CLEANUP_INTERVAL == 0 {
         let cutoff_ts = (chrono::Utc::now() - chrono::Duration::hours(1)).timestamp() as u64;
-        let cutoff = hopnet_common::CustomUUID::new(Some(
-            &uuid::Timestamp::from_unix(uuid::NoContext, cutoff_ts, 0)
-        ));
-        let payload = bincode::serde::encode_to_vec(&cutoff, bincode::config::standard())
-            .unwrap_or_default();
+        let cutoff = hopnet_common::CustomUUID::new(Some(&uuid::Timestamp::from_unix(
+            uuid::NoContext,
+            cutoff_ts,
+            0,
+        )));
+        let payload =
+            bincode::serde::encode_to_vec(&cutoff, bincode::config::standard()).unwrap_or_default();
         if let Ok(cleanup_tx) = super::functions::create_signed_transaction(
             app_state,
             "system.cleanup_nonces".to_string(),
@@ -468,7 +492,11 @@ async fn handle_as_leader(
             (Vec::new(), DispatchOutcome::ViewAdvanced)
         }
         Err(e) => {
-            tracing::warn!("run_consensus failed: {:?}, holding {} transactions for retry", e, batch.len());
+            tracing::warn!(
+                "run_consensus failed: {:?}, holding {} transactions for retry",
+                e,
+                batch.len()
+            );
             // We attempted a proposal — wait for TC to advance the view
             (batch, DispatchOutcome::WaitForViewChange)
         }
@@ -488,7 +516,8 @@ async fn handle_as_forwarder(
     if consensus_state.last_propose_vote_block_hash.is_some() {
         tracing::debug!(
             "Already voted on proposal in view {}, holding {} transactions for next view",
-            consensus_state.view, batch.len()
+            consensus_state.view,
+            batch.len()
         );
         return (batch, DispatchOutcome::WaitForViewChange);
     }
@@ -501,7 +530,9 @@ async fn handle_as_forwarder(
 
     tracing::debug!(
         "Forwarding {} transactions to leader node {} (view: {})",
-        transactions.len(), leader.node_id, view
+        transactions.len(),
+        leader.node_id,
+        view
     );
 
     let forward_result = super::rpc::forward_transactions_with_ack(
@@ -511,13 +542,20 @@ async fn handle_as_forwarder(
         transactions,
         view,
         &app_state.view_changed,
-    ).await;
+    )
+    .await;
 
     match forward_result {
         Ok(super::rpc::ForwardAckResult::NoAck) => {
             // Leader never received our request — safe to retry
-            tracing::warn!("No ACK from leader node {} — evicting connection and retrying", leader.node_id);
-            app_state.iroh_transport.remove_connection(leader.node_id).await;
+            tracing::warn!(
+                "No ACK from leader node {} — evicting connection and retrying",
+                leader.node_id
+            );
+            app_state
+                .iroh_transport
+                .remove_connection(leader.node_id)
+                .await;
             (batch, DispatchOutcome::RetryAfterDelay)
         }
         Ok(super::rpc::ForwardAckResult::AckedWithResult(results)) => {
@@ -527,14 +565,20 @@ async fn handle_as_forwarder(
         Ok(super::rpc::ForwardAckResult::AckedViewChanged) => {
             // View advanced before leader result — nonces are committed in local DB.
             // Synthesize results from nonce table and process through unified codepath.
-            tracing::debug!("Leader node {} ACKed, view changed — resolving via nonce table", leader.node_id);
+            tracing::debug!(
+                "Leader node {} ACKed, view changed — resolving via nonce table",
+                leader.node_id
+            );
             let results = synthesize_results_from_nonces(&batch, conn);
             process_forward_results(app_state, batch, results, consensus_state, conn)
         }
         Ok(super::rpc::ForwardAckResult::AckedNoResult) => {
             // Safety timeout — view hasn't changed, leader still processing.
             // Wait for view change; next cycle will resolve via nonce dedup.
-            tracing::debug!("Leader node {} ACKed but safety timeout — waiting for view change", leader.node_id);
+            tracing::debug!(
+                "Leader node {} ACKed but safety timeout — waiting for view change",
+                leader.node_id
+            );
             (batch, DispatchOutcome::WaitForViewChange)
         }
         Ok(super::rpc::ForwardAckResult::NotLeader { view: leader_view }) => {
@@ -545,7 +589,9 @@ async fn handle_as_forwarder(
             // matching the pattern other handlers have when receiving ensure_caught_up_for_message
             tracing::debug!(
                 "Node {} not leader (at view {}, we're at {}) — waiting for catch-up",
-                leader.node_id, leader_view, view
+                leader.node_id,
+                leader_view,
+                view
             );
             (batch, DispatchOutcome::WaitForViewChange)
         }
@@ -553,7 +599,8 @@ async fn handle_as_forwarder(
             // Leader's consensus lock is held — wait for next view
             tracing::debug!(
                 "Leader node {} busy in view {} — waiting for next view",
-                leader.node_id, view
+                leader.node_id,
+                view
             );
             (batch, DispatchOutcome::WaitForViewChange)
         }
@@ -573,15 +620,18 @@ fn synthesize_results_from_nonces(
 ) -> Vec<super::rpc::TransactionForwardResult> {
     let nonces: Vec<_> = batch.iter().map(|q| q.tx.nonce.clone()).collect();
     let committed = db::check_committed_nonces(conn, &nonces).unwrap_or_default();
-    batch.iter().map(|q| {
-        if committed.contains(&q.tx.nonce.to_string()) {
-            super::rpc::TransactionForwardResult::Committed
-        } else {
-            super::rpc::TransactionForwardResult::Retry {
-                reason: "view changed before leader result".into(),
+    batch
+        .iter()
+        .map(|q| {
+            if committed.contains(&q.tx.nonce.to_string()) {
+                super::rpc::TransactionForwardResult::Committed
+            } else {
+                super::rpc::TransactionForwardResult::Retry {
+                    reason: "view changed before leader result".into(),
+                }
             }
-        }
-    }).collect()
+        })
+        .collect()
 }
 
 /// Process per-transaction results from the leader forward response.
@@ -612,9 +662,9 @@ fn process_forward_results(
                 ) {
                     Ok(v) => v.len(),
                     Err(_) => {
-                        let _ = queued.notifier.send(ConsensusResult::Failed(
-                            "failed to get validators".into(),
-                        ));
+                        let _ = queued
+                            .notifier
+                            .send(ConsensusResult::Failed("failed to get validators".into()));
                         continue;
                     }
                 };
@@ -634,7 +684,9 @@ fn process_forward_results(
                 got_retry = true;
                 tracing::debug!(
                     "Transient forward failure from leader node {} (view {}): {}",
-                    leader.node_id, consensus_state.view, reason
+                    leader.node_id,
+                    consensus_state.view,
+                    reason
                 );
                 retries.push(QueuedTransaction {
                     tx: queued.tx,

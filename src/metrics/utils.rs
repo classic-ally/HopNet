@@ -1,7 +1,4 @@
-pub fn format_bandwidth(
-    bytes_per_second: f64,
-    bits_mode: bool,
-) -> String {
+pub fn format_bandwidth(bytes_per_second: f64, bits_mode: bool) -> String {
     let is_negative = bytes_per_second < 0.0;
     let value = bytes_per_second.abs();
 

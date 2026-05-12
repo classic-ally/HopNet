@@ -41,7 +41,10 @@ fn describe_diff(a: &FunctionResult, b: &FunctionResult) -> Option<String> {
                 None
             }
         }
-        (FunctionResult::Error { error_variant: ea }, FunctionResult::Error { error_variant: eb }) => {
+        (
+            FunctionResult::Error { error_variant: ea },
+            FunctionResult::Error { error_variant: eb },
+        ) => {
             if ea != eb {
                 Some(format!("error variant changed: {} -> {}", ea, eb))
             } else {

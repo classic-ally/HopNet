@@ -1,7 +1,7 @@
 // Android DocumentProvider types
+use super::db::CustomUUID;
 use serde::{Deserialize, Serialize};
 use typeshare::typeshare;
-use super::db::CustomUUID;
 
 /// Document item for Android DocumentProvider
 /// Represents a file or folder in the HopNet storage

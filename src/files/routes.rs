@@ -1,19 +1,21 @@
-use axum::{
-    extract::{
-        DefaultBodyLimit, Multipart, Path, Query, State, Extension
-    },
-    Json,
-    response::{Response, IntoResponse},
-    http::header,
-    body::Body,
-    routing::{get, post, delete},
-    Router,
-};
-use reed_solomon_simd::ReedSolomonEncoder;
 use axum::http::StatusCode;
+use axum::{
+    Json, Router,
+    body::Body,
+    extract::{DefaultBodyLimit, Extension, Multipart, Path, Query, State},
+    http::header,
+    response::{IntoResponse, Response},
+    routing::{delete, get, post},
+};
 use rand::RngCore;
+use reed_solomon_simd::ReedSolomonEncoder;
 
-use crate::{db::{self, Blake3Hash, Data, DataRecord, DatabaseError, FragmentHash, Inode}, files::functions::{calculate_chunk_padding, encrypt_chunk, encrypt_part, encrypt_path, store_fragment}};
+use crate::{
+    db::{self, Blake3Hash, Data, DataRecord, DatabaseError, FragmentHash, Inode},
+    files::functions::{
+        calculate_chunk_padding, encrypt_chunk, encrypt_part, encrypt_path, store_fragment,
+    },
+};
 use hopnet_common::FileItem;
 use serde::{Deserialize, Serialize};
 
@@ -26,7 +28,7 @@ use tokio_util::io::StreamReader;
 
 #[derive(Deserialize)]
 pub struct GetQueryParams {
-    path: String
+    path: String,
 }
 
 #[derive(Deserialize)]
@@ -45,7 +47,10 @@ pub fn router(state: crate::AppState) -> Router<crate::AppState> {
         .route("/{*path}", get(get_file_fragments));
 
     let writes = Router::new()
-        .route("/", post(post_files).patch(patch_files).delete(delete_files))
+        .route(
+            "/",
+            post(post_files).patch(patch_files).delete(delete_files),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state,
             crate::takeout::import_gate::import_gate,
@@ -68,7 +73,10 @@ fn process_logical_chunk(
     fragments_dir: &str,
     output_metadata: &mut Vec<FragmentHash>,
 ) -> Result<usize, StatusCode> {
-    use crate::files::functions::{ORIGINAL_FRAGMENTS_PER_CHUNK, RECOVERY_FRAGMENTS_PER_CHUNK, calculate_chunk_padding, calculate_padding_and_chunks};
+    use crate::files::functions::{
+        ORIGINAL_FRAGMENTS_PER_CHUNK, RECOVERY_FRAGMENTS_PER_CHUNK, calculate_chunk_padding,
+        calculate_padding_and_chunks,
+    };
 
     let chunk_size = chunk_data.len();
 
@@ -77,8 +85,13 @@ fn process_logical_chunk(
     let padded_size = chunk_size + padding;
     let fragment_size = padded_size / ORIGINAL_FRAGMENTS_PER_CHUNK;
 
-    tracing::debug!("process_logical_chunk: chunk_number={}, size={}, padding={}, fragment_size={}",
-                   chunk_number, chunk_size, padding, fragment_size);
+    tracing::debug!(
+        "process_logical_chunk: chunk_number={}, size={}, padding={}, fragment_size={}",
+        chunk_number,
+        chunk_size,
+        padding,
+        fragment_size
+    );
 
     // Pad and split into 10 equal fragments
     let mut padded_chunk = chunk_data.to_vec();
@@ -87,7 +100,8 @@ fn process_logical_chunk(
         rand::rng().fill_bytes(&mut padded_chunk[chunk_size..]);
     }
 
-    let (fragment_chunks, _) = calculate_padding_and_chunks(padded_chunk, ORIGINAL_FRAGMENTS_PER_CHUNK);
+    let (fragment_chunks, _) =
+        calculate_padding_and_chunks(padded_chunk, ORIGINAL_FRAGMENTS_PER_CHUNK);
 
     // Encrypt each fragment and calculate encrypted size for RS encoder
     let mut encrypted_fragments = Vec::new();
@@ -103,20 +117,29 @@ fn process_logical_chunk(
     let encrypted_fragment_size = encrypted_fragments[0].1.len();
 
     // Reset Reed-Solomon encoder for this chunk's shard size (reuses tables + workspace)
-    encoder.reset(
-        ORIGINAL_FRAGMENTS_PER_CHUNK,
-        RECOVERY_FRAGMENTS_PER_CHUNK,
-        encrypted_fragment_size
-    ).map_err(|e| {
-        tracing::error!("Reed-Solomon encoder reset failed for chunk {}: {:?}", chunk_number, e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    encoder
+        .reset(
+            ORIGINAL_FRAGMENTS_PER_CHUNK,
+            RECOVERY_FRAGMENTS_PER_CHUNK,
+            encrypted_fragment_size,
+        )
+        .map_err(|e| {
+            tracing::error!(
+                "Reed-Solomon encoder reset failed for chunk {}: {:?}",
+                chunk_number,
+                e
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     // Add encrypted fragments to encoder and store them
-    for (local_index, (fragment_id, encrypted_fragment)) in encrypted_fragments.into_iter().enumerate() {
+    for (local_index, (fragment_id, encrypted_fragment)) in
+        encrypted_fragments.into_iter().enumerate()
+    {
         // Calculate hash and add to encoder first (both only need borrows)
         let fragment_hash = Blake3Hash::new(blake3::hash(&encrypted_fragment));
-        encoder.add_original_shard(&encrypted_fragment)
+        encoder
+            .add_original_shard(&encrypted_fragment)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         // Now move encrypted_fragment to storage (no clone needed)
@@ -135,7 +158,9 @@ fn process_logical_chunk(
     }
 
     // Generate recovery fragments
-    let recovery_generator = encoder.encode().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let recovery_generator = encoder
+        .encode()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mut recovery_iter = recovery_generator.recovery_iter();
 
     let mut recovery_index = ORIGINAL_FRAGMENTS_PER_CHUNK;
@@ -159,8 +184,12 @@ fn process_logical_chunk(
         recovery_index += 1;
     }
 
-    tracing::debug!("process_logical_chunk: chunk {} complete, created {} fragments (10 original + 20 recovery), padding={} bytes",
-                   chunk_number, output_metadata.len() - (chunk_number as usize * 30), padding);
+    tracing::debug!(
+        "process_logical_chunk: chunk {} complete, created {} fragments (10 original + 20 recovery), padding={} bytes",
+        chunk_number,
+        output_metadata.len() - (chunk_number as usize * 30),
+        padding
+    );
 
     Ok(padding)
 }
@@ -175,7 +204,10 @@ pub async fn process_uploaded_file<R: AsyncRead + Unpin>(
     per_file_key: &chacha20poly1305::Key,
     fragments_dir: &str,
 ) -> Result<DataRecord, StatusCode> {
-    use crate::files::functions::{calculate_chunked_fragments, CHUNK_SIZE, ORIGINAL_FRAGMENTS_PER_CHUNK, RECOVERY_FRAGMENTS_PER_CHUNK};
+    use crate::files::functions::{
+        CHUNK_SIZE, ORIGINAL_FRAGMENTS_PER_CHUNK, RECOVERY_FRAGMENTS_PER_CHUNK,
+        calculate_chunked_fragments,
+    };
 
     const READ_BUF_SIZE: usize = 64 * 1024;
 
@@ -184,15 +216,21 @@ pub async fn process_uploaded_file<R: AsyncRead + Unpin>(
 
     let (num_chunks, total_original, total_recovery) = calculate_chunked_fragments(file_size);
 
-    tracing::debug!("process_uploaded_file: file_size={}, num_chunks={}, total_original={}, total_recovery={}",
-                   file_size, num_chunks, total_original, total_recovery);
+    tracing::debug!(
+        "process_uploaded_file: file_size={}, num_chunks={}, total_original={}, total_recovery={}",
+        file_size,
+        num_chunks,
+        total_original,
+        total_recovery
+    );
 
     let max_fragment_size = (CHUNK_SIZE / ORIGINAL_FRAGMENTS_PER_CHUNK) + 28;
     let mut encoder = ReedSolomonEncoder::new(
         ORIGINAL_FRAGMENTS_PER_CHUNK,
         RECOVERY_FRAGMENTS_PER_CHUNK,
-        max_fragment_size
-    ).map_err(|e| {
+        max_fragment_size,
+    )
+    .map_err(|e| {
         tracing::error!("Reed-Solomon encoder creation failed: {:?}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
@@ -217,8 +255,11 @@ pub async fn process_uploaded_file<R: AsyncRead + Unpin>(
         while logical_chunk_buffer.len() >= CHUNK_SIZE {
             let chunk_data: Vec<u8> = logical_chunk_buffer.drain(..CHUNK_SIZE).collect();
 
-            tracing::debug!("process_uploaded_file: encoding logical chunk {} ({} bytes)",
-                           current_chunk_number, chunk_data.len());
+            tracing::debug!(
+                "process_uploaded_file: encoding logical chunk {} ({} bytes)",
+                current_chunk_number,
+                chunk_data.len()
+            );
 
             last_chunk_padding = process_logical_chunk(
                 &mut encoder,
@@ -236,8 +277,11 @@ pub async fn process_uploaded_file<R: AsyncRead + Unpin>(
 
     // Process final partial chunk (if any remaining data < 40MB)
     if !logical_chunk_buffer.is_empty() {
-        tracing::debug!("process_uploaded_file: processing final partial chunk {} ({} bytes)",
-                       current_chunk_number, logical_chunk_buffer.len());
+        tracing::debug!(
+            "process_uploaded_file: processing final partial chunk {} ({} bytes)",
+            current_chunk_number,
+            logical_chunk_buffer.len()
+        );
 
         // Process the final chunk (will be < 40MB, gets padded internally)
         last_chunk_padding = process_logical_chunk(
@@ -255,14 +299,18 @@ pub async fn process_uploaded_file<R: AsyncRead + Unpin>(
     full_file_hasher.update(dataid.as_bytes());
     let full_file_hash = Blake3Hash::new(full_file_hasher.finalize());
 
-    tracing::debug!("process_uploaded_file: complete - {} chunks, {} fragments, {} bytes padding in last chunk",
-                   num_chunks, output_chunk_metadata.len(), last_chunk_padding);
+    tracing::debug!(
+        "process_uploaded_file: complete - {} chunks, {} fragments, {} bytes padding in last chunk",
+        num_chunks,
+        output_chunk_metadata.len(),
+        last_chunk_padding
+    );
 
     // Create DataRecord
     let data = Data {
         hash: full_file_hash,
         fragments: output_chunk_metadata,
-        added_bytes: last_chunk_padding as u8  // Only padding from last chunk matters
+        added_bytes: last_chunk_padding as u8, // Only padding from last chunk matters
     };
 
     Ok(DataRecord {
@@ -295,7 +343,13 @@ pub fn build_share_propagation(
     user_id: i32,
     new_data_block_id: &CustomUUID,
     per_file_key: &chacha20poly1305::Key,
-) -> Result<(Vec<crate::db::types::FileAccess>, Option<Vec<crate::shares::types::IncomingShareUpdate>>), StatusCode> {
+) -> Result<
+    (
+        Vec<crate::db::types::FileAccess>,
+        Option<Vec<crate::shares::types::IncomingShareUpdate>>,
+    ),
+    StatusCode,
+> {
     // Look up the inode's current data_id (old data_block)
     let inode_info = crate::db::files::get_inode_by_id(conn, inode_id, user_id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
@@ -316,16 +370,23 @@ pub fn build_share_propagation(
     // Create FileAccess entries for other accepted sharers
     let mut extra_file_access_entries = Vec::new();
     for &sharer_id in &sharers {
-        if sharer_id == user_id { continue; }
+        if sharer_id == user_id {
+            continue;
+        }
         let fa = crate::db::types::FileAccess::new_for_user_with_conn(
-            conn, new_data_block_id.clone(), sharer_id, per_file_key,
-        ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            conn,
+            new_data_block_id.clone(),
+            sharer_id,
+            per_file_key,
+        )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         extra_file_access_entries.push(fa);
     }
 
     // Build IncomingShareUpdate entries for pending shares
-    let pending = crate::db::shares::get_incoming_shares_for_data_block_conn(conn, &old_data_block_id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let pending =
+        crate::db::shares::get_incoming_shares_for_data_block_conn(conn, &old_data_block_id)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let incoming_share_updates = if pending.is_empty() {
         None
@@ -333,8 +394,12 @@ pub fn build_share_propagation(
         let mut updates = Vec::new();
         for incoming in &pending {
             let fa = crate::db::types::FileAccess::new_for_user_with_conn(
-                conn, new_data_block_id.clone(), incoming.recipient_id, per_file_key,
-            ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                conn,
+                new_data_block_id.clone(),
+                incoming.recipient_id,
+                per_file_key,
+            )
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
             let blob = bincode::serde::encode_to_vec(&fa, bincode::config::standard())
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
             updates.push(crate::shares::types::IncomingShareUpdate {
@@ -351,15 +416,21 @@ pub fn build_share_propagation(
 pub async fn get_files(
     State(app_state): State<AppState>,
     Extension(user_id): Extension<i32>,
-    Query(params): Query<GetQueryParams>
+    Query(params): Query<GetQueryParams>,
 ) -> Result<Json<Vec<FileItem>>, StatusCode> {
     let session = app_state.get_session(user_id).await?;
     // let's encrypt the path so we can search for it
-    let enc_path = encrypt_path(params.path, &session.siv_key, &session.siv_nonce).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    match db::files::get_files(app_state.db_pool.get(), enc_path, user_id, &session.siv_key, &session.siv_nonce) {
-        Ok(files) => {
-            Ok(Json(files))
-        }
+    let enc_path = encrypt_path(params.path, &session.siv_key, &session.siv_nonce)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    match db::files::get_files(
+        app_state.db_pool.get(),
+        enc_path,
+        user_id,
+        &session.siv_key,
+        &session.siv_nonce,
+    ) {
+        Ok(files) => Ok(Json(files)),
         Err(e) => {
             tracing::error!("Error getting files: {:?}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
@@ -375,11 +446,17 @@ pub struct RecentQueryParams {
 pub async fn get_recent_files(
     State(app_state): State<AppState>,
     Extension(user_id): Extension<i32>,
-    Query(params): Query<RecentQueryParams>
+    Query(params): Query<RecentQueryParams>,
 ) -> Result<Json<Vec<FileItem>>, StatusCode> {
     let session = app_state.get_session(user_id).await?;
     let limit = params.limit.unwrap_or(50);
-    match db::files::get_recent_files(app_state.db_pool.get(), user_id, limit, &session.siv_key, &session.siv_nonce) {
+    match db::files::get_recent_files(
+        app_state.db_pool.get(),
+        user_id,
+        limit,
+        &session.siv_key,
+        &session.siv_nonce,
+    ) {
         Ok(files) => Ok(Json(files)),
         Err(e) => {
             tracing::error!("Error getting recent files: {:?}", e);
@@ -408,12 +485,14 @@ pub async fn get_file_fragments(
         let s = val.to_str().ok()?;
         let s = s.strip_prefix("bytes=")?;
         // Ignore multi-range (contains comma)
-        if s.contains(',') { return None; }
+        if s.contains(',') {
+            return None;
+        }
         let mut parts = s.splitn(2, '-');
         let start: u64 = parts.next()?.parse().ok()?;
-        let end: Option<u64> = parts.next().and_then(|e| {
-            if e.is_empty() { None } else { e.parse().ok() }
-        });
+        let end: Option<u64> = parts
+            .next()
+            .and_then(|e| if e.is_empty() { None } else { e.parse().ok() });
         Some((start, end))
     });
 
@@ -427,7 +506,9 @@ pub async fn get_file_fragments(
         user_id,
         &app_state.fragments_dir,
         requested_range,
-    ).await {
+    )
+    .await
+    {
         Ok(info) => info,
         Err(crate::files::download::FileReconstructionError::RangeNotSatisfiable(file_size)) => {
             let response = Response::builder()
@@ -449,7 +530,10 @@ pub async fn get_file_fragments(
         .unwrap_or("application/octet-stream");
 
     let mut builder = Response::builder()
-        .header(header::CONTENT_DISPOSITION, format!("inline; filename=\"{}\"", filename))
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("inline; filename=\"{}\"", filename),
+        )
         .header(header::CONTENT_TYPE, content_type)
         .header(header::ACCEPT_RANGES, "bytes");
 
@@ -459,7 +543,13 @@ pub async fn get_file_fragments(
         builder = builder
             .status(StatusCode::PARTIAL_CONTENT)
             .header(header::CONTENT_LENGTH, content_length)
-            .header(header::CONTENT_RANGE, format!("bytes {}-{}/{}", range.start, range.end, download_info.file_size));
+            .header(
+                header::CONTENT_RANGE,
+                format!(
+                    "bytes {}-{}/{}",
+                    range.start, range.end, download_info.file_size
+                ),
+            );
     } else {
         builder = builder
             .status(StatusCode::OK)
@@ -473,8 +563,8 @@ pub async fn get_file_fragments(
 
 pub async fn post_files(
     State(app_state): State<AppState>,
-    Extension(user_id): Extension<i32>,  // Extract user_id from JWT via auth middleware
-    mut multipart: Multipart
+    Extension(user_id): Extension<i32>, // Extract user_id from JWT via auth middleware
+    mut multipart: Multipart,
 ) -> Result<(), StatusCode> {
     let session = app_state.get_session(user_id).await?;
     // Get user from database to access their X25519 public key
@@ -492,31 +582,57 @@ pub async fn post_files(
     let mut folder_name: Option<String> = None;
 
     // Handle both regular path and FileProvider parent_item_identifier approaches
-    let path = match multipart.next_field().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? {
+    let path = match multipart
+        .next_field()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    {
         Some(part) => {
             match part.name() {
                 Some("path") => {
                     // Regular path approach
-                    let unencrypted_path = part.text().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                    encrypt_path(unencrypted_path, &session.siv_key, &session.siv_nonce).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-                },
+                    let unencrypted_path = part
+                        .text()
+                        .await
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                    encrypt_path(unencrypted_path, &session.siv_key, &session.siv_nonce)
+                        .await
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                }
                 Some("parent_item_identifier") => {
                     // FileProvider approach - need to look up parent path and construct full path
-                    let parent_item_identifier = part.text().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                    
-                    tracing::debug!("Received parent_item_identifier: '{}'", parent_item_identifier);
-                    
+                    let parent_item_identifier = part
+                        .text()
+                        .await
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+                    tracing::debug!(
+                        "Received parent_item_identifier: '{}'",
+                        parent_item_identifier
+                    );
+
                     // Get parent path and return it encrypted
                     if parent_item_identifier == "NSFileProviderRootContainerItemIdentifier" {
                         tracing::debug!("Handling root container case");
-                        encrypt_path("/".to_string(), &session.siv_key, &session.siv_nonce).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                        encrypt_path("/".to_string(), &session.siv_key, &session.siv_nonce)
+                            .await
+                            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
                     } else if parent_item_identifier.starts_with("item:") {
                         // Extract inode_id and look up encrypted path
                         let inode_id_str = &parent_item_identifier[5..];
-                        tracing::debug!("Trying to parse inode_id: '{}' from parent_item_identifier: '{}'", inode_id_str, parent_item_identifier);
-                        let inode_id = crate::db::CustomUUID::from_str(inode_id_str).map_err(|_| StatusCode::BAD_REQUEST)?;
-                
-                        tracing::debug!("Looking up inode_id: {} for user_id: {}", inode_id, user_id);
+                        tracing::debug!(
+                            "Trying to parse inode_id: '{}' from parent_item_identifier: '{}'",
+                            inode_id_str,
+                            parent_item_identifier
+                        );
+                        let inode_id = crate::db::CustomUUID::from_str(inode_id_str)
+                            .map_err(|_| StatusCode::BAD_REQUEST)?;
+
+                        tracing::debug!(
+                            "Looking up inode_id: {} for user_id: {}",
+                            inode_id,
+                            user_id
+                        );
                         match crate::db::fileprovider::get_item_metadata_by_inode_id(
                             app_state.db_pool.get(),
                             inode_id,
@@ -525,7 +641,7 @@ pub async fn post_files(
                             Ok((encrypted_path, _, _, _, _, _)) => {
                                 tracing::debug!("Found encrypted_path: {}", &encrypted_path);
                                 encrypted_path
-                            },
+                            }
                             Err(e) => {
                                 tracing::error!("Failed to find item metadata: {:?}", e);
                                 return Err(StatusCode::NOT_FOUND);
@@ -534,33 +650,39 @@ pub async fn post_files(
                     } else {
                         return Err(StatusCode::BAD_REQUEST);
                     }
-                },
+                }
                 _ => return Err(StatusCode::BAD_REQUEST),
             }
-        },
+        }
         None => return Err(StatusCode::BAD_REQUEST),
     };
-    
+
     tracing::debug!("Final path after ALL path processing: '{}'", path);
-    
-    while let Some(part) = multipart.next_field().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? {
+
+    while let Some(part) = multipart
+        .next_field()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    {
         match part.name() {
             Some(field_name) if field_name.starts_with("file_") => {
                 has_files = true;
-                let filename = part.file_name().map(|s| s.to_string()).ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-                let file_size_str = field_name.strip_prefix("file_").ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
-                let file_size = file_size_str.parse::<usize>().map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
+                let filename = part
+                    .file_name()
+                    .map(|s| s.to_string())
+                    .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+                let file_size_str = field_name
+                    .strip_prefix("file_")
+                    .ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+                let file_size = file_size_str
+                    .parse::<usize>()
+                    .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
 
                 let reader = StreamReader::new(part.map(|r| r.map_err(std::io::Error::other)));
                 let (inode, dataid) = crate::files::helpers::assemble_file_inode(
-                    &app_state,
-                    &session,
-                    user_id,
-                    &path,
-                    &filename,
-                    reader,
-                    file_size,
-                ).await?;
+                    &app_state, &session, user_id, &path, &filename, reader, file_size,
+                )
+                .await?;
 
                 if file_size > 0 {
                     uploaded_data_block_ids.push(dataid);
@@ -568,20 +690,26 @@ pub async fn post_files(
                 inodes.push(inode);
             }
             Some("folder_name") => {
-                folder_name = Some(part.text().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?);
+                folder_name = Some(
+                    part.text()
+                        .await
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+                );
             }
             Some(_) => return Err(StatusCode::UNPROCESSABLE_ENTITY),
             None => {}
         }
     }
-    
+
     // If no files were found, create a folder
     if !has_files {
         tracing::debug!("NO FILES FOUND, FOLDER CREATION");
         let folder_path = if let Some(folder_name) = folder_name {
             // FileProvider approach - concatenate parent path + folder name (same as file creation)
             tracing::debug!("FOLDER CREATION FILEPROVIDER: '{}'", &folder_name);
-            path + &encrypt_part(&folder_name, &session.siv_key, &session.siv_nonce).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            path + &encrypt_part(&folder_name, &session.siv_key, &session.siv_nonce)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         } else {
             // Old API approach - path already contains the full folder path
             path
@@ -592,27 +720,40 @@ pub async fn post_files(
             owner: Left(user_id),
             path: folder_path,
             inode_type: hopnet_common::InodeType::Folder,
-            data_id: None
+            data_id: None,
         };
         inodes.push(folder_inode);
     }
-    
+
     // Pre-generate parent folder inodes so every node gets identical folder UUIDs
     {
-        let conn = app_state.db_pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let tx = conn.unchecked_transaction().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let conn = app_state
+            .db_pool
+            .get()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         crate::files::helpers::prepend_missing_parents(&tx, &mut inodes, user_id)?;
     }
 
     // Build upload attestation for fragments being inserted (best-effort —
     // periodic self-check reconciles if this fails)
     let attestation = if let Ok(node_id) = app_state.get_node_id() {
-        let conn = app_state.db_pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let tx = conn.unchecked_transaction().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let conn = app_state
+            .db_pool
+            .get()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         match crate::files::helpers::build_upload_attestation(&app_state, &tx, node_id, &inodes) {
             Ok(opt) => opt,
             Err(e) => {
-                tracing::warn!("Failed to build upload attestation: {}. Continuing with file insert only - periodic self-check will handle attestation", e);
+                tracing::warn!(
+                    "Failed to build upload attestation: {}. Continuing with file insert only - periodic self-check will handle attestation",
+                    e
+                );
                 None
             }
         }
@@ -626,51 +767,56 @@ pub async fn post_files(
         inodes,
         attestation,
         uploaded_data_block_ids,
-    ).await
-
+    )
+    .await
 }
 
 pub async fn delete_files(
     State(app_state): State<AppState>,
-    Extension(user_id): Extension<i32>,  // Extract user_id from JWT via auth middleware
-    Query(params): Query<GetQueryParams>
+    Extension(user_id): Extension<i32>, // Extract user_id from JWT via auth middleware
+    Query(params): Query<GetQueryParams>,
 ) -> Result<(), StatusCode> {
     let session = app_state.get_session(user_id).await?;
-    let enc_path = encrypt_path(params.path, &session.siv_key, &session.siv_nonce).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let enc_path = encrypt_path(params.path, &session.siv_key, &session.siv_nonce)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Validate that files exist before submitting to consensus
     // IMPORTANT: Use a fresh transaction to avoid snapshot isolation issues
     // Transactions capture a snapshot at creation time, which may not see recently checkpointed data
     {
-        let conn = app_state.db_pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let conn = app_state
+            .db_pool
+            .get()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         // Quick existence check without full transaction to avoid stale snapshot
         let exists: Result<i32, _> = conn.query_row(
             "SELECT COUNT(*) FROM inodes WHERE path = ? AND owner_id = ?",
             rusqlite::params![enc_path.clone(), user_id],
-            |row| row.get(0)
+            |row| row.get(0),
         );
 
         match exists {
             Ok(count) if count > 0 => {
                 // File exists, proceed to consensus
-            },
+            }
             Ok(_) => {
                 return Err(StatusCode::NOT_FOUND);
-            },
+            }
             Err(e) => {
                 tracing::error!("Error validating file existence: {:?}", e);
                 return Err(StatusCode::INTERNAL_SERVER_ERROR);
             }
         }
     }
-    
+
     // Create payload for consensus
     let payload = crate::files::handlers::DeleteFilesPayload {
         encrypted_path: enc_path,
         user_id,
     };
-    
+
     // Serialize payload for consensus submission
     match bincode::serde::encode_to_vec(&payload, bincode::config::standard()) {
         Ok(encoded_payload) => {
@@ -679,22 +825,27 @@ pub async fn delete_files(
                 "delete_files".to_string(),
                 encoded_payload,
                 user_id,
-            ).await {
+            )
+            .await
+            {
                 Ok(tx) => tx,
                 Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
             };
             // Use consensus queue to ensure distributed agreement
             match app_state.consensus_queue.submit(transaction).await {
                 Ok(()) => {
-                    tracing::info!("Successfully submitted file deletion to consensus for user {}", user_id);
+                    tracing::info!(
+                        "Successfully submitted file deletion to consensus for user {}",
+                        user_id
+                    );
                     Ok(())
-                },
+                }
                 Err(e) => {
                     tracing::error!("Failed to submit file deletion to consensus: {:?}", e);
                     Err(StatusCode::INTERNAL_SERVER_ERROR)
                 }
             }
-        },
+        }
         Err(e) => {
             tracing::error!("Failed to serialize delete files payload: {:?}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
@@ -709,7 +860,11 @@ pub async fn patch_files(
     mut multipart: Multipart,
 ) -> Result<(), StatusCode> {
     // First field must be inode_id
-    let inode_id = match multipart.next_field().await.map_err(|_| StatusCode::BAD_REQUEST)? {
+    let inode_id = match multipart
+        .next_field()
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?
+    {
         Some(field) if field.name() == Some("inode_id") => {
             let id_str = field.text().await.map_err(|_| StatusCode::BAD_REQUEST)?;
             CustomUUID::from_str(&id_str).map_err(|_| StatusCode::BAD_REQUEST)?
@@ -718,7 +873,10 @@ pub async fn patch_files(
     };
 
     // Validate inode exists, belongs to user, and is a file
-    let conn = app_state.db_pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let conn = app_state
+        .db_pool
+        .get()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let inode_info = crate::db::files::get_inode_by_id(&conn, &inode_id, user_id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
@@ -728,16 +886,24 @@ pub async fn patch_files(
     drop(conn);
 
     // Second field must be file_<size>
-    let field = multipart.next_field().await.map_err(|_| StatusCode::BAD_REQUEST)?
+    let field = multipart
+        .next_field()
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?
         .ok_or(StatusCode::BAD_REQUEST)?;
     let field_name = field.name().ok_or(StatusCode::BAD_REQUEST)?.to_string();
-    let file_size_str = field_name.strip_prefix("file_").ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
-    let file_size = file_size_str.parse::<usize>().map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
+    let file_size_str = field_name
+        .strip_prefix("file_")
+        .ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+    let file_size = file_size_str
+        .parse::<usize>()
+        .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
 
     let (dataid, data_record, incoming_share_updates, _per_file_key) =
         crate::files::functions::prepare_content_update(
             &app_state, user_id, &inode_id, field, file_size,
-        ).await?;
+        )
+        .await?;
 
     // Build, validate, and submit ModifyItemPayload
     let payload = crate::files::handlers::ModifyItemPayload {
@@ -750,26 +916,46 @@ pub async fn patch_files(
     };
 
     {
-        let mut conn = app_state.db_pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let db_tx = conn.transaction().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let mut conn = app_state
+            .db_pool
+            .get()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let db_tx = conn
+            .transaction()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         crate::db::files::modify_item(
-            &db_tx, payload.user_id, payload.inode_id.clone(),
-            payload.new_encrypted_path.clone(), payload.new_data_block_id.clone(),
-            payload.new_data_record.clone(), None,
-        ).map_err(|e| match e {
+            &db_tx,
+            payload.user_id,
+            payload.inode_id.clone(),
+            payload.new_encrypted_path.clone(),
+            payload.new_data_block_id.clone(),
+            payload.new_data_record.clone(),
+            None,
+        )
+        .map_err(|e| match e {
             crate::db::DatabaseError::NotFound => StatusCode::NOT_FOUND,
             crate::db::DatabaseError::ConflictError => StatusCode::CONFLICT,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         })?;
-        db_tx.rollback().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        db_tx
+            .rollback()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     }
 
     let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let transaction = crate::consensus::functions::create_signed_user_transaction(
-        &app_state, "modify_item".to_string(), encoded, user_id,
-    ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    app_state.consensus_queue.submit(transaction).await
+        &app_state,
+        "modify_item".to_string(),
+        encoded,
+        user_id,
+    )
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    app_state
+        .consensus_queue
+        .submit(transaction)
+        .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(())
@@ -779,7 +965,7 @@ pub async fn patch_files(
 /// Get count of fragments stored locally on this node
 pub async fn get_fragments_count(
     State(app_state): State<AppState>,
-    Extension(user_id): Extension<i32>,  // Extract user_id from JWT via auth middleware
+    Extension(user_id): Extension<i32>, // Extract user_id from JWT via auth middleware
 ) -> impl IntoResponse {
     match crate::db::files::get_local_fragment_count(app_state.db_pool.get()) {
         Ok(count) => {
@@ -787,8 +973,14 @@ pub async fn get_fragments_count(
             struct FragmentCountResponse {
                 locally_stored_fragments: i64,
             }
-            
-            (StatusCode::OK, Json(FragmentCountResponse { locally_stored_fragments: count })).into_response()
+
+            (
+                StatusCode::OK,
+                Json(FragmentCountResponse {
+                    locally_stored_fragments: count,
+                }),
+            )
+                .into_response()
         }
         Err(e) => {
             tracing::error!("Failed to get local fragment count: {:?}", e);
@@ -803,39 +995,49 @@ pub async fn post_cleanup_orphaned_data_blocks(
     Query(params): Query<CleanupQueryParams>,
     Extension(uid): Extension<i32>,
 ) -> impl IntoResponse {
-    tracing::info!("Manual cleanup trigger requested by user {} (batch_size: {}, retention_days: {})", 
-                   uid, params.batch_size, params.retention_days);
-    
+    tracing::info!(
+        "Manual cleanup trigger requested by user {} (batch_size: {}, retention_days: {})",
+        uid,
+        params.batch_size,
+        params.retention_days
+    );
+
     // Run the cleanup job directly with parameters
-    match super::jobs::run_orphaned_data_block_cleanup(&app_state, params.batch_size, params.retention_days).await {
+    match super::jobs::run_orphaned_data_block_cleanup(
+        &app_state,
+        params.batch_size,
+        params.retention_days,
+    )
+    .await
+    {
         Ok(data_blocks_cleaned) => {
             #[derive(Serialize)]
             struct CleanupResponse {
                 status: String,
                 data_blocks_cleaned: usize,
             }
-            
+
             let response = CleanupResponse {
                 status: "success".to_string(),
                 data_blocks_cleaned,
             };
-            
+
             (StatusCode::OK, Json(response)).into_response()
         }
         Err(e) => {
             tracing::error!("Manual cleanup failed: {:?}", e);
-            
+
             #[derive(Serialize)]
             struct ErrorResponse {
                 status: String,
                 error: String,
             }
-            
+
             let response = ErrorResponse {
                 status: "error".to_string(),
                 error: format!("Cleanup failed: {:?}", e),
             };
-            
+
             (StatusCode::INTERNAL_SERVER_ERROR, Json(response)).into_response()
         }
     }
@@ -848,44 +1050,62 @@ pub async fn post_rebalance_network(
     Query(params): Query<RebalanceQueryParams>,
     Extension(uid): Extension<i32>,
 ) -> impl IntoResponse {
-    tracing::info!("Manual rebalancing trigger requested by user {} (max_data_blocks: {}, min_age_heights: {})", 
-                   uid, params.max_data_blocks, params.min_age_heights);
-    
+    tracing::info!(
+        "Manual rebalancing trigger requested by user {} (max_data_blocks: {}, min_age_heights: {})",
+        uid,
+        params.max_data_blocks,
+        params.min_age_heights
+    );
+
     // Validate parameters
     if params.max_data_blocks <= 0 {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "status": "error",
-            "error": "max_data_blocks must be positive"
-        }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "status": "error",
+                "error": "max_data_blocks must be positive"
+            })),
+        )
+            .into_response();
     }
-    
+
     if params.min_age_heights < 0 {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "status": "error",
-            "error": "min_age_heights cannot be negative"
-        }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "status": "error",
+                "error": "min_age_heights cannot be negative"
+            })),
+        )
+            .into_response();
     }
-    
+
     // Run the rebalancing job directly with parameters
-    match super::jobs::run_network_rebalancing(&app_state, params.max_data_blocks, params.min_age_heights).await {
+    match super::jobs::run_network_rebalancing(
+        &app_state,
+        params.max_data_blocks,
+        params.min_age_heights,
+    )
+    .await
+    {
         Ok(result) => {
             tracing::info!("Manual rebalancing completed: {:?}", result);
             (StatusCode::OK, Json(result)).into_response()
         }
         Err(e) => {
             tracing::error!("Manual rebalancing failed: {:?}", e);
-            
+
             #[derive(Serialize)]
             struct ErrorResponse {
                 status: String,
                 error: String,
             }
-            
+
             let response = ErrorResponse {
                 status: "error".to_string(),
                 error: format!("Rebalancing failed: {:?}", e),
             };
-            
+
             (StatusCode::INTERNAL_SERVER_ERROR, Json(response)).into_response()
         }
     }
@@ -903,13 +1123,14 @@ pub async fn get_fragment_inventory_differential(
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
-    match crate::db::inventory::compute_inventory_differential(
-        app_state.db_pool.get(),
-        node_id,
-    ) {
+    match crate::db::inventory::compute_inventory_differential(app_state.db_pool.get(), node_id) {
         Ok(differential) => {
-            tracing::debug!("Fragment inventory differential computed for node {}: {} added, {} removed",
-                          node_id, differential.fragments_added.len(), differential.fragments_removed.len());
+            tracing::debug!(
+                "Fragment inventory differential computed for node {}: {} added, {} removed",
+                node_id,
+                differential.fragments_added.len(),
+                differential.fragments_removed.len()
+            );
             (StatusCode::OK, Json(differential)).into_response()
         }
         Err(e) => {
@@ -925,7 +1146,10 @@ pub async fn post_fragment_inventory_self_check(
     State(app_state): State<AppState>,
     Extension(uid): Extension<i32>,
 ) -> impl IntoResponse {
-    tracing::info!("Manual fragment inventory self-check triggered by user {}", uid);
+    tracing::info!(
+        "Manual fragment inventory self-check triggered by user {}",
+        uid
+    );
 
     match super::jobs::run_fragment_inventory_self_check(&app_state).await {
         Ok(_) => StatusCode::OK.into_response(),
@@ -954,20 +1178,30 @@ pub async fn get_orphaned_fragments_scan(
     Extension(uid): Extension<i32>,
     Query(params): Query<OrphanedFragmentsScanParams>,
 ) -> impl IntoResponse {
-    tracing::info!("Orphaned fragments scan triggered by user {} (grace_period_hours: {})",
-                   uid, params.grace_period_hours);
+    tracing::info!(
+        "Orphaned fragments scan triggered by user {} (grace_period_hours: {})",
+        uid,
+        params.grace_period_hours
+    );
 
     if params.grace_period_hours < 0 {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "status": "error",
-            "error": "grace_period_hours cannot be negative"
-        }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "status": "error",
+                "error": "grace_period_hours cannot be negative"
+            })),
+        )
+            .into_response();
     }
 
     match super::jobs::run_orphaned_fragments_scan(&app_state, params.grace_period_hours).await {
         Ok(scan_result) => {
-            tracing::info!("Scan complete: {} orphaned fragments found ({} bytes)",
-                          scan_result.orphaned_fragments.len(), scan_result.total_bytes);
+            tracing::info!(
+                "Scan complete: {} orphaned fragments found ({} bytes)",
+                scan_result.orphaned_fragments.len(),
+                scan_result.total_bytes
+            );
             (StatusCode::OK, Json(scan_result)).into_response()
         }
         Err(e) => {
@@ -1000,8 +1234,12 @@ pub async fn delete_orphaned_fragments(
 
     match super::jobs::run_orphaned_fragments_cleanup(&app_state).await {
         Ok(result) => {
-            tracing::info!("Cleanup complete: {} deleted, {} failed, {} bytes freed",
-                          result.deleted_count, result.failed_count, result.bytes_freed);
+            tracing::info!(
+                "Cleanup complete: {} deleted, {} failed, {} bytes freed",
+                result.deleted_count,
+                result.failed_count,
+                result.bytes_freed
+            );
             (StatusCode::OK, Json(result)).into_response()
         }
         Err(e) => {
@@ -1037,7 +1275,8 @@ pub async fn get_file_fragment_distribution(
         Err(e) => return e.into_response(),
     };
 
-    let encrypted_path = match encrypt_path(params.path, &session.siv_key, &session.siv_nonce).await {
+    let encrypted_path = match encrypt_path(params.path, &session.siv_key, &session.siv_nonce).await
+    {
         Ok(path) => path,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };

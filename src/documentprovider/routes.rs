@@ -1,25 +1,23 @@
 use axum::{
+    Extension, Json, Router,
     body::Body,
     extract::{Multipart, Query, State},
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     middleware,
     response::Response,
     routing::{delete, get, patch, post},
-    Extension,
-    Json,
-    Router,
 };
 use serde::Deserialize;
 
-use crate::devices::auth::device_token_auth_middleware;
 use crate::AppState;
 use crate::db::{self, CustomUUID};
+use crate::devices::auth::device_token_auth_middleware;
 use crate::files::functions::{build_encrypted_path, encrypt_part, encrypt_path};
+use hopnet_common::db::InodeType;
 use hopnet_common::documentprovider::{
     DocumentProviderEnumerateResponse, DocumentProviderItem, ModifyDocumentProviderRequest,
     ModifyDocumentProviderResponse,
 };
-use hopnet_common::db::InodeType;
 
 /// Build the DocumentProvider router. Reads bypass the import gate; writes
 /// have the gate applied via a sub-router so attachment is explicit.
@@ -37,9 +35,10 @@ pub fn router(app_state: AppState) -> Router<AppState> {
             crate::takeout::import_gate::import_gate,
         ));
 
-    reads
-        .merge(writes)
-        .layer(middleware::from_fn_with_state(app_state, device_token_auth_middleware))
+    reads.merge(writes).layer(middleware::from_fn_with_state(
+        app_state,
+        device_token_auth_middleware,
+    ))
 }
 
 /// Query parameters for enumerate endpoint
@@ -61,13 +60,15 @@ pub async fn get_enumerate(
     let session = app_state.get_session(user_id).await?;
 
     // Get db lock once for both operations
-    let db_lock = app_state.db_pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let db_lock = app_state
+        .db_pool
+        .get()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Resolve parent_id to encrypted path
     let (encrypted_parent_path, parent_uuid) = match &query.parent_id {
         Some(id) => {
-            let inode_id = CustomUUID::from_str(id)
-                .map_err(|_| StatusCode::BAD_REQUEST)?;
+            let inode_id = CustomUUID::from_str(id).map_err(|_| StatusCode::BAD_REQUEST)?;
 
             let path = db::documentprovider::get_path_by_inode_id(&db_lock, &inode_id, user_id)
                 .map_err(|_| StatusCode::NOT_FOUND)?;
@@ -83,7 +84,12 @@ pub async fn get_enumerate(
         }
     };
 
-    tracing::debug!("get_enumerate: user_id={} encrypted_parent_path='{}' parent_id={:?}", user_id, encrypted_parent_path, query.parent_id);
+    tracing::debug!(
+        "get_enumerate: user_id={} encrypted_parent_path='{}' parent_id={:?}",
+        user_id,
+        encrypted_parent_path,
+        query.parent_id
+    );
 
     // Get children
     let items = db::documentprovider::get_children(
@@ -93,7 +99,8 @@ pub async fn get_enumerate(
         &session.siv_key,
         &session.siv_nonce,
         parent_uuid,
-    ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     tracing::debug!("get_enumerate: found {} items", items.len());
     Ok(Json(DocumentProviderEnumerateResponse { items }))
@@ -115,10 +122,12 @@ pub async fn get_item(
 ) -> Result<Json<DocumentProviderItem>, StatusCode> {
     let session = app_state.get_session(user_id).await?;
 
-    let inode_id = CustomUUID::from_str(&query.id)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let inode_id = CustomUUID::from_str(&query.id).map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    let db_lock = app_state.db_pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let db_lock = app_state
+        .db_pool
+        .get()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let item = db::documentprovider::get_item(
         &db_lock,
@@ -126,7 +135,8 @@ pub async fn get_item(
         user_id,
         &session.siv_key,
         &session.siv_nonce,
-    ).map_err(|e| match e {
+    )
+    .map_err(|e| match e {
         db::DatabaseError::NotFound => StatusCode::NOT_FOUND,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     })?;
@@ -144,17 +154,20 @@ pub async fn get_download(
 ) -> Result<Response<Body>, StatusCode> {
     let session = app_state.get_session(user_id).await?;
 
-    let inode_id = CustomUUID::from_str(&query.id)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let inode_id = CustomUUID::from_str(&query.id).map_err(|_| StatusCode::BAD_REQUEST)?;
 
     // Lightweight query - just path and type, no joins
     let (encrypted_path, item_type) = {
-        let db_lock = app_state.db_pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        db::documentprovider::get_download_metadata(&db_lock, &inode_id, user_id)
-            .map_err(|e| match e {
+        let db_lock = app_state
+            .db_pool
+            .get()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        db::documentprovider::get_download_metadata(&db_lock, &inode_id, user_id).map_err(|e| {
+            match e {
                 db::DatabaseError::NotFound => StatusCode::NOT_FOUND,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
-            })?
+            }
+        })?
     };
 
     // Only allow downloads for files, not folders
@@ -167,8 +180,12 @@ pub async fn get_download(
         .rsplit('/')
         .next()
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-    let filename = crate::files::functions::decrypt_part(encrypted_filename, &session.siv_key, &session.siv_nonce)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let filename = crate::files::functions::decrypt_part(
+        encrypted_filename,
+        &session.siv_key,
+        &session.siv_nonce,
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Derive MIME type from filename
     let mime_type = mime_guess::from_path(&filename)
@@ -191,7 +208,10 @@ pub async fn get_download(
 
     // Build streaming response
     Response::builder()
-        .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{}\"", filename))
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}\"", filename),
+        )
         .header(header::CONTENT_TYPE, mime_type)
         .body(Body::from_stream(stream))
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
@@ -205,18 +225,20 @@ pub async fn delete_item(
     Query(query): Query<ItemQuery>,
 ) -> Result<StatusCode, StatusCode> {
     // Parse inode_id from query
-    let inode_id = CustomUUID::from_str(&query.id)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let inode_id = CustomUUID::from_str(&query.id).map_err(|_| StatusCode::BAD_REQUEST)?;
 
     // Get db connection
-    let db_lock = app_state.db_pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let db_lock = app_state
+        .db_pool
+        .get()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Look up encrypted_path by inode_id
     let encrypted_path = db::documentprovider::get_path_by_inode_id(&db_lock, &inode_id, user_id)
         .map_err(|e| match e {
-            db::DatabaseError::NotFound => StatusCode::NOT_FOUND,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
-        })?;
+        db::DatabaseError::NotFound => StatusCode::NOT_FOUND,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    })?;
 
     // Drop db_lock before consensus (which may need the connection)
     drop(db_lock);
@@ -237,10 +259,15 @@ pub async fn delete_item(
         "delete_files".to_string(),
         encoded_payload,
         user_id,
-    ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    )
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Submit to consensus
-    app_state.consensus_queue.submit(transaction).await
+    app_state
+        .consensus_queue
+        .submit(transaction)
+        .await
         .map_err(|e| {
             tracing::error!("Failed to delete item via consensus: {:?}", e);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -261,16 +288,22 @@ pub async fn patch_item(
     let session = app_state.get_session(user_id).await?;
 
     // Parse inode_id from request
-    let inode_id = CustomUUID::from_str(&request.id)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let inode_id = CustomUUID::from_str(&request.id).map_err(|_| StatusCode::BAD_REQUEST)?;
 
     // Get db connection
-    let db_lock = app_state.db_pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let db_lock = app_state
+        .db_pool
+        .get()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Get current encrypted_path
     let current_path = db::documentprovider::get_path_by_inode_id(&db_lock, &inode_id, user_id)
         .map_err(|e| {
-            tracing::debug!("patch_item: failed to get current path for inode_id={}: {:?}", inode_id, e);
+            tracing::debug!(
+                "patch_item: failed to get current path for inode_id={}: {:?}",
+                inode_id,
+                e
+            );
             match e {
                 db::DatabaseError::NotFound => StatusCode::NOT_FOUND,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -291,14 +324,20 @@ pub async fn patch_item(
         build_encrypted_path(parent_path, &encrypted_name)
     } else if let Some(ref new_parent_id) = request.parent_id {
         // MOVE: Change parent, keep filename
-        tracing::debug!("patch_item: MOVE operation, new_parent_id={}", new_parent_id);
+        tracing::debug!(
+            "patch_item: MOVE operation, new_parent_id={}",
+            new_parent_id
+        );
         let new_parent_path = if new_parent_id == "root" {
             // Moving to root
             "".to_string()
         } else {
-            let parent_inode_id = CustomUUID::from_str(new_parent_id)
-                .map_err(|_| StatusCode::BAD_REQUEST)?;
-            tracing::debug!("patch_item: looking up parent path for inode_id={}", parent_inode_id);
+            let parent_inode_id =
+                CustomUUID::from_str(new_parent_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+            tracing::debug!(
+                "patch_item: looking up parent path for inode_id={}",
+                parent_inode_id
+            );
             db::documentprovider::get_path_by_inode_id(&db_lock, &parent_inode_id, user_id)
                 .map_err(|e| {
                     tracing::debug!("patch_item: failed to get parent path: {:?}", e);
@@ -343,10 +382,15 @@ pub async fn patch_item(
         "modify_item".to_string(),
         encoded_payload,
         user_id,
-    ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    )
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Submit to consensus
-    app_state.consensus_queue.submit(transaction).await
+    app_state
+        .consensus_queue
+        .submit(transaction)
+        .await
         .map_err(|e| {
             tracing::error!("Failed to modify item via consensus: {:?}", e);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -368,11 +412,7 @@ pub async fn post_upload(
 ) -> Result<StatusCode, StatusCode> {
     // Forward to post_files which handles the multipart processing
     // The DocumentProvider uses parent_item_identifier format which post_files already supports
-    crate::files::routes::post_files(
-        State(app_state),
-        Extension(user_id),
-        multipart,
-    ).await?;
+    crate::files::routes::post_files(State(app_state), Extension(user_id), multipart).await?;
 
     Ok(StatusCode::CREATED)
 }

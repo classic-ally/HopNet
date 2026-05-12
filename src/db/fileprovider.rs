@@ -1,9 +1,9 @@
 use super::*;
-use aes_siv::{siv::Aes256Siv, Key, Nonce};
-use crate::files::functions::decrypt_path;
-use hopnet_common::InodeType;
-use crate::db::CustomUUID;
 use crate::db::CustomDateTime;
+use crate::db::CustomUUID;
+use crate::files::functions::decrypt_path;
+use aes_siv::{Key, Nonce, siv::Aes256Siv};
+use hopnet_common::InodeType;
 
 /// Simple database result for FileProvider items
 /// Raw data that gets serialized over HTTP to FileProvider binary
@@ -11,12 +11,12 @@ use crate::db::CustomDateTime;
 pub struct FileProviderItemData {
     pub identifier: String,
     pub item_type: InodeType,
-    pub filename: String,        // Decrypted filename
-    pub parent_item_identifier: String,  // Parent folder's item: identifier
-    pub file_size: Option<u64>,  // File size in bytes (None for folders)
-    pub creation_date: Option<CustomDateTime>,           // Timestamp extracted from UUIDv7 or folder creation
+    pub filename: String,                                  // Decrypted filename
+    pub parent_item_identifier: String,                    // Parent folder's item: identifier
+    pub file_size: Option<u64>,                            // File size in bytes (None for folders)
+    pub creation_date: Option<CustomDateTime>, // Timestamp extracted from UUIDv7 or folder creation
     pub content_modification_date: Option<CustomDateTime>, // Timestamp from modified_at column
-    pub modification_height: Option<i32>,               // Consensus height when item was last modified
+    pub modification_height: Option<i32>,      // Consensus height when item was last modified
 }
 
 /// FileProvider enumeration result with consensus height for sync anchoring
@@ -24,7 +24,7 @@ pub struct FileProviderItemData {
 pub struct FileProviderEnumerateResult {
     pub items: Vec<FileProviderItemData>,
     pub current_consensus_height: i32,
-    pub deleted_identifiers: Option<Vec<String>>,  // Optional list of deleted item identifiers
+    pub deleted_identifiers: Option<Vec<String>>, // Optional list of deleted item identifiers
 }
 
 /// Get folder contents for FileProvider directory enumeration
@@ -84,42 +84,64 @@ pub fn get_folder_contents(
                 LIMIT ?
             "#;
 
-            let mut stmt = db_lock.prepare(query).map_err(|_| DatabaseError::ProcessingError)?;
-            
+            let mut stmt = db_lock
+                .prepare(query)
+                .map_err(|_| DatabaseError::ProcessingError)?;
+
             // Create not_like_pattern same as get_files
             let not_like_pattern = format!("{}/%", parent_path_pattern);
-            
-            let rows = stmt.query_map(
-                params![user_id, user_id, parent_path_pattern, not_like_pattern, cursor, cursor, limit as i64],
-                |row| {
-                    let identifier: String = row.get(0)?;
-                    let item_type: InodeType = row.get(1)?;  // Direct deserialization using FromSql
-                    let encrypted_path: String = row.get(2)?;  // path is VARCHAR in database
-                    let parent_item_identifier: String = row.get(3)?;  // Parent identifier from JOIN
-                    let file_size = row.get::<_, Option<i64>>(4)?.map(|v| v as u64);  // File size from data_blocks (NULL for folders)
-                    let creation_date: Option<CustomDateTime> = row.get(5)?;  // UUIDv7 timestamp or NULL for folders
-                    let content_modification_date: Option<CustomDateTime> = row.get(6)?;  // modified_at from data_blocks
-                    let modification_height: Option<i32> = row.get(7)?;  // Consensus height when item was last modified
-                    
-                    // Decrypt the full path using the same pattern as get_files
-                    let decrypted_path = decrypt_path(encrypted_path, siv_key, siv_nonce)
-                        .map_err(|_| rusqlite::Error::InvalidColumnType(2, "path_decryption".to_string(), rusqlite::types::Type::Text))?;
-                    
-                    // Extract filename from path (last component after '/')
-                    let filename = decrypted_path.split('/').last().unwrap_or(&decrypted_path).to_string();
-                    
-                    Ok(FileProviderItemData {
-                        identifier,
-                        item_type,
-                        filename,
-                        parent_item_identifier,
-                        file_size,
-                        creation_date,
-                        content_modification_date,
-                        modification_height,
-                    })
-                }
-            ).map_err(|_| DatabaseError::RecallError)?;
+
+            let rows = stmt
+                .query_map(
+                    params![
+                        user_id,
+                        user_id,
+                        parent_path_pattern,
+                        not_like_pattern,
+                        cursor,
+                        cursor,
+                        limit as i64
+                    ],
+                    |row| {
+                        let identifier: String = row.get(0)?;
+                        let item_type: InodeType = row.get(1)?; // Direct deserialization using FromSql
+                        let encrypted_path: String = row.get(2)?; // path is VARCHAR in database
+                        let parent_item_identifier: String = row.get(3)?; // Parent identifier from JOIN
+                        let file_size = row.get::<_, Option<i64>>(4)?.map(|v| v as u64); // File size from data_blocks (NULL for folders)
+                        let creation_date: Option<CustomDateTime> = row.get(5)?; // UUIDv7 timestamp or NULL for folders
+                        let content_modification_date: Option<CustomDateTime> = row.get(6)?; // modified_at from data_blocks
+                        let modification_height: Option<i32> = row.get(7)?; // Consensus height when item was last modified
+
+                        // Decrypt the full path using the same pattern as get_files
+                        let decrypted_path = decrypt_path(encrypted_path, siv_key, siv_nonce)
+                            .map_err(|_| {
+                                rusqlite::Error::InvalidColumnType(
+                                    2,
+                                    "path_decryption".to_string(),
+                                    rusqlite::types::Type::Text,
+                                )
+                            })?;
+
+                        // Extract filename from path (last component after '/')
+                        let filename = decrypted_path
+                            .split('/')
+                            .last()
+                            .unwrap_or(&decrypted_path)
+                            .to_string();
+
+                        Ok(FileProviderItemData {
+                            identifier,
+                            item_type,
+                            filename,
+                            parent_item_identifier,
+                            file_size,
+                            creation_date,
+                            content_modification_date,
+                            modification_height,
+                        })
+                    },
+                )
+                .map_err(|_| DatabaseError::RecallError)?;
 
             let items: Result<Vec<FileProviderItemData>, _> = rows
                 .map(|row_result| row_result.map_err(|_| DatabaseError::RecallError))
@@ -134,18 +156,20 @@ pub fn get_folder_contents(
                 LEFT JOIN blocks b ON t.committed_block_hash = b.block_hash
                 WHERE t.internal_id = 1
             "#;
-            let mut consensus_stmt = db_lock.prepare(consensus_query).map_err(|_| DatabaseError::ProcessingError)?;
-            let current_consensus_height: i32 = consensus_stmt.query_row([], |row| {
-                row.get(0)
-            }).map_err(|_| DatabaseError::RecallError)?;
+            let mut consensus_stmt = db_lock
+                .prepare(consensus_query)
+                .map_err(|_| DatabaseError::ProcessingError)?;
+            let current_consensus_height: i32 = consensus_stmt
+                .query_row([], |row| row.get(0))
+                .map_err(|_| DatabaseError::RecallError)?;
 
             Ok(FileProviderEnumerateResult {
                 items,
                 current_consensus_height,
-                deleted_identifiers: None,  // Not needed for regular enumeration
+                deleted_identifiers: None, // Not needed for regular enumeration
             })
         }
-        Err(_) => Err(DatabaseError::LockError)
+        Err(_) => Err(DatabaseError::LockError),
     }
 }
 
@@ -163,7 +187,7 @@ pub fn get_folder_changes_since_height(
         Ok(db_lock) => {
             // Check if this is a root query (empty encrypted path means root "/")
             let is_root = encrypted_parent_path.is_empty();
-            
+
             // Common metadata selection logic
             let base_query = r#"
                 SELECT DISTINCT
@@ -202,7 +226,7 @@ pub fn get_folder_changes_since_height(
                 )
                 ORDER BY status DESC, i.type DESC, i.path ASC
             "#;
-            
+
             let final_query = if is_root {
                 // Root case: all modifications
                 let root_query = base_query.replace("{source_query}", "SELECT DISTINCT ml.inode_id, ml.modified_at_height FROM modification_log ml WHERE ml.owner_id = ? AND ml.modified_at_height > ?");
@@ -239,10 +263,26 @@ pub fn get_folder_changes_since_height(
                 folder_query
             };
 
-            let mut stmt = db_lock.prepare(&final_query).map_err(|_| DatabaseError::ProcessingError)?;
-            
+            let mut stmt = db_lock
+                .prepare(&final_query)
+                .map_err(|_| DatabaseError::ProcessingError)?;
+
             // Define the closure once to avoid type mismatch
-            let row_mapper = |row: &rusqlite::Row| -> Result<(String, CustomUUID, Option<String>, Option<InodeType>, Option<String>, Option<String>, Option<u64>, Option<CustomDateTime>, Option<CustomDateTime>, Option<i32>), rusqlite::Error> {
+            let row_mapper = |row: &rusqlite::Row| -> Result<
+                (
+                    String,
+                    CustomUUID,
+                    Option<String>,
+                    Option<InodeType>,
+                    Option<String>,
+                    Option<String>,
+                    Option<u64>,
+                    Option<CustomDateTime>,
+                    Option<CustomDateTime>,
+                    Option<i32>,
+                ),
+                rusqlite::Error,
+            > {
                 let inode_id: CustomUUID = row.get(0)?;
                 let status: String = row.get(1)?;
                 let identifier: Option<String> = row.get(2)?;
@@ -253,29 +293,63 @@ pub fn get_folder_changes_since_height(
                 let creation_date: Option<CustomDateTime> = row.get(7)?;
                 let content_modification_date: Option<CustomDateTime> = row.get(8)?;
                 let modification_height: Option<i32> = row.get(9)?;
-                
-                Ok((status, inode_id, identifier, item_type, encrypted_path, parent_item_identifier, file_size, creation_date, content_modification_date, modification_height))
+
+                Ok((
+                    status,
+                    inode_id,
+                    identifier,
+                    item_type,
+                    encrypted_path,
+                    parent_item_identifier,
+                    file_size,
+                    creation_date,
+                    content_modification_date,
+                    modification_height,
+                ))
             };
-            
-            tracing::debug!("Executing query with params - user_id: {}, since_height: {}, is_root: {}", 
-                           user_id, since_height, is_root);
-            
+
+            tracing::debug!(
+                "Executing query with params - user_id: {}, since_height: {}, is_root: {}",
+                user_id,
+                since_height,
+                is_root
+            );
+
             let rows = if is_root {
                 stmt.query_map(params![user_id, since_height], row_mapper)
                     .map_err(|_| DatabaseError::RecallError)?
             } else {
-                stmt.query_map(params![user_id, encrypted_parent_path, user_id, since_height, user_id, since_height], row_mapper)
-                    .map_err(|_| DatabaseError::RecallError)?
+                stmt.query_map(
+                    params![
+                        user_id,
+                        encrypted_parent_path,
+                        user_id,
+                        since_height,
+                        user_id,
+                        since_height
+                    ],
+                    row_mapper,
+                )
+                .map_err(|_| DatabaseError::RecallError)?
             };
-            
 
             let mut items: Vec<FileProviderItemData> = Vec::new();
             let mut deleted_identifiers: Vec<String> = Vec::new();
-            
+
             for row_result in rows {
-                let (status, inode_id, identifier, item_type, encrypted_path, parent_item_identifier, file_size, creation_date, content_modification_date, modification_height) = 
-                    row_result.map_err(|_| DatabaseError::RecallError)?;
-                
+                let (
+                    status,
+                    inode_id,
+                    identifier,
+                    item_type,
+                    encrypted_path,
+                    parent_item_identifier,
+                    file_size,
+                    creation_date,
+                    content_modification_date,
+                    modification_height,
+                ) = row_result.map_err(|_| DatabaseError::RecallError)?;
+
                 if status == "deleted" {
                     // Add to deleted_identifiers array
                     deleted_identifiers.push(format!("item:{}", inode_id));
@@ -284,14 +358,19 @@ pub fn get_folder_changes_since_height(
                     let encrypted_path = encrypted_path.ok_or(DatabaseError::ProcessingError)?;
                     let decrypted_path = decrypt_path(encrypted_path, siv_key, siv_nonce)
                         .map_err(|_| DatabaseError::ProcessingError)?;
-                    
-                    let filename = decrypted_path.split('/').last().unwrap_or(&decrypted_path).to_string();
-                    
+
+                    let filename = decrypted_path
+                        .split('/')
+                        .last()
+                        .unwrap_or(&decrypted_path)
+                        .to_string();
+
                     items.push(FileProviderItemData {
                         identifier: identifier.ok_or(DatabaseError::ProcessingError)?,
                         item_type: item_type.ok_or(DatabaseError::ProcessingError)?,
                         filename,
-                        parent_item_identifier: parent_item_identifier.ok_or(DatabaseError::ProcessingError)?,
+                        parent_item_identifier: parent_item_identifier
+                            .ok_or(DatabaseError::ProcessingError)?,
                         file_size,
                         creation_date,
                         content_modification_date,
@@ -307,13 +386,19 @@ pub fn get_folder_changes_since_height(
                 LEFT JOIN blocks b ON t.committed_block_hash = b.block_hash
                 WHERE t.internal_id = 1
             "#;
-            let mut consensus_stmt = db_lock.prepare(consensus_query).map_err(|_| DatabaseError::ProcessingError)?;
-            let current_consensus_height: i32 = consensus_stmt.query_row([], |row| {
-                row.get(0)
-            }).map_err(|_| DatabaseError::RecallError)?;
-            
-            tracing::debug!("Found {} changed items and {} deleted items since height {}", 
-                          items.len(), deleted_identifiers.len(), since_height);
+            let mut consensus_stmt = db_lock
+                .prepare(consensus_query)
+                .map_err(|_| DatabaseError::ProcessingError)?;
+            let current_consensus_height: i32 = consensus_stmt
+                .query_row([], |row| row.get(0))
+                .map_err(|_| DatabaseError::RecallError)?;
+
+            tracing::debug!(
+                "Found {} changed items and {} deleted items since height {}",
+                items.len(),
+                deleted_identifiers.len(),
+                since_height
+            );
 
             Ok(FileProviderEnumerateResult {
                 items,
@@ -321,7 +406,7 @@ pub fn get_folder_changes_since_height(
                 deleted_identifiers: Some(deleted_identifiers),
             })
         }
-        Err(_) => Err(DatabaseError::LockError)
+        Err(_) => Err(DatabaseError::LockError),
     }
 }
 
@@ -331,7 +416,17 @@ pub fn get_item_metadata_by_inode_id(
     db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     inode_id: CustomUUID,
     user_id: i32,
-) -> Result<(String, InodeType, Option<u64>, CustomDateTime, Option<CustomDateTime>, Option<i32>), DatabaseError> {
+) -> Result<
+    (
+        String,
+        InodeType,
+        Option<u64>,
+        CustomDateTime,
+        Option<CustomDateTime>,
+        Option<i32>,
+    ),
+    DatabaseError,
+> {
     match db_connection {
         Ok(db_lock) => {
             let query = r#"
@@ -364,31 +459,40 @@ pub fn get_item_metadata_by_inode_id(
                 WHERE i.id = ? AND i.owner_id = ?
                 LIMIT 1
             "#;
-            
-            let mut stmt = db_lock.prepare(query).map_err(|_| DatabaseError::ProcessingError)?;
-            
-            let result = stmt.query_row(
-                params![user_id, inode_id, user_id],
-                |row| {
+
+            let mut stmt = db_lock
+                .prepare(query)
+                .map_err(|_| DatabaseError::ProcessingError)?;
+
+            let result = stmt
+                .query_row(params![user_id, inode_id, user_id], |row| {
                     let path: String = row.get(0)?;
                     let item_type: InodeType = row.get(1)?;
-                    let file_size = row.get::<_, Option<i64>>(2)?.map(|v| v as u64);  // NULL for folders
-                    let creation_date: CustomDateTime = row.get(3)?;  // UUIDv7 from inode.id (always exists)
-                    let content_modification_date: Option<CustomDateTime> = row.get(4)?;  // UUIDv7 from data_id (files only)
-                    let modification_height: Option<i32> = row.get(5)?;  // Consensus height when item was last modified
-                    Ok((path, item_type, file_size, creation_date, content_modification_date, modification_height))
-                }
-            ).map_err(|e| {
-                match e {
+                    let file_size = row.get::<_, Option<i64>>(2)?.map(|v| v as u64); // NULL for folders
+                    let creation_date: CustomDateTime = row.get(3)?; // UUIDv7 from inode.id (always exists)
+                    let content_modification_date: Option<CustomDateTime> = row.get(4)?; // UUIDv7 from data_id (files only)
+                    let modification_height: Option<i32> = row.get(5)?; // Consensus height when item was last modified
+                    Ok((
+                        path,
+                        item_type,
+                        file_size,
+                        creation_date,
+                        content_modification_date,
+                        modification_height,
+                    ))
+                })
+                .map_err(|e| match e {
                     rusqlite::Error::QueryReturnedNoRows => DatabaseError::NotFound,
-                    _ => DatabaseError::RecallError
-                }
-            })?;
-            
+                    _ => DatabaseError::RecallError,
+                })?;
+
             Ok(result)
         }
         Err(e) => {
-            tracing::error!("Database connection error in get_item_metadata_by_inode_id: {:?}", e);
+            tracing::error!(
+                "Database connection error in get_item_metadata_by_inode_id: {:?}",
+                e
+            );
             Err(DatabaseError::LockError)
         }
     }
@@ -409,22 +513,21 @@ pub fn get_file_path_by_data_id(
                 WHERE data_id = ? AND owner_id = ? AND type = 0
                 LIMIT 1
             "#;
-            
-            let mut stmt = db_lock.prepare(query).map_err(|_| DatabaseError::ProcessingError)?;
-            
-            let encrypted_path: String = stmt.query_row(
-                params![data_id, user_id],
-                |row| row.get(0)
-            ).map_err(|e| {
-                match e {
+
+            let mut stmt = db_lock
+                .prepare(query)
+                .map_err(|_| DatabaseError::ProcessingError)?;
+
+            let encrypted_path: String = stmt
+                .query_row(params![data_id, user_id], |row| row.get(0))
+                .map_err(|e| match e {
                     rusqlite::Error::QueryReturnedNoRows => DatabaseError::NotFound,
-                    _ => DatabaseError::RecallError
-                }
-            })?;
-            
+                    _ => DatabaseError::RecallError,
+                })?;
+
             Ok(encrypted_path)
         }
-        Err(_) => Err(DatabaseError::LockError)
+        Err(_) => Err(DatabaseError::LockError),
     }
 }
 
@@ -443,22 +546,21 @@ pub fn get_inode_id_by_path(
                 WHERE path = ? AND owner_id = ?
                 LIMIT 1
             "#;
-            
-            let mut stmt = db_lock.prepare(query).map_err(|_| DatabaseError::ProcessingError)?;
-            
-            let inode_id: CustomUUID = stmt.query_row(
-                params![encrypted_path, user_id],
-                |row| row.get(0)
-            ).map_err(|e| {
-                match e {
+
+            let mut stmt = db_lock
+                .prepare(query)
+                .map_err(|_| DatabaseError::ProcessingError)?;
+
+            let inode_id: CustomUUID = stmt
+                .query_row(params![encrypted_path, user_id], |row| row.get(0))
+                .map_err(|e| match e {
                     rusqlite::Error::QueryReturnedNoRows => DatabaseError::NotFound,
-                    _ => DatabaseError::RecallError
-                }
-            })?;
-            
+                    _ => DatabaseError::RecallError,
+                })?;
+
             Ok(inode_id)
         }
-        Err(_) => Err(DatabaseError::LockError)
+        Err(_) => Err(DatabaseError::LockError),
     }
 }
 
@@ -478,19 +580,20 @@ pub fn is_folder_empty(
                 WHERE path LIKE ? AND owner_id = ?
                 LIMIT 1
             "#;
-            
-            let mut stmt = db_lock.prepare(query).map_err(|_| DatabaseError::ProcessingError)?;
-            
+
+            let mut stmt = db_lock
+                .prepare(query)
+                .map_err(|_| DatabaseError::ProcessingError)?;
+
             // Pattern to match children: "path/%"
             let children_pattern = format!("{}/%", encrypted_path);
-            
-            let count: i64 = stmt.query_row(
-                params![children_pattern, user_id],
-                |row| row.get(0)
-            ).map_err(|_| DatabaseError::RecallError)?;
-            
+
+            let count: i64 = stmt
+                .query_row(params![children_pattern, user_id], |row| row.get(0))
+                .map_err(|_| DatabaseError::RecallError)?;
+
             Ok(count == 0)
         }
-        Err(_) => Err(DatabaseError::LockError)
+        Err(_) => Err(DatabaseError::LockError),
     }
 }

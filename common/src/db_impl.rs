@@ -1,9 +1,9 @@
 // Database-specific implementations for common types
 // Only included by the main binary, not the FileProvider
 
-use rusqlite::types::{ToSql, ToSqlOutput, FromSql, FromSqlResult, ValueRef, FromSqlError};
-use super::{InodeType, TakeoutStatus, ImportStatus, ImportPathStatus, CustomUUID};
+use super::{CustomUUID, ImportPathStatus, ImportStatus, InodeType, TakeoutStatus};
 use crate::users::OnboardingFlags;
+use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use uuid::Uuid;
 
 impl ToSql for InodeType {
@@ -131,11 +131,11 @@ impl FromSql for CustomUUID {
                                 // Use from_str to construct CustomUUID properly
                                 CustomUUID::from_str(utf_value)
                                     .map_err(|_| FromSqlError::InvalidType)
-                            },
-                            Err(_) => Err(FromSqlError::InvalidType)
+                            }
+                            Err(_) => Err(FromSqlError::InvalidType),
                         }
                     }
-                    Err(_) => Err(FromSqlError::InvalidType)
+                    Err(_) => Err(FromSqlError::InvalidType),
                 }
             }
             _ => Err(FromSqlError::InvalidType),

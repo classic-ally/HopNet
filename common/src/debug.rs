@@ -12,7 +12,7 @@ pub struct StateSnapshot {
 /// Hash and metadata for a single consensus-tracked table
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableHashInfo {
-    pub hash: String,  // Blake3 hash as hex string
+    pub hash: String, // Blake3 hash as hex string
     pub row_count: usize,
     pub excluded_columns: Vec<String>,
 }

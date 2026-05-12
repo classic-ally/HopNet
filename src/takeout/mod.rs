@@ -1,12 +1,12 @@
-pub mod routes;
-pub mod handlers;
-pub mod materialization;
 pub mod archive;
 pub mod barriers;
+pub mod handlers;
 pub mod import;
 pub mod import_gate;
 pub mod jobs;
 pub mod manifest;
+pub mod materialization;
+pub mod routes;
 
 pub use routes::takeout_routes;
 
@@ -24,8 +24,7 @@ pub struct TakeoutRuntime {
     /// Owner-restart import resume registry. Populated by
     /// `jobs::scan_at_startup`; drained by `jobs::maybe_resume_for_user` as
     /// users re-authenticate after an owner-process restart.
-    pub resume_registry:
-        tokio::sync::Mutex<std::collections::HashMap<i32, crate::db::CustomUUID>>,
+    pub resume_registry: tokio::sync::Mutex<std::collections::HashMap<i32, crate::db::CustomUUID>>,
     /// Test-only barriers gating points in the takeout/import lifecycle.
     /// Registered with the central `barriers` registry via `inventory`.
     pub barriers: std::sync::Arc<crate::barriers::Barriers>,

@@ -1,4 +1,4 @@
-pub mod types;
+pub mod auth;
 pub mod handlers;
 pub mod routes;
-pub mod auth;
+pub mod types;

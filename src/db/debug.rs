@@ -1,15 +1,11 @@
 use super::*;
-use std::collections::HashMap;
 use blake3::Hasher;
-use serde::{Deserialize, Serialize};
 use rusqlite::OptionalExtension;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Tables to skip entirely (local-only state)
-const LOCAL_ONLY_TABLES: &[&str] = &[
-    "this_node",
-    "modification_log",
-    "pending_fragment_requests",
-];
+const LOCAL_ONLY_TABLES: &[&str] = &["this_node", "modification_log", "pending_fragment_requests"];
 
 /// Columns to exclude from consensus-tracked tables
 const EXCLUDED_COLUMNS: &[(&str, &[&str])] = &[
@@ -65,11 +61,14 @@ impl From<StateSnapshot> for hopnet_common::StateSnapshot {
                 .table_hashes
                 .into_iter()
                 .map(|(table_name, info)| {
-                    (table_name, hopnet_common::TableHashInfo {
-                        hash: info.hash.to_hex(),
-                        row_count: info.row_count,
-                        excluded_columns: info.excluded_columns,
-                    })
+                    (
+                        table_name,
+                        hopnet_common::TableHashInfo {
+                            hash: info.hash.to_hex(),
+                            row_count: info.row_count,
+                            excluded_columns: info.excluded_columns,
+                        },
+                    )
                 })
                 .collect(),
         }
@@ -88,18 +87,21 @@ fn get_excluded_columns(table_name: &str) -> Vec<&'static str> {
 /// Get primary key columns dynamically from schema
 fn get_primary_key_columns(
     tx: &rusqlite::Transaction,
-    table_name: &str
+    table_name: &str,
 ) -> Result<Vec<String>, DatabaseError> {
-    let mut stmt = tx.prepare(&format!("PRAGMA table_info({})", table_name))
+    let mut stmt = tx
+        .prepare(&format!("PRAGMA table_info({})", table_name))
         .map_err(|_| DatabaseError::RecallError)?;
 
     let mut pk_columns: Vec<String> = Vec::new();
 
-    let rows = stmt.query_map([], |row| {
-        let name: String = row.get(1)?;      // Column name
-        let is_pk: bool = row.get(5)?;       // Part of primary key?
-        Ok((name, is_pk))
-    }).map_err(|_| DatabaseError::RecallError)?;
+    let rows = stmt
+        .query_map([], |row| {
+            let name: String = row.get(1)?; // Column name
+            let is_pk: bool = row.get(5)?; // Part of primary key?
+            Ok((name, is_pk))
+        })
+        .map_err(|_| DatabaseError::RecallError)?;
 
     for row in rows {
         let (col_name, is_pk) = row.map_err(|_| DatabaseError::RecallError)?;
@@ -124,28 +126,33 @@ fn get_primary_key_columns(
 fn build_table_query(
     tx: &rusqlite::Transaction,
     table_name: &str,
-    excluded_cols: &[&str]
+    excluded_cols: &[&str],
 ) -> Result<String, DatabaseError> {
     let pk_cols = get_primary_key_columns(tx, table_name)?;
 
     // Get all column names and types from PRAGMA table_info
-    let mut stmt = tx.prepare(&format!("PRAGMA table_info({})", table_name))
+    let mut stmt = tx
+        .prepare(&format!("PRAGMA table_info({})", table_name))
         .map_err(|_| DatabaseError::RecallError)?;
 
-    let all_columns: Vec<(String, String)> = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
-    }).map_err(|_| DatabaseError::RecallError)?
-    .collect::<Result<Vec<_>, _>>()
-    .map_err(|_| DatabaseError::RecallError)?;
+    let all_columns: Vec<(String, String)> = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        })
+        .map_err(|_| DatabaseError::RecallError)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| DatabaseError::RecallError)?;
 
     // Filter out excluded columns
-    let columns: Vec<&(String, String)> = all_columns.iter()
+    let columns: Vec<&(String, String)> = all_columns
+        .iter()
         .filter(|(col, _)| !excluded_cols.contains(&col.as_str()))
         .collect();
 
     // Build json_object arguments: 'col1', col1, 'col2', col2, ...
     // BLOB columns must be hex-encoded (SQLite json_object cannot hold BLOBs)
-    let json_args: Vec<String> = columns.iter()
+    let json_args: Vec<String> = columns
+        .iter()
         .map(|(col, col_type)| {
             if col_type.eq_ignore_ascii_case("BLOB") {
                 format!("'{}', hex({})", col, col)
@@ -157,7 +164,8 @@ fn build_table_query(
     let json_object_expr = format!("json_object({})", json_args.join(", "));
 
     // Build explicit column list for SELECT
-    let column_list = columns.iter()
+    let column_list = columns
+        .iter()
         .map(|(c, _)| c.as_str())
         .collect::<Vec<_>>()
         .join(", ");
@@ -183,18 +191,17 @@ fn compute_table_hash_tx(
     let query = build_table_query(tx, table_name, &excluded_cols)?;
 
     // Get row count
-    let row_count: usize = tx.query_row(
-        &format!("SELECT COUNT(*) FROM {}", table_name),
-        [],
-        |row| row.get::<_, i64>(0)
-    ).map_err(|_| DatabaseError::RecallError)? as usize;
+    let row_count: usize = tx
+        .query_row(&format!("SELECT COUNT(*) FROM {}", table_name), [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(|_| DatabaseError::RecallError)? as usize;
 
     // Execute query and hash the JSON result
-    let rows_json: String = tx.query_row(&query, [], |row| row.get(0))
-        .map_err(|e| {
-            tracing::error!("Failed to query table {}: {:?}", table_name, e);
-            DatabaseError::RecallError
-        })?;
+    let rows_json: String = tx.query_row(&query, [], |row| row.get(0)).map_err(|e| {
+        tracing::error!("Failed to query table {}: {:?}", table_name, e);
+        DatabaseError::RecallError
+    })?;
 
     let mut hasher = Hasher::new();
     hasher.update(rows_json.as_bytes());
@@ -241,7 +248,7 @@ pub fn compute_state_snapshot(
             let tx = conn.transaction().map_err(|_| DatabaseError::LockError)?;
             compute_state_snapshot_tx(&tx)
         }
-        Err(_) => Err(DatabaseError::LockError)
+        Err(_) => Err(DatabaseError::LockError),
     }
 }
 
@@ -316,10 +323,12 @@ pub fn get_db_stats(
     let conn = db_connection.map_err(|_| DatabaseError::LockError)?;
 
     let q_i64 = |sql: &str| -> Result<i64, DatabaseError> {
-        conn.query_row(sql, [], |r| r.get(0)).map_err(|_| DatabaseError::RecallError)
+        conn.query_row(sql, [], |r| r.get(0))
+            .map_err(|_| DatabaseError::RecallError)
     };
     let q_str = |sql: &str| -> Result<String, DatabaseError> {
-        conn.query_row(sql, [], |r| r.get(0)).map_err(|_| DatabaseError::RecallError)
+        conn.query_row(sql, [], |r| r.get(0))
+            .map_err(|_| DatabaseError::RecallError)
     };
 
     let page_count = q_i64("PRAGMA page_count")?;
@@ -332,11 +341,14 @@ pub fn get_db_stats(
     let temp_store_int = q_i64("PRAGMA temp_store")?;
     let busy_timeout_ms = q_i64("PRAGMA busy_timeout")?;
 
-    let db_path: Option<String> = conn.query_row(
-        "SELECT file FROM pragma_database_list WHERE name = 'main'",
-        [],
-        |r| r.get(0),
-    ).optional().map_err(|_| DatabaseError::RecallError)?;
+    let db_path: Option<String> = conn
+        .query_row(
+            "SELECT file FROM pragma_database_list WHERE name = 'main'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|_| DatabaseError::RecallError)?;
 
     let wal_bytes = db_path
         .as_deref()
@@ -351,14 +363,16 @@ pub fn get_db_stats(
         2 => "FULL",
         3 => "EXTRA",
         _ => "UNKNOWN",
-    }.to_string();
+    }
+    .to_string();
 
     let temp_store = match temp_store_int {
         0 => "DEFAULT",
         1 => "FILE",
         2 => "MEMORY",
         _ => "UNKNOWN",
-    }.to_string();
+    }
+    .to_string();
 
     let cache_bytes = if cache_size_raw < 0 {
         -cache_size_raw * 1024
@@ -369,9 +383,15 @@ pub fn get_db_stats(
     let db_bytes = page_count * page_size;
 
     let counters = CounterSnapshot {
-        txn_commits: crate::db::shared::DB_COUNTERS.txn_commits.load(std::sync::atomic::Ordering::Relaxed),
-        txn_rollbacks: crate::db::shared::DB_COUNTERS.txn_rollbacks.load(std::sync::atomic::Ordering::Relaxed),
-        conn_acquires: crate::db::shared::DB_COUNTERS.conn_acquires.load(std::sync::atomic::Ordering::Relaxed),
+        txn_commits: crate::db::shared::DB_COUNTERS
+            .txn_commits
+            .load(std::sync::atomic::Ordering::Relaxed),
+        txn_rollbacks: crate::db::shared::DB_COUNTERS
+            .txn_rollbacks
+            .load(std::sync::atomic::Ordering::Relaxed),
+        conn_acquires: crate::db::shared::DB_COUNTERS
+            .conn_acquires
+            .load(std::sync::atomic::Ordering::Relaxed),
     };
 
     let commit_latency_us = {
@@ -415,25 +435,31 @@ pub fn get_file_fragment_distribution(
     match db_connection {
         Ok(db_lock) => {
             // First, get the file's inode_id, data_block_id, and basic metadata
-            let file_metadata: Option<(CustomUUID, CustomUUID, u64, Option<i32>, i32)> = db_lock.query_row(
-                "SELECT i.id, db.id, db.file_size, db.placement_height, db.fragment_count
+            let file_metadata: Option<(CustomUUID, CustomUUID, u64, Option<i32>, i32)> = db_lock
+                .query_row(
+                    "SELECT i.id, db.id, db.file_size, db.placement_height, db.fragment_count
                  FROM inodes i
                  JOIN data_blocks db ON i.data_id = db.id
                  WHERE i.path = ? AND i.owner_id = ? AND i.type = 0",
-                params![encrypted_path, user_id],
-                |row| Ok((
-                    row.get(0)?,  // inode_id
-                    row.get(1)?,  // data_block_id
-                    row.get::<_, i64>(2)? as u64,  // file_size
-                    row.get(3)?,  // placement_height
-                    row.get(4)?,  // fragment_count
-                ))
-            ).optional().map_err(|_| DatabaseError::RecallError)?;
+                    params![encrypted_path, user_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,                  // inode_id
+                            row.get(1)?,                  // data_block_id
+                            row.get::<_, i64>(2)? as u64, // file_size
+                            row.get(3)?,                  // placement_height
+                            row.get(4)?,                  // fragment_count
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|_| DatabaseError::RecallError)?;
 
-            let (inode_id, data_block_id, file_size, placement_height, fragment_count) = match file_metadata {
-                Some(metadata) => metadata,
-                None => return Err(DatabaseError::NotFound),
-            };
+            let (inode_id, data_block_id, file_size, placement_height, fragment_count) =
+                match file_metadata {
+                    Some(metadata) => metadata,
+                    None => return Err(DatabaseError::NotFound),
+                };
 
             // Get all fragments for this file with their metadata
             let mut stmt = db_lock.prepare(
@@ -443,15 +469,17 @@ pub fn get_file_fragment_distribution(
                  ORDER BY fh.chunk_number, fh.local_index"
             ).map_err(|_| DatabaseError::RecallError)?;
 
-            let fragment_rows = stmt.query_map(params![data_block_id], |row| {
-                Ok((
-                    row.get::<_, u32>(0)?,         // chunk_number
-                    row.get::<_, u32>(1)?,         // local_index
-                    row.get::<_, CustomUUID>(2)?,  // fragment_id
-                    row.get::<_, Blake3Hash>(3)?,  // fragment_hash
-                    row.get::<_, ChunkType>(4)?,   // chunk_type
-                ))
-            }).map_err(|_| DatabaseError::ProcessingError)?;
+            let fragment_rows = stmt
+                .query_map(params![data_block_id], |row| {
+                    Ok((
+                        row.get::<_, u32>(0)?,        // chunk_number
+                        row.get::<_, u32>(1)?,        // local_index
+                        row.get::<_, CustomUUID>(2)?, // fragment_id
+                        row.get::<_, Blake3Hash>(3)?, // fragment_hash
+                        row.get::<_, ChunkType>(4)?,  // chunk_type
+                    ))
+                })
+                .map_err(|_| DatabaseError::ProcessingError)?;
 
             // Collect fragment data
             let mut fragments = Vec::new();
@@ -469,18 +497,19 @@ pub fn get_file_fragment_distribution(
                 }
 
                 // Query fragment_inventory for node IDs that have this fragment
-                let mut inv_stmt = db_lock.prepare(
-                    "SELECT node_id
+                let mut inv_stmt = db_lock
+                    .prepare(
+                        "SELECT node_id
                      FROM fragment_inventory
                      WHERE fragment_hash = ?
-                     ORDER BY self_verified_height DESC"
-                ).map_err(|_| DatabaseError::RecallError)?;
+                     ORDER BY self_verified_height DESC",
+                    )
+                    .map_err(|_| DatabaseError::RecallError)?;
 
-                let nodes: Result<Vec<i32>, _> = inv_stmt.query_map(
-                    params![fragment_hash],
-                    |row| row.get(0)
-                ).map_err(|_| DatabaseError::RecallError)?
-                .collect();
+                let nodes: Result<Vec<i32>, _> = inv_stmt
+                    .query_map(params![fragment_hash], |row| row.get(0))
+                    .map_err(|_| DatabaseError::RecallError)?
+                    .collect();
 
                 fragments.push(FragmentInfo {
                     chunk_number,
@@ -503,6 +532,6 @@ pub fn get_file_fragment_distribution(
                 fragments,
             })
         }
-        Err(_) => Err(DatabaseError::LockError)
+        Err(_) => Err(DatabaseError::LockError),
     }
 }

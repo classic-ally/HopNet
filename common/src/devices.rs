@@ -1,7 +1,7 @@
 // Device management types for Android DocumentProvider and macOS FileProvider
+use super::db::CustomUUID;
 use serde::{Deserialize, Serialize};
 use typeshare::typeshare;
-use super::db::CustomUUID;
 
 /// API request for device registration
 #[derive(Debug, Deserialize, Serialize)]

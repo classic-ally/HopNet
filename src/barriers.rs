@@ -8,16 +8,16 @@
 //! primitive are shared.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
 
 use axum::{
+    Json, Router,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
 };
 use serde::Serialize;
 
@@ -156,13 +156,19 @@ async fn post_barrier_hold(
     Path((subsystem, name)): Path<(String, String)>,
 ) -> impl IntoResponse {
     let Some(reg) = lookup(&subsystem) else {
-        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "unknown subsystem"})));
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "unknown subsystem"})),
+        );
     };
     let barriers = (reg.accessor)(&state);
     if barriers.hold(&name) {
         (StatusCode::OK, Json(serde_json::json!({"ok": true})))
     } else {
-        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "unknown barrier"})))
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "unknown barrier"})),
+        )
     }
 }
 
@@ -171,13 +177,19 @@ async fn post_barrier_release(
     Path((subsystem, name)): Path<(String, String)>,
 ) -> impl IntoResponse {
     let Some(reg) = lookup(&subsystem) else {
-        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "unknown subsystem"})));
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "unknown subsystem"})),
+        );
     };
     let barriers = (reg.accessor)(&state);
     if barriers.release(&name) {
         (StatusCode::OK, Json(serde_json::json!({"ok": true})))
     } else {
-        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "unknown barrier"})))
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "unknown barrier"})),
+        )
     }
 }
 
@@ -186,12 +198,20 @@ async fn get_barrier_status(
     Path((subsystem, name)): Path<(String, String)>,
 ) -> impl IntoResponse {
     let Some(reg) = lookup(&subsystem) else {
-        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "unknown subsystem"}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "unknown subsystem"})),
+        )
+            .into_response();
     };
     let barriers = (reg.accessor)(&state);
     match barriers.status(&name) {
         Some(s) => (StatusCode::OK, Json(serde_json::json!(s))).into_response(),
-        None => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "unknown barrier"}))).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "unknown barrier"})),
+        )
+            .into_response(),
     }
 }
 
@@ -200,7 +220,11 @@ async fn list_barriers(
     Path(subsystem): Path<String>,
 ) -> impl IntoResponse {
     let Some(reg) = lookup(&subsystem) else {
-        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "unknown subsystem"}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "unknown subsystem"})),
+        )
+            .into_response();
     };
     let barriers = (reg.accessor)(&state);
     let map: HashMap<String, BarrierStatus> = barriers

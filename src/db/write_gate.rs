@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
 
 use crate::types::Blake3Hash;
@@ -81,7 +81,9 @@ pub async fn drain_local_state_queue(
         let mut classify = |item: LocalStateUpdate| match item {
             LocalStateUpdate::MarkLocal { fragment_hash } => mark_local.push(fragment_hash),
             LocalStateUpdate::MarkRemote { fragment_hash } => mark_remote.push(fragment_hash),
-            LocalStateUpdate::MarkRemoteBatch { fragment_hashes } => mark_remote.extend(fragment_hashes),
+            LocalStateUpdate::MarkRemoteBatch { fragment_hashes } => {
+                mark_remote.extend(fragment_hashes)
+            }
         };
 
         classify(first);
@@ -93,23 +95,25 @@ pub async fn drain_local_state_queue(
         write_gate.wait_for_open().await;
 
         if !mark_local.is_empty() {
-            if let Err(e) = super::files::mark_fragments_local_state_batch(
-                db_pool.get(), &mark_local, true,
-            ) {
+            if let Err(e) =
+                super::files::mark_fragments_local_state_batch(db_pool.get(), &mark_local, true)
+            {
                 tracing::warn!(
                     "Failed to batch-mark {} fragments as local: {:?}",
-                    mark_local.len(), e
+                    mark_local.len(),
+                    e
                 );
             }
         }
 
         if !mark_remote.is_empty() {
-            if let Err(e) = super::files::mark_fragments_local_state_batch(
-                db_pool.get(), &mark_remote, false,
-            ) {
+            if let Err(e) =
+                super::files::mark_fragments_local_state_batch(db_pool.get(), &mark_remote, false)
+            {
                 tracing::warn!(
                     "Failed to batch-mark {} fragments as remote: {:?}",
-                    mark_remote.len(), e
+                    mark_remote.len(),
+                    e
                 );
             }
         }

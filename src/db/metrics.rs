@@ -8,12 +8,14 @@ pub fn get_metric(
     match db_connection {
         Ok(db_lock) => {
             // Prepare the query
-            let mut stmt = db_lock.prepare("SELECT * FROM metrics").map_err(|_| DatabaseError::RecallError)?;
+            let mut stmt = db_lock
+                .prepare("SELECT * FROM metrics")
+                .map_err(|_| DatabaseError::RecallError)?;
             // Execute the query and map each row to a Metric
             let results = stmt.query_map([], |row| {
                 let from_node: i32 = row.get(0)?;
                 let to_node: i32 = row.get(1)?;
-                
+
                 // Read timestamp as RFC3339 string (SQLite stores as text)
                 let start_time_str: String = row.get(2)?;
                 let start_time = DateTime::parse_from_rfc3339(&start_time_str)
@@ -22,7 +24,7 @@ pub fn get_metric(
                         tracing::error!("Invalid timestamp: {}", start_time_str);
                         rusqlite::Error::InvalidColumnName("start_time".to_string())
                     })?;
-                
+
                 Ok(Metric {
                     from_node,
                     to_node,
@@ -31,27 +33,24 @@ pub fn get_metric(
                     rtt_variance: row.get(4)?,
                     rtt_jitter: row.get(5)?,
                     throughput: row.get(6)?,
-                    height: row.get(7)?,        // New: consensus height
-                    available: row.get(8)?,     // New: node availability
-                    storage_total_gb: row.get(9)?,  // New: storage capacity
-                    storage_used_gb: row.get(10)?,  // New: storage utilization
+                    height: row.get(7)?,           // New: consensus height
+                    available: row.get(8)?,        // New: node availability
+                    storage_total_gb: row.get(9)?, // New: storage capacity
+                    storage_used_gb: row.get(10)?, // New: storage utilization
                 })
             });
 
             match results {
-                Ok(metrics) => {
-                    metrics.collect::<Result<Vec<_>, _>>()
-                        .map_err(|e| {
-                            tracing::error!("Error parsing metric row: {:?}", e);
-                            DatabaseError::ProcessingError
-                        })
-                },
+                Ok(metrics) => metrics.collect::<Result<Vec<_>, _>>().map_err(|e| {
+                    tracing::error!("Error parsing metric row: {:?}", e);
+                    DatabaseError::ProcessingError
+                }),
                 Err(e) => {
                     tracing::error!("Error querying metrics: {:?}", e);
                     Err(DatabaseError::RecordError)
                 }
             }
-        },
+        }
         Err(e) => {
             tracing::error!("Database connection error in get_metric: {:?}", e);
             Err(DatabaseError::LockError)
@@ -95,7 +94,7 @@ pub fn insert_metric(
                 }
             }
         }
-        Err(_) => Err(DatabaseError::LockError)
+        Err(_) => Err(DatabaseError::LockError),
     }
 }
 
@@ -135,33 +134,40 @@ pub fn insert_metrics_batch(
 /// Get all network nodes excluding specified node (for metrics collection)
 pub fn get_nodes_to_measure(
     db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
-    exclude_node_id: i32
+    exclude_node_id: i32,
 ) -> Result<Vec<crate::types::Node>, DatabaseError> {
     match db_connection {
         Ok(db_lock) => {
-            let mut stmt = db_lock.prepare(
-                "SELECT node_id, name, owner, pubkey
+            let mut stmt = db_lock
+                .prepare(
+                    "SELECT node_id, name, owner, pubkey
                 FROM nodes
                 WHERE node_id != ?
-                ORDER BY node_id"
-            ).map_err(|_| DatabaseError::RecallError)?;
+                ORDER BY node_id",
+                )
+                .map_err(|_| DatabaseError::RecallError)?;
 
-            let nodes = stmt.query_map([exclude_node_id], |row| {
-                Ok(crate::types::Node {
-                    node_id: row.get(0)?,
-                    name: row.get(1)?,
-                    owner: row.get(2)?,
-                    pubkey: row.get(3)?,
+            let nodes = stmt
+                .query_map([exclude_node_id], |row| {
+                    Ok(crate::types::Node {
+                        node_id: row.get(0)?,
+                        name: row.get(1)?,
+                        owner: row.get(2)?,
+                        pubkey: row.get(3)?,
+                    })
                 })
-            }).map_err(|_| DatabaseError::RecallError)?
-            .collect::<Result<Vec<crate::types::Node>, _>>()
-            .map_err(|_| DatabaseError::RecallError)?;
-            
-            tracing::debug!("Found {} network nodes to measure (excluding node {})", 
-                nodes.len(), exclude_node_id);
+                .map_err(|_| DatabaseError::RecallError)?
+                .collect::<Result<Vec<crate::types::Node>, _>>()
+                .map_err(|_| DatabaseError::RecallError)?;
+
+            tracing::debug!(
+                "Found {} network nodes to measure (excluding node {})",
+                nodes.len(),
+                exclude_node_id
+            );
             Ok(nodes)
         }
-        Err(_) => Err(DatabaseError::LockError)
+        Err(_) => Err(DatabaseError::LockError),
     }
 }
 
@@ -172,12 +178,12 @@ pub struct NodeMetrics {
     pub pubkey: crate::types::PubKey,
     pub sample_count_7d: u32,
     pub trust_factor: f64,
-    pub availability_score: f64,      // Time-weighted: 24h * 0.7 + 7d * 0.3
-    pub throughput_score: f64,        // Log-normalized with consistency factor
-    pub latency_score: f64,           // Inverse normalized latency
-    pub stability_score: f64,         // Inverse of 7d latency variance
-    pub storage_utilization: f64,     // used_gb / total_gb ratio
-    pub storage_multiplier: f64,      // e^(-5 * utilization)
+    pub availability_score: f64,  // Time-weighted: 24h * 0.7 + 7d * 0.3
+    pub throughput_score: f64,    // Log-normalized with consistency factor
+    pub latency_score: f64,       // Inverse normalized latency
+    pub stability_score: f64,     // Inverse of 7d latency variance
+    pub storage_utilization: f64, // used_gb / total_gb ratio
+    pub storage_multiplier: f64,  // e^(-5 * utilization)
 }
 
 /// Get computed placement scores for all nodes at specific consensus height
@@ -308,34 +314,39 @@ pub fn get_all_node_metrics(
                 DatabaseError::RecallError
             })?;
 
-            let metrics = stmt.query_map(&params, |row| {
-                Ok(NodeMetrics {
-                    node_id: row.get("node_id")?,
-                    pubkey: row.get("pubkey")?,
-                    sample_count_7d: row.get::<_, i64>("sample_count_7d")? as u32,
-                    trust_factor: row.get("trust_factor")?,
-                    availability_score: row.get("availability_score")?,
-                    throughput_score: row.get("throughput_score")?,
-                    latency_score: row.get("latency_score")?,
-                    stability_score: row.get("stability_score")?,
-                    storage_utilization: row.get("storage_utilization")?,
-                    storage_multiplier: row.get("storage_multiplier")?,
+            let metrics = stmt
+                .query_map(&params, |row| {
+                    Ok(NodeMetrics {
+                        node_id: row.get("node_id")?,
+                        pubkey: row.get("pubkey")?,
+                        sample_count_7d: row.get::<_, i64>("sample_count_7d")? as u32,
+                        trust_factor: row.get("trust_factor")?,
+                        availability_score: row.get("availability_score")?,
+                        throughput_score: row.get("throughput_score")?,
+                        latency_score: row.get("latency_score")?,
+                        stability_score: row.get("stability_score")?,
+                        storage_utilization: row.get("storage_utilization")?,
+                        storage_multiplier: row.get("storage_multiplier")?,
+                    })
                 })
-            }).map_err(|e| {
-                tracing::error!("Failed to execute metrics query: {:?}", e);
-                DatabaseError::RecallError
-            })?
-            .collect::<Result<Vec<NodeMetrics>, _>>()
-            .map_err(|e| {
-                tracing::error!("Failed to parse metrics results: {:?}", e);
-                DatabaseError::ProcessingError
-            })?;
+                .map_err(|e| {
+                    tracing::error!("Failed to execute metrics query: {:?}", e);
+                    DatabaseError::RecallError
+                })?
+                .collect::<Result<Vec<NodeMetrics>, _>>()
+                .map_err(|e| {
+                    tracing::error!("Failed to parse metrics results: {:?}", e);
+                    DatabaseError::ProcessingError
+                })?;
 
-            tracing::debug!("Retrieved metrics for {} nodes at height {}",
-                metrics.len(), consensus_height);
+            tracing::debug!(
+                "Retrieved metrics for {} nodes at height {}",
+                metrics.len(),
+                consensus_height
+            );
 
             Ok(metrics)
         }
-        Err(_) => Err(DatabaseError::LockError)
+        Err(_) => Err(DatabaseError::LockError),
     }
 }

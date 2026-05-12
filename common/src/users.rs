@@ -1,4 +1,4 @@
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use typeshare::typeshare;
 
 /// Public user info returned by `GET /users/` (list endpoint, all peers on
@@ -53,8 +53,8 @@ pub enum OnboardingFlag {
 impl OnboardingFlag {
     pub fn bit(self) -> OnboardingFlags {
         match self {
-            OnboardingFlag::ImportOffered    => OnboardingFlags(1 << 0),
-            OnboardingFlag::ImportCompleted  => OnboardingFlags(1 << 1),
+            OnboardingFlag::ImportOffered => OnboardingFlags(1 << 0),
+            OnboardingFlag::ImportCompleted => OnboardingFlags(1 << 1),
             OnboardingFlag::ProfileCompleted => OnboardingFlags(1 << 2),
         }
     }
@@ -71,27 +71,37 @@ pub struct OnboardingFlags(pub u32);
 impl OnboardingFlags {
     pub const NONE: Self = Self(0);
 
-    pub const IMPORT_OFFERED:    Self = Self(1 << 0);
-    pub const IMPORT_COMPLETED:  Self = Self(1 << 1);
+    pub const IMPORT_OFFERED: Self = Self(1 << 0);
+    pub const IMPORT_COMPLETED: Self = Self(1 << 1);
     pub const PROFILE_COMPLETED: Self = Self(1 << 2);
 
     pub fn contains(self, other: Self) -> bool {
         (self.0 & other.0) == other.0 && other.0 != 0
     }
 
-    pub fn insert(&mut self, other: Self) { self.0 |= other.0; }
-    pub fn remove(&mut self, other: Self) { self.0 &= !other.0; }
+    pub fn insert(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
+    pub fn remove(&mut self, other: Self) {
+        self.0 &= !other.0;
+    }
 
-    pub fn raw(self) -> u32 { self.0 }
+    pub fn raw(self) -> u32 {
+        self.0
+    }
 }
 
 impl std::ops::BitOr for OnboardingFlags {
     type Output = Self;
-    fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) }
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
 }
 
 impl std::ops::BitOrAssign for OnboardingFlags {
-    fn bitor_assign(&mut self, rhs: Self) { self.0 |= rhs.0; }
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
 }
 
 impl FromIterator<OnboardingFlag> for OnboardingFlags {

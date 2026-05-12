@@ -45,6 +45,4 @@ jobs:
         run: nix build .#default --print-build-logs
 
       - name: Verify headless binary
-        run: |
-          test -x result/bin/hopnet
-          file result/bin/hopnet
+        run: test -x result/bin/hopnet

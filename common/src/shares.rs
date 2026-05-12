@@ -1,4 +1,4 @@
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use typeshare::typeshare;
 
 /// Request to share a file with another user

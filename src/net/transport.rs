@@ -1,7 +1,7 @@
-use r2d2_sqlite::SqliteConnectionManager;
-use iroh::{endpoint::Connection, Endpoint, PublicKey, SecretKey};
 use iroh::endpoint::{AfterHandshakeOutcome, EndpointHooks};
+use iroh::{Endpoint, PublicKey, SecretKey, endpoint::Connection};
 use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -47,7 +47,11 @@ pub enum TransportError {
 /// Protocol-layer errors - generally non-retryable
 #[derive(Debug)]
 pub enum ProtocolError {
-    ValueMismatch { field: &'static str, expected: String, got: String },
+    ValueMismatch {
+        field: &'static str,
+        expected: String,
+        got: String,
+    },
     PeerError(String),
     MalformedResponse(String),
     MessageTooLarge(usize),
@@ -83,7 +87,11 @@ impl std::fmt::Display for TransportError {
 impl std::fmt::Display for ProtocolError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ProtocolError::ValueMismatch { field, expected, got } => {
+            ProtocolError::ValueMismatch {
+                field,
+                expected,
+                got,
+            } => {
                 write!(f, "{} mismatch: expected {}, got {}", field, expected, got)
             }
             ProtocolError::PeerError(msg) => write!(f, "peer error: {}", msg),
@@ -111,9 +119,13 @@ pub async fn send_raw(
     bytes: &[u8],
 ) -> Result<(), IrohError> {
     let len = bytes.len() as u32;
-    stream.write_all(&len.to_le_bytes()).await
+    stream
+        .write_all(&len.to_le_bytes())
+        .await
         .map_err(|e| IrohError::Transport(TransportError::StreamFailed(e.to_string())))?;
-    stream.write_all(&bytes).await
+    stream
+        .write_all(&bytes)
+        .await
         .map_err(|e| IrohError::Transport(TransportError::StreamFailed(e.to_string())))?;
     Ok(())
 }
@@ -133,7 +145,9 @@ async fn send_request(
     request_id: u64,
     req: &IrohRequest,
 ) -> Result<(), IrohError> {
-    stream.write_all(&request_id.to_le_bytes()).await
+    stream
+        .write_all(&request_id.to_le_bytes())
+        .await
         .map_err(|e| IrohError::Transport(TransportError::StreamFailed(e.to_string())))?;
     send_message(stream, req).await
 }
@@ -143,7 +157,9 @@ pub async fn recv_message<T: serde::de::DeserializeOwned>(
     stream: &mut iroh::endpoint::RecvStream,
 ) -> Result<T, IrohError> {
     let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).await
+    stream
+        .read_exact(&mut len_buf)
+        .await
         .map_err(|e| IrohError::Transport(TransportError::StreamFailed(e.to_string())))?;
     let len = u32::from_le_bytes(len_buf) as usize;
 
@@ -152,7 +168,9 @@ pub async fn recv_message<T: serde::de::DeserializeOwned>(
     }
 
     let mut bytes = vec![0u8; len];
-    stream.read_exact(&mut bytes).await
+    stream
+        .read_exact(&mut bytes)
+        .await
         .map_err(|e| IrohError::Transport(TransportError::StreamFailed(e.to_string())))?;
 
     let (msg, _) = bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
@@ -203,18 +221,20 @@ impl EndpointHooks for PeerValidator {
             // used by PubKey::to_sql() so the query matches the DB BLOB.
             let pubkey = PubKey(
                 ed25519_dalek::VerifyingKey::from_bytes(remote_id.as_bytes())
-                    .expect("iroh EndpointId is valid Ed25519")
+                    .expect("iroh EndpointId is valid Ed25519"),
             );
-            let pubkey_encoded = bincode::serde::encode_to_vec(
-                &pubkey, bincode::config::standard()
-            ).expect("PubKey encoding cannot fail");
+            let pubkey_encoded =
+                bincode::serde::encode_to_vec(&pubkey, bincode::config::standard())
+                    .expect("PubKey encoding cannot fail");
 
             let is_known = match self.db_pool.get() {
-                Ok(conn) => conn.query_row(
-                    "SELECT 1 FROM nodes WHERE pubkey = ?",
-                    [pubkey_encoded.as_slice()],
-                    |_| Ok(()),
-                ).is_ok(),
+                Ok(conn) => conn
+                    .query_row(
+                        "SELECT 1 FROM nodes WHERE pubkey = ?",
+                        [pubkey_encoded.as_slice()],
+                        |_| Ok(()),
+                    )
+                    .is_ok(),
                 Err(e) => {
                     tracing::error!("failed to get DB connection in peer validator: {}", e);
                     false
@@ -254,12 +274,19 @@ impl IrohTransport {
     /// Create a new IrohTransport with the given secret key and database pool.
     /// `is_setup_complete` should be true if this node already has persisted state (restart),
     /// false if this is a fresh node waiting for genesis setup or JoinInfo.
-    pub async fn new(secret_key: SecretKey, db_pool: Pool<SqliteConnectionManager>, is_setup_complete: bool) -> Result<Self, IrohError> {
+    pub async fn new(
+        secret_key: SecretKey,
+        db_pool: Pool<SqliteConnectionManager>,
+        is_setup_complete: bool,
+    ) -> Result<Self, IrohError> {
         let setup_complete = Arc::new(AtomicBool::new(is_setup_complete));
         let endpoint = Endpoint::builder()
             .secret_key(secret_key)
             .alpns(vec![HOPNET_ALPN.to_vec()])
-            .hooks(PeerValidator { db_pool, setup_complete: setup_complete.clone() })
+            .hooks(PeerValidator {
+                db_pool,
+                setup_complete: setup_complete.clone(),
+            })
             .bind()
             .await
             .map_err(|e| IrohError::Transport(TransportError::ConnectionFailed(e.to_string())))?;
@@ -290,7 +317,11 @@ impl IrohTransport {
     /// Get or establish a connection to a peer.
     /// Uses cached connection if available. Connection establishment is bounded
     /// by CONNECTION_TIMEOUT to prevent indefinite hangs when a peer is unreachable.
-    pub async fn get_connection(&self, node_id: i32, peer_node_id: PublicKey) -> Result<Connection, IrohError> {
+    pub async fn get_connection(
+        &self,
+        node_id: i32,
+        peer_node_id: PublicKey,
+    ) -> Result<Connection, IrohError> {
         // Check cache first
         {
             let connections = self.connections.read().await;
@@ -307,9 +338,12 @@ impl IrohTransport {
             self.endpoint.connect(peer_node_id, HOPNET_ALPN),
         )
         .await
-        .map_err(|_| IrohError::Transport(TransportError::ConnectionFailed(
-            format!("connection to node {} timed out after {:?}", node_id, CONNECTION_TIMEOUT),
-        )))?
+        .map_err(|_| {
+            IrohError::Transport(TransportError::ConnectionFailed(format!(
+                "connection to node {} timed out after {:?}",
+                node_id, CONNECTION_TIMEOUT
+            )))
+        })?
         .map_err(|e| IrohError::Transport(TransportError::ConnectionFailed(e.to_string())))?;
 
         // Cache it
@@ -327,7 +361,14 @@ impl IrohTransport {
         let start = Instant::now();
         let nonce = rand::random::<u64>();
 
-        let response = self.request(node_id, peer_node_id, &IrohRequest::Ping { nonce }, Duration::from_secs(5)).await?;
+        let response = self
+            .request(
+                node_id,
+                peer_node_id,
+                &IrohRequest::Ping { nonce },
+                Duration::from_secs(5),
+            )
+            .await?;
 
         match response {
             IrohResponse::Pong { nonce: got } if got == nonce => {
@@ -343,11 +384,9 @@ impl IrohTransport {
             IrohResponse::Error { message } => {
                 Err(IrohError::Protocol(ProtocolError::PeerError(message)))
             }
-            other => {
-                Err(IrohError::Protocol(ProtocolError::MalformedResponse(
-                    format!("unexpected response to Ping: {:?}", other),
-                )))
-            }
+            other => Err(IrohError::Protocol(ProtocolError::MalformedResponse(
+                format!("unexpected response to Ping: {:?}", other),
+            ))),
         }
     }
 
@@ -362,9 +401,16 @@ impl IrohTransport {
     /// Connection establishment is outside the timeout budget (bounded separately by
     /// CONNECTION_TIMEOUT). The `timeout` parameter covers only stream I/O — opening
     /// the stream, sending the request, and receiving the response.
-    pub async fn request(&self, node_id: i32, peer_node_id: PublicKey, req: &IrohRequest, timeout: Duration) -> Result<IrohResponse, IrohError> {
+    pub async fn request(
+        &self,
+        node_id: i32,
+        peer_node_id: PublicKey,
+        req: &IrohRequest,
+        timeout: Duration,
+    ) -> Result<IrohResponse, IrohError> {
         let request_id: u64 = rand::random();
-        let span = tracing::debug_span!("rpc_req", id = %format!("{:016x}", request_id), to = node_id);
+        let span =
+            tracing::debug_span!("rpc_req", id = %format!("{:016x}", request_id), to = node_id);
         async {
             let conn = self.get_connection(node_id, peer_node_id).await?;
 
@@ -380,13 +426,22 @@ impl IrohTransport {
                 }
                 Err(e) => Err(e),
             }
-        }.instrument(span).await
+        }
+        .instrument(span)
+        .await
     }
 
     /// Attempt a single request on an existing connection.
-    async fn try_request(conn: &Connection, request_id: u64, req: &IrohRequest, timeout: Duration) -> Result<IrohResponse, IrohError> {
+    async fn try_request(
+        conn: &Connection,
+        request_id: u64,
+        req: &IrohRequest,
+        timeout: Duration,
+    ) -> Result<IrohResponse, IrohError> {
         tokio::time::timeout(timeout, async {
-            let (mut send, mut recv) = conn.open_bi().await
+            let (mut send, mut recv) = conn
+                .open_bi()
+                .await
                 .map_err(|e| IrohError::Transport(TransportError::StreamFailed(e.to_string())))?;
 
             send_request(&mut send, request_id, req).await?;
@@ -421,23 +476,22 @@ mod tests {
         let pubkey = PubKey(verifying_key);
 
         // What the DB stores (via PubKey::to_sql → bincode encode)
-        let db_encoded = bincode::serde::encode_to_vec(
-            &pubkey, bincode::config::standard()
-        ).unwrap();
+        let db_encoded =
+            bincode::serde::encode_to_vec(&pubkey, bincode::config::standard()).unwrap();
 
         // What the PeerValidator hook produces from the iroh EndpointId
         let iroh_secret = iroh::SecretKey::from_bytes(&signing_key.to_bytes());
         let iroh_public = iroh_secret.public();
         let hook_pubkey = PubKey(
-            ed25519_dalek::VerifyingKey::from_bytes(iroh_public.as_bytes())
-                .expect("valid Ed25519")
+            ed25519_dalek::VerifyingKey::from_bytes(iroh_public.as_bytes()).expect("valid Ed25519"),
         );
-        let hook_encoded = bincode::serde::encode_to_vec(
-            &hook_pubkey, bincode::config::standard()
-        ).unwrap();
+        let hook_encoded =
+            bincode::serde::encode_to_vec(&hook_pubkey, bincode::config::standard()).unwrap();
 
-        assert_eq!(db_encoded, hook_encoded,
-            "PeerValidator encoding must match DB storage format");
+        assert_eq!(
+            db_encoded, hook_encoded,
+            "PeerValidator encoding must match DB storage format"
+        );
     }
 
     /// Verify the encoding differs from raw bytes (the old buggy behavior).
@@ -447,13 +501,16 @@ mod tests {
         let pubkey = PubKey(signing_key.verifying_key());
 
         let raw_bytes = signing_key.verifying_key().to_bytes();
-        let encoded = bincode::serde::encode_to_vec(
-            &pubkey, bincode::config::standard()
-        ).unwrap();
+        let encoded = bincode::serde::encode_to_vec(&pubkey, bincode::config::standard()).unwrap();
 
-        assert_ne!(raw_bytes.as_slice(), encoded.as_slice(),
-            "bincode-encoded PubKey should differ from raw 32-byte key (has length prefix)");
-        assert!(encoded.len() > 32,
-            "bincode encoding should be longer than raw key");
+        assert_ne!(
+            raw_bytes.as_slice(),
+            encoded.as_slice(),
+            "bincode-encoded PubKey should differ from raw 32-byte key (has length prefix)"
+        );
+        assert!(
+            encoded.len() > 32,
+            "bincode encoding should be longer than raw key"
+        );
     }
 }

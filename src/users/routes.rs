@@ -1,23 +1,21 @@
 use axum::{
-    extract::{DefaultBodyLimit, State, Multipart},
+    Extension, Json, Router,
+    extract::{DefaultBodyLimit, Multipart, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post, put},
-    Extension,
-    Json,
-    Router,
 };
-use serde::{Serialize, Deserialize};
 use base64::Engine;
+use serde::{Deserialize, Serialize};
 
-use crate::{
-    db::{users, PubKey, PrivKey},
-    types::User,
-    AppState,
-};
-use super::types::UpdateUserProfilePayload;
 use super::helpers::submit_onboarding_update;
-use hopnet_common::{PublicUserInfo, SelfUserInfo, OnboardingFlags, OnboardingFlag};
+use super::types::UpdateUserProfilePayload;
+use crate::{
+    AppState,
+    db::{PrivKey, PubKey, users},
+    types::User,
+};
+use hopnet_common::{OnboardingFlag, OnboardingFlags, PublicUserInfo, SelfUserInfo};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -35,9 +33,10 @@ fn user_to_public(u: &User) -> PublicUserInfo {
         username: u.username.clone(),
         first_name: u.first_name.clone(),
         last_name: u.last_name.clone(),
-        avatar: u.avatar.as_ref().map(|bytes| {
-            base64::engine::general_purpose::STANDARD.encode(bytes)
-        }),
+        avatar: u
+            .avatar
+            .as_ref()
+            .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
     }
 }
 
@@ -47,16 +46,15 @@ fn user_to_self(u: &User) -> SelfUserInfo {
         username: u.username.clone(),
         first_name: u.first_name.clone(),
         last_name: u.last_name.clone(),
-        avatar: u.avatar.as_ref().map(|bytes| {
-            base64::engine::general_purpose::STANDARD.encode(bytes)
-        }),
+        avatar: u
+            .avatar
+            .as_ref()
+            .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
         onboarding_flags: u.onboarding_flags.raw(),
     }
 }
 
-pub async fn get_users(
-    State(app_state): State<AppState>,
-) -> impl IntoResponse {
+pub async fn get_users(State(app_state): State<AppState>) -> impl IntoResponse {
     match users::get_users(app_state.db_pool.get()) {
         Ok(users) => {
             let public: Vec<PublicUserInfo> = users.iter().map(user_to_public).collect();
@@ -103,8 +101,13 @@ pub async fn put_profile(
     };
 
     let transaction = match crate::consensus::functions::create_signed_user_transaction(
-        &app_state, "update_user_profile".to_string(), encoded, user_id,
-    ).await {
+        &app_state,
+        "update_user_profile".to_string(),
+        encoded,
+        user_id,
+    )
+    .await
+    {
         Ok(tx) => tx,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
@@ -123,12 +126,10 @@ pub async fn put_avatar(
 ) -> impl IntoResponse {
     // Read image bytes from multipart field
     let image_bytes = match multipart.next_field().await {
-        Ok(Some(field)) => {
-            match field.bytes().await {
-                Ok(bytes) => bytes,
-                Err(_) => return StatusCode::BAD_REQUEST.into_response(),
-            }
-        }
+        Ok(Some(field)) => match field.bytes().await {
+            Ok(bytes) => bytes,
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        },
         _ => return StatusCode::BAD_REQUEST.into_response(),
     };
 
@@ -142,8 +143,8 @@ pub async fn put_avatar(
     // Decode, resize to 256x256, encode to JPEG — blocking work
     // (image crate only supports lossless WebP which is too large for avatars)
     let avatar_bytes = match tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
-        let img = image::load_from_memory(&image_bytes)
-            .map_err(|e| format!("Invalid image: {}", e))?;
+        let img =
+            image::load_from_memory(&image_bytes).map_err(|e| format!("Invalid image: {}", e))?;
 
         tracing::debug!("Avatar decoded: {}x{}", img.width(), img.height());
 
@@ -153,13 +154,21 @@ pub async fn put_avatar(
 
         let mut buf = std::io::Cursor::new(Vec::new());
         let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 85);
-        encoder.encode(&rgb, rgb.width(), rgb.height(), image::ExtendedColorType::Rgb8)
+        encoder
+            .encode(
+                &rgb,
+                rgb.width(),
+                rgb.height(),
+                image::ExtendedColorType::Rgb8,
+            )
             .map_err(|e| format!("JPEG encoding failed: {}", e))?;
 
         let result = buf.into_inner();
         tracing::debug!("Avatar JPEG output: {} bytes", result.len());
         Ok(result)
-    }).await {
+    })
+    .await
+    {
         Ok(Ok(bytes)) => bytes,
         Ok(Err(e)) => {
             tracing::warn!("Avatar processing failed: {}", e);
@@ -181,8 +190,13 @@ pub async fn put_avatar(
     };
 
     let transaction = match crate::consensus::functions::create_signed_user_transaction(
-        &app_state, "update_user_profile".to_string(), encoded, user_id,
-    ).await {
+        &app_state,
+        "update_user_profile".to_string(),
+        encoded,
+        user_id,
+    )
+    .await
+    {
         Ok(tx) => tx,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
@@ -198,10 +212,10 @@ pub struct UserRequest {
     username: String,
 }
 
-pub async fn post_users (
+pub async fn post_users(
     State(app_state): State<AppState>,
     Extension(user_id): Extension<i32>,
-    Json(payload): Json<UserRequest>
+    Json(payload): Json<UserRequest>,
 ) -> impl IntoResponse {
     // Server generates all key material
     let (user_priv_key, user_pub_key) = crate::consensus::functions::generate_ed25519_key();
@@ -216,9 +230,9 @@ pub async fn post_users (
     let passphrase_clone = passphrase.clone();
     let privkey_clone = privkey.clone();
     let wrap_result = tokio::task::spawn_blocking(move || {
-        crate::auth::wrap_user_privkey(&privkey_clone, &passphrase_clone)
-            .map_err(|e| e.to_string())
-    }).await;
+        crate::auth::wrap_user_privkey(&privkey_clone, &passphrase_clone).map_err(|e| e.to_string())
+    })
+    .await;
 
     let (encrypted_privkey, key_salt) = match wrap_result {
         Ok(Ok(result)) => result,
@@ -242,7 +256,9 @@ pub async fn post_users (
                 "insert_user".to_string(),
                 encoded_user,
                 user_id,
-            ).await {
+            )
+            .await
+            {
                 Ok(tx) => tx,
                 Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
             };
@@ -252,10 +268,14 @@ pub async fn post_users (
             if results.iter().any(|r| r.is_err()) {
                 StatusCode::INTERNAL_SERVER_ERROR.into_response()
             } else {
-                (StatusCode::CREATED, Json(hopnet_common::setup::PassphraseResponse { passphrase })).into_response()
+                (
+                    StatusCode::CREATED,
+                    Json(hopnet_common::setup::PassphraseResponse { passphrase }),
+                )
+                    .into_response()
             }
         }
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 

@@ -1,10 +1,10 @@
-use aes_siv::{siv::Aes256Siv, Key, Nonce};
-use rusqlite::params;
+use aes_siv::{Key, Nonce, siv::Aes256Siv};
 use r2d2::PooledConnection;
+use rusqlite::params;
 
-use crate::db::{CustomUUID, CustomDateTime, SqliteConnectionManager};
-use hopnet_common::db::InodeType;
+use crate::db::{CustomDateTime, CustomUUID, SqliteConnectionManager};
 use crate::files::functions::decrypt_path;
+use hopnet_common::db::InodeType;
 use hopnet_common::documentprovider::DocumentProviderItem;
 
 use super::DatabaseError;
@@ -38,7 +38,9 @@ pub fn get_item(
         LIMIT 1
     "#;
 
-    let mut stmt = db_lock.prepare(query).map_err(|_| DatabaseError::ProcessingError)?;
+    let mut stmt = db_lock
+        .prepare(query)
+        .map_err(|_| DatabaseError::ProcessingError)?;
 
     let (id, item_type, encrypted_path, file_size, last_modified, parent_id): (
         CustomUUID,
@@ -49,7 +51,14 @@ pub fn get_item(
         Option<CustomUUID>,
     ) = stmt
         .query_row(params![inode_id, user_id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
         })
         .map_err(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => DatabaseError::NotFound,
@@ -98,7 +107,9 @@ pub fn get_download_metadata(
         LIMIT 1
     "#;
 
-    let mut stmt = db_lock.prepare(query).map_err(|_| DatabaseError::ProcessingError)?;
+    let mut stmt = db_lock
+        .prepare(query)
+        .map_err(|_| DatabaseError::ProcessingError)?;
 
     stmt.query_row(params![inode_id, user_id], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, InodeType>(1)?))
@@ -123,15 +134,16 @@ pub fn get_path_by_inode_id(
         LIMIT 1
     "#;
 
-    let mut stmt = db_lock.prepare(query).map_err(|_| DatabaseError::ProcessingError)?;
+    let mut stmt = db_lock
+        .prepare(query)
+        .map_err(|_| DatabaseError::ProcessingError)?;
 
-    let path: String = stmt.query_row(
-        params![inode_id, user_id],
-        |row| row.get(0)
-    ).map_err(|e| match e {
-        rusqlite::Error::QueryReturnedNoRows => DatabaseError::NotFound,
-        _ => DatabaseError::RecallError,
-    })?;
+    let path: String = stmt
+        .query_row(params![inode_id, user_id], |row| row.get(0))
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => DatabaseError::NotFound,
+            _ => DatabaseError::RecallError,
+        })?;
 
     Ok(path)
 }

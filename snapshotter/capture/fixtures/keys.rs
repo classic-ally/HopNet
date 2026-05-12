@@ -1,5 +1,5 @@
-use aes_siv::aead::generic_array::GenericArray;
 use aes_siv::aead::KeyInit;
+use aes_siv::aead::generic_array::GenericArray;
 use aes_siv::siv::Aes256Siv;
 use ed25519_dalek::SigningKey;
 use hopnet::db::types::XPubKey;

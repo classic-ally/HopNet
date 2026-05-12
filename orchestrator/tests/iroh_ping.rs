@@ -33,7 +33,12 @@ impl TestScenario for IrohPing {
         "Verify iroh connectivity between all nodes in the mesh"
     }
 
-    async fn run(&self, _mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
+    async fn run(
+        &self,
+        _mesh_id: u32,
+        nodes: &[NodeInfo],
+        _flags: &[String],
+    ) -> Result<TestResult> {
         let start = Instant::now();
         let mut result = TestResult::new();
         let client = Client::new();
@@ -60,42 +65,59 @@ impl TestScenario for IrohPing {
                 Ok(resp) if resp.status().is_success() => {
                     match resp.json::<IrohPingAllResponse>().await {
                         Ok(ping_result) => {
-                            if ping_result.failed == 0 && ping_result.successful == ping_result.total_nodes {
-                                print_and_add_check(&mut result, Check {
-                                    name: format!("Node {} iroh ping", source.node_id),
-                                    passed: true,
-                                    detail: Some(format!(
-                                        "{}/{} nodes reachable",
-                                        ping_result.successful,
-                                        ping_result.total_nodes
-                                    )),
-                                });
+                            if ping_result.failed == 0
+                                && ping_result.successful == ping_result.total_nodes
+                            {
+                                print_and_add_check(
+                                    &mut result,
+                                    Check {
+                                        name: format!("Node {} iroh ping", source.node_id),
+                                        passed: true,
+                                        detail: Some(format!(
+                                            "{}/{} nodes reachable",
+                                            ping_result.successful, ping_result.total_nodes
+                                        )),
+                                    },
+                                );
                             } else {
                                 all_successful = false;
-                                let failed_nodes: Vec<String> = ping_result.results
+                                let failed_nodes: Vec<String> = ping_result
+                                    .results
                                     .iter()
                                     .filter(|r| !r.success)
-                                    .map(|r| format!("node {} ({})", r.node_id, r.error.as_deref().unwrap_or("unknown")))
+                                    .map(|r| {
+                                        format!(
+                                            "node {} ({})",
+                                            r.node_id,
+                                            r.error.as_deref().unwrap_or("unknown")
+                                        )
+                                    })
                                     .collect();
-                                print_and_add_check(&mut result, Check {
-                                    name: format!("Node {} iroh ping", source.node_id),
-                                    passed: false,
-                                    detail: Some(format!(
-                                        "{}/{} failed: {}",
-                                        ping_result.failed,
-                                        ping_result.total_nodes,
-                                        failed_nodes.join(", ")
-                                    )),
-                                });
+                                print_and_add_check(
+                                    &mut result,
+                                    Check {
+                                        name: format!("Node {} iroh ping", source.node_id),
+                                        passed: false,
+                                        detail: Some(format!(
+                                            "{}/{} failed: {}",
+                                            ping_result.failed,
+                                            ping_result.total_nodes,
+                                            failed_nodes.join(", ")
+                                        )),
+                                    },
+                                );
                             }
                         }
                         Err(e) => {
                             all_successful = false;
-                            print_and_add_check(&mut result, Check {
-                                name: format!("Node {} iroh ping", source.node_id),
-                                passed: false,
-                                detail: Some(format!("Failed to parse response: {}", e)),
-                            });
+                            print_and_add_check(
+                                &mut result,
+                                Check {
+                                    name: format!("Node {} iroh ping", source.node_id),
+                                    passed: false,
+                                    detail: Some(format!("Failed to parse response: {}", e)),
+                                },
+                            );
                         }
                     }
                 }
@@ -103,37 +125,43 @@ impl TestScenario for IrohPing {
                     all_successful = false;
                     let status = resp.status();
                     let body = resp.text().await.unwrap_or_default();
-                    print_and_add_check(&mut result, Check {
-                        name: format!("Node {} iroh ping", source.node_id),
-                        passed: false,
-                        detail: Some(format!("HTTP {}: {}", status, body)),
-                    });
+                    print_and_add_check(
+                        &mut result,
+                        Check {
+                            name: format!("Node {} iroh ping", source.node_id),
+                            passed: false,
+                            detail: Some(format!("HTTP {}: {}", status, body)),
+                        },
+                    );
                 }
                 Err(e) => {
                     all_successful = false;
-                    print_and_add_check(&mut result, Check {
-                        name: format!("Node {} iroh ping", source.node_id),
-                        passed: false,
-                        detail: Some(format!("Request failed: {}", e)),
-                    });
+                    print_and_add_check(
+                        &mut result,
+                        Check {
+                            name: format!("Node {} iroh ping", source.node_id),
+                            passed: false,
+                            detail: Some(format!("Request failed: {}", e)),
+                        },
+                    );
                 }
             }
         }
 
         // Summary check
         if all_successful {
-            print_and_add_check(&mut result, Check {
-                name: "All nodes have iroh connectivity".to_string(),
-                passed: true,
-                detail: Some(format!("{} nodes verified", nodes.len())),
-            });
+            print_and_add_check(
+                &mut result,
+                Check {
+                    name: "All nodes have iroh connectivity".to_string(),
+                    passed: true,
+                    detail: Some(format!("{} nodes verified", nodes.len())),
+                },
+            );
         }
 
         result.duration = start.elapsed();
-        result.details = format!(
-            "Verified iroh connectivity across {} nodes",
-            nodes.len()
-        );
+        result.details = format!("Verified iroh connectivity across {} nodes", nodes.len());
 
         Ok(result)
     }

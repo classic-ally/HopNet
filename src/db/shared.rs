@@ -1,11 +1,11 @@
 use super::*;
-use std::path::Path;
+use hdrhistogram::Histogram;
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 use std::fs;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
-use parking_lot::Mutex;
-use once_cell::sync::Lazy;
-use hdrhistogram::Histogram;
 
 /// Always-on telemetry counters. Cost: one `fetch_add` per event. Negligible.
 /// Exposed via `/debug/db-stats` for both bench harness and prod observability.
@@ -30,8 +30,9 @@ pub static DB_COUNTERS: DbCounters = DbCounters::new();
 /// Commit-phase latency in microseconds. Recorded by `commit_timed()` only.
 /// Bounded 1us..60s, 3 significant figures (~10KB memory).
 pub static COMMIT_LATENCY_US: Lazy<Mutex<Histogram<u64>>> = Lazy::new(|| {
-    Mutex::new(Histogram::<u64>::new_with_bounds(1, 60_000_000, 3)
-        .expect("hdrhistogram bounds are valid"))
+    Mutex::new(
+        Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).expect("hdrhistogram bounds are valid"),
+    )
 });
 
 /// Project-wide replacement for `tx.commit()`: records commit latency into
@@ -49,8 +50,12 @@ pub fn commit_timed(tx: rusqlite::Transaction) -> rusqlite::Result<()> {
 
 /// Get the XDG data directory for storing the database
 pub fn get_database_path() -> String {
-    let data_dir = std::env::var("XDG_DATA_HOME")
-        .unwrap_or_else(|_| format!("{}/.local/share", std::env::var("HOME").unwrap_or_else(|_| ".".to_string())));
+    let data_dir = std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| {
+        format!(
+            "{}/.local/share",
+            std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
+        )
+    });
 
     let db_dir = format!("{}/hopnet", data_dir);
     let db_path = format!("{}/database.db", db_dir);
@@ -64,12 +69,14 @@ pub fn database_exists(db_path: &str) -> bool {
 }
 
 /// Check if the database schema is initialized by checking for critical tables
-pub fn is_schema_initialized(db: &PooledConnection<SqliteConnectionManager>) -> Result<bool, DuckdbError> {
+pub fn is_schema_initialized(
+    db: &PooledConnection<SqliteConnectionManager>,
+) -> Result<bool, DuckdbError> {
     // Check if the critical 'blocks' table exists
     let result = db.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'blocks'",
         [],
-        |row| row.get::<_, i64>(0)
+        |row| row.get::<_, i64>(0),
     );
 
     match result {
@@ -114,7 +121,8 @@ fn page_size_pragma() -> String {
             _ => {
                 tracing::warn!(
                     "ignoring invalid HOPNET_DB_PAGE_SIZE={} (must be power of 2 in [512, 65536]); using default {}",
-                    v, DEFAULT_PAGE_SIZE
+                    v,
+                    DEFAULT_PAGE_SIZE
                 );
                 DEFAULT_PAGE_SIZE
             }
@@ -180,11 +188,13 @@ impl r2d2::CustomizeConnection<rusqlite::Connection, rusqlite::Error> for Sqlite
         // the DB header at the current page size and locks it.
         conn.execute_batch(&page_size_pragma())?;
 
-        conn.execute_batch("
+        conn.execute_batch(
+            "
             PRAGMA journal_mode = WAL;
             PRAGMA foreign_keys = ON;
             PRAGMA busy_timeout = 5000;
-        ")?;
+        ",
+        )?;
         let overrides = env_pragma_overrides();
         if !overrides.is_empty() {
             conn.execute_batch(&overrides)?;
@@ -209,48 +219,73 @@ impl r2d2::CustomizeConnection<rusqlite::Connection, rusqlite::Error> for Sqlite
 pub fn register_custom_functions(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     // uuid_extract_timestamp(uuid_text) → INTEGER (NULL-safe: NULL in → NULL out)
     // Parse UUIDv7 hex, extract 48-bit timestamp, return epoch millis
-    conn.create_scalar_function("uuid_extract_timestamp", 1, rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC, |ctx| {
-        let uuid_str: Option<String> = ctx.get(0)?;
-        match uuid_str {
-            None => Ok(None),
-            Some(s) => {
-                let hex_only: String = s.replace('-', "");
-                if hex_only.len() < 12 {
-                    return Ok(Some(0i64));
-                }
-                match i64::from_str_radix(&hex_only[..12], 16) {
-                    Ok(millis) => Ok(Some(millis)),
-                    Err(_) => Ok(Some(0i64)),
+    conn.create_scalar_function(
+        "uuid_extract_timestamp",
+        1,
+        rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let uuid_str: Option<String> = ctx.get(0)?;
+            match uuid_str {
+                None => Ok(None),
+                Some(s) => {
+                    let hex_only: String = s.replace('-', "");
+                    if hex_only.len() < 12 {
+                        return Ok(Some(0i64));
+                    }
+                    match i64::from_str_radix(&hex_only[..12], 16) {
+                        Ok(millis) => Ok(Some(millis)),
+                        Err(_) => Ok(Some(0i64)),
+                    }
                 }
             }
-        }
-    })?;
+        },
+    )?;
 
     // reverse(text) → TEXT
     // String reversal for parent-path extraction patterns
-    conn.create_scalar_function("reverse", 1, rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC, |ctx| {
-        let s: String = ctx.get(0)?;
-        Ok(s.chars().rev().collect::<String>())
-    })?;
+    conn.create_scalar_function(
+        "reverse",
+        1,
+        rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let s: String = ctx.get(0)?;
+            Ok(s.chars().rev().collect::<String>())
+        },
+    )?;
 
     // sqrt(x) → REAL
-    conn.create_scalar_function("sqrt", 1, rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC, |ctx| {
-        let x: f64 = ctx.get(0)?;
-        Ok(x.sqrt())
-    })?;
+    conn.create_scalar_function(
+        "sqrt",
+        1,
+        rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let x: f64 = ctx.get(0)?;
+            Ok(x.sqrt())
+        },
+    )?;
 
     // pow(x, y) → REAL
-    conn.create_scalar_function("pow", 2, rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC, |ctx| {
-        let base: f64 = ctx.get(0)?;
-        let exp: f64 = ctx.get(1)?;
-        Ok(base.powf(exp))
-    })?;
+    conn.create_scalar_function(
+        "pow",
+        2,
+        rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let base: f64 = ctx.get(0)?;
+            let exp: f64 = ctx.get(1)?;
+            Ok(base.powf(exp))
+        },
+    )?;
 
     // log10(x) → REAL
-    conn.create_scalar_function("log10", 1, rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC, |ctx| {
-        let x: f64 = ctx.get(0)?;
-        Ok(x.log10())
-    })?;
+    conn.create_scalar_function(
+        "log10",
+        1,
+        rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let x: f64 = ctx.get(0)?;
+            Ok(x.log10())
+        },
+    )?;
 
     Ok(())
 }

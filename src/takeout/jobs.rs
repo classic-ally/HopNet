@@ -1,12 +1,12 @@
+use crate::AppState;
+use crate::consensus::Transaction;
+use crate::db::{CustomUUID, takeout::TakeoutStatusPayload};
 use apalis::prelude::*;
 use apalis_cron::CronContext;
-use serde::{Deserialize, Serialize};
 use chrono::Utc;
-use std::sync::Arc;
-use crate::AppState;
-use crate::db::{CustomUUID, takeout::TakeoutStatusPayload};
-use crate::consensus::Transaction;
 use hopnet_common::TakeoutStatus;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TakeoutMaintenanceJob;
@@ -33,14 +33,14 @@ pub async fn handle_takeout_maintenance(
 
     // Step 1: Find and mark expired takeouts (network-wide, not just this node's)
     let expired_takeouts = match crate::db::takeout::get_expired_takeouts_needing_status_update(
-        app_state.db_pool.get()
+        app_state.db_pool.get(),
     ) {
         Ok(takeouts) => takeouts,
         Err(e) => {
             tracing::error!("Failed to get expired takeouts: {:?}", e);
             return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("Failed to get expired takeouts: {:?}", e)
+                format!("Failed to get expired takeouts: {:?}", e),
             )))));
         }
     };
@@ -48,7 +48,10 @@ pub async fn handle_takeout_maintenance(
     if expired_takeouts.is_empty() {
         tracing::debug!("No expired takeouts found needing status update");
     } else {
-        tracing::info!("Found {} expired takeouts needing status update", expired_takeouts.len());
+        tracing::info!(
+            "Found {} expired takeouts needing status update",
+            expired_takeouts.len()
+        );
 
         // Batch all expiration updates into a single consensus submission
         let mut transactions = Vec::new();
@@ -59,40 +62,62 @@ pub async fn handle_takeout_maintenance(
                 new_status: TakeoutStatus::Expired,
             };
 
-            let encoded_payload = match bincode::serde::encode_to_vec(&status_payload, bincode::config::standard()) {
-                Ok(data) => data,
-                Err(e) => {
-                    tracing::error!("Failed to encode expired status payload for takeout {}: {:?}", takeout_id, e);
-                    continue; // Skip this one but continue with others
-                }
-            };
+            let encoded_payload =
+                match bincode::serde::encode_to_vec(&status_payload, bincode::config::standard()) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to encode expired status payload for takeout {}: {:?}",
+                            takeout_id,
+                            e
+                        );
+                        continue; // Skip this one but continue with others
+                    }
+                };
 
-            transactions.push(crate::consensus::functions::create_signed_transaction(
-                app_state,
-                "update_takeout_status".to_string(),
-                encoded_payload,
-            ).map_err(|_| Error::Failed(Arc::new(Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Failed to sign transaction"
-            )))))?);
+            transactions.push(
+                crate::consensus::functions::create_signed_transaction(
+                    app_state,
+                    "update_takeout_status".to_string(),
+                    encoded_payload,
+                )
+                .map_err(|_| {
+                    Error::Failed(Arc::new(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Failed to sign transaction",
+                    ))))
+                })?,
+            );
         }
 
         if transactions.is_empty() {
             tracing::warn!("No valid transactions to submit for expiration updates");
         } else {
-            tracing::info!("Submitting {} expiration updates to consensus in single batch", transactions.len());
+            tracing::info!(
+                "Submitting {} expiration updates to consensus in single batch",
+                transactions.len()
+            );
 
             // Submit all expiration updates in one consensus call
             // This triggers cleanup on owner nodes for all expired takeouts
             let results = app_state.consensus_queue.submit_batch(transactions).await;
             let failures: Vec<_> = results.iter().filter(|r| r.is_err()).collect();
             if failures.is_empty() {
-                tracing::info!("Successfully marked {} takeouts as expired via consensus", expired_takeouts.len());
+                tracing::info!(
+                    "Successfully marked {} takeouts as expired via consensus",
+                    expired_takeouts.len()
+                );
             } else {
-                tracing::error!("Failed to submit expiration updates to consensus: {} failures", failures.len());
+                tracing::error!(
+                    "Failed to submit expiration updates to consensus: {} failures",
+                    failures.len()
+                );
                 return Err(Error::Failed(Arc::new(Box::new(std::io::Error::new(
                     std::io::ErrorKind::Other,
-                    format!("Failed to submit expiration updates: {} failures", failures.len())
+                    format!(
+                        "Failed to submit expiration updates: {} failures",
+                        failures.len()
+                    ),
                 )))));
             }
         }
@@ -192,7 +217,9 @@ pub async fn scan_at_startup(state: &AppState) -> Result<usize, crate::db::Datab
             if status != hopnet_common::ImportStatus::Importing {
                 tracing::warn!(
                     "Import {} for user {} stranded at {:?}; not resumable in v1",
-                    import_id, user_id, status
+                    import_id,
+                    user_id,
+                    status
                 );
                 continue;
             }
@@ -206,7 +233,9 @@ pub async fn scan_at_startup(state: &AppState) -> Result<usize, crate::db::Datab
             if counts.total == 0 || counts.pending == 0 {
                 tracing::warn!(
                     "Import {} has no pending rows ({} total / {} pending); skipping resume",
-                    import_id, counts.total, counts.pending
+                    import_id,
+                    counts.total,
+                    counts.pending
                 );
                 continue;
             }
@@ -238,7 +267,11 @@ pub async fn maybe_resume_for_user(state: AppState, user_id: i32) {
         }
     };
 
-    tracing::info!("Resuming stranded import {} for user {}", import_id, user_id);
+    tracing::info!(
+        "Resuming stranded import {} for user {}",
+        import_id,
+        user_id
+    );
     let staging = crate::takeout::import::staging_dir(&state, &import_id);
 
     let state_for_task = state.clone();
@@ -254,7 +287,9 @@ pub async fn maybe_resume_for_user(state: AppState, user_id: i32) {
         {
             tracing::error!(
                 "Resume of import {} for user {} failed: {:?}",
-                import_id_for_task, user_id, e
+                import_id_for_task,
+                user_id,
+                e
             );
             // On failure, re-stash so the next auth event tries again.
             state_for_task

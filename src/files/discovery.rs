@@ -1,7 +1,7 @@
 use crate::{
-    types::{Blake3Hash, NodeConnectionInfo},
     files::placement::FragmentType,
     net::IrohTransport,
+    types::{Blake3Hash, NodeConnectionInfo},
 };
 use either::Either;
 
@@ -31,10 +31,14 @@ pub async fn try_fetch_from_node(
         node.node_id,
         iroh_node_id,
         *fragment_hash,
-    ).await.map_err(|e| {
+    )
+    .await
+    .map_err(|e| {
         use crate::net::transport::ProtocolError;
         match &e {
-            crate::net::IrohError::Protocol(ProtocolError::PeerError(msg)) if msg == "fragment not found" => {
+            crate::net::IrohError::Protocol(ProtocolError::PeerError(msg))
+                if msg == "fragment not found" =>
+            {
                 DiscoveryError::NotFound
             }
             _ => DiscoveryError::Network(e.to_string()),
@@ -44,11 +48,16 @@ pub async fn try_fetch_from_node(
     // Defense in depth: verify hash even though server already verified
     let actual_hash = Blake3Hash::new(blake3::hash(&fragment_data));
     if actual_hash != *fragment_hash {
-        return Err(DiscoveryError::Network("Fragment hash mismatch".to_string()));
+        return Err(DiscoveryError::Network(
+            "Fragment hash mismatch".to_string(),
+        ));
     }
 
-    tracing::debug!("Successfully fetched fragment {} from node {} via iroh",
-                   fragment_hash.to_hex(), node.node_id);
+    tracing::debug!(
+        "Successfully fetched fragment {} from node {} via iroh",
+        fragment_hash.to_hex(),
+        node.node_id
+    );
 
     Ok(fragment_data)
 }
@@ -61,11 +70,21 @@ pub async fn try_ask_node_for_fragment(
     iroh_transport: &IrohTransport,
 ) -> Result<bool, DiscoveryError> {
     let iroh_node_id = node.pubkey.to_iroh_node_id();
-    match crate::files::rpc::check_fragment_health(iroh_transport, node.node_id, iroh_node_id, *fragment_hash).await {
+    match crate::files::rpc::check_fragment_health(
+        iroh_transport,
+        node.node_id,
+        iroh_node_id,
+        *fragment_hash,
+    )
+    .await
+    {
         Ok(healthy) => {
-            tracing::debug!("Health check for fragment {} on node {}: {}",
-                fragment_hash.to_hex(), node.node_id,
-                if healthy { "HAS" } else { "MISSING" });
+            tracing::debug!(
+                "Health check for fragment {} on node {}: {}",
+                fragment_hash.to_hex(),
+                node.node_id,
+                if healthy { "HAS" } else { "MISSING" }
+            );
             Ok(healthy)
         }
         Err(e) => Err(DiscoveryError::Network(e.to_string())),
@@ -87,10 +106,16 @@ pub async fn find_fragment(
     // Phase 0: Try fragment inventory nodes first (PRIMARY lookup mechanism)
     if let Some(inventory_nodes) = inventory_hint {
         if !inventory_nodes.is_empty() {
-            tracing::debug!("Trying {} inventory nodes for fragment {}",
-                          inventory_nodes.len(), fragment_hash.to_hex());
+            tracing::debug!(
+                "Trying {} inventory nodes for fragment {}",
+                inventory_nodes.len(),
+                fragment_hash.to_hex()
+            );
 
-            if let Ok(data) = try_reactive_discovery_and_fetch(fragment_hash, &inventory_nodes, iroh_transport).await {
+            if let Ok(data) =
+                try_reactive_discovery_and_fetch(fragment_hash, &inventory_nodes, iroh_transport)
+                    .await
+            {
                 tracing::debug!("Fragment {} found via inventory!", fragment_hash.to_hex());
                 return Ok(data);
             }
@@ -102,19 +127,23 @@ pub async fn find_fragment(
     // Phase 1: Fallback to reactive discovery across all available nodes
     let discovery_nodes = match nodes {
         Either::Left(node_list) => node_list,
-        Either::Right(node_metrics) => {
-            node_metrics.into_iter()
-                .map(|m| NodeConnectionInfo {
-                    node_id: m.node_id,
-                    pubkey: m.pubkey,
-                })
-                .collect()
-        }
+        Either::Right(node_metrics) => node_metrics
+            .into_iter()
+            .map(|m| NodeConnectionInfo {
+                node_id: m.node_id,
+                pubkey: m.pubkey,
+            })
+            .collect(),
     };
 
     if !discovery_nodes.is_empty() {
-        tracing::debug!("Trying reactive discovery across {} nodes", discovery_nodes.len());
-        if let Ok(data) = try_reactive_discovery_and_fetch(fragment_hash, &discovery_nodes, iroh_transport).await {
+        tracing::debug!(
+            "Trying reactive discovery across {} nodes",
+            discovery_nodes.len()
+        );
+        if let Ok(data) =
+            try_reactive_discovery_and_fetch(fragment_hash, &discovery_nodes, iroh_transport).await
+        {
             return Ok(data);
         }
     }
@@ -139,11 +168,9 @@ async fn try_reactive_discovery_and_fetch(
         let transport = iroh_transport.clone();
 
         tokio::spawn(async move {
-            let has_fragment = try_ask_node_for_fragment(
-                &fragment_hash,
-                &node_info,
-                &transport,
-            ).await.unwrap_or(false);
+            let has_fragment = try_ask_node_for_fragment(&fragment_hash, &node_info, &transport)
+                .await
+                .unwrap_or(false);
 
             if has_fragment {
                 let _ = tx.send(node_info);

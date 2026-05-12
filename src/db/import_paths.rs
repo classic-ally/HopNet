@@ -9,7 +9,7 @@
 
 use chrono::Utc;
 use hopnet_common::{CustomUUID, ImportPathCounts, ImportPathRow, ImportPathStatus, InodeType};
-use rusqlite::{params, Connection, Transaction};
+use rusqlite::{Connection, Transaction, params};
 
 use crate::db::DatabaseError;
 
@@ -66,7 +66,13 @@ pub fn insert_path_pending(
              VALUES (?, ?, ?, ?, ?)",
             table
         ),
-        params![path, path_type, size, source_data_block_id, ImportPathStatus::Pending],
+        params![
+            path,
+            path_type,
+            size,
+            source_data_block_id,
+            ImportPathStatus::Pending
+        ],
     )
     .map_err(|e| {
         tracing::error!("insert_path_pending {} failed: {:?}", table, e);
@@ -98,7 +104,11 @@ pub fn mark_path_imported(
             DatabaseError::ProcessingError
         })?;
     if rows == 0 {
-        tracing::warn!("mark_path_imported: no row matched path {} in {}", path, table);
+        tracing::warn!(
+            "mark_path_imported: no row matched path {} in {}",
+            path,
+            table
+        );
     }
     Ok(())
 }
@@ -121,14 +131,24 @@ pub fn mark_path_failed(
                  WHERE path = ?",
                 table
             ),
-            params![ImportPathStatus::Failed, error_code, error_message, now, path],
+            params![
+                ImportPathStatus::Failed,
+                error_code,
+                error_message,
+                now,
+                path
+            ],
         )
         .map_err(|e| {
             tracing::error!("mark_path_failed {} failed: {:?}", table, e);
             DatabaseError::ProcessingError
         })?;
     if rows == 0 {
-        tracing::warn!("mark_path_failed: no row matched path {} in {}", path, table);
+        tracing::warn!(
+            "mark_path_failed: no row matched path {} in {}",
+            path,
+            table
+        );
     }
     Ok(())
 }
@@ -153,7 +173,9 @@ pub fn count_paths_by_status(
 
     let mut counts = ImportPathCounts::default();
     let query = format!("SELECT status, COUNT(*) FROM {} GROUP BY status", table);
-    let mut stmt = conn.prepare(&query).map_err(|_| DatabaseError::RecallError)?;
+    let mut stmt = conn
+        .prepare(&query)
+        .map_err(|_| DatabaseError::RecallError)?;
     let rows = stmt
         .query_map([], |row| {
             let status: ImportPathStatus = row.get(0)?;

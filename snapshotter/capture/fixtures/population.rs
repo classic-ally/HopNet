@@ -3,10 +3,10 @@ use std::collections::BTreeMap;
 use aes_siv::aead::OsRng;
 use chrono::{Duration, Utc};
 use either::Either;
+use hopnet::consensus::ConsensusPhase;
 use hopnet::consensus::types::{
     Block, BlockData, QuorumCertificate, VoteSignMessage, VoteSignMessages,
 };
-use hopnet::consensus::ConsensusPhase;
 use hopnet::db;
 use hopnet::db::types::{
     ChunkType, CustomUUID, Data, DataRecord, FileAccess, FragmentHash, Inode, XPubKey,
@@ -18,8 +18,8 @@ use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::params;
 
-use super::keys;
 use super::FixtureContext;
+use super::keys;
 
 /// Deterministic Blake3Hash from an index
 fn hash_from_index(index: u8) -> Blake3Hash {
@@ -98,7 +98,8 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
         db::consensus::activate_validator(&tx, 1, 0).expect("Failed to activate validator 1");
         db::consensus::activate_validator(&tx, 2, 0).expect("Failed to activate validator 2");
 
-        tx.commit().expect("Failed to commit extra nodes/validators");
+        tx.commit()
+            .expect("Failed to commit extra nodes/validators");
     } // conn dropped here
 
     // === Insert blocks 1-5 with QCs ===
@@ -126,8 +127,7 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
     }
 
     for block in &blocks {
-        db::consensus::insert_block(pool.get(), block)
-            .expect("Failed to insert block");
+        db::consensus::insert_block(pool.get(), block).expect("Failed to insert block");
     }
 
     // Insert QCs for each block (Propose + Lock)
@@ -155,8 +155,7 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
 
             db::consensus::insert_qc_unsafe_tx(&tx, &propose_qc)
                 .expect("Failed to insert propose QC");
-            db::consensus::insert_qc_unsafe_tx(&tx, &lock_qc)
-                .expect("Failed to insert lock QC");
+            db::consensus::insert_qc_unsafe_tx(&tx, &lock_qc).expect("Failed to insert lock QC");
         }
         tx.commit().expect("Failed to commit QCs");
     }
@@ -209,7 +208,10 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
 
     // Encrypt paths with AES-SIV to match what the read functions expect
     let encrypt_path = |path: &str| -> String {
-        use aes_siv::{Aes256SivAead, aead::{Aead, KeyInit}};
+        use aes_siv::{
+            Aes256SivAead,
+            aead::{Aead, KeyInit},
+        };
         let cipher = Aes256SivAead::new(&siv_key);
         // Encrypt each segment individually, prefixed with / (matching HopNet encrypt_part)
         let mut output = String::new();
@@ -266,7 +268,10 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
         data_records.push(DataRecord {
             id: data_block_id.clone(),
             modified_at: Some(hopnet::db::types::CustomDateTime::new(
-                chrono::DateTime::parse_from_rfc3339("2026-01-01T12:00:00Z").unwrap().with_timezone(&Utc) - Duration::hours(24 - db_idx as i64),
+                chrono::DateTime::parse_from_rfc3339("2026-01-01T12:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+                    - Duration::hours(24 - db_idx as i64),
             )),
             data: Data {
                 hash: hash_from_index(db_idx as u8 + 10),
@@ -315,7 +320,8 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
             },
         ];
         // Insert root folder first (before subfolder, to avoid conflict with auto-created parents)
-        db::files::insert_files(&tx, vec![folder_inodes.remove(0)]).expect("Failed to insert root folder");
+        db::files::insert_files(&tx, vec![folder_inodes.remove(0)])
+            .expect("Failed to insert root folder");
         // Then insert subfolder (its parent /root now exists)
         db::files::insert_files(&tx, folder_inodes).expect("Failed to insert subfolder");
 
@@ -347,15 +353,13 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
 
         // Insert a file for user 1 (file3 in subfolder, no data block - just inode)
         let user1_folder_id = uuid_from_index(102);
-        let user1_file_inodes = vec![
-            Inode {
-                id: user1_folder_id,
-                owner: Either::Left(1),
-                path: encrypted_root.clone(),
-                inode_type: hopnet_common::InodeType::Folder,
-                data_id: None,
-            },
-        ];
+        let user1_file_inodes = vec![Inode {
+            id: user1_folder_id,
+            owner: Either::Left(1),
+            path: encrypted_root.clone(),
+            inode_type: hopnet_common::InodeType::Folder,
+            data_id: None,
+        }];
         db::files::insert_files(&tx, user1_file_inodes).expect("Failed to insert user 1 folder");
 
         tx.commit().expect("Failed to commit files");
@@ -365,7 +369,9 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
 
     // Fixed base time for all metric timestamps (determinism).
     // capture_all() will time-shift metrics into the live window before running aggregate queries.
-    let base_time = chrono::DateTime::parse_from_rfc3339("2026-01-01T12:00:00Z").unwrap().with_timezone(&Utc);
+    let base_time = chrono::DateTime::parse_from_rfc3339("2026-01-01T12:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
     ctx.metrics_base_time = Some(base_time);
 
     // === Insert metrics ===
@@ -457,12 +463,12 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
         db::shares::insert_incoming_share(
             &tx,
             share_id,
-            data_block_ids[0].clone(),    // shares the first data block
-            0,                     // sender: user 0
-            1,                     // recipient: user 1
-            &[0u8; 48],           // dummy file_access
-            &[0u8; 32],           // dummy display_ephemeral_pubkey
-            &[0u8; 32],           // dummy encrypted_display_name
+            data_block_ids[0].clone(), // shares the first data block
+            0,                         // sender: user 0
+            1,                         // recipient: user 1
+            &[0u8; 48],                // dummy file_access
+            &[0u8; 32],                // dummy display_ephemeral_pubkey
+            &[0u8; 32],                // dummy encrypted_display_name
         )
         .expect("Failed to insert share");
 
@@ -477,11 +483,11 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
             db::files::log_modification(
                 &tx,
                 file_id.clone(),
-                0,            // owner_id
-                None,         // old_parent_id (new file)
-                None,         // old_path
+                0,                                     // owner_id
+                None,                                  // old_parent_id (new file)
+                None,                                  // old_path
                 Some(&format!("/root/file{}.txt", i)), // new_path
-                i as i32 + 1, // modification_height
+                i as i32 + 1,                          // modification_height
             )
             .expect("Failed to log modification");
         }
@@ -518,15 +524,17 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
         // 30 within "24h" of base, 70 within "7d" of base
         for i in 0..50u32 {
             let hours_before_base = if i < 15 {
-                3 + i as i64         // 3-17h before base: within 24h window after shift
+                3 + i as i64 // 3-17h before base: within 24h window after shift
             } else {
-                25 + (i - 15) as i64 * 3  // 25-130h before base: within 7d, outside 24h
+                25 + (i - 15) as i64 * 3 // 25-130h before base: within 7d, outside 24h
             };
             for &from_node in &[1i32, 2] {
                 metrics.push(Metric {
                     from_node,
                     to_node: 0,
-                    start_time: base_time - Duration::hours(hours_before_base) - Duration::minutes(30 + from_node as i64 * 10),
+                    start_time: base_time
+                        - Duration::hours(hours_before_base)
+                        - Duration::minutes(30 + from_node as i64 * 10),
                     rtt_latency: Some(8.0 + i as f64 * 0.1 + from_node as f64),
                     rtt_variance: Some(0.5 + i as f64 * 0.02),
                     rtt_jitter: Some(0.3),
@@ -541,18 +549,20 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
 
         // Node 1 as target: 20 samples, low throughput, 20% unavailable, high latency variance
         for i in 0..10u32 {
-            let hours_before_base = 3 + i as i64 * 8;  // spread across 7 days
+            let hours_before_base = 3 + i as i64 * 8; // spread across 7 days
             for &from_node in &[0i32, 2] {
                 metrics.push(Metric {
                     from_node,
                     to_node: 1,
-                    start_time: base_time - Duration::hours(hours_before_base) - Duration::minutes(30 + from_node as i64 * 10),
+                    start_time: base_time
+                        - Duration::hours(hours_before_base)
+                        - Duration::minutes(30 + from_node as i64 * 10),
                     rtt_latency: Some(80.0 + i as f64 * 30.0 + from_node as f64 * 5.0),
                     rtt_variance: Some(15.0 + i as f64 * 5.0),
                     rtt_jitter: Some(8.0),
                     throughput: Some(10_000 + i as i64 * 500 + from_node as i64 * 100),
                     height: 5,
-                    available: i < 8,  // last 2 iterations → unavailable
+                    available: i < 8, // last 2 iterations → unavailable
                     storage_total_gb: Some(50),
                     storage_used_gb: Some(20),
                 });
@@ -566,7 +576,9 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
                 metrics.push(Metric {
                     from_node,
                     to_node: 2,
-                    start_time: base_time - Duration::hours(hours_before_base) - Duration::minutes(30 + from_node as i64 * 10),
+                    start_time: base_time
+                        - Duration::hours(hours_before_base)
+                        - Duration::minutes(30 + from_node as i64 * 10),
                     rtt_latency: Some(15.0 + i as f64 * 0.5 + from_node as f64),
                     rtt_variance: Some(2.0),
                     rtt_jitter: Some(1.0),
@@ -574,7 +586,7 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
                     height: 5,
                     available: true,
                     storage_total_gb: Some(100),
-                    storage_used_gb: Some(95),  // 95% → triggers quartic decay
+                    storage_used_gb: Some(95), // 95% → triggers quartic decay
                 });
             }
         }
@@ -596,7 +608,8 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
             });
         }
 
-        db::metrics::insert_metrics_batch(&tx, metrics).expect("Failed to insert enrichment metrics");
+        db::metrics::insert_metrics_batch(&tx, metrics)
+            .expect("Failed to insert enrichment metrics");
         tx.commit().expect("Failed to commit enrichment metrics");
     }
 
@@ -609,16 +622,40 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
         // 4 data blocks with targeted distribution patterns
         struct ResilienceBlock {
             db_id: CustomUUID,
-            hash_base: u8,       // base index for hash_from_index
-            frag_base: u16,      // base index for uuid_from_index (fragment IDs)
-            originals: u32,      // number of original chunks (chunk_type=0)
-            recoveries: u32,     // number of recovery chunks (chunk_type=1)
+            hash_base: u8,   // base index for hash_from_index
+            frag_base: u16,  // base index for uuid_from_index (fragment IDs)
+            originals: u32,  // number of original chunks (chunk_type=0)
+            recoveries: u32, // number of recovery chunks (chunk_type=1)
         }
         let enrichment_blocks = vec![
-            ResilienceBlock { db_id: uuid_from_index(210), hash_base: 100, frag_base: 800, originals: 2, recoveries: 1 }, // → level 1 (good)
-            ResilienceBlock { db_id: uuid_from_index(211), hash_base: 110, frag_base: 810, originals: 2, recoveries: 1 }, // → level 0 (critical)
-            ResilienceBlock { db_id: uuid_from_index(212), hash_base: 120, frag_base: 820, originals: 3, recoveries: 0 }, // → level -1 (unrecoverable)
-            ResilienceBlock { db_id: uuid_from_index(213), hash_base: 130, frag_base: 830, originals: 2, recoveries: 1 }, // → level -2 (unknown)
+            ResilienceBlock {
+                db_id: uuid_from_index(210),
+                hash_base: 100,
+                frag_base: 800,
+                originals: 2,
+                recoveries: 1,
+            }, // → level 1 (good)
+            ResilienceBlock {
+                db_id: uuid_from_index(211),
+                hash_base: 110,
+                frag_base: 810,
+                originals: 2,
+                recoveries: 1,
+            }, // → level 0 (critical)
+            ResilienceBlock {
+                db_id: uuid_from_index(212),
+                hash_base: 120,
+                frag_base: 820,
+                originals: 3,
+                recoveries: 0,
+            }, // → level -1 (unrecoverable)
+            ResilienceBlock {
+                db_id: uuid_from_index(213),
+                hash_base: 130,
+                frag_base: 830,
+                originals: 2,
+                recoveries: 1,
+            }, // → level -2 (unknown)
         ];
 
         for block in &enrichment_blocks {
@@ -681,7 +718,8 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
             params![phantom_hash, 0i32],
         ).expect("Failed to insert phantom inventory entry");
 
-        tx.commit().expect("Failed to commit resilience/inventory enrichment");
+        tx.commit()
+            .expect("Failed to commit resilience/inventory enrichment");
     }
 
     // Update this_node to point to the latest block (height 5)

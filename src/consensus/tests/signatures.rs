@@ -13,12 +13,8 @@ mod signature_tests {
         let function = "test_function".to_string();
         let payload = b"test payload".to_vec();
 
-        let tx = Transaction::new(
-            function,
-            payload,
-            node.node_id,
-            &node.signing_key,
-        ).expect("Failed to create transaction");
+        let tx = Transaction::new(function, payload, node.node_id, &node.signing_key)
+            .expect("Failed to create transaction");
 
         // Verify the signature using the node's public key
         let result = tx.verify_signature(&node.verifying_key);
@@ -37,12 +33,8 @@ mod signature_tests {
         let function = "test_function".to_string();
         let payload = b"test payload".to_vec();
 
-        let tx = Transaction::new(
-            function,
-            payload,
-            node1.node_id,
-            &node1.signing_key,
-        ).expect("Failed to create transaction");
+        let tx = Transaction::new(function, payload, node1.node_id, &node1.signing_key)
+            .expect("Failed to create transaction");
 
         // Try to verify the signature using node2's public key (should fail)
         let result = tx.verify_signature(&node2.verifying_key);
@@ -68,15 +60,22 @@ mod signature_tests {
             &node.signing_key,
             user.user_id,
             &user.signing_key,
-        ).expect("Failed to create transaction");
+        )
+        .expect("Failed to create transaction");
 
         // Verify both signatures
         let node_result = tx.verify_signature(&node.verifying_key);
         let user_result = tx.verify_user_signature(&user.verifying_key);
 
         // Assert that both signature verifications succeed
-        assert!(node_result.is_ok(), "Valid node signature should be accepted");
-        assert!(user_result.is_ok(), "Valid user signature should be accepted");
+        assert!(
+            node_result.is_ok(),
+            "Valid node signature should be accepted"
+        );
+        assert!(
+            user_result.is_ok(),
+            "Valid user signature should be accepted"
+        );
     }
 
     #[test]
@@ -87,15 +86,14 @@ mod signature_tests {
         let function = "test_function".to_string();
         let payload = b"test payload".to_vec();
 
-        let tx = Transaction::new(
-            function,
-            payload,
-            node.node_id,
-            &node.signing_key,
-        ).expect("Failed to create transaction");
+        let tx = Transaction::new(function, payload, node.node_id, &node.signing_key)
+            .expect("Failed to create transaction");
 
         // Verify that tx.user is None
-        assert!(tx.user.is_none(), "Node-only transaction should have no user signature");
+        assert!(
+            tx.user.is_none(),
+            "Node-only transaction should have no user signature"
+        );
 
         // Create a mock user pubkey to attempt verification
         let user = MockUser::new(100);
@@ -122,9 +120,10 @@ mod signature_tests {
             payload,
             node.node_id,
             &node.signing_key,
-            user2.user_id,  // Claims to be user2
-            &user1.signing_key,  // But signed with user1's key (forgery)
-        ).expect("Failed to create transaction");
+            user2.user_id,      // Claims to be user2
+            &user1.signing_key, // But signed with user1's key (forgery)
+        )
+        .expect("Failed to create transaction");
 
         // When we verify with user2's public key (the claimed identity), it should fail
         let result = tx.verify_user_signature(&user2.verifying_key);
@@ -141,12 +140,8 @@ mod signature_tests {
         let function = "test_function".to_string();
         let payload = b"original payload".to_vec();
 
-        let mut tx = Transaction::new(
-            function,
-            payload,
-            node.node_id,
-            &node.signing_key,
-        ).expect("Failed to create transaction");
+        let mut tx = Transaction::new(function, payload, node.node_id, &node.signing_key)
+            .expect("Failed to create transaction");
 
         // Attacker modifies the payload after signing
         tx.rpc.payload = b"tampered payload".to_vec();
@@ -154,7 +149,10 @@ mod signature_tests {
         // Signature verification should fail (signature doesn't match modified payload)
         let result = tx.verify_signature(&node.verifying_key);
 
-        assert!(result.is_err(), "Tampered payload should invalidate signature");
+        assert!(
+            result.is_err(),
+            "Tampered payload should invalidate signature"
+        );
     }
 
     #[test]
@@ -165,12 +163,8 @@ mod signature_tests {
         let function = "original_function".to_string();
         let payload = b"test payload".to_vec();
 
-        let mut tx = Transaction::new(
-            function,
-            payload,
-            node.node_id,
-            &node.signing_key,
-        ).expect("Failed to create transaction");
+        let mut tx = Transaction::new(function, payload, node.node_id, &node.signing_key)
+            .expect("Failed to create transaction");
 
         // Attacker modifies the function name after signing
         tx.rpc.function = "tampered_function".to_string();
@@ -178,6 +172,9 @@ mod signature_tests {
         // Signature verification should fail (signature doesn't match modified function)
         let result = tx.verify_signature(&node.verifying_key);
 
-        assert!(result.is_err(), "Tampered function should invalidate signature");
+        assert!(
+            result.is_err(),
+            "Tampered function should invalidate signature"
+        );
     }
 }

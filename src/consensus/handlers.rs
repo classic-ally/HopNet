@@ -1,36 +1,45 @@
 use crate::{
+    AppState,
+    consensus::types::Transaction,
     db::{
         DatabaseError,
-        consensus::{activate_validator, is_node_active, get_current_consensus_height},
-        users::insert_user_tx,
+        consensus::{activate_validator, get_current_consensus_height, is_node_active},
         nodes::insert_node_tx,
         setup::initialize_sequences_tx,
+        users::insert_user_tx,
     },
     handlers::{HandlerResult, TransactionHandler},
-    consensus::types::Transaction,
-    types::{User, Node},
-    AppState,
+    types::{Node, User},
 };
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ActivationRequest {
     pub node_id: i32,
-    pub current_height: i32,              // Proof node is caught up
-    // Activation height computed automatically during execution as committed_height + 1
+    pub current_height: i32, // Proof node is caught up
+                             // Activation height computed automatically during execution as committed_height + 1
 }
 
 pub struct ValidatorActivationHandler;
 
 impl TransactionHandler for ValidatorActivationHandler {
-    fn name(&self) -> &'static str { "validator_activation" }
+    fn name(&self) -> &'static str {
+        "validator_activation"
+    }
 
-    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
+    fn process(
+        &self,
+        state: &AppState,
+        tx: &Transaction,
+        execute: bool,
+        db_tx: &rusqlite::Transaction,
+    ) -> HandlerResult {
         // Decode activation request payload
         let (activation_req, _) = bincode::serde::decode_from_slice::<ActivationRequest, _>(
             &tx.rpc.payload,
-            bincode::config::standard()
-        ).map_err(|_| DatabaseError::InvalidPayload)?;
+            bincode::config::standard(),
+        )
+        .map_err(|_| DatabaseError::InvalidPayload)?;
 
         // Authorization: Only the node itself can request its own activation
         // This check happens regardless of execute flag (determines vote)
@@ -73,7 +82,7 @@ impl TransactionHandler for ValidatorActivationHandler {
             // Compute activation height deterministically during execution
             // All nodes are synchronized to same committed height by Lock QC insertion
             let committed_height = get_current_consensus_height(db_tx)?;
-            let effective_height = committed_height + 0;  // Activate immediately.
+            let effective_height = committed_height + 0; // Activate immediately.
 
             tracing::info!(
                 "Activating node {} at effective height {} (committed_height={}, next_block={})",
@@ -84,11 +93,7 @@ impl TransactionHandler for ValidatorActivationHandler {
             );
 
             // Activate the validator (INSERT or UPDATE future activation)
-            activate_validator(
-                db_tx,
-                activation_req.node_id,
-                effective_height
-            )?;
+            activate_validator(db_tx, activation_req.node_id, effective_height)?;
         }
 
         Ok(())
@@ -127,17 +132,29 @@ pub struct GenesisPayload {
 pub struct InsertGenesisHandler;
 
 impl TransactionHandler for InsertGenesisHandler {
-    fn name(&self) -> &'static str { "insert_genesis" }
+    fn name(&self) -> &'static str {
+        "insert_genesis"
+    }
 
-    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
+    fn process(
+        &self,
+        state: &AppState,
+        tx: &Transaction,
+        execute: bool,
+        db_tx: &rusqlite::Transaction,
+    ) -> HandlerResult {
         tracing::debug!("InsertGenesisHandler: Starting (execute={})", execute);
 
         // Decode genesis payload
         let (genesis_data, _) = bincode::serde::decode_from_slice::<GenesisPayload, _>(
             &tx.rpc.payload,
-            bincode::config::standard()
-        ).map_err(|e| {
-            tracing::error!("InsertGenesisHandler: Failed to decode genesis payload: {:?}", e);
+            bincode::config::standard(),
+        )
+        .map_err(|e| {
+            tracing::error!(
+                "InsertGenesisHandler: Failed to decode genesis payload: {:?}",
+                e
+            );
             DatabaseError::InvalidPayload
         })?;
         tracing::debug!("InsertGenesisHandler: Decoded genesis payload");
@@ -146,15 +163,16 @@ impl TransactionHandler for InsertGenesisHandler {
         // Check if sequences already exist - if so, genesis already processed
         // Fail if query fails (don't proceed with unknown database state)
         tracing::debug!("InsertGenesisHandler: Checking if sequences exist");
-        let existing_sequences: i32 = db_tx.query_row(
-            "SELECT COUNT(*) FROM sequences",
-            [],
-            |row| row.get(0)
-        ).map_err(|e| {
-            tracing::error!("InsertGenesisHandler: Failed to query sequences: {:?}", e);
-            DatabaseError::RecallError
-        })?;
-        tracing::debug!("InsertGenesisHandler: Found {} existing sequences", existing_sequences);
+        let existing_sequences: i32 = db_tx
+            .query_row("SELECT COUNT(*) FROM sequences", [], |row| row.get(0))
+            .map_err(|e| {
+                tracing::error!("InsertGenesisHandler: Failed to query sequences: {:?}", e);
+                DatabaseError::RecallError
+            })?;
+        tracing::debug!(
+            "InsertGenesisHandler: Found {} existing sequences",
+            existing_sequences
+        );
 
         if existing_sequences > 0 {
             tracing::error!(
@@ -170,7 +188,10 @@ impl TransactionHandler for InsertGenesisHandler {
         // 1. Initialize sequences
         tracing::debug!("InsertGenesisHandler: Initializing sequences");
         initialize_sequences_tx(db_tx).map_err(|e| {
-            tracing::error!("InsertGenesisHandler: Failed to initialize sequences: {:?}", e);
+            tracing::error!(
+                "InsertGenesisHandler: Failed to initialize sequences: {:?}",
+                e
+            );
             e
         })?;
         tracing::debug!("InsertGenesisHandler: Initialized sequences");
@@ -195,7 +216,10 @@ impl TransactionHandler for InsertGenesisHandler {
         // Uses same activate_validator function as normal activation for consistency
         tracing::debug!("InsertGenesisHandler: Activating validator");
         activate_validator(db_tx, node_id, 0).map_err(|e| {
-            tracing::error!("InsertGenesisHandler: Failed to activate validator: {:?}", e);
+            tracing::error!(
+                "InsertGenesisHandler: Failed to activate validator: {:?}",
+                e
+            );
             e
         })?;
         tracing::debug!("InsertGenesisHandler: Activated validator");
@@ -228,20 +252,33 @@ inventory::submit! {
 pub struct CleanupNoncesHandler;
 
 impl TransactionHandler for CleanupNoncesHandler {
-    fn name(&self) -> &'static str { "system.cleanup_nonces" }
+    fn name(&self) -> &'static str {
+        "system.cleanup_nonces"
+    }
 
-    fn process(&self, _state: &AppState, tx: &Transaction, execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
+    fn process(
+        &self,
+        _state: &AppState,
+        tx: &Transaction,
+        execute: bool,
+        db_tx: &rusqlite::Transaction,
+    ) -> HandlerResult {
         let (cutoff, _) = bincode::serde::decode_from_slice::<hopnet_common::CustomUUID, _>(
             &tx.rpc.payload,
-            bincode::config::standard()
-        ).map_err(|_| DatabaseError::InvalidPayload)?;
+            bincode::config::standard(),
+        )
+        .map_err(|_| DatabaseError::InvalidPayload)?;
 
         if !execute {
             return Ok(());
         }
 
         let deleted = crate::db::consensus::cleanup_old_nonces(db_tx, &cutoff)?;
-        tracing::debug!("Cleaned up {} old transaction nonces (cutoff: {})", deleted, cutoff);
+        tracing::debug!(
+            "Cleaned up {} old transaction nonces (cutoff: {})",
+            deleted,
+            cutoff
+        );
         Ok(())
     }
 }

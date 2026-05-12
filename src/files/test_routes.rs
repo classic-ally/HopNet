@@ -1,9 +1,9 @@
+use axum::http::StatusCode;
 use axum::{
+    Json,
     extract::{Path, State},
     response::IntoResponse,
-    Json,
 };
-use axum::http::StatusCode;
 use serde::Serialize;
 
 use crate::AppState;
@@ -38,15 +38,22 @@ pub async fn get_fragment_health_check(
     let nodes: Vec<Node> = match crate::db::nodes::get_nodes(app_state.db_pool.get()) {
         Ok(n) => n.into_iter().filter(|n| n.node_id != my_node_id).collect(),
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(FragmentHealthCheckResponse {
-                fragment_hash: fragment_hash.to_hex(),
-                total_nodes: 0, healthy: 0, unhealthy: 0, errors: 1,
-                results: vec![NodeFragmentHealthResult {
-                    node_id: -1, healthy: None,
-                    error: Some(format!("database error: {:?}", e)),
-                    latency_ms: 0.0,
-                }],
-            }));
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(FragmentHealthCheckResponse {
+                    fragment_hash: fragment_hash.to_hex(),
+                    total_nodes: 0,
+                    healthy: 0,
+                    unhealthy: 0,
+                    errors: 1,
+                    results: vec![NodeFragmentHealthResult {
+                        node_id: -1,
+                        healthy: None,
+                        error: Some(format!("database error: {:?}", e)),
+                        latency_ms: 0.0,
+                    }],
+                }),
+            );
         }
     };
 
@@ -61,7 +68,9 @@ pub async fn get_fragment_health_check(
 
         tasks.push(tokio::spawn(async move {
             let start = std::time::Instant::now();
-            match crate::files::rpc::check_fragment_health(&transport, node_id, iroh_node_id, hash).await {
+            match crate::files::rpc::check_fragment_health(&transport, node_id, iroh_node_id, hash)
+                .await
+            {
                 Ok(healthy) => NodeFragmentHealthResult {
                     node_id,
                     healthy: Some(healthy),
@@ -89,12 +98,15 @@ pub async fn get_fragment_health_check(
     let unhealthy = results.iter().filter(|r| r.healthy == Some(false)).count();
     let errors = results.iter().filter(|r| r.healthy.is_none()).count();
 
-    (StatusCode::OK, Json(FragmentHealthCheckResponse {
-        fragment_hash: fragment_hash.to_hex(),
-        total_nodes,
-        healthy,
-        unhealthy,
-        errors,
-        results,
-    }))
+    (
+        StatusCode::OK,
+        Json(FragmentHealthCheckResponse {
+            fragment_hash: fragment_hash.to_hex(),
+            total_nodes,
+            healthy,
+            unhealthy,
+            errors,
+            results,
+        }),
+    )
 }

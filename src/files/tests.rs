@@ -1,13 +1,13 @@
 /// File processing functions test module
 #[cfg(test)]
 mod tests {
+    use crate::db::{Blake3Hash, ChunkType, CustomUUID, SqliteConnectionManager};
     use crate::files::functions::{
-        calculate_chunked_fragments, calculate_padding_and_chunks,
-        FileReassemblyData, reconstruct_file_chunked,
-        MAX_FRAGMENT_SIZE, CHUNK_SIZE, ORIGINAL_FRAGMENTS_PER_CHUNK, RECOVERY_FRAGMENTS_PER_CHUNK
+        CHUNK_SIZE, FileReassemblyData, MAX_FRAGMENT_SIZE, ORIGINAL_FRAGMENTS_PER_CHUNK,
+        RECOVERY_FRAGMENTS_PER_CHUNK, calculate_chunked_fragments, calculate_padding_and_chunks,
+        reconstruct_file_chunked,
     };
     use crate::files::routes::process_uploaded_file;
-    use crate::db::{Blake3Hash, ChunkType, CustomUUID, SqliteConnectionManager};
     use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::OsRng as ChaChaOsRng};
     use rand::prelude::*;
     use rusqlite::params;
@@ -27,9 +27,18 @@ mod tests {
     fn test_calculate_chunked_fragments() {
         // Empty file: special case, no chunks
         let (num_chunks, total_original, total_recovery) = calculate_chunked_fragments(0);
-        assert_eq!(num_chunks, 0, "Empty file should have 0 chunks (handled separately)");
-        assert_eq!(total_original, 0, "Empty file should have 0 original fragments");
-        assert_eq!(total_recovery, 0, "Empty file should have 0 recovery fragments");
+        assert_eq!(
+            num_chunks, 0,
+            "Empty file should have 0 chunks (handled separately)"
+        );
+        assert_eq!(
+            total_original, 0,
+            "Empty file should have 0 original fragments"
+        );
+        assert_eq!(
+            total_recovery, 0,
+            "Empty file should have 0 recovery fragments"
+        );
 
         // 1 byte file: 1 chunk (< 40MB)
         let (num_chunks, total_original, total_recovery) = calculate_chunked_fragments(1);
@@ -56,22 +65,43 @@ mod tests {
         assert_eq!(total_recovery, 20, "Should have 20 recovery fragments");
 
         // 45MB file: 2 chunks (chunk 0: 40MB, chunk 1: 5MB)
-        let (num_chunks, total_original, total_recovery) = calculate_chunked_fragments(45 * 1024 * 1024);
+        let (num_chunks, total_original, total_recovery) =
+            calculate_chunked_fragments(45 * 1024 * 1024);
         assert_eq!(num_chunks, 2, "45MB file should have 2 chunks");
-        assert_eq!(total_original, 20, "Should have 20 original fragments (10 per chunk)");
-        assert_eq!(total_recovery, 40, "Should have 40 recovery fragments (20 per chunk)");
+        assert_eq!(
+            total_original, 20,
+            "Should have 20 original fragments (10 per chunk)"
+        );
+        assert_eq!(
+            total_recovery, 40,
+            "Should have 40 recovery fragments (20 per chunk)"
+        );
 
         // 100MB file: 3 chunks (40MB + 40MB + 20MB)
-        let (num_chunks, total_original, total_recovery) = calculate_chunked_fragments(100 * 1024 * 1024);
+        let (num_chunks, total_original, total_recovery) =
+            calculate_chunked_fragments(100 * 1024 * 1024);
         assert_eq!(num_chunks, 3, "100MB file should have 3 chunks");
-        assert_eq!(total_original, 30, "Should have 30 original fragments (10 per chunk)");
-        assert_eq!(total_recovery, 60, "Should have 60 recovery fragments (20 per chunk)");
+        assert_eq!(
+            total_original, 30,
+            "Should have 30 original fragments (10 per chunk)"
+        );
+        assert_eq!(
+            total_recovery, 60,
+            "Should have 60 recovery fragments (20 per chunk)"
+        );
 
         // 1GB file: 26 chunks (25 × 40MB + 1 × 24MB)
-        let (num_chunks, total_original, total_recovery) = calculate_chunked_fragments(1024 * 1024 * 1024);
+        let (num_chunks, total_original, total_recovery) =
+            calculate_chunked_fragments(1024 * 1024 * 1024);
         assert_eq!(num_chunks, 26, "1GB file should have 26 chunks");
-        assert_eq!(total_original, 260, "Should have 260 original fragments (10 per chunk)");
-        assert_eq!(total_recovery, 520, "Should have 520 recovery fragments (20 per chunk)");
+        assert_eq!(
+            total_original, 260,
+            "Should have 260 original fragments (10 per chunk)"
+        );
+        assert_eq!(
+            total_recovery, 520,
+            "Should have 520 recovery fragments (20 per chunk)"
+        );
 
         // Verify constants relationship: CHUNK_SIZE should equal MAX_FRAGMENT_SIZE * ORIGINAL_FRAGMENTS_PER_CHUNK
         assert_eq!(
@@ -89,7 +119,10 @@ mod tests {
         let (chunks, padding) = calculate_padding_and_chunks(test_data.clone(), 2);
 
         assert_eq!(chunks.len(), 2, "Should create 2 chunks");
-        assert_eq!(padding, 0, "No padding needed when chunk length is already even");
+        assert_eq!(
+            padding, 0,
+            "No padding needed when chunk length is already even"
+        );
         assert_eq!(chunks[0].len(), 6, "Each chunk should have 6 bytes");
         assert_eq!(chunks[1].len(), 6, "Each chunk should have 6 bytes");
 
@@ -99,9 +132,20 @@ mod tests {
         let (chunks, padding) = calculate_padding_and_chunks(test_data.clone(), 2);
 
         assert_eq!(chunks.len(), 2, "Should create 2 chunks");
-        assert_eq!(padding, 2, "Should add 2 bytes of padding to make chunk length even");
-        assert_eq!(chunks[0].len(), 6, "Each chunk should have 6 bytes (5 + padding)");
-        assert_eq!(chunks[1].len(), 6, "Each chunk should have 6 bytes (5 + padding)");
+        assert_eq!(
+            padding, 2,
+            "Should add 2 bytes of padding to make chunk length even"
+        );
+        assert_eq!(
+            chunks[0].len(),
+            6,
+            "Each chunk should have 6 bytes (5 + padding)"
+        );
+        assert_eq!(
+            chunks[1].len(),
+            6,
+            "Each chunk should have 6 bytes (5 + padding)"
+        );
 
         // Test with data requiring padding for both uneven division AND even chunk length
         // 5 bytes / 2 chunks = 2.5, rounds up to 3 bytes each (odd)
@@ -110,9 +154,20 @@ mod tests {
         let (chunks, padding) = calculate_padding_and_chunks(test_data.clone(), 2);
 
         assert_eq!(chunks.len(), 2, "Should create 2 chunks");
-        assert_eq!(padding, 3, "Should add 3 bytes of padding to ensure even chunk length");
-        assert_eq!(chunks[0].len(), 4, "Each chunk should have 4 bytes (even length)");
-        assert_eq!(chunks[1].len(), 4, "Each chunk should have 4 bytes (even length)");
+        assert_eq!(
+            padding, 3,
+            "Should add 3 bytes of padding to ensure even chunk length"
+        );
+        assert_eq!(
+            chunks[0].len(),
+            4,
+            "Each chunk should have 4 bytes (even length)"
+        );
+        assert_eq!(
+            chunks[1].len(),
+            4,
+            "Each chunk should have 4 bytes (even length)"
+        );
     }
 
     /// Test that chunk content is preserved correctly
@@ -120,16 +175,19 @@ mod tests {
     fn test_chunk_content_preservation() {
         let test_data = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
         let (chunks, _padding) = calculate_padding_and_chunks(test_data.clone(), 2);
-        
+
         // Reconstruct data from chunks to verify preservation
         let mut reconstructed = Vec::new();
         for chunk in chunks {
             reconstructed.extend_from_slice(&chunk);
         }
-        
+
         // Should match original data (with possible padding at end)
-        assert_eq!(&reconstructed[..test_data.len()], test_data.as_slice(), 
-            "Original data should be preserved in chunks");
+        assert_eq!(
+            &reconstructed[..test_data.len()],
+            test_data.as_slice(),
+            "Original data should be preserved in chunks"
+        );
     }
 
     fn build_reassembly_data(
@@ -139,20 +197,29 @@ mod tests {
         per_file_key: chacha20poly1305::Key,
     ) -> FileReassemblyData {
         let _ = plaintext_size;
-        let mut chunks: HashMap<u32, (
-            HashMap<usize, (Blake3Hash, CustomUUID, bool)>,
-            HashMap<usize, (Blake3Hash, CustomUUID, bool)>,
-        )> = HashMap::new();
+        let mut chunks: HashMap<
+            u32,
+            (
+                HashMap<usize, (Blake3Hash, CustomUUID, bool)>,
+                HashMap<usize, (Blake3Hash, CustomUUID, bool)>,
+            ),
+        > = HashMap::new();
 
         for fragment in &data_record.data.fragments {
-            let entry = chunks.entry(fragment.chunk_number).or_insert_with(|| (HashMap::new(), HashMap::new()));
+            let entry = chunks
+                .entry(fragment.chunk_number)
+                .or_insert_with(|| (HashMap::new(), HashMap::new()));
             let bucket = match fragment.chunk_type {
                 ChunkType::Original => &mut entry.0,
                 ChunkType::Recovery => &mut entry.1,
             };
             bucket.insert(
                 fragment.local_index as usize,
-                (fragment.fragment_hash.clone(), fragment.fragment_id.clone(), true),
+                (
+                    fragment.fragment_hash.clone(),
+                    fragment.fragment_id.clone(),
+                    true,
+                ),
             );
         }
 
@@ -179,12 +246,22 @@ mod tests {
             dataid.clone(),
             &per_file_key,
             &fragments_dir,
-        ).await.expect("process_uploaded_file should succeed");
+        )
+        .await
+        .expect("process_uploaded_file should succeed");
 
-        assert_eq!(data_record.id, dataid, "DataRecord id must equal input dataid");
-        assert_eq!(data_record.file_size, plaintext.len() as u64, "file_size must match plaintext length");
+        assert_eq!(
+            data_record.id, dataid,
+            "DataRecord id must equal input dataid"
+        );
+        assert_eq!(
+            data_record.file_size,
+            plaintext.len() as u64,
+            "file_size must match plaintext length"
+        );
 
-        let reassembly = build_reassembly_data(plaintext.len(), &data_record, &dataid, per_file_key);
+        let reassembly =
+            build_reassembly_data(plaintext.len(), &data_record, &dataid, per_file_key);
 
         let stream = reconstruct_file_chunked(fragments_dir, reassembly, None, None, None);
         tokio::pin!(stream);
@@ -195,8 +272,15 @@ mod tests {
             reconstructed.extend_from_slice(&chunk);
         }
 
-        assert_eq!(reconstructed.len(), plaintext.len(), "reconstructed size must match plaintext");
-        assert_eq!(reconstructed, plaintext, "reconstructed bytes must match plaintext");
+        assert_eq!(
+            reconstructed.len(),
+            plaintext.len(),
+            "reconstructed size must match plaintext"
+        );
+        assert_eq!(
+            reconstructed, plaintext,
+            "reconstructed bytes must match plaintext"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -261,7 +345,8 @@ mod tests {
         conn.execute(
             "INSERT INTO inodes (id, owner_id, path, type, data_id) VALUES (?, ?, ?, 1, NULL)",
             params![CustomUUID::new(None), user_id, path],
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     #[test]
@@ -304,23 +389,33 @@ mod tests {
     fn test_padding_edge_cases() {
         // Test files that don't divide evenly into chunks
         let odd_cases = vec![
-            (1, 3),    // 1 byte into 3 chunks
-            (5, 2),    // 5 bytes into 2 chunks  
-            (7, 3),    // 7 bytes into 3 chunks
-            (100, 7),  // 100 bytes into 7 chunks
+            (1, 3),   // 1 byte into 3 chunks
+            (5, 2),   // 5 bytes into 2 chunks
+            (7, 3),   // 7 bytes into 3 chunks
+            (100, 7), // 100 bytes into 7 chunks
         ];
-        
+
         for (data_size, num_chunks) in odd_cases {
             let test_data = generate_random_data(data_size);
             let (chunks, _padding) = calculate_padding_and_chunks(test_data.clone(), num_chunks);
-            
-            assert_eq!(chunks.len(), num_chunks, "Should create exactly {} chunks", num_chunks);
-            
+
+            assert_eq!(
+                chunks.len(),
+                num_chunks,
+                "Should create exactly {} chunks",
+                num_chunks
+            );
+
             // All chunks should have equal size (with padding)
             let expected_chunk_size = chunks[0].len();
             for (i, chunk) in chunks.iter().enumerate() {
-                assert_eq!(chunk.len(), expected_chunk_size, 
-                    "Chunk {} should have even length for input size {}", i, data_size);
+                assert_eq!(
+                    chunk.len(),
+                    expected_chunk_size,
+                    "Chunk {} should have even length for input size {}",
+                    i,
+                    data_size
+                );
             }
         }
     }

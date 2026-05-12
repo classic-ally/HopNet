@@ -1,27 +1,29 @@
+use aes_siv::{Key, Nonce, siv::Aes256Siv};
+use argon2::{Algorithm, Argon2 as Argon2Raw, Params, Version};
 use axum::http;
-use chrono::{TimeDelta, Utc, Duration};
-use jsonwebtoken::{TokenData, Validation};
-use jsonwebtoken::{DecodingKey, EncodingKey, Header, encode, decode};
 use axum::{
-    extract::{Request, State},
-    response::{Response, IntoResponse},
+    Extension, Json,
     body::Body,
-    Extension,
-    Json,
+    extract::{Request, State},
     http::StatusCode,
     middleware::Next,
+    response::{IntoResponse, Response},
 };
-use serde::{Serialize, Deserialize};
+use chacha20poly1305::{
+    ChaCha20Poly1305,
+    aead::{Aead, KeyInit},
+};
+use chrono::{Duration, TimeDelta, Utc};
+use jsonwebtoken::{DecodingKey, EncodingKey, Header, decode, encode};
+use jsonwebtoken::{TokenData, Validation};
 use rand::Rng;
-use aes_siv::{siv::Aes256Siv, Key, Nonce};
-use chacha20poly1305::{ChaCha20Poly1305, aead::{Aead, KeyInit}};
-use argon2::{Algorithm, Version, Params, Argon2 as Argon2Raw};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tokio::sync::RwLock;
 
 use crate::db;
-use crate::{AppState, PrivKey};
 use crate::db::types::XPubKey;
+use crate::{AppState, PrivKey};
 
 #[derive(Clone, Debug)]
 pub struct SessionEntry {
@@ -35,9 +37,9 @@ pub type SessionStore = RwLock<HashMap<i32, SessionEntry>>;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
-    exp: usize,         // expiry of our token
-    iss: String,        // issuer is nodeID that issued it
-    uid: String,        // userid id userID it's valid for
+    exp: usize,  // expiry of our token
+    iss: String, // issuer is nodeID that issued it
+    uid: String, // userid id userID it's valid for
 }
 
 #[derive(Serialize, Deserialize)]
@@ -75,20 +77,22 @@ pub fn generate_jwt_key() -> (EncodingKey, DecodingKey) {
 // middleware for validation
 pub async fn auth_middleware(
     State(app_state): State<AppState>,
-    mut req: Request, 
-    next: Next
+    mut req: Request,
+    next: Next,
 ) -> Result<Response<Body>, AuthError> {
     let auth_header = req.headers_mut().get(http::header::AUTHORIZATION);
-    
+
     let auth_header = match auth_header {
         Some(header) => header.to_str().map_err(|_| AuthError {
             message: "Empty header is not allowed".to_string(),
-            status_code: StatusCode::FORBIDDEN
+            status_code: StatusCode::FORBIDDEN,
         })?,
-        None => return Err(AuthError {
-            message: "Please add the JWT token to the header".to_string(),
-            status_code: StatusCode::FORBIDDEN
-        }),
+        None => {
+            return Err(AuthError {
+                message: "Please add the JWT token to the header".to_string(),
+                status_code: StatusCode::FORBIDDEN,
+            });
+        }
     };
 
     let mut header = auth_header.split_whitespace();
@@ -97,62 +101,76 @@ pub async fn auth_middleware(
 
     let token_data = match decode_jwt(token.unwrap().to_string(), app_state.decoding_key) {
         Ok(data) => data,
-        Err(_) => return Err(AuthError {
-            message: "Unable to decode token".to_string(),
-            status_code: StatusCode::UNAUTHORIZED
-        }),
+        Err(_) => {
+            return Err(AuthError {
+                message: "Unable to decode token".to_string(),
+                status_code: StatusCode::UNAUTHORIZED,
+            });
+        }
     };
 
     // check user exists in db (what if deleted?)
-    let uid: i32 = token_data.claims.uid.parse().map_err(|_| AuthError{ message: "Malformed JWT".to_string(), status_code: StatusCode::BAD_REQUEST })?;
+    let uid: i32 = token_data.claims.uid.parse().map_err(|_| AuthError {
+        message: "Malformed JWT".to_string(),
+        status_code: StatusCode::BAD_REQUEST,
+    })?;
     match db::users::get_user_by_userid(app_state.db_pool.get(), uid) {
         Ok(Some(_user)) => {
             // store the user ID in request extensions
             req.extensions_mut().insert(uid);
-            return Ok(next.run(req).await) // future can check user perms here
-        },
-        Ok(None) => return Err(AuthError { message: "User does not exist".to_string(), status_code: StatusCode::UNAUTHORIZED }),
-        Err(_) => return Err(AuthError { message: "Error checking user database".to_string(), status_code: StatusCode::INTERNAL_SERVER_ERROR })
+            return Ok(next.run(req).await); // future can check user perms here
+        }
+        Ok(None) => {
+            return Err(AuthError {
+                message: "User does not exist".to_string(),
+                status_code: StatusCode::UNAUTHORIZED,
+            });
+        }
+        Err(_) => {
+            return Err(AuthError {
+                message: "Error checking user database".to_string(),
+                status_code: StatusCode::INTERNAL_SERVER_ERROR,
+            });
+        }
     };
-    
-
 }
 
 fn decode_jwt(jwt_token: String, key: DecodingKey) -> Result<TokenData<Claims>, StatusCode> {
-    return decode(&jwt_token, &key, &Validation::default()).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+    return decode(&jwt_token, &key, &Validation::default())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
 }
 
 fn encode_jwt(iss: String, uid: String, key: EncodingKey) -> Result<String, StatusCode> {
     let now = Utc::now();
     let expire: TimeDelta = Duration::hours(1);
     let exp: usize = (now + expire).timestamp() as usize;
-    let claim = Claims {
-        exp,
-        iss,
-        uid
-    };
+    let claim = Claims { exp, iss, uid };
 
-    return encode(
-        &Header::default(),
-        &claim,
-        &key
-    ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+    return encode(&Header::default(), &claim, &key).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
 }
 
 pub async fn sign_in(
     State(app_state): State<AppState>,
-    Json(user_data): Json<SignInData>
+    Json(user_data): Json<SignInData>,
 ) -> Result<Json<SignInResponse>, AuthError> {
     let remember_me = user_data.remember_me.unwrap_or(false);
     let duration_hours: i64 = if remember_me { 24 } else { 1 };
 
-    let node_id = app_state.get_node_id()
-        .map_err(|_| AuthError { message: "Node not initialized".into(), status_code: StatusCode::SERVICE_UNAVAILABLE })?;
+    let node_id = app_state.get_node_id().map_err(|_| AuthError {
+        message: "Node not initialized".into(),
+        status_code: StatusCode::SERVICE_UNAVAILABLE,
+    })?;
 
     // Look up user
     let db_user = db::users::get_user_by_username(app_state.db_pool.get(), user_data.username)
-        .map_err(|_| AuthError { message: "Database error".into(), status_code: StatusCode::INTERNAL_SERVER_ERROR })?
-        .ok_or(AuthError { message: "Invalid credentials".into(), status_code: StatusCode::UNAUTHORIZED })?;
+        .map_err(|_| AuthError {
+            message: "Database error".into(),
+            status_code: StatusCode::INTERNAL_SERVER_ERROR,
+        })?
+        .ok_or(AuthError {
+            message: "Invalid credentials".into(),
+            status_code: StatusCode::UNAUTHORIZED,
+        })?;
 
     // Unwrap private key — this IS the authentication (3-5s, 1 GiB Argon2id)
     // If the passphrase is wrong, ChaCha20-Poly1305 decryption fails
@@ -160,11 +178,17 @@ pub async fn sign_in(
     let key_salt = db_user.key_salt.clone();
     let passphrase = crate::passphrase::normalize_passphrase(&user_data.passphrase);
     let privkey = tokio::task::spawn_blocking(move || {
-        unwrap_user_privkey(&encrypted_privkey, &key_salt, &passphrase)
-            .map_err(|e| e.to_string())
-    }).await
-        .map_err(|_| AuthError { message: "Internal error".into(), status_code: StatusCode::INTERNAL_SERVER_ERROR })?
-        .map_err(|_| AuthError { message: "Invalid credentials".into(), status_code: StatusCode::UNAUTHORIZED })?;
+        unwrap_user_privkey(&encrypted_privkey, &key_salt, &passphrase).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|_| AuthError {
+        message: "Internal error".into(),
+        status_code: StatusCode::INTERNAL_SERVER_ERROR,
+    })?
+    .map_err(|_| AuthError {
+        message: "Invalid credentials".into(),
+        status_code: StatusCode::UNAUTHORIZED,
+    })?;
 
     // Derive all key material
     let pubkey = crate::db::PubKey(privkey.verifying_key());
@@ -174,11 +198,19 @@ pub async fn sign_in(
     #[cfg(all(target_os = "macos", feature = "gui", not(debug_assertions)))]
     let privkey_bytes = privkey.0.to_bytes();
 
-    let user_keys = crate::UserKeys { private_key: privkey, public_key: pubkey };
+    let user_keys = crate::UserKeys {
+        private_key: privkey,
+        public_key: pubkey,
+    };
 
     // Build session entry
     let expires_at = Utc::now() + Duration::hours(duration_hours);
-    let session = SessionEntry { user_keys, siv_key, siv_nonce, expires_at };
+    let session = SessionEntry {
+        user_keys,
+        siv_key,
+        siv_nonce,
+        expires_at,
+    };
 
     // Insert into session store
     {
@@ -203,7 +235,12 @@ pub async fn sign_in(
                     &privkey_bytes,
                 );
 
-                if let Err(e) = crate::devices::routes::ensure_fileprovider_device_token(&app_state, db_user.user_id).await {
+                if let Err(e) = crate::devices::routes::ensure_fileprovider_device_token(
+                    &app_state,
+                    db_user.user_id,
+                )
+                .await
+                {
                     tracing::warn!("Failed to ensure FileProvider device token: {:?}", e);
                 }
             }
@@ -212,19 +249,28 @@ pub async fn sign_in(
 
     // Encode JWT with matching duration
     let token = encode_jwt_with_duration(
-        node_id.to_string(), db_user.user_id.to_string(),
-        app_state.encoding_key, duration_hours,
+        node_id.to_string(),
+        db_user.user_id.to_string(),
+        app_state.encoding_key,
+        duration_hours,
     )?;
 
     Ok(Json(SignInResponse { token }))
 }
 
-pub fn encode_jwt_with_duration(iss: String, uid: String, key: EncodingKey, hours: i64) -> Result<String, AuthError> {
+pub fn encode_jwt_with_duration(
+    iss: String,
+    uid: String,
+    key: EncodingKey,
+    hours: i64,
+) -> Result<String, AuthError> {
     let now = Utc::now();
     let exp = (now + Duration::hours(hours)).timestamp() as usize;
     let claim = Claims { exp, iss, uid };
-    encode(&Header::default(), &claim, &key)
-        .map_err(|_| AuthError { message: "JWT encoding failed".into(), status_code: StatusCode::INTERNAL_SERVER_ERROR })
+    encode(&Header::default(), &claim, &key).map_err(|_| AuthError {
+        message: "JWT encoding failed".into(),
+        status_code: StatusCode::INTERNAL_SERVER_ERROR,
+    })
 }
 
 /// Logout endpoint. Removes session from store.
@@ -251,7 +297,7 @@ pub async fn sign_out(
 pub fn derive_siv_key_from_user(user_privkey: &PrivKey, context: &str) -> (Key<Aes256Siv>, Nonce) {
     // Use the user's private key bytes as input key material
     let ikm = user_privkey.to_bytes();
-    
+
     // Derive SIV key (64 bytes for AES-256-SIV) using XOF for custom length
     let mut siv_key_bytes = [0u8; 64];
     let mut hasher = blake3::Hasher::new_derive_key(&format!("hopnet {} siv_key", context));
@@ -259,7 +305,7 @@ pub fn derive_siv_key_from_user(user_privkey: &PrivKey, context: &str) -> (Key<A
     let mut xof = hasher.finalize_xof();
     xof.fill(&mut siv_key_bytes);
     let siv_key = Key::<Aes256Siv>::from(siv_key_bytes);
-    
+
     // Derive SIV nonce (16 bytes) using XOF for custom length
     let mut siv_nonce_bytes = [0u8; 16];
     let mut hasher = blake3::Hasher::new_derive_key(&format!("hopnet {} siv_nonce", context));
@@ -267,7 +313,7 @@ pub fn derive_siv_key_from_user(user_privkey: &PrivKey, context: &str) -> (Key<A
     let mut xof = hasher.finalize_xof();
     xof.fill(&mut siv_nonce_bytes);
     let siv_nonce = Nonce::from(siv_nonce_bytes);
-    
+
     (siv_key, siv_nonce)
 }
 
@@ -275,14 +321,14 @@ pub fn derive_siv_key_from_user(user_privkey: &PrivKey, context: &str) -> (Key<A
 pub fn derive_x25519_pubkey_from_user(user_privkey: &PrivKey) -> XPubKey {
     // Use the user's private key bytes as input key material
     let ikm = user_privkey.to_bytes();
-    
+
     // Derive X25519 secret key (32 bytes) using Blake3 for deterministic key derivation
     let mut x25519_secret_bytes = [0u8; 32];
     let mut hasher = blake3::Hasher::new_derive_key("hopnet x25519_secret");
     hasher.update(&ikm);
     let mut xof = hasher.finalize_xof();
     xof.fill(&mut x25519_secret_bytes);
-    
+
     // Create X25519 static secret and derive public key
     let x25519_secret = x25519_dalek::StaticSecret::from(x25519_secret_bytes);
     let x25519_pubkey = x25519_dalek::PublicKey::from(&x25519_secret);
@@ -293,21 +339,24 @@ pub fn derive_x25519_pubkey_from_user(user_privkey: &PrivKey) -> XPubKey {
 pub fn derive_x25519_privkey_from_user(user_privkey: &PrivKey) -> x25519_dalek::StaticSecret {
     // Use the user's private key bytes as input key material
     let ikm = user_privkey.to_bytes();
-    
+
     // Derive X25519 secret key (32 bytes) using Blake3 for deterministic key derivation
     let mut x25519_secret_bytes = [0u8; 32];
     let mut hasher = blake3::Hasher::new_derive_key("hopnet x25519_secret");
     hasher.update(&ikm);
     let mut xof = hasher.finalize_xof();
     xof.fill(&mut x25519_secret_bytes);
-    
+
     // Create X25519 static secret
     x25519_dalek::StaticSecret::from(x25519_secret_bytes)
 }
 
 /// Wrap a user private key with a password using Argon2id + ChaCha20-Poly1305.
 /// Returns (nonce || ciphertext, salt).
-pub fn wrap_user_privkey(privkey: &PrivKey, password: &str) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
+pub fn wrap_user_privkey(
+    privkey: &PrivKey,
+    password: &str,
+) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
     // Generate 16-byte random salt
     let mut salt = [0u8; 16];
     let mut rng = rand::rng();
@@ -317,7 +366,8 @@ pub fn wrap_user_privkey(privkey: &PrivKey, password: &str) -> Result<(Vec<u8>, 
     let params = Params::new(1_048_576, 2, 1, Some(32))?;
     let argon2 = Argon2Raw::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut key_bytes = [0u8; 32];
-    argon2.hash_password_into(password.as_bytes(), &salt, &mut key_bytes)
+    argon2
+        .hash_password_into(password.as_bytes(), &salt, &mut key_bytes)
         .map_err(|e| format!("Argon2 key derivation failed: {}", e))?;
 
     // Generate 12-byte random nonce
@@ -327,7 +377,8 @@ pub fn wrap_user_privkey(privkey: &PrivKey, password: &str) -> Result<(Vec<u8>, 
 
     // Encrypt the private key
     let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&key_bytes));
-    let ciphertext = cipher.encrypt(&nonce, privkey.0.to_bytes().as_slice())
+    let ciphertext = cipher
+        .encrypt(&nonce, privkey.0.to_bytes().as_slice())
         .map_err(|e| format!("Encryption failed: {:?}", e))?;
 
     // Return nonce || ciphertext, and salt
@@ -340,7 +391,11 @@ pub fn wrap_user_privkey(privkey: &PrivKey, password: &str) -> Result<(Vec<u8>, 
 
 /// Unwrap a password-wrapped user private key.
 /// encrypted_privkey is nonce (12 bytes) || ciphertext.
-pub fn unwrap_user_privkey(encrypted_privkey: &[u8], key_salt: &[u8], password: &str) -> Result<PrivKey, Box<dyn std::error::Error>> {
+pub fn unwrap_user_privkey(
+    encrypted_privkey: &[u8],
+    key_salt: &[u8],
+    password: &str,
+) -> Result<PrivKey, Box<dyn std::error::Error>> {
     if encrypted_privkey.len() < 12 {
         return Err("Encrypted private key too short".into());
     }
@@ -352,12 +407,14 @@ pub fn unwrap_user_privkey(encrypted_privkey: &[u8], key_salt: &[u8], password: 
     let params = Params::new(1_048_576, 2, 1, Some(32))?;
     let argon2 = Argon2Raw::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut key_bytes = [0u8; 32];
-    argon2.hash_password_into(password.as_bytes(), key_salt, &mut key_bytes)
+    argon2
+        .hash_password_into(password.as_bytes(), key_salt, &mut key_bytes)
         .map_err(|e| format!("Argon2 key derivation failed: {}", e))?;
 
     // Decrypt
     let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&key_bytes));
-    let plaintext = cipher.decrypt(nonce, ciphertext)
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext)
         .map_err(|e| format!("Decryption failed: {:?}", e))?;
 
     if plaintext.len() != 32 {
@@ -389,7 +446,8 @@ pub fn wrap_user_key_for_device(
     let nonce = chacha20poly1305::Nonce::from(nonce_bytes);
 
     let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&key_bytes));
-    let ciphertext = cipher.encrypt(&nonce, privkey.0.to_bytes().as_slice())
+    let ciphertext = cipher
+        .encrypt(&nonce, privkey.0.to_bytes().as_slice())
         .map_err(|e| format!("Device key wrap encryption failed: {:?}", e))?;
 
     let mut wrapped = Vec::with_capacity(12 + ciphertext.len());
@@ -420,11 +478,16 @@ pub fn unwrap_user_key_from_device(
     hasher.finalize_xof().fill(&mut key_bytes);
 
     let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&key_bytes));
-    let plaintext = cipher.decrypt(nonce, ciphertext)
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext)
         .map_err(|e| format!("Device key unwrap decryption failed: {:?}", e))?;
 
     if plaintext.len() != 32 {
-        return Err(format!("Decrypted device key is {} bytes, expected 32", plaintext.len()).into());
+        return Err(format!(
+            "Decrypted device key is {} bytes, expected 32",
+            plaintext.len()
+        )
+        .into());
     }
 
     let mut key_arr = [0u8; 32];
@@ -438,8 +501,9 @@ pub fn decrypt_wrapped_file_key(
     user_x25519_privkey: &x25519_dalek::StaticSecret,
 ) -> Result<chacha20poly1305::Key, Box<dyn std::error::Error>> {
     // Perform ECDH with ephemeral public key
-    let shared_secret = user_x25519_privkey.diffie_hellman(file_access.ephemeral_pubkey.as_x25519());
-    
+    let shared_secret =
+        user_x25519_privkey.diffie_hellman(file_access.ephemeral_pubkey.as_x25519());
+
     // Derive ChaCha20Poly1305 key from shared secret using Blake3
     let mut wrap_key_bytes = [0u8; 32];
     let mut hasher = blake3::Hasher::new_derive_key("hopnet key_wrap");
@@ -447,7 +511,7 @@ pub fn decrypt_wrapped_file_key(
     let mut xof = hasher.finalize_xof();
     xof.fill(&mut wrap_key_bytes);
     let wrap_key = chacha20poly1305::Key::from(wrap_key_bytes);
-    
+
     // Derive deterministic nonce from data_block_id + user_id + ephemeral_pubkey
     let mut nonce_bytes = [0u8; 12];
     let mut nonce_hasher = blake3::Hasher::new_derive_key("hopnet wrap_nonce");
@@ -456,16 +520,17 @@ pub fn decrypt_wrapped_file_key(
     nonce_hasher.update(file_access.ephemeral_pubkey.as_bytes());
     nonce_hasher.finalize_xof().fill(&mut nonce_bytes);
     let wrap_nonce = chacha20poly1305::Nonce::from(nonce_bytes);
-    
+
     // Decrypt the per-file key
     let wrap_cipher = ChaCha20Poly1305::new(&wrap_key);
-    let decrypted_file_key = wrap_cipher.decrypt(&wrap_nonce, file_access.encrypted_file_key.as_slice())
+    let decrypted_file_key = wrap_cipher
+        .decrypt(&wrap_nonce, file_access.encrypted_file_key.as_slice())
         .map_err(|e| format!("Decryption failed: {:?}", e))?;
-    
+
     if decrypted_file_key.len() != 32 {
         return Err("Invalid decrypted key length".into());
     }
-    
+
     let mut key_bytes = [0u8; 32];
     key_bytes.copy_from_slice(&decrypted_file_key);
     Ok(chacha20poly1305::Key::from(key_bytes))

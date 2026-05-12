@@ -1,7 +1,7 @@
 use crate::db::{CustomUUID, DatabaseError};
-use hopnet_common::{ImportStatus, ImportRecord};
+use hopnet_common::{ImportRecord, ImportStatus};
 use rusqlite::params;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 /// Unified payload for import operations (creation, sync)
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -23,7 +23,10 @@ impl ImportPayload {
     /// Convert to ImportRecord for frontend API.
     /// `created_at` derives from the UUIDv7 id; mirrors `TakeoutPayload::to_record`.
     pub fn to_record(&self) -> ImportRecord {
-        let created_at = self.import_id.extract_timestamp().unwrap_or_else(chrono::Utc::now);
+        let created_at = self
+            .import_id
+            .extract_timestamp()
+            .unwrap_or_else(chrono::Utc::now);
         ImportRecord {
             id: self.import_id.clone(),
             user_id: self.user_id,
@@ -37,15 +40,14 @@ impl ImportPayload {
 /// Whether the user has an in-flight import. Distinct from `is_import_eligible`:
 /// eligibility blocks Completed too (v1 forbids re-import) but Completed users
 /// can still write to their tree, so the write-gate uses this narrower check.
-pub fn has_active_import(
-    conn: &rusqlite::Connection,
-    user_id: i32,
-) -> Result<bool, DatabaseError> {
-    let count: i32 = conn.query_row(
-        "SELECT COUNT(*) FROM imports WHERE user_id = ? AND status IN (0, 1)",
-        params![user_id],
-        |row| row.get(0),
-    ).map_err(|_| DatabaseError::RecallError)?;
+pub fn has_active_import(conn: &rusqlite::Connection, user_id: i32) -> Result<bool, DatabaseError> {
+    let count: i32 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM imports WHERE user_id = ? AND status IN (0, 1)",
+            params![user_id],
+            |row| row.get(0),
+        )
+        .map_err(|_| DatabaseError::RecallError)?;
     Ok(count > 0)
 }
 
@@ -69,20 +71,24 @@ pub fn is_import_eligible(
     conn: &rusqlite::Connection,
     user_id: i32,
 ) -> Result<bool, DatabaseError> {
-    let blocking_imports: i32 = conn.query_row(
-        "SELECT COUNT(*) FROM imports WHERE user_id = ? AND status IN (0, 1, 2)",
-        params![user_id],
-        |row| row.get(0),
-    ).map_err(|_| DatabaseError::RecallError)?;
+    let blocking_imports: i32 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM imports WHERE user_id = ? AND status IN (0, 1, 2)",
+            params![user_id],
+            |row| row.get(0),
+        )
+        .map_err(|_| DatabaseError::RecallError)?;
     if blocking_imports > 0 {
         return Ok(false);
     }
 
-    let inode_count: i32 = conn.query_row(
-        "SELECT COUNT(*) FROM inodes WHERE owner_id = ?",
-        params![user_id],
-        |row| row.get(0),
-    ).map_err(|_| DatabaseError::RecallError)?;
+    let inode_count: i32 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM inodes WHERE owner_id = ?",
+            params![user_id],
+            |row| row.get(0),
+        )
+        .map_err(|_| DatabaseError::RecallError)?;
 
     Ok(inode_count == 0)
 }
@@ -99,31 +105,39 @@ pub fn process_import_creation(
 ) -> Result<(), DatabaseError> {
     tracing::debug!(
         "Processing import creation for user_id: {} (execute={})",
-        payload.user_id, execute
+        payload.user_id,
+        execute
     );
 
     if !is_import_eligible(db_tx, payload.user_id)? {
-        tracing::debug!("User {} is not eligible to start an import", payload.user_id);
+        tracing::debug!(
+            "User {} is not eligible to start an import",
+            payload.user_id
+        );
         return Err(DatabaseError::ConflictError);
     }
 
-    db_tx.execute(
-        "INSERT INTO imports (id, user_id, owner_node_id, status) VALUES (?, ?, ?, ?)",
-        params![
-            payload.import_id,
-            payload.user_id,
-            payload.owner_node_id,
-            payload.status,
-        ],
-    ).map_err(|e| {
-        tracing::error!("Failed to insert import record: {:?}", e);
-        DatabaseError::InsertError
-    })?;
+    db_tx
+        .execute(
+            "INSERT INTO imports (id, user_id, owner_node_id, status) VALUES (?, ?, ?, ?)",
+            params![
+                payload.import_id,
+                payload.user_id,
+                payload.owner_node_id,
+                payload.status,
+            ],
+        )
+        .map_err(|e| {
+            tracing::error!("Failed to insert import record: {:?}", e);
+            DatabaseError::InsertError
+        })?;
 
     if execute {
         tracing::info!(
             "Import {} created for user {} (owner node {})",
-            payload.import_id, payload.user_id, payload.owner_node_id
+            payload.import_id,
+            payload.user_id,
+            payload.owner_node_id
         );
     } else {
         tracing::debug!("Validation phase completed for import creation");
@@ -142,24 +156,35 @@ pub fn process_import_status_update(
 ) -> Result<(), DatabaseError> {
     tracing::debug!(
         "Processing import status update for {} -> {:?} (execute={})",
-        payload.import_id, payload.new_status, execute
+        payload.import_id,
+        payload.new_status,
+        execute
     );
 
-    let rows = db_tx.execute(
-        "UPDATE imports SET status = ? WHERE id = ?",
-        params![payload.new_status, payload.import_id],
-    ).map_err(|e| {
-        tracing::error!("Failed to update import status: {:?}", e);
-        DatabaseError::ProcessingError
-    })?;
+    let rows = db_tx
+        .execute(
+            "UPDATE imports SET status = ? WHERE id = ?",
+            params![payload.new_status, payload.import_id],
+        )
+        .map_err(|e| {
+            tracing::error!("Failed to update import status: {:?}", e);
+            DatabaseError::ProcessingError
+        })?;
 
     if rows == 0 {
-        tracing::warn!("update_import_status: no row matched id {}", payload.import_id);
+        tracing::warn!(
+            "update_import_status: no row matched id {}",
+            payload.import_id
+        );
         return Err(DatabaseError::RecallError);
     }
 
     if execute {
-        tracing::info!("Import {} status updated to {:?}", payload.import_id, payload.new_status);
+        tracing::info!(
+            "Import {} status updated to {:?}",
+            payload.import_id,
+            payload.new_status
+        );
     }
 
     Ok(())
@@ -219,7 +244,8 @@ pub async fn get_total_validator_storage_available(
     drop(db_lock);
     tracing::warn!(
         "No validator storage metrics yet (height={}); bootstrapping quota from owner filesystem × {} validators",
-        height, validator_count
+        height,
+        validator_count
     );
     match crate::metrics::routes::calculate_storage_usage(&state.fragments_dir).await {
         Ok(s) => {
@@ -262,7 +288,11 @@ pub fn get_current_import_for_user(
         Ok(payload) => Ok(Some(payload.to_record())),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => {
-            tracing::error!("Failed to fetch current import for user {}: {:?}", user_id, e);
+            tracing::error!(
+                "Failed to fetch current import for user {}: {:?}",
+                user_id,
+                e
+            );
             Err(DatabaseError::RecallError)
         }
     }

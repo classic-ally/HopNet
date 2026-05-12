@@ -4,25 +4,25 @@ use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::params;
 
-use crate::schema::FunctionResult;
 use super::fixtures::FixtureContext;
+use crate::schema::FunctionResult;
 
-mod helpers;
 mod consensus;
-mod metrics;
 mod debug;
-mod resilience;
+mod devices;
+mod documentprovider;
+mod fileprovider;
 mod files;
 mod fragments;
+mod helpers;
 mod inventory;
-mod fileprovider;
-mod documentprovider;
+mod metrics;
 mod nodes;
-mod users;
-mod shares;
-mod devices;
-mod takeout;
+mod resilience;
 mod setup;
+mod shares;
+mod takeout;
+mod users;
 
 pub fn capture_all(
     pool: &Pool<SqliteConnectionManager>,
@@ -44,7 +44,8 @@ pub fn capture_all(
         conn.execute(
             "UPDATE metrics SET start_time = datetime(start_time, '+' || ? || ' seconds')",
             params![shift_seconds],
-        ).expect("Failed to time-shift metrics");
+        )
+        .expect("Failed to time-shift metrics");
     }
 
     // Phase 3: Capture time-windowed functions (metrics are now "recent")

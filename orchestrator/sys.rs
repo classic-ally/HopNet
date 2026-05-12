@@ -25,8 +25,8 @@ pub fn detect_socket_path() -> Result<String> {
     }
 
     // Common socket paths
-    candidates.push("unix:///var/run/docker.sock".to_string());      // Docker
-    candidates.push("unix:///run/podman/podman.sock".to_string());   // Rootful Podman
+    candidates.push("unix:///var/run/docker.sock".to_string()); // Docker
+    candidates.push("unix:///run/podman/podman.sock".to_string()); // Rootful Podman
 
     for socket_path in candidates {
         // Extract actual file path from unix:// URL
@@ -83,5 +83,9 @@ pub async fn find_available_port(mesh_id: u32, node_id: u32) -> Result<u16> {
         }
     }
 
-    anyhow::bail!("No available ports found in range {}-{}", preferred, preferred + 100)
+    anyhow::bail!(
+        "No available ports found in range {}-{}",
+        preferred,
+        preferred + 100
+    )
 }

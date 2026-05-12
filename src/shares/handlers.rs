@@ -1,22 +1,32 @@
-use crate::handlers::{TransactionHandler, HandlerResult};
 use crate::AppState;
 use crate::consensus::types::Transaction;
 use crate::db::DatabaseError;
+use crate::handlers::{HandlerResult, TransactionHandler};
 use rusqlite::params;
 
-use super::types::{ShareFilePayload, AcceptSharePayload, DeclineSharePayload, UnsharePayload};
+use super::types::{AcceptSharePayload, DeclineSharePayload, ShareFilePayload, UnsharePayload};
 
 // --- ShareFileHandler ---
 
 pub struct ShareFileHandler;
 
 impl TransactionHandler for ShareFileHandler {
-    fn name(&self) -> &'static str { "share_file" }
+    fn name(&self) -> &'static str {
+        "share_file"
+    }
 
-    fn process(&self, _state: &AppState, tx: &Transaction, _execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
+    fn process(
+        &self,
+        _state: &AppState,
+        tx: &Transaction,
+        _execute: bool,
+        db_tx: &rusqlite::Transaction,
+    ) -> HandlerResult {
         let (payload, _) = bincode::serde::decode_from_slice::<ShareFilePayload, _>(
-            &tx.rpc.payload, bincode::config::standard()
-        ).map_err(|_| DatabaseError::InvalidPayload)?;
+            &tx.rpc.payload,
+            bincode::config::standard(),
+        )
+        .map_err(|_| DatabaseError::InvalidPayload)?;
 
         // Authorization: sender must be the authenticated user
         let user = tx.user.as_ref().ok_or(DatabaseError::AuthorizationError)?;
@@ -30,21 +40,29 @@ impl TransactionHandler for ShareFileHandler {
         }
 
         // Validation: data_block exists
-        db_tx.query_row(
-            "SELECT 1 FROM data_blocks WHERE id = ?",
-            params![payload.data_block_id],
-            |_| Ok(())
-        ).map_err(|_| DatabaseError::NotFound)?;
+        db_tx
+            .query_row(
+                "SELECT 1 FROM data_blocks WHERE id = ?",
+                params![payload.data_block_id],
+                |_| Ok(()),
+            )
+            .map_err(|_| DatabaseError::NotFound)?;
 
         // Validation: recipient exists
-        db_tx.query_row(
-            "SELECT 1 FROM users WHERE user_id = ?",
-            [payload.recipient_id],
-            |_| Ok(())
-        ).map_err(|_| DatabaseError::NotFound)?;
+        db_tx
+            .query_row(
+                "SELECT 1 FROM users WHERE user_id = ?",
+                [payload.recipient_id],
+                |_| Ok(()),
+            )
+            .map_err(|_| DatabaseError::NotFound)?;
 
         // Validation: no duplicate share
-        if crate::db::shares::share_exists_for_recipient(db_tx, &payload.data_block_id, payload.recipient_id)? {
+        if crate::db::shares::share_exists_for_recipient(
+            db_tx,
+            &payload.data_block_id,
+            payload.recipient_id,
+        )? {
             return Err(DatabaseError::ConflictError);
         }
 
@@ -71,12 +89,22 @@ inventory::submit! { &ShareFileHandler as &dyn TransactionHandler }
 pub struct AcceptShareHandler;
 
 impl TransactionHandler for AcceptShareHandler {
-    fn name(&self) -> &'static str { "accept_share" }
+    fn name(&self) -> &'static str {
+        "accept_share"
+    }
 
-    fn process(&self, state: &AppState, tx: &Transaction, execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
+    fn process(
+        &self,
+        state: &AppState,
+        tx: &Transaction,
+        execute: bool,
+        db_tx: &rusqlite::Transaction,
+    ) -> HandlerResult {
         let (payload, _) = bincode::serde::decode_from_slice::<AcceptSharePayload, _>(
-            &tx.rpc.payload, bincode::config::standard()
-        ).map_err(|_| DatabaseError::InvalidPayload)?;
+            &tx.rpc.payload,
+            bincode::config::standard(),
+        )
+        .map_err(|_| DatabaseError::InvalidPayload)?;
 
         // Authorization: recipient must be the authenticated user
         let user = tx.user.as_ref().ok_or(DatabaseError::AuthorizationError)?;
@@ -85,28 +113,34 @@ impl TransactionHandler for AcceptShareHandler {
         }
 
         // Validation: incoming_share exists and belongs to this recipient
-        let incoming_share = crate::db::shares::get_incoming_share_by_id(db_tx, &payload.incoming_share_id)?
-            .ok_or(DatabaseError::NotFound)?;
+        let incoming_share =
+            crate::db::shares::get_incoming_share_by_id(db_tx, &payload.incoming_share_id)?
+                .ok_or(DatabaseError::NotFound)?;
 
         if incoming_share.recipient_id != payload.recipient_id {
             return Err(DatabaseError::AuthorizationError);
         }
 
         // Validation: path not already taken
-        let path_exists: bool = db_tx.query_row(
-            "SELECT COUNT(*) > 0 FROM inodes WHERE path = ? AND owner_id = ?",
-            params![payload.encrypted_path, payload.recipient_id],
-            |row| row.get(0)
-        ).map_err(|_| DatabaseError::RecallError)?;
+        let path_exists: bool = db_tx
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM inodes WHERE path = ? AND owner_id = ?",
+                params![payload.encrypted_path, payload.recipient_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| DatabaseError::RecallError)?;
 
         if path_exists {
             return Err(DatabaseError::ConflictError);
         }
 
         // 1. Deserialize FileAccess from blob and insert into file_access table
-        let (file_access_entry, _) = bincode::serde::decode_from_slice::<crate::db::types::FileAccess, _>(
-            &incoming_share.file_access, bincode::config::standard()
-        ).map_err(|_| DatabaseError::InvalidPayload)?;
+        let (file_access_entry, _) =
+            bincode::serde::decode_from_slice::<crate::db::types::FileAccess, _>(
+                &incoming_share.file_access,
+                bincode::config::standard(),
+            )
+            .map_err(|_| DatabaseError::InvalidPayload)?;
 
         db_tx.execute(
             "INSERT INTO file_access (data_block_id, user_id, ephemeral_pubkey, encrypted_file_key) VALUES (?, ?, ?, ?)",
@@ -125,13 +159,20 @@ impl TransactionHandler for AcceptShareHandler {
         }
 
         // 3. Insert inode in recipient's namespace
-        db_tx.execute(
-            "INSERT INTO inodes (id, owner_id, path, type, data_id) VALUES (?, ?, ?, 0, ?)",
-            params![payload.inode_id, payload.recipient_id, payload.encrypted_path, incoming_share.data_block_id]
-        ).map_err(|e| {
-            tracing::error!("Failed to insert inode for share accept: {:?}", e);
-            DatabaseError::InsertError
-        })?;
+        db_tx
+            .execute(
+                "INSERT INTO inodes (id, owner_id, path, type, data_id) VALUES (?, ?, ?, 0, ?)",
+                params![
+                    payload.inode_id,
+                    payload.recipient_id,
+                    payload.encrypted_path,
+                    incoming_share.data_block_id
+                ],
+            )
+            .map_err(|e| {
+                tracing::error!("Failed to insert inode for share accept: {:?}", e);
+                DatabaseError::InsertError
+            })?;
 
         // 4. Insert share members for both sender and recipient
         crate::db::shares::insert_share_members(
@@ -146,8 +187,13 @@ impl TransactionHandler for AcceptShareHandler {
         // 6. Log modification for FileProvider
         let current_height = crate::db::consensus::get_current_consensus_height(db_tx)?;
         crate::db::files::log_modification(
-            db_tx, payload.inode_id, payload.recipient_id,
-            None, None, Some(&payload.encrypted_path), current_height,
+            db_tx,
+            payload.inode_id,
+            payload.recipient_id,
+            None,
+            None,
+            Some(&payload.encrypted_path),
+            current_height,
         )?;
 
         // 7. Signal FileProvider refresh
@@ -156,8 +202,13 @@ impl TransactionHandler for AcceptShareHandler {
             {
                 let test_mode = state.test_mode;
                 tokio::spawn(async move {
-                    if let Err(e) = crate::fileprovider::domain::signal_fileprovider_refresh(test_mode).await {
-                        tracing::warn!("Failed to signal FileProvider refresh after share accept: {}", e);
+                    if let Err(e) =
+                        crate::fileprovider::domain::signal_fileprovider_refresh(test_mode).await
+                    {
+                        tracing::warn!(
+                            "Failed to signal FileProvider refresh after share accept: {}",
+                            e
+                        );
                     }
                 });
             }
@@ -174,12 +225,22 @@ inventory::submit! { &AcceptShareHandler as &dyn TransactionHandler }
 pub struct DeclineShareHandler;
 
 impl TransactionHandler for DeclineShareHandler {
-    fn name(&self) -> &'static str { "decline_share" }
+    fn name(&self) -> &'static str {
+        "decline_share"
+    }
 
-    fn process(&self, _state: &AppState, tx: &Transaction, _execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
+    fn process(
+        &self,
+        _state: &AppState,
+        tx: &Transaction,
+        _execute: bool,
+        db_tx: &rusqlite::Transaction,
+    ) -> HandlerResult {
         let (payload, _) = bincode::serde::decode_from_slice::<DeclineSharePayload, _>(
-            &tx.rpc.payload, bincode::config::standard()
-        ).map_err(|_| DatabaseError::InvalidPayload)?;
+            &tx.rpc.payload,
+            bincode::config::standard(),
+        )
+        .map_err(|_| DatabaseError::InvalidPayload)?;
 
         // Authorization: must be the authenticated user
         let user = tx.user.as_ref().ok_or(DatabaseError::AuthorizationError)?;
@@ -210,12 +271,22 @@ inventory::submit! { &DeclineShareHandler as &dyn TransactionHandler }
 pub struct UnshareHandler;
 
 impl TransactionHandler for UnshareHandler {
-    fn name(&self) -> &'static str { "unshare" }
+    fn name(&self) -> &'static str {
+        "unshare"
+    }
 
-    fn process(&self, _state: &AppState, tx: &Transaction, _execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
+    fn process(
+        &self,
+        _state: &AppState,
+        tx: &Transaction,
+        _execute: bool,
+        db_tx: &rusqlite::Transaction,
+    ) -> HandlerResult {
         let (payload, _) = bincode::serde::decode_from_slice::<UnsharePayload, _>(
-            &tx.rpc.payload, bincode::config::standard()
-        ).map_err(|_| DatabaseError::InvalidPayload)?;
+            &tx.rpc.payload,
+            bincode::config::standard(),
+        )
+        .map_err(|_| DatabaseError::InvalidPayload)?;
 
         // Authorization: must be the authenticated user
         let user = tx.user.as_ref().ok_or(DatabaseError::AuthorizationError)?;
@@ -224,8 +295,9 @@ impl TransactionHandler for UnshareHandler {
         }
 
         // Look up inode → get data_block_id
-        let data_block_id = crate::db::shares::get_data_block_for_inode(db_tx, &payload.inode_id, payload.user_id)?
-            .ok_or(DatabaseError::NotFound)?;
+        let data_block_id =
+            crate::db::shares::get_data_block_for_inode(db_tx, &payload.inode_id, payload.user_id)?
+                .ok_or(DatabaseError::NotFound)?;
 
         // Verify user is in shares table for this data_block
         let sharers = crate::db::shares::get_sharers_for_data_block(db_tx, &data_block_id)?;

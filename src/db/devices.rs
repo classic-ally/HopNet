@@ -1,6 +1,6 @@
-use rusqlite::{Transaction, params};
+use crate::db::{Blake3Hash, CustomUUID, DatabaseError, SqliteConnectionManager};
 use r2d2::PooledConnection;
-use crate::db::{CustomUUID, SqliteConnectionManager, DatabaseError, Blake3Hash};
+use rusqlite::{Transaction, params};
 
 /// Insert device token within a consensus transaction
 pub fn insert_device_token_tx(
@@ -28,13 +28,15 @@ pub fn delete_device_token_tx(
     device_id: &CustomUUID,
     user_id: i32,
 ) -> Result<(), DatabaseError> {
-    db_tx.execute(
-        "DELETE FROM device_tokens WHERE id = ? AND user_id = ?",
-        params![device_id, user_id],
-    ).map_err(|e| {
-        tracing::error!("Failed to delete device token: {:?}", e);
-        DatabaseError::ProcessingError
-    })?;
+    db_tx
+        .execute(
+            "DELETE FROM device_tokens WHERE id = ? AND user_id = ?",
+            params![device_id, user_id],
+        )
+        .map_err(|e| {
+            tracing::error!("Failed to delete device token: {:?}", e);
+            DatabaseError::ProcessingError
+        })?;
     Ok(())
 }
 
@@ -54,12 +56,14 @@ pub fn get_device_by_id(
     let result = db_lock.query_row(
         "SELECT id, user_id, api_key_hash, wrapped_user_key FROM device_tokens WHERE id = ?",
         params![device_id],
-        |row| Ok(DeviceTokenRecord {
-            id: row.get(0)?,
-            user_id: row.get(1)?,
-            api_key_hash: row.get(2)?,
-            wrapped_user_key: row.get(3)?,
-        }),
+        |row| {
+            Ok(DeviceTokenRecord {
+                id: row.get(0)?,
+                user_id: row.get(1)?,
+                api_key_hash: row.get(2)?,
+                wrapped_user_key: row.get(3)?,
+            })
+        },
     );
 
     match result {
@@ -84,22 +88,26 @@ pub fn get_devices_for_user(
     db_lock: &PooledConnection<SqliteConnectionManager>,
     user_id: i32,
 ) -> Result<Vec<DeviceListRecord>, DatabaseError> {
-    let mut stmt = db_lock.prepare(
-        "SELECT id, encrypted_device_name FROM device_tokens WHERE user_id = ? ORDER BY id"
-    ).map_err(|e| {
-        tracing::error!("Failed to prepare device list query: {:?}", e);
-        DatabaseError::RecallError
-    })?;
+    let mut stmt = db_lock
+        .prepare(
+            "SELECT id, encrypted_device_name FROM device_tokens WHERE user_id = ? ORDER BY id",
+        )
+        .map_err(|e| {
+            tracing::error!("Failed to prepare device list query: {:?}", e);
+            DatabaseError::RecallError
+        })?;
 
-    let rows = stmt.query_map(params![user_id], |row| {
-        Ok(DeviceListRecord {
-            id: row.get(0)?,
-            encrypted_device_name: row.get(1)?,
+    let rows = stmt
+        .query_map(params![user_id], |row| {
+            Ok(DeviceListRecord {
+                id: row.get(0)?,
+                encrypted_device_name: row.get(1)?,
+            })
         })
-    }).map_err(|e| {
-        tracing::error!("Failed to query devices: {:?}", e);
-        DatabaseError::RecallError
-    })?;
+        .map_err(|e| {
+            tracing::error!("Failed to query devices: {:?}", e);
+            DatabaseError::RecallError
+        })?;
 
     let mut devices = Vec::new();
     for row in rows {

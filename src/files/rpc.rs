@@ -1,10 +1,10 @@
-use serde::{Deserialize, Serialize};
-use std::time::Duration;
-use crate::types::Blake3Hash;
-use crate::net::{IrohError, IrohTransport};
+use crate::AppState;
 use crate::net::protocol::{IrohRequest, IrohResponse};
 use crate::net::transport::ProtocolError;
-use crate::AppState;
+use crate::net::{IrohError, IrohTransport};
+use crate::types::Blake3Hash;
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 // ============================================================================
 // Fragment Health Check
@@ -22,8 +22,12 @@ pub struct FragmentHealthResponse {
 
 /// Server-side: handle a fragment health check from a peer node.
 /// No auth needed — iroh connections are already authenticated by the PeerValidator hook.
-pub fn handle_fragment_health_check(req: FragmentHealthRequest, fragments_dir: &str) -> FragmentHealthResponse {
-    let healthy = crate::files::functions::fragment_exists_and_valid(fragments_dir, &req.fragment_hash);
+pub fn handle_fragment_health_check(
+    req: FragmentHealthRequest,
+    fragments_dir: &str,
+) -> FragmentHealthResponse {
+    let healthy =
+        crate::files::functions::fragment_exists_and_valid(fragments_dir, &req.fragment_hash);
     FragmentHealthResponse { healthy }
 }
 
@@ -44,18 +48,18 @@ pub async fn check_fragment_health(
     fragment_hash: Blake3Hash,
 ) -> Result<bool, IrohError> {
     let req = IrohRequest::FragmentHealthCheck(FragmentHealthRequest { fragment_hash });
-    let response = transport.request(node_id, peer_node_id, &req, HEALTH_CHECK_TIMEOUT).await?;
+    let response = transport
+        .request(node_id, peer_node_id, &req, HEALTH_CHECK_TIMEOUT)
+        .await?;
 
     match response {
         IrohResponse::FragmentHealthCheckResponse(result) => Ok(result.healthy),
         IrohResponse::Error { message } => {
             Err(IrohError::Protocol(ProtocolError::PeerError(message)))
         }
-        other => {
-            Err(IrohError::Protocol(ProtocolError::MalformedResponse(
-                format!("unexpected response to FragmentHealthCheck: {:?}", other),
-            )))
-        }
+        other => Err(IrohError::Protocol(ProtocolError::MalformedResponse(
+            format!("unexpected response to FragmentHealthCheck: {:?}", other),
+        ))),
     }
 }
 
@@ -75,10 +79,19 @@ pub struct FragmentFetchResponse {
 }
 
 /// Server-side: handle a fragment fetch request from a peer node.
-pub fn handle_fragment_fetch(req: FragmentFetchRequest, fragments_dir: &str) -> FragmentFetchResponse {
+pub fn handle_fragment_fetch(
+    req: FragmentFetchRequest,
+    fragments_dir: &str,
+) -> FragmentFetchResponse {
     match crate::files::functions::fetch_and_verify_fragment(&req.fragment_hash, fragments_dir) {
-        Ok(data) => FragmentFetchResponse { found: true, data: Some(data) },
-        Err(_) => FragmentFetchResponse { found: false, data: None },
+        Ok(data) => FragmentFetchResponse {
+            found: true,
+            data: Some(data),
+        },
+        Err(_) => FragmentFetchResponse {
+            found: false,
+            data: None,
+        },
     }
 }
 
@@ -90,7 +103,9 @@ pub async fn fetch_fragment(
     fragment_hash: Blake3Hash,
 ) -> Result<Vec<u8>, IrohError> {
     let req = IrohRequest::FragmentFetch(FragmentFetchRequest { fragment_hash });
-    let response = transport.request(node_id, peer_node_id, &req, FRAGMENT_TRANSFER_TIMEOUT).await?;
+    let response = transport
+        .request(node_id, peer_node_id, &req, FRAGMENT_TRANSFER_TIMEOUT)
+        .await?;
 
     match response {
         IrohResponse::FragmentFetchResponse(result) => {
@@ -101,17 +116,17 @@ pub async fn fetch_fragment(
                     ))
                 })
             } else {
-                Err(IrohError::Protocol(ProtocolError::PeerError("fragment not found".into())))
+                Err(IrohError::Protocol(ProtocolError::PeerError(
+                    "fragment not found".into(),
+                )))
             }
         }
         IrohResponse::Error { message } => {
             Err(IrohError::Protocol(ProtocolError::PeerError(message)))
         }
-        other => {
-            Err(IrohError::Protocol(ProtocolError::MalformedResponse(
-                format!("unexpected response to FragmentFetch: {:?}", other),
-            )))
-        }
+        other => Err(IrohError::Protocol(ProtocolError::MalformedResponse(
+            format!("unexpected response to FragmentFetch: {:?}", other),
+        ))),
     }
 }
 
@@ -132,7 +147,10 @@ pub struct FragmentStoreResponse {
 }
 
 /// Server-side: handle a fragment store request from a peer node.
-pub async fn handle_fragment_store(req: FragmentStoreRequest, app_state: &AppState) -> IrohResponse {
+pub async fn handle_fragment_store(
+    req: FragmentStoreRequest,
+    app_state: &AppState,
+) -> IrohResponse {
     let max_encrypted_size = crate::files::functions::calculate_encrypted_chunk_length(
         crate::files::functions::MAX_FRAGMENT_SIZE,
     );
@@ -140,7 +158,11 @@ pub async fn handle_fragment_store(req: FragmentStoreRequest, app_state: &AppSta
     // Verify fragment size
     if req.data.len() > max_encrypted_size {
         return IrohResponse::Error {
-            message: format!("fragment too large: {} bytes (max: {})", req.data.len(), max_encrypted_size),
+            message: format!(
+                "fragment too large: {} bytes (max: {})",
+                req.data.len(),
+                max_encrypted_size
+            ),
         };
     }
 
@@ -148,12 +170,19 @@ pub async fn handle_fragment_store(req: FragmentStoreRequest, app_state: &AppSta
     let actual_hash = Blake3Hash::new(blake3::hash(&req.data));
     if actual_hash != req.fragment_hash {
         return IrohResponse::Error {
-            message: format!("hash mismatch: expected {}, got {}", req.fragment_hash.to_hex(), actual_hash.to_hex()),
+            message: format!(
+                "hash mismatch: expected {}, got {}",
+                req.fragment_hash.to_hex(),
+                actual_hash.to_hex()
+            ),
         };
     }
 
     // Check if already exists
-    if crate::files::functions::fragment_exists_and_valid(&app_state.fragments_dir, &req.fragment_hash) {
+    if crate::files::functions::fragment_exists_and_valid(
+        &app_state.fragments_dir,
+        &req.fragment_hash,
+    ) {
         return IrohResponse::FragmentStoreResponse(FragmentStoreResponse {
             success: true,
             already_existed: true,
@@ -161,17 +190,29 @@ pub async fn handle_fragment_store(req: FragmentStoreRequest, app_state: &AppSta
     }
 
     // Store to disk
-    if let Err(e) = crate::files::functions::store_fragment(&app_state.fragments_dir, &req.fragment_hash, req.data) {
+    if let Err(e) = crate::files::functions::store_fragment(
+        &app_state.fragments_dir,
+        &req.fragment_hash,
+        req.data,
+    ) {
         return IrohResponse::Error {
             message: format!("failed to store fragment: {:?}", e),
         };
     }
 
     // Queue async DB update (drain task will batch-flush through write gate)
-    if let Err(e) = app_state.local_state_tx.try_send(
-        crate::db::write_gate::LocalStateUpdate::MarkLocal { fragment_hash: req.fragment_hash.clone() }
-    ) {
-        tracing::warn!("Local state queue full, dropping mark-local for {}: {}", req.fragment_hash.to_hex(), e);
+    if let Err(e) =
+        app_state
+            .local_state_tx
+            .try_send(crate::db::write_gate::LocalStateUpdate::MarkLocal {
+                fragment_hash: req.fragment_hash.clone(),
+            })
+    {
+        tracing::warn!(
+            "Local state queue full, dropping mark-local for {}: {}",
+            req.fragment_hash.to_hex(),
+            e
+        );
     }
 
     IrohResponse::FragmentStoreResponse(FragmentStoreResponse {
@@ -188,18 +229,21 @@ pub async fn store_fragment_remote(
     fragment_hash: Blake3Hash,
     data: Vec<u8>,
 ) -> Result<FragmentStoreResponse, IrohError> {
-    let req = IrohRequest::FragmentStore(FragmentStoreRequest { fragment_hash, data });
-    let response = transport.request(node_id, peer_node_id, &req, FRAGMENT_TRANSFER_TIMEOUT).await?;
+    let req = IrohRequest::FragmentStore(FragmentStoreRequest {
+        fragment_hash,
+        data,
+    });
+    let response = transport
+        .request(node_id, peer_node_id, &req, FRAGMENT_TRANSFER_TIMEOUT)
+        .await?;
 
     match response {
         IrohResponse::FragmentStoreResponse(result) => Ok(result),
         IrohResponse::Error { message } => {
             Err(IrohError::Protocol(ProtocolError::PeerError(message)))
         }
-        other => {
-            Err(IrohError::Protocol(ProtocolError::MalformedResponse(
-                format!("unexpected response to FragmentStore: {:?}", other),
-            )))
-        }
+        other => Err(IrohError::Protocol(ProtocolError::MalformedResponse(
+            format!("unexpected response to FragmentStore: {:?}", other),
+        ))),
     }
 }

@@ -6,7 +6,10 @@ use serde::Serialize;
 
 use crate::schema::FunctionResult;
 
-pub fn capture(pool: &Pool<SqliteConnectionManager>, results: &mut BTreeMap<String, FunctionResult>) {
+pub fn capture(
+    pool: &Pool<SqliteConnectionManager>,
+    results: &mut BTreeMap<String, FunctionResult>,
+) {
     use hopnet::db::debug;
 
     // StateSnapshot doesn't implement Serialize, use proxy

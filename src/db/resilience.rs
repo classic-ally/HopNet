@@ -3,7 +3,9 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::params;
 
 use crate::db::DatabaseError;
-use hopnet_common::db::{NetworkResilienceStats, ResilienceLevel, NodeStorageBaseline, FaultToleranceCurvePoint};
+use hopnet_common::db::{
+    FaultToleranceCurvePoint, NetworkResilienceStats, NodeStorageBaseline, ResilienceLevel,
+};
 
 /// Compute network-wide file resilience statistics using OLAP-optimized query
 /// Returns distribution of files across fault tolerance levels
@@ -128,36 +130,89 @@ pub fn compute_network_resilience_stats(
                 ORDER BY classified_level DESC
             "#;
 
-            let mut stmt = conn.prepare(query).map_err(|_| DatabaseError::ProcessingError)?;
+            let mut stmt = conn
+                .prepare(query)
+                .map_err(|_| DatabaseError::ProcessingError)?;
 
-            let rows = stmt.query_map(params![], |row| {
-                let level: i32 = row.get(0)?;
-                let count: i64 = row.get(1)?;
-                let percentage: f64 = row.get(2)?;
-                Ok((level, count as u32, percentage))
-            }).map_err(|_| DatabaseError::RecallError)?;
+            let rows = stmt
+                .query_map(params![], |row| {
+                    let level: i32 = row.get(0)?;
+                    let count: i64 = row.get(1)?;
+                    let percentage: f64 = row.get(2)?;
+                    Ok((level, count as u32, percentage))
+                })
+                .map_err(|_| DatabaseError::RecallError)?;
 
             // Initialize all levels to zero
-            let mut unknown = ResilienceLevel { file_count: 0, percentage: 0.0 };
-            let mut unrecoverable = ResilienceLevel { file_count: 0, percentage: 0.0 };
-            let mut critical = ResilienceLevel { file_count: 0, percentage: 0.0 };
-            let mut good = ResilienceLevel { file_count: 0, percentage: 0.0 };
-            let mut excellent = ResilienceLevel { file_count: 0, percentage: 0.0 };
-            let mut exceptional = ResilienceLevel { file_count: 0, percentage: 0.0 };
+            let mut unknown = ResilienceLevel {
+                file_count: 0,
+                percentage: 0.0,
+            };
+            let mut unrecoverable = ResilienceLevel {
+                file_count: 0,
+                percentage: 0.0,
+            };
+            let mut critical = ResilienceLevel {
+                file_count: 0,
+                percentage: 0.0,
+            };
+            let mut good = ResilienceLevel {
+                file_count: 0,
+                percentage: 0.0,
+            };
+            let mut excellent = ResilienceLevel {
+                file_count: 0,
+                percentage: 0.0,
+            };
+            let mut exceptional = ResilienceLevel {
+                file_count: 0,
+                percentage: 0.0,
+            };
             let mut total_files = 0u32;
 
             // Process results
             for row_result in rows {
-                let (level, count, percentage) = row_result.map_err(|_| DatabaseError::RecallError)?;
+                let (level, count, percentage) =
+                    row_result.map_err(|_| DatabaseError::RecallError)?;
                 total_files += count;
 
                 match level {
-                    -2 => unknown = ResilienceLevel { file_count: count, percentage },
-                    -1 => unrecoverable = ResilienceLevel { file_count: count, percentage },
-                    0 => critical = ResilienceLevel { file_count: count, percentage },
-                    1 => good = ResilienceLevel { file_count: count, percentage },
-                    2 => excellent = ResilienceLevel { file_count: count, percentage },
-                    3 => exceptional = ResilienceLevel { file_count: count, percentage },
+                    -2 => {
+                        unknown = ResilienceLevel {
+                            file_count: count,
+                            percentage,
+                        }
+                    }
+                    -1 => {
+                        unrecoverable = ResilienceLevel {
+                            file_count: count,
+                            percentage,
+                        }
+                    }
+                    0 => {
+                        critical = ResilienceLevel {
+                            file_count: count,
+                            percentage,
+                        }
+                    }
+                    1 => {
+                        good = ResilienceLevel {
+                            file_count: count,
+                            percentage,
+                        }
+                    }
+                    2 => {
+                        excellent = ResilienceLevel {
+                            file_count: count,
+                            percentage,
+                        }
+                    }
+                    3 => {
+                        exceptional = ResilienceLevel {
+                            file_count: count,
+                            percentage,
+                        }
+                    }
                     _ => {
                         tracing::warn!("Unexpected fault tolerance level: {}", level);
                     }
@@ -168,7 +223,8 @@ pub fn compute_network_resilience_stats(
 
             tracing::debug!(
                 "Network resilience computed: {} files total in {}ms",
-                total_files, computation_time_ms
+                total_files,
+                computation_time_ms
             );
 
             Ok(NetworkResilienceStats {
@@ -246,24 +302,32 @@ pub fn get_node_storage_baselines(
             "#;
 
             let mut stmt = conn.prepare(query).map_err(|e| {
-                tracing::error!("Failed to prepare query for node storage baselines: {:?}", e);
+                tracing::error!(
+                    "Failed to prepare query for node storage baselines: {:?}",
+                    e
+                );
                 DatabaseError::ProcessingError
             })?;
 
-            let rows = stmt.query_map(params![], |row| {
-                Ok(NodeStorageBaseline {
-                    node_id: row.get(0)?,
-                    name: row.get(1)?,
-                    display_name: row.get(2)?,
-                    storage_total_gb: row.get(3)?,
-                    baseline_storage_gb: row.get(4)?,
-                    source: hopnet_common::db::NodeSource::System,
-                    original_values: None,
+            let rows = stmt
+                .query_map(params![], |row| {
+                    Ok(NodeStorageBaseline {
+                        node_id: row.get(0)?,
+                        name: row.get(1)?,
+                        display_name: row.get(2)?,
+                        storage_total_gb: row.get(3)?,
+                        baseline_storage_gb: row.get(4)?,
+                        source: hopnet_common::db::NodeSource::System,
+                        original_values: None,
+                    })
                 })
-            }).map_err(|e| {
-                tracing::error!("Failed to execute query for node storage baselines: {:?}", e);
-                DatabaseError::RecallError
-            })?;
+                .map_err(|e| {
+                    tracing::error!(
+                        "Failed to execute query for node storage baselines: {:?}",
+                        e
+                    );
+                    DatabaseError::RecallError
+                })?;
 
             let baselines: Vec<NodeStorageBaseline> = rows
                 .collect::<Result<Vec<_>, _>>()
@@ -273,7 +337,8 @@ pub fn get_node_storage_baselines(
 
             tracing::debug!(
                 "Retrieved storage baselines for {} nodes in {}ms",
-                baselines.len(), computation_time_ms
+                baselines.len(),
+                computation_time_ms
             );
 
             Ok(baselines)
@@ -292,7 +357,8 @@ pub fn generate_fault_tolerance_curve(
     let viable_nodes: Vec<NodeStorageBaseline> = nodes
         .into_iter()
         .filter(|node| {
-            let available_capacity = node.storage_total_gb * threshold_ratio - node.baseline_storage_gb;
+            let available_capacity =
+                node.storage_total_gb * threshold_ratio - node.baseline_storage_gb;
             available_capacity > 0.0
         })
         .collect();
@@ -350,7 +416,8 @@ pub fn generate_fault_tolerance_curve(
             .unwrap();
 
         // Calculate how much additional user data fills this node
-        let node_available_capacity = next_to_fail.storage_total_gb * threshold_ratio - next_to_fail.baseline_storage_gb;
+        let node_available_capacity =
+            next_to_fail.storage_total_gb * threshold_ratio - next_to_fail.baseline_storage_gb;
         let additional_user_data = node_available_capacity / 3.0 * current_nodes.len() as f64;
         total_user_data_gb += additional_user_data;
 
@@ -397,12 +464,30 @@ mod tests {
     #[test]
     fn test_network_stats_serialization() {
         let stats = NetworkResilienceStats {
-            unknown: ResilienceLevel { file_count: 0, percentage: 0.0 },
-            unrecoverable: ResilienceLevel { file_count: 5, percentage: 2.1 },
-            critical: ResilienceLevel { file_count: 15, percentage: 6.3 },
-            good: ResilienceLevel { file_count: 80, percentage: 33.6 },
-            excellent: ResilienceLevel { file_count: 100, percentage: 42.0 },
-            exceptional: ResilienceLevel { file_count: 38, percentage: 16.0 },
+            unknown: ResilienceLevel {
+                file_count: 0,
+                percentage: 0.0,
+            },
+            unrecoverable: ResilienceLevel {
+                file_count: 5,
+                percentage: 2.1,
+            },
+            critical: ResilienceLevel {
+                file_count: 15,
+                percentage: 6.3,
+            },
+            good: ResilienceLevel {
+                file_count: 80,
+                percentage: 33.6,
+            },
+            excellent: ResilienceLevel {
+                file_count: 100,
+                percentage: 42.0,
+            },
+            exceptional: ResilienceLevel {
+                file_count: 38,
+                percentage: 16.0,
+            },
             total_files: 238,
             computation_time_ms: 156,
         };
@@ -493,8 +578,24 @@ mod tests {
 
         // Test two nodes: 15 fragments each, need 1 node min (ceil(10/15)=1), can fail 1
         let two_nodes = vec![
-            NodeStorageBaseline { node_id: 1, name: None, display_name: "Node 1".to_string(), storage_total_gb: 1000.0, baseline_storage_gb: 100.0, source: hopnet_common::db::NodeSource::System, original_values: None },
-            NodeStorageBaseline { node_id: 2, name: None, display_name: "Node 2".to_string(), storage_total_gb: 1000.0, baseline_storage_gb: 100.0, source: hopnet_common::db::NodeSource::System, original_values: None },
+            NodeStorageBaseline {
+                node_id: 1,
+                name: None,
+                display_name: "Node 1".to_string(),
+                storage_total_gb: 1000.0,
+                baseline_storage_gb: 100.0,
+                source: hopnet_common::db::NodeSource::System,
+                original_values: None,
+            },
+            NodeStorageBaseline {
+                node_id: 2,
+                name: None,
+                display_name: "Node 2".to_string(),
+                storage_total_gb: 1000.0,
+                baseline_storage_gb: 100.0,
+                source: hopnet_common::db::NodeSource::System,
+                original_values: None,
+            },
         ];
         let curve = generate_fault_tolerance_curve(two_nodes, 0.9);
         assert_eq!(curve[0].active_nodes, 2);

@@ -1,18 +1,37 @@
-use crate::{db::{DatabaseError, users::{insert_user_tx, update_user_profile_tx, update_user_onboarding_tx}}, handlers::{HandlerResult, TransactionHandler}, types::User, consensus::types::Transaction};
+use super::types::{UpdateUserOnboardingPayload, UpdateUserProfilePayload};
 use crate::AppState;
-use super::types::{UpdateUserProfilePayload, UpdateUserOnboardingPayload};
+use crate::{
+    consensus::types::Transaction,
+    db::{
+        DatabaseError,
+        users::{insert_user_tx, update_user_onboarding_tx, update_user_profile_tx},
+    },
+    handlers::{HandlerResult, TransactionHandler},
+    types::User,
+};
 
 pub struct InsertUserHandler;
 
 impl TransactionHandler for InsertUserHandler {
-    fn name(&self) -> &'static str { "insert_user" }
+    fn name(&self) -> &'static str {
+        "insert_user"
+    }
 
-    fn process(&self, _state: &AppState, tx: &Transaction, _execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
-        match bincode::serde::decode_from_slice::<User, _>(&tx.rpc.payload, bincode::config::standard()) {
+    fn process(
+        &self,
+        _state: &AppState,
+        tx: &Transaction,
+        _execute: bool,
+        db_tx: &rusqlite::Transaction,
+    ) -> HandlerResult {
+        match bincode::serde::decode_from_slice::<User, _>(
+            &tx.rpc.payload,
+            bincode::config::standard(),
+        ) {
             Ok((user_data, _)) => {
                 insert_user_tx(db_tx, user_data)?;
                 Ok(())
-            },
+            }
             Err(_) => Err(DatabaseError::InvalidPayload),
         }
     }
@@ -25,12 +44,22 @@ inventory::submit! {
 pub struct UpdateUserProfileHandler;
 
 impl TransactionHandler for UpdateUserProfileHandler {
-    fn name(&self) -> &'static str { "update_user_profile" }
+    fn name(&self) -> &'static str {
+        "update_user_profile"
+    }
 
-    fn process(&self, _state: &AppState, tx: &Transaction, _execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
+    fn process(
+        &self,
+        _state: &AppState,
+        tx: &Transaction,
+        _execute: bool,
+        db_tx: &rusqlite::Transaction,
+    ) -> HandlerResult {
         let (payload, _) = bincode::serde::decode_from_slice::<UpdateUserProfilePayload, _>(
-            &tx.rpc.payload, bincode::config::standard()
-        ).map_err(|_| DatabaseError::InvalidPayload)?;
+            &tx.rpc.payload,
+            bincode::config::standard(),
+        )
+        .map_err(|_| DatabaseError::InvalidPayload)?;
 
         // Authorization: must be the authenticated user
         let user = tx.user.as_ref().ok_or(DatabaseError::AuthorizationError)?;
@@ -39,18 +68,24 @@ impl TransactionHandler for UpdateUserProfileHandler {
         }
 
         // Validation: user exists
-        db_tx.query_row(
-            "SELECT 1 FROM users WHERE user_id = ?",
-            [payload.user_id],
-            |_| Ok(())
-        ).map_err(|_| DatabaseError::NotFound)?;
+        db_tx
+            .query_row(
+                "SELECT 1 FROM users WHERE user_id = ?",
+                [payload.user_id],
+                |_| Ok(()),
+            )
+            .map_err(|_| DatabaseError::NotFound)?;
 
         // Validation: name fields <= 32 chars
         if let Some(Some(ref name)) = payload.first_name {
-            if name.len() > 32 { return Err(DatabaseError::InvalidPayload); }
+            if name.len() > 32 {
+                return Err(DatabaseError::InvalidPayload);
+            }
         }
         if let Some(Some(ref name)) = payload.last_name {
-            if name.len() > 32 { return Err(DatabaseError::InvalidPayload); }
+            if name.len() > 32 {
+                return Err(DatabaseError::InvalidPayload);
+            }
         }
 
         // Validation: avatar <= 128KB
@@ -81,12 +116,22 @@ inventory::submit! {
 pub struct UpdateUserOnboardingHandler;
 
 impl TransactionHandler for UpdateUserOnboardingHandler {
-    fn name(&self) -> &'static str { "update_user_onboarding" }
+    fn name(&self) -> &'static str {
+        "update_user_onboarding"
+    }
 
-    fn process(&self, _state: &AppState, tx: &Transaction, _execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
+    fn process(
+        &self,
+        _state: &AppState,
+        tx: &Transaction,
+        _execute: bool,
+        db_tx: &rusqlite::Transaction,
+    ) -> HandlerResult {
         let (payload, _) = bincode::serde::decode_from_slice::<UpdateUserOnboardingPayload, _>(
-            &tx.rpc.payload, bincode::config::standard()
-        ).map_err(|_| DatabaseError::InvalidPayload)?;
+            &tx.rpc.payload,
+            bincode::config::standard(),
+        )
+        .map_err(|_| DatabaseError::InvalidPayload)?;
 
         // Authorization: must be the authenticated user
         let user = tx.user.as_ref().ok_or(DatabaseError::AuthorizationError)?;
@@ -95,10 +140,13 @@ impl TransactionHandler for UpdateUserOnboardingHandler {
         }
 
         // Validation: user exists
-        db_tx.query_row(
-            "SELECT 1 FROM users WHERE user_id = ?",
-            [payload.user_id], |_| Ok(())
-        ).map_err(|_| DatabaseError::NotFound)?;
+        db_tx
+            .query_row(
+                "SELECT 1 FROM users WHERE user_id = ?",
+                [payload.user_id],
+                |_| Ok(()),
+            )
+            .map_err(|_| DatabaseError::NotFound)?;
 
         update_user_onboarding_tx(db_tx, &payload)?;
         Ok(())
@@ -126,7 +174,11 @@ mod tests {
         let jpeg_bytes = buf.into_inner();
 
         println!("Generated 256x256 JPEG avatar: {} bytes", jpeg_bytes.len());
-        assert!(jpeg_bytes.len() < 128_000, "JPEG avatar {} bytes exceeds 128KB handler limit", jpeg_bytes.len());
+        assert!(
+            jpeg_bytes.len() < 128_000,
+            "JPEG avatar {} bytes exceeds 128KB handler limit",
+            jpeg_bytes.len()
+        );
 
         let payload = UpdateUserProfilePayload {
             user_id: 1,
@@ -138,13 +190,18 @@ mod tests {
         // Encode then decode — this is the exact path the consensus handler takes
         let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard()).unwrap();
         let (decoded, _) = bincode::serde::decode_from_slice::<UpdateUserProfilePayload, _>(
-            &encoded, bincode::config::standard()
-        ).unwrap();
+            &encoded,
+            bincode::config::standard(),
+        )
+        .unwrap();
 
         assert_eq!(decoded.user_id, 1);
         assert_eq!(decoded.first_name, Some(Some("Alice".to_string())));
         assert_eq!(decoded.last_name, Some(None));
-        assert_eq!(decoded.avatar.as_ref().unwrap().as_ref().unwrap().len(), jpeg_bytes.len());
+        assert_eq!(
+            decoded.avatar.as_ref().unwrap().as_ref().unwrap().len(),
+            jpeg_bytes.len()
+        );
     }
 
     #[test]
@@ -160,7 +217,9 @@ mod tests {
 
         // Encode as PNG (what the frontend canvas toBlob produces)
         let mut png_buf = std::io::Cursor::new(Vec::new());
-        large_img.write_to(&mut png_buf, image::ImageFormat::Png).unwrap();
+        large_img
+            .write_to(&mut png_buf, image::ImageFormat::Png)
+            .unwrap();
         let png_bytes = png_buf.into_inner();
         println!("Input PNG: {} bytes ({}x{})", png_bytes.len(), 2048, 1536);
 
@@ -174,8 +233,11 @@ mod tests {
         let jpeg_bytes = jpeg_buf.into_inner();
         println!("Output JPEG: {} bytes (256x256)", jpeg_bytes.len());
 
-        assert!(jpeg_bytes.len() < 128_000,
-            "Resized avatar JPEG {} bytes exceeds 128KB handler limit", jpeg_bytes.len());
+        assert!(
+            jpeg_bytes.len() < 128_000,
+            "Resized avatar JPEG {} bytes exceeds 128KB handler limit",
+            jpeg_bytes.len()
+        );
 
         // Verify it round-trips through the consensus payload
         let payload = UpdateUserProfilePayload {
@@ -186,8 +248,10 @@ mod tests {
         };
         let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard()).unwrap();
         let (decoded, _) = bincode::serde::decode_from_slice::<UpdateUserProfilePayload, _>(
-            &encoded, bincode::config::standard()
-        ).unwrap();
+            &encoded,
+            bincode::config::standard(),
+        )
+        .unwrap();
         assert!(decoded.avatar.unwrap().unwrap().len() > 0);
     }
 
@@ -201,8 +265,10 @@ mod tests {
         };
         let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard()).unwrap();
         let (decoded, _) = bincode::serde::decode_from_slice::<UpdateUserOnboardingPayload, _>(
-            &encoded, bincode::config::standard()
-        ).unwrap();
+            &encoded,
+            bincode::config::standard(),
+        )
+        .unwrap();
         assert_eq!(decoded.user_id, 7);
         assert_eq!(decoded.set_flags.raw(), 0b11);
         assert_eq!(decoded.clear_flags.raw(), 0);
@@ -211,9 +277,12 @@ mod tests {
     #[test]
     fn test_onboarding_flag_iter_collect() {
         use hopnet_common::{OnboardingFlag, OnboardingFlags};
-        let flags: OnboardingFlags = vec![OnboardingFlag::ImportOffered, OnboardingFlag::ImportCompleted]
-            .into_iter()
-            .collect();
+        let flags: OnboardingFlags = vec![
+            OnboardingFlag::ImportOffered,
+            OnboardingFlag::ImportCompleted,
+        ]
+        .into_iter()
+        .collect();
         assert_eq!(flags.raw(), 0b11);
         let empty: OnboardingFlags = std::iter::empty::<OnboardingFlag>().collect();
         assert_eq!(empty, OnboardingFlags::NONE);
@@ -230,8 +299,10 @@ mod tests {
         };
         let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard()).unwrap();
         let (decoded, _) = bincode::serde::decode_from_slice::<UpdateUserProfilePayload, _>(
-            &encoded, bincode::config::standard()
-        ).unwrap();
+            &encoded,
+            bincode::config::standard(),
+        )
+        .unwrap();
         assert_eq!(decoded.user_id, 5);
         assert!(decoded.first_name.is_none());
         assert!(decoded.avatar.is_none());

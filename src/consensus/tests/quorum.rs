@@ -1,5 +1,7 @@
 use super::*;
-use crate::consensus::types::{Block, BlockData, QuorumCertificate, VoteSignData, VoteSignMessage, ConsensusPhase};
+use crate::consensus::types::{
+    Block, BlockData, ConsensusPhase, QuorumCertificate, VoteSignData, VoteSignMessage,
+};
 
 #[cfg(test)]
 mod quorum_tests {
@@ -17,11 +19,13 @@ mod quorum_tests {
         phase: ConsensusPhase,
         count: usize,
     ) -> Vec<VoteSignMessage> {
-        validators.iter()
+        validators
+            .iter()
             .take(count)
             .map(|validator| {
                 let vote_data = VoteSignData::from_block(block.clone(), phase.clone());
-                let signature = vote_data.sign(&validator.signing_key)
+                let signature = vote_data
+                    .sign(&validator.signing_key)
                     .expect("Failed to sign vote");
                 VoteSignMessage {
                     replica_id: validator.node_id,
@@ -46,11 +50,14 @@ mod quorum_tests {
         let phase = ConsensusPhase::Propose;
 
         // Get only 3 voters (insufficient for BFT quorum with 7 validators)
-        let all_nodes_except_leader: Vec<MockNode> = network.nodes.iter()
+        let all_nodes_except_leader: Vec<MockNode> = network
+            .nodes
+            .iter()
             .filter(|n| n.node_id != leader.node_id)
             .cloned()
             .collect();
-        let voter_signatures = create_vote_signatures(&all_nodes_except_leader, &block, phase.clone(), 3);
+        let voter_signatures =
+            create_vote_signatures(&all_nodes_except_leader, &block, phase.clone(), 3);
 
         let qc = QuorumCertificate::create_unverified(
             &block,
@@ -58,11 +65,18 @@ mod quorum_tests {
             leader.node_id,
             &leader.signing_key,
             voter_signatures,
-        ).expect("Failed to create QC");
+        )
+        .expect("Failed to create QC");
 
         let result = qc.verify(&leader.app_state, &block);
-        assert!(result.is_err(), "QC with 4/7 votes should fail in BFT mode (need 5)");
-        assert!(matches!(result.unwrap_err(), CertificateError::InsufficientVotes));
+        assert!(
+            result.is_err(),
+            "QC with 4/7 votes should fail in BFT mode (need 5)"
+        );
+        assert!(matches!(
+            result.unwrap_err(),
+            CertificateError::InsufficientVotes
+        ));
     }
 
     #[test]
@@ -79,11 +93,14 @@ mod quorum_tests {
         let phase = ConsensusPhase::Propose;
 
         // Get exactly 2 voters (3 total with proposer = simple majority threshold)
-        let all_nodes_except_leader: Vec<MockNode> = network.nodes.iter()
+        let all_nodes_except_leader: Vec<MockNode> = network
+            .nodes
+            .iter()
             .filter(|n| n.node_id != leader.node_id)
             .cloned()
             .collect();
-        let voter_signatures = create_vote_signatures(&all_nodes_except_leader, &block, phase.clone(), 2);
+        let voter_signatures =
+            create_vote_signatures(&all_nodes_except_leader, &block, phase.clone(), 2);
 
         let qc = QuorumCertificate::create_unverified(
             &block,
@@ -91,10 +108,15 @@ mod quorum_tests {
             leader.node_id,
             &leader.signing_key,
             voter_signatures,
-        ).expect("Failed to create QC");
+        )
+        .expect("Failed to create QC");
 
         let result = qc.verify(&leader.app_state, &block);
-        assert!(result.is_ok(), "QC with simple majority (3/5) should succeed in relaxed mode: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "QC with simple majority (3/5) should succeed in relaxed mode: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -111,11 +133,14 @@ mod quorum_tests {
         let phase = ConsensusPhase::Propose;
 
         // Get exactly 1 voter (2 total with proposer = simple majority threshold)
-        let all_nodes_except_leader: Vec<MockNode> = network.nodes.iter()
+        let all_nodes_except_leader: Vec<MockNode> = network
+            .nodes
+            .iter()
             .filter(|n| n.node_id != leader.node_id)
             .cloned()
             .collect();
-        let voter_signatures = create_vote_signatures(&all_nodes_except_leader, &block, phase.clone(), 1);
+        let voter_signatures =
+            create_vote_signatures(&all_nodes_except_leader, &block, phase.clone(), 1);
 
         let qc = QuorumCertificate::create_unverified(
             &block,
@@ -123,10 +148,15 @@ mod quorum_tests {
             leader.node_id,
             &leader.signing_key,
             voter_signatures,
-        ).expect("Failed to create QC");
+        )
+        .expect("Failed to create QC");
 
         let result = qc.verify(&leader.app_state, &block);
-        assert!(result.is_ok(), "QC with simple majority (2/3) should succeed in relaxed mode: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "QC with simple majority (2/3) should succeed in relaxed mode: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -142,11 +172,14 @@ mod quorum_tests {
         let phase = ConsensusPhase::Propose;
 
         // Get all non-leader nodes as voters (2 voters, exceeds 2-signature requirement)
-        let all_nodes_except_leader: Vec<MockNode> = network.nodes.iter()
+        let all_nodes_except_leader: Vec<MockNode> = network
+            .nodes
+            .iter()
             .filter(|n| n.node_id != leader.node_id)
             .cloned()
             .collect();
-        let voter_signatures = create_vote_signatures(&all_nodes_except_leader, &block, phase.clone(), 2);
+        let voter_signatures =
+            create_vote_signatures(&all_nodes_except_leader, &block, phase.clone(), 2);
 
         let qc = QuorumCertificate::create_unverified(
             &block,
@@ -154,10 +187,15 @@ mod quorum_tests {
             leader.node_id,
             &leader.signing_key,
             voter_signatures,
-        ).expect("Failed to create QC");
+        )
+        .expect("Failed to create QC");
 
         let result = qc.verify(&leader.app_state, &block);
-        assert!(result.is_ok(), "QC with all validators should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "QC with all validators should succeed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -179,11 +217,15 @@ mod quorum_tests {
             leader.node_id,
             &leader.signing_key,
             voter_signatures,
-        ).expect("Failed to create QC");
+        )
+        .expect("Failed to create QC");
 
         let result = qc.verify(&leader.app_state, &block);
         assert!(result.is_err(), "QC with only proposer should fail");
-        assert!(matches!(result.unwrap_err(), CertificateError::InsufficientVotes));
+        assert!(matches!(
+            result.unwrap_err(),
+            CertificateError::InsufficientVotes
+        ));
     }
 
     #[test]
@@ -200,11 +242,14 @@ mod quorum_tests {
         let phase = ConsensusPhase::Propose;
 
         // Get only 5 voters (insufficient for BFT quorum with 10 validators)
-        let all_nodes_except_leader: Vec<MockNode> = network.nodes.iter()
+        let all_nodes_except_leader: Vec<MockNode> = network
+            .nodes
+            .iter()
             .filter(|n| n.node_id != leader.node_id)
             .cloned()
             .collect();
-        let voter_signatures = create_vote_signatures(&all_nodes_except_leader, &block, phase.clone(), 5);
+        let voter_signatures =
+            create_vote_signatures(&all_nodes_except_leader, &block, phase.clone(), 5);
 
         let qc = QuorumCertificate::create_unverified(
             &block,
@@ -212,11 +257,18 @@ mod quorum_tests {
             leader.node_id,
             &leader.signing_key,
             voter_signatures,
-        ).expect("Failed to create QC");
+        )
+        .expect("Failed to create QC");
 
         let result = qc.verify(&leader.app_state, &block);
-        assert!(result.is_err(), "QC with 6 signatures should fail when 7 required in BFT mode");
-        assert!(matches!(result.unwrap_err(), CertificateError::InsufficientVotes));
+        assert!(
+            result.is_err(),
+            "QC with 6 signatures should fail when 7 required in BFT mode"
+        );
+        assert!(matches!(
+            result.unwrap_err(),
+            CertificateError::InsufficientVotes
+        ));
     }
 
     #[test]
@@ -232,11 +284,14 @@ mod quorum_tests {
         let phase = ConsensusPhase::Propose;
 
         // Get 6 voters (enough for BFT quorum with 10 validators)
-        let all_nodes_except_leader: Vec<MockNode> = network.nodes.iter()
+        let all_nodes_except_leader: Vec<MockNode> = network
+            .nodes
+            .iter()
             .filter(|n| n.node_id != leader.node_id)
             .cloned()
             .collect();
-        let voter_signatures = create_vote_signatures(&all_nodes_except_leader, &block, phase.clone(), 6);
+        let voter_signatures =
+            create_vote_signatures(&all_nodes_except_leader, &block, phase.clone(), 6);
 
         let qc = QuorumCertificate::create_unverified(
             &block,
@@ -244,9 +299,14 @@ mod quorum_tests {
             leader.node_id,
             &leader.signing_key,
             voter_signatures,
-        ).expect("Failed to create QC");
+        )
+        .expect("Failed to create QC");
 
         let result = qc.verify(&leader.app_state, &block);
-        assert!(result.is_ok(), "QC with BFT quorum should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "QC with BFT quorum should succeed: {:?}",
+            result.err()
+        );
     }
 }

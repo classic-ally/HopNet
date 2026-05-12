@@ -7,9 +7,9 @@ pub enum DatabaseError {
     ProcessingError,
     InvalidPayload,
     NotFound,
-    ConflictError,  // Resource already exists at the specified location/identifier
-    AuthorizationError,  // User or node not authorized for the operation
-    ValidationError  // Data validation failed (e.g., cryptographic verification, consistency checks)
+    ConflictError,      // Resource already exists at the specified location/identifier
+    AuthorizationError, // User or node not authorized for the operation
+    ValidationError, // Data validation failed (e.g., cryptographic verification, consistency checks)
 }
 
 use crate::db::{Blake3Hash, PrivKey, User};
@@ -18,14 +18,17 @@ pub struct MyNode {
     pub node_id: i32,
     pub privkey: PrivKey,
 }
+use chacha20poly1305::{
+    ChaCha20Poly1305,
+    aead::{Aead, KeyInit, OsRng},
+};
 use chrono::{DateTime, Utc};
 use either::Either;
-use serde::{Serialize, Deserialize};
-use rusqlite::types::{ToSql, ToSqlOutput, FromSql, FromSqlResult, ValueRef, FromSqlError};
-use x25519_dalek::{PublicKey as X25519PublicKey, EphemeralSecret};
-use chacha20poly1305::{ChaCha20Poly1305, aead::{Aead, OsRng, KeyInit}};
-use r2d2_sqlite::SqliteConnectionManager;
 pub use hopnet_common::CustomUUID;
+use r2d2_sqlite::SqliteConnectionManager;
+use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
+use serde::{Deserialize, Serialize};
+use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CustomDateTime(DateTime<Utc>);
@@ -59,31 +62,23 @@ impl FromSql for CustomDateTime {
                     .map(CustomDateTime)
                     .ok_or(FromSqlError::InvalidType)
             }
-            ValueRef::Text(str) => {
-                match std::str::from_utf8(str) {
-                    Ok(utf_value) => {
-                        match DateTime::parse_from_rfc3339(utf_value) {
-                            Ok(dt) => Ok(CustomDateTime(dt.with_timezone(&Utc))),
-                            Err(_) => Err(FromSqlError::InvalidType)
-                        }
-                    }
-                    Err(_) => Err(FromSqlError::InvalidType)
-                }
-            }
-            _ => {
-                Err(FromSqlError::InvalidType)
-            }
+            ValueRef::Text(str) => match std::str::from_utf8(str) {
+                Ok(utf_value) => match DateTime::parse_from_rfc3339(utf_value) {
+                    Ok(dt) => Ok(CustomDateTime(dt.with_timezone(&Utc))),
+                    Err(_) => Err(FromSqlError::InvalidType),
+                },
+                Err(_) => Err(FromSqlError::InvalidType),
+            },
+            _ => Err(FromSqlError::InvalidType),
         }
     }
 }
 
-
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 pub enum ChunkType {
     Original,
-    Recovery
+    Recovery,
 }
-
 
 impl ToSql for ChunkType {
     fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
@@ -122,7 +117,7 @@ pub struct Inode {
     pub inode_type: hopnet_common::InodeType,
     // if file, point to datablock
     // if folder, None
-    pub data_id: Option<Either<CustomUUID, DataRecord>>
+    pub data_id: Option<Either<CustomUUID, DataRecord>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -135,7 +130,7 @@ pub struct DataRecord {
     pub modified_at: Option<CustomDateTime>,
     pub data: Data,
     pub file_access_entries: Option<Vec<FileAccess>>,
-    pub file_size: u64,  // Total size of the file in bytes
+    pub file_size: u64, // Total size of the file in bytes
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -154,11 +149,11 @@ impl XPubKey {
     pub fn from_x25519(pubkey: X25519PublicKey) -> Self {
         XPubKey(pubkey)
     }
-    
+
     pub fn as_x25519(&self) -> &X25519PublicKey {
         &self.0
     }
-    
+
     pub fn as_bytes(&self) -> &[u8; 32] {
         self.0.as_bytes()
     }
@@ -203,7 +198,7 @@ pub struct FileAccess {
     pub data_block_id: CustomUUID,
     pub user_id: i32,
     pub ephemeral_pubkey: XPubKey,
-    pub encrypted_file_key: Vec<u8>,  // 48 bytes (32 key + 16 auth tag)
+    pub encrypted_file_key: Vec<u8>, // 48 bytes (32 key + 16 auth tag)
 }
 
 impl FileAccess {
@@ -224,10 +219,10 @@ impl FileAccess {
         // Generate ephemeral key pair for this file
         let ephemeral_secret = EphemeralSecret::random_from_rng(&mut OsRng);
         let ephemeral_public = X25519PublicKey::from(&ephemeral_secret);
-        
+
         // Perform ECDH with user's X25519 public key
         let shared_secret = ephemeral_secret.diffie_hellman(user.x25519_pubkey.as_x25519());
-        
+
         // Derive ChaCha20Poly1305 key from shared secret using Blake3
         let mut wrap_key_bytes = [0u8; 32];
         let mut hasher = blake3::Hasher::new_derive_key("hopnet key_wrap");
@@ -235,7 +230,7 @@ impl FileAccess {
         let mut xof = hasher.finalize_xof();
         xof.fill(&mut wrap_key_bytes);
         let wrap_key = chacha20poly1305::Key::from(wrap_key_bytes);
-        
+
         // Derive deterministic nonce from data_block_id + user_id + ephemeral_pubkey
         let mut nonce_bytes = [0u8; 12];
         let mut nonce_hasher = blake3::Hasher::new_derive_key("hopnet wrap_nonce");
@@ -244,12 +239,13 @@ impl FileAccess {
         nonce_hasher.update(ephemeral_public.as_bytes());
         nonce_hasher.finalize_xof().fill(&mut nonce_bytes);
         let wrap_nonce = chacha20poly1305::Nonce::from(nonce_bytes);
-        
+
         // Encrypt the per-file key
         let wrap_cipher = ChaCha20Poly1305::new(&wrap_key);
-        let encrypted_file_key = wrap_cipher.encrypt(&wrap_nonce, per_file_key.as_slice())
+        let encrypted_file_key = wrap_cipher
+            .encrypt(&wrap_nonce, per_file_key.as_slice())
             .map_err(|_| DatabaseError::ProcessingError)?;
-        
+
         Ok(FileAccess {
             data_block_id,
             user_id,
@@ -265,7 +261,9 @@ impl FileAccess {
         per_file_key: &chacha20poly1305::Key,
     ) -> Result<Self, DatabaseError> {
         match db_connection {
-            Ok(db_lock) => Self::new_for_user_with_conn(&db_lock, data_block_id, user_id, per_file_key),
+            Ok(db_lock) => {
+                Self::new_for_user_with_conn(&db_lock, data_block_id, user_id, per_file_key)
+            }
             Err(_) => Err(DatabaseError::LockError),
         }
     }
@@ -276,8 +274,8 @@ pub struct FragmentHash {
     pub data_block_id: CustomUUID,
     pub chunk_number: u32,
     pub local_index: u32,
-    pub fragment_id: CustomUUID,        // UUID v7 for chunk identification and nonce derivation
-    pub fragment_hash: Blake3Hash,      // Hash of encrypted chunk for storage verification
+    pub fragment_id: CustomUUID, // UUID v7 for chunk identification and nonce derivation
+    pub fragment_hash: Blake3Hash, // Hash of encrypted chunk for storage verification
     pub chunk_type: ChunkType,
     pub stored_locally: bool,
 }

@@ -5,9 +5,12 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    crane = {
+      url = "github:ipetkov/crane";
+    };
   };
 
-  outputs = { nixpkgs, rust-overlay, ... }:
+  outputs = { nixpkgs, rust-overlay, crane, ... }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
       forAllSystems = fn: nixpkgs.lib.genAttrs systems (system:
@@ -20,10 +23,8 @@
     {
       packages = forAllSystems (pkgs:
         let
-          rustPlatform = pkgs.makeRustPlatform {
-            cargo = pkgs.rust-bin.stable.latest.default;
-            rustc = pkgs.rust-bin.stable.latest.default;
-          };
+          rustToolchain = pkgs.rust-bin.stable.latest.default;
+          craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
           generatedTypes = pkgs.stdenvNoCC.mkDerivation {
             pname = "hopnet-generated-types";
@@ -85,31 +86,46 @@
             '';
           };
 
-          hopnet = rustPlatform.buildRustPackage {
-            pname = "hopnet";
-            version = "0.1.0";
-            src = ./.;
+          # crane shares one dependency-only build across every workspace
+          # rebuild. `buildDepsOnly` synthesizes a stub src (Cargo.toml +
+          # Cargo.lock only), compiles all third-party crates once, and
+          # stashes the resulting target/ in the Nix store keyed on the
+          # lockfile. Source-only edits then reuse those artifacts instead
+          # of recompiling 400+ crates from scratch — big win on slow CI
+          # boxes.
+          commonArgs = {
+            src = craneLib.cleanCargoSource ./.;
+            strictDeps = true;
 
-            cargoLock = {
-              lockFile = ./Cargo.lock;
+            cargoExtraArgs = "--features skip-frontend --bin hopnet";
+
+            # iroh fork lives in [patch.crates-io]; crane reads outputHashes
+            # from the same place buildRustPackage does.
+            cargoVendorDir = craneLib.vendorCargoDeps {
+              src = ./.;
               outputHashes = {
                 "iroh-0.96.1" = "sha256-+nasc9F8OsegyrdDGN/WsZ4niIZEz7Qe44qPN82sKKU=";
               };
             };
-
-            cargoBuildFlags = [ "--bin" "hopnet" ];
-            buildFeatures = [ "skip-frontend" ];
-
-            preBuild = ''
-              mkdir -p frontend/dist
-              cp -r ${frontend}/* frontend/dist/
-            '';
 
             nativeBuildInputs = [ pkgs.pkg-config ];
             buildInputs = [ pkgs.openssl ];
 
             doCheck = false;
           };
+
+          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+
+          hopnet = craneLib.buildPackage (commonArgs // {
+            inherit cargoArtifacts;
+            pname = "hopnet";
+            version = "0.1.0";
+
+            preBuild = ''
+              mkdir -p frontend/dist
+              cp -r ${frontend}/* frontend/dist/
+            '';
+          });
         in {
           default = hopnet;
         } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {

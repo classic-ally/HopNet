@@ -1,11 +1,11 @@
-use axum::response::{IntoResponse,Response};
-use serde::{Serialize, Deserialize, Deserializer, Serializer};
-use std::ops::Deref;
+use axum::response::{IntoResponse, Response};
+use bincode::{Decode, Encode};
 use ed25519_dalek::VerifyingKey;
-use bincode::{Encode, Decode};
-use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
-pub use ed25519_dalek::{SigningKey,Signer};
+pub use ed25519_dalek::{Signer, SigningKey};
 use hex;
+use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::ops::Deref;
 
 /// A wrapper around blake3::Hash that implements bincode's Encode and Decode traits
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
@@ -16,27 +16,27 @@ impl Blake3Hash {
     pub fn new(hash: blake3::Hash) -> Self {
         Self(hash)
     }
-    
+
     /// Get the inner blake3::Hash
     pub fn inner(&self) -> &blake3::Hash {
         &self.0
     }
-    
+
     /// Convert into the inner blake3::Hash
     pub fn into_inner(self) -> blake3::Hash {
         self.0
     }
-    
+
     /// Create from bytes
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(blake3::Hash::from(bytes))
     }
-    
+
     /// Get as bytes
     pub fn as_bytes(&self) -> &[u8] {
         self.0.as_bytes()
     }
-    
+
     /// Convert to hex string
     pub fn to_hex(&self) -> String {
         self.0.to_hex().to_string()
@@ -92,13 +92,17 @@ impl<'de> Deserialize<'de> for Blake3Hash {
             }
 
             fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-            where E: Error {
+            where
+                E: Error,
+            {
                 let bytes = hex::decode(value).map_err(E::custom)?;
                 self.visit_bytes(&bytes)
             }
 
             fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
-            where E: Error {
+            where
+                E: Error,
+            {
                 if value.len() != 32 {
                     return Err(E::custom("Blake3 hash must be exactly 32 bytes"));
                 }
@@ -135,7 +139,9 @@ impl<Context> Decode<Context> for Blake3Hash {
         // Decode as Vec<u8> and convert to [u8; 32]
         let bytes: Vec<u8> = Vec::decode(decoder)?;
         if bytes.len() != 32 {
-            return Err(bincode::error::DecodeError::Other("Blake3 hash must be exactly 32 bytes"));
+            return Err(bincode::error::DecodeError::Other(
+                "Blake3 hash must be exactly 32 bytes",
+            ));
         }
         let mut array = [0u8; 32];
         array.copy_from_slice(&bytes);
@@ -150,7 +156,9 @@ impl<'de, Context> bincode::BorrowDecode<'de, Context> for Blake3Hash {
         // Borrow decode as a slice and convert to [u8; 32]
         let bytes: &[u8] = bincode::BorrowDecode::borrow_decode(decoder)?;
         if bytes.len() != 32 {
-            return Err(bincode::error::DecodeError::Other("Blake3 hash must be exactly 32 bytes"));
+            return Err(bincode::error::DecodeError::Other(
+                "Blake3 hash must be exactly 32 bytes",
+            ));
         }
         let mut array = [0u8; 32];
         array.copy_from_slice(bytes);
@@ -163,10 +171,13 @@ impl FromSql for Blake3Hash {
         match value {
             ValueRef::Blob(bytes) => {
                 if bytes.len() != 32 {
-                    return Err(FromSqlError::Other(format!(
-                        "Blake3Hash must be exactly 32 bytes, got {} bytes",
-                        bytes.len()
-                    ).into()));
+                    return Err(FromSqlError::Other(
+                        format!(
+                            "Blake3Hash must be exactly 32 bytes, got {} bytes",
+                            bytes.len()
+                        )
+                        .into(),
+                    ));
                 }
                 let mut array = [0u8; 32];
                 array.copy_from_slice(bytes);
@@ -235,10 +246,10 @@ impl<'de> Deserialize<'de> for PubKey {
                 if value.len() != 32 {
                     return Err(E::custom("Public key must be exactly 32 bytes"));
                 }
-                
+
                 let mut array = [0u8; 32];
                 array.copy_from_slice(value);
-                
+
                 match VerifyingKey::from_bytes(&array) {
                     Ok(verifying_key) => Ok(PubKey(verifying_key)),
                     Err(_) => Err(E::custom("Invalid public key bytes")),
@@ -276,12 +287,11 @@ impl Deref for PubKey {
     }
 }
 
-
 impl ToSql for PubKey {
     fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
         match bincode::serde::encode_to_vec(&self, bincode::config::standard()) {
             Ok(data) => Ok(ToSqlOutput::Owned(rusqlite::types::Value::Blob(data))),
-            Err(e) => Err(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+            Err(e) => Err(rusqlite::Error::ToSqlConversionFailure(Box::new(e))),
         }
     }
 }
@@ -292,7 +302,7 @@ impl FromSql for PubKey {
             ValueRef::Blob(b) => {
                 match bincode::serde::decode_from_slice(b, bincode::config::standard()) {
                     Ok((data, _)) => Ok(PubKey(data)),
-                    Err(_) => Err(FromSqlError::InvalidType)
+                    Err(_) => Err(FromSqlError::InvalidType),
                 }
             }
             _ => Err(FromSqlError::InvalidType),
@@ -312,17 +322,17 @@ impl PubKey {
     /// Create a PubKey from a hex string (for parsing JSON responses)
     pub fn from_hex(hex_str: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let bytes = hex::decode(hex_str)?;
-        
+
         if bytes.len() != 32 {
             return Err("Public key must be exactly 32 bytes".into());
         }
-        
+
         let mut array = [0u8; 32];
         array.copy_from_slice(&bytes);
         let verifying_key = VerifyingKey::from_bytes(&array)?;
         Ok(PubKey(verifying_key))
     }
-    
+
     /// Convert to hex string
     pub fn to_hex(&self) -> String {
         hex::encode(self.0.to_bytes())
@@ -358,7 +368,7 @@ impl ToSql for PrivKey {
     fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
         match bincode::serde::encode_to_vec(&self, bincode::config::standard()) {
             Ok(data) => Ok(ToSqlOutput::Owned(rusqlite::types::Value::Blob(data))),
-            Err(e) => Err(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+            Err(e) => Err(rusqlite::Error::ToSqlConversionFailure(Box::new(e))),
         }
     }
 }
@@ -369,7 +379,7 @@ impl FromSql for PrivKey {
             ValueRef::Blob(b) => {
                 match bincode::serde::decode_from_slice(b, bincode::config::standard()) {
                     Ok((data, _)) => Ok(PrivKey(data)),
-                    Err(_) => Err(FromSqlError::InvalidType)
+                    Err(_) => Err(FromSqlError::InvalidType),
                 }
             }
             _ => Err(FromSqlError::InvalidType),
@@ -391,8 +401,8 @@ pub struct User {
     pub username: String,
     pub pubkey: PubKey,
     pub x25519_pubkey: crate::db::types::XPubKey,
-    pub encrypted_privkey: Vec<u8>,  // nonce || ChaCha20-Poly1305 ciphertext
-    pub key_salt: Vec<u8>,           // Argon2 salt
+    pub encrypted_privkey: Vec<u8>, // nonce || ChaCha20-Poly1305 ciphertext
+    pub key_salt: Vec<u8>,          // Argon2 salt
     pub first_name: Option<String>,
     pub last_name: Option<String>,
     pub avatar: Option<Vec<u8>>,
@@ -408,7 +418,18 @@ impl User {
         encrypted_privkey: Vec<u8>,
         key_salt: Vec<u8>,
     ) -> User {
-        User { user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt, first_name: None, last_name: None, avatar: None, onboarding_flags: hopnet_common::OnboardingFlags::NONE }
+        User {
+            user_id,
+            username,
+            pubkey,
+            x25519_pubkey,
+            encrypted_privkey,
+            key_salt,
+            first_name: None,
+            last_name: None,
+            avatar: None,
+            onboarding_flags: hopnet_common::OnboardingFlags::NONE,
+        }
     }
 }
 
@@ -437,5 +458,5 @@ pub struct NodeConnectionInfo {
 pub struct JoinInfo {
     pub node_id: i32,
     pub user_id: i32,
-    pub bootstrap_validators: Vec<Node>,  // Full node info for catch-up
+    pub bootstrap_validators: Vec<Node>, // Full node info for catch-up
 }

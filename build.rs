@@ -1,6 +1,6 @@
-use std::process::Command;
 use std::env;
 use std::path::Path;
+use std::process::Command;
 
 fn main() {
     // Handle Tauri build if GUI feature is enabled
@@ -36,7 +36,9 @@ fn main() {
 
         // Verify that dist exists (from a previous build)
         if !dist_dir.exists() {
-            println!("cargo:warning=No frontend dist found. Run 'cargo build --release' or 'cd frontend && pnpm build' to build frontend");
+            println!(
+                "cargo:warning=No frontend dist found. Run 'cargo build --release' or 'cd frontend && pnpm build' to build frontend"
+            );
             println!("cargo:warning=Continuing without frontend - app may not work correctly");
         } else {
             println!("cargo:warning=Using existing frontend dist from previous build");
@@ -54,17 +56,24 @@ fn main() {
         match Command::new("pnpm")
             .args(&["install"])
             .current_dir(&frontend_dir)
-            .output() {
+            .output()
+        {
             Ok(output) => {
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     let stdout = String::from_utf8_lossy(&output.stdout);
-                    panic!("pnpm install failed:\nSTDOUT: {}\nSTDERR: {}", stdout, stderr);
+                    panic!(
+                        "pnpm install failed:\nSTDOUT: {}\nSTDERR: {}",
+                        stdout, stderr
+                    );
                 }
                 println!("cargo:warning=Frontend dependencies installed successfully");
             }
             Err(e) => {
-                println!("cargo:warning=pnpm install failed: {} - skipping frontend build", e);
+                println!(
+                    "cargo:warning=pnpm install failed: {} - skipping frontend build",
+                    e
+                );
                 println!("cargo:warning=To build frontend, install pnpm or use pre-built dist");
             }
         }
@@ -75,23 +84,33 @@ fn main() {
     match Command::new("pnpm")
         .args(&["run", "build"])
         .current_dir(&frontend_dir)
-        .output() {
+        .output()
+    {
         Ok(output) => {
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                panic!("pnpm run build failed:\nSTDOUT: {}\nSTDERR: {}", stdout, stderr);
+                panic!(
+                    "pnpm run build failed:\nSTDOUT: {}\nSTDERR: {}",
+                    stdout, stderr
+                );
             }
         }
         Err(e) => {
-            println!("cargo:warning=pnpm run build failed: {} - skipping frontend build", e);
+            println!(
+                "cargo:warning=pnpm run build failed: {} - skipping frontend build",
+                e
+            );
             println!("cargo:warning=To build frontend, install pnpm or use pre-built dist");
         }
     }
 
     // Verify that the dist directory was created
     if !dist_dir.exists() {
-        panic!("Frontend dist directory not found at: {} - either build frontend with pnpm or provide pre-built dist", dist_dir.display());
+        panic!(
+            "Frontend dist directory not found at: {} - either build frontend with pnpm or provide pre-built dist",
+            dist_dir.display()
+        );
     }
 
     println!("cargo:warning=Frontend build completed successfully");

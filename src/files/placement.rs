@@ -1,6 +1,6 @@
-use crate::types::Blake3Hash;
-use crate::db::metrics::NodeMetrics;
 use crate::db::Node;
+use crate::db::metrics::NodeMetrics;
+use crate::types::Blake3Hash;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FragmentType {
@@ -32,13 +32,17 @@ pub fn select_nodes_for_file(
 ) -> Vec<Node> {
     // Strategy 1: Small network (≤30 validators) - use ALL for maximum failure tolerance
     if validators.len() <= 30 {
-        tracing::debug!("Small network ({}≤30): using all validators", validators.len());
-        return validators;  // Early exit - no metrics filtering needed
+        tracing::debug!(
+            "Small network ({}≤30): using all validators",
+            validators.len()
+        );
+        return validators; // Early exit - no metrics filtering needed
     }
 
     // Strategy 2: Large network (>30 validators) - select best 30
     // Step 1: Filter metrics to only active validators
-    let validator_ids: std::collections::HashSet<i32> = validators.iter().map(|v| v.node_id).collect();
+    let validator_ids: std::collections::HashSet<i32> =
+        validators.iter().map(|v| v.node_id).collect();
     let validator_metrics: Vec<NodeMetrics> = all_metrics
         .into_iter()
         .filter(|m| validator_ids.contains(&m.node_id))
@@ -51,10 +55,8 @@ pub fn select_nodes_for_file(
     );
 
     // Step 2: Score all validator metrics (using FragmentType::Original for base scoring)
-    let mut scored_candidates = calculate_final_placement_scores(
-        validator_metrics,
-        FragmentType::Original,
-    );
+    let mut scored_candidates =
+        calculate_final_placement_scores(validator_metrics, FragmentType::Original);
 
     // Step 3: Take top 60 candidates (2× target for diversity)
     let top_count = 60.min(scored_candidates.len());
@@ -66,7 +68,10 @@ pub fn select_nodes_for_file(
     let mut top_nodes: Vec<Node> = scored_candidates
         .into_iter()
         .filter_map(|candidate| {
-            validators.iter().find(|v| v.node_id == candidate.node_id).cloned()
+            validators
+                .iter()
+                .find(|v| v.node_id == candidate.node_id)
+                .cloned()
         })
         .collect();
 
@@ -108,8 +113,14 @@ fn deterministic_shuffle(nodes: &mut [Node], seed: &Blake3Hash) {
 
         // Use first 8 bytes of hash as u64 for swap index
         let random_value = u64::from_be_bytes([
-            hash.as_bytes()[0], hash.as_bytes()[1], hash.as_bytes()[2], hash.as_bytes()[3],
-            hash.as_bytes()[4], hash.as_bytes()[5], hash.as_bytes()[6], hash.as_bytes()[7],
+            hash.as_bytes()[0],
+            hash.as_bytes()[1],
+            hash.as_bytes()[2],
+            hash.as_bytes()[3],
+            hash.as_bytes()[4],
+            hash.as_bytes()[5],
+            hash.as_bytes()[6],
+            hash.as_bytes()[7],
         ]);
 
         // Fisher-Yates: swap current with random element from remaining
@@ -153,7 +164,7 @@ pub fn get_fragment_placement(local_index: u32, selected_nodes: &[Node]) -> Vec<
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Phase2Candidate {
     pub node_id: i32,
-    pub final_score: f64,  // Weighted score for placement ranking
+    pub final_score: f64, // Weighted score for placement ranking
 }
 
 /// RFC-004 scoring weights: availability, throughput, latency, stability
@@ -172,20 +183,20 @@ pub fn calculate_final_placement_scores(
             let base_score = match fragment_type {
                 FragmentType::Original => {
                     // Standard scoring: higher performance = higher score
-                    metrics.availability_score * PLACEMENT_WEIGHTS.0 +
-                    metrics.throughput_score * PLACEMENT_WEIGHTS.1 +
-                    metrics.latency_score * PLACEMENT_WEIGHTS.2 +
-                    metrics.stability_score * PLACEMENT_WEIGHTS.3
+                    metrics.availability_score * PLACEMENT_WEIGHTS.0
+                        + metrics.throughput_score * PLACEMENT_WEIGHTS.1
+                        + metrics.latency_score * PLACEMENT_WEIGHTS.2
+                        + metrics.stability_score * PLACEMENT_WEIGHTS.3
                 }
                 FragmentType::Recovery => {
                     // Inverse scoring for geographic diversity and load distribution
                     metrics.availability_score * PLACEMENT_WEIGHTS.0 +
                     (1.0 - metrics.throughput_score) * PLACEMENT_WEIGHTS.1 + // Prefer lower throughput nodes
                     (1.0 - metrics.latency_score) * PLACEMENT_WEIGHTS.2 +    // Prefer higher latency (distant) nodes
-                    (1.0 - metrics.stability_score) * PLACEMENT_WEIGHTS.3     // Prefer less stable nodes for diversity
+                    (1.0 - metrics.stability_score) * PLACEMENT_WEIGHTS.3 // Prefer less stable nodes for diversity
                 }
             };
-            
+
             // Apply trust factor blending for new nodes
             let trusted_score = if metrics.trust_factor < 1.0 {
                 // Blend measured score with conservative fallback (0.5)
@@ -193,17 +204,17 @@ pub fn calculate_final_placement_scores(
             } else {
                 base_score
             };
-            
+
             // Apply storage multiplier (e^(-5 * utilization))
             let final_score = trusted_score * metrics.storage_multiplier;
-            
+
             Phase2Candidate {
                 node_id: metrics.node_id,
                 final_score,
             }
         })
         .collect();
-    
+
     // Sort by final score (descending - best first)
     candidates.sort_by(|a, b| b.final_score.partial_cmp(&a.final_score).unwrap());
 
@@ -213,7 +224,7 @@ pub fn calculate_final_placement_scores(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{SqliteConnectionManager, PubKey};
+    use crate::db::{PubKey, SqliteConnectionManager};
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
 
@@ -338,7 +349,10 @@ mod tests {
         // Order should be different (deterministic shuffle with different seeds)
         // At least some positions should differ
         let differences = ids1.iter().zip(ids2.iter()).filter(|(a, b)| a != b).count();
-        assert!(differences > 0, "Expected different orderings for different file hashes");
+        assert!(
+            differences > 0,
+            "Expected different orderings for different file hashes"
+        );
     }
 
     #[test]
@@ -386,15 +400,15 @@ mod tests {
         let placement = get_fragment_placement(9, &nodes);
         assert_eq!(placement.len(), 3);
         assert_eq!(placement[0].node_id, 10); // nodes[9] - primary
-        assert_eq!(placement[1].node_id, 1);  // nodes[0] - wraparound backup1
-        assert_eq!(placement[2].node_id, 2);  // nodes[1] - wraparound backup2
+        assert_eq!(placement[1].node_id, 1); // nodes[0] - wraparound backup1
+        assert_eq!(placement[2].node_id, 2); // nodes[1] - wraparound backup2
 
         // Fragment 8 should have one wraparound backup
         let placement = get_fragment_placement(8, &nodes);
         assert_eq!(placement.len(), 3);
-        assert_eq!(placement[0].node_id, 9);  // nodes[8] - primary
+        assert_eq!(placement[0].node_id, 9); // nodes[8] - primary
         assert_eq!(placement[1].node_id, 10); // nodes[9] - backup1
-        assert_eq!(placement[2].node_id, 1);  // nodes[0] - wraparound backup2
+        assert_eq!(placement[2].node_id, 1); // nodes[0] - wraparound backup2
     }
 
     #[test]
@@ -444,7 +458,10 @@ mod tests {
         // Expected: 30/7 = 4.28, so nodes get 4 or 5 fragments
         let min_count = *primary_counts.iter().min().unwrap();
         let max_count = *primary_counts.iter().max().unwrap();
-        assert!(max_count - min_count <= 1, "Max imbalance should be ±1 fragment");
+        assert!(
+            max_count - min_count <= 1,
+            "Max imbalance should be ±1 fragment"
+        );
 
         // Verify total is 30
         let total: i32 = primary_counts.iter().sum();

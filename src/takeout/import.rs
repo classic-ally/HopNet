@@ -8,26 +8,26 @@
 //! and hash-verify each file. Phase 3.5 will pick up creation from the same
 //! per-path table.
 
+use axum::Router;
 use axum::extract::{DefaultBodyLimit, Extension, Multipart, State};
 use axum::http::StatusCode;
 use axum::response::Json;
 use axum::routing::get;
-use axum::Router;
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use tokio_stream::StreamExt;
 use tokio_util::io::StreamReader;
 
+use crate::AppState;
 use crate::auth::SessionEntry;
+use crate::db::CustomUUID;
 use crate::db::import_paths;
 use crate::db::imports::{self, ImportPayload, ImportStatusPayload};
-use crate::db::CustomUUID;
-use crate::takeout::archive::{read_manifest_from_archive, ImportArchiveError};
-use crate::takeout::manifest::{TakeoutManifest, ARCHIVE_FILES_PREFIX};
 use crate::takeout::STORAGE_SAFETY_MARGIN_BYTES;
+use crate::takeout::archive::{ImportArchiveError, read_manifest_from_archive};
+use crate::takeout::manifest::{ARCHIVE_FILES_PREFIX, TakeoutManifest};
 use crate::types::Blake3Hash;
-use crate::AppState;
 use hopnet_common::{ImportPathCounts, ImportPathRow, ImportRecord, ImportStatus, InodeType};
 
 /// Router for `/takeout/import` and its children. Mounted from
@@ -62,7 +62,10 @@ async fn get_current_import(
     State(app_state): State<AppState>,
     Extension(user_id): Extension<i32>,
 ) -> Result<Json<Option<ImportRecord>>, StatusCode> {
-    let conn = app_state.db_pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let conn = app_state
+        .db_pool
+        .get()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     match imports::get_current_import_for_user(&conn, user_id) {
         Ok(record) => Ok(Json(record)),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
@@ -76,7 +79,10 @@ async fn get_current_import_paths(
     State(app_state): State<AppState>,
     Extension(user_id): Extension<i32>,
 ) -> Result<Json<Vec<ImportPathRow>>, StatusCode> {
-    let conn = app_state.db_pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let conn = app_state
+        .db_pool
+        .get()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let record = imports::get_current_import_for_user(&conn, user_id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
@@ -102,7 +108,10 @@ async fn get_current_import_status(
     State(app_state): State<AppState>,
     Extension(user_id): Extension<i32>,
 ) -> Result<Json<ImportPathCounts>, StatusCode> {
-    let conn = app_state.db_pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let conn = app_state
+        .db_pool
+        .get()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let record = imports::get_current_import_for_user(&conn, user_id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
@@ -234,11 +243,10 @@ pub async fn process_upload(
 
     // 5. Read manifest from staging in spawn_blocking (sync tar reads).
     let upload_path_for_blocking = upload_path.clone();
-    let manifest_result = tokio::task::spawn_blocking(move || {
-        read_manifest_from_archive(&upload_path_for_blocking)
-    })
-    .await
-    .map_err(|e| ImportUploadError::Internal(format!("spawn_blocking join: {}", e)))?;
+    let manifest_result =
+        tokio::task::spawn_blocking(move || read_manifest_from_archive(&upload_path_for_blocking))
+            .await
+            .map_err(|e| ImportUploadError::Internal(format!("spawn_blocking join: {}", e)))?;
     let manifest: TakeoutManifest = match manifest_result {
         Ok(m) => m,
         Err(e) => {
@@ -282,7 +290,10 @@ pub async fn process_upload(
 
     tracing::info!(
         "Initiated import {} for user {} ({} files, {} bytes manifest)",
-        import_id, user_id, manifest.total_files, manifest.total_bytes
+        import_id,
+        user_id,
+        manifest.total_files,
+        manifest.total_bytes
     );
 
     let record = payload.to_record();
@@ -363,7 +374,10 @@ async fn check_quota(
         .ok_or(ImportUploadError::SizeOverflow)?;
 
     if required > available {
-        return Err(ImportUploadError::QuotaExceeded { required, available });
+        return Err(ImportUploadError::QuotaExceeded {
+            required,
+            available,
+        });
     }
     Ok(())
 }
@@ -469,7 +483,8 @@ async fn run_extraction(
 
     tracing::info!(
         "Extraction complete for import {} (user {}); starting creation walk",
-        import_id, user_id
+        import_id,
+        user_id
     );
 
     // 4. Phase 3.5 creation walk: folders (depth-asc) → files → terminal flip.
@@ -512,8 +527,19 @@ pub(crate) async fn run_creation_phase(
         match crate::files::helpers::create_folder(state, user_id, &absolute).await {
             Ok(()) => mark_imported(state, import_id, path)?,
             Err(status) => {
-                tracing::warn!("create_folder {} failed for import {}: {}", path, import_id, status);
-                mark_failed(state, import_id, path, "create_folder", &format!("status {}", status.as_u16()))?;
+                tracing::warn!(
+                    "create_folder {} failed for import {}: {}",
+                    path,
+                    import_id,
+                    status
+                );
+                mark_failed(
+                    state,
+                    import_id,
+                    path,
+                    "create_folder",
+                    &format!("status {}", status.as_u16()),
+                )?;
             }
         }
     }
@@ -527,7 +553,13 @@ pub(crate) async fn run_creation_phase(
         match create_one_file(state, user_id, &files_root, path).await {
             Ok(()) => mark_imported(state, import_id, path)?,
             Err((code, message)) => {
-                tracing::warn!("create_file {} failed for import {}: {} ({})", path, import_id, code, message);
+                tracing::warn!(
+                    "create_file {} failed for import {}: {} ({})",
+                    path,
+                    import_id,
+                    code,
+                    message
+                );
                 mark_failed(state, import_id, path, code, &message)?;
             }
         }
@@ -542,10 +574,18 @@ pub(crate) async fn run_creation_phase(
     if let Err(e) = crate::users::helpers::submit_onboarding_update(
         state,
         user_id,
-        hopnet_common::OnboardingFlags::IMPORT_OFFERED | hopnet_common::OnboardingFlags::IMPORT_COMPLETED,
+        hopnet_common::OnboardingFlags::IMPORT_OFFERED
+            | hopnet_common::OnboardingFlags::IMPORT_COMPLETED,
         hopnet_common::OnboardingFlags::NONE,
-    ).await {
-        tracing::warn!("onboarding flag update for user {} after import {} failed: {}", user_id, import_id, e);
+    )
+    .await
+    {
+        tracing::warn!(
+            "onboarding flag update for user {} after import {} failed: {}",
+            user_id,
+            import_id,
+            e
+        );
     }
 
     // 4. Remove staging dir; per-file extracted bytes are no longer needed
@@ -559,7 +599,9 @@ pub(crate) async fn run_creation_phase(
 
     tracing::info!(
         "Import {} complete: {} folders + {} files attempted",
-        import_id, folder_paths.len(), file_paths.len()
+        import_id,
+        folder_paths.len(),
+        file_paths.len()
     );
     Ok(())
 }
@@ -635,12 +677,7 @@ async fn create_one_file(
     };
 
     crate::files::helpers::create_file_with_fragments(
-        state,
-        user_id,
-        &parent,
-        &filename,
-        source,
-        file_size,
+        state, user_id, &parent, &filename, source, file_size,
     )
     .await
     .map(|_data_block_id| ())
@@ -710,14 +747,14 @@ async fn submit_status_update(
     )
     .await
     .map_err(|_| ImportExtractError::ConsensusFailed)?;
-    state
-        .consensus_queue
-        .submit(txn)
-        .await
-        .map_err(|e| {
-            tracing::error!("update_import_status submit failed for {}: {:?}", import_id, e);
-            ImportExtractError::ConsensusFailed
-        })?;
+    state.consensus_queue.submit(txn).await.map_err(|e| {
+        tracing::error!(
+            "update_import_status submit failed for {}: {:?}",
+            import_id,
+            e
+        );
+        ImportExtractError::ConsensusFailed
+    })?;
     Ok(())
 }
 
@@ -746,7 +783,8 @@ fn walk_archive_entries(
 
     // Discard the manifest entry (already validated in 3.3).
     if let Some(first) = entries.next() {
-        let _ = first.map_err(|e| ImportExtractError::ArchiveRead(format!("first entry: {}", e)))?;
+        let _ =
+            first.map_err(|e| ImportExtractError::ArchiveRead(format!("first entry: {}", e)))?;
     }
 
     for entry_result in entries {
@@ -842,7 +880,11 @@ fn walk_archive_entries(
                 }
             }
             other => {
-                tracing::debug!("Skipping unsupported tar entry type {:?} in {}", other, import_id);
+                tracing::debug!(
+                    "Skipping unsupported tar entry type {:?} in {}",
+                    other,
+                    import_id
+                );
             }
         }
     }
@@ -852,7 +894,10 @@ fn walk_archive_entries(
 /// Per-file extraction failure category. Maps to `error_code` on the path row.
 enum ExtractFailure {
     Io(std::io::Error),
-    HashMismatch { expected: Blake3Hash, computed: Blake3Hash },
+    HashMismatch {
+        expected: Blake3Hash,
+        computed: Blake3Hash,
+    },
 }
 
 impl ExtractFailure {

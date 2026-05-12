@@ -1,6 +1,6 @@
+use super::types::UpdateUserOnboardingPayload;
 use crate::AppState;
 use hopnet_common::OnboardingFlags;
-use super::types::UpdateUserOnboardingPayload;
 
 /// Submit a `update_user_onboarding` consensus transaction. Used by the
 /// `PUT /users/me/onboarding` route and by import-completion side effects.
@@ -11,7 +11,11 @@ pub async fn submit_onboarding_update(
     set_flags: OnboardingFlags,
     clear_flags: OnboardingFlags,
 ) -> Result<(), String> {
-    let payload = UpdateUserOnboardingPayload { user_id, set_flags, clear_flags };
+    let payload = UpdateUserOnboardingPayload {
+        user_id,
+        set_flags,
+        clear_flags,
+    };
     let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
         .map_err(|e| format!("encode: {:?}", e))?;
     let txn = crate::consensus::functions::create_signed_user_transaction(

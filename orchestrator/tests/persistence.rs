@@ -4,10 +4,10 @@ use reqwest::Client;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
-use crate::tests::{Check, TestResult, TestScenario, print_and_add_check};
-use crate::tests::files::{upload_file, download_file_from_all_nodes_with_timeout};
-use crate::tests::{get_max_view, wait_for_minimum_view};
 use crate::NodeInfo;
+use crate::tests::files::{download_file_from_all_nodes_with_timeout, upload_file};
+use crate::tests::{Check, TestResult, TestScenario, print_and_add_check};
+use crate::tests::{get_max_view, wait_for_minimum_view};
 
 // ============================================================================
 // Container Lifecycle Utilities
@@ -16,9 +16,11 @@ use crate::NodeInfo;
 /// Stop a container by node ID
 pub async fn stop_node(docker: &Docker, mesh_id: u32, node_id: u32) -> Result<()> {
     let containers = docker
-        .list_containers(Some(bollard::query_parameters::ListContainersOptionsBuilder::new()
-            .all(true)
-            .build()))
+        .list_containers(Some(
+            bollard::query_parameters::ListContainersOptionsBuilder::new()
+                .all(true)
+                .build(),
+        ))
         .await?;
 
     for container in containers {
@@ -36,15 +38,21 @@ pub async fn stop_node(docker: &Docker, mesh_id: u32, node_id: u32) -> Result<()
         }
     }
 
-    Err(anyhow::anyhow!("Container for mesh {} node {} not found", mesh_id, node_id))
+    Err(anyhow::anyhow!(
+        "Container for mesh {} node {} not found",
+        mesh_id,
+        node_id
+    ))
 }
 
 /// Start a container by node ID
 pub async fn start_node(docker: &Docker, mesh_id: u32, node_id: u32) -> Result<()> {
     let containers = docker
-        .list_containers(Some(bollard::query_parameters::ListContainersOptionsBuilder::new()
-            .all(true)
-            .build()))
+        .list_containers(Some(
+            bollard::query_parameters::ListContainersOptionsBuilder::new()
+                .all(true)
+                .build(),
+        ))
         .await?;
 
     for container in containers {
@@ -54,7 +62,10 @@ pub async fn start_node(docker: &Docker, mesh_id: u32, node_id: u32) -> Result<(
             {
                 if let Some(id) = &container.id {
                     docker
-                        .start_container(id, None::<bollard::query_parameters::StartContainerOptions>)
+                        .start_container(
+                            id,
+                            None::<bollard::query_parameters::StartContainerOptions>,
+                        )
                         .await?;
                     return Ok(());
                 }
@@ -62,7 +73,11 @@ pub async fn start_node(docker: &Docker, mesh_id: u32, node_id: u32) -> Result<(
         }
     }
 
-    Err(anyhow::anyhow!("Container for mesh {} node {} not found", mesh_id, node_id))
+    Err(anyhow::anyhow!(
+        "Container for mesh {} node {} not found",
+        mesh_id,
+        node_id
+    ))
 }
 
 /// Wait for a node to become responsive after restart
@@ -134,11 +149,14 @@ impl TestScenario for RestartPersistence {
         println!("\nRunning checks:");
 
         if nodes.len() < 3 {
-            print_and_add_check(&mut result, Check {
-                name: "Insufficient nodes".to_string(),
-                passed: false,
-                detail: Some(format!("Need at least 3 nodes, found {}", nodes.len())),
-            });
+            print_and_add_check(
+                &mut result,
+                Check {
+                    name: "Insufficient nodes".to_string(),
+                    passed: false,
+                    detail: Some(format!("Need at least 3 nodes, found {}", nodes.len())),
+                },
+            );
             result.duration = start.elapsed();
             return Ok(result);
         }
@@ -155,19 +173,25 @@ impl TestScenario for RestartPersistence {
         // Step 1: Get node 1's public key (proves identity)
         let pubkey_before = match get_node_pubkey(&nodes[1]).await {
             Ok(key) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Get node 1 pubkey before restart".to_string(),
-                    passed: true,
-                    detail: Some(format!("{}...", &key[..16])),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Get node 1 pubkey before restart".to_string(),
+                        passed: true,
+                        detail: Some(format!("{}...", &key[..16])),
+                    },
+                );
                 key
             }
             Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Failed to get pubkey".to_string(),
-                    passed: false,
-                    detail: Some(e.to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Failed to get pubkey".to_string(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
                 result.duration = start.elapsed();
                 return Ok(result);
             }
@@ -177,11 +201,14 @@ impl TestScenario for RestartPersistence {
         let initial_view = match get_max_view(nodes).await {
             Ok(view) => view,
             Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Failed to get initial view".to_string(),
-                    passed: false,
-                    detail: Some(e.to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Failed to get initial view".to_string(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
                 result.duration = start.elapsed();
                 return Ok(result);
             }
@@ -189,18 +216,24 @@ impl TestScenario for RestartPersistence {
 
         match upload_file(&nodes[0], test_path, &test_filename, test_contents.clone()).await {
             Ok(_) => {
-                print_and_add_check(&mut result, Check {
-                    name: format!("Upload {} to node 0", test_filename),
-                    passed: true,
-                    detail: Some(format!("{} bytes", test_contents.len())),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: format!("Upload {} to node 0", test_filename),
+                        passed: true,
+                        detail: Some(format!("{} bytes", test_contents.len())),
+                    },
+                );
             }
             Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Upload failed".to_string(),
-                    passed: false,
-                    detail: Some(e.to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Upload failed".to_string(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
                 result.duration = start.elapsed();
                 return Ok(result);
             }
@@ -210,27 +243,36 @@ impl TestScenario for RestartPersistence {
         let target_view = initial_view + 1;
         match wait_for_minimum_view(nodes, target_view, Duration::from_secs(15)).await {
             Ok(true) => {
-                print_and_add_check(&mut result, Check {
-                    name: format!("Consensus reached view {}", target_view),
-                    passed: true,
-                    detail: None,
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: format!("Consensus reached view {}", target_view),
+                        passed: true,
+                        detail: None,
+                    },
+                );
             }
             Ok(false) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Consensus timeout".to_string(),
-                    passed: false,
-                    detail: Some(format!("Failed to reach view {} in 15s", target_view)),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Consensus timeout".to_string(),
+                        passed: false,
+                        detail: Some(format!("Failed to reach view {} in 15s", target_view)),
+                    },
+                );
                 result.duration = start.elapsed();
                 return Ok(result);
             }
             Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Consensus check failed".to_string(),
-                    passed: false,
-                    detail: Some(e.to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Consensus check failed".to_string(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
                 result.duration = start.elapsed();
                 return Ok(result);
             }
@@ -240,18 +282,24 @@ impl TestScenario for RestartPersistence {
         let docker = Docker::connect_with_local_defaults()?;
         match stop_node(&docker, mesh_id, nodes[1].node_id).await {
             Ok(_) => {
-                print_and_add_check(&mut result, Check {
-                    name: format!("Stop node {}", nodes[1].node_id),
-                    passed: true,
-                    detail: None,
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: format!("Stop node {}", nodes[1].node_id),
+                        passed: true,
+                        detail: None,
+                    },
+                );
             }
             Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Failed to stop node".to_string(),
-                    passed: false,
-                    detail: Some(e.to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Failed to stop node".to_string(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
                 result.duration = start.elapsed();
                 return Ok(result);
             }
@@ -263,18 +311,24 @@ impl TestScenario for RestartPersistence {
         // Step 5: Restart node 1
         match start_node(&docker, mesh_id, nodes[1].node_id).await {
             Ok(_) => {
-                print_and_add_check(&mut result, Check {
-                    name: format!("Restart node {}", nodes[1].node_id),
-                    passed: true,
-                    detail: None,
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: format!("Restart node {}", nodes[1].node_id),
+                        passed: true,
+                        detail: None,
+                    },
+                );
             }
             Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Failed to restart node".to_string(),
-                    passed: false,
-                    detail: Some(e.to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Failed to restart node".to_string(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
                 result.duration = start.elapsed();
                 return Ok(result);
             }
@@ -283,27 +337,36 @@ impl TestScenario for RestartPersistence {
         // Step 6: Wait for node 1 to become ready
         match wait_for_node_ready(&nodes[1], Duration::from_secs(30)).await {
             Ok(true) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Node 1 responsive after restart".to_string(),
-                    passed: true,
-                    detail: None,
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Node 1 responsive after restart".to_string(),
+                        passed: true,
+                        detail: None,
+                    },
+                );
             }
             Ok(false) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Node 1 startup timeout".to_string(),
-                    passed: false,
-                    detail: Some("Node did not respond within 30s".to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Node 1 startup timeout".to_string(),
+                        passed: false,
+                        detail: Some("Node did not respond within 30s".to_string()),
+                    },
+                );
                 result.duration = start.elapsed();
                 return Ok(result);
             }
             Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Node readiness check failed".to_string(),
-                    passed: false,
-                    detail: Some(e.to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Node readiness check failed".to_string(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
                 result.duration = start.elapsed();
                 return Ok(result);
             }
@@ -311,21 +374,34 @@ impl TestScenario for RestartPersistence {
 
         // Step 7: Get fresh JWT token for restarted node (JWT keys are regenerated on startup)
         let docker = Docker::connect_with_local_defaults()?;
-        let fresh_jwt = match crate::get_jwt_token(&docker, mesh_id, nodes[1].node_id, crate::sys::ContainerRuntime::Docker).await {
+        let fresh_jwt = match crate::get_jwt_token(
+            &docker,
+            mesh_id,
+            nodes[1].node_id,
+            crate::sys::ContainerRuntime::Docker,
+        )
+        .await
+        {
             Ok(token) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Obtain fresh JWT token after restart".to_string(),
-                    passed: true,
-                    detail: None,
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Obtain fresh JWT token after restart".to_string(),
+                        passed: true,
+                        detail: None,
+                    },
+                );
                 token
             }
             Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Failed to get fresh JWT token".to_string(),
-                    passed: false,
-                    detail: Some(e.to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Failed to get fresh JWT token".to_string(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
                 result.duration = start.elapsed();
                 return Ok(result);
             }
@@ -340,80 +416,119 @@ impl TestScenario for RestartPersistence {
         match get_node_pubkey(&nodes[1]).await {
             Ok(pubkey_after) => {
                 let keys_match = pubkey_before == pubkey_after;
-                print_and_add_check(&mut result, Check {
-                    name: "Node identity preserved".to_string(),
-                    passed: keys_match,
-                    detail: if keys_match {
-                        Some("Public key matches (privkey persisted)".to_string())
-                    } else {
-                        Some(format!("Before: {}..., After: {}...", &pubkey_before[..16], &pubkey_after[..16]))
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Node identity preserved".to_string(),
+                        passed: keys_match,
+                        detail: if keys_match {
+                            Some("Public key matches (privkey persisted)".to_string())
+                        } else {
+                            Some(format!(
+                                "Before: {}..., After: {}...",
+                                &pubkey_before[..16],
+                                &pubkey_after[..16]
+                            ))
+                        },
                     },
-                });
+                );
             }
             Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Failed to get pubkey after restart".to_string(),
-                    passed: false,
-                    detail: Some(e.to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Failed to get pubkey after restart".to_string(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
             }
         }
 
         // Step 9: Wait for node 1 to catch up
         sleep(Duration::from_secs(5)).await;
 
-        match wait_for_minimum_view(&[nodes[1].clone()], target_view, Duration::from_secs(20)).await {
+        match wait_for_minimum_view(&[nodes[1].clone()], target_view, Duration::from_secs(20)).await
+        {
             Ok(true) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Node 1 caught up to network".to_string(),
-                    passed: true,
-                    detail: Some(format!("Reached view {}", target_view)),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Node 1 caught up to network".to_string(),
+                        passed: true,
+                        detail: Some(format!("Reached view {}", target_view)),
+                    },
+                );
             }
             Ok(false) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Catch-up timeout".to_string(),
-                    passed: false,
-                    detail: Some(format!("Failed to reach view {} in 20s", target_view)),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Catch-up timeout".to_string(),
+                        passed: false,
+                        detail: Some(format!("Failed to reach view {} in 20s", target_view)),
+                    },
+                );
             }
             Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Catch-up check failed".to_string(),
-                    passed: false,
-                    detail: Some(e.to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Catch-up check failed".to_string(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
             }
         }
 
         // Step 10: Download file from node 1 (verify data accessible)
         let full_path = format!("{}{}", test_path, test_filename);
-        match download_file_from_all_nodes_with_timeout(&[nodes[1].clone()], &full_path, Duration::from_secs(10)).await {
+        match download_file_from_all_nodes_with_timeout(
+            &[nodes[1].clone()],
+            &full_path,
+            Duration::from_secs(10),
+        )
+        .await
+        {
             Ok(downloads) if downloads.len() == 1 => {
                 let content_matches = downloads[0] == test_contents;
-                print_and_add_check(&mut result, Check {
-                    name: "File accessible from node 1".to_string(),
-                    passed: content_matches,
-                    detail: if content_matches {
-                        Some("Content matches original".to_string())
-                    } else {
-                        Some(format!("Size mismatch: expected {}, got {}", test_contents.len(), downloads[0].len()))
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "File accessible from node 1".to_string(),
+                        passed: content_matches,
+                        detail: if content_matches {
+                            Some("Content matches original".to_string())
+                        } else {
+                            Some(format!(
+                                "Size mismatch: expected {}, got {}",
+                                test_contents.len(),
+                                downloads[0].len()
+                            ))
+                        },
                     },
-                });
+                );
             }
             Ok(_) => {
-                print_and_add_check(&mut result, Check {
-                    name: "File download unexpected result".to_string(),
-                    passed: false,
-                    detail: Some("Wrong number of downloads".to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "File download unexpected result".to_string(),
+                        passed: false,
+                        detail: Some("Wrong number of downloads".to_string()),
+                    },
+                );
             }
             Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "File download failed".to_string(),
-                    passed: false,
-                    detail: Some(e.to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "File download failed".to_string(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
             }
         }
 
@@ -426,33 +541,52 @@ impl TestScenario for RestartPersistence {
             Err(_) => target_view,
         };
 
-        match upload_file(&nodes[0], test_path, &test_filename2, test_contents2.clone()).await {
+        match upload_file(
+            &nodes[0],
+            test_path,
+            &test_filename2,
+            test_contents2.clone(),
+        )
+        .await
+        {
             Ok(_) => {
                 // Wait for consensus
                 let target_view2 = view_before_second_upload + 1;
                 match wait_for_minimum_view(nodes, target_view2, Duration::from_secs(15)).await {
                     Ok(true) => {
-                        print_and_add_check(&mut result, Check {
-                            name: "Node 1 participates in consensus post-restart".to_string(),
-                            passed: true,
-                            detail: Some(format!("New consensus round completed (view {})", target_view2)),
-                        });
+                        print_and_add_check(
+                            &mut result,
+                            Check {
+                                name: "Node 1 participates in consensus post-restart".to_string(),
+                                passed: true,
+                                detail: Some(format!(
+                                    "New consensus round completed (view {})",
+                                    target_view2
+                                )),
+                            },
+                        );
                     }
                     _ => {
-                        print_and_add_check(&mut result, Check {
-                            name: "Post-restart consensus".to_string(),
-                            passed: false,
-                            detail: Some("Timeout waiting for new consensus".to_string()),
-                        });
+                        print_and_add_check(
+                            &mut result,
+                            Check {
+                                name: "Post-restart consensus".to_string(),
+                                passed: false,
+                                detail: Some("Timeout waiting for new consensus".to_string()),
+                            },
+                        );
                     }
                 }
             }
             Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Second upload failed".to_string(),
-                    passed: false,
-                    detail: Some(e.to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Second upload failed".to_string(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
             }
         }
 

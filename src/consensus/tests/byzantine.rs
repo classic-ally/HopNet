@@ -1,5 +1,7 @@
 use super::*;
-use crate::consensus::types::{Block, QuorumCertificate, VoteSignData, VoteSignMessage, ConsensusPhase, CertificateError};
+use crate::consensus::types::{
+    Block, CertificateError, ConsensusPhase, QuorumCertificate, VoteSignData, VoteSignMessage,
+};
 
 #[cfg(test)]
 mod byzantine_tests {
@@ -25,13 +27,16 @@ mod byzantine_tests {
 
         // For 4 validators, need (4*2)/3 + 1 = 3 signatures
         // Get only 1 legitimate voter
-        let legitimate_voter = network.nodes.iter()
+        let legitimate_voter = network
+            .nodes
+            .iter()
             .find(|n| n.node_id != leader.node_id)
             .unwrap();
 
         // Create signature from legitimate voter
         let vote_data = VoteSignData::from_block(block.clone(), phase.clone());
-        let signature = vote_data.sign(&legitimate_voter.signing_key)
+        let signature = vote_data
+            .sign(&legitimate_voter.signing_key)
             .expect("Failed to sign vote");
         let voter_sig = VoteSignMessage {
             replica_id: legitimate_voter.node_id,
@@ -47,7 +52,8 @@ mod byzantine_tests {
             leader.node_id,
             &leader.signing_key,
             voter_signatures,
-        ).expect("Failed to create QC");
+        )
+        .expect("Failed to create QC");
 
         // This QC has proposer + 2 duplicate voter sigs = appears to be 3 signatures
         // But after deduplication: only 2 unique nodes voted (proposer + 1 voter)
@@ -57,12 +63,17 @@ mod byzantine_tests {
         // After deduplication, we have: 1 proposer + 1 unique voter = 2 signatures
         // But we need (4*2)/3 + 1 = 3 signatures
         // So this should fail with InsufficientVotes due to insufficient unique signatures
-        assert!(result.is_err(), "QC with duplicate signatures should fail after deduplication");
+        assert!(
+            result.is_err(),
+            "QC with duplicate signatures should fail after deduplication"
+        );
         if let Err(e) = &result {
             eprintln!("Actual error: {:?}", e);
         }
-        assert!(matches!(result.unwrap_err(), CertificateError::InsufficientVotes),
-            "Should fail with InsufficientVotes due to insufficient unique signatures");
+        assert!(
+            matches!(result.unwrap_err(), CertificateError::InsufficientVotes),
+            "Should fail with InsufficientVotes due to insufficient unique signatures"
+        );
     }
 
     #[test]
@@ -78,7 +89,9 @@ mod byzantine_tests {
         let phase = ConsensusPhase::Propose;
 
         // Get two non-leader nodes
-        let voters: Vec<MockNode> = network.nodes.iter()
+        let voters: Vec<MockNode> = network
+            .nodes
+            .iter()
             .filter(|n| n.node_id != leader.node_id)
             .cloned()
             .collect();
@@ -88,16 +101,18 @@ mod byzantine_tests {
 
         // Create a forged signature: claim it's from victim, but sign with attacker's key
         let vote_data = VoteSignData::from_block(block.clone(), phase.clone());
-        let forged_signature = vote_data.sign(&attacker_node.signing_key)
+        let forged_signature = vote_data
+            .sign(&attacker_node.signing_key)
             .expect("Failed to sign vote");
 
         let forged_voter_sig = VoteSignMessage {
-            replica_id: victim_node.node_id,  // Claims to be victim
-            signature: forged_signature,       // But signed with attacker's key
+            replica_id: victim_node.node_id, // Claims to be victim
+            signature: forged_signature,     // But signed with attacker's key
         };
 
         // Create one legitimate voter signature (so we have enough count)
-        let legitimate_signature = vote_data.sign(&attacker_node.signing_key)
+        let legitimate_signature = vote_data
+            .sign(&attacker_node.signing_key)
             .expect("Failed to sign vote");
         let legitimate_voter_sig = VoteSignMessage {
             replica_id: attacker_node.node_id,
@@ -112,14 +127,20 @@ mod byzantine_tests {
             leader.node_id,
             &leader.signing_key,
             voter_signatures,
-        ).expect("Failed to create QC");
+        )
+        .expect("Failed to create QC");
 
         // Verification should fail - the forged signature won't verify against victim's pubkey
         let result = qc.verify(&leader.app_state, &block);
 
-        assert!(result.is_err(), "QC with forged signature should fail verification");
-        assert!(matches!(result.unwrap_err(), CertificateError::ValidationError),
-            "Should fail with ValidationError due to signature mismatch");
+        assert!(
+            result.is_err(),
+            "QC with forged signature should fail verification"
+        );
+        assert!(
+            matches!(result.unwrap_err(), CertificateError::ValidationError),
+            "Should fail with ValidationError due to signature mismatch"
+        );
     }
 
     #[test]
@@ -147,26 +168,31 @@ mod byzantine_tests {
                     format!("rogue_node_{}", rogue_node.node_id),
                     0,
                     rogue_node.verifying_key
-                ]
-            ).expect("Failed to insert rogue node");
+                ],
+            )
+            .expect("Failed to insert rogue node");
         }
 
         // Get one legitimate voter
-        let legitimate_voter = network.nodes.iter()
+        let legitimate_voter = network
+            .nodes
+            .iter()
             .find(|n| n.node_id != leader.node_id)
             .unwrap();
 
         // Create signatures
         let vote_data = VoteSignData::from_block(block.clone(), phase.clone());
 
-        let rogue_signature = vote_data.sign(&rogue_node.signing_key)
+        let rogue_signature = vote_data
+            .sign(&rogue_node.signing_key)
             .expect("Failed to sign vote");
         let rogue_voter_sig = VoteSignMessage {
             replica_id: rogue_node.node_id,
             signature: rogue_signature,
         };
 
-        let legitimate_signature = vote_data.sign(&legitimate_voter.signing_key)
+        let legitimate_signature = vote_data
+            .sign(&legitimate_voter.signing_key)
             .expect("Failed to sign vote");
         let legitimate_voter_sig = VoteSignMessage {
             replica_id: legitimate_voter.node_id,
@@ -181,7 +207,8 @@ mod byzantine_tests {
             leader.node_id,
             &leader.signing_key,
             voter_signatures,
-        ).expect("Failed to create QC");
+        )
+        .expect("Failed to create QC");
 
         // Verification should fail - rogue node exists in nodes table but NOT in validators
         // get_validators() won't return it, so the rogue vote is filtered out
@@ -190,8 +217,10 @@ mod byzantine_tests {
         let result = qc.verify(&leader.app_state, &block);
 
         assert!(result.is_err(), "QC with non-validator vote should fail");
-        assert!(matches!(result.unwrap_err(), CertificateError::InsufficientVotes),
-            "Should fail with InsufficientVotes after filtering out non-validator vote");
+        assert!(
+            matches!(result.unwrap_err(), CertificateError::InsufficientVotes),
+            "Should fail with InsufficientVotes after filtering out non-validator vote"
+        );
     }
 
     #[test]
@@ -209,14 +238,15 @@ mod byzantine_tests {
             payload: vec![1, 2, 3],
         };
 
-        let forged_signature = rpc.sign(&node1.signing_key)
+        let forged_signature = rpc
+            .sign(&node1.signing_key)
             .expect("Failed to sign with node1's key");
 
         let forged_tx = crate::consensus::types::Transaction {
             rpc,
             submitter: crate::consensus::types::SignedIdentity {
-                id: node0.node_id,  // Claims to be node0
-                signature: forged_signature,  // But signed with node1's key
+                id: node0.node_id,           // Claims to be node0
+                signature: forged_signature, // But signed with node1's key
             },
             user: None,
             nonce: hopnet_common::CustomUUID::new(None),
@@ -226,9 +256,17 @@ mod byzantine_tests {
         let result = Block::new_tip(&node0.app_state, vec![forged_tx]);
 
         // Block creation should fail due to signature verification
-        assert!(result.is_err(), "Block with forged node signature should be rejected");
-        assert!(matches!(result.unwrap_err(), crate::consensus::types::BlockError::ValidationError),
-            "Should fail with ValidationError due to forged signature");
+        assert!(
+            result.is_err(),
+            "Block with forged node signature should be rejected"
+        );
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                crate::consensus::types::BlockError::ValidationError
+            ),
+            "Should fail with ValidationError due to forged signature"
+        );
     }
 
     #[test]
@@ -266,9 +304,11 @@ mod byzantine_tests {
             payload: vec![1, 2, 3],
         };
 
-        let node_signature = rpc.sign(&node.signing_key)
+        let node_signature = rpc
+            .sign(&node.signing_key)
             .expect("Failed to sign with node key");
-        let forged_user_signature = rpc.sign(&user1.signing_key)
+        let forged_user_signature = rpc
+            .sign(&user1.signing_key)
             .expect("Failed to sign with user1's key");
 
         let forged_tx = crate::consensus::types::Transaction {
@@ -278,8 +318,8 @@ mod byzantine_tests {
                 signature: node_signature,
             },
             user: Some(crate::consensus::types::SignedIdentity {
-                id: user0.user_id,  // Claims to be user0
-                signature: forged_user_signature,  // But signed with user1's key
+                id: user0.user_id,                // Claims to be user0
+                signature: forged_user_signature, // But signed with user1's key
             }),
             nonce: hopnet_common::CustomUUID::new(None),
         };
@@ -288,9 +328,17 @@ mod byzantine_tests {
         let result = Block::new_tip(&node.app_state, vec![forged_tx]);
 
         // Block creation should fail due to signature verification
-        assert!(result.is_err(), "Block with forged user signature should be rejected");
-        assert!(matches!(result.unwrap_err(), crate::consensus::types::BlockError::ValidationError),
-            "Should fail with ValidationError due to forged user signature");
+        assert!(
+            result.is_err(),
+            "Block with forged user signature should be rejected"
+        );
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                crate::consensus::types::BlockError::ValidationError
+            ),
+            "Should fail with ValidationError due to forged user signature"
+        );
     }
 
     #[test]
@@ -310,21 +358,29 @@ mod byzantine_tests {
                 vec![i as u8; 10],
                 leader.node_id,
                 &leader.signing_key,
-            ).expect("Failed to create valid transaction");
+            )
+            .expect("Failed to create valid transaction");
             transactions.push(tx);
         }
 
         // Create 1 invalid transaction (forged signature)
-        let other_node = network.nodes.iter().find(|n| n.node_id != leader.node_id).unwrap();
+        let other_node = network
+            .nodes
+            .iter()
+            .find(|n| n.node_id != leader.node_id)
+            .unwrap();
         let mut invalid_tx = crate::consensus::types::Transaction::new(
             "invalid_function".to_string(),
             vec![99; 10],
             leader.node_id,
             &leader.signing_key,
-        ).expect("Failed to create transaction");
+        )
+        .expect("Failed to create transaction");
 
         // Corrupt the signature by signing with wrong key
-        let wrong_signature = invalid_tx.rpc.sign(&other_node.signing_key)
+        let wrong_signature = invalid_tx
+            .rpc
+            .sign(&other_node.signing_key)
             .expect("Failed to sign with wrong key");
         invalid_tx.submitter.signature = wrong_signature;
 
@@ -334,9 +390,16 @@ mod byzantine_tests {
         let result = Block::new_tip(&leader.app_state, transactions);
 
         // Block creation should fail because of the invalid transaction
-        assert!(result.is_err(), "Block with invalid transaction should be rejected");
-        assert!(matches!(result.unwrap_err(), crate::consensus::types::BlockError::ValidationError),
-            "Should fail with ValidationError due to invalid transaction signature");
+        assert!(
+            result.is_err(),
+            "Block with invalid transaction should be rejected"
+        );
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                crate::consensus::types::BlockError::ValidationError
+            ),
+            "Should fail with ValidationError due to invalid transaction signature"
+        );
     }
-
 }

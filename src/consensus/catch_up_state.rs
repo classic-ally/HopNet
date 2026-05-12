@@ -1,8 +1,8 @@
-use tokio::sync::{watch, Mutex};
+use crate::AppState;
 use crate::consensus::functions::CatchUpError;
 use crate::consensus::routes::perform_catch_up;
 use crate::db::consensus as db;
-use crate::AppState;
+use tokio::sync::{Mutex, watch};
 
 #[derive(Clone, Debug)]
 pub enum CatchUpOutcome {
@@ -92,7 +92,9 @@ impl CatchUpState {
                     // We're the initiator. Acquire consensus_lock and do the work.
                     let result = async {
                         let _guard = app_state.consensus_lock.lock().await;
-                        let conn = app_state.db_pool.get()
+                        let conn = app_state
+                            .db_pool
+                            .get()
                             .map_err(|_| CatchUpError::Database)?;
                         let (our_view, _) = db::get_consensus_progress(&conn)
                             .map_err(|_| CatchUpError::Database)?;

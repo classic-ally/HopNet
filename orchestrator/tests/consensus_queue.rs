@@ -4,14 +4,14 @@ use serde::Deserialize;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinSet;
 
+use crate::NodeInfo;
 use crate::divergence::build_divergence_report;
 use crate::tests::files::{
     delete_file, download_file, list_files_from_all_nodes, upload_file, verify_listings_identical,
 };
 use crate::tests::multi_user::fetch_state_snapshots;
+use crate::tests::{Check, TestResult, TestScenario, print_and_add_check};
 use crate::tests::{get_max_view, wait_for_minimum_view};
-use crate::tests::{print_and_add_check, Check, TestResult, TestScenario};
-use crate::NodeInfo;
 
 // ============================================================================
 // Helpers
@@ -78,7 +78,11 @@ async fn register_device(node: &NodeInfo, device_name: &str) -> Result<RegisterD
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("Device registration failed with status {}: {}", status, body);
+        anyhow::bail!(
+            "Device registration failed with status {}: {}",
+            status,
+            body
+        );
     }
 
     Ok(response.json().await?)
@@ -87,7 +91,10 @@ async fn register_device(node: &NodeInfo, device_name: &str) -> Result<RegisterD
 /// DELETE /devices/{device_id}
 async fn revoke_device(node: &NodeInfo, device_id: &str) -> Result<()> {
     let client = Client::new();
-    let url = format!("http://{}:{}/devices/{}", node.ip_address, node.port, device_id);
+    let url = format!(
+        "http://{}:{}/devices/{}",
+        node.ip_address, node.port, device_id
+    );
 
     let response = client
         .delete(&url)
@@ -106,11 +113,7 @@ async fn revoke_device(node: &NodeInfo, device_id: &str) -> Result<()> {
 }
 
 /// Fetch snapshots, build divergence report, check full consensus.
-async fn check_zero_divergence(
-    mesh_id: u32,
-    nodes: &[NodeInfo],
-    result: &mut TestResult,
-) -> bool {
+async fn check_zero_divergence(mesh_id: u32, nodes: &[NodeInfo], result: &mut TestResult) -> bool {
     match fetch_state_snapshots(nodes).await {
         Ok(snapshots) => match build_divergence_report(mesh_id, snapshots) {
             Ok(report) => {
@@ -187,12 +190,7 @@ impl TestScenario for ConsensusQueueBurst {
         "Fire 10 concurrent mixed operations at one node. Verify batching and consistency."
     }
 
-    async fn run(
-        &self,
-        mesh_id: u32,
-        nodes: &[NodeInfo],
-        _flags: &[String],
-    ) -> Result<TestResult> {
+    async fn run(&self, mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
         let start = Instant::now();
         let mut result = TestResult::new();
 
@@ -267,12 +265,7 @@ impl TestScenario for ConsensusQueueBurst {
         for i in 0..2 {
             let node = target.clone();
             set.spawn(async move {
-                update_user_profile(
-                    &node,
-                    &format!("Burst{}", i),
-                    &format!("Test{}", i),
-                )
-                .await
+                update_user_profile(&node, &format!("Burst{}", i), &format!("Test{}", i)).await
             });
         }
 
@@ -299,7 +292,10 @@ impl TestScenario for ConsensusQueueBurst {
             Check {
                 name: "All 10 operations succeed".to_string(),
                 passed: all_ok,
-                detail: Some(format!("{} succeeded, {} failed", success_count, fail_count)),
+                detail: Some(format!(
+                    "{} succeeded, {} failed",
+                    success_count, fail_count
+                )),
             },
         );
 
@@ -410,12 +406,7 @@ impl TestScenario for ConsensusQueueCrossNode {
         "Fire concurrent operations at different nodes. Tests two-phase ACK forwarding."
     }
 
-    async fn run(
-        &self,
-        mesh_id: u32,
-        nodes: &[NodeInfo],
-        _flags: &[String],
-    ) -> Result<TestResult> {
+    async fn run(&self, mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
         let start = Instant::now();
         let mut result = TestResult::new();
 
@@ -506,7 +497,13 @@ impl TestScenario for ConsensusQueueCrossNode {
             let d = dir.clone();
             let idx = i;
             wave1.spawn(async move {
-                upload_file(&node, &d, &format!("from-node{}.txt", idx), vec![0x33u8; 512]).await
+                upload_file(
+                    &node,
+                    &d,
+                    &format!("from-node{}.txt", idx),
+                    vec![0x33u8; 512],
+                )
+                .await
             });
             wave1_count += 1;
         }
@@ -535,7 +532,9 @@ impl TestScenario for ConsensusQueueCrossNode {
                 passed: w1_fail == 0,
                 detail: Some(format!(
                     "{}/{} succeeded across {} nodes",
-                    w1_success, wave1_count, nodes.len()
+                    w1_success,
+                    wave1_count,
+                    nodes.len()
                 )),
             },
         );
@@ -554,10 +553,7 @@ impl TestScenario for ConsensusQueueCrossNode {
             Check {
                 name: "Wave 1 batching".to_string(),
                 passed: true,
-                detail: Some(format!(
-                    "{} ops in {} views",
-                    wave1_count, w1_views
-                )),
+                detail: Some(format!("{} ops in {} views", wave1_count, w1_views)),
             },
         );
 
@@ -579,9 +575,7 @@ impl TestScenario for ConsensusQueueCrossNode {
         // Node 1: profile update
         {
             let node = nodes[1].clone();
-            wave2.spawn(async move {
-                update_user_profile(&node, "CrossNode", "Wave2").await
-            });
+            wave2.spawn(async move { update_user_profile(&node, "CrossNode", "Wave2").await });
             wave2_count += 1;
         }
 
@@ -617,10 +611,7 @@ impl TestScenario for ConsensusQueueCrossNode {
             Check {
                 name: "Wave 2 operations succeed".to_string(),
                 passed: w2_fail == 0,
-                detail: Some(format!(
-                    "{}/{} succeeded",
-                    w2_success, wave2_count
-                )),
+                detail: Some(format!("{}/{} succeeded", w2_success, wave2_count)),
             },
         );
 
@@ -638,10 +629,7 @@ impl TestScenario for ConsensusQueueCrossNode {
             Check {
                 name: "Wave 2 batching".to_string(),
                 passed: true,
-                detail: Some(format!(
-                    "{} ops in {} views",
-                    wave2_count, w2_views
-                )),
+                detail: Some(format!("{} ops in {} views", wave2_count, w2_views)),
             },
         );
 
@@ -679,10 +667,7 @@ impl TestScenario for ConsensusQueueCrossNode {
                         Check {
                             name: "Cross-node download mismatch".to_string(),
                             passed: false,
-                            detail: Some(format!(
-                                "Expected 512 bytes, got {}",
-                                data.len()
-                            )),
+                            detail: Some(format!("Expected 512 bytes, got {}", data.len())),
                         },
                     );
                 }
@@ -736,12 +721,7 @@ impl TestScenario for ConsensusQueueThroughput {
         "High-volume sustained mixed-operation load (~6000 ops). Measures throughput and enforces 100% success with zero divergence."
     }
 
-    async fn run(
-        &self,
-        mesh_id: u32,
-        nodes: &[NodeInfo],
-        _flags: &[String],
-    ) -> Result<TestResult> {
+    async fn run(&self, mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
         let start = Instant::now();
         let mut result = TestResult::new();
 
@@ -812,9 +792,7 @@ impl TestScenario for ConsensusQueueThroughput {
                 let size = 500 + ((round * 137) % 1500) as usize;
                 let fname = format!("tp-{}.txt", r);
                 file_names.push(fname.clone());
-                set.spawn(async move {
-                    upload_file(&node, &d, &fname, vec![0x54u8; size]).await
-                });
+                set.spawn(async move { upload_file(&node, &d, &fname, vec![0x54u8; size]).await });
                 spawned_count += 1;
             }
 
@@ -824,12 +802,8 @@ impl TestScenario for ConsensusQueueThroughput {
                 let node = nodes[node_idx].clone();
                 let r = round;
                 set.spawn(async move {
-                    update_user_profile(
-                        &node,
-                        &format!("Tp{}", r % 5),
-                        &format!("Load{}", r % 5),
-                    )
-                    .await
+                    update_user_profile(&node, &format!("Tp{}", r % 5), &format!("Load{}", r % 5))
+                        .await
                 });
                 spawned_count += 1;
             } else {

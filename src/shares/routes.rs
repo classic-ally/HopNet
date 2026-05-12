@@ -1,16 +1,16 @@
-use axum::{
-    extract::{State, Extension, Path, Json},
-    http::StatusCode,
-    response::IntoResponse,
-    routing::{get, post, delete},
-    Router,
-};
+use super::types::*;
 use crate::AppState;
+use crate::consensus::queue::ConsensusSubmitError;
 use crate::db::CustomUUID;
 use crate::db::DatabaseError;
 use crate::db::types::FileAccess;
-use crate::consensus::queue::ConsensusSubmitError;
-use super::types::*;
+use axum::{
+    Router,
+    extract::{Extension, Json, Path, State},
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{delete, get, post},
+};
 
 fn database_error_to_status(e: DatabaseError) -> StatusCode {
     match e {
@@ -59,7 +59,10 @@ pub async fn post_share(
     };
 
     // Look up recipient by username
-    let recipient = match crate::db::users::get_user_by_username(app_state.db_pool.get(), payload.recipient_username.clone()) {
+    let recipient = match crate::db::users::get_user_by_username(
+        app_state.db_pool.get(),
+        payload.recipient_username.clone(),
+    ) {
         Ok(Some(u)) => u,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -89,21 +92,27 @@ pub async fn post_share(
     };
 
     // Get sender's FileAccess → decrypt per-file key
-    let file_access_entry = match crate::db::files::get_file_access(&conn, &data_block_id, user_id) {
+    let file_access_entry = match crate::db::files::get_file_access(&conn, &data_block_id, user_id)
+    {
         Ok(Some(fa)) => fa,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
-    let x25519_privkey = crate::auth::derive_x25519_privkey_from_user(&session.user_keys.private_key);
-    let per_file_key = match crate::auth::decrypt_wrapped_file_key(&file_access_entry, &x25519_privkey) {
-        Ok(key) => key,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
+    let x25519_privkey =
+        crate::auth::derive_x25519_privkey_from_user(&session.user_keys.private_key);
+    let per_file_key =
+        match crate::auth::decrypt_wrapped_file_key(&file_access_entry, &x25519_privkey) {
+            Ok(key) => key,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
 
     // Create FileAccess for recipient
     let recipient_file_access = match FileAccess::new_for_user(
-        app_state.db_pool.get(), data_block_id.clone(), recipient.user_id, &per_file_key,
+        app_state.db_pool.get(),
+        data_block_id.clone(),
+        recipient.user_id,
+        &per_file_key,
     ) {
         Ok(fa) => fa,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -111,22 +120,28 @@ pub async fn post_share(
 
     // Extract filename: decrypt last path segment
     let last_segment = encrypted_path.rsplit('/').next().unwrap_or("");
-    let filename = match crate::files::functions::decrypt_part(last_segment, &session.siv_key, &session.siv_nonce) {
+    let filename = match crate::files::functions::decrypt_part(
+        last_segment,
+        &session.siv_key,
+        &session.siv_nonce,
+    ) {
         Ok(name) => name,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
     // Encrypt display name for recipient
-    let (display_ephemeral_pubkey, encrypted_display_name) = match encrypt_display_name(&filename, &recipient.x25519_pubkey) {
-        Ok(result) => result,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
+    let (display_ephemeral_pubkey, encrypted_display_name) =
+        match encrypt_display_name(&filename, &recipient.x25519_pubkey) {
+            Ok(result) => result,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
 
     // Serialize FileAccess as bincode blob
-    let file_access_blob = match bincode::serde::encode_to_vec(&recipient_file_access, bincode::config::standard()) {
-        Ok(blob) => blob,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
+    let file_access_blob =
+        match bincode::serde::encode_to_vec(&recipient_file_access, bincode::config::standard()) {
+            Ok(blob) => blob,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
 
     // Build consensus payload
     let share_payload = ShareFilePayload {
@@ -145,8 +160,13 @@ pub async fn post_share(
     };
 
     let transaction = match crate::consensus::functions::create_signed_user_transaction(
-        &app_state, "share_file".to_string(), encoded, user_id,
-    ).await {
+        &app_state,
+        "share_file".to_string(),
+        encoded,
+        user_id,
+    )
+    .await
+    {
         Ok(tx) => tx,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
@@ -171,12 +191,14 @@ pub async fn get_incoming_shares(
         Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
     };
 
-    let x25519_privkey = crate::auth::derive_x25519_privkey_from_user(&session.user_keys.private_key);
+    let x25519_privkey =
+        crate::auth::derive_x25519_privkey_from_user(&session.user_keys.private_key);
 
-    let shares = match crate::db::shares::get_incoming_shares_for_user(app_state.db_pool.get(), user_id) {
-        Ok(s) => s,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
+    let shares =
+        match crate::db::shares::get_incoming_shares_for_user(app_state.db_pool.get(), user_id) {
+            Ok(s) => s,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
 
     let mut response = Vec::new();
     for (share, sender_username) in shares {
@@ -189,7 +211,9 @@ pub async fn get_incoming_shares(
             Err(_) => continue,
         };
 
-        let created_at = share.id.extract_timestamp()
+        let created_at = share
+            .id
+            .extract_timestamp()
             .map(|dt| dt.to_rfc3339())
             .unwrap_or_default();
 
@@ -234,8 +258,12 @@ pub async fn post_accept_share(
 
     // Encrypt placement path with recipient's SIV key
     let encrypted_path = match crate::files::functions::encrypt_path(
-        payload.placement_path, &session.siv_key, &session.siv_nonce,
-    ).await {
+        payload.placement_path,
+        &session.siv_key,
+        &session.siv_nonce,
+    )
+    .await
+    {
         Ok(p) => p,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
@@ -249,11 +277,15 @@ pub async fn post_accept_share(
             Ok(t) => t,
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         };
-        let missing = match crate::db::files::find_missing_parents(&tx, &[encrypted_path.as_str()]) {
+        let missing = match crate::db::files::find_missing_parents(&tx, &[encrypted_path.as_str()])
+        {
             Ok(m) => m,
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         };
-        missing.into_iter().map(|p| (CustomUUID::new(None), p)).collect()
+        missing
+            .into_iter()
+            .map(|p| (CustomUUID::new(None), p))
+            .collect()
     };
 
     let accept_payload = AcceptSharePayload {
@@ -264,14 +296,20 @@ pub async fn post_accept_share(
         parent_folder_inodes,
     };
 
-    let encoded = match bincode::serde::encode_to_vec(&accept_payload, bincode::config::standard()) {
+    let encoded = match bincode::serde::encode_to_vec(&accept_payload, bincode::config::standard())
+    {
         Ok(e) => e,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
     let transaction = match crate::consensus::functions::create_signed_user_transaction(
-        &app_state, "accept_share".to_string(), encoded, user_id,
-    ).await {
+        &app_state,
+        "accept_share".to_string(),
+        encoded,
+        user_id,
+    )
+    .await
+    {
         Ok(tx) => tx,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
@@ -302,14 +340,20 @@ pub async fn delete_incoming_share(
         user_id,
     };
 
-    let encoded = match bincode::serde::encode_to_vec(&decline_payload, bincode::config::standard()) {
+    let encoded = match bincode::serde::encode_to_vec(&decline_payload, bincode::config::standard())
+    {
         Ok(e) => e,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
     let transaction = match crate::consensus::functions::create_signed_user_transaction(
-        &app_state, "decline_share".to_string(), encoded, user_id,
-    ).await {
+        &app_state,
+        "decline_share".to_string(),
+        encoded,
+        user_id,
+    )
+    .await
+    {
         Ok(tx) => tx,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
@@ -349,19 +393,25 @@ pub async fn get_share_details(
 
     let data_block_id = match inode_info.0 {
         Some(id) => id,
-        None => return (StatusCode::OK, Json(ShareDetailResponse { users: vec![] })).into_response(),
+        None => {
+            return (StatusCode::OK, Json(ShareDetailResponse { users: vec![] })).into_response();
+        }
     };
 
-    let members = match crate::db::shares::get_share_details(app_state.db_pool.get(), &data_block_id) {
-        Ok(m) => m,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
+    let members =
+        match crate::db::shares::get_share_details(app_state.db_pool.get(), &data_block_id) {
+            Ok(m) => m,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
 
-    let users: Vec<ShareParticipant> = members.into_iter().map(|m| ShareParticipant {
-        username: m.username,
-        user_id: m.user_id,
-        status: m.status,
-    }).collect();
+    let users: Vec<ShareParticipant> = members
+        .into_iter()
+        .map(|m| ShareParticipant {
+            username: m.username,
+            user_id: m.user_id,
+            status: m.status,
+        })
+        .collect();
 
     (StatusCode::OK, Json(ShareDetailResponse { users })).into_response()
 }
@@ -382,14 +432,20 @@ pub async fn delete_unshare(
         user_id,
     };
 
-    let encoded = match bincode::serde::encode_to_vec(&unshare_payload, bincode::config::standard()) {
+    let encoded = match bincode::serde::encode_to_vec(&unshare_payload, bincode::config::standard())
+    {
         Ok(e) => e,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
     let transaction = match crate::consensus::functions::create_signed_user_transaction(
-        &app_state, "unshare".to_string(), encoded, user_id,
-    ).await {
+        &app_state,
+        "unshare".to_string(),
+        encoded,
+        user_id,
+    )
+    .await
+    {
         Ok(tx) => tx,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };

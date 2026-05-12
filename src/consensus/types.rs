@@ -1,16 +1,19 @@
 use super::*;
-use serde::{Serialize, Deserialize};
-use std::ops::Deref;
-use rusqlite::{ToSql,types::ToSqlOutput,types::FromSql,types::FromSqlResult,types::ValueRef,TransactionBehavior};
+use crate::consensus::functions::process_transactions;
 use crate::db::consensus as db;
 use crate::db::types::MyNode;
-use hopnet_common::CustomUUID;
-use bincode::serde::encode_to_vec;
-use ed25519_dalek::Signature;
 use bincode::config;
+use bincode::serde::encode_to_vec;
 use blake3::Hasher;
+use ed25519_dalek::Signature;
+use hopnet_common::CustomUUID;
 use rayon::prelude::*;
-use crate::consensus::functions::process_transactions;
+use rusqlite::{
+    ToSql, TransactionBehavior, types::FromSql, types::FromSqlResult, types::ToSqlOutput,
+    types::ValueRef,
+};
+use serde::{Deserialize, Serialize};
+use std::ops::Deref;
 
 /// BFT threshold for transitioning between relaxed and full BFT modes
 pub const BFT_THRESHOLD: usize = 6;
@@ -117,13 +120,15 @@ impl Ballot {
         block: Block,
         phase: ConsensusPhase,
         me: &MyNode,
-        tx: rusqlite::Transaction<'a>
+        tx: rusqlite::Transaction<'a>,
     ) -> Result<Ballot, VoteError> {
         // Create vote data from block and phase
         let data = VoteSignData::from_block(block.clone(), phase);
 
         // Create signature (same as follower does in sign())
-        let signature = data.sign(&me.privkey).map_err(|_| VoteError::ProcessingError)?;
+        let signature = data
+            .sign(&me.privkey)
+            .map_err(|_| VoteError::ProcessingError)?;
         let initiator = VoteSignMessage {
             replica_id: me.node_id,
             signature,
@@ -132,21 +137,26 @@ impl Ballot {
         // Bug #5 fix: Leader double-vote check (only for Propose phase)
         if data.phase == ConsensusPhase::Propose {
             // Use the transaction to read last vote (avoids race conditions)
-            let last_vote_hash = db::get_last_propose_vote_tx(&tx)
-                .map_err(|_| VoteError::DatabaseError)?;
+            let last_vote_hash =
+                db::get_last_propose_vote_tx(&tx).map_err(|_| VoteError::DatabaseError)?;
 
             if let Some(last_vote_hash) = last_vote_hash {
                 if last_vote_hash != block.block_hash {
                     tracing::warn!(
                         "Leader double-vote attempt rejected: already proposed {:?}, rejecting proposal for {:?} in view {}",
-                        last_vote_hash, block.block_hash, data.view
+                        last_vote_hash,
+                        block.block_hash,
+                        data.view
                     );
-                    return Err(VoteError::ProgressionError(ProgressionErrorKind::DoubleVote));
+                    return Err(VoteError::ProgressionError(
+                        ProgressionErrorKind::DoubleVote,
+                    ));
                 }
                 // Same block = retry allowed
                 tracing::debug!(
                     "Leader retry detected: already proposed {:?} in view {}, allowing re-proposal",
-                    block.block_hash, data.view
+                    block.block_hash,
+                    data.view
                 );
             }
 
@@ -170,7 +180,8 @@ impl Ballot {
         let db_conn = state.db_pool.get().map_err(|_| VoteError::DatabaseError)?;
 
         // Check leader signature is valid and leader is authorized for view
-        let consensus_state = db::get_consensus_with_conn(&db_conn).map_err(|_| VoteError::DatabaseError)?;
+        let consensus_state =
+            db::get_consensus_with_conn(&db_conn).map_err(|_| VoteError::DatabaseError)?;
 
         let leader_verifyingkey = consensus_state.leader.pubkey;
         let message = self.data.encode().map_err(|_| VoteError::ProcessingError)?;
@@ -181,50 +192,60 @@ impl Ballot {
                     return Err(VoteError::InitiatorError);
                 }
             }
-            Err(_) => {return Err(VoteError::InitiatorError)}
+            Err(_) => return Err(VoteError::InitiatorError),
         }
 
         // Check block hash is valid and actually matches the proposal's hash
         match self.block.verify() {
             Ok(_) => {
                 if self.block.block_hash != self.data.block_hash {
-                    return Err(VoteError::BlockError)
+                    return Err(VoteError::BlockError);
                 }
             }
-            Err(_) => {return Err(VoteError::BlockError)}
+            Err(_) => return Err(VoteError::BlockError),
         }
 
         // Validate all transaction signatures in parallel
         if let Some(ref transactions) = self.block.data.transactions {
             // Batch fetch all pubkeys for signature validation (using shared connection)
-            let node_pubkeys = db::get_all_node_pubkeys(&db_conn)
-                .map_err(|_| VoteError::DatabaseError)?;
-            let user_pubkeys = db::get_all_user_pubkeys(&db_conn)
-                .map_err(|_| VoteError::DatabaseError)?;
+            let node_pubkeys =
+                db::get_all_node_pubkeys(&db_conn).map_err(|_| VoteError::DatabaseError)?;
+            let user_pubkeys =
+                db::get_all_user_pubkeys(&db_conn).map_err(|_| VoteError::DatabaseError)?;
 
             // Parallel signature verification using Rayon
-            transactions.0.par_iter()
+            transactions
+                .0
+                .par_iter()
                 .try_for_each(|tx| -> Result<(), VoteError> {
                     // Verify node signature
-                    let node_pubkey = node_pubkeys.get(&tx.submitter.id)
-                        .ok_or_else(|| VoteError::TransactionValidationError(
-                            format!("Unknown node_id: {}", tx.submitter.id)
-                        ))?;
-                    tx.verify_signature(node_pubkey)
-                        .map_err(|_| VoteError::TransactionValidationError(
-                            format!("Invalid node signature for node_id: {}", tx.submitter.id)
-                        ))?;
+                    let node_pubkey = node_pubkeys.get(&tx.submitter.id).ok_or_else(|| {
+                        VoteError::TransactionValidationError(format!(
+                            "Unknown node_id: {}",
+                            tx.submitter.id
+                        ))
+                    })?;
+                    tx.verify_signature(node_pubkey).map_err(|_| {
+                        VoteError::TransactionValidationError(format!(
+                            "Invalid node signature for node_id: {}",
+                            tx.submitter.id
+                        ))
+                    })?;
 
                     // Verify user signature if present
                     if let Some(ref user) = tx.user {
-                        let user_pubkey = user_pubkeys.get(&user.id)
-                            .ok_or_else(|| VoteError::TransactionValidationError(
-                                format!("Unknown user_id: {}", user.id)
-                            ))?;
-                        tx.verify_user_signature(user_pubkey)
-                            .map_err(|_| VoteError::TransactionValidationError(
-                                format!("Invalid user signature for user_id: {}", user.id)
-                            ))?;
+                        let user_pubkey = user_pubkeys.get(&user.id).ok_or_else(|| {
+                            VoteError::TransactionValidationError(format!(
+                                "Unknown user_id: {}",
+                                user.id
+                            ))
+                        })?;
+                        tx.verify_user_signature(user_pubkey).map_err(|_| {
+                            VoteError::TransactionValidationError(format!(
+                                "Invalid user signature for user_id: {}",
+                                user.id
+                            ))
+                        })?;
                     }
 
                     Ok(())
@@ -238,9 +259,12 @@ impl Ballot {
                 // we're locking a phase we didn't just get phase 1 QC for
                 tracing::warn!(
                     "Lock phase ballot rejected: QC mismatch (ballot={:?}, highest_qc={:?})",
-                    self.data.block_hash, consensus_state.highest_qc_block.block_hash
+                    self.data.block_hash,
+                    consensus_state.highest_qc_block.block_hash
                 );
-                return Err(VoteError::ProgressionError(ProgressionErrorKind::LockPhaseQcMismatch));
+                return Err(VoteError::ProgressionError(
+                    ProgressionErrorKind::LockPhaseQcMismatch,
+                ));
             }
             // not checking view number matches original
             // logic: if crash after phase1 issuance, later view leader can request phase2 votes
@@ -250,22 +274,32 @@ impl Ballot {
             // Reject proposals with views less than or equal to highest QC view seen
             // View number must go up with each successful proposal
             // One leader cannot make two proposals
-            return Err(VoteError::ProgressionError(ProgressionErrorKind::ViewTooOld));
+            return Err(VoteError::ProgressionError(
+                ProgressionErrorKind::ViewTooOld,
+            ));
         }
 
         // View must equal our current view
         if self.data.view != consensus_state.view {
             tracing::warn!(
                 "Ballot rejected: view mismatch (ballot view={}, our view={})",
-                self.data.view, consensus_state.view
+                self.data.view,
+                consensus_state.view
             );
-            return Err(VoteError::ProgressionError(ProgressionErrorKind::ViewMismatch));
+            return Err(VoteError::ProgressionError(
+                ProgressionErrorKind::ViewMismatch,
+            ));
         }
 
         // Check if we've already issued a timeout vote for this view
         if consensus_state.last_timeout_vote_view == self.data.view {
-            tracing::warn!("Rejecting ballot for view {} - already issued timeout vote", self.data.view);
-            return Err(VoteError::ProgressionError(ProgressionErrorKind::AlreadyIssuedTimeout));
+            tracing::warn!(
+                "Rejecting ballot for view {} - already issued timeout vote",
+                self.data.view
+            );
+            return Err(VoteError::ProgressionError(
+                ProgressionErrorKind::AlreadyIssuedTimeout,
+            ));
         }
 
         // Bug #5 fix: Check for double-voting in Propose phase
@@ -275,14 +309,19 @@ impl Ballot {
                     // Different block in same view = double-vote attempt
                     tracing::warn!(
                         "Double-vote attempt rejected: already voted for {:?}, rejecting vote for {:?} in view {}",
-                        last_vote_hash, self.block.block_hash, self.data.view
+                        last_vote_hash,
+                        self.block.block_hash,
+                        self.data.view
                     );
-                    return Err(VoteError::ProgressionError(ProgressionErrorKind::DoubleVote));
+                    return Err(VoteError::ProgressionError(
+                        ProgressionErrorKind::DoubleVote,
+                    ));
                 }
                 // Same block = retry allowed (idempotent, will regenerate same signature)
                 tracing::debug!(
                     "Retry detected: already voted for {:?} in view {}, allowing re-vote",
-                    self.block.block_hash, self.data.view
+                    self.block.block_hash,
+                    self.data.view
                 );
             }
         }
@@ -294,13 +333,18 @@ impl Ballot {
                 if parent_hash != &consensus_state.committed_block.block_hash {
                     tracing::warn!(
                         "Ballot rejected: invalid parent (expected={:?}, got={:?})",
-                        consensus_state.committed_block.block_hash, parent_hash
+                        consensus_state.committed_block.block_hash,
+                        parent_hash
                     );
-                    return Err(VoteError::ProgressionError(ProgressionErrorKind::InvalidParent))
+                    return Err(VoteError::ProgressionError(
+                        ProgressionErrorKind::InvalidParent,
+                    ));
                 }
             }
             None => {
-                return Err(VoteError::ProgressionError(ProgressionErrorKind::InvalidParent))
+                return Err(VoteError::ProgressionError(
+                    ProgressionErrorKind::InvalidParent,
+                ));
             }
         }
 
@@ -313,7 +357,9 @@ impl Ballot {
                         "Ballot rejected: prepared block conflict (height={})",
                         self.data.block_height
                     );
-                    return Err(VoteError::ProgressionError(ProgressionErrorKind::PreparedBlockConflict))
+                    return Err(VoteError::ProgressionError(
+                        ProgressionErrorKind::PreparedBlockConflict,
+                    ));
                 }
             }
         } else if self.data.phase == ConsensusPhase::Lock {
@@ -322,9 +368,12 @@ impl Ballot {
                 if self.data.block_hash != prepared.block_hash {
                     tracing::warn!(
                         "Lock phase ballot rejected: block mismatch (ballot={:?}, prepared={:?})",
-                        self.data.block_hash, prepared.block_hash
+                        self.data.block_hash,
+                        prepared.block_hash
                     );
-                    return Err(VoteError::ProgressionError(ProgressionErrorKind::PreparedBlockConflict))
+                    return Err(VoteError::ProgressionError(
+                        ProgressionErrorKind::PreparedBlockConflict,
+                    ));
                 }
             }
         }
@@ -334,9 +383,12 @@ impl Ballot {
         if self.data.block_height != consensus_state.committed_block.data.height + 1 {
             tracing::warn!(
                 "Ballot rejected: invalid height (expected={}, got={})",
-                consensus_state.committed_block.data.height + 1, self.data.block_height
+                consensus_state.committed_block.data.height + 1,
+                self.data.block_height
             );
-            return Err(VoteError::ProgressionError(ProgressionErrorKind::InvalidHeight))
+            return Err(VoteError::ProgressionError(
+                ProgressionErrorKind::InvalidHeight,
+            ));
         }
 
         // 5. Transaction validation (only for Propose phase)
@@ -345,9 +397,13 @@ impl Ballot {
             // Create validation transaction
             let mut conn = state.db_pool.get().map_err(|_| VoteError::DatabaseError)?;
             let _wg = state.write_gate.guard();
-            let db_tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| VoteError::DatabaseError)?;
+            let db_tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|_| VoteError::DatabaseError)?;
 
-            if let Err(e) = process_transactions(&self.block.data.transactions, state, false, &db_tx) {
+            if let Err(e) =
+                process_transactions(&self.block.data.transactions, state, false, &db_tx)
+            {
                 let error_msg = format!("Transaction validation failed: {:?}", e);
                 tracing::warn!("Refusing to vote for ballot - {}", error_msg);
                 return Err(VoteError::TransactionValidationError(error_msg));
@@ -362,8 +418,13 @@ impl Ballot {
     }
 
     pub fn sign(&self, app_state: &AppState) -> Result<VoteSignMessage, VoteError> {
-        let node_id = app_state.get_node_id().map_err(|_| VoteError::DatabaseError)?;
-        let signature = self.data.sign(&app_state.private_key).map_err(|_| VoteError::ProcessingError)?;
+        let node_id = app_state
+            .get_node_id()
+            .map_err(|_| VoteError::DatabaseError)?;
+        let signature = self
+            .data
+            .sign(&app_state.private_key)
+            .map_err(|_| VoteError::ProcessingError)?;
 
         // Bug #5 fix: Record Propose vote after signing to prevent double-voting
         if self.data.phase == ConsensusPhase::Propose {
@@ -372,9 +433,9 @@ impl Ballot {
                 .map_err(|_| VoteError::DatabaseError)?;
         }
 
-        Ok(VoteSignMessage{
+        Ok(VoteSignMessage {
             replica_id: node_id,
-            signature: signature
+            signature: signature,
         })
     }
 }
@@ -392,11 +453,18 @@ impl VoteSignData {
         return encode_to_vec(&self, config::standard()).map_err(|_| VoteError::ProcessingError);
     }
     pub fn from_block(block: Block, phase: ConsensusPhase) -> VoteSignData {
-        return VoteSignData { block_hash: block.block_hash, block_height: block.data.height, view: block.data.view_number, phase: phase }
+        return VoteSignData {
+            block_hash: block.block_hash,
+            block_height: block.data.height,
+            view: block.data.view_number,
+            phase: phase,
+        };
     }
     pub fn sign(&self, private_key: &PrivKey) -> Result<Signature, VoteError> {
         let data = &self.encode()?;
-        let signature = private_key.try_sign(&data).map_err(|_| VoteError::ProcessingError)?;
+        let signature = private_key
+            .try_sign(&data)
+            .map_err(|_| VoteError::ProcessingError)?;
         return Ok(signature);
     }
 }
@@ -415,7 +483,7 @@ impl ToSql for VoteSignMessage {
         // let's turn votesignmessage into Vec<u8>
         match bincode::serde::encode_to_vec(&self, bincode::config::standard()) {
             Ok(data) => Ok(ToSqlOutput::Owned(rusqlite::types::Value::Blob(data))),
-            Err(e) => Err(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+            Err(e) => Err(rusqlite::Error::ToSqlConversionFailure(Box::new(e))),
         }
     }
 }
@@ -446,7 +514,7 @@ impl ToSql for VoteSignMessages {
     fn to_sql(&self) -> Result<ToSqlOutput<'_>, rusqlite::Error> {
         match bincode::serde::encode_to_vec(&self, bincode::config::standard()) {
             Ok(data) => Ok(ToSqlOutput::Owned(rusqlite::types::Value::Blob(data))),
-            Err(e) => Err(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+            Err(e) => Err(rusqlite::Error::ToSqlConversionFailure(Box::new(e))),
         }
     }
 }
@@ -474,7 +542,6 @@ pub struct QuorumCertificate {
     // Vote tracking
     pub proposer_signature: VoteSignMessage,
     pub voter_signatures: VoteSignMessages,
-
 }
 
 impl QuorumCertificate {
@@ -486,22 +553,29 @@ impl QuorumCertificate {
         proposer_key: &PrivKey,
         voter_signatures: Vec<VoteSignMessage>,
         validators: &Vec<Node>,
-        app_state: &AppState
+        app_state: &AppState,
     ) -> Result<QuorumCertificate, CertificateError> {
         // Layer 1: Leader abandonment - check if network is timing out
-        let timeout_count = app_state.timeout_vote_collector.get_vote_count(block.data.view_number).await;
+        let timeout_count = app_state
+            .timeout_vote_collector
+            .get_vote_count(block.data.view_number)
+            .await;
         let quorum_threshold = calculate_quorum_threshold(validators.len());
 
         // If timeout votes >= quorum threshold, network is timing out - refuse to create QC
         if timeout_count >= quorum_threshold {
             tracing::warn!(
                 "Layer 1: Leader abandonment - refusing to create {:?} QC for view {} ({} timeout votes >= {} threshold)",
-                phase, block.data.view_number, timeout_count, quorum_threshold
+                phase,
+                block.data.view_number,
+                timeout_count,
+                quorum_threshold
             );
             return Err(CertificateError::NetworkTimeout);
         }
 
-        let qc = Self::create_unverified(block, phase, proposer_id, proposer_key, voter_signatures)?;
+        let qc =
+            Self::create_unverified(block, phase, proposer_id, proposer_key, voter_signatures)?;
         qc.verify(app_state, block)?;
         Ok(qc)
     }
@@ -515,10 +589,12 @@ impl QuorumCertificate {
         voter_signatures: Vec<VoteSignMessage>,
     ) -> Result<QuorumCertificate, CertificateError> {
         // sign off ourselves
-        let proposer_signature = VoteSignData::from_block(block.clone(), phase.clone()).sign(&proposer_key).map_err(|_| CertificateError::SigningError)?;
+        let proposer_signature = VoteSignData::from_block(block.clone(), phase.clone())
+            .sign(&proposer_key)
+            .map_err(|_| CertificateError::SigningError)?;
         let proposer_signature_message = VoteSignMessage {
             replica_id: proposer_id,
-            signature: proposer_signature
+            signature: proposer_signature,
         };
         // cast to VoteSignMessages
         let vsm = VoteSignMessages(voter_signatures);
@@ -528,19 +604,20 @@ impl QuorumCertificate {
             phase: phase,
             block_hash: block.block_hash,
             proposer_signature: proposer_signature_message,
-            voter_signatures: vsm
+            voter_signatures: vsm,
         })
     }
     pub fn verify(&self, state: &AppState, block: &Block) -> Result<(), CertificateError> {
         // Get current consensus state for view validation
-        let consensus_state = db::get_consensus(state.db_pool.get())
-            .map_err(|_| CertificateError::DatabaseError)?;
-        
+        let consensus_state =
+            db::get_consensus(state.db_pool.get()).map_err(|_| CertificateError::DatabaseError)?;
+
         // Validate view number - only accept current view
         if self.view_number != consensus_state.view {
             tracing::warn!(
                 "QC verification failed: invalid view {} (current view: {})",
-                self.view_number, consensus_state.view
+                self.view_number,
+                consensus_state.view
             );
             return Err(CertificateError::ValidationError);
         }
@@ -552,19 +629,21 @@ impl QuorumCertificate {
                 state.db_pool.get(),
                 &self.view_number,
                 &self.block_hash,
-                &ConsensusPhase::Propose
+                &ConsensusPhase::Propose,
             ) {
                 Ok(_) => {
                     // Propose QC exists, safe to proceed with Lock QC
                     tracing::debug!(
                         "Lock QC validation passed: found Propose QC for view {} block {:?}",
-                        self.view_number, self.block_hash
+                        self.view_number,
+                        self.block_hash
                     );
                 }
                 Err(_) => {
                     tracing::warn!(
                         "Lock QC rejected: missing Propose QC for view {} block {:?}",
-                        self.view_number, self.block_hash
+                        self.view_number,
+                        self.block_hash
                     );
                     return Err(CertificateError::ValidationError);
                 }
@@ -574,18 +653,22 @@ impl QuorumCertificate {
         // Get validators for committed height (parent block), not proposed block height
         // This ensures consistency with middleware activation checks and leader's validator selection
         let committed_height = consensus_state.committed_block.data.height;
-        let validators = db::get_validators(state.db_pool.get(), committed_height).map_err(|_| CertificateError::DatabaseError)?;
+        let validators = db::get_validators(state.db_pool.get(), committed_height)
+            .map_err(|_| CertificateError::DatabaseError)?;
         let num_validators = validators.len();
 
         // Deduplicate voters: collect unique voter replica_ids (excluding proposer)
-        let mut unique_voters: std::collections::HashMap<i32, &VoteSignMessage> = std::collections::HashMap::new();
+        let mut unique_voters: std::collections::HashMap<i32, &VoteSignMessage> =
+            std::collections::HashMap::new();
         for voter_sig in &*self.voter_signatures {
             // Skip if this is the proposer trying to vote again (proposer already counted separately)
             if voter_sig.replica_id == self.proposer_signature.replica_id {
                 continue;
             }
             // Insert only first occurrence of each replica_id (deduplicates)
-            unique_voters.entry(voter_sig.replica_id).or_insert(voter_sig);
+            unique_voters
+                .entry(voter_sig.replica_id)
+                .or_insert(voter_sig);
         }
 
         // Filter to only votes from validators (prevents DoS from invalid votes)
@@ -594,13 +677,18 @@ impl QuorumCertificate {
         let mut invalid_vote_count = 0;
 
         for voter_sig in unique_voters.values() {
-            if let Some(voter_node) = validators.iter().find(|v| v.node_id == voter_sig.replica_id) {
+            if let Some(voter_node) = validators
+                .iter()
+                .find(|v| v.node_id == voter_sig.replica_id)
+            {
                 valid_voter_pairs.push((voter_sig, voter_node));
             } else {
                 invalid_vote_count += 1;
                 tracing::warn!(
                     "Ignoring vote from non-validator node {} in QC for view {} phase {:?}",
-                    voter_sig.replica_id, self.view_number, self.phase
+                    voter_sig.replica_id,
+                    self.view_number,
+                    self.phase
                 );
             }
         }
@@ -612,19 +700,28 @@ impl QuorumCertificate {
         if total_valid_signatures < required_signatures {
             tracing::warn!(
                 "QC verification failed: insufficient valid signatures (got: {}, required: {}, validators: {}, invalid votes filtered: {})",
-                total_valid_signatures, required_signatures, num_validators, invalid_vote_count
+                total_valid_signatures,
+                required_signatures,
+                num_validators,
+                invalid_vote_count
             );
             return Err(CertificateError::InsufficientVotes);
         }
 
         tracing::debug!(
             "Verifying QC for view {} phase {:?} with {} valid signatures from {} validators (filtered {} invalid votes)",
-            self.view_number, self.phase, total_valid_signatures, num_validators, invalid_vote_count
+            self.view_number,
+            self.phase,
+            total_valid_signatures,
+            num_validators,
+            invalid_vote_count
         );
 
         // Prepare data for batch verification
         let vote_data = VoteSignData::from_block(block.clone(), self.phase.clone());
-        let message = vote_data.encode().map_err(|_| CertificateError::ValidationError)?;
+        let message = vote_data
+            .encode()
+            .map_err(|_| CertificateError::ValidationError)?;
 
         // Collect all signatures and public keys for batch verification (using only valid voters)
         let mut signatures = Vec::new();
@@ -635,7 +732,8 @@ impl QuorumCertificate {
         signatures.push(self.proposer_signature.signature);
 
         // Find proposer's public key (proposer must be a validator)
-        let proposer_node = validators.iter()
+        let proposer_node = validators
+            .iter()
             .find(|v| v.node_id == self.proposer_signature.replica_id)
             .ok_or(CertificateError::SignerNotFound)?;
         let proposer_pubkey = proposer_node.pubkey;
@@ -648,7 +746,7 @@ impl QuorumCertificate {
             public_keys.push(*voter_node.pubkey);
             messages.push(message.as_slice());
         }
-        
+
         // Perform batch verification
         match ed25519_dalek::verify_batch(&messages, &signatures, &public_keys) {
             Ok(_) => {
@@ -656,30 +754,35 @@ impl QuorumCertificate {
                 if self.block_hash != block.block_hash {
                     tracing::warn!(
                         "QC verification failed: block hash mismatch (qc: {:?}, block: {:?})",
-                        self.block_hash, block.block_hash
+                        self.block_hash,
+                        block.block_hash
                     );
                     return Err(CertificateError::ValidationError);
                 }
-                
+
                 // Ensure view number matches
                 if self.view_number != block.data.view_number {
                     tracing::warn!(
                         "QC verification failed: view number mismatch (qc: {}, block: {})",
-                        self.view_number, block.data.view_number
+                        self.view_number,
+                        block.data.view_number
                     );
                     return Err(CertificateError::ValidationError);
                 }
-                
+
                 tracing::debug!(
                     "QC verified successfully for view {} phase {:?} block {:?}",
-                    self.view_number, self.phase, self.block_hash
+                    self.view_number,
+                    self.phase,
+                    self.block_hash
                 );
                 Ok(())
             }
             Err(_) => {
                 tracing::warn!(
                     "QC verification failed: signature verification failed for view {} phase {:?}",
-                    self.view_number, self.phase
+                    self.view_number,
+                    self.phase
                 );
                 Err(CertificateError::ValidationError)
             }
@@ -700,14 +803,19 @@ impl TimeoutSignData {
     pub fn encode(&self) -> Result<Vec<u8>, VoteError> {
         return encode_to_vec(&self, config::standard()).map_err(|_| VoteError::ProcessingError);
     }
-    
+
     pub fn sign(&self, private_key: &PrivKey) -> Result<Signature, VoteError> {
         let data = &self.encode()?;
-        let signature = private_key.try_sign(&data).map_err(|_| VoteError::ProcessingError)?;
+        let signature = private_key
+            .try_sign(&data)
+            .map_err(|_| VoteError::ProcessingError)?;
         return Ok(signature);
     }
-    
-    pub fn from_consensus_state(view_number: i32, consensus_state: &ConsensusState) -> TimeoutSignData {
+
+    pub fn from_consensus_state(
+        view_number: i32,
+        consensus_state: &ConsensusState,
+    ) -> TimeoutSignData {
         TimeoutSignData {
             view_number,
             highest_qc_view: consensus_state.highest_qc_block.data.view_number,
@@ -734,14 +842,14 @@ pub struct TimeoutVote {
 /// Carries independently-verifiable signatures (not covered by timeout signature).
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct LockVoteEvidence {
-    pub vote_data: VoteSignData,              // Lock phase (block_hash, height, view, phase=Lock)
-    pub proposer_signature: VoteSignMessage,  // Leader's signature from Lock ballot
-    pub voter_signature: VoteSignMessage,     // This voter's Lock ballot response
+    pub vote_data: VoteSignData, // Lock phase (block_hash, height, view, phase=Lock)
+    pub proposer_signature: VoteSignMessage, // Leader's signature from Lock ballot
+    pub voter_signature: VoteSignMessage, // This voter's Lock ballot response
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TimeoutCertificate {
-    pub view_number: i32,           // View that timed out
+    pub view_number: i32, // View that timed out
     pub highest_qc: QuorumCertificate,
     pub signatures: VoteSignMessages,
 }
@@ -762,27 +870,31 @@ impl TimeoutCertificate {
         if timeout_votes.is_empty() {
             return Err(CertificateError::InsufficientVotes);
         }
-        
+
         // Find majority timeout data with quorum validation for each view
-        let (majority_timeout_data, valid_votes) = Self::find_majority_timeout_data_and_filter(timeout_votes, app_state)?;
-        
+        let (majority_timeout_data, valid_votes) =
+            Self::find_majority_timeout_data_and_filter(timeout_votes, app_state)?;
+
         // Get the QC from the majority timeout data
-        let highest_qc = db::get_quorum_certificate_by_hash(app_state.db_pool.get(), &majority_timeout_data.highest_qc_view, &majority_timeout_data.highest_qc_hash, &majority_timeout_data.highest_qc_phase)
-            .map_err(|_| CertificateError::DatabaseError)?;
+        let highest_qc = db::get_quorum_certificate_by_hash(
+            app_state.db_pool.get(),
+            &majority_timeout_data.highest_qc_view,
+            &majority_timeout_data.highest_qc_hash,
+            &majority_timeout_data.highest_qc_phase,
+        )
+        .map_err(|_| CertificateError::DatabaseError)?;
 
         // Extract signatures from valid votes
-        let signatures: Vec<VoteSignMessage> = valid_votes
-            .into_iter()
-            .map(|vote| vote.sender)
-            .collect();
-        
+        let signatures: Vec<VoteSignMessage> =
+            valid_votes.into_iter().map(|vote| vote.sender).collect();
+
         Ok(TimeoutCertificate {
             view_number: majority_timeout_data.view_number,
             highest_qc,
             signatures: VoteSignMessages(signatures),
         })
     }
-    
+
     pub fn verify(&self, app_state: &AppState) -> Result<(), CertificateError> {
         // Get current consensus state for view validation
         let consensus_state = db::get_consensus(app_state.db_pool.get())
@@ -792,15 +904,21 @@ impl TimeoutCertificate {
         if self.view_number != consensus_state.view {
             tracing::warn!(
                 "TC verification failed: invalid view {} (current view: {})",
-                self.view_number, consensus_state.view
+                self.view_number,
+                consensus_state.view
             );
             return Err(CertificateError::ValidationError);
         }
 
         // Get validators for the height at this view (not raw view number)
         // This ensures correct threshold calculation when view diverges from height
-        let mut conn = app_state.db_pool.get().map_err(|_| CertificateError::DatabaseError)?;
-        let tx = conn.transaction().map_err(|_| CertificateError::DatabaseError)?;
+        let mut conn = app_state
+            .db_pool
+            .get()
+            .map_err(|_| CertificateError::DatabaseError)?;
+        let tx = conn
+            .transaction()
+            .map_err(|_| CertificateError::DatabaseError)?;
         let height = db::get_height_at_view_tx(&tx, self.view_number)
             .map_err(|_| CertificateError::DatabaseError)?;
         drop(tx); // Release transaction before getting validators
@@ -820,7 +938,8 @@ impl TimeoutCertificate {
                 invalid_vote_count += 1;
                 tracing::warn!(
                     "Ignoring timeout vote from non-validator node {} in TC for view {}",
-                    vote_sig.replica_id, self.view_number
+                    vote_sig.replica_id,
+                    self.view_number
                 );
             }
         }
@@ -832,14 +951,20 @@ impl TimeoutCertificate {
         if total_valid_signatures < required_signatures {
             tracing::warn!(
                 "TC verification failed: insufficient valid signatures (got: {}, required: {}, validators: {}, invalid votes filtered: {})",
-                total_valid_signatures, required_signatures, num_validators, invalid_vote_count
+                total_valid_signatures,
+                required_signatures,
+                num_validators,
+                invalid_vote_count
             );
             return Err(CertificateError::InsufficientVotes);
         }
 
         tracing::debug!(
             "Verifying TC for view {} with {} valid signatures from {} validators (filtered {} invalid votes)",
-            self.view_number, total_valid_signatures, num_validators, invalid_vote_count
+            self.view_number,
+            total_valid_signatures,
+            num_validators,
+            invalid_vote_count
         );
 
         // Verify signatures on timeout data
@@ -849,7 +974,9 @@ impl TimeoutCertificate {
             highest_qc_phase: self.highest_qc.phase,
             highest_qc_hash: self.highest_qc.block_hash,
         };
-        let message = timeout_data.encode().map_err(|_| CertificateError::ValidationError)?;
+        let message = timeout_data
+            .encode()
+            .map_err(|_| CertificateError::ValidationError)?;
 
         // Collect signatures and public keys for batch verification (using only valid voters)
         let mut signatures = Vec::new();
@@ -868,31 +995,42 @@ impl TimeoutCertificate {
             Err(_) => Err(CertificateError::ValidationError),
         }
     }
-    
+
     fn find_majority_timeout_data_and_filter(
         timeout_votes: Vec<TimeoutVote>,
         app_state: &AppState,
     ) -> Result<(TimeoutSignData, Vec<TimeoutVote>), CertificateError> {
         use std::collections::HashMap;
-        
+
         let mut data_counts = HashMap::new();
-        
+
         // Group votes by their timeout data hash
         for vote in &timeout_votes {
-            let data_hash = vote.data.encode().map_err(|_| CertificateError::ValidationError)?;
-            data_counts.entry(data_hash).or_insert(Vec::new()).push(vote);
+            let data_hash = vote
+                .data
+                .encode()
+                .map_err(|_| CertificateError::ValidationError)?;
+            data_counts
+                .entry(data_hash)
+                .or_insert(Vec::new())
+                .push(vote);
         }
-        
+
         // Check each group to see if it has sufficient quorum for its view
         let mut valid_groups = Vec::new();
-        
+
         for (data_hash, votes) in data_counts {
             let view_number = votes[0].data.view_number;
-            
+
             // Get validator count for the height at this view (not raw view number)
             // This ensures correct threshold calculation when view diverges from height
-            let mut conn = app_state.db_pool.get().map_err(|_| CertificateError::DatabaseError)?;
-            let tx = conn.transaction().map_err(|_| CertificateError::DatabaseError)?;
+            let mut conn = app_state
+                .db_pool
+                .get()
+                .map_err(|_| CertificateError::DatabaseError)?;
+            let tx = conn
+                .transaction()
+                .map_err(|_| CertificateError::DatabaseError)?;
             let height = db::get_height_at_view_tx(&tx, view_number)
                 .map_err(|_| CertificateError::DatabaseError)?;
             drop(tx); // Release transaction before getting validators
@@ -906,16 +1044,16 @@ impl TimeoutCertificate {
                 valid_groups.push((data_hash, votes));
             }
         }
-        
+
         // Find the group with the most votes among valid groups
         let (_, majority_votes) = valid_groups
             .into_iter()
             .max_by_key(|(_, votes)| votes.len())
-            .ok_or(CertificateError::InsufficientVotes)?;  // Fail if no group has quorum
-        
+            .ok_or(CertificateError::InsufficientVotes)?; // Fail if no group has quorum
+
         let majority_timeout_data = majority_votes[0].data.clone();
         let valid_votes = majority_votes.into_iter().cloned().collect();
-        
+
         Ok((majority_timeout_data, valid_votes))
     }
 }
@@ -934,7 +1072,7 @@ pub struct BlockData {
     pub height: i32,
     pub view_number: i32,
     pub parent_hash: Option<Blake3Hash>,
-    pub transactions: Option<Transactions>
+    pub transactions: Option<Transactions>,
 }
 
 impl BlockData {
@@ -955,40 +1093,46 @@ impl Block {
     pub fn new(data: BlockData) -> Result<Block, BlockError> {
         // compute hash over blockdata
         let digest = data.compute_hash()?;
-        
+
         return Ok(Block {
             block_hash: digest,
-            data: data
-        })
+            data: data,
+        });
     }
-    
+
     pub fn new_tip(
         app_state: &AppState,
-        transactions: Vec<Transaction>
+        transactions: Vec<Transaction>,
     ) -> Result<Block, BlockError> {
         // Get single DB connection for all queries (snapshot consistency + performance)
-        let mut db_conn = app_state.db_pool.get().map_err(|_| BlockError::DatabaseError)?;
+        let mut db_conn = app_state
+            .db_pool
+            .get()
+            .map_err(|_| BlockError::DatabaseError)?;
 
         // Validate all transaction signatures before creating block (leader validation)
         if !transactions.is_empty() {
             // Batch fetch all pubkeys for signature validation
-            let node_pubkeys = db::get_all_node_pubkeys(&db_conn)
-                .map_err(|_| BlockError::DatabaseError)?;
-            let user_pubkeys = db::get_all_user_pubkeys(&db_conn)
-                .map_err(|_| BlockError::DatabaseError)?;
+            let node_pubkeys =
+                db::get_all_node_pubkeys(&db_conn).map_err(|_| BlockError::DatabaseError)?;
+            let user_pubkeys =
+                db::get_all_user_pubkeys(&db_conn).map_err(|_| BlockError::DatabaseError)?;
 
             // Parallel signature verification
-            transactions.par_iter()
+            transactions
+                .par_iter()
                 .try_for_each(|tx| -> Result<(), BlockError> {
                     // Verify node signature
-                    let node_pubkey = node_pubkeys.get(&tx.submitter.id)
+                    let node_pubkey = node_pubkeys
+                        .get(&tx.submitter.id)
                         .ok_or(BlockError::ValidationError)?;
                     tx.verify_signature(node_pubkey)
                         .map_err(|_| BlockError::ValidationError)?;
 
                     // Verify user signature if present
                     if let Some(ref user) = tx.user {
-                        let user_pubkey = user_pubkeys.get(&user.id)
+                        let user_pubkey = user_pubkeys
+                            .get(&user.id)
                             .ok_or(BlockError::ValidationError)?;
                         tx.verify_user_signature(user_pubkey)
                             .map_err(|_| BlockError::ValidationError)?;
@@ -999,21 +1143,23 @@ impl Block {
         }
 
         // Get the current tip (committed_block)
-        let consensus_state = db::get_consensus_with_conn(&db_conn)
-            .map_err(|_| BlockError::DatabaseError)?;
+        let consensus_state =
+            db::get_consensus_with_conn(&db_conn).map_err(|_| BlockError::DatabaseError)?;
 
         let height = consensus_state.committed_block.data.height + 1;
         let view = consensus_state.view;
         tracing::info!(
             "Creating new block at height {} for view {} with {} transactions",
-            height, view, transactions.len()
+            height,
+            view,
+            transactions.len()
         );
 
         let tip_data = BlockData {
             height,
             view_number: view,
             parent_hash: Some(consensus_state.committed_block.block_hash),
-            transactions: Some(Transactions(transactions))
+            transactions: Some(Transactions(transactions)),
         };
         let new_block = Block::new(tip_data)?;
 
@@ -1029,7 +1175,7 @@ impl Block {
         // compute hash and compare to self
         let digest = self.data.compute_hash()?;
         if digest != self.block_hash {
-            return Err(BlockError::EncodingError)
+            return Err(BlockError::EncodingError);
         }
         Ok(())
     }
@@ -1043,13 +1189,13 @@ pub struct RpcCall {
 
 impl RpcCall {
     pub fn encode(&self) -> Result<Vec<u8>, TransactionError> {
-        encode_to_vec(&self, config::standard())
-            .map_err(|_| TransactionError::EncodingError)
+        encode_to_vec(&self, config::standard()).map_err(|_| TransactionError::EncodingError)
     }
 
     pub fn sign(&self, private_key: &PrivKey) -> Result<Signature, TransactionError> {
         let data = &self.encode()?;
-        let signature = private_key.try_sign(&data)
+        let signature = private_key
+            .try_sign(&data)
             .map_err(|_| TransactionError::SigningError)?;
         Ok(signature)
     }
@@ -1064,14 +1210,19 @@ pub struct SignedIdentity {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Transaction {
     pub rpc: RpcCall,
-    pub submitter: SignedIdentity,  // Node that submitted this transaction
-    pub user: Option<SignedIdentity>,  // User who initiated this (if user operation)
-    pub nonce: CustomUUID,  // UUIDv7 nonce for dedup (prevents stale resubmission)
+    pub submitter: SignedIdentity, // Node that submitted this transaction
+    pub user: Option<SignedIdentity>, // User who initiated this (if user operation)
+    pub nonce: CustomUUID,         // UUIDv7 nonce for dedup (prevents stale resubmission)
 }
 
 impl Transaction {
     // Create a node-only transaction (automated operations)
-    pub fn new(function: String, payload: Vec<u8>, submitter_id: i32, submitter_key: &PrivKey) -> Result<Self, TransactionError> {
+    pub fn new(
+        function: String,
+        payload: Vec<u8>,
+        submitter_id: i32,
+        submitter_key: &PrivKey,
+    ) -> Result<Self, TransactionError> {
         let rpc = RpcCall { function, payload };
         let signature = rpc.sign(submitter_key)?;
 
@@ -1093,7 +1244,7 @@ impl Transaction {
         submitter_id: i32,
         submitter_key: &PrivKey,
         user_id: i32,
-        user_key: &PrivKey
+        user_key: &PrivKey,
     ) -> Result<Self, TransactionError> {
         let rpc = RpcCall { function, payload };
         let submitter_signature = rpc.sign(submitter_key)?;
@@ -1115,14 +1266,16 @@ impl Transaction {
 
     pub fn verify_signature(&self, submitter_pubkey: &PubKey) -> Result<(), TransactionError> {
         let message = self.rpc.encode()?;
-        submitter_pubkey.verify_strict(&message, &self.submitter.signature)
+        submitter_pubkey
+            .verify_strict(&message, &self.submitter.signature)
             .map_err(|_| TransactionError::InvalidSignature)
     }
 
     pub fn verify_user_signature(&self, user_pubkey: &PubKey) -> Result<(), TransactionError> {
         if let Some(user) = &self.user {
             let message = self.rpc.encode()?;
-            user_pubkey.verify_strict(&message, &user.signature)
+            user_pubkey
+                .verify_strict(&message, &user.signature)
                 .map_err(|_| TransactionError::InvalidSignature)
         } else {
             Err(TransactionError::InvalidSignature)
@@ -1153,7 +1306,7 @@ impl ToSql for Transactions {
         // let's turn transactions into Vec<u8>
         match bincode::serde::encode_to_vec(&self, bincode::config::standard()) {
             Ok(data) => Ok(ToSqlOutput::Owned(rusqlite::types::Value::Blob(data))),
-            Err(e) => Err(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+            Err(e) => Err(rusqlite::Error::ToSqlConversionFailure(Box::new(e))),
         }
     }
 }
@@ -1196,8 +1349,8 @@ pub struct ViewConsensusData {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ViewCompletenessState {
-    Complete,    // Has lock QC or TC (view finished, network moved on)
-    InProgress,  // Current view, may be incomplete (propose phase in progress)
+    Complete,   // Has lock QC or TC (view finished, network moved on)
+    InProgress, // Current view, may be incomplete (propose phase in progress)
 }
 
 /// Validate that view data is complete enough to integrate
@@ -1222,7 +1375,8 @@ pub fn validate_view_completeness(
     if view_data.view < target_view {
         tracing::warn!(
             "View {} is incomplete (no lock QC or TC) but is historical (target: {})",
-            view_data.view, target_view
+            view_data.view,
+            target_view
         );
         return Err(CatchUpError::ValidationFailed(view_data.view));
     }
@@ -1235,7 +1389,8 @@ pub fn validate_view_completeness(
     // Future view - shouldn't happen
     tracing::error!(
         "View {} is in the future (target: {})",
-        view_data.view, target_view
+        view_data.view,
+        target_view
     );
     Err(CatchUpError::ValidationFailed(view_data.view))
 }
@@ -1328,7 +1483,9 @@ mod tests {
             assert!(
                 tolerable >= prev_tolerable,
                 "Fault tolerance regressed at n={}: can tolerate {} faults (previous: {})",
-                n, tolerable, prev_tolerable
+                n,
+                tolerable,
+                prev_tolerable
             );
 
             prev_tolerable = tolerable;
@@ -1348,7 +1505,10 @@ mod tests {
         assert_eq!(tolerable_7, 2, "7 validators should tolerate 2 faults");
 
         // No regression at boundary (lateral move)
-        assert_eq!(tolerable_6, tolerable_7, "Boundary transition should maintain fault tolerance");
+        assert_eq!(
+            tolerable_6, tolerable_7,
+            "Boundary transition should maintain fault tolerance"
+        );
     }
 
     #[test]
@@ -1387,7 +1547,8 @@ mod tests {
             assert!(
                 threshold > n / 2,
                 "Quorum {} must be more than half of {} validators",
-                threshold, n
+                threshold,
+                n
             );
         }
     }
@@ -1401,7 +1562,8 @@ mod tests {
             assert!(
                 buffer >= 2,
                 "BFT mode with {} validators must have buffer ≥ 2, got {}",
-                n, buffer
+                n,
+                buffer
             );
         }
     }

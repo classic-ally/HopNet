@@ -2,19 +2,19 @@
 //! callers (import pipeline). Built out incrementally in Phase 3.2.
 
 use axum::http::StatusCode;
-use chacha20poly1305::{aead::OsRng, ChaCha20Poly1305, KeyInit};
+use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::OsRng};
 use either::Either::{Left, Right};
 use rusqlite::Transaction as RusqliteTransaction;
 use std::collections::HashSet;
 use tokio::io::AsyncRead;
 
+use crate::AppState;
 use crate::auth::SessionEntry;
 use crate::consensus::types::Transaction;
 use crate::db::{Blake3Hash, CustomUUID, DatabaseError, Inode};
 use crate::files::functions::{encrypt_part, encrypt_path};
 use crate::files::routes::process_uploaded_file;
 use crate::files::types::SelfCheckFragments;
-use crate::AppState;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AttestationError {
@@ -167,7 +167,10 @@ pub async fn submit_inodes(
     }
 
     for data_block_id in data_block_ids {
-        tracing::info!("Triggering fragment distribution for uploaded file {}", data_block_id);
+        tracing::info!(
+            "Triggering fragment distribution for uploaded file {}",
+            data_block_id
+        );
         let app_state_clone = app_state.clone();
         let data_block_id_clone = data_block_id.clone();
         tokio::spawn(async move {
@@ -177,8 +180,15 @@ pub async fn submit_inodes(
             )
             .await
             {
-                Ok(()) => tracing::info!("Successfully completed fragment distribution for {}", data_block_id),
-                Err(e) => tracing::error!("Fragment distribution failed for {}: {:?}", data_block_id, e),
+                Ok(()) => tracing::info!(
+                    "Successfully completed fragment distribution for {}",
+                    data_block_id
+                ),
+                Err(e) => tracing::error!(
+                    "Fragment distribution failed for {}: {:?}",
+                    data_block_id,
+                    e
+                ),
             }
         });
     }
@@ -225,7 +235,11 @@ fn query_inventory_state(
         return Ok((previous_count, HashSet::new()));
     }
 
-    let placeholders = candidates.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+    let placeholders = candidates
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(", ");
     let query = format!(
         "SELECT fragment_hash FROM fragment_inventory \
          WHERE node_id = ? AND fragment_hash IN ({})",
@@ -358,18 +372,31 @@ pub async fn create_file_with_fragments<R: AsyncRead + Unpin>(
     let mut inodes = vec![inode];
 
     {
-        let conn = app_state.db_pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let tx = conn.unchecked_transaction().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let conn = app_state
+            .db_pool
+            .get()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         prepend_missing_parents(&tx, &mut inodes, user_id)?;
     }
 
     let attestation = if let Ok(node_id) = app_state.get_node_id() {
-        let conn = app_state.db_pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let tx = conn.unchecked_transaction().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let conn = app_state
+            .db_pool
+            .get()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         match build_upload_attestation(app_state, &tx, node_id, &inodes) {
             Ok(opt) => opt,
             Err(e) => {
-                tracing::warn!("Failed to build upload attestation: {}. Continuing without — periodic self-check will reconcile", e);
+                tracing::warn!(
+                    "Failed to build upload attestation: {}. Continuing without — periodic self-check will reconcile",
+                    e
+                );
                 None
             }
         }
@@ -409,8 +436,13 @@ pub async fn create_folder(
     let mut inodes = vec![folder_inode];
 
     {
-        let conn = app_state.db_pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let tx = conn.unchecked_transaction().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let conn = app_state
+            .db_pool
+            .get()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         prepend_missing_parents(&tx, &mut inodes, user_id)?;
     }
 

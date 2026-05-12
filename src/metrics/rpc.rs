@@ -1,9 +1,9 @@
-use serde::{Deserialize, Serialize};
-use std::time::Duration;
-use crate::net::{IrohError, IrohTransport};
+use crate::AppState;
 use crate::net::protocol::{IrohRequest, IrohResponse};
 use crate::net::transport::ProtocolError;
-use crate::AppState;
+use crate::net::{IrohError, IrohTransport};
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 /// Stream I/O timeout for latency pings (lightweight, should be fast)
 const LATENCY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -39,7 +39,9 @@ pub struct LatencyPongResponse {
 
 /// Server-side: echo back the timestamp for RTT measurement.
 pub fn handle_latency_ping(req: LatencyPingRequest) -> LatencyPongResponse {
-    LatencyPongResponse { timestamp_nanos: req.timestamp_nanos }
+    LatencyPongResponse {
+        timestamp_nanos: req.timestamp_nanos,
+    }
 }
 
 /// Client-side: measure latency to a remote node over iroh.
@@ -58,9 +60,13 @@ pub async fn measure_latency(
             .unwrap_or_default()
             .as_nanos() as u64;
 
-        let req = IrohRequest::LatencyPing(LatencyPingRequest { timestamp_nanos: ts });
+        let req = IrohRequest::LatencyPing(LatencyPingRequest {
+            timestamp_nanos: ts,
+        });
         let send_time = std::time::Instant::now();
-        let response = transport.request(node_id, peer_pubkey, &req, LATENCY_TIMEOUT).await?;
+        let response = transport
+            .request(node_id, peer_pubkey, &req, LATENCY_TIMEOUT)
+            .await?;
 
         match response {
             IrohResponse::LatencyPong(resp) if resp.timestamp_nanos == ts => {
@@ -94,7 +100,10 @@ fn calculate_rtt_metrics(rtts: Vec<Duration>) -> (f64, f64, f64) {
         return (0.0, 0.0, 0.0);
     }
 
-    let ms: Vec<f64> = rtts.iter().map(|d| d.as_nanos() as f64 / 1_000_000.0).collect();
+    let ms: Vec<f64> = rtts
+        .iter()
+        .map(|d| d.as_nanos() as f64 / 1_000_000.0)
+        .collect();
     let count = ms.len();
 
     // RTT Average
@@ -151,7 +160,9 @@ pub async fn measure_throughput(
 
     while start.elapsed() < THROUGHPUT_TEST_DURATION {
         let req = IrohRequest::ThroughputUpload(ThroughputUploadRequest { data: data.clone() });
-        let response = transport.request(node_id, peer_pubkey, &req, THROUGHPUT_TIMEOUT).await?;
+        let response = transport
+            .request(node_id, peer_pubkey, &req, THROUGHPUT_TIMEOUT)
+            .await?;
 
         match response {
             IrohResponse::ThroughputAck(_) => {
@@ -211,17 +222,17 @@ pub async fn query_storage(
     peer_pubkey: iroh::PublicKey,
 ) -> Result<(u32, u32), IrohError> {
     let req = IrohRequest::StorageQuery(StorageQueryRequest);
-    let response = transport.request(node_id, peer_pubkey, &req, STORAGE_TIMEOUT).await?;
+    let response = transport
+        .request(node_id, peer_pubkey, &req, STORAGE_TIMEOUT)
+        .await?;
 
     match response {
         IrohResponse::StorageResult(result) => Ok((result.total_gb, result.used_gb)),
         IrohResponse::Error { message } => {
             Err(IrohError::Protocol(ProtocolError::PeerError(message)))
         }
-        other => {
-            Err(IrohError::Protocol(ProtocolError::MalformedResponse(
-                format!("unexpected response to StorageQuery: {:?}", other),
-            )))
-        }
+        other => Err(IrohError::Protocol(ProtocolError::MalformedResponse(
+            format!("unexpected response to StorageQuery: {:?}", other),
+        ))),
     }
 }

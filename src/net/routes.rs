@@ -1,9 +1,4 @@
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    Json,
-};
+use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use serde::Serialize;
 
 use crate::AppState;
@@ -27,9 +22,7 @@ pub struct NodePingResult {
 
 /// Debug endpoint for testing iroh connectivity to all nodes
 /// GET /debug/iroh-ping
-pub async fn debug_iroh_ping(
-    State(app_state): State<AppState>,
-) -> impl IntoResponse {
+pub async fn debug_iroh_ping(State(app_state): State<AppState>) -> impl IntoResponse {
     let my_node_id = app_state.get_node_id().unwrap_or(-1);
 
     // Get all nodes from database

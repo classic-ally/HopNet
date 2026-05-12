@@ -6,7 +6,9 @@ pub fn get_users(
 ) -> Result<Vec<User>, DatabaseError> {
     match db_connection {
         Ok(db_lock) => {
-            let mut stmt = db_lock.prepare("SELECT * FROM users").map_err(|_| DatabaseError::RecallError)?;
+            let mut stmt = db_lock
+                .prepare("SELECT * FROM users")
+                .map_err(|_| DatabaseError::RecallError)?;
             let results = stmt.query_map([], |row| {
                 Ok(User {
                     user_id: row.get(0)?,
@@ -23,13 +25,15 @@ pub fn get_users(
             });
 
             match results {
-                Ok(users) => Ok(users.collect::<Result<_, _>>().map_err(|_| DatabaseError::ProcessingError)?),
+                Ok(users) => Ok(users
+                    .collect::<Result<_, _>>()
+                    .map_err(|_| DatabaseError::ProcessingError)?),
                 Err(e) => {
                     tracing::error!("Error querying users: {:?}", e);
                     Err(DatabaseError::RecordError)
                 }
             }
-        },
+        }
         Err(e) => {
             tracing::error!("Database connection error in get_users: {:?}", e);
             Err(DatabaseError::LockError)
@@ -43,11 +47,13 @@ pub fn get_user_by_username(
 ) -> Result<Option<User>, DatabaseError> {
     match db_connection {
         Ok(db_lock) => {
-            let mut stmt = db_lock.prepare(
-                "SELECT * FROM users WHERE username = ?"
-            ).map_err(|_|DatabaseError::RecallError)?;
+            let mut stmt = db_lock
+                .prepare("SELECT * FROM users WHERE username = ?")
+                .map_err(|_| DatabaseError::RecallError)?;
 
-            let mut rows = stmt.query(&[&username]).map_err(|_|DatabaseError::RecallError)?;
+            let mut rows = stmt
+                .query(&[&username])
+                .map_err(|_| DatabaseError::RecallError)?;
 
             if let Some(row) = rows.next().map_err(|_| DatabaseError::RecallError)? {
                 let user = User {
@@ -62,12 +68,12 @@ pub fn get_user_by_username(
                     avatar: row.get(8).map_err(|_| DatabaseError::RecallError)?,
                     onboarding_flags: row.get(9).map_err(|_| DatabaseError::RecallError)?,
                 };
-                return Ok(Some(user))
+                return Ok(Some(user));
             } else {
-                return Ok(None)
+                return Ok(None);
             }
         }
-        Err(_) => Err(DatabaseError::LockError)
+        Err(_) => Err(DatabaseError::LockError),
     }
 }
 
@@ -75,11 +81,13 @@ pub fn get_user_by_userid_conn(
     conn: &rusqlite::Connection,
     userid: i32,
 ) -> Result<Option<User>, DatabaseError> {
-    let mut stmt = conn.prepare(
-        "SELECT * FROM users WHERE user_id = ?"
-    ).map_err(|_| DatabaseError::RecallError)?;
+    let mut stmt = conn
+        .prepare("SELECT * FROM users WHERE user_id = ?")
+        .map_err(|_| DatabaseError::RecallError)?;
 
-    let mut rows = stmt.query(&[&userid]).map_err(|_| DatabaseError::RecallError)?;
+    let mut rows = stmt
+        .query(&[&userid])
+        .map_err(|_| DatabaseError::RecallError)?;
 
     if let Some(row) = rows.next().map_err(|_| DatabaseError::RecallError)? {
         let user = User {
@@ -112,15 +120,14 @@ pub fn get_user_by_userid(
 
 /// Core user insertion logic - operates within provided transaction for atomicity
 /// Returns the assigned user_id
-pub fn insert_user_tx(
-    tx: &rusqlite::Transaction,
-    user: User,
-) -> Result<i32, DatabaseError> {
-    let next_id = tx.query_row(
-        "SELECT next_id FROM sequences WHERE name = 'users'",
-        [],
-        |row| row.get::<_, i32>(0)
-    ).map_err(|_| DatabaseError::RecallError)?;
+pub fn insert_user_tx(tx: &rusqlite::Transaction, user: User) -> Result<i32, DatabaseError> {
+    let next_id = tx
+        .query_row(
+            "SELECT next_id FROM sequences WHERE name = 'users'",
+            [],
+            |row| row.get::<_, i32>(0),
+        )
+        .map_err(|_| DatabaseError::RecallError)?;
 
     tx.execute(
         "INSERT INTO users (user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt) VALUES (?, ?, ?, ?, ?, ?)",
@@ -130,8 +137,9 @@ pub fn insert_user_tx(
     // Update the sequence for next user
     tx.execute(
         "UPDATE sequences SET next_id = next_id + 1 WHERE name = 'users'",
-        []
-    ).map_err(|_| DatabaseError::InsertError)?;
+        [],
+    )
+    .map_err(|_| DatabaseError::InsertError)?;
 
     Ok(next_id)
 }
@@ -161,8 +169,17 @@ pub fn update_user_profile_tx(
             last_name  = CASE WHEN ? THEN ? ELSE last_name END, \
             avatar     = CASE WHEN ? THEN ? ELSE avatar END \
          WHERE user_id = ?",
-        params![fn_changing, fn_val, ln_changing, ln_val, av_changing, av_val, user_id]
-    ).map_err(|_| DatabaseError::InsertError)?;
+        params![
+            fn_changing,
+            fn_val,
+            ln_changing,
+            ln_val,
+            av_changing,
+            av_val,
+            user_id
+        ],
+    )
+    .map_err(|_| DatabaseError::InsertError)?;
 
     Ok(())
 }
@@ -176,7 +193,8 @@ pub fn update_user_onboarding_tx(
     tx.execute(
         "UPDATE users SET onboarding_flags = (onboarding_flags | ?) & ~? WHERE user_id = ?",
         params![payload.set_flags, payload.clear_flags, payload.user_id],
-    ).map_err(|_| DatabaseError::InsertError)?;
+    )
+    .map_err(|_| DatabaseError::InsertError)?;
     Ok(())
 }
 
@@ -186,10 +204,11 @@ pub fn insert_user(
     user: User,
     execute: bool,
 ) -> Result<(), DatabaseError> {
-
     match db_connection {
         Ok(mut db_lock) => {
-            let tx = db_lock.transaction().map_err(|_| DatabaseError::LockError)?;
+            let tx = db_lock
+                .transaction()
+                .map_err(|_| DatabaseError::LockError)?;
 
             let user_id = insert_user_tx(&tx, user)?;
 
@@ -199,11 +218,14 @@ pub fn insert_user(
                 tracing::info!("Successfully inserted user {}", user_id);
             } else {
                 tx.rollback().map_err(|_| DatabaseError::LockError)?;
-                tracing::debug!("User {} insertion validated successfully (rolled back)", user_id);
+                tracing::debug!(
+                    "User {} insertion validated successfully (rolled back)",
+                    user_id
+                );
             }
 
             Ok(())
-        },
+        }
         Err(_) => Err(DatabaseError::LockError),
     }
 }

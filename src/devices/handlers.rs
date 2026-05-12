@@ -1,10 +1,13 @@
-use crate::{
-    db::{DatabaseError, devices::{insert_device_token_tx, delete_device_token_tx}},
-    handlers::{HandlerResult, TransactionHandler},
-    consensus::types::Transaction,
-    AppState,
-};
 use super::types::{RegisterDevicePayload, RevokeDevicePayload};
+use crate::{
+    AppState,
+    consensus::types::Transaction,
+    db::{
+        DatabaseError,
+        devices::{delete_device_token_tx, insert_device_token_tx},
+    },
+    handlers::{HandlerResult, TransactionHandler},
+};
 
 /// Handler for register_device consensus transactions
 pub struct RegisterDeviceHandler;
@@ -14,18 +17,26 @@ impl TransactionHandler for RegisterDeviceHandler {
         "register_device"
     }
 
-    fn process(&self, _state: &AppState, tx: &Transaction, _execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
+    fn process(
+        &self,
+        _state: &AppState,
+        tx: &Transaction,
+        _execute: bool,
+        db_tx: &rusqlite::Transaction,
+    ) -> HandlerResult {
         let (payload, _) = bincode::serde::decode_from_slice::<RegisterDevicePayload, _>(
             &tx.rpc.payload,
-            bincode::config::standard()
-        ).map_err(|_| DatabaseError::InvalidPayload)?;
+            bincode::config::standard(),
+        )
+        .map_err(|_| DatabaseError::InvalidPayload)?;
 
         // Authorization: user in transaction must match payload user_id
         if let Some(ref user) = tx.user {
             if payload.user_id != user.id {
                 tracing::warn!(
                     "Authorization failed: user {} attempted to register device for user {}",
-                    user.id, payload.user_id
+                    user.id,
+                    payload.user_id
                 );
                 return Err(DatabaseError::AuthorizationError);
             }
@@ -59,18 +70,26 @@ impl TransactionHandler for RevokeDeviceHandler {
         "revoke_device"
     }
 
-    fn process(&self, _state: &AppState, tx: &Transaction, _execute: bool, db_tx: &rusqlite::Transaction) -> HandlerResult {
+    fn process(
+        &self,
+        _state: &AppState,
+        tx: &Transaction,
+        _execute: bool,
+        db_tx: &rusqlite::Transaction,
+    ) -> HandlerResult {
         let (payload, _) = bincode::serde::decode_from_slice::<RevokeDevicePayload, _>(
             &tx.rpc.payload,
-            bincode::config::standard()
-        ).map_err(|_| DatabaseError::InvalidPayload)?;
+            bincode::config::standard(),
+        )
+        .map_err(|_| DatabaseError::InvalidPayload)?;
 
         // Authorization: user in transaction must match payload user_id
         if let Some(ref user) = tx.user {
             if payload.user_id != user.id {
                 tracing::warn!(
                     "Authorization failed: user {} attempted to revoke device for user {}",
-                    user.id, payload.user_id
+                    user.id,
+                    payload.user_id
                 );
                 return Err(DatabaseError::AuthorizationError);
             }

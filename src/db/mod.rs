@@ -1,33 +1,33 @@
 pub use {
-    rusqlite::{params, Error as DuckdbError},
-    r2d2_sqlite::SqliteConnectionManager,
+    crate::types::*,
     r2d2::PooledConnection,
+    r2d2_sqlite::SqliteConnectionManager,
+    rusqlite::{Error as DuckdbError, params},
     types::*,
-    crate::types::*
 };
 
 // Re-export CustomUUID from common module for backward compatibility
 pub use hopnet_common::CustomUUID;
 
-pub mod shared;
-pub mod users;
 pub mod consensus;
-pub mod metrics;
-pub mod types;
-pub mod setup;
-pub mod nodes;
+pub mod debug;
+pub mod devices;
+pub mod documentprovider;
+pub mod fileprovider;
 pub mod files;
 pub mod fragments;
-pub mod fileprovider;
-pub mod documentprovider;
-pub mod takeout;
-pub mod imports;
 pub mod import_paths;
-pub mod devices;
+pub mod imports;
 pub mod inventory;
+pub mod metrics;
+pub mod nodes;
 pub mod resilience;
-pub mod debug;
+pub mod setup;
+pub mod shared;
 pub mod shares;
+pub mod takeout;
+pub mod types;
+pub mod users;
 pub mod write_gate;
 
 /// Maximum r2d2 connections checked out simultaneously across the process.

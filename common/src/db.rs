@@ -1,9 +1,9 @@
 // Shared database types for FileProvider
-use serde::{Deserialize, Serialize};
-use typeshare::typeshare;
 use chrono::{DateTime, Utc};
-use uuid::{Timestamp, Uuid};
+use serde::{Deserialize, Serialize};
 use std::ops::Deref;
+use typeshare::typeshare;
+use uuid::{Timestamp, Uuid};
 
 /// Inode type - file or folder
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -30,7 +30,7 @@ pub enum TakeoutStatus {
 pub struct TakeoutRecord {
     pub id: String, // UUID as string for frontend compatibility
     pub user_id: i32,
-    pub owner_node_id: i32,  // Node that owns and processes this takeout
+    pub owner_node_id: i32, // Node that owns and processes this takeout
     pub status: TakeoutStatus,
     #[typeshare(serialized_as = "String")]
     pub created_at: DateTime<Utc>,
@@ -119,7 +119,7 @@ impl CustomUUID {
     pub fn new(timestamp: Option<&Timestamp>) -> CustomUUID {
         match timestamp {
             Some(timestamp) => CustomUUID(Uuid::new_v7(*timestamp)),
-            None => CustomUUID(Uuid::now_v7())
+            None => CustomUUID(Uuid::now_v7()),
         }
     }
 
@@ -189,12 +189,12 @@ pub struct FileItem {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[typeshare]
 pub struct NetworkResilienceStats {
-    pub unknown: ResilienceLevel,          // -2: Files without attestation data
-    pub unrecoverable: ResilienceLevel,    // -1: Files that cannot be recovered
-    pub critical: ResilienceLevel,         //  0: No fault tolerance (single point of failure)
-    pub good: ResilienceLevel,             //  1: Can survive 1 node failure
-    pub excellent: ResilienceLevel,        //  2: Can survive 2 node failures
-    pub exceptional: ResilienceLevel,      // 3+: Can survive 3+ node failures
+    pub unknown: ResilienceLevel,       // -2: Files without attestation data
+    pub unrecoverable: ResilienceLevel, // -1: Files that cannot be recovered
+    pub critical: ResilienceLevel,      //  0: No fault tolerance (single point of failure)
+    pub good: ResilienceLevel,          //  1: Can survive 1 node failure
+    pub excellent: ResilienceLevel,     //  2: Can survive 2 node failures
+    pub exceptional: ResilienceLevel,   // 3+: Can survive 3+ node failures
     pub total_files: u32,
     #[typeshare(serialized_as = "number")]
     pub computation_time_ms: u64,
@@ -212,9 +212,9 @@ pub struct ResilienceLevel {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[typeshare]
 pub enum NodeSource {
-    System,    // Real system data
-    Modified,  // Modified from system data
-    Added,     // User-added hypothetical node
+    System,   // Real system data
+    Modified, // Modified from system data
+    Added,    // User-added hypothetical node
 }
 
 /// Original values for tracking modifications

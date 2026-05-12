@@ -1,19 +1,24 @@
+use apalis::prelude::*;
 use axum::{
-    extract::DefaultBodyLimit, http::{HeaderValue, Method, StatusCode}, middleware, routing::{get,post,patch,delete}, serve, Router
+    Router,
+    extract::DefaultBodyLimit,
+    http::{HeaderValue, Method, StatusCode},
+    middleware,
+    routing::{delete, get, patch, post},
+    serve,
 };
-use tower_serve_static::ServeDir;
-use tower_http::cors::CorsLayer;
-use tower_http::trace::TraceLayer;
 use include_dir::{Dir, include_dir};
 use once_cell::sync::{Lazy, OnceCell};
-use std::sync::Arc;
-use r2d2_sqlite::SqliteConnectionManager;
 use r2d2::Pool;
-use apalis::prelude::*;
+use r2d2_sqlite::SqliteConnectionManager;
 use std::str::FromStr;
+use std::sync::Arc;
+use tower_http::cors::CorsLayer;
+use tower_http::trace::TraceLayer;
+use tower_serve_static::ServeDir;
 
-use hopnet::*;
 use hopnet::db::{PrivKey, PubKey};
+use hopnet::*;
 
 static ASSETS_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/frontend/dist");
 
@@ -24,8 +29,7 @@ const HEADLESS_BACKEND_PORT: u16 = 34632;
 /// Actual bound port. Populated by `run_server` after `TcpListener::bind`
 /// returns — needed in GUI mode because we bind `127.0.0.1:0` and let the
 /// kernel pick a free port, so two HopNet processes never clash.
-static ACTUAL_BACKEND_PORT: std::sync::atomic::AtomicU16 =
-    std::sync::atomic::AtomicU16::new(0);
+static ACTUAL_BACKEND_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
 
 /// Global AppState accessible to Tauri IPC commands (GUI mode only).
 /// Set by run_server() after AppState creation; read by Tauri commands.
@@ -79,7 +83,8 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
         Pool::builder()
             .max_size(db::DB_POOL_MAX_SIZE)
             .connection_customizer(Box::new(db::shared::SqliteInitializer))
-            .build(manager).unwrap()
+            .build(manager)
+            .unwrap()
     } else {
         // Get database path and ensure directory exists
         let db_path = db::shared::get_database_path();
@@ -87,8 +92,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
 
         if !db_file_exists {
             tracing::info!("Creating new database at {}", db_path);
-            db::shared::ensure_database_dir(&db_path)
-                .expect("Failed to create database directory");
+            db::shared::ensure_database_dir(&db_path).expect("Failed to create database directory");
         } else {
             tracing::info!("Found existing database file at {}", db_path);
         }
@@ -97,7 +101,8 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
         let pool = Pool::builder()
             .max_size(db::DB_POOL_MAX_SIZE)
             .connection_customizer(Box::new(db::shared::SqliteInitializer))
-            .build(manager).unwrap();
+            .build(manager)
+            .unwrap();
 
         tracing::info!("Database connection pool established (WAL mode)");
         pool
@@ -107,10 +112,9 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
     let conn = pool.get().unwrap();
 
     let schema_initialized = if use_ephemeral_db {
-        false  // Ephemeral database always needs initialization
+        false // Ephemeral database always needs initialization
     } else {
-        db::shared::is_schema_initialized(&conn)
-            .expect("Failed to check schema status")
+        db::shared::is_schema_initialized(&conn).expect("Failed to check schema status")
     };
 
     let init_result = if schema_initialized {
@@ -126,8 +130,11 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             // Try to load existing state from database, or generate new keys if this is a new node
             let startup_state_opt = match db::consensus::get_startup_state(pool.get()) {
                 Ok(state) => {
-                    tracing::info!("Loaded existing state from database (node_id: {}, user_id: {})",
-                        state.node_id, state.user_id);
+                    tracing::info!(
+                        "Loaded existing state from database (node_id: {}, user_id: {})",
+                        state.node_id,
+                        state.user_id
+                    );
                     Some(state)
                 }
                 Err(db::DatabaseError::RecallError) => {
@@ -152,17 +159,19 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("Failed to get fragments directory, using current directory");
                 "./hopnet/fragments".to_string()
             });
-            std::fs::create_dir_all(&fragments_dir)
-                .expect("Failed to create fragments directory");
+            std::fs::create_dir_all(&fragments_dir).expect("Failed to create fragments directory");
 
             // Create iroh transport
             let iroh_secret = PrivKey(privatekey.clone()).to_iroh_secret_key();
-            let iroh_transport = net::IrohTransport::new(iroh_secret, pool.clone(), startup_state_opt.is_some()).await
-                .expect("Failed to create iroh transport");
+            let iroh_transport =
+                net::IrohTransport::new(iroh_secret, pool.clone(), startup_state_opt.is_some())
+                    .await
+                    .expect("Failed to create iroh transport");
             tracing::info!("iroh endpoint ready, node_id: {}", iroh_transport.node_id());
 
             // Create consensus queue (channel + submit handle)
-            let (consensus_queue, consensus_queue_rx) = consensus::queue::ConsensusQueue::new(pool.clone(), 300);
+            let (consensus_queue, consensus_queue_rx) =
+                consensus::queue::ConsensusQueue::new(pool.clone(), 300);
 
             // Create write gate + local-state channel
             let write_gate = Arc::new(db::write_gate::WriteGate::new());
@@ -197,12 +206,18 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
 
             // If we loaded state from database, populate the OnceCell fields
             if let Some(state) = startup_state_opt {
-                app_state.node_id.set(state.node_id)
+                app_state
+                    .node_id
+                    .set(state.node_id)
                     .expect("Failed to set node_id in AppState");
-                app_state.user_id.set(state.user_id)
+                app_state
+                    .user_id
+                    .set(state.user_id)
                     .expect("Failed to set user_id in AppState");
 
-                tracing::info!("AppState initialized from persisted database (user keys require login)");
+                tracing::info!(
+                    "AppState initialized from persisted database (user keys require login)"
+                );
 
                 // Scan for stranded imports owned by this node so that on the
                 // next user authentication event the resume hook can finish them.
@@ -215,22 +230,34 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 // GUI auto-login: load owner session from keychain if available
                 #[cfg(all(target_os = "macos", feature = "gui", not(debug_assertions)))]
                 {
-                    if let Ok((kc_user_id, privkey_bytes)) = fileprovider::keychain::load_session_key(
-                        fileprovider::keychain::KeychainEnvironment::Production,
-                    ) {
+                    if let Ok((kc_user_id, privkey_bytes)) =
+                        fileprovider::keychain::load_session_key(
+                            fileprovider::keychain::KeychainEnvironment::Production,
+                        )
+                    {
                         if let Ok(key_bytes) = <[u8; 32]>::try_from(privkey_bytes.as_slice()) {
-                            let privkey = db::PrivKey(ed25519_dalek::SigningKey::from_bytes(&key_bytes));
+                            let privkey =
+                                db::PrivKey(ed25519_dalek::SigningKey::from_bytes(&key_bytes));
                             let pubkey = db::PubKey(privkey.verifying_key());
-                            let (siv_key, siv_nonce) = auth::derive_siv_key_from_user(&privkey, "file_path");
+                            let (siv_key, siv_nonce) =
+                                auth::derive_siv_key_from_user(&privkey, "file_path");
                             let session = auth::SessionEntry {
-                                user_keys: UserKeys { private_key: privkey, public_key: pubkey },
-                                siv_key, siv_nonce,
+                                user_keys: UserKeys {
+                                    private_key: privkey,
+                                    public_key: pubkey,
+                                },
+                                siv_key,
+                                siv_nonce,
                                 expires_at: chrono::Utc::now() + chrono::Duration::hours(876000),
                             };
-                            app_state.session_store.blocking_write().insert(kc_user_id, session);
+                            app_state
+                                .session_store
+                                .blocking_write()
+                                .insert(kc_user_id, session);
                             tracing::info!("Loaded owner session from keychain (auto-login ready)");
                             tokio::spawn(takeout::jobs::maybe_resume_for_user(
-                                app_state.clone(), kc_user_id,
+                                app_state.clone(),
+                                kc_user_id,
                             ));
                         }
                     }
@@ -245,23 +272,31 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
 
             // Warn about test mode being enabled
             if cfg!(debug_assertions) {
-                tracing::warn!("⚠️  TEST MODE ENABLED: Test endpoints are exposed and will return API credentials");
-                tracing::warn!("⚠️  This is a SECURITY RISK in production - test mode is automatically disabled in release builds");
+                tracing::warn!(
+                    "⚠️  TEST MODE ENABLED: Test endpoints are exposed and will return API credentials"
+                );
+                tracing::warn!(
+                    "⚠️  This is a SECURITY RISK in production - test mode is automatically disabled in release builds"
+                );
             }
 
             // Initialize FileProvider on startup - only cleans up if app is uninitialized (release builds only)
             #[cfg(all(target_os = "macos", not(debug_assertions)))]
             {
-                if let Err(e) = fileprovider::domain::initialize_fileprovider_on_startup(&app_state).await {
+                if let Err(e) =
+                    fileprovider::domain::initialize_fileprovider_on_startup(&app_state).await
+                {
                     tracing::warn!("Failed to initialize FileProvider on startup: {}", e);
                 } else {
                     tracing::info!("FileProvider startup initialization completed");
                 }
             }
-            
+
             #[cfg(all(target_os = "macos", debug_assertions))]
             {
-                tracing::info!("Skipping FileProvider domain initialization in debug build - testing API endpoints only");
+                tracing::info!(
+                    "Skipping FileProvider domain initialization in debug build - testing API endpoints only"
+                );
             }
 
             // Start deterministic timeout detector (replaces cron-based detection)
@@ -272,14 +307,15 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             let random_second = rand::rng().random_range(5..55);
             let random_minute = rand::rng().random_range(0..10); // 0-9 minutes offset within each 10-minute window
             let metrics_cron_expression = format!("{} {}/10 * * * *", random_second, random_minute);
-            let metrics_schedule = apalis_cron::Schedule::from_str(&metrics_cron_expression).unwrap();
+            let metrics_schedule =
+                apalis_cron::Schedule::from_str(&metrics_cron_expression).unwrap();
             let metrics_cron_stream = apalis_cron::CronStream::new(metrics_schedule);
-            
+
             let metrics_worker = WorkerBuilder::new("metrics-collection")
                 .data(app_state.clone())
                 .backend(metrics_cron_stream)
                 .build_fn(metrics::jobs::handle_metrics_collection);
-            
+
             tokio::spawn(async move {
                 metrics_worker.run().await;
             });
@@ -288,8 +324,12 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             let random_second = rand::rng().random_range(5..55);
             let random_minute = rand::rng().random_range(0..60);
             let random_hour_offset = rand::rng().random_range(4..7); // 4-6 hours
-            let takeout_cron_expression = format!("{} {} */{} * * *", random_second, random_minute, random_hour_offset);
-            let takeout_schedule = apalis_cron::Schedule::from_str(&takeout_cron_expression).unwrap();
+            let takeout_cron_expression = format!(
+                "{} {} */{} * * *",
+                random_second, random_minute, random_hour_offset
+            );
+            let takeout_schedule =
+                apalis_cron::Schedule::from_str(&takeout_cron_expression).unwrap();
             let takeout_cron_stream = apalis_cron::CronStream::new(takeout_schedule);
 
             let takeout_worker = WorkerBuilder::new("takeout-maintenance")
@@ -304,8 +344,10 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             // Start fragment inventory self-check worker with randomized 20-30 minute schedule
             let random_second = rand::rng().random_range(5..55);
             let random_minute = rand::rng().random_range(0..30); // 0-29 minutes offset within each 30-minute window
-            let self_check_cron_expression = format!("{} {}/30 * * * *", random_second, random_minute);
-            let self_check_schedule = apalis_cron::Schedule::from_str(&self_check_cron_expression).unwrap();
+            let self_check_cron_expression =
+                format!("{} {}/30 * * * *", random_second, random_minute);
+            let self_check_schedule =
+                apalis_cron::Schedule::from_str(&self_check_cron_expression).unwrap();
             let self_check_cron_stream = apalis_cron::CronStream::new(self_check_schedule);
 
             let self_check_worker = WorkerBuilder::new("fragment-inventory-self-check")
@@ -330,7 +372,12 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 let db_pool_clone = app_state.db_pool.clone();
                 let write_gate_clone = write_gate;
                 tokio::spawn(async move {
-                    db::write_gate::drain_local_state_queue(local_state_rx, db_pool_clone, write_gate_clone).await;
+                    db::write_gate::drain_local_state_queue(
+                        local_state_rx,
+                        db_pool_clone,
+                        write_gate_clone,
+                    )
+                    .await;
                 });
             }
 
@@ -350,36 +397,77 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 .route("/nodes", post(nodes::routes::post_nodes))
                 .nest("/files", files::routes::router(app_state.clone()))
                 .route("/fragments", get(files::routes::get_fragments_count))
-                .route("/maintenance/cleanup-orphaned", post(files::routes::post_cleanup_orphaned_data_blocks))
-                .route("/maintenance/rebalance", post(files::routes::post_rebalance_network))
-                .route("/maintenance/takeout", post(takeout::routes::post_takeout_maintenance))
-                .route("/maintenance/fragment-inventory-self-check", post(files::routes::post_fragment_inventory_self_check))
-                .route("/maintenance/orphaned-fragments", get(files::routes::get_orphaned_fragments_scan).delete(files::routes::delete_orphaned_fragments))
-                .route("/diagnostics/fragment-inventory-differential", get(files::routes::get_fragment_inventory_differential))
-                .route("/diagnostics/file-fragments", get(files::routes::get_file_fragment_distribution))
-                .route("/diagnostics/network-resilience", get(files::routes::get_network_resilience_stats))
+                .route(
+                    "/maintenance/cleanup-orphaned",
+                    post(files::routes::post_cleanup_orphaned_data_blocks),
+                )
+                .route(
+                    "/maintenance/rebalance",
+                    post(files::routes::post_rebalance_network),
+                )
+                .route(
+                    "/maintenance/takeout",
+                    post(takeout::routes::post_takeout_maintenance),
+                )
+                .route(
+                    "/maintenance/fragment-inventory-self-check",
+                    post(files::routes::post_fragment_inventory_self_check),
+                )
+                .route(
+                    "/maintenance/orphaned-fragments",
+                    get(files::routes::get_orphaned_fragments_scan)
+                        .delete(files::routes::delete_orphaned_fragments),
+                )
+                .route(
+                    "/diagnostics/fragment-inventory-differential",
+                    get(files::routes::get_fragment_inventory_differential),
+                )
+                .route(
+                    "/diagnostics/file-fragments",
+                    get(files::routes::get_file_fragment_distribution),
+                )
+                .route(
+                    "/diagnostics/network-resilience",
+                    get(files::routes::get_network_resilience_stats),
+                )
                 .route("/debug/iroh-ping", get(net::routes::debug_iroh_ping))
                 .route("/debug/db-stats", get(consensus::routes::get_db_stats))
                 .route("/validators", get(consensus::routes::get_validators))
                 .route("/metrics", get(metrics::routes::get_metrics))
-                .route("/metrics/trigger", get(metrics::routes::get_metrics_trigger))
-                .route("/metrics/scores", get(metrics::routes::get_placement_scores))
+                .route(
+                    "/metrics/trigger",
+                    get(metrics::routes::get_metrics_trigger),
+                )
+                .route(
+                    "/metrics/scores",
+                    get(metrics::routes::get_placement_scores),
+                )
                 .nest("/takeout", takeout::takeout_routes())
                 .nest("/admin", admin::routes::admin_routes())
                 .nest("/shares", shares::routes::router(app_state.clone()))
                 .route("/logout", post(auth::sign_out))
-                .layer(middleware::from_fn_with_state(app_state.clone(), auth::auth_middleware));
+                .layer(middleware::from_fn_with_state(
+                    app_state.clone(),
+                    auth::auth_middleware,
+                ));
 
             // State snapshot endpoint requires DuckDB JSON extension (not codesigned for macOS release)
             #[cfg(any(not(target_os = "macos"), debug_assertions))]
-            let protected_routes = protected_routes.route("/debug/state", get(consensus::routes::get_state_snapshot));
+            let protected_routes =
+                protected_routes.route("/debug/state", get(consensus::routes::get_state_snapshot));
 
             // Routes that accept either JWT (users) or RPC (nodes) authentication
             let jwt_or_rpc_routes = Router::new()
                 .route("/consensus", get(consensus::routes::get_consensus))
-                .route("/consensus/history", get(consensus::routes::get_consensus_history))
+                .route(
+                    "/consensus/history",
+                    get(consensus::routes::get_consensus_history),
+                )
                 .route("/consensus/view", post(consensus::routes::debug_view_state))
-                .layer(middleware::from_fn_with_state(app_state.clone(), consensus::routes::jwt_or_rpc_auth_middleware));
+                .layer(middleware::from_fn_with_state(
+                    app_state.clone(),
+                    consensus::routes::jwt_or_rpc_auth_middleware,
+                ));
 
             // FileProvider routes with device token authentication. Reads bypass
             // the import gate; writes have the gate applied via a sub-router so
@@ -394,19 +482,34 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 .route("/delete", delete(fileprovider::routes::delete_item))
                 .route("/create", post(fileprovider::routes::create_item))
                 .route("/modify", patch(fileprovider::routes::modify_item))
-                .layer(middleware::from_fn_with_state(app_state.clone(), takeout::import_gate::import_gate));
+                .layer(middleware::from_fn_with_state(
+                    app_state.clone(),
+                    takeout::import_gate::import_gate,
+                ));
 
             let fileprovider_routes = fileprovider_reads
                 .merge(fileprovider_writes)
-                .layer(DefaultBodyLimit::max(5000*1_000_000)) // 5GB limit for file uploads
-                .layer(middleware::from_fn_with_state(app_state.clone(), devices::auth::device_token_auth_middleware));
+                .layer(DefaultBodyLimit::max(5000 * 1_000_000)) // 5GB limit for file uploads
+                .layer(middleware::from_fn_with_state(
+                    app_state.clone(),
+                    devices::auth::device_token_auth_middleware,
+                ));
 
             // Test routes - only available in test mode
             let test_routes = if app_state.test_mode {
                 Router::new()
-                    .route("/integrations/fileprovider/test", get(fileprovider::routes::get_test))
-                    .route("/integrations/fileprovider/test/signals", get(fileprovider::routes::get_test_signals))
-                    .route("/test/fragment-health-check/{fragment_hash}", get(files::test_routes::get_fragment_health_check))
+                    .route(
+                        "/integrations/fileprovider/test",
+                        get(fileprovider::routes::get_test),
+                    )
+                    .route(
+                        "/integrations/fileprovider/test/signals",
+                        get(fileprovider::routes::get_test_signals),
+                    )
+                    .route(
+                        "/test/fragment-health-check/{fragment_hash}",
+                        get(files::test_routes::get_fragment_health_check),
+                    )
                     .nest("/test/barriers", barriers::test_routes())
             } else {
                 Router::new() // Empty router when not in test mode
@@ -417,8 +520,14 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 .merge(protected_routes)
                 .merge(jwt_or_rpc_routes)
                 .nest("/integrations/fileprovider", fileprovider_routes)
-                .route("/integrations/fileprovider/health", get(fileprovider::routes::get_health))
-                .nest("/integrations/documentprovider", documentprovider::routes::router(app_state.clone()))
+                .route(
+                    "/integrations/fileprovider/health",
+                    get(fileprovider::routes::get_health),
+                )
+                .nest(
+                    "/integrations/documentprovider",
+                    documentprovider::routes::router(app_state.clone()),
+                )
                 .nest("/devices", devices::routes::router(app_state.clone()))
                 .merge(test_routes)
                 .route("/setup", get(setup::get_setup))
@@ -426,8 +535,8 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 .route("/login", post(auth::sign_in));
 
             // Create trace layer with request IDs
-            let trace_layer = TraceLayer::new_for_http()
-                .make_span_with(|request: &axum::http::Request<_>| {
+            let trace_layer =
+                TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
                     let id = hopnet_common::CustomUUID::new(None);
                     tracing::info_span!(
                         "api_req",
@@ -441,7 +550,10 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 let cors = CorsLayer::new()
                     .allow_origin("http://localhost:5173".parse::<HeaderValue>().unwrap()) // allow vite dev
                     .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
-                    .allow_headers([axum::http::header::CONTENT_TYPE, axum::http::header::AUTHORIZATION])
+                    .allow_headers([
+                        axum::http::header::CONTENT_TYPE,
+                        axum::http::header::AUTHORIZATION,
+                    ])
                     .max_age(std::time::Duration::from_secs(3600))
                     .allow_credentials(false);
 
@@ -459,7 +571,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(error) => return Err(error.into()),
     }
-    
+
     Ok(())
 }
 
@@ -469,7 +581,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         run_with_gui().await
     }
-    
+
     #[cfg(not(feature = "gui"))]
     {
         run_server(&format!("0.0.0.0:{}", HEADLESS_BACKEND_PORT)).await
@@ -485,62 +597,79 @@ async fn auto_login() -> Result<auth::SignInResponse, String> {
     let state_guard = GUI_APP_STATE.read().await;
     let app_state = state_guard.as_ref().ok_or("Server not ready")?;
 
-    let node_id = app_state.get_node_id().map_err(|_| "Node not initialized".to_string())?;
-    let user_id = app_state.get_user_id().map_err(|_| "Node not initialized".to_string())?;
+    let node_id = app_state
+        .get_node_id()
+        .map_err(|_| "Node not initialized".to_string())?;
+    let user_id = app_state
+        .get_user_id()
+        .map_err(|_| "Node not initialized".to_string())?;
 
     // Verify owner session exists (pre-loaded from keychain at startup)
-    app_state.get_session(user_id).await.map_err(|_| "No owner session available".to_string())?;
+    app_state
+        .get_session(user_id)
+        .await
+        .map_err(|_| "No owner session available".to_string())?;
 
     let token = auth::encode_jwt_with_duration(
-        node_id.to_string(), user_id.to_string(),
-        app_state.encoding_key.clone(), 24,
-    ).map_err(|_| "JWT encoding failed".to_string())?;
+        node_id.to_string(),
+        user_id.to_string(),
+        app_state.encoding_key.clone(),
+        24,
+    )
+    .map_err(|_| "JWT encoding failed".to_string())?;
 
     Ok(auth::SignInResponse { token })
 }
 
 #[cfg(feature = "gui")]
 async fn run_with_gui() -> Result<(), Box<dyn std::error::Error>> {
-    use tauri::{Manager, menu::{Menu, MenuItem, PredefinedMenuItem}, tray::TrayIconBuilder, TitleBarStyle, WebviewWindowBuilder};
-    
+    use tauri::{
+        Manager, TitleBarStyle, WebviewWindowBuilder,
+        menu::{Menu, MenuItem, PredefinedMenuItem},
+        tray::TrayIconBuilder,
+    };
+
     // Helper function to create and configure the main window
-    fn create_main_window(app: &tauri::AppHandle, port: u16) -> Result<tauri::WebviewWindow, Box<dyn std::error::Error>> {
+    fn create_main_window(
+        app: &tauri::AppHandle,
+        port: u16,
+    ) -> Result<tauri::WebviewWindow, Box<dyn std::error::Error>> {
         let win_builder = WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::default())
             .title("HopNet")
             .inner_size(1200.0, 800.0);
-        
+
         // Set transparent title bar only when building for macOS
         #[cfg(target_os = "macos")]
         let win_builder = win_builder.title_bar_style(TitleBarStyle::Transparent);
-        
+
         let window = win_builder.build()?;
-        
+
         // Set background color only when building for macOS
         #[cfg(target_os = "macos")]
         {
             use cocoa::appkit::{NSColor, NSWindow};
             use cocoa::base::{id, nil};
-            
+
             let ns_window = window.ns_window().unwrap() as id;
             unsafe {
                 let bg_color = NSColor::colorWithRed_green_blue_alpha_(
                     nil,
-                    17.0 / 255.0,   // #11111b red component (crust)
-                    17.0 / 255.0,   // #11111b green component (crust)
-                    27.0 / 255.0,   // #11111b blue component (crust)
+                    17.0 / 255.0, // #11111b red component (crust)
+                    17.0 / 255.0, // #11111b green component (crust)
+                    27.0 / 255.0, // #11111b blue component (crust)
                     1.0,
                 );
                 ns_window.setBackgroundColor_(bg_color);
             }
         }
-        
+
         // Load the local server
         let url = format!("http://localhost:{}", port);
         window.navigate(url.parse()?)?;
-        
+
         Ok(window)
     }
-    
+
     // Start the server in a background task. Bind loopback only with an
     // ephemeral port so multiple HopNet processes can coexist (e.g. dev
     // `cargo run` alongside the installed .app).
@@ -567,7 +696,7 @@ async fn run_with_gui() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     tracing::info!("Tauri webview loading backend on port {}", port);
-    
+
     // Create Tauri app
     let context = tauri::generate_context!();
     let app = tauri::Builder::default()
@@ -577,19 +706,15 @@ async fn run_with_gui() -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             // Create tray menu with toggle item (text will be updated dynamically)
-            let toggle_item = MenuItem::with_id(app, "toggle", "Toggle window", true, None::<&str>)?;
+            let toggle_item =
+                MenuItem::with_id(app, "toggle", "Toggle window", true, None::<&str>)?;
             let separator = PredefinedMenuItem::separator(app)?;
             let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            
-            let menu = Menu::with_items(app, &[
-                &toggle_item,
-                &separator,
-                &quit_item,
-            ])?;
-            
+
+            let menu = Menu::with_items(app, &[&toggle_item, &separator, &quit_item])?;
+
             // Create tray icon with proper error handling
-            let mut tray_builder = TrayIconBuilder::with_id("main_tray")
-                .menu(&menu);
+            let mut tray_builder = TrayIconBuilder::with_id("main_tray").menu(&menu);
 
             // Load tray icon from icon.png (different from app icon)
             if let Some(resource_path) = app.path().resource_dir().ok() {
@@ -598,7 +723,7 @@ async fn run_with_gui() -> Result<(), Box<dyn std::error::Error>> {
                     tray_builder = tray_builder.icon(icon);
                 }
             }
-            
+
             let toggle_item_ref = toggle_item.clone();
             let port_for_toggle = port;
             let _tray = tray_builder
@@ -638,11 +763,15 @@ async fn run_with_gui() -> Result<(), Box<dyn std::error::Error>> {
                     let app_handle = app.handle().clone();
                     move |_tray, event| {
                         // Update menu text when tray is right-clicked (before menu shows)
-                        if let tauri::tray::TrayIconEvent::Click { button: tauri::tray::MouseButton::Right, .. } = event {
+                        if let tauri::tray::TrayIconEvent::Click {
+                            button: tauri::tray::MouseButton::Right,
+                            ..
+                        } = event
+                        {
                             let text = if app_handle.get_webview_window("main").is_some() {
                                 "Close window"
                             } else {
-                                "Open window"  
+                                "Open window"
                             };
                             if let Err(e) = toggle_item_ref.set_text(text) {
                                 tracing::error!("Failed to update menu text: {}", e);
@@ -651,18 +780,18 @@ async fn run_with_gui() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 })
                 .build(app)?;
-            
+
             // Create the main window using the helper function
             let window = create_main_window(&app.handle(), port)?;
-            
+
             // Start visible (no dock icon due to Accessory policy)
             window.show()?;
             window.set_focus()?;
-            
+
             Ok(())
         })
         .build(context)?;
-    
+
     // Run the Tauri app (this blocks until the app is closed)
     app.run(|app_handle, event| {
         match event {
@@ -672,10 +801,10 @@ async fn run_with_gui() -> Result<(), Box<dyn std::error::Error>> {
                     api.prevent_exit();
                 }
             }
-            tauri::RunEvent::WindowEvent { 
-                label, 
-                event: tauri::WindowEvent::CloseRequested { .. }, 
-                .. 
+            tauri::RunEvent::WindowEvent {
+                label,
+                event: tauri::WindowEvent::CloseRequested { .. },
+                ..
             } => {
                 // Window close requested - let it close but don't exit app
                 if label == "main" {
@@ -689,9 +818,9 @@ async fn run_with_gui() -> Result<(), Box<dyn std::error::Error>> {
             _ => {}
         }
     });
-    
+
     // If we get here, the GUI was closed, so stop the server
     server_handle.abort();
-    
+
     Ok(())
 }

@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use crate::types::Blake3Hash;
+use serde::{Deserialize, Serialize};
 
 /// Differential self-attestation report for fragment inventory synchronization
 #[derive(Debug, Clone, Serialize, Deserialize)]

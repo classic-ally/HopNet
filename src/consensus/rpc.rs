@@ -1,11 +1,11 @@
-use serde::{Deserialize, Serialize};
-use std::time::Duration;
-use crate::net::{IrohError, IrohTransport};
-use crate::net::protocol::{IrohRequest, IrohResponse};
-use crate::net::transport::{ProtocolError, TransportError};
+use super::types::{Ballot, QuorumCertificate, TimeoutCertificate, TimeoutVote, VoteSignMessage};
 use crate::AppState;
 use crate::db::consensus as db;
-use super::types::{Ballot, VoteSignMessage, TimeoutVote, TimeoutCertificate, QuorumCertificate};
+use crate::net::protocol::{IrohRequest, IrohResponse};
+use crate::net::transport::{ProtocolError, TransportError};
+use crate::net::{IrohError, IrohTransport};
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 // ============================================================================
 // View Data Fetch (catch-up)
@@ -42,18 +42,18 @@ pub async fn fetch_view_data(
     view: i32,
 ) -> Result<super::types::ViewConsensusData, IrohError> {
     let req = IrohRequest::ViewDataFetch(ViewDataRequest { view });
-    let response = transport.request(node_id, peer_node_id, &req, VIEW_DATA_TIMEOUT).await?;
+    let response = transport
+        .request(node_id, peer_node_id, &req, VIEW_DATA_TIMEOUT)
+        .await?;
 
     match response {
         IrohResponse::ViewDataFetchResponse(result) => Ok(result.view_data),
         IrohResponse::Error { message } => {
             Err(IrohError::Protocol(ProtocolError::PeerError(message)))
         }
-        other => {
-            Err(IrohError::Protocol(ProtocolError::MalformedResponse(
-                format!("unexpected response to ViewDataFetch: {:?}", other),
-            )))
-        }
+        other => Err(IrohError::Protocol(ProtocolError::MalformedResponse(
+            format!("unexpected response to ViewDataFetch: {:?}", other),
+        ))),
     }
 }
 
@@ -89,18 +89,18 @@ pub async fn poll_view(
     peer_node_id: iroh::PublicKey,
 ) -> Result<i32, IrohError> {
     let req = IrohRequest::ViewPoll(ViewPollRequest {});
-    let response = transport.request(node_id, peer_node_id, &req, VIEW_POLL_TIMEOUT).await?;
+    let response = transport
+        .request(node_id, peer_node_id, &req, VIEW_POLL_TIMEOUT)
+        .await?;
 
     match response {
         IrohResponse::ViewPollResponse(result) => Ok(result.view),
         IrohResponse::Error { message } => {
             Err(IrohError::Protocol(ProtocolError::PeerError(message)))
         }
-        other => {
-            Err(IrohError::Protocol(ProtocolError::MalformedResponse(
-                format!("unexpected response to ViewPoll: {:?}", other),
-            )))
-        }
+        other => Err(IrohError::Protocol(ProtocolError::MalformedResponse(
+            format!("unexpected response to ViewPoll: {:?}", other),
+        ))),
     }
 }
 
@@ -142,18 +142,18 @@ pub async fn broadcast_timeout_vote(
     let req = IrohRequest::TimeoutVoteBroadcast(TimeoutVoteBroadcastRequest {
         timeout_vote: timeout_vote.clone(),
     });
-    let response = transport.request(node_id, peer_node_id, &req, BROADCAST_TIMEOUT).await?;
+    let response = transport
+        .request(node_id, peer_node_id, &req, BROADCAST_TIMEOUT)
+        .await?;
 
     match response {
         IrohResponse::TimeoutVoteBroadcastResponse(_) => Ok(()),
         IrohResponse::Error { message } => {
             Err(IrohError::Protocol(ProtocolError::PeerError(message)))
         }
-        other => {
-            Err(IrohError::Protocol(ProtocolError::MalformedResponse(
-                format!("unexpected response to TimeoutVoteBroadcast: {:?}", other),
-            )))
-        }
+        other => Err(IrohError::Protocol(ProtocolError::MalformedResponse(
+            format!("unexpected response to TimeoutVoteBroadcast: {:?}", other),
+        ))),
     }
 }
 
@@ -172,10 +172,7 @@ pub struct TcBroadcastResponse {}
 /// Server: process an incoming timeout certificate.
 /// Stale TCs (already applied / view advanced) are acked as success — the sender
 /// doesn't need to distinguish "applied now" from "already applied".
-pub async fn handle_tc_broadcast(
-    req: TcBroadcastRequest,
-    app_state: &AppState,
-) -> IrohResponse {
+pub async fn handle_tc_broadcast(req: TcBroadcastRequest, app_state: &AppState) -> IrohResponse {
     if let Err(e) = req.tc.verify(app_state) {
         return match e {
             super::types::CertificateError::ValidationError => {
@@ -207,21 +204,19 @@ pub async fn broadcast_tc(
     peer_node_id: iroh::PublicKey,
     tc: &TimeoutCertificate,
 ) -> Result<(), IrohError> {
-    let req = IrohRequest::TcBroadcast(TcBroadcastRequest {
-        tc: tc.clone(),
-    });
-    let response = transport.request(node_id, peer_node_id, &req, BROADCAST_TIMEOUT).await?;
+    let req = IrohRequest::TcBroadcast(TcBroadcastRequest { tc: tc.clone() });
+    let response = transport
+        .request(node_id, peer_node_id, &req, BROADCAST_TIMEOUT)
+        .await?;
 
     match response {
         IrohResponse::TcBroadcastResponse(_) => Ok(()),
         IrohResponse::Error { message } => {
             Err(IrohError::Protocol(ProtocolError::PeerError(message)))
         }
-        other => {
-            Err(IrohError::Protocol(ProtocolError::MalformedResponse(
-                format!("unexpected response to TcBroadcast: {:?}", other),
-            )))
-        }
+        other => Err(IrohError::Protocol(ProtocolError::MalformedResponse(
+            format!("unexpected response to TcBroadcast: {:?}", other),
+        ))),
     }
 }
 
@@ -238,10 +233,7 @@ pub struct QcBroadcastRequest {
 pub struct QcBroadcastResponse {}
 
 /// Server: process an incoming quorum certificate.
-pub async fn handle_qc_broadcast(
-    req: QcBroadcastRequest,
-    app_state: &AppState,
-) -> IrohResponse {
+pub async fn handle_qc_broadcast(req: QcBroadcastRequest, app_state: &AppState) -> IrohResponse {
     match super::routes::process_incoming_qc(req.qc, app_state).await {
         Ok(()) => IrohResponse::QcBroadcastResponse(QcBroadcastResponse {}),
         Err(e) => IrohResponse::Error {
@@ -257,21 +249,19 @@ pub async fn broadcast_qc_to_peer(
     peer_node_id: iroh::PublicKey,
     qc: &QuorumCertificate,
 ) -> Result<(), IrohError> {
-    let req = IrohRequest::QcBroadcast(QcBroadcastRequest {
-        qc: qc.clone(),
-    });
-    let response = transport.request(node_id, peer_node_id, &req, BROADCAST_TIMEOUT).await?;
+    let req = IrohRequest::QcBroadcast(QcBroadcastRequest { qc: qc.clone() });
+    let response = transport
+        .request(node_id, peer_node_id, &req, BROADCAST_TIMEOUT)
+        .await?;
 
     match response {
         IrohResponse::QcBroadcastResponse(_) => Ok(()),
         IrohResponse::Error { message } => {
             Err(IrohError::Protocol(ProtocolError::PeerError(message)))
         }
-        other => {
-            Err(IrohError::Protocol(ProtocolError::MalformedResponse(
-                format!("unexpected response to QcBroadcast: {:?}", other),
-            )))
-        }
+        other => Err(IrohError::Protocol(ProtocolError::MalformedResponse(
+            format!("unexpected response to QcBroadcast: {:?}", other),
+        ))),
     }
 }
 
@@ -290,10 +280,7 @@ pub struct BallotResponse {
 }
 
 /// Server: process an incoming ballot and return signed vote.
-pub async fn handle_ballot_request(
-    req: BallotRequest,
-    app_state: &AppState,
-) -> IrohResponse {
+pub async fn handle_ballot_request(req: BallotRequest, app_state: &AppState) -> IrohResponse {
     match super::routes::process_incoming_ballot(req.ballot, app_state).await {
         Ok(vote) => IrohResponse::BallotSubmissionResponse(BallotResponse { vote }),
         Err(e) => IrohResponse::Error {
@@ -316,18 +303,18 @@ pub async fn submit_ballot_to_peer(
     let req = IrohRequest::BallotSubmission(BallotRequest {
         ballot: ballot.clone(),
     });
-    let response = transport.request(node_id, peer_node_id, &req, BALLOT_TIMEOUT).await?;
+    let response = transport
+        .request(node_id, peer_node_id, &req, BALLOT_TIMEOUT)
+        .await?;
 
     match response {
         IrohResponse::BallotSubmissionResponse(result) => Ok(result.vote),
         IrohResponse::Error { message } => {
             Err(IrohError::Protocol(ProtocolError::PeerError(message)))
         }
-        other => {
-            Err(IrohError::Protocol(ProtocolError::MalformedResponse(
-                format!("unexpected response to BallotSubmission: {:?}", other),
-            )))
-        }
+        other => Err(IrohError::Protocol(ProtocolError::MalformedResponse(
+            format!("unexpected response to BallotSubmission: {:?}", other),
+        ))),
     }
 }
 
@@ -338,16 +325,20 @@ pub async fn submit_ballot_to_peer(
 #[derive(Serialize, Deserialize, Debug)]
 pub struct TransactionForwardRequest {
     pub transactions: Vec<super::types::Transaction>,
-    pub view: i32,  // Forwarder's current view — catch-up hint, not a gate
+    pub view: i32, // Forwarder's current view — catch-up hint, not a gate
 }
 
 /// Per-transaction result returned by the leader after forwarding.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum TransactionForwardResult {
     Committed,
-    Rejected { reason: String },
+    Rejected {
+        reason: String,
+    },
     /// Transient failure — caller should re-queue for retry after view change
-    Retry { reason: String },
+    Retry {
+        reason: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -365,7 +356,9 @@ pub async fn handle_transaction_forward(
     // Early nonce dedup: check which transactions were already committed
     let nonces: Vec<_> = req.transactions.iter().map(|tx| tx.nonce.clone()).collect();
     let committed_nonces = match app_state.db_pool.get() {
-        Ok(conn) => crate::db::consensus::check_committed_nonces(&conn, &nonces).unwrap_or_default(),
+        Ok(conn) => {
+            crate::db::consensus::check_committed_nonces(&conn, &nonces).unwrap_or_default()
+        }
         Err(_) => std::collections::HashSet::new(),
     };
 
@@ -385,7 +378,10 @@ pub async fn handle_transaction_forward(
 
     // Enqueue remaining pending transactions
     if !pending_txs.is_empty() {
-        let submit_results = app_state.consensus_queue.enqueue_forwarded(pending_txs).await;
+        let submit_results = app_state
+            .consensus_queue
+            .enqueue_forwarded(pending_txs)
+            .await;
         for (idx, result) in pending_indices.into_iter().zip(submit_results.into_iter()) {
             results_map[idx] = Some(match result {
                 Ok(()) => TransactionForwardResult::Committed,
@@ -445,20 +441,20 @@ pub async fn forward_transactions_with_ack(
     // Capture view change signal BEFORE any network I/O
     let view_notified = view_changed.notified();
 
-    let req = IrohRequest::TransactionForward(TransactionForwardRequest {
-        transactions,
-        view,
-    });
+    let req = IrohRequest::TransactionForward(TransactionForwardRequest { transactions, view });
 
     let request_id: u64 = rand::random();
     let conn = transport.get_connection(node_id, peer_node_id).await?;
 
-    let (mut send, mut recv) = conn.open_bi().await
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
         .map_err(|e| IrohError::Transport(TransportError::StreamFailed(e.to_string())))?;
 
     // Send request with request_id prefix
     use tokio::io::AsyncWriteExt;
-    send.write_all(&request_id.to_le_bytes()).await
+    send.write_all(&request_id.to_le_bytes())
+        .await
         .map_err(|e| IrohError::Transport(TransportError::StreamFailed(e.to_string())))?;
     crate::net::transport::send_message(&mut send, &req).await?;
     send.finish()
@@ -468,7 +464,9 @@ pub async fn forward_transactions_with_ack(
     let first_msg: Result<IrohResponse, IrohError> = tokio::time::timeout(
         FORWARD_ACK_TIMEOUT,
         crate::net::transport::recv_message(&mut recv),
-    ).await.map_err(|_| IrohError::Transport(TransportError::Timeout))?;
+    )
+    .await
+    .map_err(|_| IrohError::Transport(TransportError::Timeout))?;
 
     let first_msg = match first_msg {
         Ok(msg) => msg,
@@ -480,9 +478,7 @@ pub async fn forward_transactions_with_ack(
         IrohResponse::TransactionForwardNotLeader { view } => {
             Ok(ForwardAckResult::NotLeader { view })
         }
-        IrohResponse::TransactionForwardBusy => {
-            Ok(ForwardAckResult::Busy)
-        }
+        IrohResponse::TransactionForwardBusy => Ok(ForwardAckResult::Busy),
         IrohResponse::TransactionForwardAck => {
             // Got ACK — leader has received and is processing
             // Phase 2: Race result against view change notification.
@@ -515,11 +511,9 @@ pub async fn forward_transactions_with_ack(
         IrohResponse::Error { message } => {
             Err(IrohError::Protocol(ProtocolError::PeerError(message)))
         }
-        other => {
-            Err(IrohError::Protocol(ProtocolError::MalformedResponse(
-                format!("unexpected response to TransactionForward: {:?}", other),
-            )))
-        }
+        other => Err(IrohError::Protocol(ProtocolError::MalformedResponse(
+            format!("unexpected response to TransactionForward: {:?}", other),
+        ))),
     }
 }
 
@@ -543,7 +537,8 @@ mod tests {
         };
 
         let response = ViewDataResponse { view_data };
-        let encoded = bincode::serde::encode_to_vec(&response, bincode::config::standard()).unwrap();
+        let encoded =
+            bincode::serde::encode_to_vec(&response, bincode::config::standard()).unwrap();
         let (decoded, _): (ViewDataResponse, _) =
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
 
@@ -554,7 +549,8 @@ mod tests {
     #[test]
     fn view_poll_bincode_roundtrip() {
         let response = ViewPollResponse { view: 99 };
-        let encoded = bincode::serde::encode_to_vec(&response, bincode::config::standard()).unwrap();
+        let encoded =
+            bincode::serde::encode_to_vec(&response, bincode::config::standard()).unwrap();
         let (decoded, _): (ViewPollResponse, _) =
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
 
@@ -563,7 +559,7 @@ mod tests {
 
     #[test]
     fn timeout_vote_request_bincode_roundtrip() {
-        use crate::consensus::types::{VoteSignMessage, TimeoutSignData, ConsensusPhase};
+        use crate::consensus::types::{ConsensusPhase, TimeoutSignData, VoteSignMessage};
 
         let req = TimeoutVoteBroadcastRequest {
             timeout_vote: TimeoutVote {
@@ -590,7 +586,9 @@ mod tests {
 
     #[test]
     fn tc_request_bincode_roundtrip() {
-        use crate::consensus::types::{VoteSignMessage, VoteSignMessages, QuorumCertificate, ConsensusPhase};
+        use crate::consensus::types::{
+            ConsensusPhase, QuorumCertificate, VoteSignMessage, VoteSignMessages,
+        };
 
         let req = TcBroadcastRequest {
             tc: TimeoutCertificate {
@@ -618,7 +616,9 @@ mod tests {
 
     #[test]
     fn ballot_request_bincode_roundtrip() {
-        use crate::consensus::types::{Ballot, VoteSignMessage, VoteSignData, ConsensusPhase, Block, BlockData};
+        use crate::consensus::types::{
+            Ballot, Block, BlockData, ConsensusPhase, VoteSignData, VoteSignMessage,
+        };
 
         let req = BallotRequest {
             ballot: Ballot {
@@ -668,7 +668,7 @@ mod tests {
 
     #[test]
     fn qc_broadcast_request_bincode_roundtrip() {
-        use crate::consensus::types::{VoteSignMessage, VoteSignMessages, ConsensusPhase};
+        use crate::consensus::types::{ConsensusPhase, VoteSignMessage, VoteSignMessages};
 
         let req = QcBroadcastRequest {
             qc: QuorumCertificate {
@@ -708,8 +708,12 @@ mod tests {
         let resp = TransactionForwardResponse {
             results: vec![
                 TransactionForwardResult::Committed,
-                TransactionForwardResult::Rejected { reason: "test".into() },
-                TransactionForwardResult::Retry { reason: "already proposed".into() },
+                TransactionForwardResult::Rejected {
+                    reason: "test".into(),
+                },
+                TransactionForwardResult::Retry {
+                    reason: "already proposed".into(),
+                },
             ],
         };
         let encoded = bincode::serde::encode_to_vec(&resp, bincode::config::standard()).unwrap();

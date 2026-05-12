@@ -1,7 +1,7 @@
+use hopnet::consensus::ConsensusPhase;
 use hopnet::consensus::types::{
     Block, BlockData, QuorumCertificate, VoteSignMessage, VoteSignMessages,
 };
-use hopnet::consensus::ConsensusPhase;
 use hopnet::db;
 use hopnet::types::{Node, PrivKey, PubKey, User};
 use r2d2::Pool;
@@ -45,7 +45,8 @@ pub fn setup_genesis(pool: &Pool<SqliteConnectionManager>) {
 
         db::consensus::activate_validator(&tx, 0, 0).expect("Failed to activate validator 0");
 
-        tx.commit().expect("Failed to commit genesis user/node/validator");
+        tx.commit()
+            .expect("Failed to commit genesis user/node/validator");
     }
 
     // === Transaction 2: Genesis block ===

@@ -6,7 +6,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tar::{Archive, Builder};
 use tracing;
 
-use crate::takeout::manifest::{TakeoutManifest, ARCHIVE_FILES_PREFIX, MANIFEST_FILENAME, MANIFEST_VERSION};
+use crate::takeout::manifest::{
+    ARCHIVE_FILES_PREFIX, MANIFEST_FILENAME, MANIFEST_VERSION, TakeoutManifest,
+};
 
 /// Errors raised while reading an import-side archive (read counterpart to
 /// `create_archive`'s write side). Each variant maps cleanly to a route-level
@@ -52,7 +54,9 @@ pub fn create_archive(
 ) -> Result<u64, std::io::Error> {
     tracing::info!(
         "Creating archive {} with manifest ({} bytes) and {} entries",
-        archive_path, manifest_bytes.len(), entries.len()
+        archive_path,
+        manifest_bytes.len(),
+        entries.len()
     );
 
     // Create the archive file and tar.gz encoder
@@ -81,9 +85,9 @@ pub fn create_archive(
     let mut sorted_entries = entries;
     sorted_entries.sort_by(|a, b| {
         match (a.is_directory, b.is_directory) {
-            (true, false) => std::cmp::Ordering::Less,  // Directories first
+            (true, false) => std::cmp::Ordering::Less, // Directories first
             (false, true) => std::cmp::Ordering::Greater, // Files second
-            _ => a.archive_path.cmp(&b.archive_path),    // Alphabetical within type
+            _ => a.archive_path.cmp(&b.archive_path),  // Alphabetical within type
         }
     });
 
@@ -101,7 +105,11 @@ pub fn create_archive(
         if entry.is_directory {
             // Add directory to archive
             if let Err(e) = tar_builder.append_dir(&prefixed_archive_path, &entry.staging_path) {
-                tracing::error!("Failed to add directory {} to archive: {:?}", entry.staging_path, e);
+                tracing::error!(
+                    "Failed to add directory {} to archive: {:?}",
+                    entry.staging_path,
+                    e
+                );
                 continue;
             }
             tracing::debug!("Added directory: {}", prefixed_archive_path);
@@ -116,15 +124,25 @@ pub fn create_archive(
             };
 
             // Add file to tar.gz
-            if let Err(e) = tar_builder.append_path_with_name(&entry.staging_path, &prefixed_archive_path) {
-                tracing::error!("Failed to add file {} to archive: {:?}", entry.staging_path, e);
+            if let Err(e) =
+                tar_builder.append_path_with_name(&entry.staging_path, &prefixed_archive_path)
+            {
+                tracing::error!(
+                    "Failed to add file {} to archive: {:?}",
+                    entry.staging_path,
+                    e
+                );
                 continue;
             }
 
             files_archived += 1;
             total_size += file_size;
 
-            tracing::debug!("Added file: {} ({} bytes)", prefixed_archive_path, file_size);
+            tracing::debug!(
+                "Added file: {} ({} bytes)",
+                prefixed_archive_path,
+                file_size
+            );
         }
 
         // Delete source file/directory if requested
@@ -159,7 +177,11 @@ pub fn create_archive(
         e
     })?;
 
-    tracing::info!("Archive creation completed: {} files archived, {} total bytes", files_archived, total_size);
+    tracing::info!(
+        "Archive creation completed: {} files archived, {} total bytes",
+        files_archived,
+        total_size
+    );
     Ok(total_size)
 }
 
@@ -212,7 +234,8 @@ fn cleanup_empty_directories(dir_path: &Path) {
         || path_str.ends_with("/takeouts")
         || path_str.ends_with("/staging/files")
         || path_str.ends_with("/staging/folders")
-        || path_str.ends_with("/staging") {
+        || path_str.ends_with("/staging")
+    {
         return;
     }
 
@@ -251,17 +274,20 @@ mod tests {
         let mut file = File::create(&test_file).unwrap();
         file.write_all(b"hello world").unwrap();
 
-        let entries = vec![
-            ArchiveEntry {
-                staging_path: test_file.to_string_lossy().to_string(),
-                archive_path: "test.txt".to_string(),
-                is_directory: false,
-            }
-        ];
+        let entries = vec![ArchiveEntry {
+            staging_path: test_file.to_string_lossy().to_string(),
+            archive_path: "test.txt".to_string(),
+            is_directory: false,
+        }];
 
         let archive_path = temp_dir.path().join("test.tar.gz");
         let manifest_bytes = br#"{"version":1}"#;
-        let result = create_archive(manifest_bytes, entries, archive_path.to_str().unwrap(), true);
+        let result = create_archive(
+            manifest_bytes,
+            entries,
+            archive_path.to_str().unwrap(),
+            true,
+        );
 
         assert!(result.is_ok());
         assert!(archive_path.exists());

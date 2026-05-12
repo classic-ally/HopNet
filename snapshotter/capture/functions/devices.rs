@@ -4,10 +4,14 @@ use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use serde::Serialize;
 
-use crate::schema::FunctionResult;
 use super::super::fixtures::FixtureContext;
+use crate::schema::FunctionResult;
 
-pub fn capture(pool: &Pool<SqliteConnectionManager>, ctx: &FixtureContext, results: &mut BTreeMap<String, FunctionResult>) {
+pub fn capture(
+    pool: &Pool<SqliteConnectionManager>,
+    ctx: &FixtureContext,
+    results: &mut BTreeMap<String, FunctionResult>,
+) {
     use hopnet::db::devices;
 
     let conn = pool.get().unwrap();
@@ -28,11 +32,16 @@ pub fn capture(pool: &Pool<SqliteConnectionManager>, ctx: &FixtureContext, resul
                             id: record.id.to_string(),
                             user_id: record.user_id,
                             api_key_hash: record.api_key_hash.to_hex(),
-                        }).unwrap(),
+                        })
+                        .unwrap(),
                     }
                 }
-                Ok(None) => FunctionResult::Ok { value: serde_json::Value::Null },
-                Err(e) => FunctionResult::Error { error_variant: format!("{:?}", e) },
+                Ok(None) => FunctionResult::Ok {
+                    value: serde_json::Value::Null,
+                },
+                Err(e) => FunctionResult::Error {
+                    error_variant: format!("{:?}", e),
+                },
             }
         });
     }
@@ -59,7 +68,9 @@ pub fn capture(pool: &Pool<SqliteConnectionManager>, ctx: &FixtureContext, resul
                         value: serde_json::to_value(&proxies).unwrap(),
                     }
                 }
-                Err(e) => FunctionResult::Error { error_variant: format!("{:?}", e) },
+                Err(e) => FunctionResult::Error {
+                    error_variant: format!("{:?}", e),
+                },
             }
         });
     }

@@ -1,5 +1,5 @@
 use crate::db::{CustomUUID, takeout::MaterializationStatus};
-use crate::files::download::{reconstruct_file_stream, FileReconstructionError};
+use crate::files::download::{FileReconstructionError, reconstruct_file_stream};
 use crate::types::Blake3Hash;
 
 /// Materialize a single file by reconstructing from fragments and writing to staging
@@ -14,45 +14,74 @@ pub async fn materialize_single_file(
     fragments_dir: &str,
     user_id: i32,
 ) -> (CustomUUID, MaterializationStatus, Option<String>) {
-    let staging_dir = format!("{}/takeouts/{}/staging/files", fragments_dir, takeout_id.simple());
+    let staging_dir = format!(
+        "{}/takeouts/{}/staging/files",
+        fragments_dir,
+        takeout_id.simple()
+    );
 
     // Get SIV key and nonce from session store
     let session = match app_state.get_session(user_id).await {
         Ok(s) => s,
-        Err(_) => return (file_id, MaterializationStatus::Failed, Some("Failed to get session keys".to_string())),
+        Err(_) => {
+            return (
+                file_id,
+                MaterializationStatus::Failed,
+                Some("Failed to get session keys".to_string()),
+            );
+        }
     };
 
     // Decrypt the path segments
-    let decrypted_path = match crate::files::functions::decrypt_path(encrypted_path.clone(), &session.siv_key, &session.siv_nonce) {
+    let decrypted_path = match crate::files::functions::decrypt_path(
+        encrypted_path.clone(),
+        &session.siv_key,
+        &session.siv_nonce,
+    ) {
         Ok(path) => path,
         Err(e) => {
             tracing::error!("Failed to decrypt file path {}: {:?}", encrypted_path, e);
-            return (file_id, MaterializationStatus::Failed, Some("Path decryption failed".to_string()));
+            return (
+                file_id,
+                MaterializationStatus::Failed,
+                Some("Path decryption failed".to_string()),
+            );
         }
     };
 
-    tracing::debug!("Materializing file: {} -> {}", encrypted_path, decrypted_path);
+    tracing::debug!(
+        "Materializing file: {} -> {}",
+        encrypted_path,
+        decrypted_path
+    );
 
     // Use shared file reconstruction logic
     // Get streaming reconstruction (memory-efficient for large files)
-    let mut stream = match reconstruct_file_stream(
-        app_state,
-        encrypted_path.clone(),
-        user_id,
-        fragments_dir,
-    ).await {
-        Ok(stream) => stream,
-        Err(e) => {
-            tracing::error!("Failed to reconstruct file {} (data_id: {}): {:?}", encrypted_path, data_id, e);
-            let error_msg = match e {
-                FileReconstructionError::NotFound => "File not found",
-                FileReconstructionError::Forbidden => "Access denied",
-                FileReconstructionError::KeyDecryptionError => "Key decryption failed",
-                _ => "File reconstruction failed",
-            };
-            return (file_id, MaterializationStatus::Failed, Some(error_msg.to_string()));
-        }
-    };
+    let mut stream =
+        match reconstruct_file_stream(app_state, encrypted_path.clone(), user_id, fragments_dir)
+            .await
+        {
+            Ok(stream) => stream,
+            Err(e) => {
+                tracing::error!(
+                    "Failed to reconstruct file {} (data_id: {}): {:?}",
+                    encrypted_path,
+                    data_id,
+                    e
+                );
+                let error_msg = match e {
+                    FileReconstructionError::NotFound => "File not found",
+                    FileReconstructionError::Forbidden => "Access denied",
+                    FileReconstructionError::KeyDecryptionError => "Key decryption failed",
+                    _ => "File reconstruction failed",
+                };
+                return (
+                    file_id,
+                    MaterializationStatus::Failed,
+                    Some(error_msg.to_string()),
+                );
+            }
+        };
 
     // Write file to staging directory (chunk-by-chunk streaming)
     let full_staging_path = format!("{}/{}", staging_dir, decrypted_path.trim_start_matches('/'));
@@ -60,8 +89,16 @@ pub async fn materialize_single_file(
     // Ensure parent directory exists
     if let Some(parent) = std::path::Path::new(&full_staging_path).parent() {
         if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            tracing::error!("Failed to create parent directory for {}: {:?}", full_staging_path, e);
-            return (file_id, MaterializationStatus::Failed, Some(format!("Parent directory creation failed: {}", e)));
+            tracing::error!(
+                "Failed to create parent directory for {}: {:?}",
+                full_staging_path,
+                e
+            );
+            return (
+                file_id,
+                MaterializationStatus::Failed,
+                Some(format!("Parent directory creation failed: {}", e)),
+            );
         }
     }
 
@@ -70,7 +107,11 @@ pub async fn materialize_single_file(
         Ok(f) => f,
         Err(e) => {
             tracing::error!("Failed to create file {}: {:?}", full_staging_path, e);
-            return (file_id, MaterializationStatus::Failed, Some(format!("File creation failed: {}", e)));
+            return (
+                file_id,
+                MaterializationStatus::Failed,
+                Some(format!("File creation failed: {}", e)),
+            );
         }
     };
 
@@ -85,8 +126,16 @@ pub async fn materialize_single_file(
         let chunk = match chunk_result {
             Ok(chunk) => chunk,
             Err(e) => {
-                tracing::error!("Stream error while reconstructing {}: {:?}", full_staging_path, e);
-                return (file_id, MaterializationStatus::Failed, Some("Stream reconstruction error".to_string()));
+                tracing::error!(
+                    "Stream error while reconstructing {}: {:?}",
+                    full_staging_path,
+                    e
+                );
+                return (
+                    file_id,
+                    MaterializationStatus::Failed,
+                    Some("Stream reconstruction error".to_string()),
+                );
             }
         };
 
@@ -94,7 +143,11 @@ pub async fn materialize_single_file(
 
         if let Err(e) = file.write_all(&chunk).await {
             tracing::error!("Failed to write chunk to {}: {:?}", full_staging_path, e);
-            return (file_id, MaterializationStatus::Failed, Some(format!("Chunk write failed: {}", e)));
+            return (
+                file_id,
+                MaterializationStatus::Failed,
+                Some(format!("Chunk write failed: {}", e)),
+            );
         }
 
         total_bytes += chunk.len();
@@ -103,7 +156,11 @@ pub async fn materialize_single_file(
     // Ensure all data is flushed to disk
     if let Err(e) = file.sync_all().await {
         tracing::error!("Failed to sync file {}: {:?}", full_staging_path, e);
-        return (file_id, MaterializationStatus::Failed, Some(format!("File sync failed: {}", e)));
+        return (
+            file_id,
+            MaterializationStatus::Failed,
+            Some(format!("File sync failed: {}", e)),
+        );
     }
 
     // Integrity check: formula must match upload-time hash at src/files/routes.rs:239
@@ -113,14 +170,28 @@ pub async fn materialize_single_file(
     if computed_hash != expected_file_hash {
         tracing::error!(
             "Integrity check failed for {}: expected {}, got {}",
-            full_staging_path, expected_file_hash, computed_hash
+            full_staging_path,
+            expected_file_hash,
+            computed_hash
         );
         if let Err(e) = tokio::fs::remove_file(&full_staging_path).await {
-            tracing::warn!("Failed to remove corrupted staging file {}: {:?}", full_staging_path, e);
+            tracing::warn!(
+                "Failed to remove corrupted staging file {}: {:?}",
+                full_staging_path,
+                e
+            );
         }
-        return (file_id, MaterializationStatus::Failed, Some("integrity check failed".to_string()));
+        return (
+            file_id,
+            MaterializationStatus::Failed,
+            Some("integrity check failed".to_string()),
+        );
     }
 
-    tracing::debug!("Materialized file: {} ({} bytes)", full_staging_path, total_bytes);
+    tracing::debug!(
+        "Materialized file: {} ({} bytes)",
+        full_staging_path,
+        total_bytes
+    );
     (file_id, MaterializationStatus::Success, None)
 }

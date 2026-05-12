@@ -7,12 +7,18 @@ use serde::Serialize;
 use crate::schema::FunctionResult;
 
 /// Capture time-windowed fragment functions. Called AFTER metrics have been time-shifted.
-pub fn capture_time_windowed(pool: &Pool<SqliteConnectionManager>, results: &mut BTreeMap<String, FunctionResult>) {
+pub fn capture_time_windowed(
+    pool: &Pool<SqliteConnectionManager>,
+    results: &mut BTreeMap<String, FunctionResult>,
+) {
     use hopnet::db::fragments;
 
     // get_node_availability_classification uses datetime('now', '-N days')
     for node_id in 0..3i32 {
-        let key = format!("db::fragments::get_node_availability_classification(node={},days=30)", node_id);
+        let key = format!(
+            "db::fragments::get_node_availability_classification(node={},days=30)",
+            node_id
+        );
         results.insert(key, {
             match fragments::get_node_availability_classification(pool.get(), node_id, 30) {
                 Ok((score, class)) => {
@@ -25,10 +31,13 @@ pub fn capture_time_windowed(pool: &Pool<SqliteConnectionManager>, results: &mut
                         value: serde_json::to_value(ClassificationProxy {
                             score,
                             class: format!("{:?}", class),
-                        }).unwrap(),
+                        })
+                        .unwrap(),
                     }
                 }
-                Err(e) => FunctionResult::Error { error_variant: format!("{:?}", e) },
+                Err(e) => FunctionResult::Error {
+                    error_variant: format!("{:?}", e),
+                },
             }
         });
     }

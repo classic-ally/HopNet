@@ -3,10 +3,10 @@ use reqwest::Client;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
+use crate::NodeInfo;
+use crate::tests::files::upload_file;
 use crate::tests::{Check, TestResult, TestScenario, print_and_add_check};
 use crate::tests::{get_max_view, wait_for_minimum_view};
-use crate::tests::files::upload_file;
-use crate::NodeInfo;
 
 // ============================================================================
 // Barrier HTTP helpers
@@ -18,7 +18,8 @@ async fn barrier_hold(node: &NodeInfo, barrier_name: &str) -> Result<()> {
         "http://{}:{}/test/barriers/consensus/{}/hold",
         node.ip_address, node.port, barrier_name
     );
-    let resp = client.post(&url)
+    let resp = client
+        .post(&url)
         .header("Authorization", format!("Bearer {}", node.jwt_token))
         .timeout(Duration::from_secs(5))
         .send()
@@ -35,7 +36,8 @@ async fn barrier_release(node: &NodeInfo, barrier_name: &str) -> Result<()> {
         "http://{}:{}/test/barriers/consensus/{}/release",
         node.ip_address, node.port, barrier_name
     );
-    let resp = client.post(&url)
+    let resp = client
+        .post(&url)
         .header("Authorization", format!("Bearer {}", node.jwt_token))
         .timeout(Duration::from_secs(5))
         .send()
@@ -58,7 +60,8 @@ async fn barrier_status(node: &NodeInfo, barrier_name: &str) -> Result<BarrierSt
         "http://{}:{}/test/barriers/consensus/{}/status",
         node.ip_address, node.port, barrier_name
     );
-    let resp = client.get(&url)
+    let resp = client
+        .get(&url)
         .header("Authorization", format!("Bearer {}", node.jwt_token))
         .timeout(Duration::from_secs(5))
         .send()
@@ -96,7 +99,8 @@ async fn wait_for_barrier_waiting(
 async fn get_leader_node_id(node: &NodeInfo) -> Result<u32> {
     let client = Client::new();
     let url = format!("http://{}:{}/consensus", node.ip_address, node.port);
-    let resp = client.get(&url)
+    let resp = client
+        .get(&url)
         .header("Authorization", format!("Bearer {}", node.jwt_token))
         .timeout(Duration::from_secs(5))
         .send()
@@ -146,7 +150,8 @@ struct ViewHistoryEntry {
 async fn get_consensus_history(node: &NodeInfo) -> Result<Vec<ViewHistoryEntry>> {
     let client = Client::new();
     let url = format!("http://{}:{}/consensus/history", node.ip_address, node.port);
-    let resp = client.get(&url)
+    let resp = client
+        .get(&url)
         .header("Authorization", format!("Bearer {}", node.jwt_token))
         .timeout(Duration::from_secs(5))
         .send()
@@ -166,22 +171,32 @@ async fn get_consensus_history(node: &NodeInfo) -> Result<Vec<ViewHistoryEntry>>
 pub struct ConsensusBarrierBasic;
 
 impl TestScenario for ConsensusBarrierBasic {
-    fn name(&self) -> &'static str { "consensus-barrier-basic" }
+    fn name(&self) -> &'static str {
+        "consensus-barrier-basic"
+    }
     fn description(&self) -> &'static str {
         "Verify barrier hold/release works by pausing leader between Propose and Lock phases"
     }
 
-    async fn run(&self, _mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
+    async fn run(
+        &self,
+        _mesh_id: u32,
+        nodes: &[NodeInfo],
+        _flags: &[String],
+    ) -> Result<TestResult> {
         let start = Instant::now();
         let mut result = TestResult::new();
         println!("\nRunning checks:");
 
         if nodes.len() < 3 {
-            print_and_add_check(&mut result, Check {
-                name: "Insufficient nodes".into(),
-                passed: false,
-                detail: Some(format!("Need >=3, found {}", nodes.len())),
-            });
+            print_and_add_check(
+                &mut result,
+                Check {
+                    name: "Insufficient nodes".into(),
+                    passed: false,
+                    detail: Some(format!("Need >=3, found {}", nodes.len())),
+                },
+            );
             result.duration = start.elapsed();
             return Ok(result);
         }
@@ -190,23 +205,36 @@ impl TestScenario for ConsensusBarrierBasic {
         let barrier_name = "after_propose_qc_broadcast";
         for node in nodes {
             if let Err(e) = barrier_hold(node, barrier_name).await {
-                print_and_add_check(&mut result, Check {
-                    name: format!("Hold barrier on node {}", node.node_id),
-                    passed: false, detail: Some(e.to_string()),
-                });
-                for n in nodes { let _ = barrier_release(n, barrier_name).await; }
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: format!("Hold barrier on node {}", node.node_id),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
+                for n in nodes {
+                    let _ = barrier_release(n, barrier_name).await;
+                }
                 result.duration = start.elapsed();
                 return Ok(result);
             }
         }
-        print_and_add_check(&mut result, Check {
-            name: "Hold barrier on all nodes".into(), passed: true, detail: None,
-        });
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Hold barrier on all nodes".into(),
+                passed: true,
+                detail: None,
+            },
+        );
 
         // Step 2: Upload file to trigger consensus (spawned in background — the barrier
         // blocks consensus_middleware, so the upload HTTP response won't arrive until release)
         let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
         let filename = format!("barrier-basic-{}.txt", timestamp);
         let contents = format!("barrier test {}", timestamp).into_bytes();
 
@@ -218,26 +246,41 @@ impl TestScenario for ConsensusBarrierBasic {
 
         // Step 3: Find which node is waiting — that's the leader
         println!("  ... waiting for leader to reach barrier");
-        let leader_node = match find_waiting_node(nodes, barrier_name, Duration::from_secs(30)).await {
-            Some(n) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Leader reached barrier".into(), passed: true,
-                    detail: Some(format!("node {} waiting after Propose QC broadcast", n.node_id)),
-                });
-                n
-            }
-            None => {
-                print_and_add_check(&mut result, Check {
-                    name: "Leader reached barrier".into(), passed: false,
-                    detail: Some("no node reached waiting=true within 30s".into()),
-                });
-                for n in nodes { let _ = barrier_release(n, barrier_name).await; }
-                result.duration = start.elapsed();
-                return Ok(result);
-            }
-        };
+        let leader_node =
+            match find_waiting_node(nodes, barrier_name, Duration::from_secs(30)).await {
+                Some(n) => {
+                    print_and_add_check(
+                        &mut result,
+                        Check {
+                            name: "Leader reached barrier".into(),
+                            passed: true,
+                            detail: Some(format!(
+                                "node {} waiting after Propose QC broadcast",
+                                n.node_id
+                            )),
+                        },
+                    );
+                    n
+                }
+                None => {
+                    print_and_add_check(
+                        &mut result,
+                        Check {
+                            name: "Leader reached barrier".into(),
+                            passed: false,
+                            detail: Some("no node reached waiting=true within 30s".into()),
+                        },
+                    );
+                    for n in nodes {
+                        let _ = barrier_release(n, barrier_name).await;
+                    }
+                    result.duration = start.elapsed();
+                    return Ok(result);
+                }
+            };
 
-        let followers: Vec<&NodeInfo> = nodes.iter()
+        let followers: Vec<&NodeInfo> = nodes
+            .iter()
             .filter(|n| n.node_id != leader_node.node_id)
             .collect();
 
@@ -263,77 +306,125 @@ impl TestScenario for ConsensusBarrierBasic {
                 }
                 match get_consensus_history(follower).await {
                     Ok(history) => {
-                        has_propose = history.iter().any(|e| {
-                            e.view == target_view as i64 && e.has_propose_qc
-                        });
-                        if has_propose { break; }
+                        has_propose = history
+                            .iter()
+                            .any(|e| e.view == target_view as i64 && e.has_propose_qc);
+                        if has_propose {
+                            break;
+                        }
                     }
                     Err(_) => {}
                 }
             }
             if !has_propose {
                 propose_qc_ok = false;
-                print_and_add_check(&mut result, Check {
-                    name: format!("Propose QC on node {}", follower.node_id),
-                    passed: false,
-                    detail: Some(format!("view {} missing propose QC after retries", target_view)),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: format!("Propose QC on node {}", follower.node_id),
+                        passed: false,
+                        detail: Some(format!(
+                            "view {} missing propose QC after retries",
+                            target_view
+                        )),
+                    },
+                );
             }
         }
         if propose_qc_ok {
-            print_and_add_check(&mut result, Check {
-                name: "Followers have Propose QC".into(), passed: true,
-                detail: Some(format!("view {} has_propose_qc=true on {} followers", target_view, followers.len())),
-            });
+            print_and_add_check(
+                &mut result,
+                Check {
+                    name: "Followers have Propose QC".into(),
+                    passed: true,
+                    detail: Some(format!(
+                        "view {} has_propose_qc=true on {} followers",
+                        target_view,
+                        followers.len()
+                    )),
+                },
+            );
         }
 
         // Step 6: Release barriers on all nodes
-        for n in nodes { let _ = barrier_release(n, barrier_name).await; }
-        print_and_add_check(&mut result, Check {
-            name: "Release barriers".into(), passed: true, detail: None,
-        });
+        for n in nodes {
+            let _ = barrier_release(n, barrier_name).await;
+        }
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Release barriers".into(),
+                passed: true,
+                detail: None,
+            },
+        );
 
         // Step 7: Wait for view to advance (Lock phase completes)
         let next_view = target_view + 1;
         match wait_for_minimum_view(nodes, next_view, Duration::from_secs(30)).await {
             Ok(true) => {
-                print_and_add_check(&mut result, Check {
-                    name: "View advanced after release".into(), passed: true,
-                    detail: Some(format!("all nodes reached view {}", next_view)),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "View advanced after release".into(),
+                        passed: true,
+                        detail: Some(format!("all nodes reached view {}", next_view)),
+                    },
+                );
             }
             Ok(false) => {
-                print_and_add_check(&mut result, Check {
-                    name: "View advanced after release".into(), passed: false,
-                    detail: Some(format!("not all nodes reached view {} in 30s", next_view)),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "View advanced after release".into(),
+                        passed: false,
+                        detail: Some(format!("not all nodes reached view {} in 30s", next_view)),
+                    },
+                );
             }
             Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "View advance check".into(), passed: false,
-                    detail: Some(e.to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "View advance check".into(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
             }
         }
 
         // Verify the background upload completed successfully
         match upload_handle.await {
             Ok(Ok(_)) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Upload completed after release".into(), passed: true, detail: None,
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Upload completed after release".into(),
+                        passed: true,
+                        detail: None,
+                    },
+                );
             }
             Ok(Err(e)) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Upload completed after release".into(), passed: false,
-                    detail: Some(e.to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Upload completed after release".into(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
             }
             Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Upload task".into(), passed: false,
-                    detail: Some(format!("join error: {}", e)),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Upload task".into(),
+                        passed: false,
+                        detail: Some(format!("join error: {}", e)),
+                    },
+                );
             }
         }
 
@@ -342,32 +433,46 @@ impl TestScenario for ConsensusBarrierBasic {
         for node in nodes {
             match get_consensus_history(node).await {
                 Ok(history) => {
-                    let has_lock = history.iter().any(|e| {
-                        e.view == target_view as i64 && e.has_lock_qc
-                    });
+                    let has_lock = history
+                        .iter()
+                        .any(|e| e.view == target_view as i64 && e.has_lock_qc);
                     if !has_lock {
                         lock_qc_ok = false;
-                        print_and_add_check(&mut result, Check {
-                            name: format!("Lock QC on node {}", node.node_id),
-                            passed: false,
-                            detail: Some(format!("view {} missing lock QC", target_view)),
-                        });
+                        print_and_add_check(
+                            &mut result,
+                            Check {
+                                name: format!("Lock QC on node {}", node.node_id),
+                                passed: false,
+                                detail: Some(format!("view {} missing lock QC", target_view)),
+                            },
+                        );
                     }
                 }
                 Err(e) => {
                     lock_qc_ok = false;
-                    print_and_add_check(&mut result, Check {
-                        name: format!("Lock QC check node {}", node.node_id),
-                        passed: false, detail: Some(e.to_string()),
-                    });
+                    print_and_add_check(
+                        &mut result,
+                        Check {
+                            name: format!("Lock QC check node {}", node.node_id),
+                            passed: false,
+                            detail: Some(e.to_string()),
+                        },
+                    );
                 }
             }
         }
         if lock_qc_ok {
-            print_and_add_check(&mut result, Check {
-                name: "All nodes have Lock QC".into(), passed: true,
-                detail: Some(format!("view {} has_lock_qc=true on all nodes", target_view)),
-            });
+            print_and_add_check(
+                &mut result,
+                Check {
+                    name: "All nodes have Lock QC".into(),
+                    passed: true,
+                    detail: Some(format!(
+                        "view {} has_lock_qc=true on all nodes",
+                        target_view
+                    )),
+                },
+            );
         }
 
         result.duration = start.elapsed();
@@ -383,21 +488,32 @@ impl TestScenario for ConsensusBarrierBasic {
 pub struct ConsensusBarrierMissedBallot;
 
 impl TestScenario for ConsensusBarrierMissedBallot {
-    fn name(&self) -> &'static str { "consensus-barrier-missed-ballot" }
+    fn name(&self) -> &'static str {
+        "consensus-barrier-missed-ballot"
+    }
     fn description(&self) -> &'static str {
         "Hold a follower's ballot dispatch, let consensus complete without it, then release and verify catch-up"
     }
 
-    async fn run(&self, _mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
+    async fn run(
+        &self,
+        _mesh_id: u32,
+        nodes: &[NodeInfo],
+        _flags: &[String],
+    ) -> Result<TestResult> {
         let start = Instant::now();
         let mut result = TestResult::new();
         println!("\nRunning checks:");
 
         if nodes.len() < 3 {
-            print_and_add_check(&mut result, Check {
-                name: "Insufficient nodes".into(), passed: false,
-                detail: Some(format!("Need >=3, found {}", nodes.len())),
-            });
+            print_and_add_check(
+                &mut result,
+                Check {
+                    name: "Insufficient nodes".into(),
+                    passed: false,
+                    detail: Some(format!("Need >=3, found {}", nodes.len())),
+                },
+            );
             result.duration = start.elapsed();
             return Ok(result);
         }
@@ -407,24 +523,37 @@ impl TestScenario for ConsensusBarrierMissedBallot {
         // Step 1: Hold barrier on ALL nodes (only followers receive BallotSubmission)
         for node in nodes {
             if let Err(e) = barrier_hold(node, barrier_name).await {
-                print_and_add_check(&mut result, Check {
-                    name: format!("Hold barrier on node {}", node.node_id),
-                    passed: false, detail: Some(e.to_string()),
-                });
-                for n in nodes { let _ = barrier_release(n, barrier_name).await; }
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: format!("Hold barrier on node {}", node.node_id),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
+                for n in nodes {
+                    let _ = barrier_release(n, barrier_name).await;
+                }
                 result.duration = start.elapsed();
                 return Ok(result);
             }
         }
-        print_and_add_check(&mut result, Check {
-            name: "Hold ballot dispatch barrier on all nodes".into(), passed: true, detail: None,
-        });
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Hold ballot dispatch barrier on all nodes".into(),
+                passed: true,
+                detail: None,
+            },
+        );
 
         // Step 2: Upload file — followers will block at ballot dispatch.
         // Spawned in background because consensus_middleware blocks until ballots complete,
         // and followers are held at the barrier.
         let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
         let filename = format!("barrier-missed-{}.txt", timestamp);
         let contents = format!("missed ballot test {}", timestamp).into_bytes();
 
@@ -436,31 +565,46 @@ impl TestScenario for ConsensusBarrierMissedBallot {
 
         // Step 3: Find the first follower that hits the barrier
         println!("  ... waiting for a follower to reach barrier");
-        let first_follower = match find_waiting_node(nodes, barrier_name, Duration::from_secs(30)).await {
-            Some(n) => {
-                print_and_add_check(&mut result, Check {
-                    name: "First follower at barrier".into(), passed: true,
-                    detail: Some(format!("node {} waiting", n.node_id)),
-                });
-                n.clone()
-            }
-            None => {
-                print_and_add_check(&mut result, Check {
-                    name: "First follower at barrier".into(), passed: false,
-                    detail: Some("no node reached waiting=true within 30s".into()),
-                });
-                for n in nodes { let _ = barrier_release(n, barrier_name).await; }
-                result.duration = start.elapsed();
-                return Ok(result);
-            }
-        };
+        let first_follower =
+            match find_waiting_node(nodes, barrier_name, Duration::from_secs(30)).await {
+                Some(n) => {
+                    print_and_add_check(
+                        &mut result,
+                        Check {
+                            name: "First follower at barrier".into(),
+                            passed: true,
+                            detail: Some(format!("node {} waiting", n.node_id)),
+                        },
+                    );
+                    n.clone()
+                }
+                None => {
+                    print_and_add_check(
+                        &mut result,
+                        Check {
+                            name: "First follower at barrier".into(),
+                            passed: false,
+                            detail: Some("no node reached waiting=true within 30s".into()),
+                        },
+                    );
+                    for n in nodes {
+                        let _ = barrier_release(n, barrier_name).await;
+                    }
+                    result.duration = start.elapsed();
+                    return Ok(result);
+                }
+            };
 
         // Step 4: Release this follower so it can vote (gives leader 2/3 quorum)
         let _ = barrier_release(&first_follower, barrier_name).await;
-        print_and_add_check(&mut result, Check {
-            name: "Release first follower".into(), passed: true,
-            detail: Some(format!("node {} released to vote", first_follower.node_id)),
-        });
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Release first follower".into(),
+                passed: true,
+                detail: Some(format!("node {} released to vote", first_follower.node_id)),
+            },
+        );
 
         // Step 5: Give consensus a moment to complete with the released follower
         sleep(Duration::from_secs(3)).await;
@@ -468,21 +612,34 @@ impl TestScenario for ConsensusBarrierMissedBallot {
         // Verify the first upload completed (leader got quorum from released follower)
         match upload_handle.await {
             Ok(Ok(_)) => {
-                print_and_add_check(&mut result, Check {
-                    name: "First upload completed".into(), passed: true, detail: None,
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "First upload completed".into(),
+                        passed: true,
+                        detail: None,
+                    },
+                );
             }
             Ok(Err(e)) => {
-                print_and_add_check(&mut result, Check {
-                    name: "First upload completed".into(), passed: false,
-                    detail: Some(e.to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "First upload completed".into(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
             }
             Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "First upload task".into(), passed: false,
-                    detail: Some(format!("join error: {}", e)),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "First upload task".into(),
+                        passed: false,
+                        detail: Some(format!("join error: {}", e)),
+                    },
+                );
             }
         }
 
@@ -490,7 +647,9 @@ impl TestScenario for ConsensusBarrierMissedBallot {
         let held_node = {
             let mut held = None;
             for node in nodes {
-                if node.node_id == first_follower.node_id { continue; }
+                if node.node_id == first_follower.node_id {
+                    continue;
+                }
                 if let Ok(status) = barrier_status(node, barrier_name).await {
                     if status.waiting {
                         held = Some(node);
@@ -500,10 +659,14 @@ impl TestScenario for ConsensusBarrierMissedBallot {
             }
             match held {
                 Some(n) => {
-                    print_and_add_check(&mut result, Check {
-                        name: "Identify held follower".into(), passed: true,
-                        detail: Some(format!("node {} still held at barrier", n.node_id)),
-                    });
+                    print_and_add_check(
+                        &mut result,
+                        Check {
+                            name: "Identify held follower".into(),
+                            passed: true,
+                            detail: Some(format!("node {} still held at barrier", n.node_id)),
+                        },
+                    );
                     n
                 }
                 None => {
@@ -514,7 +677,9 @@ impl TestScenario for ConsensusBarrierMissedBallot {
                         name: "Identify held follower".into(), passed: false,
                         detail: Some("no node still waiting — barrier may not have caught second follower".into()),
                     });
-                    for n in nodes { let _ = barrier_release(n, barrier_name).await; }
+                    for n in nodes {
+                        let _ = barrier_release(n, barrier_name).await;
+                    }
                     result.duration = start.elapsed();
                     return Ok(result);
                 }
@@ -522,13 +687,15 @@ impl TestScenario for ConsensusBarrierMissedBallot {
         };
 
         // The leader is the remaining node
-        let leader_id = nodes.iter()
+        let leader_id = nodes
+            .iter()
             .find(|n| n.node_id != first_follower.node_id && n.node_id != held_node.node_id)
             .map(|n| n.node_id)
             .unwrap_or(0);
 
         // Step 6: Wait for view to advance on non-held nodes
-        let non_held_nodes: Vec<NodeInfo> = nodes.iter()
+        let non_held_nodes: Vec<NodeInfo> = nodes
+            .iter()
             .filter(|n| n.node_id != held_node.node_id)
             .cloned()
             .collect();
@@ -538,28 +705,49 @@ impl TestScenario for ConsensusBarrierMissedBallot {
             Err(_) => 0,
         };
 
-        match wait_for_minimum_view(&non_held_nodes, view_after_first, Duration::from_secs(30)).await {
+        match wait_for_minimum_view(&non_held_nodes, view_after_first, Duration::from_secs(30))
+            .await
+        {
             Ok(true) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Non-held nodes advanced".into(), passed: true,
-                    detail: Some(format!("leader={}, released follower={}, view {}", leader_id, first_follower.node_id, view_after_first)),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Non-held nodes advanced".into(),
+                        passed: true,
+                        detail: Some(format!(
+                            "leader={}, released follower={}, view {}",
+                            leader_id, first_follower.node_id, view_after_first
+                        )),
+                    },
+                );
             }
             Ok(false) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Non-held nodes advanced".into(), passed: false,
-                    detail: Some("did not advance in 30s".into()),
-                });
-                for n in nodes { let _ = barrier_release(n, barrier_name).await; }
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Non-held nodes advanced".into(),
+                        passed: false,
+                        detail: Some("did not advance in 30s".into()),
+                    },
+                );
+                for n in nodes {
+                    let _ = barrier_release(n, barrier_name).await;
+                }
                 result.duration = start.elapsed();
                 return Ok(result);
             }
             Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "View check".into(), passed: false,
-                    detail: Some(e.to_string()),
-                });
-                for n in nodes { let _ = barrier_release(n, barrier_name).await; }
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "View check".into(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
+                for n in nodes {
+                    let _ = barrier_release(n, barrier_name).await;
+                }
                 result.duration = start.elapsed();
                 return Ok(result);
             }
@@ -567,10 +755,14 @@ impl TestScenario for ConsensusBarrierMissedBallot {
 
         // Step 7: Release held follower — stale ballots process
         let _ = barrier_release(held_node, barrier_name).await;
-        print_and_add_check(&mut result, Check {
-            name: "Release held follower".into(), passed: true,
-            detail: Some(format!("node {} released", held_node.node_id)),
-        });
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Release held follower".into(),
+                passed: true,
+                detail: Some(format!("node {} released", held_node.node_id)),
+            },
+        );
 
         // Step 8: Upload another file to trigger catch-up via message-driven dispatch
         let filename2 = format!("barrier-missed2-{}.txt", timestamp);
@@ -578,15 +770,24 @@ impl TestScenario for ConsensusBarrierMissedBallot {
 
         match upload_file(&nodes[0], "/", &filename2, contents2).await {
             Ok(_) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Upload second file (catch-up trigger)".into(), passed: true, detail: None,
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Upload second file (catch-up trigger)".into(),
+                        passed: true,
+                        detail: None,
+                    },
+                );
             }
             Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Upload second file".into(), passed: false,
-                    detail: Some(e.to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Upload second file".into(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
                 result.duration = start.elapsed();
                 return Ok(result);
             }
@@ -596,22 +797,34 @@ impl TestScenario for ConsensusBarrierMissedBallot {
         let target_view = view_after_first + 1;
         match wait_for_minimum_view(nodes, target_view, Duration::from_secs(60)).await {
             Ok(true) => {
-                print_and_add_check(&mut result, Check {
-                    name: "All nodes caught up".into(), passed: true,
-                    detail: Some(format!("all at view {}", target_view)),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "All nodes caught up".into(),
+                        passed: true,
+                        detail: Some(format!("all at view {}", target_view)),
+                    },
+                );
             }
             Ok(false) => {
-                print_and_add_check(&mut result, Check {
-                    name: "All nodes caught up".into(), passed: false,
-                    detail: Some(format!("not all nodes reached view {} in 30s", target_view)),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "All nodes caught up".into(),
+                        passed: false,
+                        detail: Some(format!("not all nodes reached view {} in 30s", target_view)),
+                    },
+                );
             }
             Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Catch-up check".into(), passed: false,
-                    detail: Some(e.to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Catch-up check".into(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
             }
         }
 
@@ -638,21 +851,32 @@ impl TestScenario for ConsensusBarrierMissedBallot {
 pub struct ConsensusBarrierTcLate;
 
 impl TestScenario for ConsensusBarrierTcLate {
-    fn name(&self) -> &'static str { "consensus-barrier-tc-late" }
+    fn name(&self) -> &'static str {
+        "consensus-barrier-tc-late"
+    }
     fn description(&self) -> &'static str {
         "Lock QC reconstruction from timeout votes when leader broadcast is delayed"
     }
 
-    async fn run(&self, _mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
+    async fn run(
+        &self,
+        _mesh_id: u32,
+        nodes: &[NodeInfo],
+        _flags: &[String],
+    ) -> Result<TestResult> {
         let start = Instant::now();
         let mut result = TestResult::new();
         println!("\nRunning checks:");
 
         if nodes.len() < 3 {
-            print_and_add_check(&mut result, Check {
-                name: "Insufficient nodes".into(), passed: false,
-                detail: Some(format!("Need >=3, found {}", nodes.len())),
-            });
+            print_and_add_check(
+                &mut result,
+                Check {
+                    name: "Insufficient nodes".into(),
+                    passed: false,
+                    detail: Some(format!("Need >=3, found {}", nodes.len())),
+                },
+            );
             result.duration = start.elapsed();
             return Ok(result);
         }
@@ -661,20 +885,31 @@ impl TestScenario for ConsensusBarrierTcLate {
 
         // Step 1: Warm-up consensus round
         let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
         let warmup_filename = format!("barrier-tclate-warmup-{}.txt", timestamp);
         let warmup_contents = format!("warmup {}", timestamp).into_bytes();
         match upload_file(&nodes[0], "/", &warmup_filename, warmup_contents).await {
             Ok(_) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Warm-up consensus round".into(), passed: true, detail: None,
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Warm-up consensus round".into(),
+                        passed: true,
+                        detail: None,
+                    },
+                );
             }
             Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Warm-up round".into(), passed: false,
-                    detail: Some(e.to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Warm-up round".into(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
                 result.duration = start.elapsed();
                 return Ok(result);
             }
@@ -683,10 +918,14 @@ impl TestScenario for ConsensusBarrierTcLate {
         let warmup_view = match get_max_view(nodes).await {
             Ok(v) => v,
             Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Get warmup view".into(), passed: false,
-                    detail: Some(e.to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Get warmup view".into(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
                 result.duration = start.elapsed();
                 return Ok(result);
             }
@@ -694,16 +933,24 @@ impl TestScenario for ConsensusBarrierTcLate {
 
         match wait_for_minimum_view(nodes, warmup_view, Duration::from_secs(30)).await {
             Ok(true) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Warm-up complete".into(), passed: true,
-                    detail: Some(format!("all at view {}", warmup_view)),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Warm-up complete".into(),
+                        passed: true,
+                        detail: Some(format!("all at view {}", warmup_view)),
+                    },
+                );
             }
             _ => {
-                print_and_add_check(&mut result, Check {
-                    name: "Warm-up complete".into(), passed: false,
-                    detail: Some("warm-up round did not complete".into()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Warm-up complete".into(),
+                        passed: false,
+                        detail: Some("warm-up round did not complete".into()),
+                    },
+                );
                 result.duration = start.elapsed();
                 return Ok(result);
             }
@@ -715,19 +962,29 @@ impl TestScenario for ConsensusBarrierTcLate {
         // Step 2: Hold ONLY before_lock_qc_broadcast on all nodes (do NOT hold TC barrier)
         for node in nodes {
             if let Err(e) = barrier_hold(node, lock_qc_barrier).await {
-                print_and_add_check(&mut result, Check {
-                    name: format!("Hold Lock QC barrier on node {}", node.node_id),
-                    passed: false, detail: Some(e.to_string()),
-                });
-                for n in nodes { let _ = barrier_release(n, lock_qc_barrier).await; }
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: format!("Hold Lock QC barrier on node {}", node.node_id),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
+                for n in nodes {
+                    let _ = barrier_release(n, lock_qc_barrier).await;
+                }
                 result.duration = start.elapsed();
                 return Ok(result);
             }
         }
-        print_and_add_check(&mut result, Check {
-            name: "Hold Lock QC barriers on all nodes".into(), passed: true,
-            detail: Some("before_lock_qc_broadcast only (TC barriers NOT held)".into()),
-        });
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Hold Lock QC barriers on all nodes".into(),
+                passed: true,
+                detail: Some("before_lock_qc_broadcast only (TC barriers NOT held)".into()),
+            },
+        );
 
         // Step 3: Upload file to trigger consensus (background)
         let filename = format!("barrier-tclate-{}.txt", timestamp);
@@ -740,27 +997,43 @@ impl TestScenario for ConsensusBarrierTcLate {
 
         // Step 4: Poll all nodes for before_lock_qc_broadcast waiting=true → identifies leader
         println!("  ... waiting for leader to form Lock QC and hit barrier");
-        let leader_node = match find_waiting_node(nodes, lock_qc_barrier, Duration::from_secs(30)).await {
+        let leader_node = match find_waiting_node(nodes, lock_qc_barrier, Duration::from_secs(30))
+            .await
+        {
             Some(n) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Leader formed Lock QC".into(), passed: true,
-                    detail: Some(format!("node {} waiting at before_lock_qc_broadcast", n.node_id)),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Leader formed Lock QC".into(),
+                        passed: true,
+                        detail: Some(format!(
+                            "node {} waiting at before_lock_qc_broadcast",
+                            n.node_id
+                        )),
+                    },
+                );
                 n
             }
             None => {
-                print_and_add_check(&mut result, Check {
-                    name: "Leader formed Lock QC".into(), passed: false,
-                    detail: Some("no node reached before_lock_qc_broadcast within 30s".into()),
-                });
-                for n in nodes { let _ = barrier_release(n, lock_qc_barrier).await; }
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Leader formed Lock QC".into(),
+                        passed: false,
+                        detail: Some("no node reached before_lock_qc_broadcast within 30s".into()),
+                    },
+                );
+                for n in nodes {
+                    let _ = barrier_release(n, lock_qc_barrier).await;
+                }
                 let _ = upload_handle.await;
                 result.duration = start.elapsed();
                 return Ok(result);
             }
         };
 
-        let followers: Vec<&NodeInfo> = nodes.iter()
+        let followers: Vec<&NodeInfo> = nodes
+            .iter()
             .filter(|n| n.node_id != leader_node.node_id)
             .collect();
 
@@ -769,7 +1042,9 @@ impl TestScenario for ConsensusBarrierTcLate {
         // Step 5: Wait ~130s for followers to time out and reconstruct Lock QC from timeout votes.
         // Followers voted Lock, so their timeout votes carry Lock ballot evidence.
         // The TC assembler detects this evidence and reconstructs the Lock QC instead of forming a TC.
-        println!("  ... waiting up to 180s for Lock QC reconstruction from timeout votes on followers");
+        println!(
+            "  ... waiting up to 180s for Lock QC reconstruction from timeout votes on followers"
+        );
         let lock_qc_reconstructed = {
             let mut all_applied = false;
             let deadline = Instant::now() + Duration::from_secs(180);
@@ -777,7 +1052,10 @@ impl TestScenario for ConsensusBarrierTcLate {
                 let mut count = 0;
                 for node in &followers {
                     if let Ok(history) = get_consensus_history(node).await {
-                        if history.iter().any(|e| e.view == competing_view as i64 && e.has_lock_qc) {
+                        if history
+                            .iter()
+                            .any(|e| e.view == competing_view as i64 && e.has_lock_qc)
+                        {
                             count += 1;
                         }
                     }
@@ -792,16 +1070,33 @@ impl TestScenario for ConsensusBarrierTcLate {
         };
 
         if lock_qc_reconstructed {
-            print_and_add_check(&mut result, Check {
-                name: "Lock QC reconstructed on followers".into(), passed: true,
-                detail: Some(format!("view {} has Lock QC on all {} followers (from timeout vote evidence)", competing_view, followers.len())),
-            });
+            print_and_add_check(
+                &mut result,
+                Check {
+                    name: "Lock QC reconstructed on followers".into(),
+                    passed: true,
+                    detail: Some(format!(
+                        "view {} has Lock QC on all {} followers (from timeout vote evidence)",
+                        competing_view,
+                        followers.len()
+                    )),
+                },
+            );
         } else {
-            print_and_add_check(&mut result, Check {
-                name: "Lock QC reconstructed on followers".into(), passed: false,
-                detail: Some(format!("not all followers reconstructed Lock QC for view {} within 140s", competing_view)),
-            });
-            for n in nodes { let _ = barrier_release(n, lock_qc_barrier).await; }
+            print_and_add_check(
+                &mut result,
+                Check {
+                    name: "Lock QC reconstructed on followers".into(),
+                    passed: false,
+                    detail: Some(format!(
+                        "not all followers reconstructed Lock QC for view {} within 140s",
+                        competing_view
+                    )),
+                },
+            );
+            for n in nodes {
+                let _ = barrier_release(n, lock_qc_barrier).await;
+            }
             let _ = upload_handle.await;
             result.duration = start.elapsed();
             return Ok(result);
@@ -809,11 +1104,20 @@ impl TestScenario for ConsensusBarrierTcLate {
 
         // Step 6: Release before_lock_qc_broadcast → leader broadcasts Lock QC + applies locally
         // (followers already have Lock QC from reconstruction, so broadcast is redundant for them)
-        for n in nodes { let _ = barrier_release(n, lock_qc_barrier).await; }
-        print_and_add_check(&mut result, Check {
-            name: "Release Lock QC barrier".into(), passed: true,
-            detail: Some("leader broadcasting Lock QC (followers already have it from reconstruction)".into()),
-        });
+        for n in nodes {
+            let _ = barrier_release(n, lock_qc_barrier).await;
+        }
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Release Lock QC barrier".into(),
+                passed: true,
+                detail: Some(
+                    "leader broadcasting Lock QC (followers already have it from reconstruction)"
+                        .into(),
+                ),
+            },
+        );
 
         // Step 7: Wait for Lock QC propagation and settlement
         sleep(Duration::from_secs(5)).await;
@@ -821,21 +1125,34 @@ impl TestScenario for ConsensusBarrierTcLate {
         // Wait for upload to complete
         match upload_handle.await {
             Ok(Ok(_)) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Upload completed".into(), passed: true, detail: None,
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Upload completed".into(),
+                        passed: true,
+                        detail: None,
+                    },
+                );
             }
             Ok(Err(e)) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Upload completed".into(), passed: false,
-                    detail: Some(e.to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Upload completed".into(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
             }
             Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Upload task".into(), passed: false,
-                    detail: Some(format!("join error: {}", e)),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Upload task".into(),
+                        passed: false,
+                        detail: Some(format!("join error: {}", e)),
+                    },
+                );
             }
         }
 
@@ -853,25 +1170,40 @@ impl TestScenario for ConsensusBarrierTcLate {
                 if let Some(entry) = history.iter().find(|e| e.view == competing_view as i64) {
                     leader_has_lock_qc = entry.has_lock_qc;
                     leader_has_tc = entry.has_tc;
-                    print_and_add_check(&mut result, Check {
-                        name: "Leader state".into(), passed: true,
-                        detail: Some(format!(
-                            "view {}: has_lock_qc={}, has_tc={}",
-                            competing_view, entry.has_lock_qc, entry.has_tc
-                        )),
-                    });
+                    print_and_add_check(
+                        &mut result,
+                        Check {
+                            name: "Leader state".into(),
+                            passed: true,
+                            detail: Some(format!(
+                                "view {}: has_lock_qc={}, has_tc={}",
+                                competing_view, entry.has_lock_qc, entry.has_tc
+                            )),
+                        },
+                    );
                 } else {
-                    print_and_add_check(&mut result, Check {
-                        name: "Leader state".into(), passed: false,
-                        detail: Some(format!("view {} not found in leader history", competing_view)),
-                    });
+                    print_and_add_check(
+                        &mut result,
+                        Check {
+                            name: "Leader state".into(),
+                            passed: false,
+                            detail: Some(format!(
+                                "view {} not found in leader history",
+                                competing_view
+                            )),
+                        },
+                    );
                 }
             }
             Err(e) => {
-                print_and_add_check(&mut result, Check {
-                    name: "Leader history".into(), passed: false,
-                    detail: Some(e.to_string()),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Leader history".into(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
             }
         }
 
@@ -880,66 +1212,103 @@ impl TestScenario for ConsensusBarrierTcLate {
             match get_consensus_history(node).await {
                 Ok(history) => {
                     if let Some(entry) = history.iter().find(|e| e.view == competing_view as i64) {
-                        if entry.has_lock_qc { follower_lock_qc_count += 1; }
-                        if entry.has_tc { follower_tc_count += 1; }
-                        print_and_add_check(&mut result, Check {
-                            name: format!("Follower {} state", node.node_id), passed: true,
-                            detail: Some(format!(
-                                "view {}: has_lock_qc={}, has_tc={}",
-                                competing_view, entry.has_lock_qc, entry.has_tc
-                            )),
-                        });
+                        if entry.has_lock_qc {
+                            follower_lock_qc_count += 1;
+                        }
+                        if entry.has_tc {
+                            follower_tc_count += 1;
+                        }
+                        print_and_add_check(
+                            &mut result,
+                            Check {
+                                name: format!("Follower {} state", node.node_id),
+                                passed: true,
+                                detail: Some(format!(
+                                    "view {}: has_lock_qc={}, has_tc={}",
+                                    competing_view, entry.has_lock_qc, entry.has_tc
+                                )),
+                            },
+                        );
                     } else {
-                        print_and_add_check(&mut result, Check {
-                            name: format!("Follower {} state", node.node_id), passed: false,
-                            detail: Some(format!("view {} not found in history", competing_view)),
-                        });
+                        print_and_add_check(
+                            &mut result,
+                            Check {
+                                name: format!("Follower {} state", node.node_id),
+                                passed: false,
+                                detail: Some(format!(
+                                    "view {} not found in history",
+                                    competing_view
+                                )),
+                            },
+                        );
                     }
                 }
                 Err(e) => {
-                    print_and_add_check(&mut result, Check {
-                        name: format!("Follower {} history", node.node_id), passed: false,
-                        detail: Some(e.to_string()),
-                    });
+                    print_and_add_check(
+                        &mut result,
+                        Check {
+                            name: format!("Follower {} history", node.node_id),
+                            passed: false,
+                            detail: Some(e.to_string()),
+                        },
+                    );
                 }
             }
         }
 
         // Step 9: Verify no TC formed (Lock QC reconstruction should prevent TC entirely)
         let no_tc_anywhere = !leader_has_tc && follower_tc_count == 0;
-        print_and_add_check(&mut result, Check {
-            name: "No TC formed".into(),
-            passed: no_tc_anywhere,
-            detail: Some(format!(
-                "leader has_tc={}, followers with TC: {}/{} (expected: no TC anywhere)",
-                leader_has_tc, follower_tc_count, followers.len()
-            )),
-        });
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "No TC formed".into(),
+                passed: no_tc_anywhere,
+                detail: Some(format!(
+                    "leader has_tc={}, followers with TC: {}/{} (expected: no TC anywhere)",
+                    leader_has_tc,
+                    follower_tc_count,
+                    followers.len()
+                )),
+            },
+        );
 
         // All nodes should have Lock QC (leader applied locally, followers via reconstruction)
         let all_have_lock_qc = leader_has_lock_qc && follower_lock_qc_count == followers.len();
-        print_and_add_check(&mut result, Check {
-            name: "Lock QC on all nodes".into(),
-            passed: all_have_lock_qc,
-            detail: Some(format!(
-                "leader={}, followers={}/{}",
-                leader_has_lock_qc, follower_lock_qc_count, followers.len()
-            )),
-        });
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Lock QC on all nodes".into(),
+                passed: all_have_lock_qc,
+                detail: Some(format!(
+                    "leader={}, followers={}/{}",
+                    leader_has_lock_qc,
+                    follower_lock_qc_count,
+                    followers.len()
+                )),
+            },
+        );
 
         // Verify all nodes advanced past the competing view
         match wait_for_minimum_view(nodes, competing_view + 1, Duration::from_secs(10)).await {
             Ok(true) => {
-                print_and_add_check(&mut result, Check {
-                    name: "All nodes advanced".into(), passed: true,
-                    detail: Some(format!("all at view >= {}", competing_view + 1)),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "All nodes advanced".into(),
+                        passed: true,
+                        detail: Some(format!("all at view >= {}", competing_view + 1)),
+                    },
+                );
             }
             _ => {
-                print_and_add_check(&mut result, Check {
-                    name: "All nodes advanced".into(), passed: false,
-                    detail: Some(format!("not all nodes reached view {}", competing_view + 1)),
-                });
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "All nodes advanced".into(),
+                        passed: false,
+                        detail: Some(format!("not all nodes reached view {}", competing_view + 1)),
+                    },
+                );
             }
         }
 

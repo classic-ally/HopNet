@@ -9,26 +9,26 @@ use r2d2_sqlite::SqliteConnectionManager;
 use crate::db::{PrivKey, PubKey};
 use crate::handlers::TransactionHandler;
 
-pub mod barriers;
-pub mod nodes;
-pub mod setup;
-pub mod users;
-pub mod metrics;
-pub mod db;
-pub mod auth;
-pub mod consensus;
-pub mod types;
-pub mod handlers;
-pub mod files;
-pub mod fileprovider;
-pub mod documentprovider;
-pub mod takeout;
 pub mod admin;
+pub mod auth;
+pub mod barriers;
+pub mod consensus;
+pub mod db;
 pub mod devices;
+pub mod documentprovider;
+pub mod fileprovider;
+pub mod files;
+pub mod handlers;
+pub mod metrics;
 pub mod net;
+pub mod nodes;
 pub mod passphrase;
-pub mod shares;
 pub mod reference_providers;
+pub mod setup;
+pub mod shares;
+pub mod takeout;
+pub mod types;
+pub mod users;
 
 #[derive(Clone, Debug)]
 pub struct UserKeys {

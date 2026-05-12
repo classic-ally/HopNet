@@ -11,31 +11,31 @@ pub use crate::NodeInfo;
 pub mod files;
 
 // Test implementations
+mod consensus_barriers;
+mod consensus_queue;
+mod db_pragma_bench;
 mod device_tokens;
 mod documentprovider_write;
 mod file_upload;
+mod fileprovider_device_token;
 mod fragment_distribution;
 mod fragment_health_check;
+mod import;
 mod iroh_ping;
 mod iroh_reject_unknown;
 mod metrics;
 mod multi_size_files;
+pub(crate) mod multi_user;
+mod orphan_cleanup;
 mod performance;
 pub(crate) mod persistence;
-mod timeout_progression;
-mod consensus_barriers;
-pub(crate) mod multi_user;
-mod sharing;
-mod consensus_queue;
-mod orphan_cleanup;
-mod fileprovider_device_token;
+mod post_files_mixed;
+mod post_files_shape;
 mod range_download;
 mod recents;
+mod sharing;
 mod takeout;
-mod import;
-mod post_files_shape;
-mod post_files_mixed;
-mod db_pragma_bench;
+mod timeout_progression;
 
 /// Represents the result of a test scenario execution
 #[derive(Debug)]
@@ -91,133 +91,194 @@ pub trait TestScenario: Send + Sync {
 }
 
 /// Run a test by name
-pub async fn run_test_by_name(mesh_id: u32, name: &str, nodes: &[NodeInfo], flags: &[String]) -> Result<TestResult> {
+pub async fn run_test_by_name(
+    mesh_id: u32,
+    name: &str,
+    nodes: &[NodeInfo],
+    flags: &[String],
+) -> Result<TestResult> {
     match name {
         "file-upload-consistency" => {
-            file_upload::FileUploadConsistency.run(mesh_id, nodes, flags).await
+            file_upload::FileUploadConsistency
+                .run(mesh_id, nodes, flags)
+                .await
         }
         "fragment-distribution" => {
-            fragment_distribution::FragmentDistribution.run(mesh_id, nodes, flags).await
+            fragment_distribution::FragmentDistribution
+                .run(mesh_id, nodes, flags)
+                .await
         }
         "fragment-health-check" => {
-            fragment_health_check::FragmentHealthCheck.run(mesh_id, nodes, flags).await
+            fragment_health_check::FragmentHealthCheck
+                .run(mesh_id, nodes, flags)
+                .await
         }
         "chunked-streaming-performance" => {
-            performance::ChunkedStreamingPerformance.run(mesh_id, nodes, flags).await
+            performance::ChunkedStreamingPerformance
+                .run(mesh_id, nodes, flags)
+                .await
         }
         "multi-size-file-consistency" => {
-            multi_size_files::MultiSizeFileConsistency.run(mesh_id, nodes, flags).await
+            multi_size_files::MultiSizeFileConsistency
+                .run(mesh_id, nodes, flags)
+                .await
         }
         "restart-persistence" => {
-            persistence::RestartPersistence.run(mesh_id, nodes, flags).await
+            persistence::RestartPersistence
+                .run(mesh_id, nodes, flags)
+                .await
         }
         "device-token-consistency" => {
-            device_tokens::DeviceTokenConsistency.run(mesh_id, nodes, flags).await
+            device_tokens::DeviceTokenConsistency
+                .run(mesh_id, nodes, flags)
+                .await
         }
         "documentprovider-write-consistency" => {
-            documentprovider_write::DocumentProviderWriteConsistency.run(mesh_id, nodes, flags).await
+            documentprovider_write::DocumentProviderWriteConsistency
+                .run(mesh_id, nodes, flags)
+                .await
         }
-        "iroh-ping" => {
-            iroh_ping::IrohPing.run(mesh_id, nodes, flags).await
-        }
+        "iroh-ping" => iroh_ping::IrohPing.run(mesh_id, nodes, flags).await,
         "iroh-reject-unknown" => {
-            iroh_reject_unknown::IrohRejectUnknown.run(mesh_id, nodes, flags).await
+            iroh_reject_unknown::IrohRejectUnknown
+                .run(mesh_id, nodes, flags)
+                .await
         }
         "timeout-progression" => {
-            timeout_progression::TimeoutProgression.run(mesh_id, nodes, flags).await
+            timeout_progression::TimeoutProgression
+                .run(mesh_id, nodes, flags)
+                .await
         }
         "consensus-barrier-basic" => {
-            consensus_barriers::ConsensusBarrierBasic.run(mesh_id, nodes, flags).await
+            consensus_barriers::ConsensusBarrierBasic
+                .run(mesh_id, nodes, flags)
+                .await
         }
         "consensus-barrier-missed-ballot" => {
-            consensus_barriers::ConsensusBarrierMissedBallot.run(mesh_id, nodes, flags).await
+            consensus_barriers::ConsensusBarrierMissedBallot
+                .run(mesh_id, nodes, flags)
+                .await
         }
         "consensus-barrier-tc-late" => {
-            consensus_barriers::ConsensusBarrierTcLate.run(mesh_id, nodes, flags).await
+            consensus_barriers::ConsensusBarrierTcLate
+                .run(mesh_id, nodes, flags)
+                .await
         }
-        "metrics-collection" => {
-            metrics::MetricsCollection.run(mesh_id, nodes, flags).await
-        }
+        "metrics-collection" => metrics::MetricsCollection.run(mesh_id, nodes, flags).await,
         "multi-user-isolation" => {
-            multi_user::MultiUserIsolation.run(mesh_id, nodes, flags).await
+            multi_user::MultiUserIsolation
+                .run(mesh_id, nodes, flags)
+                .await
         }
-        "multi-user-sharing" => {
-            sharing::MultiUserSharing.run(mesh_id, nodes, flags).await
-        }
+        "multi-user-sharing" => sharing::MultiUserSharing.run(mesh_id, nodes, flags).await,
         "multi-user-sharing-live-link" => {
-            sharing::MultiUserSharingLiveLink.run(mesh_id, nodes, flags).await
+            sharing::MultiUserSharingLiveLink
+                .run(mesh_id, nodes, flags)
+                .await
         }
         "consensus-queue-burst" => {
-            consensus_queue::ConsensusQueueBurst.run(mesh_id, nodes, flags).await
+            consensus_queue::ConsensusQueueBurst
+                .run(mesh_id, nodes, flags)
+                .await
         }
         "consensus-queue-cross-node" => {
-            consensus_queue::ConsensusQueueCrossNode.run(mesh_id, nodes, flags).await
+            consensus_queue::ConsensusQueueCrossNode
+                .run(mesh_id, nodes, flags)
+                .await
         }
         "consensus-queue-throughput" => {
-            consensus_queue::ConsensusQueueThroughput.run(mesh_id, nodes, flags).await
+            consensus_queue::ConsensusQueueThroughput
+                .run(mesh_id, nodes, flags)
+                .await
         }
         "orphan-cleanup" => {
-            orphan_cleanup::OrphanCleanup.run(mesh_id, nodes, flags).await
+            orphan_cleanup::OrphanCleanup
+                .run(mesh_id, nodes, flags)
+                .await
         }
         "device-token-session-bootstrap" => {
-            fileprovider_device_token::DeviceTokenSessionBootstrap.run(mesh_id, nodes, flags).await
+            fileprovider_device_token::DeviceTokenSessionBootstrap
+                .run(mesh_id, nodes, flags)
+                .await
         }
         "fileprovider-device-token-auth" => {
-            fileprovider_device_token::FileProviderDeviceTokenAuth.run(mesh_id, nodes, flags).await
+            fileprovider_device_token::FileProviderDeviceTokenAuth
+                .run(mesh_id, nodes, flags)
+                .await
         }
-        "recents-ordering" => {
-            recents::RecentsOrdering.run(mesh_id, nodes, flags).await
-        }
+        "recents-ordering" => recents::RecentsOrdering.run(mesh_id, nodes, flags).await,
         "range-download" => {
-            range_download::RangeDownload.run(mesh_id, nodes, flags).await
+            range_download::RangeDownload
+                .run(mesh_id, nodes, flags)
+                .await
         }
-        "takeout-happy-path" => {
-            takeout::TakeoutHappyPath.run(mesh_id, nodes, flags).await
-        }
+        "takeout-happy-path" => takeout::TakeoutHappyPath.run(mesh_id, nodes, flags).await,
         "import-create-active-conflict" => {
-            import::ImportCreateActiveConflict.run(mesh_id, nodes, flags).await
+            import::ImportCreateActiveConflict
+                .run(mesh_id, nodes, flags)
+                .await
         }
         "import-upload-happy-path" => {
-            import::ImportUploadHappyPath.run(mesh_id, nodes, flags).await
+            import::ImportUploadHappyPath
+                .run(mesh_id, nodes, flags)
+                .await
         }
         "import-upload-version-rejected" => {
-            import::ImportUploadVersionRejected.run(mesh_id, nodes, flags).await
+            import::ImportUploadVersionRejected
+                .run(mesh_id, nodes, flags)
+                .await
         }
         "import-upload-missing-manifest" => {
-            import::ImportUploadMissingManifest.run(mesh_id, nodes, flags).await
+            import::ImportUploadMissingManifest
+                .run(mesh_id, nodes, flags)
+                .await
         }
         "import-upload-quota-exceeded" => {
-            import::ImportUploadQuotaExceeded.run(mesh_id, nodes, flags).await
+            import::ImportUploadQuotaExceeded
+                .run(mesh_id, nodes, flags)
+                .await
         }
         "import-extraction-happy-path" => {
-            import::ImportExtractionHappyPath.run(mesh_id, nodes, flags).await
+            import::ImportExtractionHappyPath
+                .run(mesh_id, nodes, flags)
+                .await
         }
         "import-extraction-hash-mismatch" => {
-            import::ImportExtractionHashMismatch.run(mesh_id, nodes, flags).await
+            import::ImportExtractionHashMismatch
+                .run(mesh_id, nodes, flags)
+                .await
         }
         "import-creation-happy-path" => {
-            import::ImportCreationHappyPath.run(mesh_id, nodes, flags).await
+            import::ImportCreationHappyPath
+                .run(mesh_id, nodes, flags)
+                .await
         }
         "import-creation-mixed-failure" => {
-            import::ImportCreationMixedFailure.run(mesh_id, nodes, flags).await
+            import::ImportCreationMixedFailure
+                .run(mesh_id, nodes, flags)
+                .await
         }
-        "import-write-gate" => {
-            import::ImportWriteGate.run(mesh_id, nodes, flags).await
-        }
-        "import-status-counts" => {
-            import::ImportStatusCounts.run(mesh_id, nodes, flags).await
-        }
+        "import-write-gate" => import::ImportWriteGate.run(mesh_id, nodes, flags).await,
+        "import-status-counts" => import::ImportStatusCounts.run(mesh_id, nodes, flags).await,
         "import-resume-after-restart" => {
-            import::ImportResumeAfterRestart.run(mesh_id, nodes, flags).await
+            import::ImportResumeAfterRestart
+                .run(mesh_id, nodes, flags)
+                .await
         }
         "post-files-consensus-shape" => {
-            post_files_shape::PostFilesConsensusShape.run(mesh_id, nodes, flags).await
+            post_files_shape::PostFilesConsensusShape
+                .run(mesh_id, nodes, flags)
+                .await
         }
         "mixed-files-and-folders-one-request" => {
-            post_files_mixed::PostFilesMixedFilesAndParents.run(mesh_id, nodes, flags).await
+            post_files_mixed::PostFilesMixedFilesAndParents
+                .run(mesh_id, nodes, flags)
+                .await
         }
         "db-pragma-bench" => {
-            db_pragma_bench::DbPragmaBench.run(mesh_id, nodes, flags).await
+            db_pragma_bench::DbPragmaBench
+                .run(mesh_id, nodes, flags)
+                .await
         }
         _ => Err(anyhow::anyhow!("Unknown test: {}", name)),
     }
@@ -295,12 +356,11 @@ pub async fn get_max_view(nodes: &[NodeInfo]) -> Result<u64> {
                 .await;
 
             match response {
-                Ok(resp) if resp.status().is_success() => {
-                    resp.json::<serde_json::Value>()
-                        .await
-                        .ok()
-                        .and_then(|json| json["view"].as_u64())
-                }
+                Ok(resp) if resp.status().is_success() => resp
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .and_then(|json| json["view"].as_u64()),
                 _ => None,
             }
         });
@@ -353,12 +413,11 @@ pub async fn wait_for_minimum_view(
                     .await;
 
                 match response {
-                    Ok(resp) if resp.status().is_success() => {
-                        resp.json::<serde_json::Value>()
-                            .await
-                            .ok()
-                            .and_then(|json| json["view"].as_u64())
-                    }
+                    Ok(resp) if resp.status().is_success() => resp
+                        .json::<serde_json::Value>()
+                        .await
+                        .ok()
+                        .and_then(|json| json["view"].as_u64()),
                     _ => None,
                 }
             });
@@ -375,9 +434,9 @@ pub async fn wait_for_minimum_view(
 
         // Check if all nodes reached minimum view
         let all_reached = results.len() == nodes.len()
-            && results.iter().all(|view_opt| {
-                view_opt.map(|v| v >= min_view).unwrap_or(false)
-            });
+            && results
+                .iter()
+                .all(|view_opt| view_opt.map(|v| v >= min_view).unwrap_or(false));
 
         if all_reached {
             return Ok(true);
@@ -415,7 +474,8 @@ pub async fn handle_test_command(
     }
 
     // If no test specified and not listing, error
-    let test_name = test.ok_or_else(|| anyhow::anyhow!("No test specified. Use --test <name> or --list"))?;
+    let test_name =
+        test.ok_or_else(|| anyhow::anyhow!("No test specified. Use --test <name> or --list"))?;
 
     println!("Running test '{}' on mesh {}", test_name, mesh_id);
     if !flags.is_empty() {
@@ -436,7 +496,8 @@ pub async fn handle_test_command(
     for (node_id, ip_address, port) in addresses {
         let docker = docker.clone();
         let task = tokio::spawn(async move {
-            crate::get_jwt_token(&docker, mesh_id, node_id, runtime).await
+            crate::get_jwt_token(&docker, mesh_id, node_id, runtime)
+                .await
                 .map(|jwt_token| NodeInfo {
                     node_id,
                     ip_address,
@@ -466,9 +527,13 @@ pub async fn handle_test_command(
     println!("\n{}", "=".repeat(60));
     println!("Test Results for '{}'", test_name);
     println!("{}", "=".repeat(60));
-    println!("Status: {}", if result.passed { "PASSED" } else { "FAILED" });
+    println!(
+        "Status: {}",
+        if result.passed { "PASSED" } else { "FAILED" }
+    );
     println!("Duration: {:.2}s", result.duration.as_secs_f64());
-    println!("Checks: {} total ({} passed, {} failed)",
+    println!(
+        "Checks: {} total ({} passed, {} failed)",
         result.checks.len(),
         result.checks.iter().filter(|c| c.passed).count(),
         result.checks.iter().filter(|c| !c.passed).count()

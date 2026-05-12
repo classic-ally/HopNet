@@ -1,8 +1,11 @@
-use serde::{Serialize, Deserialize};
 use crate::db::CustomUUID;
 use crate::db::types::XPubKey;
+use chacha20poly1305::{
+    ChaCha20Poly1305,
+    aead::{Aead, KeyInit, OsRng},
+};
+use serde::{Deserialize, Serialize};
 use x25519_dalek::PublicKey as X25519PublicKey;
-use chacha20poly1305::{ChaCha20Poly1305, aead::{Aead, OsRng, KeyInit}};
 
 // --- Consensus payload structs ---
 
@@ -12,9 +15,9 @@ pub struct ShareFilePayload {
     pub data_block_id: CustomUUID,
     pub sender_id: i32,
     pub recipient_id: i32,
-    pub file_access: Vec<u8>,                // bincode-encoded FileAccess for recipient
-    pub display_ephemeral_pubkey: Vec<u8>,   // 32 bytes X25519 ephemeral public key
-    pub encrypted_display_name: Vec<u8>,     // ChaCha20-Poly1305 ciphertext
+    pub file_access: Vec<u8>, // bincode-encoded FileAccess for recipient
+    pub display_ephemeral_pubkey: Vec<u8>, // 32 bytes X25519 ephemeral public key
+    pub encrypted_display_name: Vec<u8>, // ChaCha20-Poly1305 ciphertext
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -50,8 +53,8 @@ pub struct UnsharePayload {
 // --- API request/response types (re-exported from common) ---
 
 pub use hopnet_common::shares::{
-    ShareRequest, AcceptShareRequest, IncomingShareResponse,
-    ShareCountResponse, ShareDetailResponse, ShareParticipant,
+    AcceptShareRequest, IncomingShareResponse, ShareCountResponse, ShareDetailResponse,
+    ShareParticipant, ShareRequest,
 };
 
 // --- Display name crypto ---
@@ -82,7 +85,8 @@ pub fn encrypt_display_name(
     let nonce = chacha20poly1305::Nonce::from(nonce_bytes);
 
     let cipher = ChaCha20Poly1305::new(&key);
-    let ciphertext = cipher.encrypt(&nonce, plaintext.as_bytes())
+    let ciphertext = cipher
+        .encrypt(&nonce, plaintext.as_bytes())
         .map_err(|e| format!("Display name encryption failed: {:?}", e))?;
 
     Ok((ephemeral_public.as_bytes().to_vec(), ciphertext))
@@ -117,7 +121,8 @@ pub fn decrypt_display_name(
     let nonce = chacha20poly1305::Nonce::from(nonce_bytes);
 
     let cipher = ChaCha20Poly1305::new(&key);
-    let plaintext = cipher.decrypt(&nonce, ciphertext)
+    let plaintext = cipher
+        .decrypt(&nonce, ciphertext)
         .map_err(|e| format!("Display name decryption failed: {:?}", e))?;
 
     String::from_utf8(plaintext).map_err(|e| e.into())
