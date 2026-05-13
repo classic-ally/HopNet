@@ -27,7 +27,7 @@ skip-frontend = []  # Skip frontend build (for orchestrator-only builds)
 hopnet-common = { path = "common", features = ["database"] }
 axum = { version = "0.8.4", features = ["multipart", "macros"] }
 chrono = { version = "0.4.41", features = ["serde"] }
-rand = "0.9.1"
+rand = "0.10"
 tokio = { version = "1.45.1", features = ["full"] }
 tokio-util = { version = "0.7.16", features = ["io"] }
 tokio-stream = "0.1.17"
@@ -44,9 +44,16 @@ r2d2_sqlite = "0.32"
 r2d2 = "0.8.10"
 argon2 = {version = "0.5.3", features = ["std"] }
 jsonwebtoken = "9.3.1"
-ed25519-dalek = { version = "2.1.1", features = ["rand_core", "batch", "serde"] }
+ed25519-dalek = { version = "3.0.0-pre.6", features = ["rand_core", "batch", "serde"] }
 x25519-dalek = { version = "2.0.1", features = ["serde", "static_secrets"] }
-rand_core = "0.6"
+# Pinned to match iroh-fork's known-good resolution; resolver otherwise picks
+# digest 0.11.3 + crypto-common 0.2.0 which has an upstream trait-bound bug.
+digest = "=0.11.2"
+crypto-common = "=0.2.1"
+# ed25519-dalek 3.0.0-pre.6 was built against keccak 0.2.0-rc.1; final 0.2.0
+# release renamed/removed `f1600`. Drop this pin when iroh-fork bumps to
+# ed25519-dalek 3.0.0-pre.7 (which uses strobe-rs and accepts keccak ^0.2).
+keccak = "=0.2.0-rc.1"
 hex = "0.4.3"
 mime_guess = "2.0.5"
 blake3 = { version = "1.8.2", features = ["serde", "rayon"] }
@@ -76,7 +83,7 @@ base64 = "0.22"
 
 # Tauri dependencies (optional for GUI mode)
 tauri = { version = "2.7.0", features = ["tray-icon", "image-png"], optional = true }
-iroh = "0.96.1"
+iroh = "0.98.2"
 thiserror = "2.0.18"
 parking_lot = "0.12.5"
 hdrhistogram = { version = "7.5.4", default-features = false }
@@ -111,7 +118,7 @@ name = "snapshotter"
 path = "snapshotter/main.rs"
 
 [patch.crates-io]
-iroh = { git = "https://github.com/classic-ally/iroh", branch = "auth-before-register" }
+iroh = { git = "https://github.com/classic-ally/iroh", branch = "auth-before-register-v0.98" }
 
 # FileProvider now implemented in Swift
 # [[bin]]

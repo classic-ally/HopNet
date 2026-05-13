@@ -7,14 +7,15 @@ use crate::{db::consensus as db, handlers::HandlerResult};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use r2d2_sqlite::SqliteConnectionManager;
 use rand::prelude::*;
-use rand_core::OsRng;
+use rand::rand_core::UnwrapErr;
+use rand::rngs::SysRng;
 use rusqlite::TransactionBehavior;
 use std::collections::HashMap;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 
 pub fn generate_ed25519_key() -> (SigningKey, VerifyingKey) {
-    let mut csprng = OsRng;
+    let mut csprng = UnwrapErr(SysRng);
     let private_key = SigningKey::generate(&mut csprng);
     let public_key = private_key.verifying_key();
 
@@ -1223,7 +1224,7 @@ pub async fn poll_subset_for_max_view(
     // Retry loop for handling unlucky validator selection
     for attempt in 1..=MAX_ATTEMPTS {
         let selected_validators: Vec<&Node> = other_validators
-            .choose_multiple(&mut rand::rng(), SUBSET_SIZE)
+            .sample(&mut rand::rng(), SUBSET_SIZE)
             .collect();
 
         tracing::debug!(

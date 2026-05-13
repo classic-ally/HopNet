@@ -13,7 +13,7 @@ use axum::{
     middleware,
     routing::{delete, get, post},
 };
-use rand::Rng;
+use rand::RngExt;
 use std::str::FromStr;
 
 /// Build the devices management router (JWT-authenticated)

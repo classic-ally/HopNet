@@ -80,7 +80,7 @@ impl TestScenario for IrohRejectUnknown {
         // Generate random 32 bytes for the secret key
         let secret_bytes: [u8; 32] = rand::random();
         let unknown_secret = iroh::SecretKey::from_bytes(&secret_bytes);
-        let unknown_endpoint = Endpoint::builder()
+        let unknown_endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
             .secret_key(unknown_secret)
             .alpns(vec![HOPNET_ALPN.to_vec()])
             .bind()

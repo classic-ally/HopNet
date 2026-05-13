@@ -277,7 +277,7 @@ impl IrohTransport {
         is_setup_complete: bool,
     ) -> Result<Self, IrohError> {
         let setup_complete = Arc::new(AtomicBool::new(is_setup_complete));
-        let endpoint = Endpoint::builder()
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
             .secret_key(secret_key)
             .alpns(vec![HOPNET_ALPN.to_vec()])
             .hooks(PeerValidator {

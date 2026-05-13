@@ -7,7 +7,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
-use rand::RngCore;
+use rand::Rng;
 use reed_solomon_simd::ReedSolomonEncoder;
 use std::str::FromStr;
 

@@ -226,7 +226,8 @@ mod tests {
     use super::*;
     use crate::db::{PubKey, SqliteConnectionManager};
     use ed25519_dalek::SigningKey;
-    use rand_core::OsRng;
+    use rand::rand_core::UnwrapErr;
+    use rand::rngs::SysRng;
 
     fn setup_test_db() -> r2d2::Pool<SqliteConnectionManager> {
         let manager = SqliteConnectionManager::memory();
@@ -241,7 +242,7 @@ mod tests {
     }
 
     fn generate_test_pubkey() -> PubKey {
-        let signing_key = SigningKey::generate(&mut OsRng);
+        let signing_key = SigningKey::generate(&mut UnwrapErr(SysRng));
         PubKey(signing_key.verifying_key())
     }
 

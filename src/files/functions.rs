@@ -13,7 +13,7 @@ use chacha20poly1305::{
     aead::stream::{DecryptorBE32, EncryptorBE32},
 };
 use hex;
-use rand::Rng;
+use rand::RngExt;
 use reed_solomon_simd::ReedSolomonDecoder;
 use std::collections::HashMap;
 use std::fs;

@@ -4,7 +4,7 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use rand::Rng;
+use rand::RngExt;
 use serde::Deserialize;
 use std::str::FromStr;
 

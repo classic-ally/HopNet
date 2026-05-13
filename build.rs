@@ -34,12 +34,14 @@ fn main() {
     if !is_release {
         println!("cargo:warning=Debug build - skipping frontend build for speed");
 
-        // Verify that dist exists (from a previous build)
+        // Verify that dist exists (from a previous build). If not, create an
+        // empty dir so the `include_dir!` macro in main.rs can still succeed
+        // (CI runs clippy/test without pre-building the frontend).
         if !dist_dir.exists() {
             println!(
-                "cargo:warning=No frontend dist found. Run 'cargo build --release' or 'cd frontend && pnpm build' to build frontend"
+                "cargo:warning=No frontend dist found. Creating empty placeholder so include_dir! compiles."
             );
-            println!("cargo:warning=Continuing without frontend - app may not work correctly");
+            std::fs::create_dir_all(&dist_dir).expect("create empty frontend/dist placeholder");
         } else {
             println!("cargo:warning=Using existing frontend dist from previous build");
         }

@@ -1,6 +1,7 @@
 use super::*;
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use rand_core::OsRng; // Import from parent consensus module
+use rand::rand_core::UnwrapErr;
+use rand::rngs::SysRng;
 
 mod authorization;
 mod byzantine;
@@ -17,7 +18,7 @@ pub struct MockNode {
 
 impl MockNode {
     pub fn new(node_id: i32) -> Self {
-        let signing_key = SigningKey::generate(&mut OsRng);
+        let signing_key = SigningKey::generate(&mut UnwrapErr(SysRng));
         let verifying_key = signing_key.verifying_key();
         let priv_key = crate::db::PrivKey(signing_key);
         let pub_key = crate::db::PubKey(verifying_key);
@@ -39,7 +40,7 @@ pub struct MockUser {
 
 impl MockUser {
     pub fn new(user_id: i32) -> Self {
-        let signing_key = SigningKey::generate(&mut OsRng);
+        let signing_key = SigningKey::generate(&mut UnwrapErr(SysRng));
         let verifying_key = signing_key.verifying_key();
         Self {
             user_id,
@@ -519,7 +520,7 @@ pub fn create_test_app_state_with_keys(
 }
 
 pub fn create_test_app_state() -> AppState {
-    let signing_key = SigningKey::generate(&mut OsRng);
+    let signing_key = SigningKey::generate(&mut UnwrapErr(SysRng));
     let verifying_key = signing_key.verifying_key();
     create_test_app_state_with_keys(
         crate::db::PrivKey(signing_key),

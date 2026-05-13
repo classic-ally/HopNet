@@ -1,4 +1,4 @@
-use rand::Rng;
+use rand::RngExt;
 
 const EFF_LARGE_WORDLIST: &[&str; 7776] = &[
     "abacus",

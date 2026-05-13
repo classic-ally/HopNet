@@ -303,7 +303,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             tokio::spawn(consensus::jobs::timeout_detector(app_state.clone()));
 
             // Start metrics collection worker with randomized 10-minute schedule
-            use rand::Rng;
+            use rand::RngExt;
             let random_second = rand::rng().random_range(5..55);
             let random_minute = rand::rng().random_range(0..10); // 0-9 minutes offset within each 10-minute window
             let metrics_cron_expression = format!("{} {}/10 * * * *", random_second, random_minute);
