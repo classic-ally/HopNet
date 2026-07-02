@@ -154,7 +154,7 @@ fn copy_blob(src: &BlobPaths, dst: &BlobPaths, hash: &ContentHash, ext: &str) ->
         }
         writer.write_all(&buf[..n]).map_err(io_err)?;
     }
-    writer.sync_all().map_err(io_err)?;
+    crate::writer::sync_file(&writer).map_err(io_err)?;
     drop(writer);
 
     let parent = dst_path.parent().expect("blob path has fan-out parents");

@@ -105,13 +105,39 @@ pub fn sweep_partials(paths: &BlobPaths) -> Result<u64> {
     Ok(removed)
 }
 
+/// fsync with the network-mount fallback. Rust's `sync_all` issues macOS
+/// `F_FULLFSYNC`, which smbfs rejects with ENOTSUP (os error 45) — hit live
+/// on the first real SMB soak. The spec accepts plain-fsync semantics on
+/// network mounts (§Failure Handling: the storage server's write cache is
+/// the real durability boundary), so fall back to `fsync(2)` before
+/// propagating an error.
+pub(crate) fn sync_file(file: &fs::File) -> std::io::Result<()> {
+    match file.sync_all() {
+        // Raw-errno match, not ErrorKind::Unsupported: on Darwin, ENOTSUP
+        // (45, what smbfs returns for F_FULLFSYNC) is distinct from
+        // EOPNOTSUPP (102, the one std maps to Unsupported).
+        Err(e)
+            if e.raw_os_error() == Some(libc::ENOTSUP)
+                || e.kind() == std::io::ErrorKind::Unsupported =>
+        {
+            use std::os::fd::AsRawFd as _;
+            if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }
+        other => other,
+    }
+}
+
 /// The filesystem half of a dedup miss (spec §Write path step 3): fsync the
 /// temp, create the fan-out dirs, atomically rename into place, best-effort
 /// fsync the parent dir. Separately callable so crash-window tests can
 /// exercise "renamed but not committed" without fault injection.
 pub fn place_blob(paths: &BlobPaths, finished: &FinishedStream, ext: &str) -> Result<PathBuf> {
     let file = fs::File::open(&finished.temp_path).map_err(io_err)?;
-    file.sync_all().map_err(io_err)?;
+    sync_file(&file).map_err(io_err)?;
     drop(file);
 
     let blob_path = paths.blob_path(&finished.hash, ext);

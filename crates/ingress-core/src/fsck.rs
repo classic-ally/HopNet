@@ -231,14 +231,16 @@ async fn check_blob_tree(
         row_exts.insert(row.content_hash, row.ext);
     }
 
-    // (c) walk <blob_root>/blobs/ two fan-out levels, skipping .partial.
+    // (c) walk <blob_root>/blobs/ two fan-out levels, skipping .partial
+    // and Finder's .DS_Store droppings (browsing the share plants them at
+    // every level; flagging them would pin fsck at exit 1 forever).
     let blobs_dir = paths.blobs_dir();
     if !blobs_dir.is_dir() {
         return Ok(()); // nothing written yet; (b) already covered the rows
     }
     for aa in fs::read_dir(&blobs_dir).map_err(io_invariant)?.flatten() {
         let name = aa.file_name().to_string_lossy().into_owned();
-        if name == ".partial" {
+        if name == ".partial" || name == ".DS_Store" {
             continue;
         }
         if !aa.path().is_dir() || !is_hex_pair(&name) {
@@ -247,6 +249,9 @@ async fn check_blob_tree(
         }
         for bb in fs::read_dir(aa.path()).map_err(io_invariant)?.flatten() {
             let bb_name = bb.file_name().to_string_lossy().into_owned();
+            if bb_name == ".DS_Store" {
+                continue;
+            }
             if !bb.path().is_dir() || !is_hex_pair(&bb_name) {
                 report.foreign_files.push(bb.path());
                 continue;
@@ -283,6 +288,9 @@ fn classify_blob_file(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
+    if name == ".DS_Store" {
+        return;
+    }
     let parsed = name.split_once('.').and_then(|(stem, ext)| {
         let hex = stem.len() == 64
             && stem

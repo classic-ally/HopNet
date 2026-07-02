@@ -304,6 +304,12 @@ async fn ext_mismatch_and_foreign_files_never_deleted() {
     // Junk at fan-out depth and at top level.
     let junk = paths.blobs_dir().join("README.txt");
     std::fs::write(&junk, b"hello").unwrap();
+    // Finder droppings at every level: exempt, never findings (a browsed
+    // share would otherwise pin fsck at exit 1 forever).
+    let ds_top = paths.blobs_dir().join(".DS_Store");
+    std::fs::write(&ds_top, b"finder").unwrap();
+    let ds_leaf = mismatched.parent().unwrap().join(".DS_Store");
+    std::fs::write(&ds_leaf, b"finder").unwrap();
 
     let report = fsck(&store, &data_dir, true, false).await;
     assert_eq!(report.ext_mismatches.len(), 1);
@@ -312,6 +318,7 @@ async fn ext_mismatch_and_foreign_files_never_deleted() {
     assert!(!report.is_clean());
     assert!(mismatched.is_file(), "ext mismatch never deleted");
     assert!(junk.is_file(), "foreign file never deleted");
+    assert!(ds_top.is_file() && ds_leaf.is_file(), ".DS_Store untouched");
 }
 
 // Impact: a down mount looks exactly like mass byte loss to a naive check;
