@@ -55,21 +55,47 @@ These tables are replicated across all nodes via consensus. They contain **no pl
 CREATE TABLE photos (
     id               TEXT PRIMARY KEY,     -- UUIDv7 (creation timestamp encoded)
     library_id       TEXT,                 -- NULL = personal library
-    data_block_id    TEXT NOT NULL,        -- FK to data_blocks (current version)
     uploaded_by      INTEGER NOT NULL,     -- user who added this photo
     encrypted_metadata       BLOB NOT NULL,-- ChaCha20-Poly1305 encrypted metadata
     metadata_nonce           BLOB NOT NULL,-- 12-byte nonce for metadata decryption
 
-    FOREIGN KEY (data_block_id) REFERENCES data_blocks(id),
+    -- Cross-asset grouping (burst, stack, panorama frames, HDR bracket).
+    -- Each frame is its own photo; group_id links them.
+    group_id         TEXT,
+    group_type       INTEGER,              -- see Group Types below
+    group_index      INTEGER,              -- ordering within group
+    is_group_pick    INTEGER NOT NULL DEFAULT 0,  -- 1 = key/representative frame
+
+    -- Soft delete: NULL = active, set = tombstoned, 30-day retention window.
+    -- Periodic cleanup hard-deletes the row and cascades to photo_resources
+    -- once retention expires.
+    deleted_at       TEXT,                 -- ISO 8601, NULL when active
+    deleted_by       INTEGER,              -- user who deleted (FK users)
+
     FOREIGN KEY (uploaded_by) REFERENCES users(user_id),
+    FOREIGN KEY (deleted_by) REFERENCES users(user_id),
     FOREIGN KEY (library_id) REFERENCES shared_libraries(id)
 );
 
 CREATE INDEX idx_photos_library ON photos(library_id);
-CREATE INDEX idx_photos_data_block ON photos(data_block_id);
+CREATE INDEX idx_photos_group ON photos(group_id) WHERE group_id IS NOT NULL;
+CREATE INDEX idx_photos_deleted ON photos(deleted_at) WHERE deleted_at IS NOT NULL;
 ```
 
 The `encrypted_metadata` blob contains all photo metadata: date taken, dimensions, orientation, media type, duration, camera make/model, GPS coordinates, EXIF data. None of this is queryable at the consensus level. The photo ID (UUIDv7) encodes upload timestamp, which is the only temporal signal visible to nodes.
+
+Bytes for a photo (original, edited variant, paired Live Photo video, thumbnails, etc.) live in `photo_resources` (below). A photo has at minimum one resource (the original). The `photos` row carries identity, grouping, and tombstone state only.
+
+##### Group Types
+
+| Value | Name | Description |
+|-------|------|-------------|
+| 0 | `burst` | PhotoKit burst frames sharing a `burstIdentifier` |
+| 1 | `stack` | Stacked / Live Text grouping |
+| 2 | `panorama_frames` | Source frames of a panorama |
+| 3 | `hdr_bracket` | Bracketed exposures of an HDR composite |
+
+A photo not part of any group has `group_id = NULL`. Group membership is observable at the consensus level (group_id is a plaintext UUID), but this leaks only the existence of related photos, not their content. Future work may encrypt group_id if even this is too much exposure.
 
 #### Photo Metadata Access
 
@@ -91,26 +117,40 @@ CREATE TABLE photo_metadata_access (
 
 This mirrors the `file_access` table pattern. When a photo is shared to a new context (shared library, shared album, individual share), the per-photo metadata key is wrapped with each new recipient's pubkey and a row is inserted. The metadata blob itself does not change.
 
-#### Thumbnails
+#### Photo Resources
+
+A single photo can have multiple byte streams associated with it: the original capture, an edited variant, the paired Live Photo video, RAW sensor data, thumbnails, and so on. PhotoKit exposes these as `PHAssetResource` entries on a single `PHAsset`. The `photo_resources` table maps a photo to its constituent data blocks:
 
 ```sql
--- Thumbnail data blocks linked to source photos.
--- Thumbnails are stored as regular data_blocks (encrypted, replicated)
--- and uploaded by the client alongside the photo.
-CREATE TABLE photo_thumbnails (
+CREATE TABLE photo_resources (
     photo_id         TEXT NOT NULL,
-    size_class       INTEGER NOT NULL,     -- 0=small (256px), 1=medium (1024px)
+    resource_type    INTEGER NOT NULL,     -- see Resource Types below
     data_block_id    TEXT NOT NULL,         -- FK to data_blocks
 
-    PRIMARY KEY (photo_id, size_class),
+    PRIMARY KEY (photo_id, resource_type),
     FOREIGN KEY (photo_id) REFERENCES photos(id),
     FOREIGN KEY (data_block_id) REFERENCES data_blocks(id)
 );
+
+CREATE INDEX idx_photo_resources_data_block ON photo_resources(data_block_id);
 ```
 
-Thumbnails are generated **client-side** during upload — the client has the raw image and produces two size classes before encrypting and uploading. Each thumbnail is a separate `data_block`, encrypted with its own key, replicated via the existing fragment distribution system. The upload interface requires thumbnails to be provided alongside the photo; the server never sees raw image data and makes no thumbnail generation decisions.
+##### Resource Types
 
-Two size classes cover gallery grid view (small) and detail preview (medium). The full-resolution original is fetched on demand.
+| Value | Name | Description |
+|-------|------|-------------|
+| 0 | `original` | Unmodified capture as taken (HEIC, JPEG, ProRAW, MOV for video) |
+| 1 | `edited` | User-edited current version (post-crop/filter/adjustment) |
+| 2 | `paired_video` | Live Photo motion track (MOV alongside HEIC still) |
+| 3 | `adjustment_data` | PhotoKit `PHAdjustmentData` blob for reversible edit reconstruction |
+| 4 | `raw_alternate` | RAW sensor data paired with a JPEG original (PhotoKit `alternateRepresentation`) |
+| 5 | `thumbnail_small` | ~256px gallery thumbnail |
+| 6 | `thumbnail_medium` | ~1024px detail preview |
+| 7 | `edited_paired_video` | Edited render of a Live Photo's motion track (accompanies `edited`; PhotoKit `fullSizePairedVideo`) |
+
+The "primary display" resource for gallery view is `edited` if present, otherwise `original`. Clients enforce this at query time against the sidecar.
+
+All resources except thumbnails are required to be supplied by the client at upload time when they exist on the source asset — the daemon ingesting from PhotoKit must enumerate `PHAsset.assetResources` and submit every applicable resource. Thumbnails are generated client-side from whichever resource is the primary display. Each resource is encrypted with its own per-data-block key and replicated via the standard fragment distribution path. The server never sees raw image data.
 
 #### Shared Libraries
 
@@ -188,9 +228,10 @@ CREATE TABLE photo_operations (
     library_id            TEXT,              -- NULL = personal operation
     photo_id              TEXT NOT NULL,
     operation_type        INTEGER NOT NULL,  -- see Operation Types below
-    prior_data_block_id   TEXT,              -- previous content version (NULL for non-content ops)
-    new_data_block_id     TEXT,              -- new content version (NULL for deletes and metadata ops)
-    operation_data        BLOB,              -- metadata diff for non-content ops (encrypted)
+    resource_type         INTEGER,           -- which resource (content ops only); NULL otherwise
+    prior_data_block_id   TEXT,              -- previous data_block for the resource (content ops only)
+    new_data_block_id     TEXT,              -- new data_block for the resource (content ops only)
+    operation_data        BLOB,              -- payload for non-content ops (encrypted metadata diff, album_id, etc.)
     performed_by          INTEGER NOT NULL,
 
     FOREIGN KEY (photo_id) REFERENCES photos(id),
@@ -198,30 +239,33 @@ CREATE TABLE photo_operations (
 );
 
 CREATE INDEX idx_photo_ops_photo ON photo_operations(photo_id);
-CREATE INDEX idx_photo_ops_prior_data ON photo_operations(prior_data_block_id);
+CREATE INDEX idx_photo_ops_prior_data ON photo_operations(prior_data_block_id) WHERE prior_data_block_id IS NOT NULL;
+CREATE INDEX idx_photo_ops_new_data ON photo_operations(new_data_block_id) WHERE new_data_block_id IS NOT NULL;
 CREATE INDEX idx_photo_ops_library ON photo_operations(library_id);
 ```
 
 ##### Operation Types
 
-| Value | Name | prior_data_block_id | new_data_block_id | operation_data |
-|-------|------|--------------------|--------------------|----------------|
-| 0 | `add` | NULL | data_block_id | NULL |
-| 1 | `content_edit` | old data_block_id | new data_block_id | NULL |
-| 2 | `delete` | current data_block_id | NULL | NULL |
-| 3 | `metadata_edit` | NULL | NULL | encrypted diff of changed fields |
-| 4 | `album_add` | NULL | NULL | album_id |
-| 5 | `album_remove` | NULL | NULL | album_id |
-| 6 | `favorite` | NULL | NULL | NULL |
-| 7 | `unfavorite` | NULL | NULL | NULL |
-| 8 | `restore` | restored-from data_block_id | restored-to data_block_id | NULL |
+| Value | Name | resource_type | prior_data_block_id | new_data_block_id | operation_data |
+|-------|------|---------------|---------------------|---------------------|----------------|
+| 0 | `add` | NULL | NULL | NULL | NULL (resources captured in `photo_resources`) |
+| 1 | `content_edit` | edited resource type | old data_block_id for that resource | new data_block_id | NULL |
+| 2 | `delete` | NULL | NULL | NULL | NULL (tombstone recorded via `photos.deleted_at`) |
+| 3 | `metadata_edit` | NULL | NULL | NULL | encrypted diff of changed fields |
+| 4 | `album_add` | NULL | NULL | NULL | album_id |
+| 5 | `album_remove` | NULL | NULL | NULL | album_id |
+| 6 | `favorite` | NULL | NULL | NULL | NULL |
+| 7 | `unfavorite` | NULL | NULL | NULL | NULL |
+| 8 | `restore` | NULL | NULL | NULL | NULL (clears `photos.deleted_at`) |
 
 **Undo semantics:**
 
-- **Content edit**: Revert by pointing `photos.data_block_id` back to `prior_data_block_id`. The old data block is still alive because the operation log references it.
-- **Delete**: Restore by re-creating the photo row from the operation entry. The data block survives the 30-day retention window via the reference in `prior_data_block_id`.
-- **Metadata edit**: Apply the inverse of `operation_data`.
+- **Content edit**: Revert by pointing the affected `photo_resources` row back to `prior_data_block_id`. The old data block is still alive because the operation log references it for the duration of edit history retention.
+- **Delete**: Restore by clearing `photos.deleted_at` and `photos.deleted_by`. All `photo_resources` rows are retained intact during the 30-day window, so no resource re-linking is required.
+- **Metadata edit**: Apply the inverse of `operation_data` to `photos.encrypted_metadata`.
 - **Album/favorite changes**: Reverse the relation change (insert ↔ delete in the junction table).
+
+A content edit on a Live Photo emits **two** operation entries (one for the `edited` still, one for `edited_paired_video`) if both renders change. Editing only the still emits one entry. The `original` and `paired_video` resources are never touched by edits — edited renders are separate resources.
 
 ### Client-Side Sidecar Database
 
@@ -234,7 +278,6 @@ The sidecar is a local, non-replicated SQLite database maintained by each client
 CREATE TABLE photo_index (
     photo_id         TEXT PRIMARY KEY,
     library_id       TEXT,
-    data_block_id    TEXT NOT NULL,
 
     -- Temporal
     date_taken       TEXT,                 -- ISO 8601
@@ -255,6 +298,17 @@ CREATE TABLE photo_index (
     latitude         REAL,
     longitude        REAL,
 
+    -- Grouping (mirrored from consensus photos table)
+    group_id         TEXT,
+    group_type       INTEGER,
+    group_index      INTEGER,
+    is_group_pick    INTEGER NOT NULL DEFAULT 0,
+
+    -- Soft-delete state (mirrored from consensus)
+    deleted_at       TEXT,                 -- NULL = active
+    deleted_by       INTEGER,
+    expires_at       TEXT,                 -- 30 days after deleted_at; NULL when active
+
     -- Sync tracking
     synced_at_height INTEGER NOT NULL      -- consensus height when last processed
 );
@@ -264,43 +318,44 @@ CREATE INDEX idx_sidecar_library ON photo_index(library_id);
 CREATE INDEX idx_sidecar_media ON photo_index(media_type);
 CREATE INDEX idx_sidecar_location ON photo_index(latitude, longitude);
 CREATE INDEX idx_sidecar_camera ON photo_index(camera_make, camera_model);
+CREATE INDEX idx_sidecar_group ON photo_index(group_id) WHERE group_id IS NOT NULL;
+CREATE INDEX idx_sidecar_active ON photo_index(deleted_at) WHERE deleted_at IS NULL;
+CREATE INDEX idx_sidecar_recently_deleted ON photo_index(expires_at) WHERE deleted_at IS NOT NULL;
 
--- Recently deleted photos, hydrated from photo_operations delete entries.
--- Enables the "Recently Deleted" album view and restore functionality.
-CREATE TABLE deleted_photos (
-    photo_id         TEXT PRIMARY KEY,
-    library_id       TEXT,
-    data_block_id    TEXT NOT NULL,        -- data_block at time of deletion
-    deleted_by       INTEGER NOT NULL,
-    deleted_at       TEXT NOT NULL,         -- ISO 8601
-    expires_at       TEXT NOT NULL,         -- 30 days after deleted_at
-
-    -- Preserved metadata from photo_index at time of deletion
-    date_taken       TEXT,
-    media_type       INTEGER,
-    width            INTEGER,
-    height           INTEGER
+-- Local cache of which resources each photo has and their data_block_ids.
+-- Populated from the consensus photo_resources table. Used to find the
+-- primary display resource for gallery rendering and to drive byte fetches.
+CREATE TABLE photo_resources_cache (
+    photo_id         TEXT NOT NULL,
+    resource_type    INTEGER NOT NULL,
+    data_block_id    TEXT NOT NULL,
+    PRIMARY KEY (photo_id, resource_type)
 );
+
+CREATE INDEX idx_resources_cache_data_block ON photo_resources_cache(data_block_id);
 ```
+
+Active gallery queries filter `WHERE deleted_at IS NULL`. The Recently Deleted view filters `WHERE deleted_at IS NOT NULL AND expires_at > now`. Burst frame rollups query `WHERE is_group_pick = 1` to show one frame per burst, with expansion fetching all rows for a given `group_id`.
 
 The sidecar schema can evolve freely — it's local-only, not consensus-tracked, and can be rebuilt at any time. New columns can be added for face tags, scene labels, or any future metadata without schema migrations on the consensus side.
 
 #### Sidecar Sync Model
 
 **Initial hydration** (new device or cache rebuild):
-1. Fetch all `photos` rows and `photo_metadata_access` entries for the current user
+1. Fetch all `photos` rows (including soft-deleted) and `photo_metadata_access` entries for the current user
 2. For each photo: ECDH with the ephemeral pubkey to unwrap the per-photo metadata key, then ChaCha20-Poly1305 decrypt the metadata blob
-3. Insert decrypted fields into `photo_index`
-4. Fetch non-expired `photo_operations` delete entries, decrypt associated metadata, populate `deleted_photos`
+3. Insert decrypted fields into `photo_index`, copying `deleted_at` / `deleted_by` and computing `expires_at = deleted_at + 30d` when soft-deleted
+4. Fetch all `photo_resources` rows for those photos and populate `photo_resources_cache`
 5. Record the current consensus height as `synced_at_height`
 
 **Incremental sync** (ongoing):
 1. On new consensus block, check for photo-related transactions since last synced height
 2. For new/modified photos: decrypt metadata, upsert into `photo_index`
-3. For deleted photos: move from `photo_index` to `deleted_photos` with expiry timestamp
-4. For restored photos: move from `deleted_photos` back to `photo_index`
-5. Prune expired entries from `deleted_photos`
-6. Update `synced_at_height`
+3. For new/modified resources: upsert into `photo_resources_cache`
+4. For soft-deleted photos: set `deleted_at` / `expires_at` on the existing `photo_index` row (no row move)
+5. For restored photos: clear `deleted_at` / `expires_at`
+6. For hard-deleted photos (30-day retention expired): drop from `photo_index` and `photo_resources_cache`
+7. Update `synced_at_height`
 
 The incremental path processes only changes since the last sync, so ongoing cost is proportional to new activity, not library size.
 
@@ -310,18 +365,34 @@ Thumbnails are encrypted data blocks fetched and decrypted on demand as the user
 
 ### Deletion Lifecycle
 
+Deletion is soft. The `photos` row and all `photo_resources` rows stay in place; only the tombstone columns flip. This avoids snapshotting multi-resource state into a separate table for the recovery window.
+
 When a photo is deleted (by any shared library member, or the user for personal photos):
 
-1. A `delete` operation is logged with `prior_data_block_id` set to the photo's current `data_block_id`
-2. The `photos` row is deleted (photo disappears from all views)
-3. Associated `photo_album_entries` and `photo_favorites` rows are deleted
-4. `photo_thumbnails` rows are deleted (thumbnail data blocks become candidates for cleanup)
-5. `photo_metadata_access` entries and `file_access` entries are **retained** for the 30-day recovery window
-6. A periodic cleanup job scans `photo_operations WHERE operation_type = 2` and purges entries older than 30 days, at which point `photo_metadata_access`, `file_access`, and ultimately the `data_block` can be cleaned up via standard orphan cleanup
+1. A `delete` operation is logged in `photo_operations` (operation_type=2, no data_block fields)
+2. `photos.deleted_at` is set to the current timestamp and `photos.deleted_by` is set to the actor
+3. `photo_album_entries`, `photo_favorites`, and any per-user state are deleted (photo disappears from active views immediately)
+4. `photo_resources`, `photo_metadata_access`, and `file_access` entries are **retained** for the 30-day recovery window
 
-The 30-day window is enforced by the operation log entry keeping the `prior_data_block_id` alive through the `DataBlockReferenceProvider` mechanism described below.
+A periodic cleanup job scans for expired tombstones:
 
-Clients remove the photo from their sidecar `photo_index` on the next incremental sync.
+```sql
+SELECT id FROM photos
+WHERE deleted_at IS NOT NULL
+  AND datetime(deleted_at, '+30 days') < datetime('now')
+```
+
+For each expired photo, the job:
+1. Deletes `photo_resources` rows (data blocks become orphan-cleanup candidates)
+2. Deletes `photo_metadata_access` and `file_access` rows for those data blocks
+3. Deletes the `photos` row itself
+4. Optionally compacts the `photo_operations` history for the photo (delete + add entries; content-edit entries may be retained or pruned per edit history retention policy)
+
+The 30-day window is enforced by the `photos` row's existence (with `deleted_at` set) keeping all its `photo_resources` rows alive, which in turn keep their `data_block`s pinned via the `DataBlockReferenceProvider` mechanism described below.
+
+Clients flip `deleted_at` / `expires_at` on the sidecar `photo_index` row during incremental sync and hard-delete the row only after the consensus row is hard-deleted.
+
+**Restore**: any operation_type=8 (`restore`) entry within the 30-day window clears `deleted_at` / `deleted_by`. All resources and access entries are still present, so restore is atomic and free of data movement.
 
 ## Integration with Core Storage
 
@@ -339,10 +410,9 @@ let has_inodes: bool = db_tx.query_row(
 
 The photos module adds additional reference checks. The orphan cleanup query must be expanded to also verify that a data block is not referenced by:
 
-1. **`photos.data_block_id`** — an active photo's current content
-2. **`photo_thumbnails.data_block_id`** — an active photo's thumbnails
-3. **`photo_operations.prior_data_block_id`** — historical content retained for undo (within retention window)
-4. **`photo_operations.new_data_block_id`** — edge case: operation logged but photo row already updated
+1. **`photo_resources.data_block_id`** — any resource (original, edited, paired_video, thumbnails, etc.) of any photo, active or soft-deleted within the retention window
+2. **`photo_operations.prior_data_block_id`** — historical content retained for edit-history undo (within retention window)
+3. **`photo_operations.new_data_block_id`** — symmetric: covers in-flight content edits and recently-superseded edits within retention
 
 The cleanest integration approach is a `DataBlockReferenceProvider` trait:
 
@@ -358,7 +428,7 @@ pub trait DataBlockReferenceProvider: Send + Sync {
 inventory::collect!(&'static dyn DataBlockReferenceProvider);
 ```
 
-The filesystem module registers a provider that checks `inodes` and `shares`. The photos module, if compiled in, registers a provider that checks `photos`, `photo_thumbnails`, and non-expired `photo_operations`. Orphan cleanup iterates all registered providers and only proceeds when none claim the data block.
+The filesystem module registers a provider that checks `inodes` and `shares`. The photos module, if compiled in, registers a provider that checks `photo_resources` and non-expired `photo_operations`. Orphan cleanup iterates all registered providers and only proceeds when none claim the data block.
 
 For the photos module, the reference check is:
 
@@ -371,24 +441,21 @@ impl DataBlockReferenceProvider for PhotosReferenceProvider {
         db_tx: &rusqlite::Transaction,
         data_block_id: &str,
     ) -> Result<bool, DatabaseError> {
-        // Active photo content
-        let in_photos: bool = db_tx.query_row(
-            "SELECT COUNT(*) > 0 FROM photos WHERE data_block_id = ?",
+        // Any resource (original, edited, paired_video, thumbnails, etc.)
+        // of any photo, active or soft-deleted within retention.
+        // photo_resources rows are only hard-deleted after the parent photo's
+        // 30-day tombstone expires, so this check naturally covers both
+        // active photos and recently-deleted ones.
+        let in_resources: bool = db_tx.query_row(
+            "SELECT COUNT(*) > 0 FROM photo_resources WHERE data_block_id = ?",
             rusqlite::params![data_block_id],
             |row| row.get(0),
         )?;
-        if in_photos { return Ok(true); }
+        if in_resources { return Ok(true); }
 
-        // Active thumbnail
-        let in_thumbnails: bool = db_tx.query_row(
-            "SELECT COUNT(*) > 0 FROM photo_thumbnails WHERE data_block_id = ?",
-            rusqlite::params![data_block_id],
-            |row| row.get(0),
-        )?;
-        if in_thumbnails { return Ok(true); }
-
-        // Historical content within retention window (30 days).
-        // UUIDv7 encodes timestamp, so we can filter by ID range.
+        // Edit-history retention: prior versions referenced by content_edit
+        // operations within the 30-day window. UUIDv7 encodes timestamp,
+        // so we can filter by ID range.
         let retention_cutoff = Uuid::now_v7_minus_days(30);
         let in_history: bool = db_tx.query_row(
             "SELECT COUNT(*) > 0 FROM photo_operations
@@ -413,12 +480,12 @@ The photos module registers its own transaction handlers via the existing `inven
 
 | Transaction | Handler | Description |
 |-------------|---------|-------------|
-| `photo_add` | `PhotoAddHandler` | Batch: create photo rows + metadata_access + thumbnail entries, file_access for library members. Single upload is batch of one. |
-| `photo_delete` | `PhotoDeleteHandler` | Log delete operation, remove photo + album/favorite rows, retain access entries for recovery window |
-| `photo_edit_content` | `PhotoEditContentHandler` | Log content edit, update photos.data_block_id, distribute new file_access to library members |
+| `photo_add` | `PhotoAddHandler` | Batch: create photo rows + photo_resources rows (per-asset variants and thumbnails) + metadata_access, file_access for library members. Single upload is batch of one. |
+| `photo_delete` | `PhotoDeleteHandler` | Log delete operation, set `photos.deleted_at` / `deleted_by`, drop album/favorite rows. Resources and access entries retained for the recovery window. |
+| `photo_edit_content` | `PhotoEditContentHandler` | Log content edit for a specific `resource_type`, update `photo_resources.data_block_id` for that row, distribute new file_access to library members |
 | `photo_edit_metadata` | `PhotoEditMetadataHandler` | Log metadata diff, update encrypted_metadata blob on photos row |
-| `photo_restore` | `PhotoRestoreHandler` | Restore deleted photo from operation log within retention window |
-| `photo_undo` | `PhotoUndoHandler` | Revert most recent operation on a photo (content or metadata) |
+| `photo_restore` | `PhotoRestoreHandler` | Restore soft-deleted photo within retention window (clear `deleted_at` / `deleted_by`) |
+| `photo_undo` | `PhotoUndoHandler` | Revert most recent operation on a photo (content edit on a specific resource, or metadata edit) |
 | `create_shared_library` | `CreateSharedLibraryHandler` | Create library + initial membership |
 | `join_shared_library` | `JoinSharedLibraryHandler` | Add member, create file_access + photo_metadata_access for all existing library photos |
 | `leave_shared_library` | `LeaveSharedLibraryHandler` | Remove member, clean up their file_access and photo_metadata_access entries |
@@ -428,7 +495,7 @@ The photos module registers its own transaction handlers via the existing `inven
 
 **Batch payloads**: The `photo_add` transaction accepts a `Vec<PhotoAddEntry>`, where each entry contains the photo metadata, thumbnail references, and per-member key wrappings. Single-photo upload submits a batch of one. This scales along both axes — multiple photos per transaction, and multiple transactions per consensus block.
 
-**Concurrent edit policy**: Last writer wins via consensus ordering. The `photo_edit_content` handler logs `prior_data_block_id` as the **current** value at execution time (not the value claimed in the payload). This ensures the operation chain is contiguous even when edits race: if A's edit lands first (X → A_version) and B's lands second, B's log entry records (prior=A_version, new=B_version) regardless of what B's payload claimed. All versions are reachable by walking the operation log, and any superseded edit can be manually restored.
+**Concurrent edit policy**: Last writer wins via consensus ordering. The `photo_edit_content` handler logs `prior_data_block_id` as the **current** value at execution time (looked up from `photo_resources` for the targeted `resource_type`), not the value claimed in the payload. This ensures the operation chain is contiguous even when edits race: if A's edit lands first (X → A_version) and B's lands second, B's log entry records (prior=A_version, new=B_version) regardless of what B's payload claimed. All versions are reachable by walking the operation log, and any superseded edit can be manually restored.
 
 ### Shared Library: Add Photo Flow
 
@@ -437,21 +504,21 @@ When a member adds a photo to a shared library:
 ```
 Client-side:
   1. Extract metadata from raw image (EXIF, dimensions, etc.)
-  2. Generate thumbnails (small + medium)
-  3. Encrypt photo bytes → data_block (existing upload infrastructure)
-  4. Encrypt thumbnails → data_blocks
+  2. Enumerate source asset resources (original, edited, paired_video,
+     adjustment_data, raw_alternate as applicable from PhotoKit)
+  3. Generate thumbnails (small + medium) from the primary display resource
+  4. Encrypt each resource's bytes → its own data_block
   5. Encrypt metadata blob with per-photo metadata key
   6. Wrap metadata key for each library member (ECDH per member)
-  7. Wrap file keys for each library member (existing file_access pattern)
+  7. Wrap each resource's file key for each library member (file_access pattern)
   8. Upload all data_blocks + submit photo_add consensus transaction
 
 photo_add handler (all nodes):
-  1. Insert into photos (id, library_id, data_block_id, encrypted_metadata...)
-  2. Insert into photo_thumbnails
+  1. Insert into photos (id, library_id, encrypted_metadata, group_*, ...)
+  2. Insert one photo_resources row per supplied resource
   3. For each shared_library_member:
-     a. Insert file_access entry for photo data_block
-     b. Insert file_access entries for thumbnail data_blocks
-     c. Insert photo_metadata_access entry
+     a. Insert file_access entries for every resource's data_block
+     b. Insert photo_metadata_access entry
   4. Log photo_operations entry (type=add)
 ```
 
@@ -463,23 +530,26 @@ When a member edits a photo (e.g. external editor export, crop, filter):
 
 ```
 Client-side:
-  1. Generate new thumbnails for edited content
-  2. Encrypt new photo bytes → new data_block
-  3. Encrypt new thumbnails → new data_blocks
-  4. Wrap new file keys for each library member
-  5. Upload + submit photo_edit_content transaction
+  1. Decide which resource_type is being edited (typically `edited`;
+     creating it if the photo had only `original` before)
+  2. Generate new thumbnails reflecting the edit
+  3. Encrypt new resource bytes → new data_block
+  4. Encrypt new thumbnails → new data_blocks
+  5. Wrap new file keys for each library member
+  6. Upload + submit photo_edit_content transaction (one tx per resource_type
+     being edited; Live Photo still + paired_video edits = two txs)
 
 photo_edit_content handler (all nodes):
-  1. Log photo_operations (type=content_edit, prior=old_id, new=new_id)
-  2. Update photos.data_block_id to new data_block_id
-  3. Update photo_thumbnails with new thumbnail data_blocks
-  4. For each shared_library_member:
-     a. Create file_access for new data_block_id
-     b. Create file_access for new thumbnail data_blocks
-  5. Update shares entries (old data_block_id → new data_block_id)
+  1. Look up current data_block_id for (photo_id, resource_type) in photo_resources
+  2. Log photo_operations (type=content_edit, resource_type=R,
+     prior=current, new=payload.new_id)
+  3. Upsert photo_resources(photo_id, resource_type=R) → new data_block_id
+  4. Upsert photo_resources rows for the thumbnail resource_types to new data_blocks
+  5. For each shared_library_member: insert file_access for each new data_block
+  6. Update shares entries pointing to the superseded data_block
 ```
 
-The old data block is retained because the operation log entry references its `prior_data_block_id`. Any member can undo by submitting `photo_undo`, which swaps back.
+The old data block is retained because the operation log entry references its `prior_data_block_id`. Any member can undo by submitting `photo_undo`, which swaps the `photo_resources` row back.
 
 ### Shared Library: Join Flow
 
@@ -488,15 +558,14 @@ When a new member joins an existing library:
 ```
 Client-side (initiated by existing member):
   1. For each photo in library:
-     a. Wrap photo file key for new member
-     b. Wrap thumbnail file keys for new member
-     c. Wrap metadata key for new member
+     a. For each resource of the photo: wrap file key for new member
+     b. Wrap metadata key for new member
   2. Submit join_shared_library transaction with all wrapped keys
 
 join_shared_library handler (all nodes):
   1. Insert into shared_library_members
   2. For each photo in library:
-     a. Insert file_access entries (photo + thumbnails)
+     a. Insert file_access entries for every photo_resources row
      b. Insert photo_metadata_access entry
 ```
 
@@ -506,27 +575,29 @@ This may be a large transaction for libraries with many photos. A batched approa
 
 | Data | Retention | Mechanism |
 |------|-----------|-----------|
-| Active photo content | Indefinite | Referenced by `photos.data_block_id` |
-| Thumbnail content | Tied to parent photo | Referenced by `photo_thumbnails.data_block_id` |
-| Edit history (prior versions) | Indefinite | Referenced by `photo_operations.prior_data_block_id` |
-| Deleted photo content | 30 days | `photo_operations` delete entry keeps reference alive; periodic job prunes expired entries |
+| Active photo resources (original, edited, paired_video, thumbnails, …) | Indefinite | Referenced by `photo_resources.data_block_id` for the active `photos` row |
+| Edit history (prior versions) | 30 days (edit history window) | Referenced by `photo_operations.prior_data_block_id`; window enforced by UUIDv7 ID range filter in reference provider |
+| Soft-deleted photo resources | 30 days | `photos.deleted_at + 30d` keeps the row alive, which keeps `photo_resources` rows alive, which pins data_blocks |
 | Operation log entries (non-delete) | Indefinite | Small rows; negligible storage cost |
-| Operation log entries (delete) | 30 days | Pruned by periodic cleanup job |
-| Sidecar photo_index | Ephemeral | Rebuilt from consensus state; can be purged at any time |
+| Operation log entries (delete) | Indefinite (small row, no data_block reference) | Optionally pruned after the soft-delete window if desired |
+| Sidecar photo_index / photo_resources_cache | Ephemeral | Rebuilt from consensus state; can be purged at any time |
 
-The periodic cleanup job scans for delete operations older than the retention window:
+The periodic cleanup job scans for expired tombstones:
 
 ```sql
--- Find expired delete operations
-SELECT id, prior_data_block_id FROM photo_operations
-WHERE operation_type = 2
-  AND id < ?  -- UUIDv7 cutoff for 30 days ago
+-- Find photos whose soft-delete window has elapsed
+SELECT id FROM photos
+WHERE deleted_at IS NOT NULL
+  AND datetime(deleted_at, '+30 days') < datetime('now')
 ```
 
-For each expired entry, the job:
-1. Removes the `photo_operations` row
-2. Removes remaining `photo_metadata_access` and `file_access` entries for that data block
-3. The standard orphan cleanup job handles the data block itself on its next pass (if no other references exist)
+For each expired photo, the job:
+1. Deletes all `photo_resources` rows for that photo (drops references; data blocks become candidates for orphan cleanup)
+2. Deletes all `photo_metadata_access` and `file_access` rows for that photo and its data blocks
+3. Deletes the `photos` row itself
+4. The standard orphan cleanup job handles the data blocks on its next pass (if no other references exist)
+
+Edit-history retention (separate from soft-delete retention) is enforced entirely in the `DataBlockReferenceProvider` by filtering `photo_operations` rows by UUIDv7 timestamp. No periodic deletion of operation log rows is required; the rows themselves are small and can be retained indefinitely for audit purposes.
 
 ## Client Architecture
 
@@ -640,12 +711,13 @@ If the module is not compiled, no photos tables are created, no handlers are reg
 
 ### Phase 1: photos-core Crate and Schema [ ]
 - Extract `crates/photos-core/` with crypto, metadata, thumbnail, payload, and dispatch trait
-- Consensus-tracked photo tables (photos, photo_metadata_access, photo_thumbnails)
-- `photo_add` / `photo_delete` consensus handlers in `src/photos/`
+- Consensus-tracked photo tables (photos, photo_resources, photo_metadata_access)
+- `photo_add` / `photo_delete` consensus handlers in `src/photos/` (soft-delete model)
 - `DataBlockReferenceProvider` integration with orphan cleanup
+- Periodic cleanup job for expired soft-deleted photos
 - `dispatch_local` implementation for node clients
-- Basic HTTP API: upload, submit transaction, list photo IDs, delete
-- Metadata sync endpoint (return encrypted blobs for sidecar hydration)
+- Basic HTTP API: upload, submit transaction, list photo IDs, delete, restore
+- Metadata sync endpoint (return encrypted blobs + photo_resources rows for sidecar hydration)
 - ECDH per-photo performance validation
 
 ### Phase 2: Sidecar and History [ ]
