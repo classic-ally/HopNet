@@ -78,8 +78,47 @@ pub struct FfiAssetDescriptor {
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum FfiResolution {
     AlreadyKnown { photo_id: String, metadata_changed: bool, scope_changed: bool },
+    /// Previously-unmapped photo adopted its now-bound library.
+    Adopted { photo_id: String },
     NeedsOriginal,
     UnmappedScope { photo_id: String },
+}
+
+/// Outcome of a seed pass (mirrors `resolve::SeedOutcome`).
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum FfiSeedOutcome {
+    AlreadyKnown { photo_id: String },
+    Adopted { photo_id: String },
+    MintedPending { photo_id: String, resources: u32 },
+    Unmapped { photo_id: String },
+}
+
+/// Drain knobs (CLI flags; spec defaults).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiDrainOptions {
+    pub fetch_concurrency: u32,
+    pub retry_cap: i64,
+    pub retry_base_secs: u64,
+    pub retry_max_secs: u64,
+    pub reserve_floor_gib: u64,
+    pub pressure_pause_secs: u64,
+    pub storage_poll_secs: u64,
+}
+
+/// Drain outcome (mirrors `scheduler::DrainReport`).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiDrainReport {
+    pub photos_completed: u64,
+    pub resources_written: u64,
+    pub resources_deduped: u64,
+    pub bytes_written: u64,
+    pub late_binding_merges: u64,
+    pub swept_partials: u64,
+    pub pauses: u64,
+    pub awaiting_retry: i64,
+    pub gave_up: i64,
+    /// ISO 8601, when retries remain.
+    pub earliest_next_retry_at: Option<String>,
 }
 
 /// How the original's hash resolved (mirrors `resolve::HashResolution`).

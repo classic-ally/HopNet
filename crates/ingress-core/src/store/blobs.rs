@@ -11,6 +11,15 @@ use crate::model::BlobRecord;
 use super::StateStore;
 
 impl StateStore {
+    /// Largest blob seen in a library — the pessimistic size estimate for
+    /// admission when a descriptor reports no expected size.
+    pub async fn max_blob_size(&self, library_id: &LibraryId) -> Result<Option<i64>> {
+        Ok(sqlx::query_scalar("SELECT MAX(size_bytes) FROM blobs WHERE library_id = ?")
+            .bind(library_id)
+            .fetch_one(self.pool())
+            .await?)
+    }
+
     pub async fn blob(&self, library_id: &LibraryId, hash: &ContentHash) -> Result<Option<BlobRecord>> {
         Ok(
             sqlx::query_as("SELECT * FROM blobs WHERE library_id = ? AND content_hash = ?")

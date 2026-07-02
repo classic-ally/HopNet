@@ -13,6 +13,7 @@ pub mod ids;
 pub mod model;
 pub mod paths;
 pub mod resolve;
+pub mod scheduler;
 pub mod sidecar;
 pub mod sidecar_io;
 pub mod store;
@@ -22,6 +23,10 @@ pub use descriptor::{AssetDescriptor, LibraryScope, ResourceDescriptor};
 pub use error::{IngressError, Result};
 pub use ids::{ContentHash, LibraryId, PhotoId};
 pub use model::{LibraryConfig, PhotoRecord, ResourceRecord, ResourceType};
-pub use resolve::{resolve_descriptor, resolve_with_hash, HashResolution, Resolution};
+pub use resolve::{
+    late_binding_merge, resolve_descriptor, resolve_with_hash, seed_descriptor, HashResolution,
+    Resolution, SeedOutcome,
+};
+pub use scheduler::{DrainReport, Scheduler, SchedulerConfig};
 pub use sidecar::Sidecar;
 pub use store::StateStore;

@@ -6,9 +6,11 @@ uniffi::setup_scaffolding!();
 
 pub mod convert;
 pub mod error;
+pub mod fetcher;
 pub mod session;
 pub mod types;
 
 pub use error::FfiError;
+pub use fetcher::{FfiFetchRequest, PhotoResourceFetcher};
 pub use session::{ChunkSink, IngressSession};
 pub use types::*;

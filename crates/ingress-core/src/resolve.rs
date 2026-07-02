@@ -27,6 +27,10 @@ pub enum Resolution {
         /// and reported here; the hard move is Phase 4.
         scope_changed: bool,
     },
+    /// Rule 1 hit on a previously-unmapped photo whose scope now resolves:
+    /// `library_id` populated in this call; its pending resource rows become
+    /// drain-eligible. (Adopt-on-redelivery — the unmapped-unblock path.)
+    Adopted { photo_id: PhotoId, library_id: crate::ids::LibraryId },
     /// Rule 1 miss: caller must materialize + hash the original, then call
     /// [`resolve_with_hash`].
     NeedsContentHash,
@@ -60,6 +64,18 @@ pub async fn resolve_descriptor(store: &StateStore, desc: &AssetDescriptor) -> R
             photos::update_local_id(&mut *tx, &existing.photo_id, &desc.local_id).await?;
         }
 
+        let current_scope_library = libraries::resolve_scope(&mut *tx, desc.scope).await?;
+
+        // Adopt-on-redelivery: a previously-unmapped photo whose scope is now
+        // bound gains its library here; pending rows become drain-eligible.
+        if existing.library_id.is_none()
+            && let Some(library) = current_scope_library.clone()
+        {
+            photos::adopt_library(&mut *tx, &existing.photo_id, &library).await?;
+            tx.commit().await?;
+            return Ok(Resolution::Adopted { photo_id: existing.photo_id, library_id: library });
+        }
+
         // NULL stored modification date = never successfully synced → changed.
         let metadata_changed = match (existing.asset_modified_at, desc.asset_modified_at) {
             (None, _) => true,
@@ -67,7 +83,6 @@ pub async fn resolve_descriptor(store: &StateStore, desc: &AssetDescriptor) -> R
             (Some(_), None) => false,
         };
 
-        let current_scope_library = libraries::resolve_scope(&mut *tx, desc.scope).await?;
         let scope_changed = match (&existing.library_id, &current_scope_library) {
             (Some(stored), Some(current)) => stored != current,
             // Unmapped-then-bound (or vice versa) is a binding change, not a
@@ -220,6 +235,108 @@ async fn mint_photo(
     }
 
     Ok(photo_id)
+}
+
+/// Outcome of a seed pass (discovery without bytes — spec §Discovery: rows
+/// are minted at discovery, before any bytes move).
+#[derive(Debug, PartialEq, Eq)]
+pub enum SeedOutcome {
+    /// Rule 1 hit (or the local-only re-seed guard): nothing minted.
+    AlreadyKnown { photo_id: PhotoId },
+    /// Previously-unmapped photo adopted its now-bound library.
+    Adopted { photo_id: PhotoId },
+    /// New photo + pending resource rows minted; drain-eligible.
+    MintedPending { photo_id: PhotoId, resources: u32 },
+    /// Scope unbound: NULL-library row minted, ingest blocked.
+    Unmapped { photo_id: PhotoId },
+}
+
+/// Seed one descriptor: rule 1, adoption, or mint-on-miss. Idempotent —
+/// re-seeding resolves to `AlreadyKnown`. Identity rules 2a/2b are handled
+/// at drain time ([`late_binding_merge`] / the dedup-hit write path).
+pub async fn seed_descriptor(store: &StateStore, desc: &AssetDescriptor) -> Result<SeedOutcome> {
+    match resolve_descriptor(store, desc).await? {
+        Resolution::KnownByCloudId { photo_id, .. } => {
+            return Ok(SeedOutcome::AlreadyKnown { photo_id })
+        }
+        Resolution::Adopted { photo_id, .. } => return Ok(SeedOutcome::Adopted { photo_id }),
+        Resolution::UnmappedScope { photo_id } => {
+            return Ok(SeedOutcome::Unmapped { photo_id })
+        }
+        Resolution::NeedsContentHash => {}
+    }
+
+    let mut tx = store.pool().begin().await?;
+
+    // Local-only re-seed guard: rule 1 can't match cloud_id-less assets, so
+    // without this a second seed pass would double-mint. local_id is not an
+    // identity key (spec), but as a same-device seed guard it is sound; the
+    // drain-time hash merge remains the correctness backstop.
+    if desc.cloud_id.is_none()
+        && let Some(existing) = photos::photo_by_local_id_no_cloud(&mut *tx, &desc.local_id).await?
+    {
+        tx.commit().await?;
+        return Ok(SeedOutcome::AlreadyKnown { photo_id: existing.photo_id });
+    }
+
+    let library = libraries::resolve_scope(&mut *tx, desc.scope)
+        .await?
+        .ok_or(IngressError::UnmappedScope(desc.scope))?; // unreachable: handled above
+
+    let photo_id = mint_photo(&mut tx, desc, Some(&library)).await?;
+    let resources = resources::resources_for_photo(&mut *tx, &photo_id).await?.len() as u32;
+    tx.commit().await?;
+    Ok(SeedOutcome::MintedPending { photo_id, resources })
+}
+
+/// Drain-time rule 2a: the freshly-hashed ORIGINAL of a seed-minted photo
+/// matches an existing same-library photo with no `cloud_id` — same logical
+/// photo. Merge into the OLD row (keeps its photo_id, written blobs, and
+/// sidecar continuity; gains the cloud identifiers) and delete the
+/// provisional row. Caller must invoke this BEFORE finalizing the original,
+/// so nothing on disk references the provisional `photo_id` yet.
+///
+/// Returns the surviving photo_id on merge, `None` when no merge applies.
+pub async fn late_binding_merge(
+    store: &StateStore,
+    library: &crate::ids::LibraryId,
+    original_hash: &ContentHash,
+    desc: &AssetDescriptor,
+    provisional: &PhotoId,
+) -> Result<Option<PhotoId>> {
+    // Merge only applies when the incoming asset brings a cloud_id and the
+    // existing record lacks one (2a shape). Byte-identical pairs where both
+    // have (distinct) cloud_ids are rule 2b — distinct photos, shared blob.
+    let Some(cloud_id) = desc.cloud_id.as_deref() else { return Ok(None) };
+
+    let mut tx = store.pool().begin().await?;
+    let existing = resources::photo_by_original_hash(&mut *tx, library, original_hash).await?;
+    let Some(old) = existing else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+    if old.photo_id == *provisional || old.cloud_id.is_some() {
+        tx.commit().await?;
+        return Ok(None);
+    }
+
+    // Delete the provisional FIRST: it holds the same cloud_id, and setting
+    // it on the old row while both exist violates the UNIQUE constraint.
+    photos::delete_photo(&mut tx, provisional).await?;
+    photos::set_cloud_id(&mut *tx, &old.photo_id, cloud_id).await?;
+    photos::update_local_id(&mut *tx, &old.photo_id, &desc.local_id).await?;
+    log::append(
+        &mut *tx,
+        "late_binding_merge",
+        Some(&old.photo_id),
+        Some(serde_json::json!({
+            "provisional_photo_id": provisional.to_string(),
+            "cloud_id": cloud_id,
+        })),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Some(old.photo_id))
 }
 
 /// Difference between a photo's stored resource set and a freshly-enumerated

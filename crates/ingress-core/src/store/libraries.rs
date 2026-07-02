@@ -30,6 +30,13 @@ impl StateStore {
         Ok(())
     }
 
+    /// All configured libraries.
+    pub async fn libraries(&self) -> Result<Vec<LibraryConfig>> {
+        Ok(sqlx::query_as("SELECT * FROM libraries ORDER BY library_id")
+            .fetch_all(self.pool())
+            .await?)
+    }
+
     pub async fn library(&self, id: &LibraryId) -> Result<Option<LibraryConfig>> {
         Ok(sqlx::query_as("SELECT * FROM libraries WHERE library_id = ?")
             .bind(id)

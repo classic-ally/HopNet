@@ -793,13 +793,15 @@ Structure: a Swift executable (the LaunchAgent) linking `ingress-core` (Rust, in
 - One real asset end-to-end: fetch → hash → temp → rename → sidecar → committed rows (verified against a Shared Photo Library Live Photo, b3sum-exact)
 - The resource-fetch callback interface moved to Phase 3 — the scheduler's concurrency model shapes that trait's signature
 
-### Phase 3: Pipeline [ ]
-- Scheduler with bounded fetch/write pools
-- Resource-fetch foreign trait (Rust drives Swift for bytes; deferred from Phase 2 so the scheduler shapes its signature)
-- Retry/backoff, terminal give-up
-- Storage-aware admission (free-space checks, reserve floor)
-- SIGTERM-clean cancellation, startup temp sweep
-- Unblock unmapped photos when their scope gains a binding (slice finding: rule-1 re-delivery leaves `library_id` NULL)
+### Phase 3: Pipeline [x] — `crates/ingress-core/src/scheduler/`, seed/drain subcommands
+- Scheduler with a bounded fetch pool (single knob: writes structurally ride the fetch path — sync sink writes are the backpressure; a write pool would mean local spooling, which §Write path rejects)
+- Resource-fetch foreign trait (`PhotoResourceFetcher`: `descriptor_for` + `fetch_resource` into a scheduler-owned sink; blocking, spawn_blocking under a semaphore)
+- Retry/backoff (exponential, per-resource columns), terminal give-up at a flag-configured cap (`retry_count >= cap`, still pending; raising the cap on a later run revives gave-up rows)
+- Storage-aware admission (statvfs vs reserve floor + inflight expected sizes; descriptor `fileSize` with a max-blob pessimistic fallback). 1005 = daemon-wide pause with timed re-probe (cloudphotod's threshold is unobservable)
+- SIGTERM-clean cancellation (verified live against a mid-download 1.6 GB video; PhotoKit's `cancelDataRequest` does NOT reliably fire completion handlers — the Swift fetcher poll-waits and abandons on cancel), startup `.partial` sweep, exclusive `drain.lock`
+- Unmapped photos adopt their library on re-delivery (rule-1 branch); pending rows become drain-eligible
+- Seed mints photo + pending resource rows at discovery (aligns with §Discovery); rule 2a consequently runs at drain time as a **late-binding merge** — the existing cloud_id-less photo survives (keeps photo_id + blobs), the seed-minted provisional row is deleted before anything on disk references it (original streams first), logged as `late_binding_merge`
+- Drain-time descriptors come fresh from `descriptor_for` per admitted photo (never persisted; serves sidecar fields, ext derivation, and admission sizes)
 
 ### Phase 4: Discovery [ ]
 - Change observer wiring

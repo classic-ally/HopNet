@@ -80,6 +80,26 @@ fn io_err(e: std::io::Error) -> IngressError {
     IngressError::Invariant(format!("blob write io: {e}"))
 }
 
+/// Startup sweep (spec §Write path crash windows): delete every file under
+/// `.partial/` — nothing ever references temps, so this is always safe.
+/// Returns the number of files removed.
+pub fn sweep_partials(paths: &BlobPaths) -> Result<u64> {
+    let dir = paths.partial_dir();
+    let mut removed = 0u64;
+    match fs::read_dir(&dir) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                if fs::remove_file(entry.path()).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(io_err(e)),
+    }
+    Ok(removed)
+}
+
 /// The filesystem half of a dedup miss (spec §Write path step 3): fsync the
 /// temp, create the fan-out dirs, atomically rename into place, best-effort
 /// fsync the parent dir. Separately callable so crash-window tests can

@@ -243,6 +243,55 @@ typedef void (*UniffiForeignFutureCompleteVoid)(uint64_t, UniffiForeignFutureRes
     );
 
 #endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_PHOTO_RESOURCE_FETCHER_METHOD0
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_PHOTO_RESOURCE_FETCHER_METHOD0
+typedef void (*UniffiCallbackInterfacePhotoResourceFetcherMethod0)(uint64_t, RustBuffer, RustBuffer* _Nonnull, 
+        RustCallStatus *_Nonnull uniffiCallStatus
+    );
+
+#endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_PHOTO_RESOURCE_FETCHER_METHOD1
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_PHOTO_RESOURCE_FETCHER_METHOD1
+typedef void (*UniffiCallbackInterfacePhotoResourceFetcherMethod1)(uint64_t, RustBuffer, uint64_t, void* _Nonnull, 
+        RustCallStatus *_Nonnull uniffiCallStatus
+    );
+
+#endif
+#ifndef UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_PHOTO_RESOURCE_FETCHER
+#define UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_PHOTO_RESOURCE_FETCHER
+typedef struct UniffiVTableCallbackInterfacePhotoResourceFetcher {
+    UniffiCallbackInterfaceFree _Nonnull uniffiFree;
+    UniffiCallbackInterfaceClone _Nonnull uniffiClone;
+    UniffiCallbackInterfacePhotoResourceFetcherMethod0 _Nonnull descriptorFor;
+    UniffiCallbackInterfacePhotoResourceFetcherMethod1 _Nonnull fetchResource;
+} UniffiVTableCallbackInterfacePhotoResourceFetcher;
+
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_CLONE_PHOTORESOURCEFETCHER
+#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_CLONE_PHOTORESOURCEFETCHER
+uint64_t uniffi_ingress_ffi_fn_clone_photoresourcefetcher(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_FREE_PHOTORESOURCEFETCHER
+#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_FREE_PHOTORESOURCEFETCHER
+void uniffi_ingress_ffi_fn_free_photoresourcefetcher(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_INIT_CALLBACK_VTABLE_PHOTORESOURCEFETCHER
+#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_INIT_CALLBACK_VTABLE_PHOTORESOURCEFETCHER
+void uniffi_ingress_ffi_fn_init_callback_vtable_photoresourcefetcher(const UniffiVTableCallbackInterfacePhotoResourceFetcher* _Nonnull vtable
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_PHOTORESOURCEFETCHER_DESCRIPTOR_FOR
+#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_PHOTORESOURCEFETCHER_DESCRIPTOR_FOR
+RustBuffer uniffi_ingress_ffi_fn_method_photoresourcefetcher_descriptor_for(uint64_t ptr, RustBuffer local_id, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_PHOTORESOURCEFETCHER_FETCH_RESOURCE
+#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_PHOTORESOURCEFETCHER_FETCH_RESOURCE
+void uniffi_ingress_ffi_fn_method_photoresourcefetcher_fetch_resource(uint64_t ptr, RustBuffer request, uint64_t sink, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_CLONE_CHUNKSINK
 #define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_CLONE_CHUNKSINK
 uint64_t uniffi_ingress_ffi_fn_clone_chunksink(uint64_t handle, RustCallStatus *_Nonnull out_status
@@ -298,9 +347,24 @@ uint64_t uniffi_ingress_ffi_fn_method_ingresssession_begin_original(uint64_t ptr
 uint64_t uniffi_ingress_ffi_fn_method_ingresssession_begin_resource(uint64_t ptr, RustBuffer photo_id, int32_t ph_resource_type, RustBuffer uti, RustBuffer original_filename, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_CANCEL_DRAIN
+#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_CANCEL_DRAIN
+void uniffi_ingress_ffi_fn_method_ingresssession_cancel_drain(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_DRAIN
+#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_DRAIN
+RustBuffer uniffi_ingress_ffi_fn_method_ingresssession_drain(uint64_t ptr, uint64_t fetcher, RustBuffer options, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_INGEST_DESCRIPTOR
 #define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_INGEST_DESCRIPTOR
 RustBuffer uniffi_ingress_ffi_fn_method_ingresssession_ingest_descriptor(uint64_t ptr, RustBuffer desc, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_SEED_DESCRIPTOR
+#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_SEED_DESCRIPTOR
+RustBuffer uniffi_ingress_ffi_fn_method_ingresssession_seed_descriptor(uint64_t ptr, RustBuffer desc, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_FFI_INGRESS_FFI_RUSTBUFFER_ALLOC
@@ -563,6 +627,18 @@ void ffi_ingress_ffi_rust_future_free_void(uint64_t handle
 void ffi_ingress_ffi_rust_future_complete_void(uint64_t handle, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_PHOTORESOURCEFETCHER_DESCRIPTOR_FOR
+#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_PHOTORESOURCEFETCHER_DESCRIPTOR_FOR
+uint16_t uniffi_ingress_ffi_checksum_method_photoresourcefetcher_descriptor_for(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_PHOTORESOURCEFETCHER_FETCH_RESOURCE
+#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_PHOTORESOURCEFETCHER_FETCH_RESOURCE
+uint16_t uniffi_ingress_ffi_checksum_method_photoresourcefetcher_fetch_resource(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_CHUNKSINK_ABORT
 #define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_CHUNKSINK_ABORT
 uint16_t uniffi_ingress_ffi_checksum_method_chunksink_abort(void
@@ -599,9 +675,27 @@ uint16_t uniffi_ingress_ffi_checksum_method_ingresssession_begin_resource(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_CANCEL_DRAIN
+#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_CANCEL_DRAIN
+uint16_t uniffi_ingress_ffi_checksum_method_ingresssession_cancel_drain(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_DRAIN
+#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_DRAIN
+uint16_t uniffi_ingress_ffi_checksum_method_ingresssession_drain(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_INGEST_DESCRIPTOR
 #define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_INGEST_DESCRIPTOR
 uint16_t uniffi_ingress_ffi_checksum_method_ingresssession_ingest_descriptor(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_SEED_DESCRIPTOR
+#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_SEED_DESCRIPTOR
+uint16_t uniffi_ingress_ffi_checksum_method_ingresssession_seed_descriptor(void
     
 );
 #endif

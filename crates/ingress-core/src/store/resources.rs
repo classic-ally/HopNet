@@ -50,7 +50,7 @@ impl StateStore {
         sqlx::query(
             "UPDATE photo_resources \
              SET content_hash = ?, ext = ?, size_bytes = ?, written_at = ?, \
-                 next_retry_at = NULL, last_error = NULL \
+                 retry_count = 0, next_retry_at = NULL, last_error = NULL \
              WHERE photo_id = ? AND resource_type = ?",
         )
         .bind(hash)
@@ -81,6 +81,77 @@ impl StateStore {
 
         tx.commit().await?;
         Ok(completed)
+    }
+}
+
+/// Summary of resources awaiting retry (drain exit report).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct RetrySummary {
+    pub awaiting_retry: i64,
+    pub gave_up: i64,
+    pub earliest_next_retry_at: Option<chrono::DateTime<Utc>>,
+}
+
+impl StateStore {
+    /// Record a per-resource fetch failure in ONE transaction: bump
+    /// `retry_count`, stamp `next_retry_at` (exponential backoff computed by
+    /// the caller) and `last_error`; when the bump reaches the cap, append
+    /// the `resource_gave_up` ingest-log event in the same transaction —
+    /// exactly once per give-up.
+    pub async fn record_resource_failure(
+        &self,
+        photo_id: &PhotoId,
+        resource_type: ResourceType,
+        error: &str,
+        next_retry_at: chrono::DateTime<Utc>,
+        retry_cap: i64,
+    ) -> Result<i64> {
+        let mut tx = self.pool().begin().await?;
+        let (retry_count,): (i64,) = sqlx::query_as(
+            "UPDATE photo_resources \
+             SET retry_count = retry_count + 1, next_retry_at = ?, last_error = ? \
+             WHERE photo_id = ? AND resource_type = ? \
+             RETURNING retry_count",
+        )
+        .bind(next_retry_at)
+        .bind(error)
+        .bind(photo_id)
+        .bind(resource_type)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        if retry_count == retry_cap {
+            super::log::append(
+                &mut *tx,
+                "resource_gave_up",
+                Some(photo_id),
+                Some(serde_json::json!({
+                    "resource_type": resource_type.as_str(),
+                    "final_error": error,
+                    "retries": retry_count,
+                })),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(retry_count)
+    }
+
+    /// Retry-state summary for the drain exit report.
+    pub async fn retry_summary(&self, retry_cap: i64) -> Result<RetrySummary> {
+        Ok(sqlx::query_as(
+            "SELECT \
+               COUNT(*) FILTER (WHERE retry_count < ?) AS awaiting_retry, \
+               COUNT(*) FILTER (WHERE retry_count >= ?) AS gave_up, \
+               MIN(next_retry_at) FILTER (WHERE retry_count < ?) AS earliest_next_retry_at \
+             FROM photo_resources \
+             WHERE written_at IS NULL AND next_retry_at IS NOT NULL",
+        )
+        .bind(retry_cap)
+        .bind(retry_cap)
+        .bind(retry_cap)
+        .fetch_one(self.pool())
+        .await?)
     }
 }
 

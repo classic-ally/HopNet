@@ -28,8 +28,11 @@ struct Inner {
     data_dir: DataDir,
     /// Descriptors retained until the photo's sidecar is written — sidecar
     /// fields (media type, subtypes, favorite, capture) are deliberately not
-    /// persisted in state.db.
+    /// persisted in state.db. Legacy (Phase-2 slice) flows only; scheduler
+    /// flows hold descriptors in task scope instead.
     inflight: Mutex<HashMap<String, AssetDescriptor>>,
+    /// Cooperative drain cancellation (SIGTERM).
+    cancel: ingress_core::scheduler::CancelToken,
 }
 
 /// One daemon-side ingest session over a data directory.
@@ -56,7 +59,12 @@ impl IngressSession {
         let store = runtime.block_on(StateStore::open(&data_dir.state_db_path()))?;
         Ok(Arc::new(Self {
             runtime,
-            inner: Arc::new(Inner { store, data_dir, inflight: Mutex::new(HashMap::new()) }),
+            inner: Arc::new(Inner {
+                store,
+                data_dir,
+                inflight: Mutex::new(HashMap::new()),
+                cancel: ingress_core::scheduler::CancelToken::default(),
+            }),
         }))
     }
 
@@ -97,6 +105,9 @@ impl IngressSession {
                     scope_changed,
                 }
             }
+            Resolution::Adopted { photo_id, .. } => {
+                FfiResolution::Adopted { photo_id: photo_id.to_string() }
+            }
             Resolution::NeedsContentHash => FfiResolution::NeedsOriginal,
             Resolution::UnmappedScope { photo_id } => {
                 FfiResolution::UnmappedScope { photo_id: photo_id.to_string() }
@@ -121,14 +132,16 @@ impl IngressSession {
         let key = TempKey::Probe { token: uuid_token() };
         let write = ResourceWrite::begin(&paths, &key)?;
         Ok(Arc::new(ChunkSink {
-            handle: self.runtime.handle().clone(),
-            inner: self.inner.clone(),
-            state: Mutex::new(Some(SinkState {
-                write,
-                paths,
-                library,
-                ext,
-                kind: SinkKind::Original { desc: Box::new(desc) },
+            mode: Mutex::new(Some(SinkMode::Legacy {
+                handle: self.runtime.handle().clone(),
+                inner: self.inner.clone(),
+                state: Box::new(SinkState {
+                    write,
+                    paths,
+                    library,
+                    ext,
+                    kind: SinkKind::Original { desc: Box::new(desc) },
+                }),
             })),
         }))
     }
@@ -167,16 +180,94 @@ impl IngressSession {
         let key = TempKey::Resource { photo_id: photo.photo_id.clone(), resource_type };
         let write = ResourceWrite::begin(&paths, &key)?;
         Ok(Arc::new(ChunkSink {
-            handle: self.runtime.handle().clone(),
-            inner: self.inner.clone(),
-            state: Mutex::new(Some(SinkState {
-                write,
-                paths,
-                library: library.library_id.clone(),
-                ext,
-                kind: SinkKind::Additional { photo_id: photo.photo_id, resource_type },
+            mode: Mutex::new(Some(SinkMode::Legacy {
+                handle: self.runtime.handle().clone(),
+                inner: self.inner.clone(),
+                state: Box::new(SinkState {
+                    write,
+                    paths,
+                    library: library.library_id.clone(),
+                    ext,
+                    kind: SinkKind::Additional { photo_id: photo.photo_id, resource_type },
+                }),
             })),
         }))
+    }
+}
+
+/// Scheduler entry points.
+#[uniffi::export]
+impl IngressSession {
+    /// Seed one descriptor: rule 1, adoption, or mint-on-miss (no bytes).
+    pub fn seed_descriptor(&self, desc: FfiAssetDescriptor) -> Result<FfiSeedOutcome, FfiError> {
+        let desc = descriptor_from_ffi(desc)?;
+        let outcome =
+            self.runtime.block_on(ingress_core::seed_descriptor(&self.inner.store, &desc))?;
+        Ok(match outcome {
+            ingress_core::SeedOutcome::AlreadyKnown { photo_id } => {
+                FfiSeedOutcome::AlreadyKnown { photo_id: photo_id.to_string() }
+            }
+            ingress_core::SeedOutcome::Adopted { photo_id } => {
+                FfiSeedOutcome::Adopted { photo_id: photo_id.to_string() }
+            }
+            ingress_core::SeedOutcome::MintedPending { photo_id, resources } => {
+                FfiSeedOutcome::MintedPending { photo_id: photo_id.to_string(), resources }
+            }
+            ingress_core::SeedOutcome::Unmapped { photo_id } => {
+                FfiSeedOutcome::Unmapped { photo_id: photo_id.to_string() }
+            }
+        })
+    }
+
+    /// Drain pending work through the fetcher until the queue is empty,
+    /// only future retries remain, or cancellation. Blocking; call from a
+    /// background thread. Progress is the returned report (per-photo
+    /// progress lines are the Phase 4 daemon loop's job).
+    pub fn drain(
+        &self,
+        fetcher: Arc<dyn crate::fetcher::PhotoResourceFetcher>,
+        options: FfiDrainOptions,
+    ) -> Result<FfiDrainReport, FfiError> {
+        use ingress_core::scheduler::{BackoffConfig, Scheduler, SchedulerConfig, StatvfsProbe};
+        let config = SchedulerConfig {
+            fetch_concurrency: options.fetch_concurrency.max(1) as usize,
+            retry_cap: options.retry_cap.max(1),
+            backoff: BackoffConfig {
+                base: std::time::Duration::from_secs(options.retry_base_secs),
+                max: std::time::Duration::from_secs(options.retry_max_secs),
+            },
+            reserve_floor_bytes: options.reserve_floor_gib * 1024 * 1024 * 1024,
+            pressure_pause: std::time::Duration::from_secs(options.pressure_pause_secs),
+            storage_poll: std::time::Duration::from_secs(options.storage_poll_secs),
+            ..SchedulerConfig::default()
+        };
+        let scheduler = Scheduler::new(
+            self.inner.store.clone(),
+            self.inner.data_dir.clone(),
+            Arc::new(crate::fetcher::ForeignFetcher { inner: fetcher }),
+            Arc::new(StatvfsProbe),
+            config,
+            self.inner.cancel.clone(),
+        );
+        let report = self.runtime.block_on(scheduler.drain())?;
+        Ok(FfiDrainReport {
+            photos_completed: report.photos_completed,
+            resources_written: report.resources_written,
+            resources_deduped: report.resources_deduped,
+            bytes_written: report.bytes_written,
+            late_binding_merges: report.late_binding_merges,
+            swept_partials: report.swept_partials,
+            pauses: report.pauses,
+            awaiting_retry: report.awaiting_retry,
+            gave_up: report.gave_up,
+            earliest_next_retry_at: report.earliest_next_retry_at.map(|t| t.to_rfc3339()),
+        })
+    }
+
+    /// Trip cooperative cancellation (SIGTERM handler): admission stops,
+    /// inflight sink writes fail Cancelled, rows stay untouched.
+    pub fn cancel_drain(&self) {
+        self.inner.cancel.cancel();
     }
 }
 
@@ -226,45 +317,83 @@ struct SinkState {
     kind: SinkKind,
 }
 
+enum SinkMode {
+    /// Phase-2 slice flows: the sink owns the whole finish→finalize path.
+    /// Boxed: SinkState is much larger than the Scheduled variant.
+    Legacy { handle: tokio::runtime::Handle, inner: Arc<Inner>, state: Box<SinkState> },
+    /// Scheduler flows: writes delegate to the core StreamSink; commit
+    /// control stays with the scheduler, so `finish` is rejected here.
+    Scheduled(Arc<ingress_core::scheduler::StreamSink>),
+}
+
 /// One in-flight resource byte stream. `write` chunks (~1 MiB), then exactly
-/// one of `finish` / `abort`.
+/// one of `finish` / `abort` (legacy mode) or plain return (scheduled mode).
 #[derive(uniffi::Object)]
 pub struct ChunkSink {
-    handle: tokio::runtime::Handle,
-    inner: Arc<Inner>,
-    state: Mutex<Option<SinkState>>,
+    mode: Mutex<Option<SinkMode>>,
+}
+
+impl ChunkSink {
+    pub(crate) fn scheduled(sink: Arc<ingress_core::scheduler::StreamSink>) -> Self {
+        Self { mode: Mutex::new(Some(SinkMode::Scheduled(sink))) }
+    }
 }
 
 impl std::fmt::Debug for ChunkSink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let open = self.state.lock().map(|g| g.is_some()).unwrap_or(false);
+        let open = self.mode.lock().map(|g| g.is_some()).unwrap_or(false);
         f.debug_struct("ChunkSink").field("open", &open).finish()
+    }
+}
+
+fn ffi_from_failure(f: ingress_core::scheduler::FetchFailure) -> FfiError {
+    use ingress_core::scheduler::FetchFailure as F;
+    match f {
+        F::Cancelled => FfiError::Cancelled,
+        F::LocalDiskPressure => FfiError::LocalDiskPressure,
+        F::AssetUnavailable(msg) => FfiError::AssetUnavailable { msg },
+        F::Transient(msg) => FfiError::FetchTransient { msg },
+        F::Sink(msg) => FfiError::Io { msg },
     }
 }
 
 #[uniffi::export]
 impl ChunkSink {
     pub fn write(&self, chunk: Vec<u8>) -> Result<(), FfiError> {
-        let mut guard = self.state.lock().expect("sink mutex");
-        let state = guard
+        let mut guard = self.mode.lock().expect("sink mutex");
+        match guard
             .as_mut()
-            .ok_or_else(|| FfiError::SinkState { msg: "write after finish/abort".into() })?;
-        state.write.append(&chunk)?;
-        Ok(())
+            .ok_or_else(|| FfiError::SinkState { msg: "write after finish/abort".into() })?
+        {
+            SinkMode::Legacy { state, .. } => {
+                state.write.append(&chunk)?;
+                Ok(())
+            }
+            SinkMode::Scheduled(sink) => sink.write(&chunk).map_err(ffi_from_failure),
+        }
     }
 
     pub fn finish(&self) -> Result<FfiWriteOutcome, FfiError> {
-        let state = self
-            .state
+        let mode = self
+            .mode
             .lock()
             .expect("sink mutex")
             .take()
             .ok_or_else(|| FfiError::SinkState { msg: "finish after finish/abort".into() })?;
-        let SinkState { write, paths, library, ext, kind } = state;
+        let (handle, inner, state) = match mode {
+            SinkMode::Legacy { handle, inner, state } => (handle, inner, state),
+            SinkMode::Scheduled(sink) => {
+                // Commit control stays with the scheduler; put the stream back.
+                *self.mode.lock().expect("sink mutex") = Some(SinkMode::Scheduled(sink));
+                return Err(FfiError::SinkState {
+                    msg: "scheduled sinks are finished by the scheduler".into(),
+                });
+            }
+        };
+        let SinkState { write, paths, library, ext, kind } = *state;
         let finished = write.finish()?;
-        let inner = self.inner.clone();
 
-        self.handle.block_on(async move {
+        handle.block_on(async move {
             let (photo_id, resolution_kind, resource_type) = match kind {
                 SinkKind::Original { desc } => {
                     let resolution =
@@ -337,8 +466,11 @@ impl ChunkSink {
     }
 
     pub fn abort(&self) {
-        if let Some(state) = self.state.lock().expect("sink mutex").take() {
-            state.write.abort();
+        if let Some(mode) = self.mode.lock().expect("sink mutex").take() {
+            match mode {
+                SinkMode::Legacy { state, .. } => state.write.abort(),
+                SinkMode::Scheduled(sink) => sink.abort(),
+            }
         }
     }
 }

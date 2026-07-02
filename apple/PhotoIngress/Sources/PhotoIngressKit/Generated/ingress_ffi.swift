@@ -414,7 +414,13 @@ fileprivate final class UniffiHandleMap<T>: @unchecked Sendable {
 
 
 // Public interface members begin here.
-
+// Magic number for the Rust proxy to call using the same mechanism as every other method,
+// to free the callback once it's dropped by Rust.
+private let IDX_CALLBACK_FREE: Int32 = 0
+// Callback return codes
+private let UNIFFI_CALLBACK_SUCCESS: Int32 = 0
+private let UNIFFI_CALLBACK_ERROR: Int32 = 1
+private let UNIFFI_CALLBACK_UNEXPECTED_ERROR: Int32 = 2
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
@@ -476,6 +482,22 @@ fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
     }
 
     public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterInt64: FfiConverterPrimitive {
+    typealias FfiType = Int64
+    typealias SwiftType = Int64
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Int64 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: Int64, into buf: inout [UInt8]) {
         writeInt(&buf, lower(value))
     }
 }
@@ -589,7 +611,7 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
 
 /**
  * One in-flight resource byte stream. `write` chunks (~1 MiB), then exactly
- * one of `finish` / `abort`.
+ * one of `finish` / `abort` (legacy mode) or plain return (scheduled mode).
  */
 public protocol ChunkSinkProtocol: AnyObject, Sendable {
     
@@ -602,7 +624,7 @@ public protocol ChunkSinkProtocol: AnyObject, Sendable {
 }
 /**
  * One in-flight resource byte stream. `write` chunks (~1 MiB), then exactly
- * one of `finish` / `abort`.
+ * one of `finish` / `abort` (legacy mode) or plain return (scheduled mode).
  */
 open class ChunkSink: ChunkSinkProtocol, @unchecked Sendable {
     fileprivate let handle: UInt64
@@ -752,10 +774,29 @@ public protocol IngressSessionProtocol: AnyObject, Sendable {
     func beginResource(photoId: String, phResourceType: Int32, uti: String, originalFilename: String?) throws  -> ChunkSink
     
     /**
+     * Trip cooperative cancellation (SIGTERM handler): admission stops,
+     * inflight sink writes fail Cancelled, rows stay untouched.
+     */
+    func cancelDrain() 
+    
+    /**
+     * Drain pending work through the fetcher until the queue is empty,
+     * only future retries remain, or cancellation. Blocking; call from a
+     * background thread. Progress is the returned report (per-photo
+     * progress lines are the Phase 4 daemon loop's job).
+     */
+    func drain(fetcher: PhotoResourceFetcher, options: FfiDrainOptions) throws  -> FfiDrainReport
+    
+    /**
      * Match-precedence rule 1. `NeedsOriginal` → stream the original via
      * [`Self::begin_original`]; `AlreadyKnown` → done for the slice.
      */
     func ingestDescriptor(desc: FfiAssetDescriptor) throws  -> FfiResolution
+    
+    /**
+     * Seed one descriptor: rule 1, adoption, or mint-on-miss (no bytes).
+     */
+    func seedDescriptor(desc: FfiAssetDescriptor) throws  -> FfiSeedOutcome
     
 }
 /**
@@ -869,12 +910,51 @@ open func beginResource(photoId: String, phResourceType: Int32, uti: String, ori
 }
     
     /**
+     * Trip cooperative cancellation (SIGTERM handler): admission stops,
+     * inflight sink writes fail Cancelled, rows stay untouched.
+     */
+open func cancelDrain()  {try! rustCall() {
+    uniffi_ingress_ffi_fn_method_ingresssession_cancel_drain(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * Drain pending work through the fetcher until the queue is empty,
+     * only future retries remain, or cancellation. Blocking; call from a
+     * background thread. Progress is the returned report (per-photo
+     * progress lines are the Phase 4 daemon loop's job).
+     */
+open func drain(fetcher: PhotoResourceFetcher, options: FfiDrainOptions)throws  -> FfiDrainReport  {
+    return try  FfiConverterTypeFfiDrainReport_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_ingress_ffi_fn_method_ingresssession_drain(
+            self.uniffiCloneHandle(),
+        FfiConverterTypePhotoResourceFetcher_lower(fetcher),
+        FfiConverterTypeFfiDrainOptions_lower(options),$0
+    )
+})
+}
+    
+    /**
      * Match-precedence rule 1. `NeedsOriginal` → stream the original via
      * [`Self::begin_original`]; `AlreadyKnown` → done for the slice.
      */
 open func ingestDescriptor(desc: FfiAssetDescriptor)throws  -> FfiResolution  {
     return try  FfiConverterTypeFfiResolution_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_ingress_ffi_fn_method_ingresssession_ingest_descriptor(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeFfiAssetDescriptor_lower(desc),$0
+    )
+})
+}
+    
+    /**
+     * Seed one descriptor: rule 1, adoption, or mint-on-miss (no bytes).
+     */
+open func seedDescriptor(desc: FfiAssetDescriptor)throws  -> FfiSeedOutcome  {
+    return try  FfiConverterTypeFfiSeedOutcome_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_ingress_ffi_fn_method_ingresssession_seed_descriptor(
             self.uniffiCloneHandle(),
         FfiConverterTypeFfiAssetDescriptor_lower(desc),$0
     )
@@ -924,6 +1004,269 @@ public func FfiConverterTypeIngressSession_lift(_ handle: UInt64) throws -> Ingr
 #endif
 public func FfiConverterTypeIngressSession_lower(_ value: IngressSession) -> UInt64 {
     return FfiConverterTypeIngressSession.lower(value)
+}
+
+
+
+
+
+
+/**
+ * Implemented in Swift. Both methods are blocking; never called on the
+ * main thread (scheduler worker threads only).
+ */
+public protocol PhotoResourceFetcher: AnyObject, Sendable {
+    
+    /**
+     * Re-extract a fresh descriptor for an asset (sidecar fields, ext
+     * derivation, expected sizes at admission).
+     */
+    func descriptorFor(localId: String) throws  -> FfiAssetDescriptor
+    
+    /**
+     * Stream one resource's bytes into the sink. On success return Ok
+     * WITHOUT calling `finish` — commit control stays in Rust. On failure,
+     * classify the PhotoKit error into the matching `FfiError` variant.
+     */
+    func fetchResource(request: FfiFetchRequest, sink: ChunkSink) throws 
+    
+}
+/**
+ * Implemented in Swift. Both methods are blocking; never called on the
+ * main thread (scheduler worker threads only).
+ */
+open class PhotoResourceFetcherImpl: PhotoResourceFetcher, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_ingress_ffi_fn_clone_photoresourcefetcher(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_ingress_ffi_fn_free_photoresourcefetcher(handle, $0) }
+    }
+
+    
+
+    
+    /**
+     * Re-extract a fresh descriptor for an asset (sidecar fields, ext
+     * derivation, expected sizes at admission).
+     */
+open func descriptorFor(localId: String)throws  -> FfiAssetDescriptor  {
+    return try  FfiConverterTypeFfiAssetDescriptor_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_ingress_ffi_fn_method_photoresourcefetcher_descriptor_for(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(localId),$0
+    )
+})
+}
+    
+    /**
+     * Stream one resource's bytes into the sink. On success return Ok
+     * WITHOUT calling `finish` — commit control stays in Rust. On failure,
+     * classify the PhotoKit error into the matching `FfiError` variant.
+     */
+open func fetchResource(request: FfiFetchRequest, sink: ChunkSink)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_ingress_ffi_fn_method_photoresourcefetcher_fetch_resource(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeFfiFetchRequest_lower(request),
+        FfiConverterTypeChunkSink_lower(sink),$0
+    )
+}
+}
+    
+
+    
+}
+
+
+
+// Put the implementation in a struct so we don't pollute the top-level namespace
+fileprivate struct UniffiCallbackInterfacePhotoResourceFetcher {
+
+    // Create the VTable using a series of closures.
+    // Swift automatically converts these into C callback functions.
+    //
+    // Store the vtable directly.
+    static let vtable: UniffiVTableCallbackInterfacePhotoResourceFetcher = UniffiVTableCallbackInterfacePhotoResourceFetcher(
+        uniffiFree: { (uniffiHandle: UInt64) -> () in
+            do {
+                try FfiConverterTypePhotoResourceFetcher.handleMap.remove(handle: uniffiHandle)
+            } catch {
+                print("Uniffi callback interface PhotoResourceFetcher: handle missing in uniffiFree")
+            }
+        },
+        uniffiClone: { (uniffiHandle: UInt64) -> UInt64 in
+            do {
+                return try FfiConverterTypePhotoResourceFetcher.handleMap.clone(handle: uniffiHandle)
+            } catch {
+                fatalError("Uniffi callback interface PhotoResourceFetcher: handle missing in uniffiClone")
+            }
+        },
+        descriptorFor: { (
+            uniffiHandle: UInt64,
+            localId: RustBuffer,
+            uniffiOutReturn: UnsafeMutablePointer<RustBuffer>,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> FfiAssetDescriptor in
+                guard let uniffiObj = try? FfiConverterTypePhotoResourceFetcher.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return try uniffiObj.descriptorFor(
+                     localId: try FfiConverterString.lift(localId)
+                )
+            }
+
+            
+            let writeReturn = { uniffiOutReturn.pointee = FfiConverterTypeFfiAssetDescriptor_lower($0) }
+            uniffiTraitInterfaceCallWithError(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn,
+                lowerError: FfiConverterTypeFfiError_lower
+            )
+        },
+        fetchResource: { (
+            uniffiHandle: UInt64,
+            request: RustBuffer,
+            sink: UInt64,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterTypePhotoResourceFetcher.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return try uniffiObj.fetchResource(
+                     request: try FfiConverterTypeFfiFetchRequest_lift(request),
+                     sink: try FfiConverterTypeChunkSink_lift(sink)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCallWithError(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn,
+                lowerError: FfiConverterTypeFfiError_lower
+            )
+        }
+    )
+
+    // Rust stores this pointer for future callback invocations, so it must live
+    // for the process lifetime (not just for the init function call).
+    //
+    // `nonisolated(unsafe)` is needed under Swift 6 strict concurrency.
+    // This is safe because the pointee is initialized once during static init
+    // and never mutated by either side of the FFI.  Its fields are C function pointers.
+    nonisolated(unsafe) static let vtablePtr: UnsafePointer<UniffiVTableCallbackInterfacePhotoResourceFetcher> = {
+        let ptr = UnsafeMutablePointer<UniffiVTableCallbackInterfacePhotoResourceFetcher>.allocate(capacity: 1)
+        ptr.initialize(to: vtable)
+        return UnsafePointer(ptr)
+    }()
+}
+
+private func uniffiCallbackInitPhotoResourceFetcher() {
+    uniffi_ingress_ffi_fn_init_callback_vtable_photoresourcefetcher(UniffiCallbackInterfacePhotoResourceFetcher.vtablePtr)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePhotoResourceFetcher: FfiConverter {
+    fileprivate static let handleMap = UniffiHandleMap<PhotoResourceFetcher>()
+
+    typealias FfiType = UInt64
+    typealias SwiftType = PhotoResourceFetcher
+
+    public static func lift(_ handle: UInt64) throws -> PhotoResourceFetcher {
+        if ((handle & 1) == 0) {
+            // Rust-generated handle, construct a new class that uses the handle to implement the
+            // interface
+            return PhotoResourceFetcherImpl(unsafeFromHandle: handle)
+        } else {
+            // Swift-generated handle, get the object from the handle map
+            return try handleMap.remove(handle: handle)
+        }
+    }
+
+    public static func lower(_ value: PhotoResourceFetcher) -> UInt64 {
+         if let rustImpl = value as? PhotoResourceFetcherImpl {
+             // Rust-implemented object.  Clone the handle and return it
+            return rustImpl.uniffiCloneHandle()
+         } else {
+            // Swift object, generate a new vtable handle and return that.
+            return handleMap.insert(obj: value)
+         }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PhotoResourceFetcher {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: PhotoResourceFetcher, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePhotoResourceFetcher_lift(_ handle: UInt64) throws -> PhotoResourceFetcher {
+    return try FfiConverterTypePhotoResourceFetcher.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePhotoResourceFetcher_lower(_ value: PhotoResourceFetcher) -> UInt64 {
+    return FfiConverterTypePhotoResourceFetcher.lower(value)
 }
 
 
@@ -1209,6 +1552,251 @@ public func FfiConverterTypeFfiCaptureMetadata_lower(_ value: FfiCaptureMetadata
 }
 
 
+/**
+ * Drain knobs (CLI flags; spec defaults).
+ */
+public struct FfiDrainOptions: Equatable, Hashable {
+    public var fetchConcurrency: UInt32
+    public var retryCap: Int64
+    public var retryBaseSecs: UInt64
+    public var retryMaxSecs: UInt64
+    public var reserveFloorGib: UInt64
+    public var pressurePauseSecs: UInt64
+    public var storagePollSecs: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(fetchConcurrency: UInt32, retryCap: Int64, retryBaseSecs: UInt64, retryMaxSecs: UInt64, reserveFloorGib: UInt64, pressurePauseSecs: UInt64, storagePollSecs: UInt64) {
+        self.fetchConcurrency = fetchConcurrency
+        self.retryCap = retryCap
+        self.retryBaseSecs = retryBaseSecs
+        self.retryMaxSecs = retryMaxSecs
+        self.reserveFloorGib = reserveFloorGib
+        self.pressurePauseSecs = pressurePauseSecs
+        self.storagePollSecs = storagePollSecs
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiDrainOptions: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiDrainOptions: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiDrainOptions {
+        return
+            try FfiDrainOptions(
+                fetchConcurrency: FfiConverterUInt32.read(from: &buf), 
+                retryCap: FfiConverterInt64.read(from: &buf), 
+                retryBaseSecs: FfiConverterUInt64.read(from: &buf), 
+                retryMaxSecs: FfiConverterUInt64.read(from: &buf), 
+                reserveFloorGib: FfiConverterUInt64.read(from: &buf), 
+                pressurePauseSecs: FfiConverterUInt64.read(from: &buf), 
+                storagePollSecs: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiDrainOptions, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.fetchConcurrency, into: &buf)
+        FfiConverterInt64.write(value.retryCap, into: &buf)
+        FfiConverterUInt64.write(value.retryBaseSecs, into: &buf)
+        FfiConverterUInt64.write(value.retryMaxSecs, into: &buf)
+        FfiConverterUInt64.write(value.reserveFloorGib, into: &buf)
+        FfiConverterUInt64.write(value.pressurePauseSecs, into: &buf)
+        FfiConverterUInt64.write(value.storagePollSecs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiDrainOptions_lift(_ buf: RustBuffer) throws -> FfiDrainOptions {
+    return try FfiConverterTypeFfiDrainOptions.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiDrainOptions_lower(_ value: FfiDrainOptions) -> RustBuffer {
+    return FfiConverterTypeFfiDrainOptions.lower(value)
+}
+
+
+/**
+ * Drain outcome (mirrors `scheduler::DrainReport`).
+ */
+public struct FfiDrainReport: Equatable, Hashable {
+    public var photosCompleted: UInt64
+    public var resourcesWritten: UInt64
+    public var resourcesDeduped: UInt64
+    public var bytesWritten: UInt64
+    public var lateBindingMerges: UInt64
+    public var sweptPartials: UInt64
+    public var pauses: UInt64
+    public var awaitingRetry: Int64
+    public var gaveUp: Int64
+    /**
+     * ISO 8601, when retries remain.
+     */
+    public var earliestNextRetryAt: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(photosCompleted: UInt64, resourcesWritten: UInt64, resourcesDeduped: UInt64, bytesWritten: UInt64, lateBindingMerges: UInt64, sweptPartials: UInt64, pauses: UInt64, awaitingRetry: Int64, gaveUp: Int64, 
+        /**
+         * ISO 8601, when retries remain.
+         */earliestNextRetryAt: String?) {
+        self.photosCompleted = photosCompleted
+        self.resourcesWritten = resourcesWritten
+        self.resourcesDeduped = resourcesDeduped
+        self.bytesWritten = bytesWritten
+        self.lateBindingMerges = lateBindingMerges
+        self.sweptPartials = sweptPartials
+        self.pauses = pauses
+        self.awaitingRetry = awaitingRetry
+        self.gaveUp = gaveUp
+        self.earliestNextRetryAt = earliestNextRetryAt
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiDrainReport: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiDrainReport: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiDrainReport {
+        return
+            try FfiDrainReport(
+                photosCompleted: FfiConverterUInt64.read(from: &buf), 
+                resourcesWritten: FfiConverterUInt64.read(from: &buf), 
+                resourcesDeduped: FfiConverterUInt64.read(from: &buf), 
+                bytesWritten: FfiConverterUInt64.read(from: &buf), 
+                lateBindingMerges: FfiConverterUInt64.read(from: &buf), 
+                sweptPartials: FfiConverterUInt64.read(from: &buf), 
+                pauses: FfiConverterUInt64.read(from: &buf), 
+                awaitingRetry: FfiConverterInt64.read(from: &buf), 
+                gaveUp: FfiConverterInt64.read(from: &buf), 
+                earliestNextRetryAt: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiDrainReport, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.photosCompleted, into: &buf)
+        FfiConverterUInt64.write(value.resourcesWritten, into: &buf)
+        FfiConverterUInt64.write(value.resourcesDeduped, into: &buf)
+        FfiConverterUInt64.write(value.bytesWritten, into: &buf)
+        FfiConverterUInt64.write(value.lateBindingMerges, into: &buf)
+        FfiConverterUInt64.write(value.sweptPartials, into: &buf)
+        FfiConverterUInt64.write(value.pauses, into: &buf)
+        FfiConverterInt64.write(value.awaitingRetry, into: &buf)
+        FfiConverterInt64.write(value.gaveUp, into: &buf)
+        FfiConverterOptionString.write(value.earliestNextRetryAt, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiDrainReport_lift(_ buf: RustBuffer) throws -> FfiDrainReport {
+    return try FfiConverterTypeFfiDrainReport.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiDrainReport_lower(_ value: FfiDrainReport) -> RustBuffer {
+    return FfiConverterTypeFfiDrainReport.lower(value)
+}
+
+
+/**
+ * Which resource of which photo to fetch.
+ */
+public struct FfiFetchRequest: Equatable, Hashable {
+    public var photoId: String
+    /**
+     * `PHAsset.localIdentifier` to fetch by.
+     */
+    public var localId: String
+    /**
+     * Raw `PHAssetResourceType` selecting the resource on the asset.
+     */
+    public var phResourceType: Int32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(photoId: String, 
+        /**
+         * `PHAsset.localIdentifier` to fetch by.
+         */localId: String, 
+        /**
+         * Raw `PHAssetResourceType` selecting the resource on the asset.
+         */phResourceType: Int32) {
+        self.photoId = photoId
+        self.localId = localId
+        self.phResourceType = phResourceType
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiFetchRequest: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiFetchRequest: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiFetchRequest {
+        return
+            try FfiFetchRequest(
+                photoId: FfiConverterString.read(from: &buf), 
+                localId: FfiConverterString.read(from: &buf), 
+                phResourceType: FfiConverterInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiFetchRequest, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.photoId, into: &buf)
+        FfiConverterString.write(value.localId, into: &buf)
+        FfiConverterInt32.write(value.phResourceType, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiFetchRequest_lift(_ buf: RustBuffer) throws -> FfiFetchRequest {
+    return try FfiConverterTypeFfiFetchRequest.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiFetchRequest_lower(_ value: FfiFetchRequest) -> RustBuffer {
+    return FfiConverterTypeFfiFetchRequest.lower(value)
+}
+
+
 public struct FfiLocation: Equatable, Hashable {
     public var lat: Double
     public var lon: Double
@@ -1430,20 +2018,39 @@ public enum FfiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedErro
 
     
     
-    case Database(message: String)
-    
-    case Io(message: String)
-    
-    case UnmappedScope(message: String)
-    
-    case CloudIdConflict(message: String)
-    
-    case Invariant(message: String)
-    
-    case InvalidDescriptor(message: String)
-    
-    case SinkState(message: String)
-    
+    case Database(msg: String
+    )
+    case Io(msg: String
+    )
+    case UnmappedScope(msg: String
+    )
+    case CloudIdConflict(msg: String
+    )
+    case Invariant(msg: String
+    )
+    case InvalidDescriptor(msg: String
+    )
+    case SinkState(msg: String
+    )
+    /**
+     * `CloudPhotoLibraryErrorDomain` code 1005: local disk pressure.
+     * Daemon-wide pause, never a per-resource failure.
+     */
+    case LocalDiskPressure
+    /**
+     * Cancellation (SIGTERM / user): rows untouched, no retry consumed.
+     */
+    case Cancelled
+    /**
+     * The PHAsset disappeared between seed and drain.
+     */
+    case AssetUnavailable(msg: String
+    )
+    /**
+     * Everything else from PhotoKit: retry with backoff.
+     */
+    case FetchTransient(msg: String
+    )
 
     
 
@@ -1474,35 +2081,36 @@ public struct FfiConverterTypeFfiError: FfiConverterRustBuffer {
 
         
         case 1: return .Database(
-            message: try FfiConverterString.read(from: &buf)
-        )
-        
+            msg: try FfiConverterString.read(from: &buf)
+            )
         case 2: return .Io(
-            message: try FfiConverterString.read(from: &buf)
-        )
-        
+            msg: try FfiConverterString.read(from: &buf)
+            )
         case 3: return .UnmappedScope(
-            message: try FfiConverterString.read(from: &buf)
-        )
-        
+            msg: try FfiConverterString.read(from: &buf)
+            )
         case 4: return .CloudIdConflict(
-            message: try FfiConverterString.read(from: &buf)
-        )
-        
+            msg: try FfiConverterString.read(from: &buf)
+            )
         case 5: return .Invariant(
-            message: try FfiConverterString.read(from: &buf)
-        )
-        
+            msg: try FfiConverterString.read(from: &buf)
+            )
         case 6: return .InvalidDescriptor(
-            message: try FfiConverterString.read(from: &buf)
-        )
-        
+            msg: try FfiConverterString.read(from: &buf)
+            )
         case 7: return .SinkState(
-            message: try FfiConverterString.read(from: &buf)
-        )
-        
+            msg: try FfiConverterString.read(from: &buf)
+            )
+        case 8: return .LocalDiskPressure
+        case 9: return .Cancelled
+        case 10: return .AssetUnavailable(
+            msg: try FfiConverterString.read(from: &buf)
+            )
+        case 11: return .FetchTransient(
+            msg: try FfiConverterString.read(from: &buf)
+            )
 
-        default: throw UniffiInternalError.unexpectedEnumCase
+         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
 
@@ -1512,22 +2120,59 @@ public struct FfiConverterTypeFfiError: FfiConverterRustBuffer {
         
 
         
-        case .Database(_ /* message is ignored*/):
-            writeInt(&buf, Int32(1))
-        case .Io(_ /* message is ignored*/):
-            writeInt(&buf, Int32(2))
-        case .UnmappedScope(_ /* message is ignored*/):
-            writeInt(&buf, Int32(3))
-        case .CloudIdConflict(_ /* message is ignored*/):
-            writeInt(&buf, Int32(4))
-        case .Invariant(_ /* message is ignored*/):
-            writeInt(&buf, Int32(5))
-        case .InvalidDescriptor(_ /* message is ignored*/):
-            writeInt(&buf, Int32(6))
-        case .SinkState(_ /* message is ignored*/):
-            writeInt(&buf, Int32(7))
-
         
+        case let .Database(msg):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(msg, into: &buf)
+            
+        
+        case let .Io(msg):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(msg, into: &buf)
+            
+        
+        case let .UnmappedScope(msg):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(msg, into: &buf)
+            
+        
+        case let .CloudIdConflict(msg):
+            writeInt(&buf, Int32(4))
+            FfiConverterString.write(msg, into: &buf)
+            
+        
+        case let .Invariant(msg):
+            writeInt(&buf, Int32(5))
+            FfiConverterString.write(msg, into: &buf)
+            
+        
+        case let .InvalidDescriptor(msg):
+            writeInt(&buf, Int32(6))
+            FfiConverterString.write(msg, into: &buf)
+            
+        
+        case let .SinkState(msg):
+            writeInt(&buf, Int32(7))
+            FfiConverterString.write(msg, into: &buf)
+            
+        
+        case .LocalDiskPressure:
+            writeInt(&buf, Int32(8))
+        
+        
+        case .Cancelled:
+            writeInt(&buf, Int32(9))
+        
+        
+        case let .AssetUnavailable(msg):
+            writeInt(&buf, Int32(10))
+            FfiConverterString.write(msg, into: &buf)
+            
+        
+        case let .FetchTransient(msg):
+            writeInt(&buf, Int32(11))
+            FfiConverterString.write(msg, into: &buf)
+            
         }
     }
 }
@@ -1785,6 +2430,11 @@ public enum FfiResolution: Equatable, Hashable {
     
     case alreadyKnown(photoId: String, metadataChanged: Bool, scopeChanged: Bool
     )
+    /**
+     * Previously-unmapped photo adopted its now-bound library.
+     */
+    case adopted(photoId: String
+    )
     case needsOriginal
     case unmappedScope(photoId: String
     )
@@ -1812,9 +2462,12 @@ public struct FfiConverterTypeFfiResolution: FfiConverterRustBuffer {
         case 1: return .alreadyKnown(photoId: try FfiConverterString.read(from: &buf), metadataChanged: try FfiConverterBool.read(from: &buf), scopeChanged: try FfiConverterBool.read(from: &buf)
         )
         
-        case 2: return .needsOriginal
+        case 2: return .adopted(photoId: try FfiConverterString.read(from: &buf)
+        )
         
-        case 3: return .unmappedScope(photoId: try FfiConverterString.read(from: &buf)
+        case 3: return .needsOriginal
+        
+        case 4: return .unmappedScope(photoId: try FfiConverterString.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -1832,12 +2485,17 @@ public struct FfiConverterTypeFfiResolution: FfiConverterRustBuffer {
             FfiConverterBool.write(scopeChanged, into: &buf)
             
         
-        case .needsOriginal:
+        case let .adopted(photoId):
             writeInt(&buf, Int32(2))
+            FfiConverterString.write(photoId, into: &buf)
+            
+        
+        case .needsOriginal:
+            writeInt(&buf, Int32(3))
         
         
         case let .unmappedScope(photoId):
-            writeInt(&buf, Int32(3))
+            writeInt(&buf, Int32(4))
             FfiConverterString.write(photoId, into: &buf)
             
         }
@@ -1857,6 +2515,103 @@ public func FfiConverterTypeFfiResolution_lift(_ buf: RustBuffer) throws -> FfiR
 #endif
 public func FfiConverterTypeFfiResolution_lower(_ value: FfiResolution) -> RustBuffer {
     return FfiConverterTypeFfiResolution.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Outcome of a seed pass (mirrors `resolve::SeedOutcome`).
+ */
+
+public enum FfiSeedOutcome: Equatable, Hashable {
+    
+    case alreadyKnown(photoId: String
+    )
+    case adopted(photoId: String
+    )
+    case mintedPending(photoId: String, resources: UInt32
+    )
+    case unmapped(photoId: String
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FfiSeedOutcome: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiSeedOutcome: FfiConverterRustBuffer {
+    typealias SwiftType = FfiSeedOutcome
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiSeedOutcome {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .alreadyKnown(photoId: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 2: return .adopted(photoId: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 3: return .mintedPending(photoId: try FfiConverterString.read(from: &buf), resources: try FfiConverterUInt32.read(from: &buf)
+        )
+        
+        case 4: return .unmapped(photoId: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiSeedOutcome, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .alreadyKnown(photoId):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(photoId, into: &buf)
+            
+        
+        case let .adopted(photoId):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(photoId, into: &buf)
+            
+        
+        case let .mintedPending(photoId,resources):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(photoId, into: &buf)
+            FfiConverterUInt32.write(resources, into: &buf)
+            
+        
+        case let .unmapped(photoId):
+            writeInt(&buf, Int32(4))
+            FfiConverterString.write(photoId, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiSeedOutcome_lift(_ buf: RustBuffer) throws -> FfiSeedOutcome {
+    return try FfiConverterTypeFfiSeedOutcome.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiSeedOutcome_lower(_ value: FfiSeedOutcome) -> RustBuffer {
+    return FfiConverterTypeFfiSeedOutcome.lower(value)
 }
 
 
@@ -2117,6 +2872,12 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if (uniffi_ingress_ffi_checksum_method_photoresourcefetcher_descriptor_for() != 48784) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ingress_ffi_checksum_method_photoresourcefetcher_fetch_resource() != 55469) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_ingress_ffi_checksum_method_chunksink_abort() != 44232) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -2135,13 +2896,23 @@ private let initializationResult: InitializationResult = {
     if (uniffi_ingress_ffi_checksum_method_ingresssession_begin_resource() != 35203) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_ingress_ffi_checksum_method_ingresssession_cancel_drain() != 12111) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ingress_ffi_checksum_method_ingresssession_drain() != 12569) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_ingress_ffi_checksum_method_ingresssession_ingest_descriptor() != 48163) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ingress_ffi_checksum_method_ingresssession_seed_descriptor() != 29230) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ingress_ffi_checksum_constructor_ingresssession_new() != 3728) {
         return InitializationResult.apiChecksumMismatch
     }
 
+    uniffiCallbackInitPhotoResourceFetcher()
     return InitializationResult.ok
 }()
 

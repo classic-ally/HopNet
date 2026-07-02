@@ -178,6 +178,63 @@ fn sink_and_descriptor_misuse() {
     ));
 }
 
+// Impact: this is the exact call sequence the Swift daemon performs for
+// seed + drain; a native impl of the foreign trait exercises the whole
+// adapter/scheduled-sink path without codegen.
+// Should: seed then drain a live photo through the foreign-trait surface.
+// Should not: allow Swift-side finish on a scheduled sink.
+#[test]
+fn seed_and_drain_through_fetcher_trait() {
+    use ingress_ffi::{FfiDrainOptions, FfiFetchRequest, FfiSeedOutcome, PhotoResourceFetcher};
+
+    struct NativeFetcher {
+        desc: FfiAssetDescriptor,
+    }
+    impl PhotoResourceFetcher for NativeFetcher {
+        fn descriptor_for(&self, _local_id: String) -> Result<FfiAssetDescriptor, FfiError> {
+            Ok(self.desc.clone())
+        }
+        fn fetch_resource(
+            &self,
+            request: FfiFetchRequest,
+            sink: std::sync::Arc<ingress_ffi::ChunkSink>,
+        ) -> Result<(), FfiError> {
+            // Scheduled sinks must reject finish — commit control is Rust's.
+            assert!(matches!(sink.finish(), Err(FfiError::SinkState { .. })));
+            let bytes: &[u8] =
+                if request.ph_resource_type == 1 { b"still-bytes" } else { b"motion-bytes" };
+            sink.write(bytes.to_vec())?;
+            Ok(())
+        }
+    }
+
+    let rig = rig();
+    let desc = slice_descriptor("CLOUD-DRAIN:001", true);
+    match rig.session.seed_descriptor(desc.clone()).unwrap() {
+        FfiSeedOutcome::MintedPending { resources, .. } => assert_eq!(resources, 2),
+        other => panic!("expected MintedPending, got {other:?}"),
+    }
+
+    let report = rig
+        .session
+        .drain(
+            std::sync::Arc::new(NativeFetcher { desc }),
+            FfiDrainOptions {
+                fetch_concurrency: 2,
+                retry_cap: 3,
+                retry_base_secs: 0,
+                retry_max_secs: 0,
+                reserve_floor_gib: 0,
+                pressure_pause_secs: 1,
+                storage_poll_secs: 1,
+            },
+        )
+        .unwrap();
+    assert_eq!(report.photos_completed, 1);
+    assert_eq!(report.resources_written, 2);
+    assert_eq!(report.gave_up, 0);
+}
+
 // Should: reject malformed timestamps as InvalidDescriptor.
 #[test]
 fn bad_timestamp_rejected() {

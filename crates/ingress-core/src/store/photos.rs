@@ -104,6 +104,85 @@ where
     Ok(())
 }
 
+/// Adopt-on-redelivery: populate `library_id` on a previously-unmapped row.
+pub(crate) async fn adopt_library<'e, E>(exec: E, id: &PhotoId, library: &LibraryId) -> Result<()>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    sqlx::query("UPDATE photos SET library_id = ? WHERE photo_id = ? AND library_id IS NULL")
+        .bind(library)
+        .bind(id)
+        .execute(exec)
+        .await?;
+    Ok(())
+}
+
+/// Local-only seed guard: the live record for a cloud_id-less asset on this
+/// device. NOT an identity lookup — a same-device double-mint guard only.
+pub(crate) async fn photo_by_local_id_no_cloud<'e, E>(
+    exec: E,
+    local_id: &str,
+) -> Result<Option<PhotoRecord>>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    Ok(sqlx::query_as(
+        "SELECT * FROM photos \
+         WHERE local_id = ? AND cloud_id IS NULL AND deleted_at IS NULL",
+    )
+    .bind(local_id)
+    .fetch_optional(exec)
+    .await?)
+}
+
+/// Delete a photo row and its resource rows (late-binding merge of a
+/// provisional photo; nothing on disk references it by construction).
+pub(crate) async fn delete_photo(
+    exec: &mut sqlx::SqliteConnection,
+    id: &PhotoId,
+) -> Result<()> {
+    sqlx::query("DELETE FROM photo_resources WHERE photo_id = ?")
+        .bind(id)
+        .execute(&mut *exec)
+        .await?;
+    sqlx::query("DELETE FROM photos WHERE photo_id = ?")
+        .bind(id)
+        .execute(&mut *exec)
+        .await?;
+    Ok(())
+}
+
+/// The drain work queue (spec §Discovery: state.db IS the work queue):
+/// FIFO by discovery time, photos with at least one fetchable resource.
+pub(crate) async fn pending_photos<'e, E>(
+    exec: E,
+    retry_cap: i64,
+    now: DateTime<Utc>,
+    limit: i64,
+) -> Result<Vec<PhotoRecord>>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    Ok(sqlx::query_as(
+        "SELECT p.* FROM photos p \
+         WHERE p.library_id IS NOT NULL \
+           AND p.materialized_at IS NULL \
+           AND p.deleted_at IS NULL \
+           AND EXISTS (SELECT 1 FROM photo_resources r \
+                       WHERE r.photo_id = p.photo_id \
+                         AND r.written_at IS NULL \
+                         AND r.retry_count < ? \
+                         AND (r.next_retry_at IS NULL OR r.next_retry_at <= ?)) \
+         ORDER BY p.discovered_at, p.photo_id \
+         LIMIT ?",
+    )
+    .bind(retry_cap)
+    .bind(now)
+    .bind(limit)
+    .fetch_all(exec)
+    .await?)
+}
+
 // NOTE: `set_asset_modified_at` (stamping the modification date after a
 // successful metadata refresh) arrives with Phase 4's change classification —
 // resolve only *reports* metadata_changed in Phase 1.

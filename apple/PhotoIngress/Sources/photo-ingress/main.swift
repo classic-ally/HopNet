@@ -79,6 +79,10 @@ func runIngest() throws {
         print("resolution: UNMAPPED SCOPE photo_id=\(photoId)")
         print("run setup with the appropriate blob root to bind this scope")
         return
+    case .adopted(let photoId):
+        print("resolution: ADOPTED photo_id=\(photoId) — pending rows now drain-eligible")
+        print("run `photo-ingress drain` to materialize")
+        return
     case .needsOriginal:
         print("resolution: NEW — streaming resources")
     }
@@ -108,6 +112,96 @@ func runIngest() throws {
     print("done")
 }
 
+func intFlag(_ name: String, default def: UInt64) -> UInt64 {
+    flagValue(args, name).flatMap { UInt64($0) } ?? def
+}
+
+/// Enumerate real assets (default fetch: personal + Shared Photo Library,
+/// legacy shared albums excluded for free) and mint pending rows. No bytes.
+func runSeed() throws {
+    let limit = Int(intFlag("--limit", default: 25))
+    let mediaFilter = flagValue(args, "--media")  // image|video|live
+    try ensureAuthorized()
+    let session = try IngressSession(dataDir: dataDir)
+
+    var minted = 0, known = 0, adopted = 0, unmapped = 0, errors = 0
+    var seen = 0
+    let all = PHAsset.fetchAssets(with: nil)
+    all.enumerateObjects { asset, _, stop in
+        if seen >= limit { stop.pointee = true; return }
+        if let f = mediaFilter {
+            let isLive = asset.mediaSubtypes.contains(.photoLive)
+            let matches = switch f {
+            case "image": asset.mediaType == .image && !isLive
+            case "video": asset.mediaType == .video
+            case "live": isLive
+            default: true
+            }
+            if !matches { return }
+        }
+        seen += 1
+        do {
+            let desc = try extractDescriptor(asset: asset)
+            switch try session.seedDescriptor(desc: desc) {
+            case .mintedPending: minted += 1
+            case .alreadyKnown: known += 1
+            case .adopted: adopted += 1
+            case .unmapped: unmapped += 1
+            }
+        } catch {
+            errors += 1
+            print("  seed error \(asset.localIdentifier): \(error)")
+        }
+    }
+    print("seeded \(seen): minted=\(minted) known=\(known) adopted=\(adopted) " +
+          "unmapped=\(unmapped) errors=\(errors)")
+}
+
+func runDrain() throws {
+    try ensureAuthorized()
+    let session = try IngressSession(dataDir: dataDir)
+    let fetcher = PhotoKitFetcher()
+
+    // SIGTERM/SIGINT → cooperative cancellation: PhotoKit requests cancelled,
+    // admission stops, rows stay untouched.
+    signal(SIGTERM, SIG_IGN)
+    signal(SIGINT, SIG_IGN)
+    let makeHandler = { (sig: Int32) -> DispatchSourceSignal in
+        let src = DispatchSource.makeSignalSource(signal: sig, queue: .global())
+        src.setEventHandler {
+            print("signal received — cancelling drain (rows stay pending)")
+            fetcher.cancelAll()
+            session.cancelDrain()
+        }
+        src.resume()
+        return src
+    }
+    let sigterm = makeHandler(SIGTERM)
+    let sigint = makeHandler(SIGINT)
+    defer { sigterm.cancel(); sigint.cancel() }
+
+    let options = FfiDrainOptions(
+        fetchConcurrency: UInt32(intFlag("--fetch-concurrency", default: 4)),
+        retryCap: Int64(intFlag("--retry-cap", default: 5)),
+        retryBaseSecs: intFlag("--retry-base-secs", default: 30),
+        retryMaxSecs: intFlag("--retry-max-secs", default: 3600),
+        reserveFloorGib: intFlag("--reserve-floor-gib", default: 10),
+        pressurePauseSecs: intFlag("--pressure-pause-secs", default: 60),
+        storagePollSecs: intFlag("--storage-poll-secs", default: 15)
+    )
+    let report = try session.drain(fetcher: fetcher, options: options)
+    print("drain report:")
+    print("  photos completed:     \(report.photosCompleted)")
+    print("  resources written:    \(report.resourcesWritten) (\(report.bytesWritten) bytes)")
+    print("  resources deduped:    \(report.resourcesDeduped)")
+    print("  late-binding merges:  \(report.lateBindingMerges)")
+    print("  swept partial temps:  \(report.sweptPartials)")
+    print("  pauses:               \(report.pauses)")
+    print("  awaiting retry:       \(report.awaitingRetry)" +
+          (report.earliestNextRetryAt.map { " (earliest \($0))" } ?? ""))
+    print("  gave up:              \(report.gaveUp)")
+}
+
 // Never block the main thread on PhotoKit (spike lesson): work on a
 // background queue, main thread services the main dispatch queue.
 DispatchQueue.global().async {
@@ -115,6 +209,8 @@ DispatchQueue.global().async {
         switch command {
         case "setup": try runSetup()
         case "ingest": try runIngest()
+        case "seed": try runSeed()
+        case "drain": try runDrain()
         default: fail("unknown command \(command)")
         }
         exit(0)

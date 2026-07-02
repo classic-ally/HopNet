@@ -13,6 +13,39 @@ public enum StreamError: Error, CustomStringConvertible {
     }
 }
 
+/// Pump one PHAssetResource's bytes into a ChunkSink WITHOUT finishing it —
+/// commit control stays in Rust (scheduler flows / the fetch foreign trait).
+/// On failure the sink is left un-finished; the Rust side aborts it.
+public func streamResourceBytes(
+    _ resource: PHAssetResource,
+    into sink: ChunkSink,
+    networkAllowed: Bool = true
+) throws {
+    let options = PHAssetResourceRequestOptions()
+    options.isNetworkAccessAllowed = networkAllowed
+
+    let sema = DispatchSemaphore(value: 0)
+    var writeError: Error?
+    var fetchError: Error?
+
+    PHAssetResourceManager.default().requestData(
+        for: resource,
+        options: options,
+        dataReceivedHandler: { data in
+            guard writeError == nil else { return }
+            do { try sink.write(chunk: data) } catch { writeError = error }
+        },
+        completionHandler: { error in
+            fetchError = error
+            sema.signal()
+        }
+    )
+    sema.wait()
+
+    if let e = fetchError { throw StreamError.photoKit(String(describing: e)) }
+    if let e = writeError { throw StreamError.sinkWrite(String(describing: e)) }
+}
+
 /// Pump one PHAssetResource's bytes into a ChunkSink and finish it.
 ///
 /// Chunks are written synchronously inside `dataReceivedHandler` — PhotoKit's
