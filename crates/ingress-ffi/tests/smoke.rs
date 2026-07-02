@@ -59,23 +59,39 @@ struct Rig {
 fn rig() -> Rig {
     let data_dir = tempfile::tempdir().unwrap();
     let blob_dir = tempfile::tempdir().unwrap();
+    // Library config has no FFI surface (it lives in ingress-cli, Phase 6);
+    // seed via ingress-core BEFORE the session opens its pool, and drop the
+    // seeding store so exactly one writer pool is live at a time.
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let store = ingress_core::StateStore::open(&data_dir.path().join("state.db"))
+                .await
+                .unwrap();
+            store
+                .insert_library(&ingress_core::LibraryConfig {
+                    library_id: ingress_core::LibraryId::new("personal"),
+                    display_name: "Personal".into(),
+                    blob_root: blob_dir.path().to_string_lossy().into_owned(),
+                    sidecar_root_remote: Some(
+                        blob_dir
+                            .path()
+                            .join("sidecar-backup")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    scope_binding: None,
+                    retention_days: 30,
+                    created_at: chrono::Utc::now(),
+                })
+                .await
+                .unwrap();
+        });
+    }
     let session = IngressSession::new(data_dir.path().to_string_lossy().into_owned()).unwrap();
-    session
-        .add_library(
-            "personal".into(),
-            "Personal".into(),
-            blob_dir.path().to_string_lossy().into_owned(),
-            Some(
-                blob_dir
-                    .path()
-                    .join("sidecar-backup")
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
-            30,
-            FfiLibraryScope::Personal,
-        )
-        .unwrap();
     Rig {
         session,
         data_dir,

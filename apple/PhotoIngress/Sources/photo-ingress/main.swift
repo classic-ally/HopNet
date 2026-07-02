@@ -2,10 +2,10 @@ import Foundation
 import Photos
 import PhotoIngressKit
 
-// Phase 2 vertical slice: ingest one asset end-to-end. These subcommands are
-// slice scaffolding — this executable becomes the LaunchAgent daemon shell in
-// later phases; the real user-facing CLI is the Rust ingress-cli (Phase 6).
-//   photo-ingress setup  --data-dir D --blob-root B [--shared-blob-root S]
+// PhotoKit-side executable: the daemon shell plus the PhotoKit-dependent
+// scaffolding subcommands. Everything that does NOT need PhotoKit — status,
+// fsck, recover, library configuration — lives in the Rust ingress-cli.
+//   photo-ingress setup  --data-dir D    (data dir + Photos authorization)
 //   photo-ingress ingest --data-dir D <local_id>
 
 setvbuf(stdout, nil, _IOLBF, 0)
@@ -22,7 +22,7 @@ func flagValue(_ args: [String], _ name: String) -> String? {
 
 let args = Array(CommandLine.arguments.dropFirst())
 guard let command = args.first else {
-    print("usage: photo-ingress setup --data-dir D --blob-root B [--shared-blob-root S]")
+    print("usage: photo-ingress setup --data-dir D    (libraries: see `ingress-cli library add`)")
     print("       photo-ingress ingest --data-dir D <local_id>")
     exit(2)
 }
@@ -43,35 +43,17 @@ func describe(_ outcome: FfiWriteOutcome, label: String) {
     }
 }
 
+// Library configuration moved to the Rust CLI (Phase 6): setup only
+// creates the data dir + state.db and walks the Photos authorization
+// prompt — the two things that need this process (PhotoKit entitlement).
 func runSetup() throws {
-    guard let blobRoot = flagValue(args, "--blob-root") else { fail("--blob-root is required") }
-    let retentionDays = Int64(intFlag("--retention-days", default: 30))
-    let session = try IngressSession(dataDir: dataDir)
-
-    let warnNoRemote = { (library: String) in
-        print("WARNING: library '\(library)' has no remote sidecar backup — recovery from a")
-        print("         lost Mac degrades to blob-only rebuild (all PhotoKit-derived metadata")
-        print("         and photo_ids are lost). Configure --sidecar-remote when possible.")
-    }
-
-    let personalRemote = flagValue(args, "--sidecar-remote")
-    try session.addLibrary(
-        libraryId: "personal", displayName: "Personal", blobRoot: blobRoot,
-        sidecarRootRemote: personalRemote, retentionDays: retentionDays, scope: .personal)
-    print("configured library 'personal' → \(blobRoot)" +
-          (personalRemote.map { " (sidecar backup: \($0))" } ?? ""))
-    if personalRemote == nil { warnNoRemote("personal") }
-
-    if let shared = flagValue(args, "--shared-blob-root") {
-        let sharedRemote = flagValue(args, "--shared-sidecar-remote")
-        try session.addLibrary(
-            libraryId: "shared", displayName: "Shared Library", blobRoot: shared,
-            sidecarRootRemote: sharedRemote, retentionDays: retentionDays, scope: .shared)
-        print("configured library 'shared' → \(shared)" +
-              (sharedRemote.map { " (sidecar backup: \($0))" } ?? ""))
-        if sharedRemote == nil { warnNoRemote("shared") }
-    }
+    _ = try IngressSession(dataDir: dataDir)
     print("state: \(dataDir)/state.db")
+    try ensureAuthorized()
+    print("Photos authorization: granted")
+    print("next: configure libraries with")
+    print("  ingress-cli --data-dir \(dataDir) library add --blob-root <path> --scope personal [--sidecar-remote <path>]")
+    print("  ingress-cli --data-dir \(dataDir) library add --blob-root <path> --scope shared   [--sidecar-remote <path>]")
 }
 
 func runIngest() throws {

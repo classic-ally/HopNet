@@ -95,6 +95,32 @@ pub fn find_sidecar(root: &Path, photo_id: &PhotoId) -> Result<Option<PathBuf>> 
     Ok(None)
 }
 
+/// Every `*.json` under a sidecar root's two-level `YYYY/MM` tree —
+/// recovery's rebuild walk and fsck-adjacent audits. Non-directories at the
+/// year/month levels and non-`.json` leaves are skipped silently (the tree
+/// may carry `.tmp` staging leftovers). Missing root = empty.
+pub fn walk_sidecars(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    let years = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(found),
+        Err(e) => return Err(io_err(e)),
+    };
+    for year in years.flatten().filter(|e| e.path().is_dir()) {
+        let months = fs::read_dir(year.path()).map_err(io_err)?;
+        for month in months.flatten().filter(|e| e.path().is_dir()) {
+            for entry in fs::read_dir(month.path()).map_err(io_err)?.flatten() {
+                let path = entry.path();
+                if path.is_file() && path.extension().is_some_and(|e| e == "json") {
+                    found.push(path);
+                }
+            }
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
 /// Read-modify-write of an existing sidecar's `deleted_at` (spec §Tombstone
 /// step 5 / §Restore step 2). The asset is gone from PhotoKit at delete time,
 /// so recomposition is impossible — the on-disk document is the source.

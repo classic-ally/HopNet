@@ -309,7 +309,9 @@ A library is fully described by these pieces of configuration, persisted in `sta
 
 The configuration is editable via the CLI but is not edited by the daemon itself — changing where bytes are written is a deliberate user action that requires the daemon to be stopped, the configuration to be edited, and (if the new root differs from the old) a one-time migration to be run.
 
-The Swift layer is told which PhotoKit scope identifier maps to which `library_id` via the `scope_binding` value. This decoupling lets the user rename a `library_id` without breaking the PhotoKit binding, and lets the user opt out of shared-library ingest entirely by simply not binding its scope.
+The Swift layer is told which PhotoKit scope identifier maps to which `library_id` via the `scope_binding` value. This decoupling lets the user rename a library's display name without breaking the PhotoKit binding (*Phase 6 errata:* the `library_id` itself is generated and immutable — see the `libraries` notes), and lets the user opt out of shared-library ingest entirely by simply not binding its scope. Unbinding is refused while another NULL-scope row exists — the personal routing rule picks the NULL-scope row, so a second one would route personal photos arbitrarily.
+
+*Phase 6 note:* library configuration lives **entirely in the Rust `ingress-cli`** (`library add/list/bind/rename/set-retention`); the FFI exposes no config surface and `photo-ingress setup` shrank to data-dir creation plus the Photos authorization walk — the two things that need the PhotoKit-entitled process. Every config write takes the exclusive run lock (refused while the daemon runs, with the holder's pid) and runs the Tier-1 refcount repair on an unclean reclaim.
 
 ### Dedup namespace per library
 
@@ -341,7 +343,7 @@ CREATE TABLE libraries (
 
 Notes:
 
-- `library_id` doubles as the on-disk path component (`/<root>/<library_id>/blobs/...`), so it must be filesystem-safe: lowercase, `[a-z0-9_]`, no path separators. Enforced by the CLI at configuration time.
+- `library_id` doubles as the on-disk path component (`/<root>/<library_id>/blobs/...`), so it must be filesystem-safe: lowercase, `[a-z0-9_]`, no path separators. Enforced by the CLI at configuration time. *Phase 6 errata:* the id is **generated, not user-chosen** — `library add` mints a two-word id from an embedded wordlist (`crisp_harbor`) and it is **immutable** thereafter; `display_name` is the mutable human-facing label (`library rename` edits only it). A user-supplied id duplicated `display_name`'s job while carrying path-layout and sidecar-embedded weight it could never shed; generating it removes both the naming decision and the id-rename problem (which would have meant a multi-table PK migration plus rewriting the id inside every sidecar document). An `--id` override remains for scripts and tests, validated against the charset above.
 - `sidecar_root_local` is **not** stored. It is always derived as `~/.local/share/hopnet-photo-ingress/sidecars/<library_id>/`; storing it would invite drift between the stored value and the derivation rule.
 - `scope_binding` is `UNIQUE`: a PhotoKit scope maps to at most one library. SQLite permits multiple NULLs, so this does not constrain personal or future non-PhotoKit libraries.
 - `retention_days` is per-library — a shared library may warrant a longer window than a personal one. The hard-delete cleanup job reads the owning library's value on each run; changing it applies from the next run (see the retention edge-case table in Deletion and Retention).
@@ -765,6 +767,13 @@ On-demand invariant audit across `state.db`, the sidecar trees, and the blob tre
 - **Orphan blobs**: files under `blobs/` with no corresponding `blobs` row (the crash window between rename and commit, or leftovers from a crashed hard-delete). Deleted only under `--repair` — this is the one destructive repair, which is why it lives here and not in tier 1.
 - Sidecar consistency: every non-`NULL`-library photo has a local sidecar whose contents match its rows; remote copies match `sidecar_replicated_at` claims.
 
+*Implementation notes (Phase 6):*
+
+- The default run is **read-only** (read-only pool, no lock, logs nothing) so it can audit beside a live daemon; a live `drain.lock` prints an in-flight-work banner since transient states (a renamed-but-uncommitted blob) read as findings. `--repair` takes the exclusive run lock, applies the refcount repair, deletes exact-match orphans (logged as `fsck_orphans_deleted`), and runs Tier-1 first on an unclean reclaim — the reclaim signal must never be swallowed.
+- "Contents match its rows" is **db-backed fields only**: identity, tombstone, `ingested_at`, and the written-resource array. Capture metadata exists solely in the sidecar and cannot be cross-checked. Remote copies get an existence check by default; `--deep` byte-compares (replication is a byte copy, so byte equality is the oracle).
+- **Mount-down ≠ byte loss**: an entirely-absent blob or remote root is reported once under `skipped_roots` (advisory, excluded from the exit code) instead of flooding false byte-loss findings. Ext-mismatched and foreign (unparseable-name / wrong-depth) files are reported but never deleted — the delete gate is exact-match orphans only.
+- Exit codes follow fsck(8): 0 clean, 1 findings remain, 2 operational error.
+
 ### Tier 3 — `ingress-cli recover`
 
 Explicit rebuild of `state.db` from a storage root, for a dead Mac or lost local disk. Two sources, in preference order:
@@ -772,15 +781,19 @@ Explicit rebuild of `state.db` from a storage root, for a dead Mac or lost local
 1. **State snapshot** (`state-snapshots/state.db.<timestamp>.sqlite3`): restore the newest snapshot, then let normal startup plus a reconciliation scan close the gap — PhotoKit re-delivers everything that changed since the snapshot, and match precedence makes re-delivery idempotent. Complete recovery: `photo_id`s, tombstones, pipeline state.
 2. **Sidecar-tree rebuild** (no usable snapshot): walk `sidecars/<YYYY>/<MM>/*.json` per library, reconstruct `photos` and `photo_resources` rows from each document, rebuild `blobs` by recounting resource references, and verify each referenced blob file exists. `photo_id`s survive — they are in the sidecars. Lost: retry state and the ingest log (both disposable) and `local_id`s, which are device-scoped and would be useless on a replacement Mac anyway — the first reconciliation scan re-links every asset by `cloud_id` (match-precedence step 1) and repopulates them.
 
-Only if both sources are absent (blobs survived, sidecars did not) does recovery degrade to the blob-only case: fresh `photo_id`s, metadata re-derived from blob bytes where possible. This is the scenario the remote sidecar backup exists to prevent — see the `sidecar_root_remote` warning in the `libraries` notes.
+Only if both sources are absent (blobs survived, sidecars did not) does recovery degrade to the blob-only case: fresh `photo_id`s, metadata re-derived from blob bytes where possible. This is the scenario the remote sidecar backup exists to prevent — see the `sidecar_root_remote` warning in the `libraries` notes. *Phase 6 note:* blob-only recovery is **deliberately not implemented** — it needs the deferred EXIF pass and produces permanently degraded records; `recover` instead errors with a per-root inventory (snapshots found? sidecar tree? blob fan-out?) so the operator knows exactly what survived.
 
 After any tier-3 recovery, the daemon's first reconciliation scan doubles as verification: assets still in PhotoKit re-resolve by `cloud_id`, and discrepancies surface as ordinary pipeline work rather than recovery-specific logic.
+
+*Implementation notes (Phase 6):* `state.db` is dead in this scenario, so configuration comes from arguments: `--root <path>` (repeatable) names storage roots to search for snapshots; `--library id=…,blob=…[,sidecars=…][,scope=…][,retention=…][,name=…]` (repeatable) supplies the rebuild specs — the CLI spec wins over a document's embedded `library_id` (pre-rename stragglers), with a warning. An existing `state.db` is refused unless `--force`, which moves the db *and its WAL companions* aside as `state.db.pre-recover.<unix-ts>*` (never deleted; a stale `-wal` beside a restored db is a corruption hazard). The exclusive run lock is held throughout. **Local-sidecar hydration (spec gap):** a restored snapshot claims materialized-and-replicated photos, but the dead Mac's *local* sidecar tree is gone — recovery copies each library's remote tree into `~/.local/share/…/sidecars/<library_id>/` ("stamped ⇒ remote ≥ local" makes the remote copies current); unhydrated photos remain fsck findings. The sidecar rebuild inserts rows from documents (`materialized_at`/`sidecar_replicated_at = now`, `local_id = NULL` — the first scan re-links), then runs the Tier-1 recount, whose missing-row insertion path *is* the "rebuild `blobs` by recounting" step, and finally verifies every rebuilt row's blob file on disk — a flood of misses means a wrong `blob=` path in a spec.
 
 ### State snapshots
 
 Written by the periodic cleanup job: once per day per library root (on the first run after the day rolls over), to `<blob_root>/state-snapshots/state.db.<unix-ts>.sqlite3`, keeping the newest 7. Snapshot staleness is benign — tier 3 reconciles the gap from PhotoKit — so no tighter cadence is warranted. Snapshot cadence is unrelated to ingest freshness: blobs and sidecars replicate continuously as changes happen.
 
 *Implementation errata (Phase 5):* snapshots use `VACUUM INTO` (an online, consistent copy since SQLite 3.27) rather than the backup API — sqlx does not expose the latter, and adding a second SQLite driver for backups alone would reintroduce the `links` conflict this workspace exists to avoid. One shared VACUUM per run lands in a local staging dir, then copies (temp + rename) to every due root. The due-check derives from the destination filenames (newest parseable timestamp's UTC day vs today) — no extra state, self-healing if snapshots are deleted. An unavailable root is skipped quietly and remains due.
+
+*Read-only caveat (Phase 6):* a read-only SQLite connection cannot run WAL recovery, so the CLI's read paths can fail against a hot `-wal` left by a crashed daemon (`SQLITE_READONLY_RECOVERY`). When that happens and no live pid holds `drain.lock`, the CLI falls back to a normal read-write open (safe: no live writer, migrations are a no-op) with a printed note.
 
 ## Implementation Phases
 
@@ -834,11 +847,13 @@ Structure: a Swift executable (the LaunchAgent) linking `ingress-core` (Rust, in
 - Drive-by fix: the revert path's blob decrement now gates on `content_hash` (not `written_at`) — a revert landing while a re-edit sat superseded-pending leaked the old blob's refcount and stranded its file forever.
 - Verified on-device: 5-asset seed/drain → remote sidecars replicated + stamped; retention-0 hard delete removes rows, blob file, local AND remote sidecars with the in-tx log; mount break/restore → stall flag + `mount_lost`, drain resumes on recovery; daily snapshot once (same-day rerun no-op, snapshot opens as a valid db); `kill -9` → stale lock reclaimed by the next run; `cleanup` vs a live daemon → refused with the holder's pid. 130 Rust tests.
 
-### Phase 6: CLI [ ]
-- `status` (library, pipeline, and per-photo views)
-- `fsck` with `--repair`
-- `recover` (snapshot-first, sidecar-tree fallback)
-- Library configuration commands (add/bind/rename, retention)
+### Phase 6: CLI [x] — `crates/ingress-cli/`, core modules `status.rs`/`fsck.rs`/`recover.rs`/`libconfig.rs`
+- Pure-Rust `ingress-cli` binary (clap), no PhotoKit; all logic in ingress-core modules (testable without the binary, `cleanup::run_standalone` pattern). `--data-dir` defaults to the canonical `~/.local/share/hopnet-photo-ingress`. Human tables by default, `--json` on `status`/`fsck`/`library list`. Exit codes: 0 clean, 1 fsck findings remain, 2 error.
+- `status` — per-library counters (active/pending/tombstones/dirty-sidecars/blob count+bytes), pipeline posture (fresh vs awaiting-retry vs gave-up at `--retry-cap`, unmapped count, earliest retry), and `status <photo_id|cloud_id>` drill-down (row state, per-resource blob paths with existence bits, sidecar path, newest-first log tail). Reads through a new `StateStore::open_read_only` (WAL concurrent reader; schema-version guard; see the read-only caveat under §State snapshots).
+- `fsck` per §Tier 2 with its Phase 6 notes: read-only default + `--deep` + `--repair`; `recovery.rs` split into a pure recount/diff half (shared with the default run) and the repairing half (`repair_refcounts`, API unchanged).
+- `recover` per §Tier 3 with its Phase 6 notes: snapshot-first across `--root`s, sidecar-tree rebuild from `--library` specs, local-sidecar hydration, `--force` aside-move, per-root inventory error; blob-only deferred.
+- Library config moved wholesale from Swift `setup` to `ingress-cli library add/list/bind/rename/set-retention`: generated immutable two-word ids (see §libraries errata), single-personal + single-shared-marker invariants enforced with friendly errors, unbind-ambiguity guard, no-remote-backup warning relocated from setup, all writes lock-guarded + Tier-1-on-unclean + logged (`library_added`/`library_bound`/`library_renamed`/`retention_changed`). FFI `add_library` removed (bindings regenerated); `setup` = data dir + Photos authorization only.
+- Verified on-device (scratch env, 5 real assets): generated-id adds, seed/drain, status views against live rows, replication then `fsck --deep` clean, planted orphan + deleted blob → exit 1 with BYTE LOSS banner, `--repair` deletes only the orphan, snapshot recover into a fresh data dir (5 photos + hydration), sidecar-tree recover catching the destroyed blob in verification, `--force` interlock, live-daemon coexistence (read-only status, fsck banner, config writes refused with holder pid). 139 Rust tests across the workspace.
 
 ### Phase 7: Hardening [ ]
 - LaunchAgent packaging, login autostart

@@ -35,6 +35,17 @@ impl StateStore {
                 .await?,
         )
     }
+
+    /// Every blob row of one library — feeds fsck's missing-blob and
+    /// orphan-file checks. fetch_all is fine at photo-library scale.
+    pub async fn blobs_for_library(&self, library_id: &LibraryId) -> Result<Vec<BlobRecord>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM blobs WHERE library_id = ? ORDER BY content_hash")
+                .bind(library_id)
+                .fetch_all(self.pool())
+                .await?,
+        )
+    }
 }
 
 /// Increment the refcount, creating the row at 1 if absent. On conflict the

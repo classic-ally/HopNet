@@ -83,6 +83,26 @@ impl LibraryId {
         Self(id.into())
     }
 
+    /// Parse an untrusted (CLI-supplied) id: non-empty, lowercase
+    /// `[a-z0-9_]` only — the id is an on-disk path component and must
+    /// never smuggle separators or case-sensitivity hazards.
+    pub fn parse(s: &str) -> crate::error::Result<Self> {
+        if s.is_empty() {
+            return Err(crate::error::IngressError::Invariant(
+                "library id must not be empty".into(),
+            ));
+        }
+        if !s
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        {
+            return Err(crate::error::IngressError::Invariant(format!(
+                "library id {s:?} invalid: lowercase [a-z0-9_] only"
+            )));
+        }
+        Ok(Self(s.to_string()))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -155,5 +175,20 @@ mod tests {
     fn content_hash_fanout() {
         let h = ContentHash::from_hex("ab34cdef00112233445566778899aabb");
         assert_eq!(h.fanout(), ("ab", "34"));
+    }
+
+    // Impact: library_id is an on-disk path component; accepting a
+    // separator or uppercase here would corrupt the sidecar tree layout or
+    // split it across case-folding filesystems.
+    // Should: accept lowercase [a-z0-9_] ids.
+    // Should not: accept empty, uppercase, separators, dots, or hyphens.
+    #[test]
+    fn library_id_parse_enforces_charset() {
+        for ok in ["personal", "brave_otter", "lib2", "_x"] {
+            assert!(LibraryId::parse(ok).is_ok(), "{ok:?} should parse");
+        }
+        for bad in ["", "Personal", "a/b", "a\\b", "..", "a-b", "a b", "café"] {
+            assert!(LibraryId::parse(bad).is_err(), "{bad:?} should be rejected");
+        }
     }
 }

@@ -351,7 +351,8 @@ fn prune_snapshots(dir: &Path, keep: usize) {
 }
 
 /// Newest parseable `state.db.<unix-ts>.sqlite3` timestamp in a dir.
-fn newest_snapshot_ts(dir: &Path) -> Option<i64> {
+/// Shared with Tier-3 recovery's snapshot search.
+pub(crate) fn newest_snapshot_ts(dir: &Path) -> Option<i64> {
     let entries = fs::read_dir(dir).ok()?;
     entries
         .flatten()
@@ -359,7 +360,7 @@ fn newest_snapshot_ts(dir: &Path) -> Option<i64> {
         .max()
 }
 
-fn parse_snapshot_ts(name: &str) -> Option<i64> {
+pub(crate) fn parse_snapshot_ts(name: &str) -> Option<i64> {
     name.strip_prefix("state.db.")?
         .strip_suffix(".sqlite3")?
         .parse()

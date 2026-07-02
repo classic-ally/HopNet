@@ -139,7 +139,7 @@ pub struct WriteCommit {
 }
 
 /// Summary of resources awaiting retry (drain exit report).
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct RetrySummary {
     pub awaiting_retry: i64,
     pub gave_up: i64,

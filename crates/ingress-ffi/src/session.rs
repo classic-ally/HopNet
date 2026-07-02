@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use chrono::Utc;
 use ingress_core::descriptor::AssetDescriptor;
 use ingress_core::ext::{ExtDerivation, ext_for_uti};
-use ingress_core::model::{ICLOUD_SHARED_LIBRARY_BINDING, LibraryConfig, ResourceType};
+use ingress_core::model::ResourceType;
 use ingress_core::paths::{BlobPaths, DataDir, TempKey};
 use ingress_core::resolve::{HashResolution, Resolution, resolve_descriptor, resolve_with_hash};
 use ingress_core::sidecar_io::write_photo_sidecar;
@@ -78,35 +78,9 @@ impl IngressSession {
         }))
     }
 
-    /// Seed a library row (slice/CLI configuration path). A NULL
-    /// `sidecar_root_remote` disables the remote sidecar backup — recovery
-    /// from a lost Mac then degrades to blob-only rebuild (spec warns
-    /// loudly; the CLI surfaces that warning).
-    pub fn add_library(
-        &self,
-        library_id: String,
-        display_name: String,
-        blob_root: String,
-        sidecar_root_remote: Option<String>,
-        retention_days: i64,
-        scope: FfiLibraryScope,
-    ) -> Result<(), FfiError> {
-        let config = LibraryConfig {
-            library_id: LibraryId::new(library_id),
-            display_name,
-            blob_root,
-            sidecar_root_remote,
-            scope_binding: match scope {
-                FfiLibraryScope::Personal => None,
-                FfiLibraryScope::Shared => Some(ICLOUD_SHARED_LIBRARY_BINDING.to_string()),
-            },
-            retention_days: retention_days.max(0),
-            created_at: Utc::now(),
-        };
-        self.runtime
-            .block_on(self.inner.store.insert_library(&config))?;
-        Ok(())
-    }
+    // Library configuration deliberately has NO FFI surface: it moved
+    // wholesale to the Rust `ingress-cli` (Phase 6) — `library add/bind/
+    // rename/set-retention` — which generates the immutable library_id.
 
     /// Match-precedence rule 1. `NeedsOriginal` → stream the original via
     /// [`Self::begin_original`]; `AlreadyKnown` → done for the slice.

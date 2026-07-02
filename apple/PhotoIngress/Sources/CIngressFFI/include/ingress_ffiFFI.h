@@ -337,11 +337,6 @@ uint64_t uniffi_ingress_ffi_fn_constructor_ingresssession_new(RustBuffer data_di
 void uniffi_ingress_ffi_fn_method_ingresssession_abort_scan(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
-#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_ADD_LIBRARY
-#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_ADD_LIBRARY
-void uniffi_ingress_ffi_fn_method_ingresssession_add_library(uint64_t ptr, RustBuffer library_id, RustBuffer display_name, RustBuffer blob_root, RustBuffer sidecar_root_remote, int64_t retention_days, RustBuffer scope, RustCallStatus *_Nonnull out_status
-);
-#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_BEGIN_ORIGINAL
 #define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_BEGIN_ORIGINAL
 uint64_t uniffi_ingress_ffi_fn_method_ingresssession_begin_original(uint64_t ptr, RustBuffer desc, RustCallStatus *_Nonnull out_status
@@ -700,12 +695,6 @@ uint16_t uniffi_ingress_ffi_checksum_method_chunksink_write(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_ABORT_SCAN
 #define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_ABORT_SCAN
 uint16_t uniffi_ingress_ffi_checksum_method_ingresssession_abort_scan(void
-    
-);
-#endif
-#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_ADD_LIBRARY
-#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_ADD_LIBRARY
-uint16_t uniffi_ingress_ffi_checksum_method_ingresssession_add_library(void
     
 );
 #endif

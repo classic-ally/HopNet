@@ -764,14 +764,6 @@ public protocol IngressSessionProtocol: AnyObject, Sendable {
     func abortScan() 
     
     /**
-     * Seed a library row (slice/CLI configuration path). A NULL
-     * `sidecar_root_remote` disables the remote sidecar backup — recovery
-     * from a lost Mac then degrades to blob-only rebuild (spec warns
-     * loudly; the CLI surfaces that warning).
-     */
-    func addLibrary(libraryId: String, displayName: String, blobRoot: String, sidecarRootRemote: String?, retentionDays: Int64, scope: FfiLibraryScope) throws 
-    
-    /**
      * Begin streaming the ORIGINAL resource of a not-yet-known asset
      * (pre-mint probe temp; rules 2a–2c run at `finish`).
      */
@@ -927,25 +919,6 @@ public convenience init(dataDir: String)throws  {
 open func abortScan()  {try! rustCall() {
     uniffi_ingress_ffi_fn_method_ingresssession_abort_scan(
             self.uniffiCloneHandle(),$0
-    )
-}
-}
-    
-    /**
-     * Seed a library row (slice/CLI configuration path). A NULL
-     * `sidecar_root_remote` disables the remote sidecar backup — recovery
-     * from a lost Mac then degrades to blob-only rebuild (spec warns
-     * loudly; the CLI surfaces that warning).
-     */
-open func addLibrary(libraryId: String, displayName: String, blobRoot: String, sidecarRootRemote: String?, retentionDays: Int64, scope: FfiLibraryScope)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
-    uniffi_ingress_ffi_fn_method_ingresssession_add_library(
-            self.uniffiCloneHandle(),
-        FfiConverterString.lower(libraryId),
-        FfiConverterString.lower(displayName),
-        FfiConverterString.lower(blobRoot),
-        FfiConverterOptionString.lower(sidecarRootRemote),
-        FfiConverterInt64.lower(retentionDays),
-        FfiConverterTypeFfiLibraryScope_lower(scope),$0
     )
 }
 }
@@ -3613,9 +3586,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ingress_ffi_checksum_method_ingresssession_abort_scan() != 54287) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_ingress_ffi_checksum_method_ingresssession_add_library() != 3107) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ingress_ffi_checksum_method_ingresssession_begin_original() != 8294) {

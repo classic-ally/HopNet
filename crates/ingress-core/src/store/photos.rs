@@ -298,6 +298,26 @@ where
     .await?)
 }
 
+/// Every materialized photo of one library, tombstoned included — fsck's
+/// sidecar-consistency population (a materialized photo must have a local
+/// sidecar; tombstoned ones carry their `deleted_at` in it).
+pub(crate) async fn materialized_photos<'e, E>(
+    exec: E,
+    library: &LibraryId,
+) -> Result<Vec<PhotoRecord>>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    Ok(sqlx::query_as(
+        "SELECT * FROM photos \
+         WHERE library_id = ? AND materialized_at IS NOT NULL \
+         ORDER BY photo_id",
+    )
+    .bind(library)
+    .fetch_all(exec)
+    .await?)
+}
+
 /// Tombstone (spec §Deletion): set `deleted_at` only when active. Returns
 /// whether this call did the tombstoning — the guard makes PhotoKit's
 /// redundant event delivery (2–4 per action) idempotent, and the caller logs

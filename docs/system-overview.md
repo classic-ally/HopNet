@@ -238,6 +238,20 @@ S3-compatible API layer enabling standard S3 clients and SDKs to interact with H
 - [ ] Pre-signed URLs for temporary access
 - [ ] Integration with AWS CLI and standard S3 SDKs
 
+### 11. Apple Photos Ingress ([spec](specs/apple-photos-ingress.md))
+**Status**: Phases 0–6 complete; Phase 7 (hardening) remaining
+
+Interim daemon archiving an Apple Photos library (personal + iCloud Shared Photo Library) to content-addressed BLAKE3 blobs + JSON sidecars on user-controlled storage, designed to migrate into the RFC-011 photos module. Standalone Rust workspace at `crates/` (sqlx 0.9 pilot) + Swift PhotoKit shim at `apple/PhotoIngress/`.
+
+- [x] Phase 0: PhotoKit spike (identity, scope detection, streaming)
+- [x] Phase 1: ingress-core skeleton (schema, match precedence, sidecars)
+- [x] Phase 2: UniFFI bridge + vertical slice (one asset end-to-end)
+- [x] Phase 3: Pipeline (scheduler, retry/backoff, admission, SIGTERM)
+- [x] Phase 4: Discovery (change classification, reconciliation scan, hard moves, daemon loop)
+- [x] Phase 5: Lifecycle (hard-delete cleanup, snapshots, sidecar replication, Tier-1 repair)
+- [x] Phase 6: CLI (`ingress-cli`: status, fsck --repair, recover, library config)
+- [ ] Phase 7: Hardening (LaunchAgent packaging, long-run soak, real SMB behavior)
+
 ### Reliability Goals
 - **Single node failure**: No data loss, minimal performance impact
 - **Regional outage**: Full data availability through geographic redundancy

@@ -10,7 +10,7 @@ use crate::ids::PhotoId;
 use super::StateStore;
 
 /// One ingest-log row.
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct LogEvent {
     pub id: i64,
     pub at: DateTime<Utc>,
@@ -36,6 +36,18 @@ impl StateStore {
         Ok(
             sqlx::query_as("SELECT * FROM ingest_log WHERE event_type = ? ORDER BY id")
                 .bind(event_type)
+                .fetch_all(self.pool())
+                .await?,
+        )
+    }
+
+    /// The newest events for one photo, newest first — the CLI's per-photo
+    /// history view.
+    pub async fn log_tail_for_photo(&self, id: &PhotoId, limit: i64) -> Result<Vec<LogEvent>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM ingest_log WHERE photo_id = ? ORDER BY id DESC LIMIT ?")
+                .bind(id)
+                .bind(limit)
                 .fetch_all(self.pool())
                 .await?,
         )

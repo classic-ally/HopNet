@@ -81,10 +81,37 @@ impl GroupType {
             Self::HdrBracket => "hdr_bracket",
         }
     }
+
+    /// Reverse of [`GroupType::as_str`] — sidecar-tree recovery maps the
+    /// document's group type name back to the schema integer.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "burst" => Some(Self::Burst),
+            "stack" => Some(Self::Stack),
+            "panorama_frames" => Some(Self::PanoramaFrames),
+            "hdr_bracket" => Some(Self::HdrBracket),
+            _ => None,
+        }
+    }
+}
+
+// JSON output (CLI `--json`, sidecars) uses the RFC-011 NAMES, never the
+// integer discriminants — hand-rolled so a serde derive can't drift to
+// CamelCase variant names.
+impl serde::Serialize for ResourceType {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl serde::Serialize for GroupType {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
 }
 
 /// A `photos` row.
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct PhotoRecord {
     pub photo_id: PhotoId,
     /// NULL = unmapped scope; ingest blocked until the user binds it.
@@ -106,7 +133,7 @@ pub struct PhotoRecord {
 }
 
 /// A `photo_resources` row.
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct ResourceRecord {
     pub photo_id: PhotoId,
     pub resource_type: ResourceType,
@@ -123,7 +150,7 @@ pub struct ResourceRecord {
 }
 
 /// A `libraries` row.
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct LibraryConfig {
     pub library_id: LibraryId,
     pub display_name: String,
@@ -140,7 +167,7 @@ pub struct LibraryConfig {
 pub const ICLOUD_SHARED_LIBRARY_BINDING: &str = "icloud-shared-library";
 
 /// A `blobs` row (refcount bookkeeping; file I/O is Phase 2+).
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct BlobRecord {
     pub library_id: LibraryId,
     pub content_hash: ContentHash,

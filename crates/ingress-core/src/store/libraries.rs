@@ -13,21 +13,7 @@ use super::StateStore;
 impl StateStore {
     /// Insert a library row (CLI configuration path).
     pub async fn insert_library(&self, lib: &LibraryConfig) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO libraries \
-             (library_id, display_name, blob_root, sidecar_root_remote, scope_binding, retention_days, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&lib.library_id)
-        .bind(&lib.display_name)
-        .bind(&lib.blob_root)
-        .bind(&lib.sidecar_root_remote)
-        .bind(&lib.scope_binding)
-        .bind(lib.retention_days)
-        .bind(lib.created_at)
-        .execute(self.pool())
-        .await?;
-        Ok(())
+        insert(self.pool(), lib).await
     }
 
     /// All configured libraries.
@@ -56,6 +42,84 @@ impl StateStore {
             None => Ok(None),
         }
     }
+}
+
+/// Insert a library row on any executor (libconfig logs in the same tx).
+pub(crate) async fn insert<'e, E>(exec: E, lib: &LibraryConfig) -> Result<()>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    sqlx::query(
+        "INSERT INTO libraries \
+         (library_id, display_name, blob_root, sidecar_root_remote, scope_binding, retention_days, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&lib.library_id)
+    .bind(&lib.display_name)
+    .bind(&lib.blob_root)
+    .bind(&lib.sidecar_root_remote)
+    .bind(&lib.scope_binding)
+    .bind(lib.retention_days)
+    .bind(lib.created_at)
+    .execute(exec)
+    .await?;
+    Ok(())
+}
+
+/// Set or clear a library's PhotoKit scope binding. Returns false if the
+/// library does not exist. A UNIQUE violation (scope already bound
+/// elsewhere) surfaces as the sqlx error for the caller to translate.
+pub(crate) async fn update_scope_binding<'e, E>(
+    exec: E,
+    id: &LibraryId,
+    binding: Option<&str>,
+) -> Result<bool>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    Ok(
+        sqlx::query("UPDATE libraries SET scope_binding = ? WHERE library_id = ?")
+            .bind(binding)
+            .bind(id)
+            .execute(exec)
+            .await?
+            .rows_affected()
+            > 0,
+    )
+}
+
+/// Update a library's retention window. Returns false if the library does
+/// not exist.
+pub(crate) async fn update_retention<'e, E>(exec: E, id: &LibraryId, days: i64) -> Result<bool>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    Ok(
+        sqlx::query("UPDATE libraries SET retention_days = ? WHERE library_id = ?")
+            .bind(days)
+            .bind(id)
+            .execute(exec)
+            .await?
+            .rows_affected()
+            > 0,
+    )
+}
+
+/// Update a library's display name. Returns false if the library does not
+/// exist.
+pub(crate) async fn update_display_name<'e, E>(exec: E, id: &LibraryId, name: &str) -> Result<bool>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    Ok(
+        sqlx::query("UPDATE libraries SET display_name = ? WHERE library_id = ?")
+            .bind(name)
+            .bind(id)
+            .execute(exec)
+            .await?
+            .rows_affected()
+            > 0,
+    )
 }
 
 /// Resolve a descriptor's scope to a configured `library_id`

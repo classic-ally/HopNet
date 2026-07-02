@@ -63,6 +63,12 @@ impl BlobPaths {
         self.partial_dir().join(key.file_name())
     }
 
+    /// `<blob_root>/blobs/` — the content-addressed tree root (fsck's
+    /// orphan-scan walk starts here).
+    pub fn blobs_dir(&self) -> PathBuf {
+        self.blob_root.join("blobs")
+    }
+
     /// `<blob_root>/blobs/<aa>/<bb>/<hash>.<ext>` — final content-addressed path.
     pub fn blob_path(&self, hash: &ContentHash, ext: &str) -> PathBuf {
         let (aa, bb) = hash.fanout();
