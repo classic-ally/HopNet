@@ -20,6 +20,17 @@ pub struct LogEvent {
 }
 
 impl StateStore {
+    /// Append an ingest-log event (public entry point for callers outside
+    /// the store's own transactions, e.g. the FFI layer's `unknown_uti`).
+    pub async fn append_log(
+        &self,
+        event_type: &str,
+        photo_id: Option<&PhotoId>,
+        detail: Option<serde_json::Value>,
+    ) -> Result<()> {
+        append(self.pool(), event_type, photo_id, detail).await
+    }
+
     /// Events of one type, oldest first — CLI history and test assertions.
     pub async fn log_events(&self, event_type: &str) -> Result<Vec<LogEvent>> {
         Ok(

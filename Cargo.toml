@@ -4,7 +4,7 @@ members = [".", "common"]
 # (via optional sqlx-mysql) requires sha2 ^0.11.0, which cannot unify with
 # iroh-base's sha2 =0.11.0-rc.5 pin. It is a standalone workspace with its
 # own lockfile; rejoin once iroh drops the prerelease pin.
-exclude = ["crates/ingress-core"]
+exclude = ["crates/ingress-core", "crates/ingress-ffi"]
 
 [package]
 name = "hopnet"

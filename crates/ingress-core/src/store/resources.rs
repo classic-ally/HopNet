@@ -15,10 +15,12 @@ impl StateStore {
         resources_for_photo(self.pool(), id).await
     }
 
-    /// Commit a materialized resource (Phase 2 write path, and test seeding):
-    /// in ONE transaction, set `content_hash`/`ext`/`size_bytes`/`written_at`
-    /// on the resource row, upsert the blob refcount, and stamp
-    /// `photos.materialized_at` if this was the photo's last pending resource.
+    /// Commit a materialized resource (the write path's DB half): in ONE
+    /// transaction, set `content_hash`/`ext`/`size_bytes`/`written_at` on
+    /// the resource row, upsert the blob refcount, and stamp
+    /// `photos.materialized_at` if this was the photo's last pending
+    /// resource. Returns whether the photo completed (materialized_at was
+    /// stamped by this call).
     ///
     /// `content_hash` and `written_at` commit together or not at all
     /// (two-state rule, spec §Per-resource state machine); the refcount
@@ -30,7 +32,7 @@ impl StateStore {
         hash: &ContentHash,
         ext: &str,
         size_bytes: i64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let mut tx = self.pool().begin().await?;
 
         let library_id: Option<LibraryId> =
@@ -63,9 +65,9 @@ impl StateStore {
         super::blobs::upsert_increment(&mut *tx, &library_id, hash, ext, size_bytes).await?;
 
         // Photo-level completion: same transaction as the final resource write.
-        sqlx::query(
+        let completed = sqlx::query(
             "UPDATE photos SET materialized_at = ? \
-             WHERE photo_id = ? \
+             WHERE photo_id = ? AND materialized_at IS NULL \
                AND NOT EXISTS (SELECT 1 FROM photo_resources \
                                WHERE photo_id = ? AND written_at IS NULL)",
         )
@@ -73,10 +75,12 @@ impl StateStore {
         .bind(photo_id)
         .bind(photo_id)
         .execute(&mut *tx)
-        .await?;
+        .await?
+        .rows_affected()
+            > 0;
 
         tx.commit().await?;
-        Ok(())
+        Ok(completed)
     }
 }
 

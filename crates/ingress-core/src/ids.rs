@@ -21,6 +21,12 @@ impl PhotoId {
         Self(Uuid::now_v7().to_string())
     }
 
+    /// Wrap an existing id (FFI boundary, recovery). No format validation —
+    /// lookups against `photos` simply miss for garbage input.
+    pub fn from_string(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }

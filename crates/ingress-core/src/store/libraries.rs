@@ -36,6 +36,15 @@ impl StateStore {
             .fetch_optional(self.pool())
             .await?)
     }
+
+    /// The library bound to a PhotoKit scope, if configured (public wrapper
+    /// over the routing rule used by the resolve engine).
+    pub async fn library_for_scope(&self, scope: LibraryScope) -> Result<Option<LibraryConfig>> {
+        match resolve_scope(self.pool(), scope).await? {
+            Some(id) => self.library(&id).await,
+            None => Ok(None),
+        }
+    }
 }
 
 /// Resolve a descriptor's scope to a configured `library_id`

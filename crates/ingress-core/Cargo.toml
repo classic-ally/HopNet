@@ -1,8 +1,3 @@
-# Standalone workspace: excluded from the parent HopNet workspace because
-# sqlx 0.9's optional sqlx-mysql requires sha2 ^0.11.0, which conflicts with
-# iroh-base's sha2 =0.11.0-rc.5 pin in the parent graph. Own Cargo.lock.
-[workspace]
-
 [package]
 name = "ingress-core"
 version = "0.1.0"
@@ -36,3 +31,4 @@ thiserror = "2.0.18"
 [dev-dependencies]
 tokio = { version = "1.45", features = ["macros", "rt"] }
 ingress-core = { path = ".", features = ["fixtures"] }
+tempfile = "3"
