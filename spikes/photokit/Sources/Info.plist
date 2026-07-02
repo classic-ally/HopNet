@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>app.hopnet.photokit-spike</string>
+    <key>CFBundleName</key>
+    <string>photokit-spike</string>
+    <key>NSPhotoLibraryUsageDescription</key>
+    <string>HopNet ingress spike: read-only probing of PhotoKit APIs against the local library.</string>
+</dict>
+</plist>
