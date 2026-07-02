@@ -1,12 +1,12 @@
 //! Blob write path (spec §Write path): streaming, dedup, crash windows,
 //! photo completion, sidecar composition on disk.
 
-use ingress_core::fixtures::{store_with_personal, AssetDescriptorBuilder};
+use ingress_core::fixtures::{AssetDescriptorBuilder, store_with_personal};
 use ingress_core::model::ResourceType;
 use ingress_core::paths::{BlobPaths, DataDir, TempKey};
 use ingress_core::resolve::{resolve_descriptor, resolve_with_hash};
 use ingress_core::sidecar_io::write_photo_sidecar;
-use ingress_core::writer::{finalize_resource, place_blob, FinalizeOutcome, ResourceWrite};
+use ingress_core::writer::{FinalizeOutcome, ResourceWrite, finalize_resource, place_blob};
 use ingress_core::{ContentHash, HashResolution, LibraryId, PhotoId, Resolution, StateStore};
 
 struct Rig {
@@ -20,10 +20,19 @@ async fn rig() -> Rig {
     let (store, library) = store_with_personal().await;
     let blob_dir = tempfile::tempdir().expect("temp blob root");
     let paths = BlobPaths::new(blob_dir.path());
-    Rig { store, library, paths, _blob_dir: blob_dir }
+    Rig {
+        store,
+        library,
+        paths,
+        _blob_dir: blob_dir,
+    }
 }
 
-fn stream_chunks(paths: &BlobPaths, key: &TempKey, chunks: &[&[u8]]) -> ingress_core::writer::FinishedStream {
+fn stream_chunks(
+    paths: &BlobPaths,
+    key: &TempKey,
+    chunks: &[&[u8]],
+) -> ingress_core::writer::FinishedStream {
     let mut w = ResourceWrite::begin(paths, key).expect("begin");
     for c in chunks {
         w.append(c).expect("append");
@@ -37,7 +46,10 @@ async fn minted_photo(rig: &Rig, bytes: &[u8]) -> PhotoId {
         resolve_descriptor(&rig.store, &desc).await.unwrap(),
         Resolution::NeedsContentHash
     ));
-    match resolve_with_hash(&rig.store, &desc, &ContentHash::of_bytes(bytes)).await.unwrap() {
+    match resolve_with_hash(&rig.store, &desc, &ContentHash::of_bytes(bytes))
+        .await
+        .unwrap()
+    {
         HashResolution::NewPhoto { photo_id } => photo_id,
         other => panic!("expected NewPhoto, got {other:?}"),
     }
@@ -54,7 +66,9 @@ async fn streamed_hash_matches_whole_buffer() {
     let (a, rest) = payload.split_at(7);
     let (b, c) = rest.split_at(1024);
 
-    let key = TempKey::Probe { token: "hash-check".into() };
+    let key = TempKey::Probe {
+        token: "hash-check".into(),
+    };
     let finished = stream_chunks(&rig.paths, &key, &[a, b, c]);
 
     assert_eq!(finished.hash, ContentHash::of_bytes(&payload));
@@ -69,12 +83,21 @@ async fn streamed_hash_matches_whole_buffer() {
 async fn finalize_miss_places_blob() {
     let rig = rig().await;
     let photo_id = minted_photo(&rig, b"miss-bytes").await;
-    let key = TempKey::Resource { photo_id: photo_id.clone(), resource_type: ResourceType::Original };
+    let key = TempKey::Resource {
+        photo_id: photo_id.clone(),
+        resource_type: ResourceType::Original,
+    };
     let finished = stream_chunks(&rig.paths, &key, &[b"miss-bytes"]);
     let hash = finished.hash.clone();
 
     let outcome = finalize_resource(
-        &rig.store, &rig.paths, &rig.library, &photo_id, ResourceType::Original, finished, "heic",
+        &rig.store,
+        &rig.paths,
+        &rig.library,
+        &photo_id,
+        ResourceType::Original,
+        finished,
+        "heic",
     )
     .await
     .unwrap();
@@ -83,7 +106,9 @@ async fn finalize_miss_places_blob() {
     assert!(outcome.photo_completed());
     assert!(outcome.blob_path().exists());
     assert_eq!(outcome.blob_path(), &rig.paths.blob_path(&hash, "heic"));
-    let leftovers: Vec<_> = std::fs::read_dir(rig.paths.partial_dir()).unwrap().collect();
+    let leftovers: Vec<_> = std::fs::read_dir(rig.paths.partial_dir())
+        .unwrap()
+        .collect();
     assert!(leftovers.is_empty());
 
     let blob = rig.store.blob(&rig.library, &hash).await.unwrap().unwrap();
@@ -103,27 +128,52 @@ async fn finalize_hit_dedupes() {
 
     // First photo: normal miss path.
     let first = minted_photo(&rig, bytes).await;
-    let k1 = TempKey::Resource { photo_id: first.clone(), resource_type: ResourceType::Original };
+    let k1 = TempKey::Resource {
+        photo_id: first.clone(),
+        resource_type: ResourceType::Original,
+    };
     let f1 = stream_chunks(&rig.paths, &k1, &[bytes]);
     let hash = f1.hash.clone();
-    finalize_resource(&rig.store, &rig.paths, &rig.library, &first, ResourceType::Original, f1, "heic")
-        .await
+    finalize_resource(
+        &rig.store,
+        &rig.paths,
+        &rig.library,
+        &first,
+        ResourceType::Original,
+        f1,
+        "heic",
+    )
+    .await
+    .unwrap();
+    let mtime_before = std::fs::metadata(rig.paths.blob_path(&hash, "heic"))
+        .unwrap()
+        .modified()
         .unwrap();
-    let mtime_before = std::fs::metadata(rig.paths.blob_path(&hash, "heic")).unwrap().modified().unwrap();
 
     // Second photo, byte-identical original (2b shape: different cloud_id).
-    let desc2 = AssetDescriptorBuilder::simple_image().with_cloud_id("CLOUD-2B:001").build();
+    let desc2 = AssetDescriptorBuilder::simple_image()
+        .with_cloud_id("CLOUD-2B:001")
+        .build();
     resolve_descriptor(&rig.store, &desc2).await.unwrap();
     let second = match resolve_with_hash(&rig.store, &desc2, &hash).await.unwrap() {
         HashResolution::NewPhotoSharedBlob { photo_id, .. } => photo_id,
         other => panic!("expected NewPhotoSharedBlob, got {other:?}"),
     };
-    let k2 = TempKey::Resource { photo_id: second.clone(), resource_type: ResourceType::Original };
+    let k2 = TempKey::Resource {
+        photo_id: second.clone(),
+        resource_type: ResourceType::Original,
+    };
     let f2 = stream_chunks(&rig.paths, &k2, &[bytes]);
     let temp2 = f2.temp_path.clone();
 
     let outcome = finalize_resource(
-        &rig.store, &rig.paths, &rig.library, &second, ResourceType::Original, f2, "heic",
+        &rig.store,
+        &rig.paths,
+        &rig.library,
+        &second,
+        ResourceType::Original,
+        f2,
+        "heic",
     )
     .await
     .unwrap();
@@ -132,7 +182,10 @@ async fn finalize_hit_dedupes() {
     assert!(!temp2.exists());
     let blob = rig.store.blob(&rig.library, &hash).await.unwrap().unwrap();
     assert_eq!(blob.ref_count, 2);
-    let mtime_after = std::fs::metadata(rig.paths.blob_path(&hash, "heic")).unwrap().modified().unwrap();
+    let mtime_after = std::fs::metadata(rig.paths.blob_path(&hash, "heic"))
+        .unwrap()
+        .modified()
+        .unwrap();
     assert_eq!(mtime_before, mtime_after);
 }
 
@@ -144,7 +197,10 @@ async fn finalize_hit_dedupes() {
 async fn crash_mid_stream_leaves_only_orphan_temp() {
     let rig = rig().await;
     let photo_id = minted_photo(&rig, b"crash-bytes").await;
-    let key = TempKey::Resource { photo_id: photo_id.clone(), resource_type: ResourceType::Original };
+    let key = TempKey::Resource {
+        photo_id: photo_id.clone(),
+        resource_type: ResourceType::Original,
+    };
 
     let mut w = ResourceWrite::begin(&rig.paths, &key).unwrap();
     w.append(b"partial-").unwrap();
@@ -156,7 +212,13 @@ async fn crash_mid_stream_leaves_only_orphan_temp() {
         assert!(r.content_hash.is_none());
         assert!(r.written_at.is_none());
     }
-    assert!(rig.store.blob(&rig.library, &ContentHash::of_bytes(b"partial-")).await.unwrap().is_none());
+    assert!(
+        rig.store
+            .blob(&rig.library, &ContentHash::of_bytes(b"partial-"))
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 // Impact: proves the spec's rename-before-commit crash window row — a blob
@@ -167,7 +229,10 @@ async fn crash_mid_stream_leaves_only_orphan_temp() {
 async fn crash_after_rename_before_commit_converges() {
     let rig = rig().await;
     let photo_id = minted_photo(&rig, b"window-bytes").await;
-    let key = TempKey::Resource { photo_id: photo_id.clone(), resource_type: ResourceType::Original };
+    let key = TempKey::Resource {
+        photo_id: photo_id.clone(),
+        resource_type: ResourceType::Original,
+    };
 
     // Filesystem half only — simulates dying between rename and commit.
     let finished = stream_chunks(&rig.paths, &key, &[b"window-bytes"]);
@@ -179,7 +244,13 @@ async fn crash_after_rename_before_commit_converges() {
     // Recovery-by-retry: stream again, full finalize.
     let finished2 = stream_chunks(&rig.paths, &key, &[b"window-bytes"]);
     let outcome = finalize_resource(
-        &rig.store, &rig.paths, &rig.library, &photo_id, ResourceType::Original, finished2, "heic",
+        &rig.store,
+        &rig.paths,
+        &rig.library,
+        &photo_id,
+        ResourceType::Original,
+        finished2,
+        "heic",
     )
     .await
     .unwrap();
@@ -188,7 +259,15 @@ async fn crash_after_rename_before_commit_converges() {
     // idempotent (content addressing), and the row commits.
     assert!(matches!(outcome, FinalizeOutcome::Written { .. }));
     assert!(blob_path.exists());
-    assert_eq!(rig.store.blob(&rig.library, &hash).await.unwrap().unwrap().ref_count, 1);
+    assert_eq!(
+        rig.store
+            .blob(&rig.library, &hash)
+            .await
+            .unwrap()
+            .unwrap()
+            .ref_count,
+        1
+    );
 }
 
 // Should: remove the temp on abort.
@@ -196,7 +275,9 @@ async fn crash_after_rename_before_commit_converges() {
 #[tokio::test]
 async fn abort_and_reentry_semantics() {
     let rig = rig().await;
-    let key = TempKey::Probe { token: "reentry".into() };
+    let key = TempKey::Probe {
+        token: "reentry".into(),
+    };
 
     let mut w = ResourceWrite::begin(&rig.paths, &key).unwrap();
     w.append(b"doomed").unwrap();
@@ -229,16 +310,28 @@ async fn completion_and_sidecar_for_multi_resource_photo() {
         Resolution::NeedsContentHash
     ));
     let still = b"still-bytes".as_slice();
-    let photo_id = match resolve_with_hash(&rig.store, &desc, &ContentHash::of_bytes(still)).await.unwrap() {
+    let photo_id = match resolve_with_hash(&rig.store, &desc, &ContentHash::of_bytes(still))
+        .await
+        .unwrap()
+    {
         HashResolution::NewPhoto { photo_id } => photo_id,
         other => panic!("expected NewPhoto, got {other:?}"),
     };
 
     // First resource (still): not complete yet.
-    let k1 = TempKey::Resource { photo_id: photo_id.clone(), resource_type: ResourceType::Original };
+    let k1 = TempKey::Resource {
+        photo_id: photo_id.clone(),
+        resource_type: ResourceType::Original,
+    };
     let f1 = stream_chunks(&rig.paths, &k1, &[still]);
     let o1 = finalize_resource(
-        &rig.store, &rig.paths, &rig.library, &photo_id, ResourceType::Original, f1, "heic",
+        &rig.store,
+        &rig.paths,
+        &rig.library,
+        &photo_id,
+        ResourceType::Original,
+        f1,
+        "heic",
     )
     .await
     .unwrap();
@@ -246,16 +339,27 @@ async fn completion_and_sidecar_for_multi_resource_photo() {
 
     // Second resource (paired video): completes the photo.
     let video = b"video-bytes".as_slice();
-    let k2 = TempKey::Resource { photo_id: photo_id.clone(), resource_type: ResourceType::PairedVideo };
+    let k2 = TempKey::Resource {
+        photo_id: photo_id.clone(),
+        resource_type: ResourceType::PairedVideo,
+    };
     let f2 = stream_chunks(&rig.paths, &k2, &[video]);
     let o2 = finalize_resource(
-        &rig.store, &rig.paths, &rig.library, &photo_id, ResourceType::PairedVideo, f2, "mov",
+        &rig.store,
+        &rig.paths,
+        &rig.library,
+        &photo_id,
+        ResourceType::PairedVideo,
+        f2,
+        "mov",
     )
     .await
     .unwrap();
     assert!(o2.photo_completed());
 
-    let sidecar_path = write_photo_sidecar(&rig.store, &data_dir, &desc, &photo_id).await.unwrap();
+    let sidecar_path = write_photo_sidecar(&rig.store, &data_dir, &desc, &photo_id)
+        .await
+        .unwrap();
     assert!(sidecar_path.exists());
     let doc: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&sidecar_path).unwrap()).unwrap();

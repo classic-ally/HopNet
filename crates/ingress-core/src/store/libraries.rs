@@ -1,12 +1,12 @@
 //! `libraries` table access and scope resolution.
 
-use sqlx::sqlite::Sqlite;
 use sqlx::Executor;
+use sqlx::sqlite::Sqlite;
 
 use crate::descriptor::LibraryScope;
 use crate::error::Result;
 use crate::ids::LibraryId;
-use crate::model::{LibraryConfig, ICLOUD_SHARED_LIBRARY_BINDING};
+use crate::model::{ICLOUD_SHARED_LIBRARY_BINDING, LibraryConfig};
 
 use super::StateStore;
 
@@ -32,16 +32,20 @@ impl StateStore {
 
     /// All configured libraries.
     pub async fn libraries(&self) -> Result<Vec<LibraryConfig>> {
-        Ok(sqlx::query_as("SELECT * FROM libraries ORDER BY library_id")
-            .fetch_all(self.pool())
-            .await?)
+        Ok(
+            sqlx::query_as("SELECT * FROM libraries ORDER BY library_id")
+                .fetch_all(self.pool())
+                .await?,
+        )
     }
 
     pub async fn library(&self, id: &LibraryId) -> Result<Option<LibraryConfig>> {
-        Ok(sqlx::query_as("SELECT * FROM libraries WHERE library_id = ?")
-            .bind(id)
-            .fetch_optional(self.pool())
-            .await?)
+        Ok(
+            sqlx::query_as("SELECT * FROM libraries WHERE library_id = ?")
+                .bind(id)
+                .fetch_optional(self.pool())
+                .await?,
+        )
     }
 
     /// The library bound to a PhotoKit scope, if configured (public wrapper

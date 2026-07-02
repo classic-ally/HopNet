@@ -2,7 +2,7 @@
 //! 2a–2c, plus the edge-case table).
 
 use chrono::{Duration, Utc};
-use ingress_core::fixtures::{add_shared, store_with_personal, AssetDescriptorBuilder};
+use ingress_core::fixtures::{AssetDescriptorBuilder, add_shared, store_with_personal};
 use ingress_core::model::ResourceType;
 use ingress_core::resolve::{diff_resources, resolve_descriptor, resolve_with_hash};
 use ingress_core::{ContentHash, HashResolution, IngressError, LibraryScope, PhotoId, Resolution};
@@ -16,7 +16,10 @@ async fn ingest_new(
         Resolution::NeedsContentHash => {}
         other => panic!("expected NeedsContentHash, got {other:?}"),
     }
-    match resolve_with_hash(store, desc, hash).await.expect("resolve with hash") {
+    match resolve_with_hash(store, desc, hash)
+        .await
+        .expect("resolve with hash")
+    {
         HashResolution::NewPhoto { photo_id } => photo_id,
         other => panic!("expected NewPhoto, got {other:?}"),
     }
@@ -49,7 +52,11 @@ async fn rule1_steady_state_is_idempotent() {
 
     let second = resolve_descriptor(&store, &desc).await.unwrap();
     match second {
-        Resolution::KnownByCloudId { photo_id: found, scope_changed, .. } => {
+        Resolution::KnownByCloudId {
+            photo_id: found,
+            scope_changed,
+            ..
+        } => {
             assert_eq!(found, photo_id);
             assert!(!scope_changed);
         }
@@ -62,7 +69,9 @@ async fn rule1_steady_state_is_idempotent() {
 #[tokio::test]
 async fn rule1_refreshes_local_id() {
     let (store, _) = store_with_personal().await;
-    let desc = AssetDescriptorBuilder::simple_image().with_local_id("OLD/L0/001").build();
+    let desc = AssetDescriptorBuilder::simple_image()
+        .with_local_id("OLD/L0/001")
+        .build();
     let photo_id = ingest_new(&store, &desc, &ContentHash::of_bytes(b"img-2")).await;
 
     let mut redelivered = desc.clone();
@@ -79,22 +88,42 @@ async fn rule1_refreshes_local_id() {
 async fn rule1_detects_metadata_change() {
     let (store, _) = store_with_personal().await;
     let t1 = Utc::now();
-    let desc = AssetDescriptorBuilder::simple_image().modified_at(t1).build();
+    let desc = AssetDescriptorBuilder::simple_image()
+        .modified_at(t1)
+        .build();
     ingest_new(&store, &desc, &ContentHash::of_bytes(b"img-3")).await;
 
     let same = resolve_descriptor(&store, &desc).await.unwrap();
-    assert!(matches!(same, Resolution::KnownByCloudId { metadata_changed: false, .. }));
+    assert!(matches!(
+        same,
+        Resolution::KnownByCloudId {
+            metadata_changed: false,
+            ..
+        }
+    ));
 
     let mut newer = desc.clone();
     newer.asset_modified_at = Some(t1 + Duration::seconds(5));
     let changed = resolve_descriptor(&store, &newer).await.unwrap();
-    assert!(matches!(changed, Resolution::KnownByCloudId { metadata_changed: true, .. }));
+    assert!(matches!(
+        changed,
+        Resolution::KnownByCloudId {
+            metadata_changed: true,
+            ..
+        }
+    ));
 
     // Never-synced photo (stored NULL) must always refresh.
     let no_date = AssetDescriptorBuilder::simple_image().build();
     ingest_new(&store, &no_date, &ContentHash::of_bytes(b"img-4")).await;
     let redelivered = resolve_descriptor(&store, &no_date).await.unwrap();
-    assert!(matches!(redelivered, Resolution::KnownByCloudId { metadata_changed: true, .. }));
+    assert!(matches!(
+        redelivered,
+        Resolution::KnownByCloudId {
+            metadata_changed: true,
+            ..
+        }
+    ));
 }
 
 // Impact: late binding is what keeps a photo's identity stable across the
@@ -139,16 +168,23 @@ async fn rule2b_new_photo_shared_blob() {
     let (store, _) = store_with_personal().await;
     let hash = ContentHash::of_bytes(b"same-bytes");
 
-    let first = AssetDescriptorBuilder::simple_image().with_cloud_id("CLOUD-A:001").build();
+    let first = AssetDescriptorBuilder::simple_image()
+        .with_cloud_id("CLOUD-A:001")
+        .build();
     let first_id = ingest_written(&store, &first, &hash).await;
 
-    let second = AssetDescriptorBuilder::simple_image().with_cloud_id("CLOUD-B:001").build();
+    let second = AssetDescriptorBuilder::simple_image()
+        .with_cloud_id("CLOUD-B:001")
+        .build();
     assert!(matches!(
         resolve_descriptor(&store, &second).await.unwrap(),
         Resolution::NeedsContentHash
     ));
     match resolve_with_hash(&store, &second, &hash).await.unwrap() {
-        HashResolution::NewPhotoSharedBlob { photo_id, shared_hash } => {
+        HashResolution::NewPhotoSharedBlob {
+            photo_id,
+            shared_hash,
+        } => {
             assert_ne!(photo_id, first_id);
             assert_eq!(shared_hash, hash);
         }
@@ -205,7 +241,9 @@ async fn hash_lookup_is_scoped_per_library() {
 #[tokio::test]
 async fn unmapped_scope_blocks_ingest() {
     let (store, _) = store_with_personal().await; // no shared library bound
-    let desc = AssetDescriptorBuilder::simple_image().scope(LibraryScope::Shared).build();
+    let desc = AssetDescriptorBuilder::simple_image()
+        .scope(LibraryScope::Shared)
+        .build();
 
     let photo_id = match resolve_descriptor(&store, &desc).await.unwrap() {
         Resolution::UnmappedScope { photo_id } => photo_id,
@@ -258,7 +296,11 @@ async fn edit_diff_adds_edited_renders() {
     let diff = diff_resources(&stored, &incoming);
     assert_eq!(
         diff.added.into_iter().collect::<Vec<_>>(),
-        vec![ResourceType::Edited, ResourceType::AdjustmentData, ResourceType::EditedPairedVideo]
+        vec![
+            ResourceType::Edited,
+            ResourceType::AdjustmentData,
+            ResourceType::EditedPairedVideo
+        ]
     );
     assert!(diff.removed.is_empty());
     assert_eq!(
@@ -303,7 +345,10 @@ async fn live_photo_resource_rows() {
         .into_iter()
         .map(|r| r.resource_type)
         .collect();
-    assert_eq!(types, vec![ResourceType::Original, ResourceType::PairedVideo]);
+    assert_eq!(
+        types,
+        vec![ResourceType::Original, ResourceType::PairedVideo]
+    );
 }
 
 // Should: mint one photo with original + raw_alternate rows for a RAW+JPEG pair.
@@ -320,7 +365,10 @@ async fn raw_jpeg_resource_rows() {
         .into_iter()
         .map(|r| r.resource_type)
         .collect();
-    assert_eq!(types, vec![ResourceType::Original, ResourceType::RawAlternate]);
+    assert_eq!(
+        types,
+        vec![ResourceType::Original, ResourceType::RawAlternate]
+    );
 }
 
 // Impact: guards the archive-known-and-log decision — an exotic resource must
@@ -356,12 +404,16 @@ async fn unknown_resource_type_logged_not_blocking() {
 #[tokio::test]
 async fn duplicate_cloud_id_fails_loud() {
     let (store, _) = store_with_personal().await;
-    let desc = AssetDescriptorBuilder::simple_image().with_cloud_id("CLOUD-DUP:001").build();
+    let desc = AssetDescriptorBuilder::simple_image()
+        .with_cloud_id("CLOUD-DUP:001")
+        .build();
     ingest_new(&store, &desc, &ContentHash::of_bytes(b"dup-1")).await;
 
     // Bypass rule 1 (as a diverged-state caller would) and try to mint the
     // same cloud_id with different bytes.
-    let clash = AssetDescriptorBuilder::simple_image().with_cloud_id("CLOUD-DUP:001").build();
+    let clash = AssetDescriptorBuilder::simple_image()
+        .with_cloud_id("CLOUD-DUP:001")
+        .build();
     let err = resolve_with_hash(&store, &clash, &ContentHash::of_bytes(b"dup-2"))
         .await
         .unwrap_err();

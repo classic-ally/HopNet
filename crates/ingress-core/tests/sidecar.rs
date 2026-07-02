@@ -2,7 +2,7 @@
 
 use chrono::{DateTime, FixedOffset, Utc};
 use ingress_core::descriptor::{Camera, Location};
-use ingress_core::sidecar::{Sidecar, SidecarGroup, SidecarResource, SIDECAR_SCHEMA_V1};
+use ingress_core::sidecar::{SIDECAR_SCHEMA_V1, Sidecar, SidecarGroup, SidecarResource};
 use ingress_core::{IngressError, LibraryId, PhotoId};
 
 fn example_sidecar() -> Sidecar {
@@ -16,7 +16,9 @@ fn example_sidecar() -> Sidecar {
         ingested_at: "2026-07-02T14:03:11Z".parse::<DateTime<Utc>>().unwrap(),
         deleted_at: None,
         captured_at: Some(
-            "2019-08-14T16:22:03+02:00".parse::<DateTime<FixedOffset>>().unwrap(),
+            "2019-08-14T16:22:03+02:00"
+                .parse::<DateTime<FixedOffset>>()
+                .unwrap(),
         ),
         media_type: ingress_core::descriptor::MediaType::Image,
         media_subtypes: vec!["hdr".to_string()],
@@ -24,8 +26,14 @@ fn example_sidecar() -> Sidecar {
         pixel_height: Some(3024),
         orientation: Some(6),
         duration_ms: None,
-        camera: Some(Camera { make: Some("Apple".into()), model: Some("iPhone 15 Pro".into()) }),
-        location: Some(Location { lat: 45.5017, lon: -73.5673 }),
+        camera: Some(Camera {
+            make: Some("Apple".into()),
+            model: Some("iPhone 15 Pro".into()),
+        }),
+        location: Some(Location {
+            lat: 45.5017,
+            lon: -73.5673,
+        }),
         favorite: false,
         group: Some(SidecarGroup {
             id: "3f9a0000000000000000000000000000".to_string(),

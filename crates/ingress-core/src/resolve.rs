@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 
 use crate::descriptor::AssetDescriptor;
 use crate::error::{IngressError, Result};
-use crate::ids::{derive_group_id, ContentHash, GroupDomain, PhotoId};
+use crate::ids::{ContentHash, GroupDomain, PhotoId, derive_group_id};
 use crate::model::{GroupType, ResourceType};
 use crate::store::StateStore;
 use crate::store::{libraries, log, photos, resources};
@@ -30,7 +30,10 @@ pub enum Resolution {
     /// Rule 1 hit on a previously-unmapped photo whose scope now resolves:
     /// `library_id` populated in this call; its pending resource rows become
     /// drain-eligible. (Adopt-on-redelivery — the unmapped-unblock path.)
-    Adopted { photo_id: PhotoId, library_id: crate::ids::LibraryId },
+    Adopted {
+        photo_id: PhotoId,
+        library_id: crate::ids::LibraryId,
+    },
     /// Rule 1 miss: caller must materialize + hash the original, then call
     /// [`resolve_with_hash`].
     NeedsContentHash,
@@ -48,7 +51,10 @@ pub enum HashResolution {
     /// Rule 2b: byte-identical original under a *different* `cloud_id` —
     /// a distinct logical photo. The blob refcount increment happens at
     /// write time (Phase 2); this outcome just reports the shared hash.
-    NewPhotoSharedBlob { photo_id: PhotoId, shared_hash: ContentHash },
+    NewPhotoSharedBlob {
+        photo_id: PhotoId,
+        shared_hash: ContentHash,
+    },
     /// Rule 2c: genuinely new.
     NewPhoto { photo_id: PhotoId },
 }
@@ -73,7 +79,10 @@ pub async fn resolve_descriptor(store: &StateStore, desc: &AssetDescriptor) -> R
         {
             photos::adopt_library(&mut *tx, &existing.photo_id, &library).await?;
             tx.commit().await?;
-            return Ok(Resolution::Adopted { photo_id: existing.photo_id, library_id: library });
+            return Ok(Resolution::Adopted {
+                photo_id: existing.photo_id,
+                library_id: library,
+            });
         }
 
         // NULL stored modification date = never successfully synced → changed.
@@ -143,7 +152,9 @@ pub async fn resolve_with_hash(
                 photos::set_cloud_id(&mut *tx, &photo.photo_id, cloud_id).await?;
             }
             photos::update_local_id(&mut *tx, &photo.photo_id, &desc.local_id).await?;
-            HashResolution::LateBound { photo_id: photo.photo_id }
+            HashResolution::LateBound {
+                photo_id: photo.photo_id,
+            }
         }
         // Rule 2b: distinct logical photo with a byte-identical original.
         Some(_) => {
@@ -201,9 +212,7 @@ async fn mint_photo(
     .map_err(|e| match &e {
         // Surface the spec's fail-loud posture: a UNIQUE violation on
         // cloud_id means Apple's invariant broke or state diverged.
-        IngressError::Db(sqlx::Error::Database(db))
-            if db.message().contains("photos.cloud_id") =>
-        {
+        IngressError::Db(sqlx::Error::Database(db)) if db.message().contains("photos.cloud_id") => {
             IngressError::CloudIdConflict(desc.cloud_id.clone().unwrap_or_default())
         }
         _ => e,
@@ -257,12 +266,10 @@ pub enum SeedOutcome {
 pub async fn seed_descriptor(store: &StateStore, desc: &AssetDescriptor) -> Result<SeedOutcome> {
     match resolve_descriptor(store, desc).await? {
         Resolution::KnownByCloudId { photo_id, .. } => {
-            return Ok(SeedOutcome::AlreadyKnown { photo_id })
+            return Ok(SeedOutcome::AlreadyKnown { photo_id });
         }
         Resolution::Adopted { photo_id, .. } => return Ok(SeedOutcome::Adopted { photo_id }),
-        Resolution::UnmappedScope { photo_id } => {
-            return Ok(SeedOutcome::Unmapped { photo_id })
-        }
+        Resolution::UnmappedScope { photo_id } => return Ok(SeedOutcome::Unmapped { photo_id }),
         Resolution::NeedsContentHash => {}
     }
 
@@ -276,7 +283,9 @@ pub async fn seed_descriptor(store: &StateStore, desc: &AssetDescriptor) -> Resu
         && let Some(existing) = photos::photo_by_local_id_no_cloud(&mut *tx, &desc.local_id).await?
     {
         tx.commit().await?;
-        return Ok(SeedOutcome::AlreadyKnown { photo_id: existing.photo_id });
+        return Ok(SeedOutcome::AlreadyKnown {
+            photo_id: existing.photo_id,
+        });
     }
 
     let library = libraries::resolve_scope(&mut *tx, desc.scope)
@@ -284,9 +293,14 @@ pub async fn seed_descriptor(store: &StateStore, desc: &AssetDescriptor) -> Resu
         .ok_or(IngressError::UnmappedScope(desc.scope))?; // unreachable: handled above
 
     let photo_id = mint_photo(&mut tx, desc, Some(&library)).await?;
-    let resources = resources::resources_for_photo(&mut *tx, &photo_id).await?.len() as u32;
+    let resources = resources::resources_for_photo(&mut *tx, &photo_id)
+        .await?
+        .len() as u32;
     tx.commit().await?;
-    Ok(SeedOutcome::MintedPending { photo_id, resources })
+    Ok(SeedOutcome::MintedPending {
+        photo_id,
+        resources,
+    })
 }
 
 /// Drain-time rule 2a: the freshly-hashed ORIGINAL of a seed-minted photo
@@ -307,7 +321,9 @@ pub async fn late_binding_merge(
     // Merge only applies when the incoming asset brings a cloud_id and the
     // existing record lacks one (2a shape). Byte-identical pairs where both
     // have (distinct) cloud_ids are rule 2b — distinct photos, shared blob.
-    let Some(cloud_id) = desc.cloud_id.as_deref() else { return Ok(None) };
+    let Some(cloud_id) = desc.cloud_id.as_deref() else {
+        return Ok(None);
+    };
 
     let mut tx = store.pool().begin().await?;
     let existing = resources::photo_by_original_hash(&mut *tx, library, original_hash).await?;

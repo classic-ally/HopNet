@@ -31,12 +31,15 @@ impl From<FfiMediaType> for MediaType {
 fn parse_utc(field: &str, s: &str) -> Result<DateTime<Utc>, FfiError> {
     DateTime::parse_from_rfc3339(s)
         .map(|t| t.with_timezone(&Utc))
-        .map_err(|e| FfiError::InvalidDescriptor { msg: format!("{field}: {e}") })
+        .map_err(|e| FfiError::InvalidDescriptor {
+            msg: format!("{field}: {e}"),
+        })
 }
 
 fn parse_offset(field: &str, s: &str) -> Result<DateTime<FixedOffset>, FfiError> {
-    DateTime::parse_from_rfc3339(s)
-        .map_err(|e| FfiError::InvalidDescriptor { msg: format!("{field}: {e}") })
+    DateTime::parse_from_rfc3339(s).map_err(|e| FfiError::InvalidDescriptor {
+        msg: format!("{field}: {e}"),
+    })
 }
 
 pub fn descriptor_from_ffi(d: FfiAssetDescriptor) -> Result<AssetDescriptor, FfiError> {
@@ -67,8 +70,14 @@ pub fn descriptor_from_ffi(d: FfiAssetDescriptor) -> Result<AssetDescriptor, Ffi
             pixel_height: d.capture.pixel_height,
             orientation: d.capture.orientation,
             duration_ms: d.capture.duration_ms,
-            camera: d.capture.camera.map(|c| Camera { make: c.make, model: c.model }),
-            location: d.capture.location.map(|l| Location { lat: l.lat, lon: l.lon }),
+            camera: d.capture.camera.map(|c| Camera {
+                make: c.make,
+                model: c.model,
+            }),
+            location: d.capture.location.map(|l| Location {
+                lat: l.lat,
+                lon: l.lon,
+            }),
         },
         resources: d
             .resources

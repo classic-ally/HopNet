@@ -43,25 +43,33 @@ pub enum FfiError {
 
 impl From<uniffi::UnexpectedUniFFICallbackError> for FfiError {
     fn from(e: uniffi::UnexpectedUniFFICallbackError) -> Self {
-        FfiError::FetchTransient { msg: format!("unexpected callback error: {e}") }
+        FfiError::FetchTransient {
+            msg: format!("unexpected callback error: {e}"),
+        }
     }
 }
 
 impl From<IngressError> for FfiError {
     fn from(e: IngressError) -> Self {
         match e {
-            IngressError::Db(inner) => FfiError::Database { msg: inner.to_string() },
-            IngressError::Migrate(inner) => FfiError::Database { msg: inner.to_string() },
-            IngressError::Json(inner) => FfiError::Invariant { msg: inner.to_string() },
-            IngressError::UnsupportedSidecarSchema(s) => {
-                FfiError::Invariant { msg: format!("unsupported sidecar schema {s}") }
-            }
-            IngressError::UnknownResourceType(t) => {
-                FfiError::InvalidDescriptor { msg: format!("unknown PHAssetResourceType {t}") }
-            }
-            IngressError::UnmappedScope(scope) => {
-                FfiError::UnmappedScope { msg: format!("{scope:?}") }
-            }
+            IngressError::Db(inner) => FfiError::Database {
+                msg: inner.to_string(),
+            },
+            IngressError::Migrate(inner) => FfiError::Database {
+                msg: inner.to_string(),
+            },
+            IngressError::Json(inner) => FfiError::Invariant {
+                msg: inner.to_string(),
+            },
+            IngressError::UnsupportedSidecarSchema(s) => FfiError::Invariant {
+                msg: format!("unsupported sidecar schema {s}"),
+            },
+            IngressError::UnknownResourceType(t) => FfiError::InvalidDescriptor {
+                msg: format!("unknown PHAssetResourceType {t}"),
+            },
+            IngressError::UnmappedScope(scope) => FfiError::UnmappedScope {
+                msg: format!("{scope:?}"),
+            },
             IngressError::CloudIdConflict(id) => FfiError::CloudIdConflict { msg: id },
             IngressError::Invariant(msg) => FfiError::Invariant { msg },
         }

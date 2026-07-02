@@ -60,7 +60,10 @@ pub fn admit(
     reserve_floor: u64,
 ) -> Result<bool> {
     let free = probe.free_bytes(root)?;
-    Ok(free.saturating_sub(inflight.total()).saturating_sub(expected) > reserve_floor)
+    Ok(free
+        .saturating_sub(inflight.total())
+        .saturating_sub(expected)
+        > reserve_floor)
 }
 
 #[cfg(test)]

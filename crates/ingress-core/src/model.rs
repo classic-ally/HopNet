@@ -27,12 +27,12 @@ impl ResourceType {
     /// skips the resource without blocking the asset.
     pub fn from_ph_type(ph: i32) -> Option<Self> {
         match ph {
-            1 | 2 => Some(Self::Original),         // photo / video
-            5 | 6 => Some(Self::Edited),           // fullSizePhoto / fullSizeVideo
-            9 => Some(Self::PairedVideo),          // pairedVideo
-            7 => Some(Self::AdjustmentData),       // adjustmentData
-            4 => Some(Self::RawAlternate),         // alternatePhoto
-            10 => Some(Self::EditedPairedVideo),   // fullSizePairedVideo
+            1 | 2 => Some(Self::Original),       // photo / video
+            5 | 6 => Some(Self::Edited),         // fullSizePhoto / fullSizeVideo
+            9 => Some(Self::PairedVideo),        // pairedVideo
+            7 => Some(Self::AdjustmentData),     // adjustmentData
+            4 => Some(Self::RawAlternate),       // alternatePhoto
+            10 => Some(Self::EditedPairedVideo), // fullSizePairedVideo
             _ => None,
         }
     }
@@ -165,10 +165,22 @@ mod tests {
         assert_eq!(ResourceType::from_ph_type(2), Some(ResourceType::Original));
         assert_eq!(ResourceType::from_ph_type(5), Some(ResourceType::Edited));
         assert_eq!(ResourceType::from_ph_type(6), Some(ResourceType::Edited));
-        assert_eq!(ResourceType::from_ph_type(9), Some(ResourceType::PairedVideo));
-        assert_eq!(ResourceType::from_ph_type(7), Some(ResourceType::AdjustmentData));
-        assert_eq!(ResourceType::from_ph_type(4), Some(ResourceType::RawAlternate));
-        assert_eq!(ResourceType::from_ph_type(10), Some(ResourceType::EditedPairedVideo));
+        assert_eq!(
+            ResourceType::from_ph_type(9),
+            Some(ResourceType::PairedVideo)
+        );
+        assert_eq!(
+            ResourceType::from_ph_type(7),
+            Some(ResourceType::AdjustmentData)
+        );
+        assert_eq!(
+            ResourceType::from_ph_type(4),
+            Some(ResourceType::RawAlternate)
+        );
+        assert_eq!(
+            ResourceType::from_ph_type(10),
+            Some(ResourceType::EditedPairedVideo)
+        );
         assert_eq!(ResourceType::from_ph_type(3), None);
         assert_eq!(ResourceType::from_ph_type(8), None);
         assert_eq!(ResourceType::from_ph_type(999), None);

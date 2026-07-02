@@ -28,7 +28,11 @@ fn slice_descriptor(cloud_id: &str, live_photo: bool) -> FfiAssetDescriptor {
         local_id: format!("LOCAL-{cloud_id}/L0/001"),
         cloud_id: Some(cloud_id.to_string()),
         scope: FfiLibraryScope::Personal,
-        media_type: if live_photo { FfiMediaType::LivePhoto } else { FfiMediaType::Image },
+        media_type: if live_photo {
+            FfiMediaType::LivePhoto
+        } else {
+            FfiMediaType::Image
+        },
         media_subtypes: vec![],
         asset_modified_at: Some("2026-07-02T12:00:00Z".into()),
         favorite: false,
@@ -64,7 +68,11 @@ fn rig() -> Rig {
             FfiLibraryScope::Personal,
         )
         .unwrap();
-    Rig { session, data_dir, blob_dir }
+    Rig {
+        session,
+        data_dir,
+        blob_dir,
+    }
 }
 
 // Impact: this is the exact call sequence the Swift slice performs; if it
@@ -90,7 +98,10 @@ fn end_to_end_live_photo() {
         sink.write(chunk.to_vec()).unwrap();
     }
     let outcome = sink.finish().unwrap();
-    assert!(matches!(outcome.resolution_kind, FfiHashResolutionKind::NewPhoto));
+    assert!(matches!(
+        outcome.resolution_kind,
+        FfiHashResolutionKind::NewPhoto
+    ));
     assert!(!outcome.deduped);
     assert!(!outcome.photo_completed); // paired video still pending
     assert!(std::path::Path::new(&outcome.blob_path).exists());
@@ -101,14 +112,24 @@ fn end_to_end_live_photo() {
     let video = b"fake-video-bytes".to_vec();
     let sink = rig
         .session
-        .begin_resource(outcome.photo_id.clone(), 9, "com.apple.quicktime-movie".into(), None)
+        .begin_resource(
+            outcome.photo_id.clone(),
+            9,
+            "com.apple.quicktime-movie".into(),
+            None,
+        )
         .unwrap();
     sink.write(video.clone()).unwrap();
     let outcome2 = sink.finish().unwrap();
-    assert!(matches!(outcome2.resolution_kind, FfiHashResolutionKind::ExistingPhoto));
+    assert!(matches!(
+        outcome2.resolution_kind,
+        FfiHashResolutionKind::ExistingPhoto
+    ));
     assert!(outcome2.photo_completed);
     assert_eq!(outcome2.ext, "mov");
-    let sidecar_path = outcome2.sidecar_path.expect("sidecar written on completion");
+    let sidecar_path = outcome2
+        .sidecar_path
+        .expect("sidecar written on completion");
     assert!(std::path::Path::new(&sidecar_path).exists());
 
     // Sidecar content sanity: both resources, capture offset preserved.
@@ -167,8 +188,14 @@ fn sink_and_descriptor_misuse() {
     let sink = rig.session.begin_original(desc.clone()).unwrap();
     sink.write(b"x".to_vec()).unwrap();
     sink.finish().unwrap();
-    assert!(matches!(sink.write(b"y".to_vec()).unwrap_err(), FfiError::SinkState { .. }));
-    assert!(matches!(sink.finish().unwrap_err(), FfiError::SinkState { .. }));
+    assert!(matches!(
+        sink.write(b"y".to_vec()).unwrap_err(),
+        FfiError::SinkState { .. }
+    ));
+    assert!(matches!(
+        sink.finish().unwrap_err(),
+        FfiError::SinkState { .. }
+    ));
 
     let mut no_original = slice_descriptor("CLOUD-NOORIG:001", false);
     no_original.resources.clear();
@@ -201,8 +228,11 @@ fn seed_and_drain_through_fetcher_trait() {
         ) -> Result<(), FfiError> {
             // Scheduled sinks must reject finish — commit control is Rust's.
             assert!(matches!(sink.finish(), Err(FfiError::SinkState { .. })));
-            let bytes: &[u8] =
-                if request.ph_resource_type == 1 { b"still-bytes" } else { b"motion-bytes" };
+            let bytes: &[u8] = if request.ph_resource_type == 1 {
+                b"still-bytes"
+            } else {
+                b"motion-bytes"
+            };
             sink.write(bytes.to_vec())?;
             Ok(())
         }

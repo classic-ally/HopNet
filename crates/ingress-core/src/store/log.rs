@@ -1,8 +1,8 @@
 //! `ingest_log` — the black-box recorder. Authoritative for nothing.
 
 use chrono::{DateTime, Utc};
-use sqlx::sqlite::Sqlite;
 use sqlx::Executor;
+use sqlx::sqlite::Sqlite;
 
 use crate::error::Result;
 use crate::ids::PhotoId;

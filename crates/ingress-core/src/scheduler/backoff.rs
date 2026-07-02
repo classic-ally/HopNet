@@ -11,7 +11,10 @@ pub struct BackoffConfig {
 
 impl Default for BackoffConfig {
     fn default() -> Self {
-        Self { base: Duration::from_secs(30), max: Duration::from_secs(3600) }
+        Self {
+            base: Duration::from_secs(30),
+            max: Duration::from_secs(3600),
+        }
     }
 }
 
@@ -19,7 +22,11 @@ impl Default for BackoffConfig {
 /// `min(base × 2^(n−1), max)`.
 pub fn delay(config: &BackoffConfig, n: i64) -> Duration {
     let exp = (n - 1).clamp(0, 62) as u32;
-    config.base.checked_mul(1u32 << exp.min(31)).unwrap_or(config.max).min(config.max)
+    config
+        .base
+        .checked_mul(1u32 << exp.min(31))
+        .unwrap_or(config.max)
+        .min(config.max)
 }
 
 #[cfg(test)]
@@ -31,7 +38,10 @@ mod tests {
     // Should: double per retry from base and clamp at max.
     #[test]
     fn exponential_with_cap() {
-        let cfg = BackoffConfig { base: Duration::from_secs(30), max: Duration::from_secs(3600) };
+        let cfg = BackoffConfig {
+            base: Duration::from_secs(30),
+            max: Duration::from_secs(3600),
+        };
         assert_eq!(delay(&cfg, 1), Duration::from_secs(30));
         assert_eq!(delay(&cfg, 2), Duration::from_secs(60));
         assert_eq!(delay(&cfg, 3), Duration::from_secs(120));

@@ -136,7 +136,10 @@ mod tests {
     fn group_id_derivation_is_stable() {
         let id = derive_group_id(GroupDomain::Burst, "E5A6CEB6-B839-45AD-A028-D625CD72470D");
         assert_eq!(id.len(), 32);
-        assert!(id.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            id.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
         // Golden value pinned from the first run of this derivation.
         assert_eq!(id, "1b789102453c47eb496002d53501d570");
     }

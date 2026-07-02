@@ -72,8 +72,14 @@ mod tests {
     // Should: map every spike-verified UTI to its canonical extension.
     #[test]
     fn spike_verified_utis() {
-        assert_eq!(ext_for_uti("public.heic", None), ExtDerivation::Known("heic"));
-        assert_eq!(ext_for_uti("public.jpeg", None), ExtDerivation::Known("jpg"));
+        assert_eq!(
+            ext_for_uti("public.heic", None),
+            ExtDerivation::Known("heic")
+        );
+        assert_eq!(
+            ext_for_uti("public.jpeg", None),
+            ExtDerivation::Known("jpg")
+        );
         assert_eq!(
             ext_for_uti("com.apple.quicktime-movie", None),
             ExtDerivation::Known("mov")
@@ -96,12 +102,18 @@ mod tests {
             ext_for_uti("com.example.exotic", Some("IMG_0001.XYZ")),
             ExtDerivation::FromFilename("xyz".into())
         );
-        assert_eq!(ext_for_uti("com.example.exotic", Some("no-extension")), ExtDerivation::Fallback);
+        assert_eq!(
+            ext_for_uti("com.example.exotic", Some("no-extension")),
+            ExtDerivation::Fallback
+        );
         assert_eq!(
             ext_for_uti("com.example.exotic", Some("weird.ext-with-dash")),
             ExtDerivation::Fallback
         );
-        assert_eq!(ext_for_uti("com.example.exotic", None), ExtDerivation::Fallback);
+        assert_eq!(
+            ext_for_uti("com.example.exotic", None),
+            ExtDerivation::Fallback
+        );
         assert_eq!(ext_for_uti("com.example.exotic", None).ext(), "bin");
     }
 }

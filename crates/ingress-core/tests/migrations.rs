@@ -1,7 +1,7 @@
 //! Migration behavior.
 
-use ingress_core::fixtures::store_with_personal;
 use ingress_core::StateStore;
+use ingress_core::fixtures::store_with_personal;
 
 // Impact: state.db lives across many daemon versions pre-1.0; migration
 // idempotence is what lets every open() run the migrator unconditionally.
@@ -17,7 +17,16 @@ async fn fresh_migrate_creates_schema() {
     .await
     .unwrap();
     let names: Vec<&str> = tables.iter().map(|(n,)| n.as_str()).collect();
-    assert_eq!(names, vec!["blobs", "ingest_log", "libraries", "photo_resources", "photos"]);
+    assert_eq!(
+        names,
+        vec![
+            "blobs",
+            "ingest_log",
+            "libraries",
+            "photo_resources",
+            "photos"
+        ]
+    );
 
     let indexes: Vec<(String,)> = sqlx::query_as(
         "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%' ORDER BY name",
@@ -48,7 +57,9 @@ async fn migrate_is_idempotent() {
 
     let first = StateStore::open(&path).await.expect("first open");
     drop(first);
-    let second = StateStore::open(&path).await.expect("second open (re-migrate)");
+    let second = StateStore::open(&path)
+        .await
+        .expect("second open (re-migrate)");
     let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM _sqlx_migrations")
         .fetch_one(second.raw_pool())
         .await

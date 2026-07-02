@@ -8,12 +8,14 @@ use crate::descriptor::{
     AssetDescriptor, BurstInfo, CaptureMetadata, LibraryScope, MediaType, ResourceDescriptor,
 };
 use crate::ids::LibraryId;
-use crate::model::{LibraryConfig, ICLOUD_SHARED_LIBRARY_BINDING};
+use crate::model::{ICLOUD_SHARED_LIBRARY_BINDING, LibraryConfig};
 use crate::store::StateStore;
 
 /// An in-memory store seeded with a `personal` library.
 pub async fn store_with_personal() -> (StateStore, LibraryId) {
-    let store = StateStore::open_in_memory().await.expect("open in-memory store");
+    let store = StateStore::open_in_memory()
+        .await
+        .expect("open in-memory store");
     let id = LibraryId::new("personal");
     store
         .insert_library(&LibraryConfig {
@@ -91,7 +93,10 @@ impl AssetDescriptorBuilder {
     /// Live Photo: `[photo, pairedVideo]`.
     pub fn live_photo() -> Self {
         Self::base(
-            vec![resource(1, "public.heic"), resource(9, "com.apple.quicktime-movie")],
+            vec![
+                resource(1, "public.heic"),
+                resource(9, "com.apple.quicktime-movie"),
+            ],
             MediaType::LivePhoto,
         )
     }
@@ -114,7 +119,10 @@ impl AssetDescriptorBuilder {
     /// RAW+JPEG pair: `[photo, alternatePhoto]`.
     pub fn raw_jpeg() -> Self {
         Self::base(
-            vec![resource(1, "public.jpeg"), resource(4, "com.sony.arw-raw-image")],
+            vec![
+                resource(1, "public.jpeg"),
+                resource(4, "com.sony.arw-raw-image"),
+            ],
             MediaType::Image,
         )
     }

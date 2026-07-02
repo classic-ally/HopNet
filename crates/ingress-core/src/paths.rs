@@ -18,7 +18,10 @@ use crate::model::ResourceType;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TempKey {
     /// Post-mint resource stream: spec naming.
-    Resource { photo_id: PhotoId, resource_type: ResourceType },
+    Resource {
+        photo_id: PhotoId,
+        resource_type: ResourceType,
+    },
     /// Pre-mint original probe (rules 2a–2c): caller-supplied unique token.
     Probe { token: String },
 }
@@ -26,7 +29,10 @@ pub enum TempKey {
 impl TempKey {
     fn file_name(&self) -> String {
         match self {
-            TempKey::Resource { photo_id, resource_type } => {
+            TempKey::Resource {
+                photo_id,
+                resource_type,
+            } => {
                 format!("{photo_id}.{}", *resource_type as i64)
             }
             TempKey::Probe { token } => format!("probe-{token}"),
@@ -42,7 +48,9 @@ pub struct BlobPaths {
 
 impl BlobPaths {
     pub fn new(blob_root: impl Into<PathBuf>) -> Self {
-        Self { blob_root: blob_root.into() }
+        Self {
+            blob_root: blob_root.into(),
+        }
     }
 
     /// `<blob_root>/blobs/.partial/` — in-flight write temps. Same
@@ -116,7 +124,9 @@ mod tests {
     #[test]
     fn temp_paths_live_under_partial() {
         let paths = BlobPaths::new("/mnt/photos/personal");
-        let probe = paths.temp_path(&TempKey::Probe { token: "abc123".into() });
+        let probe = paths.temp_path(&TempKey::Probe {
+            token: "abc123".into(),
+        });
         assert_eq!(
             probe.to_string_lossy(),
             "/mnt/photos/personal/blobs/.partial/probe-abc123"
@@ -137,9 +147,13 @@ mod tests {
     #[test]
     fn data_dir_derivations() {
         let dir = DataDir::new("/tmp/ingress");
-        assert_eq!(dir.state_db_path().to_string_lossy(), "/tmp/ingress/state.db");
         assert_eq!(
-            dir.sidecar_root(&LibraryId::new("personal")).to_string_lossy(),
+            dir.state_db_path().to_string_lossy(),
+            "/tmp/ingress/state.db"
+        );
+        assert_eq!(
+            dir.sidecar_root(&LibraryId::new("personal"))
+                .to_string_lossy(),
             "/tmp/ingress/sidecars/personal"
         );
     }

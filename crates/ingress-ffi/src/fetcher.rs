@@ -60,7 +60,10 @@ impl ingress_core::scheduler::ResourceFetcher for ForeignFetcher {
         local_id: &str,
     ) -> Result<ingress_core::descriptor::AssetDescriptor, ingress_core::scheduler::FetchFailure>
     {
-        let ffi = self.inner.descriptor_for(local_id.to_string()).map_err(failure_from_ffi)?;
+        let ffi = self
+            .inner
+            .descriptor_for(local_id.to_string())
+            .map_err(failure_from_ffi)?;
         crate::convert::descriptor_from_ffi(ffi).map_err(failure_from_ffi)
     }
 
@@ -75,6 +78,8 @@ impl ingress_core::scheduler::ResourceFetcher for ForeignFetcher {
             ph_resource_type: request.ph_resource_type,
         };
         let ffi_sink = Arc::new(ChunkSink::scheduled(sink));
-        self.inner.fetch_resource(ffi_request, ffi_sink).map_err(failure_from_ffi)
+        self.inner
+            .fetch_resource(ffi_request, ffi_sink)
+            .map_err(failure_from_ffi)
     }
 }

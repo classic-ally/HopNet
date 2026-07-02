@@ -35,7 +35,9 @@ impl<'de> Deserialize<'de> for MediaType {
             "image" => Ok(MediaType::Image),
             "video" => Ok(MediaType::Video),
             "live_photo" => Ok(MediaType::LivePhoto),
-            other => Err(serde::de::Error::custom(format!("unknown media_type {other:?}"))),
+            other => Err(serde::de::Error::custom(format!(
+                "unknown media_type {other:?}"
+            ))),
         }
     }
 }
