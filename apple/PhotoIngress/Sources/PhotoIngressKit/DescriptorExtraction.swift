@@ -69,7 +69,13 @@ public func extractDescriptor(asset: PHAsset) throws -> FfiAssetDescriptor {
     let mappings = PHPhotoLibrary.shared()
         .cloudIdentifierMappings(forLocalIdentifiers: [asset.localIdentifier])
     let cloudId: String? = mappings[asset.localIdentifier].flatMap { try? $0.get().stringValue }
+    return try extractDescriptor(asset: asset, cloudId: cloudId)
+}
 
+/// Overload taking a pre-mapped cloud identifier — the reconciliation scan
+/// batches `cloudIdentifierMappings` in 1k chunks and must not pay a
+/// per-asset mapping call on the NeedsFull path.
+public func extractDescriptor(asset: PHAsset, cloudId: String?) throws -> FfiAssetDescriptor {
     // Library scope: private KVC property, verified exact in the spike.
     guard let inScope = asset.value(forKey: "participatesInLibraryScope") as? Bool else {
         throw ExtractionError.scopeUnavailable(asset.localIdentifier)

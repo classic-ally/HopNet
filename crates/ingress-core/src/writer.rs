@@ -47,7 +47,12 @@ impl ResourceWrite {
         fs::create_dir_all(&dir).map_err(io_err)?;
         let temp_path = paths.temp_path(key);
         let file = fs::File::create(&temp_path).map_err(io_err)?;
-        Ok(Self { temp_path, file, hasher: blake3::Hasher::new(), bytes: 0 })
+        Ok(Self {
+            temp_path,
+            file,
+            hasher: blake3::Hasher::new(),
+            bytes: 0,
+        })
     }
 
     pub fn append(&mut self, chunk: &[u8]) -> Result<()> {
@@ -123,9 +128,15 @@ pub fn place_blob(paths: &BlobPaths, finished: &FinishedStream, ext: &str) -> Re
 #[derive(Debug, PartialEq, Eq)]
 pub enum FinalizeOutcome {
     /// Dedup miss: bytes placed at `blob_path`.
-    Written { blob_path: PathBuf, photo_completed: bool },
+    Written {
+        blob_path: PathBuf,
+        photo_completed: bool,
+    },
     /// Dedup hit: temp discarded, existing blob's refcount incremented.
-    Deduped { blob_path: PathBuf, photo_completed: bool },
+    Deduped {
+        blob_path: PathBuf,
+        photo_completed: bool,
+    },
 }
 
 impl FinalizeOutcome {
@@ -138,8 +149,12 @@ impl FinalizeOutcome {
 
     pub fn photo_completed(&self) -> bool {
         match self {
-            FinalizeOutcome::Written { photo_completed, .. }
-            | FinalizeOutcome::Deduped { photo_completed, .. } => *photo_completed,
+            FinalizeOutcome::Written {
+                photo_completed, ..
+            }
+            | FinalizeOutcome::Deduped {
+                photo_completed, ..
+            } => *photo_completed,
         }
     }
 
@@ -173,15 +188,35 @@ pub async fn finalize_resource(
     };
 
     // Single transaction: content_hash + written_at together (two-state
-    // rule), refcount upsert (insert-at-1 or increment), materialized_at
-    // stamp when this was the last pending resource.
-    let photo_completed = store
-        .mark_resource_written(photo_id, resource_type, &finished.hash, ext, finished.size_bytes as i64)
+    // rule), refcount upsert (insert-at-1 or increment), superseded-blob
+    // swap for reopened rows, materialized_at stamp when this was the last
+    // pending resource.
+    let commit = store
+        .mark_resource_written(
+            photo_id,
+            resource_type,
+            &finished.hash,
+            ext,
+            finished.size_bytes as i64,
+        )
         .await?;
+    let photo_completed = commit.photo_completed;
+
+    // Reap a superseded blob whose refcount hit 0 — after the commit, so a
+    // crash here leaves only a benign orphan file (recovery's orphan scan).
+    if let Some((old_hash, old_ext)) = commit.reap_superseded {
+        let _ = fs::remove_file(paths.blob_path(&old_hash, &old_ext));
+    }
 
     Ok(if deduped {
-        FinalizeOutcome::Deduped { blob_path, photo_completed }
+        FinalizeOutcome::Deduped {
+            blob_path,
+            photo_completed,
+        }
     } else {
-        FinalizeOutcome::Written { blob_path, photo_completed }
+        FinalizeOutcome::Written {
+            blob_path,
+            photo_completed,
+        }
     })
 }

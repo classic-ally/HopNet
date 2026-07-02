@@ -332,6 +332,11 @@ void uniffi_ingress_ffi_fn_free_ingresssession(uint64_t handle, RustCallStatus *
 uint64_t uniffi_ingress_ffi_fn_constructor_ingresssession_new(RustBuffer data_dir, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_ABORT_SCAN
+#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_ABORT_SCAN
+void uniffi_ingress_ffi_fn_method_ingresssession_abort_scan(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_ADD_LIBRARY
 #define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_ADD_LIBRARY
 void uniffi_ingress_ffi_fn_method_ingresssession_add_library(uint64_t ptr, RustBuffer library_id, RustBuffer display_name, RustBuffer blob_root, RustBuffer scope, RustCallStatus *_Nonnull out_status
@@ -347,6 +352,11 @@ uint64_t uniffi_ingress_ffi_fn_method_ingresssession_begin_original(uint64_t ptr
 uint64_t uniffi_ingress_ffi_fn_method_ingresssession_begin_resource(uint64_t ptr, RustBuffer photo_id, int32_t ph_resource_type, RustBuffer uti, RustBuffer original_filename, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_BEGIN_SCAN
+#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_BEGIN_SCAN
+void uniffi_ingress_ffi_fn_method_ingresssession_begin_scan(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_CANCEL_DRAIN
 #define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_CANCEL_DRAIN
 void uniffi_ingress_ffi_fn_method_ingresssession_cancel_drain(uint64_t ptr, RustCallStatus *_Nonnull out_status
@@ -357,9 +367,34 @@ void uniffi_ingress_ffi_fn_method_ingresssession_cancel_drain(uint64_t ptr, Rust
 RustBuffer uniffi_ingress_ffi_fn_method_ingresssession_drain(uint64_t ptr, uint64_t fetcher, RustBuffer options, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_FINISH_SCAN
+#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_FINISH_SCAN
+RustBuffer uniffi_ingress_ffi_fn_method_ingresssession_finish_scan(uint64_t ptr, uint64_t enumerated, int64_t retry_cap, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_INGEST_DESCRIPTOR
 #define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_INGEST_DESCRIPTOR
 RustBuffer uniffi_ingress_ffi_fn_method_ingresssession_ingest_descriptor(uint64_t ptr, RustBuffer desc, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_OBSERVE_DESCRIPTORS
+#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_OBSERVE_DESCRIPTORS
+void uniffi_ingress_ffi_fn_method_ingresssession_observe_descriptors(uint64_t ptr, RustBuffer descs, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_OBSERVE_REMOVED
+#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_OBSERVE_REMOVED
+void uniffi_ingress_ffi_fn_method_ingresssession_observe_removed(uint64_t ptr, RustBuffer local_ids, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_RUN_DAEMON
+#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_RUN_DAEMON
+RustBuffer uniffi_ingress_ffi_fn_method_ingresssession_run_daemon(uint64_t ptr, uint64_t fetcher, RustBuffer options, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_SCAN_ASSET
+#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_SCAN_ASSET
+RustBuffer uniffi_ingress_ffi_fn_method_ingresssession_scan_asset(uint64_t ptr, RustBuffer probe, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_SEED_DESCRIPTOR
@@ -657,6 +692,12 @@ uint16_t uniffi_ingress_ffi_checksum_method_chunksink_write(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_ABORT_SCAN
+#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_ABORT_SCAN
+uint16_t uniffi_ingress_ffi_checksum_method_ingresssession_abort_scan(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_ADD_LIBRARY
 #define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_ADD_LIBRARY
 uint16_t uniffi_ingress_ffi_checksum_method_ingresssession_add_library(void
@@ -675,6 +716,12 @@ uint16_t uniffi_ingress_ffi_checksum_method_ingresssession_begin_resource(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_BEGIN_SCAN
+#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_BEGIN_SCAN
+uint16_t uniffi_ingress_ffi_checksum_method_ingresssession_begin_scan(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_CANCEL_DRAIN
 #define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_CANCEL_DRAIN
 uint16_t uniffi_ingress_ffi_checksum_method_ingresssession_cancel_drain(void
@@ -687,9 +734,39 @@ uint16_t uniffi_ingress_ffi_checksum_method_ingresssession_drain(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_FINISH_SCAN
+#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_FINISH_SCAN
+uint16_t uniffi_ingress_ffi_checksum_method_ingresssession_finish_scan(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_INGEST_DESCRIPTOR
 #define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_INGEST_DESCRIPTOR
 uint16_t uniffi_ingress_ffi_checksum_method_ingresssession_ingest_descriptor(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_OBSERVE_DESCRIPTORS
+#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_OBSERVE_DESCRIPTORS
+uint16_t uniffi_ingress_ffi_checksum_method_ingresssession_observe_descriptors(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_OBSERVE_REMOVED
+#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_OBSERVE_REMOVED
+uint16_t uniffi_ingress_ffi_checksum_method_ingresssession_observe_removed(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_RUN_DAEMON
+#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_RUN_DAEMON
+uint16_t uniffi_ingress_ffi_checksum_method_ingresssession_run_daemon(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_SCAN_ASSET
+#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_SCAN_ASSET
+uint16_t uniffi_ingress_ffi_checksum_method_ingresssession_scan_asset(void
     
 );
 #endif

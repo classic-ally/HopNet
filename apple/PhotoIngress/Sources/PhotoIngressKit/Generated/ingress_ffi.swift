@@ -758,6 +758,12 @@ public func FfiConverterTypeChunkSink_lower(_ value: ChunkSink) -> UInt64 {
 public protocol IngressSessionProtocol: AnyObject, Sendable {
     
     /**
+     * Drop the active scan without synthesis (enumeration failed midway —
+     * an incomplete seen set must never drive deletion synthesis).
+     */
+    func abortScan() 
+    
+    /**
      * Seed a library row (slice/CLI configuration path).
      */
     func addLibrary(libraryId: String, displayName: String, blobRoot: String, scope: FfiLibraryScope) throws 
@@ -774,6 +780,11 @@ public protocol IngressSessionProtocol: AnyObject, Sendable {
     func beginResource(photoId: String, phResourceType: Int32, uti: String, originalFilename: String?) throws  -> ChunkSink
     
     /**
+     * Start a reconciliation scan. Errors if one is already active.
+     */
+    func beginScan() throws 
+    
+    /**
      * Trip cooperative cancellation (SIGTERM handler): admission stops,
      * inflight sink writes fail Cancelled, rows stay untouched.
      */
@@ -788,10 +799,41 @@ public protocol IngressSessionProtocol: AnyObject, Sendable {
     func drain(fetcher: PhotoResourceFetcher, options: FfiDrainOptions) throws  -> FfiDrainReport
     
     /**
+     * Close the active scan: offline-deletion synthesis (guarded against
+     * zero-enumeration), gave-up retry reset, `scan_completed` log. Wakes
+     * the daemon loop so revived work is picked up promptly.
+     */
+    func finishScan(enumerated: UInt64, retryCap: Int64) throws  -> FfiScanSummary
+    
+    /**
      * Match-precedence rule 1. `NeedsOriginal` → stream the original via
      * [`Self::begin_original`]; `AlreadyKnown` → done for the slice.
      */
     func ingestDescriptor(desc: FfiAssetDescriptor) throws  -> FfiResolution
+    
+    /**
+     * Push observer insert/change descriptors (or scan `NeedsFull`
+     * re-deliveries) into the daemon's inbox.
+     */
+    func observeDescriptors(descs: [FfiAssetDescriptor]) throws 
+    
+    /**
+     * Push observer removals (deletions) by local identifier.
+     */
+    func observeRemoved(localIds: [String]) 
+    
+    /**
+     * Run the daemon loop until cancellation (`cancel_drain`). Blocking;
+     * call from a background thread AFTER registering the observer (missed
+     * window closes via idempotent duplicate delivery). One run per session.
+     */
+    func runDaemon(fetcher: PhotoResourceFetcher, options: FfiDaemonOptions) throws  -> FfiDaemonReport
+    
+    /**
+     * Probe one enumerated asset (light — no resource enumeration).
+     * `NeedsFull` → extract the full descriptor and `observe_descriptors`.
+     */
+    func scanAsset(probe: FfiScanProbe) throws  -> FfiScanVerdict
     
     /**
      * Seed one descriptor: rule 1, adoption, or mint-on-miss (no bytes).
@@ -868,6 +910,17 @@ public convenience init(dataDir: String)throws  {
 
     
     /**
+     * Drop the active scan without synthesis (enumeration failed midway —
+     * an incomplete seen set must never drive deletion synthesis).
+     */
+open func abortScan()  {try! rustCall() {
+    uniffi_ingress_ffi_fn_method_ingresssession_abort_scan(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
      * Seed a library row (slice/CLI configuration path).
      */
 open func addLibrary(libraryId: String, displayName: String, blobRoot: String, scope: FfiLibraryScope)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
@@ -910,6 +963,16 @@ open func beginResource(photoId: String, phResourceType: Int32, uti: String, ori
 }
     
     /**
+     * Start a reconciliation scan. Errors if one is already active.
+     */
+open func beginScan()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_ingress_ffi_fn_method_ingresssession_begin_scan(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
      * Trip cooperative cancellation (SIGTERM handler): admission stops,
      * inflight sink writes fail Cancelled, rows stay untouched.
      */
@@ -937,6 +1000,21 @@ open func drain(fetcher: PhotoResourceFetcher, options: FfiDrainOptions)throws  
 }
     
     /**
+     * Close the active scan: offline-deletion synthesis (guarded against
+     * zero-enumeration), gave-up retry reset, `scan_completed` log. Wakes
+     * the daemon loop so revived work is picked up promptly.
+     */
+open func finishScan(enumerated: UInt64, retryCap: Int64)throws  -> FfiScanSummary  {
+    return try  FfiConverterTypeFfiScanSummary_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_ingress_ffi_fn_method_ingresssession_finish_scan(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt64.lower(enumerated),
+        FfiConverterInt64.lower(retryCap),$0
+    )
+})
+}
+    
+    /**
      * Match-precedence rule 1. `NeedsOriginal` → stream the original via
      * [`Self::begin_original`]; `AlreadyKnown` → done for the slice.
      */
@@ -945,6 +1023,57 @@ open func ingestDescriptor(desc: FfiAssetDescriptor)throws  -> FfiResolution  {
     uniffi_ingress_ffi_fn_method_ingresssession_ingest_descriptor(
             self.uniffiCloneHandle(),
         FfiConverterTypeFfiAssetDescriptor_lower(desc),$0
+    )
+})
+}
+    
+    /**
+     * Push observer insert/change descriptors (or scan `NeedsFull`
+     * re-deliveries) into the daemon's inbox.
+     */
+open func observeDescriptors(descs: [FfiAssetDescriptor])throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_ingress_ffi_fn_method_ingresssession_observe_descriptors(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceTypeFfiAssetDescriptor.lower(descs),$0
+    )
+}
+}
+    
+    /**
+     * Push observer removals (deletions) by local identifier.
+     */
+open func observeRemoved(localIds: [String])  {try! rustCall() {
+    uniffi_ingress_ffi_fn_method_ingresssession_observe_removed(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceString.lower(localIds),$0
+    )
+}
+}
+    
+    /**
+     * Run the daemon loop until cancellation (`cancel_drain`). Blocking;
+     * call from a background thread AFTER registering the observer (missed
+     * window closes via idempotent duplicate delivery). One run per session.
+     */
+open func runDaemon(fetcher: PhotoResourceFetcher, options: FfiDaemonOptions)throws  -> FfiDaemonReport  {
+    return try  FfiConverterTypeFfiDaemonReport_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_ingress_ffi_fn_method_ingresssession_run_daemon(
+            self.uniffiCloneHandle(),
+        FfiConverterTypePhotoResourceFetcher_lower(fetcher),
+        FfiConverterTypeFfiDaemonOptions_lower(options),$0
+    )
+})
+}
+    
+    /**
+     * Probe one enumerated asset (light — no resource enumeration).
+     * `NeedsFull` → extract the full descriptor and `observe_descriptors`.
+     */
+open func scanAsset(probe: FfiScanProbe)throws  -> FfiScanVerdict  {
+    return try  FfiConverterTypeFfiScanVerdict_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_ingress_ffi_fn_method_ingresssession_scan_asset(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeFfiScanProbe_lower(probe),$0
     )
 })
 }
@@ -1553,6 +1682,162 @@ public func FfiConverterTypeFfiCaptureMetadata_lower(_ value: FfiCaptureMetadata
 
 
 /**
+ * Daemon knobs — the drain knobs verbatim (the rescan timer is owned by the
+ * platform side, which also owns enumeration).
+ */
+public struct FfiDaemonOptions: Equatable, Hashable {
+    public var fetchConcurrency: UInt32
+    public var retryCap: Int64
+    public var retryBaseSecs: UInt64
+    public var retryMaxSecs: UInt64
+    public var reserveFloorGib: UInt64
+    public var pressurePauseSecs: UInt64
+    public var storagePollSecs: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(fetchConcurrency: UInt32, retryCap: Int64, retryBaseSecs: UInt64, retryMaxSecs: UInt64, reserveFloorGib: UInt64, pressurePauseSecs: UInt64, storagePollSecs: UInt64) {
+        self.fetchConcurrency = fetchConcurrency
+        self.retryCap = retryCap
+        self.retryBaseSecs = retryBaseSecs
+        self.retryMaxSecs = retryMaxSecs
+        self.reserveFloorGib = reserveFloorGib
+        self.pressurePauseSecs = pressurePauseSecs
+        self.storagePollSecs = storagePollSecs
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiDaemonOptions: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiDaemonOptions: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiDaemonOptions {
+        return
+            try FfiDaemonOptions(
+                fetchConcurrency: FfiConverterUInt32.read(from: &buf), 
+                retryCap: FfiConverterInt64.read(from: &buf), 
+                retryBaseSecs: FfiConverterUInt64.read(from: &buf), 
+                retryMaxSecs: FfiConverterUInt64.read(from: &buf), 
+                reserveFloorGib: FfiConverterUInt64.read(from: &buf), 
+                pressurePauseSecs: FfiConverterUInt64.read(from: &buf), 
+                storagePollSecs: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiDaemonOptions, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.fetchConcurrency, into: &buf)
+        FfiConverterInt64.write(value.retryCap, into: &buf)
+        FfiConverterUInt64.write(value.retryBaseSecs, into: &buf)
+        FfiConverterUInt64.write(value.retryMaxSecs, into: &buf)
+        FfiConverterUInt64.write(value.reserveFloorGib, into: &buf)
+        FfiConverterUInt64.write(value.pressurePauseSecs, into: &buf)
+        FfiConverterUInt64.write(value.storagePollSecs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiDaemonOptions_lift(_ buf: RustBuffer) throws -> FfiDaemonOptions {
+    return try FfiConverterTypeFfiDaemonOptions.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiDaemonOptions_lower(_ value: FfiDaemonOptions) -> RustBuffer {
+    return FfiConverterTypeFfiDaemonOptions.lower(value)
+}
+
+
+/**
+ * Daemon outcome (mirrors `daemon::DaemonReport`): drain counters plus the
+ * event side.
+ */
+public struct FfiDaemonReport: Equatable, Hashable {
+    public var drain: FfiDrainReport
+    public var eventsApplied: UInt64
+    public var eventsDeferred: UInt64
+    public var deletions: UInt64
+    public var restores: UInt64
+    public var transitions: UInt64
+    public var resourcesReopened: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(drain: FfiDrainReport, eventsApplied: UInt64, eventsDeferred: UInt64, deletions: UInt64, restores: UInt64, transitions: UInt64, resourcesReopened: UInt64) {
+        self.drain = drain
+        self.eventsApplied = eventsApplied
+        self.eventsDeferred = eventsDeferred
+        self.deletions = deletions
+        self.restores = restores
+        self.transitions = transitions
+        self.resourcesReopened = resourcesReopened
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiDaemonReport: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiDaemonReport: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiDaemonReport {
+        return
+            try FfiDaemonReport(
+                drain: FfiConverterTypeFfiDrainReport.read(from: &buf), 
+                eventsApplied: FfiConverterUInt64.read(from: &buf), 
+                eventsDeferred: FfiConverterUInt64.read(from: &buf), 
+                deletions: FfiConverterUInt64.read(from: &buf), 
+                restores: FfiConverterUInt64.read(from: &buf), 
+                transitions: FfiConverterUInt64.read(from: &buf), 
+                resourcesReopened: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiDaemonReport, into buf: inout [UInt8]) {
+        FfiConverterTypeFfiDrainReport.write(value.drain, into: &buf)
+        FfiConverterUInt64.write(value.eventsApplied, into: &buf)
+        FfiConverterUInt64.write(value.eventsDeferred, into: &buf)
+        FfiConverterUInt64.write(value.deletions, into: &buf)
+        FfiConverterUInt64.write(value.restores, into: &buf)
+        FfiConverterUInt64.write(value.transitions, into: &buf)
+        FfiConverterUInt64.write(value.resourcesReopened, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiDaemonReport_lift(_ buf: RustBuffer) throws -> FfiDaemonReport {
+    return try FfiConverterTypeFfiDaemonReport.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiDaemonReport_lower(_ value: FfiDaemonReport) -> RustBuffer {
+    return FfiConverterTypeFfiDaemonReport.lower(value)
+}
+
+
+/**
  * Drain knobs (CLI flags; spec defaults).
  */
 public struct FfiDrainOptions: Equatable, Hashable {
@@ -1920,6 +2205,147 @@ public func FfiConverterTypeFfiResourceDescriptor_lift(_ buf: RustBuffer) throws
 #endif
 public func FfiConverterTypeFfiResourceDescriptor_lower(_ value: FfiResourceDescriptor) -> RustBuffer {
     return FfiConverterTypeFfiResourceDescriptor.lower(value)
+}
+
+
+/**
+ * Light reconciliation-scan probe (mirrors `scan::ScanProbe`) — identity +
+ * scope + modification date only, NO resource enumeration.
+ */
+public struct FfiScanProbe: Equatable, Hashable {
+    public var localId: String
+    public var cloudId: String?
+    public var scope: FfiLibraryScope
+    /**
+     * ISO 8601 UTC.
+     */
+    public var assetModifiedAt: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(localId: String, cloudId: String?, scope: FfiLibraryScope, 
+        /**
+         * ISO 8601 UTC.
+         */assetModifiedAt: String?) {
+        self.localId = localId
+        self.cloudId = cloudId
+        self.scope = scope
+        self.assetModifiedAt = assetModifiedAt
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiScanProbe: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiScanProbe: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiScanProbe {
+        return
+            try FfiScanProbe(
+                localId: FfiConverterString.read(from: &buf), 
+                cloudId: FfiConverterOptionString.read(from: &buf), 
+                scope: FfiConverterTypeFfiLibraryScope.read(from: &buf), 
+                assetModifiedAt: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiScanProbe, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.localId, into: &buf)
+        FfiConverterOptionString.write(value.cloudId, into: &buf)
+        FfiConverterTypeFfiLibraryScope.write(value.scope, into: &buf)
+        FfiConverterOptionString.write(value.assetModifiedAt, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiScanProbe_lift(_ buf: RustBuffer) throws -> FfiScanProbe {
+    return try FfiConverterTypeFfiScanProbe.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiScanProbe_lower(_ value: FfiScanProbe) -> RustBuffer {
+    return FfiConverterTypeFfiScanProbe.lower(value)
+}
+
+
+/**
+ * Scan outcome (mirrors `scan::ScanSummary`).
+ */
+public struct FfiScanSummary: Equatable, Hashable {
+    public var probed: UInt64
+    public var neededFull: UInt64
+    public var deletionsSynthesized: UInt64
+    public var gaveUpReset: UInt64
+    public var synthesisSkipped: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(probed: UInt64, neededFull: UInt64, deletionsSynthesized: UInt64, gaveUpReset: UInt64, synthesisSkipped: Bool) {
+        self.probed = probed
+        self.neededFull = neededFull
+        self.deletionsSynthesized = deletionsSynthesized
+        self.gaveUpReset = gaveUpReset
+        self.synthesisSkipped = synthesisSkipped
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiScanSummary: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiScanSummary: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiScanSummary {
+        return
+            try FfiScanSummary(
+                probed: FfiConverterUInt64.read(from: &buf), 
+                neededFull: FfiConverterUInt64.read(from: &buf), 
+                deletionsSynthesized: FfiConverterUInt64.read(from: &buf), 
+                gaveUpReset: FfiConverterUInt64.read(from: &buf), 
+                synthesisSkipped: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiScanSummary, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.probed, into: &buf)
+        FfiConverterUInt64.write(value.neededFull, into: &buf)
+        FfiConverterUInt64.write(value.deletionsSynthesized, into: &buf)
+        FfiConverterUInt64.write(value.gaveUpReset, into: &buf)
+        FfiConverterBool.write(value.synthesisSkipped, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiScanSummary_lift(_ buf: RustBuffer) throws -> FfiScanSummary {
+    return try FfiConverterTypeFfiScanSummary.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiScanSummary_lower(_ value: FfiScanSummary) -> RustBuffer {
+    return FfiConverterTypeFfiScanSummary.lower(value)
 }
 
 
@@ -2521,6 +2947,82 @@ public func FfiConverterTypeFfiResolution_lower(_ value: FfiResolution) -> RustB
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * Per-asset probe verdict (mirrors `scan::ScanVerdict`).
+ */
+
+public enum FfiScanVerdict: Equatable, Hashable {
+    
+    /**
+     * Nothing to do — skip the full descriptor.
+     */
+    case done
+    /**
+     * Build the full descriptor and push via `observe_descriptors`.
+     */
+    case needsFull
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FfiScanVerdict: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiScanVerdict: FfiConverterRustBuffer {
+    typealias SwiftType = FfiScanVerdict
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiScanVerdict {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .done
+        
+        case 2: return .needsFull
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiScanVerdict, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .done:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .needsFull:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiScanVerdict_lift(_ buf: RustBuffer) throws -> FfiScanVerdict {
+    return try FfiConverterTypeFfiScanVerdict.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiScanVerdict_lower(_ value: FfiScanVerdict) -> RustBuffer {
+    return FfiConverterTypeFfiScanVerdict.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * Outcome of a seed pass (mirrors `resolve::SeedOutcome`).
  */
 
@@ -2835,6 +3337,31 @@ fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeFfiAssetDescriptor: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiAssetDescriptor]
+
+    public static func write(_ value: [FfiAssetDescriptor], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiAssetDescriptor.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiAssetDescriptor] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiAssetDescriptor]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiAssetDescriptor.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeFfiResourceDescriptor: FfiConverterRustBuffer {
     typealias SwiftType = [FfiResourceDescriptor]
 
@@ -2887,6 +3414,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_ingress_ffi_checksum_method_chunksink_write() != 47546) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_ingress_ffi_checksum_method_ingresssession_abort_scan() != 54287) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_ingress_ffi_checksum_method_ingresssession_add_library() != 27566) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -2896,13 +3426,31 @@ private let initializationResult: InitializationResult = {
     if (uniffi_ingress_ffi_checksum_method_ingresssession_begin_resource() != 35203) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_ingress_ffi_checksum_method_ingresssession_begin_scan() != 2861) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_ingress_ffi_checksum_method_ingresssession_cancel_drain() != 12111) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ingress_ffi_checksum_method_ingresssession_drain() != 12569) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_ingress_ffi_checksum_method_ingresssession_finish_scan() != 31670) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_ingress_ffi_checksum_method_ingresssession_ingest_descriptor() != 48163) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ingress_ffi_checksum_method_ingresssession_observe_descriptors() != 43035) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ingress_ffi_checksum_method_ingresssession_observe_removed() != 38301) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ingress_ffi_checksum_method_ingresssession_run_daemon() != 30255) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ingress_ffi_checksum_method_ingresssession_scan_asset() != 65296) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ingress_ffi_checksum_method_ingresssession_seed_descriptor() != 29230) {

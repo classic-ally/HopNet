@@ -202,6 +202,92 @@ func runDrain() throws {
     print("  gave up:              \(report.gaveUp)")
 }
 
+/// The continuous daemon (spec §Process model): change observer + startup and
+/// periodic reconciliation scans feeding the never-exiting Rust loop.
+func runDaemon() throws {
+    try ensureAuthorized()
+    let session = try IngressSession(dataDir: dataDir)
+    let fetcher = PhotoKitFetcher()
+    let retryCap = Int64(intFlag("--retry-cap", default: 5))
+    let scanQueue = DispatchQueue(label: "photo-ingress.scan")
+
+    let scanLimit = flagValue(args, "--scan-limit").flatMap { Int($0) }
+    let runScanLogged = { (label: String) in
+        do {
+            let s = try runScan(session: session, retryCap: retryCap, limit: scanLimit)
+            print("scan (\(label)): probed=\(s.probed) needed_full=\(s.neededFull) " +
+                  "deletions=\(s.deletionsSynthesized) gave_up_reset=\(s.gaveUpReset)" +
+                  (s.synthesisSkipped ? " SYNTHESIS SKIPPED (zero enumeration)" : ""))
+        } catch {
+            // Includes "a scan is already active" — a periodic tick landing
+            // mid-scan just skips.
+            print("scan (\(label)) skipped/failed: \(error)")
+        }
+    }
+
+    // Observer registers BEFORE the startup scan: the overlap window closes
+    // via idempotent duplicate delivery; an unobserved window does not.
+    // A non-incremental (full reload) change falls back to a rescan.
+    let observer = LibraryObserver(session: session) {
+        scanQueue.async { runScanLogged("full-reload") }
+    }
+    observer.start()
+    scanQueue.async { runScanLogged("startup") }
+
+    let scanInterval = intFlag("--scan-interval-secs", default: 3600)
+    let timer = DispatchSource.makeTimerSource(queue: scanQueue)
+    timer.schedule(deadline: .now() + Double(scanInterval), repeating: Double(scanInterval))
+    timer.setEventHandler { runScanLogged("periodic") }
+    timer.resume()
+
+    signal(SIGTERM, SIG_IGN)
+    signal(SIGINT, SIG_IGN)
+    let makeHandler = { (sig: Int32) -> DispatchSourceSignal in
+        let src = DispatchSource.makeSignalSource(signal: sig, queue: .global())
+        src.setEventHandler {
+            print("signal received — stopping daemon (rows stay pending)")
+            fetcher.cancelAll()
+            session.cancelDrain()
+        }
+        src.resume()
+        return src
+    }
+    let sigterm = makeHandler(SIGTERM)
+    let sigint = makeHandler(SIGINT)
+    defer {
+        sigterm.cancel()
+        sigint.cancel()
+        timer.cancel()
+        observer.stop()
+    }
+
+    let options = FfiDaemonOptions(
+        fetchConcurrency: UInt32(intFlag("--fetch-concurrency", default: 4)),
+        retryCap: retryCap,
+        retryBaseSecs: intFlag("--retry-base-secs", default: 30),
+        retryMaxSecs: intFlag("--retry-max-secs", default: 3600),
+        reserveFloorGib: intFlag("--reserve-floor-gib", default: 10),
+        pressurePauseSecs: intFlag("--pressure-pause-secs", default: 60),
+        storagePollSecs: intFlag("--storage-poll-secs", default: 15)
+    )
+    print("daemon running (scan interval \(scanInterval)s) — SIGTERM/SIGINT to stop")
+    let report = try session.runDaemon(fetcher: fetcher, options: options)
+    print("daemon report:")
+    print("  events applied:       \(report.eventsApplied) (deferred \(report.eventsDeferred))")
+    print("  deletions:            \(report.deletions)")
+    print("  restores:             \(report.restores)")
+    print("  transitions:          \(report.transitions)")
+    print("  resources reopened:   \(report.resourcesReopened)")
+    print("  photos completed:     \(report.drain.photosCompleted)")
+    print("  resources written:    \(report.drain.resourcesWritten) (\(report.drain.bytesWritten) bytes)")
+    print("  resources deduped:    \(report.drain.resourcesDeduped)")
+    print("  swept partial temps:  \(report.drain.sweptPartials)")
+    print("  pauses:               \(report.drain.pauses)")
+    print("  awaiting retry:       \(report.drain.awaitingRetry)" +
+          (report.drain.earliestNextRetryAt.map { " (earliest \($0))" } ?? ""))
+    print("  gave up:              \(report.drain.gaveUp)")
+}
+
 // Never block the main thread on PhotoKit (spike lesson): work on a
 // background queue, main thread services the main dispatch queue.
 DispatchQueue.global().async {
@@ -211,6 +297,7 @@ DispatchQueue.global().async {
         case "ingest": try runIngest()
         case "seed": try runSeed()
         case "drain": try runDrain()
+        case "daemon": try runDaemon()
         default: fail("unknown command \(command)")
         }
         exit(0)

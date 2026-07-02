@@ -5,6 +5,7 @@
 
 pub mod admission;
 pub mod backoff;
+pub mod daemon;
 pub mod fetcher;
 pub mod locks;
 
@@ -23,8 +24,8 @@ use crate::model::{LibraryConfig, PhotoRecord, ResourceType};
 use crate::paths::{BlobPaths, DataDir, TempKey};
 use crate::resolve::late_binding_merge;
 use crate::sidecar_io::write_photo_sidecar;
-use crate::store::{photos, StateStore};
-use crate::writer::{finalize_resource, sweep_partials, ResourceWrite};
+use crate::store::{StateStore, photos};
+use crate::writer::{ResourceWrite, finalize_resource, sweep_partials};
 
 pub use admission::{FreeSpaceProbe, StatvfsProbe};
 pub use backoff::BackoffConfig;
@@ -100,6 +101,9 @@ struct Shared {
     locks: locks::KeyedLocks,
     counters: Mutex<Counters>,
     pause: Mutex<PauseState>,
+    /// Photos with a live `photo_task`. Hoisted here (not loop-local) so the
+    /// daemon's event classification can defer changes to inflight photos.
+    inflight: Mutex<HashSet<PhotoId>>,
 }
 
 /// One drain run over the state store.
@@ -115,11 +119,18 @@ struct DrainLock(std::path::PathBuf);
 impl DrainLock {
     fn acquire(data_dir: &DataDir) -> Result<Self> {
         let path = data_dir.root().join("drain.lock");
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
             Ok(_) => Ok(Self(path)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(IngressError::Invariant(
-                format!("another drain is running (or crashed): {} exists", path.display()),
-            )),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(IngressError::Invariant(format!(
+                    "another drain is running (or crashed): {} exists",
+                    path.display()
+                )))
+            }
             Err(e) => Err(IngressError::Invariant(format!("drain lock: {e}"))),
         }
     }
@@ -152,6 +163,7 @@ impl<F: ResourceFetcher> Scheduler<F> {
                 locks: locks::KeyedLocks::new(),
                 counters: Mutex::new(Counters::default()),
                 pause: Mutex::new(PauseState::default()),
+                inflight: Mutex::new(HashSet::new()),
             }),
         }
     }
@@ -160,20 +172,12 @@ impl<F: ResourceFetcher> Scheduler<F> {
     /// from the caller's perspective only in the async sense — run inside a
     /// multi-thread runtime (fetcher calls use `spawn_blocking`).
     pub async fn drain(&self) -> Result<DrainReport> {
-        let _lock = DrainLock::acquire(&self.shared.data_dir)?;
-        let libraries = self.shared.store.libraries().await?;
-        let mut swept = 0u64;
-        for lib in &libraries {
-            // First-run: the configured blob root may not exist yet, and the
-            // admission statvfs needs a real path to probe.
-            std::fs::create_dir_all(&lib.blob_root)
-                .map_err(|e| IngressError::Invariant(format!("blob_root {}: {e}", lib.blob_root)))?;
-            swept += sweep_partials(&BlobPaths::new(&lib.blob_root))?;
-        }
-
+        let (_lock, swept) = self.prepare().await?;
         let mut tasks: JoinSet<()> = JoinSet::new();
-        let inflight: Arc<Mutex<HashSet<PhotoId>>> = Arc::new(Mutex::new(HashSet::new()));
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(self.shared.config.fetch_concurrency));
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(
+            self.shared.config.fetch_concurrency,
+        ));
+        let no_skip = HashSet::new();
 
         loop {
             if self.shared.cancel.is_cancelled() {
@@ -184,18 +188,7 @@ impl<F: ResourceFetcher> Scheduler<F> {
                 continue;
             }
 
-            let batch = photos::pending_photos(
-                self.shared.store.pool(),
-                self.shared.config.retry_cap,
-                Utc::now(),
-                (self.shared.config.fetch_concurrency * 2) as i64,
-            )
-            .await?;
-            let claimable: Vec<PhotoRecord> = {
-                let inflight = inflight.lock().expect("inflight mutex");
-                batch.into_iter().filter(|p| !inflight.contains(&p.photo_id)).collect()
-            };
-
+            let claimable = self.claim_batch(&no_skip).await?;
             if claimable.is_empty() {
                 if tasks.is_empty() {
                     break; // queue drained (or only future retries remain)
@@ -203,47 +196,109 @@ impl<F: ResourceFetcher> Scheduler<F> {
                 let _ = tasks.join_next().await; // wait for capacity/progress
                 continue;
             }
-
-            for photo in claimable {
-                let permit = semaphore.clone().acquire_owned().await.expect("semaphore open");
-                if self.shared.cancel.is_cancelled() {
-                    break;
-                }
-                inflight.lock().expect("inflight mutex").insert(photo.photo_id.clone());
-                let shared = self.shared.clone();
-                let fetcher = self.fetcher.clone();
-                let inflight = inflight.clone();
-                tasks.spawn(async move {
-                    let photo_id = photo.photo_id.clone();
-                    if let Err(e) = photo_task(shared.clone(), fetcher, photo.clone()).await {
-                        // Task-level invariant failures are logged AND bump
-                        // retries like a transient failure — a persistent
-                        // error must converge to give-up, never livelock the
-                        // work queue on an unbumped pending photo.
-                        let _ = shared
-                            .store
-                            .append_log(
-                                "drain_task_error",
-                                Some(&photo_id),
-                                Some(serde_json::json!({ "error": e.to_string() })),
-                            )
-                            .await;
-                        let _ = apply_failure_to_photo(
-                            &shared,
-                            &photo,
-                            &FetchFailure::Transient(format!("task error: {e}")),
-                        )
-                        .await;
-                    }
-                    inflight.lock().expect("inflight mutex").remove(&photo_id);
-                    drop(permit);
-                });
-            }
+            self.spawn_all(&mut tasks, &semaphore, claimable).await;
         }
 
         while tasks.join_next().await.is_some() {}
+        self.report(swept).await
+    }
 
-        let summary = self.shared.store.retry_summary(self.shared.config.retry_cap).await?;
+    /// One-time run setup shared by `drain` and `run_daemon`: the exclusive
+    /// lock, blob-root creation, and the startup `.partial` sweep.
+    async fn prepare(&self) -> Result<(DrainLock, u64)> {
+        let lock = DrainLock::acquire(&self.shared.data_dir)?;
+        let libraries = self.shared.store.libraries().await?;
+        let mut swept = 0u64;
+        for lib in &libraries {
+            // First-run: the configured blob root may not exist yet, and the
+            // admission statvfs needs a real path to probe.
+            std::fs::create_dir_all(&lib.blob_root).map_err(|e| {
+                IngressError::Invariant(format!("blob_root {}: {e}", lib.blob_root))
+            })?;
+            swept += sweep_partials(&BlobPaths::new(&lib.blob_root))?;
+        }
+        Ok((lock, swept))
+    }
+
+    /// Pull the next work batch, filtered against inflight photos and the
+    /// caller's skip set (the daemon's deferred photos — a photo with a
+    /// queued hard move must not start fetching into the old root).
+    async fn claim_batch(&self, skip: &HashSet<PhotoId>) -> Result<Vec<PhotoRecord>> {
+        let batch = photos::pending_photos(
+            self.shared.store.pool(),
+            self.shared.config.retry_cap,
+            Utc::now(),
+            (self.shared.config.fetch_concurrency * 2) as i64,
+        )
+        .await?;
+        let inflight = self.shared.inflight.lock().expect("inflight mutex");
+        Ok(batch
+            .into_iter()
+            .filter(|p| !inflight.contains(&p.photo_id) && !skip.contains(&p.photo_id))
+            .collect())
+    }
+
+    /// Spawn one `photo_task` per claimed photo, bounded by the semaphore.
+    async fn spawn_all(
+        &self,
+        tasks: &mut JoinSet<()>,
+        semaphore: &Arc<tokio::sync::Semaphore>,
+        claimable: Vec<PhotoRecord>,
+    ) {
+        for photo in claimable {
+            let permit = semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("semaphore open");
+            if self.shared.cancel.is_cancelled() {
+                break;
+            }
+            self.shared
+                .inflight
+                .lock()
+                .expect("inflight mutex")
+                .insert(photo.photo_id.clone());
+            let shared = self.shared.clone();
+            let fetcher = self.fetcher.clone();
+            tasks.spawn(async move {
+                let photo_id = photo.photo_id.clone();
+                if let Err(e) = photo_task(shared.clone(), fetcher, photo.clone()).await {
+                    // Task-level invariant failures are logged AND bump
+                    // retries like a transient failure — a persistent
+                    // error must converge to give-up, never livelock the
+                    // work queue on an unbumped pending photo.
+                    let _ = shared
+                        .store
+                        .append_log(
+                            "drain_task_error",
+                            Some(&photo_id),
+                            Some(serde_json::json!({ "error": e.to_string() })),
+                        )
+                        .await;
+                    let _ = apply_failure_to_photo(
+                        &shared,
+                        &photo,
+                        &FetchFailure::Transient(format!("task error: {e}")),
+                    )
+                    .await;
+                }
+                shared
+                    .inflight
+                    .lock()
+                    .expect("inflight mutex")
+                    .remove(&photo_id);
+                drop(permit);
+            });
+        }
+    }
+
+    async fn report(&self, swept: u64) -> Result<DrainReport> {
+        let summary = self
+            .shared
+            .store
+            .retry_summary(self.shared.config.retry_cap)
+            .await?;
         let c = self.shared.counters.lock().expect("counters mutex");
         Ok(DrainReport {
             photos_completed: c.photos_completed,
@@ -274,7 +329,12 @@ impl<F: ResourceFetcher> Scheduler<F> {
         } else {
             self.shared.config.storage_poll
         };
-        tokio::time::sleep(wait).await;
+        // Cancellation must not wait the pause out (the caller re-checks the
+        // token immediately).
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = self.shared.cancel.cancelled() => return true,
+        }
         {
             // Recovery is probe-by-retry: clear the pause and let the next
             // admission/fetch re-detect if the condition persists.
@@ -285,7 +345,11 @@ impl<F: ResourceFetcher> Scheduler<F> {
         let _ = self
             .shared
             .store
-            .append_log("storage_recovered", None, Some(serde_json::json!({ "probe": "resume" })))
+            .append_log(
+                "storage_recovered",
+                None,
+                Some(serde_json::json!({ "probe": "resume" })),
+            )
             .await;
         true
     }
@@ -295,14 +359,21 @@ impl<F: ResourceFetcher> Scheduler<F> {
 async fn enter_pause(shared: &Shared, local_disk: bool, detail: serde_json::Value) {
     let newly = {
         let mut p = shared.pause.lock().expect("pause mutex");
-        let flag = if local_disk { &mut p.local_pressure } else { &mut p.storage_low };
+        let flag = if local_disk {
+            &mut p.local_pressure
+        } else {
+            &mut p.storage_low
+        };
         let newly = !*flag;
         *flag = true;
         newly
     };
     if newly {
         shared.counters.lock().expect("counters mutex").pauses += 1;
-        let _ = shared.store.append_log("storage_low", None, Some(detail)).await;
+        let _ = shared
+            .store
+            .append_log("storage_low", None, Some(detail))
+            .await;
     }
 }
 
@@ -313,17 +384,19 @@ async fn photo_task<F: ResourceFetcher>(
     fetcher: Arc<F>,
     photo: PhotoRecord,
 ) -> Result<()> {
-    let library_id = photo.library_id.clone().expect("work query filters NULL libraries");
+    let library_id = photo
+        .library_id
+        .clone()
+        .expect("work query filters NULL libraries");
     let library = shared
         .store
         .library(&library_id)
         .await?
         .ok_or_else(|| IngressError::Invariant(format!("no library row {library_id}")))?;
     let paths = BlobPaths::new(&library.blob_root);
-    let local_id = photo
-        .local_id
-        .clone()
-        .ok_or_else(|| IngressError::Invariant(format!("photo {} has no local_id", photo.photo_id)))?;
+    let local_id = photo.local_id.clone().ok_or_else(|| {
+        IngressError::Invariant(format!("photo {} has no local_id", photo.photo_id))
+    })?;
 
     // Fresh descriptor (blocking platform call).
     let desc = {
@@ -349,9 +422,7 @@ async fn photo_task<F: ResourceFetcher>(
         .await?
         .into_iter()
         .filter(|r| r.written_at.is_none() && r.retry_count < shared.config.retry_cap)
-        .filter(|r| {
-            r.next_retry_at.map(|t| t <= Utc::now()).unwrap_or(true)
-        })
+        .filter(|r| r.next_retry_at.map(|t| t <= Utc::now()).unwrap_or(true))
         .map(|r| r.resource_type)
         .collect();
     pending.sort(); // ResourceType::Original == 0 sorts first
@@ -366,9 +437,11 @@ async fn photo_task<F: ResourceFetcher>(
         }
 
         // Locate this resource on the fresh descriptor.
-        let Some(res_desc) = desc.resources.iter().find(|r| {
-            ResourceType::from_ph_type(r.ph_resource_type) == Some(resource_type)
-        }) else {
+        let Some(res_desc) = desc
+            .resources
+            .iter()
+            .find(|r| ResourceType::from_ph_type(r.ph_resource_type) == Some(resource_type))
+        else {
             let n = bump_failure(
                 &shared,
                 &current_photo_id,
@@ -468,7 +541,10 @@ async fn stream_one_resource<F: ResourceFetcher>(
     }
     let ext = derivation.ext().to_string();
 
-    let key = TempKey::Resource { photo_id: current_photo_id.clone(), resource_type };
+    let key = TempKey::Resource {
+        photo_id: current_photo_id.clone(),
+        resource_type,
+    };
     let write = match ResourceWrite::begin(paths, &key) {
         Ok(w) => w,
         Err(e) => {
@@ -508,8 +584,12 @@ async fn stream_one_resource<F: ResourceFetcher>(
     let finished = match sink.take_finished() {
         Ok(f) => f,
         Err(_) => {
-            enter_pause(shared, false, serde_json::json!({ "disk": "blob_root", "op": "finish" }))
-                .await;
+            enter_pause(
+                shared,
+                false,
+                serde_json::json!({ "disk": "blob_root", "op": "finish" }),
+            )
+            .await;
             return Ok(TaskFlow::Stop);
         }
     };
@@ -527,7 +607,11 @@ async fn stream_one_resource<F: ResourceFetcher>(
         .await?
     {
         std::fs::remove_file(&finished.temp_path).ok();
-        shared.counters.lock().expect("counters mutex").late_binding_merges += 1;
+        shared
+            .counters
+            .lock()
+            .expect("counters mutex")
+            .late_binding_merges += 1;
         *current_photo_id = survivor;
         // The surviving photo's remaining pending resources (if any) drain
         // via the queue under its own admission; this provisional task is done.
@@ -578,13 +662,22 @@ async fn handle_fetch_failure(
 ) -> Result<TaskFlow> {
     match failure {
         FetchFailure::LocalDiskPressure => {
-            enter_pause(shared, true, serde_json::json!({ "disk": "local", "code": 1005 })).await;
+            enter_pause(
+                shared,
+                true,
+                serde_json::json!({ "disk": "local", "code": 1005 }),
+            )
+            .await;
             Ok(TaskFlow::Stop)
         }
         FetchFailure::Cancelled => Ok(TaskFlow::Stop),
         FetchFailure::Sink(msg) => {
-            enter_pause(shared, false, serde_json::json!({ "disk": "blob_root", "error": msg }))
-                .await;
+            enter_pause(
+                shared,
+                false,
+                serde_json::json!({ "disk": "blob_root", "error": msg }),
+            )
+            .await;
             Ok(TaskFlow::Stop)
         }
         FetchFailure::AssetUnavailable(msg) | FetchFailure::Transient(msg) => {
@@ -629,13 +722,22 @@ async fn apply_failure_to_photo(
 ) -> Result<()> {
     match failure {
         FetchFailure::LocalDiskPressure => {
-            enter_pause(shared, true, serde_json::json!({ "disk": "local", "code": 1005 })).await;
+            enter_pause(
+                shared,
+                true,
+                serde_json::json!({ "disk": "local", "code": 1005 }),
+            )
+            .await;
             Ok(())
         }
         FetchFailure::Cancelled => Ok(()),
         FetchFailure::Sink(msg) => {
-            enter_pause(shared, false, serde_json::json!({ "disk": "blob_root", "error": msg }))
-                .await;
+            enter_pause(
+                shared,
+                false,
+                serde_json::json!({ "disk": "blob_root", "error": msg }),
+            )
+            .await;
             Ok(())
         }
         FetchFailure::AssetUnavailable(msg) | FetchFailure::Transient(msg) => {

@@ -288,6 +288,8 @@ Step 4's refcount check matters symmetrically: if another photo in the source li
 
 The refcount updates (steps 3 and 4) and the `photos` row update (step 5) run inside a single SQLite transaction. The filesystem operations (copy, delete) are bracketed by but not part of that transaction. If a copy or delete fails mid-way, the daemon recovers using the rules described in the Recovery section: refcounts in `state.db` are the authoritative reference state, and the on-disk presence of a blob is reconciled against them on startup.
 
+*Implementation errata (Phase 4):* all copies run **before** the transaction, not interleaved per step 3's numbering. A dst refcount committed ahead of its copy could reference bytes that never arrived — which fsck classifies as byte loss — whereas copy-first leaves only benign orphan files on a crash, consistent with the write path's durability-precedes-commit invariant. Source-file deletes still run after the transaction.
+
 #### Why hard move, not soft
 
 An earlier draft considered leaving blobs in their original library's subtree after a transition and updating only the logical `library_id`. That approach was rejected: it would leave a `shared`-scope photo with bytes physically located under `/<root>/personal/blobs/`, which the personal-library-only ACL would correctly deny to shared-library participants. The photo's access state would become incoherent. Hard move keeps the invariant that **a photo's bytes are always under its current `library_id`'s subtree**, and this invariant is what makes the server-side ACL story work without app-level coordination.
@@ -431,7 +433,7 @@ Notes:
 - **Blob paths are not stored.** A resource's blob path is reconstructed at read time as `<blob_root(photos.library_id)>/<aa>/<bb>/<content_hash>.<ext>` — this is what makes library transitions a pure refcount-plus-`photos.library_id` operation with no per-resource updates.
 - **Resource lifecycle mirrors PhotoKit's current state; no version history.**
   - *First edit* (asset gains an edited rendition): a new row with `resource_type = 1` appears alongside the untouched `original` row (for Live Photos, an `edited_paired_video = 7` row appears as well). This is additional current resources, not history.
-  - *Re-edit* (asset's edited rendition is replaced): the `edited` row is updated in place with the new `content_hash`. In the same transaction, the superseded blob's refcount is decremented (deleting the file if it reaches 0) and the new blob's refcount is incremented. Superseded edit renditions are not retained — the daemon archives the current iCloud state; version history is RFC-011's operation log's job post-migration.
+  - *Re-edit* (asset's edited rendition is replaced): the `edited` row is updated in place with the new `content_hash`. In the same transaction — the **write-commit transaction of the replacement bytes**, not the classification event (the new bytes must be fetched first; between classification and commit the row sits in the superseded-pending state, see §Per-resource state machine) — the superseded blob's refcount is decremented (deleting the file if it reaches 0) and the new blob's refcount is incremented. Detection is a `fileSize` compare (descriptor vs stored `size_bytes`) on written edit-mutable rows; equal or absent sizes are assumed unchanged, and a false positive (changed size, identical bytes) nets to a refcount no-op. Superseded edit renditions are not retained — the daemon archives the current iCloud state; version history is RFC-011's operation log's job post-migration.
   - *Revert to original* (user discards edits): the `edited` row (and `adjustment_data` row, if PhotoKit drops it) is deleted, with the same refcount decrement semantics.
   - The `original` row is never overwritten in any of these flows.
 - **`adjustment_data` (type 3) is captured.** `PHAdjustmentData` is the reversible-edit recipe and cannot be re-derived once the Photos library is gone; RFC-011 expects it for edit reconstruction. The payload is a small non-image blob; it flows through the same content-addressed write path with an extension derived from its UTI.
@@ -579,12 +581,13 @@ Every discovery event resolves to exactly one of five kinds. All sidecar rewrite
 
 ### Per-resource state machine
 
-A resource has exactly **two persistent states**:
+A resource has three persistent states, keyed on `written_at`:
 
 - **pending** — `content_hash IS NULL`, `written_at IS NULL`. Retry metadata (`retry_count`, `next_retry_at`, `last_error`) annotates this state; a resource that exhausted retries is still `pending`, terminally, with a `resource_gave_up` log event.
+- **superseded-pending** *(Phase 4 amendment)* — `content_hash` set, `written_at IS NULL`. A re-edit *reopens* the row: `written_at` and retry state clear, but the old `content_hash` is **retained as the superseded pointer** so the blob refcount swap (decrement old, increment new, `blob_superseded` log) commits atomically with the replacement bytes at write time. This preserves both the no-byte-loss window (the old render's refcount survives until the new render is durable) and the `ref_count` recount invariant (the row still references the old blob until the swap). The work queue keys on `written_at IS NULL`, so this state is pending for scheduling purposes.
 - **written** — `content_hash` and `written_at` both set, always in the same transaction.
 
-There is deliberately no persisted intermediate ("fetched", "hashed"): bytes stream once through the BLAKE3 hasher into the temp file simultaneously, so the hash is only known at the moment the blob is already durably placeable — the two facts commit together or not at all. A crash mid-stream leaves only an orphan temp file and an untouched `pending` row.
+There is deliberately no persisted intermediate ("fetched", "hashed"): bytes stream once through the BLAKE3 hasher into the temp file simultaneously, so the hash is only known at the moment the blob is already durably placeable — the two facts commit together or not at all. A crash mid-stream leaves only an orphan temp file and an untouched `pending` (or superseded-pending) row.
 
 ### Write path
 
@@ -636,7 +639,7 @@ When a deletion event fires for an asset the daemon has previously ingested:
 2. No deleting actor is recorded — the daemon has a single implicit user; RFC-011's `deleted_by` is assigned to the importing user at migration (see the `photos` schema notes).
 3. `photo_resources` rows are **not** touched.
 4. `blobs.ref_count` values are **not** decremented.
-5. The sidecar's `deleted_at` field is set and the sidecar JSON is rewritten in place.
+5. The sidecar's `deleted_at` field is set and the sidecar JSON is rewritten in place. This is a **read-modify-write of the existing document** — the asset no longer exists in PhotoKit, so recomposition from a descriptor is impossible; and since the sidecar path is keyed on `captured_at` (not persisted in `state.db`), the document is located by a two-level `YYYY/MM` walk. A photo that never materialized has no sidecar; the step is skipped silently.
 6. A `deletion_observed` event is recorded in the ingest log.
 
 Steps 3 and 4 mean the bytes stay on disk and the refcount remains accurate to the (still-existing) `photo_resources` rows. The photo disappears from active queries (`WHERE deleted_at IS NULL`) but is fully restorable until the retention window expires.
@@ -803,13 +806,17 @@ Structure: a Swift executable (the LaunchAgent) linking `ingress-core` (Rust, in
 - Seed mints photo + pending resource rows at discovery (aligns with §Discovery); rule 2a consequently runs at drain time as a **late-binding merge** — the existing cloud_id-less photo survives (keeps photo_id + blobs), the seed-minted provisional row is deleted before anything on disk references it (original streams first), logged as `late_binding_merge`
 - Drain-time descriptors come fresh from `descriptor_for` per admitted photo (never persisted; serves sidecar fields, ext derivation, and admission sizes)
 
-### Phase 4: Discovery [ ]
-- Change observer wiring
-- Reconciliation scan (startup + periodic), offline-deletion synthesis
-- Change classification (all five kinds), metadata-only updates, library transitions
+### Phase 4: Discovery [x] — `classify.rs`, `scan.rs`, `transition.rs`, `scheduler/daemon.rs`, `daemon` subcommand
+- Change classification: pure planner (`plan_changes`) + applier (`apply_change`) covering all five kinds; observer events and scan re-deliveries funnel through the same idempotent path. NoOp is the hot path (redundant PhotoKit delivery). Original-class rows are never removed by a diff (`original_disappeared` invariant event).
+- Tombstone/restore pulled forward from Phase 5 (deletion synthesis needs them): guarded single-tx updates + `deletion_observed`/`restore_observed`; sidecar `deleted_at` via read-modify-write (see §Tombstone step 5).
+- Re-edit = fileSize compare → superseded-pending reopen; refcount swap commits with the replacement bytes (see §Per-resource state machine amendment). Revert deletes rows + reaps blobs (row deleted at refcount 0 — a lingering file is the benign fsck class, a lingering row is the loud one).
+- Hard moves per §Asset migrating, copy-before-tx (see errata there); sidecar relocates between library roots; pending resources ride along logically and fetch into the dst root.
+- Reconciliation scan: light-probe protocol (`scan_asset` — identity/scope/date only, NO per-asset resource enumeration; full descriptors only for probe misses). Seen-marking at probe time so deletion synthesis is immune to event-queue lag. Health guard: zero enumeration vs non-empty store skips synthesis (lost TCC must never mass-tombstone). Gave-up retry state resets at scan close (spec §Failure Handling).
+- Daemon loop: drain that never exits; Swift pushes observer events (unbounded channel + wake). Events for inflight photos DEFER into a per-photo FIFO and those photos are not admitted — structural prevention of the finalize-vs-move race (verified by a barrier-pinned test). `CancelToken` gained an async `cancelled()` waker — a live SIGTERM test caught the idle `select!` sleeping through cancellation.
+- AssetUnavailable is NOT inline-reclassified as deletion (local_id ≠ identity; API-health rule) — observer removals + scan synthesis are the two deletion detectors.
+- Verified on-device: cold-start daemon scan seeds+drains 25 assets (21 personal / 4 shared, b3sum-exact); live favorite → metadata-only sidecar refresh, zero fetches; idempotent restart rescan (probed=25, needed_full=0); SIGTERM → prompt report + lock release. EXIF pass (orientation/camera/UTC offset) deliberately deferred.
 
 ### Phase 5: Lifecycle [ ]
-- Tombstone / restore handling
 - Hourly cleanup job: hard deletes, refcount-zero blob removal, log pruning, daily state snapshots
 - `sidecar_replicated_at` dirty-set drain
 

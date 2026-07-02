@@ -8,8 +8,8 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::SqlitePool;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 
 use crate::error::Result;
 
@@ -20,6 +20,7 @@ pub(crate) mod photos;
 pub(crate) mod resources;
 
 pub use log::LogEvent;
+pub use resources::{RetrySummary, WriteCommit};
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 

@@ -77,11 +77,19 @@ pub struct FfiAssetDescriptor {
 /// Outcome of the no-bytes resolution pass (mirrors `resolve::Resolution`).
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum FfiResolution {
-    AlreadyKnown { photo_id: String, metadata_changed: bool, scope_changed: bool },
+    AlreadyKnown {
+        photo_id: String,
+        metadata_changed: bool,
+        scope_changed: bool,
+    },
     /// Previously-unmapped photo adopted its now-bound library.
-    Adopted { photo_id: String },
+    Adopted {
+        photo_id: String,
+    },
     NeedsOriginal,
-    UnmappedScope { photo_id: String },
+    UnmappedScope {
+        photo_id: String,
+    },
 }
 
 /// Outcome of a seed pass (mirrors `resolve::SeedOutcome`).
@@ -119,6 +127,62 @@ pub struct FfiDrainReport {
     pub gave_up: i64,
     /// ISO 8601, when retries remain.
     pub earliest_next_retry_at: Option<String>,
+}
+
+/// Light reconciliation-scan probe (mirrors `scan::ScanProbe`) — identity +
+/// scope + modification date only, NO resource enumeration.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiScanProbe {
+    pub local_id: String,
+    pub cloud_id: Option<String>,
+    pub scope: FfiLibraryScope,
+    /// ISO 8601 UTC.
+    pub asset_modified_at: Option<String>,
+}
+
+/// Per-asset probe verdict (mirrors `scan::ScanVerdict`).
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum FfiScanVerdict {
+    /// Nothing to do — skip the full descriptor.
+    Done,
+    /// Build the full descriptor and push via `observe_descriptors`.
+    NeedsFull,
+}
+
+/// Scan outcome (mirrors `scan::ScanSummary`).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiScanSummary {
+    pub probed: u64,
+    pub needed_full: u64,
+    pub deletions_synthesized: u64,
+    pub gave_up_reset: u64,
+    pub synthesis_skipped: bool,
+}
+
+/// Daemon knobs — the drain knobs verbatim (the rescan timer is owned by the
+/// platform side, which also owns enumeration).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiDaemonOptions {
+    pub fetch_concurrency: u32,
+    pub retry_cap: i64,
+    pub retry_base_secs: u64,
+    pub retry_max_secs: u64,
+    pub reserve_floor_gib: u64,
+    pub pressure_pause_secs: u64,
+    pub storage_poll_secs: u64,
+}
+
+/// Daemon outcome (mirrors `daemon::DaemonReport`): drain counters plus the
+/// event side.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiDaemonReport {
+    pub drain: FfiDrainReport,
+    pub events_applied: u64,
+    pub events_deferred: u64,
+    pub deletions: u64,
+    pub restores: u64,
+    pub transitions: u64,
+    pub resources_reopened: u64,
 }
 
 /// How the original's hash resolved (mirrors `resolve::HashResolution`).

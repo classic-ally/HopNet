@@ -7,13 +7,13 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
 
 use ingress_core::descriptor::AssetDescriptor;
-use ingress_core::fixtures::{add_shared, store_with_personal, AssetDescriptorBuilder};
+use ingress_core::fixtures::{AssetDescriptorBuilder, add_shared, store_with_personal};
 use ingress_core::paths::DataDir;
 use ingress_core::scheduler::{
     BackoffConfig, CancelToken, FetchFailure, FetchRequest, FreeSpaceProbe, ResourceFetcher,
     Scheduler, SchedulerConfig, StreamSink,
 };
-use ingress_core::{seed_descriptor, LibraryScope, SeedOutcome, StateStore};
+use ingress_core::{LibraryScope, SeedOutcome, StateStore, seed_descriptor};
 
 // ---------------------------------------------------------------- fixtures
 
@@ -134,7 +134,10 @@ async fn rig() -> Rig {
         config: SchedulerConfig {
             fetch_concurrency: 2,
             retry_cap: 5,
-            backoff: BackoffConfig { base: Duration::ZERO, max: Duration::ZERO },
+            backoff: BackoffConfig {
+                base: Duration::ZERO,
+                max: Duration::ZERO,
+            },
             reserve_floor_bytes: 0,
             pressure_pause: Duration::from_millis(10),
             storage_poll: Duration::from_millis(10),
@@ -201,16 +204,16 @@ async fn transient_failure_retries_and_recovers() {
     let rig = rig().await;
     let desc = AssetDescriptorBuilder::simple_image().build();
     seed_asset(&rig, &desc, b"eventually-fine", None).await;
-    rig.fetcher.fail_next(&desc.local_id, 1, FetchFailure::Transient("blip".into()));
+    rig.fetcher
+        .fail_next(&desc.local_id, 1, FetchFailure::Transient("blip".into()));
 
     let report = scheduler(&rig).drain().await.unwrap();
     assert_eq!(report.photos_completed, 1);
-    let rt: (i64,) = sqlx::query_as(
-        "SELECT retry_count FROM photo_resources WHERE resource_type = 0",
-    )
-    .fetch_one(rig.store.raw_pool())
-    .await
-    .unwrap();
+    let rt: (i64,) =
+        sqlx::query_as("SELECT retry_count FROM photo_resources WHERE resource_type = 0")
+            .fetch_one(rig.store.raw_pool())
+            .await
+            .unwrap();
     assert_eq!(rt.0, 0); // reset on success
 }
 
@@ -225,7 +228,8 @@ async fn gives_up_at_retry_cap() {
     let desc = AssetDescriptorBuilder::simple_image().build();
     seed_asset(&rig, &desc, b"never-arrives", None).await;
     for _ in 0..10 {
-        rig.fetcher.fail_next(&desc.local_id, 1, FetchFailure::Transient("down".into()));
+        rig.fetcher
+            .fail_next(&desc.local_id, 1, FetchFailure::Transient("down".into()));
     }
 
     let report = scheduler(&rig).drain().await.unwrap();
@@ -246,7 +250,8 @@ async fn disk_pressure_pauses_without_retry_burn() {
     let rig = rig().await;
     let desc = AssetDescriptorBuilder::simple_image().build();
     seed_asset(&rig, &desc, b"pressured", None).await;
-    rig.fetcher.fail_next(&desc.local_id, 1, FetchFailure::LocalDiskPressure);
+    rig.fetcher
+        .fail_next(&desc.local_id, 1, FetchFailure::LocalDiskPressure);
 
     let report = scheduler(&rig).drain().await.unwrap();
     assert_eq!(report.photos_completed, 1);
@@ -258,7 +263,14 @@ async fn disk_pressure_pauses_without_retry_burn() {
             .unwrap();
     assert_eq!(rt.0, 0);
     assert_eq!(rig.store.log_events("storage_low").await.unwrap().len(), 1);
-    assert_eq!(rig.store.log_events("storage_recovered").await.unwrap().len(), 1);
+    assert_eq!(
+        rig.store
+            .log_events("storage_recovered")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 // Should: admit nothing while free space is under the reserve floor, and
@@ -282,7 +294,13 @@ async fn admission_floor_blocks_then_recovers() {
     raise.await.unwrap();
     assert_eq!(report.photos_completed, 1);
     assert!(report.pauses >= 1);
-    assert!(!rig.store.log_events("storage_low").await.unwrap().is_empty());
+    assert!(
+        !rig.store
+            .log_events("storage_low")
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 // Impact: SIGTERM-clean is a spec invariant — cancellation must never
@@ -363,9 +381,21 @@ async fn late_binding_merge_on_drain() {
     let report = scheduler(&rig).drain().await.unwrap();
     assert_eq!(report.late_binding_merges, 1);
     assert_eq!(rig.store.count_photos().await.unwrap(), 1);
-    let survivor = rig.store.photo_by_cloud_id("CLOUD-MERGE:001").await.unwrap().unwrap();
+    let survivor = rig
+        .store
+        .photo_by_cloud_id("CLOUD-MERGE:001")
+        .await
+        .unwrap()
+        .unwrap();
     assert!(survivor.materialized_at.is_some());
-    assert_eq!(rig.store.log_events("late_binding_merge").await.unwrap().len(), 1);
+    assert_eq!(
+        rig.store
+            .log_events("late_binding_merge")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 // Should: adopt an unmapped photo once its scope is bound, making its
@@ -373,7 +403,9 @@ async fn late_binding_merge_on_drain() {
 #[tokio::test(flavor = "multi_thread")]
 async fn unmapped_then_adopted_then_drained() {
     let rig = rig().await;
-    let desc = AssetDescriptorBuilder::simple_image().scope(LibraryScope::Shared).build();
+    let desc = AssetDescriptorBuilder::simple_image()
+        .scope(LibraryScope::Shared)
+        .build();
     rig.fetcher.add_asset(&desc, b"shared-bytes", None);
 
     match seed_descriptor(&rig.store, &desc).await.unwrap() {
@@ -385,7 +417,14 @@ async fn unmapped_then_adopted_then_drained() {
 
     let shared_lib = add_shared(&rig.store).await;
     sqlx::query("UPDATE libraries SET blob_root = ? WHERE library_id = ?")
-        .bind(rig._dirs.0.path().join("shared").to_string_lossy().into_owned())
+        .bind(
+            rig._dirs
+                .0
+                .path()
+                .join("shared")
+                .to_string_lossy()
+                .into_owned(),
+        )
         .bind(shared_lib.as_str())
         .execute(rig.store.raw_pool())
         .await
@@ -416,18 +455,317 @@ async fn descriptor_drift_bumps_missing_resource() {
             .collect(),
         ..desc.clone()
     };
-    rig.fetcher.descriptors.lock().unwrap().insert(desc.local_id.clone(), drifted);
+    rig.fetcher
+        .descriptors
+        .lock()
+        .unwrap()
+        .insert(desc.local_id.clone(), drifted);
 
     let report = scheduler(&rig).drain().await.unwrap();
     assert_eq!(report.photos_completed, 0); // paired video still pending
     assert_eq!(report.resources_written, 1); // original archived
-    let (err,): (Option<String>,) = sqlx::query_as(
-        "SELECT last_error FROM photo_resources WHERE resource_type = 2",
-    )
-    .fetch_one(rig.store.raw_pool())
-    .await
-    .unwrap();
+    let (err,): (Option<String>,) =
+        sqlx::query_as("SELECT last_error FROM photo_resources WHERE resource_type = 2")
+            .fetch_one(rig.store.raw_pool())
+            .await
+            .unwrap();
     assert!(err.unwrap().contains("no longer enumerated"));
+}
+
+// ------------------------------------------------------------ daemon tests
+
+use ingress_core::scheduler::daemon::{ChangeEvent, DaemonHandle};
+
+/// Poll `check` until true or panic after ~5s.
+async fn wait_until<F, Fut>(what: &str, mut check: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for _ in 0..500 {
+        if check().await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting for: {what}");
+}
+
+// Impact: the finalize-vs-move race is this phase's scariest corruption
+// window — a hard move applied mid-task would relocate state under a
+// photo_task that already resolved its blob paths.
+// Should: defer the scope-flip event while the photo is inflight (its bytes
+// land under the pre-move root), then apply it — bytes end under the
+// destination exactly once.
+// Should not: admit or re-fetch anything into the old root after the move.
+#[tokio::test(flavor = "multi_thread")]
+async fn events_for_inflight_photo_are_deferred() {
+    let mut r = rig().await;
+    let barrier = Arc::new(Barrier::new(2));
+    r.fetcher = Arc::new(FakeFetcher {
+        barrier: Some(barrier.clone()),
+        ..FakeFetcher::default()
+    });
+    let rig = r;
+
+    // Bind the shared library with its own temp root.
+    let shared_lib = add_shared(&rig.store).await;
+    let shared_root = rig._dirs.0.path().join("shared");
+    sqlx::query("UPDATE libraries SET blob_root = ? WHERE library_id = ?")
+        .bind(shared_root.to_string_lossy().into_owned())
+        .bind(shared_lib.as_str())
+        .execute(rig.store.raw_pool())
+        .await
+        .unwrap();
+
+    let desc = AssetDescriptorBuilder::simple_image().build();
+    seed_asset(&rig, &desc, b"moving-bytes", None).await;
+
+    let (handle, rx) = DaemonHandle::new();
+    let sched = scheduler(&rig);
+    let daemon = {
+        let handle = handle.clone();
+        tokio::spawn(async move { sched.run_daemon(rx, handle).await })
+    };
+
+    // Wait for the fetch to pin at the barrier (photo inflight), THEN push.
+    let fetcher = rig.fetcher.clone();
+    wait_until("fetch pinned inflight", || {
+        let fetcher = fetcher.clone();
+        async move { fetcher.fetch_calls.load(Ordering::Relaxed) >= 1 }
+    })
+    .await;
+    let mut moved = desc.clone();
+    moved.scope = LibraryScope::Shared;
+    handle.push(ChangeEvent::Descriptor(Box::new(moved)));
+    tokio::time::sleep(Duration::from_millis(150)).await; // let it route+defer
+    barrier.wait(); // release the pinned fetch
+
+    let store = rig.store.clone();
+    let cloud = desc.cloud_id.clone().unwrap();
+    wait_until("photo transitioned to shared", || {
+        let store = store.clone();
+        let shared_lib = shared_lib.clone();
+        let cloud = cloud.clone();
+        async move {
+            store
+                .photo_by_cloud_id(&cloud)
+                .await
+                .unwrap()
+                .map(|p| p.library_id == Some(shared_lib.clone()))
+                .unwrap_or(false)
+        }
+    })
+    .await;
+
+    rig.cancel.cancel();
+    handle.wake();
+    let report = daemon.await.unwrap().unwrap();
+    assert_eq!(
+        report.events_deferred, 1,
+        "the move waited out the inflight task"
+    );
+    assert_eq!(report.transitions, 1);
+    assert_eq!(
+        rig.store
+            .log_events("library_transition")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Bytes live under the destination — and only there.
+    let hash = ingress_core::ContentHash::of_bytes(b"moving-bytes");
+    let src_paths = ingress_core::paths::BlobPaths::new(rig._dirs.0.path());
+    let dst_paths = ingress_core::paths::BlobPaths::new(&shared_root);
+    assert!(dst_paths.blob_path(&hash, "heic").is_file());
+    assert!(!src_paths.blob_path(&hash, "heic").is_file());
+}
+
+// Impact: reordering deferred events resurrects deleted renders — an edit
+// applied after its own revert re-mints rows the user discarded.
+// Should: apply a photo's deferred events in arrival order (edit, then
+// revert), converging on the reverted shape with the photo materialized.
+#[tokio::test(flavor = "multi_thread")]
+async fn deferred_events_apply_in_fifo_order() {
+    let mut r = rig().await;
+    let barrier = Arc::new(Barrier::new(2));
+    r.fetcher = Arc::new(FakeFetcher {
+        barrier: Some(barrier.clone()),
+        ..FakeFetcher::default()
+    });
+    let rig = r;
+
+    let t1 = chrono::Utc::now();
+    let desc = AssetDescriptorBuilder::simple_image()
+        .modified_at(t1)
+        .build();
+    seed_asset(&rig, &desc, b"fifo-bytes", None).await;
+
+    let (handle, rx) = DaemonHandle::new();
+    let sched = scheduler(&rig);
+    let daemon = {
+        let handle = handle.clone();
+        tokio::spawn(async move { sched.run_daemon(rx, handle).await })
+    };
+
+    // Wait for the fetch to pin at the barrier (photo inflight)…
+    let fetcher = rig.fetcher.clone();
+    wait_until("fetch pinned inflight", || {
+        let fetcher = fetcher.clone();
+        async move { fetcher.fetch_calls.load(Ordering::Relaxed) >= 1 }
+    })
+    .await;
+    // …then, while pinned: an edit event followed by its revert.
+    let mut edited = desc.clone();
+    edited.asset_modified_at = Some(t1 + chrono::Duration::seconds(5));
+    edited.resources.push(ingress_core::ResourceDescriptor {
+        ph_resource_type: 5,
+        uti: "public.heic".into(),
+        original_filename: None,
+        expected_size: Some(2_000_000),
+        locally_available: Some(true),
+    });
+    let mut reverted = desc.clone();
+    reverted.asset_modified_at = Some(t1 + chrono::Duration::seconds(10));
+    handle.push(ChangeEvent::Descriptor(Box::new(edited)));
+    handle.push(ChangeEvent::Descriptor(Box::new(reverted)));
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    barrier.wait();
+
+    let store = rig.store.clone();
+    let cloud = desc.cloud_id.clone().unwrap();
+    wait_until("photo settles reverted + materialized", || {
+        let store = store.clone();
+        let cloud = cloud.clone();
+        async move {
+            store
+                .photo_by_cloud_id(&cloud)
+                .await
+                .unwrap()
+                .map(|p| p.materialized_at.is_some() && p.asset_modified_at > Some(t1))
+                .unwrap_or(false)
+        }
+    })
+    .await;
+
+    rig.cancel.cancel();
+    handle.wake();
+    let report = daemon.await.unwrap().unwrap();
+    assert_eq!(report.events_deferred, 2);
+
+    let photo = rig
+        .store
+        .photo_by_cloud_id(desc.cloud_id.as_deref().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let rows = rig
+        .store
+        .resources_for_photo(&photo.photo_id)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "edit row minted then reverted away — FIFO");
+    assert_eq!(rows[0].resource_type, ingress_core::ResourceType::Original);
+    assert!(
+        photo.materialized_at.is_some(),
+        "revert re-stamped completion"
+    );
+}
+
+// Impact: the core daemon promise — an observer insert becomes a materialized
+// photo without restarting anything, and the loop stays alive afterward.
+// Should: seed from a pushed descriptor, drain it, and keep running until
+// cancelled.
+#[tokio::test(flavor = "multi_thread")]
+async fn daemon_processes_event_then_drains_new_pending() {
+    let rig = rig().await;
+    let desc = AssetDescriptorBuilder::simple_image()
+        .modified_at(chrono::Utc::now())
+        .build();
+    rig.fetcher.add_asset(&desc, b"observer-insert", None);
+
+    let (handle, rx) = DaemonHandle::new();
+    let sched = scheduler(&rig);
+    let daemon = {
+        let handle = handle.clone();
+        tokio::spawn(async move { sched.run_daemon(rx, handle).await })
+    };
+
+    handle.push(ChangeEvent::Descriptor(Box::new(desc.clone())));
+    let store = rig.store.clone();
+    let cloud = desc.cloud_id.clone().unwrap();
+    wait_until("photo materialized", || {
+        let store = store.clone();
+        let cloud = cloud.clone();
+        async move {
+            store
+                .photo_by_cloud_id(&cloud)
+                .await
+                .unwrap()
+                .map(|p| p.materialized_at.is_some())
+                .unwrap_or(false)
+        }
+    })
+    .await;
+    assert!(
+        !daemon.is_finished(),
+        "loop is a daemon — queue-empty must not exit"
+    );
+
+    // A removal now flows through the same loop.
+    handle.push(ChangeEvent::Removed {
+        local_id: desc.local_id.clone(),
+    });
+    let store = rig.store.clone();
+    wait_until("photo tombstoned", || {
+        let store = store.clone();
+        let cloud = cloud.clone();
+        async move {
+            store
+                .photo_by_cloud_id(&cloud)
+                .await
+                .unwrap()
+                .map(|p| p.deleted_at.is_some())
+                .unwrap_or(false)
+        }
+    })
+    .await;
+
+    rig.cancel.cancel();
+    handle.wake();
+    let report = daemon.await.unwrap().unwrap();
+    assert_eq!(report.events_applied, 2);
+    assert_eq!(report.deletions, 1);
+    assert_eq!(report.drain.photos_completed, 1);
+}
+
+// Impact: SIGTERM-clean is a spec process-model requirement.
+// Should: exit promptly on cancellation with a report, even when idle.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_exits_daemon_with_report() {
+    let rig = rig().await;
+    let (handle, rx) = DaemonHandle::new();
+    let sched = scheduler(&rig);
+    let daemon = {
+        let handle = handle.clone();
+        tokio::spawn(async move { sched.run_daemon(rx, handle).await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    rig.cancel.cancel();
+    handle.wake();
+    let report = tokio::time::timeout(Duration::from_secs(5), daemon)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.events_applied, 0);
+    assert!(
+        !rig.data_dir.root().join("drain.lock").exists(),
+        "lock released on exit"
+    );
 }
 
 // Should: idempotently re-seed known assets without minting duplicates.
