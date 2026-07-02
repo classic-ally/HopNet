@@ -589,7 +589,7 @@ There is deliberately no persisted intermediate ("fetched", "hashed"): bytes str
 ### Write path
 
 1. **Admission** — storage-aware check (below) before a fetch slot is granted.
-2. **Stream** — `PHAssetResourceManager.requestData` (with `isNetworkAccessAllowed = true`) delivers chunks in memory; each chunk feeds the BLAKE3 hasher and appends to `<blob_root>/blobs/.partial/<photo_id>.<resource_type>`. The temp is named by `(photo_id, resource_type)` — the hash isn't known yet, and this naming makes per-resource inflight exclusivity structural.
+2. **Stream** — `PHAssetResourceManager.requestData` (with `isNetworkAccessAllowed = true`) delivers chunks in memory; each chunk feeds the BLAKE3 hasher and appends to `<blob_root>/blobs/.partial/<photo_id>.<resource_type>`. The temp is named by `(photo_id, resource_type)` — the hash isn't known yet, and this naming makes per-resource inflight exclusivity structural. Exception: a brand-new photo's original streams *before* any `photo_id` exists (identity rules 2a–2c resolve from its hash), so pre-mint originals use a fresh probe token (`probe-<uuid>`) under the same `.partial/` directory, swept identically at startup.
 3. **Dedup decision** — stream complete, hash known. Query `blobs(library_id, content_hash)`:
    - **Hit**: delete the temp. Transaction: increment `ref_count`, set `content_hash`/`ext`/`size_bytes`/`written_at` on the resource row.
    - **Miss**: fsync the temp, rename to `blobs/<aa>/<bb>/<hash>.<ext>`. Transaction: insert `blobs` row with `ref_count = 1`, update the resource row as above.
@@ -787,15 +787,19 @@ Structure: a Swift executable (the LaunchAgent) linking `ingress-core` (Rust, in
 - Sidecar serialization
 - Unit tests against fixture `AssetDescriptor`s — no Mac, no PhotoKit
 
-### Phase 2: Bridge and Vertical Slice [ ]
-- UniFFI bindings: descriptor ingestion, resource-fetch callback interface, chunk streaming
-- One real asset end-to-end: fetch → hash → temp → rename → sidecar → committed rows
+### Phase 2: Bridge and Vertical Slice [x] — `crates/ingress-ffi/`, `apple/PhotoIngress/`
+- UniFFI bindings: descriptor ingestion, chunk streaming (blocking session API, Rust-owned runtime)
+- Blob write path in ingress-core: streaming writer, dedup-hit discard, crash-window-safe finalize
+- One real asset end-to-end: fetch → hash → temp → rename → sidecar → committed rows (verified against a Shared Photo Library Live Photo, b3sum-exact)
+- The resource-fetch callback interface moved to Phase 3 — the scheduler's concurrency model shapes that trait's signature
 
 ### Phase 3: Pipeline [ ]
 - Scheduler with bounded fetch/write pools
+- Resource-fetch foreign trait (Rust drives Swift for bytes; deferred from Phase 2 so the scheduler shapes its signature)
 - Retry/backoff, terminal give-up
 - Storage-aware admission (free-space checks, reserve floor)
 - SIGTERM-clean cancellation, startup temp sweep
+- Unblock unmapped photos when their scope gains a binding (slice finding: rule-1 re-delivery leaves `library_id` NULL)
 
 ### Phase 4: Discovery [ ]
 - Change observer wiring
