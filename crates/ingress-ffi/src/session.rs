@@ -78,24 +78,29 @@ impl IngressSession {
         }))
     }
 
-    /// Seed a library row (slice/CLI configuration path).
+    /// Seed a library row (slice/CLI configuration path). A NULL
+    /// `sidecar_root_remote` disables the remote sidecar backup — recovery
+    /// from a lost Mac then degrades to blob-only rebuild (spec warns
+    /// loudly; the CLI surfaces that warning).
     pub fn add_library(
         &self,
         library_id: String,
         display_name: String,
         blob_root: String,
+        sidecar_root_remote: Option<String>,
+        retention_days: i64,
         scope: FfiLibraryScope,
     ) -> Result<(), FfiError> {
         let config = LibraryConfig {
             library_id: LibraryId::new(library_id),
             display_name,
             blob_root,
-            sidecar_root_remote: None,
+            sidecar_root_remote,
             scope_binding: match scope {
                 FfiLibraryScope::Personal => None,
                 FfiLibraryScope::Shared => Some(ICLOUD_SHARED_LIBRARY_BINDING.to_string()),
             },
-            retention_days: 30,
+            retention_days: retention_days.max(0),
             created_at: Utc::now(),
         };
         self.runtime
@@ -464,6 +469,10 @@ impl IngressSession {
             reserve_floor_bytes: options.reserve_floor_gib * 1024 * 1024 * 1024,
             pressure_pause: std::time::Duration::from_secs(options.pressure_pause_secs),
             storage_poll: std::time::Duration::from_secs(options.storage_poll_secs),
+            cleanup_interval: std::time::Duration::from_secs(options.cleanup_interval_secs.max(1)),
+            replication_interval: std::time::Duration::from_secs(
+                options.replication_interval_secs.max(1),
+            ),
             ..SchedulerConfig::default()
         };
         let scheduler = Scheduler::new(
@@ -496,7 +505,45 @@ impl IngressSession {
             restores: report.restores,
             transitions: report.transitions,
             resources_reopened: report.resources_reopened,
+            cleanup: cleanup_report_to_ffi(&report.cleanup, &report.replication),
         })
+    }
+
+    /// One-shot lifecycle run (the `cleanup` subcommand): exclusive lock
+    /// (errors while the daemon holds it), Tier-1 repair on an unclean
+    /// reclaim, one cleanup pass + one replication pass. No PhotoKit
+    /// involvement — safe without authorization.
+    pub fn cleanup(&self, options: FfiCleanupOptions) -> Result<FfiCleanupReport, FfiError> {
+        let cfg = ingress_core::cleanup::CleanupConfig {
+            log_retention_days: options.log_retention_days.max(0),
+            snapshot_keep: options.snapshot_keep.max(1) as usize,
+            hard_delete_batch: options.hard_delete_batch.max(1) as usize,
+            replication_batch: options.replication_batch.max(1) as usize,
+        };
+        let (cleanup, replication) =
+            self.runtime
+                .block_on(ingress_core::cleanup::run_standalone(
+                    &self.inner.store,
+                    &self.inner.data_dir,
+                    &cfg,
+                    Utc::now(),
+                ))?;
+        Ok(cleanup_report_to_ffi(&cleanup, &replication))
+    }
+}
+
+fn cleanup_report_to_ffi(
+    cleanup: &ingress_core::cleanup::CleanupReport,
+    replication: &ingress_core::cleanup::ReplicationReport,
+) -> FfiCleanupReport {
+    FfiCleanupReport {
+        photos_hard_deleted: cleanup.photos_hard_deleted,
+        blob_files_deleted: cleanup.blob_files_deleted,
+        log_rows_pruned: cleanup.log_rows_pruned,
+        snapshots_written: cleanup.snapshots_written,
+        sidecars_replicated: replication.replicated,
+        sidecars_missing: replication.missing,
+        replication_stalled: replication.stalled,
     }
 }
 

@@ -45,14 +45,31 @@ func describe(_ outcome: FfiWriteOutcome, label: String) {
 
 func runSetup() throws {
     guard let blobRoot = flagValue(args, "--blob-root") else { fail("--blob-root is required") }
+    let retentionDays = Int64(intFlag("--retention-days", default: 30))
     let session = try IngressSession(dataDir: dataDir)
+
+    let warnNoRemote = { (library: String) in
+        print("WARNING: library '\(library)' has no remote sidecar backup — recovery from a")
+        print("         lost Mac degrades to blob-only rebuild (all PhotoKit-derived metadata")
+        print("         and photo_ids are lost). Configure --sidecar-remote when possible.")
+    }
+
+    let personalRemote = flagValue(args, "--sidecar-remote")
     try session.addLibrary(
-        libraryId: "personal", displayName: "Personal", blobRoot: blobRoot, scope: .personal)
-    print("configured library 'personal' → \(blobRoot)")
+        libraryId: "personal", displayName: "Personal", blobRoot: blobRoot,
+        sidecarRootRemote: personalRemote, retentionDays: retentionDays, scope: .personal)
+    print("configured library 'personal' → \(blobRoot)" +
+          (personalRemote.map { " (sidecar backup: \($0))" } ?? ""))
+    if personalRemote == nil { warnNoRemote("personal") }
+
     if let shared = flagValue(args, "--shared-blob-root") {
+        let sharedRemote = flagValue(args, "--shared-sidecar-remote")
         try session.addLibrary(
-            libraryId: "shared", displayName: "Shared Library", blobRoot: shared, scope: .shared)
-        print("configured library 'shared' → \(shared)")
+            libraryId: "shared", displayName: "Shared Library", blobRoot: shared,
+            sidecarRootRemote: sharedRemote, retentionDays: retentionDays, scope: .shared)
+        print("configured library 'shared' → \(shared)" +
+              (sharedRemote.map { " (sidecar backup: \($0))" } ?? ""))
+        if sharedRemote == nil { warnNoRemote("shared") }
     }
     print("state: \(dataDir)/state.db")
 }
@@ -202,6 +219,29 @@ func runDrain() throws {
     print("  gave up:              \(report.gaveUp)")
 }
 
+func printCleanup(_ c: FfiCleanupReport, indent: String = "  ") {
+    print("\(indent)photos hard-deleted:  \(c.photosHardDeleted)")
+    print("\(indent)blob files deleted:   \(c.blobFilesDeleted)")
+    print("\(indent)log rows pruned:      \(c.logRowsPruned)")
+    print("\(indent)snapshots written:    \(c.snapshotsWritten)")
+    print("\(indent)sidecars replicated:  \(c.sidecarsReplicated) (missing \(c.sidecarsMissing))" +
+          (c.replicationStalled ? " REPLICATION STALLED (mount down?)" : ""))
+}
+
+/// One-shot lifecycle run. No PhotoKit involvement — needs no authorization;
+/// errors if the daemon is running (shared exclusive lock).
+func runCleanup() throws {
+    let session = try IngressSession(dataDir: dataDir)
+    let report = try session.cleanup(options: FfiCleanupOptions(
+        logRetentionDays: Int64(intFlag("--log-retention-days", default: 180)),
+        snapshotKeep: UInt32(intFlag("--snapshot-keep", default: 7)),
+        hardDeleteBatch: UInt32(intFlag("--hard-delete-batch", default: 500)),
+        replicationBatch: UInt32(intFlag("--replication-batch", default: 500))
+    ))
+    print("cleanup report:")
+    printCleanup(report)
+}
+
 /// The continuous daemon (spec §Process model): change observer + startup and
 /// periodic reconciliation scans feeding the never-exiting Rust loop.
 func runDaemon() throws {
@@ -268,7 +308,9 @@ func runDaemon() throws {
         retryMaxSecs: intFlag("--retry-max-secs", default: 3600),
         reserveFloorGib: intFlag("--reserve-floor-gib", default: 10),
         pressurePauseSecs: intFlag("--pressure-pause-secs", default: 60),
-        storagePollSecs: intFlag("--storage-poll-secs", default: 15)
+        storagePollSecs: intFlag("--storage-poll-secs", default: 15),
+        cleanupIntervalSecs: intFlag("--cleanup-interval-secs", default: 3600),
+        replicationIntervalSecs: intFlag("--replication-interval-secs", default: 60)
     )
     print("daemon running (scan interval \(scanInterval)s) — SIGTERM/SIGINT to stop")
     let report = try session.runDaemon(fetcher: fetcher, options: options)
@@ -286,6 +328,8 @@ func runDaemon() throws {
     print("  awaiting retry:       \(report.drain.awaitingRetry)" +
           (report.drain.earliestNextRetryAt.map { " (earliest \($0))" } ?? ""))
     print("  gave up:              \(report.drain.gaveUp)")
+    print("  lifecycle:")
+    printCleanup(report.cleanup, indent: "    ")
 }
 
 // Never block the main thread on PhotoKit (spike lesson): work on a
@@ -298,6 +342,7 @@ DispatchQueue.global().async {
         case "seed": try runSeed()
         case "drain": try runDrain()
         case "daemon": try runDaemon()
+        case "cleanup": try runCleanup()
         default: fail("unknown command \(command)")
         }
         exit(0)

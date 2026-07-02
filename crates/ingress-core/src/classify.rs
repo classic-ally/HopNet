@@ -291,8 +291,11 @@ pub async fn apply_change(
                 let Some(row) = rows.iter().find(|r| r.resource_type == *rt) else {
                     continue;
                 };
+                // Gate on the hash, NOT written_at: a superseded-pending row
+                // (reopened re-edit, hash retained as the swap pointer) still
+                // holds a refcount — deleting it without decrementing leaks
+                // the count and strands the blob file forever.
                 if let (Some(hash), Some(library)) = (&row.content_hash, &library)
-                    && row.written_at.is_some()
                     && let Some(ext) =
                         crate::store::blobs::decrement_and_reap(&mut tx, library, hash).await?
                 {
@@ -330,6 +333,12 @@ pub async fn apply_change(
             .execute(&mut *tx)
             .await?;
         }
+        // T2: this tx precedes a sidecar rewrite (revert path) or a later
+        // completion rewrite (add/reopen) — dirty the remote copy either way.
+        // The restamp UPDATE above can't carry it: its materialized-IS-NULL
+        // guard doesn't fire on adjustment-only reverts, yet the sidecar is
+        // still rewritten.
+        crate::store::photos::mark_sidecar_dirty(&mut *tx, &plan.photo_id).await?;
         tx.commit().await?;
 
         // Post-commit: reaped blob files. A crash here leaves benign orphans.
@@ -418,6 +427,9 @@ pub(crate) async fn tombstone_photo(
         return Ok(false);
     }
     crate::store::log::append(&mut *tx, "deletion_observed", Some(&photo.photo_id), None).await?;
+    // T3: the sidecar's deleted_at is rewritten below — an unreplicated
+    // tombstone dying with this Mac would resurrect the photo in recovery.
+    crate::store::photos::mark_sidecar_dirty(&mut *tx, &photo.photo_id).await?;
     tx.commit().await?;
 
     if let Some(library) = &photo.library_id {
@@ -438,6 +450,8 @@ pub(crate) async fn restore_photo(store: &StateStore, photo_id: &PhotoId) -> Res
         return Ok(false);
     }
     crate::store::log::append(&mut *tx, "restore_observed", Some(photo_id), None).await?;
+    // T4: the caller rewrites the sidecar (recompose or deleted_at clear).
+    crate::store::photos::mark_sidecar_dirty(&mut *tx, photo_id).await?;
     tx.commit().await?;
     Ok(true)
 }

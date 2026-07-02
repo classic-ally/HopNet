@@ -7,7 +7,7 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
 
 use ingress_core::descriptor::AssetDescriptor;
-use ingress_core::fixtures::{AssetDescriptorBuilder, add_shared, store_with_personal};
+use ingress_core::fixtures::{AssetDescriptorBuilder, add_shared};
 use ingress_core::paths::DataDir;
 use ingress_core::scheduler::{
     BackoffConfig, CancelToken, FetchFailure, FetchRequest, FreeSpaceProbe, ResourceFetcher,
@@ -115,14 +115,24 @@ struct Rig {
 }
 
 async fn rig() -> Rig {
-    let (store, library) = store_with_personal().await;
     let blob_dir = tempfile::tempdir().unwrap();
     let data_tmp = tempfile::tempdir().unwrap();
-    // Point the personal library's blob_root at the temp dir.
-    sqlx::query("UPDATE libraries SET blob_root = ? WHERE library_id = ?")
-        .bind(blob_dir.path().to_string_lossy().into_owned())
-        .bind(library.as_str())
-        .execute(store.raw_pool())
+    // File-backed (not in-memory): the lifecycle ticks snapshot via
+    // `VACUUM INTO`, which silently no-ops on an in-memory store.
+    let store = StateStore::open(&data_tmp.path().join("state.db"))
+        .await
+        .unwrap();
+    let library = ingress_core::LibraryId::new("personal");
+    store
+        .insert_library(&ingress_core::LibraryConfig {
+            library_id: library.clone(),
+            display_name: "Personal".into(),
+            blob_root: blob_dir.path().to_string_lossy().into_owned(),
+            sidecar_root_remote: None,
+            scope_binding: None,
+            retention_days: 30,
+            created_at: chrono::Utc::now(),
+        })
         .await
         .unwrap();
     Rig {
@@ -142,6 +152,11 @@ async fn rig() -> Rig {
             pressure_pause: Duration::from_millis(10),
             storage_poll: Duration::from_millis(10),
             default_size_estimate: 1024,
+            // Long intervals: lifecycle ticks stay out of the way unless a
+            // test opts in by zeroing them.
+            cleanup_interval: Duration::from_secs(3600),
+            replication_interval: Duration::from_secs(3600),
+            cleanup: ingress_core::cleanup::CleanupConfig::default(),
         },
         _dirs: (blob_dir, data_tmp),
     }
@@ -765,6 +780,130 @@ async fn cancel_exits_daemon_with_report() {
     assert!(
         !rig.data_dir.root().join("drain.lock").exists(),
         "lock released on exit"
+    );
+}
+
+// Impact: the lifecycle job must run INSIDE the daemon without an operator —
+// hard deletes, log pruning, and replication all ride the loop's timers.
+// Should: with zero intervals, an expired tombstone hard-deletes and a dirty
+// sidecar replicates during run_daemon; the report carries both.
+#[tokio::test(flavor = "multi_thread")]
+async fn daemon_tick_runs_cleanup_and_replication() {
+    let mut r = rig().await;
+    r.config.cleanup_interval = Duration::ZERO;
+    r.config.replication_interval = Duration::ZERO;
+    let rig = r;
+
+    // Remote sidecar root for the personal library.
+    let remote = rig._dirs.0.path().join("remote");
+    sqlx::query("UPDATE libraries SET sidecar_root_remote = ? WHERE library_id = 'personal'")
+        .bind(remote.to_string_lossy().into_owned())
+        .execute(rig.store.raw_pool())
+        .await
+        .unwrap();
+
+    // One photo to materialize (dirty sidecar → replication) and one
+    // pre-materialized tombstone past retention (hard delete).
+    let live = AssetDescriptorBuilder::simple_image().build();
+    seed_asset(&rig, &live, b"live-bytes", None).await;
+    let dead = AssetDescriptorBuilder::simple_image().build();
+    seed_asset(&rig, &dead, b"dead-bytes", None).await;
+    scheduler(&rig).drain().await.unwrap();
+    let dead_id = rig
+        .store
+        .photo_by_cloud_id(dead.cloud_id.as_deref().unwrap())
+        .await
+        .unwrap()
+        .unwrap()
+        .photo_id;
+    ingress_core::classify::apply_removal(&rig.store, &rig.data_dir, &dead.local_id)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE photos SET deleted_at = ? WHERE photo_id = ?")
+        .bind(chrono::Utc::now() - chrono::Duration::days(31))
+        .bind(dead_id.to_string())
+        .execute(rig.store.raw_pool())
+        .await
+        .unwrap();
+
+    let (handle, rx) = DaemonHandle::new();
+    let sched = scheduler(&rig);
+    let daemon = {
+        let handle = handle.clone();
+        tokio::spawn(async move { sched.run_daemon(rx, handle).await })
+    };
+
+    let store = rig.store.clone();
+    let dead_check = dead_id.clone();
+    wait_until("tombstone hard-deleted by daemon tick", || {
+        let store = store.clone();
+        let id = dead_check.clone();
+        async move { store.photo(&id).await.unwrap().is_none() }
+    })
+    .await;
+    let store = rig.store.clone();
+    wait_until("dirty sidecar replicated", || {
+        let store = store.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM photos WHERE sidecar_replicated_at IS NOT NULL",
+            )
+            .fetch_one(store.raw_pool())
+            .await
+            .unwrap()
+                > 0
+        }
+    })
+    .await;
+
+    rig.cancel.cancel();
+    handle.wake();
+    let report = daemon.await.unwrap().unwrap();
+    assert!(report.cleanup.photos_hard_deleted >= 1);
+    assert!(report.replication.replicated >= 1);
+    assert!(remote.join("sidecars").parent().is_some()); // remote tree exists
+    let events = rig.store.log_events("hard_delete").await.unwrap();
+    assert_eq!(events.len(), 1);
+}
+
+// Impact: a crashed LaunchAgent daemon must reclaim its own stale lock and
+// repair refcount drift BEFORE admitting work — drifted counts gate
+// irreversible file deletes.
+// Should: dead-pid lock reclaimed, seeded drift repaired, drain proceeds.
+#[tokio::test(flavor = "multi_thread")]
+async fn unclean_start_reclaims_lock_and_repairs_refcounts() {
+    let rig = rig().await;
+    let desc = AssetDescriptorBuilder::simple_image().build();
+    seed_asset(&rig, &desc, b"unclean-bytes", None).await;
+    scheduler(&rig).drain().await.unwrap();
+
+    // Simulate a crash: stale lock from a dead pid + refcount drift.
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    let dead_pid = child.id();
+    child.wait().unwrap();
+    std::fs::write(rig.data_dir.root().join("drain.lock"), dead_pid.to_string()).unwrap();
+    sqlx::query("UPDATE blobs SET ref_count = 42")
+        .execute(rig.store.raw_pool())
+        .await
+        .unwrap();
+
+    scheduler(&rig).drain().await.unwrap(); // reclaims, repairs, proceeds
+    let (count,): (i64,) = sqlx::query_as("SELECT ref_count FROM blobs")
+        .fetch_one(rig.store.raw_pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "drift repaired before work");
+    assert_eq!(
+        rig.store
+            .log_events("refcount_repaired")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        !rig.data_dir.root().join("drain.lock").exists(),
+        "reclaimed lock released"
     );
 }
 

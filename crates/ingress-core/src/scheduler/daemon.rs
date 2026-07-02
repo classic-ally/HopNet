@@ -87,7 +87,8 @@ impl DaemonHandle {
     }
 }
 
-/// Daemon outcome counters: everything `drain` reports, plus the event side.
+/// Daemon outcome counters: everything `drain` reports, plus the event side
+/// and the lifecycle-tick aggregates.
 #[derive(Debug, Default, Clone)]
 pub struct DaemonReport {
     pub drain: DrainReport,
@@ -97,6 +98,8 @@ pub struct DaemonReport {
     pub restores: u64,
     pub transitions: u64,
     pub resources_reopened: u64,
+    pub cleanup: crate::cleanup::CleanupReport,
+    pub replication: crate::cleanup::ReplicationReport,
 }
 
 #[derive(Default)]
@@ -124,13 +127,83 @@ impl<F: ResourceFetcher> Scheduler<F> {
         ));
         let mut deferred: HashMap<PhotoId, VecDeque<ChangeEvent>> = HashMap::new();
         let mut counters = EventCounters::default();
+        // Lifecycle timers: None = due immediately, so a boot runs the
+        // startup cleanup and begins draining the replication backlog.
+        let mut last_cleanup: Option<std::time::Instant> = None;
+        let mut last_replication: Option<std::time::Instant> = None;
+        let mut repl_state = crate::cleanup::ReplicationState::default();
+        let mut cleanup_totals = crate::cleanup::CleanupReport::default();
+        let mut replication_totals = crate::cleanup::ReplicationReport::default();
+
+        fn due(last: Option<std::time::Instant>, interval: std::time::Duration) -> bool {
+            last.map(|t| t.elapsed() >= interval).unwrap_or(true)
+        }
 
         loop {
             if self.shared.cancel.is_cancelled() {
                 break;
             }
+            // Placed after the pause check: a storage pause implies the
+            // mount is suspect — don't hammer it with lifecycle fs work.
             if self.paused_wait().await {
                 continue;
+            }
+
+            // 0. Lifecycle ticks (serialized with event application — no
+            //    race with restores; photo_tasks are unaffected). A failed
+            //    tick logs and retries next interval, never exits the loop.
+            if due(last_cleanup, self.shared.config.cleanup_interval) {
+                match crate::cleanup::run_cleanup(
+                    &self.shared.store,
+                    &self.shared.data_dir,
+                    &self.shared.config.cleanup,
+                    Utc::now(),
+                )
+                .await
+                {
+                    Ok(r) => cleanup_totals.absorb(&r),
+                    Err(e) => {
+                        let _ = self
+                            .shared
+                            .store
+                            .append_log(
+                                "cleanup_error",
+                                None,
+                                Some(serde_json::json!({ "error": e.to_string() })),
+                            )
+                            .await;
+                    }
+                }
+                last_cleanup = Some(std::time::Instant::now());
+            }
+            if due(last_replication, self.shared.config.replication_interval) {
+                // Skip inflight photos: their sidecars may be rewritten
+                // concurrently by photo_tasks (post-tx), and stamping a
+                // stale copy would record it as current.
+                let skip = self.shared.inflight.lock().expect("inflight mutex").clone();
+                match crate::cleanup::replicate_dirty_sidecars(
+                    &self.shared.store,
+                    &self.shared.data_dir,
+                    self.shared.config.cleanup.replication_batch,
+                    &skip,
+                    &mut repl_state,
+                )
+                .await
+                {
+                    Ok(r) => replication_totals.absorb(&r),
+                    Err(e) => {
+                        let _ = self
+                            .shared
+                            .store
+                            .append_log(
+                                "cleanup_error",
+                                None,
+                                Some(serde_json::json!({ "op": "replication", "error": e.to_string() })),
+                            )
+                            .await;
+                    }
+                }
+                last_replication = Some(std::time::Instant::now());
             }
 
             // 1. Route everything currently queued.
@@ -172,8 +245,10 @@ impl<F: ResourceFetcher> Scheduler<F> {
             }
 
             // 4. Idle: wake on a new event, a task exit (may unblock
-            //    deferrals or free capacity), an external nudge, or the
-            //    earliest retry deadline.
+            //    deferrals or free capacity), an external nudge, the
+            //    earliest retry deadline, or the next lifecycle tick (an
+            //    idle daemon must not skew the 60s replication cadence to
+            //    the retry default).
             let summary = self
                 .shared
                 .store
@@ -183,6 +258,16 @@ impl<F: ResourceFetcher> Scheduler<F> {
                 .earliest_next_retry_at
                 .and_then(|t| (t - Utc::now()).to_std().ok())
                 .unwrap_or(std::time::Duration::from_secs(3600));
+            let time_to = |last: Option<std::time::Instant>, interval: std::time::Duration| {
+                last.map(|t| interval.saturating_sub(t.elapsed()))
+                    .unwrap_or_default()
+            };
+            let next_retry = next_retry
+                .min(time_to(last_cleanup, self.shared.config.cleanup_interval))
+                .min(time_to(
+                    last_replication,
+                    self.shared.config.replication_interval,
+                ));
             tokio::select! {
                 event = rx.recv() => {
                     match event {
@@ -212,6 +297,8 @@ impl<F: ResourceFetcher> Scheduler<F> {
             restores: counters.restores,
             transitions: counters.transitions,
             resources_reopened: counters.reopened,
+            cleanup: cleanup_totals,
+            replication: replication_totals,
         })
     }
 

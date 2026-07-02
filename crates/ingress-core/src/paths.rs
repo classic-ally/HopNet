@@ -72,6 +72,12 @@ impl BlobPaths {
             .join(bb)
             .join(format!("{hash}.{ext}"))
     }
+
+    /// `<blob_root>/state-snapshots/` — daily state.db snapshots on the
+    /// storage side (what Tier-3 recovery restores from on a dead Mac).
+    pub fn snapshot_dir(&self) -> PathBuf {
+        self.blob_root.join("state-snapshots")
+    }
 }
 
 /// The daemon's local data directory (`~/.local/share/hopnet-photo-ingress`
@@ -100,6 +106,13 @@ impl DataDir {
     /// Always derived, never stored (spec: `libraries` notes).
     pub fn sidecar_root(&self, library: &LibraryId) -> PathBuf {
         self.root.join("sidecars").join(library.as_str())
+    }
+
+    /// `<root>/state-snapshots-tmp/` — staging dir for `VACUUM INTO` before
+    /// the per-root copies (VACUUM refuses an existing target, so the dir is
+    /// cleaned before each use).
+    pub fn snapshot_tmp_dir(&self) -> PathBuf {
+        self.root.join("state-snapshots-tmp")
     }
 }
 

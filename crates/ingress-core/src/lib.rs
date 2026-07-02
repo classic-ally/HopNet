@@ -5,6 +5,7 @@
 //! sidecar JSON serialization. See `docs/specs/apple-photos-ingress.md`.
 
 pub mod classify;
+pub mod cleanup;
 pub mod descriptor;
 pub mod error;
 pub mod ext;
@@ -13,7 +14,9 @@ pub mod fixtures;
 pub mod ids;
 pub mod model;
 pub mod paths;
+pub mod recovery;
 pub mod resolve;
+pub(crate) mod runlock;
 pub mod scan;
 pub mod scheduler;
 pub mod sidecar;

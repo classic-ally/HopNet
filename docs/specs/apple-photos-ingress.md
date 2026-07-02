@@ -282,6 +282,8 @@ For each photo_resources row R of the transitioning photo:
 
 `photo_resources` rows stay keyed by `(photo_id, resource_type)` and need no library-aware updates; the blob path is reconstructed from `photos.library_id` and `content_hash` at read time.
 
+*Phase 5 note on step 6:* "local copy and remote backup" — the destination's remote copy arrives via the ordinary dirty-set drain, but the copy under the **source** library's `sidecar_root_remote` must be explicitly removed (best-effort, post-transaction): a lingering src document would resurrect the photo in the wrong library during a sidecar-tree recovery. A mount-down failure leaves it for fsck's remote-consistency audit.
+
 Step 3's refcount check matters: if another photo in the destination library already shares this blob (for example the user previously imported the same content into the shared library independently), the bytes are already on disk and the copy is skipped — only the refcount increments.
 
 Step 4's refcount check matters symmetrically: if another photo in the source library still references the blob (unlikely but possible), the file is not deleted; only the refcount decrements.
@@ -692,6 +694,8 @@ The transaction commits before the filesystem operations because:
 
 The cleanup job is idempotent: re-running it produces no additional effect once a photo has been fully hard-deleted.
 
+*Implementation errata (Phase 5):* the `hard_delete` log event (step 7) commits **inside** the step-1–3 transaction, not after the filesystem operations — a crash between the transaction and fs cleanup must never leave a vanished photo with a silent black box, which is the exact forensic failure the ingest log exists to prevent. The detail (resources, hashes, reaped blobs) is fully known pre-fs. Each photo is its own transaction; retention cutoffs are computed Rust-side (`now − retention_days`) and bound as parameters, reading each library's `retention_days` fresh per run. Hard deletes are batch-capped per run (default 500) — a whole-library expiry processes across consecutive runs rather than stalling the daemon loop.
+
 ### Edge cases
 
 | Scenario | Behavior |
@@ -702,6 +706,8 @@ The cleanup job is idempotent: re-running it produces no additional effect once 
 | User deletes the entire iCloud Shared Photo Library | Every shared-library asset transitions to a deletion event on the change observer; daemon tombstones them all. After 30 days, cleanup hard-deletes the rows and the bytes. The `libraries` row for the shared library remains until the user explicitly removes it via CLI. |
 | Photo deleted, then user attempts to re-import the same image file as a new asset | Rule 2b: new `cloud_id`, new `photo_id`. The old tombstoned record proceeds through normal hard-delete on schedule; the new record begins fresh. Blob refcount handles the byte-level overlap (single blob, refcount 2 during overlap, refcount 1 after the tombstone expires). |
 | Retention window changed (config edited from 30 to 60 days) | Cleanup job uses the new value on its next run. Photos already past the old window are not retroactively hard-deleted by re-extending; they may have already been processed. |
+| Unmapped tombstone (`library_id IS NULL`, scope never bound) | Hard-deleted after a fixed 30-day default (no per-library config exists for it); degenerates to row deletion + log — an unmapped photo holds no bytes and no sidecar. |
+| Tombstoned photo with a superseded-pending row (re-edit reopened, never refetched) | The row's retained `content_hash` still holds a refcount and is decremented at hard delete — same hash-gate rule as the revert path. |
 
 ### Why this matches RFC-011
 
@@ -727,7 +733,7 @@ The spec constrains failure *semantics* — what state each failure class may an
 | iCloud fetch failure | Per-resource exponential backoff via `retry_count` / `next_retry_at`. After a configurable retry cap, the resource goes terminally pending with a `resource_gave_up` event. Terminal resources are automatically re-enqueued by the next reconciliation scan — transient iCloud outages self-heal without operator action. |
 | Local disk pressure (`CloudPhotoLibraryErrorDomain` code 1005) | `cloudphotod` refuses downloads below a local-headroom threshold (spike-verified: instant failure, no network attempt; resolves when space is freed). Classified as a daemon-wide pause like `storage_low`, but for the *local* disk: fetch admission stops, no retry counts are consumed, admission resumes when headroom recovers. Treating it as a per-resource failure would spin the retry budget uselessly. |
 | Partial blob write (crash, mount drop mid-stream) | Covered by the crash-window table in the Ingest Pipeline: orphan `.partial` temps are swept at startup; a renamed-but-uncommitted blob is reconciled by the orphan scan. No committed row ever references unverified bytes. |
-| Remote sidecar replication failure | Best-effort and asynchronous by design; durability comes from the `sidecar_replicated_at` dirty flag, drained whenever the mount is up. Metadata-only rewrites (tombstone, favorite) accumulate safely while the mount is down. |
+| Remote sidecar replication failure | Best-effort and asynchronous by design; durability comes from the `sidecar_replicated_at` dirty flag, drained whenever the mount is up. Metadata-only rewrites (tombstone, favorite) accumulate safely while the mount is down. *(Phase 5: drained on a short interval — default 60s — with a per-pass batch cap; photos with a live fetch task are skipped for the pass, so a stamp never records a mid-rewrite copy as current. Stalls surface as edge-triggered `mount_lost`/`mount_regained` events, op-tagged.)* |
 | PhotoKit authorization revoked | Hard stall: the daemon stops all PhotoKit interaction, logs a loud event, and the CLI surfaces the condition. No state is modified — in particular, an empty enumeration due to lost authorization must not be interpreted as mass deletion. |
 | Local `state.db` corruption | Disaster case; recover from the most recent state snapshot (see Recovery). |
 
@@ -747,6 +753,8 @@ On every start:
 2. If the previous shutdown was unclean (stale pid/lock in `run/`): recount `blobs.ref_count` from the JOIN through `photos`/`photo_resources`, diff against stored values, repair and log any drift.
 
 Startup repair never deletes blob files — orphan deletion is deliberately excluded from the automatic tier.
+
+*Implementation notes (Phase 5):* the `drain.lock` file is pid-stamped. A starting process finding a lock held by a dead pid (or an empty/unparseable file) reclaims it and treats the start as unclean, running the recount before any work is admitted — repaired counts gate the irreversible file deletes. A live-pid lock is a hard error. Repair is row-level only: count mismatches are updated, zero-recount `blobs` rows deleted (the file becomes fsck's benign orphan class), missing rows inserted from a referencing resource row (file existence deliberately unchecked — a missing file is fsck's loud byte-loss class). Rows are counted by `content_hash` regardless of `written_at` (superseded-pending rows still reference their old blob). One `refcount_repaired` event per run, drift only.
 
 ### Tier 2 — `ingress-cli fsck`
 
@@ -770,7 +778,9 @@ After any tier-3 recovery, the daemon's first reconciliation scan doubles as ver
 
 ### State snapshots
 
-Written by the periodic cleanup job: once per day per library root (on the first run after the day rolls over), via the SQLite backup API to `state-snapshots/state.db.<timestamp>.sqlite3`, keeping the newest 7. Snapshot staleness is benign — tier 3 reconciles the gap from PhotoKit — so no tighter cadence is warranted. Snapshot cadence is unrelated to ingest freshness: blobs and sidecars replicate continuously as changes happen.
+Written by the periodic cleanup job: once per day per library root (on the first run after the day rolls over), to `<blob_root>/state-snapshots/state.db.<unix-ts>.sqlite3`, keeping the newest 7. Snapshot staleness is benign — tier 3 reconciles the gap from PhotoKit — so no tighter cadence is warranted. Snapshot cadence is unrelated to ingest freshness: blobs and sidecars replicate continuously as changes happen.
+
+*Implementation errata (Phase 5):* snapshots use `VACUUM INTO` (an online, consistent copy since SQLite 3.27) rather than the backup API — sqlx does not expose the latter, and adding a second SQLite driver for backups alone would reintroduce the `links` conflict this workspace exists to avoid. One shared VACUUM per run lands in a local staging dir, then copies (temp + rename) to every due root. The due-check derives from the destination filenames (newest parseable timestamp's UTC day vs today) — no extra state, self-healing if snapshots are deleted. An unavailable root is skipped quietly and remains due.
 
 ## Implementation Phases
 
@@ -816,9 +826,13 @@ Structure: a Swift executable (the LaunchAgent) linking `ingress-core` (Rust, in
 - AssetUnavailable is NOT inline-reclassified as deletion (local_id ≠ identity; API-health rule) — observer removals + scan synthesis are the two deletion detectors.
 - Verified on-device: cold-start daemon scan seeds+drains 25 assets (21 personal / 4 shared, b3sum-exact); live favorite → metadata-only sidecar refresh, zero fetches; idempotent restart rescan (probed=25, needed_full=0); SIGTERM → prompt report + lock release. EXIF pass (orientation/camera/UTC offset) deliberately deferred.
 
-### Phase 5: Lifecycle [ ]
-- Hourly cleanup job: hard deletes, refcount-zero blob removal, log pruning, daily state snapshots
-- `sidecar_replicated_at` dirty-set drain
+### Phase 5: Lifecycle [x] — `cleanup.rs`, `recovery.rs`, `runlock.rs`, `cleanup` subcommand
+- Hourly cleanup job, integrated into the daemon loop (serialized with event application; photo_tasks unaffected) plus a one-shot `photo-ingress cleanup` subcommand sharing the exclusive run lock (no PhotoKit — runs without authorization). Hard deletes per the 7-step procedure with the in-tx `hard_delete` errata (see §Hard-delete cleanup); per-library retention read fresh per run; unmapped tombstones on the 30-day default; batch-capped. Log pruning (180d). Daily snapshots via `VACUUM INTO` (see §State snapshots errata) to `<blob_root>/state-snapshots/`, keep 7, filename-derived due-check.
+- `sidecar_replicated_at` dirty-set drain: every sidecar-rewrite trigger NULLs the flag in the same transaction as its state change (completion, metadata refresh, revert/resource-change, tombstone, restore, hard move); the drain runs on its own faster cadence (default 60s, batch 500), skips photos with a live fetch task (stamp-vs-rewrite race), and edge-logs `mount_lost`/`mount_regained` (per-process edge: the standalone subcommand re-logs per run).
+- Tier-1 startup repair: pid-stamped `drain.lock`, dead-pid reclaim = unclean start → refcount recount/repair before any work (see §Recovery Tier 1 notes). Reused by Phase 6 fsck.
+- Hard-move spec-gap fix: the source library's REMOTE sidecar copy is removed at transition (see §Asset migrating note).
+- Drive-by fix: the revert path's blob decrement now gates on `content_hash` (not `written_at`) — a revert landing while a re-edit sat superseded-pending leaked the old blob's refcount and stranded its file forever.
+- Verified on-device: 5-asset seed/drain → remote sidecars replicated + stamped; retention-0 hard delete removes rows, blob file, local AND remote sidecars with the in-tx log; mount break/restore → stall flag + `mount_lost`, drain resumes on recovery; daily snapshot once (same-day rerun no-op, snapshot opens as a valid db); `kill -9` → stale lock reclaimed by the next run; `cleanup` vs a live daemon → refused with the holder's pid. 130 Rust tests.
 
 ### Phase 6: CLI [ ]
 - `status` (library, pipeline, and per-photo views)

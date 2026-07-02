@@ -159,8 +159,8 @@ pub struct FfiScanSummary {
     pub synthesis_skipped: bool,
 }
 
-/// Daemon knobs — the drain knobs verbatim (the rescan timer is owned by the
-/// platform side, which also owns enumeration).
+/// Daemon knobs — the drain knobs plus the lifecycle-tick cadences (the
+/// rescan timer is owned by the platform side, which also owns enumeration).
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiDaemonOptions {
     pub fetch_concurrency: u32,
@@ -170,10 +170,36 @@ pub struct FfiDaemonOptions {
     pub reserve_floor_gib: u64,
     pub pressure_pause_secs: u64,
     pub storage_poll_secs: u64,
+    /// Hourly lifecycle job cadence (hard deletes, log pruning, snapshots).
+    pub cleanup_interval_secs: u64,
+    /// Dirty-sidecar replication cadence (faster, batch-capped).
+    pub replication_interval_secs: u64,
+}
+
+/// Lifecycle knobs for the one-shot `cleanup` subcommand.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiCleanupOptions {
+    pub log_retention_days: i64,
+    pub snapshot_keep: u32,
+    pub hard_delete_batch: u32,
+    pub replication_batch: u32,
+}
+
+/// Lifecycle outcome (mirrors `cleanup::CleanupReport` + the replication
+/// side).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiCleanupReport {
+    pub photos_hard_deleted: u64,
+    pub blob_files_deleted: u64,
+    pub log_rows_pruned: u64,
+    pub snapshots_written: u64,
+    pub sidecars_replicated: u64,
+    pub sidecars_missing: u64,
+    pub replication_stalled: bool,
 }
 
 /// Daemon outcome (mirrors `daemon::DaemonReport`): drain counters plus the
-/// event side.
+/// event side and the lifecycle-tick aggregates.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiDaemonReport {
     pub drain: FfiDrainReport,
@@ -183,6 +209,7 @@ pub struct FfiDaemonReport {
     pub restores: u64,
     pub transitions: u64,
     pub resources_reopened: u64,
+    pub cleanup: FfiCleanupReport,
 }
 
 /// How the original's hash resolved (mirrors `resolve::HashResolution`).

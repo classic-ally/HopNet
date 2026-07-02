@@ -65,6 +65,14 @@ fn rig() -> Rig {
             "personal".into(),
             "Personal".into(),
             blob_dir.path().to_string_lossy().into_owned(),
+            Some(
+                blob_dir
+                    .path()
+                    .join("sidecar-backup")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            30,
             FfiLibraryScope::Personal,
         )
         .unwrap();
@@ -263,6 +271,68 @@ fn seed_and_drain_through_fetcher_trait() {
     assert_eq!(report.photos_completed, 1);
     assert_eq!(report.resources_written, 2);
     assert_eq!(report.gave_up, 0);
+}
+
+// Impact: this is the exact call sequence the Swift `cleanup` subcommand
+// performs — lock, hard-delete with retention 0, replicate, report.
+// Should: hard-delete an expired tombstone and replicate the other photo's
+// sidecar to the configured remote root, reporting both.
+#[test]
+fn cleanup_round_trip() {
+    use ingress_ffi::FfiCleanupOptions;
+
+    let rig = rig();
+
+    // One completed photo (sidecar becomes replication work)…
+    let keep = slice_descriptor("CLOUD-CLEAN-KEEP:001", false);
+    rig.session.ingest_descriptor(keep.clone()).unwrap();
+    let sink = rig.session.begin_original(keep.clone()).unwrap();
+    sink.write(b"keep-bytes".to_vec()).unwrap();
+    sink.finish().unwrap();
+
+    // …and one completed, tombstoned, retention-expired photo.
+    let gone = slice_descriptor("CLOUD-CLEAN-GONE:001", false);
+    rig.session.ingest_descriptor(gone.clone()).unwrap();
+    let sink = rig.session.begin_original(gone.clone()).unwrap();
+    sink.write(b"gone-bytes".to_vec()).unwrap();
+    let outcome = sink.finish().unwrap();
+    // Tombstone + backdate directly (retention 30 in this rig).
+    let db = rusqlite_free_update(
+        rig.data_dir.path(),
+        &format!(
+            "UPDATE photos SET deleted_at = datetime('now', '-31 days') WHERE photo_id = '{}'",
+            outcome.photo_id
+        ),
+    );
+    assert!(db, "backdate tombstone");
+
+    let report = rig
+        .session
+        .cleanup(FfiCleanupOptions {
+            log_retention_days: 180,
+            snapshot_keep: 7,
+            hard_delete_batch: 500,
+            replication_batch: 500,
+        })
+        .unwrap();
+    assert_eq!(report.photos_hard_deleted, 1);
+    assert_eq!(report.blob_files_deleted, 1);
+    assert!(report.sidecars_replicated >= 1);
+    assert!(!report.replication_stalled);
+    assert!(report.snapshots_written >= 1);
+    assert!(rig.blob_dir.path().join("sidecar-backup").is_dir());
+    assert!(rig.blob_dir.path().join("state-snapshots").is_dir());
+}
+
+/// The FFI crate has no direct sqlx dev-dep; shell out to sqlite3 for the
+/// one test fixture mutation the surface doesn't (and shouldn't) expose.
+fn rusqlite_free_update(data_dir: &std::path::Path, sql: &str) -> bool {
+    std::process::Command::new("sqlite3")
+        .arg(data_dir.join("state.db"))
+        .arg(sql)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 // Should: reject malformed timestamps as InvalidDescriptor.

@@ -764,9 +764,12 @@ public protocol IngressSessionProtocol: AnyObject, Sendable {
     func abortScan() 
     
     /**
-     * Seed a library row (slice/CLI configuration path).
+     * Seed a library row (slice/CLI configuration path). A NULL
+     * `sidecar_root_remote` disables the remote sidecar backup — recovery
+     * from a lost Mac then degrades to blob-only rebuild (spec warns
+     * loudly; the CLI surfaces that warning).
      */
-    func addLibrary(libraryId: String, displayName: String, blobRoot: String, scope: FfiLibraryScope) throws 
+    func addLibrary(libraryId: String, displayName: String, blobRoot: String, sidecarRootRemote: String?, retentionDays: Int64, scope: FfiLibraryScope) throws 
     
     /**
      * Begin streaming the ORIGINAL resource of a not-yet-known asset
@@ -789,6 +792,14 @@ public protocol IngressSessionProtocol: AnyObject, Sendable {
      * inflight sink writes fail Cancelled, rows stay untouched.
      */
     func cancelDrain() 
+    
+    /**
+     * One-shot lifecycle run (the `cleanup` subcommand): exclusive lock
+     * (errors while the daemon holds it), Tier-1 repair on an unclean
+     * reclaim, one cleanup pass + one replication pass. No PhotoKit
+     * involvement — safe without authorization.
+     */
+    func cleanup(options: FfiCleanupOptions) throws  -> FfiCleanupReport
     
     /**
      * Drain pending work through the fetcher until the queue is empty,
@@ -921,14 +932,19 @@ open func abortScan()  {try! rustCall() {
 }
     
     /**
-     * Seed a library row (slice/CLI configuration path).
+     * Seed a library row (slice/CLI configuration path). A NULL
+     * `sidecar_root_remote` disables the remote sidecar backup — recovery
+     * from a lost Mac then degrades to blob-only rebuild (spec warns
+     * loudly; the CLI surfaces that warning).
      */
-open func addLibrary(libraryId: String, displayName: String, blobRoot: String, scope: FfiLibraryScope)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+open func addLibrary(libraryId: String, displayName: String, blobRoot: String, sidecarRootRemote: String?, retentionDays: Int64, scope: FfiLibraryScope)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_ingress_ffi_fn_method_ingresssession_add_library(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(libraryId),
         FfiConverterString.lower(displayName),
         FfiConverterString.lower(blobRoot),
+        FfiConverterOptionString.lower(sidecarRootRemote),
+        FfiConverterInt64.lower(retentionDays),
         FfiConverterTypeFfiLibraryScope_lower(scope),$0
     )
 }
@@ -981,6 +997,21 @@ open func cancelDrain()  {try! rustCall() {
             self.uniffiCloneHandle(),$0
     )
 }
+}
+    
+    /**
+     * One-shot lifecycle run (the `cleanup` subcommand): exclusive lock
+     * (errors while the daemon holds it), Tier-1 repair on an unclean
+     * reclaim, one cleanup pass + one replication pass. No PhotoKit
+     * involvement — safe without authorization.
+     */
+open func cleanup(options: FfiCleanupOptions)throws  -> FfiCleanupReport  {
+    return try  FfiConverterTypeFfiCleanupReport_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_ingress_ffi_fn_method_ingresssession_cleanup(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeFfiCleanupOptions_lower(options),$0
+    )
+})
 }
     
     /**
@@ -1682,8 +1713,151 @@ public func FfiConverterTypeFfiCaptureMetadata_lower(_ value: FfiCaptureMetadata
 
 
 /**
- * Daemon knobs — the drain knobs verbatim (the rescan timer is owned by the
- * platform side, which also owns enumeration).
+ * Lifecycle knobs for the one-shot `cleanup` subcommand.
+ */
+public struct FfiCleanupOptions: Equatable, Hashable {
+    public var logRetentionDays: Int64
+    public var snapshotKeep: UInt32
+    public var hardDeleteBatch: UInt32
+    public var replicationBatch: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(logRetentionDays: Int64, snapshotKeep: UInt32, hardDeleteBatch: UInt32, replicationBatch: UInt32) {
+        self.logRetentionDays = logRetentionDays
+        self.snapshotKeep = snapshotKeep
+        self.hardDeleteBatch = hardDeleteBatch
+        self.replicationBatch = replicationBatch
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiCleanupOptions: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiCleanupOptions: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiCleanupOptions {
+        return
+            try FfiCleanupOptions(
+                logRetentionDays: FfiConverterInt64.read(from: &buf), 
+                snapshotKeep: FfiConverterUInt32.read(from: &buf), 
+                hardDeleteBatch: FfiConverterUInt32.read(from: &buf), 
+                replicationBatch: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiCleanupOptions, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.logRetentionDays, into: &buf)
+        FfiConverterUInt32.write(value.snapshotKeep, into: &buf)
+        FfiConverterUInt32.write(value.hardDeleteBatch, into: &buf)
+        FfiConverterUInt32.write(value.replicationBatch, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCleanupOptions_lift(_ buf: RustBuffer) throws -> FfiCleanupOptions {
+    return try FfiConverterTypeFfiCleanupOptions.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCleanupOptions_lower(_ value: FfiCleanupOptions) -> RustBuffer {
+    return FfiConverterTypeFfiCleanupOptions.lower(value)
+}
+
+
+/**
+ * Lifecycle outcome (mirrors `cleanup::CleanupReport` + the replication
+ * side).
+ */
+public struct FfiCleanupReport: Equatable, Hashable {
+    public var photosHardDeleted: UInt64
+    public var blobFilesDeleted: UInt64
+    public var logRowsPruned: UInt64
+    public var snapshotsWritten: UInt64
+    public var sidecarsReplicated: UInt64
+    public var sidecarsMissing: UInt64
+    public var replicationStalled: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(photosHardDeleted: UInt64, blobFilesDeleted: UInt64, logRowsPruned: UInt64, snapshotsWritten: UInt64, sidecarsReplicated: UInt64, sidecarsMissing: UInt64, replicationStalled: Bool) {
+        self.photosHardDeleted = photosHardDeleted
+        self.blobFilesDeleted = blobFilesDeleted
+        self.logRowsPruned = logRowsPruned
+        self.snapshotsWritten = snapshotsWritten
+        self.sidecarsReplicated = sidecarsReplicated
+        self.sidecarsMissing = sidecarsMissing
+        self.replicationStalled = replicationStalled
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiCleanupReport: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiCleanupReport: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiCleanupReport {
+        return
+            try FfiCleanupReport(
+                photosHardDeleted: FfiConverterUInt64.read(from: &buf), 
+                blobFilesDeleted: FfiConverterUInt64.read(from: &buf), 
+                logRowsPruned: FfiConverterUInt64.read(from: &buf), 
+                snapshotsWritten: FfiConverterUInt64.read(from: &buf), 
+                sidecarsReplicated: FfiConverterUInt64.read(from: &buf), 
+                sidecarsMissing: FfiConverterUInt64.read(from: &buf), 
+                replicationStalled: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiCleanupReport, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.photosHardDeleted, into: &buf)
+        FfiConverterUInt64.write(value.blobFilesDeleted, into: &buf)
+        FfiConverterUInt64.write(value.logRowsPruned, into: &buf)
+        FfiConverterUInt64.write(value.snapshotsWritten, into: &buf)
+        FfiConverterUInt64.write(value.sidecarsReplicated, into: &buf)
+        FfiConverterUInt64.write(value.sidecarsMissing, into: &buf)
+        FfiConverterBool.write(value.replicationStalled, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCleanupReport_lift(_ buf: RustBuffer) throws -> FfiCleanupReport {
+    return try FfiConverterTypeFfiCleanupReport.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCleanupReport_lower(_ value: FfiCleanupReport) -> RustBuffer {
+    return FfiConverterTypeFfiCleanupReport.lower(value)
+}
+
+
+/**
+ * Daemon knobs — the drain knobs plus the lifecycle-tick cadences (the
+ * rescan timer is owned by the platform side, which also owns enumeration).
  */
 public struct FfiDaemonOptions: Equatable, Hashable {
     public var fetchConcurrency: UInt32
@@ -1693,10 +1867,24 @@ public struct FfiDaemonOptions: Equatable, Hashable {
     public var reserveFloorGib: UInt64
     public var pressurePauseSecs: UInt64
     public var storagePollSecs: UInt64
+    /**
+     * Hourly lifecycle job cadence (hard deletes, log pruning, snapshots).
+     */
+    public var cleanupIntervalSecs: UInt64
+    /**
+     * Dirty-sidecar replication cadence (faster, batch-capped).
+     */
+    public var replicationIntervalSecs: UInt64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(fetchConcurrency: UInt32, retryCap: Int64, retryBaseSecs: UInt64, retryMaxSecs: UInt64, reserveFloorGib: UInt64, pressurePauseSecs: UInt64, storagePollSecs: UInt64) {
+    public init(fetchConcurrency: UInt32, retryCap: Int64, retryBaseSecs: UInt64, retryMaxSecs: UInt64, reserveFloorGib: UInt64, pressurePauseSecs: UInt64, storagePollSecs: UInt64, 
+        /**
+         * Hourly lifecycle job cadence (hard deletes, log pruning, snapshots).
+         */cleanupIntervalSecs: UInt64, 
+        /**
+         * Dirty-sidecar replication cadence (faster, batch-capped).
+         */replicationIntervalSecs: UInt64) {
         self.fetchConcurrency = fetchConcurrency
         self.retryCap = retryCap
         self.retryBaseSecs = retryBaseSecs
@@ -1704,6 +1892,8 @@ public struct FfiDaemonOptions: Equatable, Hashable {
         self.reserveFloorGib = reserveFloorGib
         self.pressurePauseSecs = pressurePauseSecs
         self.storagePollSecs = storagePollSecs
+        self.cleanupIntervalSecs = cleanupIntervalSecs
+        self.replicationIntervalSecs = replicationIntervalSecs
     }
 
     
@@ -1728,7 +1918,9 @@ public struct FfiConverterTypeFfiDaemonOptions: FfiConverterRustBuffer {
                 retryMaxSecs: FfiConverterUInt64.read(from: &buf), 
                 reserveFloorGib: FfiConverterUInt64.read(from: &buf), 
                 pressurePauseSecs: FfiConverterUInt64.read(from: &buf), 
-                storagePollSecs: FfiConverterUInt64.read(from: &buf)
+                storagePollSecs: FfiConverterUInt64.read(from: &buf), 
+                cleanupIntervalSecs: FfiConverterUInt64.read(from: &buf), 
+                replicationIntervalSecs: FfiConverterUInt64.read(from: &buf)
         )
     }
 
@@ -1740,6 +1932,8 @@ public struct FfiConverterTypeFfiDaemonOptions: FfiConverterRustBuffer {
         FfiConverterUInt64.write(value.reserveFloorGib, into: &buf)
         FfiConverterUInt64.write(value.pressurePauseSecs, into: &buf)
         FfiConverterUInt64.write(value.storagePollSecs, into: &buf)
+        FfiConverterUInt64.write(value.cleanupIntervalSecs, into: &buf)
+        FfiConverterUInt64.write(value.replicationIntervalSecs, into: &buf)
     }
 }
 
@@ -1761,7 +1955,7 @@ public func FfiConverterTypeFfiDaemonOptions_lower(_ value: FfiDaemonOptions) ->
 
 /**
  * Daemon outcome (mirrors `daemon::DaemonReport`): drain counters plus the
- * event side.
+ * event side and the lifecycle-tick aggregates.
  */
 public struct FfiDaemonReport: Equatable, Hashable {
     public var drain: FfiDrainReport
@@ -1771,10 +1965,11 @@ public struct FfiDaemonReport: Equatable, Hashable {
     public var restores: UInt64
     public var transitions: UInt64
     public var resourcesReopened: UInt64
+    public var cleanup: FfiCleanupReport
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(drain: FfiDrainReport, eventsApplied: UInt64, eventsDeferred: UInt64, deletions: UInt64, restores: UInt64, transitions: UInt64, resourcesReopened: UInt64) {
+    public init(drain: FfiDrainReport, eventsApplied: UInt64, eventsDeferred: UInt64, deletions: UInt64, restores: UInt64, transitions: UInt64, resourcesReopened: UInt64, cleanup: FfiCleanupReport) {
         self.drain = drain
         self.eventsApplied = eventsApplied
         self.eventsDeferred = eventsDeferred
@@ -1782,6 +1977,7 @@ public struct FfiDaemonReport: Equatable, Hashable {
         self.restores = restores
         self.transitions = transitions
         self.resourcesReopened = resourcesReopened
+        self.cleanup = cleanup
     }
 
     
@@ -1806,7 +2002,8 @@ public struct FfiConverterTypeFfiDaemonReport: FfiConverterRustBuffer {
                 deletions: FfiConverterUInt64.read(from: &buf), 
                 restores: FfiConverterUInt64.read(from: &buf), 
                 transitions: FfiConverterUInt64.read(from: &buf), 
-                resourcesReopened: FfiConverterUInt64.read(from: &buf)
+                resourcesReopened: FfiConverterUInt64.read(from: &buf), 
+                cleanup: FfiConverterTypeFfiCleanupReport.read(from: &buf)
         )
     }
 
@@ -1818,6 +2015,7 @@ public struct FfiConverterTypeFfiDaemonReport: FfiConverterRustBuffer {
         FfiConverterUInt64.write(value.restores, into: &buf)
         FfiConverterUInt64.write(value.transitions, into: &buf)
         FfiConverterUInt64.write(value.resourcesReopened, into: &buf)
+        FfiConverterTypeFfiCleanupReport.write(value.cleanup, into: &buf)
     }
 }
 
@@ -3417,7 +3615,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_ingress_ffi_checksum_method_ingresssession_abort_scan() != 54287) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ingress_ffi_checksum_method_ingresssession_add_library() != 27566) {
+    if (uniffi_ingress_ffi_checksum_method_ingresssession_add_library() != 3107) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ingress_ffi_checksum_method_ingresssession_begin_original() != 8294) {
@@ -3430,6 +3628,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ingress_ffi_checksum_method_ingresssession_cancel_drain() != 12111) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ingress_ffi_checksum_method_ingresssession_cleanup() != 13048) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ingress_ffi_checksum_method_ingresssession_drain() != 12569) {

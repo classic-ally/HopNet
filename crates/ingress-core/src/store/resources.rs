@@ -103,9 +103,11 @@ impl StateStore {
             }
         }
 
-        // Photo-level completion: same transaction as the final resource write.
+        // Photo-level completion: same transaction as the final resource
+        // write. Completion triggers the sidecar (re)write, so the remote
+        // dirty flag rides along (T1).
         let photo_completed = sqlx::query(
-            "UPDATE photos SET materialized_at = ? \
+            "UPDATE photos SET materialized_at = ?, sidecar_replicated_at = NULL \
              WHERE photo_id = ? AND materialized_at IS NULL \
                AND NOT EXISTS (SELECT 1 FROM photo_resources \
                                WHERE photo_id = ? AND written_at IS NULL)",

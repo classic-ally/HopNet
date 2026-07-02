@@ -104,6 +104,9 @@ pub async fn execute_transition(
         Some(serde_json::json!({ "src": src.to_string(), "dst": dst.to_string() })),
     )
     .await?;
+    // T5: the sidecar relocates below (new library_id inside it) — the
+    // remote copy under the DESTINATION root doesn't exist yet.
+    crate::store::photos::mark_sidecar_dirty(&mut *tx, photo_id).await?;
     tx.commit().await?;
 
     // Step 3 — post-transaction cleanup. Failures here leave benign orphans.
@@ -112,7 +115,21 @@ pub async fn execute_transition(
             report.src_files_deleted += 1;
         }
     }
+    // Capture the rel-path BEFORE the move — the remote copy under the
+    // SOURCE library's backup root must go too, or a sidecar-tree recovery
+    // resurrects the photo in the wrong library (spec §Asset migrating
+    // step 6 note). Best-effort: a mount-down failure leaves a stale
+    // document for fsck.
+    let src_rel =
+        crate::sidecar_io::find_sidecar(&data_dir.sidecar_root(src), photo_id)?.and_then(|p| {
+            p.strip_prefix(data_dir.sidecar_root(src))
+                .ok()
+                .map(|r| r.to_path_buf())
+        });
     move_sidecar(data_dir, photo_id, src, dst)?;
+    if let (Some(rel), Some(remote)) = (src_rel, &src_config.sidecar_root_remote) {
+        let _ = fs::remove_file(std::path::Path::new(remote).join(rel));
+    }
 
     Ok(report)
 }

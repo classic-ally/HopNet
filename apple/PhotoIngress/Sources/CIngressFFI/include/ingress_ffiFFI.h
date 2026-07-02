@@ -339,7 +339,7 @@ void uniffi_ingress_ffi_fn_method_ingresssession_abort_scan(uint64_t ptr, RustCa
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_ADD_LIBRARY
 #define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_ADD_LIBRARY
-void uniffi_ingress_ffi_fn_method_ingresssession_add_library(uint64_t ptr, RustBuffer library_id, RustBuffer display_name, RustBuffer blob_root, RustBuffer scope, RustCallStatus *_Nonnull out_status
+void uniffi_ingress_ffi_fn_method_ingresssession_add_library(uint64_t ptr, RustBuffer library_id, RustBuffer display_name, RustBuffer blob_root, RustBuffer sidecar_root_remote, int64_t retention_days, RustBuffer scope, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_BEGIN_ORIGINAL
@@ -360,6 +360,11 @@ void uniffi_ingress_ffi_fn_method_ingresssession_begin_scan(uint64_t ptr, RustCa
 #ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_CANCEL_DRAIN
 #define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_CANCEL_DRAIN
 void uniffi_ingress_ffi_fn_method_ingresssession_cancel_drain(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_CLEANUP
+#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_CLEANUP
+RustBuffer uniffi_ingress_ffi_fn_method_ingresssession_cleanup(uint64_t ptr, RustBuffer options, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_DRAIN
@@ -725,6 +730,12 @@ uint16_t uniffi_ingress_ffi_checksum_method_ingresssession_begin_scan(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_CANCEL_DRAIN
 #define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_CANCEL_DRAIN
 uint16_t uniffi_ingress_ffi_checksum_method_ingresssession_cancel_drain(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_CLEANUP
+#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_CLEANUP
+uint16_t uniffi_ingress_ffi_checksum_method_ingresssession_cleanup(void
     
 );
 #endif

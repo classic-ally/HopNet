@@ -42,6 +42,14 @@ pub struct SchedulerConfig {
     /// Fallback pessimistic size when neither descriptor nor blob history
     /// offers an estimate (fresh library).
     pub default_size_estimate: u64,
+    /// Daemon-loop cadence of the hourly lifecycle job (hard deletes, log
+    /// pruning, snapshots).
+    pub cleanup_interval: Duration,
+    /// Daemon-loop cadence of the dirty-sidecar replication drain — faster
+    /// than cleanup so the remote backup tracks changes closely, batch-capped
+    /// so one tick never stalls the loop.
+    pub replication_interval: Duration,
+    pub cleanup: crate::cleanup::CleanupConfig,
 }
 
 impl Default for SchedulerConfig {
@@ -54,6 +62,9 @@ impl Default for SchedulerConfig {
             pressure_pause: Duration::from_secs(60),
             storage_poll: Duration::from_secs(15),
             default_size_estimate: 64 * 1024 * 1024,
+            cleanup_interval: Duration::from_secs(3600),
+            replication_interval: Duration::from_secs(60),
+            cleanup: crate::cleanup::CleanupConfig::default(),
         }
     }
 }
@@ -110,36 +121,6 @@ struct Shared {
 pub struct Scheduler<F: ResourceFetcher> {
     fetcher: Arc<F>,
     shared: Arc<Shared>,
-}
-
-/// Exclusive-drain guard: `O_EXCL` lock file in the data dir, removed on drop.
-/// Temp naming and the inflight set assume a single drain process.
-struct DrainLock(std::path::PathBuf);
-
-impl DrainLock {
-    fn acquire(data_dir: &DataDir) -> Result<Self> {
-        let path = data_dir.root().join("drain.lock");
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(_) => Ok(Self(path)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                Err(IngressError::Invariant(format!(
-                    "another drain is running (or crashed): {} exists",
-                    path.display()
-                )))
-            }
-            Err(e) => Err(IngressError::Invariant(format!("drain lock: {e}"))),
-        }
-    }
-}
-
-impl Drop for DrainLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
 }
 
 impl<F: ResourceFetcher> Scheduler<F> {
@@ -204,9 +185,15 @@ impl<F: ResourceFetcher> Scheduler<F> {
     }
 
     /// One-time run setup shared by `drain` and `run_daemon`: the exclusive
-    /// lock, blob-root creation, and the startup `.partial` sweep.
-    async fn prepare(&self) -> Result<(DrainLock, u64)> {
-        let lock = DrainLock::acquire(&self.shared.data_dir)?;
+    /// pid-stamped lock (Tier-1 refcount repair on an unclean reclaim,
+    /// BEFORE any work is admitted — repaired counts gate irreversible
+    /// deletes), blob-root creation, and the startup `.partial` sweep.
+    async fn prepare(&self) -> Result<(crate::runlock::DrainLock, u64)> {
+        let acquired = crate::runlock::DrainLock::acquire(&self.shared.data_dir)?;
+        if acquired.unclean {
+            // Outcome lands in the ingest log (`refcount_repaired`, drift only).
+            crate::recovery::repair_refcounts(&self.shared.store).await?;
+        }
         let libraries = self.shared.store.libraries().await?;
         let mut swept = 0u64;
         for lib in &libraries {
@@ -217,7 +204,7 @@ impl<F: ResourceFetcher> Scheduler<F> {
             })?;
             swept += sweep_partials(&BlobPaths::new(&lib.blob_root))?;
         }
-        Ok((lock, swept))
+        Ok((acquired.lock, swept))
     }
 
     /// Pull the next work batch, filtered against inflight photos and the

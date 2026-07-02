@@ -42,6 +42,19 @@ impl StateStore {
     }
 }
 
+/// Prune rows older than the cutoff (spec §ingest_log: 180 days, by the
+/// hourly cleanup job). Returns the number of rows removed.
+pub(crate) async fn prune_before<'e, E>(exec: E, cutoff: DateTime<Utc>) -> Result<u64>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    Ok(sqlx::query("DELETE FROM ingest_log WHERE at < ?")
+        .bind(cutoff)
+        .execute(exec)
+        .await?
+        .rows_affected())
+}
+
 pub(crate) async fn append<'e, E>(
     exec: E,
     event_type: &str,
