@@ -72,6 +72,9 @@ impl From<IngressError> for FfiError {
             },
             IngressError::CloudIdConflict(id) => FfiError::CloudIdConflict { msg: id },
             IngressError::Invariant(msg) => FfiError::Invariant { msg },
+            // Pause class inside the scheduler; if it ever escapes to the
+            // FFI surface it reads as an I/O condition, not an invariant.
+            IngressError::StorageUnavailable(msg) => FfiError::Io { msg },
         }
     }
 }

@@ -32,4 +32,10 @@ pub enum IngressError {
 
     #[error("invariant violated: {0}")]
     Invariant(String),
+
+    /// A blob root's filesystem is gone (network mount dropped). A pause
+    /// class, not a failure class: the scheduler polls for the mount's
+    /// return instead of charging retries to individual resources.
+    #[error("storage unavailable: {0}")]
+    StorageUnavailable(String),
 }

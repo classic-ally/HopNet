@@ -23,11 +23,19 @@ impl FreeSpaceProbe for StatvfsProbe {
         let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
         let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
         if rc != 0 {
-            return Err(IngressError::Invariant(format!(
-                "statvfs({}) failed: {}",
-                path.display(),
-                std::io::Error::last_os_error()
-            )));
+            let err = std::io::Error::last_os_error();
+            // ENOENT/ENOTDIR on the blob root means the mount is gone —
+            // an unmount rips the whole directory away. That is a
+            // transport outage (pause class), not an invariant breach.
+            return Err(match err.raw_os_error() {
+                Some(libc::ENOENT) | Some(libc::ENOTDIR) => IngressError::StorageUnavailable(
+                    format!("statvfs({}): {err}", path.display()),
+                ),
+                _ => IngressError::Invariant(format!(
+                    "statvfs({}) failed: {err}",
+                    path.display()
+                )),
+            });
         }
         Ok(stat.f_bavail as u64 * stat.f_frsize as u64)
     }

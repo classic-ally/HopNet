@@ -318,6 +318,66 @@ async fn admission_floor_blocks_then_recovers() {
     );
 }
 
+// Impact: an unmounted SMB blob root fails statvfs instantly, so charging
+// the outage to resources burns the whole retry budget in minutes and
+// strands the queue until the next scan's gave-up reset (observed live:
+// 5,961 gave-ups from one overnight unmount).
+// Should: pause on a vanished blob root without consuming retries, then
+// resume and complete once the root returns.
+// Should not: log drain_task_error for the outage.
+#[tokio::test(flavor = "multi_thread")]
+async fn vanished_blob_root_pauses_without_retry_burn() {
+    struct VanishingProbe(AtomicU64);
+    impl FreeSpaceProbe for VanishingProbe {
+        fn free_bytes(&self, path: &std::path::Path) -> ingress_core::Result<u64> {
+            if self.0.load(Ordering::Relaxed) > 0 {
+                self.0.fetch_sub(1, Ordering::Relaxed);
+                return Err(ingress_core::IngressError::StorageUnavailable(format!(
+                    "statvfs({}): No such file or directory",
+                    path.display()
+                )));
+            }
+            Ok(u64::MAX)
+        }
+    }
+
+    let rig = rig().await;
+    let desc = AssetDescriptorBuilder::simple_image().build();
+    seed_asset(&rig, &desc, b"mount-flaps", None).await;
+
+    let scheduler = Scheduler::new(
+        rig.store.clone(),
+        rig.data_dir.clone(),
+        rig.fetcher.clone(),
+        Arc::new(VanishingProbe(AtomicU64::new(3))),
+        rig.config.clone(),
+        rig.cancel.clone(),
+    );
+    let report = scheduler.drain().await.unwrap();
+    assert_eq!(report.photos_completed, 1);
+    assert!(report.pauses >= 1);
+    let rt: (i64,) =
+        sqlx::query_as("SELECT retry_count FROM photo_resources WHERE resource_type = 0")
+            .fetch_one(rig.store.raw_pool())
+            .await
+            .unwrap();
+    assert_eq!(rt.0, 0);
+    assert!(
+        rig.store
+            .log_events("drain_task_error")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !rig.store
+            .log_events("storage_low")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
 // Impact: SIGTERM-clean is a spec invariant — cancellation must never
 // consume retries or commit partial state.
 // Should: stop draining on cancellation with rows untouched.

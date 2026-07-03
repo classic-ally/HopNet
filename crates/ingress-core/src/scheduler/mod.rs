@@ -450,13 +450,28 @@ async fn photo_task<F: ResourceFetcher>(
                 .map(|s| s as u64)
                 .unwrap_or(shared.config.default_size_estimate),
         };
-        let admitted = admission::admit(
+        let admitted = match admission::admit(
             shared.probe.as_ref(),
             std::path::Path::new(&library.blob_root),
             &shared.inflight_bytes,
             expected,
             shared.config.reserve_floor_bytes,
-        )?;
+        ) {
+            // A vanished blob root fails instantly, so treating it as a
+            // per-resource failure burns the whole retry budget in minutes
+            // and strands the queue until the next scan's gave-up reset.
+            // Pause-and-poll instead; the photo re-queues untouched.
+            Err(IngressError::StorageUnavailable(e)) => {
+                enter_pause(
+                    &shared,
+                    false,
+                    serde_json::json!({ "disk": "blob_root", "error": e }),
+                )
+                .await;
+                return Ok(());
+            }
+            other => other?,
+        };
         if !admitted {
             enter_pause(
                 &shared,
