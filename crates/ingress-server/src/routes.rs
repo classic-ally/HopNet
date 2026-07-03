@@ -11,15 +11,17 @@ use axum::routing::get;
 use tower::ServiceExt as _;
 use tower_http::services::ServeFile;
 
-use crate::auth::{self, AccessRules, AuthContext, AuthUser, can_access};
+use crate::auth::{self, AccessRules, AuthContext, AuthUser, SessionUser, can_access};
 use crate::dto::{Cursor, LibrarySummary, PhotoDetail, PhotoFilter, PhotoPage};
 use crate::index::Index;
+use crate::render::{self, Variant};
 
 #[derive(Clone)]
 pub struct AppState {
     pub index: Arc<Index>,
     pub auth: Arc<AuthContext>,
     pub rules: Arc<AccessRules>,
+    pub cache_dir: Arc<std::path::PathBuf>,
 }
 
 // Sub-extractors so handlers can take the narrow state they need.
@@ -78,6 +80,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/libraries", get(list_libraries))
         .route("/api/photos", get(list_photos))
         .route("/api/photos/{photo_id}", get(photo_detail))
+        .route("/api/photos/{photo_id}/thumb", get(thumb))
+        .route("/api/photos/{photo_id}/display", get(display))
         .route(
             "/api/photos/{photo_id}/resource/{resource_type}",
             get(resource),
@@ -150,6 +154,65 @@ async fn photo_detail(
         return Err(AppError::Forbidden);
     }
     Ok(Json(detail))
+}
+
+async fn thumb(
+    State(st): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path(photo_id): Path<String>,
+    req: Request,
+) -> Result<Response, AppError> {
+    rendition(&st, &user, &photo_id, Variant::Thumb, req).await
+}
+
+async fn display(
+    State(st): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path(photo_id): Path<String>,
+    req: Request,
+) -> Result<Response, AppError> {
+    rendition(&st, &user, &photo_id, Variant::Display, req).await
+}
+
+/// Serve a cached JPEG rendition of a photo's `original` resource (a video
+/// original yields a poster frame). Cached by content_hash → immutable.
+async fn rendition(
+    st: &AppState,
+    user: &SessionUser,
+    photo_id: &str,
+    variant: Variant,
+    req: Request,
+) -> Result<Response, AppError> {
+    let loc = st
+        .index
+        .resource_blob(photo_id, "original")
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if !can_access(&st.rules, user, &loc.library_id) {
+        return Err(AppError::Forbidden);
+    }
+    let bp = st
+        .index
+        .blob_paths(&loc.library_id)
+        .ok_or(AppError::NotFound)?;
+    let hash = ingress_core::ContentHash::from_hex(loc.content_hash.clone());
+    let blob = bp.blob_path(&hash, &loc.ext);
+    let cached =
+        render::render_to_cache(&st.cache_dir, &loc.content_hash, &blob, &loc.ext, variant)
+            .await
+            .map_err(AppError::internal)?;
+
+    let mut resp = ServeFile::new(&cached)
+        .oneshot(req)
+        .await
+        .map_err(|e| AppError::internal(anyhow::anyhow!("serve rendition: {e}")))?
+        .map(axum::body::Body::new);
+    // Renditions are content-addressed → immutable, cache aggressively.
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    Ok(resp)
 }
 
 /// Raw blob bytes with HTTP range support (video streaming + download). No

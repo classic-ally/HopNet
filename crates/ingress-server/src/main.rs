@@ -53,6 +53,7 @@ async fn main() -> anyhow::Result<()> {
         index: index.clone(),
         auth,
         rules: Arc::new(rules),
+        cache_dir: Arc::new(config.cache_dir.clone()),
     };
 
     // Interim in-memory session store: LOSES SESSIONS ON RESTART (users

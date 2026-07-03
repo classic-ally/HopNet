@@ -35,6 +35,12 @@ tower-sessions = "0.15"
 # keeping this slice C-dep-free (same category as the bundled sqlite).
 openidconnect = { version = "4.0.1", default-features = false, features = ["reqwest", "rustls-tls"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "charset", "json"] }
+# Renderer (slice 2b). These pull C libs (libheif via pkg-config, ffmpeg via
+# bindgen) — build needs the devshell in shell.nix (libheif + ffmpeg_7 +
+# bindgenHook). Pin ffmpeg-next to 7.x: ffmpeg 8 dropped avfft.h (see spike).
+libheif-rs = "1.0"
+image = "0.25"
+ffmpeg-next = "7.1"
 
 [dev-dependencies]
 tempfile = "3"
