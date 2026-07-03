@@ -38,15 +38,49 @@ pub struct LibraryEntry {
     pub blob_root: PathBuf,
     /// Local path to this library's sidecar tree (`YYYY/MM/<photo_id>.json`).
     pub sidecar_root: PathBuf,
+    /// Group-based access rule (TOML: `access = { groups = ["shared_photo_library"] }`).
+    #[serde(default)]
+    pub access: LibraryAccess,
 }
 
-/// Deferred to the auth slice — parsed but not consumed here.
+/// Per-library authorization: a session may access this library iff its OIDC
+/// `groups` claim intersects this set. An unlisted library denies by default.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct LibraryAccess {
+    #[serde(default)]
+    pub groups: Vec<String>,
+}
+
+/// pocket-id OIDC settings. The client secret is NEVER in the TOML — it comes
+/// from `$INGRESS_SERVER_OIDC_CLIENT_SECRET` so it never lands in git.
 #[derive(Debug, Clone, Deserialize)]
 pub struct OidcConfig {
     pub issuer: String,
     pub client_id: String,
-    pub client_secret: String,
     pub redirect_uri: String,
+    #[serde(default)]
+    pub post_logout_redirect_uri: Option<String>,
+    /// Force the cookie `Secure` flag off (localhost dev over http). When
+    /// unset, inferred from the redirect_uri scheme.
+    #[serde(default)]
+    pub dev_insecure_cookies: Option<bool>,
+}
+
+impl OidcConfig {
+    /// Read the client secret from the environment. Errors if unset.
+    pub fn client_secret(&self) -> anyhow::Result<String> {
+        std::env::var("INGRESS_SERVER_OIDC_CLIENT_SECRET")
+            .map_err(|_| anyhow::anyhow!("INGRESS_SERVER_OIDC_CLIENT_SECRET is unset"))
+    }
+
+    /// Cookie `Secure`: true for an https redirect (prod), false for http
+    /// localhost dev. Explicit `dev_insecure_cookies` overrides.
+    pub fn secure_cookies(&self) -> bool {
+        match self.dev_insecure_cookies {
+            Some(dev) => !dev,
+            None => self.redirect_uri.starts_with("https://"),
+        }
+    }
 }
 
 fn default_refresh_secs() -> u64 {

@@ -51,6 +51,7 @@ impl Rig {
                 display_name: "Test".to_string(),
                 blob_root: self.sidecar_root.clone(),
                 sidecar_root: self.sidecar_root.clone(),
+                access: Default::default(),
             }],
             oidc: None,
         }

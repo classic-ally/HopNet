@@ -5,6 +5,7 @@
 //! `i64`/`f64` to match SQLite column affinity.
 
 use serde::Serialize;
+use typeshare::typeshare;
 
 /// Opaque keyset cursor over `(sort_ms DESC, photo_id DESC)`. Serialized to the
 /// client as a single base64url token so pagination internals stay private.
@@ -39,6 +40,7 @@ pub struct PhotoFilter {
     pub favorite: Option<bool>,
 }
 
+#[typeshare]
 #[derive(Debug, Clone, Serialize)]
 pub struct LibrarySummary {
     pub library_id: String,
@@ -47,6 +49,7 @@ pub struct LibrarySummary {
     pub count: i64,
 }
 
+#[typeshare]
 #[derive(Debug, Clone, Serialize)]
 pub struct PhotoSummary {
     pub photo_id: String,
@@ -64,6 +67,7 @@ pub struct PhotoSummary {
     pub group_type: Option<String>,
 }
 
+#[typeshare]
 #[derive(Debug, Clone, Serialize)]
 pub struct ResourceInfo {
     pub resource_type: String,
@@ -72,6 +76,7 @@ pub struct ResourceInfo {
     pub size_bytes: i64,
 }
 
+#[typeshare]
 #[derive(Debug, Clone, Serialize)]
 pub struct PhotoDetail {
     pub photo_id: String,
@@ -97,6 +102,7 @@ pub struct PhotoDetail {
     pub resources: Vec<ResourceInfo>,
 }
 
+#[typeshare]
 #[derive(Debug, Clone, Serialize)]
 pub struct PhotoPage {
     pub items: Vec<PhotoSummary>,

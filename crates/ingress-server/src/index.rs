@@ -91,6 +91,16 @@ struct IndexedLibrary {
     sidecar_root: PathBuf,
 }
 
+/// A resolved resource: its owning library plus the blob coordinates needed to
+/// build the on-disk path via `BlobPaths::blob_path`.
+#[derive(Debug, Clone)]
+pub struct ResourceLocation {
+    pub library_id: String,
+    pub content_hash: String,
+    pub ext: String,
+    pub size_bytes: i64,
+}
+
 /// Per-scan counters (logging).
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct IndexStats {
@@ -353,6 +363,33 @@ impl Index {
             group_index: r.get("group_index"),
             group_is_pick: r.get::<Option<i64>, _>("group_is_pick").map(|v| v != 0),
             resources,
+        }))
+    }
+
+    /// Resolve a photo's resource to its owning library + blob coordinates. The
+    /// join also gates cross-library `photo_id` enumeration (the library comes
+    /// from the row, not the caller). `Ok(None)` when the photo or the named
+    /// resource is absent or the photo is tombstoned → the route maps that to 404.
+    pub async fn resource_blob(
+        &self,
+        photo_id: &str,
+        resource_type: &str,
+    ) -> anyhow::Result<Option<ResourceLocation>> {
+        let row = sqlx::query(
+            "SELECT p.library_id AS library_id, r.content_hash AS content_hash, \
+             r.ext AS ext, r.size_bytes AS size_bytes \
+             FROM resources r JOIN photos p ON p.photo_id = r.photo_id \
+             WHERE r.photo_id = ? AND r.resource_type = ? AND p.deleted_at IS NULL",
+        )
+        .bind(photo_id)
+        .bind(resource_type)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| ResourceLocation {
+            library_id: r.get("library_id"),
+            content_hash: r.get("content_hash"),
+            ext: r.get("ext"),
+            size_bytes: r.get("size_bytes"),
         }))
     }
 

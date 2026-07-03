@@ -3,6 +3,8 @@
 //! The binary (`main.rs`) is a thin shell over these modules; `tests/` drives
 //! them directly.
 
+pub mod auth;
 pub mod config;
 pub mod dto;
 pub mod index;
+pub mod routes;
