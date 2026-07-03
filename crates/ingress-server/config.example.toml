@@ -1,0 +1,30 @@
+# ingress-server configuration. Copy to config.toml and edit for the host.
+# Paths are LOCAL to the machine running the server (the NAS), NOT the Mac's
+# mount paths — the server reads blobs + sidecars off local storage.
+
+bind = "0.0.0.0:8080"
+cache_dir = "/tank/ingress-viewer/cache"
+index_db = "/tank/ingress-viewer/index.db"
+refresh_interval_secs = 60
+
+# sidecar_root is the library's replicated sidecar tree — the YYYY/MM buckets
+# sit directly under it (it is the daemon's per-library sidecar_root_remote),
+# NOT nested under the library id.
+[[libraries]]
+library_id = "vivid_birch"
+display_name = "Shared"
+blob_root = "/tank/shared/photos"
+sidecar_root = "/tank/shared/photos/sidecars"
+
+# [[libraries]]
+# library_id = "personal_xxx"
+# display_name = "Personal"
+# blob_root = "/tank/personal/photos"
+# sidecar_root = "/tank/personal/photos/sidecars"
+
+# OIDC (pocket-id) — parsed but unused until the auth slice; leave commented.
+# [oidc]
+# issuer = "https://id.bentley.sh"
+# client_id = "ingress-viewer"
+# client_secret = "..."
+# redirect_uri = "https://photos.bentley.sh/auth/callback"
