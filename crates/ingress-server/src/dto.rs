@@ -46,6 +46,7 @@ pub struct LibrarySummary {
     pub library_id: String,
     pub display_name: String,
     /// Non-tombstoned photos.
+    #[typeshare(serialized_as = "number")]
     pub count: i64,
 }
 
@@ -57,9 +58,13 @@ pub struct PhotoSummary {
     pub captured_at: Option<String>,
     pub media_type: String,
     pub is_live_photo: bool,
+    #[typeshare(serialized_as = "number")]
     pub pixel_width: Option<i64>,
+    #[typeshare(serialized_as = "number")]
     pub pixel_height: Option<i64>,
+    #[typeshare(serialized_as = "number")]
     pub orientation: Option<i64>,
+    #[typeshare(serialized_as = "number")]
     pub duration_ms: Option<i64>,
     pub favorite: bool,
     pub media_subtypes: Vec<String>,
@@ -73,6 +78,7 @@ pub struct ResourceInfo {
     pub resource_type: String,
     pub content_hash: String,
     pub ext: String,
+    #[typeshare(serialized_as = "number")]
     pub size_bytes: i64,
 }
 
@@ -86,9 +92,13 @@ pub struct PhotoDetail {
     pub ingested_at: String,
     pub media_type: String,
     pub media_subtypes: Vec<String>,
+    #[typeshare(serialized_as = "number")]
     pub pixel_width: Option<i64>,
+    #[typeshare(serialized_as = "number")]
     pub pixel_height: Option<i64>,
+    #[typeshare(serialized_as = "number")]
     pub orientation: Option<i64>,
+    #[typeshare(serialized_as = "number")]
     pub duration_ms: Option<i64>,
     pub camera_make: Option<String>,
     pub camera_model: Option<String>,
@@ -97,6 +107,7 @@ pub struct PhotoDetail {
     pub favorite: bool,
     pub group_id: Option<String>,
     pub group_type: Option<String>,
+    #[typeshare(serialized_as = "number")]
     pub group_index: Option<i64>,
     pub group_is_pick: Option<bool>,
     pub resources: Vec<ResourceInfo>,

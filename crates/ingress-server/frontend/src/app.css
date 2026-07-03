@@ -1,0 +1,34 @@
+:root {
+  font-family: 'Red Hat Display';
+  background-color: #11111b; /* crust */
+  color: #cdd6f4; /* text */
+
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  color-scheme: dark;
+}
+
+button {
+  font-family: inherit;
+}
+
+@layer base {
+  * {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+  }
+}
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+/* The viewer is a full-bleed photo grid — no centered max-width clamp. */
+#app {
+  width: 100%;
+}
