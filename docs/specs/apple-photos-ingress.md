@@ -796,6 +796,38 @@ Written by the periodic cleanup job: once per day per library root (on the first
 
 *Read-only caveat (Phase 6):* a read-only SQLite connection cannot run WAL recovery, so the CLI's read paths can fail against a hot `-wal` left by a crashed daemon (`SQLITE_READONLY_RECOVERY`). When that happens and no live pid holds `drain.lock`, the CLI falls back to a normal read-write open (safe: no live writer, migrations are a no-op) with a printed note.
 
+## Interim viewer
+
+The archive is useless to a human until it can be browsed. A freestanding, **read-only** web
+viewer (`crates/ingress-server`, an Axum server on the storage host) serves the materialized
+libraries — the interim way to actually *use* the off-iCloud copy before the full RFC-011 photos
+module exists. This subsection records the load-bearing decisions so the eventual fold-in into
+HopNet's own file/photo UI is copy-adapt, not rewrite. It is not a full RFC — the surface is a
+thin read shim; most of the work is frontend.
+
+- **Read source is the sidecar tree, not `state.db`.** The server runs on the storage host; the
+  live `state.db` lives on the Mac and the snapshots rotate (`snapshot_keep: 7`). The sidecar tree
+  is the complete, durable, non-rotating record already replicated to the host — so the viewer
+  indexes *it* into its own read-optimized store, rebuilt incrementally. This realizes the spec's
+  stated aim ("a structured, queryable archive that survives the absence of the daemon"). The
+  indexer reuses the same `sidecar_io::walk_sidecars` + `Sidecar::from_json` as `recover.rs`, so the
+  reconstruction path is exercised on every boot and cannot silently rot.
+- **The REST contract is the seam.** The frontend asks "list / thumbnail / full asset / metadata"
+  and never knows an ingress sits behind it. At fold-in these routes move into HopNet's server and
+  the pane into HopNet's frontend; the contract is shaped to match HopNet's existing file API.
+- **Thumbnails/renditions are a viewer-side cache, never blobs.** Consistent with the rule that
+  thumbnail resource types (5, 6) are never stored: the viewer decodes on demand (HEIC→JPEG via
+  libheif; video poster via ffmpeg) and caches by content_hash. The blob store stays RFC-011-pure.
+  RAW (RAF/DNG) is download-only — never decoded, since every RAW asset carries a display-friendly
+  original.
+- **Auth diverges deliberately.** The viewer uses OIDC (pocket-id) with a server-side session,
+  not HopNet's Bearer-JWT — it is network-exposed and HopNet credentials are not operational here.
+  Re-aligned at fold-in (or HopNet adopts sessions).
+- **Future security note (not a now-problem):** the viewer decodes *the owner's own* library, so
+  in-process C decoders (libheif/ffmpeg) run on trusted input. When this folds into HopNet with
+  multi-user sharing, those decoders would run on *other users'* files — at which point the decode
+  path should be sandboxed (subprocess / seccomp), a known image-parser CVE surface.
+
 ## Implementation Phases
 
 Structure: a Swift executable (the LaunchAgent) linking `ingress-core` (Rust, in the HopNet monorepo at `crates/ingress-core/`) as a static library via UniFFI. The tokio runtime lives on the Rust side; Swift pushes `AssetDescriptor`s in, Rust calls back out for resource byte streams. The CLI is a pure-Rust binary reading `state.db` directly — no PhotoKit dependency. Chunk streaming across the FFI boundary uses large (~1 MB) buffers, not per-read chunks.
@@ -856,7 +888,11 @@ Structure: a Swift executable (the LaunchAgent) linking `ingress-core` (Rust, in
 - Library config moved wholesale from Swift `setup` to `ingress-cli library add/list/bind/rename/set-retention`: generated immutable two-word ids (see §libraries errata), single-personal + single-shared-marker invariants enforced with friendly errors, unbind-ambiguity guard, no-remote-backup warning relocated from setup, all writes lock-guarded + Tier-1-on-unclean + logged (`library_added`/`library_bound`/`library_renamed`/`retention_changed`). FFI `add_library` removed (bindings regenerated); `setup` = data dir + Photos authorization only.
 - Verified on-device (scratch env, 5 real assets): generated-id adds, seed/drain, status views against live rows, replication then `fsck --deep` clean, planted orphan + deleted blob → exit 1 with BYTE LOSS banner, `--repair` deletes only the orphan, snapshot recover into a fresh data dir (5 photos + hydration), sidecar-tree recover catching the destroyed blob in verification, `--force` interlock, live-daemon coexistence (read-only status, fsck banner, config writes refused with holder pid). 139 Rust tests across the workspace.
 
-### Phase 7: Hardening [ ]
+### Phase 7: Hardening [~]
 - LaunchAgent packaging, login autostart
-- Long-run soak against a full-size library
-- Mount-loss / storage-low behavior under real SMB conditions
+- Long-run soak against a full-size library — shared library (10,140 photos / 170 GiB) drained clean end-to-end; personal (~26k) in progress
+- Mount-loss / storage-low behavior under real SMB conditions [x] — vanished blob root (`statvfs` ENOENT/ENOTDIR) now maps to `StorageUnavailable` and routes into the `storage_low` pause-and-poll path instead of burning per-resource retries (one overnight unmount had driven 5,961 resources to gave-up). See §Storage-aware admission errata.
+
+### Phase 8: Interim viewer [~] — `crates/ingress-server/` (see §Interim viewer)
+- Freestanding read-only web viewer on the storage host: sidecar-tree index (own SQLite, incremental) + Renderer (libheif HEIC→JPEG, ffmpeg video poster, `image` for JPG/PNG; RAW download-only) + Axum REST + pocket-id OIDC session; forked Svelte frontend (virtualized photo grid + lightbox), reusing HopNet primitives/tokens.
+- Decode spike [x]: `libheif-rs 1.1` (real HEIC→JPEG) and `ffmpeg-next 7.1` (HEVC `.mov` poster) validated under Nix. Pin `ffmpeg_7` (ffmpeg 8 drops `avfft.h`, breaks `ffmpeg-sys-next`).

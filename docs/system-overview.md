@@ -239,9 +239,9 @@ S3-compatible API layer enabling standard S3 clients and SDKs to interact with H
 - [ ] Integration with AWS CLI and standard S3 SDKs
 
 ### 11. Apple Photos Ingress ([spec](specs/apple-photos-ingress.md))
-**Status**: Phases 0–6 complete; Phase 7 (hardening) remaining
+**Status**: Phases 0–6 complete; Phase 7 (hardening) in progress; Phase 8 (interim viewer) started
 
-Interim daemon archiving an Apple Photos library (personal + iCloud Shared Photo Library) to content-addressed BLAKE3 blobs + JSON sidecars on user-controlled storage, designed to migrate into the RFC-011 photos module. Standalone Rust workspace at `crates/` (sqlx 0.9 pilot) + Swift PhotoKit shim at `apple/PhotoIngress/`.
+Interim daemon archiving an Apple Photos library (personal + iCloud Shared Photo Library) to content-addressed BLAKE3 blobs + JSON sidecars on user-controlled storage, designed to migrate into the RFC-011 photos module. Standalone Rust workspace at `crates/` (sqlx 0.9 pilot) + Swift PhotoKit shim at `apple/PhotoIngress/`. A freestanding read-only web viewer (`crates/ingress-server`, Phase 8) serves the archive off the storage host — folds into HopNet's own UI later.
 
 - [x] Phase 0: PhotoKit spike (identity, scope detection, streaming)
 - [x] Phase 1: ingress-core skeleton (schema, match precedence, sidecars)
@@ -250,7 +250,8 @@ Interim daemon archiving an Apple Photos library (personal + iCloud Shared Photo
 - [x] Phase 4: Discovery (change classification, reconciliation scan, hard moves, daemon loop)
 - [x] Phase 5: Lifecycle (hard-delete cleanup, snapshots, sidecar replication, Tier-1 repair)
 - [x] Phase 6: CLI (`ingress-cli`: status, fsck --repair, recover, library config)
-- [ ] Phase 7: Hardening (LaunchAgent packaging, long-run soak, real SMB behavior)
+- [~] Phase 7: Hardening (mount-loss pause fix done + shared-library soak clean; LaunchAgent packaging + full soak remaining)
+- [~] Phase 8: Interim viewer (`ingress-server`: sidecar-index → Axum REST → Svelte grid; decode spike done)
 
 ### Reliability Goals
 - **Single node failure**: No data loss, minimal performance impact
