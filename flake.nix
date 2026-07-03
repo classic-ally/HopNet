@@ -126,8 +126,36 @@
               cp -r ${frontend}/* frontend/dist/
             '';
           });
+
+          # The photo-viewer backend. Lives in the standalone `crates/`
+          # workspace (own Cargo.lock, no iroh patch). Built with
+          # buildRustPackage rather than crane so `cargo build -p
+          # ingress-server` naturally skips the sibling ingress-ffi (whose
+          # UniFFI build.rs would trip crane's deps-only dummy build). Needs
+          # C libs for the Renderer: libheif (HEIC, via pkg-config) and
+          # ffmpeg 7 (video posters, via bindgen — ffmpeg 8 dropped avfft.h).
+          rustPlatform = pkgs.makeRustPlatform {
+            cargo = rustToolchain;
+            rustc = rustToolchain;
+          };
+          ingress-server = rustPlatform.buildRustPackage {
+            pname = "ingress-server";
+            version = "0.1.0";
+            src = craneLib.cleanCargoSource ./crates;
+            cargoLock.lockFile = ./crates/Cargo.lock;
+            cargoBuildFlags = [ "-p" "ingress-server" ];
+            doCheck = false;
+            nativeBuildInputs = [ pkgs.pkg-config pkgs.rustPlatform.bindgenHook ];
+            buildInputs = [ pkgs.libheif pkgs.ffmpeg_7 ];
+            BINDGEN_EXTRA_CLANG_ARGS = "-I${pkgs.ffmpeg_7.dev}/include";
+            meta = {
+              description = "Read-only web viewer for the Apple Photos ingress blob store";
+              mainProgram = "ingress-server";
+            };
+          };
         in {
           default = hopnet;
+          inherit ingress-server;
         } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
           dockerImage = pkgs.dockerTools.buildLayeredImage {
             name = "hopnet";
