@@ -173,6 +173,17 @@
 
             nativeBuildInputs = [ pkgs.nodejs pkgs.pnpm_10 pkgs.pnpmConfigHook ];
 
+            # pnpm 10.34+ re-verifies the minimumReleaseAge supply-chain
+            # policy at install time; offline (in the sandbox) there is no
+            # registry metadata, so verification rejects entries and surfaces
+            # as ERR_PNPM_NO_OFFLINE_TARBALL. The online fetchPnpmDeps step
+            # already enforced the policy — trust its result here.
+            # (pnpmConfigHook only does this for pnpm >= 11.)
+            prePnpmInstall = ''
+              export pnpm_config_trust_lockfile=true
+              pnpm config set minimum-release-age 0
+            '';
+
             buildPhase = ''
               runHook preBuild
               # The re-exported repo-root frontend/uno.config.ts resolves its
