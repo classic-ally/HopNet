@@ -91,7 +91,12 @@ pub fn mark_seen(scan: &ScanState, photo_id: &PhotoId) {
 /// Probe one enumerated asset. Resolution mirrors identity precedence:
 /// `cloud_id` first, then the same-device `local_id` guard for cloud-less
 /// assets. Any resolved photo is marked seen regardless of verdict.
-pub async fn probe(store: &StateStore, scan: &ScanState, p: &ScanProbe) -> Result<ScanVerdict> {
+pub async fn probe(
+    store: &StateStore,
+    data_dir: &DataDir,
+    scan: &ScanState,
+    p: &ScanProbe,
+) -> Result<ScanVerdict> {
     scan.probes.fetch_add(1, Ordering::Relaxed);
 
     let photo = match p.cloud_id.as_deref() {
@@ -136,6 +141,23 @@ pub async fn probe(store: &StateStore, scan: &ScanState, p: &ScanProbe) -> Resul
         (Some(_), None) => false,
     };
     if modified {
+        scan.needed_full.fetch_add(1, Ordering::Relaxed);
+        return Ok(ScanVerdict::NeedsFull);
+    }
+
+    // Self-heal the crash-window class: a materialized, active photo whose
+    // local sidecar is missing (the completion tx committed but
+    // `write_photo_sidecar` never landed) is otherwise invisible — the light
+    // probe sees no metadata drift, and the replication drain skips it
+    // unstamped forever (`report.missing`). Force a full descriptor so
+    // `apply_change` can recompose it; only the full path carries the
+    // sidecar-only fields (media type, favorite, capture metadata) that are
+    // not persisted in `state.db`, so nothing else could regenerate it.
+    if photo.materialized_at.is_some()
+        && let Some(library_id) = &photo.library_id
+        && crate::sidecar_io::find_sidecar(&data_dir.sidecar_root(library_id), &photo.photo_id)?
+            .is_none()
+    {
         scan.needed_full.fetch_add(1, Ordering::Relaxed);
         return Ok(ScanVerdict::NeedsFull);
     }

@@ -359,7 +359,12 @@ impl IngressSession {
         };
         let verdict =
             self.runtime
-                .block_on(ingress_core::scan::probe(&self.inner.store, &scan, &p))?;
+                .block_on(ingress_core::scan::probe(
+                    &self.inner.store,
+                    &self.inner.data_dir,
+                    &scan,
+                    &p,
+                ))?;
         Ok(match verdict {
             ingress_core::scan::ScanVerdict::Done => FfiScanVerdict::Done,
             ingress_core::scan::ScanVerdict::NeedsFull => FfiScanVerdict::NeedsFull,

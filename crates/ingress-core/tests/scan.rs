@@ -42,7 +42,7 @@ async fn probe_done_for_unchanged_marks_seen() {
 
     let scan = begin(&store).await.unwrap();
     assert_eq!(
-        probe(&store, &scan, &probe_of(&desc)).await.unwrap(),
+        probe(&store, &data_dir, &scan, &probe_of(&desc)).await.unwrap(),
         ScanVerdict::Done
     );
 
@@ -80,7 +80,7 @@ async fn probe_needs_full_for_every_change_class() {
         .modified_at(t1)
         .build();
     assert_eq!(
-        probe(&store, &scan, &probe_of(&unknown)).await.unwrap(),
+        probe(&store, &data_dir, &scan, &probe_of(&unknown)).await.unwrap(),
         ScanVerdict::NeedsFull
     );
 
@@ -93,7 +93,7 @@ async fn probe_needs_full_for_every_change_class() {
         .await
         .unwrap();
     assert_eq!(
-        probe(&store, &scan, &probe_of(&tomb_desc)).await.unwrap(),
+        probe(&store, &data_dir, &scan, &probe_of(&tomb_desc)).await.unwrap(),
         ScanVerdict::NeedsFull
     );
 
@@ -105,7 +105,7 @@ async fn probe_needs_full_for_every_change_class() {
     let mut flipped = probe_of(&flip_desc);
     flipped.scope = LibraryScope::Shared;
     assert_eq!(
-        probe(&store, &scan, &flipped).await.unwrap(),
+        probe(&store, &data_dir, &scan, &flipped).await.unwrap(),
         ScanVerdict::NeedsFull
     );
 
@@ -117,7 +117,7 @@ async fn probe_needs_full_for_every_change_class() {
     let mut newer = probe_of(&mod_desc);
     newer.asset_modified_at = Some(t1 + Duration::seconds(5));
     assert_eq!(
-        probe(&store, &scan, &newer).await.unwrap(),
+        probe(&store, &data_dir, &scan, &newer).await.unwrap(),
         ScanVerdict::NeedsFull
     );
 
@@ -125,7 +125,7 @@ async fn probe_needs_full_for_every_change_class() {
     let null_desc = AssetDescriptorBuilder::simple_image().build();
     seed_one(&store, &null_desc).await;
     assert_eq!(
-        probe(&store, &scan, &probe_of(&null_desc)).await.unwrap(),
+        probe(&store, &data_dir, &scan, &probe_of(&null_desc)).await.unwrap(),
         ScanVerdict::NeedsFull
     );
 }
@@ -152,7 +152,7 @@ async fn finish_synthesizes_deletions_for_unseen_only() {
     let gone_id = seed_one(&store, &gone_desc).await;
 
     let scan = begin(&store).await.unwrap();
-    probe(&store, &scan, &probe_of(&seen_desc)).await.unwrap();
+    probe(&store, &data_dir, &scan, &probe_of(&seen_desc)).await.unwrap();
     // `gone` is never probed — absent from PhotoKit.
 
     // Minted mid-scan (observer insert racing the enumeration): protected by
@@ -249,7 +249,7 @@ async fn finish_resets_gave_up_and_logs_counts() {
     }
 
     let scan = begin(&store).await.unwrap();
-    probe(&store, &scan, &probe_of(&desc)).await.unwrap();
+    probe(&store, &data_dir, &scan, &probe_of(&desc)).await.unwrap();
     let summary = finish(&store, &data_dir, &scan, 1, cap).await.unwrap();
     assert_eq!(summary.gave_up_reset, 1);
 

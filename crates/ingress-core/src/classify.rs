@@ -242,6 +242,14 @@ pub async fn apply_change(
     desc: &AssetDescriptor,
 ) -> Result<(Classification, ChangeOutcome)> {
     let classification = classify(store, desc).await?;
+    // A NoOp delivery still heals a missing local sidecar: the scan re-probes a
+    // materialized photo whose sidecar vanished (crash window) as NeedsFull, but
+    // `classify` — pure and fs-blind — sees no work and returns NoOp. Recompose
+    // it here from the live descriptor before the early return.
+    if let Classification::NoOp { photo_id } = &classification {
+        heal_missing_sidecar(store, data_dir, desc, photo_id).await?;
+        return Ok((classification, ChangeOutcome::default()));
+    }
     let Classification::Known(plan) = &classification else {
         return Ok((classification, ChangeOutcome::default()));
     };
@@ -355,15 +363,20 @@ pub async fn apply_change(
 
     // Sidecar rewrite: only when the photo is materialized — a sidecar
     // reflects committed state; drain (re)writes it at completion otherwise.
+    // On a committed change, always rewrite; with no change, still recompose a
+    // missing sidecar (crash-window self-heal, same as the NoOp branch above).
     let state_changed = outcome.restored
         || outcome.transitioned
         || outcome.resources_removed > 0
         || plan.metadata_refresh;
-    if state_changed
-        && let Some(photo) = store.photo(&plan.photo_id).await?
-        && photo.materialized_at.is_some()
-    {
-        write_photo_sidecar(store, data_dir, desc, &plan.photo_id).await?;
+    if state_changed {
+        if let Some(photo) = store.photo(&plan.photo_id).await?
+            && photo.materialized_at.is_some()
+        {
+            write_photo_sidecar(store, data_dir, desc, &plan.photo_id).await?;
+        }
+    } else {
+        heal_missing_sidecar(store, data_dir, desc, &plan.photo_id).await?;
     }
     if plan.metadata_refresh {
         if let Some(at) = desc.asset_modified_at {
@@ -373,6 +386,33 @@ pub async fn apply_change(
     }
 
     Ok((classification, outcome))
+}
+
+/// Recompose a materialized photo's local sidecar iff it is absent on disk —
+/// the crash-window class (completion tx committed, `write_photo_sidecar` never
+/// landed). No-op for an unmaterialized/unmapped photo or an existing sidecar.
+/// Needs the live descriptor: sidecar-only fields are not persisted in the DB,
+/// so nothing else can regenerate it. The replication drain then backs up the
+/// recomposed file on its next pass (the photo is already sidecar-dirty).
+async fn heal_missing_sidecar(
+    store: &StateStore,
+    data_dir: &DataDir,
+    desc: &AssetDescriptor,
+    photo_id: &PhotoId,
+) -> Result<()> {
+    let Some(photo) = store.photo(photo_id).await? else {
+        return Ok(());
+    };
+    if photo.materialized_at.is_none() {
+        return Ok(());
+    }
+    let Some(library_id) = &photo.library_id else {
+        return Ok(());
+    };
+    if crate::sidecar_io::find_sidecar(&data_dir.sidecar_root(library_id), photo_id)?.is_none() {
+        write_photo_sidecar(store, data_dir, desc, photo_id).await?;
+    }
+    Ok(())
 }
 
 /// Outcome of [`apply_removal`].

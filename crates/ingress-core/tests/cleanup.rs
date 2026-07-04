@@ -1030,6 +1030,80 @@ async fn replication_removes_tmp_after_failed_copy() {
     );
 }
 
+// Impact: the crash-window class (materialized, local sidecar never written)
+// leaks forever — the drain skips it unstamped (report.missing) and the
+// light-probe scan sees no metadata drift, so nothing re-triggers the write.
+// The scan must self-heal it: re-probe as NeedsFull -> apply recomposes the
+// sidecar from the live descriptor -> the drain finally backs it up.
+// Should: probe verdict flips Done -> NeedsFull when the local sidecar vanishes;
+// apply_change (even a no-op delivery) rewrites it; the drain then replicates
+// and stamps it.
+// Should not: verdict Done for a materialized photo with no local sidecar.
+#[tokio::test]
+async fn scan_self_heals_missing_local_sidecar() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, lib, _) = store_with_remotes(tmp.path()).await;
+    let data_dir = DataDir::new(tmp.path().join("data"));
+    let desc = AssetDescriptorBuilder::simple_image()
+        .modified_at(Utc::now())
+        .build();
+    let id = seed_one(&store, &desc).await;
+    materialize_all(&store, &data_dir, &desc, &id).await;
+
+    let probe_of = ingress_core::scan::ScanProbe {
+        local_id: desc.local_id.clone(),
+        cloud_id: desc.cloud_id.clone(),
+        scope: desc.scope,
+        asset_modified_at: desc.asset_modified_at,
+    };
+
+    // Baseline: an unchanged photo WITH its sidecar verdicts Done.
+    let scan = ingress_core::scan::begin(&store).await.unwrap();
+    assert_eq!(
+        ingress_core::scan::probe(&store, &data_dir, &scan, &probe_of)
+            .await
+            .unwrap(),
+        ingress_core::scan::ScanVerdict::Done,
+        "unchanged + sidecar present = Done"
+    );
+
+    // Simulate the crash window: the completion committed but the sidecar is
+    // gone (deleted / never landed).
+    let local = ingress_core::sidecar_io::find_sidecar(&data_dir.sidecar_root(&lib), &id)
+        .unwrap()
+        .unwrap();
+    std::fs::remove_file(&local).unwrap();
+
+    // The ONLY signal now is the absent sidecar — the probe must escalate.
+    let scan2 = ingress_core::scan::begin(&store).await.unwrap();
+    assert_eq!(
+        ingress_core::scan::probe(&store, &data_dir, &scan2, &probe_of)
+            .await
+            .unwrap(),
+        ingress_core::scan::ScanVerdict::NeedsFull,
+        "missing sidecar forces a full re-probe"
+    );
+
+    // The re-delivered descriptor classifies NoOp (nothing else changed), yet
+    // apply_change recomposes the sidecar on disk.
+    apply_change(&store, &data_dir, &desc).await.unwrap();
+    assert!(
+        ingress_core::sidecar_io::find_sidecar(&data_dir.sidecar_root(&lib), &id)
+            .unwrap()
+            .is_some(),
+        "sidecar recomposed on disk"
+    );
+
+    // And the drain — which skipped it as `missing` before — now backs it up.
+    let mut state = ReplicationState::default();
+    let report = replicate_dirty_sidecars(&store, &data_dir, 100, &HashSet::new(), &mut state)
+        .await
+        .unwrap();
+    assert_eq!(report.replicated, 1, "healed sidecar replicates");
+    assert_eq!(report.missing, 0, "no longer the missing-sidecar class");
+    assert!(replicated_at(&store, &id).await.is_some(), "stamped");
+}
+
 // Impact: a cleanup run concurrent with a live daemon would race photo_tasks
 // and the loop's own ticks — the shared lock is the exclusivity story.
 // Should: error while a live-pid lock exists; run + release otherwise.
