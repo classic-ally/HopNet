@@ -33,10 +33,16 @@ impl Cursor {
     }
 }
 
-/// Browse filters. Date-range is a deliberate future slot.
+/// Browse filters. Each flag is tri-state: `Some(true)` = only, `Some(false)`
+/// = exclude, `None` = don't care. Date-range is a deliberate future slot.
 #[derive(Debug, Clone, Default)]
 pub struct PhotoFilter {
-    pub media_type: Option<String>,
+    /// `media_type == "video"`.
+    pub video: Option<bool>,
+    /// `media_type == "live_photo"`.
+    pub live: Option<bool>,
+    /// Photo has a `raw_alternate` resource.
+    pub raw: Option<bool>,
     pub favorite: Option<bool>,
 }
 
@@ -45,9 +51,14 @@ pub struct PhotoFilter {
 pub struct LibrarySummary {
     pub library_id: String,
     pub display_name: String,
-    /// Non-tombstoned photos.
+    /// Shared (multi-person) library — fused views badge its assets.
+    pub shared: bool,
+    /// Non-tombstoned stills (image + live_photo).
     #[typeshare(serialized_as = "number")]
-    pub count: i64,
+    pub photo_count: i64,
+    /// Non-tombstoned videos.
+    #[typeshare(serialized_as = "number")]
+    pub video_count: i64,
 }
 
 #[typeshare]
@@ -118,6 +129,17 @@ pub struct PhotoDetail {
 pub struct PhotoPage {
     pub items: Vec<PhotoSummary>,
     pub next_cursor: Option<String>,
+}
+
+/// One month of the browse timeline, newest-first, for the histogram rail.
+#[typeshare]
+#[derive(Debug, Clone, Serialize)]
+pub struct MonthBucket {
+    /// `"YYYY-MM"` derived from `sort_ms` (so undated photos land under their
+    /// ingest month, same total order the grid scrolls through).
+    pub month: String,
+    #[typeshare(serialized_as = "number")]
+    pub count: i64,
 }
 
 // --- minimal base64url (RFC 4648 §5, no padding) ---------------------------

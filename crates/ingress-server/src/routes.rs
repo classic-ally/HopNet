@@ -12,7 +12,7 @@ use tower::ServiceExt as _;
 use tower_http::services::ServeFile;
 
 use crate::auth::{self, AccessRules, AuthContext, AuthUser, SessionUser, can_access};
-use crate::dto::{Cursor, LibrarySummary, PhotoDetail, PhotoFilter, PhotoPage};
+use crate::dto::{Cursor, LibrarySummary, MonthBucket, PhotoDetail, PhotoFilter, PhotoPage};
 use crate::index::Index;
 use crate::render::{self, Variant};
 
@@ -79,6 +79,7 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/logout", get(auth::logout))
         .route("/api/libraries", get(list_libraries))
         .route("/api/photos", get(list_photos))
+        .route("/api/photos/histogram", get(histogram))
         .route("/api/photos/{photo_id}", get(photo_detail))
         .route("/api/photos/{photo_id}/thumb", get(thumb))
         .route("/api/photos/{photo_id}/display", get(display))
@@ -110,11 +111,48 @@ async fn list_libraries(
 
 #[derive(serde::Deserialize)]
 struct PhotosQuery {
+    /// One or more library ids, comma-separated (ids are `[a-z0-9_]`, so the
+    /// comma is unambiguous). Multiple libraries fuse into one timeline.
     library: String,
     cursor: Option<String>,
     limit: Option<u32>,
-    media_type: Option<String>,
+    // Tri-state filters: absent = any, true = only, false = exclude.
+    video: Option<bool>,
+    live: Option<bool>,
+    raw: Option<bool>,
     favorite: Option<bool>,
+}
+
+impl PhotosQuery {
+    /// Split + authorize the library set. Every requested library must be
+    /// accessible — a fused request never silently drops a forbidden one.
+    fn libraries(&self, st: &AppState, user: &SessionUser) -> Result<Vec<String>, AppError> {
+        let libs: Vec<String> = self
+            .library
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        if libs.is_empty() {
+            return Err(AppError::Forbidden);
+        }
+        for lib in &libs {
+            if !can_access(&st.rules, user, lib) {
+                return Err(AppError::Forbidden);
+            }
+        }
+        Ok(libs)
+    }
+
+    fn filter(&self) -> PhotoFilter {
+        PhotoFilter {
+            video: self.video,
+            live: self.live,
+            raw: self.raw,
+            favorite: self.favorite,
+        }
+    }
 }
 
 async fn list_photos(
@@ -122,20 +160,23 @@ async fn list_photos(
     AuthUser(user): AuthUser,
     Query(q): Query<PhotosQuery>,
 ) -> Result<Json<PhotoPage>, AppError> {
-    if !can_access(&st.rules, &user, &q.library) {
-        return Err(AppError::Forbidden);
-    }
+    let libs = q.libraries(&st, &user)?;
     // A malformed cursor degrades to page 1, never a 500.
     let cursor = q.cursor.as_deref().and_then(Cursor::from_token);
-    let filter = PhotoFilter {
-        media_type: q.media_type,
-        favorite: q.favorite,
-    };
     let page = st
         .index
-        .list_photos(&q.library, cursor, q.limit.unwrap_or(100), &filter)
+        .list_photos(&libs, cursor, q.limit.unwrap_or(100), &q.filter())
         .await?;
     Ok(Json(page))
+}
+
+async fn histogram(
+    State(st): State<AppState>,
+    AuthUser(user): AuthUser,
+    Query(q): Query<PhotosQuery>,
+) -> Result<Json<Vec<MonthBucket>>, AppError> {
+    let libs = q.libraries(&st, &user)?;
+    Ok(Json(st.index.month_histogram(&libs, &q.filter()).await?))
 }
 
 async fn photo_detail(

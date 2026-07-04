@@ -127,6 +127,57 @@
             '';
           });
 
+          # The photo-viewer SPA. Needs BOTH its own sources and HopNet's
+          # frontend/src/lib in the tree: the vite `$ui` alias resolves
+          # ../../../frontend/src/lib (zero-copy primitive reuse), so the
+          # source root spans the repo, and we build from the viewer subdir.
+          viewer-frontend = pkgs.stdenvNoCC.mkDerivation {
+            pname = "ingress-viewer-frontend";
+            version = "0.1.0";
+            src = pkgs.lib.fileset.toSource {
+              root = ./.;
+              fileset = pkgs.lib.fileset.unions [
+                ./frontend/src/lib
+                ./frontend/uno.config.ts
+                (pkgs.lib.fileset.difference
+                  ./crates/ingress-server/frontend
+                  (pkgs.lib.fileset.unions [
+                    (pkgs.lib.fileset.maybeMissing ./crates/ingress-server/frontend/node_modules)
+                    (pkgs.lib.fileset.maybeMissing ./crates/ingress-server/frontend/dist)
+                    (pkgs.lib.fileset.maybeMissing ./crates/ingress-server/frontend/storybook-static)
+                  ]))
+              ];
+            };
+            sourceRoot = "source/crates/ingress-server/frontend";
+
+            pnpmDeps = pkgs.fetchPnpmDeps {
+              pname = "ingress-viewer-frontend";
+              version = "0.1.0";
+              src = ./crates/ingress-server/frontend;
+              fetcherVersion = 3;
+              hash = "sha256-1U3vi1mn7zUr1yJiVxXp44KXmz83QdKh7/2r0xNxB7I=";
+            };
+
+            nativeBuildInputs = [ pkgs.nodejs pkgs.pnpm_10 pkgs.pnpmConfigHook ];
+
+            buildPhase = ''
+              runHook preBuild
+              # The re-exported repo-root frontend/uno.config.ts resolves its
+              # @unocss/* imports from ITS directory; give it this package's
+              # node_modules (the presets are declared in our package.json).
+              chmod u+w ../../../frontend
+              ln -s "$PWD/node_modules" ../../../frontend/node_modules
+              pnpm build
+              runHook postBuild
+            '';
+
+            installPhase = ''
+              runHook preInstall
+              cp -r dist $out
+              runHook postInstall
+            '';
+          };
+
           # The photo-viewer backend. Lives in the standalone `crates/`
           # workspace (own Cargo.lock, no iroh patch). Built with
           # buildRustPackage rather than crane so `cargo build -p
@@ -148,6 +199,12 @@
             nativeBuildInputs = [ pkgs.pkg-config pkgs.rustPlatform.bindgenHook ];
             buildInputs = [ pkgs.libheif pkgs.ffmpeg_7 ];
             BINDGEN_EXTRA_CLANG_ARGS = "-I${pkgs.ffmpeg_7.dev}/include";
+            # include_dir! bakes the SPA into the binary at compile time;
+            # cleanCargoSource strips frontend/, so restore the built dist.
+            preBuild = ''
+              mkdir -p ingress-server/frontend/dist
+              cp -r ${viewer-frontend}/* ingress-server/frontend/dist/
+            '';
             meta = {
               description = "Read-only web viewer for the Apple Photos ingress blob store";
               mainProgram = "ingress-server";

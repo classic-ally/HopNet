@@ -5,7 +5,21 @@
 export interface LibrarySummary {
 	library_id: string;
 	display_name: string;
-	/** Non-tombstoned photos. */
+	/** Shared (multi-person) library — fused views badge its assets. */
+	shared: boolean;
+	/** Non-tombstoned stills (image + live_photo). */
+	photo_count: number;
+	/** Non-tombstoned videos. */
+	video_count: number;
+}
+
+/** One month of the browse timeline, newest-first, for the histogram rail. */
+export interface MonthBucket {
+	/**
+	 * `"YYYY-MM"` derived from `sort_ms` (so undated photos land under their
+	 * ingest month, same total order the grid scrolls through).
+	 */
+	month: string;
 	count: number;
 }
 

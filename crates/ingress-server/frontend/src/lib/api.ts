@@ -18,12 +18,19 @@ export function login(): void {
   window.location.href = '/auth/login';
 }
 
+// A 401 anywhere (boot probe or a mid-session expiry during grid fetches)
+// flips the app to the login page rather than hard-redirecting into the OIDC
+// provider — the user gets a deliberate "Sign in" step, not a surprise bounce.
+let onUnauthorized: (() => void) | null = null;
+export function setUnauthorizedHandler(fn: () => void): void {
+  onUnauthorized = fn;
+}
+
 async function request(path: string, init?: RequestInit): Promise<Response> {
   const res = await fetch(path, { credentials: 'same-origin', ...init });
   if (res.status === 401) {
-    login();
-    // Give the redirect a tick; never resolve so callers don't render on a 401.
-    await new Promise(() => {});
+    onUnauthorized?.();
+    throw new ApiError(401, 'Not signed in');
   }
   return res;
 }

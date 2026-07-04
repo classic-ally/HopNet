@@ -12,11 +12,14 @@ refresh_interval_secs = 60
 # NOT nested under the library id.
 # access.groups: a user may see this library iff their OIDC `groups` claim
 # intersects this list. An unlisted library denies by default.
+# shared: marks a multi-person library — the viewer badges its assets when
+# showing a fused multi-library timeline.
 [[libraries]]
 library_id = "vivid_birch"
 display_name = "Shared"
 blob_root = "/tank/shared/photos"
 sidecar_root = "/tank/shared/photos/sidecars"
+shared = true
 access = { groups = ["shared_photo_library"] }
 
 # [[libraries]]

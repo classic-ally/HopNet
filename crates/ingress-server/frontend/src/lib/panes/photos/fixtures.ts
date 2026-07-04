@@ -1,6 +1,23 @@
 // Mock data for Storybook — lets the presentational views render with no
 // backend. Shapes mirror the typeshare DTOs exactly.
-import type { PhotoSummary, PhotoDetail } from '../../types';
+import type { LibrarySummary, MonthBucket, PhotoSummary, PhotoDetail } from '../../types';
+
+export const mockLibraries: LibrarySummary[] = [
+  {
+    library_id: 'vivid_birch',
+    display_name: 'Shared',
+    shared: true,
+    photo_count: 6912,
+    video_count: 228,
+  },
+  {
+    library_id: 'quiet_maple',
+    display_name: 'Personal',
+    shared: false,
+    photo_count: 24102,
+    video_count: 1893,
+  },
+];
 
 function photo(over: Partial<PhotoSummary> & { photo_id: string }): PhotoSummary {
   return {
@@ -74,3 +91,30 @@ export const mockDetail: PhotoDetail = {
 
 // Placeholder thumbnails for Storybook (no /api backend). Deterministic per id.
 export const placeholderThumb = (id: string) => `https://picsum.photos/seed/${id}/300/300`;
+// Same seed, higher res — what the hover preview upgrades to.
+export const placeholderDisplay = (id: string) => `https://picsum.photos/seed/${id}/900/900`;
+
+// ~4 years of months with seasonal-ish variation, deterministic (no RNG so
+// stories are stable). Newest first, matching the API.
+export const mockBuckets: MonthBucket[] = Array.from({ length: 48 }, (_, i) => {
+  const d = new Date(Date.UTC(2026, 5 - i, 1)); // 2026-06 walking backwards
+  const month = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+  const count = 40 + Math.round(260 * Math.abs(Math.sin(i * 1.7)) + (i % 5) * 30);
+  return { month, count };
+});
+
+// A large flat page for scroll/scrub stories: one photo per mock bucket day.
+export const mockManyPhotos: PhotoSummary[] = Array.from({ length: 120 }, (_, i) => {
+  const day = String((i % 27) + 1).padStart(2, '0');
+  const d = new Date(Date.UTC(2026, 5 - Math.floor(i / 10), 1));
+  const month = String(d.getUTCMonth() + 1).padStart(2, '0');
+  return photo({
+    photo_id: `m${i}`,
+    // Alternate libraries so fused-view stories can badge the shared ones.
+    library_id: i % 3 === 0 ? 'vivid_birch' : 'quiet_maple',
+    captured_at: `${d.getUTCFullYear()}-${month}-${day}T12:00:00Z`,
+    favorite: i % 11 === 0,
+    media_type: i % 7 === 0 ? 'video' : 'image',
+    duration_ms: i % 7 === 0 ? 9000 + i * 500 : 0,
+  });
+});

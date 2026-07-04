@@ -51,6 +51,7 @@ impl Rig {
                 display_name: "Test".to_string(),
                 blob_root: self.sidecar_root.clone(),
                 sidecar_root: self.sidecar_root.clone(),
+                shared: false,
                 access: Default::default(),
             }],
             oidc: None,
@@ -277,7 +278,7 @@ async fn refresh_updates_tombstone() {
     index.refresh().await.unwrap();
 
     let page = index
-        .list_photos(&rig.library_id, None, 50, &PhotoFilter::default())
+        .list_photos(std::slice::from_ref(&rig.library_id), None, 50, &PhotoFilter::default())
         .await
         .unwrap();
     assert!(page.items.iter().all(|p| p.photo_id != "t"));
@@ -335,7 +336,7 @@ async fn keyset_pagination_returns_each_photo_once() {
     let mut cursor: Option<Cursor> = None;
     loop {
         let page = index
-            .list_photos(&rig.library_id, cursor.clone(), 10, &PhotoFilter::default())
+            .list_photos(std::slice::from_ref(&rig.library_id), cursor.clone(), 10, &PhotoFilter::default())
             .await
             .unwrap();
         seen.extend(page.items.iter().map(|p| p.photo_id.clone()));
@@ -370,20 +371,188 @@ async fn list_photos_orders_null_captured_by_ingested() {
     let index = rig.open().await;
     index.build().await.unwrap();
     let page = index
-        .list_photos(&rig.library_id, None, 50, &PhotoFilter::default())
+        .list_photos(std::slice::from_ref(&rig.library_id), None, 50, &PhotoFilter::default())
         .await
         .unwrap();
     assert_eq!(page.items.len(), 1);
     assert_eq!(page.items[0].photo_id, "nocap");
 }
 
-// Should: media_type + favorite filters narrow results.
-#[tokio::test]
-async fn list_photos_filters_media_type_and_favorite() {
+/// Four-photo fixture spanning every filter axis: a plain image, a video, a
+/// favorite live photo, and a RAW-backed image (raw_alternate resource).
+async fn filter_rig() -> (Rig, Arc<Index>) {
     let rig = Rig::new();
     rig.write(
         &sidecar(
             "img",
+            &rig.library_id,
+            Some("2020-01-01T00:00:00Z"),
+            MediaType::Image,
+            false,
+            vec![res("original", "h-img", "jpg")],
+        ),
+        1000,
+    );
+    rig.write(
+        &sidecar(
+            "vid",
+            &rig.library_id,
+            Some("2020-01-02T00:00:00Z"),
+            MediaType::Video,
+            false,
+            vec![res("original", "h-vid", "mov")],
+        ),
+        1000,
+    );
+    rig.write(
+        &sidecar(
+            "fav-live",
+            &rig.library_id,
+            Some("2020-02-03T00:00:00Z"),
+            MediaType::LivePhoto,
+            true,
+            vec![
+                res("original", "h-live", "heic"),
+                res("paired_video", "h-pv", "mov"),
+            ],
+        ),
+        1000,
+    );
+    rig.write(
+        &sidecar(
+            "raw",
+            &rig.library_id,
+            Some("2020-02-04T00:00:00Z"),
+            MediaType::Image,
+            false,
+            vec![
+                res("original", "h-raw-jpg", "jpg"),
+                res("raw_alternate", "h-raw", "raf"),
+            ],
+        ),
+        1000,
+    );
+    let index = rig.open().await;
+    index.build().await.unwrap();
+    (rig, index)
+}
+
+// Should: each tri-state filter narrows in both polarities (only / exclude).
+// Should not: `None` flags constrain anything.
+// Impact: the dropdown's checkmarks and inverse subfilters are only as correct
+// as this pushdown.
+#[tokio::test]
+async fn list_photos_tri_state_filters() {
+    let (rig, index) = filter_rig().await;
+    let ids = |page: ingress_server::dto::PhotoPage| {
+        let mut v: Vec<String> = page.items.into_iter().map(|p| p.photo_id).collect();
+        v.sort();
+        v
+    };
+    let list = |f: PhotoFilter| {
+        let index = index.clone();
+        let lib = rig.library_id.clone();
+        async move { index.list_photos(std::slice::from_ref(&lib), None, 50, &f).await.unwrap() }
+    };
+
+    // video: only / exclude
+    let f = |video, live, raw, favorite| PhotoFilter {
+        video,
+        live,
+        raw,
+        favorite,
+    };
+    assert_eq!(ids(list(f(Some(true), None, None, None)).await), ["vid"]);
+    assert_eq!(
+        ids(list(f(Some(false), None, None, None)).await),
+        ["fav-live", "img", "raw"]
+    );
+    // live: only / exclude
+    assert_eq!(ids(list(f(None, Some(true), None, None)).await), ["fav-live"]);
+    assert_eq!(
+        ids(list(f(None, Some(false), None, None)).await),
+        ["img", "raw", "vid"]
+    );
+    // raw (via raw_alternate resource): only / exclude
+    assert_eq!(ids(list(f(None, None, Some(true), None)).await), ["raw"]);
+    assert_eq!(
+        ids(list(f(None, None, Some(false), None)).await),
+        ["fav-live", "img", "vid"]
+    );
+    // favorite: only / exclude
+    assert_eq!(
+        ids(list(f(None, None, None, Some(true))).await),
+        ["fav-live"]
+    );
+    assert_eq!(
+        ids(list(f(None, None, None, Some(false))).await),
+        ["img", "raw", "vid"]
+    );
+    // conjunction: not-video + not-live + no-raw = plain images only
+    assert_eq!(
+        ids(list(f(Some(false), Some(false), Some(false), None)).await),
+        ["img"]
+    );
+    // all-None = everything
+    assert_eq!(
+        ids(list(PhotoFilter::default()).await),
+        ["fav-live", "img", "raw", "vid"]
+    );
+}
+
+// Should: bucket per calendar month over sort_ms, newest first, honoring the
+// same filters as list_photos.
+// Impact: the histogram rail must mirror exactly what the grid can scroll to,
+// or its counts lie.
+#[tokio::test]
+async fn month_histogram_buckets_and_filters() {
+    let (rig, index) = filter_rig().await;
+
+    let all = index
+        .month_histogram(std::slice::from_ref(&rig.library_id), &PhotoFilter::default())
+        .await
+        .unwrap();
+    let pairs: Vec<(String, i64)> = all.into_iter().map(|b| (b.month, b.count)).collect();
+    assert_eq!(
+        pairs,
+        [("2020-02".to_string(), 2), ("2020-01".to_string(), 2)]
+    );
+
+    let no_video = index
+        .month_histogram(
+            std::slice::from_ref(&rig.library_id),
+            &PhotoFilter {
+                video: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let pairs: Vec<(String, i64)> = no_video.into_iter().map(|b| (b.month, b.count)).collect();
+    assert_eq!(
+        pairs,
+        [("2020-02".to_string(), 2), ("2020-01".to_string(), 1)]
+    );
+}
+
+// Should: an unknown photo_id resolves to Ok(None), never an error/panic.
+#[tokio::test]
+async fn photo_detail_absent_returns_none() {
+    let rig = Rig::new();
+    let index = rig.open().await;
+    index.build().await.unwrap();
+    assert!(index.photo_detail("nope").await.unwrap().is_none());
+}
+
+// Should: photo/video counts are broken out per library, tombstones excluded
+// from both.
+// Impact: the library dropdown surfaces these numbers directly.
+#[tokio::test]
+async fn libraries_counts_break_out_media_and_exclude_deleted() {
+    let rig = Rig::new();
+    rig.write(
+        &sidecar(
+            "live",
             &rig.library_id,
             Some("2020-01-01T00:00:00Z"),
             MediaType::Image,
@@ -396,77 +565,8 @@ async fn list_photos_filters_media_type_and_favorite() {
         &sidecar(
             "vid",
             &rig.library_id,
-            Some("2020-01-02T00:00:00Z"),
-            MediaType::Video,
-            false,
-            vec![],
-        ),
-        1000,
-    );
-    rig.write(
-        &sidecar(
-            "fav",
-            &rig.library_id,
             Some("2020-01-03T00:00:00Z"),
-            MediaType::Image,
-            true,
-            vec![],
-        ),
-        1000,
-    );
-    let index = rig.open().await;
-    index.build().await.unwrap();
-
-    let videos = index
-        .list_photos(
-            &rig.library_id,
-            None,
-            50,
-            &PhotoFilter {
-                media_type: Some("video".into()),
-                favorite: None,
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(videos.items.len(), 1);
-    assert_eq!(videos.items[0].photo_id, "vid");
-
-    let favs = index
-        .list_photos(
-            &rig.library_id,
-            None,
-            50,
-            &PhotoFilter {
-                media_type: None,
-                favorite: Some(true),
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(favs.items.len(), 1);
-    assert_eq!(favs.items[0].photo_id, "fav");
-}
-
-// Should: an unknown photo_id resolves to Ok(None), never an error/panic.
-#[tokio::test]
-async fn photo_detail_absent_returns_none() {
-    let rig = Rig::new();
-    let index = rig.open().await;
-    index.build().await.unwrap();
-    assert!(index.photo_detail("nope").await.unwrap().is_none());
-}
-
-// Should: a tombstoned photo is excluded from the library count.
-#[tokio::test]
-async fn libraries_counts_exclude_deleted() {
-    let rig = Rig::new();
-    rig.write(
-        &sidecar(
-            "live",
-            &rig.library_id,
-            Some("2020-01-01T00:00:00Z"),
-            MediaType::Image,
+            MediaType::Video,
             false,
             vec![],
         ),
@@ -486,7 +586,100 @@ async fn libraries_counts_exclude_deleted() {
     index.build().await.unwrap();
     let libs = index.libraries().await.unwrap();
     assert_eq!(libs.len(), 1);
-    assert_eq!(libs[0].count, 1, "tombstone excluded");
+    assert_eq!(libs[0].photo_count, 1, "tombstone excluded from stills");
+    assert_eq!(libs[0].video_count, 1);
+    assert!(!libs[0].shared);
+}
+
+// Should: a multi-library request fuses both timelines in global sort order,
+// and the histogram sums across them; a single-library request still narrows.
+// Should not: leak photos from an unrequested library.
+// Impact: this is the "one or many libraries" selector contract.
+#[tokio::test]
+async fn list_photos_fuses_multiple_libraries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root_a = tmp.path().join("a");
+    let root_b = tmp.path().join("b");
+    std::fs::create_dir_all(&root_a).unwrap();
+    std::fs::create_dir_all(&root_b).unwrap();
+    let entry = |id: &str, root: &std::path::PathBuf, shared: bool| LibraryEntry {
+        library_id: id.to_string(),
+        display_name: id.to_string(),
+        blob_root: root.clone(),
+        sidecar_root: root.clone(),
+        shared,
+        access: Default::default(),
+    };
+    let config = Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        cache_dir: tmp.path().join("cache"),
+        index_db: tmp.path().join("index.db"),
+        refresh_interval_secs: 60,
+        libraries: vec![
+            entry("lib_a", &root_a, false),
+            entry("lib_b", &root_b, true),
+        ],
+        oidc: None,
+    };
+
+    // Interleaved capture times across the two libraries.
+    for (root, lib, id, ts) in [
+        (&root_a, "lib_a", "a1", "2020-01-04T00:00:00Z"),
+        (&root_a, "lib_a", "a2", "2020-01-02T00:00:00Z"),
+        (&root_b, "lib_b", "b1", "2020-01-03T00:00:00Z"),
+        (&root_b, "lib_b", "b2", "2020-01-01T00:00:00Z"),
+    ] {
+        let path =
+            write_sidecar_local(root, &sidecar(id, lib, Some(ts), MediaType::Image, false, vec![]))
+                .unwrap();
+        set_mtime(&path, 1000);
+    }
+
+    let index = Index::open(&config).await.unwrap();
+    index.build().await.unwrap();
+
+    let both = ["lib_a".to_string(), "lib_b".to_string()];
+    let fused = index
+        .list_photos(&both, None, 50, &PhotoFilter::default())
+        .await
+        .unwrap();
+    let order: Vec<&str> = fused.items.iter().map(|p| p.photo_id.as_str()).collect();
+    assert_eq!(order, ["a1", "b1", "a2", "b2"], "global capture-time order");
+
+    let only_a = index
+        .list_photos(std::slice::from_ref(&both[0]), None, 50, &PhotoFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(only_a.items.len(), 2);
+    assert!(only_a.items.iter().all(|p| p.library_id == "lib_a"));
+
+    // Fused cursor pagination: page of 2, then the rest — no dupes, no gaps.
+    let page1 = index
+        .list_photos(&both, None, 2, &PhotoFilter::default())
+        .await
+        .unwrap();
+    let c = Cursor::from_token(page1.next_cursor.as_deref().unwrap()).unwrap();
+    let page2 = index
+        .list_photos(&both, Some(c), 50, &PhotoFilter::default())
+        .await
+        .unwrap();
+    let all: Vec<&str> = page1
+        .items
+        .iter()
+        .chain(page2.items.iter())
+        .map(|p| p.photo_id.as_str())
+        .collect();
+    assert_eq!(all, ["a1", "b1", "a2", "b2"]);
+
+    let hist = index
+        .month_histogram(&both, &PhotoFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(hist.len(), 1);
+    assert_eq!(hist[0].count, 4, "fused month bucket sums both libraries");
+
+    let libs = index.libraries().await.unwrap();
+    assert!(!libs[0].shared && libs[1].shared, "shared flag from config");
 }
 
 // Should: reopening and rebuilding is idempotent (upsert PK dedup, no doubling).

@@ -38,6 +38,10 @@ pub struct LibraryEntry {
     pub blob_root: PathBuf,
     /// Local path to this library's sidecar tree (`YYYY/MM/<photo_id>.json`).
     pub sidecar_root: PathBuf,
+    /// Shared (multi-person) library — the viewer badges its assets when
+    /// displaying a fused multi-library timeline.
+    #[serde(default)]
+    pub shared: bool,
     /// Group-based access rule (TOML: `access = { groups = ["shared_photo_library"] }`).
     #[serde(default)]
     pub access: LibraryAccess,

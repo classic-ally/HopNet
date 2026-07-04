@@ -9,6 +9,8 @@ const hopnetLib = path.resolve(dirname, '../../../../frontend/src/lib');
 const config: StorybookConfig = {
   stories: ['../src/**/*.stories.@(js|ts|svelte)'],
   addons: ['@storybook/addon-svelte-csf', '@storybook/addon-docs', '@storybook/addon-a11y'],
+  // Serve the app's public assets (hopnet-logo.png for LoginPane stories).
+  staticDirs: ['../public'],
   framework: { name: '@storybook/svelte-vite', options: {} },
   async viteFinal(config) {
     config.plugins?.push(UnoCSS());

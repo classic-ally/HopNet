@@ -7,7 +7,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use include_dir::{Dir, include_dir};
 use tower_http::trace::TraceLayer;
+use tower_serve_static::ServeDir;
 use tower_sessions::cookie::SameSite;
 use tower_sessions::{Expiry, MemoryStore, SessionManagerLayer};
 
@@ -15,6 +17,10 @@ use ingress_server::auth::{self, AccessRules};
 use ingress_server::config::Config;
 use ingress_server::index::Index;
 use ingress_server::routes::{self, AppState};
+
+/// The built SPA, baked into the binary (same pattern as HopNet's
+/// `src/main.rs`). `npm run build` in `frontend/` must precede `cargo build`.
+static ASSETS_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/frontend/dist");
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
@@ -69,7 +75,11 @@ async fn main() -> anyhow::Result<()> {
             tower_sessions::cookie::time::Duration::days(7),
         ));
 
+    // Anything that isn't an /api, /auth, or /health route falls through to
+    // the embedded SPA (index.html at `/`). Static files are public by design;
+    // every API route stays behind the session check.
     let app = routes::router(state)
+        .fallback_service(ServeDir::new(&ASSETS_DIR))
         .layer(session_layer)
         .layer(TraceLayer::new_for_http());
 

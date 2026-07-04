@@ -26,7 +26,8 @@ use ingress_core::{LibraryId, Sidecar};
 
 use crate::config::Config;
 use crate::dto::{
-    Cursor, LibrarySummary, PhotoDetail, PhotoFilter, PhotoPage, PhotoSummary, ResourceInfo,
+    Cursor, LibrarySummary, MonthBucket, PhotoDetail, PhotoFilter, PhotoPage, PhotoSummary,
+    ResourceInfo,
 };
 
 /// Bump to invalidate every index DB (drop + full rebuild on next open).
@@ -87,6 +88,7 @@ CREATE TABLE IF NOT EXISTS index_meta (
 struct IndexedLibrary {
     library_id: LibraryId,
     display_name: String,
+    shared: bool,
     blob_root: PathBuf,
     sidecar_root: PathBuf,
 }
@@ -116,6 +118,53 @@ pub struct Index {
     libraries: Vec<IndexedLibrary>,
 }
 
+/// Append the `library_id IN (...)` membership clause. Callers guarantee a
+/// non-empty, pre-authorized set (routes 403 before this). An empty slice
+/// still yields valid SQL (`IN ()` via a FALSE literal) returning no rows.
+fn push_library_set(qb: &mut QueryBuilder<Sqlite>, library_ids: &[String]) {
+    if library_ids.is_empty() {
+        qb.push("0");
+        return;
+    }
+    qb.push("library_id IN (");
+    let mut sep = qb.separated(", ");
+    for id in library_ids {
+        sep.push_bind(id.clone());
+    }
+    qb.push(")");
+}
+
+/// Append `PhotoFilter`'s WHERE clauses. Shared by `list_photos` and
+/// `month_histogram` so the rail can never disagree with the grid.
+fn push_filter(qb: &mut QueryBuilder<Sqlite>, filter: &PhotoFilter) {
+    if let Some(video) = filter.video {
+        qb.push(if video {
+            " AND media_type = 'video'"
+        } else {
+            " AND media_type != 'video'"
+        });
+    }
+    if let Some(live) = filter.live {
+        qb.push(if live {
+            " AND media_type = 'live_photo'"
+        } else {
+            " AND media_type != 'live_photo'"
+        });
+    }
+    if let Some(raw) = filter.raw {
+        // Ground truth is the resource row, not media_subtypes: RAF originals
+        // land as a `raw_alternate` resource alongside the JPEG.
+        qb.push(if raw { " AND EXISTS" } else { " AND NOT EXISTS" })
+            .push(
+                " (SELECT 1 FROM resources r WHERE r.photo_id = photos.photo_id \
+                 AND r.resource_type = 'raw_alternate')",
+            );
+    }
+    if let Some(fav) = filter.favorite {
+        qb.push(" AND favorite = ").push_bind(fav as i64);
+    }
+}
+
 impl Index {
     /// Open (create if missing) the index DB and reconcile its schema. Mirrors
     /// `StateStore::open`'s PRAGMA template, but allows several connections
@@ -140,6 +189,7 @@ impl Index {
             .map(|l| IndexedLibrary {
                 library_id: LibraryId::parse(&l.library_id).expect("validated in Config::load"),
                 display_name: l.display_name.clone(),
+                shared: l.shared,
                 blob_root: l.blob_root.clone(),
                 sidecar_root: l.sidecar_root.clone(),
             })
@@ -226,24 +276,33 @@ impl Index {
     pub async fn libraries(&self) -> anyhow::Result<Vec<LibrarySummary>> {
         let mut out = Vec::with_capacity(self.libraries.len());
         for lib in &self.libraries {
-            let count: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM photos WHERE library_id = ? AND deleted_at IS NULL",
+            let row = sqlx::query(
+                "SELECT COUNT(*) AS total, \
+                 COUNT(*) FILTER (WHERE media_type = 'video') AS videos \
+                 FROM photos WHERE library_id = ? AND deleted_at IS NULL",
             )
             .bind(lib.library_id.as_str())
             .fetch_one(&self.pool)
             .await?;
+            let total: i64 = row.get("total");
+            let videos: i64 = row.get("videos");
             out.push(LibrarySummary {
                 library_id: lib.library_id.as_str().to_string(),
                 display_name: lib.display_name.clone(),
-                count,
+                shared: lib.shared,
+                photo_count: total - videos,
+                video_count: videos,
             });
         }
         Ok(out)
     }
 
+    /// List across one or more libraries, fused into a single timeline. The
+    /// keyset cursor is on `(sort_ms, photo_id)` — a total order independent
+    /// of library, so fusion needs no per-library sub-cursors.
     pub async fn list_photos(
         &self,
-        library_id: &str,
+        library_ids: &[String],
         cursor: Option<Cursor>,
         limit: u32,
         filter: &PhotoFilter,
@@ -252,15 +311,10 @@ impl Index {
         let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
             "SELECT photo_id, library_id, captured_at, media_type, pixel_width, pixel_height, \
              orientation, duration_ms, favorite, media_subtypes, group_id, group_type, sort_ms \
-             FROM photos WHERE deleted_at IS NULL AND library_id = ",
+             FROM photos WHERE deleted_at IS NULL AND ",
         );
-        qb.push_bind(library_id.to_string());
-        if let Some(mt) = &filter.media_type {
-            qb.push(" AND media_type = ").push_bind(mt.clone());
-        }
-        if let Some(fav) = filter.favorite {
-            qb.push(" AND favorite = ").push_bind(fav as i64);
-        }
+        push_library_set(&mut qb, library_ids);
+        push_filter(&mut qb, filter);
         // Keyset on (sort_ms DESC, photo_id DESC), expanded from the row-value
         // tuple form so the bind order is explicit.
         if let Some(c) = &cursor {
@@ -314,6 +368,31 @@ impl Index {
             None
         };
         Ok(PhotoPage { items, next_cursor })
+    }
+
+    /// Photo counts per calendar month over `sort_ms`, newest month first,
+    /// honoring the same filters as `list_photos` so the histogram rail always
+    /// mirrors what the grid can actually reach.
+    pub async fn month_histogram(
+        &self,
+        library_ids: &[String],
+        filter: &PhotoFilter,
+    ) -> anyhow::Result<Vec<MonthBucket>> {
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+            "SELECT strftime('%Y-%m', sort_ms / 1000, 'unixepoch') AS month, COUNT(*) AS n \
+             FROM photos WHERE deleted_at IS NULL AND ",
+        );
+        push_library_set(&mut qb, library_ids);
+        push_filter(&mut qb, filter);
+        qb.push(" GROUP BY month ORDER BY month DESC");
+        let rows = qb.build().fetch_all(&self.pool).await?;
+        Ok(rows
+            .iter()
+            .map(|r| MonthBucket {
+                month: r.get("month"),
+                count: r.get("n"),
+            })
+            .collect())
     }
 
     pub async fn photo_detail(&self, photo_id: &str) -> anyhow::Result<Option<PhotoDetail>> {
