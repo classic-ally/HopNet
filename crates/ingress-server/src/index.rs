@@ -26,8 +26,8 @@ use ingress_core::{LibraryId, Sidecar};
 
 use crate::config::Config;
 use crate::dto::{
-    Cursor, LibrarySummary, MonthBucket, PhotoDetail, PhotoFilter, PhotoPage, PhotoSummary,
-    ResourceInfo,
+    Cursor, LibrarySummary, ListDir, MonthBucket, PhotoDetail, PhotoFilter, PhotoPage,
+    PhotoSummary, ResourceInfo,
 };
 
 /// Bump to invalidate every index DB (drop + full rebuild on next open).
@@ -300,14 +300,21 @@ impl Index {
     /// List across one or more libraries, fused into a single timeline. The
     /// keyset cursor is on `(sort_ms, photo_id)` — a total order independent
     /// of library, so fusion needs no per-library sub-cursors.
+    ///
+    /// `dir` walks the timeline relative to the cursor: `Older` (default)
+    /// pages downward, `Newer` fetches the items just above it (ASC under the
+    /// hood, reversed before return). Items are ALWAYS newest-first either
+    /// way. `Newer` with no cursor degenerates to the top of the timeline.
     pub async fn list_photos(
         &self,
         library_ids: &[String],
         cursor: Option<Cursor>,
         limit: u32,
         filter: &PhotoFilter,
+        dir: ListDir,
     ) -> anyhow::Result<PhotoPage> {
         let limit = limit.clamp(1, 500);
+        let newer = dir == ListDir::Newer && cursor.is_some();
         let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
             "SELECT photo_id, library_id, captured_at, media_type, pixel_width, pixel_height, \
              orientation, duration_ms, favorite, media_subtypes, group_id, group_type, sort_ms \
@@ -315,25 +322,35 @@ impl Index {
         );
         push_library_set(&mut qb, library_ids);
         push_filter(&mut qb, filter);
-        // Keyset on (sort_ms DESC, photo_id DESC), expanded from the row-value
-        // tuple form so the bind order is explicit.
+        // Keyset on (sort_ms, photo_id), expanded from the row-value tuple
+        // form so the bind order is explicit. Comparison + scan order flip
+        // together with the direction.
         if let Some(c) = &cursor {
-            qb.push(" AND (sort_ms < ")
+            let (cmp1, cmp2) = if newer { (">", ">") } else { ("<", "<") };
+            qb.push(" AND (sort_ms ")
+                .push(cmp1)
+                .push(" ")
                 .push_bind(c.sort_ms)
                 .push(" OR (sort_ms = ")
                 .push_bind(c.sort_ms)
-                .push(" AND photo_id < ")
+                .push(" AND photo_id ")
+                .push(cmp2)
+                .push(" ")
                 .push_bind(c.photo_id.clone())
                 .push("))");
         }
-        qb.push(" ORDER BY sort_ms DESC, photo_id DESC LIMIT ")
-            .push_bind(limit as i64 + 1);
+        qb.push(if newer {
+            " ORDER BY sort_ms ASC, photo_id ASC LIMIT "
+        } else {
+            " ORDER BY sort_ms DESC, photo_id DESC LIMIT "
+        })
+        .push_bind(limit as i64 + 1);
 
         let rows = qb.build().fetch_all(&self.pool).await?;
         let has_more = rows.len() > limit as usize;
         let kept = &rows[..rows.len().min(limit as usize)];
 
-        let items: Vec<PhotoSummary> = kept
+        let mut items: Vec<PhotoSummary> = kept
             .iter()
             .map(|r| {
                 let media_type: String = r.get("media_type");
@@ -341,6 +358,7 @@ impl Index {
                 PhotoSummary {
                     photo_id: r.get("photo_id"),
                     library_id: r.get("library_id"),
+                    sort_ms: r.get("sort_ms"),
                     captured_at: r.get("captured_at"),
                     is_live_photo: media_type == "live_photo",
                     media_type,
@@ -355,7 +373,13 @@ impl Index {
                 }
             })
             .collect();
+        // Newer pages scan ASC — restore the invariant order for the client.
+        if newer {
+            items.reverse();
+        }
 
+        // Continuation in the SAME direction: the scan-order last row kept
+        // (for Newer that's the newest item, i.e. items[0] post-reverse).
         let next_cursor = if has_more {
             kept.last().map(|r| {
                 Cursor {

@@ -57,6 +57,11 @@ export interface PhotoDetail {
 export interface PhotoSummary {
 	photo_id: string;
 	library_id: string;
+	/**
+	 * The browse sort key (captured_at ms, else ingested_at ms). Exposed so
+	 * the client can synthesize edge cursors for its sliding window.
+	 */
+	sort_ms: number;
 	captured_at?: string;
 	media_type: string;
 	is_live_photo: boolean;

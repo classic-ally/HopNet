@@ -13,6 +13,8 @@
     displayUrl = (id: string) => `/api/photos/${id}/display`,
     hoverPreview = true,
     sharedLibs = [],
+    scrollEl = undefined,
+    onTopMonth = undefined,
     footer,
   }: {
     items: PhotoSummary[];
@@ -24,13 +26,19 @@
     /** library_ids whose assets get a shared badge (multi-library fused view;
      *  pass [] in single-library views to keep cells clean). */
     sharedLibs?: string[];
+    /** The scrollable ancestor — needed for scroll-synced month reporting. */
+    scrollEl?: HTMLElement;
+    /** Reports the month ("YYYY-MM") currently at the top of the viewport. */
+    onTopMonth?: (month: string) => void;
+    /** Rendered inside the grid before the first row (top scroll sentinel). */
+    header?: Snippet;
     footer?: Snippet;
   } = $props();
 
   const isShared = (p: PhotoSummary) => sharedLibs.includes(p.library_id);
 
   type Row =
-    | { kind: 'header'; label: string; key: string }
+    | { kind: 'header'; label: string; key: string; month: string | null }
     | { kind: 'photo'; photo: PhotoSummary; index: number };
 
   const dateFmt = new Intl.DateTimeFormat(undefined, {
@@ -44,6 +52,13 @@
     return isNaN(d.getTime()) ? 'Undated' : dateFmt.format(d);
   }
 
+  /** UTC "YYYY-MM" — must match the histogram's strftime-over-sort_ms buckets. */
+  function monthKey(iso: string | undefined): string | null {
+    if (!iso) return null;
+    const d = new Date(iso);
+    return isNaN(d.getTime()) ? null : d.toISOString().slice(0, 7);
+  }
+
   // Items arrive already sorted (sort_ms DESC); a linear scan finds day breaks.
   const rows = $derived.by(() => {
     const out: Row[] = [];
@@ -51,12 +66,51 @@
     items.forEach((photo, index) => {
       const label = dayLabel(photo.captured_at);
       if (label !== last) {
-        out.push({ kind: 'header', label, key: `${label}-${index}` });
+        out.push({
+          kind: 'header',
+          label,
+          key: `${label}-${index}`,
+          month: monthKey(photo.captured_at),
+        });
         last = label;
       }
       out.push({ kind: 'photo', photo, index });
     });
     return out;
+  });
+
+  // --- scroll-synced month: report which month the viewport top sits in -----
+  // Day headers are sticky with a shared containing block, so every header
+  // scrolled past stays pinned at the container top — the LAST header at or
+  // above the threshold is exactly the section under the viewport. rAF-
+  // throttled; also recomputed when a new page lands (items.length).
+  let gridEl = $state<HTMLDivElement>();
+  $effect(() => {
+    const root = scrollEl;
+    const grid = gridEl;
+    const report = onTopMonth;
+    if (!root || !grid || !report) return;
+    void items.length;
+    let raf = 0;
+    const compute = () => {
+      raf = 0;
+      const rootTop = root.getBoundingClientRect().top;
+      let current: string | null = null;
+      for (const h of grid.querySelectorAll<HTMLElement>('h2[data-month]')) {
+        if (h.getBoundingClientRect().top - rootTop <= 48) current = h.dataset.month ?? null;
+        else break;
+      }
+      if (current) report(current);
+    };
+    const onScroll = () => {
+      if (!raf) raf = requestAnimationFrame(compute);
+    };
+    root.addEventListener('scroll', onScroll, { passive: true });
+    compute();
+    return () => {
+      root.removeEventListener('scroll', onScroll);
+      if (raf) cancelAnimationFrame(raf);
+    };
   });
 
   function badges(p: PhotoSummary): string[] {
@@ -167,10 +221,14 @@
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="photo-grid p-2" onmousemove={trackPointer}>
+<div class="photo-grid p-2" bind:this={gridEl} onmousemove={trackPointer}>
+  {@render header?.()}
   {#each rows as row (row.kind === 'header' ? row.key : row.photo.photo_id)}
     {#if row.kind === 'header'}
-      <h2 class="col-span-full sticky top-0 z-10 bg-crust/90 px-1 py-2 text-sm text-subtitle">
+      <h2
+        class="col-span-full sticky top-0 z-10 bg-crust/90 px-1 py-2 text-sm text-subtitle"
+        data-month={row.month}
+      >
         {row.label}
       </h2>
     {:else}

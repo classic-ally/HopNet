@@ -14,7 +14,7 @@ use ingress_core::sidecar_io::write_sidecar_local;
 use ingress_core::{LibraryId, PhotoId};
 
 use ingress_server::config::{Config, LibraryEntry};
-use ingress_server::dto::{Cursor, PhotoFilter};
+use ingress_server::dto::{Cursor, ListDir, PhotoFilter};
 use ingress_server::index::Index;
 
 // ------------------------------------------------------------------ fixtures
@@ -278,7 +278,7 @@ async fn refresh_updates_tombstone() {
     index.refresh().await.unwrap();
 
     let page = index
-        .list_photos(std::slice::from_ref(&rig.library_id), None, 50, &PhotoFilter::default())
+        .list_photos(std::slice::from_ref(&rig.library_id), None, 50, &PhotoFilter::default(), ListDir::Older)
         .await
         .unwrap();
     assert!(page.items.iter().all(|p| p.photo_id != "t"));
@@ -336,7 +336,7 @@ async fn keyset_pagination_returns_each_photo_once() {
     let mut cursor: Option<Cursor> = None;
     loop {
         let page = index
-            .list_photos(std::slice::from_ref(&rig.library_id), cursor.clone(), 10, &PhotoFilter::default())
+            .list_photos(std::slice::from_ref(&rig.library_id), cursor.clone(), 10, &PhotoFilter::default(), ListDir::Older)
             .await
             .unwrap();
         seen.extend(page.items.iter().map(|p| p.photo_id.clone()));
@@ -351,6 +351,73 @@ async fn keyset_pagination_returns_each_photo_once() {
     // DESC by captured time → p24 first, p00 last.
     assert_eq!(seen.first().unwrap(), "p24");
     assert_eq!(seen.last().unwrap(), "p00");
+}
+
+// Impact: the windowed grid scrolls UP after a month jump via dir=newer;
+// broken ordering or off-by-one at the cursor breaks upward pagination.
+// Should: Newer returns the items strictly above the cursor, still newest-first.
+// Should not: include the cursor row itself, or items below it.
+#[tokio::test]
+async fn keyset_pagination_newer_walks_upward() {
+    let rig = Rig::new();
+    for i in 0..25 {
+        let captured = format!("2020-01-{:02}T00:00:00Z", i + 1);
+        rig.write(
+            &sidecar(
+                &format!("p{i:02}"),
+                &rig.library_id,
+                Some(&captured),
+                MediaType::Image,
+                false,
+                vec![],
+            ),
+            1000,
+        );
+    }
+    let index = rig.open().await;
+    index.build().await.unwrap();
+    let lib = std::slice::from_ref(&rig.library_id);
+
+    // Anchor mid-timeline at p10 (captured Jan 11).
+    let anchor = index
+        .list_photos(lib, None, 50, &PhotoFilter::default(), ListDir::Older)
+        .await
+        .unwrap()
+        .items
+        .iter()
+        .find(|p| p.photo_id == "p10")
+        .map(|p| Cursor {
+            sort_ms: p.sort_ms,
+            photo_id: p.photo_id.clone(),
+        })
+        .expect("anchor present");
+
+    // One page up: the 5 items immediately newer than p10, newest-first.
+    let up = index
+        .list_photos(lib, Some(anchor.clone()), 5, &PhotoFilter::default(), ListDir::Newer)
+        .await
+        .unwrap();
+    let ids: Vec<_> = up.items.iter().map(|p| p.photo_id.as_str()).collect();
+    assert_eq!(ids, ["p15", "p14", "p13", "p12", "p11"]);
+    assert!(up.next_cursor.is_some(), "more newer pages remain");
+
+    // Continue upward from the returned cursor: reaches the top, then stops.
+    let c = Cursor::from_token(&up.next_cursor.unwrap()).unwrap();
+    let top = index
+        .list_photos(lib, Some(c), 50, &PhotoFilter::default(), ListDir::Newer)
+        .await
+        .unwrap();
+    let ids: Vec<_> = top.items.iter().map(|p| p.photo_id.as_str()).collect();
+    assert_eq!(ids.first().unwrap(), &"p24", "newest-first order preserved");
+    assert_eq!(ids.last().unwrap(), &"p16");
+    assert!(top.next_cursor.is_none(), "top of timeline reached");
+
+    // Newer with no cursor degenerates to the top page (no panic, no ASC leak).
+    let none = index
+        .list_photos(lib, None, 5, &PhotoFilter::default(), ListDir::Newer)
+        .await
+        .unwrap();
+    assert_eq!(none.items.first().unwrap().photo_id, "p24");
 }
 
 // Should: photos with no captured_at still list, ordered by the ingested_at fallback.
@@ -371,7 +438,7 @@ async fn list_photos_orders_null_captured_by_ingested() {
     let index = rig.open().await;
     index.build().await.unwrap();
     let page = index
-        .list_photos(std::slice::from_ref(&rig.library_id), None, 50, &PhotoFilter::default())
+        .list_photos(std::slice::from_ref(&rig.library_id), None, 50, &PhotoFilter::default(), ListDir::Older)
         .await
         .unwrap();
     assert_eq!(page.items.len(), 1);
@@ -452,7 +519,7 @@ async fn list_photos_tri_state_filters() {
     let list = |f: PhotoFilter| {
         let index = index.clone();
         let lib = rig.library_id.clone();
-        async move { index.list_photos(std::slice::from_ref(&lib), None, 50, &f).await.unwrap() }
+        async move { index.list_photos(std::slice::from_ref(&lib), None, 50, &f, ListDir::Older).await.unwrap() }
     };
 
     // video: only / exclude
@@ -640,14 +707,14 @@ async fn list_photos_fuses_multiple_libraries() {
 
     let both = ["lib_a".to_string(), "lib_b".to_string()];
     let fused = index
-        .list_photos(&both, None, 50, &PhotoFilter::default())
+        .list_photos(&both, None, 50, &PhotoFilter::default(), ListDir::Older)
         .await
         .unwrap();
     let order: Vec<&str> = fused.items.iter().map(|p| p.photo_id.as_str()).collect();
     assert_eq!(order, ["a1", "b1", "a2", "b2"], "global capture-time order");
 
     let only_a = index
-        .list_photos(std::slice::from_ref(&both[0]), None, 50, &PhotoFilter::default())
+        .list_photos(std::slice::from_ref(&both[0]), None, 50, &PhotoFilter::default(), ListDir::Older)
         .await
         .unwrap();
     assert_eq!(only_a.items.len(), 2);
@@ -655,12 +722,12 @@ async fn list_photos_fuses_multiple_libraries() {
 
     // Fused cursor pagination: page of 2, then the rest — no dupes, no gaps.
     let page1 = index
-        .list_photos(&both, None, 2, &PhotoFilter::default())
+        .list_photos(&both, None, 2, &PhotoFilter::default(), ListDir::Older)
         .await
         .unwrap();
     let c = Cursor::from_token(page1.next_cursor.as_deref().unwrap()).unwrap();
     let page2 = index
-        .list_photos(&both, Some(c), 50, &PhotoFilter::default())
+        .list_photos(&both, Some(c), 50, &PhotoFilter::default(), ListDir::Older)
         .await
         .unwrap();
     let all: Vec<&str> = page1

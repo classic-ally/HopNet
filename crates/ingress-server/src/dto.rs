@@ -33,6 +33,16 @@ impl Cursor {
     }
 }
 
+/// Pagination direction relative to the cursor. The timeline is always
+/// returned newest-first; `Newer` walks the window upward (items just above
+/// the cursor), which the windowed grid uses to scroll back up after a jump.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ListDir {
+    #[default]
+    Older,
+    Newer,
+}
+
 /// Browse filters. Each flag is tri-state: `Some(true)` = only, `Some(false)`
 /// = exclude, `None` = don't care. Date-range is a deliberate future slot.
 #[derive(Debug, Clone, Default)]
@@ -66,6 +76,10 @@ pub struct LibrarySummary {
 pub struct PhotoSummary {
     pub photo_id: String,
     pub library_id: String,
+    /// The browse sort key (captured_at ms, else ingested_at ms). Exposed so
+    /// the client can synthesize edge cursors for its sliding window.
+    #[typeshare(serialized_as = "number")]
+    pub sort_ms: i64,
     pub captured_at: Option<String>,
     pub media_type: String,
     pub is_live_photo: bool,

@@ -62,3 +62,28 @@ export function filterQuery(f: Filter, q: URLSearchParams): void {
 export function filterKey(f: Filter): string {
   return `${f.video}:${f.live}:${f.raw}:${f.favorite}`;
 }
+
+/**
+ * Encode a keyset cursor (mirrors the server's base64url `sort_ms:photo_id`
+ * token). The windowed grid synthesizes these from its edge items — and from
+ * a month boundary with an empty photo_id, which sits between the months in
+ * the total order: dir=older admits exactly the boundary month and older,
+ * dir=newer exactly everything above it.
+ */
+export function edgeCursor(sortMs: number, photoId: string): string {
+  return btoa(`${sortMs}:${photoId}`)
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+}
+
+/**
+ * First ms of the month AFTER `month` ("YYYY-MM") — the jump anchor for
+ * starting a window at the top of `month`. Histogram buckets come from
+ * strftime over sort_ms in UTC, so the boundary must be UTC too.
+ */
+export function monthBoundaryMs(month: string): number {
+  const [y, m] = month.split('-').map(Number);
+  // JS months are 0-based, `m` is 1-based: Date.UTC(y, m, 1) = next month's start.
+  return Date.UTC(y, m, 1);
+}

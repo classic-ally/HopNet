@@ -12,7 +12,9 @@ use tower::ServiceExt as _;
 use tower_http::services::ServeFile;
 
 use crate::auth::{self, AccessRules, AuthContext, AuthUser, SessionUser, can_access};
-use crate::dto::{Cursor, LibrarySummary, MonthBucket, PhotoDetail, PhotoFilter, PhotoPage};
+use crate::dto::{
+    Cursor, LibrarySummary, ListDir, MonthBucket, PhotoDetail, PhotoFilter, PhotoPage,
+};
 use crate::index::Index;
 use crate::render::{self, Variant};
 
@@ -116,6 +118,8 @@ struct PhotosQuery {
     library: String,
     cursor: Option<String>,
     limit: Option<u32>,
+    /// "older" (default) or "newer" — which side of the cursor to page.
+    dir: Option<String>,
     // Tri-state filters: absent = any, true = only, false = exclude.
     video: Option<bool>,
     live: Option<bool>,
@@ -163,9 +167,13 @@ async fn list_photos(
     let libs = q.libraries(&st, &user)?;
     // A malformed cursor degrades to page 1, never a 500.
     let cursor = q.cursor.as_deref().and_then(Cursor::from_token);
+    let dir = match q.dir.as_deref() {
+        Some("newer") => ListDir::Newer,
+        _ => ListDir::Older,
+    };
     let page = st
         .index
-        .list_photos(&libs, cursor, q.limit.unwrap_or(100), &q.filter())
+        .list_photos(&libs, cursor, q.limit.unwrap_or(100), &q.filter(), dir)
         .await?;
     Ok(Json(page))
 }

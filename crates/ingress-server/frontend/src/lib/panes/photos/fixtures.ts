@@ -20,9 +20,9 @@ export const mockLibraries: LibrarySummary[] = [
 ];
 
 function photo(over: Partial<PhotoSummary> & { photo_id: string }): PhotoSummary {
-  return {
+  const merged = {
     library_id: 'vivid_birch',
-    captured_at: undefined,
+    captured_at: undefined as string | undefined,
     media_type: 'image',
     is_live_photo: false,
     pixel_width: 4032,
@@ -35,6 +35,11 @@ function photo(over: Partial<PhotoSummary> & { photo_id: string }): PhotoSummary
     group_type: undefined,
     ...over,
   };
+  // Mirror the server: sort key falls back to an "ingest" epoch when undated.
+  merged.sort_ms ??= merged.captured_at
+    ? Date.parse(merged.captured_at)
+    : Date.parse('2026-01-01T00:00:00Z');
+  return merged as PhotoSummary;
 }
 
 // A spread across three capture days plus one undated, exercising every badge.

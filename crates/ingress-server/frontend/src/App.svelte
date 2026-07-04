@@ -8,6 +8,7 @@
     filterKey,
     filterQuery,
     isEmpty,
+    monthBoundaryMs,
     toFilter,
     type FilterState,
   } from './lib/panes/photos/filters';
@@ -46,6 +47,43 @@
   // The grid publishes its loaded page here so the lightbox can navigate it.
   let items = $state<PhotoSummary[]>([]);
   let lightboxIndex = $state<number | null>(null);
+
+  // --- histogram <-> grid sync ----------------------------------------------
+  let scrollEl = $state<HTMLDivElement>();
+  // Month the grid is currently scrolled to (reported by the grid view).
+  let currentMonth = $state<string | null>(null);
+  // Non-null after a histogram jump to a month outside the loaded window:
+  // the grid remounts anchored at this sort_ms boundary and pages BOTH
+  // directions from there (windowed browse).
+  let anchorMs = $state<number | null>(null);
+
+  function jumpToMonth(month: string) {
+    // Already in the window → just scroll to its first day header.
+    const el = scrollEl?.querySelector(`h2[data-month="${month}"]`);
+    if (el) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      return;
+    }
+    // Outside the window → re-anchor the window at that month's boundary.
+    resetBrowse();
+    anchorMs = monthBoundaryMs(month);
+    currentMonth = month;
+  }
+
+  // --- rail hover: zoom the grid out instead of reflowing it ----------------
+  // The rail overlay grows 28px -> 176px; the grid's LAYOUT width never
+  // changes (constant column count, no reflow, scroll position intact) — it
+  // scales down by k to clear the overlay, with height compensated so the
+  // visual viewport stays full.
+  const RAIL_STRIP = 28;
+  const RAIL_EXPANDED = 176;
+  let railExpanded = $state(false);
+  let gridAreaW = $state(0);
+  const zoomK = $derived(
+    railExpanded && gridAreaW > 0
+      ? (gridAreaW - (RAIL_EXPANDED - RAIL_STRIP)) / gridAreaW
+      : 1,
+  );
 
   // Month histogram for the rail. Absent on the old backend (404) or on any
   // error → the rail simply doesn't render.
@@ -91,6 +129,9 @@
   function resetBrowse() {
     items = [];
     lightboxIndex = null;
+    anchorMs = null;
+    currentMonth = null;
+    if (scrollEl) scrollEl.scrollTop = 0;
   }
 </script>
 
@@ -115,37 +156,69 @@
   </header>
 
   <main class="flex-1 min-h-0 flex">
-    <div class="flex-1 min-w-0 overflow-y-auto">
-      {#if !ready}
-        <div class="h-full grid place-items-center text-muted">
-          <span class="i-carbon-circle-dash text-3xl animate-spin"></span>
-        </div>
-      {:else if loadError}
-        <div class="h-full grid place-items-center text-red">{loadError}</div>
-      {:else if selectedLibs.length === 0}
-        <div class="h-full grid place-items-center text-muted">No libraries available.</div>
-      {:else if filterEmpty}
-        <div class="h-full grid place-items-center text-muted">
-          No media types selected.
-        </div>
-      {:else}
-        {#key `${selectedLibs.join(',')}:${filterKey(filter)}`}
-          <PhotoGrid
-            libraries={selectedLibs}
-            {filter}
-            {sharedLibs}
-            bind:items
-            onOpen={(i) => (lightboxIndex = i)}
-          />
-        {/key}
-      {/if}
+    <div class="flex-1 min-w-0" bind:clientWidth={gridAreaW}>
+      <div
+        class="grid-zoom h-full overflow-y-auto"
+        bind:this={scrollEl}
+        style={zoomK < 1
+          ? `height: calc(100% / ${zoomK}); transform: scale(${zoomK});`
+          : ''}
+      >
+        {#if !ready}
+          <div class="h-full grid place-items-center text-muted">
+            <span class="i-carbon-circle-dash text-3xl animate-spin"></span>
+          </div>
+        {:else if loadError}
+          <div class="h-full grid place-items-center text-red">{loadError}</div>
+        {:else if selectedLibs.length === 0}
+          <div class="h-full grid place-items-center text-muted">No libraries available.</div>
+        {:else if filterEmpty}
+          <div class="h-full grid place-items-center text-muted">
+            No media types selected.
+          </div>
+        {:else}
+          {#key `${selectedLibs.join(',')}:${filterKey(filter)}:${anchorMs ?? ''}`}
+            <PhotoGrid
+              libraries={selectedLibs}
+              {filter}
+              {sharedLibs}
+              {anchorMs}
+              paused={lightboxIndex !== null}
+              {scrollEl}
+              onTopMonth={(m) => (currentMonth = m)}
+              bind:items
+              onOpen={(i) => (lightboxIndex = i)}
+            />
+          {/key}
+        {/if}
+      </div>
     </div>
 
     {#if ready && !loadError && selectedLibs.length > 0 && !filterEmpty}
-      <MonthHistogram {buckets} />
+      <MonthHistogram
+        {buckets}
+        current={currentMonth}
+        onJump={jumpToMonth}
+        onExpand={(e) => (railExpanded = e)}
+      />
     {/if}
   </main>
 </div>
+
+<style>
+  /* Rail-hover zoom: transform only while expanded — at rest there's no
+     transform so position:fixed children (hover preview) keep viewport
+     coordinates. none <-> scale interpolates as identity.
+     overflow-anchor off: the windowed grid pins the scroll position itself
+     around prepends/evictions — browser scroll anchoring would double-adjust. */
+  .grid-zoom {
+    transform-origin: top left;
+    overflow-anchor: none;
+    transition:
+      transform 0.18s ease,
+      height 0.18s ease;
+  }
+</style>
 
 {#if lightboxIndex !== null && items[lightboxIndex]}
   <PhotoLightbox

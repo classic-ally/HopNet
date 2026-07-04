@@ -1,14 +1,25 @@
 <script lang="ts">
+  import { tick } from 'svelte';
   import { apiJson } from '../../api';
   import type { PhotoPage, PhotoSummary } from '../../types';
-  import { filterQuery, type Filter } from './filters';
+  import { edgeCursor, filterQuery, type Filter } from './filters';
   import PhotoGridView from './PhotoGridView.svelte';
 
+  // Windowed timeline: `items` is a sliding window over the library, not a
+  // grow-only list. Both ends page independently (dir=older / dir=newer) and
+  // the window is capped — far items are evicted so a long session or a month
+  // jump never accumulates the whole library in the DOM. Continuation cursors
+  // are synthesized from the window's edge items (sort_ms is on every
+  // PhotoSummary for exactly this), so there is no cursor state to desync.
   let {
     libraries,
     filter = {},
     items = $bindable<PhotoSummary[]>([]),
     sharedLibs = [],
+    anchorMs = null,
+    paused = false,
+    scrollEl = undefined,
+    onTopMonth = undefined,
     onOpen,
   }: {
     /** One or more library_ids; multiple fuse into one timeline. */
@@ -17,98 +28,191 @@
     items?: PhotoSummary[];
     /** library_ids whose assets get the shared badge (fused view). */
     sharedLibs?: string[];
+    /** Start the window at this sort_ms boundary (histogram month jump)
+     *  instead of the top of the timeline. Read once — jumps remount via
+     *  {#key}. */
+    anchorMs?: number | null;
+    /** Freeze loading/eviction (lightbox open — its index into `items` must
+     *  not shift underneath it). */
+    paused?: boolean;
+    /** Scrollable ancestor: scroll compensation + month sync need it. */
+    scrollEl?: HTMLElement;
+    onTopMonth?: (month: string) => void;
     onOpen: (index: number) => void;
   } = $props();
 
   const PAGE = 100;
+  /** Window cap — 6 pages. Eviction keeps the DOM bounded; the evicted side's
+   *  `done` flag resets so scrolling back re-fetches it. */
+  const CAP = 600;
 
-  let cursor: string | null = null;
-  let done = $state(false);
+  const anchorCursor = anchorMs != null ? edgeCursor(anchorMs, '') : null;
+
+  let doneOlder = $state(false);
+  // No anchor = window starts at the top of the timeline — nothing newer.
+  let doneNewer = $state(anchorMs == null);
+  // One shared in-flight flag: both directions mutate `items` and adjust
+  // scroll, so they are serialized.
   let loading = $state(false);
-  let error = $state<string | null>(null);
-  let sentinel = $state<HTMLDivElement>();
-  let sentinelVisible = $state(false);
+  let loadingDir = $state<'older' | 'newer' | null>(null);
+  let errorOlder = $state<string | null>(null);
+  let errorNewer = $state<string | null>(null);
 
-  async function loadMore() {
-    if (loading || done) return;
+  function cursorFor(dir: 'older' | 'newer'): string | null {
+    const edge = dir === 'older' ? items[items.length - 1] : items[0];
+    return edge ? edgeCursor(edge.sort_ms, edge.photo_id) : anchorCursor;
+  }
+
+  async function load(dir: 'older' | 'newer') {
+    if (loading || (dir === 'older' ? doneOlder : doneNewer)) return;
     loading = true;
-    error = null;
+    loadingDir = dir;
+    if (dir === 'older') errorOlder = null;
+    else errorNewer = null;
     try {
       const q = new URLSearchParams({ library: libraries.join(','), limit: String(PAGE) });
+      const cursor = cursorFor(dir);
       if (cursor) q.set('cursor', cursor);
+      if (dir === 'newer') q.set('dir', 'newer');
       filterQuery(filter, q);
       const page = await apiJson<PhotoPage>(`/api/photos?${q}`);
-      items.push(...page.items);
-      cursor = page.next_cursor ?? null;
-      if (!cursor || page.items.length === 0) done = true;
+      const exhausted = !page.next_cursor || page.items.length === 0;
+
+      if (dir === 'older') {
+        items.push(...page.items);
+        if (exhausted) doneOlder = true;
+        if (items.length > CAP) {
+          // Evict from the head. Content above the viewport disappears, so
+          // pin the view by the measured height delta (headers merge/split —
+          // arithmetic on row counts would drift).
+          await tick();
+          const before = scrollEl?.scrollHeight ?? 0;
+          items.splice(0, items.length - CAP);
+          doneNewer = false;
+          await tick();
+          if (scrollEl) scrollEl.scrollTop -= before - scrollEl.scrollHeight;
+        }
+      } else {
+        // Prepend grows content above the viewport — same pinning, other sign.
+        // done flips BEFORE tick so the vanishing top strip is inside the
+        // measured delta. overflow-anchor is off on the container (App), so
+        // this is the only scroll adjustment in play.
+        const before = scrollEl?.scrollHeight ?? 0;
+        items.unshift(...page.items);
+        if (exhausted) doneNewer = true;
+        await tick();
+        if (scrollEl) scrollEl.scrollTop += scrollEl.scrollHeight - before;
+        if (items.length > CAP) {
+          // Tail eviction is below the viewport: no scroll adjustment needed.
+          items.splice(CAP);
+          doneOlder = false;
+        }
+      }
     } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
+      const msg = e instanceof Error ? e.message : String(e);
+      if (dir === 'older') errorOlder = msg;
+      else errorNewer = msg;
     } finally {
       loading = false;
+      loadingDir = null;
     }
   }
 
-  // Infinite scroll: the observer only reports visibility; the effect below
-  // owns the load loop. An IO callback fires on *transitions* — if one lands
-  // while a load is in flight and the sentinel then stays visible, no second
-  // callback ever comes, which is exactly the "scroll to bottom, nothing
-  // loads" stall. rootMargin prefetches a screenful early.
-  //
-  // An $effect (not onMount) so the observer re-attaches whenever the sentinel
-  // *element* is recreated — an observer pointed at a detached node goes
-  // silent forever, the other way this stalls.
-  $effect(() => {
-    const el = sentinel;
+  // Infinite scroll, both ends: observers only report visibility; the effects
+  // below own the load loops. An IO callback fires on *transitions* — if one
+  // lands while a load is in flight and the sentinel then stays visible, no
+  // second callback ever comes ("scroll to end, nothing loads"). Observers
+  // are (re)created in $effects tracking the sentinel bind — one pointed at a
+  // detached node goes silent forever.
+  let topSentinel = $state<HTMLDivElement>();
+  let bottomSentinel = $state<HTMLDivElement>();
+  let topVisible = $state(false);
+  let bottomVisible = $state(false);
+
+  function observe(el: HTMLElement | undefined, set: (v: boolean) => void) {
     if (!el) return;
     const io = new IntersectionObserver(
-      (entries) => {
-        sentinelVisible = entries[0]?.isIntersecting ?? false;
-      },
+      (entries) => set(entries[0]?.isIntersecting ?? false),
       { rootMargin: '800px' },
     );
     io.observe(el);
     return () => {
       io.disconnect();
-      sentinelVisible = false;
+      set(false);
     };
-  });
+  }
 
-  // The load loop: whenever the sentinel is visible and we're idle, load the
-  // next page. `loading` flipping back to false re-runs this, so short pages
-  // keep loading until the sentinel scrolls out of range or the cursor ends.
-  // An error breaks the loop (no retry storm) — the Load More button retries.
+  $effect(() => observe(topSentinel, (v) => (topVisible = v)));
+  $effect(() => observe(bottomSentinel, (v) => (bottomVisible = v)));
+
+  // Load loops. `loading` flipping back re-runs them, so short pages keep
+  // loading until the sentinel leaves range. An error breaks the loop (no
+  // retry storm) — the end's button retries. Older wins when both ends are
+  // hungry (fills the viewport downward first).
   $effect(() => {
-    if (sentinelVisible && !loading && !done && !error) loadMore();
+    if (!paused && bottomVisible && !loading && !doneOlder && !errorOlder) load('older');
+  });
+  $effect(() => {
+    if (!paused && topVisible && !loading && !doneNewer && !errorNewer) load('newer');
   });
 </script>
 
-<PhotoGridView {items} {onOpen} {sharedLibs}>
+{#if !doneNewer}
+  <!-- Constant height whatever the state — this strip sits above the grid,
+       so a height change here would shift content mid-prepend-measurement. -->
+  <div class="edge-strip">
+    {#if loadingDir === 'newer'}
+      <span class="i-carbon-circle-dash text-2xl animate-spin text-muted"></span>
+    {:else}
+      {#if errorNewer}
+        <div class="text-red text-sm">{errorNewer}</div>
+      {/if}
+      <button class="load-more" onclick={() => load('newer')}>
+        {errorNewer ? 'Retry' : 'Load newer'}
+      </button>
+    {/if}
+  </div>
+{/if}
+
+<PhotoGridView {items} {onOpen} {sharedLibs} {scrollEl} {onTopMonth}>
+  {#snippet header()}
+    <div bind:this={topSentinel} class="col-span-full h-1"></div>
+  {/snippet}
   {#snippet footer()}
-    <div bind:this={sentinel} class="col-span-full h-4"></div>
+    <div bind:this={bottomSentinel} class="col-span-full h-4"></div>
   {/snippet}
 </PhotoGridView>
 
-{#if loading}
+{#if loadingDir === 'older'}
   <div class="grid place-items-center py-4 text-muted">
     <span class="i-carbon-circle-dash text-2xl animate-spin"></span>
   </div>
-{:else if !done}
+{:else if !doneOlder}
   <!-- Belt-and-suspenders: if observer wiring ever fails, pagination stays
        reachable by hand. Also the retry path after an error. -->
   <div class="flex flex-col items-center gap-2 py-4">
-    {#if error}
-      <div class="text-red text-sm">{error}</div>
+    {#if errorOlder}
+      <div class="text-red text-sm">{errorOlder}</div>
     {/if}
-    <button class="load-more" onclick={() => loadMore()}>
-      {error ? 'Retry' : 'Load more'}
+    <button class="load-more" onclick={() => load('older')}>
+      {errorOlder ? 'Retry' : 'Load more'}
     </button>
   </div>
 {/if}
-{#if done && items.length === 0}
+{#if doneOlder && doneNewer && items.length === 0}
   <div class="grid place-items-center py-16 text-muted">No photos match.</div>
 {/if}
 
 <style>
+  .edge-strip {
+    height: 3.5rem;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.25rem;
+  }
+
   .load-more {
     padding: 0.375rem 1rem;
     border: 1px solid #45475a; /* surface1 */
