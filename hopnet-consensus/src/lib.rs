@@ -14,6 +14,7 @@
 //! versions and intentionally duplicate main-crate shapes until the Stage-5
 //! swap re-points the main crate at this crate.
 
+pub mod codec;
 pub mod config;
 pub mod context;
 pub mod signing;
