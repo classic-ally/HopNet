@@ -1,0 +1,117 @@
+//! Host trait seams: everything the consensus host needs from the outside
+//! world, abstracted so the deterministic simulator and production supply
+//! interchangeable implementations. All methods are SYNCHRONOUS — the sans-io
+//! dispatch core never awaits; asynchrony (spawning value builds, network
+//! sends) lives in the shell around it.
+
+use malachitebft_core_types::{Timeout, Validity};
+
+use crate::codec::{WireCommitCertificate, WireConsensusMsg, WireWalEntry};
+use crate::context::{Height, HopNetValidatorSet};
+use crate::types::Block;
+
+/// Consensus persistence: the WAL plus the atomic decide transaction.
+///
+/// The decide path is the load-bearing part: `decide_atomically` must run the
+/// provided closure inside ONE storage transaction — application state
+/// mutation, block+certificate persistence, and WAL truncation commit
+/// together or not at all (crash consistency across app and consensus state).
+///
+/// `wal_append` must be DURABLE before it returns: the engine publishes a
+/// message only after its WAL entry is appended, and that ordering is the
+/// no-equivocation-across-crash guarantee.
+pub trait Storage {
+    /// Transaction handle passed through to the application during decide.
+    type Tx<'a>
+    where
+        Self: 'a;
+    type Error: std::fmt::Debug;
+
+    fn wal_append(
+        &mut self,
+        height: Height,
+        seq: u64,
+        entry: &WireWalEntry,
+    ) -> Result<(), Self::Error>;
+    /// Entries for `height` in seq order (crash recovery).
+    fn wal_fetch(&mut self, height: Height) -> Result<Vec<WireWalEntry>, Self::Error>;
+    /// Drop ALL WAL entries (engine semantics of is_restart = true).
+    fn wal_reset(&mut self) -> Result<(), Self::Error>;
+
+    /// Run `f` inside one atomic transaction.
+    fn decide_atomically<R>(
+        &mut self,
+        f: impl FnOnce(&mut Self::Tx<'_>) -> Result<R, Self::Error>,
+    ) -> Result<R, Self::Error>;
+
+    /// Run `f` inside a transaction that is ALWAYS rolled back (validation
+    /// dry-runs).
+    fn with_rollback<R>(
+        &mut self,
+        f: impl FnOnce(&mut Self::Tx<'_>) -> R,
+    ) -> Result<R, Self::Error>;
+
+    // Consensus-side writes inside the decide transaction.
+    fn store_decided_tx(
+        tx: &mut Self::Tx<'_>,
+        block: &Block,
+        cert: &WireCommitCertificate,
+    ) -> Result<(), Self::Error>;
+    fn truncate_wal_tx(tx: &mut Self::Tx<'_>, up_to: Height) -> Result<(), Self::Error>;
+    fn set_last_decided_tx(tx: &mut Self::Tx<'_>, height: Height) -> Result<(), Self::Error>;
+
+    /// Last decided height, if any (startup).
+    fn last_decided(&mut self) -> Result<Option<Height>, Self::Error>;
+
+    /// Lift an application apply failure into the storage error channel, so
+    /// the whole decide closure shares one error type.
+    fn apply_error(e: ApplyError) -> Self::Error;
+}
+
+/// The application seam (ABCI in spirit). Deterministic: same inputs must
+/// produce the same verdicts and state on every node — that's what agreement
+/// on blocks means. No network, no clocks, no randomness.
+///
+/// Value BUILDING (the proposer's job) is deliberately absent: the host
+/// surfaces `HostOutput::NeedValue` and the shell feeds `Input::Propose`,
+/// because building may be asynchronous (queue drain, preflight) and the
+/// dispatch core never blocks.
+pub trait Application<S: Storage> {
+    /// Rule-8 dry-run: signatures, nonce/staleness, execute=false dispatch.
+    /// Runs inside a rollback transaction the host opens.
+    fn validate_block(&mut self, height: Height, block: &Block, tx: &mut S::Tx<'_>) -> Validity;
+
+    /// Apply a decided block (execute=true dispatch + nonce insertion) inside
+    /// the host's decide transaction.
+    fn apply_block(
+        &mut self,
+        height: Height,
+        block: &Block,
+        tx: &mut S::Tx<'_>,
+    ) -> Result<(), ApplyError>;
+
+    /// Validator set effective at `height` (historical heights during sync).
+    fn validator_set(&mut self, height: Height) -> HopNetValidatorSet;
+
+    /// Post-commit hook, outside the transaction: notify submitters, kick
+    /// replication, submit follow-up transactions.
+    fn on_decided(&mut self, height: Height, block: &Block, cert: &WireCommitCertificate);
+}
+
+#[derive(Debug)]
+pub struct ApplyError(pub String);
+
+/// Outbound consensus traffic. `broadcast` is fire-and-forget and must not
+/// block: production spawns per-peer sends; the simulator enqueues.
+pub trait Gossip {
+    fn broadcast(&mut self, msg: &WireConsensusMsg);
+}
+
+/// Timer service. The engine requests timeouts; the host's clock decides when
+/// `Input::TimeoutElapsed` comes back. Production: DelayQueue; sim: virtual
+/// clock — which is exactly why time never appears inside the dispatch core.
+pub trait Timers {
+    fn schedule(&mut self, timeout: Timeout);
+    fn cancel(&mut self, timeout: &Timeout);
+    fn cancel_all(&mut self);
+}

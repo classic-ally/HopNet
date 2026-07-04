@@ -24,6 +24,12 @@ use crate::types::{Blake3Hash, Block, PubKey};
 pub struct Height(pub u64);
 
 impl Height {
+    /// The genesis / not-yet-produced height (0). Mirrors the `Height` trait
+    /// const so callers need not import the trait.
+    pub const ZERO: Self = Height(0);
+    /// The first consensus height (1).
+    pub const INITIAL: Self = Height(1);
+
     pub fn from_db(v: i64) -> Self {
         Height(u64::try_from(v).expect("negative height in database"))
     }

@@ -17,7 +17,10 @@
 pub mod codec;
 pub mod config;
 pub mod context;
+pub mod host;
 pub mod signing;
+pub mod sim;
+pub mod traits;
 pub mod types;
 pub mod verify;
 
