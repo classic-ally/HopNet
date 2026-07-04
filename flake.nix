@@ -155,7 +155,14 @@
               version = "0.1.0";
               src = ./crates/ingress-server/frontend;
               fetcherVersion = 3;
-              hash = "sha256-4q2p9Qq3fPlOC80gAb/GhmOnM1pcLbNdsbuR7ULSF+Y=";
+              # Platform-dependent: pnpm fetches platform-specific optional
+              # deps (esbuild/rollup native binaries), so the FOD differs per
+              # system. Add entries here for new build platforms.
+              hash =
+                {
+                  "aarch64-darwin" = "sha256-4q2p9Qq3fPlOC80gAb/GhmOnM1pcLbNdsbuR7ULSF+Y=";
+                  "x86_64-linux" = "sha256-EETRTVOK9Ava927j352FxZitLMQ8ai81azrvQxNvUWU=";
+                }.${pkgs.stdenv.hostPlatform.system} or pkgs.lib.fakeHash;
             };
 
             nativeBuildInputs = [ pkgs.nodejs pkgs.pnpm_10 pkgs.pnpmConfigHook ];
