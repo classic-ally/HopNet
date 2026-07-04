@@ -1,0 +1,29 @@
+[package]
+name = "malachite-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone — not part of the root workspace (spikes/ precedent: photokit).
+[workspace]
+
+[dependencies]
+# Malachite consensus engine (pinned — single published release as of 2026-07-04)
+malachitebft-core-consensus = { package = "arc-malachitebft-core-consensus", version = "=0.7.0-pre", default-features = false, features = ["std"] }
+malachitebft-core-types = { package = "arc-malachitebft-core-types", version = "=0.7.0-pre" }
+malachitebft-wal = { package = "arc-malachitebft-wal", version = "=0.7.0-pre" }
+
+# HopNet's dep graph — combined-resolution test (risk #7)
+iroh = "0.98.2"
+ed25519-dalek = { version = "3.0.0-pre.6", features = ["batch", "serde"] }
+rusqlite = { version = "0.38", features = ["bundled"] }
+tokio = { version = "1.45.1", features = ["full"] }
+bincode = "2.0.1"
+blake3 = "1.5"
+rand = "0.9"
+
+# Same pins as the main workspace (Cargo.toml:55-61): ed25519-dalek 3.0.0-pre.6
+# was built against keccak 0.2.0-rc.1, and digest 0.11.3 pulls a broken
+# crypto-common. Combined-graph test must include these or it tests nothing.
+digest = "=0.11.2"
+keccak = "=0.2.0-rc.1"
