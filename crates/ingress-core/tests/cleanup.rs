@@ -414,6 +414,51 @@ fn walkdir_count(root: &std::path::Path) -> usize {
     n
 }
 
+/// Count leftover `.json.tmp` staging files under a remote root — the litter
+/// a failed `copy_atomic` must clean up.
+fn tmp_litter_count(root: &std::path::Path) -> usize {
+    fn walk(p: &std::path::Path, acc: &mut usize) {
+        if let Ok(entries) = std::fs::read_dir(p) {
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    walk(&path, acc);
+                } else if path.extension().map(|x| x == "tmp").unwrap_or(false) {
+                    *acc += 1;
+                }
+            }
+        }
+    }
+    let mut n = 0;
+    walk(root, &mut n);
+    n
+}
+
+/// The remote path a photo's local sidecar replicates to (mirrors the drain's
+/// own `<remote_root>/<YYYY/MM>/<id>.json` derivation).
+async fn remote_dest(
+    store: &StateStore,
+    data_dir: &DataDir,
+    lib: &LibraryId,
+    id: &PhotoId,
+) -> std::path::PathBuf {
+    let local = ingress_core::sidecar_io::find_sidecar(&data_dir.sidecar_root(lib), id)
+        .unwrap()
+        .unwrap();
+    let rel = local
+        .strip_prefix(data_dir.sidecar_root(lib))
+        .unwrap()
+        .to_path_buf();
+    let remote_root = store
+        .library(lib)
+        .await
+        .unwrap()
+        .unwrap()
+        .sidecar_root_remote
+        .unwrap();
+    std::path::Path::new(&remote_root).join(rel)
+}
+
 // Should: retention 0 reaps while retention 1000 survives, in the same run
 // (per-library retention_days read fresh — spec edge-case table).
 #[tokio::test]
@@ -858,6 +903,131 @@ async fn replication_stall_edge_logs_once() {
     assert_eq!(r.replicated, 1);
     assert!(!r.stalled);
     assert_eq!(store.log_events("mount_regained").await.unwrap().len(), 1);
+}
+
+// Impact: the drain visits photos in `photo_id` order; before this fix one
+// un-copyable photo at the head aborted the whole pass, so a single poison
+// file (a Photos-provenance xattr the mount rejected, a stale destination)
+// froze replication for every following photo AND every other library — the
+// production incident where a Personal-library head photo left 26k sidecars
+// unbacked while the mount was healthy.
+// Should: skip the failing photo, keep draining the rest, stamp the good one,
+// leave the poison unstamped, and log ONE sidecar_copy_failed (not mount_lost)
+// with no leftover .tmp litter.
+// Should not: set stalled, or block the later photo.
+#[tokio::test]
+async fn replication_poison_file_does_not_freeze_backlog() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, lib, _) = store_with_remotes(tmp.path()).await;
+    let data_dir = DataDir::new(tmp.path().join("data"));
+
+    // Two dirty photos in one library. Materialize both, then pick the one
+    // that sorts FIRST by photo_id (SQLite BINARY order == Rust String order)
+    // as the poison — reproducing the head-of-line freeze exactly.
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let desc = AssetDescriptorBuilder::simple_image()
+            .modified_at(Utc::now())
+            .build();
+        let id = seed_one(&store, &desc).await;
+        materialize_all(&store, &data_dir, &desc, &id).await;
+        ids.push(id);
+    }
+    ids.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+    let (poison, healthy) = (ids[0].clone(), ids[1].clone());
+
+    // Sabotage the poison's destination: a NON-EMPTY directory where its
+    // `.json` should land makes the rename fail (ENOTEMPTY) while the remote
+    // ROOT stays a healthy directory — a per-file failure, not a lost mount.
+    let dst = remote_dest(&store, &data_dir, &lib, &poison).await;
+    std::fs::create_dir_all(&dst).unwrap();
+    std::fs::write(dst.join("blocker"), b"x").unwrap();
+
+    let mut state = ReplicationState::default();
+    let report = replicate_dirty_sidecars(&store, &data_dir, 100, &HashSet::new(), &mut state)
+        .await
+        .unwrap();
+
+    assert_eq!(report.replicated, 1, "the healthy photo still drains");
+    assert_eq!(report.failed, 1, "the poison is counted, not fatal");
+    assert!(!report.stalled, "a healthy mount never stalls");
+
+    assert!(
+        replicated_at(&store, &healthy).await.is_some(),
+        "later photo stamped despite the poison at the head"
+    );
+    assert_eq!(
+        replicated_at(&store, &poison).await,
+        None,
+        "poison stays dirty for a later retry"
+    );
+
+    assert_eq!(
+        store.log_events("sidecar_copy_failed").await.unwrap().len(),
+        1,
+        "one row per pass, not one per poison tick"
+    );
+    assert_eq!(
+        store.log_events("mount_lost").await.unwrap().len(),
+        0,
+        "a per-file failure is not a mount loss"
+    );
+
+    let remote_root = store
+        .library(&lib)
+        .await
+        .unwrap()
+        .unwrap()
+        .sidecar_root_remote
+        .unwrap();
+    assert_eq!(
+        tmp_litter_count(std::path::Path::new(&remote_root)),
+        0,
+        "failed copy left no .tmp behind"
+    );
+}
+
+// Impact: the pre-fix copy left a 0-byte `.json.tmp` on every failed pass
+// (fs::copy creates the destination before the metadata step that EPERM'd on
+// the mount) — litter a later pass could mistake for a real sidecar, and the
+// visible symptom that first exposed the freeze.
+// Should: a failed copy removes its own staging file, leaving zero litter.
+#[tokio::test]
+async fn replication_removes_tmp_after_failed_copy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, lib, _) = store_with_remotes(tmp.path()).await;
+    let data_dir = DataDir::new(tmp.path().join("data"));
+    let desc = AssetDescriptorBuilder::simple_image()
+        .modified_at(Utc::now())
+        .build();
+    let id = seed_one(&store, &desc).await;
+    materialize_all(&store, &data_dir, &desc, &id).await;
+
+    // Block just this file's destination; the mount root stays healthy.
+    let dst = remote_dest(&store, &data_dir, &lib, &id).await;
+    std::fs::create_dir_all(&dst).unwrap();
+    std::fs::write(dst.join("blocker"), b"x").unwrap();
+
+    let mut state = ReplicationState::default();
+    let report = replicate_dirty_sidecars(&store, &data_dir, 100, &HashSet::new(), &mut state)
+        .await
+        .unwrap();
+    assert_eq!(report.failed, 1);
+    assert!(!report.stalled);
+    assert_eq!(replicated_at(&store, &id).await, None, "unstamped on failure");
+
+    let remote_root = store
+        .library(&lib)
+        .await
+        .unwrap()
+        .unwrap()
+        .sidecar_root_remote
+        .unwrap();
+    assert_eq!(
+        tmp_litter_count(std::path::Path::new(&remote_root)),
+        0,
+        "no 0-byte .json.tmp survives a failed copy"
+    );
 }
 
 // Impact: a cleanup run concurrent with a live daemon would race photo_tasks

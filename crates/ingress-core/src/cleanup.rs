@@ -73,6 +73,12 @@ pub struct ReplicationReport {
     /// completion tx and the first sidecar write) — skipped unstamped;
     /// fsck tier-2's class.
     pub missing: u64,
+    /// Dirty photos the mount accepted the root of but refused the copy for
+    /// (e.g. a destination clash, or a per-file fs error) — skipped unstamped
+    /// and retried next pass, but NOT allowed to stall the whole drain. The
+    /// poison-pill guard: one un-copyable photo at the head of the `photo_id`
+    /// order must not freeze replication for every following photo/library.
+    pub failed: u64,
     pub stalled: bool,
 }
 
@@ -80,6 +86,7 @@ impl ReplicationReport {
     pub fn absorb(&mut self, other: &ReplicationReport) {
         self.replicated += other.replicated;
         self.missing += other.missing;
+        self.failed += other.failed;
         self.stalled = other.stalled;
     }
 }
@@ -391,6 +398,9 @@ pub async fn replicate_dirty_sidecars(
         .collect();
 
     let mut copied_any = false;
+    // First per-file copy failure of this pass, logged once at the end so a
+    // recurring poison photo does not write one row per tick.
+    let mut first_failure: Option<(PhotoId, String)> = None;
     for photo in candidates {
         if skip.contains(&photo.photo_id) {
             continue;
@@ -424,25 +434,52 @@ pub async fn replicate_dirty_sidecars(
                 copied_any = true;
             }
             Err(e) => {
-                // Mount-flavored stall: stop the pass, edge-log once.
-                report.stalled = true;
-                if !state.stalled {
-                    state.stalled = true;
-                    store
-                        .append_log(
-                            "mount_lost",
-                            None,
-                            Some(serde_json::json!({
-                                "op": "sidecar_replication",
-                                "library": library.library_id.to_string(),
-                                "error": e.to_string(),
-                            })),
-                        )
-                        .await?;
+                // Two distinct failure modes, told apart by probing the root:
+                //   - root not a reachable directory  => the mount is gone.
+                //     Stop the pass (hammering a dead mount is wasted work)
+                //     and edge-log `mount_lost` once.
+                //   - root still a live directory      => this one file failed
+                //     (destination clash, per-file fs error). Skip it and keep
+                //     draining — a single un-copyable photo at the head of the
+                //     `photo_id` order must not freeze the whole backlog.
+                if !Path::new(remote_root).is_dir() {
+                    report.stalled = true;
+                    if !state.stalled {
+                        state.stalled = true;
+                        store
+                            .append_log(
+                                "mount_lost",
+                                None,
+                                Some(serde_json::json!({
+                                    "op": "sidecar_replication",
+                                    "library": library.library_id.to_string(),
+                                    "error": e.to_string(),
+                                })),
+                            )
+                            .await?;
+                    }
+                    return Ok(report);
                 }
-                return Ok(report);
+                report.failed += 1;
+                if first_failure.is_none() {
+                    first_failure = Some((photo.photo_id.clone(), e.to_string()));
+                }
             }
         }
+    }
+
+    if let Some((photo_id, error)) = first_failure {
+        store
+            .append_log(
+                "sidecar_copy_failed",
+                Some(&photo_id),
+                Some(serde_json::json!({
+                    "op": "sidecar_replication",
+                    "error": error,
+                    "failed_in_pass": report.failed,
+                })),
+            )
+            .await?;
     }
 
     if state.stalled && copied_any {
@@ -458,12 +495,36 @@ pub async fn replicate_dirty_sidecars(
     Ok(report)
 }
 
-/// Copy via `.tmp` + rename on the destination filesystem.
+/// Copy sidecar *data* via `.tmp` + rename on the destination filesystem.
+///
+/// Deliberately NOT `fs::copy`: on macOS that lowers to `copyfile(…,
+/// COPYFILE_ALL)`, which also replicates the source's xattrs (Photos-derived
+/// sidecars carry `com.apple.provenance`). Network/FUSE backups (macfuse over
+/// SMB/NFS) reject that `setxattr` with EPERM *after* creating the
+/// destination, aborting the copy and leaving a 0-byte `.tmp`. A plain data
+/// copy sidesteps the metadata replication entirely — the sidecar is
+/// self-describing JSON; its xattrs are not part of the backup.
+///
+/// The `.tmp` is removed on any failure so an aborted pass leaves no litter
+/// (and no partial file for a later pass to mistake for a real sidecar).
 fn copy_atomic(src: &Path, dst: &Path) -> std::io::Result<()> {
     let parent = dst.parent().expect("sidecar dst has YYYY/MM parents");
     fs::create_dir_all(parent)?;
     let tmp = dst.with_extension("json.tmp");
-    fs::copy(src, &tmp)?;
-    fs::rename(&tmp, dst)?;
-    Ok(())
+    match copy_data(src, &tmp).and_then(|()| fs::rename(&tmp, dst)) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// Byte-for-byte data copy, flushed to disk before the caller renames it into
+/// place. No metadata (mode/xattrs/times) is carried over.
+fn copy_data(src: &Path, tmp: &Path) -> std::io::Result<()> {
+    let mut reader = fs::File::open(src)?;
+    let mut writer = fs::File::create(tmp)?;
+    std::io::copy(&mut reader, &mut writer)?;
+    writer.sync_all()
 }
