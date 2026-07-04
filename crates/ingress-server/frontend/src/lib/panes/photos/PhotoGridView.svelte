@@ -15,6 +15,7 @@
     sharedLibs = [],
     scrollEl = undefined,
     onTopMonth = undefined,
+    header,
     footer,
   }: {
     items: PhotoSummary[];
