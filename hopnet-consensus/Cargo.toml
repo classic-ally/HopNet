@@ -1,0 +1,23 @@
+[package]
+name = "hopnet-consensus"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+repository = "https://git.bentley.sh/HopNet/HopNet"
+description = "HopNet consensus engine: Malachite (Tendermint) host, Application seam, and wire/storage adapters"
+
+[dependencies]
+# Malachite engine — pinned exactly; 0.7.0-pre is the only published release.
+# default-features = false drops the prometheus metrics dep (Metrics = ()).
+malachitebft-core-types = { package = "arc-malachitebft-core-types", version = "=0.7.0-pre" }
+malachitebft-core-consensus = { package = "arc-malachitebft-core-consensus", version = "=0.7.0-pre", default-features = false, features = ["std"] }
+
+hopnet-common = { path = "../common", features = ["database"] }
+
+blake3 = "1.8.2"
+ed25519-dalek = { version = "3.0.0-pre.6", features = ["batch", "serde"] }
+bincode = { version = "2.0.1", features = ["serde"] }
+serde = { version = "1.0.219", features = ["derive"] }
+rusqlite = { version = "0.38.0", features = ["bundled"] }
+hex = "0.4.3"
+tracing = "0.1"

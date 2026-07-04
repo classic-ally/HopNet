@@ -215,6 +215,87 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-malachitebft-core-consensus"
+version = "0.7.0-pre"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b17596a3ba4d4763c5775a5da27f6ee6e5212fc7db0aa3605e8c2baea014dac5"
+dependencies = [
+ "arc-malachitebft-core-driver",
+ "arc-malachitebft-core-types",
+ "arc-malachitebft-core-votekeeper",
+ "arc-malachitebft-peer",
+ "async-recursion",
+ "derive-where",
+ "futures",
+ "genawaiter",
+ "multiaddr",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "arc-malachitebft-core-driver"
+version = "0.7.0-pre"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3205f4f79f069fd2dff72872e9c0b84299b9e3014cd2a940dd6f67b9ec776ab5"
+dependencies = [
+ "arc-malachitebft-core-state-machine",
+ "arc-malachitebft-core-types",
+ "arc-malachitebft-core-votekeeper",
+ "derive-where",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "arc-malachitebft-core-state-machine"
+version = "0.7.0-pre"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e7bd202ea98cb2b892b4827d04192364f83345b6b98866cd8b5f1a1ff109b00"
+dependencies = [
+ "arc-malachitebft-core-types",
+ "derive-where",
+ "displaydoc",
+]
+
+[[package]]
+name = "arc-malachitebft-core-types"
+version = "0.7.0-pre"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40ee11d813a72b64c996deaced06d71eec8defb5227fff0132fc563a7aa25639"
+dependencies = [
+ "arc-malachitebft-peer",
+ "async-trait",
+ "bytes",
+ "derive-where",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "arc-malachitebft-core-votekeeper"
+version = "0.7.0-pre"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "95536416f3a0bdff16f23fcd14d457d52eadae62ae010f5653b7dd393c787a07"
+dependencies = [
+ "arc-malachitebft-core-types",
+ "derive-where",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "arc-malachitebft-peer"
+version = "0.7.0-pre"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "56186de0652458136ba18f878f60b1ea8f0d2022b51c96ac37feb691deaa7f37"
+dependencies = [
+ "bs58",
+ "multihash",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "argon2"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -237,6 +318,17 @@ name = "arrayvec"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
+
+[[package]]
+name = "async-recursion"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b43422f69d8ff38f95f1b2bb76517c91589a924d1559a0e935d7c8ce0274c11"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.106",
+]
 
 [[package]]
 name = "async-stream"
@@ -432,6 +524,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "base-x"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cbbc9d0964165b47557570cce6c952866c2678457aca742aafc9fb771d30270"
+
+[[package]]
+name = "base256emoji"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5e9430d9a245a77c92176e649af6e275f20839a48389859d1661e9a128d077c"
+dependencies = [
+ "const-str",
+ "match-lookup",
+]
+
+[[package]]
+name = "base45"
+version = "3.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "240e56f4d3c453c36faacb695c535a4d5f8c7d23dac175014f32eb0a71012a03"
+
+[[package]]
 name = "base64"
 version = "0.21.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -615,6 +729,15 @@ checksum = "874bb8112abecc98cbd6d81ea4fa7e94fb9449648c93cc89aa40c81c24d7de03"
 dependencies = [
  "alloc-no-stdlib",
  "alloc-stdlib",
+]
+
+[[package]]
+name = "bs58"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf88ba1141d185c399bee5288d850d63b8369520c1eafc32a0430b5b6c287bf4"
+dependencies = [
+ "tinyvec",
 ]
 
 [[package]]
@@ -942,6 +1065,12 @@ name = "const-oid"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
+
+[[package]]
+name = "const-str"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f421161cb492475f1661ddc9815a745a1c894592070661180fdec3d4872e9c3"
 
 [[package]]
 name = "constant_time_eq"
@@ -1321,6 +1450,17 @@ checksum = "ececcb659e7ba858fb4f10388c250a7252eb0a27373f1a72b8748afdd248e587"
 dependencies = [
  "powerfmt",
  "serde_core",
+]
+
+[[package]]
+name = "derive-where"
+version = "1.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d08b3a0bcc0d079199cd476b2cae8435016ec11d1c0986c6901c5ac223041534"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -2038,6 +2178,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "genawaiter"
+version = "0.99.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c86bd0361bcbde39b13475e6e36cb24c329964aa2611be285289d1e4b751c1a0"
+dependencies = [
+ "genawaiter-macro",
+]
+
+[[package]]
+name = "genawaiter-macro"
+version = "0.99.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b32dfe1fdfc0bbde1f22a5da25355514b5e450c33a6af6770884c8750aedfbc"
+
+[[package]]
 name = "generator"
 version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2473,6 +2628,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "hkdf"
+version = "0.12.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b5f8eb2ad728638ea2c7d47a21db23b7b58a72ed6a38256b8a1849f15fbbdf7"
+dependencies = [
+ "hmac",
+]
+
+[[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest 0.10.7",
+]
+
+[[package]]
 name = "hopnet"
 version = "0.1.0"
 dependencies = [
@@ -2550,6 +2723,22 @@ dependencies = [
  "serde",
  "typeshare",
  "uuid",
+]
+
+[[package]]
+name = "hopnet-consensus"
+version = "0.1.0"
+dependencies = [
+ "arc-malachitebft-core-consensus",
+ "arc-malachitebft-core-types",
+ "bincode",
+ "blake3",
+ "ed25519-dalek",
+ "hex",
+ "hopnet-common",
+ "rusqlite",
+ "serde",
+ "tracing",
 ]
 
 [[package]]
@@ -3432,6 +3621,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "libp2p-identity"
+version = "0.2.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0c7892c221730ba55f7196e98b0b8ba5e04b4155651736036628e9f73ed6fc3"
+dependencies = [
+ "bs58",
+ "hkdf",
+ "multihash",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "libredox"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3541,6 +3744,17 @@ dependencies = [
  "string_cache",
  "string_cache_codegen",
  "tendril",
+]
+
+[[package]]
+name = "match-lookup"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "757aee279b8bdbb9f9e676796fd459e4207a1f986e87886700abf589f5abf771"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -3680,6 +3894,47 @@ dependencies = [
  "mime",
  "spin 0.9.8",
  "version_check",
+]
+
+[[package]]
+name = "multiaddr"
+version = "0.18.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe6351f60b488e04c1d21bc69e56b89cb3f5e8f5d22557d6e8031bdfd79b6961"
+dependencies = [
+ "arrayref",
+ "byteorder",
+ "data-encoding",
+ "libp2p-identity",
+ "multibase",
+ "multihash",
+ "percent-encoding",
+ "serde",
+ "static_assertions",
+ "unsigned-varint",
+ "url",
+]
+
+[[package]]
+name = "multibase"
+version = "0.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e0e4a371cbf1dfd666b658ba137763edb23c45beb43cfe369b5593cd6b437b6"
+dependencies = [
+ "base-x",
+ "base256emoji",
+ "base45",
+ "data-encoding",
+ "data-encoding-macro",
+]
+
+[[package]]
+name = "multihash"
+version = "0.19.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "577c63b00ad74d57e8c9aa870b5fccebf2fd64a308a5aee9f1bb88e4aea19447"
+dependencies = [
+ "unsigned-varint",
 ]
 
 [[package]]
@@ -6104,6 +6359,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a8f112729512f8e442d81f95a8a7ddf2b7c6b8a1a6f509a95864142b30cab2d3"
 
 [[package]]
+name = "static_assertions"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
 name = "string_cache"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7150,6 +7411,12 @@ dependencies = [
  "crypto-common 0.1.6",
  "subtle",
 ]
+
+[[package]]
+name = "unsigned-varint"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb066959b24b5196ae73cb057f45598450d2c5f71460e98c49b738086eff9c06"
 
 [[package]]
 name = "untrusted"
