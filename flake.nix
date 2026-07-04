@@ -160,15 +160,18 @@
               # exist on older nixpkgs — so gate on the pnpm that will run.
               fetcherVersion =
                 if builtins.compareVersions pkgs.pnpm_10.version "10.34" >= 0 then 4 else 3;
-              # Hashes are platform-dependent (pnpm fetches platform-specific
-              # optional deps: esbuild/rollup native binaries) AND
-              # fetcherVersion-dependent. Keyed on both.
+              # fetcherVersion 3's tarball normalization is platform-independent
+              # (verified: aarch64-darwin and x86_64-linux produce the same
+              # hash under pnpm 10.30). Keyed on fetcherVersion because v4
+              # output differs. NOTE: as of nixpkgs e73de5b (26.11 unstable),
+              # pnpm 10.34 + fetcherVersion 4 offline install is broken
+              # (ERR_PNPM_NO_OFFLINE_TARBALL with a complete store) — build
+              # this package with a nixpkgs whose pnpm_10 is < 10.34.
               hash =
                 {
-                  "aarch64-darwin-3" = "sha256-4q2p9Qq3fPlOC80gAb/GhmOnM1pcLbNdsbuR7ULSF+Y=";
-                  "x86_64-linux-4" = "sha256-rVTjvm5YduXQov0pB3biMh8plNtz7OylJ7rTg77CEug=";
-                }."${pkgs.stdenv.hostPlatform.system}-${toString fetcherVersion}"
-                  or pkgs.lib.fakeHash;
+                  "3" = "sha256-4q2p9Qq3fPlOC80gAb/GhmOnM1pcLbNdsbuR7ULSF+Y=";
+                  "4" = "sha256-rVTjvm5YduXQov0pB3biMh8plNtz7OylJ7rTg77CEug=";
+                }.${toString fetcherVersion} or pkgs.lib.fakeHash;
             };
 
             nativeBuildInputs = [ pkgs.nodejs pkgs.pnpm_10 pkgs.pnpmConfigHook ];
