@@ -13,7 +13,7 @@
   },
   "devDependencies": {
     "@chromatic-com/storybook": "^4.1.1",
-    "@iconify-json/carbon": "^1.2.9",
+    "@iconify-json/carbon": "^1.2.23",
     "@storybook/addon-a11y": "^9.1.8",
     "@storybook/addon-docs": "^9.1.8",
     "@storybook/addon-svelte-csf": "^5.0.8",

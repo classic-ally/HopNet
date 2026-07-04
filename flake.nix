@@ -155,7 +155,7 @@
               version = "0.1.0";
               src = ./crates/ingress-server/frontend;
               fetcherVersion = 3;
-              hash = "sha256-1U3vi1mn7zUr1yJiVxXp44KXmz83QdKh7/2r0xNxB7I=";
+              hash = "sha256-4q2p9Qq3fPlOC80gAb/GhmOnM1pcLbNdsbuR7ULSF+Y=";
             };
 
             nativeBuildInputs = [ pkgs.nodejs pkgs.pnpm_10 pkgs.pnpmConfigHook ];
