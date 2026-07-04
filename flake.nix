@@ -150,19 +150,25 @@
             };
             sourceRoot = "source/crates/ingress-server/frontend";
 
-            pnpmDeps = pkgs.fetchPnpmDeps {
+            pnpmDeps = pkgs.fetchPnpmDeps rec {
               pname = "ingress-viewer-frontend";
               version = "0.1.0";
               src = ./crates/ingress-server/frontend;
-              fetcherVersion = 3;
-              # Platform-dependent: pnpm fetches platform-specific optional
-              # deps (esbuild/rollup native binaries), so the FOD differs per
-              # system. Add entries here for new build platforms.
+              # pnpm >= 10.34 (nixpkgs 26.11) keeps its store index in SQLite;
+              # fetcherVersion 3's tarball normalization breaks it (offline
+              # install then fails ERR_PNPM_NO_OFFLINE_TARBALL) and 4 doesn't
+              # exist on older nixpkgs — so gate on the pnpm that will run.
+              fetcherVersion =
+                if builtins.compareVersions pkgs.pnpm_10.version "10.34" >= 0 then 4 else 3;
+              # Hashes are platform-dependent (pnpm fetches platform-specific
+              # optional deps: esbuild/rollup native binaries) AND
+              # fetcherVersion-dependent. Keyed on both.
               hash =
                 {
-                  "aarch64-darwin" = "sha256-4q2p9Qq3fPlOC80gAb/GhmOnM1pcLbNdsbuR7ULSF+Y=";
-                  "x86_64-linux" = "sha256-EETRTVOK9Ava927j352FxZitLMQ8ai81azrvQxNvUWU=";
-                }.${pkgs.stdenv.hostPlatform.system} or pkgs.lib.fakeHash;
+                  "aarch64-darwin-3" = "sha256-4q2p9Qq3fPlOC80gAb/GhmOnM1pcLbNdsbuR7ULSF+Y=";
+                  "x86_64-linux-4" = "sha256-rVTjvm5YduXQov0pB3biMh8plNtz7OylJ7rTg77CEug=";
+                }."${pkgs.stdenv.hostPlatform.system}-${toString fetcherVersion}"
+                  or pkgs.lib.fakeHash;
             };
 
             nativeBuildInputs = [ pkgs.nodejs pkgs.pnpm_10 pkgs.pnpmConfigHook ];
