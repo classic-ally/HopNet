@@ -68,6 +68,20 @@ pub trait Storage {
     fn apply_error(e: ApplyError) -> Self::Error;
 }
 
+/// Where a block being validated came from — live checks may be
+/// time-dependent; sync checks must not be.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ValidationOrigin {
+    /// A live proposal for the current height: full Rule-8 including
+    /// time-dependent checks (nonce staleness, committed-nonce dedup).
+    Live,
+    /// A decided value fetched by sync, already backed by a verified commit
+    /// certificate. Time-dependent checks MUST be skipped (a node replaying
+    /// week-old history would otherwise reject every block); deterministic
+    /// checks (signatures, parent linkage, handler validation) still run.
+    Sync,
+}
+
 /// The application seam (ABCI in spirit). Deterministic: same inputs must
 /// produce the same verdicts and state on every node — that's what agreement
 /// on blocks means. No network, no clocks, no randomness.
@@ -79,7 +93,13 @@ pub trait Storage {
 pub trait Application<S: Storage> {
     /// Rule-8 dry-run: signatures, nonce/staleness, execute=false dispatch.
     /// Runs inside a rollback transaction the host opens.
-    fn validate_block(&mut self, height: Height, block: &Block, tx: &mut S::Tx<'_>) -> Validity;
+    fn validate_block(
+        &mut self,
+        height: Height,
+        block: &Block,
+        tx: &mut S::Tx<'_>,
+        origin: ValidationOrigin,
+    ) -> Validity;
 
     /// Apply a decided block (execute=true dispatch + nonce insertion) inside
     /// the host's decide transaction.

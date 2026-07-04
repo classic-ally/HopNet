@@ -6,6 +6,7 @@ use rand::rngs::SysRng;
 mod authorization;
 mod byzantine;
 mod quorum;
+mod malachite_integration;
 mod signatures;
 
 #[derive(Clone)]
@@ -456,6 +457,23 @@ impl MockNetwork {
     }
 }
 
+/// One shared runtime for every test transport: the endpoint's internal
+/// actors are spawned on the runtime that creates it, so a throwaway runtime
+/// would kill them the moment it drops (any later dial then fails with
+/// RemoteStateActorStopped). Tests that DIAL these endpoints should drive
+/// their futures on this same runtime.
+pub fn test_iroh_rt() -> &'static tokio::runtime::Runtime {
+    static TEST_IROH_RT: once_cell::sync::Lazy<tokio::runtime::Runtime> =
+        once_cell::sync::Lazy::new(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .enable_all()
+                .build()
+                .expect("test iroh runtime")
+        });
+    &TEST_IROH_RT
+}
+
 pub fn create_test_app_state_with_keys(
     signing_key: crate::db::PrivKey,
     verifying_key: crate::db::PubKey,
@@ -479,8 +497,7 @@ pub fn create_test_app_state_with_keys(
     let decoding_key = DecodingKey::from_secret(jwt_secret);
 
     let iroh_secret = signing_key.to_iroh_secret_key();
-    let iroh_transport = tokio::runtime::Runtime::new()
-        .unwrap()
+    let iroh_transport = test_iroh_rt()
         .block_on(crate::net::IrohTransport::new(
             iroh_secret,
             pool.clone(),

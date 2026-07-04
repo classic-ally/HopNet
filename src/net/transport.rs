@@ -456,6 +456,22 @@ impl IrohTransport {
         let mut connections = self.connections.write().await;
         connections.remove(&node_id);
     }
+
+    /// Establish and cache a connection to a peer at a KNOWN address,
+    /// bypassing discovery. Used by in-process tests over loopback, where
+    /// endpoints know each other's bound sockets directly.
+    pub async fn connect_to_addr(
+        &self,
+        node_id: i32,
+        addr: iroh::EndpointAddr,
+    ) -> Result<(), IrohError> {
+        let conn = tokio::time::timeout(CONNECTION_TIMEOUT, self.endpoint.connect(addr, HOPNET_ALPN))
+            .await
+            .map_err(|_| IrohError::Transport(TransportError::Timeout))?
+            .map_err(|e| IrohError::Transport(TransportError::ConnectionFailed(e.to_string())))?;
+        self.connections.write().await.insert(node_id, conn);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

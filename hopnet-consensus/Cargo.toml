@@ -15,9 +15,24 @@ malachitebft-core-consensus = { package = "arc-malachitebft-core-consensus", ver
 hopnet-common = { path = "../common", features = ["database"] }
 
 blake3 = "1.8.2"
+bytes = "1"
 ed25519-dalek = { version = "3.0.0-pre.6", features = ["batch", "serde"] }
 bincode = { version = "2.0.1", features = ["serde"] }
 serde = { version = "1.0.219", features = ["derive"] }
 rusqlite = { version = "0.38.0", features = ["bundled"] }
 hex = "0.4.3"
 tracing = "0.1"
+
+# Shell feature: the production tokio wrapper around the sans-io HostCore.
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"], optional = true }
+tokio-util = { version = "0.7", features = ["time"], optional = true }
+
+[features]
+shell = ["dep:tokio", "dep:tokio-util"]
+
+[dev-dependencies]
+tracing-subscriber = "0.3"
+
+[[test]]
+name = "shell"
+required-features = ["shell"]

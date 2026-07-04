@@ -18,8 +18,11 @@ pub mod codec;
 pub mod config;
 pub mod context;
 pub mod host;
+#[cfg(feature = "shell")]
+pub mod shell;
 pub mod signing;
 pub mod sim;
+pub mod store;
 pub mod traits;
 pub mod types;
 pub mod verify;
@@ -34,3 +37,8 @@ pub use types::{Block, BlockData, BlockError, Transaction, Transactions};
 /// Convenience alias: the engine instantiated over HopNet's context.
 pub type SignedConsensusMsg = malachitebft_core_consensus::SignedConsensusMsg<HopNetContext>;
 pub type CommitCertificate = malachitebft_core_types::CommitCertificate<HopNetContext>;
+
+// Engine types the embedding application needs at the seams, re-exported so
+// it never depends on the malachite crates directly (version pin isolation).
+pub use malachitebft_core_consensus::{Params, PeerId};
+pub use malachitebft_core_types::{LinearTimeouts, Round, Timeout, Validity, ValuePayload};

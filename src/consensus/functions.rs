@@ -849,7 +849,7 @@ pub(crate) async fn broadcast_qc(
 /// Must be strictly less than the nonce cleanup cutoff (1 hour) to ensure that
 /// any transaction whose nonce was cleaned up is also caught by the staleness check.
 /// The 10-minute gap provides clock skew tolerance across nodes.
-const MAX_TRANSACTION_AGE: chrono::TimeDelta = chrono::TimeDelta::minutes(50);
+pub const MAX_TRANSACTION_AGE: chrono::TimeDelta = chrono::TimeDelta::minutes(50);
 
 pub fn process_transactions(
     transactions: &Option<Transactions>,

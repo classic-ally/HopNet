@@ -294,6 +294,14 @@ async fn handle_stream(
                             },
                         }
                     }
+                    // Malachite-engine traffic: dispatched here at the Stage-5
+                    // cutover (needs the engine handle in AppState). Until
+                    // then the standalone consensus accept loop serves it.
+                    IrohRequest::ConsensusMsg(_) | IrohRequest::DecidedFetch { .. } => {
+                        IrohResponse::Error {
+                            message: "malachite engine not active".into(),
+                        }
+                    }
                 };
 
                 encode_message(&response)

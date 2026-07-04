@@ -125,6 +125,79 @@ fn crash_restart_healthy_quorum_progresses_no_equivocation() {
     sim.assert_agreement_common();
 }
 
+// Should: bring a partition-stranded node to the tip via decided-value sync,
+// through the SAME atomic decide path as live consensus (oracles keep running).
+// Should not: equivocate, skip a height, or diverge from the majority's chain
+// during catch-up.
+// Impact: closes the liveness gap every Stage-2/3 test scoped around — loss,
+// partition, and crash strand nodes; sync is how they come back. This is the
+// recovery half of the protocol.
+#[test]
+fn stranded_node_catches_up_via_decided_value_sync() {
+    let faults = FaultConfig {
+        seed: 99,
+        delay: 1..10,
+        drop_p: 0.0,
+        duplicate_p: 0.0,
+        // Isolate node 3 for an initial window, then heal.
+        partitions: vec![Partition {
+            start: 0,
+            end: 300,
+            side_a: vec![3],
+        }],
+        crashes: Vec::new(),
+    };
+    let mut sim = Sim::with_faults(4, QuorumProfile::Bft, faults);
+    sim.start().unwrap();
+    // Majority reaches height 5; the isolated node stays behind (pre-sync).
+    sim.run(5, 3).unwrap();
+    let before = sim.decided_height(3);
+    let target = sim.decided_height(0);
+    assert!(before < target, "node 3 should be stranded before sync");
+
+    sim.sync_from_peer(3, 0).unwrap();
+
+    assert!(
+        sim.decided_height(3) >= target,
+        "sync must bring the laggard to the source's tip ({} < {target})",
+        sim.decided_height(3)
+    );
+    // Full-history agreement now that everyone shares the prefix.
+    let common = sim.assert_agreement_common();
+    assert!(common >= target);
+}
+
+// Should: let a crash-restarted node that fell behind catch up via sync.
+// Should not: let the WAL replay + sync interaction double-apply or corrupt
+// the decided history.
+// Impact: the crash-recovery + sync composition — the exact sequence a real
+// node experiences after an outage.
+#[test]
+fn crashed_node_rejoins_via_sync_after_restart() {
+    let faults = FaultConfig {
+        seed: 5,
+        delay: 1..10,
+        drop_p: 0.0,
+        duplicate_p: 0.0,
+        partitions: Vec::new(),
+        // Crash node 2 early; restart later. Survivors (3 of 4) keep quorum.
+        crashes: vec![(50, 2, 400)],
+    };
+    let mut sim = Sim::with_faults(4, QuorumProfile::Bft, faults);
+    sim.start().unwrap();
+    sim.run(6, 3).unwrap();
+
+    let target = sim.decided_height(0).max(sim.decided_height(1));
+    sim.sync_from_peer(2, 0).unwrap();
+
+    assert!(
+        sim.decided_height(2) >= target.min(6),
+        "restarted node must reach the tip via sync (got {})",
+        sim.decided_height(2)
+    );
+    sim.assert_agreement_common();
+}
+
 // Should: decide in a 3-node mesh under the majority (CFT) profile.
 // Should not: require a 2/3 supermajority.
 // Impact: the home-mesh profile end-to-end through the real host loop.

@@ -20,15 +20,17 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use malachitebft_core_consensus::{
-    process, ConsensusMsg, Effect, Input, LivenessMsg, LocallyProposedValue, Params, ProposedValue,
-    Resumable, SignedConsensusMsg, State,
+    process, ConsensusMsg, Effect, Input, LivenessMsg, LocallyProposedValue, Params, PeerId,
+    ProposedValue, Resumable, SignedConsensusMsg, State,
 };
-use malachitebft_core_types::{Round, SignedMessage, Timeout, Validity, ValueOrigin};
+use malachitebft_core_types::{
+    CommitCertificate, Round, SignedMessage, Timeout, Validity, ValueOrigin, ValueResponse,
+};
 
 use crate::codec::{self, WireCommitCertificate, WireConsensusMsg, WireWalEntry};
 use crate::context::{Address, ConsensusVote, Height, HopNetContext, HopNetValidatorSet};
 use crate::signing;
-use crate::traits::{Application, Gossip, Storage, Timers};
+use crate::traits::{Application, Gossip, Storage, Timers, ValidationOrigin};
 use crate::types::{Blake3Hash, Block, PrivKey};
 use crate::verify;
 
@@ -46,6 +48,28 @@ pub enum HostOutput {
     NeedValue { height: Height, round: Round },
     /// A value was decided and committed at `height`.
     Decided { height: Height },
+    /// A synced value at `height` did not apply (bad certificate, undecodable
+    /// value, or a validity mismatch). The sync client should try another
+    /// peer for this height.
+    SyncInvalid { peer: PeerId, height: Height },
+}
+
+/// PeerId for a HopNet node: an identity multihash over the node_id bytes.
+/// Deterministic and reversible — no libp2p key material involved.
+pub fn peer_id_for_node(node_id: i32) -> PeerId {
+    // Multihash binary layout: varint(code=0x00 identity), varint(len=4), digest.
+    let d = node_id.to_le_bytes();
+    PeerId::from_bytes(&[0x00, 0x04, d[0], d[1], d[2], d[3]])
+        .expect("identity multihash over 4 bytes is always valid")
+}
+
+/// Recover the node_id from a `peer_id_for_node`-shaped PeerId.
+pub fn node_id_from_peer(peer: &PeerId) -> Option<i32> {
+    let bytes = peer.to_bytes();
+    match bytes.as_slice() {
+        [0x00, 0x04, d0, d1, d2, d3] => Some(i32::from_le_bytes([*d0, *d1, *d2, *d3])),
+        _ => None,
+    }
 }
 
 #[derive(Debug)]
@@ -167,13 +191,20 @@ where
         self.feed_strict(Input::StartHeight(height, valset, is_restart, None))?;
 
         // Replay persisted entries as ordinary inputs, in order (strict).
+        // Entries that carry a full block must ALSO re-populate the host's
+        // blocks map — a later Decide (live or via sync) resolves value_id
+        // through it, and the map died with the crashed process.
         for wire in &entries {
             let entry = recovered_input(wire).map_err(HostError::Codec)?;
             match entry {
                 RecoveredInput::Vote(v) => self.feed_strict(Input::Vote(v))?,
-                RecoveredInput::Proposal(p) => self.feed_strict(Input::Proposal(p))?,
+                RecoveredInput::Proposal(p) => {
+                    self.remember_block(p.message.height, p.message.value.clone());
+                    self.feed_strict(Input::Proposal(p))?
+                }
                 RecoveredInput::Timeout(t) => self.feed_strict(Input::TimeoutElapsed(t))?,
                 RecoveredInput::ProposedValue(pv) => {
+                    self.remember_block(pv.height, pv.value.clone());
                     self.feed_strict(Input::ProposedValue(pv, ValueOrigin::Consensus))?
                 }
             }
@@ -208,7 +239,9 @@ where
                 let validity = {
                     let Self { app, storage, .. } = self;
                     storage
-                        .with_rollback(|tx| app.validate_block(height, &block, tx))
+                        .with_rollback(|tx| {
+                            app.validate_block(height, &block, tx, ValidationOrigin::Live)
+                        })
                         .map_err(HostError::Storage)?
                 };
                 let pv = w.into_proposed_value(validity).map_err(HostError::Codec)?;
@@ -257,6 +290,40 @@ where
         self.feed(Input::TimeoutElapsed(timeout))
     }
 
+    /// A decided (block, certificate) pair fetched from `peer` by the sync
+    /// client. MUST be fed sequentially, lowest height first: the engine
+    /// processes a sync certificate only at its CURRENT height (each resulting
+    /// Decide advances it, so a contiguous range applies in one loop).
+    ///
+    /// Flow: `Input::SyncValueResponse` → engine verifies the certificate
+    /// (VerifyCommitCertificate, current valset) → `Effect::ValidSyncValue`
+    /// → we validate the block (Rule-8 rollback tx) and feed
+    /// `Input::ProposedValue(_, Sync)` → sync decision → the SAME atomic
+    /// decide path as live consensus.
+    pub fn on_sync_value(
+        &mut self,
+        peer: PeerId,
+        block: Block,
+        cert: &WireCommitCertificate,
+    ) -> Result<(), HostError<S::Error>> {
+        // Structural pre-checks; the sync client also performs these, so a
+        // failure here is defensive — drop, don't feed garbage to the engine.
+        if block.verify().is_err() || block.block_hash != cert.value_id {
+            tracing::warn!(
+                height = cert.height,
+                "dropping malformed sync value (hash/cert mismatch)"
+            );
+            return Ok(());
+        }
+        let cert: CommitCertificate<HopNetContext> = cert.try_into().map_err(HostError::Codec)?;
+        let bytes = codec::encode(&block).map_err(HostError::Codec)?;
+        self.feed(Input::SyncValueResponse(ValueResponse::new(
+            peer,
+            bytes::Bytes::from(bytes),
+            cert,
+        )))
+    }
+
     // --------------------------------------------------------------- driving
 
     fn remember_block(&mut self, height: Height, block: Block) {
@@ -274,7 +341,13 @@ where
         while let Some(input) = self.pending_inputs.pop_front() {
             match self.drive_once(input) {
                 Ok(()) => {}
-                Err(HostError::Engine(_)) | Err(HostError::Codec(_)) => {} // drop, continue
+                // Drop and continue (matching the reference engine), but say so.
+                Err(HostError::Engine(e)) => {
+                    tracing::warn!("engine error on live input (dropped): {e}");
+                }
+                Err(HostError::Codec(e)) => {
+                    tracing::warn!("codec error on live input (dropped): {e}");
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -512,11 +585,65 @@ where
         Effect::ExtendVote(_h, _round, _vid, r) => Ok(r.resume_with(None)),
         Effect::VerifyVoteExtension(_h, _round, _vid, _ext, _pk, r) => Ok(r.resume_with(Ok(()))),
 
-        // Sync value plumbing arrives at Stage 4 (custom decided-value sync).
-        // Until then these effects are only emitted if the shell feeds a sync
-        // input, which it doesn't yet — acknowledge and move on.
-        Effect::ValidSyncValue(_response, _from, r) => Ok(r.resume_with(())),
-        Effect::InvalidSyncValue(_peer, _height, _err, r) => Ok(r.resume_with(())),
+        // Decided-value sync: the certificate verified against the current
+        // valset — decode the value, attach OUR validity verdict (Rule-8, same
+        // seam as live proposals), and hand it back as a ProposedValue so the
+        // engine takes the sync decision path (same atomic decide as live).
+        Effect::ValidSyncValue(value, proposer, r) => {
+            let height = value.certificate.height;
+            let round = value.certificate.round;
+            let decoded = codec::decode::<Block>(&value.value_bytes);
+            match decoded {
+                Ok(block)
+                    if block.verify().is_ok() && block.block_hash == value.certificate.value_id =>
+                {
+                    let validity = {
+                        let app = &mut *ctx.app;
+                        ctx.storage
+                            .with_rollback(|tx| {
+                                app.validate_block(height, &block, tx, ValidationOrigin::Sync)
+                            })
+                            .map_err(HostError::Storage)?
+                    };
+                    if validity == Validity::Invalid {
+                        // A quorum committed a value our app rejects: an app
+                        // determinism violation, not a peer fault. Surface it —
+                        // the engine will log and hold at this height.
+                        tracing::error!(
+                            %height,
+                            "sync value failed local validation despite a valid commit certificate"
+                        );
+                        ctx.outputs.push(HostOutput::SyncInvalid {
+                            peer: value.peer,
+                            height,
+                        });
+                    }
+                    ctx.blocks.insert((height, block.block_hash), block.clone());
+                    let pv = ProposedValue {
+                        height,
+                        round,
+                        valid_round: Round::Nil,
+                        proposer,
+                        value: block,
+                        validity,
+                    };
+                    ctx.pending_inputs
+                        .push_back(Input::ProposedValue(pv, ValueOrigin::Sync));
+                }
+                _ => {
+                    ctx.outputs.push(HostOutput::SyncInvalid {
+                        peer: value.peer,
+                        height,
+                    });
+                }
+            }
+            Ok(r.resume_with(()))
+        }
+        Effect::InvalidSyncValue(peer, height, err, r) => {
+            tracing::warn!(%height, "invalid sync value: {err}");
+            ctx.outputs.push(HostOutput::SyncInvalid { peer, height });
+            Ok(r.resume_with(()))
+        }
     }
 }
 

@@ -34,7 +34,7 @@ use crate::codec::{WireCommitCertificate, WireConsensusMsg, WireVote, WireVoteTy
 use crate::config::QuorumProfile;
 use crate::context::{Address, Height, HopNetValidatorSet, Validator};
 use crate::host::{HostCore, HostError, HostOutput};
-use crate::traits::{Application, ApplyError, Gossip, Storage, Timers};
+use crate::traits::{Application, ApplyError, Gossip, Storage, Timers, ValidationOrigin};
 use crate::types::{Blake3Hash, Block, BlockData, PrivKey, Transactions};
 
 // ---------------------------------------------------------------------------
@@ -107,6 +107,10 @@ impl MemStorage {
             .iter()
             .map(|(b, _)| (Height(b.data.height), b.block_hash))
             .collect()
+    }
+    /// Full decided history (block + certificate) — the sync server's view.
+    pub fn decided_full(&self) -> Vec<(Block, WireCommitCertificate)> {
+        self.0.borrow().decided.clone()
     }
     pub fn wal_len(&self) -> usize {
         self.0.borrow().wal.len()
@@ -201,7 +205,13 @@ impl MemApp {
 }
 
 impl Application<MemStorage> for MemApp {
-    fn validate_block(&mut self, height: Height, _block: &Block, _tx: &mut MemTx) -> Validity {
+    fn validate_block(
+        &mut self,
+        height: Height,
+        _block: &Block,
+        _tx: &mut MemTx,
+        _origin: ValidationOrigin,
+    ) -> Validity {
         if self.reject_height == Some(height) {
             Validity::Invalid
         } else {
@@ -232,7 +242,8 @@ pub struct MemGossip {
 }
 
 impl MemGossip {
-    fn take_outbox(&self) -> Vec<WireConsensusMsg> {
+    /// Drain accumulated broadcasts (also used by the SQLite storage tests).
+    pub fn take_outbox(&self) -> Vec<WireConsensusMsg> {
         std::mem::take(&mut self.outbox.borrow_mut())
     }
 }
@@ -560,6 +571,9 @@ impl Sim {
                         self.nodes[i].core.propose(height, round, block)?;
                     }
                     HostOutput::Decided { height } => self.on_decided(i, height),
+                    HostOutput::SyncInvalid { height, .. } => {
+                        panic!("sync value rejected at height {height} — sim peers are honest")
+                    }
                 }
             }
         }
@@ -820,6 +834,29 @@ impl Sim {
         Ok(())
     }
 
+    /// Decided-value sync: feed `laggard` every decided (block, cert) pair
+    /// from `source`'s store, starting at the laggard's current height. Models
+    /// the Stage-4 sync client with a perfectly-behaved peer; each pair
+    /// decides through the SAME atomic path as live consensus, so the
+    /// agreement/contiguity oracles keep running.
+    pub fn sync_from_peer(
+        &mut self,
+        laggard: usize,
+        source: usize,
+    ) -> Result<(), HostError<MemError>> {
+        let peer = crate::host::peer_id_for_node(self.nodes[source].node_id);
+        let history = self.nodes[source].storage.decided_full();
+        let from = self.nodes[laggard].core.height().0;
+        for (block, cert) in history {
+            if block.data.height < from {
+                continue;
+            }
+            self.nodes[laggard].core.on_sync_value(peer, block, &cert)?;
+            self.settle(laggard)?;
+        }
+        Ok(())
+    }
+
     // -------- assertions used by tests --------
 
     pub fn n(&self) -> usize {
@@ -851,6 +888,11 @@ impl Sim {
 
     pub fn decided_height(&self, node: usize) -> u64 {
         self.nodes[node].storage.decided_blocks().len() as u64
+    }
+
+    /// The engine's current working height for a node.
+    pub fn engine_height(&self, node: usize) -> u64 {
+        self.nodes[node].core.height().0
     }
 }
 

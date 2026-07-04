@@ -37,6 +37,14 @@ pub enum IrohRequest {
     StorageQuery(metrics_rpc::StorageQueryRequest),
     /// Deliver JoinInfo to a joining node (coordinator → new node)
     JoinDeliver(setup::JoinDeliverRequest),
+    /// Malachite consensus gossip: a bincode-encoded
+    /// `hopnet_consensus::codec::WireConsensusMsg`. Fire-and-forget (ack only).
+    /// Appended at the enum tail so older variants keep their bincode
+    /// discriminants. Dispatched by the new engine only (Stage-5 wiring).
+    ConsensusMsg(Vec<u8>),
+    /// Fetch decided (block, certificate) pairs for `[from_height, to_height]`
+    /// — the new engine's decided-value sync protocol.
+    DecidedFetch { from_height: i64, to_height: i64 },
 }
 
 /// Response envelope for all iroh communication
@@ -84,6 +92,11 @@ pub enum IrohResponse {
     JoinAck(setup::JoinAckResponse),
     /// Error response
     Error { message: String },
+    /// Ack for ConsensusMsg (the publish is fire-and-forget)
+    ConsensusMsgAck,
+    /// Decided (block bytes, certificate bytes) pairs, ascending and
+    /// contiguous from `from_height` (bincode-encoded engine types)
+    DecidedFetchResponse { items: Vec<(Vec<u8>, Vec<u8>)> },
 }
 
 impl IrohRequest {

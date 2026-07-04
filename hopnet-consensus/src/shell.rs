@@ -1,0 +1,310 @@
+//! Production tokio shell around the sans-io [`HostCore`].
+//!
+//! The core is `!Send` (the engine's generator state), so the shell runs it on
+//! a DEDICATED thread with a `current_thread` runtime; the seams are built
+//! inside that thread by a `Send` builder closure. Everything crossing the
+//! thread boundary is a channel:
+//!
+//! - inbound:  [`HostInput`] (network messages, built values, sync values)
+//! - outbound: gossip broadcasts (`WireConsensusMsg` on the sender you pass),
+//!   [`HostEvent`]s (value requests, sync triggers), and a `watch` of the
+//!   last decided height.
+//!
+//! Timers are a `tokio_util` `DelayQueue` with the same lazy-cancellation
+//! generation scheme the simulator uses: `schedule` bumps a generation,
+//! expiry is honoured only if that generation is still armed. The code paths
+//! the deterministic fuzzer exercised in `HostCore` are exactly the ones
+//! running here — the shell adds clock and channels, no protocol logic.
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+
+use malachitebft_core_types::{LinearTimeouts, Round, Timeout};
+use tokio::sync::{mpsc, watch};
+use tokio_util::time::DelayQueue;
+
+use crate::codec::{WireCommitCertificate, WireConsensusMsg};
+use crate::context::Height;
+use crate::host::{peer_id_for_node, HostCore, HostOutput};
+use crate::traits::{Application, Gossip, Storage, Timers};
+use crate::types::Block;
+
+// ---------------------------------------------------------------------------
+// Seams
+
+/// Gossip seam: forwards every broadcast onto an unbounded channel. The
+/// embedding application drains it with a publisher task (fire-and-forget
+/// per-peer sends in production).
+#[derive(Clone)]
+pub struct ShellGossip {
+    tx: mpsc::UnboundedSender<WireConsensusMsg>,
+}
+
+impl Gossip for ShellGossip {
+    fn broadcast(&mut self, msg: &WireConsensusMsg) {
+        // Receiver dropped = shutting down; nothing useful to do with the msg.
+        let _ = self.tx.send(msg.clone());
+    }
+}
+
+/// Generation-tracked timers (single-threaded; the shell thread owns all
+/// clones). `schedule` arms a new generation and records it for the shell to
+/// insert into the DelayQueue; cancellation is lazy — a fired entry is
+/// honoured only if its generation is still the armed one.
+#[derive(Clone, Default)]
+pub struct ShellTimers {
+    armed: Rc<RefCell<HashMap<Timeout, u64>>>,
+    pending: Rc<RefCell<Vec<(Timeout, u64)>>>,
+    next_gen: Rc<RefCell<u64>>,
+}
+
+impl ShellTimers {
+    fn take_pending(&self) -> Vec<(Timeout, u64)> {
+        std::mem::take(&mut self.pending.borrow_mut())
+    }
+    fn is_current(&self, timeout: &Timeout, gen: u64) -> bool {
+        self.armed.borrow().get(timeout) == Some(&gen)
+    }
+    fn disarm(&self, timeout: &Timeout) {
+        self.armed.borrow_mut().remove(timeout);
+    }
+}
+
+impl Timers for ShellTimers {
+    fn schedule(&mut self, timeout: Timeout) {
+        let mut g = self.next_gen.borrow_mut();
+        *g += 1;
+        let gen = *g;
+        self.armed.borrow_mut().insert(timeout, gen);
+        self.pending.borrow_mut().push((timeout, gen));
+    }
+    fn cancel(&mut self, timeout: &Timeout) {
+        self.armed.borrow_mut().remove(timeout);
+    }
+    fn cancel_all(&mut self) {
+        self.armed.borrow_mut().clear();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Channel types
+
+/// Inputs the embedding application feeds the shell.
+#[derive(Debug)]
+pub enum HostInput {
+    /// A consensus message received from `from` (node_id) over the network.
+    Wire { from: i32, msg: WireConsensusMsg },
+    /// The value built in response to [`HostEvent::NeedValue`].
+    Propose {
+        height: Height,
+        round: Round,
+        block: Block,
+    },
+    /// A decided (block, certificate) pair fetched by the sync client. Feed
+    /// lowest height first; each one decides and advances the engine.
+    SyncValue {
+        peer_node: i32,
+        block: Block,
+        cert: WireCommitCertificate,
+    },
+    Shutdown,
+}
+
+/// Signals the shell surfaces for the embedding application.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostEvent {
+    /// We are the proposer for (height, round): build a value and send
+    /// [`HostInput::Propose`].
+    NeedValue { height: Height, round: Round },
+    /// A peer's message is ahead of our height — trigger decided-value sync
+    /// toward `target`, starting with `hint_peer`.
+    SyncNeeded { target: Height, hint_peer: i32 },
+    /// A synced value at `height` did not apply; try another peer.
+    SyncInvalid {
+        peer_node: Option<i32>,
+        height: Height,
+    },
+}
+
+/// The application's handle to a running consensus shell.
+pub struct ConsensusHandle {
+    pub input_tx: mpsc::Sender<HostInput>,
+    /// Last decided height (0 until the first decide).
+    pub decided: watch::Receiver<u64>,
+    /// Event stream (single consumer — move into your driver task).
+    pub events: mpsc::UnboundedReceiver<HostEvent>,
+}
+
+// ---------------------------------------------------------------------------
+// Shell
+
+/// Spawn the consensus host on a dedicated thread.
+///
+/// `build` constructs the core INSIDE the shell thread (the core is !Send)
+/// from the two seams the shell owns; everything else it captures must be
+/// `Send` (storage connection, application, keys). `outbound` receives every
+/// gossip broadcast. `start_height` is `last_decided + 1` (WAL replay happens
+/// inside `start_height`).
+pub fn spawn<A, S, F>(
+    build: F,
+    start_height: Height,
+    timeouts: LinearTimeouts,
+    outbound: mpsc::UnboundedSender<WireConsensusMsg>,
+) -> ConsensusHandle
+where
+    S: Storage + 'static,
+    A: Application<S> + 'static,
+    F: FnOnce(ShellGossip, ShellTimers) -> HostCore<A, S, ShellGossip, ShellTimers>
+        + Send
+        + 'static,
+{
+    let (input_tx, input_rx) = mpsc::channel::<HostInput>(256);
+    let (event_tx, event_rx) = mpsc::unbounded_channel::<HostEvent>();
+    let (decided_tx, decided_rx) = watch::channel(0u64);
+
+    std::thread::Builder::new()
+        .name("hopnet-consensus".into())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("consensus shell runtime");
+            rt.block_on(run_shell(
+                build,
+                start_height,
+                timeouts,
+                outbound,
+                input_rx,
+                event_tx,
+                decided_tx,
+            ));
+        })
+        .expect("spawn consensus shell thread");
+
+    ConsensusHandle {
+        input_tx,
+        decided: decided_rx,
+        events: event_rx,
+    }
+}
+
+async fn run_shell<A, S, F>(
+    build: F,
+    start_height: Height,
+    timeouts: LinearTimeouts,
+    outbound: mpsc::UnboundedSender<WireConsensusMsg>,
+    mut input_rx: mpsc::Receiver<HostInput>,
+    event_tx: mpsc::UnboundedSender<HostEvent>,
+    decided_tx: watch::Sender<u64>,
+) where
+    S: Storage,
+    A: Application<S>,
+    F: FnOnce(ShellGossip, ShellTimers) -> HostCore<A, S, ShellGossip, ShellTimers>,
+{
+    let timers = ShellTimers::default();
+    let gossip = ShellGossip { tx: outbound };
+    let mut core = build(gossip, timers.clone());
+    let mut dq: DelayQueue<(Timeout, u64)> = DelayQueue::new();
+
+    if start_height.0 > 1 {
+        decided_tx.send_replace(start_height.0 - 1);
+    }
+    if let Err(e) = core.start_height(start_height, false) {
+        tracing::error!("consensus start_height failed: {e:?}");
+        return;
+    }
+    drain(&mut core, &timers, &mut dq, &timeouts, &event_tx, &decided_tx);
+
+    loop {
+        let step: Result<bool, String> = tokio::select! {
+            biased;
+
+            expired = std::future::poll_fn(|cx| dq.poll_expired(cx)), if !dq.is_empty() => {
+                if let Some(exp) = expired {
+                    let (timeout, gen) = exp.into_inner();
+                    if timers.is_current(&timeout, gen) {
+                        timers.disarm(&timeout);
+                        core.on_timeout(timeout).map(|_| true).map_err(|e| format!("{e:?}"))
+                    } else {
+                        Ok(true) // superseded or cancelled
+                    }
+                } else {
+                    Ok(true)
+                }
+            }
+
+            maybe = input_rx.recv() => match maybe {
+                None | Some(HostInput::Shutdown) => Ok(false),
+                Some(HostInput::Wire { from, msg }) => {
+                    // Lag detection: a message from a future height means we
+                    // missed decides — kick the sync client before feeding
+                    // (the engine buffers/drops what it can't use yet).
+                    let msg_height = msg.height();
+                    if msg_height > core.height().0 {
+                        let _ = event_tx.send(HostEvent::SyncNeeded {
+                            target: Height(msg_height),
+                            hint_peer: from,
+                        });
+                    }
+                    core.on_wire(msg).map(|_| true).map_err(|e| format!("{e:?}"))
+                }
+                Some(HostInput::Propose { height, round, block }) => {
+                    core.propose(height, round, block).map(|_| true).map_err(|e| format!("{e:?}"))
+                }
+                Some(HostInput::SyncValue { peer_node, block, cert }) => {
+                    core.on_sync_value(peer_id_for_node(peer_node), block, &cert)
+                        .map(|_| true).map_err(|e| format!("{e:?}"))
+                }
+            },
+        };
+
+        match step {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(e) => {
+                // Only storage/host-invariant failures reach here (engine and
+                // codec errors are handled leniently inside the core). A
+                // durability failure is fatal for consensus participation.
+                tracing::error!("consensus host fatal error, shell stopping: {e}");
+                break;
+            }
+        }
+
+        drain(&mut core, &timers, &mut dq, &timeouts, &event_tx, &decided_tx);
+    }
+    tracing::info!("consensus shell stopped");
+}
+
+/// After every step: surface outputs and arm newly-scheduled timers.
+fn drain<A, S>(
+    core: &mut HostCore<A, S, ShellGossip, ShellTimers>,
+    timers: &ShellTimers,
+    dq: &mut DelayQueue<(Timeout, u64)>,
+    timeouts: &LinearTimeouts,
+    event_tx: &mpsc::UnboundedSender<HostEvent>,
+    decided_tx: &watch::Sender<u64>,
+) where
+    S: Storage,
+    A: Application<S>,
+{
+    for out in core.take_outputs() {
+        match out {
+            HostOutput::NeedValue { height, round } => {
+                let _ = event_tx.send(HostEvent::NeedValue { height, round });
+            }
+            HostOutput::Decided { height } => {
+                decided_tx.send_replace(height.0);
+            }
+            HostOutput::SyncInvalid { peer, height } => {
+                let _ = event_tx.send(HostEvent::SyncInvalid {
+                    peer_node: crate::host::node_id_from_peer(&peer),
+                    height,
+                });
+            }
+        }
+    }
+    for (timeout, gen) in timers.take_pending() {
+        dq.insert((timeout, gen), timeouts.duration_for(timeout));
+    }
+}

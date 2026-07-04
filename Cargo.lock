@@ -2675,6 +2675,7 @@ dependencies = [
  "hdrhistogram",
  "hex",
  "hopnet-common",
+ "hopnet-consensus",
  "image",
  "include_dir",
  "inventory",
@@ -2733,12 +2734,16 @@ dependencies = [
  "arc-malachitebft-core-types",
  "bincode",
  "blake3",
+ "bytes",
  "ed25519-dalek",
  "hex",
  "hopnet-common",
  "rusqlite",
  "serde",
+ "tokio",
+ "tokio-util",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -7016,6 +7021,7 @@ dependencies = [
  "futures-sink",
  "futures-util",
  "pin-project-lite",
+ "slab",
  "tokio",
 ]
 
