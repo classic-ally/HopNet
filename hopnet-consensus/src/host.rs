@@ -164,17 +164,17 @@ where
             self.phase = Phase::Recovering;
         }
 
-        self.feed(Input::StartHeight(height, valset, is_restart, None))?;
+        self.feed_strict(Input::StartHeight(height, valset, is_restart, None))?;
 
-        // Replay persisted entries as ordinary inputs, in order.
+        // Replay persisted entries as ordinary inputs, in order (strict).
         for wire in &entries {
             let entry = recovered_input(wire).map_err(HostError::Codec)?;
             match entry {
-                RecoveredInput::Vote(v) => self.feed(Input::Vote(v))?,
-                RecoveredInput::Proposal(p) => self.feed(Input::Proposal(p))?,
-                RecoveredInput::Timeout(t) => self.feed(Input::TimeoutElapsed(t))?,
+                RecoveredInput::Vote(v) => self.feed_strict(Input::Vote(v))?,
+                RecoveredInput::Proposal(p) => self.feed_strict(Input::Proposal(p))?,
+                RecoveredInput::Timeout(t) => self.feed_strict(Input::TimeoutElapsed(t))?,
                 RecoveredInput::ProposedValue(pv) => {
-                    self.feed(Input::ProposedValue(pv, ValueOrigin::Consensus))?
+                    self.feed_strict(Input::ProposedValue(pv, ValueOrigin::Consensus))?
                 }
             }
         }
@@ -189,11 +189,15 @@ where
         Ok(())
     }
 
-    /// Feed an inbound wire message from a peer.
+    /// Feed an inbound wire message from a peer. Malformed bytes are dropped;
+    /// otherwise the input flows through `feed`, which is itself lenient to
+    /// engine errors (see there).
     pub fn on_wire(&mut self, msg: WireConsensusMsg) -> Result<(), HostError<S::Error>> {
         match msg {
             WireConsensusMsg::Vote(w) | WireConsensusMsg::LivenessVote(w) => {
-                let sv = (&w).try_into().map_err(HostError::Codec)?;
+                let Ok(sv) = (&w).try_into() else {
+                    return Ok(()); // malformed — drop
+                };
                 self.feed(Input::Vote(sv))
             }
             WireConsensusMsg::ProposedValue(w) => {
@@ -259,7 +263,27 @@ where
         self.blocks.insert((height, block.block_hash), block);
     }
 
+    /// Feed a live input and drain any queued follow-ups (e.g. StartHeight
+    /// after Decide). LENIENT to engine errors: the reference engine logs and
+    /// continues on every live vote/proposal/timeout processing error (a lost
+    /// polka certificate makes a reproposal transiently unverifiable, etc.);
+    /// only WAL replay is strict. Storage errors always propagate — they are
+    /// real durability failures, not transient protocol states.
     fn feed(&mut self, input: Input<HopNetContext>) -> Result<(), HostError<S::Error>> {
+        self.pending_inputs.push_back(input);
+        while let Some(input) = self.pending_inputs.pop_front() {
+            match self.drive_once(input) {
+                Ok(()) => {}
+                Err(HostError::Engine(_)) | Err(HostError::Codec(_)) => {} // drop, continue
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// Strict variant for WAL replay: an engine error replaying our OWN
+    /// persisted entries is a genuine corruption/bug, not a transient state.
+    fn feed_strict(&mut self, input: Input<HopNetContext>) -> Result<(), HostError<S::Error>> {
         self.pending_inputs.push_back(input);
         while let Some(input) = self.pending_inputs.pop_front() {
             self.drive_once(input)?;
@@ -384,7 +408,25 @@ where
                 .broadcast(&WireConsensusMsg::LivenessSkipRound((&c).into()));
             Ok(r.resume_with(()))
         }
-        Effect::RestreamProposal(_, _, _, _, _, r) => Ok(r.resume_with(())),
+        Effect::RestreamProposal(height, round, valid_round, proposer, value_id, r) => {
+            // Re-send the full value (PartsOnly): rebroadcast only re-sends
+            // votes, so without this a dropped ProposedValue is never
+            // recovered and a lossy network livelocks. We can only restream a
+            // value we hold (we proposed it, or received and stored it).
+            if let Some(block) = ctx.blocks.get(&(height, value_id)).cloned() {
+                let pv = ProposedValue {
+                    height,
+                    round,
+                    valid_round,
+                    proposer,
+                    value: block,
+                    validity: Validity::Valid,
+                };
+                ctx.gossip
+                    .broadcast(&WireConsensusMsg::ProposedValue((&pv).into()));
+            }
+            Ok(r.resume_with(()))
+        }
 
         Effect::GetValue(height, round, _timeout, r) => {
             // Suppress during recovery — the replay already supplies the value.

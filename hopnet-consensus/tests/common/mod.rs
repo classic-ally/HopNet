@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use ed25519_dalek::SigningKey;
 use hopnet_consensus::context::Validator;
 use hopnet_consensus::types::{Blake3Hash, PrivKey, PubKey};
