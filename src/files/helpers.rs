@@ -25,7 +25,7 @@ pub enum AttestationError {
     #[error("Serialization failed: {0}")]
     Serialize(#[from] bincode::error::EncodeError),
     #[error("Signing failed: {0:?}")]
-    Sign(crate::consensus::functions::ConsensusError),
+    Sign(crate::consensus::dispatch::ConsensusError),
 }
 
 /// Find missing ancestors of `inodes` and prepend synthetic folder inodes

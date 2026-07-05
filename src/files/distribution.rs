@@ -107,8 +107,13 @@ pub async fn distribute_fragments_for_upload(
     };
 
     // Get current consensus height for deterministic placement
-    let consensus_state = consensus::get_consensus(app_state.db_pool.get())?;
-    let consensus_height = consensus_state.committed_block.data.height;
+    let consensus_height = {
+        let conn = app_state
+            .db_pool
+            .get()
+            .map_err(|_| crate::db::DatabaseError::LockError)?;
+        consensus::get_current_consensus_height(&conn)?
+    };
 
     // Distribute all fragments for this file
     distribute_file_fragments(app_state, &data_block, consensus_height).await?;

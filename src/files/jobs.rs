@@ -253,12 +253,17 @@ pub async fn run_network_rebalancing(
     );
 
     // Get current consensus height
-    let consensus_height = match crate::db::consensus::get_consensus(app_state.db_pool.get()) {
-        Ok(consensus_state) => consensus_state.committed_block.data.height,
+    let consensus_height = match app_state
+        .db_pool
+        .get()
+        .map_err(|_| crate::db::DatabaseError::LockError)
+        .and_then(|conn| crate::db::consensus::get_current_consensus_height(&conn))
+    {
+        Ok(height) => height,
         Err(e) => {
-            tracing::error!("Failed to get consensus state for rebalancing: {:?}", e);
+            tracing::error!("Failed to get consensus height for rebalancing: {:?}", e);
             return Err(Error::Failed(Arc::new(Box::new(std::io::Error::other(
-                format!("Failed to get consensus state: {:?}", e),
+                format!("Failed to get consensus height: {:?}", e),
             )))));
         }
     };

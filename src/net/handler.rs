@@ -85,61 +85,6 @@ async fn handle_connection(
 
 /// Message-driven catch-up for consensus messages.
 ///
-/// Before dispatching any consensus message, check if the message's view is ahead of ours.
-/// If so, catch up to that view via CatchUpState (shared in-flight catch-up). For Lock-phase
-/// ballots, also ensure intra-view sync (we have the Propose QC for the current view).
-///
-/// Under burst load (100 concurrent streams for the same view), the first message initiates
-/// catch-up and all others attach via watch channel. Zero DB pool checkouts for followers.
-/// For messages at the current view (common case), ensure_view hits the Completed branch
-/// and returns immediately — also zero DB reads.
-async fn ensure_caught_up_for_message(
-    request: &IrohRequest,
-    app_state: &AppState,
-) -> Result<(), IrohError> {
-    let target_view = match request.consensus_view() {
-        Some(v) => v,
-        None => return Ok(()), // Non-consensus message, no catch-up needed
-    };
-
-    // Cross-view catch-up via shared in-flight task
-    app_state
-        .catch_up_state
-        .ensure_view(target_view, app_state)
-        .await
-        .map_err(|e| {
-            IrohError::Protocol(ProtocolError::PeerError(format!(
-                "catch-up failed: {:?}",
-                e
-            )))
-        })?;
-
-    // Intra-view catch-up: Lock-phase ballot but we're missing the Propose QC
-    if let IrohRequest::BallotSubmission(req) = request
-        && req.ballot.data.phase == crate::consensus::types::ConsensusPhase::Lock
-    {
-        // Check if we need intra-view sync (one DB read, only for Lock ballots)
-        let conn = app_state
-            .db_pool
-            .get()
-            .map_err(|_| IrohError::Protocol(ProtocolError::PeerError("db pool error".into())))?;
-        let (_, highest_qc_view) = db::get_consensus_progress(&conn)
-            .map_err(|_| IrohError::Protocol(ProtocolError::PeerError("db error".into())))?;
-        if highest_qc_view < target_view {
-            crate::consensus::routes::ensure_intra_view_synced(app_state)
-                .await
-                .map_err(|e| {
-                    IrohError::Protocol(ProtocolError::PeerError(format!(
-                        "intra-view sync failed: {:?}",
-                        e
-                    )))
-                })?;
-        }
-    }
-
-    Ok(())
-}
-
 async fn handle_stream(
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
@@ -158,9 +103,6 @@ async fn handle_stream(
     async {
         // Read the request outside the OnceCell so we can branch on it
         let request: IrohRequest = recv_message(&mut recv).await?;
-
-        // Message-driven catch-up (idempotent — safe outside OnceCell)
-        ensure_caught_up_for_message(&request, &app_state).await?;
 
         // TransactionForward uses two-phase ACK (bypasses OnceCell — nonce table handles dedup)
         if let IrohRequest::TransactionForward(req) = request {
@@ -223,15 +165,6 @@ async fn handle_stream(
         // First caller processes; duplicates wait for the same result
         let response_bytes = cell
             .get_or_try_init(|| async {
-                if app_state.test_mode
-                    && let IrohRequest::BallotSubmission(_) = &request
-                {
-                    app_state
-                        .consensus_barriers
-                        .wait(crate::consensus::barriers::names::BEFORE_BALLOT_DISPATCH)
-                        .await;
-                }
-
                 let response = match request {
                     IrohRequest::Ping { nonce } => IrohResponse::Pong { nonce },
                     IrohRequest::FragmentHealthCheck(req) => {
@@ -241,24 +174,6 @@ async fn handle_stream(
                                 &app_state.fragments_dir,
                             ),
                         )
-                    }
-                    IrohRequest::ViewDataFetch(req) => {
-                        crate::consensus::rpc::handle_view_data_request(req, &app_state)
-                    }
-                    IrohRequest::ViewPoll(_) => {
-                        crate::consensus::rpc::handle_view_poll_request(&app_state)
-                    }
-                    IrohRequest::TimeoutVoteBroadcast(req) => {
-                        crate::consensus::rpc::handle_timeout_vote_broadcast(req, &app_state).await
-                    }
-                    IrohRequest::TcBroadcast(req) => {
-                        crate::consensus::rpc::handle_tc_broadcast(req, &app_state).await
-                    }
-                    IrohRequest::QcBroadcast(req) => {
-                        crate::consensus::rpc::handle_qc_broadcast(req, &app_state).await
-                    }
-                    IrohRequest::BallotSubmission(req) => {
-                        crate::consensus::rpc::handle_ballot_request(req, &app_state).await
                     }
                     IrohRequest::TransactionForward(_) => unreachable!("handled above"),
                     IrohRequest::FragmentFetch(req) => IrohResponse::FragmentFetchResponse(

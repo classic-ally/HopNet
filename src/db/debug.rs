@@ -220,9 +220,10 @@ fn compute_table_hash_tx(
 pub fn compute_state_snapshot_tx(
     tx: &rusqlite::Transaction,
 ) -> Result<StateSnapshot, DatabaseError> {
-    // Get consensus metadata from same transaction snapshot
+    // Get consensus metadata from same transaction snapshot. Views died with
+    // the bespoke engine — the decided height is the only progress marker.
     let consensus_height = crate::db::consensus::get_current_consensus_height(tx)?;
-    let committed_view = crate::db::consensus::get_current_view_tx(tx)?;
+    let committed_view = consensus_height;
 
     let mut table_hashes = HashMap::new();
 

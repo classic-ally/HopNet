@@ -72,9 +72,10 @@ pub fn database_exists(db_path: &str) -> bool {
 pub fn is_schema_initialized(
     db: &PooledConnection<SqliteConnectionManager>,
 ) -> Result<bool, DuckdbError> {
-    // Check if the critical 'blocks' table exists
+    // Check if the critical 'this_node' table exists (the legacy 'blocks'
+    // table died with the bespoke engine at Stage 5b)
     let result = db.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'blocks'",
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'this_node'",
         [],
         |row| row.get::<_, i64>(0),
     );
@@ -326,52 +327,9 @@ pub fn initialize(db: PooledConnection<SqliteConnectionManager>) -> Result<(), D
             -- 1. user owns what nodes?
             CREATE INDEX idx_nodes_owner ON nodes(owner);
 
-            -- Consensus architecture
-            CREATE TABLE blocks (
-                block_hash      BLOB PRIMARY KEY,
-                height          INTEGER NOT NULL,
-                view_number     INTEGER NOT NULL,
-                parent_hash     BLOB,
-                transactions    BLOB,
-
-                CONSTRAINT fk_parent_exists FOREIGN KEY (parent_hash) REFERENCES blocks(block_hash)
-            );
-
-            -- Common query patterns:
-            -- 1. Give me latest blocks, most recent few
-            -- 2. Give me blocks for a given view
-            -- 3. Look up parent of a block
-            CREATE INDEX idx_blocks_height ON blocks(height DESC);
-            CREATE INDEX idx_blocks_view ON blocks(view_number);
-            CREATE INDEX idx_blocks_parent ON blocks(parent_hash);
-
-            CREATE TABLE quorum_certificates (
-                view_number         INTEGER NOT NULL,
-                phase               INTEGER NOT NULL CHECK(phase IN (0, 1)),  -- 0=propose, 1=lock
-                block_hash          BLOB NOT NULL,
-                proposer_signature  BLOB NOT NULL,
-                voter_signatures    BLOB,
-
-                PRIMARY KEY (view_number, phase, block_hash),
-                FOREIGN KEY (block_hash) REFERENCES blocks(block_hash)
-            );
-
-            CREATE INDEX idx_qc_block ON quorum_certificates(block_hash);
-            CREATE INDEX idx_view_phase ON quorum_certificates(view_number, phase);
-
-            CREATE TABLE timeout_certificates (
-                view_number             INTEGER PRIMARY KEY,    -- View that timed out
-                highest_qc_view         INTEGER NOT NULL,       -- QC's view number
-                highest_qc_phase        INTEGER NOT NULL CHECK(highest_qc_phase IN (0, 1)),  -- 0=propose, 1=lock
-                highest_qc_block_hash   BLOB NOT NULL,          -- QC's block hash
-                signatures              BLOB NOT NULL,          -- Timeout vote signatures
-
-                FOREIGN KEY (highest_qc_view, highest_qc_phase, highest_qc_block_hash)
-                    REFERENCES quorum_certificates(view_number, phase, block_hash)
-            );
-
-            CREATE INDEX idx_tc_view ON timeout_certificates(view_number);
-            CREATE INDEX idx_tc_highest_qc ON timeout_certificates(highest_qc_view, highest_qc_phase, highest_qc_block_hash);
+            -- Consensus: decided chain + engine WAL live in the crate-owned
+            -- tables (decided_blocks, decided_certificates, consensus_wal,
+            -- consensus_meta — installed below via hopnet_consensus).
 
             -- Track validators that are acceptable at any given time
             -- Not using views (nodes can be in different views due to network partitions)
@@ -392,36 +350,12 @@ pub fn initialize(db: PooledConnection<SqliteConnectionManager>) -> Result<(), D
             CREATE INDEX idx_validator_height ON validators(effective_height DESC); 
             CREATE INDEX idx_validator_active ON validators(effective_height, is_active);
 
+            -- This node's identity. Consensus progress lives in the engine's
+            -- WAL + consensus_meta, not here.
             CREATE TABLE this_node (
                 internal_id             INTEGER PRIMARY KEY DEFAULT 1,
                 node_id                 INTEGER NOT NULL UNIQUE,
-                privkey                 BLOB NOT NULL,
-
-                -- Consensus mechanics
-                -- View stored in case of leader change without block written
-                -- Block height not stored -> always computable
-                current_phase           INTEGER NOT NULL DEFAULT 0 CHECK(current_phase IN (0, 1)),  -- 0=propose, 1=lock
-                current_view            INTEGER NOT NULL DEFAULT 0,
-                -- Track last view where we issued a timeout vote to prevent conflicting votes
-                last_timeout_vote_view  INTEGER DEFAULT 0,
-                -- Track last Propose phase vote to prevent double-voting
-                last_propose_vote_block_hash BLOB,
-                -- Block is prepared when it has a QC
-                prepared_block_hash     BLOB,
-                -- HotStuff-2 efficiency improvement:
-                -- Block is committed when we're working on a later block
-                -- (Working on block n+1 implies we commit block n)
-                -- Nullable for joining nodes before genesis processed
-                committed_block_hash    BLOB,
-                -- Safety: track highest QC seen (highest view for ordered execution)
-                -- Nullable for joining nodes before genesis processed
-                highest_qc_block_hash   BLOB,
-                highest_qc_phase        INTEGER CHECK(highest_qc_phase IN (0, 1)),  -- 0=propose, 1=lock
-
-                FOREIGN KEY (last_propose_vote_block_hash) REFERENCES blocks(block_hash),
-                FOREIGN KEY (prepared_block_hash) REFERENCES blocks(block_hash),
-                FOREIGN KEY (committed_block_hash) REFERENCES blocks(block_hash),
-                FOREIGN KEY (highest_qc_block_hash) REFERENCES blocks(block_hash)
+                privkey                 BLOB NOT NULL
             );
 
             CREATE TABLE metrics (

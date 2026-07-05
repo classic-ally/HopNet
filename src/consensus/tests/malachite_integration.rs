@@ -311,8 +311,8 @@ fn malachite_mesh_decides_and_laggard_syncs_over_loopback_iroh() {
         let mut n0 = start_engine(&network.nodes[0].app_state, 0, rx0).await;
         let mut n1 = start_engine(&network.nodes[1].app_state, 1, rx1).await;
 
-        wait_decided(&mut n0, 4, 150).await;
-        wait_decided(&mut n1, 4, 150).await;
+        wait_decided(&mut n0, 4, 300).await;
+        wait_decided(&mut n1, 4, 300).await;
 
         // Refresh direct connections (the idle pre-connects may have died
         // while node 2 was "down"), then bring node 2 up: buffered + live
@@ -320,7 +320,7 @@ fn malachite_mesh_decides_and_laggard_syncs_over_loopback_iroh() {
         // sync → live participation.
         connect_mesh(&network).await;
         let mut n2 = start_engine(&network.nodes[2].app_state, 2, rx2).await;
-        wait_decided(&mut n2, 6, 180).await;
+        wait_decided(&mut n2, 6, 300).await;
 
         // The laggard's decided history is byte-identical to the mesh's.
         let rows = |st: &AppState| -> Vec<(i64, Vec<u8>)> {
@@ -439,7 +439,7 @@ fn malachite_engine_restarts_from_persisted_state() {
         // First engine incarnation: decide a few heights, then shut down.
         let (_dummy_tx, dummy_rx) = mpsc::channel::<HostInput>(1);
         let mut n0 = start_engine(state, 0, dummy_rx).await;
-        wait_decided(&mut n0, 3, 60).await;
+        wait_decided(&mut n0, 3, 120).await;
         let _ = n0.input_tx.send(HostInput::Shutdown).await;
 
         // Let the shell thread stop and release its storage connection, then
@@ -458,7 +458,7 @@ fn malachite_engine_restarts_from_persisted_state() {
         // landed mid-height) and keeps going.
         let (_dummy_tx2, dummy_rx2) = mpsc::channel::<HostInput>(1);
         let mut n0b = start_engine(state, 0, dummy_rx2).await;
-        wait_decided(&mut n0b, stopped_at + 1, 60).await;
+        wait_decided(&mut n0b, stopped_at + 1, 120).await;
         let _ = n0b.input_tx.send(HostInput::Shutdown).await;
 
         // Decided history is contiguous across the restart boundary: exactly

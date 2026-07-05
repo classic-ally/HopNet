@@ -4,10 +4,6 @@ use std::str::FromStr;
 use aes_siv::aead::OsRng;
 use chrono::{Duration, Utc};
 use either::Either;
-use hopnet::consensus::ConsensusPhase;
-use hopnet::consensus::types::{
-    Block, BlockData, QuorumCertificate, VoteSignMessage, VoteSignMessages,
-};
 use hopnet::db;
 use hopnet::db::types::{
     ChunkType, CustomUUID, Data, DataRecord, FileAccess, FragmentHash, Inode, XPubKey,
@@ -56,7 +52,7 @@ fn uuid_from_index(index: u16) -> CustomUUID {
 }
 
 pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) {
-    let (node0_priv, node0_pub) = keys::ed25519_from_seed(keys::NODE_0_SEED);
+    let (_node0_priv, node0_pub) = keys::ed25519_from_seed(keys::NODE_0_SEED);
     let (node1_priv, node1_pub) = keys::ed25519_from_seed(keys::NODE_1_SEED);
     let (node2_priv, node2_pub) = keys::ed25519_from_seed(keys::NODE_2_SEED);
     let (user1_priv, user1_pub) = keys::ed25519_from_seed(keys::USER_1_SEED);
@@ -103,91 +99,63 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
             .expect("Failed to commit extra nodes/validators");
     } // conn dropped here
 
-    // === Insert blocks 1-5 with QCs ===
-    let genesis_block = Block::new(BlockData {
-        height: 0,
-        view_number: 0,
-        parent_hash: None,
-        transactions: None,
-    })
-    .expect("genesis block");
-
-    let mut prev_hash = genesis_block.block_hash;
-    let mut blocks = Vec::new();
-
-    for i in 1..=5i32 {
-        let block = Block::new(BlockData {
-            height: i,
-            view_number: i,
-            parent_hash: Some(prev_hash),
-            transactions: None,
-        })
-        .expect("Failed to create block");
-        prev_hash = block.block_hash;
-        blocks.push(block);
-    }
-
-    for block in &blocks {
-        db::consensus::insert_block(pool.get(), block).expect("Failed to insert block");
-    }
-
-    // Insert QCs for each block (Propose + Lock)
+    // === Insert decided heights 1-5 (malachite engine tables) ===
+    // Empty engine blocks chained from the fixture genesis, each with a
+    // signature-less certificate — populates the decided history the
+    // surviving read functions (heights, history shims) consume.
     {
         let mut conn = pool.get().expect("Failed to get connection");
         let tx = conn.transaction().expect("Failed to begin transaction");
-        for block in &blocks {
-            let propose_qc = QuorumCertificate::create_unverified(
-                block,
-                ConsensusPhase::Propose,
-                0,
-                &node0_priv,
-                Vec::new(),
-            )
-            .expect("Failed to create propose QC");
 
-            let lock_qc = QuorumCertificate::create_unverified(
-                block,
-                ConsensusPhase::Lock,
-                0,
-                &node0_priv,
-                Vec::new(),
+        let mut prev_hash: hopnet_consensus::types::Blake3Hash = tx
+            .query_row(
+                "SELECT block_hash FROM decided_blocks WHERE height = 0",
+                [],
+                |row| {
+                    let bytes: Vec<u8> = row.get(0)?;
+                    Ok(hopnet_consensus::types::Blake3Hash::from_bytes(
+                        bytes.as_slice().try_into().expect("32-byte hash"),
+                    ))
+                },
             )
-            .expect("Failed to create lock QC");
+            .expect("fixture genesis missing");
 
-            db::consensus::insert_qc_unsafe_tx(&tx, &propose_qc)
-                .expect("Failed to insert propose QC");
-            db::consensus::insert_qc_unsafe_tx(&tx, &lock_qc).expect("Failed to insert lock QC");
+        for i in 1..=5u64 {
+            let block =
+                hopnet_consensus::types::Block::new(hopnet_consensus::types::BlockData {
+                    height: i,
+                    round: 0,
+                    parent_hash: Some(prev_hash),
+                    transactions: hopnet_consensus::types::Transactions(Vec::new()),
+                })
+                .expect("Failed to create block");
+            prev_hash = block.block_hash;
+
+            let block_bytes = hopnet_consensus::codec::encode(&block).expect("encode block");
+            let cert = hopnet_consensus::codec::WireCommitCertificate {
+                height: i,
+                round: 0,
+                value_id: block.block_hash,
+                signatures: Vec::new(),
+            };
+            let cert_bytes = hopnet_consensus::codec::encode(&cert).expect("encode cert");
+            tx.execute(
+                "INSERT INTO decided_blocks (height, block_hash, round, block) VALUES (?, ?, 0, ?)",
+                params![i as i64, block.block_hash.as_bytes().as_slice(), block_bytes],
+            )
+            .expect("Failed to insert decided block");
+            tx.execute(
+                "INSERT INTO decided_certificates (height, block_hash, round, certificate) VALUES (?, ?, 0, ?)",
+                params![i as i64, block.block_hash.as_bytes().as_slice(), cert_bytes],
+            )
+            .expect("Failed to insert decided certificate");
         }
-        tx.commit().expect("Failed to commit QCs");
-    }
-
-    // === Insert TC at view 3 ===
-    // insert_tc_unsafe_tx is private, so use raw SQL
-    {
-        let mut conn = pool.get().expect("Failed to get connection");
-        let tx = conn.transaction().expect("Failed to begin transaction");
-        // TC references the genesis propose QC as highest_qc
-        let genesis_propose_qc = QuorumCertificate::create_unverified(
-            &genesis_block,
-            ConsensusPhase::Propose,
-            0,
-            &node0_priv,
-            Vec::new(),
-        )
-        .expect("genesis propose QC");
-
-        let empty_sigs = VoteSignMessages(Vec::new());
         tx.execute(
-            "INSERT INTO timeout_certificates (view_number, highest_qc_view, highest_qc_phase, highest_qc_block_hash, signatures) VALUES (?, ?, ?, ?, ?)",
-            params![
-                3i32,
-                genesis_propose_qc.view_number,
-                genesis_propose_qc.phase,
-                genesis_propose_qc.block_hash,
-                empty_sigs,
-            ],
-        ).expect("Failed to insert TC");
-        tx.commit().expect("Failed to commit TC");
+            "INSERT OR REPLACE INTO consensus_meta (key, value) VALUES ('last_decided_height', 5)",
+            [],
+        )
+        .expect("Failed to update last decided height");
+        tx.commit().expect("Failed to commit decided heights");
     }
 
     // === Insert committed nonces ===
@@ -723,17 +691,6 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
             .expect("Failed to commit resilience/inventory enrichment");
     }
 
-    // Update this_node to point to the latest block (height 5)
-    {
-        let conn = pool.get().expect("Failed to get connection");
-        conn.execute(
-            "UPDATE this_node SET committed_block_hash = ?, highest_qc_block_hash = ?, current_view = 5",
-            params![blocks.last().unwrap().block_hash, blocks.last().unwrap().block_hash],
-        )
-        .expect("Failed to update this_node to latest block");
-    }
-
-    // Store block hashes for later use in function wrappers
-    ctx.block_hashes = blocks.iter().map(|b| b.block_hash).collect();
-    ctx.genesis_hash = genesis_block.block_hash;
+    // (this_node carries only identity now; consensus progress lives in
+    // consensus_meta, set above with the decided heights.)
 }

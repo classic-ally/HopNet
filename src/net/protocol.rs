@@ -4,26 +4,19 @@ use crate::metrics::rpc as metrics_rpc;
 use crate::setup;
 use serde::{Deserialize, Serialize};
 
-/// Request envelope for all iroh communication
+/// Request envelope for all iroh communication.
+///
+/// Stage 5b removed the bespoke engine's variants (ViewDataFetch, ViewPoll,
+/// TimeoutVoteBroadcast, TcBroadcast, QcBroadcast, BallotSubmission) —
+/// consensus traffic is `ConsensusMsg`/`DecidedFetch`. No wire compatibility
+/// to preserve (fresh meshes only).
 #[derive(Serialize, Deserialize, Debug)]
 pub enum IrohRequest {
     /// Ping for connection health/warmup
     Ping { nonce: u64 },
     /// Fragment health check
     FragmentHealthCheck(files_rpc::FragmentHealthRequest),
-    /// Fetch consensus data for a specific view (catch-up)
-    ViewDataFetch(consensus_rpc::ViewDataRequest),
-    /// Poll for current view number (sync detection)
-    ViewPoll(consensus_rpc::ViewPollRequest),
-    /// Broadcast timeout vote
-    TimeoutVoteBroadcast(consensus_rpc::TimeoutVoteBroadcastRequest),
-    /// Broadcast timeout certificate
-    TcBroadcast(consensus_rpc::TcBroadcastRequest),
-    /// Broadcast quorum certificate
-    QcBroadcast(consensus_rpc::QcBroadcastRequest),
-    /// Submit ballot for voting (returns signed vote)
-    BallotSubmission(consensus_rpc::BallotRequest),
-    /// Forward transactions to leader for consensus
+    /// Forward transactions to the current proposer for consensus
     TransactionForward(consensus_rpc::TransactionForwardRequest),
     /// Fetch a fragment from a remote node
     FragmentFetch(files_rpc::FragmentFetchRequest),
@@ -39,11 +32,9 @@ pub enum IrohRequest {
     JoinDeliver(setup::JoinDeliverRequest),
     /// Malachite consensus gossip: a bincode-encoded
     /// `hopnet_consensus::codec::WireConsensusMsg`. Fire-and-forget (ack only).
-    /// Appended at the enum tail so older variants keep their bincode
-    /// discriminants. Dispatched by the new engine only (Stage-5 wiring).
     ConsensusMsg(Vec<u8>),
     /// Fetch decided (block, certificate) pairs for `[from_height, to_height]`
-    /// — the new engine's decided-value sync protocol.
+    /// — the decided-value sync protocol.
     DecidedFetch { from_height: i64, to_height: i64 },
 }
 
@@ -54,21 +45,6 @@ pub enum IrohResponse {
     Pong { nonce: u64 },
     /// Fragment health check result
     FragmentHealthCheckResponse(files_rpc::FragmentHealthResponse),
-    /// View consensus data for a specific view. Boxed because the response
-    /// can carry a full Block + QC + transactions and dwarfs every other
-    /// variant — keeping the IrohResponse enum compact saves ~400 bytes per
-    /// instance across the entire response pipeline.
-    ViewDataFetchResponse(Box<consensus_rpc::ViewDataResponse>),
-    /// Current view number
-    ViewPollResponse(consensus_rpc::ViewPollResponse),
-    /// Ack for timeout vote broadcast
-    TimeoutVoteBroadcastResponse(consensus_rpc::TimeoutVoteBroadcastResponse),
-    /// Ack for TC broadcast
-    TcBroadcastResponse(consensus_rpc::TcBroadcastResponse),
-    /// Ack for QC broadcast
-    QcBroadcastResponse(consensus_rpc::QcBroadcastResponse),
-    /// Ballot vote response (signed vote)
-    BallotSubmissionResponse(consensus_rpc::BallotResponse),
     /// Ack for transaction forward (immediate ACK before processing)
     TransactionForwardAck,
     /// Rejection: this node is not the proposer for its current (height,
@@ -98,21 +74,4 @@ pub enum IrohResponse {
     /// Decided (block bytes, certificate bytes) pairs, ascending and
     /// contiguous from `from_height` (bincode-encoded engine types)
     DecidedFetchResponse { items: Vec<(Vec<u8>, Vec<u8>)> },
-}
-
-impl IrohRequest {
-    /// Extract the consensus view from a consensus message, if applicable.
-    /// Used for message-driven catch-up: if the message's view is ahead of ours,
-    /// we catch up before dispatching.
-    pub fn consensus_view(&self) -> Option<i32> {
-        match self {
-            IrohRequest::BallotSubmission(req) => Some(req.ballot.data.view),
-            IrohRequest::TimeoutVoteBroadcast(req) => Some(req.timeout_vote.data.view_number),
-            IrohRequest::TcBroadcast(req) => Some(req.tc.view_number),
-            IrohRequest::QcBroadcast(req) => Some(req.qc.view_number),
-            // TransactionForward: height-based on the malachite path; lag is
-            // detected by the shell from consensus messages, not forwards.
-            _ => None, // Ping, Fragment*, ViewDataFetch, ViewPoll, Latency*, Throughput*, StorageQuery
-        }
-    }
 }

@@ -46,16 +46,12 @@ pub struct AppState {
     pub node_id: Arc<OnceCell<i32>>,
     pub user_id: Arc<OnceCell<i32>>,
     pub fragments_dir: String,
-    pub timeout_vote_collector: Arc<consensus::functions::TimeoutVoteCollector>,
-    pub catch_up_state: Arc<consensus::catch_up_state::CatchUpState>,
-    pub consensus_lock: Arc<tokio::sync::Mutex<()>>,
     pub port: u16,
     pub test_mode: bool,
     pub orphaned_fragment_scan: Arc<std::sync::Mutex<Option<files::jobs::OrphanedFragmentScan>>>,
     pub iroh_transport: net::IrohTransport,
     pub consensus_barriers: Arc<barriers::Barriers>,
     pub dedup_cache: Arc<net::DedupCache>,
-    pub lock_vote_evidence: Arc<std::sync::Mutex<Option<consensus::types::LockVoteEvidence>>>,
     pub session_store: Arc<auth::SessionStore>,
     /// Module-owned takeout/import runtime state (resume registry today;
     /// future Phase 5 worker pool etc.). Single Arc field instead of growing
@@ -63,7 +59,6 @@ pub struct AppState {
     /// consensus/net/files will adopt in a follow-up refactor.
     pub takeout_runtime: Arc<takeout::TakeoutRuntime>,
     pub consensus_queue: consensus::queue::ConsensusQueue,
-    pub view_changed: Arc<tokio::sync::Notify>,
     pub write_gate: Arc<db::write_gate::WriteGate>,
     pub local_state_tx: tokio::sync::mpsc::Sender<db::write_gate::LocalStateUpdate>,
     /// Malachite engine handle — set by `spawn_engine` (startup restart path,

@@ -1,5 +1,5 @@
 use crate::AppState;
-use crate::db::consensus::get_consensus;
+use crate::db::consensus::get_current_consensus_height;
 use crate::db::{DatabaseError, metrics::get_nodes_to_measure};
 use crate::metrics::rpc;
 use crate::metrics::types::Metric;
@@ -35,8 +35,13 @@ pub async fn collect_all_node_metrics(
         .get_node_id()
         .map_err(|_| CollectionError::ConfigurationError)?;
 
-    let consensus_state = get_consensus(app_state.db_pool.get())?;
-    let current_height = consensus_state.committed_block.data.height;
+    let current_height = {
+        let conn = app_state
+            .db_pool
+            .get()
+            .map_err(|_| CollectionError::ConfigurationError)?;
+        get_current_consensus_height(&conn)?
+    };
 
     // Get nodes to measure using database function
     let target_nodes = get_nodes_to_measure(app_state.db_pool.get(), source_node_id)?;

@@ -19,8 +19,8 @@ use hopnet_consensus::traits::{Application, ApplyError, ValidationOrigin};
 use hopnet_consensus::types as engine;
 use hopnet_consensus::{Round, Validity};
 
-use crate::consensus::functions::{
-    process_transaction, process_transactions, MAX_TRANSACTION_AGE,
+use crate::consensus::dispatch::{
+    MAX_TRANSACTION_AGE, process_transaction, process_transactions,
 };
 use crate::consensus::types::Transactions as OldTransactions;
 use crate::db::consensus as db;

@@ -13,18 +13,7 @@ pub fn capture(
     ctx: &FixtureContext,
     results: &mut BTreeMap<String, FunctionResult>,
 ) {
-    use hopnet::consensus::ConsensusPhase;
     use hopnet::db::consensus;
-
-    results.insert(
-        "db::consensus::get_consensus".into(),
-        wrap(|| consensus::get_consensus(pool.get())),
-    );
-
-    results.insert(
-        "db::consensus::get_consensus_history".into(),
-        wrap(|| consensus::get_consensus_history(pool.get())),
-    );
 
     results.insert(
         "db::consensus::get_validators(height=5)".into(),
@@ -34,11 +23,6 @@ pub fn capture(
     results.insert(
         "db::consensus::get_validators(height=0)".into(),
         wrap(|| consensus::get_validators(pool.get(), 0)),
-    );
-
-    results.insert(
-        "db::consensus::get_validators_elect(height=5)".into(),
-        wrap(|| consensus::get_validators_elect(pool.get(), 5)),
     );
 
     results.insert(
@@ -64,30 +48,10 @@ pub fn capture(
         );
 
         results.insert(
-            "db::consensus::get_consensus_progress".into(),
-            wrap(|| consensus::get_consensus_progress(&conn)),
+            "db::consensus::get_current_consensus_height".into(),
+            wrap(|| consensus::get_current_consensus_height(&conn)),
         );
     }
-
-    results.insert("db::consensus::get_me".into(), {
-        match consensus::get_me(pool.get()) {
-            Ok(me) => {
-                #[derive(Serialize)]
-                struct MyNodeProxy {
-                    node_id: i32,
-                }
-                FunctionResult::Ok {
-                    value: serde_json::to_value(MyNodeProxy {
-                        node_id: me.node_id,
-                    })
-                    .unwrap(),
-                }
-            }
-            Err(e) => FunctionResult::Error {
-                error_variant: format!("{:?}", e),
-            },
-        }
-    });
 
     results.insert("db::consensus::get_startup_state".into(), {
         match consensus::get_startup_state(pool.get()) {
@@ -110,58 +74,6 @@ pub fn capture(
             },
         }
     });
-
-    results.insert(
-        "db::consensus::get_view_consensus_data(view=0)".into(),
-        wrap(|| consensus::get_view_consensus_data(pool.get(), 0)),
-    );
-
-    results.insert(
-        "db::consensus::get_view_consensus_data(view=3)".into(),
-        wrap(|| consensus::get_view_consensus_data(pool.get(), 3)),
-    );
-
-    results.insert(
-        "db::consensus::get_view_consensus_data(view=5)".into(),
-        wrap(|| consensus::get_view_consensus_data(pool.get(), 5)),
-    );
-
-    results.insert(
-        "db::consensus::get_block(genesis)".into(),
-        wrap(|| consensus::get_block(pool.get(), ctx.genesis_hash)),
-    );
-
-    if let Some(h) = ctx.block_hashes.first() {
-        results.insert(
-            "db::consensus::get_block(height=1)".into(),
-            wrap(|| consensus::get_block(pool.get(), *h)),
-        );
-    }
-
-    // get QC by hash for genesis block
-    results.insert(
-        "db::consensus::get_quorum_certificate_by_hash(genesis,Propose)".into(),
-        wrap(|| {
-            consensus::get_quorum_certificate_by_hash(
-                pool.get(),
-                &0,
-                &ctx.genesis_hash,
-                &ConsensusPhase::Propose,
-            )
-        }),
-    );
-
-    results.insert(
-        "db::consensus::get_quorum_certificate_by_hash(genesis,Lock)".into(),
-        wrap(|| {
-            consensus::get_quorum_certificate_by_hash(
-                pool.get(),
-                &0,
-                &ctx.genesis_hash,
-                &ConsensusPhase::Lock,
-            )
-        }),
-    );
 
     // check_committed_nonces — returns HashSet, sort for determinism
     {

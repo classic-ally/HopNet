@@ -11,7 +11,6 @@ pub use crate::NodeInfo;
 pub mod files;
 
 // Test implementations
-mod consensus_barriers;
 mod consensus_queue;
 mod db_pragma_bench;
 mod device_tokens;
@@ -35,7 +34,6 @@ mod range_download;
 mod recents;
 mod sharing;
 mod takeout;
-mod timeout_progression;
 
 /// Represents the result of a test scenario execution
 #[derive(Debug)]
@@ -144,26 +142,10 @@ pub async fn run_test_by_name(
                 .run(mesh_id, nodes, flags)
                 .await
         }
-        "timeout-progression" => {
-            timeout_progression::TimeoutProgression
-                .run(mesh_id, nodes, flags)
-                .await
-        }
-        "consensus-barrier-basic" => {
-            consensus_barriers::ConsensusBarrierBasic
-                .run(mesh_id, nodes, flags)
-                .await
-        }
-        "consensus-barrier-missed-ballot" => {
-            consensus_barriers::ConsensusBarrierMissedBallot
-                .run(mesh_id, nodes, flags)
-                .await
-        }
-        "consensus-barrier-tc-late" => {
-            consensus_barriers::ConsensusBarrierTcLate
-                .run(mesh_id, nodes, flags)
-                .await
-        }
+        // Bespoke-engine protocol tests (timeout-progression, the three
+        // consensus-barrier-* tests) died at Stage 5b; their malachite
+        // replacements (leader-down round advance, effect-tap barriers,
+        // idle-proposer wake) land at Stage 6.
         "metrics-collection" => metrics::MetricsCollection.run(mesh_id, nodes, flags).await,
         "multi-user-isolation" => {
             multi_user::MultiUserIsolation
@@ -297,10 +279,6 @@ pub fn list_test_names() -> Vec<&'static str> {
         "documentprovider-write-consistency",
         "iroh-ping",
         "iroh-reject-unknown",
-        "timeout-progression",
-        "consensus-barrier-basic",
-        "consensus-barrier-missed-ballot",
-        "consensus-barrier-tc-late",
         "metrics-collection",
         "multi-user-isolation",
         "multi-user-sharing",

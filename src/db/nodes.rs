@@ -1,6 +1,4 @@
 use super::*;
-use crate::consensus::QuorumCertificate;
-use crate::consensus::types::{Block, BlockData, ConsensusPhase};
 use crate::db::{Data, DataRecord, FragmentHash, Inode};
 use bincode::serde::decode_from_slice;
 use either::Either;
