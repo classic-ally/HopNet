@@ -187,7 +187,7 @@ async fn cleanup_orphaned_data_blocks(
                 }
             };
 
-        let transaction = crate::consensus::functions::create_signed_transaction(
+        let transaction = crate::consensus::dispatch::create_signed_transaction(
             app_state,
             "delete_orphaned_data_blocks".to_string(),
             serialized_payload,
@@ -365,7 +365,7 @@ pub async fn run_fragment_inventory_self_check(app_state: &AppState) -> Result<(
         };
 
     // Create signed transaction for consensus
-    let transaction = crate::consensus::functions::create_signed_transaction(
+    let transaction = crate::consensus::dispatch::create_signed_transaction(
         app_state,
         "self_check_fragments".to_string(),
         serialized_payload,

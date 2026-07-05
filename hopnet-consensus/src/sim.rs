@@ -411,6 +411,11 @@ enum Event {
     Restart {
         node: usize,
     },
+    /// Local work arrives at `node` (on-demand mode): wake rule 1 — the node
+    /// resumes its pending height regardless of who the proposer is.
+    Work {
+        node: usize,
+    },
 }
 
 struct Scheduled {
@@ -463,6 +468,7 @@ pub struct Sim {
     keys: Vec<PrivKey>,
     profile: QuorumProfile,
     faults: FaultConfig,
+    on_demand: bool,
     rng: Rng,
     queue: BinaryHeap<Scheduled>,
     vtime: u64,
@@ -491,6 +497,21 @@ impl Sim {
     }
 
     pub fn with_faults(n: i32, profile: QuorumProfile, faults: FaultConfig) -> Self {
+        Self::build(n, profile, faults, false)
+    }
+
+    /// A mesh running on-demand heights: nodes pause between heights and wake
+    /// on local work (`schedule_work`) or inbound messages at the pending
+    /// height — mirrors the production shell's wake rules.
+    pub fn new_on_demand(n: i32, profile: QuorumProfile) -> Self {
+        Self::build(n, profile, FaultConfig::none(0), true)
+    }
+
+    pub fn with_faults_on_demand(n: i32, profile: QuorumProfile, faults: FaultConfig) -> Self {
+        Self::build(n, profile, faults, true)
+    }
+
+    fn build(n: i32, profile: QuorumProfile, faults: FaultConfig, on_demand: bool) -> Self {
         let chain_id = Blake3Hash::from_bytes([7u8; 32]);
         let keys: Vec<PrivKey> = (0..n).map(sim_key).collect();
         let valset = HopNetValidatorSet::new(
@@ -499,7 +520,7 @@ impl Sim {
                 .collect(),
         );
         let nodes = (0..n)
-            .map(|i| build_node(i, chain_id, &valset, &keys[i as usize], profile))
+            .map(|i| build_node(i, chain_id, &valset, &keys[i as usize], profile, on_demand))
             .collect();
 
         let mut sim = Sim {
@@ -508,6 +529,7 @@ impl Sim {
             valset,
             keys,
             profile,
+            on_demand,
             rng: Rng::new(faults.seed),
             queue: BinaryHeap::new(),
             vtime: 0,
@@ -541,13 +563,26 @@ impl Sim {
         });
     }
 
-    /// Start height 1 on every node and settle the resulting effects.
+    /// Start height 1 on every node and settle the resulting effects. In
+    /// on-demand mode every node defers instead (empty WAL at boot) and waits
+    /// for a wake signal.
     pub fn start(&mut self) -> Result<(), HostError<MemError>> {
         for i in 0..self.nodes.len() {
-            self.nodes[i].core.start_height(Height::INITIAL, false)?;
+            self.nodes[i].core.start_or_defer(Height::INITIAL)?;
             self.settle(i)?;
         }
         Ok(())
+    }
+
+    /// Schedule local work arriving at `node` (wake rule 1). On-demand mode
+    /// only — a running mesh ignores it (resume is idempotent).
+    pub fn schedule_work(&mut self, vtime: u64, node: usize) {
+        self.push(vtime, Event::Work { node });
+    }
+
+    /// Whether `node` is paused before `height` (on-demand assertions).
+    pub fn paused_at(&self, node: usize) -> Option<u64> {
+        self.nodes[node].core.paused_at().map(|h| h.0)
     }
 
     /// After any interaction with node `i`, fulfil its value requests, then
@@ -570,6 +605,7 @@ impl Sim {
                         let block = build_block(height, round, self.nodes[i].node_id, parent);
                         self.nodes[i].core.propose(height, round, block)?;
                     }
+                    HostOutput::RoundStarted { .. } => {}
                     HostOutput::Decided { height } => self.on_decided(i, height),
                     HostOutput::SyncInvalid { height, .. } => {
                         panic!("sync value rejected at height {height} — sim peers are honest")
@@ -713,6 +749,13 @@ impl Sim {
                     if self.faults.crosses_partition(self.vtime, from, to) {
                         continue;
                     }
+                    // Wake rule 2: a message at/past the pending height
+                    // resumes a paused node before feeding.
+                    if let Some(pending) = self.nodes[to].core.paused_at() {
+                        if msg.height() >= pending.0 {
+                            self.nodes[to].core.resume_height()?;
+                        }
+                    }
                     self.nodes[to].core.on_wire(msg)?;
                     self.settle(to)?;
                 }
@@ -736,6 +779,13 @@ impl Sim {
                 }
                 Event::Restart { node } => {
                     self.restart(node)?;
+                }
+                Event::Work { node } => {
+                    if self.nodes[node].down {
+                        continue;
+                    }
+                    self.nodes[node].core.resume_height()?;
+                    self.settle(node)?;
                 }
             }
 
@@ -772,6 +822,11 @@ impl Sim {
                     if self.nodes[to].down || self.faults.crosses_partition(self.vtime, from, to) {
                         continue;
                     }
+                    if let Some(pending) = self.nodes[to].core.paused_at() {
+                        if msg.height() >= pending.0 {
+                            self.nodes[to].core.resume_height()?;
+                        }
+                    }
                     self.nodes[to].core.on_wire(msg)?;
                     self.settle(to)?;
                 }
@@ -791,6 +846,13 @@ impl Sim {
                     self.push(self.vtime + restart_after, Event::Restart { node });
                 }
                 Event::Restart { node } => self.restart(node)?,
+                Event::Work { node } => {
+                    if self.nodes[node].down {
+                        continue;
+                    }
+                    self.nodes[node].core.resume_height()?;
+                    self.settle(node)?;
+                }
             }
         }
         Ok(())
@@ -817,7 +879,7 @@ impl Sim {
         let params = params_for(Address(self.nodes[node].node_id), self.profile);
         self.nodes[node].timers = timers.clone();
         self.nodes[node].down = false;
-        self.nodes[node].core = HostCore::new(
+        let mut core = HostCore::new(
             self.chain_id,
             self.keys[node].clone(),
             Address(self.nodes[node].node_id),
@@ -829,7 +891,13 @@ impl Sim {
             gossip,
             timers,
         );
-        self.nodes[node].core.start_height(resume, false)?;
+        if self.on_demand {
+            core = core.on_demand();
+        }
+        self.nodes[node].core = core;
+        // Boot rule: a height with WAL state was active at crash time and
+        // must replay; an empty one defers in on-demand mode.
+        self.nodes[node].core.start_or_defer(resume)?;
         self.settle(node)?;
         Ok(())
     }
@@ -911,11 +979,12 @@ fn build_node(
     valset: &HopNetValidatorSet,
     signer: &PrivKey,
     profile: QuorumProfile,
+    on_demand: bool,
 ) -> SimNode {
     let storage = MemStorage::default();
     let gossip = MemGossip::default();
     let timers = MemTimers::default();
-    let core = HostCore::new(
+    let mut core = HostCore::new(
         chain_id,
         signer.clone(),
         Address(node_id),
@@ -927,6 +996,9 @@ fn build_node(
         gossip.clone(),
         timers.clone(),
     );
+    if on_demand {
+        core = core.on_demand();
+    }
     SimNode {
         core,
         storage,

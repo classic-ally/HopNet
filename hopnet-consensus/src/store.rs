@@ -107,9 +107,77 @@ const SCHEMA: &str = "
 
 const META_LAST_DECIDED: &str = "last_decided_height";
 
+/// consensus_meta key: the chain id (32-byte genesis block hash). Binds all
+/// signing payloads to this mesh; set once at genesis install.
+pub const META_CHAIN_ID: &str = "chain_id";
+/// consensus_meta key: the mesh's quorum profile (`QuorumProfile::as_str`).
+/// Genesis-fixed; a post-genesis change requires its own consensus scheme.
+pub const META_QUORUM_PROFILE: &str = "quorum_profile";
+
 /// Install the consensus tables on any connection to the database (idempotent).
 pub fn install_schema(conn: &Connection) -> Result<(), StoreError> {
     conn.execute_batch(SCHEMA)?;
+    Ok(())
+}
+
+/// Read `consensus_meta.last_decided_height` on any connection. `None` until
+/// genesis has been installed. Free function so hosts can read it outside the
+/// engine (startup height, progress endpoints).
+pub fn last_decided_height(conn: &Connection) -> Result<Option<Height>, StoreError> {
+    let v: Option<i64> = conn
+        .query_row(
+            "SELECT value FROM consensus_meta WHERE key = ?",
+            [META_LAST_DECIDED],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(v.map(Height::from_db))
+}
+
+/// Read an arbitrary `consensus_meta` value (chain id, quorum profile, ...).
+pub fn meta_get(conn: &Connection, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+    let v: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT value FROM consensus_meta WHERE key = ?",
+            [key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(v)
+}
+
+/// Write an arbitrary `consensus_meta` value.
+pub fn meta_put(conn: &Connection, key: &str, value: &[u8]) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT OR REPLACE INTO consensus_meta (key, value) VALUES (?, ?)",
+        rusqlite::params![key, value],
+    )?;
+    Ok(())
+}
+
+/// Install a decided (block, certificate) pair outside the engine's decide
+/// path. Genesis installation only: height 0 with the synthetic trusted
+/// certificate, plus `last_decided_height`. Everything after height 0 must go
+/// through the engine.
+pub fn install_genesis(
+    conn: &Connection,
+    block: &Block,
+    cert: &WireCommitCertificate,
+) -> Result<(), StoreError> {
+    let block_bytes = codec::encode(block).map_err(StoreError::Codec)?;
+    let cert_bytes = codec::encode(cert).map_err(StoreError::Codec)?;
+    conn.execute(
+        "INSERT INTO decided_blocks (height, block_hash, round, block) VALUES (0, ?, 0, ?)",
+        rusqlite::params![block.block_hash, block_bytes],
+    )?;
+    conn.execute(
+        "INSERT INTO decided_certificates (height, block_hash, round, certificate) VALUES (0, ?, 0, ?)",
+        rusqlite::params![block.block_hash, cert_bytes],
+    )?;
+    conn.execute(
+        "INSERT OR REPLACE INTO consensus_meta (key, value) VALUES (?, 0)",
+        [META_LAST_DECIDED],
+    )?;
     Ok(())
 }
 

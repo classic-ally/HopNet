@@ -451,6 +451,51 @@ impl MockNetwork {
             crate::db::DatabaseError::ProcessingError
         })?;
         eprintln!("sync_node_state: this_node inserted successfully");
+
+        // Malachite engine tables: replicate the genesis pair + meta the way
+        // a real joiner's height-0 bootstrap would (decided_blocks,
+        // decided_certificates, consensus_meta). Without these the joining
+        // node's decided tip is empty and parent-linkage validation rejects
+        // every block the genesis node proposes.
+        {
+            let mut copy_table = |sql_select: &str, sql_insert: &str| -> Result<(), crate::db::DatabaseError> {
+                let mut stmt = source_db.prepare(sql_select).map_err(|e| {
+                    eprintln!("Failed to prepare {sql_select}: {e:?}");
+                    crate::db::DatabaseError::RecallError
+                })?;
+                let rows: Vec<Vec<rusqlite::types::Value>> = stmt
+                    .query_map([], |row| {
+                        let n = row.as_ref().column_count();
+                        (0..n).map(|i| row.get::<_, rusqlite::types::Value>(i)).collect()
+                    })
+                    .map_err(|_| crate::db::DatabaseError::RecallError)?
+                    .flatten()
+                    .collect();
+                for values in rows {
+                    dest_db
+                        .execute(sql_insert, rusqlite::params_from_iter(values))
+                        .map_err(|e| {
+                            eprintln!("Failed to copy row via {sql_insert}: {e:?}");
+                            crate::db::DatabaseError::ProcessingError
+                        })?;
+                }
+                Ok(())
+            };
+            copy_table(
+                "SELECT height, block_hash, round, block FROM decided_blocks",
+                "INSERT OR REPLACE INTO decided_blocks (height, block_hash, round, block) VALUES (?, ?, ?, ?)",
+            )?;
+            copy_table(
+                "SELECT height, block_hash, round, certificate FROM decided_certificates",
+                "INSERT OR REPLACE INTO decided_certificates (height, block_hash, round, certificate) VALUES (?, ?, ?, ?)",
+            )?;
+            copy_table(
+                "SELECT key, value FROM consensus_meta",
+                "INSERT OR REPLACE INTO consensus_meta (key, value) VALUES (?, ?)",
+            )?;
+            eprintln!("sync_node_state: malachite tables copied successfully");
+        }
+
         eprintln!("sync_node_state: Sync complete!");
 
         Ok(())
@@ -533,6 +578,7 @@ pub fn create_test_app_state_with_keys(
         view_changed: Arc::new(tokio::sync::Notify::new()),
         write_gate: Arc::new(crate::db::write_gate::WriteGate::new()),
         local_state_tx: tokio::sync::mpsc::channel(1).0,
+        malachite: Arc::new(once_cell::sync::OnceCell::new()),
     }
 }
 

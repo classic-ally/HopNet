@@ -108,6 +108,10 @@ pub enum HostInput {
         block: Block,
         cert: WireCommitCertificate,
     },
+    /// Wake signal (on-demand heights): local work is staged — start the
+    /// pending height so the engine requests a value. Idempotent; a no-op
+    /// when a height is already running.
+    Resume,
     Shutdown,
 }
 
@@ -127,11 +131,23 @@ pub enum HostEvent {
     },
 }
 
+/// The engine's current round position — updated on every StartRound. Lets
+/// the embedding application route transaction forwarding to the proposer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoundInfo {
+    pub height: u64,
+    pub round: u32,
+    /// node_id of the proposer for this (height, round).
+    pub proposer: i32,
+}
+
 /// The application's handle to a running consensus shell.
 pub struct ConsensusHandle {
     pub input_tx: mpsc::Sender<HostInput>,
     /// Last decided height (0 until the first decide).
     pub decided: watch::Receiver<u64>,
+    /// Current (height, round, proposer). `None` until the first StartRound.
+    pub round: watch::Receiver<Option<RoundInfo>>,
     /// Event stream (single consumer — move into your driver task).
     pub events: mpsc::UnboundedReceiver<HostEvent>,
 }
@@ -162,6 +178,7 @@ where
     let (input_tx, input_rx) = mpsc::channel::<HostInput>(256);
     let (event_tx, event_rx) = mpsc::unbounded_channel::<HostEvent>();
     let (decided_tx, decided_rx) = watch::channel(0u64);
+    let (round_tx, round_rx) = watch::channel(None::<RoundInfo>);
 
     std::thread::Builder::new()
         .name("hopnet-consensus".into())
@@ -178,6 +195,7 @@ where
                 input_rx,
                 event_tx,
                 decided_tx,
+                round_tx,
             ));
         })
         .expect("spawn consensus shell thread");
@@ -185,10 +203,12 @@ where
     ConsensusHandle {
         input_tx,
         decided: decided_rx,
+        round: round_rx,
         events: event_rx,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_shell<A, S, F>(
     build: F,
     start_height: Height,
@@ -197,6 +217,7 @@ async fn run_shell<A, S, F>(
     mut input_rx: mpsc::Receiver<HostInput>,
     event_tx: mpsc::UnboundedSender<HostEvent>,
     decided_tx: watch::Sender<u64>,
+    round_tx: watch::Sender<Option<RoundInfo>>,
 ) where
     S: Storage,
     A: Application<S>,
@@ -210,11 +231,22 @@ async fn run_shell<A, S, F>(
     if start_height.0 > 1 {
         decided_tx.send_replace(start_height.0 - 1);
     }
-    if let Err(e) = core.start_height(start_height, false) {
-        tracing::error!("consensus start_height failed: {e:?}");
-        return;
+    // On-demand cores defer the boot start unless the pending height has WAL
+    // state (active at crash time — must replay, never pause).
+    match core.start_or_defer(start_height) {
+        Ok(started) => {
+            if !started {
+                tracing::debug!(height = start_height.0, "consensus paused pending work");
+            }
+        }
+        Err(e) => {
+            tracing::error!("consensus start_height failed: {e:?}");
+            return;
+        }
     }
-    drain(&mut core, &timers, &mut dq, &timeouts, &event_tx, &decided_tx);
+    drain(
+        &mut core, &timers, &mut dq, &timeouts, &event_tx, &decided_tx, &round_tx,
+    );
 
     loop {
         let step: Result<bool, String> = tokio::select! {
@@ -237,24 +269,49 @@ async fn run_shell<A, S, F>(
             maybe = input_rx.recv() => match maybe {
                 None | Some(HostInput::Shutdown) => Ok(false),
                 Some(HostInput::Wire { from, msg }) => {
+                    // Wake rule (on-demand): a peer message at (or past) the
+                    // pending height proves the mesh is active — resume
+                    // before feeding so the engine can process it.
+                    let msg_height = msg.height();
+                    let wake = match core.paused_at() {
+                        Some(pending) if msg_height >= pending.0 => {
+                            core.resume_height().map_err(|e| format!("{e:?}"))
+                        }
+                        _ => Ok(()),
+                    };
                     // Lag detection: a message from a future height means we
                     // missed decides — kick the sync client before feeding
                     // (the engine buffers/drops what it can't use yet).
-                    let msg_height = msg.height();
                     if msg_height > core.height().0 {
                         let _ = event_tx.send(HostEvent::SyncNeeded {
                             target: Height(msg_height),
                             hint_peer: from,
                         });
                     }
-                    core.on_wire(msg).map(|_| true).map_err(|e| format!("{e:?}"))
+                    wake.and_then(|_| {
+                        core.on_wire(msg).map(|_| true).map_err(|e| format!("{e:?}"))
+                    })
                 }
                 Some(HostInput::Propose { height, round, block }) => {
                     core.propose(height, round, block).map(|_| true).map_err(|e| format!("{e:?}"))
                 }
                 Some(HostInput::SyncValue { peer_node, block, cert }) => {
-                    core.on_sync_value(peer_id_for_node(peer_node), block, &cert)
-                        .map(|_| true).map_err(|e| format!("{e:?}"))
+                    // Sync feeds strictly at the engine's current height; a
+                    // paused engine must resume its pending height first (in
+                    // on-demand mode every synced decide re-pauses).
+                    let wake = match core.paused_at() {
+                        Some(pending) if block.data.height >= pending.0 => {
+                            core.resume_height().map_err(|e| format!("{e:?}"))
+                        }
+                        _ => Ok(()),
+                    };
+                    wake.and_then(|_| {
+                        core.on_sync_value(peer_id_for_node(peer_node), block, &cert)
+                            .map(|_| true).map_err(|e| format!("{e:?}"))
+                    })
+                }
+                Some(HostInput::Resume) => {
+                    core.resume_height().map(|_| true).map_err(|e| format!("{e:?}"))
                 }
             },
         };
@@ -271,7 +328,9 @@ async fn run_shell<A, S, F>(
             }
         }
 
-        drain(&mut core, &timers, &mut dq, &timeouts, &event_tx, &decided_tx);
+        drain(
+            &mut core, &timers, &mut dq, &timeouts, &event_tx, &decided_tx, &round_tx,
+        );
     }
     tracing::info!("consensus shell stopped");
 }
@@ -284,6 +343,7 @@ fn drain<A, S>(
     timeouts: &LinearTimeouts,
     event_tx: &mpsc::UnboundedSender<HostEvent>,
     decided_tx: &watch::Sender<u64>,
+    round_tx: &watch::Sender<Option<RoundInfo>>,
 ) where
     S: Storage,
     A: Application<S>,
@@ -292,6 +352,17 @@ fn drain<A, S>(
         match out {
             HostOutput::NeedValue { height, round } => {
                 let _ = event_tx.send(HostEvent::NeedValue { height, round });
+            }
+            HostOutput::RoundStarted {
+                height,
+                round,
+                proposer,
+            } => {
+                round_tx.send_replace(Some(RoundInfo {
+                    height: height.0,
+                    round: round.as_u32().unwrap_or(0),
+                    proposer: proposer.0,
+                }));
             }
             HostOutput::Decided { height } => {
                 decided_tx.send_replace(height.0);

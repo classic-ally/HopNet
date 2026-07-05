@@ -149,7 +149,7 @@ async fn post_initiate_takeout(
         };
 
     // Create consensus transaction
-    let transaction = match crate::consensus::functions::create_signed_user_transaction(
+    let transaction = match crate::consensus::dispatch::create_signed_user_transaction(
         &app_state,
         "create_takeout".to_string(),
         encoded_payload,
@@ -233,7 +233,7 @@ async fn delete_takeout(
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
         };
 
-    let transaction = match crate::consensus::functions::create_signed_transaction(
+    let transaction = match crate::consensus::dispatch::create_signed_transaction(
         &app_state,
         "update_takeout_status".to_string(),
         encoded_payload,
@@ -461,7 +461,7 @@ pub async fn execute_takeout_materialization(
         TakeoutMaterializationError::Serialization(format!("Failed to encode status: {:?}", e))
     })?;
 
-    let transaction = match crate::consensus::functions::create_signed_transaction(
+    let transaction = match crate::consensus::dispatch::create_signed_transaction(
         app_state,
         "update_takeout_status".to_string(),
         encoded_payload,
@@ -628,7 +628,7 @@ pub async fn execute_takeout_materialization(
             ))
         })?;
 
-    let ready_transaction = crate::consensus::functions::create_signed_transaction(
+    let ready_transaction = crate::consensus::dispatch::create_signed_transaction(
         app_state,
         "update_takeout_status".to_string(),
         encoded_ready_payload,

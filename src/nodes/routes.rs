@@ -101,7 +101,7 @@ pub async fn post_nodes(
     // Encode the complete node for consensus transaction
     match bincode::serde::encode_to_vec(&complete_node, config::standard()) {
         Ok(encoded_node) => {
-            let transaction = match crate::consensus::functions::create_signed_user_transaction(
+            let transaction = match crate::consensus::dispatch::create_signed_user_transaction(
                 &app_state,
                 "insert_node".to_string(),
                 encoded_node,
@@ -173,19 +173,38 @@ pub async fn post_nodes(
     // 4. Post-consensus: Create JoinInfo and send to joining node via iroh
     ///////////////
 
-    // Get current consensus height
-    let consensus_state = match crate::db::consensus::get_consensus(app_state.db_pool.get()) {
-        Ok(state) => state,
-        Err(e) => {
-            tracing::error!("Failed to get consensus state: {:?}", e);
-            return StatusCode::INTERNAL_SERVER_ERROR;
-        }
+    // Get current consensus height + the mesh's quorum profile
+    let (current_height, quorum_profile) = {
+        let mut conn = match app_state.db_pool.get() {
+            Ok(c) => c,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        let profile = hopnet_consensus::store::meta_get(
+            &conn,
+            hopnet_consensus::store::META_QUORUM_PROFILE,
+        )
+        .ok()
+        .flatten()
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_else(|| "bft".to_string());
+        let tx = match conn.transaction() {
+            Ok(tx) => tx,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        let height = match crate::db::consensus::get_current_consensus_height(&tx) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::error!("Failed to get consensus height: {:?}", e);
+                return StatusCode::INTERNAL_SERVER_ERROR;
+            }
+        };
+        (height, profile)
     };
 
     // Get all active validators for bootstrap list
     let bootstrap_validators = match crate::db::consensus::get_validators(
         app_state.db_pool.get(),
-        consensus_state.committed_block.data.height,
+        current_height,
     ) {
         Ok(validators) => validators,
         Err(e) => {
@@ -199,6 +218,7 @@ pub async fn post_nodes(
         node_id: complete_node.node_id,
         user_id: uid,
         bootstrap_validators,
+        quorum_profile,
     };
 
     ///////////////

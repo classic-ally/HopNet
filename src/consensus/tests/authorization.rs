@@ -1,5 +1,5 @@
 use super::*;
-use crate::consensus::functions::process_transaction;
+use crate::consensus::dispatch::process_transaction;
 use crate::db::CustomDateTime;
 use crate::db::DatabaseError;
 use crate::db::imports::ImportPayload;

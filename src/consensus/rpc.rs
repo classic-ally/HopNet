@@ -327,7 +327,7 @@ pub async fn submit_ballot_to_peer(
 #[derive(Serialize, Deserialize, Debug)]
 pub struct TransactionForwardRequest {
     pub transactions: Vec<super::types::Transaction>,
-    pub view: i32, // Forwarder's current view — catch-up hint, not a gate
+    pub height: i64, // Forwarder's target height — diagnostic hint, not a gate
 }
 
 /// Per-transaction result returned by the leader after forwarding.
@@ -404,17 +404,19 @@ pub async fn handle_transaction_forward(
 /// Result from the two-phase forward protocol.
 #[derive(Debug)]
 pub enum ForwardAckResult {
-    /// Leader never received the request (no ACK within timeout)
+    /// Proposer never received the request (no ACK within timeout)
     NoAck,
-    /// Leader ACKed and returned final results
+    /// Proposer ACKed and returned final results
     AckedWithResult(Vec<TransactionForwardResult>),
-    /// Leader ACKed, view advanced before result arrived — nonces are committed in local DB
-    AckedViewChanged,
-    /// Leader ACKed but safety timeout fired — view hasn't changed, nonces not committed yet
+    /// Proposer ACKed, a height decided before the result arrived — resolve
+    /// via the local nonce table
+    AckedDecided,
+    /// Proposer ACKed but safety timeout fired — nothing decided yet
     AckedNoResult,
-    /// Rejection: handler is not the leader (includes handler's view for catch-up)
-    NotLeader { view: i32 },
-    /// Rejection: consensus lock is held (leader is busy)
+    /// Rejection: handler is not the proposer (includes its position so the
+    /// forwarder can retarget)
+    NotProposer { height: i64, round: u32 },
+    /// Rejection: node is busy (legacy; malachite path never sends it)
     Busy,
 }
 
@@ -425,25 +427,31 @@ const FORWARD_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 /// blocking the batch processor for a full timeout detection cycle.
 const FORWARD_RESULT_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Client: forward transactions to the leader with two-phase ACK protocol.
+/// Client: forward transactions to the proposer with two-phase ACK protocol.
 ///
-/// Phase 1: Send request, wait for immediate ACK (leader received it).
-/// Phase 2: Wait for final result (leader processed it through consensus).
+/// Phase 1: Send request, wait for immediate ACK (proposer received it).
+/// Phase 2: Wait for final result (proposer committed it through consensus).
 ///
-/// The two-phase protocol lets the forwarder distinguish "leader never got it" (safe to retry)
-/// from "leader has it but hasn't finished" (check nonce table instead of retrying).
+/// The two-phase protocol lets the forwarder distinguish "proposer never got
+/// it" (safe to retry) from "proposer has it but hasn't finished" (check the
+/// nonce table instead of retrying). Phase 2 races the decided watch: a
+/// decide that lands before the result means the nonce table already knows.
 pub async fn forward_transactions_with_ack(
     transport: &IrohTransport,
     node_id: i32,
     peer_node_id: iroh::PublicKey,
     transactions: Vec<super::types::Transaction>,
-    view: i32,
-    view_changed: &tokio::sync::Notify,
+    height: i64,
+    decided: &mut tokio::sync::watch::Receiver<u64>,
 ) -> Result<ForwardAckResult, IrohError> {
-    // Capture view change signal BEFORE any network I/O
-    let view_notified = view_changed.notified();
+    // Mark the watch as seen BEFORE any network I/O so only NEW decides win
+    // the phase-2 race.
+    decided.borrow_and_update();
 
-    let req = IrohRequest::TransactionForward(TransactionForwardRequest { transactions, view });
+    let req = IrohRequest::TransactionForward(TransactionForwardRequest {
+        transactions,
+        height,
+    });
 
     let request_id: u64 = rand::random();
     let conn = transport.get_connection(node_id, peer_node_id).await?;
@@ -477,19 +485,17 @@ pub async fn forward_transactions_with_ack(
 
     // Check if first message is ACK, rejection, or direct result (backward compat)
     match first_msg {
-        IrohResponse::TransactionForwardNotLeader { view } => {
-            Ok(ForwardAckResult::NotLeader { view })
+        IrohResponse::TransactionForwardNotProposer { height, round } => {
+            Ok(ForwardAckResult::NotProposer { height, round })
         }
         IrohResponse::TransactionForwardBusy => Ok(ForwardAckResult::Busy),
         IrohResponse::TransactionForwardAck => {
-            // Got ACK — leader has received and is processing
-            // Phase 2: Race result against view change notification.
-            // View advances (Lock QC received, nonces committed) before the leader
-            // finishes processing — resolve via nonce table when view wins.
-            tokio::pin!(view_notified);
+            // Got ACK — proposer has received and is processing.
+            // Phase 2: race the result against the decided watch. A decide
+            // that lands first means the nonce table can already answer.
             let result = tokio::select! {
                 msg = crate::net::transport::recv_message(&mut recv) => msg,
-                _ = &mut view_notified => return Ok(ForwardAckResult::AckedViewChanged),
+                _ = decided.changed() => return Ok(ForwardAckResult::AckedDecided),
                 _ = tokio::time::sleep(FORWARD_RESULT_TIMEOUT) => {
                     return Ok(ForwardAckResult::AckedNoResult)
                 }
@@ -697,13 +703,13 @@ mod tests {
     fn transaction_forward_request_bincode_roundtrip() {
         let req = TransactionForwardRequest {
             transactions: vec![],
-            view: 15,
+            height: 15,
         };
         let encoded = bincode::serde::encode_to_vec(&req, bincode::config::standard()).unwrap();
         let (decoded, _): (TransactionForwardRequest, _) =
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
 
-        assert_eq!(decoded.view, 15);
+        assert_eq!(decoded.height, 15);
         assert!(decoded.transactions.is_empty());
 
         // Also test response roundtrip

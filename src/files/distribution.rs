@@ -471,7 +471,7 @@ async fn submit_placement_update_to_consensus(
     let updates = vec![update];
     let encoded_updates = bincode::serde::encode_to_vec(&updates, bincode::config::standard())?;
 
-    let transaction = crate::consensus::functions::create_signed_transaction(
+    let transaction = crate::consensus::dispatch::create_signed_transaction(
         app_state,
         "update_placement_heights".to_string(),
         encoded_updates,

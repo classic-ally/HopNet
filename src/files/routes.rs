@@ -821,7 +821,7 @@ pub async fn delete_files(
     // Serialize payload for consensus submission
     match bincode::serde::encode_to_vec(&payload, bincode::config::standard()) {
         Ok(encoded_payload) => {
-            let transaction = match crate::consensus::functions::create_signed_user_transaction(
+            let transaction = match crate::consensus::dispatch::create_signed_user_transaction(
                 &app_state,
                 "delete_files".to_string(),
                 encoded_payload,
@@ -945,7 +945,7 @@ pub async fn patch_files(
 
     let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let transaction = crate::consensus::functions::create_signed_user_transaction(
+    let transaction = crate::consensus::dispatch::create_signed_user_transaction(
         &app_state,
         "modify_item".to_string(),
         encoded,

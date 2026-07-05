@@ -274,7 +274,7 @@ pub async fn process_upload(
     };
     let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
         .map_err(|_| ImportUploadError::Internal("payload encode".into()))?;
-    let transaction = crate::consensus::functions::create_signed_user_transaction(
+    let transaction = crate::consensus::dispatch::create_signed_user_transaction(
         state,
         "create_import".to_string(),
         encoded,
@@ -740,7 +740,7 @@ async fn submit_status_update(
     };
     let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
         .map_err(|_| ImportExtractError::Internal("status payload encode".into()))?;
-    let txn = crate::consensus::functions::create_signed_user_transaction(
+    let txn = crate::consensus::dispatch::create_signed_user_transaction(
         state,
         "update_import_status".to_string(),
         encoded,

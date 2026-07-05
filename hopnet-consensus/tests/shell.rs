@@ -56,6 +56,7 @@ fn spawn_node(
         input_tx,
         decided,
         mut events,
+        ..
     } = handle;
 
     // Value-builder driver: answer NeedValue with a deterministic block.

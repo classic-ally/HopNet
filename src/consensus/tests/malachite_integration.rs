@@ -63,6 +63,7 @@ async fn start_net(app_state: &AppState) -> mpsc::Receiver<HostInput> {
     let server = gossip::ConsensusServer {
         input_tx: proxy_tx,
         db_pool,
+        barriers: None, // barrier taps are exercised at the orchestrator layer
     };
     tokio::spawn(gossip::run_accept_loop(
         app_state.iroh_transport.endpoint().clone(),
@@ -82,12 +83,18 @@ async fn start_engine(
     let db_pool = app_state.db_pool.clone();
 
     let (out_tx, out_rx) = mpsc::unbounded_channel();
-    tokio::spawn(gossip::run_publisher(
-        app_state.iroh_transport.clone(),
-        db_pool.clone(),
-        node_id,
-        out_rx,
-    ));
+    tokio::spawn(gossip::run_publisher(app_state.clone(), node_id, out_rx));
+
+    // Resume from persisted state (meta last_decided + 1) — the same rule
+    // spawn_engine applies; Height::INITIAL for a fresh store.
+    let start_height = {
+        let conn = db_pool.get().unwrap();
+        let last = hopnet_consensus::store::last_decided_height(&conn)
+            .unwrap()
+            .map(|h| h.0)
+            .unwrap_or(0);
+        Height(last + 1)
+    };
 
     let storage_conn = db_pool.get().unwrap();
     let signer = hopnet_consensus::types::PrivKey(app_state.private_key.0.clone());
@@ -99,14 +106,14 @@ async fn start_engine(
             let mut app = HopNetApplication::new(app_state_for_core);
             let valset = <HopNetApplication as Application<PoolStorage>>::validator_set(
                 &mut app,
-                Height::INITIAL,
+                start_height,
             );
             HostCore::new(
                 chain_id(),
                 signer,
                 Address(node_id),
                 engine_params(node_id),
-                Height::INITIAL,
+                start_height,
                 valset,
                 app,
                 storage,
@@ -114,7 +121,7 @@ async fn start_engine(
                 timers,
             )
         },
-        Height::INITIAL,
+        start_height,
         LinearTimeouts::default(),
         out_tx,
     );
@@ -123,6 +130,7 @@ async fn start_engine(
         input_tx,
         decided,
         mut events,
+        ..
     } = handle;
 
     // Forward the accept loop's proxy channel (including anything buffered
@@ -156,7 +164,7 @@ async fn start_engine(
                         let build_state = app_state.clone();
                         let built = tokio::task::spawn_blocking(move || {
                             let candidates =
-                                match crate::consensus::functions::create_signed_transaction(
+                                match crate::consensus::dispatch::create_signed_transaction(
                                     &build_state,
                                     "system.cleanup_nonces".to_string(),
                                     cleanup_payload(),
@@ -329,7 +337,8 @@ fn malachite_mesh_decides_and_laggard_syncs_over_loopback_iroh() {
         };
         let h0 = rows(&network.nodes[0].app_state);
         let h2 = rows(&network.nodes[2].app_state);
-        assert_eq!(h0.len(), 6, "mesh must have decided heights 1..=6");
+        // 7 rows: the installed genesis (height 0) + decided heights 1..=6.
+        assert_eq!(h0.len(), 7, "mesh must have genesis + decided heights 1..=6");
         assert_eq!(h0, h2, "laggard history must match the mesh exactly");
 
         // Nonces from applied blocks landed on the laggard too (app-state
@@ -410,5 +419,61 @@ fn probe_loopback_direct_connect() {
             .await
             .expect("ping");
         eprintln!("ping rtt: {rtt}ns");
+    });
+}
+
+// Should: an engine shut down mid-flight resume from persisted state (meta
+// last_decided + WAL) and keep deciding CONTIGUOUSLY — no gap, no repeat, no
+// equivocation on the restart boundary.
+// Should not: restart from genesis or corrupt the decided history.
+// Impact: the Stage-5a restart-recovery proof over the production storage
+// path (a single-node Majority mesh decides alone, so no peers needed).
+#[test]
+fn malachite_engine_restarts_from_persisted_state() {
+    let network = MockNetwork::setup_with_validators(1);
+    let rt = crate::consensus::tests::test_iroh_rt();
+    rt.block_on(async move {
+        let state = &network.nodes[0].app_state;
+        hopnet_consensus::store::install_schema(&state.db_pool.get().unwrap()).unwrap();
+
+        // First engine incarnation: decide a few heights, then shut down.
+        let (_dummy_tx, dummy_rx) = mpsc::channel::<HostInput>(1);
+        let mut n0 = start_engine(state, 0, dummy_rx).await;
+        wait_decided(&mut n0, 3, 60).await;
+        let _ = n0.input_tx.send(HostInput::Shutdown).await;
+
+        // Let the shell thread stop and release its storage connection, then
+        // read the height it durably reached.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let stopped_at = {
+            let conn = state.db_pool.get().unwrap();
+            hopnet_consensus::store::last_decided_height(&conn)
+                .unwrap()
+                .map(|h| h.0)
+                .unwrap_or(0)
+        };
+        assert!(stopped_at >= 3, "engine must have decided ≥3 before restart");
+
+        // Second incarnation resumes from meta (+ WAL replay if the shutdown
+        // landed mid-height) and keeps going.
+        let (_dummy_tx2, dummy_rx2) = mpsc::channel::<HostInput>(1);
+        let mut n0b = start_engine(state, 0, dummy_rx2).await;
+        wait_decided(&mut n0b, stopped_at + 1, 60).await;
+        let _ = n0b.input_tx.send(HostInput::Shutdown).await;
+
+        // Decided history is contiguous across the restart boundary: exactly
+        // one row per height from genesis to the tip.
+        let conn = state.db_pool.get().unwrap();
+        let heights: Vec<i64> = {
+            let mut stmt = conn
+                .prepare("SELECT height FROM decided_blocks ORDER BY height ASC")
+                .unwrap();
+            let rows = stmt.query_map([], |row| row.get(0)).unwrap();
+            rows.collect::<Result<_, _>>().unwrap()
+        };
+        for (i, h) in heights.iter().enumerate() {
+            assert_eq!(*h, i as i64, "decided history must be contiguous from 0");
+        }
+        assert!(heights.len() as u64 > stopped_at + 1);
     });
 }

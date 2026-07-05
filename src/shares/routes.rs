@@ -160,7 +160,7 @@ pub async fn post_share(
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
-    let transaction = match crate::consensus::functions::create_signed_user_transaction(
+    let transaction = match crate::consensus::dispatch::create_signed_user_transaction(
         &app_state,
         "share_file".to_string(),
         encoded,
@@ -303,7 +303,7 @@ pub async fn post_accept_share(
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
-    let transaction = match crate::consensus::functions::create_signed_user_transaction(
+    let transaction = match crate::consensus::dispatch::create_signed_user_transaction(
         &app_state,
         "accept_share".to_string(),
         encoded,
@@ -347,7 +347,7 @@ pub async fn delete_incoming_share(
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
-    let transaction = match crate::consensus::functions::create_signed_user_transaction(
+    let transaction = match crate::consensus::dispatch::create_signed_user_transaction(
         &app_state,
         "decline_share".to_string(),
         encoded,
@@ -439,7 +439,7 @@ pub async fn delete_unshare(
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
-    let transaction = match crate::consensus::functions::create_signed_user_transaction(
+    let transaction = match crate::consensus::dispatch::create_signed_user_transaction(
         &app_state,
         "unshare".to_string(),
         encoded,

@@ -71,10 +71,11 @@ pub enum IrohResponse {
     BallotSubmissionResponse(consensus_rpc::BallotResponse),
     /// Ack for transaction forward (immediate ACK before processing)
     TransactionForwardAck,
-    /// Rejection: this node is not the leader for the current view.
-    /// Includes the handler's view so the forwarder can trigger catch-up.
-    TransactionForwardNotLeader { view: i32 },
-    /// Rejection: consensus lock is held (leader is busy driving a round)
+    /// Rejection: this node is not the proposer for its current (height,
+    /// round). Includes the handler's position so the forwarder can retarget.
+    TransactionForwardNotProposer { height: i64, round: u32 },
+    /// Rejection: node is busy (kept for wire-shape stability; the malachite
+    /// path never sends it)
     TransactionForwardBusy,
     /// Ack for transaction forward (final result after processing)
     TransactionForwardResponse(consensus_rpc::TransactionForwardResponse),
@@ -109,7 +110,8 @@ impl IrohRequest {
             IrohRequest::TimeoutVoteBroadcast(req) => Some(req.timeout_vote.data.view_number),
             IrohRequest::TcBroadcast(req) => Some(req.tc.view_number),
             IrohRequest::QcBroadcast(req) => Some(req.qc.view_number),
-            IrohRequest::TransactionForward(req) => Some(req.view),
+            // TransactionForward: height-based on the malachite path; lag is
+            // detected by the shell from consensus messages, not forwards.
             _ => None, // Ping, Fragment*, ViewDataFetch, ViewPoll, Latency*, Throughput*, StorageQuery
         }
     }

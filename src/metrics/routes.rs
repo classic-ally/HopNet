@@ -188,7 +188,7 @@ pub async fn get_metrics_trigger(State(app_state): State<AppState>) -> impl Into
     // Submit metrics to consensus for distributed storage
     match bincode::serde::encode_to_vec(&metrics, bincode::config::standard()) {
         Ok(encoded_metrics) => {
-            let transaction = match crate::consensus::functions::create_signed_transaction(
+            let transaction = match crate::consensus::dispatch::create_signed_transaction(
                 &app_state,
                 "submit_metrics".to_string(),
                 encoded_metrics,

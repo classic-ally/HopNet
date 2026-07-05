@@ -451,12 +451,15 @@ pub struct NodeConnectionInfo {
 ///
 /// After receiving this, the joining node:
 /// 1. Initializes this_node table with node_id
-/// 2. Performs catch-up from view 0 using bootstrap_validators
-/// 3. Submits activation request after catching up
+/// 2. Fetches the trusted genesis (height 0) from a bootstrap validator,
+///    installs it, and starts the consensus engine
+/// 3. Decided-value-syncs to the mesh tip, then submits an activation request
 /// 4. User logs in via web UI to unwrap their key from consensus-replicated encrypted_privkey
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JoinInfo {
     pub node_id: i32,
     pub user_id: i32,
     pub bootstrap_validators: Vec<Node>, // Full node info for catch-up
+    /// The mesh's genesis-fixed quorum profile (`QuorumProfile::as_str`).
+    pub quorum_profile: String,
 }

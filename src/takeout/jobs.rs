@@ -75,7 +75,7 @@ pub async fn handle_takeout_maintenance(
                 };
 
             transactions.push(
-                crate::consensus::functions::create_signed_transaction(
+                crate::consensus::dispatch::create_signed_transaction(
                     app_state,
                     "update_takeout_status".to_string(),
                     encoded_payload,

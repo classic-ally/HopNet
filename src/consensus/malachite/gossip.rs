@@ -8,14 +8,16 @@ use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use tokio::sync::mpsc;
 
-use hopnet_consensus::codec::{self, WireConsensusMsg};
+use hopnet_consensus::codec::{self, WireConsensusMsg, WireVoteType};
 use hopnet_consensus::context::Height;
 use hopnet_consensus::shell::HostInput;
 use hopnet_consensus::store;
 
+use crate::consensus::barriers::names as barrier_names;
 use crate::db::PubKey;
 use crate::net::protocol::{IrohRequest, IrohResponse};
-use crate::net::transport::{encode_message, recv_message, send_raw, IrohTransport};
+use crate::net::transport::{IrohTransport, encode_message, recv_message, send_raw};
+use crate::AppState;
 
 /// Per-publish send timeout (matches the old broadcast paths' 3s).
 const PUBLISH_TIMEOUT: Duration = Duration::from_secs(3);
@@ -42,13 +44,36 @@ fn peers(
 /// Long-lived publisher: drains the shell's outbound channel and fire-and-
 /// forgets each message to every peer (spawn-per-peer, matching the bespoke
 /// engine's broadcast shape). Returns when the channel closes.
+///
+/// Under test_mode this is a barrier tap: full-value proposals hold at
+/// `before_publish_proposal`, precommit votes at `before_publish_precommit`
+/// — holding here pauses the node's OUTBOUND consensus effect without
+/// touching the engine.
 pub async fn run_publisher(
-    transport: IrohTransport,
-    db_pool: Pool<SqliteConnectionManager>,
+    app_state: AppState,
     my_node_id: i32,
     mut outbound: mpsc::UnboundedReceiver<WireConsensusMsg>,
 ) {
+    let transport: IrohTransport = app_state.iroh_transport.clone();
+    let db_pool: Pool<SqliteConnectionManager> = app_state.db_pool.clone();
     while let Some(msg) = outbound.recv().await {
+        if app_state.test_mode {
+            match &msg {
+                WireConsensusMsg::ProposedValue(_) => {
+                    app_state
+                        .consensus_barriers
+                        .wait(barrier_names::BEFORE_PUBLISH_PROPOSAL)
+                        .await;
+                }
+                WireConsensusMsg::Vote(v) if matches!(v.typ, WireVoteType::Precommit) => {
+                    app_state
+                        .consensus_barriers
+                        .wait(barrier_names::BEFORE_PUBLISH_PRECOMMIT)
+                        .await;
+                }
+                _ => {}
+            }
+        }
         let bytes = match codec::encode(&msg) {
             Ok(b) => b,
             Err(e) => {
@@ -84,6 +109,9 @@ pub async fn run_publisher(
 pub struct ConsensusServer {
     pub input_tx: mpsc::Sender<HostInput>,
     pub db_pool: Pool<SqliteConnectionManager>,
+    /// Barrier tap for sync serving (`before_sync_response`), set under
+    /// test_mode only.
+    pub barriers: Option<std::sync::Arc<crate::barriers::Barriers>>,
 }
 
 impl ConsensusServer {
@@ -130,6 +158,9 @@ impl ConsensusServer {
                 from_height,
                 to_height,
             } => {
+                if let Some(barriers) = &self.barriers {
+                    barriers.wait(barrier_names::BEFORE_SYNC_RESPONSE).await;
+                }
                 let to = to_height.min(from_height.saturating_add(DECIDED_FETCH_MAX - 1));
                 if from_height < 0 || to < from_height {
                     return IrohResponse::Error {

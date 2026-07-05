@@ -51,21 +51,68 @@ pub async fn sync_to_target(
     hint_peer: Option<i32>,
 ) -> Result<(), SyncError> {
     let peers = peer_list(db_pool, my_node_id, hint_peer);
-    let mut cursor = 0usize;
-    let mut failures = 0usize;
+    sync_loop(transport, input_tx, decided, Some(target), &peers).await?;
+    Ok(())
+}
 
-    while *decided.borrow() < target {
-        if peers.is_empty() || failures >= peers.len() {
-            return Err(SyncError::Exhausted {
-                reached: *decided.borrow(),
-                target,
-            });
+/// Sync to the mesh TIP when the target height is unknown (join bootstrap):
+/// keep fetching chunks until every peer answers "nothing more". Returns the
+/// height reached. `peers` is explicit — a joining node's `nodes` table only
+/// fills as blocks apply, so callers pass JoinInfo's bootstrap validators.
+pub async fn sync_to_tip(
+    transport: &IrohTransport,
+    input_tx: &mpsc::Sender<HostInput>,
+    decided: &mut watch::Receiver<u64>,
+    peers: &[(i32, PubKey)],
+) -> Result<u64, SyncError> {
+    sync_loop(transport, input_tx, decided, None, peers).await
+}
+
+/// Shared fetch/feed/apply loop. With `target = Some(h)`: sync until decided
+/// reaches h, error out when every peer failed for the current position. With
+/// `target = None`: tip mode — every peer EXPLICITLY reporting an empty range
+/// is success; transport failures never count as tip evidence.
+async fn sync_loop(
+    transport: &IrohTransport,
+    input_tx: &mpsc::Sender<HostInput>,
+    decided: &mut watch::Receiver<u64>,
+    target: Option<u64>,
+    peers: &[(i32, PubKey)],
+) -> Result<u64, SyncError> {
+    let mut cursor = 0usize;
+    // Peers that failed (transport error, malformed data, chunk didn't apply).
+    let mut failures = 0usize;
+    // Peers that answered "nothing past this height" (tip evidence).
+    let mut empty_answers = 0usize;
+
+    loop {
+        if let Some(t) = target {
+            if *decided.borrow() >= t {
+                return Ok(*decided.borrow());
+            }
+        }
+        let reached = *decided.borrow();
+        if target.is_none() && !peers.is_empty() && empty_answers >= peers.len() {
+            return Ok(reached); // tip: everyone agrees there's nothing more
+        }
+        if peers.is_empty() || failures + empty_answers >= peers.len() {
+            return match target {
+                None if failures == 0 => Ok(reached),
+                None => Err(SyncError::Exhausted {
+                    reached,
+                    target: reached,
+                }),
+                Some(target) => Err(SyncError::Exhausted { reached, target }),
+            };
         }
         let (peer_node, peer_key) = peers[cursor % peers.len()].clone();
         cursor += 1;
 
         let from = (*decided.borrow() as i64) + 1;
-        let to = (from + CHUNK - 1).min(target as i64);
+        let to = match target {
+            Some(t) => (from + CHUNK - 1).min(t as i64),
+            None => from + CHUNK - 1,
+        };
         match fetch_chunk(transport, peer_node, &peer_key, from, to).await {
             Ok(pairs) if !pairs.is_empty() => {
                 let mut last_fed = *decided.borrow();
@@ -107,7 +154,11 @@ pub async fn sync_to_target(
                 .await;
                 match applied {
                     Ok(Err(e)) => return Err(e),
-                    Ok(Ok(())) => failures = 0, // progress — reset the strike count
+                    Ok(Ok(())) => {
+                        // Progress — reset both strike counts.
+                        failures = 0;
+                        empty_answers = 0;
+                    }
                     Err(_) => {
                         tracing::warn!(
                             "sync: chunk from node {peer_node} did not apply (at {}, fed to {last_fed})",
@@ -119,7 +170,7 @@ pub async fn sync_to_target(
             }
             Ok(_) => {
                 tracing::debug!("sync: node {peer_node} has nothing for [{from}, {to}]");
-                failures += 1;
+                empty_answers += 1;
             }
             Err(e) => {
                 tracing::debug!("sync: fetch from node {peer_node} failed: {e}");
@@ -127,7 +178,40 @@ pub async fn sync_to_target(
             }
         }
     }
-    Ok(())
+}
+
+/// Fetch the genesis (block, certificate) pair from a bootstrap peer. The
+/// synthetic genesis certificate carries no signatures — it is TRUSTED by
+/// construction (there is no validator set before the genesis transaction
+/// creates one); only structural checks apply. Everything after height 0 is
+/// engine-verified against the validator sets genesis establishes.
+pub async fn fetch_genesis(
+    transport: &IrohTransport,
+    peers: &[(i32, PubKey)],
+) -> Result<(Block, WireCommitCertificate), String> {
+    let mut last_err = "no bootstrap peers".to_string();
+    for (peer_node, peer_key) in peers {
+        match fetch_chunk(transport, *peer_node, peer_key, 0, 0).await {
+            Ok(pairs) => {
+                let Some((block, cert)) = pairs.into_iter().next() else {
+                    last_err = format!("node {peer_node} has no genesis");
+                    continue;
+                };
+                if block.data.height != 0
+                    || block.data.parent_hash.is_some()
+                    || block.verify().is_err()
+                    || cert.height != 0
+                    || cert.value_id != block.block_hash
+                {
+                    last_err = format!("node {peer_node} served a malformed genesis");
+                    continue;
+                }
+                return Ok((block, cert));
+            }
+            Err(e) => last_err = format!("node {peer_node}: {e}"),
+        }
+    }
+    Err(last_err)
 }
 
 fn peer_list(

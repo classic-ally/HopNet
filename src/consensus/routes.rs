@@ -33,16 +33,55 @@ pub struct AuthenticatedNode {
     pub node_id: i32,
 }
 
-// route to get the consensus status
+// Route to get the consensus status.
+//
+// Malachite compatibility shim (full retarget is Stage 6): `view` is the
+// engine height (current round's, or the pending height while paused
+// on-demand), `leader` is the proposal target, `phase` is synthetic — the
+// orchestrator parses leader.node_id / view / phase.
 pub async fn get_consensus(State(app_state): State<AppState>) -> impl IntoResponse {
-    match db::get_consensus(app_state.db_pool.get()) {
-        Ok(info) => (StatusCode::OK, Json(info)).into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to get leader info",
+    let Some((height, round, proposer)) =
+        crate::consensus::malachite::engine::proposal_target(&app_state)
+    else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "consensus engine not active",
         )
-            .into_response(),
-    }
+            .into_response();
+    };
+
+    let leader: Option<crate::types::Node> = app_state.db_pool.get().ok().and_then(|conn| {
+        conn.query_row(
+            "SELECT node_id, name, owner, pubkey FROM nodes WHERE node_id = ?",
+            [proposer],
+            |row| {
+                Ok(crate::types::Node {
+                    node_id: row.get(0)?,
+                    name: row.get(1)?,
+                    owner: row.get(2)?,
+                    pubkey: row.get(3)?,
+                })
+            },
+        )
+        .ok()
+    });
+    let decided = app_state
+        .malachite
+        .get()
+        .map(|e| *e.decided.borrow())
+        .unwrap_or(0);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "leader": leader,
+            "view": height,
+            "round": round,
+            "phase": "Propose",
+            "last_decided_height": decided,
+        })),
+    )
+        .into_response()
 }
 
 // route to get acceptable validators for a given view
@@ -185,10 +224,58 @@ pub struct ViewHistoryEntry {
     pub block_hash: Option<String>,
 }
 
-// Get consensus history showing view progression
+// Get consensus history showing height progression.
+//
+// Malachite compatibility shim: one row per decided height from the crate's
+// decided_blocks/decided_certificates tables. `view` := height, both QC flags
+// := certificate exists (one certificate per decide), `has_tc` := false
+// (timeout certificates don't exist in Tendermint's commit path).
 pub async fn get_consensus_history(State(app_state): State<AppState>) -> impl IntoResponse {
-    match db::get_consensus_history(app_state.db_pool.get()) {
-        Ok(history) => (StatusCode::OK, Json(history)).into_response(),
+    let Ok(conn) = app_state.db_pool.get() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to get DB connection",
+        )
+            .into_response();
+    };
+    let mut stmt = match conn.prepare(
+        "SELECT b.height, b.block_hash, (c.height IS NOT NULL)
+         FROM decided_blocks b
+         LEFT JOIN decided_certificates c ON b.height = c.height
+         ORDER BY b.height ASC",
+    ) {
+        Ok(stmt) => stmt,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to get consensus history",
+            )
+                .into_response();
+        }
+    };
+    let rows = stmt.query_map([], |row| {
+        let height: i64 = row.get(0)?;
+        let hash: Vec<u8> = row.get(1)?;
+        let has_cert: bool = row.get(2)?;
+        Ok(ViewHistoryEntry {
+            view: height as i32,
+            height: height as i32,
+            has_propose_qc: has_cert,
+            has_lock_qc: has_cert,
+            has_tc: false,
+            block_hash: Some(
+                hash.iter()
+                    .take(4)
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>(),
+            ),
+        })
+    });
+    match rows {
+        Ok(rows) => {
+            let history: Vec<ViewHistoryEntry> = rows.flatten().collect();
+            (StatusCode::OK, Json(history)).into_response()
+        }
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to get consensus history",
@@ -394,7 +481,7 @@ pub async fn process_incoming_qc_with_guard(
             qc.view_number
         );
 
-        if let Err(e) = crate::consensus::functions::process_transactions(
+        if let Err(e) = crate::consensus::dispatch::process_transactions(
             &block.data.transactions,
             app_state,
             true,
@@ -908,7 +995,7 @@ async fn integrate_view(
                             lock_qc.view_number
                         );
 
-                        if let Err(e) = crate::consensus::functions::process_transactions(
+                        if let Err(e) = crate::consensus::dispatch::process_transactions(
                             &block.data.transactions,
                             app_state,
                             true,
@@ -1474,7 +1561,7 @@ pub async fn ensure_caught_up_and_active(
 }
 
 /// Request activation for this node - effective height computed automatically during execution
-async fn request_activation(
+pub(crate) async fn request_activation(
     app_state: &AppState,
     node_id: i32,
     current_height: i32,

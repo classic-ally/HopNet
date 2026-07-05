@@ -182,7 +182,7 @@ pub fn post_initial_setup(
             DatabaseError::InsertError
         })?;
 
-        crate::consensus::functions::process_transaction(&genesis_tx, state, true, &genesis_tx_db)
+        crate::consensus::dispatch::process_transaction(&genesis_tx, state, true, &genesis_tx_db)
             .map_err(|e| {
                 tracing::error!(
                     "post_initial_setup: Handler failed to process genesis transaction: {:?}",
@@ -294,6 +294,106 @@ pub fn post_initial_setup(
             DatabaseError::InsertError
         })?;
         tracing::debug!("post_initial_setup: Committed this_node+QCs");
+    }
+
+    // === TRANSACTION 3: malachite genesis (decided_blocks[0] + meta, atomic) ===
+    // The engine's chain starts here: the crate-shape genesis block at height 0
+    // with a synthetic TRUSTED certificate (empty signatures — there is no
+    // validator set before the genesis tx creates one). The chain id is the
+    // genesis block hash; it binds every consensus signature to this mesh.
+    // Sync special-cases height 0 as trusted for joining nodes.
+    {
+        let quorum_profile = match std::env::var("HOPNET_QUORUM_PROFILE") {
+            Ok(s) => hopnet_consensus::config::QuorumProfile::parse(&s).ok_or_else(|| {
+                tracing::error!(
+                    "post_initial_setup: invalid HOPNET_QUORUM_PROFILE {:?} (expected 'bft' or 'majority')",
+                    s
+                );
+                DatabaseError::ProcessingError
+            })?,
+            Err(_) => hopnet_consensus::config::QuorumProfile::Bft,
+        };
+
+        let engine_txs = crate::consensus::malachite::app::to_engine_transactions(
+            &Transactions(vec![genesis_tx.clone()]),
+        )
+        .map_err(|e| {
+            tracing::error!(
+                "post_initial_setup: Failed to bridge genesis transactions: {}",
+                e
+            );
+            DatabaseError::ProcessingError
+        })?;
+        let engine_block = hopnet_consensus::types::Block::new(hopnet_consensus::types::BlockData {
+            height: 0,
+            round: 0,
+            parent_hash: None,
+            transactions: engine_txs,
+        })
+        .map_err(|e| {
+            tracing::error!(
+                "post_initial_setup: Failed to build engine genesis block: {:?}",
+                e
+            );
+            DatabaseError::ProcessingError
+        })?;
+        let synthetic_cert = hopnet_consensus::codec::WireCommitCertificate {
+            height: 0,
+            round: 0,
+            value_id: engine_block.block_hash,
+            signatures: Vec::new(),
+        };
+
+        let mut conn = state.db_pool.get().map_err(|e| {
+            tracing::error!(
+                "post_initial_setup: Failed to get DB connection for malachite genesis: {:?}",
+                e
+            );
+            DatabaseError::LockError
+        })?;
+        let tx_db = conn.transaction().map_err(|e| {
+            tracing::error!(
+                "post_initial_setup: Failed to start transaction for malachite genesis: {:?}",
+                e
+            );
+            DatabaseError::LockError
+        })?;
+        hopnet_consensus::store::install_genesis(&tx_db, &engine_block, &synthetic_cert).map_err(
+            |e| {
+                tracing::error!("post_initial_setup: Failed to install engine genesis: {}", e);
+                DatabaseError::InsertError
+            },
+        )?;
+        hopnet_consensus::store::meta_put(
+            &tx_db,
+            hopnet_consensus::store::META_CHAIN_ID,
+            engine_block.block_hash.as_bytes(),
+        )
+        .map_err(|e| {
+            tracing::error!("post_initial_setup: Failed to store chain id: {}", e);
+            DatabaseError::InsertError
+        })?;
+        hopnet_consensus::store::meta_put(
+            &tx_db,
+            hopnet_consensus::store::META_QUORUM_PROFILE,
+            quorum_profile.as_str().as_bytes(),
+        )
+        .map_err(|e| {
+            tracing::error!("post_initial_setup: Failed to store quorum profile: {}", e);
+            DatabaseError::InsertError
+        })?;
+        crate::db::shared::commit_timed(tx_db).map_err(|e| {
+            tracing::error!(
+                "post_initial_setup: Failed to commit malachite genesis: {:?}",
+                e
+            );
+            DatabaseError::InsertError
+        })?;
+        tracing::debug!(
+            "post_initial_setup: Installed malachite genesis (chain_id {:?}, profile {})",
+            engine_block.block_hash,
+            quorum_profile.as_str()
+        );
     }
 
     tracing::info!("Successfully completed initial database setup for node 0");

@@ -164,33 +164,25 @@ async fn handle_stream(
 
         // TransactionForward uses two-phase ACK (bypasses OnceCell — nonce table handles dedup)
         if let IrohRequest::TransactionForward(req) = request {
-            // Validate leader status before ACKing — avoids multi-hop forwarding
+            // Validate proposer status before ACKing — avoids multi-hop
+            // forwarding. Best-effort: if the target is unreadable, ACK and
+            // let the local queue route (it forwards onward if needed).
             'reject: {
                 let my_node_id = match app_state.get_node_id() {
                     Ok(id) => id,
                     Err(_) => break 'reject,
                 };
-                let conn = match app_state.db_pool.get() {
-                    Ok(c) => c,
-                    Err(_) => break 'reject,
-                };
-                let state = match db::get_consensus_with_conn(&conn) {
-                    Ok(s) => s,
-                    Err(_) => break 'reject,
+                let Some((height, round, proposer)) =
+                    crate::consensus::malachite::engine::proposal_target(&app_state)
+                else {
+                    break 'reject;
                 };
 
-                if state.leader.node_id != my_node_id {
-                    let reject = encode_message(&IrohResponse::TransactionForwardNotLeader {
-                        view: state.view,
+                if proposer != my_node_id {
+                    let reject = encode_message(&IrohResponse::TransactionForwardNotProposer {
+                        height: height as i64,
+                        round,
                     })?;
-                    send_raw(&mut send, &reject).await?;
-                    send.finish().map_err(|e| {
-                        IrohError::Transport(TransportError::StreamFailed(e.to_string()))
-                    })?;
-                    return Ok(());
-                }
-                if app_state.consensus_lock.try_lock().is_err() {
-                    let reject = encode_message(&IrohResponse::TransactionForwardBusy)?;
                     send_raw(&mut send, &reject).await?;
                     send.finish().map_err(|e| {
                         IrohError::Transport(TransportError::StreamFailed(e.to_string()))
@@ -199,7 +191,7 @@ async fn handle_stream(
                 }
             }
 
-            // Phase 1: Send immediate ACK (validated as leader, hasn't proposed)
+            // Phase 1: Send immediate ACK (validated as proposer)
             let ack_bytes = encode_message(&IrohResponse::TransactionForwardAck)?;
             send_raw(&mut send, &ack_bytes).await?;
 
@@ -294,12 +286,24 @@ async fn handle_stream(
                             },
                         }
                     }
-                    // Malachite-engine traffic: dispatched here at the Stage-5
-                    // cutover (needs the engine handle in AppState). Until
-                    // then the standalone consensus accept loop serves it.
-                    IrohRequest::ConsensusMsg(_) | IrohRequest::DecidedFetch { .. } => {
-                        IrohResponse::Error {
-                            message: "malachite engine not active".into(),
+                    // Malachite-engine traffic → the consensus shell (and the
+                    // decided-block store for sync serving). "Not active"
+                    // until spawn_engine installs the handle (pre-setup).
+                    req @ (IrohRequest::ConsensusMsg(_) | IrohRequest::DecidedFetch { .. }) => {
+                        match app_state.malachite.get() {
+                            Some(engine) => {
+                                let server = crate::consensus::malachite::gossip::ConsensusServer {
+                                    input_tx: engine.input_tx.clone(),
+                                    db_pool: app_state.db_pool.clone(),
+                                    barriers: app_state
+                                        .test_mode
+                                        .then(|| app_state.consensus_barriers.clone()),
+                                };
+                                server.serve(peer_node_id, req).await
+                            }
+                            None => IrohResponse::Error {
+                                message: "malachite engine not active".into(),
+                            },
                         }
                     }
                 };

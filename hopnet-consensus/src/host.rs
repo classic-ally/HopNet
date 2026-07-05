@@ -46,6 +46,13 @@ pub enum HostOutput {
     /// The engine wants this node (the proposer) to build a value for
     /// (height, round). The shell must eventually call `propose`.
     NeedValue { height: Height, round: Round },
+    /// The engine entered (height, round) with `proposer`. Lets the embedding
+    /// application route transaction forwarding to the current proposer.
+    RoundStarted {
+        height: Height,
+        round: Round,
+        proposer: Address,
+    },
     /// A value was decided and committed at `height`.
     Decided { height: Height },
     /// A synced value at `height` did not apply (bad certificate, undecodable
@@ -105,6 +112,13 @@ pub struct HostCore<A, S, G, T> {
     pending_inputs: VecDeque<Input<HopNetContext>>,
     outputs: Vec<HostOutput>,
     last_decided: Option<Height>,
+    /// On-demand heights: when true, the next height is NOT started after a
+    /// decide — it is deferred until `resume_height` (local work arrived or a
+    /// peer message at the pending height proves the mesh is active). Keeps an
+    /// idle mesh fully quiescent: no timers, no empty blocks, no round churn.
+    on_demand: bool,
+    /// The deferred height waiting for a wake signal (on-demand mode only).
+    deferred_start: Option<Height>,
 }
 
 impl<A, S, G, T> HostCore<A, S, G, T>
@@ -148,7 +162,16 @@ where
             pending_inputs: VecDeque::new(),
             outputs: Vec::new(),
             last_decided: None,
+            on_demand: false,
+            deferred_start: None,
         }
+    }
+
+    /// Enable on-demand heights (builder): heights start only when work
+    /// exists. See the wake rules on [`Self::resume_height`].
+    pub fn on_demand(mut self) -> Self {
+        self.on_demand = true;
+        self
     }
 
     pub fn address(&self) -> Address {
@@ -157,6 +180,12 @@ where
 
     pub fn height(&self) -> Height {
         self.state.height()
+    }
+
+    /// The height this core is paused before (on-demand mode). `None` when a
+    /// height is actively running.
+    pub fn paused_at(&self) -> Option<Height> {
+        self.deferred_start
     }
 
     /// Drain the signals accumulated since the last call.
@@ -217,6 +246,40 @@ where
                 .retain(|o| !matches!(o, HostOutput::NeedValue { .. }));
         }
         self.phase = Phase::Running;
+        Ok(())
+    }
+
+    /// Boot entry for on-demand mode. A height with persisted WAL entries was
+    /// ACTIVE at crash time — it must start (and replay) immediately; pausing
+    /// it would defer votes we already durably cast. An empty WAL means the
+    /// height never started anywhere we know of — defer until a wake signal.
+    /// Without on-demand mode this is exactly `start_height`.
+    ///
+    /// Returns whether the height actually started.
+    pub fn start_or_defer(&mut self, height: Height) -> Result<bool, HostError<S::Error>> {
+        if !self.on_demand {
+            self.start_height(height, false)?;
+            return Ok(true);
+        }
+        let entries = self.storage.wal_fetch(height).map_err(HostError::Storage)?;
+        if entries.is_empty() {
+            self.deferred_start = Some(height);
+            Ok(false)
+        } else {
+            self.start_height(height, false)?;
+            Ok(true)
+        }
+    }
+
+    /// Wake a paused core (on-demand mode). Idempotent — a no-op when no
+    /// height is deferred. Wake signals, enforced by the embedding shell:
+    /// local work arrived (we want to propose), a peer message at the pending
+    /// height arrived (the mesh is active), or a sync value for the pending
+    /// height is ready to apply.
+    pub fn resume_height(&mut self) -> Result<(), HostError<S::Error>> {
+        if let Some(height) = self.deferred_start.take() {
+            self.start_height(height, false)?;
+        }
         Ok(())
     }
 
@@ -382,6 +445,8 @@ where
             pending_inputs,
             outputs,
             last_decided,
+            on_demand,
+            deferred_start,
         } = self;
 
         let metrics = ();
@@ -402,6 +467,8 @@ where
                 pending_inputs,
                 outputs,
                 last_decided,
+                on_demand: *on_demand,
+                deferred_start,
             }, effect)
         );
         result.map_err(HostError::Engine)
@@ -422,6 +489,8 @@ struct HandlerCtx<'a, A, S, G, T> {
     pending_inputs: &'a mut VecDeque<Input<HopNetContext>>,
     outputs: &'a mut Vec<HostOutput>,
     last_decided: &'a mut Option<Height>,
+    on_demand: bool,
+    deferred_start: &'a mut Option<Height>,
 }
 
 fn handle_effect<A, S, G, T>(
@@ -447,7 +516,14 @@ where
             ctx.timers.cancel_all();
             Ok(r.resume_with(()))
         }
-        Effect::StartRound(_h, _round, _proposer, _role, r) => Ok(r.resume_with(())),
+        Effect::StartRound(height, round, proposer, _role, r) => {
+            ctx.outputs.push(HostOutput::RoundStarted {
+                height,
+                round,
+                proposer,
+            });
+            Ok(r.resume_with(()))
+        }
 
         Effect::PublishConsensusMsg(msg, r) => {
             // PartsOnly: only votes cross the wire; engine proposals don't.
@@ -571,11 +647,17 @@ where
             ctx.app.on_decided(height, &block, &wire_cert);
             ctx.outputs.push(HostOutput::Decided { height });
 
-            // Advance to the next height (queued, not re-entrant).
+            // Advance to the next height (queued, not re-entrant). In
+            // on-demand mode the start is deferred until a wake signal —
+            // an idle mesh arms no timers and produces no empty blocks.
             let next = malachitebft_core_types::Height::increment(&height);
-            let valset = ctx.app.validator_set(next);
-            ctx.pending_inputs
-                .push_back(Input::StartHeight(next, valset, false, None));
+            if ctx.on_demand {
+                *ctx.deferred_start = Some(next);
+            } else {
+                let valset = ctx.app.validator_set(next);
+                ctx.pending_inputs
+                    .push_back(Input::StartHeight(next, valset, false, None));
+            }
             *ctx.wal_seq = 0;
 
             Ok(r.resume_with(()))

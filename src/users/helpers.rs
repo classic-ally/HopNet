@@ -18,7 +18,7 @@ pub async fn submit_onboarding_update(
     };
     let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
         .map_err(|e| format!("encode: {:?}", e))?;
-    let txn = crate::consensus::functions::create_signed_user_transaction(
+    let txn = crate::consensus::dispatch::create_signed_user_transaction(
         state,
         "update_user_onboarding".to_string(),
         encoded,

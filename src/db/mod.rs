@@ -33,9 +33,10 @@ pub mod write_gate;
 /// Maximum r2d2 connections checked out simultaneously across the process.
 /// Bump cautiously — each connection costs SQLite memory and a file handle.
 ///
-/// Two known long-held conns subtract from this budget:
+/// Three known long-held conns subtract from this budget:
 ///   - `consensus_queue::batch_processor` reserves 1 for its lifetime
 ///   - `execute_takeout_materialization` reserves 1 while a takeout is active
+///   - the malachite engine shell holds 1 for its SQLite storage
 ///
 /// The remainder must serve all HTTP routes, FileProvider/DocumentProvider
 /// requests, and bounded background workers.
@@ -44,7 +45,7 @@ pub const DB_POOL_MAX_SIZE: u32 = 32;
 /// Connections subtracted from the pool to account for the always-held
 /// dedicated conns. Used by `db_worker_concurrency_budget` to size workers
 /// that compete with route handlers for pool capacity.
-const DB_POOL_RESERVED: u32 = 2;
+const DB_POOL_RESERVED: u32 = 3;
 
 /// Conservative number of pool slots left available for HTTP route handling
 /// while a worker pipeline is fully saturated. Keeps the system responsive

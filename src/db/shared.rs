@@ -651,5 +651,14 @@ pub fn initialize(db: PooledConnection<SqliteConnectionManager>) -> Result<(), D
             );
         "
     )?;
+
+    // Malachite engine tables (consensus_wal, decided_blocks,
+    // decided_certificates, consensus_meta) — owned by hopnet-consensus.
+    hopnet_consensus::store::install_schema(&db).map_err(|e| match e {
+        hopnet_consensus::store::StoreError::Db(db_err) => db_err,
+        // install_schema only executes DDL — non-Db variants are unreachable
+        other => rusqlite::Error::InvalidParameterName(other.to_string()),
+    })?;
+
     Ok(())
 }

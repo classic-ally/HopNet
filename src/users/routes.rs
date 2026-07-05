@@ -100,7 +100,7 @@ pub async fn put_profile(
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
-    let transaction = match crate::consensus::functions::create_signed_user_transaction(
+    let transaction = match crate::consensus::dispatch::create_signed_user_transaction(
         &app_state,
         "update_user_profile".to_string(),
         encoded,
@@ -189,7 +189,7 @@ pub async fn put_avatar(
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
-    let transaction = match crate::consensus::functions::create_signed_user_transaction(
+    let transaction = match crate::consensus::dispatch::create_signed_user_transaction(
         &app_state,
         "update_user_profile".to_string(),
         encoded,
@@ -218,7 +218,7 @@ pub async fn post_users(
     Json(payload): Json<UserRequest>,
 ) -> impl IntoResponse {
     // Server generates all key material
-    let (user_priv_key, user_pub_key) = crate::consensus::functions::generate_ed25519_key();
+    let (user_priv_key, user_pub_key) = crate::consensus::dispatch::generate_ed25519_key();
     let privkey = PrivKey(user_priv_key);
     let pubkey = PubKey(user_pub_key);
     let x25519_pubkey = crate::auth::derive_x25519_pubkey_from_user(&privkey);
@@ -251,7 +251,7 @@ pub async fn post_users(
     // Encode user with bincode::serde standard config
     match bincode::serde::encode_to_vec(&user, bincode::config::standard()) {
         Ok(encoded_user) => {
-            let transaction = match crate::consensus::functions::create_signed_user_transaction(
+            let transaction = match crate::consensus::dispatch::create_signed_user_transaction(
                 &app_state,
                 "insert_user".to_string(),
                 encoded_user,

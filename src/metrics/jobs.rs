@@ -48,7 +48,7 @@ pub async fn handle_metrics_collection(
                 )?;
 
             // Create consensus transaction using existing pattern from routes.rs
-            let tx = crate::consensus::functions::create_signed_transaction(
+            let tx = crate::consensus::dispatch::create_signed_transaction(
                 app_state,
                 "submit_metrics".to_string(),
                 serialized_metrics,

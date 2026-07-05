@@ -66,6 +66,10 @@ pub struct AppState {
     pub view_changed: Arc<tokio::sync::Notify>,
     pub write_gate: Arc<db::write_gate::WriteGate>,
     pub local_state_tx: tokio::sync::mpsc::Sender<db::write_gate::LocalStateUpdate>,
+    /// Malachite engine handle — set by `spawn_engine` (startup restart path,
+    /// genesis setup, or join bootstrap). Empty until the node is initialized;
+    /// consensus dispatch answers "not active" meanwhile.
+    pub malachite: Arc<OnceCell<consensus::malachite::EngineHandle>>,
 }
 
 impl AppState {

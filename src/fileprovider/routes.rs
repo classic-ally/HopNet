@@ -220,7 +220,7 @@ pub async fn get_test(State(app_state): State<AppState>) -> Result<Json<TestResp
     let encoded_payload = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let transaction = crate::consensus::functions::create_signed_user_transaction(
+    let transaction = crate::consensus::dispatch::create_signed_user_transaction(
         &app_state,
         "register_device".to_string(),
         encoded_payload,
@@ -418,7 +418,7 @@ pub async fn delete_item(
         }
     };
 
-    let transaction = match crate::consensus::functions::create_signed_user_transaction(
+    let transaction = match crate::consensus::dispatch::create_signed_user_transaction(
         &app_state,
         "delete_files".to_string(),
         encoded_payload,
@@ -1003,7 +1003,7 @@ pub async fn modify_item(
     let encoded_payload = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let transaction = match crate::consensus::functions::create_signed_user_transaction(
+    let transaction = match crate::consensus::dispatch::create_signed_user_transaction(
         &app_state,
         "modify_item".to_string(),
         encoded_payload,

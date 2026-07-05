@@ -1,4 +1,4 @@
-use crate::consensus::functions::generate_ed25519_key;
+use crate::consensus::dispatch::generate_ed25519_key;
 use crate::{PrivKey, PubKey, UserKeys};
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use serde::{Deserialize, Serialize};
@@ -66,45 +66,49 @@ pub async fn process_join_info(
     // Mark setup complete — PeerValidator switches to strict mode
     app_state.iroh_transport.mark_setup_complete();
 
-    // Spawn catch-up as background task
+    // Spawn the malachite join bootstrap as a background task: trusted
+    // height-0 genesis install → engine spawn → decided-value sync to tip →
+    // validator activation request.
     let app_state_clone = app_state.clone();
     let join_info_clone = join_info.clone();
     tokio::spawn(async move {
         tracing::info!(
-            "Starting background catch-up from view 0 using {} bootstrap validators",
+            "Starting join bootstrap using {} bootstrap validators",
             join_info_clone.bootstrap_validators.len()
         );
 
-        use crate::consensus::routes::CatchUpMode;
-        match crate::consensus::routes::ensure_caught_up_and_active(
+        let reached = match crate::consensus::malachite::engine::bootstrap_join(
             &app_state_clone,
-            CatchUpMode::Convergence,
-            true, // request_activation_if_needed
-            0,    // tolerance_views (ignored for Convergence mode)
-            Some(&join_info_clone.bootstrap_validators),
+            &join_info_clone,
         )
         .await
         {
-            Ok(readiness) => {
-                if readiness.is_active {
-                    tracing::info!(
-                        "Catch-up and activation completed successfully for node {}",
-                        join_info_clone.node_id
-                    );
-                } else {
-                    tracing::info!(
-                        "Catch-up completed for node {}, activation request submitted",
-                        join_info_clone.node_id
-                    );
-                }
-            }
+            Ok(h) => h,
             Err(e) => {
                 tracing::error!(
-                    "Catch-up failed for node {}: {:?}. Node will remain inactive.",
-                    join_info_clone.node_id,
-                    e
+                    "Join bootstrap failed for node {}: {e}. Node will remain inactive.",
+                    join_info_clone.node_id
                 );
+                return;
             }
+        };
+
+        match crate::consensus::routes::request_activation(
+            &app_state_clone,
+            join_info_clone.node_id,
+            i32::try_from(reached).unwrap_or(i32::MAX),
+        )
+        .await
+        {
+            Ok(()) => tracing::info!(
+                "Join bootstrap complete for node {} (height {reached}), activation submitted",
+                join_info_clone.node_id
+            ),
+            Err(e) => tracing::error!(
+                "Activation request failed for node {}: {:?}",
+                join_info_clone.node_id,
+                e
+            ),
         }
     });
 
@@ -197,6 +201,13 @@ pub async fn post_setup(
 
             // Mark setup complete — PeerValidator switches to strict mode
             app_state.iroh_transport.mark_setup_complete();
+
+            // Genesis is installed and identity set — start the consensus
+            // engine (paused on-demand at height 1 until work arrives).
+            if let Err(e) = crate::consensus::malachite::engine::spawn_engine(&app_state) {
+                tracing::error!("failed to start consensus engine after genesis: {e}");
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
 
             // Register FileProvider domain with macOS using the setup username
             // Skip registration in test mode since we test FileProvider functionality directly

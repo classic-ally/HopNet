@@ -1,5 +1,5 @@
 use super::*;
-use crate::consensus::functions::process_transactions;
+use crate::consensus::dispatch::process_transactions;
 use crate::db::consensus as db;
 use crate::db::types::MyNode;
 use bincode::config;

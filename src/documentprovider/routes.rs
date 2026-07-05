@@ -255,7 +255,7 @@ pub async fn delete_item(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Create signed transaction
-    let transaction = crate::consensus::functions::create_signed_user_transaction(
+    let transaction = crate::consensus::dispatch::create_signed_user_transaction(
         &app_state,
         "delete_files".to_string(),
         encoded_payload,
@@ -378,7 +378,7 @@ pub async fn patch_item(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Create signed transaction
-    let transaction = crate::consensus::functions::create_signed_user_transaction(
+    let transaction = crate::consensus::dispatch::create_signed_user_transaction(
         &app_state,
         "modify_item".to_string(),
         encoded_payload,

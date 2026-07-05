@@ -12,5 +12,23 @@
 //!   the new engine).
 
 pub mod app;
+pub mod engine;
 pub mod gossip;
 pub mod sync;
+
+use hopnet_consensus::shell::{HostInput, RoundInfo};
+use tokio::sync::{mpsc, watch};
+
+/// The running engine's handle, installed into `AppState.malachite` by
+/// `spawn_engine`. Everything the rest of the process needs to talk to the
+/// consensus shell: feed inputs (network dispatch, proposals, sync values),
+/// observe decides, and locate the current proposer. The event stream is NOT
+/// here — it is single-consumer and lives in the driver task.
+#[derive(Clone)]
+pub struct EngineHandle {
+    pub input_tx: mpsc::Sender<HostInput>,
+    /// Last decided height (0 until the first decide).
+    pub decided: watch::Receiver<u64>,
+    /// Current (height, round, proposer). `None` until the first StartRound.
+    pub round: watch::Receiver<Option<RoundInfo>>,
+}

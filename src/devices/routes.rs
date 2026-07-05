@@ -2,7 +2,7 @@ use super::types::{
     DeviceInfo, RegisterDevicePayload, RegisterDeviceRequest, RegisterDeviceResponse,
     RevokeDevicePayload,
 };
-use crate::consensus::functions::create_signed_user_transaction;
+use crate::consensus::dispatch::create_signed_user_transaction;
 use crate::db::{Blake3Hash, CustomUUID, devices::get_devices_for_user};
 use crate::files::functions::{decrypt_part, encrypt_part};
 use crate::{AppState, auth, auth::auth_middleware};

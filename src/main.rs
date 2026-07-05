@@ -151,7 +151,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 let pubkey = state.node_privkey.verifying_key();
                 (state.node_privkey.0.clone(), pubkey)
             } else {
-                consensus::functions::generate_ed25519_key()
+                consensus::dispatch::generate_ed25519_key()
             };
 
             // Initialize fragments directory
@@ -202,6 +202,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 view_changed: Arc::new(tokio::sync::Notify::new()),
                 write_gate: write_gate.clone(),
                 local_state_tx,
+                malachite: Arc::new(OnceCell::new()),
             };
 
             // If we loaded state from database, populate the OnceCell fields
@@ -299,9 +300,6 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
 
-            // Start deterministic timeout detector (replaces cron-based detection)
-            tokio::spawn(consensus::jobs::timeout_detector(app_state.clone()));
-
             // Start metrics collection worker with randomized 10-minute schedule
             use rand::RngExt;
             let random_second = rand::rng().random_range(5..55);
@@ -388,6 +386,16 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 tokio::spawn(async move {
                     net::handler::handle_incoming_connections(endpoint, app_state_clone).await;
                 });
+            }
+
+            // Restart path: an initialized node starts the consensus engine
+            // now — AFTER the accept loop (QUIC handshakes only complete under
+            // a polled accept; consensus participation must not precede it).
+            // Fresh nodes spawn the engine from the setup/join flows instead.
+            if app_state.node_id.get().is_some() {
+                if let Err(e) = consensus::malachite::engine::spawn_engine(&app_state) {
+                    tracing::error!("failed to start consensus engine: {e}");
+                }
             }
 
             // Protected routes that require authentication

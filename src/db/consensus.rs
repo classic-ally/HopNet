@@ -1224,25 +1224,24 @@ pub fn get_view_consensus_data(
     }
 }
 
-/// Get the current consensus height (height of the committed block)
+/// Get the current consensus height (last decided height)
 /// This is used consistently across the system for modification tracking
+///
+/// Reads the malachite engine's `consensus_meta.last_decided_height`.
+/// Returns 0 when no height has been decided yet (pre-genesis).
 pub fn get_current_consensus_height(tx: &rusqlite::Transaction) -> Result<i32, DatabaseError> {
     use rusqlite::OptionalExtension;
 
-    let current_height: Option<i32> = tx
+    let current_height: Option<i64> = tx
         .query_row(
-            "SELECT COALESCE(b.height, 0) as committed_height
-         FROM this_node t
-         LEFT JOIN blocks b ON t.committed_block_hash = b.block_hash
-         WHERE t.internal_id = 1",
+            "SELECT value FROM consensus_meta WHERE key = 'last_decided_height'",
             [],
             |row| row.get(0),
         )
         .optional()
         .map_err(|_| DatabaseError::RecallError)?;
 
-    // Return 0 if this_node doesn't exist yet (genesis case)
-    Ok(current_height.unwrap_or(0))
+    Ok(current_height.unwrap_or(0) as i32)
 }
 
 /// Check if a node is active at a given height

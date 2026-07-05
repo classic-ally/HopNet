@@ -54,6 +54,146 @@ pub struct QueuedTransaction {
 }
 
 // ============================================================================
+// PendingPool (malachite engine path)
+// ============================================================================
+
+/// A queued transaction that made it into one of our proposals; resolved
+/// against `committed_tx_nonces` when the decided watch advances.
+struct InflightTransaction {
+    entry: QueuedTransaction,
+    /// The height we proposed it at. Once a later height decides without the
+    /// nonce landing, the proposal lost its round — re-pool for retry.
+    proposed_at: u64,
+}
+
+/// Shared staging area between the queue's intake and the engine driver.
+///
+/// The batch processor drains the submit channel here when this node is the
+/// proposer; the driver empties it on `NeedValue` (build_value → Propose) and
+/// resolves submitter notifiers when heights decide. Everything is sync-locked
+/// — touched only at proposal/decide frequency, never on hot paths.
+#[derive(Default)]
+pub struct PendingPool {
+    queued: std::sync::Mutex<Vec<QueuedTransaction>>,
+    inflight: std::sync::Mutex<Vec<InflightTransaction>>,
+    /// Wake signal for the engine driver (on-demand heights): staged work
+    /// means the pending height should start. `notify_one` stores a permit,
+    /// so a push before the driver listens is not lost.
+    work: tokio::sync::Notify,
+}
+
+impl PendingPool {
+    /// Stage a transaction for the next proposal this node makes.
+    pub fn push(&self, entry: QueuedTransaction) {
+        self.queued.lock().unwrap().push(entry);
+        self.work.notify_one();
+    }
+
+    /// Wait for staged work (engine driver wake rule 1). Consumes at most one
+    /// stored permit; callers loop.
+    pub async fn work_available(&self) {
+        self.work.notified().await;
+    }
+
+    /// Number of staged (not yet proposed) transactions.
+    pub fn staged_len(&self) -> usize {
+        self.queued.lock().unwrap().len()
+    }
+
+    /// Take up to `max` staged transactions for a proposal at `height`.
+    /// Returns the bare transactions for `build_value`; entries are parked
+    /// in a caller-held ticket to be resolved by [`Self::settle`].
+    pub fn take_for_proposal(&self, max: usize) -> Vec<QueuedTransaction> {
+        let mut queued = self.queued.lock().unwrap();
+        let n = queued.len().min(max);
+        queued.drain(..n).collect()
+    }
+
+    /// Return unproposed entries to the front of the staging area (build
+    /// failure — nothing was proposed).
+    pub fn restage(&self, entries: Vec<QueuedTransaction>) {
+        {
+            let mut queued = self.queued.lock().unwrap();
+            let rest = std::mem::take(&mut *queued);
+            *queued = entries.into_iter().chain(rest).collect();
+        }
+        self.work.notify_one();
+    }
+
+    /// Park entries that made it into a proposal at `height`, awaiting decide.
+    pub fn mark_inflight(&self, entries: Vec<QueuedTransaction>, height: u64) {
+        let mut inflight = self.inflight.lock().unwrap();
+        inflight.extend(entries.into_iter().map(|entry| InflightTransaction {
+            entry,
+            proposed_at: height,
+        }));
+    }
+
+    /// Resolve a rejected candidate (preflight refusal) — notifies the
+    /// submitter immediately.
+    pub fn reject(&self, entry: QueuedTransaction, reason: String) {
+        let _ = entry.notifier.send(ConsensusResult::Rejected(reason));
+    }
+
+    /// Resolve an entry whose nonce is already committed (duplicate submit or
+    /// a retry that raced its own earlier commit) — success for the submitter.
+    pub fn resolve_committed(&self, entry: QueuedTransaction) {
+        let _ = entry.notifier.send(ConsensusResult::Committed);
+    }
+
+    /// Settle inflight entries after `decided_height` landed: nonces present
+    /// in `committed_tx_nonces` resolve as committed; entries whose proposal
+    /// height has passed without committing go back to staging for a retry.
+    pub fn settle(
+        &self,
+        conn: &r2d2::PooledConnection<SqliteConnectionManager>,
+        decided_height: u64,
+    ) {
+        let mut inflight = self.inflight.lock().unwrap();
+        if inflight.is_empty() {
+            return;
+        }
+        let nonces: Vec<_> = inflight.iter().map(|i| i.entry.tx.nonce.clone()).collect();
+        let committed = match db::check_committed_nonces(conn, &nonces) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("PendingPool::settle nonce check failed: {:?}", e);
+                return;
+            }
+        };
+        let mut keep = Vec::new();
+        let mut repool = Vec::new();
+        for item in inflight.drain(..) {
+            if committed.contains(&item.entry.tx.nonce.to_string()) {
+                let _ = item.entry.notifier.send(ConsensusResult::Committed);
+            } else if item.proposed_at <= decided_height {
+                // Our proposal lost the round — retry in a later proposal.
+                repool.push(item.entry);
+            } else {
+                keep.push(item);
+            }
+        }
+        *inflight = keep;
+        drop(inflight);
+        if !repool.is_empty() {
+            tracing::debug!(
+                "PendingPool: re-staging {} transaction(s) after lost round",
+                repool.len()
+            );
+            self.queued.lock().unwrap().extend(repool);
+            self.work.notify_one();
+        }
+    }
+}
+
+impl QueuedTransaction {
+    /// The wrapped transaction (for building proposals / forwarding).
+    pub fn transaction(&self) -> &Transaction {
+        &self.tx
+    }
+}
+
+// ============================================================================
 // ConsensusQueue (submit handle)
 // ============================================================================
 
@@ -66,6 +206,8 @@ pub struct QueuedTransaction {
 pub struct ConsensusQueue {
     sender: mpsc::Sender<QueuedTransaction>,
     db_pool: Pool<SqliteConnectionManager>,
+    /// Staging area shared with the malachite engine driver (proposer path).
+    pending: std::sync::Arc<PendingPool>,
 }
 
 impl ConsensusQueue {
@@ -79,9 +221,15 @@ impl ConsensusQueue {
             ConsensusQueue {
                 sender: tx,
                 db_pool,
+                pending: std::sync::Arc::new(PendingPool::default()),
             },
             rx,
         )
+    }
+
+    /// The staging pool the engine driver drains on `NeedValue`.
+    pub fn pending_pool(&self) -> std::sync::Arc<PendingPool> {
+        self.pending.clone()
     }
 
     /// Submit a single transaction. Pre-validates against committed state first.
@@ -229,27 +377,27 @@ async fn await_result(rx: oneshot::Receiver<ConsensusResult>) -> Result<(), Cons
 
 const MAX_BATCH_SIZE: usize = 100;
 const RETRY_DELAY_SECS: u64 = 5;
-const BATCH_LINGER_MS: u64 = 100;
 
 /// Outcome from a dispatch attempt, determines how the batch processor gates
 /// before the next drain cycle.
 enum DispatchOutcome {
-    /// Batch was committed — view already advanced, no gate needed.
-    ViewAdvanced,
-    /// Network-level failure (leader unreachable). Retry after a short delay.
+    /// Batch fully resolved (staged locally or answered) — no gate needed.
+    Resolved,
+    /// Network-level failure (proposer unreachable). Retry after a short delay.
     RetryAfterDelay,
-    /// Leader acknowledged but can't process yet (e.g., "already proposed").
-    /// Wait for view change (TC will advance the view).
-    WaitForViewChange,
+    /// Proposer acknowledged but can't resolve yet, or refused as
+    /// not-proposer. Wait for the engine to make progress before retrying.
+    WaitForProgress,
 }
 
-/// Long-lived task that drains the queue and dispatches batches through consensus.
-/// Spawned once at startup; runs until the channel is closed (shutdown).
+/// Long-lived task that drains the queue and routes batches toward the
+/// current proposer. Spawned once at startup; runs until the channel closes.
 ///
-/// Gates the next drain cycle based on the dispatch outcome:
-/// - ViewAdvanced: no gate — loop back immediately to drain more transactions
-/// - WaitForViewChange: view-aware wait — check DB, only block if view hasn't moved
-/// - RetryAfterDelay: short sleep, then retry (leader was unreachable)
+/// Malachite path: if WE are the proposer for the engine's current (or
+/// pending, when paused on-demand) round, stage the batch in the PendingPool
+/// — pushing wakes the engine driver, which builds and proposes on NeedValue.
+/// Otherwise forward to the proposer with the two-phase ACK protocol and
+/// resolve notifiers from its per-transaction results.
 pub async fn batch_processor(mut rx: mpsc::Receiver<QueuedTransaction>, app_state: AppState) {
     // Dedicated connection for the batch processor — checked out once, held for lifetime.
     // Makes consensus throughput independent of pool contention from background tasks.
@@ -258,6 +406,7 @@ pub async fn batch_processor(mut rx: mpsc::Receiver<QueuedTransaction>, app_stat
         .get()
         .expect("batch_processor: failed to check out dedicated connection");
 
+    let pool = app_state.consensus_queue.pending_pool();
     let mut retry_holdback: Vec<QueuedTransaction> = Vec::new();
 
     loop {
@@ -296,324 +445,188 @@ pub async fn batch_processor(mut rx: mpsc::Receiver<QueuedTransaction>, app_stat
             }
         };
 
-        let consensus_state = match db::get_consensus_with_conn(&conn) {
-            Ok(state) => state,
-            Err(_) => {
-                for queued in batch {
-                    let _ = queued.notifier.send(ConsensusResult::Failed(
-                        "failed to get consensus state".into(),
-                    ));
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                continue;
-            }
+        // Engine not started yet (setup or join bootstrap in progress) —
+        // hold the batch and re-check shortly.
+        let Some(engine) = app_state.malachite.get().cloned() else {
+            retry_holdback = batch;
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            continue;
         };
 
-        let pre_dispatch_view = consensus_state.view;
+        let Some((height, round, proposer)) =
+            super::malachite::engine::proposal_target(&app_state)
+        else {
+            retry_holdback = batch;
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            continue;
+        };
 
         // ── Dispatch ──
-        let (holdback, outcome) = if consensus_state.leader.node_id == my_node_id {
-            // Leader: linger to collect forwarded transactions from other nodes
-            let deadline =
-                tokio::time::Instant::now() + std::time::Duration::from_millis(BATCH_LINGER_MS);
-            while batch.len() < MAX_BATCH_SIZE {
-                match tokio::time::timeout_at(deadline, rx.recv()).await {
-                    Ok(Some(queued)) => batch.push(queued),
-                    _ => break,
-                }
+        let (holdback, outcome) = if proposer == my_node_id {
+            // We propose: stage everything — the push wakes the engine driver
+            // (on-demand Resume), which lingers, builds, and proposes.
+            for queued in batch {
+                pool.push(queued);
             }
-            handle_as_leader(&app_state, batch, &consensus_state, &mut conn).await
+            (Vec::new(), DispatchOutcome::Resolved)
         } else {
-            handle_as_forwarder(&app_state, batch, &consensus_state, &mut conn).await
+            handle_as_forwarder(
+                &app_state,
+                &engine,
+                batch,
+                height,
+                round,
+                proposer,
+                &mut conn,
+            )
+            .await
         };
         retry_holdback = holdback;
 
-        // ── Gate: view-aware wait before next drain cycle ──
+        // ── Gate before the next cycle ──
         match outcome {
-            DispatchOutcome::ViewAdvanced => {
-                // View advanced during dispatch — loop back immediately to drain more
-            }
-            DispatchOutcome::WaitForViewChange => {
-                // Loop until view genuinely advances — notify_waiters() is a broadcast
-                // that can fire from unrelated consensus activity (spurious wakeups).
-                loop {
-                    let notified = app_state.view_changed.notified();
-                    let current_view = db::get_consensus_with_conn(&conn)
-                        .map(|s| s.view)
-                        .unwrap_or(pre_dispatch_view);
-                    if current_view != pre_dispatch_view {
-                        break; // View genuinely advanced
-                    }
-                    notified.await;
+            DispatchOutcome::Resolved => {}
+            DispatchOutcome::WaitForProgress => {
+                // Wake on engine progress (round advance or decide) — with a
+                // delay backstop so a stalled engine can't wedge the queue.
+                let mut round_rx = engine.round.clone();
+                let mut decided_rx = engine.decided.clone();
+                round_rx.borrow_and_update();
+                decided_rx.borrow_and_update();
+                tokio::select! {
+                    _ = round_rx.changed() => {}
+                    _ = decided_rx.changed() => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(RETRY_DELAY_SECS)) => {}
                 }
             }
             DispatchOutcome::RetryAfterDelay => {
-                // Network failure — leader unreachable, no view consumed.
-                // Short delay to avoid tight-looping, then retry.
                 tokio::time::sleep(std::time::Duration::from_secs(RETRY_DELAY_SECS)).await;
             }
         }
     }
 }
 
-/// Leader path: preflight-validate, run consensus, notify callers.
-/// Returns (retries, outcome).
-async fn handle_as_leader(
-    app_state: &AppState,
-    mut batch: Vec<QueuedTransaction>,
-    consensus_state: &super::types::ConsensusState,
-    conn: &mut r2d2::PooledConnection<SqliteConnectionManager>,
-) -> (Vec<QueuedTransaction>, DispatchOutcome) {
-    // Early check: if we've already proposed in this view, return all as retries
-    if consensus_state.last_propose_vote_block_hash.is_some() {
-        tracing::debug!(
-            "Already proposed in view {}, holding {} transactions for next view",
-            consensus_state.view,
-            batch.len()
-        );
-        return (batch, DispatchOutcome::WaitForViewChange);
-    }
-
-    // Nonce dedup: check if any transactions were already committed
-    {
-        let nonces: Vec<_> = batch.iter().map(|q| q.tx.nonce.clone()).collect();
-        if let Ok(committed) = db::check_committed_nonces(conn, &nonces)
-            && !committed.is_empty()
-        {
-            let mut i = 0;
-            while i < batch.len() {
-                if committed.contains(&batch[i].tx.nonce.to_string()) {
-                    let queued = batch.remove(i);
-                    let _ = queued.notifier.send(ConsensusResult::Committed);
-                } else {
-                    i += 1;
-                }
-            }
-            if batch.is_empty() {
-                return (Vec::new(), DispatchOutcome::ViewAdvanced);
-            }
-        }
-    }
-
-    // Preflight validation: SAVEPOINT-based single-pass
-    // Each tx validates against cumulative state from prior successful txs in the batch.
-    // SAVEPOINTs allow individual tx rollback within a single transaction, solving
-    // inter-tx dependency resolution that the old restart-on-failure loop could not handle.
-    let rejected_indices = {
-        let _wg = app_state.write_gate.guard();
-        let db_tx = match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
-            Ok(tx) => tx,
-            Err(_) => {
-                return (batch, DispatchOutcome::RetryAfterDelay);
-            }
-        };
-
-        let mut rejected = Vec::new();
-
-        for (i, queued) in batch.iter().enumerate() {
-            let sp = format!("preflight_{}", i);
-
-            if let Err(e) = db_tx.execute_batch(&format!("SAVEPOINT {}", sp)) {
-                tracing::error!("Failed to create savepoint {}: {:?}", sp, e);
-                rejected.push((i, format!("savepoint error: {:?}", e)));
-                continue;
-            }
-
-            if let Some(handler) = DISPATCH_TABLE.get(queued.tx.rpc.function.as_str()) {
-                match handler.process(app_state, &queued.tx, false, &db_tx) {
-                    Ok(()) => {
-                        // Keep mutations visible for subsequent txs
-                        let _ = db_tx.execute_batch(&format!("RELEASE {}", sp));
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            "Preflight rejected tx {}: {:?} (function: {})",
-                            i,
-                            e,
-                            queued.tx.rpc.function
-                        );
-                        let _ = db_tx.execute_batch(&format!("ROLLBACK TO {}", sp));
-                        let _ = db_tx.execute_batch(&format!("RELEASE {}", sp));
-                        rejected.push((i, format!("{:?}", e)));
-                    }
-                }
-            } else {
-                let _ = db_tx.execute_batch(&format!("ROLLBACK TO {}", sp));
-                let _ = db_tx.execute_batch(&format!("RELEASE {}", sp));
-                rejected.push((i, format!("no handler: {}", queued.tx.rpc.function)));
-            }
-        }
-
-        // Transaction auto-rollbacks on drop — this was a dry run
-        rejected
-    };
-
-    // Remove rejected txs and notify submitters (reverse order to maintain valid indices)
-    if !rejected_indices.is_empty() {
-        for (idx, reason) in rejected_indices.into_iter().rev() {
-            let queued = batch.remove(idx);
-            let _ = queued.notifier.send(ConsensusResult::Rejected(reason));
-        }
-    }
-
-    if batch.is_empty() {
-        return (Vec::new(), DispatchOutcome::ViewAdvanced);
-    }
-
-    // Extract transactions for consensus
-    let mut transactions: Vec<Transaction> = batch.iter().map(|q| q.tx.clone()).collect();
-
-    // Inject nonce cleanup transaction every 97 views (prime interval for leader rotation diversity)
-    const NONCE_CLEANUP_INTERVAL: u64 = 97;
-    if (consensus_state.view as u64).is_multiple_of(NONCE_CLEANUP_INTERVAL) {
-        let cutoff_ts = (chrono::Utc::now() - chrono::Duration::hours(1)).timestamp() as u64;
-        let cutoff = hopnet_common::CustomUUID::new(Some(&uuid::Timestamp::from_unix(
-            uuid::NoContext,
-            cutoff_ts,
-            0,
-        )));
-        let payload =
-            bincode::serde::encode_to_vec(&cutoff, bincode::config::standard()).unwrap_or_default();
-        if let Ok(cleanup_tx) = super::functions::create_signed_transaction(
-            app_state,
-            "system.cleanup_nonces".to_string(),
-            payload,
-        ) {
-            transactions.push(cleanup_tx);
-        }
-    }
-
-    // Run consensus (leader-only path)
-    match super::functions::run_consensus(app_state, transactions, conn).await {
-        Ok(()) => {
-            for queued in batch {
-                let _ = queued.notifier.send(ConsensusResult::Committed);
-            }
-            (Vec::new(), DispatchOutcome::ViewAdvanced)
-        }
-        Err(e) => {
-            tracing::warn!(
-                "run_consensus failed: {:?}, holding {} transactions for retry",
-                e,
-                batch.len()
-            );
-            // We attempted a proposal — wait for TC to advance the view
-            (batch, DispatchOutcome::WaitForViewChange)
-        }
-    }
-}
-
-/// Non-leader path: forward batch to leader using two-phase ACK protocol.
-/// Returns (retries, outcome).
+/// Non-proposer path: forward the batch to the proposer with two-phase ACK.
+/// Returns (retries, outcome). Any undeliverable outcome ALSO resumes our own
+/// engine (on-demand wake rule: we hold work we can't deliver — starting our
+/// height advances rounds past a dead proposer).
 async fn handle_as_forwarder(
     app_state: &AppState,
+    engine: &super::malachite::EngineHandle,
     batch: Vec<QueuedTransaction>,
-    consensus_state: &super::types::ConsensusState,
+    height: u64,
+    round: u32,
+    proposer: i32,
     conn: &mut r2d2::PooledConnection<SqliteConnectionManager>,
 ) -> (Vec<QueuedTransaction>, DispatchOutcome) {
-    // If we've already voted on a proposal this view, the leader has already proposed —
-    // forwarding would just get a Retry response. Skip the round-trip.
-    if consensus_state.last_propose_vote_block_hash.is_some() {
-        tracing::debug!(
-            "Already voted on proposal in view {}, holding {} transactions for next view",
-            consensus_state.view,
-            batch.len()
-        );
-        return (batch, DispatchOutcome::WaitForViewChange);
-    }
-
-    let leader = &consensus_state.leader;
-    let leader_iroh_id = leader.pubkey.to_iroh_node_id();
-    let view = consensus_state.view;
+    let proposer_pubkey = {
+        let pubkeys = match db::get_all_node_pubkeys(conn) {
+            Ok(map) => map,
+            Err(_) => return (batch, DispatchOutcome::RetryAfterDelay),
+        };
+        match pubkeys.get(&proposer) {
+            Some(pubkey) => pubkey.clone(),
+            None => {
+                tracing::error!("proposer node {} not in nodes table", proposer);
+                return (batch, DispatchOutcome::RetryAfterDelay);
+            }
+        }
+    };
+    let proposer_iroh_id = proposer_pubkey.to_iroh_node_id();
 
     let transactions: Vec<Transaction> = batch.iter().map(|q| q.tx.clone()).collect();
 
     tracing::debug!(
-        "Forwarding {} transactions to leader node {} (view: {})",
+        "Forwarding {} transactions to proposer node {} (height {}, round {})",
         transactions.len(),
-        leader.node_id,
-        view
+        proposer,
+        height,
+        round
     );
 
+    let mut decided_rx = engine.decided.clone();
     let forward_result = super::rpc::forward_transactions_with_ack(
         &app_state.iroh_transport,
-        leader.node_id,
-        leader_iroh_id,
+        proposer,
+        proposer_iroh_id,
         transactions,
-        view,
-        &app_state.view_changed,
+        height as i64,
+        &mut decided_rx,
     )
     .await;
 
+    // Wake our own engine on any outcome that leaves us holding the batch —
+    // if the proposer is dead, our timeouts are what advance the round.
+    let resume_own_engine = || {
+        let input_tx = engine.input_tx.clone();
+        tokio::spawn(async move {
+            let _ = input_tx
+                .send(hopnet_consensus::shell::HostInput::Resume)
+                .await;
+        });
+    };
+
     match forward_result {
         Ok(super::rpc::ForwardAckResult::NoAck) => {
-            // Leader never received our request — safe to retry
             tracing::warn!(
-                "No ACK from leader node {} — evicting connection and retrying",
-                leader.node_id
+                "No ACK from proposer node {} — evicting connection and retrying",
+                proposer
             );
-            app_state
-                .iroh_transport
-                .remove_connection(leader.node_id)
-                .await;
+            app_state.iroh_transport.remove_connection(proposer).await;
+            resume_own_engine();
             (batch, DispatchOutcome::RetryAfterDelay)
         }
         Ok(super::rpc::ForwardAckResult::AckedWithResult(results)) => {
-            // Got full results — process them
-            process_forward_results(app_state, batch, results, consensus_state, conn)
+            process_forward_results(batch, results, proposer, conn)
         }
-        Ok(super::rpc::ForwardAckResult::AckedViewChanged) => {
-            // View advanced before leader result — nonces are committed in local DB.
-            // Synthesize results from nonce table and process through unified codepath.
+        Ok(super::rpc::ForwardAckResult::AckedDecided) => {
+            // A height decided before the proposer's result — the nonce table
+            // already knows which of ours landed.
             tracing::debug!(
-                "Leader node {} ACKed, view changed — resolving via nonce table",
-                leader.node_id
+                "Proposer node {} ACKed, height decided — resolving via nonce table",
+                proposer
             );
             let results = synthesize_results_from_nonces(&batch, conn);
-            process_forward_results(app_state, batch, results, consensus_state, conn)
+            process_forward_results(batch, results, proposer, conn)
         }
         Ok(super::rpc::ForwardAckResult::AckedNoResult) => {
-            // Safety timeout — view hasn't changed, leader still processing.
-            // Wait for view change; next cycle will resolve via nonce dedup.
             tracing::debug!(
-                "Leader node {} ACKed but safety timeout — waiting for view change",
-                leader.node_id
+                "Proposer node {} ACKed but safety timeout — waiting for progress",
+                proposer
             );
-            (batch, DispatchOutcome::WaitForViewChange)
+            (batch, DispatchOutcome::WaitForProgress)
         }
-        Ok(super::rpc::ForwardAckResult::NotLeader { view: leader_view }) => {
-            // Our view is stale — the node we sent to is not the leader.
-            // WaitForViewChange will break immediately if catch-up already happened
-            // (triggered by the actual leader's ballot arriving at our RPC handler).
-            // Potentially later we'll want this to be event-driven by the leader_view,
-            // matching the pattern other handlers have when receiving ensure_caught_up_for_message
+        Ok(super::rpc::ForwardAckResult::NotProposer {
+            height: their_height,
+            round: their_round,
+        }) => {
+            // Target disagrees about who proposes — either we're stale or it
+            // is. Wait for engine progress and re-derive the target.
             tracing::debug!(
-                "Node {} not leader (at view {}, we're at {}) — waiting for catch-up",
-                leader.node_id,
-                leader_view,
-                view
+                "Node {} says not proposer (at {}/{}, we targeted {}/{}) — retargeting",
+                proposer,
+                their_height,
+                their_round,
+                height,
+                round
             );
-            (batch, DispatchOutcome::WaitForViewChange)
+            resume_own_engine();
+            (batch, DispatchOutcome::WaitForProgress)
         }
         Ok(super::rpc::ForwardAckResult::Busy) => {
-            // Leader's consensus lock is held — wait for next view
-            tracing::debug!(
-                "Leader node {} busy in view {} — waiting for next view",
-                leader.node_id,
-                view
-            );
-            (batch, DispatchOutcome::WaitForViewChange)
+            tracing::debug!("Proposer node {} busy — waiting for progress", proposer);
+            (batch, DispatchOutcome::WaitForProgress)
         }
         Err(e) => {
-            // Network failure — leader unreachable
-            tracing::warn!("Failed to forward transactions to leader: {:?}", e);
+            tracing::warn!("Failed to forward transactions to proposer: {:?}", e);
+            resume_own_engine();
             (batch, DispatchOutcome::RetryAfterDelay)
         }
     }
 }
 
-/// Synthesize forward results from the nonce table when no leader result is available.
-/// Committed nonces → Committed, uncommitted → Retry.
+/// Synthesize forward results from the nonce table when no proposer result is
+/// available. Committed nonces → Committed, uncommitted → Retry.
 fn synthesize_results_from_nonces(
     batch: &[QueuedTransaction],
     conn: &r2d2::PooledConnection<SqliteConnectionManager>,
@@ -627,22 +640,20 @@ fn synthesize_results_from_nonces(
                 super::rpc::TransactionForwardResult::Committed
             } else {
                 super::rpc::TransactionForwardResult::Retry {
-                    reason: "view changed before leader result".into(),
+                    reason: "height decided before proposer result".into(),
                 }
             }
         })
         .collect()
 }
 
-/// Process per-transaction results from the leader forward response.
+/// Process per-transaction results from the proposer's forward response.
 fn process_forward_results(
-    app_state: &AppState,
     batch: Vec<QueuedTransaction>,
     results: Vec<super::rpc::TransactionForwardResult>,
-    consensus_state: &super::types::ConsensusState,
+    proposer: i32,
     conn: &mut r2d2::PooledConnection<SqliteConnectionManager>,
 ) -> (Vec<QueuedTransaction>, DispatchOutcome) {
-    let leader = &consensus_state.leader;
     let mut retries = Vec::new();
 
     for (queued, result) in batch.into_iter().zip(results.into_iter()) {
@@ -652,13 +663,16 @@ fn process_forward_results(
             }
             super::rpc::TransactionForwardResult::Rejected { reason } => {
                 let mut rejecting_leaders = queued.rejecting_leaders;
-                rejecting_leaders.insert(leader.node_id);
+                rejecting_leaders.insert(proposer);
 
-                // Check Byzantine rejection threshold
-                let validator_count = match db::get_validators_with_conn(
-                    conn,
-                    consensus_state.committed_block.data.height,
-                ) {
+                // Byzantine rejection threshold: one proposer's word isn't
+                // final — retry via other proposers until f+1 agree.
+                let current_height = {
+                    let tx = conn.transaction().ok();
+                    tx.and_then(|t| db::get_current_consensus_height(&t).ok())
+                        .unwrap_or(0)
+                };
+                let validator_count = match db::get_validators_with_conn(conn, current_height) {
                     Ok(v) => v.len(),
                     Err(_) => {
                         let _ = queued
@@ -681,9 +695,8 @@ fn process_forward_results(
             }
             super::rpc::TransactionForwardResult::Retry { reason } => {
                 tracing::debug!(
-                    "Transient forward failure from leader node {} (view {}): {}",
-                    leader.node_id,
-                    consensus_state.view,
+                    "Transient forward failure from proposer node {}: {}",
+                    proposer,
                     reason
                 );
                 retries.push(QueuedTransaction {
@@ -696,9 +709,9 @@ fn process_forward_results(
     }
 
     let outcome = if retries.is_empty() {
-        DispatchOutcome::ViewAdvanced
+        DispatchOutcome::Resolved
     } else {
-        DispatchOutcome::WaitForViewChange
+        DispatchOutcome::WaitForProgress
     };
 
     (retries, outcome)

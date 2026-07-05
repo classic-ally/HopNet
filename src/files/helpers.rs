@@ -145,7 +145,7 @@ pub async fn submit_inodes(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    let insert_files_tx = crate::consensus::functions::create_signed_user_transaction(
+    let insert_files_tx = crate::consensus::dispatch::create_signed_user_transaction(
         app_state,
         "insert_files".to_string(),
         encoded_inodes,
@@ -307,7 +307,7 @@ pub(crate) fn build_upload_attestation(
 
     let payload = bincode::serde::encode_to_vec(&attestation, bincode::config::standard())?;
 
-    let transaction = crate::consensus::functions::create_signed_transaction(
+    let transaction = crate::consensus::dispatch::create_signed_transaction(
         app_state,
         "self_check_fragments".to_string(),
         payload,
