@@ -7,25 +7,26 @@ HopNet provides secure, reliable, performant file storage across networked devic
 
 ## Core Systems
 
-### 1. Consensus System ([RFC-001](specs/consensus-system.md))
-**Status**: Largely implemented, needs comprehensive test suite (further buildout of orchestrator) to ensure edge-case handling
+### 1. Consensus System (Malachite migration — plan in `~/.claude/plans/spicy-imagining-mango.md`)
+**Status**: Migrated to the Malachite (Tendermint) engine; orchestrator test rebuild in progress (Stage 6)
 
-Byzantine fault-tolerant consensus engine providing network coordination and state management.
+Byzantine fault-tolerant consensus via the `hopnet-consensus` crate: Malachite's
+Quint-verified Tendermint core (`arc-malachitebft-core-consensus`, tier-1 effect
+API) driven by a sans-io host with SQLite WAL + one-transaction decides. The
+bespoke HotStuff-2-style engine (RFC-001) was retired at Stage 5b after an
+audit found a view-change safety hole.
 
-- [x] HotStuff-2 style consensus with 2-phase voting (Propose → Lock)
-- [x] Block height tracking and monotonic progression
+- [x] Tendermint consensus (Malachite engine, PartsOnly proposals, Rule-8 validation before voting)
+- [x] Decided-block storage + WAL crash recovery in one SQLite transaction
+- [x] BFT (2/3) and CFT majority (1/2) quorum profiles, genesis-fixed per mesh
+- [x] On-demand heights: idle meshes are fully quiescent; wake on local work or peer messages
+- [x] Decided-value sync (replaces view catch-up); trusted height-0 join bootstrap
+- [x] Event-driven transaction queue (PendingPool + engine driver, proposer forwarding)
+- [x] Deterministic simulation + seeded fault fuzzing (200-seed safety corpus, wake-rule tests)
 - [x] Validator set management with height-based activation
-- [x] Leader rotation and timeout handling
-- [x] Quorum certificate generation and validation
-- [x] Node catch-up mechanism for network synchronization
 - [x] Performance metrics integration for node reliability (latency + throughput measurement complete)
-- [x] **NEW**: Consensus locking and retry system with race condition prevention
-- [x] **NEW**: Prepared block tracking (`prepared_block_hash`) for ongoing consensus operations
-- [x] **NEW**: Automatic retry logic (up to 3 attempts) with view change detection
-- [x] **NEW**: Timeout protection (5-second max wait) with 50ms polling intervals
-- [x] **NEW**: Leadership change handling during consensus operations
-- [~] **HOTFIX**: Database transaction retry logic for concurrent operations (write-write conflict handling)
-- [ ] **ENHANCEMENT**: Atomic consensus lock operation to eliminate race conditions at database level
+- [~] Orchestrator test suite rebuild (Stage 6: self-hosted iroh relay, leader-down, CFT meshes, barrier taps)
+- [ ] Bench vs old-engine baseline + real-mesh soak (Stage 7)
 - [ ] Node health monitoring and automatic validator management
 
 ### 2. File Storage System ([RFC-002](specs/file-storage.md))
