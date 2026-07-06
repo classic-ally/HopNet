@@ -7,14 +7,15 @@ HopNet provides secure, reliable, performant file storage across networked devic
 
 ## Core Systems
 
-### 1. Consensus System (Malachite migration — plan in `~/.claude/plans/spicy-imagining-mango.md`)
-**Status**: Migrated to the Malachite (Tendermint) engine; orchestrator test rebuild in progress (Stage 6)
+### 1. Consensus System ([RFC-013](specs/malachite-consensus.md) — plan in `~/.claude/plans/spicy-imagining-mango.md`)
+**Status**: Migrated to the Malachite (Tendermint) engine; bench + soak before merge (Stage 7)
 
 Byzantine fault-tolerant consensus via the `hopnet-consensus` crate: Malachite's
 Quint-verified Tendermint core (`arc-malachitebft-core-consensus`, tier-1 effect
 API) driven by a sans-io host with SQLite WAL + one-transaction decides. The
-bespoke HotStuff-2-style engine (RFC-001) was retired at Stage 5b after an
-audit found a view-change safety hole.
+bespoke HotStuff-2-style engine (RFC-001, retired) was deleted at Stage 5b after
+an audit found a view-change safety hole. See RFC-013 for the full design
+(quorum-profile theorems, on-demand heights, WAL/replay, decided-value sync).
 
 - [x] Tendermint consensus (Malachite engine, PartsOnly proposals, Rule-8 validation before voting)
 - [x] Decided-block storage + WAL crash recovery in one SQLite transaction
@@ -25,8 +26,8 @@ audit found a view-change safety hole.
 - [x] Deterministic simulation + seeded fault fuzzing (200-seed safety corpus, wake-rule tests)
 - [x] Validator set management with height-based activation
 - [x] Performance metrics integration for node reliability (latency + throughput measurement complete)
-- [~] Orchestrator test suite rebuild (Stage 6: self-hosted iroh relay, leader-down, CFT meshes, barrier taps)
-- [ ] Bench vs old-engine baseline + real-mesh soak (Stage 7)
+- [x] Orchestrator test suite rebuild (Stage 6: self-hosted iroh relay, leader-down, CFT meshes, barrier taps)
+- [~] Bench vs old-engine baseline + full-suite gate + real-mesh soak (Stage 7)
 - [ ] Node health monitoring and automatic validator management
 
 ### 2. File Storage System ([RFC-002](specs/file-storage.md))
@@ -270,7 +271,7 @@ Interim daemon archiving an Apple Photos library (personal + iCloud Shared Photo
 ### Backend
 - **Language**: Rust (performance, safety, concurrency)
 - **Database**: DuckDB (embedded analytics, complex queries)
-- **Consensus**: Custom HotStuff-based BFT implementation
+- **Consensus**: Malachite (Quint-verified Tendermint), tier-1 effect API, sans-io host
 - **Cryptography**: Ed25519, X25519, ChaCha20-Poly1305, Blake3
 - **Networking**: HTTP with custom authentication
 

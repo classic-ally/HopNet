@@ -1,4 +1,11 @@
-# RFC-001: Consensus System
+# RFC-001: Consensus System (RETIRED)
+
+> **RETIRED (2026-07):** This RFC describes the bespoke two-phase HotStuff-style
+> engine, which was deleted on the `consensus-malachite` branch after an audit
+> found a view-change safety hole (see RFC-013). The active consensus system is
+> the Malachite (Tendermint) engine — see
+> [`malachite-consensus.md`](malachite-consensus.md). This document is kept for
+> historical context only; nothing below reflects the current implementation.
 
 ## Overview
 
