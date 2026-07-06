@@ -13,6 +13,18 @@ use crate::{
 use either::Either;
 use serde::{Deserialize, Serialize};
 
+/// The DRIVE projection's insert envelope: substrate blob registrations
+/// (crate sub-payloads) alongside the inodes that reference them by id.
+/// Both halves apply in ONE handler transaction — blob + first reference
+/// are atomic, so mark-and-sweep never observes a zero-ref blob.
+/// (Envelope ownership: this type belongs to the drive projection and
+/// extracts with it to hopnet-drive.)
+#[derive(Serialize, Deserialize, Debug)]
+pub struct DriveInsertPayload {
+    pub blob_ops: Vec<hopnet_storage::store::BlobInsertOp>,
+    pub inodes: Vec<Inode>,
+}
+
 pub struct InsertFilesHandler;
 
 impl TransactionHandler for InsertFilesHandler {
@@ -27,11 +39,12 @@ impl TransactionHandler for InsertFilesHandler {
         execute: bool,
         db_tx: &rusqlite::Transaction,
     ) -> HandlerResult {
-        match bincode::serde::decode_from_slice::<Vec<Inode>, _>(
+        match bincode::serde::decode_from_slice::<DriveInsertPayload, _>(
             &tx.rpc.payload,
             bincode::config::standard(),
         ) {
-            Ok((mut inodes, _)) => {
+            Ok((payload, _)) => {
+                let DriveInsertPayload { blob_ops, inodes } = payload;
                 // Authorization: verify user owns the files being inserted
                 if let Some(ref user) = tx.user {
                     for inode in &inodes {
@@ -61,9 +74,10 @@ impl TransactionHandler for InsertFilesHandler {
                     return Err(DatabaseError::AuthorizationError);
                 }
 
-                // Insert the files (the substrate apply probes
-                // stored_locally against this node's disk in-crate)
-                insert_files(db_tx, inodes, &state.fragments_dir)?;
+                // Substrate half: register blobs (stored_locally probed
+                // against this node's disk in-crate), then the projection
+                // half: inodes referencing them by id.
+                insert_files(db_tx, &blob_ops, inodes, &state.fragments_dir)?;
 
                 // Signal FileProvider to refresh when files are actually inserted (execute=true)
                 if execute {
@@ -214,11 +228,18 @@ pub struct ModifyItemPayload {
     pub user_id: i32,
     pub inode_id: crate::db::CustomUUID, // Stable inode identifier
     pub new_encrypted_path: Option<String>, // New path if renaming/moving
-    // Phase 4b: Content update fields
-    pub new_data_block_id: Option<crate::db::CustomUUID>, // New content version
-    pub new_data_record: Option<crate::db::DataRecord>,   // Fragment info for new version
+    /// Content change, when present. `blob_op: None` means the content is
+    /// now EMPTY — the inode's data_id becomes NULL (no blob exists for
+    /// empty content; RFC-014).
+    pub content_update: Option<DriveContentUpdate>,
     // Phase 2b: Share propagation — pre-computed updates for pending incoming_shares
     pub incoming_share_updates: Option<Vec<crate::shares::types::IncomingShareUpdate>>,
+}
+
+/// Drive-scoped content-update sub-payload (extracts with the projection).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DriveContentUpdate {
+    pub blob_op: Option<hopnet_storage::store::BlobInsertOp>,
 }
 
 pub struct ModifyItemHandler;
@@ -264,24 +285,17 @@ impl TransactionHandler for ModifyItemHandler {
                     payload_data.new_encrypted_path
                 );
 
-                // Validate fragments exist locally and update stored_locally flags (like InsertFilesHandler)
-                if let Some(ref mut data_record) = payload_data.new_data_record {
-                    for fragment in &mut data_record.data.fragments {
-                        // Check if fragment exists and is valid on this node
-                        fragment.stored_locally = fragment_exists_and_valid(
-                            &state.fragments_dir,
-                            &fragment.fragment_hash,
-                        );
-                    }
-                }
-
+                // stored_locally is probed inside the substrate apply
+                // (apply_blob_insert) — no preprocessing pass needed.
                 crate::db::files::modify_item(
                     db_tx,
                     payload_data.user_id,
                     payload_data.inode_id.clone(),
                     payload_data.new_encrypted_path.clone(),
-                    payload_data.new_data_block_id.clone(),
-                    payload_data.new_data_record.clone(),
+                    payload_data
+                        .content_update
+                        .clone()
+                        .map(|u| u.blob_op),
                     payload_data.incoming_share_updates.clone(),
                     &state.fragments_dir,
                 )?;

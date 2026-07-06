@@ -368,8 +368,7 @@ pub async fn patch_item(
         user_id,
         inode_id: inode_id.clone(),
         new_encrypted_path: Some(new_encrypted_path),
-        new_data_block_id: None,
-        new_data_record: None,
+        content_update: None,
         incoming_share_updates: None,
     };
 

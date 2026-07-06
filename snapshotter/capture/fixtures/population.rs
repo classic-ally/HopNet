@@ -6,7 +6,7 @@ use chrono::{Duration, Utc};
 use either::Either;
 use hopnet::db;
 use hopnet::db::types::{
-    BlobAccess, ChunkType, CustomUUID, Data, DataRecord, FragmentHash, Inode, XPubKey,
+    BlobAccess, CustomUUID, Inode, XPubKey,
 };
 use hopnet::files::types::SelfCheckFragments;
 use hopnet::metrics::types::Metric;
@@ -200,9 +200,9 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
     let data_block_ids: Vec<CustomUUID> = (0..3).map(|i| uuid_from_index(200 + i)).collect();
     let file_ids: Vec<CustomUUID> = (0..4).map(|i| uuid_from_index(300 + i)).collect();
 
-    // Create fragment hashes (3 per data block: 2 original + 1 recovery)
+    // Create fragment metadata (3 per blob: 2 original + 1 recovery)
     let mut all_fragment_hashes: Vec<Blake3Hash> = Vec::new();
-    let mut data_records = Vec::new();
+    let mut blob_ops = Vec::new();
 
     for (db_idx, data_block_id) in data_block_ids.iter().enumerate() {
         let mut fragments = Vec::new();
@@ -211,18 +211,13 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
             let frag_id = uuid_from_index(400 + (db_idx as u16 * 3) + chunk_num as u16);
             all_fragment_hashes.push(frag_hash);
 
-            fragments.push(FragmentHash {
-                data_block_id: data_block_id.clone(),
+            fragments.push(hopnet_storage::store::FragmentMeta {
+                blob_id: data_block_id.clone(),
                 chunk_number: chunk_num,
                 local_index: chunk_num,
                 fragment_id: frag_id,
                 fragment_hash: frag_hash,
-                chunk_type: if chunk_num < 2 {
-                    ChunkType::Original
-                } else {
-                    ChunkType::Recovery
-                },
-                stored_locally: true,
+                recovery: chunk_num >= 2,
             });
         }
 
@@ -236,21 +231,13 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
             wrapped_key: vec![0u8; 48],
         }];
 
-        data_records.push(DataRecord {
-            id: data_block_id.clone(),
-            modified_at: Some(hopnet::db::types::CustomDateTime::new(
-                chrono::DateTime::parse_from_rfc3339("2026-01-01T12:00:00Z")
-                    .unwrap()
-                    .with_timezone(&Utc)
-                    - Duration::hours(24 - db_idx as i64),
-            )),
-            data: Data {
-                hash: hash_from_index(db_idx as u8 + 10),
-                fragments,
-                added_bytes: 0,
-            },
-            file_access_entries: Some(file_access),
+        blob_ops.push(hopnet_storage::store::BlobInsertOp {
+            blob_id: data_block_id.clone(),
+            integrity_hash: hash_from_index(db_idx as u8 + 10),
+            added_bytes: 0,
             file_size: (1024 * (db_idx + 1)) as u64,
+            fragments,
+            access: file_access,
         });
     }
 
@@ -291,36 +278,36 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
             },
         ];
         // Insert root folder first (before subfolder, to avoid conflict with auto-created parents)
-        db::files::insert_files(&tx, vec![folder_inodes.remove(0)], "/tmp/hopnet-snapshotter-fragments")
+        db::files::insert_files(&tx, &[], vec![folder_inodes.remove(0)], "/tmp/hopnet-snapshotter-fragments")
             .expect("Failed to insert root folder");
         // Then insert subfolder (its parent /root now exists)
-        db::files::insert_files(&tx, folder_inodes, "/tmp/hopnet-snapshotter-fragments").expect("Failed to insert subfolder");
+        db::files::insert_files(&tx, &[], folder_inodes, "/tmp/hopnet-snapshotter-fragments").expect("Failed to insert subfolder");
 
-        // Insert files with data records
+        // Insert files referencing the blobs by id (blob ops apply first)
         let file_inodes = vec![
             Inode {
                 id: file_ids[0].clone(),
                 owner: Either::Left(0),
                 path: encrypted_file0.clone(),
                 inode_type: hopnet_common::InodeType::File,
-                data_id: Some(Either::Right(data_records.remove(0))),
+                data_id: Some(data_block_ids[0].clone()),
             },
             Inode {
                 id: file_ids[1].clone(),
                 owner: Either::Left(0),
                 path: encrypted_file1.clone(),
                 inode_type: hopnet_common::InodeType::File,
-                data_id: Some(Either::Right(data_records.remove(0))),
+                data_id: Some(data_block_ids[1].clone()),
             },
             Inode {
                 id: file_ids[2].clone(),
                 owner: Either::Left(0),
                 path: encrypted_file2.clone(),
                 inode_type: hopnet_common::InodeType::File,
-                data_id: Some(Either::Right(data_records.remove(0))),
+                data_id: Some(data_block_ids[2].clone()),
             },
         ];
-        db::files::insert_files(&tx, file_inodes, "/tmp/hopnet-snapshotter-fragments").expect("Failed to insert files");
+        db::files::insert_files(&tx, &blob_ops, file_inodes, "/tmp/hopnet-snapshotter-fragments").expect("Failed to insert files");
 
         // Insert a file for user 1 (file3 in subfolder, no data block - just inode)
         let user1_folder_id = uuid_from_index(102);
@@ -331,7 +318,7 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
             inode_type: hopnet_common::InodeType::Folder,
             data_id: None,
         }];
-        db::files::insert_files(&tx, user1_file_inodes, "/tmp/hopnet-snapshotter-fragments").expect("Failed to insert user 1 folder");
+        db::files::insert_files(&tx, &[], user1_file_inodes, "/tmp/hopnet-snapshotter-fragments").expect("Failed to insert user 1 folder");
 
         tx.commit().expect("Failed to commit files");
     }

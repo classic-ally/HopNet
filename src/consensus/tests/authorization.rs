@@ -33,8 +33,14 @@ mod authorization_tests {
             data_id: None,
         };
 
-        let payload = bincode::serde::encode_to_vec(vec![inode], bincode::config::standard())
-            .expect("Failed to encode payload");
+        let payload = bincode::serde::encode_to_vec(
+            &crate::files::handlers::DriveInsertPayload {
+                blob_ops: Vec::new(),
+                inodes: vec![inode],
+            },
+            bincode::config::standard(),
+        )
+        .expect("Failed to encode payload");
 
         let tx = Transaction::new_with_user(
             function,
@@ -77,8 +83,7 @@ mod authorization_tests {
             user_id: user.user_id,
             inode_id: crate::db::CustomUUID::new(None),
             new_encrypted_path: Some("new/path".to_string()),
-            new_data_block_id: None,
-            new_data_record: None,
+            content_update: None,
             incoming_share_updates: None,
         };
 
@@ -177,8 +182,14 @@ mod authorization_tests {
             data_id: None,
         };
 
-        let payload = bincode::serde::encode_to_vec(vec![inode], bincode::config::standard())
-            .expect("Failed to encode payload");
+        let payload = bincode::serde::encode_to_vec(
+            &crate::files::handlers::DriveInsertPayload {
+                blob_ops: Vec::new(),
+                inodes: vec![inode],
+            },
+            bincode::config::standard(),
+        )
+        .expect("Failed to encode payload");
 
         let tx = Transaction::new_with_user(
             function,
@@ -220,8 +231,7 @@ mod authorization_tests {
             user_id: user2_id,
             inode_id: crate::db::CustomUUID::new(None),
             new_encrypted_path: Some("new/path".to_string()),
-            new_data_block_id: None,
-            new_data_record: None,
+            content_update: None,
             incoming_share_updates: None,
         };
 

@@ -192,20 +192,21 @@ fn test_chunk_content_preservation() {
 
 fn build_reassembly_data(
     plaintext_size: usize,
-    data_record: &crate::db::DataRecord,
+    blob_op: &hopnet_storage::store::BlobInsertOp,
     dataid: &CustomUUID,
     per_file_key: chacha20poly1305::Key,
 ) -> FileReassemblyData {
     let _ = plaintext_size;
     let mut chunks: crate::files::functions::ReassemblyChunks = HashMap::new();
 
-    for fragment in &data_record.data.fragments {
+    for fragment in &blob_op.fragments {
         let entry = chunks
             .entry(fragment.chunk_number)
             .or_insert_with(|| (HashMap::new(), HashMap::new()));
-        let bucket = match fragment.chunk_type {
-            ChunkType::Original => &mut entry.0,
-            ChunkType::Recovery => &mut entry.1,
+        let bucket = if fragment.recovery {
+            &mut entry.1
+        } else {
+            &mut entry.0
         };
         bucket.insert(
             fragment.local_index as usize,
@@ -215,8 +216,8 @@ fn build_reassembly_data(
 
     FileReassemblyData {
         chunks,
-        added_bytes: data_record.data.added_bytes,
-        expected_file_hash: data_record.data.hash,
+        added_bytes: blob_op.added_bytes,
+        expected_file_hash: blob_op.integrity_hash,
         data_block_id: dataid.clone(),
         per_file_key: Some(per_file_key),
         placement_height: None,
@@ -230,7 +231,7 @@ async fn run_round_trip(plaintext: Vec<u8>) {
     let per_file_key = ChaCha20Poly1305::generate_key(&mut ChaChaOsRng);
 
     let source = Cursor::new(plaintext.clone());
-    let data_record = process_uploaded_file(
+    let blob_op = process_uploaded_file(
         source,
         plaintext.len(),
         dataid.clone(),
@@ -241,16 +242,16 @@ async fn run_round_trip(plaintext: Vec<u8>) {
     .expect("process_uploaded_file should succeed");
 
     assert_eq!(
-        data_record.id, dataid,
-        "DataRecord id must equal input dataid"
+        blob_op.blob_id, dataid,
+        "BlobInsertOp id must equal input dataid"
     );
     assert_eq!(
-        data_record.file_size,
+        blob_op.file_size,
         plaintext.len() as u64,
         "file_size must match plaintext length"
     );
 
-    let reassembly = build_reassembly_data(plaintext.len(), &data_record, &dataid, per_file_key);
+    let reassembly = build_reassembly_data(plaintext.len(), &blob_op, &dataid, per_file_key);
 
     let stream = reconstruct_file_chunked(fragments_dir, reassembly, None, None, None);
     tokio::pin!(stream);

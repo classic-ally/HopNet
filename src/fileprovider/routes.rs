@@ -682,9 +682,8 @@ pub async fn modify_item(
     let mut new_parent_item_identifier: Option<String> = None;
     let mut content_result: Option<(
         crate::db::CustomUUID,
-        crate::db::DataRecord,
+        Option<hopnet_storage::store::BlobInsertOp>,
         Option<Vec<crate::shares::types::IncomingShareUpdate>>,
-        chacha20poly1305::Key,
     )> = None;
 
     // Parse multipart fields
@@ -921,16 +920,14 @@ pub async fn modify_item(
     };
 
     // Extract content processing results if provided
-    let (new_data_block_id, new_data_record, incoming_share_updates, _content_per_file_key) =
-        if let Some((dataid, data_record, share_updates, per_file_key)) = content_result {
+    let (content_update, incoming_share_updates) =
+        if let Some((_dataid, blob_op, share_updates)) = content_result {
             (
-                Some(dataid),
-                Some(data_record),
+                Some(crate::files::handlers::DriveContentUpdate { blob_op }),
                 share_updates,
-                Some(per_file_key),
             )
         } else {
-            (None, None, None, None)
+            (None, None)
         };
 
     // Validate modification before consensus
@@ -956,8 +953,7 @@ pub async fn modify_item(
             user_id,
             inode_id.clone(),
             new_encrypted_path.clone(),
-            new_data_block_id.clone(),
-            new_data_record.clone(),
+            content_update.clone().map(|u| u.blob_op),
             None, // incoming_share_updates not needed for validation
             &app_state.fragments_dir,
         ) {
@@ -995,8 +991,7 @@ pub async fn modify_item(
         user_id,
         inode_id,
         new_encrypted_path: new_encrypted_path.clone(),
-        new_data_block_id,
-        new_data_record,
+        content_update,
         incoming_share_updates,
     };
 

@@ -12,7 +12,7 @@ use reed_solomon_simd::ReedSolomonEncoder;
 use std::str::FromStr;
 
 use crate::{
-    db::{self, Blake3Hash, Data, DataRecord, DatabaseError, FragmentHash, Inode},
+    db::{self, Blake3Hash, DatabaseError, Inode},
     files::functions::{
         calculate_chunk_padding, encrypt_chunk, encrypt_part, encrypt_path, store_fragment,
     },
@@ -62,17 +62,18 @@ pub fn router(state: crate::AppState) -> Router<crate::AppState> {
         .layer(DefaultBodyLimit::max(5000 * 1_000_000))
 }
 
-/// Shared file processing function for both create and modify operations.
-/// The ingest pipeline (encrypt-then-RS, fragment store, keyed integrity
-/// hash) lives in the substrate crate (hopnet-storage::api::put); this
-/// wrapper maps the outcome into the projection's DataRecord shape.
+/// Shared file ingest for both create and modify operations. The pipeline
+/// (encrypt-then-RS, fragment store, keyed integrity hash) lives in the
+/// substrate crate; this wrapper returns the substrate's BlobInsertOp —
+/// the wire sub-payload that rides the drive envelope. The caller attaches
+/// the recipient wraps (`access`).
 pub async fn process_uploaded_file<R: AsyncRead + Unpin>(
     source: R,
     file_size: usize,
     dataid: CustomUUID,
     per_file_key: &chacha20poly1305::Key,
     fragments_dir: &str,
-) -> Result<DataRecord, StatusCode> {
+) -> Result<hopnet_storage::store::BlobInsertOp, StatusCode> {
     let outcome = hopnet_storage::api::put(source, file_size, dataid.clone(), per_file_key, fragments_dir)
         .await
         .map_err(|e| match e {
@@ -84,31 +85,23 @@ pub async fn process_uploaded_file<R: AsyncRead + Unpin>(
     let fragments = outcome
         .fragments
         .into_iter()
-        .map(|f| FragmentHash {
-            data_block_id: dataid.clone(),
+        .map(|f| hopnet_storage::store::FragmentMeta {
+            blob_id: dataid.clone(),
             chunk_number: f.chunk_number,
             local_index: f.local_index,
             fragment_id: f.fragment_id,
             fragment_hash: f.fragment_hash,
-            chunk_type: if f.recovery {
-                crate::db::ChunkType::Recovery
-            } else {
-                crate::db::ChunkType::Original
-            },
-            stored_locally: false,
+            recovery: f.recovery,
         })
         .collect();
 
-    Ok(DataRecord {
-        id: dataid,
-        modified_at: None, // Deprecated - timestamps come from UUIDv7
-        data: Data {
-            hash: outcome.integrity_hash,
-            fragments,
-            added_bytes: outcome.added_bytes,
-        },
-        file_access_entries: None, // Will be set by caller
+    Ok(hopnet_storage::store::BlobInsertOp {
+        blob_id: dataid,
+        integrity_hash: outcome.integrity_hash,
+        added_bytes: outcome.added_bytes,
         file_size: file_size as u64,
+        fragments,
+        access: Vec::new(), // caller attaches recipient wraps
     })
 }
 
@@ -369,6 +362,7 @@ pub async fn post_files(
     let mut inodes: Vec<Inode> = Vec::new();
     let mut has_files = false;
     let mut uploaded_data_block_ids: Vec<crate::db::types::CustomUUID> = Vec::new();
+    let mut blob_ops: Vec<hopnet_storage::store::BlobInsertOp> = Vec::new();
     let mut folder_name: Option<String> = None;
 
     // Handle both regular path and FileProvider parent_item_identifier approaches
@@ -469,13 +463,14 @@ pub async fn post_files(
                     .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
 
                 let reader = StreamReader::new(part.map(|r| r.map_err(std::io::Error::other)));
-                let (inode, dataid) = crate::files::helpers::assemble_file_inode(
+                let (inode, dataid, blob_op) = crate::files::helpers::assemble_file_inode(
                     &app_state, &session, user_id, &path, &filename, reader, file_size,
                 )
                 .await?;
 
-                if file_size > 0 {
+                if let Some(op) = blob_op {
                     uploaded_data_block_ids.push(dataid);
+                    blob_ops.push(op);
                 }
                 inodes.push(inode);
             }
@@ -537,7 +532,7 @@ pub async fn post_files(
         let tx = conn
             .unchecked_transaction()
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        match crate::files::helpers::build_upload_attestation(&app_state, &tx, node_id, &inodes) {
+        match crate::files::helpers::build_upload_attestation(&app_state, &tx, node_id, &blob_ops) {
             Ok(opt) => opt,
             Err(e) => {
                 tracing::warn!(
@@ -554,6 +549,7 @@ pub async fn post_files(
     crate::files::helpers::submit_inodes(
         &app_state,
         user_id,
+        blob_ops,
         inodes,
         attestation,
         uploaded_data_block_ids,
@@ -689,7 +685,7 @@ pub async fn patch_files(
         .parse::<usize>()
         .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
 
-    let (dataid, data_record, incoming_share_updates, _per_file_key) =
+    let (_dataid, blob_op, incoming_share_updates) =
         crate::files::functions::prepare_content_update(
             &app_state, user_id, &inode_id, field, file_size,
         )
@@ -700,8 +696,7 @@ pub async fn patch_files(
         user_id,
         inode_id,
         new_encrypted_path: None,
-        new_data_block_id: Some(dataid),
-        new_data_record: Some(data_record),
+        content_update: Some(crate::files::handlers::DriveContentUpdate { blob_op }),
         incoming_share_updates,
     };
 
@@ -718,8 +713,7 @@ pub async fn patch_files(
             payload.user_id,
             payload.inode_id.clone(),
             payload.new_encrypted_path.clone(),
-            payload.new_data_block_id.clone(),
-            payload.new_data_record.clone(),
+            payload.content_update.clone().map(|u| u.blob_op),
             None,
             &app_state.fragments_dir,
         )

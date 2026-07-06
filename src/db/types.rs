@@ -117,29 +117,10 @@ pub struct Inode {
     pub inode_type: hopnet_common::InodeType,
     // if file, point to datablock
     // if folder, None
-    pub data_id: Option<Either<CustomUUID, DataRecord>>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct DataRecord {
-    // PK for this datablock
-    // referenced by inoderecord
-    // distinct from hash to allow file update without needing to update inode
-    // also encodes creation time due to uuidv7
-    pub id: CustomUUID,
-    pub modified_at: Option<CustomDateTime>,
-    pub data: Data,
-    pub file_access_entries: Option<Vec<BlobAccess>>,
-    pub file_size: u64, // Total size of the file in bytes
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub struct Data {
-    // data hash for integrity
-    pub hash: Blake3Hash,
-    // list of fragment hashes with metadata
-    pub fragments: Vec<FragmentHash>,
-    pub added_bytes: u8,
+    /// Blob reference (RFC-014): inodes reference blobs by id only. Blob
+    /// registration rides the same transaction as its own sub-payload
+    /// (DriveInsertPayload.blob_ops) — never embedded in the inode.
+    pub data_id: Option<CustomUUID>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -227,13 +208,4 @@ pub fn blob_access_for_user(
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub struct FragmentHash {
-    pub data_block_id: CustomUUID,
-    pub chunk_number: u32,
-    pub local_index: u32,
-    pub fragment_id: CustomUUID, // UUID v7 for chunk identification and nonce derivation
-    pub fragment_hash: Blake3Hash, // Hash of encrypted chunk for storage verification
-    pub chunk_type: ChunkType,
-    pub stored_locally: bool,
-}
+

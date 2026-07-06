@@ -79,13 +79,27 @@ pub async fn assemble_file_inode<R: AsyncRead + Unpin>(
     filename: &str,
     source: R,
     file_size: usize,
-) -> Result<(Inode, CustomUUID), StatusCode> {
+) -> Result<(Inode, CustomUUID, Option<hopnet_storage::store::BlobInsertOp>), StatusCode> {
     let encrypted_filename = encrypt_part(filename, &session.siv_key, &session.siv_nonce)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let encrypted_path = encrypted_parent_path.to_string() + &encrypted_filename;
 
     let dataid = CustomUUID::new(None);
+
+    // Empty content: no blob at all (data_id = NULL) — the substrate never
+    // sees zero-byte puts and no key exists to wrap.
+    if file_size == 0 {
+        let inode = Inode {
+            id: CustomUUID::new(None),
+            owner: Left(user_id),
+            path: encrypted_path,
+            inode_type: hopnet_common::InodeType::File,
+            data_id: None,
+        };
+        return Ok((inode, dataid, None));
+    }
+
     let per_file_key = ChaCha20Poly1305::generate_key(&mut OsRng);
 
     let file_access = crate::db::types::blob_access_for_user(
@@ -96,35 +110,25 @@ pub async fn assemble_file_inode<R: AsyncRead + Unpin>(
     )
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let inode = if file_size == 0 {
-        Inode {
-            id: CustomUUID::new(None),
-            owner: Left(user_id),
-            path: encrypted_path,
-            inode_type: hopnet_common::InodeType::File,
-            data_id: None,
-        }
-    } else {
-        let mut data_record = process_uploaded_file(
-            source,
-            file_size,
-            dataid.clone(),
-            &per_file_key,
-            &app_state.fragments_dir,
-        )
-        .await?;
-        data_record.file_access_entries = Some(vec![file_access]);
-        data_record.file_size = file_size as u64;
-        Inode {
-            id: CustomUUID::new(None),
-            owner: Left(user_id),
-            path: encrypted_path,
-            inode_type: hopnet_common::InodeType::File,
-            data_id: Some(Right(data_record)),
-        }
+    let mut blob_op = process_uploaded_file(
+        source,
+        file_size,
+        dataid.clone(),
+        &per_file_key,
+        &app_state.fragments_dir,
+    )
+    .await?;
+    blob_op.access = vec![file_access];
+
+    let inode = Inode {
+        id: CustomUUID::new(None),
+        owner: Left(user_id),
+        path: encrypted_path,
+        inode_type: hopnet_common::InodeType::File,
+        data_id: Some(dataid.clone()),
     };
 
-    Ok((inode, dataid))
+    Ok((inode, dataid, Some(blob_op)))
 }
 
 /// Submit `inodes` (with parents already prepended by the caller) through
@@ -135,11 +139,13 @@ pub async fn assemble_file_inode<R: AsyncRead + Unpin>(
 pub async fn submit_inodes(
     app_state: &AppState,
     user_id: i32,
+    blob_ops: Vec<hopnet_storage::store::BlobInsertOp>,
     inodes: Vec<Inode>,
     attestation: Option<Transaction>,
     data_block_ids: Vec<CustomUUID>,
 ) -> Result<(), StatusCode> {
-    let encoded_inodes = bincode::serde::encode_to_vec(&inodes, bincode::config::standard())
+    let payload = crate::files::handlers::DriveInsertPayload { blob_ops, inodes };
+    let encoded_inodes = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
         .map_err(|e| {
             tracing::error!("Bincode encoding error: {:?}", e);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -196,25 +202,13 @@ pub async fn submit_inodes(
     Ok(())
 }
 
-/// Collect the fragment hashes embedded in `inodes`. Pure — no DB.
-fn extract_uploaded_fragment_hashes(inodes: &[Inode]) -> Vec<Blake3Hash> {
-    inodes
+/// Collect the fragment hashes across `blob_ops`. Pure — no DB.
+fn extract_uploaded_fragment_hashes(
+    blob_ops: &[hopnet_storage::store::BlobInsertOp],
+) -> Vec<Blake3Hash> {
+    blob_ops
         .iter()
-        .filter_map(|inode| {
-            if let Some(Right(data_record)) = &inode.data_id {
-                Some(
-                    data_record
-                        .data
-                        .fragments
-                        .iter()
-                        .map(|f| f.fragment_hash)
-                        .collect::<Vec<_>>(),
-                )
-            } else {
-                None
-            }
-        })
-        .flatten()
+        .flat_map(|op| op.fragments.iter().map(|f| f.fragment_hash))
         .collect()
 }
 
@@ -273,9 +267,9 @@ pub(crate) fn build_upload_attestation(
     app_state: &AppState,
     tx: &RusqliteTransaction,
     node_id: i32,
-    inodes: &[Inode],
+    blob_ops: &[hopnet_storage::store::BlobInsertOp],
 ) -> Result<Option<Transaction>, AttestationError> {
-    let uploaded_fragments = extract_uploaded_fragment_hashes(inodes);
+    let uploaded_fragments = extract_uploaded_fragment_hashes(blob_ops);
     if uploaded_fragments.is_empty() {
         tracing::debug!("No fragments to attest (empty upload or folder-only)");
         return Ok(None);
@@ -352,7 +346,7 @@ pub async fn create_file_with_fragments<R: AsyncRead + Unpin>(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let (inode, dataid) = assemble_file_inode(
+    let (inode, dataid, blob_op) = assemble_file_inode(
         app_state,
         &session,
         user_id,
@@ -363,11 +357,12 @@ pub async fn create_file_with_fragments<R: AsyncRead + Unpin>(
     )
     .await?;
 
-    let data_block_ids = if file_size == 0 {
-        Vec::new()
-    } else {
+    let data_block_ids = if blob_op.is_some() {
         vec![dataid.clone()]
+    } else {
+        Vec::new()
     };
+    let blob_ops: Vec<hopnet_storage::store::BlobInsertOp> = blob_op.into_iter().collect();
 
     let mut inodes = vec![inode];
 
@@ -390,7 +385,7 @@ pub async fn create_file_with_fragments<R: AsyncRead + Unpin>(
         let tx = conn
             .unchecked_transaction()
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        match build_upload_attestation(app_state, &tx, node_id, &inodes) {
+        match build_upload_attestation(app_state, &tx, node_id, &blob_ops) {
             Ok(opt) => opt,
             Err(e) => {
                 tracing::warn!(
@@ -404,7 +399,7 @@ pub async fn create_file_with_fragments<R: AsyncRead + Unpin>(
         None
     };
 
-    submit_inodes(app_state, user_id, inodes, attestation, data_block_ids).await?;
+    submit_inodes(app_state, user_id, blob_ops, inodes, attestation, data_block_ids).await?;
     Ok(dataid)
 }
 
@@ -446,5 +441,5 @@ pub async fn create_folder(
         prepend_missing_parents(&tx, &mut inodes, user_id)?;
     }
 
-    submit_inodes(app_state, user_id, inodes, None, Vec::new()).await
+    submit_inodes(app_state, user_id, Vec::new(), inodes, None, Vec::new()).await
 }

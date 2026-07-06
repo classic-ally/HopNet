@@ -729,8 +729,9 @@ pub fn fragment_exists_and_valid(fragments_dir: &str, fragment_hash: &Blake3Hash
 
 /// Shared content-update preparation for both PATCH /files and FileProvider modify_item.
 /// Handles key generation, file processing, and share propagation.
-/// Returns (data_block_id, DataRecord with file_access + propagation entries, incoming_share_updates, per_file_key).
-/// The caller is responsible for building the final ModifyItemPayload, validation, and consensus submission.
+/// Returns (data_block_id, Option<BlobInsertOp> (None = content is now empty
+/// → inode data_id becomes NULL; RFC-014 B5), incoming_share_updates).
+/// The caller builds the ModifyItemPayload and submits.
 pub async fn prepare_content_update(
     app_state: &AppState,
     user_id: i32,
@@ -740,20 +741,24 @@ pub async fn prepare_content_update(
 ) -> Result<
     (
         crate::db::CustomUUID,
-        crate::db::DataRecord,
+        Option<hopnet_storage::store::BlobInsertOp>,
         Option<Vec<crate::shares::types::IncomingShareUpdate>>,
-        chacha20poly1305::Key,
     ),
     axum::http::StatusCode,
 > {
     use axum::http::StatusCode;
     use chacha20poly1305::{ChaCha20Poly1305, aead::KeyInit, aead::OsRng as CryptoOsRng};
 
-    // Generate new data block ID and per-file key
     let dataid = crate::db::CustomUUID::new(None);
-    let per_file_key = ChaCha20Poly1305::generate_key(&mut CryptoOsRng);
 
-    // Create file access entry for the modifier
+    // Empty content: no blob, no key, nothing to share — the inode's
+    // data_id becomes NULL and pending shares have nothing to re-wrap.
+    if file_size == 0 {
+        return Ok((dataid, None, None));
+    }
+
+    // Generate new per-file key and the modifier's wrap
+    let per_file_key = ChaCha20Poly1305::generate_key(&mut CryptoOsRng);
     let file_access = crate::db::types::blob_access_for_user(
         app_state.db_pool.get(),
         dataid.clone(),
@@ -762,24 +767,8 @@ pub async fn prepare_content_update(
     )
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // Process uploaded file
-    let mut data_record = if file_size == 0 {
-        crate::db::DataRecord {
-            id: dataid.clone(),
-            modified_at: None,
-            data: crate::db::Data {
-                hash: crate::db::Blake3Hash::new({
-                    let mut hasher = blake3::Hasher::new();
-                    hasher.update(dataid.as_bytes());
-                    hasher.finalize()
-                }),
-                fragments: Vec::new(),
-                added_bytes: 0,
-            },
-            file_access_entries: None,
-            file_size: 0,
-        }
-    } else {
+    // Process uploaded file through the substrate ingest
+    let mut blob_op = {
         use tokio_stream::StreamExt;
         use tokio_util::io::StreamReader;
         let reader = StreamReader::new(field.map(|r| r.map_err(std::io::Error::other)));
@@ -792,8 +781,7 @@ pub async fn prepare_content_update(
         )
         .await?
     };
-    data_record.file_access_entries = Some(vec![file_access]);
-    data_record.file_size = file_size as u64;
+    let mut access = vec![file_access];
 
     // Build share propagation
     let conn = app_state
@@ -804,15 +792,10 @@ pub async fn prepare_content_update(
         super::routes::build_share_propagation(&conn, inode_id, user_id, &dataid, &per_file_key)?;
     drop(conn);
 
-    if !extra_file_access_entries.is_empty() {
-        if let Some(entries) = data_record.file_access_entries.as_mut() {
-            entries.extend(extra_file_access_entries);
-        } else {
-            data_record.file_access_entries = Some(extra_file_access_entries);
-        }
-    }
+    access.extend(extra_file_access_entries);
+    blob_op.access = access;
 
-    Ok((dataid, data_record, incoming_share_updates, per_file_key))
+    Ok((dataid, Some(blob_op), incoming_share_updates))
 }
 
 // Fragment cipher primitives live in the substrate crate
