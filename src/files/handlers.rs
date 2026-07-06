@@ -61,21 +61,9 @@ impl TransactionHandler for InsertFilesHandler {
                     return Err(DatabaseError::AuthorizationError);
                 }
 
-                // Preprocess inodes to verify fragments exist locally and update stored_locally flags
-                for inode in &mut inodes {
-                    if let Some(Either::Right(data_record)) = &mut inode.data_id {
-                        for fragment in &mut data_record.data.fragments {
-                            // Check if fragment exists and is valid on this node
-                            fragment.stored_locally = fragment_exists_and_valid(
-                                &state.fragments_dir,
-                                &fragment.fragment_hash,
-                            );
-                        }
-                    }
-                }
-
-                // Insert the files into the database using shared transaction
-                insert_files(db_tx, inodes)?;
+                // Insert the files (the substrate apply probes
+                // stored_locally against this node's disk in-crate)
+                insert_files(db_tx, inodes, &state.fragments_dir)?;
 
                 // Signal FileProvider to refresh when files are actually inserted (execute=true)
                 if execute {
@@ -295,6 +283,7 @@ impl TransactionHandler for ModifyItemHandler {
                     payload_data.new_data_block_id.clone(),
                     payload_data.new_data_record.clone(),
                     payload_data.incoming_share_updates.clone(),
+                    &state.fragments_dir,
                 )?;
 
                 if execute {

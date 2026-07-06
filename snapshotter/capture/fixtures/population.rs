@@ -6,7 +6,7 @@ use chrono::{Duration, Utc};
 use either::Either;
 use hopnet::db;
 use hopnet::db::types::{
-    ChunkType, CustomUUID, Data, DataRecord, FileAccess, FragmentHash, Inode, XPubKey,
+    BlobAccess, ChunkType, CustomUUID, Data, DataRecord, FragmentHash, Inode, XPubKey,
 };
 use hopnet::files::types::SelfCheckFragments;
 use hopnet::metrics::types::Metric;
@@ -226,12 +226,14 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
             });
         }
 
-        // Create file access entries for user 0
-        let file_access = vec![FileAccess {
-            data_block_id: data_block_id.clone(),
-            user_id: 0,
-            ephemeral_pubkey: XPubKey::from([40u8 + db_idx as u8; 32]),
-            encrypted_file_key: vec![0u8; 48],
+        // Blob access wrap for user 0 — recipient pubkey MUST be user 0's
+        // actual x25519 pubkey (reads JOIN users on it).
+        let user0_x25519 = keys::x25519_pubkey_from_seed(keys::USER_0_X25519_SEED);
+        let file_access = vec![BlobAccess {
+            blob_id: data_block_id.clone(),
+            recipient_pubkey: *user0_x25519.as_x25519().as_bytes(),
+            ephemeral_pubkey: [41u8 + db_idx as u8; 32],
+            wrapped_key: vec![0u8; 48],
         }];
 
         data_records.push(DataRecord {
@@ -289,10 +291,10 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
             },
         ];
         // Insert root folder first (before subfolder, to avoid conflict with auto-created parents)
-        db::files::insert_files(&tx, vec![folder_inodes.remove(0)])
+        db::files::insert_files(&tx, vec![folder_inodes.remove(0)], "/tmp/hopnet-snapshotter-fragments")
             .expect("Failed to insert root folder");
         // Then insert subfolder (its parent /root now exists)
-        db::files::insert_files(&tx, folder_inodes).expect("Failed to insert subfolder");
+        db::files::insert_files(&tx, folder_inodes, "/tmp/hopnet-snapshotter-fragments").expect("Failed to insert subfolder");
 
         // Insert files with data records
         let file_inodes = vec![
@@ -318,7 +320,7 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
                 data_id: Some(Either::Right(data_records.remove(0))),
             },
         ];
-        db::files::insert_files(&tx, file_inodes).expect("Failed to insert files");
+        db::files::insert_files(&tx, file_inodes, "/tmp/hopnet-snapshotter-fragments").expect("Failed to insert files");
 
         // Insert a file for user 1 (file3 in subfolder, no data block - just inode)
         let user1_folder_id = uuid_from_index(102);
@@ -329,7 +331,7 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
             inode_type: hopnet_common::InodeType::Folder,
             data_id: None,
         }];
-        db::files::insert_files(&tx, user1_file_inodes).expect("Failed to insert user 1 folder");
+        db::files::insert_files(&tx, user1_file_inodes, "/tmp/hopnet-snapshotter-fragments").expect("Failed to insert user 1 folder");
 
         tx.commit().expect("Failed to commit files");
     }

@@ -721,6 +721,7 @@ pub async fn patch_files(
             payload.new_data_block_id.clone(),
             payload.new_data_record.clone(),
             None,
+            &app_state.fragments_dir,
         )
         .map_err(|e| match e {
             crate::db::DatabaseError::NotFound => StatusCode::NOT_FOUND,

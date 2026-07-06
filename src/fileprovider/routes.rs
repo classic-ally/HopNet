@@ -959,6 +959,7 @@ pub async fn modify_item(
             new_data_block_id.clone(),
             new_data_record.clone(),
             None, // incoming_share_updates not needed for validation
+            &app_state.fragments_dir,
         ) {
             Ok(_) => {
                 // Validation passed, roll back transaction

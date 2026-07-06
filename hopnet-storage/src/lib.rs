@@ -17,6 +17,7 @@ pub mod error;
 pub mod fragstore;
 pub mod placement;
 pub mod rs;
+pub mod store;
 pub mod types;
 
 pub use error::StorageError;
