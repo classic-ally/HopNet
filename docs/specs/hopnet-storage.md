@@ -265,18 +265,18 @@ user decision 2026-07-06. Detailed staged plan with cut lines, tests, and
 risks: `~/.claude/plans/storage-substrate-extraction.md`.
 
 - Stage A — crate scaffold + pure code moves (placement, chunk crypto,
-  fragment I/O, wrap primitives). [ ]
+  fragment I/O, wrap primitives). [x] (a49e950, 2026-07-06)
 - Stage B — key custody: blob_access schema, mesh keypair, keyed integrity
-  hash, blob_id placement seed. The one-time format change. [ ]
+  hash, blob_id placement seed. The one-time format change. [x] (31b20d3, 2026-07-06)
 - Stage C — control-plane split: substrate apply functions, envelope
   reshape (blob ops out of `DataRecord`/`Vec<Inode>`), share-propagation
-  retarget. [ ]
+  retarget. [x] (a58369e/f1322b1/9d7b5ec, 2026-07-06)
 - Stage D — stored_locally settlement (crate-owned write paths, invariant
-  docs). [ ]
+  docs). [x] (fa5b6bb, 2026-07-06)
 - Stage E — engine + fragment RPC behind seams; on_decided kick; global
-  work queue. [ ]
+  work queue. [x] (E1 d535f94, E2 4fed607, 2026-07-06)
 - Stage F — get() untangling out of the fs projection; rebalancer
-  re-enabled as tier-1 repair. [ ]
+  re-enabled as tier-1 repair. [x] (F1 789dfb9, F2 b56685f, F3 71acbb2, 2026-07-07)
 - Stage G — photos ingress becomes projection #2 (post-merge; gets
   encryption for free — it currently stores plaintext; dep-pin unification
   with the sqlx workspace must be verified first). [ ]

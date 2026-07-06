@@ -234,7 +234,14 @@ async fn cleanup_orphaned_data_blocks(
 fn generate_cutoff_uuid(retention_days: i64) -> Result<CustomUUID, MaintenanceError> {
     let cutoff_time = Utc::now() - chrono::Duration::days(retention_days);
 
-    let timestamp = Timestamp::from_unix(NoContext, cutoff_time.timestamp() as u64, 0);
+    // Preserve sub-second precision: UUIDv7 ordering is millisecond-granular,
+    // so a seconds-truncated cutoff makes anything created in the current
+    // second invisible to retention_days=0 scans.
+    let timestamp = Timestamp::from_unix(
+        NoContext,
+        cutoff_time.timestamp() as u64,
+        cutoff_time.timestamp_subsec_nanos(),
+    );
 
     Ok(CustomUUID::new(Some(&timestamp)))
 }

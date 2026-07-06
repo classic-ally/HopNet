@@ -446,13 +446,18 @@ impl TestScenario for ConsensusBarrierDecideWindow {
             },
         );
 
-        let decided_before = decided_height(&nodes[0]).await?;
+        // Sample the pre-upload height from the HELD node: consensus is now
+        // fast enough that the quorum can already be a height ahead of a
+        // freshly-joined node at this instant, so nodes[0]'s height is not a
+        // valid stand-in for the held node's.
+        let decided_before = decided_height(held).await?;
+        let quorum_before = decided_height(&nodes[0]).await?;
         upload_file(&nodes[0], "/decide-window", "window.txt", vec![0x77; 512]).await?;
 
         // Quorum (nodes 0,1) decides; the held node's decide is stuck at the
         // commit gate.
         let quorum_advanced =
-            wait_decided(&nodes[0], decided_before + 1, Duration::from_secs(60)).await?;
+            wait_decided(&nodes[0], quorum_before + 1, Duration::from_secs(60)).await?;
         let held_height = decided_height(held).await.unwrap_or(0);
         print_and_add_check(
             &mut result,
@@ -460,8 +465,8 @@ impl TestScenario for ConsensusBarrierDecideWindow {
                 name: "Divergence window open".to_string(),
                 passed: quorum_advanced && held_height == decided_before,
                 detail: Some(format!(
-                    "quorum at {}, held node at {held_height}",
-                    decided_before + 1
+                    "quorum at {}, held node at {held_height} (held before: {decided_before})",
+                    quorum_before + 1
                 )),
             },
         );

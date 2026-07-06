@@ -700,6 +700,19 @@ async fn handle_as_forwarder(
                 height,
                 round
             );
+            // Symmetric wake rule: a HIGHER height in the reply means WE are
+            // the stale side — kick our own decided-value sync toward it.
+            // Without this, a node that missed a decide (e.g. fresh join that
+            // raced its own activation block) retargets the same stale height
+            // every 250ms until malachite's slow internal sync timer fires
+            // (~minutes), stranding the forwarded batch.
+            if their_height > height as i64 {
+                crate::consensus::malachite::engine::kick_sync_if_behind(
+                    app_state,
+                    their_height as u64,
+                    proposer,
+                );
+            }
             resume_own_engine();
             (batch, DispatchOutcome::RetryNow)
         }

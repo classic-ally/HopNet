@@ -871,7 +871,14 @@ impl TestScenario for ImportExtractionHappyPath {
             .iter()
             .filter(|r| r.path_type == InodeType::File)
             .count();
-        let all_pending = rows.iter().all(|r| r.status == ImportPathStatus::Pending);
+        // The creation walk starts as soon as extraction seeds rows, and
+        // consensus is now fast enough that it can finish entries before this
+        // poll observes them — Imported is a legal state here; Failed is not.
+        let all_seeded = rows
+            .iter()
+            .all(|r| {
+                r.status == ImportPathStatus::Pending || r.status == ImportPathStatus::Imported
+            });
         let any_failed = rows.iter().any(|r| r.error_code.is_some());
 
         print_and_add_check(
@@ -885,8 +892,9 @@ impl TestScenario for ImportExtractionHappyPath {
         print_and_add_check(
             &mut result,
             Check {
-                name: "All 5 rows are Pending".to_string(),
-                passed: all_pending,
+                name: "All 5 rows seeded (Pending, or Imported if creation raced ahead)"
+                    .to_string(),
+                passed: all_seeded,
                 detail: Some(format!(
                     "statuses: {:?}",
                     rows.iter().map(|r| &r.status).collect::<Vec<_>>()

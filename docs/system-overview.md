@@ -8,7 +8,7 @@ HopNet provides secure, reliable, performant file storage across networked devic
 ## Core Systems
 
 ### 1. Consensus System ([RFC-013](specs/malachite-consensus.md) — plan in `~/.claude/plans/spicy-imagining-mango.md`)
-**Status**: Migrated to the Malachite (Tendermint) engine; bench + soak before merge (Stage 7)
+**Status**: Migrated to the Malachite (Tendermint) engine; final gates (shared with the RFC-014 extraction) before merge
 
 Byzantine fault-tolerant consensus via the `hopnet-consensus` crate: Malachite's
 Quint-verified Tendermint core (`arc-malachitebft-core-consensus`, tier-1 effect
@@ -27,11 +27,34 @@ an audit found a view-change safety hole. See RFC-013 for the full design
 - [x] Validator set management with height-based activation
 - [x] Performance metrics integration for node reliability (latency + throughput measurement complete)
 - [x] Orchestrator test suite rebuild (Stage 6: self-hosted iroh relay, leader-down, CFT meshes, barrier taps)
-- [~] Bench vs old-engine baseline + full-suite gate + real-mesh soak (Stage 7)
+- [~] Post-extraction gates: bench trio + full app-suite (streaming 36.6 MB/s and
+      pragma benches pass; consensus-queue-throughput 68.7% vs the 80% bar —
+      admission tuning is the open follow-up)
 - [ ] Node health monitoring and automatic validator management
 
-### 2. File Storage System ([RFC-002](specs/file-storage.md))
-**Status**: Complete core functionality including chunked Reed-Solomon streaming reconstruction
+### 2. Storage Substrate ([RFC-014](specs/hopnet-storage.md)) + File Storage ([RFC-002](specs/file-storage.md))
+**Status**: Substrate extraction COMPLETE (stages A–F, 2026-07-07) — the `hopnet-storage`
+crate owns blobs end to end; the fs layer (RFC-002) is a projection over it
+
+The distribution substrate: durable, location-transparent, ENCRYPTED blobs over the
+consensus state machine. `hopnet-storage` owns the ciphers (format-frozen,
+golden-vector pinned), key custody (pubkey-keyed `blob_access` wraps, mesh-wide
+keypair for all-users access), the Reed-Solomon fragment format, deterministic
+placement (blob_id-seeded), the distribution engine, the download path (`api::get`:
+inventory → placement-directed → gossip discovery ladder, RS reconstruction, keyed
+integrity verify), and tier-1 pull-only repair. The main crate reaches it through
+four host seams (Transport / StateReader / TxSubmitter / LocalStateSink) and sync
+apply functions inside consensus handlers.
+
+- [x] Substrate key custody: v1 pubkey wraps, mesh keypair (genesis + insert_user
+      grants), keyed integrity hash (plaintext-confirmation oracle fixed)
+- [x] Control-plane apply functions + drive-scoped envelopes; stored_locally
+      settlement through crate-owned writers only
+- [x] Distribution engine behind seams (event-driven on_decided kick, global
+      workers, batched placement commits) + fragment RPC serve half
+- [x] api::get + blob manifest reads + tier-1 repair (rebalancer re-enabled)
+- [ ] Photos ingress as projection #2 (post-merge; encryption for free)
+- [ ] hopnet-drive: extract the fs projection itself (next plan cycle)
 
 Reed-Solomon encoded file storage with encryption, chunked encoding, and fragment management.
 

@@ -149,19 +149,10 @@ pub fn get_folder_contents(
 
             let items = items?;
 
-            // Get current consensus height (committed block's height)
-            let consensus_query = r#"
-                SELECT COALESCE(b.height, 0) as committed_height
-                FROM this_node t
-                LEFT JOIN blocks b ON t.committed_block_hash = b.block_hash
-                WHERE t.internal_id = 1
-            "#;
-            let mut consensus_stmt = db_lock
-                .prepare(consensus_query)
-                .map_err(|_| DatabaseError::ProcessingError)?;
-            let current_consensus_height: i32 = consensus_stmt
-                .query_row([], |row| row.get(0))
-                .map_err(|_| DatabaseError::RecallError)?;
+            // Current decided height (malachite schema — the legacy blocks
+            // table died with the bespoke engine at Stage 5b)
+            let current_consensus_height =
+                crate::db::consensus::get_current_consensus_height(&db_lock)?;
 
             Ok(FileProviderEnumerateResult {
                 items,
@@ -382,19 +373,10 @@ pub fn get_folder_changes_since_height(
                 }
             }
 
-            // Get current consensus height (same query as get_folder_contents)
-            let consensus_query = r#"
-                SELECT COALESCE(b.height, 0) as committed_height
-                FROM this_node t
-                LEFT JOIN blocks b ON t.committed_block_hash = b.block_hash
-                WHERE t.internal_id = 1
-            "#;
-            let mut consensus_stmt = db_lock
-                .prepare(consensus_query)
-                .map_err(|_| DatabaseError::ProcessingError)?;
-            let current_consensus_height: i32 = consensus_stmt
-                .query_row([], |row| row.get(0))
-                .map_err(|_| DatabaseError::RecallError)?;
+            // Current decided height (malachite schema — same as
+            // get_folder_contents)
+            let current_consensus_height =
+                crate::db::consensus::get_current_consensus_height(&db_lock)?;
 
             tracing::debug!(
                 "Found {} changed items and {} deleted items since height {}",
