@@ -369,6 +369,23 @@ where
         block: Block,
         cert: &WireCommitCertificate,
     ) -> Result<(), HostError<S::Error>> {
+        // A syncing node ALSO participates in live consensus (it buffers and
+        // processes live gossip). At the sync/live boundary both paths can
+        // reach the same height: live consensus decides height N while the
+        // sync client is still feeding a SyncValue for N. Re-applying a block
+        // the engine already decided re-runs the app (nonces now committed →
+        // the app flips Valid→Invalid), tripping the engine's "changed its
+        // mind" invariant and wedging it. So drop any sync value for a height
+        // we've already passed; the engine only advances forward.
+        let current = self.height().0;
+        if cert.height < current {
+            tracing::debug!(
+                sync_height = cert.height,
+                current,
+                "dropping already-decided sync value (live consensus got there first)"
+            );
+            return Ok(());
+        }
         // Structural pre-checks; the sync client also performs these, so a
         // failure here is defensive — drop, don't feed garbage to the engine.
         if block.verify().is_err() || block.block_hash != cert.value_id {

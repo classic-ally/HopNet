@@ -187,16 +187,24 @@ where
                 .enable_time()
                 .build()
                 .expect("consensus shell runtime");
-            rt.block_on(run_shell(
-                build,
-                start_height,
-                timeouts,
-                outbound,
-                input_rx,
-                event_tx,
-                decided_tx,
-                round_tx,
-            ));
+            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                rt.block_on(run_shell(
+                    build,
+                    start_height,
+                    timeouts,
+                    outbound,
+                    input_rx,
+                    event_tx,
+                    decided_tx,
+                    round_tx,
+                ));
+            }));
+            if run.is_err() {
+                // A node without its consensus shell is a zombie (HTTP up,
+                // chain dead) — crash loudly so supervision restarts it.
+                tracing::error!("consensus shell panicked — aborting process");
+                std::process::abort();
+            }
         })
         .expect("spawn consensus shell thread");
 

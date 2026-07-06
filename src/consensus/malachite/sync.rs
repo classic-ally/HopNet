@@ -96,6 +96,11 @@ async fn sync_loop(
             return Ok(reached); // tip: everyone agrees there's nothing more
         }
         if peers.is_empty() || failures + empty_answers >= peers.len() {
+            // Couldn't advance to `target` this pass. Returning Err lets the
+            // driver retry on the next SyncNeeded — important when the target
+            // came from an in-flight vote for a height peers haven't decided
+            // YET (they will shortly; a premature Ok would stop retrying and
+            // strand the node one height short).
             return match target {
                 None if failures == 0 => Ok(reached),
                 None => Err(SyncError::Exhausted {

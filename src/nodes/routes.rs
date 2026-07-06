@@ -222,55 +222,59 @@ pub async fn post_nodes(
     };
 
     ///////////////
-    // 5. Send JoinInfo to the joining node via iroh
+    // 5. Deliver JoinInfo to the joining node via iroh — ASYNC with retries.
+    // The node row is already committed through consensus; transient transport
+    // failures (relay warm-up, holepunching) must not fail the registration.
+    // The joining node stays passive until JoinInfo arrives, so retrying for
+    // a few minutes is safe and idempotent (initialize_joining_node conflicts
+    // are handled on its side by the setup-complete check).
     ///////////////
     tracing::info!(
-        "Sending JoinInfo to joining node {} via iroh (bootstrap validators: {})",
+        "Registering node {} complete; delivering JoinInfo in background ({} bootstrap validators)",
         complete_node.node_id,
         join_info.bootstrap_validators.len()
     );
 
-    let req = IrohRequest::JoinDeliver(JoinDeliverRequest { join_info });
-    match app_state
-        .iroh_transport
-        .request(
-            complete_node.node_id,
-            peer_iroh_id,
-            &req,
-            Duration::from_secs(30),
-        )
-        .await
-    {
-        Ok(IrohResponse::JoinAck(ack)) if ack.success => {
-            tracing::info!(
-                "Node {} accepted JoinInfo, catch-up running in background",
-                complete_node.node_id
-            );
-            StatusCode::CREATED
+    let transport = app_state.iroh_transport.clone();
+    let node_id = complete_node.node_id;
+    tokio::spawn(async move {
+        const ATTEMPTS: u32 = 10;
+        const RETRY_DELAY: Duration = Duration::from_secs(15);
+        let req = IrohRequest::JoinDeliver(JoinDeliverRequest { join_info });
+        for attempt in 1..=ATTEMPTS {
+            match transport
+                .request(node_id, peer_iroh_id, &req, Duration::from_secs(30))
+                .await
+            {
+                Ok(IrohResponse::JoinAck(ack)) if ack.success => {
+                    tracing::info!(
+                        "Node {node_id} accepted JoinInfo (attempt {attempt}), bootstrap running"
+                    );
+                    return;
+                }
+                Ok(IrohResponse::Error { message }) => {
+                    // The node answered and refused — retrying won't help.
+                    tracing::error!("Node {node_id} rejected JoinInfo: {message}");
+                    return;
+                }
+                Ok(other) => {
+                    tracing::warn!(
+                        "Unexpected JoinInfo response from node {node_id} (attempt {attempt}): {other:?}"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "JoinInfo delivery to node {node_id} failed (attempt {attempt}/{ATTEMPTS}): {e}"
+                    );
+                    transport.remove_connection(node_id).await;
+                }
+            }
+            tokio::time::sleep(RETRY_DELAY).await;
         }
-        Ok(IrohResponse::Error { message }) => {
-            tracing::error!(
-                "Node {} rejected JoinInfo: {}",
-                complete_node.node_id,
-                message
-            );
-            StatusCode::BAD_GATEWAY
-        }
-        Ok(other) => {
-            tracing::error!(
-                "Unexpected response from node {}: {:?}",
-                complete_node.node_id,
-                other
-            );
-            StatusCode::BAD_GATEWAY
-        }
-        Err(e) => {
-            tracing::error!(
-                "Failed to send JoinInfo to node {}: {}",
-                complete_node.node_id,
-                e
-            );
-            StatusCode::GATEWAY_TIMEOUT
-        }
-    }
+        tracing::error!(
+            "JoinInfo delivery to node {node_id} gave up after {ATTEMPTS} attempts — the node can re-register"
+        );
+    });
+
+    StatusCode::CREATED
 }

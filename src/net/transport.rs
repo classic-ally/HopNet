@@ -265,19 +265,47 @@ pub struct IrohTransport {
     /// Whether this node has completed setup (genesis or JoinInfo received).
     /// Shared with PeerValidator — when false, all incoming connections are allowed.
     setup_complete: Arc<AtomicBool>,
+    /// Self-hosted relay (HOPNET_RELAY_URL). When set, the endpoint uses ONLY
+    /// this relay (no n0 relays, no public discovery) and every dial pins the
+    /// peer's address to it — removes all external network dependencies for
+    /// orchestrator meshes and private deployments.
+    custom_relay: Option<iroh::RelayUrl>,
 }
 
 impl IrohTransport {
     /// Create a new IrohTransport with the given secret key and database pool.
     /// `is_setup_complete` should be true if this node already has persisted state (restart),
     /// false if this is a fresh node waiting for genesis setup or JoinInfo.
+    ///
+    /// `HOPNET_RELAY_URL` switches the endpoint from the n0 preset (public
+    /// relays + pkarr discovery) to a single self-hosted relay with no
+    /// address-lookup services.
     pub async fn new(
         secret_key: SecretKey,
         db_pool: Pool<SqliteConnectionManager>,
         is_setup_complete: bool,
     ) -> Result<Self, IrohError> {
         let setup_complete = Arc::new(AtomicBool::new(is_setup_complete));
-        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+
+        let custom_relay: Option<iroh::RelayUrl> = match std::env::var("HOPNET_RELAY_URL") {
+            Ok(url) => Some(url.parse().map_err(|e| {
+                IrohError::Transport(TransportError::ConnectionFailed(format!(
+                    "invalid HOPNET_RELAY_URL {url:?}: {e}"
+                )))
+            })?),
+            Err(_) => None,
+        };
+
+        let builder = match &custom_relay {
+            Some(url) => {
+                tracing::info!("using self-hosted iroh relay {url} (public discovery disabled)");
+                Endpoint::builder(iroh::endpoint::presets::Minimal)
+                    .relay_mode(iroh::RelayMode::Custom(iroh::RelayMap::from(url.clone())))
+            }
+            None => Endpoint::builder(iroh::endpoint::presets::N0),
+        };
+
+        let endpoint = builder
             .secret_key(secret_key)
             .alpns(vec![HOPNET_ALPN.to_vec()])
             .hooks(PeerValidator {
@@ -292,6 +320,7 @@ impl IrohTransport {
             endpoint,
             connections: Arc::new(RwLock::new(HashMap::new())),
             setup_complete,
+            custom_relay,
         })
     }
 
@@ -329,10 +358,18 @@ impl IrohTransport {
             }
         }
 
-        // Establish new connection with timeout
+        // Establish new connection with timeout. With a self-hosted relay
+        // there is no discovery — pin the peer's address to our relay.
+        let dial_addr = {
+            let mut addr = iroh::EndpointAddr::new(peer_node_id.into());
+            if let Some(url) = &self.custom_relay {
+                addr = addr.with_relay_url(url.clone());
+            }
+            addr
+        };
         let conn = tokio::time::timeout(
             CONNECTION_TIMEOUT,
-            self.endpoint.connect(peer_node_id, HOPNET_ALPN),
+            self.endpoint.connect(dial_addr, HOPNET_ALPN),
         )
         .await
         .map_err(|_| {

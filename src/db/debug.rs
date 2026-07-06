@@ -21,9 +21,12 @@ const CONSENSUS_TABLES: &[&str] = &[
     "users",
     "nodes",
     "validators",
-    "blocks",
-    "quorum_certificates",
-    "timeout_certificates",
+    // Malachite decided chain. Deliberately EXCLUDED: consensus_wal
+    // (per-node ephemeral), consensus_meta (per-node cursor), and
+    // decided_certificates (a certificate is a node-local quorum proof —
+    // different vote subsets are legitimate). decided_blocks IS the
+    // agreement invariant.
+    "decided_blocks",
     "data_blocks",
     "file_access",
     "fragment_hashes",

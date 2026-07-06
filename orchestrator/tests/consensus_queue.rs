@@ -299,15 +299,12 @@ impl TestScenario for ConsensusQueueBurst {
             },
         );
 
-        // ── Wait for consensus + fragment distribution to settle ─────────
-        // File uploads trigger async fragment distribution that writes to
-        // the `blocks` table. Wait for views to stabilize, then an extra
-        // pause for background jobs to finish.
-        let view_after_ops = get_max_view(nodes).await.unwrap_or(view_before);
-        wait_for_minimum_view(nodes, view_after_ops + 1, Duration::from_secs(60))
-            .await
-            .ok();
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        // ── Wait for fragment distribution to settle ─────────────────────
+        // A decided height IS committed state (malachite: decide = commit),
+        // so no extra height is needed — waiting for one would hang forever
+        // on an on-demand mesh with no further work. Just give the async
+        // fragment distribution a moment to finish its placement updates.
+        tokio::time::sleep(Duration::from_secs(8)).await;
 
         // ── Batching efficiency ──────────────────────────────────────────
         let view_after = get_max_view(nodes).await.unwrap_or(view_before);
@@ -539,11 +536,9 @@ impl TestScenario for ConsensusQueueCrossNode {
             },
         );
 
-        // Wait for wave 1 to settle
-        let settle_w1 = view_before_w1 + 2;
-        wait_for_minimum_view(nodes, settle_w1, Duration::from_secs(60))
-            .await
-            .ok();
+        // Wave 1 ops returned 200 = decided (malachite: submit resolves on
+        // commit). Brief pause for async fragment distribution only.
+        tokio::time::sleep(Duration::from_secs(5)).await;
 
         let view_after_w1 = get_max_view(nodes).await.unwrap_or(view_before_w1);
         let w1_views = view_after_w1.saturating_sub(view_before_w1);
@@ -615,11 +610,8 @@ impl TestScenario for ConsensusQueueCrossNode {
             },
         );
 
-        // Wait for wave 2 to settle
-        let settle_w2 = view_before_w2 + 2;
-        wait_for_minimum_view(nodes, settle_w2, Duration::from_secs(60))
-            .await
-            .ok();
+        // Same as wave 1: 200 = decided; settle fragment distribution only.
+        tokio::time::sleep(Duration::from_secs(5)).await;
 
         let view_after_w2 = get_max_view(nodes).await.unwrap_or(view_before_w2);
         let w2_views = view_after_w2.saturating_sub(view_before_w2);
@@ -886,11 +878,8 @@ impl TestScenario for ConsensusQueueThroughput {
             }
         }
 
-        // Wait for deletes to settle
-        let view_pre_settle = get_max_view(nodes).await.unwrap_or(view_before);
-        wait_for_minimum_view(nodes, view_pre_settle + 1, Duration::from_secs(30))
-            .await
-            .ok();
+        // Deletes returned = decided; settle async cleanup briefly.
+        tokio::time::sleep(Duration::from_secs(3)).await;
 
         print_and_add_check(
             &mut result,
@@ -933,11 +922,8 @@ impl TestScenario for ConsensusQueueThroughput {
         );
 
         // ── File listings identical ──────────────────────────────────────
-        // Wait for consensus + fragment distribution to settle
-        wait_for_minimum_view(nodes, view_after + 1, Duration::from_secs(30))
-            .await
-            .ok();
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        // Fragment distribution settles asynchronously after the decides.
+        tokio::time::sleep(Duration::from_secs(8)).await;
 
         let listings = list_files_from_all_nodes(nodes, &dir).await?;
         let listings_ok = verify_listings_identical(&listings).is_ok();

@@ -79,13 +79,14 @@ Pass means **test passed AND no divergence**. The mesh is only deleted when the 
 | `metrics-collection` | System metrics collection and validation |
 | `iroh-ping` | Verify iroh transport connectivity between all nodes in the mesh |
 | `iroh-reject-unknown` | Verify unknown peers are rejected before path registration (no IP leak) |
-| `timeout-progression` | Verify timeout votes broadcast over iroh, form TC, and advance view when leader is down |
-| `consensus-barrier-basic` | Hold leader between Propose and Lock phases, verify barrier mechanism and QC propagation |
-| `consensus-barrier-missed-ballot` | Hold follower's ballot dispatch, let consensus proceed without it, verify message-driven catch-up |
-| `consensus-barrier-tc-late` | Diagnostic: TC commits before Lock QC arrives — check for metadata divergence |
+| `consensus-leader-down` | Idle mesh's pending proposer is stopped, work submitted elsewhere still decides (wake rules + round rotation); proposer rejoins and catches up. **Requires `HOPNET_QUORUM_PROFILE=majority`** |
+| `consensus-lagging-catch-up` | Node offline while the chain advances, decided-value-syncs back to the tip on rejoin. **Requires `HOPNET_QUORUM_PROFILE=majority`** |
+| `consensus-bft-quorum-loss` | Negative control on the DEFAULT profile: BFT 3-node mesh must NOT decide with one node down; progress resumes at full quorum. Run WITHOUT profile env |
+| `consensus-barrier-decide-window` | `before_decide` held on one node opens an observable divergence window while quorum decides; release converges. **Requires majority profile** |
+| `consensus-barrier-proposal-hold` | `before_publish_proposal` held on the proposer stalls its transaction; release recovers it through a later round. **Requires majority profile** |
 | `consensus-queue-burst` | 10 concurrent mixed ops at one node, validates batching efficiency and cross-node consistency |
 | `consensus-queue-cross-node` | Two-phase ACK forwarding — operations sent to different nodes concurrently, verifies cross-node coordination |
-| `consensus-queue-throughput` | 30s sustained mixed-operation load, measures ops-per-view throughput (≥80% success rate) |
+| `consensus-queue-throughput` | 30s sustained mixed-operation load, measures ops-per-height throughput (≥80% success rate) |
 | `takeout-happy-path` | Upload files, initiate takeout, wait for Ready, download archive, verify manifest contract and per-file byte+hash match |
 | `import-create-active-conflict` | POST `/takeout/import` creates a Pending row visible on all nodes via consensus; concurrent POSTs (same node or cross-node, same user) are rejected 429 |
 | `import-upload-happy-path` | Valid manifest-only tar.gz upload returns 201 and produces a Pending import row visible on every node |
@@ -217,16 +218,20 @@ The `rpc_req` ID is also used for request-level deduplication — retried reques
 
 ## Understanding Output
 
-### Status Output
-- **LEADER**: Node leading current consensus view
-- **FOLLOWER**: Node following the leader
-- **View**: Current consensus view number (higher = more recent)
-- **Phase**: Consensus phase (Propose, Lock, Commit, etc.)
+### Status Output (malachite engine)
+- **LEADER**: The current/pending round's proposer (deterministic rotation)
+- **View**: The engine HEIGHT (the `/consensus` shim reports `view := height`;
+  with on-demand heights an idle mesh shows the PENDING height = decided + 1)
+- **Phase**: Synthetic `"Propose"` (Tendermint rounds aren't surfaced yet)
 
 ### Divergence Output
-- **Consensus**: All nodes at same view with same state hash
-- **Divergence**: Different hashes at same view (consensus broken - bug)
-- **Catch-up**: Nodes at lower views (normal during sync)
+- **Consensus**: All nodes at same height with same state hashes
+- **Divergence**: Different table hashes at the same decided height (bug)
+- **Catch-up**: Nodes at lower decided heights (normal during sync; an idle
+  restarted node stays paused until work or a peer message arrives)
+- Note: `decided_certificates` and `consensus_wal` are intentionally NOT
+  compared — certificates are node-local quorum proofs and may legitimately
+  contain different vote subsets
 
 ### Test Results
 - **PASSED**: All checks succeeded
@@ -237,7 +242,36 @@ The `rpc_req` ID is also used for request-level deduplication — retried reques
 
 - **Networks**: `hopnet-orchestrator-{mesh_id}-0`
 - **Containers**: `hopnet-orchestrator-{mesh_id}-{node_id}`
+- **Relay**: `hopnet-orchestrator-{mesh_id}-relay` (one per mesh — see below)
 - **Volumes**: `hopnet-orchestrator-{mesh_id}-{node_id}-data`
+
+## Self-Hosted Iroh Relay
+
+Every mesh gets its own `iroh-relay --dev` container (same hopnet image,
+entrypoint override, plain HTTP on `:3340`). Node containers receive
+`HOPNET_RELAY_URL=http://hopnet-orchestrator-{mesh_id}-relay:3340`, which
+switches their endpoints to that single relay with NO public discovery —
+mesh tests have zero dependency on n0's public relay/DNS infrastructure
+(which rate-limits under mesh churn and used to flake mesh creation).
+
+## Mesh Environment Variables
+
+Set on the orchestrator process at mesh CREATION time; forwarded into node
+containers:
+
+- `HOPNET_QUORUM_PROFILE=majority` — CFT majority quorum (default: `bft`).
+  Required by the consensus tests that expect progress with a node down.
+- `HOPNET_CONSENSUS_TIMEOUT_MS=<ms>` — round-0 propose timeout (votes and
+  per-round deltas scale with it). Small values (e.g. 2000) make
+  leader-down round advances fast in tests.
+- `HOPNET_DB_*` — SQLite pragma tuning (see `src/db/shared.rs`).
+
+Example:
+
+```bash
+HOPNET_QUORUM_PROFILE=majority HOPNET_CONSENSUS_TIMEOUT_MS=2000 \
+  ./target/release/orchestrator test --test consensus-leader-down
+```
 
 ## Port Mapping
 

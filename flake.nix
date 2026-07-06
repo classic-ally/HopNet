@@ -127,6 +127,33 @@
             '';
           });
 
+          # Self-hosted iroh relay, built from the SAME fork/rev the nodes
+          # link against (relay protocol compatibility). Ships inside the
+          # docker image; the orchestrator runs one per mesh with
+          # `iroh-relay --dev` (plain HTTP, no TLS) and points nodes at it
+          # via HOPNET_RELAY_URL — removing the n0 public relay/DNS
+          # dependency from all mesh tests.
+          iroh-relay = craneLib.buildPackage {
+            pname = "iroh-relay";
+            version = "0.98.2";
+            src = pkgs.fetchFromGitHub {
+              owner = "classic-ally";
+              repo = "iroh";
+              rev = "d97650851c16d002c6b8cb87e64b9b906889171c";
+              hash = "sha256-+nasc9F8OsegyrdDGN/WsZ4niIZEz7Qe44qPN82sKKU=";
+            };
+            strictDeps = true;
+            cargoExtraArgs = "-p iroh-relay --features server --bin iroh-relay";
+            # The iroh repo ships a .cargo/config.toml pinning cross linkers
+            # (aarch64-linux-gnu-gcc) that don't exist on a native builder.
+            postPatch = ''
+              rm -f .cargo/config.toml .cargo/config
+            '';
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            buildInputs = [ pkgs.openssl ];
+            doCheck = false;
+          };
+
           # The photo-viewer SPA. Needs BOTH its own sources and HopNet's
           # frontend/src/lib in the tree: the vite `$ui` alias resolves
           # ../../../frontend/src/lib (zero-copy primitive reuse), so the
@@ -244,7 +271,9 @@
           dockerImage = pkgs.dockerTools.buildLayeredImage {
             name = "hopnet";
             tag = "latest";
-            contents = [ hopnet ];
+            # iroh-relay rides along so the orchestrator can run a relay
+            # container from this same image (entrypoint override).
+            contents = [ hopnet iroh-relay ];
             config = {
               Entrypoint = [ "${hopnet}/bin/hopnet" ];
               ExposedPorts."34632/tcp" = {};

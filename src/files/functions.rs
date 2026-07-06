@@ -388,8 +388,16 @@ pub fn fetch_fragment_local(
     let dir_path = create_fragment_path(fragments_dir, fragment_hash)?;
     let full_file_path = format!("{}/{}", dir_path, fragment_hash.to_hex());
 
-    // Read the fragment data using block_in_place to avoid blocking the async executor
-    tokio::task::block_in_place(|| fs::read(&full_file_path).map_err(FileError::StorageError))
+    // Yield the executor around the blocking read when possible.
+    // block_in_place PANICS on a current_thread runtime — and this path runs
+    // on the consensus shell's dedicated thread (apply_block → handlers), so
+    // fall back to a plain blocking read there (that thread is ours to block).
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| fs::read(&full_file_path).map_err(FileError::StorageError))
+        }
+        _ => fs::read(&full_file_path).map_err(FileError::StorageError),
+    }
 }
 
 /// Fetch and verify a fragment from local storage

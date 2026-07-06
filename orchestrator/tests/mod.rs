@@ -22,6 +22,7 @@ mod fragment_health_check;
 mod import;
 mod iroh_ping;
 mod iroh_reject_unknown;
+mod malachite;
 mod metrics;
 mod multi_size_files;
 pub(crate) mod multi_user;
@@ -142,10 +143,34 @@ pub async fn run_test_by_name(
                 .run(mesh_id, nodes, flags)
                 .await
         }
-        // Bespoke-engine protocol tests (timeout-progression, the three
-        // consensus-barrier-* tests) died at Stage 5b; their malachite
-        // replacements (leader-down round advance, effect-tap barriers,
-        // idle-proposer wake) land at Stage 6.
+        // Malachite protocol tests. The ones that expect progress with a
+        // node down need `HOPNET_QUORUM_PROFILE=majority` set when the mesh
+        // is created (auto-managed mode inherits the orchestrator's env).
+        "consensus-leader-down" => {
+            malachite::ConsensusLeaderDown
+                .run(mesh_id, nodes, flags)
+                .await
+        }
+        "consensus-lagging-catch-up" => {
+            malachite::ConsensusLaggingCatchUp
+                .run(mesh_id, nodes, flags)
+                .await
+        }
+        "consensus-bft-quorum-loss" => {
+            malachite::ConsensusBftQuorumLoss
+                .run(mesh_id, nodes, flags)
+                .await
+        }
+        "consensus-barrier-decide-window" => {
+            malachite::ConsensusBarrierDecideWindow
+                .run(mesh_id, nodes, flags)
+                .await
+        }
+        "consensus-barrier-proposal-hold" => {
+            malachite::ConsensusBarrierProposalHold
+                .run(mesh_id, nodes, flags)
+                .await
+        }
         "metrics-collection" => metrics::MetricsCollection.run(mesh_id, nodes, flags).await,
         "multi-user-isolation" => {
             multi_user::MultiUserIsolation
@@ -279,6 +304,11 @@ pub fn list_test_names() -> Vec<&'static str> {
         "documentprovider-write-consistency",
         "iroh-ping",
         "iroh-reject-unknown",
+        "consensus-leader-down",
+        "consensus-lagging-catch-up",
+        "consensus-bft-quorum-loss",
+        "consensus-barrier-decide-window",
+        "consensus-barrier-proposal-hold",
         "metrics-collection",
         "multi-user-isolation",
         "multi-user-sharing",
@@ -338,7 +368,7 @@ pub async fn get_max_view(nodes: &[NodeInfo]) -> Result<u64> {
                     .json::<serde_json::Value>()
                     .await
                     .ok()
-                    .and_then(|json| json["view"].as_u64()),
+                    .and_then(|json| json["last_decided_height"].as_u64()),
                 _ => None,
             }
         });
@@ -395,7 +425,7 @@ pub async fn wait_for_minimum_view(
                         .json::<serde_json::Value>()
                         .await
                         .ok()
-                        .and_then(|json| json["view"].as_u64()),
+                        .and_then(|json| json["last_decided_height"].as_u64()),
                     _ => None,
                 }
             });

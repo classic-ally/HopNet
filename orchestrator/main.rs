@@ -409,6 +409,23 @@ async fn cleanup_mesh_resources(
     containers: Vec<(String, String, String)>,
     network_id: &str,
 ) {
+    // The relay container isn't in the caller's list — remove it by name.
+    {
+        let relay = relay_container_name(mesh_id);
+        let _ = docker
+            .stop_container(
+                &relay,
+                None::<bollard::query_parameters::StopContainerOptions>,
+            )
+            .await;
+        let _ = docker
+            .remove_container(
+                &relay,
+                None::<bollard::query_parameters::RemoveContainerOptions>,
+            )
+            .await;
+    }
+
     // Stop and remove containers in parallel
     let mut tasks = Vec::new();
     for (name, container_id, _) in containers {
@@ -489,6 +506,16 @@ async fn create_mesh(
             println!("Successfully created network: {}", network_id);
 
             let mut containers: Vec<(String, String, String)> = Vec::new(); // (container_name, container_id, ip_address)
+
+            // The mesh's self-hosted iroh relay comes up FIRST — nodes bind
+            // their endpoints against it at startup.
+            if let Err(e) = create_relay_container(docker, mesh_id, &network_name).await {
+                println!("Failed to start relay container: {}", e);
+                if !no_cleanup {
+                    cleanup_mesh_resources(docker, mesh_id, containers, &network_id).await;
+                }
+                return Err(anyhow::anyhow!("Mesh creation failed: relay container"));
+            }
 
             // Create containers for each node
             for node_id in 0..node_count {
@@ -724,6 +751,70 @@ async fn create_hopnet_network(docker: &Docker, network_name: &str) -> Result<St
     Ok(response.id)
 }
 
+/// The in-network DNS name + port of a mesh's self-hosted iroh relay.
+fn relay_container_name(mesh_id: u32) -> String {
+    format!("hopnet-orchestrator-{}-relay", mesh_id)
+}
+
+fn relay_url(mesh_id: u32) -> String {
+    format!("http://{}:3340", relay_container_name(mesh_id))
+}
+
+/// Start the mesh's self-hosted iroh relay: the hopnet image with an
+/// entrypoint override running `iroh-relay --dev` (plain HTTP on :3340).
+/// Nodes get HOPNET_RELAY_URL pointing here — no n0 public relay or DNS
+/// discovery dependency inside meshes (those services rate-limit under
+/// repeated mesh churn and flake mesh creation).
+async fn create_relay_container(
+    docker: &Docker,
+    mesh_id: u32,
+    network_name: &str,
+) -> Result<String> {
+    let container_name = relay_container_name(mesh_id);
+
+    let mut endpoints_config = HashMap::new();
+    endpoints_config.insert(
+        network_name.to_string(),
+        EndpointSettings {
+            ip_address: None,
+            ..Default::default()
+        },
+    );
+
+    let mut labels = HashMap::new();
+    labels.insert("hopnet.mesh_id".to_string(), mesh_id.to_string());
+    labels.insert("hopnet.role".to_string(), "relay".to_string());
+
+    let config = ContainerCreateBody {
+        image: Some("hopnet:latest".to_string()),
+        entrypoint: Some(vec!["iroh-relay".to_string(), "--dev".to_string()]),
+        labels: Some(labels),
+        networking_config: Some(NetworkingConfig {
+            endpoints_config: Some(endpoints_config),
+        }),
+        ..Default::default()
+    };
+
+    let options = CreateContainerOptionsBuilder::default()
+        .name(&container_name)
+        .build();
+    let response = docker.create_container(Some(options), config).await?;
+    docker
+        .start_container(
+            &response.id,
+            None::<bollard::query_parameters::StartContainerOptions>,
+        )
+        .await?;
+
+    println!(
+        "Started iroh relay {} on network {} ({})",
+        container_name,
+        network_name,
+        relay_url(mesh_id)
+    );
+    Ok(response.id)
+}
+
 async fn create_hopnet_container(
     docker: &Docker,
     container_name: &str,
@@ -809,11 +900,20 @@ async fn create_hopnet_container(
         image: Some("hopnet:latest".to_string()),
         labels: Some(labels),
         env: Some({
-            let mut e = vec!["HOPNET_TEST_MODE=1".to_string()];
-            // Forward any HOPNET_DB_* tuning env vars from orchestrator process to containers
-            // so bench runs can set pragmas without rebuilding the image.
+            let mut e = vec![
+                "HOPNET_TEST_MODE=1".to_string(),
+                // Self-hosted relay: no n0 public relay/discovery dependency.
+                format!("HOPNET_RELAY_URL={}", relay_url(mesh_id)),
+            ];
+            // Forward HOPNET_DB_* (pragma tuning) and HOPNET_CONSENSUS_*/
+            // HOPNET_QUORUM_* (timeouts, quorum profile) from the
+            // orchestrator process so tests can configure meshes without
+            // rebuilding the image.
             for (k, v) in std::env::vars() {
-                if k.starts_with("HOPNET_DB_") {
+                if k.starts_with("HOPNET_DB_")
+                    || k.starts_with("HOPNET_CONSENSUS_")
+                    || k.starts_with("HOPNET_QUORUM_")
+                {
                     e.push(format!("{}={}", k, v));
                 }
             }

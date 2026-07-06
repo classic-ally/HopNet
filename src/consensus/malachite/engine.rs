@@ -56,6 +56,33 @@ const BATCH_LINGER_MS: u64 = 100;
 /// Inject a `system.cleanup_nonces` transaction every N heights (was: views).
 const NONCE_CLEANUP_INTERVAL: u64 = 97;
 
+/// Consensus timeouts, optionally scaled by `HOPNET_CONSENSUS_TIMEOUT_MS`
+/// (the round-0 propose timeout in milliseconds; votes and per-round deltas
+/// scale proportionally). Orchestrator tests use small values so leader-down
+/// round advances happen in seconds instead of the default 3s+.
+fn consensus_timeouts() -> LinearTimeouts {
+    match std::env::var("HOPNET_CONSENSUS_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        Some(ms) => {
+            let propose = Duration::from_millis(ms);
+            let vote = Duration::from_millis((ms / 3).max(100));
+            let delta = Duration::from_millis((ms / 6).max(50));
+            LinearTimeouts {
+                propose,
+                propose_delta: delta,
+                prevote: vote,
+                prevote_delta: delta,
+                precommit: vote,
+                precommit_delta: delta,
+                rebroadcast: propose + vote + vote,
+            }
+        }
+        None => LinearTimeouts::default(),
+    }
+}
+
 /// The current proposal target: `(height, round, proposer node_id)`.
 ///
 /// While a height is running this is the engine's live round info. While
@@ -198,7 +225,7 @@ pub fn spawn_engine(app_state: &AppState) -> Result<(), String> {
             .on_demand()
         },
         start_height,
-        LinearTimeouts::default(),
+        consensus_timeouts(),
         out_tx,
     );
 
