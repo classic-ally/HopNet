@@ -427,6 +427,9 @@ enum DispatchOutcome {
     /// Proposer acknowledged but can't resolve yet, or refused as
     /// not-proposer. Wait for the engine to make progress before retrying.
     WaitForProgress,
+    /// State already changed (a decide raced the proposer's result) — the
+    /// wait-for-progress trigger has ALREADY fired; retry immediately.
+    RetryNow,
 }
 
 /// Long-lived task that drains the queue and routes batches toward the
@@ -556,6 +559,11 @@ pub async fn batch_processor(mut rx: mpsc::Receiver<QueuedTransaction>, app_stat
             // to US within one propose timeout, and a blind sleep would leave
             // the pool empty at our own NeedValue — deciding an empty block
             // and wasting the height.
+            // A raced decide IS the progress signal — gating here re-waits
+            // for the NEXT decide and costs whole heights on an idle mesh.
+            DispatchOutcome::RetryNow => {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
             DispatchOutcome::WaitForProgress | DispatchOutcome::RetryAfterDelay => {
                 let mut round_rx = engine.round.clone();
                 let mut decided_rx = engine.decided.clone();
@@ -652,13 +660,20 @@ async fn handle_as_forwarder(
         }
         Ok(super::rpc::ForwardAckResult::AckedDecided) => {
             // A height decided before the proposer's result — the nonce table
-            // already knows which of ours landed.
+            // already knows which of ours landed. Anything still pending
+            // retries IMMEDIATELY: the decide that raced us is the very
+            // progress the WaitForProgress gate would sit waiting for.
             tracing::debug!(
                 "Proposer node {} ACKed, height decided — resolving via nonce table",
                 proposer
             );
             let results = synthesize_results_from_nonces(&batch, conn);
-            process_forward_results(batch, results, proposer, conn)
+            let (retries, outcome) = process_forward_results(batch, results, proposer, conn);
+            let outcome = match outcome {
+                DispatchOutcome::WaitForProgress => DispatchOutcome::RetryNow,
+                other => other,
+            };
+            (retries, outcome)
         }
         Ok(super::rpc::ForwardAckResult::AckedNoResult) => {
             tracing::debug!(
@@ -672,7 +687,11 @@ async fn handle_as_forwarder(
             round: their_round,
         }) => {
             // Target disagrees about who proposes — either we're stale or it
-            // is. Wait for engine progress and re-derive the target.
+            // is. The receiver kicks a decided-value sync when it's the one
+            // behind (kick_sync_if_behind fires on the forward we just sent),
+            // so it catches up within tens of ms — retry promptly instead of
+            // camping in the 5s progress gate while live heights decide
+            // empty around the held batch.
             tracing::debug!(
                 "Node {} says not proposer (at {}/{}, we targeted {}/{}) — retargeting",
                 proposer,
@@ -682,7 +701,7 @@ async fn handle_as_forwarder(
                 round
             );
             resume_own_engine();
-            (batch, DispatchOutcome::WaitForProgress)
+            (batch, DispatchOutcome::RetryNow)
         }
         Ok(super::rpc::ForwardAckResult::Busy) => {
             tracing::debug!("Proposer node {} busy — waiting for progress", proposer);

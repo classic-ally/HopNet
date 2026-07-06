@@ -56,10 +56,33 @@ pub fn post_initial_setup(
 
     tracing::debug!("post_initial_setup: Starting genesis setup");
 
-    // Create genesis payload with user and node
+    // Mesh-wide keypair (RFC-014): generated once at genesis; privkey wrapped
+    // to user 0's X25519 pubkey. Wrap bytes go INTO the payload so replay is
+    // deterministic.
+    let mesh_secret =
+        x25519_dalek::StaticSecret::random_from_rng(chacha20poly1305::aead::OsRng);
+    let mesh_pubkey = x25519_dalek::PublicKey::from(&mesh_secret);
+    let (mesh_eph, mesh_wrapped) = hopnet_storage::crypto::wrap_mesh_privkey(
+        &mesh_pubkey,
+        &mesh_secret,
+        user.x25519_pubkey.as_x25519(),
+    )
+    .map_err(|e| {
+        tracing::error!("post_initial_setup: mesh key wrap failed: {e}");
+        DatabaseError::ProcessingError
+    })?;
+    let mesh_grant = hopnet_storage::MeshKeyGrant {
+        recipient_pubkey: *user.x25519_pubkey.as_x25519().as_bytes(),
+        ephemeral_pubkey: mesh_eph,
+        wrapped_privkey: mesh_wrapped,
+    };
+
+    // Create genesis payload with user, node, and mesh key material
     let genesis_payload = GenesisPayload {
         user: user.clone(),
         node: node.clone(),
+        mesh_pubkey: *mesh_pubkey.as_bytes(),
+        mesh_grant,
     };
 
     // Encode the payload

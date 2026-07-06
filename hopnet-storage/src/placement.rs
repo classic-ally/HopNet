@@ -8,6 +8,13 @@
 //! The placement seed is currently the caller's choice (the fs projection
 //! passes file_hash bytes); Stage B re-seeds from blob_id.
 
+/// Placement seed derived from the blob id (v1 contract): public, random,
+/// zero plaintext-derived input — every node computes placement from
+/// replicated state alone. (Replaces the plaintext-derived file_hash seed.)
+pub fn placement_seed(blob_id: &crate::types::BlobId) -> [u8; 32] {
+    *blake3::hash(blob_id.as_bytes()).as_bytes()
+}
+
 /// Anything placeable: the substrate only needs a stable node id.
 pub trait PlacementNode {
     fn node_id(&self) -> i32;

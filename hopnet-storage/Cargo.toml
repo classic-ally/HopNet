@@ -18,7 +18,14 @@ bincode = { version = "2.0.1", features = ["serde"] }
 hex = "0.4.3"
 tracing = "0.1"
 
-# Engine feature (Stage E): the tokio distribution engine. Empty for now —
-# pure modules (crypto, rs, fragstore, placement) never need a runtime.
+reed-solomon-simd = "3.0.1"
+
+# Engine feature: async substrate surfaces (api::put now; the distribution
+# engine at Stage E). Pure modules never need a runtime.
+tokio = { version = "1", features = ["io-util"], optional = true }
+
 [features]
-engine = []
+engine = ["dep:tokio"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util", "macros", "rt"] }

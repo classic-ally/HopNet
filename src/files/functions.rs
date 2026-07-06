@@ -74,7 +74,9 @@ impl From<hopnet_storage::StorageError> for FileError {
             // Fragment-hash mismatch mapped to HashingError, matching the
             // pre-extraction behavior of fetch_and_verify_fragment.
             hopnet_storage::StorageError::HashMismatch => FileError::HashingError,
-            hopnet_storage::StorageError::Io(io) => FileError::StorageError(io),
+            hopnet_storage::StorageError::Io(io)
+            | hopnet_storage::StorageError::Read(io) => FileError::StorageError(io),
+            hopnet_storage::StorageError::Rs => FileError::ShardingError,
         }
     }
 }
@@ -265,38 +267,6 @@ pub fn fetch_and_verify_fragment(
         .map_err(FileError::from)
 }
 
-/// Finalize reconstructed file by removing padding and verifying hash
-fn finalize_file(
-    mut file: Vec<u8>,
-    added_bytes: u8,
-    expected_hash: Blake3Hash,
-    data_block_id: &crate::db::CustomUUID,
-) -> Result<Vec<u8>, FileError> {
-    // Remove padding
-    if added_bytes > 0 {
-        let final_length = file.len().saturating_sub(added_bytes as usize);
-        file.truncate(final_length);
-    }
-
-    // Verify file hash (with data_block_id appended for privacy)
-    let actual_hash = {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&file);
-        hasher.update(data_block_id.as_bytes());
-        Blake3Hash::new(hasher.finalize())
-    };
-    if actual_hash != expected_hash {
-        tracing::error!(
-            "File hash mismatch after reconstruction: expected {:?}, got {:?}",
-            expected_hash,
-            actual_hash
-        );
-        return Err(FileError::HashingError);
-    }
-
-    Ok(file)
-}
-
 /// One fragment as observed at reassembly time: (hash, id, stored-locally flag).
 pub type FragmentEntry = (Blake3Hash, CustomUUID, bool);
 
@@ -318,7 +288,7 @@ pub struct FileReassemblyData {
 /// Data structure containing file metadata and access control information from database
 pub struct FileAccessData {
     pub file_reassembly_data: Option<FileReassemblyData>, // None for empty files (no fragments)
-    pub file_access_entry: Option<crate::db::types::FileAccess>,
+    pub file_access_entry: Option<crate::db::types::BlobAccess>,
     pub file_size: u64,
 }
 
@@ -784,7 +754,7 @@ pub async fn prepare_content_update(
     let per_file_key = ChaCha20Poly1305::generate_key(&mut CryptoOsRng);
 
     // Create file access entry for the modifier
-    let file_access = crate::db::types::FileAccess::new_for_user(
+    let file_access = crate::db::types::blob_access_for_user(
         app_state.db_pool.get(),
         dataid.clone(),
         user_id,
@@ -1107,7 +1077,17 @@ pub fn reconstruct_file_chunked(
         };
 
         let is_range = range.is_some();
-        let mut hasher = if is_range { None } else { Some(blake3::Hasher::new()) };
+        // Keyed integrity hasher (RFC-014) — requires the per-blob key, so
+        // verification runs exactly when decryption does. Range reads skip
+        // whole-blob verification (unchanged); fragment hashes verify per hop.
+        let mut hasher = if is_range {
+            None
+        } else {
+            file_data
+                .per_file_key
+                .as_ref()
+                .map(hopnet_storage::crypto::integrity_hasher)
+        };
 
         // Process chunks in order (streaming with per-chunk discovery for rate-matching)
         for chunk_number in start_chunk..=end_chunk {
@@ -1181,11 +1161,9 @@ pub fn reconstruct_file_chunked(
             }
         }
 
-        // Verify final hash after all chunks processed (only for full downloads)
+        // Verify final keyed hash after all chunks processed (full downloads
+        // with a key; empty/keyless blobs have nothing to verify)
         if let Some(hasher) = hasher {
-            // Note: Hash includes data_block_id as per upload flow
-            let mut hasher = hasher;
-            hasher.update(file_data.data_block_id.as_bytes());
             let computed_hash = Blake3Hash::from(hasher.finalize());
             if computed_hash != file_data.expected_file_hash {
                 tracing::error!(

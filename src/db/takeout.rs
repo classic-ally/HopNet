@@ -144,7 +144,8 @@ pub fn process_takeout_creation(
                 type INTEGER NOT NULL CHECK(type IN (0, 1)),
                 data_id TEXT,
                 materialization_status INTEGER DEFAULT 0 CHECK(materialization_status IN (0, 1, 2)),
-                error_message TEXT
+                error_message TEXT,
+                manifest_hash BLOB
             )",
                 temp_table_name
             ))
@@ -671,17 +672,17 @@ pub fn process_takeout_status_update(
 const PENDING_FILES_WARN_THRESHOLD: usize = 50_000;
 
 /// All pending files for a takeout in one query, ordered by path.
-/// JOIN against `data_blocks` surfaces `file_hash` for integrity check.
+/// (The manifest hash is computed at materialization time — the DB integrity
+/// hash is keyed and not usable for export/import verification.)
 pub fn list_pending_files(
     conn: &rusqlite::Connection,
     takeout_id: &CustomUUID,
-) -> Result<Vec<(CustomUUID, String, CustomUUID, crate::types::Blake3Hash)>, DatabaseError> {
+) -> Result<Vec<(CustomUUID, String, CustomUUID)>, DatabaseError> {
     let temp_table_name = format!("takeout_inodes_{}", takeout_id.simple());
 
     let query = format!(
-        "SELECT t.id, t.path, t.data_id, d.file_hash
+        "SELECT t.id, t.path, t.data_id
          FROM {} t
-         JOIN data_blocks d ON t.data_id = d.id
          WHERE t.type = 0 AND t.materialization_status = 0 AND t.data_id IS NOT NULL
          ORDER BY t.path",
         temp_table_name
@@ -697,8 +698,7 @@ pub fn list_pending_files(
             let id: CustomUUID = row.get(0)?;
             let encrypted_path: String = row.get(1)?;
             let data_id: CustomUUID = row.get(2)?;
-            let file_hash: crate::types::Blake3Hash = row.get(3)?;
-            Ok((id, encrypted_path, data_id, file_hash))
+            Ok((id, encrypted_path, data_id))
         })
         .map_err(|e| {
             tracing::error!("Failed to execute pending files query: {:?}", e);
@@ -736,6 +736,7 @@ pub fn update_file_status(
     file_id: &CustomUUID,
     status: MaterializationStatus,
     error_message: Option<&str>,
+    manifest_hash: Option<&crate::types::Blake3Hash>,
 ) -> Result<(), DatabaseError> {
     if let Some(error_msg) = error_message {
         let update_query = format!(
@@ -745,10 +746,10 @@ pub fn update_file_status(
         tx.execute(&update_query, params![status, error_msg, file_id])
     } else {
         let update_query = format!(
-            "UPDATE {} SET materialization_status = ? WHERE id = ?",
+            "UPDATE {} SET materialization_status = ?, manifest_hash = ? WHERE id = ?",
             temp_table_name
         );
-        tx.execute(&update_query, params![status, file_id])
+        tx.execute(&update_query, params![status, manifest_hash, file_id])
     }
     .map_err(|e| {
         tracing::error!("Failed to update file status: {:?}", e);
@@ -788,17 +789,20 @@ pub async fn materialize_all_files(
     );
 
     let temp_table_name = format!("takeout_inodes_{}", takeout_id.simple());
-    let mut set: tokio::task::JoinSet<(CustomUUID, MaterializationStatus, Option<String>)> =
-        tokio::task::JoinSet::new();
+    let mut set: tokio::task::JoinSet<(
+        CustomUUID,
+        MaterializationStatus,
+        Option<String>,
+        Option<crate::types::Blake3Hash>,
+    )> = tokio::task::JoinSet::new();
     let mut iter = pending.into_iter();
     let mut total_materialized = 0u32;
     let mut total_failed = 0u32;
 
     // Helper to spawn a single reconstruction task
     let spawn_one =
-        |set: &mut tokio::task::JoinSet<_>,
-         work: (CustomUUID, String, CustomUUID, crate::types::Blake3Hash)| {
-            let (file_id, encrypted_path, data_id, expected_file_hash) = work;
+        |set: &mut tokio::task::JoinSet<_>, work: (CustomUUID, String, CustomUUID)| {
+            let (file_id, encrypted_path, data_id) = work;
             let app_state = app_state.clone();
             let takeout_id = takeout_id.clone();
             let fragments_dir = fragments_dir.to_string();
@@ -809,7 +813,6 @@ pub async fn materialize_all_files(
                     file_id,
                     encrypted_path,
                     data_id,
-                    expected_file_hash,
                     &fragments_dir,
                     user_id,
                 )
@@ -826,8 +829,8 @@ pub async fn materialize_all_files(
 
     // Drain results, persist on reserved_conn, replenish the pipeline
     while let Some(join_result) = set.join_next().await {
-        let (file_id, status, error_msg) = match join_result {
-            Ok(triple) => triple,
+        let (file_id, status, error_msg, manifest_hash) = match join_result {
+            Ok(quad) => quad,
             Err(e) => {
                 tracing::error!("Reconstruction task panicked or was cancelled: {:?}", e);
                 total_failed += 1;
@@ -852,6 +855,7 @@ pub async fn materialize_all_files(
             &file_id,
             status.clone(),
             error_msg.as_deref(),
+            manifest_hash.as_ref(),
         ) {
             tracing::error!("Failed to update status for file {}: {:?}", file_id, e);
         } else if let Err(e) = crate::db::shared::commit_timed(tx) {
@@ -957,12 +961,14 @@ pub fn build_takeout_manifest(
         depth_a.cmp(&depth_b).then_with(|| a.path.cmp(&b.path))
     });
 
-    // Files: success-status file inodes joined to data_blocks for size + hash + source dataid.
+    // Files: success-status file inodes joined to data_blocks for size +
+    // source dataid; the manifest hash is the export-computed plaintext hash
+    // persisted at materialization (the DB integrity hash is keyed).
     let file_query = format!(
-        "SELECT t.path, t.data_id, d.file_size, d.file_hash
+        "SELECT t.path, t.data_id, d.file_size, t.manifest_hash
          FROM {} t
          JOIN data_blocks d ON t.data_id = d.id
-         WHERE t.materialization_status = ? AND t.type = ?
+         WHERE t.materialization_status = ? AND t.type = ? AND t.manifest_hash IS NOT NULL
          ORDER BY t.path",
         temp_table_name
     );

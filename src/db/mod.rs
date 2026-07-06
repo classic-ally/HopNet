@@ -19,6 +19,7 @@ pub mod fragments;
 pub mod import_paths;
 pub mod imports;
 pub mod inventory;
+pub mod mesh;
 pub mod metrics;
 pub mod nodes;
 pub mod resilience;

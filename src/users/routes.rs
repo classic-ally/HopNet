@@ -248,8 +248,63 @@ pub async fn post_users(
         key_salt,
     );
 
-    // Encode user with bincode::serde standard config
-    match bincode::serde::encode_to_vec(&user, bincode::config::standard()) {
+    // Mesh-key grant for the new member (RFC-014 induction from genesis):
+    // the creating user's session unwraps the mesh privkey via its own
+    // grant, then wraps it to the new user's pubkey. Rides the insert_user
+    // tx so every node installs the grant atomically with the user row.
+    let mesh_grant = {
+        let session = match app_state.get_session(user_id).await {
+            Ok(s) => s,
+            Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+        };
+        let creator_x25519 =
+            crate::auth::derive_x25519_privkey_from_user(&session.user_keys.private_key);
+        let creator_reader = hopnet_storage::crypto::StaticRecipient(creator_x25519);
+        let conn = match app_state.db_pool.get() {
+            Ok(c) => c,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        let mesh_pub_bytes = match crate::db::mesh::get_mesh_pubkey(&conn) {
+            Ok(Some(p)) => p,
+            _ => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        use hopnet_storage::crypto::RecipientKey;
+        let creator_pub = *creator_reader.pubkey().as_bytes();
+        let creator_grant = match crate::db::mesh::get_mesh_grant(&conn, &creator_pub) {
+            Ok(Some(g)) => g,
+            _ => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        drop(conn);
+        let mesh_pub = x25519_dalek::PublicKey::from(mesh_pub_bytes);
+        let mesh_priv = match hopnet_storage::crypto::unwrap_mesh_privkey(
+            &mesh_pub,
+            &creator_grant.recipient_pubkey,
+            &creator_grant.ephemeral_pubkey,
+            &creator_grant.wrapped_privkey,
+            &creator_reader,
+        ) {
+            Ok(k) => k,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        let (eph, wrapped) = match hopnet_storage::crypto::wrap_mesh_privkey(
+            &mesh_pub,
+            &mesh_priv,
+            user.x25519_pubkey.as_x25519(),
+        ) {
+            Ok(w) => w,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        hopnet_storage::MeshKeyGrant {
+            recipient_pubkey: *user.x25519_pubkey.as_x25519().as_bytes(),
+            ephemeral_pubkey: eph,
+            wrapped_privkey: wrapped,
+        }
+    };
+
+    let insert_payload = crate::users::types::InsertUserPayload { user, mesh_grant };
+
+    // Encode payload with bincode::serde standard config
+    match bincode::serde::encode_to_vec(&insert_payload, bincode::config::standard()) {
         Ok(encoded_user) => {
             let transaction = match crate::consensus::dispatch::create_signed_user_transaction(
                 &app_state,

@@ -255,14 +255,14 @@ pub fn insert_files(
                     })?;
                 }
 
-                // Insert file access entries if present
+                // Insert blob access entries if present
                 if let Some(ref file_access_entries) = data_record.file_access_entries {
                     for access_entry in file_access_entries {
                         db_tx.execute(
-                            "INSERT INTO file_access (data_block_id, user_id, ephemeral_pubkey, encrypted_file_key) VALUES (?, ?, ?, ?)",
-                            params![access_entry.data_block_id, access_entry.user_id, access_entry.ephemeral_pubkey, access_entry.encrypted_file_key]
+                            "INSERT INTO blob_access (blob_id, recipient_pubkey, ephemeral_pubkey, wrapped_key) VALUES (?, ?, ?, ?)",
+                            params![access_entry.blob_id, access_entry.recipient_pubkey.to_vec(), access_entry.ephemeral_pubkey.to_vec(), access_entry.wrapped_key]
                         ).map_err(|e| {
-                            tracing::error!("Failed to insert file_access: data_block_id={} user_id={} error={:?}", access_entry.data_block_id, access_entry.user_id, e);
+                            tracing::error!("Failed to insert blob_access: blob_id={} error={:?}", access_entry.blob_id, e);
                             DatabaseError::InsertError
                         })?;
                     }
@@ -683,32 +683,25 @@ pub fn modify_item(
             })?;
         }
 
-        // Insert file access entries for the new data block
+        // Insert blob access entries for the new data block
         if let Some(ref file_access_entries) = data_record.file_access_entries {
             tracing::debug!(
-                "modify_item: Inserting {} file_access entries for data_block_id={}",
+                "modify_item: Inserting {} blob_access entries for blob_id={}",
                 file_access_entries.len(),
                 data_record.id
             );
-            for (i, access_entry) in file_access_entries.iter().enumerate() {
-                tracing::debug!(
-                    "modify_item: Inserting file_access [{}/{}] data_block_id={} user_id={}",
-                    i + 1,
-                    file_access_entries.len(),
-                    access_entry.data_block_id,
-                    access_entry.user_id
-                );
+            for access_entry in file_access_entries.iter() {
                 db_tx.execute(
-                    "INSERT INTO file_access (data_block_id, user_id, ephemeral_pubkey, encrypted_file_key) VALUES (?, ?, ?, ?)",
-                    params![access_entry.data_block_id, access_entry.user_id, access_entry.ephemeral_pubkey, access_entry.encrypted_file_key]
+                    "INSERT INTO blob_access (blob_id, recipient_pubkey, ephemeral_pubkey, wrapped_key) VALUES (?, ?, ?, ?)",
+                    params![access_entry.blob_id, access_entry.recipient_pubkey.to_vec(), access_entry.ephemeral_pubkey.to_vec(), access_entry.wrapped_key]
                 ).map_err(|e| {
-                    tracing::error!("modify_item: Failed to insert file_access data_block_id={} user_id={}: {:?}", access_entry.data_block_id, access_entry.user_id, e);
+                    tracing::error!("modify_item: Failed to insert blob_access blob_id={}: {:?}", access_entry.blob_id, e);
                     DatabaseError::InsertError
                 })?;
             }
         } else {
             tracing::debug!(
-                "modify_item: No file_access entries to insert for data_block_id={}",
+                "modify_item: No blob_access entries to insert for blob_id={}",
                 data_record.id
             );
         }
@@ -983,18 +976,13 @@ pub fn get_file_fragments(
 
             match (data_block_id, file_hash, added_bytes) {
                 (Some(data_block_id), Some(file_hash), Some(added_bytes)) => {
-                    // Get file_access entry for this user and file
+                    // Get the user's blob_access wrap (resolved via their pubkey)
                     let file_access_entry = db_lock.prepare(
-                        "SELECT data_block_id, user_id, ephemeral_pubkey, encrypted_file_key FROM file_access WHERE data_block_id = ? AND user_id = ?"
+                        "SELECT ba.blob_id, ba.recipient_pubkey, ba.ephemeral_pubkey, ba.wrapped_key
+                         FROM blob_access ba JOIN users u ON u.x25519_pubkey = ba.recipient_pubkey
+                         WHERE ba.blob_id = ? AND u.user_id = ?"
                     ).and_then(|mut stmt| {
-                        stmt.query_row(params![data_block_id, user_id], |row| {
-                            Ok(crate::db::types::FileAccess {
-                                data_block_id: row.get(0)?,
-                                user_id: row.get(1)?,
-                                ephemeral_pubkey: row.get(2)?,
-                                encrypted_file_key: row.get(3)?,
-                            })
-                        })
+                        stmt.query_row(params![data_block_id, user_id], row_to_blob_access)
                     }).ok(); // Convert error to None - user might not have access
 
                     let file_reassembly_data = crate::files::functions::FileReassemblyData {
@@ -1341,20 +1329,41 @@ pub fn get_inode_by_id(
     .map_err(|_| DatabaseError::RecallError)
 }
 
-/// Look up a user's file_access entry for a specific data_block.
+/// Map a blob_access row (blob_id, recipient_pubkey, ephemeral_pubkey,
+/// wrapped_key) into the substrate's BlobAccess.
+pub(crate) fn row_to_blob_access(
+    row: &rusqlite::Row<'_>,
+) -> Result<crate::db::types::BlobAccess, rusqlite::Error> {
+    let recipient: Vec<u8> = row.get(1)?;
+    let ephemeral: Vec<u8> = row.get(2)?;
+    let to_arr = |v: Vec<u8>, idx: usize| -> Result<[u8; 32], rusqlite::Error> {
+        v.try_into().map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                idx,
+                rusqlite::types::Type::Blob,
+                "expected 32-byte X25519 key".into(),
+            )
+        })
+    };
+    Ok(crate::db::types::BlobAccess {
+        blob_id: row.get(0)?,
+        recipient_pubkey: to_arr(recipient, 1)?,
+        ephemeral_pubkey: to_arr(ephemeral, 2)?,
+        wrapped_key: row.get(3)?,
+    })
+}
+
+/// Look up a user's blob_access wrap for a specific blob (via their pubkey).
 pub fn get_file_access(
     conn: &rusqlite::Connection,
     data_block_id: &CustomUUID,
     user_id: i32,
-) -> Result<Option<crate::db::types::FileAccess>, DatabaseError> {
+) -> Result<Option<crate::db::types::BlobAccess>, DatabaseError> {
     conn.query_row(
-        "SELECT data_block_id, user_id, ephemeral_pubkey, encrypted_file_key FROM file_access WHERE data_block_id = ? AND user_id = ?",
+        "SELECT ba.blob_id, ba.recipient_pubkey, ba.ephemeral_pubkey, ba.wrapped_key
+         FROM blob_access ba JOIN users u ON u.x25519_pubkey = ba.recipient_pubkey
+         WHERE ba.blob_id = ? AND u.user_id = ?",
         params![data_block_id, user_id],
-        |row| Ok(crate::db::types::FileAccess {
-            data_block_id: row.get(0)?,
-            user_id: row.get(1)?,
-            ephemeral_pubkey: row.get(2)?,
-            encrypted_file_key: row.get(3)?,
-        })
+        row_to_blob_access,
     ).optional().map_err(|_| DatabaseError::RecallError)
 }

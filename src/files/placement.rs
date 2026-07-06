@@ -31,15 +31,16 @@ impl From<NodeMetrics> for MetricsRow {
     }
 }
 
-/// Select nodes for a specific file's fragment placement.
-/// Seeded by file_hash today; Stage B re-seeds from blob_id.
-pub fn select_nodes_for_file(
+/// Select nodes for a blob's fragment placement, seeded by the blob id
+/// (RFC-014 v1 contract).
+pub fn select_nodes_for_blob_id(
     validators: Vec<Node>,
     all_metrics: Vec<NodeMetrics>,
-    file_hash: &Blake3Hash,
+    blob_id: &crate::db::CustomUUID,
 ) -> Vec<Node> {
     let metrics: Vec<MetricsRow> = all_metrics.into_iter().map(MetricsRow::from).collect();
-    hopnet_storage::placement::select_nodes_for_blob(validators, metrics, file_hash.0.as_bytes())
+    let seed = hopnet_storage::placement::placement_seed(blob_id);
+    hopnet_storage::placement::select_nodes_for_blob(validators, metrics, &seed)
 }
 
 /// Get fragment placement candidates using modulo distribution

@@ -2,8 +2,12 @@ use crate::db::{CustomUUID, takeout::MaterializationStatus};
 use crate::files::download::{FileReconstructionError, reconstruct_file_stream};
 use crate::types::Blake3Hash;
 
-/// Materialize a single file by reconstructing from fragments and writing to staging
-/// Returns (file_id, status, optional_error_message) for database update
+/// Materialize a single file by reconstructing from fragments and writing to staging.
+/// Returns (file_id, status, optional_error_message, manifest_hash) for database
+/// update. `manifest_hash` = blake3(plaintext ‖ data_id), computed here at export
+/// time — the DB's integrity hash is KEYED (RFC-014) and unverifiable by an
+/// importer, so the manifest carries this export-computed value instead. Stream
+/// integrity is enforced inside reconstruction (keyed whole-blob verify).
 #[allow(clippy::too_many_arguments)] // context + per-file data; struct wrapper deferred
 pub async fn materialize_single_file(
     app_state: &crate::AppState,
@@ -11,10 +15,9 @@ pub async fn materialize_single_file(
     file_id: CustomUUID,
     encrypted_path: String,
     data_id: CustomUUID,
-    expected_file_hash: Blake3Hash,
     fragments_dir: &str,
     user_id: i32,
-) -> (CustomUUID, MaterializationStatus, Option<String>) {
+) -> (CustomUUID, MaterializationStatus, Option<String>, Option<Blake3Hash>) {
     let staging_dir = format!(
         "{}/takeouts/{}/staging/files",
         fragments_dir,
@@ -29,6 +32,7 @@ pub async fn materialize_single_file(
                 file_id,
                 MaterializationStatus::Failed,
                 Some("Failed to get session keys".to_string()),
+                None,
             );
         }
     };
@@ -46,6 +50,7 @@ pub async fn materialize_single_file(
                 file_id,
                 MaterializationStatus::Failed,
                 Some("Path decryption failed".to_string()),
+                None,
             );
         }
     };
@@ -80,6 +85,7 @@ pub async fn materialize_single_file(
                     file_id,
                     MaterializationStatus::Failed,
                     Some(error_msg.to_string()),
+                    None,
                 );
             }
         };
@@ -100,6 +106,7 @@ pub async fn materialize_single_file(
             file_id,
             MaterializationStatus::Failed,
             Some(format!("Parent directory creation failed: {}", e)),
+            None,
         );
     }
 
@@ -112,12 +119,13 @@ pub async fn materialize_single_file(
                 file_id,
                 MaterializationStatus::Failed,
                 Some(format!("File creation failed: {}", e)),
+                None,
             );
         }
     };
 
-    // Write chunks as they arrive from the stream, hashing plaintext in parallel
-    // for post-reconstruction integrity verification against data_blocks.file_hash.
+    // Write chunks as they arrive from the stream, hashing plaintext in
+    // parallel for the export manifest (import-side verification).
     use tokio::io::AsyncWriteExt;
     use tokio_stream::StreamExt;
 
@@ -136,6 +144,7 @@ pub async fn materialize_single_file(
                     file_id,
                     MaterializationStatus::Failed,
                     Some("Stream reconstruction error".to_string()),
+                    None,
                 );
             }
         };
@@ -148,6 +157,7 @@ pub async fn materialize_single_file(
                 file_id,
                 MaterializationStatus::Failed,
                 Some(format!("Chunk write failed: {}", e)),
+                None,
             );
         }
 
@@ -161,38 +171,27 @@ pub async fn materialize_single_file(
             file_id,
             MaterializationStatus::Failed,
             Some(format!("File sync failed: {}", e)),
+            None,
         );
     }
 
-    // Integrity check: formula must match upload-time hash at src/files/routes.rs:239
-    // (blake3(plaintext || data_id.as_bytes())). Drift on either side = takeouts fail universally.
+    // Manifest hash: blake3(plaintext ‖ data_id), the formula import-side
+    // extraction recomputes (src/takeout/import.rs extract_and_hash). Export
+    // integrity itself is enforced INSIDE the reconstruction stream (keyed
+    // whole-blob verify with the per-blob key) — the DB's integrity hash is
+    // keyed (RFC-014) and not recomputable here or by an importer.
     hasher.update(data_id.as_bytes());
-    let computed_hash = Blake3Hash::new(hasher.finalize());
-    if computed_hash != expected_file_hash {
-        tracing::error!(
-            "Integrity check failed for {}: expected {}, got {}",
-            full_staging_path,
-            expected_file_hash,
-            computed_hash
-        );
-        if let Err(e) = tokio::fs::remove_file(&full_staging_path).await {
-            tracing::warn!(
-                "Failed to remove corrupted staging file {}: {:?}",
-                full_staging_path,
-                e
-            );
-        }
-        return (
-            file_id,
-            MaterializationStatus::Failed,
-            Some("integrity check failed".to_string()),
-        );
-    }
+    let manifest_hash = Blake3Hash::new(hasher.finalize());
 
     tracing::debug!(
         "Materialized file: {} ({} bytes)",
         full_staging_path,
         total_bytes
     );
-    (file_id, MaterializationStatus::Success, None)
+    (
+        file_id,
+        MaterializationStatus::Success,
+        None,
+        Some(manifest_hash),
+    )
 }

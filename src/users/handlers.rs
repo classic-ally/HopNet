@@ -24,16 +24,23 @@ impl TransactionHandler for InsertUserHandler {
         _execute: bool,
         db_tx: &rusqlite::Transaction,
     ) -> HandlerResult {
-        match bincode::serde::decode_from_slice::<User, _>(
-            &tx.rpc.payload,
-            bincode::config::standard(),
-        ) {
-            Ok((user_data, _)) => {
-                insert_user_tx(db_tx, user_data)?;
-                Ok(())
-            }
-            Err(_) => Err(DatabaseError::InvalidPayload),
+        let (payload, _) = bincode::serde::decode_from_slice::<
+            crate::users::types::InsertUserPayload,
+            _,
+        >(&tx.rpc.payload, bincode::config::standard())
+        .map_err(|_| DatabaseError::InvalidPayload)?;
+
+        // Grant must target the new user's pubkey — a mismatched grant would
+        // strand the member outside all-users blobs.
+        if payload.mesh_grant.recipient_pubkey
+            != *payload.user.x25519_pubkey.as_x25519().as_bytes()
+        {
+            return Err(DatabaseError::InvalidPayload);
         }
+
+        insert_user_tx(db_tx, payload.user)?;
+        crate::db::mesh::insert_mesh_grant_tx(db_tx, &payload.mesh_grant)?;
+        Ok(())
     }
 }
 

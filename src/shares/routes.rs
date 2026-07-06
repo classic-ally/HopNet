@@ -3,7 +3,7 @@ use crate::AppState;
 use crate::consensus::queue::ConsensusSubmitError;
 use crate::db::CustomUUID;
 use crate::db::DatabaseError;
-use crate::db::types::FileAccess;
+use crate::db::types::BlobAccess;
 use axum::{
     Router,
     extract::{Extension, Json, Path, State},
@@ -109,7 +109,7 @@ pub async fn post_share(
         };
 
     // Create FileAccess for recipient
-    let recipient_file_access = match FileAccess::new_for_user(
+    let recipient_file_access = match crate::db::types::blob_access_for_user(
         app_state.db_pool.get(),
         data_block_id.clone(),
         recipient.user_id,

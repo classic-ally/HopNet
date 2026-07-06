@@ -134,19 +134,19 @@ impl TransactionHandler for AcceptShareHandler {
             return Err(DatabaseError::ConflictError);
         }
 
-        // 1. Deserialize FileAccess from blob and insert into file_access table
+        // 1. Deserialize BlobAccess from blob and insert into blob_access table
         let (file_access_entry, _) =
-            bincode::serde::decode_from_slice::<crate::db::types::FileAccess, _>(
+            bincode::serde::decode_from_slice::<crate::db::types::BlobAccess, _>(
                 &incoming_share.file_access,
                 bincode::config::standard(),
             )
             .map_err(|_| DatabaseError::InvalidPayload)?;
 
         db_tx.execute(
-            "INSERT INTO file_access (data_block_id, user_id, ephemeral_pubkey, encrypted_file_key) VALUES (?, ?, ?, ?)",
-            params![file_access_entry.data_block_id, file_access_entry.user_id, file_access_entry.ephemeral_pubkey, file_access_entry.encrypted_file_key]
+            "INSERT OR REPLACE INTO blob_access (blob_id, recipient_pubkey, ephemeral_pubkey, wrapped_key) VALUES (?, ?, ?, ?)",
+            params![file_access_entry.blob_id, file_access_entry.recipient_pubkey.to_vec(), file_access_entry.ephemeral_pubkey.to_vec(), file_access_entry.wrapped_key]
         ).map_err(|e| {
-            tracing::error!("Failed to insert file_access for share accept: {:?}", e);
+            tracing::error!("Failed to insert blob_access for share accept: {:?}", e);
             DatabaseError::InsertError
         })?;
 

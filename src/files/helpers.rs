@@ -88,7 +88,7 @@ pub async fn assemble_file_inode<R: AsyncRead + Unpin>(
     let dataid = CustomUUID::new(None);
     let per_file_key = ChaCha20Poly1305::generate_key(&mut OsRng);
 
-    let file_access = crate::db::types::FileAccess::new_for_user(
+    let file_access = crate::db::types::blob_access_for_user(
         app_state.db_pool.get(),
         dataid.clone(),
         user_id,

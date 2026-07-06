@@ -777,9 +777,20 @@ where
                     if validity == Validity::Invalid {
                         // A quorum committed a value our app rejects: an app
                         // determinism violation, not a peer fault. Surface it —
-                        // the engine will log and hold at this height.
+                        // the engine will log and hold at this height. Log the
+                        // block's tx functions: identifying WHICH handler
+                        // diverged is the whole diagnosis (observed once
+                        // 2026-07-06 at h=10 under a catch-up during load;
+                        // did not wedge — live decided the height).
+                        let functions: Vec<&str> = block
+                            .data
+                            .transactions
+                            .iter()
+                            .map(|t| t.rpc.function.as_str())
+                            .collect();
                         tracing::error!(
                             %height,
+                            ?functions,
                             "sync value failed local validation despite a valid commit certificate"
                         );
                         ctx.outputs.push(HostOutput::SyncInvalid {

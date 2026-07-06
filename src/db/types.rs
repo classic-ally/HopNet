@@ -129,7 +129,7 @@ pub struct DataRecord {
     pub id: CustomUUID,
     pub modified_at: Option<CustomDateTime>,
     pub data: Data,
-    pub file_access_entries: Option<Vec<FileAccess>>,
+    pub file_access_entries: Option<Vec<BlobAccess>>,
     pub file_size: u64, // Total size of the file in bytes
 }
 
@@ -193,60 +193,37 @@ impl FromSql for XPubKey {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct FileAccess {
-    pub data_block_id: CustomUUID,
-    pub user_id: i32,
-    pub ephemeral_pubkey: XPubKey,
-    pub encrypted_file_key: Vec<u8>, // 48 bytes (32 key + 16 auth tag)
+/// Access rows are substrate-owned (RFC-014): pubkey-keyed wraps of the
+/// per-blob key. The projection maps users to pubkeys at wrap time; nothing
+/// in the substrate knows user ids.
+pub use hopnet_storage::BlobAccess;
+
+/// Wrap the per-blob key to a user's X25519 pubkey — resolves the user's
+/// pubkey from the DB, then delegates to the substrate's v1 wrap.
+pub fn blob_access_for_user_with_conn(
+    conn: &rusqlite::Connection,
+    blob_id: CustomUUID,
+    user_id: i32,
+    per_blob_key: &chacha20poly1305::Key,
+) -> Result<BlobAccess, DatabaseError> {
+    let user = match crate::db::users::get_user_by_userid_conn(conn, user_id) {
+        Ok(Some(user)) => user,
+        Ok(None) => return Err(DatabaseError::RecallError), // User not found
+        Err(e) => return Err(e),
+    };
+    hopnet_storage::crypto::wrap_blob_key(&blob_id, user.x25519_pubkey.as_x25519(), per_blob_key)
+        .map_err(|_| DatabaseError::ProcessingError)
 }
 
-impl FileAccess {
-    /// Create a new FileAccess entry by wrapping the per-file key for the specified user
-    pub fn new_for_user_with_conn(
-        conn: &rusqlite::Connection,
-        data_block_id: CustomUUID,
-        user_id: i32,
-        per_file_key: &chacha20poly1305::Key,
-    ) -> Result<Self, DatabaseError> {
-        // Look up user from database to get their X25519 public key
-        let user = match crate::db::users::get_user_by_userid_conn(conn, user_id) {
-            Ok(Some(user)) => user,
-            Ok(None) => return Err(DatabaseError::RecallError), // User not found
-            Err(e) => return Err(e),
-        };
-
-        // Wrap the per-file key to the user's X25519 pubkey — the wrap crypto
-        // lives in the substrate crate (hopnet-storage::crypto, legacy format
-        // until the Stage-B blob_access migration).
-        let wrapped = hopnet_storage::crypto::wrap_file_key_legacy(
-            user.x25519_pubkey.as_x25519(),
-            &data_block_id,
-            user_id,
-            per_file_key,
-        )
-        .map_err(|_| DatabaseError::ProcessingError)?;
-
-        Ok(FileAccess {
-            data_block_id,
-            user_id,
-            ephemeral_pubkey: XPubKey::from(wrapped.ephemeral_pubkey),
-            encrypted_file_key: wrapped.wrapped_key,
-        })
-    }
-
-    pub fn new_for_user(
-        db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
-        data_block_id: CustomUUID,
-        user_id: i32,
-        per_file_key: &chacha20poly1305::Key,
-    ) -> Result<Self, DatabaseError> {
-        match db_connection {
-            Ok(db_lock) => {
-                Self::new_for_user_with_conn(&db_lock, data_block_id, user_id, per_file_key)
-            }
-            Err(_) => Err(DatabaseError::LockError),
-        }
+pub fn blob_access_for_user(
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
+    blob_id: CustomUUID,
+    user_id: i32,
+    per_blob_key: &chacha20poly1305::Key,
+) -> Result<BlobAccess, DatabaseError> {
+    match db_connection {
+        Ok(db_lock) => blob_access_for_user_with_conn(&db_lock, blob_id, user_id, per_blob_key),
+        Err(_) => Err(DatabaseError::LockError),
     }
 }
 

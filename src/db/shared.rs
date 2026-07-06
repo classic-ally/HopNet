@@ -393,15 +393,32 @@ pub fn initialize(db: PooledConnection<SqliteConnectionManager>) -> Result<(), D
                 file_size        INTEGER NOT NULL  -- Total size of the file in bytes (i64, max ~9.2 EB)
             );
 
-            CREATE TABLE file_access (
-                data_block_id    TEXT NOT NULL,
-                user_id          INTEGER NOT NULL,
-                ephemeral_pubkey BLOB NOT NULL,  -- 32 bytes X25519 ephemeral public key
-                encrypted_file_key BLOB NOT NULL, -- 48 bytes (32 + 16 auth tag)
+            -- Substrate-owned (RFC-014): pubkey-keyed wraps of per-blob keys.
+            -- No users FK: the mesh pubkey is a valid recipient with no user
+            -- row, and non-user projections may hold access later.
+            CREATE TABLE blob_access (
+                blob_id          TEXT NOT NULL,
+                recipient_pubkey BLOB NOT NULL,  -- 32 bytes X25519 (user or mesh key)
+                ephemeral_pubkey BLOB NOT NULL,  -- 32 bytes X25519 per-wrap ephemeral
+                wrapped_key      BLOB NOT NULL,  -- 48 bytes (32 + 16 auth tag)
 
-                PRIMARY KEY (data_block_id, user_id),
-                FOREIGN KEY (data_block_id) REFERENCES data_blocks(id),
-                FOREIGN KEY (user_id) REFERENCES users(user_id)
+                PRIMARY KEY (blob_id, recipient_pubkey),
+                FOREIGN KEY (blob_id) REFERENCES data_blocks(id)
+            );
+            CREATE INDEX idx_blob_access_recipient ON blob_access(recipient_pubkey);
+
+            -- Mesh-wide keypair (RFC-014 all-users access primitive).
+            -- Pubkey is public replicated state; the privkey exists ONLY
+            -- wrapped-to-member-pubkeys (rows ride genesis / insert_user txs).
+            CREATE TABLE mesh_key (
+                internal_id INTEGER PRIMARY KEY CHECK(internal_id = 1),
+                pubkey      BLOB NOT NULL,   -- 32 bytes X25519
+                key_version INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE mesh_key_access (
+                recipient_pubkey BLOB PRIMARY KEY, -- member's X25519 pubkey
+                ephemeral_pubkey BLOB NOT NULL,
+                wrapped_privkey  BLOB NOT NULL     -- 48 bytes (32 + 16 tag)
             );
 
             CREATE TABLE fragment_hashes (

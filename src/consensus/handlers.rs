@@ -127,6 +127,11 @@ inventory::submit! {
 pub struct GenesisPayload {
     pub user: User,
     pub node: Node,
+    /// Mesh-wide X25519 pubkey (RFC-014 all-users access primitive).
+    pub mesh_pubkey: [u8; 32],
+    /// Mesh privkey wrapped to user 0's pubkey — in the payload (not
+    /// recomputed) so joining nodes reproduce it via deterministic replay.
+    pub mesh_grant: hopnet_storage::MeshKeyGrant,
 }
 
 pub struct InsertGenesisHandler;
@@ -223,6 +228,11 @@ impl TransactionHandler for InsertGenesisHandler {
             e
         })?;
         tracing::debug!("InsertGenesisHandler: Activated validator");
+
+        // 5. Install the mesh keypair: public key + user-0 grant
+        crate::db::mesh::insert_mesh_key_tx(db_tx, &genesis_data.mesh_pubkey)?;
+        crate::db::mesh::insert_mesh_grant_tx(db_tx, &genesis_data.mesh_grant)?;
+        tracing::debug!("InsertGenesisHandler: Installed mesh keypair + genesis grant");
 
         // === EXECUTION PHASE ===
         if execute {

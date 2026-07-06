@@ -127,6 +127,205 @@ pub fn decrypt_chunk(
     Ok(decrypted_output)
 }
 
+// --- v1 key custody (RFC-014) ----------------------------------------------
+
+/// Domain-separation contexts for the v1 wrap/integrity family. New strings
+/// (vs the legacy "hopnet key_wrap"/"hopnet wrap_nonce") give clean
+/// separation from the pre-substrate format and from the app's other blake3
+/// contexts. Fresh genesis makes the switch free.
+pub const WRAP_KEY_CONTEXT_V1: &str = "hopnet-storage key_wrap v1";
+pub const WRAP_NONCE_CONTEXT_V1: &str = "hopnet-storage wrap_nonce v1";
+pub const INTEGRITY_CONTEXT_V1: &str = "hopnet-storage integrity v1";
+pub const MESH_KEY_ID_CONTEXT_V1: &str = "hopnet-storage mesh_key id v1";
+
+/// Capability proving read access for ONE recipient pubkey. Implementations
+/// hold the X25519 private key; it never crosses this trait — the substrate
+/// receives only per-wrap shared secrets (single-use: every wrap has a fresh
+/// ephemeral).
+pub trait RecipientKey: Send + Sync {
+    fn pubkey(&self) -> X25519PublicKey;
+    /// x25519(privkey, ephemeral_pubkey) — the raw shared secret.
+    fn dh(&self, ephemeral_pubkey: &X25519PublicKey) -> [u8; 32];
+}
+
+/// A RecipientKey backed by a held X25519 static secret. Hosts build these
+/// from session-derived user keys (SessionRecipient) or the unwrapped mesh
+/// privkey (MeshRecipient).
+pub struct StaticRecipient(pub x25519_dalek::StaticSecret);
+
+impl RecipientKey for StaticRecipient {
+    fn pubkey(&self) -> X25519PublicKey {
+        X25519PublicKey::from(&self.0)
+    }
+    fn dh(&self, ephemeral_pubkey: &X25519PublicKey) -> [u8; 32] {
+        *self.0.diffie_hellman(ephemeral_pubkey).as_bytes()
+    }
+}
+
+fn wrap_key_v1(shared_secret: &[u8; 32]) -> chacha20poly1305::Key {
+    let mut key_bytes = [0u8; 32];
+    let mut hasher = blake3::Hasher::new_derive_key(WRAP_KEY_CONTEXT_V1);
+    hasher.update(shared_secret);
+    hasher.finalize_xof().fill(&mut key_bytes);
+    key_bytes.into()
+}
+
+/// Deterministic wrap nonce, binding (wrap id, recipient, ephemeral). The
+/// ephemeral is fresh per wrap so the wrap key is already single-use; the
+/// bindings are defense-in-depth against cross-row ciphertext transplants.
+fn wrap_nonce_v1(
+    id_bytes: &[u8; 16],
+    recipient_pubkey: &[u8; 32],
+    ephemeral_pubkey: &[u8; 32],
+) -> [u8; 12] {
+    let mut nonce_bytes = [0u8; 12];
+    let mut hasher = blake3::Hasher::new_derive_key(WRAP_NONCE_CONTEXT_V1);
+    hasher.update(id_bytes);
+    hasher.update(recipient_pubkey);
+    hasher.update(ephemeral_pubkey);
+    hasher.finalize_xof().fill(&mut nonce_bytes);
+    nonce_bytes
+}
+
+fn wrap_to_recipient_v1(
+    id_bytes: &[u8; 16],
+    recipient: &X25519PublicKey,
+    key: &chacha20poly1305::Key,
+) -> Result<([u8; 32], Vec<u8>), StorageError> {
+    let ephemeral_secret = EphemeralSecret::random_from_rng(OsRng);
+    let ephemeral_public = X25519PublicKey::from(&ephemeral_secret);
+    let shared = ephemeral_secret.diffie_hellman(recipient);
+
+    let wrap_key = wrap_key_v1(shared.as_bytes());
+    let nonce = wrap_nonce_v1(id_bytes, recipient.as_bytes(), ephemeral_public.as_bytes());
+
+    let wrapped = ChaCha20Poly1305::new(&wrap_key)
+        .encrypt(&nonce.into(), key.as_slice())
+        .map_err(|_| StorageError::Encryption)?;
+
+    Ok((*ephemeral_public.as_bytes(), wrapped))
+}
+
+/// Wrap a per-blob key to a recipient pubkey (v1). Returns the replicable
+/// `blob_access` row.
+pub fn wrap_blob_key(
+    blob_id: &crate::types::BlobId,
+    recipient: &X25519PublicKey,
+    per_blob_key: &chacha20poly1305::Key,
+) -> Result<crate::types::BlobAccess, StorageError> {
+    let (ephemeral_pubkey, wrapped_key) =
+        wrap_to_recipient_v1(blob_id.as_bytes(), recipient, per_blob_key)?;
+    Ok(crate::types::BlobAccess {
+        blob_id: blob_id.clone(),
+        recipient_pubkey: *recipient.as_bytes(),
+        ephemeral_pubkey,
+        wrapped_key,
+    })
+}
+
+/// Unwrap a per-blob key via a reader capability (v1).
+pub fn unwrap_blob_key(
+    access: &crate::types::BlobAccess,
+    reader: &dyn RecipientKey,
+) -> Result<chacha20poly1305::Key, StorageError> {
+    unwrap_v1(
+        access.blob_id.as_bytes(),
+        &access.recipient_pubkey,
+        &access.ephemeral_pubkey,
+        &access.wrapped_key,
+        reader,
+    )
+}
+
+fn unwrap_v1(
+    id_bytes: &[u8; 16],
+    recipient_pubkey: &[u8; 32],
+    ephemeral_pubkey: &[u8; 32],
+    wrapped_key: &[u8],
+    reader: &dyn RecipientKey,
+) -> Result<chacha20poly1305::Key, StorageError> {
+    let ephemeral = X25519PublicKey::from(*ephemeral_pubkey);
+    let shared = reader.dh(&ephemeral);
+    let wrap_key = wrap_key_v1(&shared);
+    let nonce = wrap_nonce_v1(id_bytes, recipient_pubkey, ephemeral_pubkey);
+
+    let key_bytes = ChaCha20Poly1305::new(&wrap_key)
+        .decrypt(&nonce.into(), wrapped_key)
+        .map_err(|_| StorageError::Encryption)?;
+    if key_bytes.len() != 32 {
+        return Err(StorageError::Encryption);
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&key_bytes);
+    Ok(out.into())
+}
+
+/// Wrap-id for mesh-key grants: mesh_key_access rows reuse the v1 wrap code
+/// path with a pubkey-derived 16-byte id in place of a blob id.
+pub fn mesh_key_wrap_id(mesh_pubkey: &X25519PublicKey) -> [u8; 16] {
+    let mut id = [0u8; 16];
+    let mut hasher = blake3::Hasher::new_derive_key(MESH_KEY_ID_CONTEXT_V1);
+    hasher.update(mesh_pubkey.as_bytes());
+    hasher.finalize_xof().fill(&mut id);
+    id
+}
+
+/// Wrap the mesh X25519 private key to a member's pubkey (v1). Returns
+/// (ephemeral_pubkey, wrapped_privkey) for a `mesh_key_access` row.
+pub fn wrap_mesh_privkey(
+    mesh_pubkey: &X25519PublicKey,
+    mesh_privkey: &x25519_dalek::StaticSecret,
+    recipient: &X25519PublicKey,
+) -> Result<([u8; 32], Vec<u8>), StorageError> {
+    let id = mesh_key_wrap_id(mesh_pubkey);
+    let key: chacha20poly1305::Key = mesh_privkey.to_bytes().into();
+    wrap_to_recipient_v1(&id, recipient, &key)
+}
+
+/// Unwrap the mesh private key via a member capability (v1).
+pub fn unwrap_mesh_privkey(
+    mesh_pubkey: &X25519PublicKey,
+    recipient_pubkey: &[u8; 32],
+    ephemeral_pubkey: &[u8; 32],
+    wrapped_privkey: &[u8],
+    reader: &dyn RecipientKey,
+) -> Result<x25519_dalek::StaticSecret, StorageError> {
+    let id = mesh_key_wrap_id(mesh_pubkey);
+    let key = unwrap_v1(&id, recipient_pubkey, ephemeral_pubkey, wrapped_privkey, reader)?;
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(key.as_slice());
+    Ok(x25519_dalek::StaticSecret::from(bytes))
+}
+
+/// Subkey for the keyed whole-blob integrity hash — domain-separated from
+/// the chunk-key tree so key usage never overlaps.
+pub fn integrity_key(per_blob_key: &chacha20poly1305::Key) -> [u8; 32] {
+    let mut key_bytes = [0u8; 32];
+    let mut hasher = blake3::Hasher::new_derive_key(INTEGRITY_CONTEXT_V1);
+    hasher.update(per_blob_key);
+    hasher.finalize_xof().fill(&mut key_bytes);
+    key_bytes
+}
+
+/// Streaming hasher for the keyed integrity hash. Verifiable only by key
+/// holders — replicated state carries no unkeyed function of plaintext
+/// (the confirmation-oracle fix; see RFC-014).
+pub fn integrity_hasher(per_blob_key: &chacha20poly1305::Key) -> blake3::Hasher {
+    blake3::Hasher::new_keyed(&integrity_key(per_blob_key))
+}
+
+/// Convenience one-shot keyed integrity hash.
+pub fn integrity_hash(
+    per_blob_key: &chacha20poly1305::Key,
+    plaintext: &[u8],
+) -> hopnet_common::Blake3Hash {
+    let mut hasher = integrity_hasher(per_blob_key);
+    hasher.update(plaintext);
+    hopnet_common::Blake3Hash::new(hasher.finalize())
+}
+
+// --- legacy wrap (dies with the Stage-B call-site migration) ----------------
+
 /// One wrap of a per-file key to a recipient X25519 pubkey (legacy format).
 pub struct WrappedKey {
     pub ephemeral_pubkey: X25519PublicKey,
@@ -266,6 +465,97 @@ mod tests {
         let ct = encrypt_chunk(b"abc".to_vec(), &fixed_key(), &fixed_fid()).unwrap();
         let other = CustomUUID::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c9a2").unwrap();
         assert!(decrypt_chunk(&ct, &fixed_key(), &other).is_err());
+    }
+
+    #[test]
+    fn v1_wrap_unwrap_round_trip() {
+        // Should: reader capability unwraps its own wrap; wrong reader,
+        // transplanted blob_id, or transplanted recipient row all fail.
+        // Impact: blob_access is the entire access-control enforcement.
+        let reader = StaticRecipient(x25519_dalek::StaticSecret::random_from_rng(OsRng));
+        let other = StaticRecipient(x25519_dalek::StaticSecret::random_from_rng(OsRng));
+        let per_blob_key = fixed_key();
+        let blob_id = fixed_fid();
+
+        let access = wrap_blob_key(&blob_id, &reader.pubkey(), &per_blob_key).unwrap();
+        assert_eq!(access.wrapped_key.len(), 48);
+        assert_eq!(access.recipient_pubkey, *reader.pubkey().as_bytes());
+
+        let unwrapped = unwrap_blob_key(&access, &reader).unwrap();
+        assert_eq!(unwrapped.as_slice(), per_blob_key.as_slice());
+
+        // Wrong reader: DH mismatch → decrypt fails.
+        assert!(unwrap_blob_key(&access, &other).is_err());
+
+        // Transplanted blob id: nonce binding breaks.
+        let mut moved = access.clone();
+        moved.blob_id = CustomUUID::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c9a2").unwrap();
+        assert!(unwrap_blob_key(&moved, &reader).is_err());
+    }
+
+    #[test]
+    fn v1_mesh_key_wrap_round_trip() {
+        // Should: member unwraps the mesh privkey from its grant, then acts
+        // as MeshRecipient to unwrap mesh-wrapped blobs.
+        let mesh_secret = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let mesh_pub = X25519PublicKey::from(&mesh_secret);
+        let member = StaticRecipient(x25519_dalek::StaticSecret::random_from_rng(OsRng));
+
+        let (eph, wrapped) =
+            wrap_mesh_privkey(&mesh_pub, &mesh_secret, &member.pubkey()).unwrap();
+        let recovered = unwrap_mesh_privkey(
+            &mesh_pub,
+            member.pubkey().as_bytes(),
+            &eph,
+            &wrapped,
+            &member,
+        )
+        .unwrap();
+        assert_eq!(recovered.to_bytes(), mesh_secret.to_bytes());
+
+        // The recovered mesh key unwraps an all-users blob wrap.
+        let per_blob_key = fixed_key();
+        let blob_id = fixed_fid();
+        let access = wrap_blob_key(&blob_id, &mesh_pub, &per_blob_key).unwrap();
+        let mesh_reader = StaticRecipient(recovered);
+        let unwrapped = unwrap_blob_key(&access, &mesh_reader).unwrap();
+        assert_eq!(unwrapped.as_slice(), per_blob_key.as_slice());
+    }
+
+    #[test]
+    fn integrity_hash_keyed_and_separated() {
+        // Should: same plaintext under different blob keys → different
+        // hashes (no cross-blob linkage); integrity subkey differs from
+        // chunk keys (domain separation).
+        // Impact: this is the confirmation-oracle fix — an unkeyed or
+        // reused-key hash would leak plaintext equality to state holders.
+        let pt = b"the same plaintext";
+        let k1 = fixed_key();
+        let k2: chacha20poly1305::Key = [0x43u8; 32].into();
+        assert_ne!(integrity_hash(&k1, pt), integrity_hash(&k2, pt));
+        assert_ne!(
+            integrity_key(&k1).as_slice(),
+            derive_chunk_key(&k1, &fixed_fid()).as_slice()
+        );
+
+        // Streaming == one-shot.
+        let mut h = integrity_hasher(&k1);
+        h.update(&pt[..5]);
+        h.update(&pt[5..]);
+        assert_eq!(
+            hopnet_common::Blake3Hash::new(h.finalize()),
+            integrity_hash(&k1, pt)
+        );
+    }
+
+    #[test]
+    fn placement_seed_from_blob_id() {
+        // Should: deterministic per blob id; differs across ids.
+        let a = crate::placement::placement_seed(&fixed_fid());
+        let b = crate::placement::placement_seed(&fixed_fid());
+        assert_eq!(a, b);
+        let other = CustomUUID::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c9a2").unwrap();
+        assert_ne!(a, crate::placement::placement_seed(&other));
     }
 
     #[test]

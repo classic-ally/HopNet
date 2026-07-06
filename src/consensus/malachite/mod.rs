@@ -31,4 +31,9 @@ pub struct EngineHandle {
     pub decided: watch::Receiver<u64>,
     /// Current (height, round, proposer). `None` until the first StartRound.
     pub round: watch::Receiver<Option<RoundInfo>>,
+    /// One decided-value sync at a time — shared by the driver's SyncNeeded
+    /// arm and the forward-receive lag kick (a forward targeting a height
+    /// above ours proves peers decided past us; waiting for timeout-driven
+    /// republish costs seconds).
+    pub sync_inflight: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }

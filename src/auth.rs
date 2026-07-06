@@ -490,45 +490,16 @@ pub fn unwrap_user_key_from_device(
     Ok(PrivKey(ed25519_dalek::SigningKey::from_bytes(&key_arr)))
 }
 
-/// Decrypt a wrapped per-file key using X25519 ECDH and ChaCha20-Poly1305
+/// Unwrap a per-blob key via the substrate's v1 wrap, using the session
+/// user's X25519 privkey as the RecipientKey capability. The wrap format is
+/// crate-private to hopnet-storage — this is the only unwrap path.
 pub fn decrypt_wrapped_file_key(
-    file_access: &crate::db::types::FileAccess,
+    blob_access: &crate::db::types::BlobAccess,
     user_x25519_privkey: &x25519_dalek::StaticSecret,
 ) -> Result<chacha20poly1305::Key, Box<dyn std::error::Error>> {
-    // Perform ECDH with ephemeral public key
-    let shared_secret =
-        user_x25519_privkey.diffie_hellman(file_access.ephemeral_pubkey.as_x25519());
-
-    // Derive ChaCha20Poly1305 key from shared secret using Blake3
-    let mut wrap_key_bytes = [0u8; 32];
-    let mut hasher = blake3::Hasher::new_derive_key("hopnet key_wrap");
-    hasher.update(shared_secret.as_bytes());
-    let mut xof = hasher.finalize_xof();
-    xof.fill(&mut wrap_key_bytes);
-    let wrap_key = chacha20poly1305::Key::from(wrap_key_bytes);
-
-    // Derive deterministic nonce from data_block_id + user_id + ephemeral_pubkey
-    let mut nonce_bytes = [0u8; 12];
-    let mut nonce_hasher = blake3::Hasher::new_derive_key("hopnet wrap_nonce");
-    nonce_hasher.update(file_access.data_block_id.as_bytes());
-    nonce_hasher.update(&file_access.user_id.to_le_bytes());
-    nonce_hasher.update(file_access.ephemeral_pubkey.as_bytes());
-    nonce_hasher.finalize_xof().fill(&mut nonce_bytes);
-    let wrap_nonce = chacha20poly1305::Nonce::from(nonce_bytes);
-
-    // Decrypt the per-file key
-    let wrap_cipher = ChaCha20Poly1305::new(&wrap_key);
-    let decrypted_file_key = wrap_cipher
-        .decrypt(&wrap_nonce, file_access.encrypted_file_key.as_slice())
-        .map_err(|e| format!("Decryption failed: {:?}", e))?;
-
-    if decrypted_file_key.len() != 32 {
-        return Err("Invalid decrypted key length".into());
-    }
-
-    let mut key_bytes = [0u8; 32];
-    key_bytes.copy_from_slice(&decrypted_file_key);
-    Ok(chacha20poly1305::Key::from(key_bytes))
+    let reader = hopnet_storage::crypto::StaticRecipient(user_x25519_privkey.clone());
+    hopnet_storage::crypto::unwrap_blob_key(blob_access, &reader)
+        .map_err(|e| format!("Unwrap failed: {e}").into())
 }
 
 #[cfg(test)]

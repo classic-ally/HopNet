@@ -53,6 +53,10 @@ const MAX_BATCH_SIZE: usize = 100;
 /// Linger before building a value, letting forwarded transactions land in
 /// the pool (the bespoke leader lingered the same way).
 const BATCH_LINGER_MS: u64 = 100;
+/// Extra wait when NeedValue finds an empty pool — covers the resume-vs-
+/// staging race (forward-wake fires before the forwarded txs are staged).
+/// Well under one propose timeout.
+const EMPTY_POOL_LINGER_MS: u64 = 500;
 /// Inject a `system.cleanup_nonces` transaction every N heights (was: views).
 const NONCE_CLEANUP_INTERVAL: u64 = 97;
 
@@ -291,6 +295,7 @@ pub fn spawn_engine(app_state: &AppState) -> Result<(), String> {
         .db_pool
         .get()
         .map_err(|e| format!("spawn_engine: build conn: {e}"))?;
+    let sync_inflight = Arc::new(AtomicBool::new(false));
     spawn_driver(
         app_state.clone(),
         node_id,
@@ -298,12 +303,14 @@ pub fn spawn_engine(app_state: &AppState) -> Result<(), String> {
         decided.clone(),
         events,
         build_conn,
+        sync_inflight.clone(),
     );
 
     let engine = EngineHandle {
         input_tx,
         decided,
         round,
+        sync_inflight,
     };
     app_state
         .malachite
@@ -412,9 +419,9 @@ fn spawn_driver(
     decided: tokio::sync::watch::Receiver<u64>,
     mut events: mpsc::UnboundedReceiver<HostEvent>,
     build_conn: r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>,
+    sync_inflight: Arc<AtomicBool>,
 ) {
     let pool = app_state.consensus_queue.pending_pool();
-    let sync_inflight = Arc::new(AtomicBool::new(false));
     let mut build_conn = Some(build_conn);
 
     // Queue runtime: the driver answers NeedValue and fires Resume — if it
@@ -494,6 +501,19 @@ async fn handle_need_value(
             .await;
     }
     tokio::time::sleep(Duration::from_millis(BATCH_LINGER_MS)).await;
+
+    // Resume can race forwarded-tx staging: an inbound TransactionForward
+    // wakes the engine, NeedValue fires at height entry, and the acked txs
+    // land in the pool a few hundred ms later — proposing immediately wastes
+    // the height on an empty block. If the pool is empty, wait briefly for
+    // the work signal before building.
+    if pool.staged_len() == 0 {
+        let _ = tokio::time::timeout(
+            Duration::from_millis(EMPTY_POOL_LINGER_MS),
+            pool.work_available(),
+        )
+        .await;
+    }
 
     let entries = pool.take_for_proposal(MAX_BATCH_SIZE);
     let mut candidates: Vec<crate::consensus::types::Transaction> =
@@ -590,4 +610,49 @@ async fn handle_need_value(
             pool.restage(entries);
         }
     }
+}
+
+/// Kick a decided-value sync toward `target` because inbound traffic proved
+/// peers are ahead (e.g. a TransactionForward for a height above ours).
+/// Shares the driver's one-sync-at-a-time flag; no-op while a sync runs or
+/// when the engine isn't active. Cuts multi-second timeout-republish waits
+/// out of the idle-mesh catch-up path.
+pub fn kick_sync_if_behind(app_state: &AppState, target: u64, hint_peer: i32) {
+    let Some(engine) = app_state.malachite.get() else {
+        return;
+    };
+    if *engine.decided.borrow() >= target {
+        return;
+    }
+    if engine.sync_inflight.swap(true, Ordering::SeqCst) {
+        return; // one sync at a time
+    }
+    let node_id = match app_state.get_node_id() {
+        Ok(id) => id,
+        Err(_) => {
+            engine.sync_inflight.store(false, Ordering::SeqCst);
+            return;
+        }
+    };
+    let transport = app_state.iroh_transport.clone();
+    let db_pool = app_state.db_pool.clone();
+    let input_tx = engine.input_tx.clone();
+    let mut decided = engine.decided.clone();
+    let flag = engine.sync_inflight.clone();
+    crate::consensus::queue::queue_rt().spawn(async move {
+        if let Err(e) = sync::sync_to_target(
+            &transport,
+            &db_pool,
+            node_id,
+            &input_tx,
+            &mut decided,
+            target,
+            Some(hint_peer),
+        )
+        .await
+        {
+            tracing::debug!("lag-kick sync toward {target} did not complete: {e:?}");
+        }
+        flag.store(false, Ordering::SeqCst);
+    });
 }

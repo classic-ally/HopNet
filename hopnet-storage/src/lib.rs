@@ -10,12 +10,16 @@
 //! the `engine` feature (Stage E) adds the tokio distribution engine, whose
 //! decisions delegate back to the pure modules.
 
+#[cfg(feature = "engine")]
+pub mod api;
 pub mod crypto;
 pub mod error;
 pub mod fragstore;
 pub mod placement;
 pub mod rs;
+pub mod types;
 
 pub use error::StorageError;
 pub use hopnet_common::Blake3Hash;
 pub use hopnet_common::CustomUUID;
+pub use types::{BlobAccess, BlobId, MeshKeyGrant};

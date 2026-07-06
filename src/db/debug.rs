@@ -28,7 +28,7 @@ const CONSENSUS_TABLES: &[&str] = &[
     // agreement invariant.
     "decided_blocks",
     "data_blocks",
-    "file_access",
+    "blob_access",
     "fragment_hashes",
     "inodes",
     "takeouts",

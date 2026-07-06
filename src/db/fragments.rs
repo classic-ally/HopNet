@@ -237,9 +237,9 @@ pub fn delete_orphaned_data_blocks_consensus(
 
     tracing::info!("Deleted {} fragment_hashes records", fragments_deleted);
 
-    // 2. Delete file_access records (encrypted file keys)
+    // 2. Delete blob_access records (wrapped blob keys)
     let access_query = format!(
-        "DELETE FROM file_access WHERE data_block_id IN ({})",
+        "DELETE FROM blob_access WHERE blob_id IN ({})",
         placeholders_str
     );
     let access_params: Vec<&dyn rusqlite::ToSql> = data_block_ids
@@ -247,16 +247,16 @@ pub fn delete_orphaned_data_blocks_consensus(
         .map(|id| id as &dyn rusqlite::ToSql)
         .collect();
 
-    tracing::debug!("Executing file_access deletion query: {}", access_query);
+    tracing::debug!("Executing blob_access deletion query: {}", access_query);
 
     let access_deleted = db_tx
         .execute(&access_query, access_params.as_slice())
         .map_err(|e| {
-            tracing::error!("Failed to delete file_access: {:?}", e);
+            tracing::error!("Failed to delete blob_access: {:?}", e);
             DatabaseError::ProcessingError
         })?;
 
-    tracing::info!("Deleted {} file_access records", access_deleted);
+    tracing::info!("Deleted {} blob_access records", access_deleted);
 
     // 3. Finally delete data_blocks records (parent records)
     let blocks_query = format!("DELETE FROM data_blocks WHERE id IN ({})", placeholders_str);

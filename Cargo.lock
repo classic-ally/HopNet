@@ -2761,7 +2761,9 @@ dependencies = [
  "hex",
  "hopnet-common",
  "rand 0.10.1",
+ "reed-solomon-simd",
  "serde",
+ "tokio",
  "tracing",
  "x25519-dalek",
 ]

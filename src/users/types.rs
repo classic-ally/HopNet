@@ -19,3 +19,12 @@ pub struct UpdateUserOnboardingPayload {
     pub set_flags: OnboardingFlags,
     pub clear_flags: OnboardingFlags,
 }
+
+/// insert_user wire payload: the new user plus their mesh-key grant
+/// (RFC-014 — the grant rides the same tx so membership and all-users
+/// access install atomically; induction from the genesis grant).
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct InsertUserPayload {
+    pub user: crate::types::User,
+    pub mesh_grant: hopnet_storage::MeshKeyGrant,
+}

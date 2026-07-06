@@ -11,6 +11,10 @@ pub enum StorageError {
     HashMismatch,
     /// Fragment file I/O failure.
     Io(std::io::Error),
+    /// Failure reading the caller-supplied plaintext source.
+    Read(std::io::Error),
+    /// Reed-Solomon encode/decode failure.
+    Rs,
 }
 
 impl std::fmt::Display for StorageError {
@@ -19,6 +23,8 @@ impl std::fmt::Display for StorageError {
             StorageError::Encryption => write!(f, "encryption error"),
             StorageError::HashMismatch => write!(f, "fragment hash mismatch"),
             StorageError::Io(e) => write!(f, "fragment I/O error: {}", e),
+            StorageError::Read(e) => write!(f, "source read error: {}", e),
+            StorageError::Rs => write!(f, "reed-solomon coding error"),
         }
     }
 }
@@ -26,7 +32,7 @@ impl std::fmt::Display for StorageError {
 impl std::error::Error for StorageError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            StorageError::Io(e) => Some(e),
+            StorageError::Io(e) | StorageError::Read(e) => Some(e),
             _ => None,
         }
     }

@@ -157,23 +157,19 @@ async fn distribute_file_fragments(
         (height, validators, metrics)
     };
 
-    // Select nodes for this file using file-level node selection
-    let selected_nodes = crate::files::placement::select_nodes_for_file(
+    // Select nodes for this blob — placement seeds from the blob id
+    // (RFC-014): deterministic, public, zero plaintext-derived input.
+    let selected_nodes = crate::files::placement::select_nodes_for_blob_id(
         validators,
         node_metrics,
-        &data_block.file_hash,
+        &data_block.id,
     );
 
     tracing::debug!(
-        "Fragment distribution using {} selected nodes at consensus height {} for file {}",
+        "Fragment distribution using {} selected nodes at consensus height {} for blob {}",
         selected_nodes.len(),
         consensus_height,
-        data_block
-            .file_hash
-            .to_hex()
-            .chars()
-            .take(8)
-            .collect::<String>()
+        data_block.id
     );
 
     // Create lookup map for node pubkeys (iroh transport addresses)

@@ -200,6 +200,16 @@ async fn process_request(
                 };
 
                 if proposer != my_node_id {
+                    // The forwarder targeting a height above ours proves peers
+                    // decided past us — kick a sync instead of waiting seconds
+                    // for timeout-driven republish to drag us forward.
+                    if req.height > height as i64 {
+                        crate::consensus::malachite::engine::kick_sync_if_behind(
+                            &app_state,
+                            (req.height - 1) as u64,
+                            peer_node_id,
+                        );
+                    }
                     let reject = encode_message(&IrohResponse::TransactionForwardNotProposer {
                         height: height as i64,
                         round,
