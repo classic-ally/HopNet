@@ -142,7 +142,6 @@ pub async fn submit_inodes(
     blob_ops: Vec<hopnet_storage::store::BlobInsertOp>,
     inodes: Vec<Inode>,
     attestation: Option<Transaction>,
-    data_block_ids: Vec<CustomUUID>,
 ) -> Result<(), StatusCode> {
     let payload = crate::files::handlers::DriveInsertPayload { blob_ops, inodes };
     let encoded_inodes = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
@@ -172,33 +171,9 @@ pub async fn submit_inodes(
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    for data_block_id in data_block_ids {
-        tracing::info!(
-            "Triggering fragment distribution for uploaded file {}",
-            data_block_id
-        );
-        let app_state_clone = app_state.clone();
-        let data_block_id_clone = data_block_id.clone();
-        tokio::spawn(async move {
-            match crate::files::distribution::distribute_fragments_for_upload(
-                &app_state_clone,
-                data_block_id_clone,
-            )
-            .await
-            {
-                Ok(()) => tracing::info!(
-                    "Successfully completed fragment distribution for {}",
-                    data_block_id
-                ),
-                Err(e) => tracing::error!(
-                    "Fragment distribution failed for {}: {:?}",
-                    data_block_id,
-                    e
-                ),
-            }
-        });
-    }
-
+    // Distribution is kicked by our own apply (on_decided → global worker
+    // queue) — no per-file spawns, no polling, and modify updates are
+    // covered by the same path.
     Ok(())
 }
 
@@ -357,11 +332,6 @@ pub async fn create_file_with_fragments<R: AsyncRead + Unpin>(
     )
     .await?;
 
-    let data_block_ids = if blob_op.is_some() {
-        vec![dataid.clone()]
-    } else {
-        Vec::new()
-    };
     let blob_ops: Vec<hopnet_storage::store::BlobInsertOp> = blob_op.into_iter().collect();
 
     let mut inodes = vec![inode];
@@ -399,7 +369,7 @@ pub async fn create_file_with_fragments<R: AsyncRead + Unpin>(
         None
     };
 
-    submit_inodes(app_state, user_id, blob_ops, inodes, attestation, data_block_ids).await?;
+    submit_inodes(app_state, user_id, blob_ops, inodes, attestation).await?;
     Ok(dataid)
 }
 
@@ -441,5 +411,5 @@ pub async fn create_folder(
         prepend_missing_parents(&tx, &mut inodes, user_id)?;
     }
 
-    submit_inodes(app_state, user_id, Vec::new(), inodes, None, Vec::new()).await
+    submit_inodes(app_state, user_id, Vec::new(), inodes, None).await
 }

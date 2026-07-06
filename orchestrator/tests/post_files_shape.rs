@@ -161,12 +161,17 @@ impl TestScenario for PostFilesConsensusShape {
             }
         };
         let views_consumed = view_after - view_before;
-        let shape_ok = views_consumed <= 2; // insert_files + optional placement update
+        // insert_files (ONE view for all N files — the batching tripwire)
+        // + one batched placement commit + up to two receiver-node
+        // fragment-receipt attestations. Distribution now kicks from the
+        // decide itself (on_decided → global workers), so receiver
+        // attestations land within this window instead of after it.
+        let shape_ok = views_consumed <= 4;
         print_and_add_check(
             &mut result,
             Check {
                 name: format!(
-                    "{} files consumed {} views (≤2 expected)",
+                    "{} files consumed {} views (≤4 expected: files + placement + receipt attestations)",
                     FILE_COUNT, views_consumed
                 ),
                 passed: shape_ok,

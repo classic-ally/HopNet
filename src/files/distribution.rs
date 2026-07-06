@@ -51,72 +51,67 @@ impl From<bincode::error::EncodeError> for DistributionError {
     }
 }
 
-/// Run fragment distribution for a newly uploaded file
-/// Called directly after file upload completion (event-driven)
-pub async fn distribute_fragments_for_upload(
+/// Number of global distribution workers (RFC-014 engine rule: concurrency
+/// tracks the mesh, not the upload count; actual sends are further bounded
+/// by SEND_PERMITS).
+const DISTRIBUTION_WORKERS: usize = 4;
+
+/// Spawn the global distribution worker pool (once, at engine start) and
+/// install the work-queue sender in AppState. Blob ids arrive from
+/// HopNetApplication::on_decided — every node enqueues every decided blob;
+/// get_distributable_file filters to the node actually holding the
+/// fragments (the origin), so non-origin nodes no-op cheaply.
+pub fn spawn_distribution_workers(app_state: &AppState) {
+    if app_state.distribution_tx.get().is_some() {
+        return;
+    }
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<CustomUUID>();
+    if app_state.distribution_tx.set(tx).is_err() {
+        return; // lost the race — another spawner won
+    }
+    let rx = std::sync::Arc::new(tokio::sync::Mutex::new(rx));
+    for worker in 0..DISTRIBUTION_WORKERS {
+        let app_state = app_state.clone();
+        let rx = rx.clone();
+        tokio::spawn(async move {
+            loop {
+                let blob_id = {
+                    let mut rx = rx.lock().await;
+                    rx.recv().await
+                };
+                let Some(blob_id) = blob_id else { break };
+                if let Err(e) = distribute_one(&app_state, blob_id.clone()).await {
+                    tracing::error!(
+                        "distribution worker {worker}: blob {blob_id} failed: {e:?}"
+                    );
+                }
+            }
+        });
+    }
+}
+
+/// Distribute one decided blob if THIS node holds its fragments. The decided
+/// blob arrives via our own apply (on_decided) — no polling, no forwarder
+/// race: state is committed before the kick fires.
+async fn distribute_one(
     app_state: &AppState,
     data_block_id: CustomUUID,
 ) -> Result<(), DistributionError> {
-    tracing::info!(
-        "Starting fragment distribution for uploaded file {}",
-        data_block_id
-    );
-
-    // The caller (submit_inodes) awaits submit_batch, which resolves post-
-    // apply on the proposer path — the file is normally distributable on the
-    // FIRST check. The short retry only covers the forwarder path, where the
-    // proposer's Committed reply can beat this node's own apply-via-gossip by
-    // a small window. (RFC-014's end state replaces this with a
-    // BlobCommitted event from the substrate's own apply hook.)
-    const MAX_WAIT_ATTEMPTS: u32 = 5; // ~1s worst case (5 * 250ms)
-    const POLL_INTERVAL_MS: u64 = 250;
-
-    let mut attempt = 0;
-    let data_block = loop {
-        match get_distributable_file(app_state.db_pool.get(), data_block_id.clone())? {
-            Some(block) => {
-                if attempt > 0 {
-                    tracing::debug!(
-                        "File {} became distributable after {} attempts ({} ms)",
-                        data_block_id,
-                        attempt,
-                        attempt as u64 * POLL_INTERVAL_MS
-                    );
-                }
-                break block;
-            }
-            None => {
-                attempt += 1;
-                if attempt >= MAX_WAIT_ATTEMPTS {
-                    tracing::warn!(
-                        "File {} did not become distributable within {}s - consensus may not have executed yet or file is already distributed",
-                        data_block_id,
-                        (MAX_WAIT_ATTEMPTS as u64 * POLL_INTERVAL_MS) / 1000
-                    );
-                    return Ok(()); // Exit gracefully - background job will handle orphans
-                }
-
-                if attempt % 5 == 0 {
-                    tracing::debug!(
-                        "Waiting for file {} to become distributable (attempt {}/{})",
-                        data_block_id,
-                        attempt,
-                        MAX_WAIT_ATTEMPTS
-                    );
-                }
-
-                tokio::time::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
-            }
-        }
+    let Some(data_block) = get_distributable_file(app_state.db_pool.get(), data_block_id.clone())?
+    else {
+        // Not ours to distribute (fragments not local), already placed, or
+        // already handled — the common case on non-origin nodes.
+        return Ok(());
     };
+
+    tracing::info!("Starting fragment distribution for blob {}", data_block_id);
 
     // Distribute all fragments for this file (reads height/validators/metrics
     // on one scoped checkout; returns the placement height it locked).
     let consensus_height = distribute_file_fragments(app_state, &data_block).await?;
 
     // Enqueue the placement commit — batched with other files' placements
-    // into ONE consensus tx per window (RFC-014 control-plane discipline;
-    // previously one tx PER FILE, so upload bursts doubled consensus load).
+    // into ONE consensus tx per window (RFC-014 control-plane discipline).
     enqueue_placement_update(
         app_state,
         PlacementHeightUpdate {

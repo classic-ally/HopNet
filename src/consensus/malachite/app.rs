@@ -210,9 +210,43 @@ impl<C: DerefMut<Target = Connection> + 'static> Application<SqliteStorage<C>>
         )
     }
 
-    fn on_decided(&mut self, height: Height, _block: &engine::Block, _cert: &WireCommitCertificate) {
-        // Stage 5 wires queue-notifier resolution and replication kicks here.
+    fn on_decided(&mut self, height: Height, block: &engine::Block, _cert: &WireCommitCertificate) {
         tracing::debug!(height = height.0, "block decided (malachite engine)");
+
+        // Distribution kick (RFC-014): collect blob ids registered in this
+        // block and push them to the global distribution queue. Runs on the
+        // shell thread — NON-BLOCKING ONLY (unbounded send; no DB, no
+        // awaits). Covers both drive envelopes, so modify content updates
+        // distribute too.
+        let Some(tx_sender) = self.app_state.distribution_tx.get() else {
+            return;
+        };
+        for tx in block.data.transactions.iter() {
+            let blob_ids: Vec<hopnet_common::CustomUUID> = match tx.rpc.function.as_str() {
+                "insert_files" => bincode::serde::decode_from_slice::<
+                    crate::files::handlers::DriveInsertPayload,
+                    _,
+                >(&tx.rpc.payload, bincode::config::standard())
+                .map(|(p, _)| p.blob_ops.into_iter().map(|op| op.blob_id).collect())
+                .unwrap_or_default(),
+                "modify_item" => bincode::serde::decode_from_slice::<
+                    crate::files::handlers::ModifyItemPayload,
+                    _,
+                >(&tx.rpc.payload, bincode::config::standard())
+                .map(|(p, _)| {
+                    p.content_update
+                        .and_then(|u| u.blob_op)
+                        .map(|op| op.blob_id)
+                        .into_iter()
+                        .collect()
+                })
+                .unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            for blob_id in blob_ids {
+                let _ = tx_sender.send(blob_id);
+            }
+        }
     }
 }
 

@@ -306,6 +306,10 @@ pub fn spawn_engine(app_state: &AppState) -> Result<(), String> {
         sync_inflight.clone(),
     );
 
+    // Distribution engine workers (RFC-014): consume blob ids pushed by
+    // on_decided. Spawned on the caller's (main) runtime — data-plane sends.
+    crate::files::distribution::spawn_distribution_workers(app_state);
+
     let engine = EngineHandle {
         input_tx,
         decided,

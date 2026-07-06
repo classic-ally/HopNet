@@ -361,7 +361,6 @@ pub async fn post_files(
     // need path in later file processing
     let mut inodes: Vec<Inode> = Vec::new();
     let mut has_files = false;
-    let mut uploaded_data_block_ids: Vec<crate::db::types::CustomUUID> = Vec::new();
     let mut blob_ops: Vec<hopnet_storage::store::BlobInsertOp> = Vec::new();
     let mut folder_name: Option<String> = None;
 
@@ -469,7 +468,7 @@ pub async fn post_files(
                 .await?;
 
                 if let Some(op) = blob_op {
-                    uploaded_data_block_ids.push(dataid);
+                    let _ = dataid; // distribution kicks from on_decided now
                     blob_ops.push(op);
                 }
                 inodes.push(inode);
@@ -546,15 +545,7 @@ pub async fn post_files(
         None
     };
 
-    crate::files::helpers::submit_inodes(
-        &app_state,
-        user_id,
-        blob_ops,
-        inodes,
-        attestation,
-        uploaded_data_block_ids,
-    )
-    .await
+    crate::files::helpers::submit_inodes(&app_state, user_id, blob_ops, inodes, attestation).await
 }
 
 pub async fn delete_files(

@@ -70,6 +70,13 @@ pub struct AppState {
     /// and submits ONE consensus tx per window instead of one per file.
     pub placement_batch_tx:
         Arc<OnceCell<tokio::sync::mpsc::UnboundedSender<db::files::PlacementHeightUpdate>>>,
+    /// Distribution work queue (RFC-014 engine): blob ids pushed from
+    /// HopNetApplication::on_decided (non-blocking), drained by the global
+    /// worker pool spawned at engine start. Every node enqueues every
+    /// decided blob; only the node holding the fragments locally actually
+    /// distributes (get_distributable_file filters the rest out).
+    pub distribution_tx:
+        Arc<OnceCell<tokio::sync::mpsc::UnboundedSender<hopnet_common::CustomUUID>>>,
 }
 
 impl AppState {
