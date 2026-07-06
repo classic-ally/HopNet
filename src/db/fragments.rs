@@ -176,110 +176,14 @@ pub fn delete_orphaned_data_blocks_consensus(
         }
     }
 
-    // Build parameter placeholders for the IN clause
-    let placeholders: Vec<String> = (0..data_block_ids.len()).map(|_| "?".to_string()).collect();
-    let placeholders_str = placeholders.join(", ");
-
-    // First collect fragment hashes that are stored locally (for opportunistic cleanup)
-    let select_local_fragments_query = format!(
-        "SELECT fragment_hash FROM fragment_hashes WHERE data_block_id IN ({}) AND stored_locally = TRUE",
-        placeholders_str
-    );
-    let select_params: Vec<&dyn rusqlite::ToSql> = data_block_ids
-        .iter()
-        .map(|id| id as &dyn rusqlite::ToSql)
-        .collect();
-
-    let mut stmt = db_tx.prepare(&select_local_fragments_query).map_err(|e| {
-        tracing::error!("Failed to prepare local fragment selection query: {:?}", e);
-        DatabaseError::ProcessingError
-    })?;
-
-    let fragment_hashes = stmt
-        .query_map(select_params.as_slice(), |row| {
-            let hash: crate::db::Blake3Hash = row.get(0)?;
-            Ok(hash)
-        })
-        .map_err(|e| {
-            tracing::error!("Failed to query local fragment hashes: {:?}", e);
-            DatabaseError::RecallError
-        })?;
-
-    let mut deleted_fragment_hashes = Vec::new();
-    for hash_result in fragment_hashes {
-        deleted_fragment_hashes.push(hash_result.map_err(|_| DatabaseError::ProcessingError)?);
-    }
-
-    tracing::debug!(
-        "Found {} locally stored fragment hashes for deletion",
-        deleted_fragment_hashes.len()
-    );
-
-    // Delete child records first (foreign key constraints)
-    // 1. Delete fragment_hashes records
-    let fragment_query = format!(
-        "DELETE FROM fragment_hashes WHERE data_block_id IN ({})",
-        placeholders_str
-    );
-    let fragment_params: Vec<&dyn rusqlite::ToSql> = data_block_ids
-        .iter()
-        .map(|id| id as &dyn rusqlite::ToSql)
-        .collect();
-
-    tracing::debug!("Executing fragment deletion query: {}", fragment_query);
-
-    let fragments_deleted = db_tx
-        .execute(&fragment_query, fragment_params.as_slice())
-        .map_err(|e| {
-            tracing::error!("Failed to delete fragment_hashes: {:?}", e);
+    // Substrate-owned deletes (RFC-014): fragment_hashes + blob_access +
+    // data_blocks, child-first; returns locally-stored hashes for the
+    // handler's post-commit file cleanup. Gates above are the host's.
+    let deleted_fragment_hashes =
+        hopnet_storage::store::apply_delete_orphaned(db_tx, &data_block_ids).map_err(|e| {
+            tracing::error!("apply_delete_orphaned failed: {e}");
             DatabaseError::ProcessingError
         })?;
-
-    tracing::info!("Deleted {} fragment_hashes records", fragments_deleted);
-
-    // 2. Delete blob_access records (wrapped blob keys)
-    let access_query = format!(
-        "DELETE FROM blob_access WHERE blob_id IN ({})",
-        placeholders_str
-    );
-    let access_params: Vec<&dyn rusqlite::ToSql> = data_block_ids
-        .iter()
-        .map(|id| id as &dyn rusqlite::ToSql)
-        .collect();
-
-    tracing::debug!("Executing blob_access deletion query: {}", access_query);
-
-    let access_deleted = db_tx
-        .execute(&access_query, access_params.as_slice())
-        .map_err(|e| {
-            tracing::error!("Failed to delete blob_access: {:?}", e);
-            DatabaseError::ProcessingError
-        })?;
-
-    tracing::info!("Deleted {} blob_access records", access_deleted);
-
-    // 3. Finally delete data_blocks records (parent records)
-    let blocks_query = format!("DELETE FROM data_blocks WHERE id IN ({})", placeholders_str);
-    let block_params: Vec<&dyn rusqlite::ToSql> = data_block_ids
-        .iter()
-        .map(|id| id as &dyn rusqlite::ToSql)
-        .collect();
-
-    tracing::debug!("Executing data_blocks deletion query: {}", blocks_query);
-
-    let blocks_deleted = db_tx
-        .execute(&blocks_query, block_params.as_slice())
-        .map_err(|e| {
-            tracing::error!("Failed to delete data_blocks: {:?}", e);
-            DatabaseError::ProcessingError
-        })?;
-
-    tracing::info!(
-        "Consensus deletion completed: {} data blocks, {} fragments, {} file access entries",
-        blocks_deleted,
-        fragments_deleted,
-        access_deleted
-    );
 
     Ok(deleted_fragment_hashes)
 }

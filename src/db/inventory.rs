@@ -16,83 +16,20 @@ pub fn apply_self_check_updates(
     db_tx: &rusqlite::Transaction,
     report: &SelfCheckFragments,
 ) -> Result<(), DatabaseError> {
-    // Verify the previous count matches our current state
-    let current_count = get_node_fragment_count_tx(db_tx, report.node_id)?;
-
-    // For operations that only add fragments (upload attestations), we can tolerate
-    // the count being higher due to concurrent additions from other uploads.
-    // For operations that remove fragments (periodic self-checks), we need exact match
-    // to ensure we're removing the right things.
-    if report.fragments_removed.is_empty() {
-        // Addition-only operation: allow count to be equal or higher
-        if current_count < report.previous_count {
-            tracing::error!(
-                "Fragment inventory count decreased unexpectedly for node {}: expected >= {}, found {}",
-                report.node_id,
-                report.previous_count,
-                current_count
-            );
-            return Err(DatabaseError::ProcessingError);
-        }
-        if current_count > report.previous_count {
-            tracing::debug!(
-                "Fragment inventory count increased due to concurrent operations for node {}: expected {}, found {} (this is OK for addition-only operations)",
-                report.node_id,
-                report.previous_count,
-                current_count
-            );
-        }
-    } else {
-        // Removal operation: require exact match for safety
-        if current_count != report.previous_count {
-            tracing::error!(
-                "Fragment inventory state mismatch for node {} (removal operation requires exact count): expected {} fragments, found {}",
-                report.node_id,
-                report.previous_count,
-                current_count
-            );
-            return Err(DatabaseError::ProcessingError);
-        }
-    }
-
-    // Apply changes in optimal order to avoid double operations:
-
-    // 1. Remove fragments that no longer exist
-    if !report.fragments_removed.is_empty() {
-        remove_fragments_tx(db_tx, report.node_id, &report.fragments_removed)?;
-
-        debug!(
-            "Removed {} fragments from inventory for node {}",
-            report.fragments_removed.len(),
-            report.node_id
-        );
-    }
-
-    // 2. Update self_verified_height for all remaining fragments owned by this node
-    update_verified_height_tx(db_tx, report.node_id, report.self_verified_height)?;
-
-    debug!(
-        "Updated self_verified_height to {} for all fragments of node {}",
-        report.self_verified_height, report.node_id
-    );
-
-    // 3. Insert newly discovered fragments (already have correct verified_height)
-    if !report.fragments_added.is_empty() {
-        insert_fragments_tx(
-            db_tx,
-            report.node_id,
-            &report.fragments_added,
-            report.self_verified_height,
-        )?;
-
-        debug!(
-            "Added {} fragments to inventory for node {}",
-            report.fragments_added.len(),
-            report.node_id
-        );
-    }
-
-    Ok(())
+    // Substrate-owned apply (RFC-014): count verification + remove /
+    // re-height / add, in-crate.
+    hopnet_storage::store::apply_self_check(
+        db_tx,
+        report.node_id,
+        report.previous_count,
+        report.self_verified_height,
+        &report.fragments_added,
+        &report.fragments_removed,
+    )
+    .map_err(|e| {
+        tracing::error!("apply_self_check failed for node {}: {e}", report.node_id);
+        DatabaseError::ProcessingError
+    })
 }
 
 /// Get the current fragment count using a transaction

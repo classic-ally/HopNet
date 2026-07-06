@@ -143,6 +143,125 @@ pub fn apply_placement_commit(
     Ok(applied)
 }
 
+
+/// Batched inventory attestation (self_check_fragments): verify the reported
+/// previous count against current state, then remove / re-height / add.
+/// Addition-only reports tolerate concurrent growth; removal reports require
+/// an exact count match (we must not remove against a stale view).
+pub fn apply_self_check(
+    db_tx: &rusqlite::Transaction,
+    node_id: i32,
+    previous_count: u32,
+    self_verified_height: i32,
+    added: &[Blake3Hash],
+    removed: &[Blake3Hash],
+) -> Result<(), StorageError> {
+    let current_count: i64 = db_tx
+        .query_row(
+            "SELECT COUNT(*) FROM fragment_inventory WHERE node_id = ?",
+            params![node_id],
+            |r| r.get(0),
+        )
+        .map_err(db_err("count fragment_inventory"))?;
+    let current_count = current_count as u32;
+
+    if removed.is_empty() {
+        if current_count < previous_count {
+            tracing::error!(
+                "Fragment inventory count decreased unexpectedly for node {node_id}: expected >= {previous_count}, found {current_count}"
+            );
+            return Err(StorageError::Rs);
+        }
+    } else if current_count != previous_count {
+        tracing::error!(
+            "Fragment inventory state mismatch for node {node_id} (removal requires exact count): expected {previous_count}, found {current_count}"
+        );
+        return Err(StorageError::Rs);
+    }
+
+    for hash in removed {
+        db_tx
+            .execute(
+                "DELETE FROM fragment_inventory WHERE node_id = ? AND fragment_hash = ?",
+                params![node_id, hash],
+            )
+            .map_err(db_err("remove inventory fragment"))?;
+    }
+
+    db_tx
+        .execute(
+            "UPDATE fragment_inventory SET self_verified_height = ? WHERE node_id = ?",
+            params![self_verified_height, node_id],
+        )
+        .map_err(db_err("update inventory verified height"))?;
+
+    for hash in added {
+        db_tx
+            .execute(
+                "INSERT INTO fragment_inventory (fragment_hash, node_id, self_verified_height) VALUES (?, ?, ?)",
+                params![hash, node_id, self_verified_height],
+            )
+            .map_err(db_err("insert inventory fragment"))?;
+    }
+
+    Ok(())
+}
+
+/// Delete orphaned blobs: fragment_hashes + blob_access + data_blocks rows,
+/// child-first. Returns the locally-stored fragment hashes so the host can
+/// opportunistically remove the files post-commit. LIVENESS GATES (takeout
+/// in flight, reference providers) are the HOST's responsibility — this
+/// deletes unconditionally.
+pub fn apply_delete_orphaned(
+    db_tx: &rusqlite::Transaction,
+    blob_ids: &[BlobId],
+) -> Result<Vec<Blake3Hash>, StorageError> {
+    if blob_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = vec!["?"; blob_ids.len()].join(", ");
+    let id_params: Vec<&dyn rusqlite::ToSql> =
+        blob_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+
+    // Collect locally-stored fragment hashes for post-commit file cleanup
+    let mut stmt = db_tx
+        .prepare(&format!(
+            "SELECT fragment_hash FROM fragment_hashes WHERE data_block_id IN ({placeholders}) AND stored_locally = TRUE"
+        ))
+        .map_err(db_err("prepare local fragment selection"))?;
+    let local_hashes: Vec<Blake3Hash> = stmt
+        .query_map(id_params.as_slice(), |row| row.get(0))
+        .map_err(db_err("query local fragment hashes"))?
+        .collect::<Result<_, _>>()
+        .map_err(db_err("collect local fragment hashes"))?;
+    drop(stmt);
+
+    let fragments_deleted = db_tx
+        .execute(
+            &format!("DELETE FROM fragment_hashes WHERE data_block_id IN ({placeholders})"),
+            id_params.as_slice(),
+        )
+        .map_err(db_err("delete fragment_hashes"))?;
+    let access_deleted = db_tx
+        .execute(
+            &format!("DELETE FROM blob_access WHERE blob_id IN ({placeholders})"),
+            id_params.as_slice(),
+        )
+        .map_err(db_err("delete blob_access"))?;
+    let blocks_deleted = db_tx
+        .execute(
+            &format!("DELETE FROM data_blocks WHERE id IN ({placeholders})"),
+            id_params.as_slice(),
+        )
+        .map_err(db_err("delete data_blocks"))?;
+
+    tracing::info!(
+        "Blob deletion applied: {blocks_deleted} blobs, {fragments_deleted} fragments, {access_deleted} access entries"
+    );
+    Ok(local_hashes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
