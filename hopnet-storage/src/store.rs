@@ -60,6 +60,83 @@ fn db_err(what: &'static str) -> impl Fn(rusqlite::Error) -> StorageError {
     }
 }
 
+/// Install the substrate-owned tables (RFC-014/015 schema seam). The host
+/// calls this AFTER its own DDL — fragment_inventory FKs the host's `nodes`
+/// table, so install order is host → consensus → storage → projections.
+pub fn install_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "
+        -- Blob control plane (RFC-014)
+        CREATE TABLE data_blocks (
+            id               TEXT PRIMARY KEY,
+            modified_at      TEXT,
+            file_hash        BLOB NOT NULL,
+            fragment_count   INTEGER NOT NULL,
+            added_bytes      INTEGER NOT NULL,
+            placement_height INTEGER,  -- Consensus height when fragment placement was determined
+            file_size        INTEGER NOT NULL  -- Total size of the file in bytes (i64, max ~9.2 EB)
+        );
+
+        -- Pubkey-keyed wraps of per-blob keys. No users FK: the mesh pubkey
+        -- is a valid recipient with no user row, and non-user projections
+        -- may hold access later.
+        CREATE TABLE blob_access (
+            blob_id          TEXT NOT NULL,
+            recipient_pubkey BLOB NOT NULL,  -- 32 bytes X25519 (user or mesh key)
+            ephemeral_pubkey BLOB NOT NULL,  -- 32 bytes X25519 per-wrap ephemeral
+            wrapped_key      BLOB NOT NULL,  -- 48 bytes (32 + 16 auth tag)
+
+            PRIMARY KEY (blob_id, recipient_pubkey),
+            FOREIGN KEY (blob_id) REFERENCES data_blocks(id)
+        );
+        CREATE INDEX idx_blob_access_recipient ON blob_access(recipient_pubkey);
+
+        -- Mesh-wide keypair (RFC-014 all-users access primitive).
+        -- Pubkey is public replicated state; the privkey exists ONLY
+        -- wrapped-to-member-pubkeys (rows ride genesis / insert_user txs).
+        CREATE TABLE mesh_key (
+            internal_id INTEGER PRIMARY KEY CHECK(internal_id = 1),
+            pubkey      BLOB NOT NULL,   -- 32 bytes X25519
+            key_version INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE TABLE mesh_key_access (
+            recipient_pubkey BLOB PRIMARY KEY, -- member's X25519 pubkey
+            ephemeral_pubkey BLOB NOT NULL,
+            wrapped_privkey  BLOB NOT NULL     -- 48 bytes (32 + 16 tag)
+        );
+
+        CREATE TABLE fragment_hashes (
+            data_block_id    TEXT NOT NULL,
+            chunk_number     INTEGER NOT NULL,
+            local_index      INTEGER NOT NULL,
+            fragment_id      TEXT NOT NULL,
+            fragment_hash    BLOB NOT NULL,
+            chunk_type       INTEGER NOT NULL CHECK(chunk_type IN (0, 1)),  -- 0=original, 1=recovery
+            stored_locally   INTEGER DEFAULT 0,
+
+            PRIMARY KEY (data_block_id, chunk_number, local_index),
+            FOREIGN KEY (data_block_id) REFERENCES data_blocks(id)
+        );
+
+        -- Index for DHT lookups: which files contain fragment X
+        CREATE INDEX idx_fragment_hash ON fragment_hashes(fragment_hash);
+
+        CREATE TABLE fragment_inventory (
+            fragment_hash           BLOB NOT NULL,
+            node_id                 INTEGER NOT NULL,
+            self_verified_height    INTEGER, -- Once every so often we ensure this verification is actual disk check NOT only DB check.
+
+            PRIMARY KEY (fragment_hash, node_id),
+            FOREIGN KEY (node_id) REFERENCES nodes(node_id)
+        );
+
+        -- Indexes for fragment discovery optimization
+        CREATE INDEX idx_fragment_inventory_node ON fragment_inventory (node_id, fragment_hash);  -- Node-specific fragment lookup
+        CREATE INDEX idx_fragment_inventory_height ON fragment_inventory (self_verified_height, node_id);  -- Height-based queries
+        ",
+    )
+}
+
 /// Register a blob: data_blocks row + fragment_hashes rows (stored_locally
 /// probed against THIS node's disk) + blob_access wraps.
 pub fn apply_blob_insert(

@@ -1,0 +1,15 @@
+[package]
+name = "hopnet-drive"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+repository = "https://git.bentley.sh/HopNet/HopNet"
+description = "HopNet fs projection: inodes, encrypted paths, shares, and provider surfaces over the storage + consensus substrates (RFC-015)"
+
+[dependencies]
+hopnet-common = { path = "../common", features = ["database"] }
+hopnet-projection = { path = "../hopnet-projection" }
+hopnet-storage = { path = "../hopnet-storage", features = ["engine"] }
+
+rusqlite = { version = "0.38", features = ["bundled"] }
+tracing = "0.1"

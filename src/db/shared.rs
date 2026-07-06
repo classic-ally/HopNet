@@ -382,103 +382,6 @@ pub fn initialize(db: PooledConnection<SqliteConnectionManager>) -> Result<(), D
             CREATE INDEX idx_metrics_to_node ON metrics(to_node, start_time);
             CREATE INDEX idx_metrics_height ON metrics(height DESC, to_node); -- For placement decisions at specific heights
 
-            -- File system
-            CREATE TABLE data_blocks (
-                id               TEXT PRIMARY KEY,
-                modified_at      TEXT,
-                file_hash        BLOB NOT NULL,
-                fragment_count   INTEGER NOT NULL,
-                added_bytes      INTEGER NOT NULL,
-                placement_height INTEGER,  -- Consensus height when fragment placement was determined
-                file_size        INTEGER NOT NULL  -- Total size of the file in bytes (i64, max ~9.2 EB)
-            );
-
-            -- Substrate-owned (RFC-014): pubkey-keyed wraps of per-blob keys.
-            -- No users FK: the mesh pubkey is a valid recipient with no user
-            -- row, and non-user projections may hold access later.
-            CREATE TABLE blob_access (
-                blob_id          TEXT NOT NULL,
-                recipient_pubkey BLOB NOT NULL,  -- 32 bytes X25519 (user or mesh key)
-                ephemeral_pubkey BLOB NOT NULL,  -- 32 bytes X25519 per-wrap ephemeral
-                wrapped_key      BLOB NOT NULL,  -- 48 bytes (32 + 16 auth tag)
-
-                PRIMARY KEY (blob_id, recipient_pubkey),
-                FOREIGN KEY (blob_id) REFERENCES data_blocks(id)
-            );
-            CREATE INDEX idx_blob_access_recipient ON blob_access(recipient_pubkey);
-
-            -- Mesh-wide keypair (RFC-014 all-users access primitive).
-            -- Pubkey is public replicated state; the privkey exists ONLY
-            -- wrapped-to-member-pubkeys (rows ride genesis / insert_user txs).
-            CREATE TABLE mesh_key (
-                internal_id INTEGER PRIMARY KEY CHECK(internal_id = 1),
-                pubkey      BLOB NOT NULL,   -- 32 bytes X25519
-                key_version INTEGER NOT NULL DEFAULT 1
-            );
-            CREATE TABLE mesh_key_access (
-                recipient_pubkey BLOB PRIMARY KEY, -- member's X25519 pubkey
-                ephemeral_pubkey BLOB NOT NULL,
-                wrapped_privkey  BLOB NOT NULL     -- 48 bytes (32 + 16 tag)
-            );
-
-            CREATE TABLE fragment_hashes (
-                data_block_id    TEXT NOT NULL,
-                chunk_number     INTEGER NOT NULL,
-                local_index      INTEGER NOT NULL,
-                fragment_id      TEXT NOT NULL,
-                fragment_hash    BLOB NOT NULL,
-                chunk_type       INTEGER NOT NULL CHECK(chunk_type IN (0, 1)),  -- 0=original, 1=recovery
-                stored_locally   INTEGER DEFAULT 0,
-
-                PRIMARY KEY (data_block_id, chunk_number, local_index),
-                FOREIGN KEY (data_block_id) REFERENCES data_blocks(id)
-            );
-
-            -- Index for DHT lookups: which files contain fragment X
-            CREATE INDEX idx_fragment_hash ON fragment_hashes(fragment_hash);
-
-            CREATE TABLE inodes (
-                -- stable identifier for FileProvider (UUIDv7 encodes creation time)
-                id              TEXT UNIQUE NOT NULL,
-                -- owner of this reference
-                owner_id        INTEGER REFERENCES users(user_id) NOT NULL,
-                -- denormalized deterministically encrypted string
-                -- enables fast folder listing queries without need for recursive parent_id
-                path            TEXT NOT NULL,
-                -- type of the inode
-                type            INTEGER NOT NULL CHECK(type IN (0, 1)),  -- 0=file, 1=folder
-                -- FK to the content block
-                data_id         TEXT REFERENCES data_blocks(id),
-
-                PRIMARY KEY     (owner_id, path)
-            );
-
-            -- 1. The MOST IMPORTANT index for listing folder contents.
-            -- Don't need text_pattern_ops due to ART index
-            CREATE INDEX idx_inodes_path ON inodes (path);
-
-            -- 2. An index to quickly find all inodes belonging to a specific user.
-            CREATE INDEX idx_inodes_owner ON inodes (owner_id);
-            
-            -- 3. Index for FileProvider lookups by stable ID
-            CREATE INDEX idx_inodes_id ON inodes (id);
-
-            -- NOTE: modification_log is NOT consensus tracked - it's used for local FileProvider state delta computation
-            -- This table tracks all file/folder modifications to support incremental sync in FileProvider
-            -- It provides a unified change tracking mechanism for all file system operations
-            CREATE TABLE modification_log (
-                inode_id           TEXT NOT NULL,     -- Stable inode identifier
-                owner_id           INTEGER NOT NULL,
-                old_parent_id      TEXT,              -- Parent folder BEFORE modification (NULL for new items)
-                modified_at_height INTEGER NOT NULL,
-
-                PRIMARY KEY (inode_id, modified_at_height),
-                FOREIGN KEY (owner_id) REFERENCES users(user_id)
-            );
-
-            -- Index for efficient queries: what was modified for user X since height Y?
-            CREATE INDEX idx_modification_log_height ON modification_log (owner_id, modified_at_height);
-
             -- User data takeout tracking (consensus-tracked for network-wide coordination)
             CREATE TABLE takeouts (
                 id TEXT PRIMARY KEY,
@@ -542,19 +445,6 @@ pub fn initialize(db: PooledConnection<SqliteConnectionManager>) -> Result<(), D
             CREATE INDEX idx_reputation_from_node ON fragment_request_metrics (from_node, consensus_height);
             CREATE INDEX idx_reputation_consensus_height ON fragment_request_metrics (consensus_height);
 
-            CREATE TABLE fragment_inventory (
-                fragment_hash           BLOB NOT NULL,
-                node_id                 INTEGER NOT NULL,
-                self_verified_height    INTEGER, -- Once every so often we ensure this verification is actual disk check NOT only DB check.
-
-                PRIMARY KEY (fragment_hash, node_id),
-                FOREIGN KEY (node_id) REFERENCES nodes(node_id)
-            );
-
-            -- Indexes for fragment discovery optimization
-            CREATE INDEX idx_fragment_inventory_node ON fragment_inventory (node_id, fragment_hash);  -- Node-specific fragment lookup
-            CREATE INDEX idx_fragment_inventory_height ON fragment_inventory (self_verified_height, node_id);  -- Height-based queries
-
             -- Device tokens for OS integration authentication (consensus-replicated)
             -- API key format: {token_id}.{secret} - only hash of secret is stored
             -- Device name is SIV-encrypted with user's key (privacy from other nodes)
@@ -571,35 +461,11 @@ pub fn initialize(db: PooledConnection<SqliteConnectionManager>) -> Result<(), D
             );
             CREATE INDEX idx_device_tokens_user_id ON device_tokens(user_id);
 
-            -- Sharing: pending share invitations
-            CREATE TABLE incoming_shares (
-                id                       TEXT PRIMARY KEY,
-                data_block_id            TEXT NOT NULL,
-                sender_id                INTEGER NOT NULL,
-                recipient_id             INTEGER NOT NULL,
-                file_access              BLOB NOT NULL,
-                display_ephemeral_pubkey BLOB NOT NULL,
-                encrypted_display_name   BLOB NOT NULL,
-                FOREIGN KEY (data_block_id) REFERENCES data_blocks(id),
-                FOREIGN KEY (sender_id) REFERENCES users(user_id),
-                FOREIGN KEY (recipient_id) REFERENCES users(user_id)
-            );
-            CREATE INDEX idx_incoming_shares_recipient ON incoming_shares(recipient_id);
-            CREATE INDEX idx_incoming_shares_data_block ON incoming_shares(data_block_id);
-
             -- Transaction nonce dedup (prevents stale resubmission after forward timeout)
             CREATE TABLE committed_tx_nonces (
                 nonce TEXT PRIMARY KEY
             );
 
-            -- Sharing: live-link membership
-            CREATE TABLE shares (
-                data_block_id   TEXT NOT NULL,
-                user_id         INTEGER NOT NULL,
-                PRIMARY KEY (data_block_id, user_id),
-                FOREIGN KEY (data_block_id) REFERENCES data_blocks(id),
-                FOREIGN KEY (user_id) REFERENCES users(user_id)
-            );
         "
     )?;
 
@@ -610,6 +476,12 @@ pub fn initialize(db: PooledConnection<SqliteConnectionManager>) -> Result<(), D
         // install_schema only executes DDL — non-Db variants are unreachable
         other => rusqlite::Error::InvalidParameterName(other.to_string()),
     })?;
+
+    // Schema seam (RFC-015): substrate tables, then each projection's unit.
+    // Order matters — storage FKs the host's nodes table; drive FKs users
+    // (host) and data_blocks (storage).
+    hopnet_storage::store::install_schema(&db)?;
+    hopnet_drive::db::install_schema(&db)?;
 
     Ok(())
 }
