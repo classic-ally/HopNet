@@ -44,23 +44,17 @@ impl TransactionHandler for InsertFilesHandler {
                 // Authorization: verify user owns the files being inserted
                 if let Some(user_id) = tx.user_id {
                     for inode in &inodes {
-                        match &inode.owner {
-                            Either::Left(owner_id) => {
-                                if *owner_id != user_id {
-                                    tracing::warn!(
-                                        "Authorization failed: user {} attempted to insert file for user {}",
-                                        user_id,
-                                        owner_id
-                                    );
-                                    return Err(DatabaseError::AuthorizationError);
-                                }
-                            }
-                            Either::Right(_) => {
-                                tracing::error!(
-                                    "Authorization failed: unexpected User object in owner field"
-                                );
-                                return Err(DatabaseError::AuthorizationError);
-                            }
+                        // (Owner narrowing, RFC-015: a legacy Either::Right
+                        // payload now fails DECODE above — same rejection,
+                        // one step earlier.)
+                        let owner_id = inode.owner.id();
+                        if owner_id != user_id {
+                            tracing::warn!(
+                                "Authorization failed: user {} attempted to insert file for user {}",
+                                user_id,
+                                owner_id
+                            );
+                            return Err(DatabaseError::AuthorizationError);
                         }
                     }
                 } else {

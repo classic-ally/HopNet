@@ -27,7 +27,7 @@ mod authorization_tests {
 
         let inode = crate::db::Inode {
             id: crate::db::CustomUUID::new(None),
-            owner: Either::Left(user.user_id),
+            owner: hopnet_drive::InodeOwner::Id(user.user_id),
             path: "test/path".to_string(),
             inode_type: hopnet_common::InodeType::File,
             data_id: None,
@@ -176,7 +176,7 @@ mod authorization_tests {
 
         let inode = crate::db::Inode {
             id: crate::db::CustomUUID::new(None),
-            owner: Either::Left(user2_id),
+            owner: hopnet_drive::InodeOwner::Id(user2_id),
             path: "test/path".to_string(),
             inode_type: hopnet_common::InodeType::File,
             data_id: None,

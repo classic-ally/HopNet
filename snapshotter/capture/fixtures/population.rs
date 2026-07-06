@@ -264,14 +264,14 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
         let mut folder_inodes = vec![
             Inode {
                 id: root_folder_id.clone(),
-                owner: Either::Left(0),
+                owner: hopnet_drive::InodeOwner::Id(0),
                 path: encrypted_root.clone(),
                 inode_type: hopnet_common::InodeType::Folder,
                 data_id: None,
             },
             Inode {
                 id: subfolder_id,
-                owner: Either::Left(0),
+                owner: hopnet_drive::InodeOwner::Id(0),
                 path: encrypted_subfolder.clone(),
                 inode_type: hopnet_common::InodeType::Folder,
                 data_id: None,
@@ -287,21 +287,21 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
         let file_inodes = vec![
             Inode {
                 id: file_ids[0].clone(),
-                owner: Either::Left(0),
+                owner: hopnet_drive::InodeOwner::Id(0),
                 path: encrypted_file0.clone(),
                 inode_type: hopnet_common::InodeType::File,
                 data_id: Some(data_block_ids[0].clone()),
             },
             Inode {
                 id: file_ids[1].clone(),
-                owner: Either::Left(0),
+                owner: hopnet_drive::InodeOwner::Id(0),
                 path: encrypted_file1.clone(),
                 inode_type: hopnet_common::InodeType::File,
                 data_id: Some(data_block_ids[1].clone()),
             },
             Inode {
                 id: file_ids[2].clone(),
-                owner: Either::Left(0),
+                owner: hopnet_drive::InodeOwner::Id(0),
                 path: encrypted_file2.clone(),
                 inode_type: hopnet_common::InodeType::File,
                 data_id: Some(data_block_ids[2].clone()),
@@ -313,7 +313,7 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
         let user1_folder_id = uuid_from_index(102);
         let user1_file_inodes = vec![Inode {
             id: user1_folder_id,
-            owner: Either::Left(1),
+            owner: hopnet_drive::InodeOwner::Id(1),
             path: encrypted_root.clone(),
             inode_type: hopnet_common::InodeType::Folder,
             data_id: None,

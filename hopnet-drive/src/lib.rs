@@ -7,3 +7,6 @@
 //! owns its schema unit only.
 
 pub mod db;
+pub mod model;
+
+pub use model::{Inode, InodeOwner};

@@ -501,7 +501,7 @@ pub async fn post_files(
         tracing::debug!("CREATING: '{}'", &folder_path);
         let folder_inode = Inode {
             id: CustomUUID::new(None),
-            owner: Left(user_id),
+            owner: crate::db::InodeOwner::Id(user_id),
             path: folder_path,
             inode_type: hopnet_common::InodeType::Folder,
             data_id: None,

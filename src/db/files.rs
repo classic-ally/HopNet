@@ -232,10 +232,7 @@ pub fn insert_files(
         let data_id: Option<CustomUUID> = inode.data_id.clone();
 
         // Get the owner_id from the inode
-        let owner_id = match inode.owner {
-            either::Either::Left(user_id) => user_id,
-            either::Either::Right(user) => user.user_id,
-        };
+        let owner_id = inode.owner.id();
 
         // Use inode ID from consensus payload for distributed consistency
         // This ensures all nodes have the same ID for the same file

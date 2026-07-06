@@ -13,6 +13,7 @@ use rand::prelude::*;
 use rusqlite::params;
 use std::collections::HashMap;
 use std::io::Cursor;
+use std::str::FromStr;
 use tempfile::TempDir;
 use tokio_stream::StreamExt;
 
@@ -406,4 +407,42 @@ fn test_padding_edge_cases() {
             );
         }
     }
+}
+
+/// Should: the narrowed InodeOwner (single tag-0 variant) reproduce the
+/// legacy Either<i32, User>::Left wire bytes EXACTLY (golden hex captured
+/// from the pre-narrowing code on 2026-07-07), and round-trip decode.
+/// Should not: change a single byte — inodes ride consensus envelopes.
+/// Impact: any drift here is a wire break for insert_files/modify_item.
+#[test]
+fn golden_inode_wire_survives_owner_narrowing() {
+    use crate::db::{Inode, InodeOwner};
+    let inode = Inode {
+        id: CustomUUID::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c9a1").unwrap(),
+        owner: InodeOwner::Id(7),
+        path: "/golden/path".to_string(),
+        inode_type: hopnet_common::InodeType::File,
+        data_id: Some(CustomUUID::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c9a2").unwrap()),
+    };
+    let bytes = bincode::serde::encode_to_vec(&inode, bincode::config::standard()).unwrap();
+    assert_eq!(
+        hex::encode(&bytes),
+        "1001890a5dac96774bb9aa9f8b24f0c9a1000e0c2f676f6c64656e2f7061746800011001890a5dac96774bb9aa9f8b24f0c9a2"
+    );
+    let (decoded, _): (Inode, _) =
+        bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+    assert_eq!(decoded.owner.id(), 7);
+
+    let folder = Inode {
+        id: CustomUUID::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c9a3").unwrap(),
+        owner: InodeOwner::Id(0),
+        path: "/g".to_string(),
+        inode_type: hopnet_common::InodeType::Folder,
+        data_id: None,
+    };
+    let bytes = bincode::serde::encode_to_vec(&folder, bincode::config::standard()).unwrap();
+    assert_eq!(
+        hex::encode(&bytes),
+        "1001890a5dac96774bb9aa9f8b24f0c9a30000022f670100"
+    );
 }

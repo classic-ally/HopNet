@@ -50,7 +50,7 @@ pub fn prepend_missing_parents(
         .into_iter()
         .map(|path| Inode {
             id: CustomUUID::new(None),
-            owner: Left(user_id),
+            owner: crate::db::InodeOwner::Id(user_id),
             path,
             inode_type: hopnet_common::InodeType::Folder,
             data_id: None,
@@ -92,7 +92,7 @@ pub async fn assemble_file_inode<R: AsyncRead + Unpin>(
     if file_size == 0 {
         let inode = Inode {
             id: CustomUUID::new(None),
-            owner: Left(user_id),
+            owner: crate::db::InodeOwner::Id(user_id),
             path: encrypted_path,
             inode_type: hopnet_common::InodeType::File,
             data_id: None,
@@ -122,7 +122,7 @@ pub async fn assemble_file_inode<R: AsyncRead + Unpin>(
 
     let inode = Inode {
         id: CustomUUID::new(None),
-        owner: Left(user_id),
+        owner: crate::db::InodeOwner::Id(user_id),
         path: encrypted_path,
         inode_type: hopnet_common::InodeType::File,
         data_id: Some(dataid.clone()),
@@ -392,7 +392,7 @@ pub async fn create_folder(
 
     let folder_inode = Inode {
         id: CustomUUID::new(None),
-        owner: Left(user_id),
+        owner: crate::db::InodeOwner::Id(user_id),
         path: encrypted_path,
         inode_type: hopnet_common::InodeType::Folder,
         data_id: None,

@@ -93,25 +93,9 @@ impl FromSql for ChunkType {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-pub struct Inode {
-    // stable identifier (UUIDv7 encodes creation time)
-    pub id: CustomUUID,
-    // the owner for this specific node:
-    pub owner: Either<i32, User>,
-    // path is split by /
-    // each segment encrypted with AES-SIV with the owner's key
-    // this way, we can compute all files in a folder quickly whilst maintaining OK privacy
-    pub path: String,
-    // it is either a folder or file
-    pub inode_type: hopnet_common::InodeType,
-    // if file, point to datablock
-    // if folder, None
-    /// Blob reference (RFC-014): inodes reference blobs by id only. Blob
-    /// registration rides the same transaction as its own sub-payload
-    /// (DriveInsertPayload.blob_ops) — never embedded in the inode.
-    pub data_id: Option<CustomUUID>,
-}
+/// Drive-owned (RFC-015): the inode model lives in hopnet-drive; owner is
+/// a wire-compatible single-variant enum (see hopnet_drive::model).
+pub use hopnet_drive::{Inode, InodeOwner};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct XPubKey(X25519PublicKey);

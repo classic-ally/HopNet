@@ -12,4 +12,5 @@ hopnet-projection = { path = "../hopnet-projection" }
 hopnet-storage = { path = "../hopnet-storage", features = ["engine"] }
 
 rusqlite = { version = "0.38", features = ["bundled"] }
+serde = { version = "1.0.219", features = ["derive"] }
 tracing = "0.1"
