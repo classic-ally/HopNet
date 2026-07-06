@@ -777,8 +777,8 @@ pub fn get_file_fragments(
                     encrypted_path
                 );
                 return Ok(crate::files::functions::FileAccessData {
-                    file_reassembly_data: None, // No fragments for empty files
-                    file_access_entry: None,    // No encryption for empty files
+                    manifest: None,          // No fragments for empty files
+                    file_access_entry: None, // No encryption for empty files
                     file_size: 0,
                 });
             }
@@ -805,19 +805,11 @@ pub fn get_file_fragments(
             let file_access_entry =
                 get_file_access(&db_lock, &data_block_id, user_id).unwrap_or(None);
 
-            let file_reassembly_data = crate::files::functions::FileReassemblyData {
-                chunks: manifest.chunks,
-                added_bytes: manifest.added_bytes,
-                expected_file_hash: manifest.integrity_hash,
-                data_block_id,
-                per_file_key: None, // Will be set after decryption
-                placement_height: manifest.placement_height,
-            };
-
+            let file_size = manifest.file_size;
             Ok(crate::files::functions::FileAccessData {
-                file_reassembly_data: Some(file_reassembly_data), // Wrap in Some for non-empty files
+                manifest: Some(manifest),
                 file_access_entry,
-                file_size: manifest.file_size,
+                file_size,
             })
         }
         Err(_) => Err(DatabaseError::LockError),

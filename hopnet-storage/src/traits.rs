@@ -100,6 +100,22 @@ pub trait StateReader: Send + Sync {
     /// Snapshot of placement inputs at the current committed height.
     fn placement_inputs(&self) -> Result<PlacementInputs, StorageError>;
 
+    /// Snapshot of placement inputs at a HISTORICAL height — the get path's
+    /// placement-directed discovery rung reads the validator set the blob's
+    /// placement commit was computed against.
+    fn placement_inputs_at(&self, height: i32) -> Result<PlacementInputs, StorageError>;
+
+    /// Top verified holders per fragment, from the replicated inventory
+    /// attestations (self-check txs). Discovery's primary rung.
+    fn fragment_sources(
+        &self,
+        fragment_hashes: &[Blake3Hash],
+    ) -> Result<std::collections::HashMap<Blake3Hash, Vec<PeerRef>>, StorageError>;
+
+    /// Every known peer except this node — discovery's gossip fallback when
+    /// a blob has no placement height.
+    fn all_peers(&self) -> Result<Vec<PeerRef>, StorageError>;
+
     /// The blob's local fragment set IF this node should distribute it:
     /// unplaced and every fragment stored locally (origin filter). `None`
     /// is the common no-op on non-origin nodes.

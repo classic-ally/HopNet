@@ -1,7 +1,6 @@
 use crate::AppState;
 use crate::db::files as db;
 
-pub mod discovery;
 pub mod download;
 pub mod functions;
 pub mod handlers;

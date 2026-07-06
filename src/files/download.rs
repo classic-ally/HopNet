@@ -61,13 +61,15 @@ impl From<FileReconstructionError> for StatusCode {
 enum PreparedFile {
     Empty,
     Ready {
-        file_data: functions::FileReassemblyData,
+        manifest: hopnet_storage::store::BlobManifest,
+        per_blob_key: chacha20poly1305::Key,
         file_size: u64,
-        placement_height: Option<i32>,
     },
 }
 
-/// Shared preparation: DB lookup, empty-file check, key decryption
+/// Shared preparation: DB lookup, empty-file check, key decryption. The
+/// session unwrap stays projection-side (user identity, session cache);
+/// reconstruction itself is the substrate's api::get.
 async fn prepare_file_data(
     app_state: &crate::AppState,
     encrypted_path: &str,
@@ -77,48 +79,64 @@ async fn prepare_file_data(
         files::get_file_fragments(app_state.db_pool.get(), encrypted_path.to_string(), user_id)?;
     let file_size = file_access_data.file_size;
 
-    let file_data = match file_access_data.file_reassembly_data {
+    let manifest = match file_access_data.manifest {
         None => {
             tracing::debug!("Empty file: {}", encrypted_path);
             return Ok(PreparedFile::Empty);
         }
-        Some(data) => data,
+        Some(manifest) => manifest,
     };
 
-    let placement_height = file_data.placement_height;
-
-    let mut file_data = file_data;
-    if let Some(file_access_entry) = file_access_data.file_access_entry {
-        let session = app_state
-            .get_session(user_id)
-            .await
-            .map_err(|_| FileReconstructionError::InternalError)?;
-        let user_x25519_privkey =
-            crate::auth::derive_x25519_privkey_from_user(&session.user_keys.private_key);
-
-        match crate::auth::decrypt_wrapped_file_key(&file_access_entry, &user_x25519_privkey) {
-            Ok(per_file_key) => {
-                file_data.per_file_key = Some(per_file_key);
-            }
-            Err(e) => {
-                tracing::error!("Failed to decrypt file key for {}: {:?}", encrypted_path, e);
-                return Err(FileReconstructionError::KeyDecryptionError);
-            }
-        }
-    } else {
+    let Some(file_access_entry) = file_access_data.file_access_entry else {
         tracing::warn!(
             "User {} does not have access to file {}",
             user_id,
             encrypted_path
         );
         return Err(FileReconstructionError::Forbidden);
-    }
+    };
+
+    let session = app_state
+        .get_session(user_id)
+        .await
+        .map_err(|_| FileReconstructionError::InternalError)?;
+    let user_x25519_privkey =
+        crate::auth::derive_x25519_privkey_from_user(&session.user_keys.private_key);
+
+    let per_blob_key =
+        match crate::auth::decrypt_wrapped_file_key(&file_access_entry, &user_x25519_privkey) {
+            Ok(key) => key,
+            Err(e) => {
+                tracing::error!("Failed to decrypt file key for {}: {:?}", encrypted_path, e);
+                return Err(FileReconstructionError::KeyDecryptionError);
+            }
+        };
 
     Ok(PreparedFile::Ready {
-        file_data,
+        manifest,
+        per_blob_key,
         file_size,
-        placement_height,
     })
+}
+
+/// Substrate reconstruction stream with errors mapped onto the projection's
+/// FileError (callers' HTTP mapping unchanged).
+fn reconstruct_stream(
+    app_state: &crate::AppState,
+    fragments_dir: &str,
+    manifest: hopnet_storage::store::BlobManifest,
+    per_blob_key: chacha20poly1305::Key,
+    range: Option<(u64, u64)>,
+) -> impl tokio_stream::Stream<Item = Result<bytes::Bytes, functions::FileError>> + use<> {
+    use tokio_stream::StreamExt;
+    hopnet_storage::api::get(
+        Some(crate::files::substrate_host::get_net(app_state)),
+        fragments_dir.to_string(),
+        manifest,
+        Some(per_blob_key),
+        range,
+    )
+    .map(|item| item.map_err(functions::FileError::from))
 }
 
 fn empty_stream() -> std::pin::Pin<
@@ -145,17 +163,12 @@ pub async fn reconstruct_file_stream(
     match prepare_file_data(app_state, &encrypted_path, user_id).await? {
         PreparedFile::Empty => Ok(empty_stream()),
         PreparedFile::Ready {
-            file_data,
-            placement_height,
+            manifest,
+            per_blob_key,
             ..
         } => {
-            let stream = functions::reconstruct_file_chunked(
-                fragments_dir.to_string(),
-                file_data,
-                Some(app_state.clone()),
-                placement_height,
-                None,
-            );
+            let stream =
+                reconstruct_stream(app_state, fragments_dir, manifest, per_blob_key, None);
             tracing::debug!(
                 "Starting streaming reconstruction for file {}",
                 encrypted_path
@@ -182,9 +195,9 @@ pub async fn reconstruct_file_range(
             range: None,
         }),
         PreparedFile::Ready {
-            file_data,
+            manifest,
+            per_blob_key,
             file_size,
-            placement_height,
         } => {
             let resolved_range = match requested_range {
                 Some((start, end_opt)) => {
@@ -200,11 +213,11 @@ pub async fn reconstruct_file_range(
             let range_tuple = resolved_range.as_ref().map(|r| (r.start, r.end));
             let is_partial = resolved_range.is_some();
 
-            let stream = functions::reconstruct_file_chunked(
-                fragments_dir.to_string(),
-                file_data,
-                Some(app_state.clone()),
-                placement_height,
+            let stream = reconstruct_stream(
+                app_state,
+                fragments_dir,
+                manifest,
+                per_blob_key,
                 range_tuple,
             );
 

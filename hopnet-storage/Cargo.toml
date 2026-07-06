@@ -21,13 +21,18 @@ tracing = "0.1"
 
 reed-solomon-simd = "3.0.1"
 
-# Engine feature: async substrate surfaces (api::put and the distribution
-# engine). Pure modules never need a runtime; the engine owns NO runtime of
-# its own — hosts pass tokio Handles at spawn.
+# Engine feature: async substrate surfaces (api::put, api::get, the
+# distribution engine). Pure modules never need a runtime; the engine owns
+# NO runtime of its own — hosts pass tokio Handles at spawn.
 tokio = { version = "1", features = ["io-util", "rt", "sync", "time", "macros"], optional = true }
+tokio-stream = { version = "0.1.17", optional = true }
+async-stream = { version = "0.3.6", optional = true }
+bytes = { version = "1.10.1", optional = true }
 
 [features]
-engine = ["dep:tokio"]
+engine = ["dep:tokio", "dep:tokio-stream", "dep:async-stream", "dep:bytes"]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["io-util", "macros", "rt"] }
+tokio = { version = "1", features = ["io-util", "macros", "rt", "rt-multi-thread"] }
+tokio-stream = "0.1.17"
+tempfile = "3"

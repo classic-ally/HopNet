@@ -56,6 +56,19 @@ pub fn spawn_storage_engine(app_state: &AppState) {
     let _ = app_state.storage.set(handle);
 }
 
+/// Seam bundle for the crate's get path (api::get) — one shared adapter
+/// behind all three capabilities.
+pub fn get_net(
+    app_state: &AppState,
+) -> hopnet_storage::api::GetNet<SubstrateHost, SubstrateHost, SubstrateHost> {
+    let host = Arc::new(SubstrateHost::new(app_state.clone()));
+    hopnet_storage::api::GetNet {
+        transport: host.clone(),
+        state: host.clone(),
+        local_state: host,
+    }
+}
+
 fn map_iroh_error(e: crate::net::IrohError) -> TransportError {
     match e {
         crate::net::IrohError::Protocol(crate::net::transport::ProtocolError::PeerError(msg)) => {
@@ -161,6 +174,75 @@ impl StateReader for SubstrateHost {
                 .collect(),
             metrics: metrics.into_iter().map(Into::into).collect(),
         })
+    }
+
+    fn placement_inputs_at(&self, height: i32) -> Result<PlacementInputs, StorageError> {
+        let conn = self
+            .app_state
+            .db_pool
+            .get()
+            .map_err(|e| StorageError::Host(format!("pool checkout: {e}")))?;
+        let validators = crate::db::consensus::get_validators_with_conn(&conn, height)
+            .map_err(|e| StorageError::Host(format!("validators at {height}: {e:?}")))?;
+        let metrics = crate::db::metrics::get_all_node_metrics_with_conn(&conn, height)
+            .map_err(|e| StorageError::Host(format!("node metrics at {height}: {e:?}")))?;
+        Ok(PlacementInputs {
+            height,
+            validators: validators
+                .into_iter()
+                .map(|n| PeerRef {
+                    node_id: n.node_id,
+                    pubkey: n.pubkey.0.to_bytes(),
+                })
+                .collect(),
+            metrics: metrics.into_iter().map(Into::into).collect(),
+        })
+    }
+
+    fn fragment_sources(
+        &self,
+        fragment_hashes: &[Blake3Hash],
+    ) -> Result<std::collections::HashMap<Blake3Hash, Vec<PeerRef>>, StorageError> {
+        let sources = crate::db::inventory::batch_query_fragment_inventory(
+            self.app_state.db_pool.get(),
+            fragment_hashes,
+            None,
+        )
+        .map_err(|e| StorageError::Host(format!("fragment inventory: {e:?}")))?;
+        Ok(sources
+            .into_iter()
+            .map(|(hash, nodes)| {
+                (
+                    hash,
+                    nodes
+                        .into_iter()
+                        .map(|n| PeerRef {
+                            node_id: n.node_id,
+                            pubkey: n.pubkey.0.to_bytes(),
+                        })
+                        .collect(),
+                )
+            })
+            .collect())
+    }
+
+    fn all_peers(&self) -> Result<Vec<PeerRef>, StorageError> {
+        let my_node_id = self
+            .app_state
+            .get_node_id()
+            .map_err(|_| StorageError::Host("node id not set".to_string()))?;
+        let nodes = crate::db::nodes::get_all_nodes_as_connection_info(
+            self.app_state.db_pool.get(),
+            my_node_id,
+        )
+        .map_err(|e| StorageError::Host(format!("gossip nodes: {e:?}")))?;
+        Ok(nodes
+            .into_iter()
+            .map(|n| PeerRef {
+                node_id: n.node_id,
+                pubkey: n.pubkey.0.to_bytes(),
+            })
+            .collect())
     }
 
     fn distributable_blob(

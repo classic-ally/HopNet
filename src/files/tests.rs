@@ -3,10 +3,10 @@
 
 use crate::db::{Blake3Hash, ChunkType, CustomUUID, SqliteConnectionManager};
 use crate::files::functions::{
-    CHUNK_SIZE, FileReassemblyData, MAX_FRAGMENT_SIZE, ORIGINAL_FRAGMENTS_PER_CHUNK,
-    RECOVERY_FRAGMENTS_PER_CHUNK, calculate_chunked_fragments, calculate_padding_and_chunks,
-    reconstruct_file_chunked,
+    CHUNK_SIZE, MAX_FRAGMENT_SIZE, ORIGINAL_FRAGMENTS_PER_CHUNK, RECOVERY_FRAGMENTS_PER_CHUNK,
+    calculate_chunked_fragments, calculate_padding_and_chunks,
 };
+use hopnet_storage::store::BlobManifest;
 use crate::files::routes::process_uploaded_file;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::OsRng as ChaChaOsRng};
 use rand::prelude::*;
@@ -190,19 +190,15 @@ fn test_chunk_content_preservation() {
     );
 }
 
-fn build_reassembly_data(
+fn build_manifest(
     plaintext_size: usize,
     blob_op: &hopnet_storage::store::BlobInsertOp,
     dataid: &CustomUUID,
-    per_file_key: chacha20poly1305::Key,
-) -> FileReassemblyData {
-    let _ = plaintext_size;
-    let mut chunks: crate::files::functions::ReassemblyChunks = HashMap::new();
+) -> BlobManifest {
+    let mut chunks: HashMap<u32, hopnet_storage::store::ChunkFragmentMaps> = HashMap::new();
 
     for fragment in &blob_op.fragments {
-        let entry = chunks
-            .entry(fragment.chunk_number)
-            .or_insert_with(|| (HashMap::new(), HashMap::new()));
+        let entry = chunks.entry(fragment.chunk_number).or_default();
         let bucket = if fragment.recovery {
             &mut entry.1
         } else {
@@ -214,13 +210,13 @@ fn build_reassembly_data(
         );
     }
 
-    FileReassemblyData {
-        chunks,
+    BlobManifest {
+        blob_id: dataid.clone(),
+        integrity_hash: blob_op.integrity_hash,
         added_bytes: blob_op.added_bytes,
-        expected_file_hash: blob_op.integrity_hash,
-        data_block_id: dataid.clone(),
-        per_file_key: Some(per_file_key),
+        file_size: plaintext_size as u64,
         placement_height: None,
+        chunks,
     }
 }
 
@@ -251,9 +247,10 @@ async fn run_round_trip(plaintext: Vec<u8>) {
         "file_size must match plaintext length"
     );
 
-    let reassembly = build_reassembly_data(plaintext.len(), &blob_op, &dataid, per_file_key);
+    let manifest = build_manifest(plaintext.len(), &blob_op, &dataid);
 
-    let stream = reconstruct_file_chunked(fragments_dir, reassembly, None, None, None);
+    let stream =
+        hopnet_storage::api::get_local(fragments_dir, manifest, Some(per_file_key), None);
     tokio::pin!(stream);
 
     let mut reconstructed = Vec::with_capacity(plaintext.len());
