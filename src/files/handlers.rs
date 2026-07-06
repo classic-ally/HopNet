@@ -4,8 +4,7 @@ use crate::{
     consensus::types::Transaction,
     db::Inode,
     db::{
-        CustomUUID, DatabaseError,
-        files::{PlacementHeightUpdate, insert_files, update_placement_heights_batch},
+        CustomUUID, DatabaseError, files::insert_files,
         fragments::delete_orphaned_data_blocks_consensus,
     },
     handlers::{HandlerResult, TransactionHandler},
@@ -123,13 +122,23 @@ impl TransactionHandler for UpdatePlacementHeightsHandler {
         execute: bool,
         db_tx: &rusqlite::Transaction,
     ) -> HandlerResult {
-        match bincode::serde::decode_from_slice::<Vec<PlacementHeightUpdate>, _>(
+        // Storage-owned tx (RFC-014): payload type and apply both live in
+        // the substrate crate; this shim only decodes and delegates.
+        match bincode::serde::decode_from_slice::<Vec<hopnet_storage::PlacementUpdate>, _>(
             &tx.rpc.payload,
             bincode::config::standard(),
         ) {
-            Ok((updates_data, _)) => {
-                // Update placement heights using shared transaction
-                update_placement_heights_batch(db_tx, updates_data)?;
+            Ok((updates, _)) => {
+                let crate_updates: Vec<(hopnet_storage::BlobId, i32)> = updates
+                    .into_iter()
+                    .map(|u| (u.blob_id, u.placement_height))
+                    .collect();
+                hopnet_storage::store::apply_placement_commit(db_tx, &crate_updates).map_err(
+                    |e| {
+                        tracing::error!("apply_placement_commit failed: {e}");
+                        DatabaseError::ProcessingError
+                    },
+                )?;
                 Ok(())
             }
             Err(_) => Err(DatabaseError::InvalidPayload),
@@ -260,7 +269,7 @@ impl TransactionHandler for ModifyItemHandler {
             &tx.rpc.payload,
             bincode::config::standard(),
         ) {
-            Ok((mut payload_data, _)) => {
+            Ok((payload_data, _)) => {
                 // Authorization: verify user matches authenticated user
                 if let Some(ref user) = tx.user {
                     if payload_data.user_id != user.id {

@@ -914,112 +914,6 @@ pub fn get_file_fragments(
 
 use serde::{Deserialize, Serialize};
 
-/// Payload for placement height updates consensus transaction
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlacementHeightUpdate {
-    pub data_block_id: CustomUUID,
-    pub placement_height: i32,
-}
-
-/// Update placement_height for data blocks after successful fragment distribution
-/// Consensus-safe function with execute flag for validation/rollback support
-pub fn update_placement_heights_batch(
-    db_tx: &rusqlite::Transaction,
-    updates: Vec<PlacementHeightUpdate>,
-) -> Result<(), DatabaseError> {
-    let updates_len = updates.len();
-    let crate_updates: Vec<(hopnet_storage::BlobId, i32)> = updates
-        .into_iter()
-        .map(|u| (u.data_block_id, u.placement_height))
-        .collect();
-    hopnet_storage::store::apply_placement_commit(db_tx, &crate_updates).map_err(|e| {
-        tracing::error!("apply_placement_commit failed: {e}");
-        DatabaseError::ProcessingError
-    })?;
-
-    tracing::debug!(
-        "Updated placement_height for {} data blocks using shared transaction",
-        updates_len
-    );
-    Ok(())
-}
-
-/// Get a specific file if it needs distribution (placement_height = NULL and all fragments stored locally)
-pub fn get_distributable_file(
-    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
-    data_block_id: CustomUUID,
-) -> Result<Option<DistributableFileData>, DatabaseError> {
-    match db_connection {
-        Ok(db_lock) => {
-            // Combined query: get file_hash + fragments together in one query
-            // This ensures we only get file_hash when the file is actually distributable
-            // If no rows match, we return Ok(None) to allow polling loop to retry
-            let mut stmt = db_lock.prepare(
-                "SELECT db.file_hash, fh.local_index, fh.fragment_hash, fh.chunk_type
-                 FROM data_blocks db
-                 JOIN fragment_hashes fh ON db.id = fh.data_block_id
-                 WHERE db.id = ?
-                   AND db.placement_height IS NULL
-                   AND fh.stored_locally = TRUE
-                   AND (SELECT COUNT(*) FROM fragment_hashes WHERE data_block_id = db.id AND stored_locally = TRUE) = db.fragment_count
-                 ORDER BY fh.chunk_number, fh.local_index"
-            ).map_err(|e| {
-                tracing::error!("Failed to prepare distributable file query for data_block {}: {:?}", data_block_id, e);
-                DatabaseError::RecallError
-            })?;
-
-            let mut file_hash: Option<crate::types::Blake3Hash> = None;
-            let mut fragments = Vec::new();
-
-            let rows = stmt
-                .query_map([data_block_id.clone()], |row| {
-                    let f_hash: crate::types::Blake3Hash = row.get(0)?;
-                    let local_index: u32 = row.get(1)?;
-                    let fragment_hash: crate::types::Blake3Hash = row.get(2)?;
-                    let chunk_type: crate::db::ChunkType = row.get(3)?;
-
-                    Ok((f_hash, local_index, fragment_hash, chunk_type))
-                })
-                .map_err(|_| DatabaseError::RecallError)?;
-
-            for row_result in rows {
-                let (f_hash, local_index, fragment_hash, chunk_type) =
-                    row_result.map_err(|_| DatabaseError::ProcessingError)?;
-
-                // Store file_hash from first row (same for all rows)
-                if file_hash.is_none() {
-                    file_hash = Some(f_hash);
-                }
-
-                let fragment_type = match chunk_type {
-                    crate::db::ChunkType::Original => {
-                        crate::files::placement::FragmentType::Original
-                    }
-                    crate::db::ChunkType::Recovery => {
-                        crate::files::placement::FragmentType::Recovery
-                    }
-                };
-
-                fragments.push((local_index as usize, fragment_hash, fragment_type));
-            }
-
-            if fragments.is_empty() {
-                // File doesn't exist, isn't ready, or has already been distributed
-                // Return Ok(None) to allow polling loop to retry
-                Ok(None)
-            } else {
-                let file_hash = file_hash.expect("file_hash must be set if fragments exist");
-                Ok(Some(DistributableFileData {
-                    id: data_block_id,
-                    file_hash,
-                    fragment_hashes: fragments,
-                }))
-            }
-        }
-        Err(_) => Err(DatabaseError::LockError),
-    }
-}
-
 /// Batch-update local storage state for multiple fragments in a single transaction.
 /// Acquires the write lock once instead of once per fragment, avoiding sustained
 /// lock contention with consensus operations.
@@ -1068,18 +962,6 @@ pub fn mark_fragments_local_state_batch(
         }
         Err(_) => Err(DatabaseError::LockError),
     }
-}
-
-/// Data about a file ready for distribution
-#[derive(Debug, Clone)]
-pub struct DistributableFileData {
-    pub id: CustomUUID,
-    pub file_hash: crate::types::Blake3Hash,
-    pub fragment_hashes: Vec<(
-        usize,
-        crate::types::Blake3Hash,
-        crate::files::placement::FragmentType,
-    )>,
 }
 
 /// Get count of fragments stored locally on this node

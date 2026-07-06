@@ -219,8 +219,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 write_gate: write_gate.clone(),
                 local_state_tx,
                 malachite: Arc::new(OnceCell::new()),
-                placement_batch_tx: Arc::new(OnceCell::new()),
-                distribution_tx: Arc::new(OnceCell::new()),
+                storage: Arc::new(OnceCell::new()),
             };
 
             // If we loaded state from database, populate the OnceCell fields

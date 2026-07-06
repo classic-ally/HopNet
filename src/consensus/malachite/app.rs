@@ -218,7 +218,7 @@ impl<C: DerefMut<Target = Connection> + 'static> Application<SqliteStorage<C>>
         // shell thread — NON-BLOCKING ONLY (unbounded send; no DB, no
         // awaits). Covers both drive envelopes, so modify content updates
         // distribute too.
-        let Some(tx_sender) = self.app_state.distribution_tx.get() else {
+        let Some(storage) = self.app_state.storage.get() else {
             return;
         };
         for tx in block.data.transactions.iter() {
@@ -244,7 +244,7 @@ impl<C: DerefMut<Target = Connection> + 'static> Application<SqliteStorage<C>>
                 _ => Vec::new(),
             };
             for blob_id in blob_ids {
-                let _ = tx_sender.send(blob_id);
+                storage.notify_blob_committed(blob_id);
             }
         }
     }

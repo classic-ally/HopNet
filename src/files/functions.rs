@@ -77,6 +77,11 @@ impl From<hopnet_storage::StorageError> for FileError {
             hopnet_storage::StorageError::Io(io)
             | hopnet_storage::StorageError::Read(io) => FileError::StorageError(io),
             hopnet_storage::StorageError::Rs => FileError::ShardingError,
+            // Host seam failures (engine-side DB/signing) never reach the
+            // projection's put/get delegations; map defensively.
+            hopnet_storage::StorageError::Host(msg) => {
+                FileError::StorageError(std::io::Error::other(msg))
+            }
         }
     }
 }

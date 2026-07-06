@@ -20,14 +20,14 @@ pub struct FragmentHealthResponse {
     pub healthy: bool,
 }
 
-/// Server-side: handle a fragment health check from a peer node.
+/// Server-side: handle a fragment health check from a peer node — delegates
+/// to the substrate's serve half.
 /// No auth needed — iroh connections are already authenticated by the PeerValidator hook.
 pub fn handle_fragment_health_check(
     req: FragmentHealthRequest,
     fragments_dir: &str,
 ) -> FragmentHealthResponse {
-    let healthy =
-        crate::files::functions::fragment_exists_and_valid(fragments_dir, &req.fragment_hash);
+    let healthy = hopnet_storage::serve::serve_fragment_health(fragments_dir, &req.fragment_hash);
     FragmentHealthResponse { healthy }
 }
 
@@ -78,17 +78,18 @@ pub struct FragmentFetchResponse {
     pub data: Option<Vec<u8>>,
 }
 
-/// Server-side: handle a fragment fetch request from a peer node.
+/// Server-side: handle a fragment fetch request from a peer node — delegates
+/// to the substrate's serve half.
 pub fn handle_fragment_fetch(
     req: FragmentFetchRequest,
     fragments_dir: &str,
 ) -> FragmentFetchResponse {
-    match crate::files::functions::fetch_and_verify_fragment(&req.fragment_hash, fragments_dir) {
-        Ok(data) => FragmentFetchResponse {
+    match hopnet_storage::serve::serve_fragment_fetch(fragments_dir, &req.fragment_hash) {
+        Some(data) => FragmentFetchResponse {
             found: true,
             data: Some(data),
         },
-        Err(_) => FragmentFetchResponse {
+        None => FragmentFetchResponse {
             found: false,
             data: None,
         },
@@ -146,79 +147,42 @@ pub struct FragmentStoreResponse {
     pub already_existed: bool,
 }
 
-/// Server-side: handle a fragment store request from a peer node.
+/// Server-side: handle a fragment store request from a peer node — the
+/// substrate's serve half enforces size cap + content addressing, persists,
+/// and queues stored_locally settlement via the LocalStateSink seam; this
+/// shell only maps the outcome onto wire responses.
 pub async fn handle_fragment_store(
     req: FragmentStoreRequest,
     app_state: &AppState,
 ) -> IrohResponse {
-    let max_encrypted_size = crate::files::functions::calculate_encrypted_chunk_length(
-        crate::files::functions::MAX_FRAGMENT_SIZE,
-    );
-
-    // Verify fragment size
-    if req.data.len() > max_encrypted_size {
-        return IrohResponse::Error {
-            message: format!(
-                "fragment too large: {} bytes (max: {})",
-                req.data.len(),
-                max_encrypted_size
-            ),
-        };
-    }
-
-    // Verify hash matches
-    let actual_hash = Blake3Hash::new(blake3::hash(&req.data));
-    if actual_hash != req.fragment_hash {
-        return IrohResponse::Error {
-            message: format!(
-                "hash mismatch: expected {}, got {}",
-                req.fragment_hash.to_hex(),
-                actual_hash.to_hex()
-            ),
-        };
-    }
-
-    // Check if already exists
-    if crate::files::functions::fragment_exists_and_valid(
+    use hopnet_storage::serve::StoreOutcome;
+    let sink = crate::files::substrate_host::SubstrateHost::new(app_state.clone());
+    match hopnet_storage::serve::serve_fragment_store(
         &app_state.fragments_dir,
-        &req.fragment_hash,
-    ) {
-        return IrohResponse::FragmentStoreResponse(FragmentStoreResponse {
-            success: true,
-            already_existed: true,
-        });
-    }
-
-    // Store to disk
-    if let Err(e) = crate::files::functions::store_fragment(
-        &app_state.fragments_dir,
+        &sink,
         &req.fragment_hash,
         req.data,
     ) {
-        return IrohResponse::Error {
-            message: format!("failed to store fragment: {:?}", e),
-        };
-    }
-
-    // Queue async DB update (drain task will batch-flush through write gate)
-    if let Err(e) =
-        app_state
-            .local_state_tx
-            .try_send(crate::db::write_gate::LocalStateUpdate::MarkLocal {
-                fragment_hash: req.fragment_hash,
+        StoreOutcome::Stored => IrohResponse::FragmentStoreResponse(FragmentStoreResponse {
+            success: true,
+            already_existed: false,
+        }),
+        StoreOutcome::AlreadyExisted => {
+            IrohResponse::FragmentStoreResponse(FragmentStoreResponse {
+                success: true,
+                already_existed: true,
             })
-    {
-        tracing::warn!(
-            "Local state queue full, dropping mark-local for {}: {}",
-            req.fragment_hash.to_hex(),
-            e
-        );
+        }
+        StoreOutcome::TooLarge { got, max } => IrohResponse::Error {
+            message: format!("fragment too large: {} bytes (max: {})", got, max),
+        },
+        StoreOutcome::HashMismatch { expected, actual } => IrohResponse::Error {
+            message: format!("hash mismatch: expected {}, got {}", expected, actual),
+        },
+        StoreOutcome::Io(e) => IrohResponse::Error {
+            message: format!("failed to store fragment: {:?}", e),
+        },
     }
-
-    IrohResponse::FragmentStoreResponse(FragmentStoreResponse {
-        success: true,
-        already_existed: false,
-    })
 }
 
 /// Client-side: store a fragment on a remote node over iroh.

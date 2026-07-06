@@ -2762,6 +2762,7 @@ dependencies = [
  "hopnet-common",
  "rand 0.10.1",
  "reed-solomon-simd",
+ "rusqlite",
  "serde",
  "tokio",
  "tracing",

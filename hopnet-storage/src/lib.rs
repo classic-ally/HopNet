@@ -13,14 +13,18 @@
 #[cfg(feature = "engine")]
 pub mod api;
 pub mod crypto;
+#[cfg(feature = "engine")]
+pub mod engine;
 pub mod error;
 pub mod fragstore;
 pub mod placement;
 pub mod rs;
+pub mod serve;
 pub mod store;
+pub mod traits;
 pub mod types;
 
 pub use error::StorageError;
 pub use hopnet_common::Blake3Hash;
 pub use hopnet_common::CustomUUID;
-pub use types::{BlobAccess, BlobId, MeshKeyGrant};
+pub use types::{BlobAccess, BlobId, MeshKeyGrant, PlacementUpdate};

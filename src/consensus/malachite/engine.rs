@@ -306,9 +306,9 @@ pub fn spawn_engine(app_state: &AppState) -> Result<(), String> {
         sync_inflight.clone(),
     );
 
-    // Distribution engine workers (RFC-014): consume blob ids pushed by
-    // on_decided. Spawned on the caller's (main) runtime — data-plane sends.
-    crate::files::distribution::spawn_distribution_workers(app_state);
+    // Storage distribution engine (RFC-014): behind the host seams. Data
+    // plane on the caller's (main) runtime; placement batcher on queue_rt.
+    crate::files::substrate_host::spawn_storage_engine(app_state);
 
     let engine = EngineHandle {
         input_tx,

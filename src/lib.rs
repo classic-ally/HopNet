@@ -65,18 +65,12 @@ pub struct AppState {
     /// genesis setup, or join bootstrap). Empty until the node is initialized;
     /// consensus dispatch answers "not active" meanwhile.
     pub malachite: Arc<OnceCell<consensus::malachite::EngineHandle>>,
-    /// Placement-commit batcher (distribution substrate, RFC-014): lazily
-    /// spawned on first distribution; collects per-blob placement updates
-    /// and submits ONE consensus tx per window instead of one per file.
-    pub placement_batch_tx:
-        Arc<OnceCell<tokio::sync::mpsc::UnboundedSender<db::files::PlacementHeightUpdate>>>,
-    /// Distribution work queue (RFC-014 engine): blob ids pushed from
-    /// HopNetApplication::on_decided (non-blocking), drained by the global
-    /// worker pool spawned at engine start. Every node enqueues every
-    /// decided blob; only the node holding the fragments locally actually
-    /// distributes (get_distributable_file filters the rest out).
-    pub distribution_tx:
-        Arc<OnceCell<tokio::sync::mpsc::UnboundedSender<hopnet_common::CustomUUID>>>,
+    /// Storage distribution engine handle (RFC-014) — set by
+    /// `files::substrate_host::spawn_storage_engine` at consensus engine
+    /// start (mirrors `.malachite`). HopNetApplication::on_decided kicks it
+    /// with decided blob ids (non-blocking); the engine's workers and
+    /// placement batcher run behind the host seams.
+    pub storage: Arc<OnceCell<hopnet_storage::engine::EngineHandle>>,
 }
 
 impl AppState {

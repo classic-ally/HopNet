@@ -284,6 +284,52 @@ pub fn mark_local_state_batch(
     Ok(total_rows)
 }
 
+/// A blob this node should distribute: its full local fragment set, ordered
+/// by (chunk_number, local_index).
+#[derive(Debug, Clone)]
+pub struct DistributableBlob {
+    pub blob_id: BlobId,
+    /// (local_index, fragment_hash) per fragment.
+    pub fragments: Vec<(u32, Blake3Hash)>,
+}
+
+/// Origin filter for the distribution engine: return the blob's fragments
+/// IFF it is unplaced (`placement_height IS NULL`) and EVERY fragment is
+/// stored locally — i.e. this node holds the complete set (the origin).
+/// `None` is the cheap common case on non-origin nodes.
+pub fn get_distributable_blob(
+    conn: &rusqlite::Connection,
+    blob_id: &BlobId,
+) -> Result<Option<DistributableBlob>, StorageError> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT fh.local_index, fh.fragment_hash
+             FROM data_blocks db
+             JOIN fragment_hashes fh ON db.id = fh.data_block_id
+             WHERE db.id = ?
+               AND db.placement_height IS NULL
+               AND fh.stored_locally = TRUE
+               AND (SELECT COUNT(*) FROM fragment_hashes
+                    WHERE data_block_id = db.id AND stored_locally = TRUE)
+                   = db.fragment_count
+             ORDER BY fh.chunk_number, fh.local_index",
+        )
+        .map_err(db_err("prepare distributable blob query"))?;
+    let fragments: Vec<(u32, Blake3Hash)> = stmt
+        .query_map(params![blob_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(db_err("query distributable blob"))?
+        .collect::<Result<_, _>>()
+        .map_err(db_err("read distributable blob row"))?;
+    if fragments.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(DistributableBlob {
+            blob_id: blob_id.clone(),
+            fragments,
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

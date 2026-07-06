@@ -15,6 +15,10 @@ pub enum StorageError {
     Read(std::io::Error),
     /// Reed-Solomon encode/decode failure.
     Rs,
+    /// Host seam failure (StateReader / TxSubmitter impls): DB checkout,
+    /// query, or signing problems surface as opaque strings — the substrate
+    /// never sees the host's error taxonomy.
+    Host(String),
 }
 
 impl std::fmt::Display for StorageError {
@@ -25,6 +29,7 @@ impl std::fmt::Display for StorageError {
             StorageError::Io(e) => write!(f, "fragment I/O error: {}", e),
             StorageError::Read(e) => write!(f, "source read error: {}", e),
             StorageError::Rs => write!(f, "reed-solomon coding error"),
+            StorageError::Host(msg) => write!(f, "host seam error: {}", msg),
         }
     }
 }

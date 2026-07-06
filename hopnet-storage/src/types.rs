@@ -19,6 +19,17 @@ pub struct MeshKeyGrant {
     pub wrapped_privkey: Vec<u8>, // 48 bytes (32 + 16 auth tag)
 }
 
+/// One blob's placement commit: records the consensus height whose
+/// validator/metrics snapshot the placement was computed against. Batched —
+/// the engine submits `Vec<PlacementUpdate>` as ONE `update_placement_heights`
+/// transaction per flush window. (Storage-owned tx payload, decision #0;
+/// bincode-compatible with the legacy PlacementHeightUpdate shape.)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlacementUpdate {
+    pub blob_id: BlobId,
+    pub placement_height: i32,
+}
+
 /// One wrap of a per-blob key to a recipient X25519 pubkey (v1 format).
 /// Replicated state: rides consensus transactions and lands in the
 /// `blob_access` table. Keyed by pubkey — the substrate is user-agnostic.
