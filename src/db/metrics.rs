@@ -194,7 +194,19 @@ pub fn get_all_node_metrics(
     consensus_height: i32,
 ) -> Result<Vec<NodeMetrics>, DatabaseError> {
     match db_connection {
-        Ok(db_lock) => {
+        Ok(db_lock) => get_all_node_metrics_with_conn(&db_lock, consensus_height),
+        Err(_) => Err(DatabaseError::LockError),
+    }
+}
+
+/// Connection-taking variant so callers holding a scoped checkout (or a
+/// transaction, via deref) can read metrics without a second pool hit.
+pub fn get_all_node_metrics_with_conn(
+    db_lock: &rusqlite::Connection,
+    consensus_height: i32,
+) -> Result<Vec<NodeMetrics>, DatabaseError> {
+    {
+        {
             // SQLite replacements for DuckDB-specific functions:
             // - STDDEV(x) → sqrt(AVG(x*x) - AVG(x)*AVG(x))  (population stddev)
             // - PERCENTILE_CONT(0.5) → AVG() as approximation for median
@@ -347,6 +359,5 @@ pub fn get_all_node_metrics(
 
             Ok(metrics)
         }
-        Err(_) => Err(DatabaseError::LockError),
     }
 }

@@ -65,6 +65,11 @@ pub struct AppState {
     /// genesis setup, or join bootstrap). Empty until the node is initialized;
     /// consensus dispatch answers "not active" meanwhile.
     pub malachite: Arc<OnceCell<consensus::malachite::EngineHandle>>,
+    /// Placement-commit batcher (distribution substrate, RFC-014): lazily
+    /// spawned on first distribution; collects per-blob placement updates
+    /// and submits ONE consensus tx per window instead of one per file.
+    pub placement_batch_tx:
+        Arc<OnceCell<tokio::sync::mpsc::UnboundedSender<db::files::PlacementHeightUpdate>>>,
 }
 
 impl AppState {

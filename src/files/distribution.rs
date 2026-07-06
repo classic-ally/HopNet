@@ -1,7 +1,7 @@
 use crate::{
     AppState,
     consensus::{queue::ConsensusSubmitError, types::Transaction},
-    db::metrics::get_all_node_metrics,
+    db::metrics::get_all_node_metrics_with_conn,
     db::types::CustomUUID,
     db::{
         DatabaseError, consensus,
@@ -62,10 +62,14 @@ pub async fn distribute_fragments_for_upload(
         data_block_id
     );
 
-    // Wait for the insert_files consensus transaction to execute and set stored_locally = TRUE
-    // This prevents a race condition where we try to distribute before fragments are marked local
-    const MAX_WAIT_ATTEMPTS: u32 = 20; // 10 seconds total (20 * 500ms)
-    const POLL_INTERVAL_MS: u64 = 500;
+    // The caller (submit_inodes) awaits submit_batch, which resolves post-
+    // apply on the proposer path — the file is normally distributable on the
+    // FIRST check. The short retry only covers the forwarder path, where the
+    // proposer's Committed reply can beat this node's own apply-via-gossip by
+    // a small window. (RFC-014's end state replaces this with a
+    // BlobCommitted event from the substrate's own apply hook.)
+    const MAX_WAIT_ATTEMPTS: u32 = 5; // ~1s worst case (5 * 250ms)
+    const POLL_INTERVAL_MS: u64 = 250;
 
     let mut attempt = 0;
     let data_block = loop {
@@ -106,27 +110,23 @@ pub async fn distribute_fragments_for_upload(
         }
     };
 
-    // Get current consensus height for deterministic placement
-    let consensus_height = {
-        let conn = app_state
-            .db_pool
-            .get()
-            .map_err(|_| crate::db::DatabaseError::LockError)?;
-        consensus::get_current_consensus_height(&conn)?
-    };
+    // Distribute all fragments for this file (reads height/validators/metrics
+    // on one scoped checkout; returns the placement height it locked).
+    let consensus_height = distribute_file_fragments(app_state, &data_block).await?;
 
-    // Distribute all fragments for this file
-    distribute_file_fragments(app_state, &data_block, consensus_height).await?;
-
-    // Submit placement height update to consensus
-    let update = PlacementHeightUpdate {
-        data_block_id: data_block.id,
-        placement_height: consensus_height,
-    };
-    submit_placement_update_to_consensus(app_state, update).await?;
+    // Enqueue the placement commit — batched with other files' placements
+    // into ONE consensus tx per window (RFC-014 control-plane discipline;
+    // previously one tx PER FILE, so upload bursts doubled consensus load).
+    enqueue_placement_update(
+        app_state,
+        PlacementHeightUpdate {
+            data_block_id: data_block.id,
+            placement_height: consensus_height,
+        },
+    );
 
     tracing::info!(
-        "Successfully completed fragment distribution for {}",
+        "Fragment distribution complete for {} (placement commit enqueued)",
         data_block_id
     );
     Ok(())
@@ -136,18 +136,26 @@ pub async fn distribute_fragments_for_upload(
 async fn distribute_file_fragments(
     app_state: &AppState,
     data_block: &DistributableFileData,
-    consensus_height: i32,
-) -> Result<(), DistributionError> {
+) -> Result<i32, DistributionError> {
     // Get our node ID to avoid sending fragments to ourselves
     let my_node_id = app_state
         .get_node_id()
         .map_err(|_| DistributionError::Network("Failed to get node ID".to_string()))?;
 
-    // Get active validators at consensus height
-    let validators = consensus::get_validators(app_state.db_pool.get(), consensus_height)?;
-
-    // Get all node metrics at the locked consensus height
-    let node_metrics = get_all_node_metrics(app_state.db_pool.get(), consensus_height)?;
+    // One scoped checkout for all placement inputs, dropped BEFORE any
+    // network send (conn-lifecycle rule: never hold a pool conn across the
+    // data plane). Height, validators, and metrics are read at the same
+    // instant so placement is computed against one consistent state.
+    let (consensus_height, validators, node_metrics) = {
+        let conn = app_state
+            .db_pool
+            .get()
+            .map_err(|_| crate::db::DatabaseError::LockError)?;
+        let height = consensus::get_current_consensus_height(&conn)?;
+        let validators = consensus::get_validators_with_conn(&conn, height)?;
+        let metrics = get_all_node_metrics_with_conn(&conn, height)?;
+        (height, validators, metrics)
+    };
 
     // Select nodes for this file using file-level node selection
     let selected_nodes = crate::files::placement::select_nodes_for_file(
@@ -177,15 +185,18 @@ async fn distribute_file_fragments(
                 .collect(),
         );
 
-    // Parallel distribution with work queue pattern
-    const NUM_WORKERS: usize = 10;
+    // Parallel distribution with work queue pattern. Workers scale with the
+    // FILE (small cap); actual sends are bounded PROCESS-WIDE by
+    // SEND_PERMITS — under an upload burst, concurrency tracks mesh
+    // bandwidth, not upload count (RFC-014 engine rule).
     const FAILURE_THRESHOLD_PERCENT: f64 = 10.0; // Fail if >10% of fragments can't be placed
 
     let total_fragments = data_block.fragment_hashes.len();
+    let num_workers = total_fragments.clamp(1, 4);
     tracing::info!(
         "Starting parallel distribution of {} fragments with {} workers",
         total_fragments,
-        NUM_WORKERS
+        num_workers
     );
 
     // Create work queue with all fragments to distribute
@@ -201,7 +212,7 @@ async fn distribute_file_fragments(
     // Spawn workers to distribute fragments
     let mut worker_handles = Vec::new();
 
-    for worker_id in 0..NUM_WORKERS {
+    for worker_id in 0..num_workers {
         let tx = failure_tx.clone();
         let remote_placed_tx = remote_tx.clone();
         let queue = work_queue.clone();
@@ -259,6 +270,9 @@ async fn distribute_file_fragments(
                             continue;
                         }
                     };
+                    // Process-wide send bound (held across the send's
+                    // internal retries; no DB conn is held here).
+                    let _permit = SEND_PERMITS.acquire().await;
                     match send_fragment_to_node(
                         &app_state_clone,
                         candidate_node.node_id,
@@ -369,7 +383,7 @@ async fn distribute_file_fragments(
         total_fragments,
         (successful as f64 / total_fragments as f64) * 100.0
     );
-    Ok(())
+    Ok(consensus_height)
 }
 
 /// Send a fragment to a specific node over iroh with domain-level retry
@@ -464,27 +478,122 @@ async fn send_fragment_to_node(
 }
 
 /// Submit placement height update to consensus
-async fn submit_placement_update_to_consensus(
-    app_state: &AppState,
-    update: PlacementHeightUpdate,
-) -> Result<(), DistributionError> {
-    let _source_node_id = app_state
-        .get_node_id()
-        .map_err(|_| DistributionError::Network("Failed to get node ID".to_string()))?;
+/// Process-wide bound on concurrent fragment sends (RFC-014: the engine's
+/// concurrency tracks mesh bandwidth, not upload count).
+static SEND_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(16);
 
-    // Single update wrapped in vector for consistency with handler
-    let updates = vec![update];
-    let encoded_updates = bincode::serde::encode_to_vec(&updates, bincode::config::standard())?;
+/// How long the placement batcher collects updates before flushing them as
+/// one `update_placement_heights` consensus tx, and the flush size cap
+/// (aligned with the consensus queue's MAX_BATCH_SIZE).
+const PLACEMENT_FLUSH_MS: u64 = 750;
+const PLACEMENT_FLUSH_MAX: usize = 100;
+/// Flush retry cap for transient failures (timeout / internal error).
+const PLACEMENT_FLUSH_ATTEMPTS: u8 = 3;
 
-    let transaction = crate::consensus::dispatch::create_signed_transaction(
-        app_state,
-        "update_placement_heights".to_string(),
-        encoded_updates,
-    )
-    .map_err(|_| DistributionError::Database(crate::db::DatabaseError::LockError))?;
+/// Enqueue a placement commit on this AppState's batcher (lazily spawned on
+/// the consensus queue runtime). Fire-and-forget: per-file distribution
+/// success means "fragments placed + commit enqueued"; the batcher owns
+/// delivery. A terminally-dropped batch leaves placement_height NULL — the
+/// file stays downloadable via inventory discovery, matching today's
+/// behavior when a per-file placement tx failed. (NULL-placement
+/// reconciliation is an RFC-014 follow-up.)
+fn enqueue_placement_update(app_state: &AppState, update: PlacementHeightUpdate) {
+    let tx = app_state.placement_batch_tx.get_or_init(|| {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        // One parked task per AppState for process lifetime (same pattern as
+        // batch_processor); in-process test nodes each get their own.
+        crate::consensus::queue::queue_rt().spawn(placement_batcher(rx, app_state.clone()));
+        tx
+    });
+    if tx.send(update).is_err() {
+        tracing::error!("placement batcher gone — placement commit dropped");
+    }
+}
 
-    app_state.consensus_queue.submit(transaction).await?;
+/// Collect placement updates and submit them as ONE consensus tx per window.
+async fn placement_batcher(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<PlacementHeightUpdate>,
+    app_state: AppState,
+) {
+    // (update, attempts) — retried entries carry their attempt count.
+    let mut pending: Vec<(PlacementHeightUpdate, u8)> = Vec::new();
+    loop {
+        // Wait for the first entry of a window (or carry-over retries).
+        if pending.is_empty() {
+            match rx.recv().await {
+                Some(u) => pending.push((u, 0)),
+                None => return,
+            }
+        }
+        // Collect until the window closes or the batch fills.
+        let window = tokio::time::sleep(std::time::Duration::from_millis(PLACEMENT_FLUSH_MS));
+        tokio::pin!(window);
+        loop {
+            tokio::select! {
+                more = rx.recv() => match more {
+                    Some(u) => {
+                        pending.push((u, 0));
+                        if pending.len() >= PLACEMENT_FLUSH_MAX {
+                            break;
+                        }
+                    }
+                    None => break,
+                },
+                _ = &mut window => break,
+            }
+        }
 
-    tracing::info!("Submitted placement height update to consensus");
-    Ok(())
+        // Dedup by data_block_id (keep the latest placement height).
+        let mut seen = std::collections::HashMap::new();
+        for (u, attempts) in pending.drain(..) {
+            seen.insert(u.data_block_id.clone(), (u, attempts));
+        }
+        let batch: Vec<(PlacementHeightUpdate, u8)> = seen.into_values().collect();
+        let updates: Vec<PlacementHeightUpdate> = batch.iter().map(|(u, _)| u.clone()).collect();
+
+        let encoded = match bincode::serde::encode_to_vec(&updates, bincode::config::standard()) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!("placement batch encode failed (dropped): {e}");
+                continue;
+            }
+        };
+        // Sign at flush time — fresh nonce per attempt.
+        let transaction = match crate::consensus::dispatch::create_signed_transaction(
+            &app_state,
+            "update_placement_heights".to_string(),
+            encoded,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!("placement batch signing failed (dropped): {e:?}");
+                continue;
+            }
+        };
+
+        match app_state.consensus_queue.submit(transaction).await {
+            Ok(()) => {
+                tracing::debug!("placement batch committed ({} blobs)", updates.len());
+            }
+            Err(crate::consensus::queue::ConsensusSubmitError::Rejected(reason)) => {
+                // Permanent business rejection — dropping is correct.
+                tracing::error!("placement batch rejected (dropped): {reason}");
+            }
+            Err(e) => {
+                // Transient (timeout / internal) — re-stage with attempt caps.
+                tracing::warn!("placement batch submit failed, will retry: {e:?}");
+                for (u, attempts) in batch {
+                    if attempts + 1 < PLACEMENT_FLUSH_ATTEMPTS {
+                        pending.push((u, attempts + 1));
+                    } else {
+                        tracing::error!(
+                            "placement commit for {} dropped after {} attempts",
+                            u.data_block_id,
+                            PLACEMENT_FLUSH_ATTEMPTS
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
