@@ -298,7 +298,7 @@ pub type ChunkFragmentMaps = (
 /// node's local availability, grouped per chunk. The substrate half of the
 /// get path — projections resolve their own reference (path → inode →
 /// blob_id) and recipients separately.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BlobManifest {
     pub blob_id: BlobId,
     /// Keyed whole-blob integrity hash (verifiable only by key holders).

@@ -452,6 +452,12 @@ impl StateReader for NullNet {
     ) -> Result<Option<crate::store::DistributableBlob>, StorageError> {
         Ok(None)
     }
+    fn blob_manifest(
+        &self,
+        _blob_id: &BlobId,
+    ) -> Result<Option<BlobManifest>, StorageError> {
+        Ok(None)
+    }
     fn local_node_id(&self) -> Option<i32> {
         None
     }
@@ -714,7 +720,8 @@ where
 
 /// Find one fragment: inventory sources first (primary rung), then reactive
 /// discovery across the candidate set. Returns the verified fragment bytes.
-async fn find_fragment_via<T: Transport + 'static>(
+/// Shared with the engine's tier-1 repair (pull side).
+pub(crate) async fn find_fragment_via<T: Transport + 'static>(
     transport: &Arc<T>,
     fragment_hash: &Blake3Hash,
     candidates: &[PeerRef],
@@ -1148,6 +1155,12 @@ mod tests {
             &self,
             _blob_id: &BlobId,
         ) -> Result<Option<crate::store::DistributableBlob>, StorageError> {
+            Ok(None)
+        }
+        fn blob_manifest(
+            &self,
+            _blob_id: &BlobId,
+        ) -> Result<Option<BlobManifest>, StorageError> {
             Ok(None)
         }
         fn local_node_id(&self) -> Option<i32> {

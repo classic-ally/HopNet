@@ -239,8 +239,10 @@ fn generate_cutoff_uuid(retention_days: i64) -> Result<CustomUUID, MaintenanceEr
     Ok(CustomUUID::new(Some(&timestamp)))
 }
 
-/// Network rebalancing job to redistribute fragments to optimal nodes
-/// Currently disabled pending re-implementation with proper chunk metadata.
+/// Network rebalancing job (tier-1 repair, RFC-014): for blobs whose
+/// placement commit has aged past min_age_heights, ask the storage engine
+/// to recompute placement at the current height and pull/re-commit if the
+/// selection moved.
 pub async fn run_network_rebalancing(
     app_state: &AppState,
     max_data_blocks: i32,
@@ -291,21 +293,56 @@ pub async fn run_network_rebalancing(
     };
 
     let total_data_blocks = data_blocks_to_rebalance.len();
-    tracing::info!(
-        "Found {} data blocks to rebalance (currently disabled, requires file_hash + local_index)",
-        total_data_blocks
-    );
+    tracing::info!("Found {} data blocks to check for repair", total_data_blocks);
 
-    // Rebalancing disabled: modulo placement requires file_hash + local_index, but rebalancing
-    // only has fragment_hash. Fragment inventory handles discovery, so rebalancing
-    // is not critical. Will be re-implemented with proper chunk metadata.
+    // Tier-1 repair (RFC-014): the storage engine recomputes the seeded
+    // placement at the current height (blob_id seed — computable again since
+    // Stage B killed the file_hash seed) and pulls what this node should now
+    // hold; the new primary re-commits placement. Serial on the engine's
+    // repair worker.
+    let Some(storage) = app_state.storage.get() else {
+        return Err(Error::Failed(Arc::new(Box::new(std::io::Error::other(
+            "storage engine not running",
+        )))));
+    };
+
+    let mut rebalanced = 0usize;
+    let mut failed = 0usize;
+    let mut migrated = 0usize;
+    for block in &data_blocks_to_rebalance {
+        use hopnet_storage::engine::RepairOutcome;
+        match storage.repair_blob(block.data_block_id.clone()).await {
+            Some(RepairOutcome::Unchanged) => {}
+            Some(RepairOutcome::Repaired {
+                fragments_pulled,
+                recommitted,
+            }) => {
+                rebalanced += 1;
+                migrated += fragments_pulled;
+                tracing::info!(
+                    "repair: blob {} pulled {} fragments (recommitted: {})",
+                    block.data_block_id,
+                    fragments_pulled,
+                    recommitted
+                );
+            }
+            Some(RepairOutcome::Failed { fragments_pulled }) => {
+                failed += 1;
+                migrated += fragments_pulled;
+            }
+            None => {
+                failed += 1;
+                tracing::error!("repair: engine gone while repairing {}", block.data_block_id);
+            }
+        }
+    }
 
     let result = NetworkRebalancingResult {
         consensus_height,
         data_blocks_checked: total_data_blocks,
-        data_blocks_rebalanced: 0,
-        data_blocks_failed: 0,
-        total_fragments_migrated: 0,
+        data_blocks_rebalanced: rebalanced,
+        data_blocks_failed: failed,
+        total_fragments_migrated: migrated,
     };
 
     tracing::info!("Network rebalancing completed: {:?}", result);

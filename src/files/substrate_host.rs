@@ -257,6 +257,18 @@ impl StateReader for SubstrateHost {
         hopnet_storage::store::get_distributable_blob(&conn, blob_id)
     }
 
+    fn blob_manifest(
+        &self,
+        blob_id: &BlobId,
+    ) -> Result<Option<hopnet_storage::store::BlobManifest>, StorageError> {
+        let conn = self
+            .app_state
+            .db_pool
+            .get()
+            .map_err(|e| StorageError::Host(format!("pool checkout: {e}")))?;
+        hopnet_storage::store::blob_manifest(&conn, blob_id)
+    }
+
     fn local_node_id(&self) -> Option<i32> {
         self.app_state.node_id.get().copied()
     }

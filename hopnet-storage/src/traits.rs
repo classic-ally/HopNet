@@ -122,6 +122,14 @@ pub trait StateReader: Send + Sync {
     fn distributable_blob(&self, blob_id: &BlobId)
     -> Result<Option<DistributableBlob>, StorageError>;
 
+    /// The blob's full reassembly manifest (tier-1 repair reads the
+    /// fragment layout + this node's local availability). `None` for an
+    /// unknown blob id.
+    fn blob_manifest(
+        &self,
+        blob_id: &BlobId,
+    ) -> Result<Option<crate::store::BlobManifest>, StorageError>;
+
     /// This node's consensus id, once initialized. The engine skips sends to
     /// itself; `None` fails the blob's distribution (retried on next kick).
     fn local_node_id(&self) -> Option<i32>;
