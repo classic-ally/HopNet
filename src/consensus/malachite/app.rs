@@ -301,9 +301,28 @@ pub fn build_value(
                 continue;
             }
             let verdict = match DISPATCH_TABLE.get(tx.rpc.function.as_str()) {
-                Some(handler) => handler
-                    .process(app_state, tx, false, &db_tx)
-                    .map_err(|e| format!("{e:?}")),
+                Some(handler) => {
+                    // Seam boundary (RFC-015): same narrowing as
+                    // dispatch::process_transaction.
+                    let meta = crate::handlers::TxMeta {
+                        function: &tx.rpc.function,
+                        payload: &tx.rpc.payload,
+                        submitter_node: tx.submitter.id,
+                        user_id: tx.user.as_ref().map(|u| u.id),
+                    };
+                    let notifier = crate::handlers::HostNotifier {
+                        test_mode: app_state.test_mode,
+                    };
+                    let ctx = crate::handlers::HandlerCtx {
+                        fragments_dir: &app_state.fragments_dir,
+                        node_id: app_state.node_id.get().copied(),
+                        notifier: &notifier,
+                        host: Some(app_state),
+                    };
+                    handler
+                        .process(&meta, false, &ctx, &db_tx)
+                        .map_err(|e| format!("{e:?}"))
+                }
                 None => Err(format!("no handler: {}", tx.rpc.function)),
             };
             match verdict {

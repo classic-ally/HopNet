@@ -1,7 +1,5 @@
-use crate::AppState;
-use crate::consensus::types::Transaction;
 use crate::db::DatabaseError;
-use crate::handlers::{HandlerResult, TransactionHandler};
+use crate::handlers::{HandlerCtx, HandlerResult, TransactionHandler, TxMeta};
 use rusqlite::params;
 
 use super::types::{AcceptSharePayload, DeclineSharePayload, ShareFilePayload, UnsharePayload};
@@ -17,20 +15,20 @@ impl TransactionHandler for ShareFileHandler {
 
     fn process(
         &self,
-        _state: &AppState,
-        tx: &Transaction,
+        tx: &TxMeta<'_>,
         _execute: bool,
-        db_tx: &rusqlite::Transaction,
+        _ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
     ) -> HandlerResult {
         let (payload, _) = bincode::serde::decode_from_slice::<ShareFilePayload, _>(
-            &tx.rpc.payload,
+            tx.payload,
             bincode::config::standard(),
         )
         .map_err(|_| DatabaseError::InvalidPayload)?;
 
         // Authorization: sender must be the authenticated user
-        let user = tx.user.as_ref().ok_or(DatabaseError::AuthorizationError)?;
-        if user.id != payload.sender_id {
+        let user_id = tx.user_id.ok_or(DatabaseError::AuthorizationError)?;
+        if user_id != payload.sender_id {
             return Err(DatabaseError::AuthorizationError);
         }
 
@@ -95,20 +93,20 @@ impl TransactionHandler for AcceptShareHandler {
 
     fn process(
         &self,
-        state: &AppState,
-        tx: &Transaction,
+        tx: &TxMeta<'_>,
         execute: bool,
-        db_tx: &rusqlite::Transaction,
+        ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
     ) -> HandlerResult {
         let (payload, _) = bincode::serde::decode_from_slice::<AcceptSharePayload, _>(
-            &tx.rpc.payload,
+            tx.payload,
             bincode::config::standard(),
         )
         .map_err(|_| DatabaseError::InvalidPayload)?;
 
         // Authorization: recipient must be the authenticated user
-        let user = tx.user.as_ref().ok_or(DatabaseError::AuthorizationError)?;
-        if user.id != payload.recipient_id {
+        let user_id = tx.user_id.ok_or(DatabaseError::AuthorizationError)?;
+        if user_id != payload.recipient_id {
             return Err(DatabaseError::AuthorizationError);
         }
 
@@ -198,20 +196,7 @@ impl TransactionHandler for AcceptShareHandler {
 
         // 7. Signal FileProvider refresh
         if execute {
-            #[cfg(target_os = "macos")]
-            {
-                let test_mode = state.test_mode;
-                tokio::spawn(async move {
-                    if let Err(e) =
-                        crate::fileprovider::domain::signal_fileprovider_refresh(test_mode).await
-                    {
-                        tracing::warn!(
-                            "Failed to signal FileProvider refresh after share accept: {}",
-                            e
-                        );
-                    }
-                });
-            }
+            ctx.notifier.files_changed();
         }
 
         Ok(())
@@ -231,20 +216,20 @@ impl TransactionHandler for DeclineShareHandler {
 
     fn process(
         &self,
-        _state: &AppState,
-        tx: &Transaction,
+        tx: &TxMeta<'_>,
         _execute: bool,
-        db_tx: &rusqlite::Transaction,
+        _ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
     ) -> HandlerResult {
         let (payload, _) = bincode::serde::decode_from_slice::<DeclineSharePayload, _>(
-            &tx.rpc.payload,
+            tx.payload,
             bincode::config::standard(),
         )
         .map_err(|_| DatabaseError::InvalidPayload)?;
 
         // Authorization: must be the authenticated user
-        let user = tx.user.as_ref().ok_or(DatabaseError::AuthorizationError)?;
-        if user.id != payload.user_id {
+        let user_id = tx.user_id.ok_or(DatabaseError::AuthorizationError)?;
+        if user_id != payload.user_id {
             return Err(DatabaseError::AuthorizationError);
         }
 
@@ -277,20 +262,20 @@ impl TransactionHandler for UnshareHandler {
 
     fn process(
         &self,
-        _state: &AppState,
-        tx: &Transaction,
+        tx: &TxMeta<'_>,
         _execute: bool,
-        db_tx: &rusqlite::Transaction,
+        _ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
     ) -> HandlerResult {
         let (payload, _) = bincode::serde::decode_from_slice::<UnsharePayload, _>(
-            &tx.rpc.payload,
+            tx.payload,
             bincode::config::standard(),
         )
         .map_err(|_| DatabaseError::InvalidPayload)?;
 
         // Authorization: must be the authenticated user
-        let user = tx.user.as_ref().ok_or(DatabaseError::AuthorizationError)?;
-        if user.id != payload.user_id {
+        let user_id = tx.user_id.ok_or(DatabaseError::AuthorizationError)?;
+        if user_id != payload.user_id {
             return Err(DatabaseError::AuthorizationError);
         }
 

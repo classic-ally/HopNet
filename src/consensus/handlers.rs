@@ -1,14 +1,12 @@
 use crate::{
-    AppState,
-    consensus::types::Transaction,
     db::{
         DatabaseError,
-        consensus::{activate_validator, get_current_consensus_height, is_node_active},
+        consensus::{activate_validator, get_current_consensus_height},
         nodes::insert_node_tx,
         setup::initialize_sequences_tx,
         users::insert_user_tx,
     },
-    handlers::{HandlerResult, TransactionHandler},
+    handlers::{HandlerCtx, HandlerResult, TransactionHandler, TxMeta},
     types::{Node, User},
 };
 use serde::{Deserialize, Serialize};
@@ -29,24 +27,24 @@ impl TransactionHandler for ValidatorActivationHandler {
 
     fn process(
         &self,
-        state: &AppState,
-        tx: &Transaction,
+        tx: &TxMeta<'_>,
         execute: bool,
-        db_tx: &rusqlite::Transaction,
+        _ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
     ) -> HandlerResult {
         // Decode activation request payload
         let (activation_req, _) = bincode::serde::decode_from_slice::<ActivationRequest, _>(
-            &tx.rpc.payload,
+            tx.payload,
             bincode::config::standard(),
         )
         .map_err(|_| DatabaseError::InvalidPayload)?;
 
         // Authorization: Only the node itself can request its own activation
         // This check happens regardless of execute flag (determines vote)
-        if activation_req.node_id != tx.submitter.id {
+        if activation_req.node_id != tx.submitter_node {
             tracing::warn!(
                 "Authorization failed: node {} attempted to activate node {}",
-                tx.submitter.id,
+                tx.submitter_node,
                 activation_req.node_id
             );
             return Err(DatabaseError::AuthorizationError);
@@ -143,16 +141,16 @@ impl TransactionHandler for InsertGenesisHandler {
 
     fn process(
         &self,
-        state: &AppState,
-        tx: &Transaction,
+        tx: &TxMeta<'_>,
         execute: bool,
-        db_tx: &rusqlite::Transaction,
+        _ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
     ) -> HandlerResult {
         tracing::debug!("InsertGenesisHandler: Starting (execute={})", execute);
 
         // Decode genesis payload
         let (genesis_data, _) = bincode::serde::decode_from_slice::<GenesisPayload, _>(
-            &tx.rpc.payload,
+            tx.payload,
             bincode::config::standard(),
         )
         .map_err(|e| {
@@ -268,13 +266,13 @@ impl TransactionHandler for CleanupNoncesHandler {
 
     fn process(
         &self,
-        _state: &AppState,
-        tx: &Transaction,
+        tx: &TxMeta<'_>,
         execute: bool,
-        db_tx: &rusqlite::Transaction,
+        _ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
     ) -> HandlerResult {
         let (cutoff, _) = bincode::serde::decode_from_slice::<hopnet_common::CustomUUID, _>(
-            &tx.rpc.payload,
+            tx.payload,
             bincode::config::standard(),
         )
         .map_err(|_| DatabaseError::InvalidPayload)?;

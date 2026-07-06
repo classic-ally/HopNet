@@ -1,8 +1,6 @@
-use crate::AppState;
 use crate::{
-    consensus::types::Transaction,
     db::{DatabaseError, nodes::insert_node_tx},
-    handlers::{HandlerResult, TransactionHandler},
+    handlers::{HandlerCtx, HandlerResult, TransactionHandler, TxMeta},
     types::Node,
 };
 
@@ -15,22 +13,20 @@ impl TransactionHandler for InsertNodeHandler {
 
     fn process(
         &self,
-        _state: &AppState,
-        tx: &Transaction,
+        tx: &TxMeta<'_>,
         _execute: bool,
-        db_tx: &rusqlite::Transaction,
+        _ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
     ) -> HandlerResult {
-        match bincode::serde::decode_from_slice::<Node, _>(
-            &tx.rpc.payload,
-            bincode::config::standard(),
-        ) {
+        match bincode::serde::decode_from_slice::<Node, _>(tx.payload, bincode::config::standard())
+        {
             Ok((node_data, _)) => {
                 // Authorization: verify user owns the node being inserted
-                if let Some(ref user) = tx.user {
-                    if node_data.owner != user.id {
+                if let Some(user_id) = tx.user_id {
+                    if node_data.owner != user_id {
                         tracing::warn!(
                             "Authorization failed: user {} attempted to insert node owned by user {}",
-                            user.id,
+                            user_id,
                             node_data.owner
                         );
                         return Err(DatabaseError::AuthorizationError);

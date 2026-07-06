@@ -6,7 +6,7 @@ use crate::{
         imports::{self, ImportPayload, ImportStatusPayload},
         takeout::{self, TakeoutPayload, TakeoutStatusPayload},
     },
-    handlers::{HandlerResult, TransactionHandler},
+    handlers::{HandlerCtx, HandlerResult, TransactionHandler, TxMeta},
 };
 
 /// Handler for create_takeout consensus transactions
@@ -19,22 +19,29 @@ impl TransactionHandler for CreateTakeoutHandler {
 
     fn process(
         &self,
-        state: &AppState,
-        tx: &Transaction,
+        tx: &TxMeta<'_>,
         execute: bool,
-        db_tx: &rusqlite::Transaction,
+        ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
     ) -> HandlerResult {
+        // TEMPORARY (RFC-015, dies at Stage D5): takeout's creation flow
+        // still spawns host-side background work from apply and needs the
+        // full AppState via the ctx.host escape hatch.
+        let Some(state) = ctx.host.and_then(|h| h.downcast_ref::<AppState>()) else {
+            tracing::error!("create_takeout: host state unavailable");
+            return Err(DatabaseError::ProcessingError);
+        };
         match bincode::serde::decode_from_slice::<TakeoutPayload, _>(
-            &tx.rpc.payload,
+            tx.payload,
             bincode::config::standard(),
         ) {
             Ok((takeout_payload, _)) => {
                 // Authorization: verify user and node match authenticated identities
-                if let Some(ref user) = tx.user {
-                    if takeout_payload.user_id != user.id {
+                if let Some(user_id) = tx.user_id {
+                    if takeout_payload.user_id != user_id {
                         tracing::warn!(
                             "Authorization failed: user {} attempted to create takeout for user {}",
-                            user.id,
+                            user_id,
                             takeout_payload.user_id
                         );
                         return Err(DatabaseError::AuthorizationError);
@@ -46,10 +53,10 @@ impl TransactionHandler for CreateTakeoutHandler {
                     return Err(DatabaseError::AuthorizationError);
                 }
 
-                if takeout_payload.owner_node_id != tx.submitter.id {
+                if takeout_payload.owner_node_id != tx.submitter_node {
                     tracing::warn!(
                         "Authorization failed: node {} attempted to create takeout owned by node {}",
-                        tx.submitter.id,
+                        tx.submitter_node,
                         takeout_payload.owner_node_id
                     );
                     return Err(DatabaseError::AuthorizationError);
@@ -90,13 +97,19 @@ impl TransactionHandler for UpdateTakeoutStatusHandler {
 
     fn process(
         &self,
-        state: &AppState,
-        tx: &Transaction,
+        tx: &TxMeta<'_>,
         execute: bool,
-        db_tx: &rusqlite::Transaction,
+        ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
     ) -> HandlerResult {
+        // TEMPORARY (RFC-015, dies at Stage D5): status updates trigger
+        // host-side materialization work and need AppState via ctx.host.
+        let Some(state) = ctx.host.and_then(|h| h.downcast_ref::<AppState>()) else {
+            tracing::error!("update_takeout_status: host state unavailable");
+            return Err(DatabaseError::ProcessingError);
+        };
         match bincode::serde::decode_from_slice::<TakeoutStatusPayload, _>(
-            &tx.rpc.payload,
+            tx.payload,
             bincode::config::standard(),
         ) {
             Ok((status_payload, _)) => {
@@ -128,23 +141,23 @@ impl TransactionHandler for CreateImportHandler {
 
     fn process(
         &self,
-        _state: &AppState,
-        tx: &Transaction,
+        tx: &TxMeta<'_>,
         execute: bool,
-        db_tx: &rusqlite::Transaction,
+        _ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
     ) -> HandlerResult {
         let (payload, _) = bincode::serde::decode_from_slice::<ImportPayload, _>(
-            &tx.rpc.payload,
+            tx.payload,
             bincode::config::standard(),
         )
         .map_err(|_| DatabaseError::InvalidPayload)?;
 
-        match &tx.user {
-            Some(user) if user.id == payload.user_id => {}
-            Some(user) => {
+        match tx.user_id {
+            Some(user_id) if user_id == payload.user_id => {}
+            Some(user_id) => {
                 tracing::warn!(
                     "Authorization failed: user {} attempted to create import for user {}",
-                    user.id,
+                    user_id,
                     payload.user_id
                 );
                 return Err(DatabaseError::AuthorizationError);
@@ -155,10 +168,10 @@ impl TransactionHandler for CreateImportHandler {
             }
         }
 
-        if payload.owner_node_id != tx.submitter.id {
+        if payload.owner_node_id != tx.submitter_node {
             tracing::warn!(
                 "Authorization failed: node {} attempted to create import owned by node {}",
-                tx.submitter.id,
+                tx.submitter_node,
                 payload.owner_node_id
             );
             return Err(DatabaseError::AuthorizationError);
@@ -183,13 +196,13 @@ impl TransactionHandler for UpdateImportStatusHandler {
 
     fn process(
         &self,
-        _state: &AppState,
-        tx: &Transaction,
+        tx: &TxMeta<'_>,
         execute: bool,
-        db_tx: &rusqlite::Transaction,
+        _ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
     ) -> HandlerResult {
         let (payload, _) = bincode::serde::decode_from_slice::<ImportStatusPayload, _>(
-            &tx.rpc.payload,
+            tx.payload,
             bincode::config::standard(),
         )
         .map_err(|_| DatabaseError::InvalidPayload)?;

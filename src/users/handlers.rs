@@ -1,13 +1,10 @@
 use super::types::{UpdateUserOnboardingPayload, UpdateUserProfilePayload};
-use crate::AppState;
 use crate::{
-    consensus::types::Transaction,
     db::{
         DatabaseError,
         users::{insert_user_tx, update_user_onboarding_tx, update_user_profile_tx},
     },
-    handlers::{HandlerResult, TransactionHandler},
-    types::User,
+    handlers::{HandlerCtx, HandlerResult, TransactionHandler, TxMeta},
 };
 
 pub struct InsertUserHandler;
@@ -19,15 +16,15 @@ impl TransactionHandler for InsertUserHandler {
 
     fn process(
         &self,
-        _state: &AppState,
-        tx: &Transaction,
+        tx: &TxMeta<'_>,
         _execute: bool,
-        db_tx: &rusqlite::Transaction,
+        _ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
     ) -> HandlerResult {
         let (payload, _) = bincode::serde::decode_from_slice::<
             crate::users::types::InsertUserPayload,
             _,
-        >(&tx.rpc.payload, bincode::config::standard())
+        >(tx.payload, bincode::config::standard())
         .map_err(|_| DatabaseError::InvalidPayload)?;
 
         // Grant must target the new user's pubkey — a mismatched grant would
@@ -57,20 +54,20 @@ impl TransactionHandler for UpdateUserProfileHandler {
 
     fn process(
         &self,
-        _state: &AppState,
-        tx: &Transaction,
+        tx: &TxMeta<'_>,
         _execute: bool,
-        db_tx: &rusqlite::Transaction,
+        _ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
     ) -> HandlerResult {
         let (payload, _) = bincode::serde::decode_from_slice::<UpdateUserProfilePayload, _>(
-            &tx.rpc.payload,
+            tx.payload,
             bincode::config::standard(),
         )
         .map_err(|_| DatabaseError::InvalidPayload)?;
 
         // Authorization: must be the authenticated user
-        let user = tx.user.as_ref().ok_or(DatabaseError::AuthorizationError)?;
-        if user.id != payload.user_id {
+        let user_id = tx.user_id.ok_or(DatabaseError::AuthorizationError)?;
+        if user_id != payload.user_id {
             return Err(DatabaseError::AuthorizationError);
         }
 
@@ -129,20 +126,20 @@ impl TransactionHandler for UpdateUserOnboardingHandler {
 
     fn process(
         &self,
-        _state: &AppState,
-        tx: &Transaction,
+        tx: &TxMeta<'_>,
         _execute: bool,
-        db_tx: &rusqlite::Transaction,
+        _ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
     ) -> HandlerResult {
         let (payload, _) = bincode::serde::decode_from_slice::<UpdateUserOnboardingPayload, _>(
-            &tx.rpc.payload,
+            tx.payload,
             bincode::config::standard(),
         )
         .map_err(|_| DatabaseError::InvalidPayload)?;
 
         // Authorization: must be the authenticated user
-        let user = tx.user.as_ref().ok_or(DatabaseError::AuthorizationError)?;
-        if user.id != payload.user_id {
+        let user_id = tx.user_id.ok_or(DatabaseError::AuthorizationError)?;
+        if user_id != payload.user_id {
             return Err(DatabaseError::AuthorizationError);
         }
 

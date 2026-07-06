@@ -1,25 +1,35 @@
-use crate::AppState;
-use crate::consensus::types::Transaction;
-use crate::db::DatabaseError;
+//! Transaction-handler seam — the contract itself lives in
+//! hopnet-projection (RFC-015) so projection crates can implement and
+//! register handlers across the crate boundary. This module re-exports it
+//! and holds the HOST-side ChangeNotifier implementation.
 
-pub type HandlerResult = Result<(), DatabaseError>;
-pub trait TransactionHandler: Send + Sync {
-    // Stable lookup name for function that handles thing
-    fn name(&self) -> &'static str;
+pub use hopnet_projection::{
+    ChangeNotifier, HandlerCtx, HandlerResult, NullNotifier, TransactionHandler, TxMeta,
+};
 
-    // Process with execution flag - receives full transaction for authorization checks
-    // Handlers can access:
-    // - tx.submitter.id (cryptographically verified node that submitted)
-    // - tx.user (optional, cryptographically verified user if present)
-    // - tx.rpc.payload (the actual operation payload to decode)
-    // - db_tx: shared database transaction for atomicity (all transactions in block use same tx)
-    fn process(
-        &self,
-        state: &AppState,
-        tx: &Transaction,
-        execute: bool,
-        db_tx: &rusqlite::Transaction,
-    ) -> HandlerResult;
+/// Host change notifier: owns platform gating and spawning for post-apply
+/// side effects (macOS FileProvider refresh). Handlers signal intent via
+/// `ctx.notifier.files_changed()`; everything platform-specific stays here.
+pub struct HostNotifier {
+    pub test_mode: bool,
 }
 
-inventory::collect!(&'static dyn TransactionHandler);
+impl ChangeNotifier for HostNotifier {
+    fn files_changed(&self) {
+        #[cfg(target_os = "macos")]
+        {
+            let test_mode = self.test_mode;
+            tokio::spawn(async move {
+                if let Err(e) =
+                    crate::fileprovider::domain::signal_fileprovider_refresh(test_mode).await
+                {
+                    tracing::warn!("Failed to signal FileProvider refresh: {}", e);
+                }
+            });
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = self.test_mode;
+        }
+    }
+}

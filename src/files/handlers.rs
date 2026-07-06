@@ -1,13 +1,10 @@
-use crate::AppState;
-use crate::files::functions::fragment_exists_and_valid;
 use crate::{
-    consensus::types::Transaction,
     db::Inode,
     db::{
         CustomUUID, DatabaseError, files::insert_files,
         fragments::delete_orphaned_data_blocks_consensus,
     },
-    handlers::{HandlerResult, TransactionHandler},
+    handlers::{HandlerCtx, HandlerResult, TransactionHandler, TxMeta},
 };
 use either::Either;
 use serde::{Deserialize, Serialize};
@@ -33,26 +30,26 @@ impl TransactionHandler for InsertFilesHandler {
 
     fn process(
         &self,
-        state: &AppState,
-        tx: &Transaction,
+        tx: &TxMeta<'_>,
         execute: bool,
-        db_tx: &rusqlite::Transaction,
+        ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
     ) -> HandlerResult {
         match bincode::serde::decode_from_slice::<DriveInsertPayload, _>(
-            &tx.rpc.payload,
+            tx.payload,
             bincode::config::standard(),
         ) {
             Ok((payload, _)) => {
                 let DriveInsertPayload { blob_ops, inodes } = payload;
                 // Authorization: verify user owns the files being inserted
-                if let Some(ref user) = tx.user {
+                if let Some(user_id) = tx.user_id {
                     for inode in &inodes {
                         match &inode.owner {
                             Either::Left(owner_id) => {
-                                if *owner_id != user.id {
+                                if *owner_id != user_id {
                                     tracing::warn!(
                                         "Authorization failed: user {} attempted to insert file for user {}",
-                                        user.id,
+                                        user_id,
                                         owner_id
                                     );
                                     return Err(DatabaseError::AuthorizationError);
@@ -76,25 +73,11 @@ impl TransactionHandler for InsertFilesHandler {
                 // Substrate half: register blobs (stored_locally probed
                 // against this node's disk in-crate), then the projection
                 // half: inodes referencing them by id.
-                insert_files(db_tx, &blob_ops, inodes, &state.fragments_dir)?;
+                insert_files(db_tx, &blob_ops, inodes, ctx.fragments_dir)?;
 
                 // Signal FileProvider to refresh when files are actually inserted (execute=true)
                 if execute {
-                    #[cfg(target_os = "macos")]
-                    {
-                        let test_mode = state.test_mode;
-                        tokio::spawn(async move {
-                            if let Err(e) =
-                                crate::fileprovider::domain::signal_fileprovider_refresh(test_mode)
-                                    .await
-                            {
-                                tracing::warn!(
-                                    "Failed to signal FileProvider refresh after file insertion: {}",
-                                    e
-                                );
-                            }
-                        });
-                    }
+                    ctx.notifier.files_changed();
                 }
 
                 Ok(())
@@ -117,15 +100,15 @@ impl TransactionHandler for UpdatePlacementHeightsHandler {
 
     fn process(
         &self,
-        state: &AppState,
-        tx: &Transaction,
+        tx: &TxMeta<'_>,
         execute: bool,
-        db_tx: &rusqlite::Transaction,
+        _ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
     ) -> HandlerResult {
         // Storage-owned tx (RFC-014): payload type and apply both live in
         // the substrate crate; this shim only decodes and delegates.
         match bincode::serde::decode_from_slice::<Vec<hopnet_storage::PlacementUpdate>, _>(
-            &tx.rpc.payload,
+            tx.payload,
             bincode::config::standard(),
         ) {
             Ok((updates, _)) => {
@@ -170,13 +153,13 @@ impl TransactionHandler for DeleteOrphanedDataBlocksHandler {
 
     fn process(
         &self,
-        state: &AppState,
-        tx: &Transaction,
+        tx: &TxMeta<'_>,
         execute: bool,
-        db_tx: &rusqlite::Transaction,
+        ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
     ) -> HandlerResult {
         match bincode::serde::decode_from_slice::<DeleteOrphanedDataBlocksPayload, _>(
-            &tx.rpc.payload,
+            tx.payload,
             bincode::config::standard(),
         ) {
             Ok((payload_data, _)) => {
@@ -193,7 +176,7 @@ impl TransactionHandler for DeleteOrphanedDataBlocksHandler {
                     let mut successfully_deleted = 0;
                     for fragment_hash in &deleted_fragment_hashes {
                         match crate::files::functions::delete_fragment(
-                            &state.fragments_dir,
+                            ctx.fragments_dir,
                             fragment_hash,
                         ) {
                             Ok(()) => {
@@ -260,22 +243,22 @@ impl TransactionHandler for ModifyItemHandler {
 
     fn process(
         &self,
-        state: &AppState,
-        tx: &Transaction,
+        tx: &TxMeta<'_>,
         execute: bool,
-        db_tx: &rusqlite::Transaction,
+        ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
     ) -> HandlerResult {
         match bincode::serde::decode_from_slice::<ModifyItemPayload, _>(
-            &tx.rpc.payload,
+            tx.payload,
             bincode::config::standard(),
         ) {
             Ok((payload_data, _)) => {
                 // Authorization: verify user matches authenticated user
-                if let Some(ref user) = tx.user {
-                    if payload_data.user_id != user.id {
+                if let Some(user_id) = tx.user_id {
+                    if payload_data.user_id != user_id {
                         tracing::warn!(
                             "Authorization failed: user {} attempted to modify item for user {}",
-                            user.id,
+                            user_id,
                             payload_data.user_id
                         );
                         return Err(DatabaseError::AuthorizationError);
@@ -306,28 +289,14 @@ impl TransactionHandler for ModifyItemHandler {
                         .clone()
                         .map(|u| u.blob_op),
                     payload_data.incoming_share_updates.clone(),
-                    &state.fragments_dir,
+                    ctx.fragments_dir,
                 )?;
 
                 if execute {
                     tracing::info!("Modified item at path for user {}", payload_data.user_id);
 
                     // Signal FileProvider to refresh when item is actually modified
-                    #[cfg(target_os = "macos")]
-                    {
-                        let test_mode = state.test_mode;
-                        tokio::spawn(async move {
-                            if let Err(e) =
-                                crate::fileprovider::domain::signal_fileprovider_refresh(test_mode)
-                                    .await
-                            {
-                                tracing::warn!(
-                                    "Failed to signal FileProvider refresh after item modification: {}",
-                                    e
-                                );
-                            }
-                        });
-                    }
+                    ctx.notifier.files_changed();
                 } else {
                     tracing::debug!(
                         "Validation passed: item exists for modification for user {}",
@@ -355,22 +324,22 @@ impl TransactionHandler for DeleteFilesHandler {
 
     fn process(
         &self,
-        state: &AppState,
-        tx: &Transaction,
+        tx: &TxMeta<'_>,
         execute: bool,
-        db_tx: &rusqlite::Transaction,
+        ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
     ) -> HandlerResult {
         match bincode::serde::decode_from_slice::<DeleteFilesPayload, _>(
-            &tx.rpc.payload,
+            tx.payload,
             bincode::config::standard(),
         ) {
             Ok((payload_data, _)) => {
                 // Authorization: verify user matches authenticated user
-                if let Some(ref user) = tx.user {
-                    if payload_data.user_id != user.id {
+                if let Some(user_id) = tx.user_id {
+                    if payload_data.user_id != user_id {
                         tracing::warn!(
                             "Authorization failed: user {} attempted to delete files for user {}",
-                            user.id,
+                            user_id,
                             payload_data.user_id
                         );
                         return Err(DatabaseError::AuthorizationError);
@@ -398,21 +367,7 @@ impl TransactionHandler for DeleteFilesHandler {
                     tracing::info!("Deleted files at path for user {}", payload_data.user_id);
 
                     // Signal FileProvider to refresh when files are actually deleted
-                    #[cfg(target_os = "macos")]
-                    {
-                        let test_mode = state.test_mode;
-                        tokio::spawn(async move {
-                            if let Err(e) =
-                                crate::fileprovider::domain::signal_fileprovider_refresh(test_mode)
-                                    .await
-                            {
-                                tracing::warn!(
-                                    "Failed to signal FileProvider refresh after file deletion: {}",
-                                    e
-                                );
-                            }
-                        });
-                    }
+                    ctx.notifier.files_changed();
                 }
                 Ok(())
             }
@@ -434,21 +389,21 @@ impl TransactionHandler for SelfCheckFragmentsHandler {
 
     fn process(
         &self,
-        state: &AppState,
-        tx: &Transaction,
+        tx: &TxMeta<'_>,
         execute: bool,
-        db_tx: &rusqlite::Transaction,
+        _ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
     ) -> HandlerResult {
         match bincode::serde::decode_from_slice::<crate::files::types::SelfCheckFragments, _>(
-            &tx.rpc.payload,
+            tx.payload,
             bincode::config::standard(),
         ) {
             Ok((report, _)) => {
                 // Authorization: verify node can only submit attestations for itself
-                if report.node_id != tx.submitter.id {
+                if report.node_id != tx.submitter_node {
                     tracing::warn!(
                         "Authorization failed: node {} attempted to submit self-attestation for node {}",
-                        tx.submitter.id,
+                        tx.submitter_node,
                         report.node_id
                     );
                     return Err(DatabaseError::AuthorizationError);

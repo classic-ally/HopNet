@@ -1,16 +1,6 @@
-#[derive(Debug)]
-pub enum DatabaseError {
-    LockError,
-    InsertError,
-    RecordError,
-    RecallError,
-    ProcessingError,
-    InvalidPayload,
-    NotFound,
-    ConflictError,      // Resource already exists at the specified location/identifier
-    AuthorizationError, // User or node not authorized for the operation
-    ValidationError, // Data validation failed (e.g., cryptographic verification, consistency checks)
-}
+/// Database-layer error taxonomy — owned by the projection seam crate
+/// (RFC-015) so projection handlers and DB code share it across crates.
+pub use hopnet_projection::DatabaseError;
 
 use crate::db::{Blake3Hash, PrivKey, User};
 use std::ops::Deref;

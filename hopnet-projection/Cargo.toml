@@ -1,0 +1,16 @@
+[package]
+name = "hopnet-projection"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+repository = "https://git.bentley.sh/HopNet/HopNet"
+description = "HopNet projection seam: the transaction-handler contract, change notification, and GC/export registries every projection crate implements (RFC-015)"
+
+[dependencies]
+hopnet-common = { path = "../common", features = ["database"] }
+
+inventory = "0.3.20"
+rusqlite = { version = "0.38", features = ["bundled"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"

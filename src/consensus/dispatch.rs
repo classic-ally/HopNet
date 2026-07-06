@@ -170,7 +170,25 @@ pub fn process_transaction(
     db_tx: &rusqlite::Transaction,
 ) -> HandlerResult {
     if let Some(handler) = DISPATCH_TABLE.get(tx.rpc.function.as_str()) {
-        handler.process(app_state, tx, execute, db_tx)
+        // Seam boundary (RFC-015): handlers get a NARROWED view — the
+        // signature-verified identities and payload, plus the minimal host
+        // slice. AppState and the full Transaction never cross.
+        let meta = crate::handlers::TxMeta {
+            function: &tx.rpc.function,
+            payload: &tx.rpc.payload,
+            submitter_node: tx.submitter.id,
+            user_id: tx.user.as_ref().map(|u| u.id),
+        };
+        let notifier = crate::handlers::HostNotifier {
+            test_mode: app_state.test_mode,
+        };
+        let ctx = crate::handlers::HandlerCtx {
+            fragments_dir: &app_state.fragments_dir,
+            node_id: app_state.node_id.get().copied(),
+            notifier: &notifier,
+            host: Some(app_state),
+        };
+        handler.process(&meta, execute, &ctx, db_tx)
     } else {
         tracing::warn!("No handler found for function: {}", &tx.rpc.function);
         Err(crate::db::DatabaseError::InvalidPayload)

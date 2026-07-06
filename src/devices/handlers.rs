@@ -1,12 +1,10 @@
 use super::types::{RegisterDevicePayload, RevokeDevicePayload};
 use crate::{
-    AppState,
-    consensus::types::Transaction,
     db::{
         DatabaseError,
         devices::{delete_device_token_tx, insert_device_token_tx},
     },
-    handlers::{HandlerResult, TransactionHandler},
+    handlers::{HandlerCtx, HandlerResult, TransactionHandler, TxMeta},
 };
 
 /// Handler for register_device consensus transactions
@@ -19,23 +17,23 @@ impl TransactionHandler for RegisterDeviceHandler {
 
     fn process(
         &self,
-        _state: &AppState,
-        tx: &Transaction,
+        tx: &TxMeta<'_>,
         _execute: bool,
-        db_tx: &rusqlite::Transaction,
+        _ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
     ) -> HandlerResult {
         let (payload, _) = bincode::serde::decode_from_slice::<RegisterDevicePayload, _>(
-            &tx.rpc.payload,
+            tx.payload,
             bincode::config::standard(),
         )
         .map_err(|_| DatabaseError::InvalidPayload)?;
 
         // Authorization: user in transaction must match payload user_id
-        if let Some(ref user) = tx.user {
-            if payload.user_id != user.id {
+        if let Some(user_id) = tx.user_id {
+            if payload.user_id != user_id {
                 tracing::warn!(
                     "Authorization failed: user {} attempted to register device for user {}",
-                    user.id,
+                    user_id,
                     payload.user_id
                 );
                 return Err(DatabaseError::AuthorizationError);
@@ -72,23 +70,23 @@ impl TransactionHandler for RevokeDeviceHandler {
 
     fn process(
         &self,
-        _state: &AppState,
-        tx: &Transaction,
+        tx: &TxMeta<'_>,
         _execute: bool,
-        db_tx: &rusqlite::Transaction,
+        _ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
     ) -> HandlerResult {
         let (payload, _) = bincode::serde::decode_from_slice::<RevokeDevicePayload, _>(
-            &tx.rpc.payload,
+            tx.payload,
             bincode::config::standard(),
         )
         .map_err(|_| DatabaseError::InvalidPayload)?;
 
         // Authorization: user in transaction must match payload user_id
-        if let Some(ref user) = tx.user {
-            if payload.user_id != user.id {
+        if let Some(user_id) = tx.user_id {
+            if payload.user_id != user_id {
                 tracing::warn!(
                     "Authorization failed: user {} attempted to revoke device for user {}",
-                    user.id,
+                    user_id,
                     payload.user_id
                 );
                 return Err(DatabaseError::AuthorizationError);

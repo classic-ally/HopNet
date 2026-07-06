@@ -2676,6 +2676,7 @@ dependencies = [
  "hex",
  "hopnet-common",
  "hopnet-consensus",
+ "hopnet-projection",
  "hopnet-storage",
  "image",
  "include_dir",
@@ -2749,6 +2750,18 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "hopnet-projection"
+version = "0.1.0"
+dependencies = [
+ "hopnet-common",
+ "inventory",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]
