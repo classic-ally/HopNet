@@ -284,6 +284,157 @@ pub fn mark_local_state_batch(
     Ok(total_rows)
 }
 
+/// One fragment as observed at reassembly time: (hash, id, stored-locally
+/// flag).
+pub type FragmentEntry = (Blake3Hash, hopnet_common::CustomUUID, bool);
+
+/// Per-chunk fragment maps keyed by local_index: (originals, recovery).
+pub type ChunkFragmentMaps = (
+    std::collections::HashMap<usize, FragmentEntry>,
+    std::collections::HashMap<usize, FragmentEntry>,
+);
+
+/// A blob's reassembly manifest: the replicated fragment layout plus this
+/// node's local availability, grouped per chunk. The substrate half of the
+/// get path — projections resolve their own reference (path → inode →
+/// blob_id) and recipients separately.
+#[derive(Debug)]
+pub struct BlobManifest {
+    pub blob_id: BlobId,
+    /// Keyed whole-blob integrity hash (verifiable only by key holders).
+    pub integrity_hash: Blake3Hash,
+    /// Padding on the LAST chunk (stripped post-reconstruction).
+    pub added_bytes: u8,
+    pub file_size: u64,
+    /// Height the placement commit was computed against; None = unplaced.
+    pub placement_height: Option<i32>,
+    /// chunk_number → (originals_by_index, recovery_by_index).
+    pub chunks: std::collections::HashMap<u32, ChunkFragmentMaps>,
+}
+
+/// Read a blob's reassembly manifest. `None` when the blob id is unknown
+/// (projections treat that as their own not-found).
+pub fn blob_manifest(
+    conn: &rusqlite::Connection,
+    blob_id: &BlobId,
+) -> Result<Option<BlobManifest>, StorageError> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT db.file_hash, db.added_bytes, db.placement_height, db.file_size,
+                    fh.chunk_number, fh.local_index, fh.fragment_id, fh.fragment_hash,
+                    fh.chunk_type, fh.stored_locally
+             FROM data_blocks db
+             JOIN fragment_hashes fh ON db.id = fh.data_block_id
+             WHERE db.id = ?
+             ORDER BY fh.chunk_number, fh.local_index",
+        )
+        .map_err(db_err("prepare blob manifest query"))?;
+
+    let mut header: Option<(Blake3Hash, u8, Option<i32>, u64)> = None;
+    let mut chunks: std::collections::HashMap<u32, ChunkFragmentMaps> =
+        std::collections::HashMap::new();
+
+    let rows = stmt
+        .query_map(params![blob_id], |row| {
+            Ok((
+                row.get::<_, Blake3Hash>(0)?,
+                row.get::<_, u8>(1)?,
+                row.get::<_, Option<i32>>(2)?,
+                row.get::<_, i64>(3).unwrap_or(0) as u64,
+                row.get::<_, u32>(4)?,
+                row.get::<_, u32>(5)?,
+                row.get::<_, hopnet_common::CustomUUID>(6)?,
+                row.get::<_, Blake3Hash>(7)?,
+                row.get::<_, i32>(8)?,
+                row.get::<_, bool>(9)?,
+            ))
+        })
+        .map_err(db_err("query blob manifest"))?;
+
+    for row in rows {
+        let (
+            integrity_hash,
+            added_bytes,
+            placement_height,
+            file_size,
+            chunk_number,
+            local_index,
+            fragment_id,
+            fragment_hash,
+            chunk_type,
+            stored_locally,
+        ) = row.map_err(db_err("read blob manifest row"))?;
+
+        if header.is_none() {
+            header = Some((integrity_hash, added_bytes, placement_height, file_size));
+        }
+
+        let entry = chunks.entry(chunk_number).or_default();
+        let target = if chunk_type == 0 {
+            &mut entry.0 // original
+        } else {
+            &mut entry.1 // recovery
+        };
+        target.insert(
+            local_index as usize,
+            (fragment_hash, fragment_id, stored_locally),
+        );
+    }
+
+    Ok(header.map(
+        |(integrity_hash, added_bytes, placement_height, file_size)| BlobManifest {
+            blob_id: blob_id.clone(),
+            integrity_hash,
+            added_bytes,
+            file_size,
+            placement_height,
+            chunks,
+        },
+    ))
+}
+
+/// Look up one recipient's wrap for a blob, by pubkey. Projections resolve
+/// their own principal → pubkey mapping (users table etc.) — the substrate
+/// never sees user ids. `None` = recipient has no access.
+pub fn get_blob_access(
+    conn: &rusqlite::Connection,
+    blob_id: &BlobId,
+    recipient_pubkey: &[u8; 32],
+) -> Result<Option<BlobAccess>, StorageError> {
+    use rusqlite::OptionalExtension;
+    conn.query_row(
+        "SELECT blob_id, recipient_pubkey, ephemeral_pubkey, wrapped_key
+         FROM blob_access
+         WHERE blob_id = ? AND recipient_pubkey = ?",
+        params![blob_id, recipient_pubkey.as_slice()],
+        row_to_blob_access,
+    )
+    .optional()
+    .map_err(db_err("query blob access"))
+}
+
+/// Map a blob_access row (blob_id, recipient_pubkey, ephemeral_pubkey,
+/// wrapped_key) into BlobAccess.
+pub fn row_to_blob_access(row: &rusqlite::Row<'_>) -> Result<BlobAccess, rusqlite::Error> {
+    let recipient: Vec<u8> = row.get(1)?;
+    let ephemeral: Vec<u8> = row.get(2)?;
+    let to_arr = |v: Vec<u8>, idx: usize| -> Result<[u8; 32], rusqlite::Error> {
+        v.try_into().map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                idx,
+                rusqlite::types::Type::Blob,
+                "expected 32-byte X25519 key".into(),
+            )
+        })
+    };
+    Ok(BlobAccess {
+        blob_id: row.get(0)?,
+        recipient_pubkey: to_arr(recipient, 1)?,
+        ephemeral_pubkey: to_arr(ephemeral, 2)?,
+        wrapped_key: row.get(3)?,
+    })
+}
+
 /// A blob this node should distribute: its full local fragment set, ordered
 /// by (chunk_number, local_index).
 #[derive(Debug, Clone)]
@@ -446,5 +597,77 @@ mod tests {
         assert_eq!(placement, Some(7));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn manifest_and_access_reads_round_trip() {
+        // Should: blob_manifest returns the header once and groups
+        // fragments per chunk into (originals, recovery) keyed by
+        // local_index; get_blob_access resolves exactly the requested
+        // recipient's wrap.
+        // Should not: return a manifest for an unknown blob id, or a wrap
+        // for a pubkey that was never granted.
+        // Impact: this is the substrate half of the get path — a grouping
+        // or key-matching bug breaks reconstruction or leaks a wrong wrap
+        // to the unwrap step (which would then fail AEAD, but waste the
+        // fetch).
+        let mut conn = test_conn();
+        let tx = conn.transaction().unwrap();
+        let blob_id = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c9a1").unwrap();
+        tx.execute(
+            "INSERT INTO data_blocks (id, file_hash, fragment_count, added_bytes,
+             placement_height, file_size) VALUES (?, ?, 3, 4, 9, 1000)",
+            params![blob_id, Blake3Hash::from_bytes([1u8; 32])],
+        )
+        .unwrap();
+        for (chunk, idx, chunk_type, stored) in
+            [(0u32, 0u32, 0i32, true), (0, 10, 1, false), (1, 0, 0, true)]
+        {
+            tx.execute(
+                "INSERT INTO fragment_hashes (data_block_id, chunk_number, local_index,
+                 fragment_id, fragment_hash, chunk_type, stored_locally)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    blob_id,
+                    chunk,
+                    idx,
+                    hopnet_common::CustomUUID::new(None),
+                    Blake3Hash::from_bytes([idx as u8 + chunk as u8 * 100; 32]),
+                    chunk_type,
+                    stored
+                ],
+            )
+            .unwrap();
+        }
+        apply_blob_access_add(
+            &tx,
+            &[BlobAccess {
+                blob_id: blob_id.clone(),
+                recipient_pubkey: [2u8; 32],
+                ephemeral_pubkey: [3u8; 32],
+                wrapped_key: vec![0u8; 48],
+            }],
+        )
+        .unwrap();
+
+        let manifest = blob_manifest(&tx, &blob_id).unwrap().unwrap();
+        assert_eq!(manifest.integrity_hash, Blake3Hash::from_bytes([1u8; 32]));
+        assert_eq!(manifest.added_bytes, 4);
+        assert_eq!(manifest.placement_height, Some(9));
+        assert_eq!(manifest.file_size, 1000);
+        assert_eq!(manifest.chunks.len(), 2);
+        let chunk0 = &manifest.chunks[&0];
+        assert_eq!(chunk0.0.len(), 1); // one original at index 0
+        assert_eq!(chunk0.1.len(), 1); // one recovery at index 10
+        assert!(chunk0.0[&0].2); // stored locally
+        assert!(!chunk0.1[&10].2);
+        assert_eq!(manifest.chunks[&1].0.len(), 1);
+
+        let unknown = BlobId::from_str("01890a5d-ac96-774b-b9aa-9f8b24f0c9a2").unwrap();
+        assert!(blob_manifest(&tx, &unknown).unwrap().is_none());
+
+        let wrap = get_blob_access(&tx, &blob_id, &[2u8; 32]).unwrap().unwrap();
+        assert_eq!(wrap.ephemeral_pubkey, [3u8; 32]);
+        assert!(get_blob_access(&tx, &blob_id, &[7u8; 32]).unwrap().is_none());
     }
 }

@@ -783,130 +783,42 @@ pub fn get_file_fragments(
                 });
             }
 
-            // Non-empty file: query for fragments with reassembly info (now chunk-aware)
-            let mut stmt = db_lock.prepare(
-                "SELECT db.id, db.file_hash, db.added_bytes, db.placement_height, fh.chunk_number, fh.local_index, fh.fragment_id, fh.fragment_hash, fh.chunk_type, fh.stored_locally, db.file_size
-                 FROM inodes i
-                 JOIN data_blocks db ON i.data_id = db.id
-                 JOIN fragment_hashes fh ON db.id = fh.data_block_id
-                 WHERE i.path = ? AND i.type = 0
-                 ORDER BY fh.chunk_number, fh.local_index"
-            ).map_err(|_| DatabaseError::RecallError)?;
+            // Projection half: resolve the inode's blob reference. The
+            // substrate half (fragment layout + wrap row) is crate-owned.
+            let data_block_id: CustomUUID = db_lock
+                .query_row(
+                    "SELECT data_id FROM inodes WHERE path = ? AND type = 0",
+                    params![encrypted_path],
+                    |row| row.get(0),
+                )
+                .map_err(|_| DatabaseError::RecallError)?;
 
-            let rows = stmt
-                .query_map(params![encrypted_path], |row| {
-                    let data_block_id: CustomUUID = row.get(0)?;
-                    let file_hash: Blake3Hash = row.get(1)?;
-                    let added_bytes: u8 = row.get(2)?;
-                    let placement_height: Option<i32> = row.get(3)?;
-                    let chunk_number: u32 = row.get(4)?;
-                    let local_index: u32 = row.get(5)?;
-                    let fragment_id: CustomUUID = row.get(6)?;
-                    let fragment_hash: Blake3Hash = row.get(7)?;
-                    let chunk_type: crate::db::ChunkType = row.get(8)?;
-                    let stored_locally: bool = row.get(9)?;
-                    let file_size: u64 = row.get::<_, i64>(10).unwrap_or(0) as u64;
-                    Ok((
-                        data_block_id,
-                        file_hash,
-                        added_bytes,
-                        placement_height,
-                        chunk_number,
-                        local_index,
-                        fragment_id,
-                        fragment_hash,
-                        chunk_type,
-                        stored_locally,
-                        file_size,
-                    ))
-                })
-                .map_err(|_| DatabaseError::ProcessingError)?;
+            let manifest = hopnet_storage::store::blob_manifest(&db_lock, &data_block_id)
+                .map_err(|e| {
+                    tracing::error!("blob_manifest failed: {e}");
+                    DatabaseError::ProcessingError
+                })?
+                .ok_or(DatabaseError::RecallError)?; // dangling blob reference
 
-            let mut data_block_id: Option<CustomUUID> = None;
-            let mut file_hash: Option<Blake3Hash> = None;
-            let mut added_bytes: Option<u8> = None;
-            let mut placement_height: Option<i32> = None;
-            let mut db_file_size: u64 = 0;
+            // The user's blob_access wrap (resolved via their pubkey);
+            // None = user might not have access.
+            let file_access_entry =
+                get_file_access(&db_lock, &data_block_id, user_id).unwrap_or(None);
 
-            // Group fragments by chunk_number: chunk_number -> (original_frags, recovery_frags)
-            let mut chunks_map: crate::files::functions::ReassemblyChunks =
-                std::collections::HashMap::new();
+            let file_reassembly_data = crate::files::functions::FileReassemblyData {
+                chunks: manifest.chunks,
+                added_bytes: manifest.added_bytes,
+                expected_file_hash: manifest.integrity_hash,
+                data_block_id,
+                per_file_key: None, // Will be set after decryption
+                placement_height: manifest.placement_height,
+            };
 
-            for row in rows {
-                let (
-                    d_block_id,
-                    f_hash,
-                    a_bytes,
-                    p_height,
-                    chunk_number,
-                    local_index,
-                    fragment_id,
-                    fragment_hash,
-                    chunk_type,
-                    stored_locally,
-                    f_size,
-                ) = row.map_err(|_| DatabaseError::ProcessingError)?;
-
-                if data_block_id.is_none() {
-                    data_block_id = Some(d_block_id);
-                    file_hash = Some(f_hash);
-                    added_bytes = Some(a_bytes);
-                    placement_height = p_height;
-                    db_file_size = f_size;
-                }
-
-                // Get or create entry for this chunk
-                let chunk_entry = chunks_map.entry(chunk_number).or_insert_with(|| {
-                    (
-                        std::collections::HashMap::new(),
-                        std::collections::HashMap::new(),
-                    )
-                });
-
-                match chunk_type {
-                    crate::db::ChunkType::Original => {
-                        chunk_entry.0.insert(
-                            local_index as usize,
-                            (fragment_hash, fragment_id, stored_locally),
-                        );
-                    }
-                    crate::db::ChunkType::Recovery => {
-                        chunk_entry.1.insert(
-                            local_index as usize,
-                            (fragment_hash, fragment_id, stored_locally),
-                        );
-                    }
-                }
-            }
-
-            match (data_block_id, file_hash, added_bytes) {
-                (Some(data_block_id), Some(file_hash), Some(added_bytes)) => {
-                    // Get the user's blob_access wrap (resolved via their pubkey)
-                    let file_access_entry = db_lock.prepare(
-                        "SELECT ba.blob_id, ba.recipient_pubkey, ba.ephemeral_pubkey, ba.wrapped_key
-                         FROM blob_access ba JOIN users u ON u.x25519_pubkey = ba.recipient_pubkey
-                         WHERE ba.blob_id = ? AND u.user_id = ?"
-                    ).and_then(|mut stmt| {
-                        stmt.query_row(params![data_block_id, user_id], row_to_blob_access)
-                    }).ok(); // Convert error to None - user might not have access
-
-                    let file_reassembly_data = crate::files::functions::FileReassemblyData {
-                        chunks: chunks_map,
-                        added_bytes,
-                        expected_file_hash: file_hash,
-                        data_block_id,
-                        per_file_key: None, // Will be set after decryption
-                        placement_height,
-                    };
-
-                    Ok(crate::files::functions::FileAccessData {
-                        file_reassembly_data: Some(file_reassembly_data), // Wrap in Some for non-empty files
-                        file_access_entry,
-                        file_size: db_file_size,
-                    })
-                }
-                _ => Err(DatabaseError::RecallError), // File not found
-            }
+            Ok(crate::files::functions::FileAccessData {
+                file_reassembly_data: Some(file_reassembly_data), // Wrap in Some for non-empty files
+                file_access_entry,
+                file_size: manifest.file_size,
+            })
         }
         Err(_) => Err(DatabaseError::LockError),
     }
@@ -1093,29 +1005,6 @@ pub fn get_inode_by_id(
     .map_err(|_| DatabaseError::RecallError)
 }
 
-/// Map a blob_access row (blob_id, recipient_pubkey, ephemeral_pubkey,
-/// wrapped_key) into the substrate's BlobAccess.
-pub(crate) fn row_to_blob_access(
-    row: &rusqlite::Row<'_>,
-) -> Result<crate::db::types::BlobAccess, rusqlite::Error> {
-    let recipient: Vec<u8> = row.get(1)?;
-    let ephemeral: Vec<u8> = row.get(2)?;
-    let to_arr = |v: Vec<u8>, idx: usize| -> Result<[u8; 32], rusqlite::Error> {
-        v.try_into().map_err(|_| {
-            rusqlite::Error::FromSqlConversionFailure(
-                idx,
-                rusqlite::types::Type::Blob,
-                "expected 32-byte X25519 key".into(),
-            )
-        })
-    };
-    Ok(crate::db::types::BlobAccess {
-        blob_id: row.get(0)?,
-        recipient_pubkey: to_arr(recipient, 1)?,
-        ephemeral_pubkey: to_arr(ephemeral, 2)?,
-        wrapped_key: row.get(3)?,
-    })
-}
 
 /// Look up a user's blob_access wrap for a specific blob (via their pubkey).
 pub fn get_file_access(
@@ -1123,11 +1012,11 @@ pub fn get_file_access(
     data_block_id: &CustomUUID,
     user_id: i32,
 ) -> Result<Option<crate::db::types::BlobAccess>, DatabaseError> {
-    conn.query_row(
-        "SELECT ba.blob_id, ba.recipient_pubkey, ba.ephemeral_pubkey, ba.wrapped_key
-         FROM blob_access ba JOIN users u ON u.x25519_pubkey = ba.recipient_pubkey
-         WHERE ba.blob_id = ? AND u.user_id = ?",
-        params![data_block_id, user_id],
-        row_to_blob_access,
-    ).optional().map_err(|_| DatabaseError::RecallError)
+    // Projection half: user → pubkey; substrate half: pubkey-keyed wrap.
+    let user = match crate::db::users::get_user_by_userid_conn(conn, user_id)? {
+        Some(user) => user,
+        None => return Ok(None),
+    };
+    hopnet_storage::store::get_blob_access(conn, data_block_id, user.x25519_pubkey.as_bytes())
+        .map_err(|_| DatabaseError::RecallError)
 }
