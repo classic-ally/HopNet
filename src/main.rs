@@ -8,6 +8,17 @@ use axum::{
     serve,
 };
 use include_dir::{Dir, include_dir};
+
+/// Maximum concurrently-executing HTTP requests before the load-shed layer
+/// starts refusing with 503 + Retry-After. Sized so a burst cannot pile
+/// hundreds of handlers onto the DB pool (32 conns, 2s checkout timeout) —
+/// beyond this, executing more requests only converts them into slow 500s.
+const API_CONCURRENCY_LIMIT: usize = 128;
+
+/// The DB-capacity gate sheds new API requests while the pool has fewer than
+/// this many idle connections, keeping a trickle available for background
+/// tasks that aren't behind the gate (settler retries, metrics, peer refresh).
+const DB_GATE_IDLE_HEADROOM: u32 = 2;
 use once_cell::sync::{Lazy, OnceCell};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
@@ -82,6 +93,13 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
         let manager = SqliteConnectionManager::file("file::memory:?cache=shared");
         Pool::builder()
             .max_size(db::DB_POOL_MAX_SIZE)
+            // Checkout waits are sub-ms in normal operation; r2d2's 30s
+            // default turns burst overload into a runtime livelock (a blocking
+            // get() parks a tokio worker — enough concurrent waiters park ALL
+            // workers, and each freed conn goes to another parked waiter).
+            // Fail fast instead so overload sheds as 500s and the runtime
+            // keeps polling accept loops and the consensus queue.
+            .connection_timeout(std::time::Duration::from_secs(2))
             .connection_customizer(Box::new(db::shared::SqliteInitializer))
             .build(manager)
             .unwrap()
@@ -100,6 +118,9 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
         let manager = SqliteConnectionManager::file(&db_path);
         let pool = Pool::builder()
             .max_size(db::DB_POOL_MAX_SIZE)
+            // See the ephemeral-pool builder above: fail checkout fast so
+            // burst overload cannot park every tokio worker for 30s waves.
+            .connection_timeout(std::time::Duration::from_secs(2))
             .connection_customizer(Box::new(db::shared::SqliteInitializer))
             .build(manager)
             .unwrap();
@@ -352,10 +373,12 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 self_check_worker.run().await;
             });
 
-            // Spawn consensus queue batch processor
+            // Spawn consensus queue batch processor — on the dedicated queue
+            // runtime (see consensus::queue::queue_rt) so consensus keeps
+            // draining when API load starves the main runtime.
             {
                 let app_state_clone = app_state.clone();
-                tokio::spawn(async move {
+                consensus::queue::queue_rt().spawn(async move {
                     consensus::queue::batch_processor(consensus_queue_rx, app_state_clone).await;
                 });
             }
@@ -374,12 +397,17 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 });
             }
 
-            // Start iroh accept loop for incoming connections
+            // Start iroh accept loop for incoming connections — on the
+            // dedicated net runtime (see net::transport::net_rt), with the
+            // main runtime's Handle threaded through so DB-touching requests
+            // hand back off. Mesh liveness must not depend on API load.
             {
                 let endpoint = iroh_transport.endpoint().clone();
                 let app_state_clone = app_state.clone();
-                tokio::spawn(async move {
-                    net::handler::handle_incoming_connections(endpoint, app_state_clone).await;
+                let app_rt = tokio::runtime::Handle::current();
+                net::transport::net_rt().spawn(async move {
+                    net::handler::handle_incoming_connections(endpoint, app_state_clone, app_rt)
+                        .await;
                 });
             }
 
@@ -537,9 +565,56 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 .route("/setup", post(setup::post_setup))
                 .route("/login", post(auth::sign_in));
 
-            // Create trace layer with request IDs
-            let trace_layer =
-                TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
+            // Overload shedding, two gates, both answering 503 + Retry-After
+            // so CLIENTS own the retry and the server never converts overload
+            // into slow 500s:
+            //  1. DB-capacity gate (precise): refuse on entry when the pool
+            //     has (almost) no idle connections — the actual scarce
+            //     resource. Snapshot-based: occasionally wrong in both
+            //     directions, which retries absorb; the headroom keeps
+            //     non-gated paths (settler, metrics, peer refresh) supplied.
+            //  2. Concurrency limit (coarse): catastrophic upper bound on
+            //     in-flight requests, far above the DB gate's trip point.
+            let base_app = base_app.layer(middleware::from_fn_with_state(
+                app_state.clone(),
+                |axum::extract::State(state): axum::extract::State<AppState>,
+                 req: axum::extract::Request,
+                 next: middleware::Next| async move {
+                    use axum::response::IntoResponse;
+                    let pool_state = state.db_pool.state();
+                    if pool_state.idle_connections < DB_GATE_IDLE_HEADROOM {
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            [(axum::http::header::RETRY_AFTER, "1")],
+                            "db capacity exhausted, retry shortly",
+                        )
+                            .into_response();
+                    }
+                    next.run(req).await
+                },
+            ));
+            let base_app = base_app.layer(
+                tower::ServiceBuilder::new()
+                    .layer(axum::error_handling::HandleErrorLayer::new(
+                        |_e: tower::BoxError| async {
+                            (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                [(axum::http::header::RETRY_AFTER, "1")],
+                                "server overloaded, retry shortly",
+                            )
+                        },
+                    ))
+                    .load_shed()
+                    .concurrency_limit(API_CONCURRENCY_LIMIT),
+            );
+
+            // Create trace layer with request IDs. Failure logging: a 503 is
+            // deliberate load shedding (the DB-capacity gate / concurrency
+            // limit doing their job) — logging each at ERROR floods the logs
+            // exactly when the system is busiest, so sheds log at DEBUG;
+            // genuine 5xx failures stay ERROR.
+            let trace_layer = TraceLayer::new_for_http()
+                .make_span_with(|request: &axum::http::Request<_>| {
                     let id = hopnet_common::CustomUUID::new(None);
                     tracing::info_span!(
                         "api_req",
@@ -547,7 +622,26 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                         method = %request.method(),
                         uri = %request.uri(),
                     )
-                });
+                })
+                .on_failure(
+                    |class: tower_http::classify::ServerErrorsFailureClass,
+                     latency: std::time::Duration,
+                     _span: &tracing::Span| {
+                        use tower_http::classify::ServerErrorsFailureClass as C;
+                        match class {
+                            C::StatusCode(StatusCode::SERVICE_UNAVAILABLE) => {
+                                tracing::debug!(latency_ms = latency.as_millis() as u64, "request shed (503)");
+                            }
+                            other => {
+                                tracing::error!(
+                                    classification = %other,
+                                    latency_ms = latency.as_millis() as u64,
+                                    "response failed"
+                                );
+                            }
+                        }
+                    },
+                );
 
             let app = if cfg!(debug_assertions) {
                 let cors = CorsLayer::new()

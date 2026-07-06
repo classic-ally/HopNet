@@ -279,29 +279,31 @@ impl ConsensusQueue {
 
     /// Enqueue forwarded transactions (from another node). Skips pre-validation
     /// since the submitting node already validated and the leader's preflight will catch issues.
+    /// Stage forwarded transactions DIRECTLY into the PendingPool, bypassing
+    /// the submit channel. The batch was already drained and batched by the
+    /// forwarding peer's processor, and it was sent HERE because this node is
+    /// the proposer — re-queueing it behind the local channel backlog under
+    /// load rots it past its round (near-empty blocks, NotProposer
+    /// ping-pong). The pool push fires the driver's work signal, which
+    /// resumes the engine (wake rule 1).
     pub async fn enqueue_forwarded(
         &self,
         transactions: Vec<Transaction>,
     ) -> Vec<Result<(), ConsensusSubmitError>> {
-        let mut results = Vec::with_capacity(transactions.len());
-        let mut receivers = Vec::new();
-
+        let mut receivers = Vec::with_capacity(transactions.len());
         for transaction in transactions {
-            match self.enqueue_with_receiver(transaction).await {
-                Ok((_, rx)) => {
-                    receivers.push((results.len(), rx));
-                    results.push(Ok(())); // placeholder
-                }
-                Err(e) => {
-                    results.push(Err(e));
-                }
-            }
+            let (result_tx, result_rx) = oneshot::channel();
+            self.pending_pool().push(QueuedTransaction {
+                tx: transaction,
+                notifier: result_tx,
+                rejecting_leaders: HashSet::new(),
+            });
+            receivers.push(result_rx);
         }
-
-        for (idx, rx) in receivers {
-            results[idx] = await_result(rx).await;
+        let mut results = Vec::with_capacity(receivers.len());
+        for rx in receivers {
+            results.push(await_result(rx).await);
         }
-
         results
     }
 
@@ -393,6 +395,30 @@ enum DispatchOutcome {
 /// Long-lived task that drains the queue and routes batches toward the
 /// current proposer. Spawned once at startup; runs until the channel closes.
 ///
+/// Dedicated runtime for the consensus DRIVE plane: the batch processor, the
+/// engine driver (NeedValue → build_value → propose, sync client, Resume
+/// signalling) and the settler.
+///
+/// WHY: these tasks are what make the engine ADVANCE. On the shared main
+/// runtime they starve under API burst load right along with the HTTP
+/// handlers — engines sat idle-paused with full pools because the driver's
+/// Resume send never got polled. Unlike the iroh net runtime (see
+/// net::transport::net_rt), blocking DB work is ALLOWED here — these tasks
+/// own dedicated connections and do SAVEPOINT preflights by design; they get
+/// their own threads precisely so that blocking never competes with anything
+/// liveness-critical.
+pub fn queue_rt() -> &'static tokio::runtime::Runtime {
+    static QUEUE_RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    QUEUE_RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("consensus-queue")
+            .enable_all()
+            .build()
+            .expect("failed to build consensus queue runtime")
+    })
+}
+
 /// Malachite path: if WE are the proposer for the engine's current (or
 /// pending, when paused on-demand) round, stage the batch in the PendingPool
 /// — pushing wakes the engine driver, which builds and proposes on NeedValue.
@@ -486,9 +512,14 @@ pub async fn batch_processor(mut rx: mpsc::Receiver<QueuedTransaction>, app_stat
         // ── Gate before the next cycle ──
         match outcome {
             DispatchOutcome::Resolved => {}
-            DispatchOutcome::WaitForProgress => {
-                // Wake on engine progress (round advance or decide) — with a
-                // delay backstop so a stalled engine can't wedge the queue.
+            // Both gates wake on engine progress (round advance or decide),
+            // with a delay backstop so a stalled engine can't wedge the
+            // queue. RetryAfterDelay (transport failure to the proposer) must
+            // NOT sleep blindly: after resume_own_engine the round can rotate
+            // to US within one propose timeout, and a blind sleep would leave
+            // the pool empty at our own NeedValue — deciding an empty block
+            // and wasting the height.
+            DispatchOutcome::WaitForProgress | DispatchOutcome::RetryAfterDelay => {
                 let mut round_rx = engine.round.clone();
                 let mut decided_rx = engine.decided.clone();
                 round_rx.borrow_and_update();
@@ -498,9 +529,6 @@ pub async fn batch_processor(mut rx: mpsc::Receiver<QueuedTransaction>, app_stat
                     _ = decided_rx.changed() => {}
                     _ = tokio::time::sleep(std::time::Duration::from_secs(RETRY_DELAY_SECS)) => {}
                 }
-            }
-            DispatchOutcome::RetryAfterDelay => {
-                tokio::time::sleep(std::time::Duration::from_secs(RETRY_DELAY_SECS)).await;
             }
         }
     }
@@ -544,6 +572,23 @@ async fn handle_as_forwarder(
         round
     );
 
+    // Wake rule 1: we HOLD work, so start our pending height now, in
+    // parallel with the forward (Resume is idempotent — a no-op on a running
+    // height). A responsive proposer still proposes at round 0 and we are
+    // simply ready to vote; a wedged one gets rotated past by OUR timeouts
+    // while the forward RPC is still in flight. Resuming only on hard forward
+    // failure (the previous shape) left every engine paused for the full
+    // connect+ack+result timeout budget under load, stalling all heights.
+    let resume_own_engine = || {
+        let input_tx = engine.input_tx.clone();
+        tokio::spawn(async move {
+            let _ = input_tx
+                .send(hopnet_consensus::shell::HostInput::Resume)
+                .await;
+        });
+    };
+    resume_own_engine();
+
     let mut decided_rx = engine.decided.clone();
     let forward_result = super::rpc::forward_transactions_with_ack(
         &app_state.iroh_transport,
@@ -554,17 +599,6 @@ async fn handle_as_forwarder(
         &mut decided_rx,
     )
     .await;
-
-    // Wake our own engine on any outcome that leaves us holding the batch —
-    // if the proposer is dead, our timeouts are what advance the round.
-    let resume_own_engine = || {
-        let input_tx = engine.input_tx.clone();
-        tokio::spawn(async move {
-            let _ = input_tx
-                .send(hopnet_consensus::shell::HostInput::Resume)
-                .await;
-        });
-    };
 
     match forward_result {
         Ok(super::rpc::ForwardAckResult::NoAck) => {

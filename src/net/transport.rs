@@ -23,6 +23,38 @@ const MAX_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
 /// Generous enough for relay/holepunch but prevents indefinite hangs.
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Dedicated runtime for iroh networking: the endpoint's internal actors
+/// (magicsock, relay client, keepalives), every outbound dial's connection
+/// driver, the accept loop, and the consensus gossip publisher live here.
+///
+/// WHY: mesh liveness must not depend on the API layer behaving. Under burst
+/// HTTP load the main runtime's workers park in blocking DB checkouts; when
+/// iroh's actors shared that runtime, missed keepalives dropped the relay
+/// connection and partitioned the mesh — freezing consensus (a partitioned
+/// Tendermint node cannot advance rounds alone).
+///
+/// DISCIPLINE (same contract class as the consensus shell thread): tasks on
+/// this runtime must never block — no r2d2 checkouts, no rusqlite, no
+/// block_in_place, no synchronous file I/O. Anything needing the database is
+/// handed off to the app runtime (see net/handler.rs routing) or wrapped in
+/// spawn_blocking.
+///
+/// NOTE (verified against the iroh fork + vendored noq): binding here places
+/// the endpoint actors, but outbound dials spawn their per-connection driver
+/// on the CALLER's runtime — so dials are also routed through here
+/// (get_connection / connect_to_addr).
+pub fn net_rt() -> &'static tokio::runtime::Runtime {
+    static NET_RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    NET_RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(3)
+            .thread_name("iroh-net")
+            .enable_all()
+            .build()
+            .expect("failed to build iroh net runtime")
+    })
+}
+
 // ============================================================================
 // Error Types
 // ============================================================================
@@ -225,7 +257,10 @@ impl EndpointHooks for PeerValidator {
         let pubkey_encoded = bincode::serde::encode_to_vec(pubkey, bincode::config::standard())
             .expect("PubKey encoding cannot fail");
 
-        let is_known = match self.db_pool.get() {
+        // Blocking pool checkout + query — this hook runs inside iroh's accept
+        // machinery on the net runtime, which must never block (see net_rt).
+        let db_pool = self.db_pool.clone();
+        let is_known = tokio::task::spawn_blocking(move || match db_pool.get() {
             Ok(conn) => conn
                 .query_row(
                     "SELECT 1 FROM nodes WHERE pubkey = ?",
@@ -237,7 +272,9 @@ impl EndpointHooks for PeerValidator {
                 tracing::error!("failed to get DB connection in peer validator: {}", e);
                 false
             }
-        };
+        })
+        .await
+        .unwrap_or(false);
 
         if is_known {
             AfterHandshakeOutcome::Accept
@@ -296,24 +333,35 @@ impl IrohTransport {
             Err(_) => None,
         };
 
-        let builder = match &custom_relay {
-            Some(url) => {
-                tracing::info!("using self-hosted iroh relay {url} (public discovery disabled)");
-                Endpoint::builder(iroh::endpoint::presets::Minimal)
-                    .relay_mode(iroh::RelayMode::Custom(iroh::RelayMap::from(url.clone())))
-            }
-            None => Endpoint::builder(iroh::endpoint::presets::N0),
-        };
-
-        let endpoint = builder
-            .secret_key(secret_key)
-            .alpns(vec![HOPNET_ALPN.to_vec()])
-            .hooks(PeerValidator {
-                db_pool,
-                setup_complete: setup_complete.clone(),
+        // Bind ON the net runtime: iroh spawns its actor tasks (magicsock,
+        // relay client, endpoint driver) on the ambient runtime at bind time —
+        // this is what pins the whole relay/keepalive machinery to net_rt.
+        let bind_relay = custom_relay.clone();
+        let bind_setup = setup_complete.clone();
+        let endpoint = net_rt()
+            .spawn(async move {
+                let builder = match &bind_relay {
+                    Some(url) => {
+                        tracing::info!(
+                            "using self-hosted iroh relay {url} (public discovery disabled)"
+                        );
+                        Endpoint::builder(iroh::endpoint::presets::Minimal)
+                            .relay_mode(iroh::RelayMode::Custom(iroh::RelayMap::from(url.clone())))
+                    }
+                    None => Endpoint::builder(iroh::endpoint::presets::N0),
+                };
+                builder
+                    .secret_key(secret_key)
+                    .alpns(vec![HOPNET_ALPN.to_vec()])
+                    .hooks(PeerValidator {
+                        db_pool,
+                        setup_complete: bind_setup,
+                    })
+                    .bind()
+                    .await
             })
-            .bind()
             .await
+            .map_err(|e| IrohError::Transport(TransportError::ConnectionFailed(e.to_string())))?
             .map_err(|e| IrohError::Transport(TransportError::ConnectionFailed(e.to_string())))?;
 
         Ok(Self {
@@ -367,18 +415,32 @@ impl IrohTransport {
             }
             addr
         };
-        let conn = tokio::time::timeout(
-            CONNECTION_TIMEOUT,
-            self.endpoint.connect(dial_addr, HOPNET_ALPN),
-        )
-        .await
-        .map_err(|_| {
-            IrohError::Transport(TransportError::ConnectionFailed(format!(
-                "connection to node {} timed out after {:?}",
-                node_id, CONNECTION_TIMEOUT
-            )))
-        })?
-        .map_err(|e| IrohError::Transport(TransportError::ConnectionFailed(e.to_string())))?;
+        // Dial ON the net runtime: the per-connection driver (ACKs, keepalives,
+        // retransmits) is spawned on the runtime that polls connect() — from
+        // the main runtime it would starve under API load. Abort the dial task
+        // on timeout so cancelled dials don't accumulate.
+        let endpoint = self.endpoint.clone();
+        let mut dial = net_rt().spawn(async move { endpoint.connect(dial_addr, HOPNET_ALPN).await });
+        let conn = match tokio::time::timeout(CONNECTION_TIMEOUT, &mut dial).await {
+            Err(_) => {
+                dial.abort();
+                return Err(IrohError::Transport(TransportError::ConnectionFailed(format!(
+                    "connection to node {} timed out after {:?}",
+                    node_id, CONNECTION_TIMEOUT
+                ))));
+            }
+            Ok(Err(join_err)) => {
+                return Err(IrohError::Transport(TransportError::ConnectionFailed(
+                    join_err.to_string(),
+                )));
+            }
+            Ok(Ok(Err(e))) => {
+                return Err(IrohError::Transport(TransportError::ConnectionFailed(
+                    e.to_string(),
+                )));
+            }
+            Ok(Ok(Ok(conn))) => conn,
+        };
 
         // Cache it
         {
@@ -502,10 +564,26 @@ impl IrohTransport {
         node_id: i32,
         addr: iroh::EndpointAddr,
     ) -> Result<(), IrohError> {
-        let conn = tokio::time::timeout(CONNECTION_TIMEOUT, self.endpoint.connect(addr, HOPNET_ALPN))
-            .await
-            .map_err(|_| IrohError::Transport(TransportError::Timeout))?
-            .map_err(|e| IrohError::Transport(TransportError::ConnectionFailed(e.to_string())))?;
+        // Same net-runtime dial routing as get_connection (driver placement).
+        let endpoint = self.endpoint.clone();
+        let mut dial = net_rt().spawn(async move { endpoint.connect(addr, HOPNET_ALPN).await });
+        let conn = match tokio::time::timeout(CONNECTION_TIMEOUT, &mut dial).await {
+            Err(_) => {
+                dial.abort();
+                return Err(IrohError::Transport(TransportError::Timeout));
+            }
+            Ok(Err(join_err)) => {
+                return Err(IrohError::Transport(TransportError::ConnectionFailed(
+                    join_err.to_string(),
+                )));
+            }
+            Ok(Ok(Err(e))) => {
+                return Err(IrohError::Transport(TransportError::ConnectionFailed(
+                    e.to_string(),
+                )));
+            }
+            Ok(Ok(Ok(conn))) => conn,
+        };
         self.connections.write().await.insert(node_id, conn);
         Ok(())
     }

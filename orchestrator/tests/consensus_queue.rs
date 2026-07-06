@@ -29,6 +29,33 @@ fn timestamp_millis() -> u128 {
 const CONSENSUS_TIMEOUT: Duration = Duration::from_secs(135);
 
 /// PUT /users/me/profile
+/// How long a load-test op keeps retrying through 503 shedding before giving
+/// up. Must sit inside the drain phase's 120s so retries resolve in-window.
+const SHED_RETRY_BUDGET: Duration = Duration::from_secs(90);
+
+/// Retry an op while the server sheds load (503 + Retry-After). A 503 is the
+/// server being HONEST about overload — the client owns the retry; counting
+/// it as failure would punish correct shedding. Anything else fails through.
+async fn with_shed_retry<T, F, Fut>(deadline: Duration, f: F) -> Result<T>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let start = Instant::now();
+    loop {
+        match f().await {
+            Ok(v) => return Ok(v),
+            Err(e)
+                if start.elapsed() < deadline
+                    && e.to_string().contains("status 503") =>
+            {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 async fn update_user_profile(node: &NodeInfo, first_name: &str, last_name: &str) -> Result<()> {
     let client = Client::new();
     let url = format!("http://{}:{}/users/me/profile", node.ip_address, node.port);
@@ -784,7 +811,12 @@ impl TestScenario for ConsensusQueueThroughput {
                 let size = 500 + ((round * 137) % 1500) as usize;
                 let fname = format!("tp-{}.txt", r);
                 file_names.push(fname.clone());
-                set.spawn(async move { upload_file(&node, &d, &fname, vec![0x54u8; size]).await });
+                set.spawn(async move {
+                    with_shed_retry(SHED_RETRY_BUDGET, || {
+                        upload_file(&node, &d, &fname, vec![0x54u8; size])
+                    })
+                    .await
+                });
                 spawned_count += 1;
             }
 
@@ -794,8 +826,12 @@ impl TestScenario for ConsensusQueueThroughput {
                 let node = nodes[node_idx].clone();
                 let r = round;
                 set.spawn(async move {
-                    update_user_profile(&node, &format!("Tp{}", r % 5), &format!("Load{}", r % 5))
-                        .await
+                    let first = format!("Tp{}", r % 5);
+                    let last = format!("Load{}", r % 5);
+                    with_shed_retry(SHED_RETRY_BUDGET, || {
+                        update_user_profile(&node, &first, &last)
+                    })
+                    .await
                 });
                 spawned_count += 1;
             } else {
@@ -804,7 +840,8 @@ impl TestScenario for ConsensusQueueThroughput {
                 let ts_copy = ts;
                 let r = round;
                 set.spawn(async move {
-                    register_device(&node, &format!("tp-dev-{}-{}", ts_copy, r))
+                    let dev = format!("tp-dev-{}-{}", ts_copy, r);
+                    with_shed_retry(SHED_RETRY_BUDGET, || register_device(&node, &dev))
                         .await
                         .map(|_| ())
                 });

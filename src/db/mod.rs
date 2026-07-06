@@ -43,9 +43,10 @@ pub mod write_gate;
 pub const DB_POOL_MAX_SIZE: u32 = 32;
 
 /// Connections subtracted from the pool to account for the always-held
-/// dedicated conns. Used by `db_worker_concurrency_budget` to size workers
-/// that compete with route handlers for pool capacity.
-const DB_POOL_RESERVED: u32 = 3;
+/// dedicated conns (batch processor, engine storage, engine app reads,
+/// engine proposal builds). Used by `db_worker_concurrency_budget` to size
+/// workers that compete with route handlers for pool capacity.
+const DB_POOL_RESERVED: u32 = 5;
 
 /// Conservative number of pool slots left available for HTTP route handling
 /// while a worker pipeline is fully saturated. Keeps the system responsive

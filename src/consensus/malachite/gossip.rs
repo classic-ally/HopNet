@@ -32,14 +32,26 @@ const DECIDED_FETCH_MAX: i64 = 100;
 fn peers(
     db_pool: &Pool<SqliteConnectionManager>,
     my_node_id: i32,
-) -> Result<Vec<(i32, PubKey)>, rusqlite::Error> {
-    let conn = db_pool
-        .get()
-        .map_err(|_| rusqlite::Error::InvalidQuery)?;
-    let mut stmt = conn.prepare_cached("SELECT node_id, pubkey FROM nodes WHERE node_id != ?")?;
-    let rows = stmt.query_map([my_node_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
-    rows.collect()
+) -> Result<Vec<(i32, PubKey)>, String> {
+    // NB: a pool checkout failure here used to be masked as
+    // rusqlite::Error::InvalidQuery ("Query is not read-only") — keep the
+    // real error visible; pool starvation under API load is a live failure
+    // mode and the publisher's cache is what rides it out.
+    let conn = db_pool.get().map_err(|e| format!("db pool: {e}"))?;
+    let mut stmt = conn
+        .prepare_cached("SELECT node_id, pubkey FROM nodes WHERE node_id != ?")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([my_node_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
 }
+
+/// How long the publisher trusts its cached peer list before re-reading the
+/// nodes table. Node membership changes only via decided blocks, so staleness
+/// here costs at most a few seconds of gossip to a brand-new node — which
+/// catches up through decided-value sync anyway.
+const PEER_CACHE_TTL: Duration = Duration::from_secs(5);
 
 /// Long-lived publisher: drains the shell's outbound channel and fire-and-
 /// forgets each message to every peer (spawn-per-peer, matching the bespoke
@@ -56,6 +68,12 @@ pub async fn run_publisher(
 ) {
     let transport: IrohTransport = app_state.iroh_transport.clone();
     let db_pool: Pool<SqliteConnectionManager> = app_state.db_pool.clone();
+    // Peer-list cache: consensus publishing must not depend on winning a pool
+    // checkout race against API load. The blocking r2d2 get() runs on the
+    // blocking pool (not an async worker), at most once per TTL; on refresh
+    // failure a non-empty cache keeps publishing with the stale list.
+    let mut peer_cache: Vec<(i32, PubKey)> = Vec::new();
+    let mut last_refresh: Option<tokio::time::Instant> = None;
     while let Some(msg) = outbound.recv().await {
         if app_state.test_mode {
             match &msg {
@@ -81,18 +99,35 @@ pub async fn run_publisher(
                 continue;
             }
         };
-        let peer_list = match peers(&db_pool, my_node_id) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!("peer enumeration failed, dropping publish: {e}");
-                continue;
+        let stale = last_refresh.is_none_or(|t| t.elapsed() > PEER_CACHE_TTL);
+        if peer_cache.is_empty() || stale {
+            let pool = db_pool.clone();
+            match tokio::task::spawn_blocking(move || peers(&pool, my_node_id)).await {
+                Ok(Ok(p)) => {
+                    peer_cache = p;
+                    last_refresh = Some(tokio::time::Instant::now());
+                }
+                Ok(Err(e)) if peer_cache.is_empty() => {
+                    tracing::warn!("peer enumeration failed, dropping publish: {e}");
+                    continue;
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("peer refresh failed, publishing with cached list: {e}");
+                }
+                Err(e) => {
+                    tracing::error!("peer refresh task died: {e}");
+                    if peer_cache.is_empty() {
+                        continue;
+                    }
+                }
             }
-        };
-        for (node_id, pubkey) in peer_list {
+        }
+        for (node_id, pubkey) in &peer_cache {
+            let node_id = *node_id;
             let transport = transport.clone();
             let req = IrohRequest::ConsensusMsg(bytes.clone());
+            let iroh_id = pubkey.to_iroh_node_id();
             tokio::spawn(async move {
-                let iroh_id = pubkey.to_iroh_node_id();
                 if let Err(e) = transport
                     .request(node_id, iroh_id, &req, PUBLISH_TIMEOUT)
                     .await

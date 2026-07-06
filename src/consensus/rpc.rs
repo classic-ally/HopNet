@@ -116,6 +116,13 @@ const FORWARD_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 /// Consensus completes in 1-3s normally; 15s covers slow rounds without
 /// blocking the batch processor for a full timeout detection cycle.
 const FORWARD_RESULT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Connect bound for the forward path, tighter than the transport-level
+/// CONNECTION_TIMEOUT (10s). The batch processor is single-threaded: while a
+/// dial to an unresponsive proposer hangs, NO transactions move on this node.
+/// Failing fast keeps the stall under one consensus propose timeout, so the
+/// caller's resume-own-engine path advances rounds past the dead proposer
+/// instead of arriving after the fact.
+const FORWARD_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Client: forward transactions to the proposer with two-phase ACK protocol.
 ///
@@ -144,7 +151,16 @@ pub async fn forward_transactions_with_ack(
     });
 
     let request_id: u64 = rand::random();
-    let conn = transport.get_connection(node_id, peer_node_id).await?;
+    let conn = tokio::time::timeout(
+        FORWARD_CONNECT_TIMEOUT,
+        transport.get_connection(node_id, peer_node_id),
+    )
+    .await
+    .map_err(|_| {
+        IrohError::Transport(TransportError::ConnectionFailed(format!(
+            "connect to proposer node {node_id} timed out after {FORWARD_CONNECT_TIMEOUT:?}"
+        )))
+    })??;
 
     let (mut send, mut recv) = conn
         .open_bi()

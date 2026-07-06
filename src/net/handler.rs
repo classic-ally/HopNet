@@ -14,14 +14,25 @@ use crate::db::consensus as db;
 use crate::types::PubKey;
 
 /// Handle incoming iroh connections
-/// This runs in a loop accepting connections from the endpoint
-pub async fn handle_incoming_connections(endpoint: Endpoint, app_state: AppState) {
+/// This runs in a loop accepting connections from the endpoint.
+///
+/// RUNTIME CONTRACT: this loop is spawned on the dedicated net runtime (see
+/// `transport::net_rt`); per-connection and per-stream tasks inherit it, so
+/// nothing on this path may block (no r2d2, no rusqlite, no sync I/O).
+/// Requests that need the database are handed off to `app_rt` — the main
+/// runtime's Handle, captured at spawn time — inside `handle_stream`.
+pub async fn handle_incoming_connections(
+    endpoint: Endpoint,
+    app_state: AppState,
+    app_rt: tokio::runtime::Handle,
+) {
     loop {
         match endpoint.accept().await {
             Some(incoming) => {
                 let app_state = app_state.clone();
+                let app_rt = app_rt.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(incoming, app_state).await {
+                    if let Err(e) = handle_connection(incoming, app_state, app_rt).await {
                         tracing::warn!("iroh connection error: {}", e);
                     }
                 });
@@ -37,21 +48,30 @@ pub async fn handle_incoming_connections(endpoint: Endpoint, app_state: AppState
 /// Look up the node_id for a known peer's public key.
 /// The before_registration hook already rejected unknown peers before the connection
 /// was established, so this is just for resolving the node_id for logging/routing.
-fn lookup_node_id(app_state: &AppState, peer_pubkey: &iroh::PublicKey) -> Option<i32> {
-    let conn = app_state.db_pool.get().ok()?;
+/// Blocking pool checkout — runs on the blocking pool, never on a net worker.
+async fn lookup_node_id(app_state: &AppState, peer_pubkey: &iroh::PublicKey) -> Option<i32> {
+    let db_pool = app_state.db_pool.clone();
     let pubkey = PubKey(ed25519_dalek::VerifyingKey::from_bytes(peer_pubkey.as_bytes()).ok()?);
-    let pubkey_encoded = bincode::serde::encode_to_vec(pubkey, bincode::config::standard()).ok()?;
-    conn.query_row(
-        "SELECT node_id FROM nodes WHERE pubkey = ?",
-        [pubkey_encoded.as_slice()],
-        |row| row.get(0),
-    )
+    tokio::task::spawn_blocking(move || {
+        let conn = db_pool.get().ok()?;
+        let pubkey_encoded =
+            bincode::serde::encode_to_vec(pubkey, bincode::config::standard()).ok()?;
+        conn.query_row(
+            "SELECT node_id FROM nodes WHERE pubkey = ?",
+            [pubkey_encoded.as_slice()],
+            |row| row.get(0),
+        )
+        .ok()
+    })
+    .await
     .ok()
+    .flatten()
 }
 
 async fn handle_connection(
     incoming: iroh::endpoint::Incoming,
     app_state: AppState,
+    app_rt: tokio::runtime::Handle,
 ) -> Result<(), IrohError> {
     // Unknown peers are already rejected by the before_registration hook
     // before the connection reaches this point (no holepunching occurs).
@@ -60,15 +80,18 @@ async fn handle_connection(
         .map_err(|e| IrohError::Transport(TransportError::ConnectionFailed(e.to_string())))?;
     let peer_pubkey = conn.remote_id();
 
-    let peer_node_id = lookup_node_id(&app_state, &peer_pubkey).unwrap_or(-1);
+    let peer_node_id = lookup_node_id(&app_state, &peer_pubkey).await.unwrap_or(-1);
     tracing::debug!("accepted iroh connection from node {}", peer_node_id);
 
     loop {
         match conn.accept_bi().await {
             Ok((send, recv)) => {
                 let app_state = app_state.clone();
+                let app_rt = app_rt.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_stream(send, recv, peer_node_id, app_state).await {
+                    if let Err(e) =
+                        handle_stream(send, recv, peer_node_id, app_state, app_rt).await
+                    {
                         tracing::debug!("iroh stream error from node {}: {}", peer_node_id, e);
                     }
                 });
@@ -83,13 +106,19 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Message-driven catch-up for consensus messages.
-///
+/// Read one request off the stream, then route it by plane:
+/// - mesh plane (Ping, LatencyPing, ThroughputUpload, ConsensusMsg — pure
+///   channel/CPU work) is served inline on the net runtime;
+/// - app plane (anything touching the DB or disk: TransactionForward,
+///   DecidedFetch, Fragment*, StorageQuery, JoinDeliver) is handed off to the
+///   main runtime, so API-load starvation degrades peer RPC service but can
+///   never stall consensus message flow.
 async fn handle_stream(
-    mut send: iroh::endpoint::SendStream,
+    send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
     peer_node_id: i32,
     app_state: AppState,
+    app_rt: tokio::runtime::Handle,
 ) -> Result<(), IrohError> {
     // Read request_id prefix (8 bytes)
     let mut id_buf = [0u8; 8];
@@ -100,10 +129,60 @@ async fn handle_stream(
 
     let span =
         tracing::debug_span!("rpc_req", id = %format!("{:016x}", request_id), from = peer_node_id);
-    async {
-        // Read the request outside the OnceCell so we can branch on it
-        let request: IrohRequest = recv_message(&mut recv).await?;
+    // Decode before routing (cheap CPU; the full request is already framed).
+    let request: IrohRequest = recv_message(&mut recv)
+        .instrument(span.clone())
+        .await?;
 
+    // Mesh plane (pure channel/CPU work) — inline on the net runtime.
+    let mesh_plane = matches!(
+        request,
+        IrohRequest::Ping { .. }
+            | IrohRequest::LatencyPing(_)
+            | IrohRequest::ThroughputUpload(_)
+            | IrohRequest::ConsensusMsg(_)
+    );
+    if mesh_plane {
+        return process_request(send, request_id, request, peer_node_id, app_state)
+            .instrument(span)
+            .await;
+    }
+    // Consensus-support plane — the QUEUE runtime (blocking DB allowed, never
+    // starved by API load). TransactionForward is consensus INTAKE: if its ACK
+    // can't beat the forwarder's timeout under load, proposers never receive
+    // batches and blocks decide empty (the image-12 finding). DecidedFetch
+    // serves laggard sync — same liveness class.
+    let queue_plane = matches!(
+        request,
+        IrohRequest::TransactionForward(_) | IrohRequest::DecidedFetch { .. }
+    );
+    if queue_plane {
+        return crate::consensus::queue::queue_rt()
+            .spawn(
+                process_request(send, request_id, request, peer_node_id, app_state)
+                    .instrument(span),
+            )
+            .await
+            .map_err(|e| IrohError::Transport(TransportError::StreamFailed(e.to_string())))?;
+    }
+    // App plane (fragments, storage, join) — the main runtime; degrades under
+    // API overload by design.
+    app_rt
+        .spawn(
+            process_request(send, request_id, request, peer_node_id, app_state).instrument(span),
+        )
+        .await
+        .map_err(|e| IrohError::Transport(TransportError::StreamFailed(e.to_string())))?
+}
+
+async fn process_request(
+    mut send: iroh::endpoint::SendStream,
+    request_id: u64,
+    request: IrohRequest,
+    peer_node_id: i32,
+    app_state: AppState,
+) -> Result<(), IrohError> {
+    {
         // TransactionForward uses two-phase ACK (bypasses OnceCell — nonce table handles dedup)
         if let IrohRequest::TransactionForward(req) = request {
             // Validate proposer status before ACKing — avoids multi-hop
@@ -234,6 +313,4 @@ async fn handle_stream(
 
         Ok(())
     }
-    .instrument(span)
-    .await
 }

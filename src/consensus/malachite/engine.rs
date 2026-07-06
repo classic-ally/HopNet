@@ -161,8 +161,15 @@ pub fn spawn_engine(app_state: &AppState) -> Result<(), String> {
     };
 
     // --- Publisher --------------------------------------------------------
+    // Runs on the dedicated net runtime: outbound votes/proposals must keep
+    // flowing when API load starves the main runtime (peer refresh inside is
+    // already spawn_blocking; per-peer send tasks inherit the net runtime).
     let (out_tx, out_rx) = mpsc::unbounded_channel();
-    tokio::spawn(gossip::run_publisher(app_state.clone(), node_id, out_rx));
+    crate::net::transport::net_rt().spawn(gossip::run_publisher(
+        app_state.clone(),
+        node_id,
+        out_rx,
+    ));
 
     // --- before_decide commit gate (test_mode) -----------------------------
     // The decide commit runs on the !Send shell thread where async barrier
@@ -171,7 +178,9 @@ pub fn spawn_engine(app_state: &AppState) -> Result<(), String> {
     // process, so a global is accurate.
     if app_state.test_mode {
         let barriers = app_state.consensus_barriers.clone();
-        tokio::spawn(async move {
+        // Queue runtime: the mirror must stay live under load, or barrier
+        // state observed by the commit gate goes stale.
+        crate::consensus::queue::queue_rt().spawn(async move {
             loop {
                 let held = barriers
                     .status(crate::consensus::barriers::names::BEFORE_DECIDE)
@@ -188,6 +197,13 @@ pub fn spawn_engine(app_state: &AppState) -> Result<(), String> {
         .db_pool
         .get()
         .map_err(|e| format!("spawn_engine: storage conn: {e}"))?;
+    // Second dedicated conn: the application's shell-thread reads (validator
+    // sets). Checked out at spawn (quiet startup), held for the engine's
+    // lifetime — the shell must never race the pool.
+    let app_conn = app_state
+        .db_pool
+        .get()
+        .map_err(|e| format!("spawn_engine: app conn: {e}"))?;
     let commit_fn: hopnet_consensus::store::CommitFn = if app_state.test_mode {
         commit_gated
     } else {
@@ -205,7 +221,7 @@ pub fn spawn_engine(app_state: &AppState) -> Result<(), String> {
         move |gossip_seam, timers| {
             let storage =
                 PoolStorage::from_handle(storage_conn, commit_fn).expect("consensus storage");
-            let mut app = HopNetApplication::new(app_state_for_core);
+            let mut app = HopNetApplication::new(app_state_for_core, app_conn);
             let valset = <HopNetApplication as Application<PoolStorage>>::validator_set(
                 &mut app,
                 start_height,
@@ -237,23 +253,52 @@ pub fn spawn_engine(app_state: &AppState) -> Result<(), String> {
     } = handle;
 
     // --- Settler: resolve queue notifiers as heights decide ---------------
+    // Queue runtime: settlement must keep pace with decides under API load.
     {
         let pool = app_state.consensus_queue.pending_pool();
         let db_pool = app_state.db_pool.clone();
         let mut decided_watch = decided.clone();
-        tokio::spawn(async move {
+        crate::consensus::queue::queue_rt().spawn(async move {
             while decided_watch.changed().await.is_ok() {
                 let h = *decided_watch.borrow_and_update();
-                match db_pool.get() {
-                    Ok(conn) => pool.settle(&conn, h),
-                    Err(e) => tracing::error!("settler: pool conn: {e}"),
+                // Retry on pool contention: a skipped settle would orphan the
+                // notifiers of committed txs (clients hang to timeout). The
+                // FINAL decide of a burst has no later settle to catch them.
+                loop {
+                    match db_pool.get() {
+                        Ok(conn) => {
+                            pool.settle(&conn, h);
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::warn!("settler: pool conn (retrying): {e}");
+                            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        }
+                    }
+                    // A newer decide supersedes this settle (nonces are
+                    // cumulative) — bail to pick up the latest height.
+                    if *decided_watch.borrow() != h {
+                        break;
+                    }
                 }
             }
         });
     }
 
     // --- Driver ------------------------------------------------------------
-    spawn_driver(app_state.clone(), node_id, input_tx.clone(), decided.clone(), events);
+    // Third dedicated conn: proposal builds (see handle_need_value).
+    let build_conn = app_state
+        .db_pool
+        .get()
+        .map_err(|e| format!("spawn_engine: build conn: {e}"))?;
+    spawn_driver(
+        app_state.clone(),
+        node_id,
+        input_tx.clone(),
+        decided.clone(),
+        events,
+        build_conn,
+    );
 
     let engine = EngineHandle {
         input_tx,
@@ -366,18 +411,22 @@ fn spawn_driver(
     input_tx: mpsc::Sender<HostInput>,
     decided: tokio::sync::watch::Receiver<u64>,
     mut events: mpsc::UnboundedReceiver<HostEvent>,
+    build_conn: r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>,
 ) {
     let pool = app_state.consensus_queue.pending_pool();
     let sync_inflight = Arc::new(AtomicBool::new(false));
+    let mut build_conn = Some(build_conn);
 
-    tokio::spawn(async move {
+    // Queue runtime: the driver answers NeedValue and fires Resume — if it
+    // can't get polled, the engine never advances (the image-10 stall).
+    crate::consensus::queue::queue_rt().spawn(async move {
         loop {
             tokio::select! {
                 maybe = events.recv() => {
                     let Some(ev) = maybe else { break };
                     match ev {
                         HostEvent::NeedValue { height, round } => {
-                            handle_need_value(&app_state, &pool, &input_tx, height, round).await;
+                            handle_need_value(&app_state, &pool, &input_tx, &mut build_conn, height, round).await;
                         }
                         HostEvent::SyncNeeded { target, hint_peer } => {
                             if sync_inflight.swap(true, Ordering::SeqCst) {
@@ -434,6 +483,7 @@ async fn handle_need_value(
     app_state: &AppState,
     pool: &Arc<crate::consensus::queue::PendingPool>,
     input_tx: &mpsc::Sender<HostInput>,
+    build_conn: &mut Option<r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>>,
     height: Height,
     round: hopnet_consensus::Round,
 ) {
@@ -469,18 +519,36 @@ async fn handle_need_value(
         }
     }
 
+    // Dedicated build connection: proposal building must never lose a pool
+    // checkout race under load (a failed build wastes the whole round — the
+    // image-14 finding: "build conn: timed out" → empty heights). The conn is
+    // moved through the blocking task and handed back; if a build panics the
+    // conn drops back to the pool and the fallback re-checks one out.
+    let taken = build_conn.take();
     let build_state = app_state.clone();
-    let built = tokio::task::spawn_blocking(move || {
-        let mut conn = build_state
-            .db_pool
-            .get()
-            .map_err(|e| format!("build conn: {e}"))?;
-        build_value(&build_state, &mut conn, height, round, candidates)
+    let joined = tokio::task::spawn_blocking(move || {
+        let mut conn = match taken {
+            Some(conn) => conn,
+            None => build_state
+                .db_pool
+                .get()
+                .map_err(|e| format!("build conn: {e}"))?,
+        };
+        let result = build_value(&build_state, &mut conn, height, round, candidates);
+        Ok::<_, String>((conn, result))
     })
     .await;
 
-    let built = match built {
-        Ok(res) => res,
+    let built = match joined {
+        Ok(Ok((conn, result))) => {
+            *build_conn = Some(conn);
+            result
+        }
+        Ok(Err(e)) => {
+            tracing::error!("build_value setup failed at height {}: {e}", height.0);
+            pool.restage(entries);
+            return;
+        }
         Err(join_err) => {
             tracing::error!("build task panicked: {join_err}");
             pool.restage(entries);

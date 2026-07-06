@@ -55,11 +55,19 @@ pub fn to_engine_transactions(txs: &OldTransactions) -> Result<engine::Transacti
 /// function of the block and committed DB state (the same on every node).
 pub struct HopNetApplication {
     app_state: AppState,
+    /// Dedicated connection for shell-thread reads (validator sets). The
+    /// engine must NEVER compete for a pool checkout: validator_set runs on
+    /// the shell thread, where a missed checkout is fatal (the shell aborts
+    /// the process on panic — that was the image-11 crash under burst load).
+    conn: r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>,
 }
 
 impl HopNetApplication {
-    pub fn new(app_state: AppState) -> Self {
-        Self { app_state }
+    pub fn new(
+        app_state: AppState,
+        conn: r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>,
+    ) -> Self {
+        Self { app_state, conn }
     }
 
     /// Rule-8 validation: structural checks, parent linkage, per-transaction
@@ -192,13 +200,8 @@ impl<C: DerefMut<Target = Connection> + 'static> Application<SqliteStorage<C>>
     }
 
     fn validator_set(&mut self, height: Height) -> HopNetValidatorSet {
-        let conn = self
-            .app_state
-            .db_pool
-            .get()
-            .expect("db pool for validator set");
         let h = i32::try_from(height.as_db()).unwrap_or(i32::MAX);
-        let nodes = db::get_validators_with_conn(&conn, h).expect("validator query");
+        let nodes = db::get_validators_with_conn(&self.conn, h).expect("validator query");
         HopNetValidatorSet::new(
             nodes
                 .into_iter()

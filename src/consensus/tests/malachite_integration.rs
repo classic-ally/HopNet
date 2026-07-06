@@ -99,11 +99,12 @@ async fn start_engine(
     let storage_conn = db_pool.get().unwrap();
     let signer = hopnet_consensus::types::PrivKey(app_state.private_key.0.clone());
     let app_state_for_core = app_state.clone();
+    let app_conn = app_state.db_pool.get().expect("app conn");
     let handle: ConsensusHandle = shell::spawn(
         move |gossip_seam, timers| {
             let storage = PoolStorage::from_handle(storage_conn, crate::db::shared::commit_timed)
                 .expect("consensus storage");
-            let mut app = HopNetApplication::new(app_state_for_core);
+            let mut app = HopNetApplication::new(app_state_for_core, app_conn);
             let valset = <HopNetApplication as Application<PoolStorage>>::validator_set(
                 &mut app,
                 start_height,
@@ -385,9 +386,11 @@ fn probe_loopback_direct_connect() {
     let rt = crate::consensus::tests::test_iroh_rt();
     rt.block_on(async move {
         // QUIC handshakes only complete once the server polls accept().
+        // The test runtime serves as the app runtime for handed-off requests.
         tokio::spawn(crate::net::handler::handle_incoming_connections(
             b.app_state.iroh_transport.endpoint().clone(),
             b.app_state.clone(),
+            tokio::runtime::Handle::current(),
         ));
         let ep_b = b.app_state.iroh_transport.endpoint();
         eprintln!("b bound sockets: {:?}", ep_b.bound_sockets());

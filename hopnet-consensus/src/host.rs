@@ -119,7 +119,22 @@ pub struct HostCore<A, S, G, T> {
     on_demand: bool,
     /// The deferred height waiting for a wake signal (on-demand mode only).
     deferred_start: Option<Height>,
+    /// Wire proposals for FUTURE heights, held UNVALIDATED until the engine
+    /// reaches their height. Rule-8 validation is state-dependent (parent
+    /// linkage, nonce dedup, handler dry-run against the tip) — validating an
+    /// ahead-of-tip proposal against today's tip judges a perfectly good
+    /// block Invalid, and that verdict poisons the engine's per-height value
+    /// record, wedging the height when we get there. Drained by
+    /// `drain_stashed_proposals` at every height entry.
+    stashed_proposals: BTreeMap<u64, Vec<codec::WireProposedValue>>,
 }
+
+/// How far ahead of the current height a wire proposal may be stashed, and
+/// the total stash bound. One height of lookahead is the common race (peer
+/// decided h while we are mid-h); sync covers real gaps. The count bound
+/// caps memory against a flooding peer (blocks can be large).
+const PROPOSAL_STASH_AHEAD: u64 = 4;
+const PROPOSAL_STASH_MAX: usize = 16;
 
 impl<A, S, G, T> HostCore<A, S, G, T>
 where
@@ -164,6 +179,7 @@ where
             last_decided: None,
             on_demand: false,
             deferred_start: None,
+            stashed_proposals: BTreeMap::new(),
         }
     }
 
@@ -246,7 +262,10 @@ where
                 .retain(|o| !matches!(o, HostOutput::NeedValue { .. }));
         }
         self.phase = Phase::Running;
-        Ok(())
+        // A proposal for this height may have arrived while it was deferred
+        // (on-demand) or before the previous height finished — validate it
+        // NOW, against the tip it belongs to.
+        self.drain_stashed_proposals()
     }
 
     /// Boot entry for on-demand mode. A height with persisted WAL entries was
@@ -292,32 +311,82 @@ where
                 let Ok(sv) = (&w).try_into() else {
                     return Ok(()); // malformed — drop
                 };
-                self.feed(Input::Vote(sv))
+                self.feed(Input::Vote(sv))?;
             }
             WireConsensusMsg::ProposedValue(w) => {
-                let block = w.block.clone();
-                let height = Height(w.height);
-                // Rule-8: the receiver decides validity in a rollback tx.
-                // Disjoint borrows so app and storage can be used together.
-                let validity = {
-                    let Self { app, storage, .. } = self;
-                    storage
-                        .with_rollback(|tx| {
-                            app.validate_block(height, &block, tx, ValidationOrigin::Live)
-                        })
-                        .map_err(HostError::Storage)?
-                };
-                let pv = w.into_proposed_value(validity).map_err(HostError::Codec)?;
-                self.remember_block(pv.height, pv.value.clone());
-                self.feed(Input::ProposedValue(pv, ValueOrigin::Consensus))
+                let current = self.height().0;
+                if w.height > current {
+                    // Rule-8 validation needs the state AT the proposal's
+                    // height — hold the proposal and validate when we get
+                    // there (drain_stashed_proposals). Beyond the window the
+                    // sync client fetches the DECIDED value instead.
+                    let stashed: usize = self.stashed_proposals.values().map(Vec::len).sum();
+                    if w.height <= current + PROPOSAL_STASH_AHEAD && stashed < PROPOSAL_STASH_MAX
+                    {
+                        self.stashed_proposals.entry(w.height).or_default().push(w);
+                    }
+                    return Ok(());
+                }
+                if w.height == current {
+                    self.ingest_proposal(w)?;
+                }
+                // w.height < current: stale — the height is already decided
+                // here; drop without validating (a dry-run against the wrong
+                // tip only produces noise).
             }
             WireConsensusMsg::LivenessPolka(w) => {
                 let cert = (&w).try_into().map_err(HostError::Codec)?;
-                self.feed(Input::PolkaCertificate(cert))
+                self.feed(Input::PolkaCertificate(cert))?;
             }
             WireConsensusMsg::LivenessSkipRound(w) => {
                 let cert = (&w).try_into().map_err(HostError::Codec)?;
-                self.feed(Input::RoundCertificate(cert))
+                self.feed(Input::RoundCertificate(cert))?;
+            }
+        }
+        // Any input can complete a decide and advance the height (votes most
+        // of all) — give stashed proposals for the new height their shot.
+        self.drain_stashed_proposals()
+    }
+
+    /// Validate a wire proposal AT the current height (Rule-8, rollback tx)
+    /// and feed the verdict-carrying ProposedValue to the engine.
+    fn ingest_proposal(&mut self, w: codec::WireProposedValue) -> Result<(), HostError<S::Error>> {
+        let block = w.block.clone();
+        let height = Height(w.height);
+        // Disjoint borrows so app and storage can be used together.
+        let validity = {
+            let Self { app, storage, .. } = self;
+            storage
+                .with_rollback(|tx| app.validate_block(height, &block, tx, ValidationOrigin::Live))
+                .map_err(HostError::Storage)?
+        };
+        let pv = w.into_proposed_value(validity).map_err(HostError::Codec)?;
+        self.remember_block(pv.height, pv.value.clone());
+        self.feed(Input::ProposedValue(pv, ValueOrigin::Consensus))
+    }
+
+    /// Re-process stashed future proposals whose height has arrived. Loops:
+    /// ingesting a proposal can itself complete a decide (buffered votes) and
+    /// advance the height again. Entries below the current height are pruned.
+    fn drain_stashed_proposals(&mut self) -> Result<(), HostError<S::Error>> {
+        loop {
+            let current = self.height().0;
+            while let Some(&h) = self.stashed_proposals.keys().next() {
+                if h < current {
+                    self.stashed_proposals.remove(&h);
+                } else {
+                    break;
+                }
+            }
+            let Some(batch) = self.stashed_proposals.remove(&current) else {
+                return Ok(());
+            };
+            for w in batch {
+                // An earlier item can complete the height — the rest of the
+                // batch is then stale, not ingestable.
+                if w.height == self.height().0 {
+                    self.ingest_proposal(w)?;
+                }
             }
         }
     }
@@ -464,6 +533,7 @@ where
             last_decided,
             on_demand,
             deferred_start,
+            stashed_proposals: _,
         } = self;
 
         let metrics = ();

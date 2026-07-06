@@ -45,7 +45,8 @@ fn validate_at_height_1(
     })
     .expect("block build");
 
-    let mut app = HopNetApplication::new(app_state.clone());
+    let app_conn = app_state.db_pool.get().expect("app conn");
+    let mut app = HopNetApplication::new(app_state.clone(), app_conn);
     let mut db_tx = conn.transaction().expect("tx");
     // Rolled back on drop — validation must not mutate state.
     <HopNetApplication as Application<PoolStorage>>::validate_block(
