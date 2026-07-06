@@ -1040,35 +1040,19 @@ pub fn mark_fragments_local_state_batch(
                 );
                 DatabaseError::LockError
             })?;
-            let mut total_rows = 0;
-            {
-                let mut stmt = tx
-                    .prepare_cached(
-                        "UPDATE fragment_hashes SET stored_locally = ? WHERE fragment_hash = ?",
-                    )
+            // Substrate-owned write (RFC-014 stored_locally invariant) —
+            // the host owns only the conn + commit telemetry.
+            let total_rows =
+                hopnet_storage::store::mark_local_state_batch(&tx, fragment_hashes, stored_locally)
                     .map_err(|e| {
-                        tracing::error!(
-                            "Failed to prepare batch fragment update statement: {:?}",
-                            e
-                        );
+                        tracing::error!("mark_local_state_batch failed: {e}");
                         DatabaseError::ProcessingError
                     })?;
-                for hash in fragment_hashes {
-                    let rows = stmt.execute(params![stored_locally, hash]).map_err(|e| {
-                        tracing::error!(
-                            "Error updating stored_locally for fragment hash {}: {:?}",
-                            hash,
-                            e
-                        );
-                        DatabaseError::ProcessingError
-                    })?;
-                    total_rows += rows;
-                }
-            }
             crate::db::shared::commit_timed(tx).map_err(|e| {
                 tracing::error!("Failed to commit batch fragment update: {:?}", e);
                 DatabaseError::InsertError
             })?;
+
             let state_text = if stored_locally {
                 "stored locally"
             } else {

@@ -262,6 +262,28 @@ pub fn apply_delete_orphaned(
     Ok(local_hashes)
 }
 
+
+/// Batch-update the node-local stored_locally flags (write-gate drain path:
+/// fragment receipt / local deletion outside consensus). The OTHER writer is
+/// the apply-time probe in apply_blob_insert — these two are the only
+/// stored_locally writers (see the module-header invariant).
+pub fn mark_local_state_batch(
+    db_tx: &rusqlite::Transaction,
+    fragment_hashes: &[Blake3Hash],
+    stored_locally: bool,
+) -> Result<usize, StorageError> {
+    let mut total_rows = 0;
+    let mut stmt = db_tx
+        .prepare_cached("UPDATE fragment_hashes SET stored_locally = ? WHERE fragment_hash = ?")
+        .map_err(db_err("prepare stored_locally batch update"))?;
+    for hash in fragment_hashes {
+        total_rows += stmt
+            .execute(params![stored_locally, hash])
+            .map_err(db_err("update stored_locally"))?;
+    }
+    Ok(total_rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
