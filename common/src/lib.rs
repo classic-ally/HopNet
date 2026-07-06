@@ -4,6 +4,7 @@ pub mod debug;
 pub mod devices;
 pub mod documentprovider;
 pub mod fileprovider;
+pub mod hash;
 pub mod setup;
 pub mod shares;
 pub mod users;
@@ -23,6 +24,7 @@ pub use fileprovider::{
     ChangesQuery, ChangesResponse, DeleteItemRequest, EnumerateResponse, FileProviderItem,
     HealthResponse, HealthStatus,
 };
+pub use hash::Blake3Hash;
 pub use shares::{
     AcceptShareRequest, IncomingShareResponse, ShareCountResponse, ShareDetailResponse,
     ShareParticipant, ShareRequest,

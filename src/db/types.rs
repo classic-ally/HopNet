@@ -216,41 +216,22 @@ impl FileAccess {
             Err(e) => return Err(e),
         };
 
-        // Generate ephemeral key pair for this file
-        let ephemeral_secret = EphemeralSecret::random_from_rng(OsRng);
-        let ephemeral_public = X25519PublicKey::from(&ephemeral_secret);
-
-        // Perform ECDH with user's X25519 public key
-        let shared_secret = ephemeral_secret.diffie_hellman(user.x25519_pubkey.as_x25519());
-
-        // Derive ChaCha20Poly1305 key from shared secret using Blake3
-        let mut wrap_key_bytes = [0u8; 32];
-        let mut hasher = blake3::Hasher::new_derive_key("hopnet key_wrap");
-        hasher.update(shared_secret.as_bytes());
-        let mut xof = hasher.finalize_xof();
-        xof.fill(&mut wrap_key_bytes);
-        let wrap_key = chacha20poly1305::Key::from(wrap_key_bytes);
-
-        // Derive deterministic nonce from data_block_id + user_id + ephemeral_pubkey
-        let mut nonce_bytes = [0u8; 12];
-        let mut nonce_hasher = blake3::Hasher::new_derive_key("hopnet wrap_nonce");
-        nonce_hasher.update(data_block_id.as_bytes());
-        nonce_hasher.update(&user_id.to_le_bytes());
-        nonce_hasher.update(ephemeral_public.as_bytes());
-        nonce_hasher.finalize_xof().fill(&mut nonce_bytes);
-        let wrap_nonce = chacha20poly1305::Nonce::from(nonce_bytes);
-
-        // Encrypt the per-file key
-        let wrap_cipher = ChaCha20Poly1305::new(&wrap_key);
-        let encrypted_file_key = wrap_cipher
-            .encrypt(&wrap_nonce, per_file_key.as_slice())
-            .map_err(|_| DatabaseError::ProcessingError)?;
+        // Wrap the per-file key to the user's X25519 pubkey — the wrap crypto
+        // lives in the substrate crate (hopnet-storage::crypto, legacy format
+        // until the Stage-B blob_access migration).
+        let wrapped = hopnet_storage::crypto::wrap_file_key_legacy(
+            user.x25519_pubkey.as_x25519(),
+            &data_block_id,
+            user_id,
+            per_file_key,
+        )
+        .map_err(|_| DatabaseError::ProcessingError)?;
 
         Ok(FileAccess {
             data_block_id,
             user_id,
-            ephemeral_pubkey: XPubKey::from(ephemeral_public),
-            encrypted_file_key,
+            ephemeral_pubkey: XPubKey::from(wrapped.ephemeral_pubkey),
+            encrypted_file_key: wrapped.wrapped_key,
         })
     }
 

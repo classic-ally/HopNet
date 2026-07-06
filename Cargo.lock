@@ -2676,6 +2676,7 @@ dependencies = [
  "hex",
  "hopnet-common",
  "hopnet-consensus",
+ "hopnet-storage",
  "image",
  "include_dir",
  "inventory",
@@ -2720,7 +2721,10 @@ dependencies = [
 name = "hopnet-common"
 version = "0.1.0"
 dependencies = [
+ "bincode",
+ "blake3",
  "chrono",
+ "hex",
  "rusqlite",
  "serde",
  "typeshare",
@@ -2745,6 +2749,21 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "hopnet-storage"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "blake3",
+ "chacha20poly1305",
+ "hex",
+ "hopnet-common",
+ "rand 0.10.1",
+ "serde",
+ "tracing",
+ "x25519-dalek",
 ]
 
 [[package]]

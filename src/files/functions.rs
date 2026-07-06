@@ -59,118 +59,24 @@ impl std::error::Error for FileError {
     }
 }
 
-// Fundamental constraint: individual fragment size limit for network performance
-pub const MAX_FRAGMENT_SIZE: usize = 4 * 1024 * 1024; // 4MB
+// Chunk/padding math and format constants live in the substrate crate
+// (hopnet-storage, RFC-014); re-exported here so call sites don't churn.
+pub use hopnet_storage::rs::{
+    CHUNK_SIZE, MAX_FRAGMENT_SIZE, ORIGINAL_FRAGMENTS_PER_CHUNK, RECOVERY_FRAGMENTS_PER_CHUNK,
+    TOTAL_FRAGMENTS_PER_CHUNK, calculate_chunk_padding, calculate_chunked_fragments,
+    calculate_optimal_chunks, calculate_padding_and_chunks,
+};
 
-// Fixed fragment count per chunk for predictable modulo placement
-pub const ORIGINAL_FRAGMENTS_PER_CHUNK: usize = 10;
-pub const RECOVERY_FRAGMENTS_PER_CHUNK: usize = 20;
-pub const TOTAL_FRAGMENTS_PER_CHUNK: usize =
-    ORIGINAL_FRAGMENTS_PER_CHUNK + RECOVERY_FRAGMENTS_PER_CHUNK;
-
-// Derived: logical chunk size is constrained by fragment size and count
-// This ensures each fragment in a full chunk is exactly MAX_FRAGMENT_SIZE
-pub const CHUNK_SIZE: usize = MAX_FRAGMENT_SIZE * ORIGINAL_FRAGMENTS_PER_CHUNK; // 40MB
-
-/// Calculate chunked Reed-Solomon parameters based on file size
-/// Returns (num_chunks, total_original_fragments, total_recovery_fragments)
-///
-/// Each chunk is encoded independently with 10 original + 20 recovery fragments
-/// Chunk size is fixed at 40MB, so files >40MB are split into multiple chunks
-///
-/// Special case: Returns (0, 0, 0) for empty files, which should be handled
-/// separately without Reed-Solomon encoding (no fragments created)
-pub fn calculate_chunked_fragments(file_size: usize) -> (usize, usize, usize) {
-    // Empty files: no chunks, no fragments
-    // These are handled specially in the upload path (skipping process_uploaded_file entirely)
-    if file_size == 0 {
-        return (0, 0, 0);
-    }
-
-    // Calculate number of logical chunks
-    let num_chunks = file_size.div_ceil(CHUNK_SIZE);
-
-    // Each chunk has fixed 10 original + 20 recovery fragments
-    let total_original = num_chunks * ORIGINAL_FRAGMENTS_PER_CHUNK;
-    let total_recovery = num_chunks * RECOVERY_FRAGMENTS_PER_CHUNK;
-
-    (num_chunks, total_original, total_recovery)
-}
-
-/// Calculate optimal number of original and recovery chunks based on file size
-/// DEPRECATED: Use calculate_chunked_fragments() instead for Phase 4+
-pub fn calculate_optimal_chunks(file_size: usize) -> (usize, usize) {
-    // Calculate minimum chunks needed to stay under fragment size limit
-    let min_original_chunks = if file_size == 0 {
-        10 // Empty files still need minimum chunks for Reed-Solomon
-    } else {
-        file_size.div_ceil(MAX_FRAGMENT_SIZE)
-    };
-
-    // Ensure at least 10 original chunks for good Reed-Solomon efficiency
-    let original_chunks = min_original_chunks.max(10);
-
-    // Use 2:1 redundancy ratio (2 recovery for every 1 original)
-    let recovery_chunks = original_chunks * 2;
-
-    (original_chunks, recovery_chunks)
-}
-
-pub fn calculate_chunk_padding(file_size: usize, num_chunks: usize) -> usize {
-    if num_chunks == 0 {
-        return 0; // Defensive: avoid division by zero
-    }
-
-    // Calculate padding needed for the chosen number of chunks
-    let mut remainder = if file_size == 0 {
-        0
-    } else {
-        (num_chunks - (file_size % num_chunks)) % num_chunks
-    };
-
-    // Ensure chunk length is even
-    let chunk_len_after_padding = if file_size + remainder == 0 {
-        0
-    } else {
-        (file_size + remainder) / num_chunks
-    };
-
-    if chunk_len_after_padding % 2 != 0 {
-        remainder += num_chunks;
-    }
-
-    remainder
-}
-
-/// Calculate padding needed to ensure even chunk sizes
-/// Returns (padded_file, added_bytes)
-pub fn calculate_padding_and_chunks(mut file: Vec<u8>, num_chunks: usize) -> (Vec<Vec<u8>>, u8) {
-    let original_len = file.len();
-
-    let remainder = calculate_chunk_padding(original_len, num_chunks);
-
-    // Apply padding in one go
-    if remainder > 0 {
-        file.resize(original_len + remainder, 0);
-    }
-    let added_bytes = remainder as u8;
-
-    // Split into chunks
-    let chunks = if file.is_empty() {
-        vec![vec![]; num_chunks] // Empty chunks for empty file
-    } else {
-        let chunk_size = file.len() / num_chunks;
-        let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(num_chunks);
-        while !file.is_empty() {
-            let current_len = file.len();
-            let chunk = file.split_off(current_len - chunk_size);
-            chunks.push(chunk);
+impl From<hopnet_storage::StorageError> for FileError {
+    fn from(e: hopnet_storage::StorageError) -> Self {
+        match e {
+            hopnet_storage::StorageError::Encryption => FileError::EncryptionError,
+            // Fragment-hash mismatch mapped to HashingError, matching the
+            // pre-extraction behavior of fetch_and_verify_fragment.
+            hopnet_storage::StorageError::HashMismatch => FileError::HashingError,
+            hopnet_storage::StorageError::Io(io) => FileError::StorageError(io),
         }
-        chunks.reverse();
-        chunks
-    };
-
-    (chunks, added_bytes)
+    }
 }
 
 impl From<FileError> for rusqlite::Error {
@@ -299,84 +205,32 @@ pub fn build_encrypted_path(parent_path: &str, filename_segment: &str) -> String
     }
 }
 
-/// Get the XDG data directory for storing fragments
+/// Fragment file I/O lives in the substrate crate (hopnet-storage::fragstore);
+/// thin delegations here keep call sites and the FileError taxonomy stable.
 pub fn get_fragments_dir() -> Result<String, FileError> {
-    let data_dir = std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| {
-        format!(
-            "{}/.local/share",
-            std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
-        )
-    });
-
-    let fragments_dir = format!("{}/hopnet/fragments", data_dir);
-    println!("Using fragments directory: {}", fragments_dir);
-    Ok(fragments_dir)
+    hopnet_storage::fragstore::get_fragments_dir().map_err(FileError::from)
 }
 
-/// Create 2-level directory structure for a fragment hash
-/// e.g., "abcdef123..." -> "fragments/ab/cd/"
 pub fn create_fragment_path(
     fragments_dir: &str,
     fragment_hash: &Blake3Hash,
 ) -> Result<String, FileError> {
-    let hash_str = fragment_hash.to_hex();
-
-    // Take first 4 hex characters for 2-level nesting
-    if hash_str.len() < 4 {
-        return Err(FileError::StorageError(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Fragment hash too short",
-        )));
-    }
-
-    let first_level = &hash_str[0..2];
-    let second_level = &hash_str[2..4];
-
-    let full_path = format!("{}/{}/{}", fragments_dir, first_level, second_level);
-
-    Ok(full_path)
+    hopnet_storage::fragstore::create_fragment_path(fragments_dir, fragment_hash)
+        .map_err(FileError::from)
 }
 
-/// Store a fragment to disk using 2-level directory structure
 pub fn store_fragment(
     fragments_dir: &str,
     fragment_hash: &Blake3Hash,
     data: Vec<u8>,
 ) -> Result<(), FileError> {
-    let dir_path = create_fragment_path(fragments_dir, fragment_hash)?;
-    let full_file_path = format!("{}/{}", dir_path, fragment_hash.to_hex());
-
-    // Create directory structure if it doesn't exist
-    fs::create_dir_all(&dir_path).map_err(FileError::StorageError)?;
-
-    // Write to temp file then atomic rename to prevent concurrent readers
-    // from seeing partial data (POSIX rename is atomic on the same filesystem)
-    let temp_path = format!("{}.tmp.{:x}", full_file_path, rand::random::<u64>());
-    fs::write(&temp_path, &data).map_err(FileError::StorageError)?;
-    fs::rename(&temp_path, &full_file_path).map_err(|e| {
-        // Clean up temp file on rename failure
-        let _ = fs::remove_file(&temp_path);
-        FileError::StorageError(e)
-    })?;
-
-    Ok(())
+    hopnet_storage::fragstore::store_fragment(fragments_dir, fragment_hash, data)
+        .map_err(FileError::from)
 }
 
-/// Delete a fragment from local storage
-/// Simple deletion without directory cleanup for performance
 pub fn delete_fragment(fragments_dir: &str, fragment_hash: &Blake3Hash) -> Result<(), FileError> {
-    let dir_path = create_fragment_path(fragments_dir, fragment_hash)?;
-    let full_file_path = format!("{}/{}", dir_path, fragment_hash.to_hex());
-
-    // Remove the fragment file
-    match fs::remove_file(&full_file_path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Fragment file doesn't exist - consider it successfully "deleted"
-            Ok(())
-        }
-        Err(e) => Err(FileError::StorageError(e)),
-    }
+    hopnet_storage::fragstore::delete_fragment(fragments_dir, fragment_hash)
+        .map_err(FileError::from)
 }
 
 /// Fetch a fragment from local storage only
@@ -385,18 +239,19 @@ pub fn fetch_fragment_local(
     fragments_dir: &str,
     fragment_hash: &Blake3Hash,
 ) -> Result<Vec<u8>, FileError> {
-    let dir_path = create_fragment_path(fragments_dir, fragment_hash)?;
-    let full_file_path = format!("{}/{}", dir_path, fragment_hash.to_hex());
-
     // Yield the executor around the blocking read when possible.
     // block_in_place PANICS on a current_thread runtime — and this path runs
     // on the consensus shell's dedicated thread (apply_block → handlers), so
     // fall back to a plain blocking read there (that thread is ours to block).
     match tokio::runtime::Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(|| fs::read(&full_file_path).map_err(FileError::StorageError))
+            tokio::task::block_in_place(|| {
+                hopnet_storage::fragstore::read_fragment(fragments_dir, fragment_hash)
+                    .map_err(FileError::from)
+            })
         }
-        _ => fs::read(&full_file_path).map_err(FileError::StorageError),
+        _ => hopnet_storage::fragstore::read_fragment(fragments_dir, fragment_hash)
+            .map_err(FileError::from),
     }
 }
 
@@ -406,20 +261,8 @@ pub fn fetch_and_verify_fragment(
     fragment_hash: &Blake3Hash,
     fragments_dir: &str,
 ) -> Result<Vec<u8>, FileError> {
-    let chunk_data = fetch_fragment_local(fragments_dir, fragment_hash)?;
-
-    // Verify chunk hash matches expected
-    let actual_chunk_hash = Blake3Hash::new(blake3::hash(&chunk_data));
-    if actual_chunk_hash != *fragment_hash {
-        tracing::error!(
-            "Fragment hash mismatch: expected {:?}, got {:?}",
-            fragment_hash,
-            actual_chunk_hash
-        );
-        return Err(FileError::HashingError);
-    }
-
-    Ok(chunk_data)
+    hopnet_storage::fragstore::fetch_and_verify_fragment(fragment_hash, fragments_dir)
+        .map_err(FileError::from)
 }
 
 /// Finalize reconstructed file by removing padding and verifying hash
@@ -911,7 +754,7 @@ pub async fn fetch_and_cache_fragment(
 
 /// Check if a fragment exists on disk and is valid (hash matches)
 pub fn fragment_exists_and_valid(fragments_dir: &str, fragment_hash: &Blake3Hash) -> bool {
-    fetch_and_verify_fragment(fragment_hash, fragments_dir).is_ok()
+    hopnet_storage::fragstore::fragment_exists_and_valid(fragments_dir, fragment_hash)
 }
 
 /// Shared content-update preparation for both PATCH /files and FileProvider modify_item.
@@ -1002,114 +845,28 @@ pub async fn prepare_content_update(
     Ok((dataid, data_record, incoming_share_updates, per_file_key))
 }
 
-/// Derive chunk encryption key from per-file key and fragment UUID
-pub fn derive_chunk_key(
-    per_file_key: &chacha20poly1305::Key,
-    fragment_id: &crate::db::CustomUUID,
-) -> chacha20poly1305::Key {
-    let mut key_bytes = [0u8; 32];
-    let mut hasher = blake3::Hasher::new_derive_key("hopnet chunk_key");
-    hasher.update(per_file_key);
-    hasher.update(fragment_id.as_bytes());
-    let mut xof = hasher.finalize_xof();
-    xof.fill(&mut key_bytes);
-    key_bytes.into()
-}
+// Fragment cipher primitives live in the substrate crate
+// (hopnet-storage::crypto, format-frozen with golden-vector tests).
+pub use hopnet_storage::crypto::{
+    calculate_encrypted_chunk_length, derive_chunk_key, derive_chunk_nonce,
+};
 
-/// Derive nonce from fragment UUID using Blake3 for collision resistance
-pub fn derive_chunk_nonce(fragment_id: &crate::db::CustomUUID) -> [u8; 7] {
-    let mut nonce_bytes = [0u8; 7];
-    let mut hasher = blake3::Hasher::new_derive_key("hopnet chunk_nonce");
-    hasher.update(fragment_id.as_bytes());
-    let mut xof = hasher.finalize_xof();
-    xof.fill(&mut nonce_bytes);
-    nonce_bytes
-}
-
-const BUFFER_SIZE: usize = 4096;
-
-pub fn calculate_encrypted_chunk_length(chunk_length: usize) -> usize {
-    chunk_length + (chunk_length.div_ceil(BUFFER_SIZE) * 16)
-}
-
-/// Encrypt a chunk using streaming ChaCha20-Poly1305 with true memory efficiency
 pub fn encrypt_chunk(
-    mut chunk: Vec<u8>, // Take ownership so we can consume it
+    chunk: Vec<u8>,
     per_file_key: &chacha20poly1305::Key,
     fragment_id: &crate::db::CustomUUID,
 ) -> Result<Vec<u8>, FileError> {
-    let chunk_key = derive_chunk_key(per_file_key, fragment_id);
-    let nonce = derive_chunk_nonce(fragment_id);
-    let cipher = ChaCha20Poly1305::new(&chunk_key);
-
-    let mut stream_encryptor = EncryptorBE32::from_aead(cipher, nonce.as_ref().into());
-    let mut encrypted_output = Vec::with_capacity(chunk.len() + 16);
-
-    // Process all segments except the last one
-    while chunk.len() > BUFFER_SIZE {
-        let segment: Vec<u8> = chunk.drain(0..BUFFER_SIZE).collect();
-
-        let ciphertext = stream_encryptor
-            .encrypt_next(segment.as_slice())
-            .map_err(|_| FileError::EncryptionError)?;
-
-        encrypted_output.extend_from_slice(&ciphertext);
-        // segment is dropped here, freeing memory
-    }
-
-    // Process the last segment (or entire chunk if smaller than BUFFER_SIZE)
-    if !chunk.is_empty() {
-        let ciphertext = stream_encryptor
-            .encrypt_last(chunk.as_slice())
-            .map_err(|_| FileError::EncryptionError)?;
-
-        encrypted_output.extend_from_slice(&ciphertext);
-    }
-
-    Ok(encrypted_output)
+    hopnet_storage::crypto::encrypt_chunk(chunk, per_file_key, fragment_id)
+        .map_err(FileError::from)
 }
 
-/// Decrypt a chunk using streaming ChaCha20-Poly1305 with memory efficiency
 pub fn decrypt_chunk(
     encrypted_chunk: &[u8],
     per_file_key: &chacha20poly1305::Key,
     fragment_id: &crate::db::CustomUUID,
 ) -> Result<Vec<u8>, FileError> {
-    let chunk_key = derive_chunk_key(per_file_key, fragment_id);
-    let nonce = derive_chunk_nonce(fragment_id);
-    let cipher = ChaCha20Poly1305::new(&chunk_key);
-
-    let mut stream_decryptor = DecryptorBE32::from_aead(cipher, nonce.as_ref().into());
-    let mut decrypted_output = Vec::with_capacity(encrypted_chunk.len());
-
-    const BUFFER_SIZE: usize = 4096;
-    const ENCRYPTED_SEGMENT_SIZE: usize = BUFFER_SIZE + 16; // Each segment has 16-byte auth tag
-    let mut chunk_offset = 0;
-
-    // Process all segments except the last one
-    while chunk_offset + ENCRYPTED_SEGMENT_SIZE < encrypted_chunk.len() {
-        let segment = &encrypted_chunk[chunk_offset..chunk_offset + ENCRYPTED_SEGMENT_SIZE];
-
-        let plaintext = stream_decryptor
-            .decrypt_next(segment)
-            .map_err(|_| FileError::EncryptionError)?;
-
-        decrypted_output.extend_from_slice(&plaintext);
-        chunk_offset += ENCRYPTED_SEGMENT_SIZE;
-    }
-
-    // Process the last segment (or entire chunk if smaller than ENCRYPTED_SEGMENT_SIZE)
-    if chunk_offset < encrypted_chunk.len() {
-        let segment = &encrypted_chunk[chunk_offset..];
-
-        let plaintext = stream_decryptor
-            .decrypt_last(segment)
-            .map_err(|_| FileError::EncryptionError)?;
-
-        decrypted_output.extend_from_slice(&plaintext);
-    }
-
-    Ok(decrypted_output)
+    hopnet_storage::crypto::decrypt_chunk(encrypted_chunk, per_file_key, fragment_id)
+        .map_err(FileError::from)
 }
 
 /// Reconstructs a single 40MB chunk from its fragments
@@ -1444,3 +1201,4 @@ pub fn reconstruct_file_chunked(
         }
     }
 }
+

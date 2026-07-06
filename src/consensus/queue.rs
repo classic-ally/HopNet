@@ -144,43 +144,80 @@ impl PendingPool {
     /// Settle inflight entries after `decided_height` landed: nonces present
     /// in `committed_tx_nonces` resolve as committed; entries whose proposal
     /// height has passed without committing go back to staging for a retry.
+    ///
+    /// QUEUED entries are settled too: a forwarded copy of a staged tx can
+    /// commit via ANOTHER node's proposal while the local entry waits for our
+    /// next NeedValue (forward → transient retry → local stage → lost round →
+    /// repool). Without this pass those notifiers strand until client timeout
+    /// even though the tx committed.
     pub fn settle(
         &self,
         conn: &r2d2::PooledConnection<SqliteConnectionManager>,
         decided_height: u64,
     ) {
         let mut inflight = self.inflight.lock().unwrap();
-        if inflight.is_empty() {
+        if !inflight.is_empty() {
+            let nonces: Vec<_> = inflight.iter().map(|i| i.entry.tx.nonce.clone()).collect();
+            let committed = match db::check_committed_nonces(conn, &nonces) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!("PendingPool::settle nonce check failed: {:?}", e);
+                    return;
+                }
+            };
+            let mut keep = Vec::new();
+            let mut repool = Vec::new();
+            for item in inflight.drain(..) {
+                if committed.contains(&item.entry.tx.nonce.to_string()) {
+                    let _ = item.entry.notifier.send(ConsensusResult::Committed);
+                } else if item.proposed_at <= decided_height {
+                    // Our proposal lost the round — retry in a later proposal.
+                    repool.push(item.entry);
+                } else {
+                    keep.push(item);
+                }
+            }
+            *inflight = keep;
+            drop(inflight);
+            if !repool.is_empty() {
+                tracing::debug!(
+                    "PendingPool: re-staging {} transaction(s) after lost round",
+                    repool.len()
+                );
+                self.queued.lock().unwrap().extend(repool);
+            }
+        } else {
+            drop(inflight);
+        }
+
+        // Second pass: resolve queued entries whose nonces already committed
+        // (via another proposer), and re-arm the driver wake while work
+        // remains — the Resume that the original stage/repool fired may have
+        // been consumed mid-height, leaving the next height paused forever.
+        let mut queued = self.queued.lock().unwrap();
+        if queued.is_empty() {
             return;
         }
-        let nonces: Vec<_> = inflight.iter().map(|i| i.entry.tx.nonce.clone()).collect();
-        let committed = match db::check_committed_nonces(conn, &nonces) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("PendingPool::settle nonce check failed: {:?}", e);
-                return;
+        let nonces: Vec<_> = queued.iter().map(|q| q.tx.nonce.clone()).collect();
+        match db::check_committed_nonces(conn, &nonces) {
+            Ok(committed) => {
+                let mut keep = Vec::new();
+                for entry in queued.drain(..) {
+                    if committed.contains(&entry.tx.nonce.to_string()) {
+                        let _ = entry.notifier.send(ConsensusResult::Committed);
+                    } else {
+                        keep.push(entry);
+                    }
+                }
+                *queued = keep;
             }
-        };
-        let mut keep = Vec::new();
-        let mut repool = Vec::new();
-        for item in inflight.drain(..) {
-            if committed.contains(&item.entry.tx.nonce.to_string()) {
-                let _ = item.entry.notifier.send(ConsensusResult::Committed);
-            } else if item.proposed_at <= decided_height {
-                // Our proposal lost the round — retry in a later proposal.
-                repool.push(item.entry);
-            } else {
-                keep.push(item);
+            Err(e) => {
+                tracing::error!("PendingPool::settle queued nonce check failed: {:?}", e);
             }
         }
-        *inflight = keep;
-        drop(inflight);
-        if !repool.is_empty() {
-            tracing::debug!(
-                "PendingPool: re-staging {} transaction(s) after lost round",
-                repool.len()
-            );
-            self.queued.lock().unwrap().extend(repool);
+        let still_has_work = !queued.is_empty();
+        drop(queued);
+        if still_has_work {
             self.work.notify_one();
         }
     }
