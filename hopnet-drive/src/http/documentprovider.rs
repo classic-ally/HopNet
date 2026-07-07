@@ -1,28 +1,34 @@
+//! /integrations/documentprovider routes — Android DocumentProvider surface.
+//! Moved from the host's `documentprovider::routes` (RFC-015 Stage D4); the
+//! host layers the device-token auth middleware around this router.
+
 use axum::{
     Extension, Json, Router,
     body::Body,
     extract::{Multipart, Query, State},
     http::{StatusCode, header},
-    middleware,
     response::Response,
-    routing::{delete, get, patch, post},
+    routing::{delete, get, post},
 };
 use serde::Deserialize;
 use std::str::FromStr;
 
-use crate::AppState;
-use crate::db::{self, CustomUUID};
-use crate::devices::auth::device_token_auth_middleware;
-use crate::files::functions::{build_encrypted_path, encrypt_part, encrypt_path};
+use crate::db;
+use crate::host::{DriveState, TxSigner, TxSpec};
+use crate::paths::{build_encrypted_path, decrypt_part, encrypt_part, encrypt_path};
+use crate::upload::session_or_status;
+use hopnet_common::CustomUUID;
 use hopnet_common::db::InodeType;
 use hopnet_common::documentprovider::{
     DocumentProviderEnumerateResponse, DocumentProviderItem, ModifyDocumentProviderRequest,
     ModifyDocumentProviderResponse,
 };
+use hopnet_projection::DatabaseError;
 
 /// Build the DocumentProvider router. Reads bypass the import gate; writes
-/// have the gate applied via a sub-router so attachment is explicit.
-pub fn router(app_state: AppState) -> Router<AppState> {
+/// have the gate applied via a sub-router so attachment is explicit. The
+/// host wraps the whole router in its device-token auth middleware.
+pub fn router<S: Clone + Send + Sync + 'static>(state: DriveState) -> Router<S> {
     let reads = Router::new()
         .route("/enumerate", get(get_enumerate))
         .route("/item", get(get_item))
@@ -31,15 +37,12 @@ pub fn router(app_state: AppState) -> Router<AppState> {
     let writes = Router::new()
         .route("/item", delete(delete_item).patch(patch_item))
         .route("/upload", post(post_upload))
-        .layer(middleware::from_fn_with_state(
-            app_state.clone(),
-            crate::takeout::import_gate::import_gate,
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            super::write_gate,
         ));
 
-    reads.merge(writes).layer(middleware::from_fn_with_state(
-        app_state,
-        device_token_auth_middleware,
-    ))
+    reads.merge(writes).with_state(state)
 }
 
 /// Query parameters for enumerate endpoint
@@ -53,15 +56,15 @@ pub struct EnumerateQuery {
 /// GET /integrations/documentprovider/enumerate
 /// GET /integrations/documentprovider/enumerate?parent_id={uuid}
 pub async fn get_enumerate(
-    State(app_state): State<AppState>,
+    State(state): State<DriveState>,
     Extension(user_id): Extension<i32>,
     Query(query): Query<EnumerateQuery>,
 ) -> Result<Json<DocumentProviderEnumerateResponse>, StatusCode> {
     // SIV keys from per-user session store
-    let session = app_state.get_session(user_id).await?;
+    let session = session_or_status(&state, user_id).await?;
 
     // Get db lock once for both operations
-    let db_lock = app_state
+    let db_lock = state
         .db_pool
         .get()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -117,15 +120,15 @@ pub struct ItemQuery {
 /// Single item metadata endpoint for Android DocumentProvider
 /// GET /integrations/documentprovider/item?id={uuid}
 pub async fn get_item(
-    State(app_state): State<AppState>,
+    State(state): State<DriveState>,
     Extension(user_id): Extension<i32>,
     Query(query): Query<ItemQuery>,
 ) -> Result<Json<DocumentProviderItem>, StatusCode> {
-    let session = app_state.get_session(user_id).await?;
+    let session = session_or_status(&state, user_id).await?;
 
     let inode_id = CustomUUID::from_str(&query.id).map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    let db_lock = app_state
+    let db_lock = state
         .db_pool
         .get()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -138,7 +141,7 @@ pub async fn get_item(
         &session.siv_nonce,
     )
     .map_err(|e| match e {
-        db::DatabaseError::NotFound => StatusCode::NOT_FOUND,
+        DatabaseError::NotFound => StatusCode::NOT_FOUND,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     })?;
 
@@ -149,23 +152,23 @@ pub async fn get_item(
 /// GET /integrations/documentprovider/download?id={uuid}
 /// Returns streaming file content
 pub async fn get_download(
-    State(app_state): State<AppState>,
+    State(state): State<DriveState>,
     Extension(user_id): Extension<i32>,
     Query(query): Query<ItemQuery>,
 ) -> Result<Response<Body>, StatusCode> {
-    let session = app_state.get_session(user_id).await?;
+    let session = session_or_status(&state, user_id).await?;
 
     let inode_id = CustomUUID::from_str(&query.id).map_err(|_| StatusCode::BAD_REQUEST)?;
 
     // Lightweight query - just path and type, no joins
     let (encrypted_path, item_type) = {
-        let db_lock = app_state
+        let db_lock = state
             .db_pool
             .get()
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         db::documentprovider::get_download_metadata(&db_lock, &inode_id, user_id).map_err(|e| {
             match e {
-                db::DatabaseError::NotFound => StatusCode::NOT_FOUND,
+                DatabaseError::NotFound => StatusCode::NOT_FOUND,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             }
         })?
@@ -181,12 +184,8 @@ pub async fn get_download(
         .rsplit('/')
         .next()
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-    let filename = crate::files::functions::decrypt_part(
-        encrypted_filename,
-        &session.siv_key,
-        &session.siv_nonce,
-    )
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let filename = decrypt_part(encrypted_filename, &session.siv_key, &session.siv_nonce)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Derive MIME type from filename
     let mime_type = mime_guess::from_path(&filename)
@@ -195,17 +194,12 @@ pub async fn get_download(
         .unwrap_or_else(|| "application/octet-stream".to_string());
 
     // Use shared file reconstruction logic (handles empty files internally)
-    let stream = crate::files::download::reconstruct_file_stream(
-        &app_state,
-        encrypted_path,
-        user_id,
-        &app_state.fragments_dir,
-    )
-    .await
-    .map_err(|e| {
-        tracing::error!("Error reconstructing file: {:?}", e);
-        StatusCode::from(e)
-    })?;
+    let stream = crate::download::reconstruct_file_stream(&state, encrypted_path, user_id)
+        .await
+        .map_err(|e| {
+            tracing::error!("Error reconstructing file: {:?}", e);
+            StatusCode::from(e)
+        })?;
 
     // Build streaming response
     Response::builder()
@@ -221,7 +215,7 @@ pub async fn get_download(
 /// Delete file or folder endpoint for Android DocumentProvider
 /// DELETE /integrations/documentprovider/item?id={uuid}
 pub async fn delete_item(
-    State(app_state): State<AppState>,
+    State(state): State<DriveState>,
     Extension(user_id): Extension<i32>,
     Query(query): Query<ItemQuery>,
 ) -> Result<StatusCode, StatusCode> {
@@ -229,7 +223,7 @@ pub async fn delete_item(
     let inode_id = CustomUUID::from_str(&query.id).map_err(|_| StatusCode::BAD_REQUEST)?;
 
     // Get db connection
-    let db_lock = app_state
+    let db_lock = state
         .db_pool
         .get()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -237,15 +231,15 @@ pub async fn delete_item(
     // Look up encrypted_path by inode_id
     let encrypted_path = db::documentprovider::get_path_by_inode_id(&db_lock, &inode_id, user_id)
         .map_err(|e| match e {
-        db::DatabaseError::NotFound => StatusCode::NOT_FOUND,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
-    })?;
+            DatabaseError::NotFound => StatusCode::NOT_FOUND,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        })?;
 
     // Drop db_lock before consensus (which may need the connection)
     drop(db_lock);
 
     // Build DeleteFilesPayload
-    let payload = crate::files::handlers::DeleteFilesPayload {
+    let payload = crate::envelopes::DeleteFilesPayload {
         encrypted_path,
         user_id,
     };
@@ -254,22 +248,19 @@ pub async fn delete_item(
     let encoded_payload = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // Create signed transaction
-    let transaction = crate::consensus::dispatch::create_signed_user_transaction(
-        &app_state,
-        "delete_files".to_string(),
-        encoded_payload,
-        user_id,
-    )
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    // Submit to consensus
-    app_state
-        .consensus_queue
-        .submit(transaction)
+    // Sign (host-side) and submit to consensus
+    state
+        .txs
+        .submit(TxSpec {
+            function: "delete_files",
+            payload: encoded_payload,
+            signer: TxSigner::User(user_id),
+        })
         .await
         .map_err(|e| {
+            if matches!(e, crate::host::TxSubmitError::Signing) {
+                return StatusCode::INTERNAL_SERVER_ERROR;
+            }
             tracing::error!("Failed to delete item via consensus: {:?}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
@@ -280,19 +271,19 @@ pub async fn delete_item(
 /// Rename or move file/folder endpoint for Android DocumentProvider
 /// PATCH /integrations/documentprovider/item
 pub async fn patch_item(
-    State(app_state): State<AppState>,
+    State(state): State<DriveState>,
     Extension(user_id): Extension<i32>,
     Json(request): Json<ModifyDocumentProviderRequest>,
 ) -> Result<Json<ModifyDocumentProviderResponse>, StatusCode> {
     tracing::debug!("patch_item: request={:?} user_id={}", request, user_id);
 
-    let session = app_state.get_session(user_id).await?;
+    let session = session_or_status(&state, user_id).await?;
 
     // Parse inode_id from request
     let inode_id = CustomUUID::from_str(&request.id).map_err(|_| StatusCode::BAD_REQUEST)?;
 
     // Get db connection
-    let db_lock = app_state
+    let db_lock = state
         .db_pool
         .get()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -306,7 +297,7 @@ pub async fn patch_item(
                 e
             );
             match e {
-                db::DatabaseError::NotFound => StatusCode::NOT_FOUND,
+                DatabaseError::NotFound => StatusCode::NOT_FOUND,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             }
         })?;
@@ -343,7 +334,7 @@ pub async fn patch_item(
                 .map_err(|e| {
                     tracing::debug!("patch_item: failed to get parent path: {:?}", e);
                     match e {
-                        db::DatabaseError::NotFound => StatusCode::NOT_FOUND,
+                        DatabaseError::NotFound => StatusCode::NOT_FOUND,
                         _ => StatusCode::INTERNAL_SERVER_ERROR,
                     }
                 })?
@@ -364,7 +355,7 @@ pub async fn patch_item(
     drop(db_lock);
 
     // Build ModifyItemPayload
-    let payload = crate::files::handlers::ModifyItemPayload {
+    let payload = crate::envelopes::ModifyItemPayload {
         user_id,
         inode_id: inode_id.clone(),
         new_encrypted_path: Some(new_encrypted_path),
@@ -376,22 +367,19 @@ pub async fn patch_item(
     let encoded_payload = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // Create signed transaction
-    let transaction = crate::consensus::dispatch::create_signed_user_transaction(
-        &app_state,
-        "modify_item".to_string(),
-        encoded_payload,
-        user_id,
-    )
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    // Submit to consensus
-    app_state
-        .consensus_queue
-        .submit(transaction)
+    // Sign (host-side) and submit to consensus
+    state
+        .txs
+        .submit(TxSpec {
+            function: "modify_item",
+            payload: encoded_payload,
+            signer: TxSigner::User(user_id),
+        })
         .await
         .map_err(|e| {
+            if matches!(e, crate::host::TxSubmitError::Signing) {
+                return StatusCode::INTERNAL_SERVER_ERROR;
+            }
             tracing::error!("Failed to modify item via consensus: {:?}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
@@ -406,13 +394,13 @@ pub async fn patch_item(
 /// Accepts multipart form with parent_item_identifier and file
 /// Returns CREATED on success - client should call enumerate to get item metadata
 pub async fn post_upload(
-    State(app_state): State<AppState>,
+    State(state): State<DriveState>,
     Extension(user_id): Extension<i32>,
     multipart: Multipart,
 ) -> Result<StatusCode, StatusCode> {
     // Forward to post_files which handles the multipart processing
     // The DocumentProvider uses parent_item_identifier format which post_files already supports
-    crate::files::routes::post_files(State(app_state), Extension(user_id), multipart).await?;
+    super::files::post_files(State(state), Extension(user_id), multipart).await?;
 
     Ok(StatusCode::CREATED)
 }

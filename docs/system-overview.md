@@ -54,7 +54,12 @@ apply functions inside consensus handlers.
       workers, batched placement commits) + fragment RPC serve half
 - [x] api::get + blob manifest reads + tier-1 repair (rebalancer re-enabled)
 - [ ] Photos ingress as projection #2 (post-merge; encryption for free)
-- [ ] hopnet-drive: extract the fs projection itself (next plan cycle)
+- [~] hopnet-drive: extract the fs projection itself — D1–D3 (schema unit,
+      model/paths/DB surface, handlers + GC provider) and D4 (HTTP/business
+      surface: files/shares/FileProvider/DocumentProvider routers + upload
+      and download flows behind the five host seams in `hopnet_drive::host`,
+      host adapter in `src/drive_host.rs`) complete; D5 (takeout/import
+      residuals) remaining
 
 Reed-Solomon encoded file storage with encryption, chunked encoding, and fragment management.
 

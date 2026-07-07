@@ -90,76 +90,9 @@ pub fn fragment_exists_and_valid(fragments_dir: &str, fragment_hash: &Blake3Hash
     hopnet_storage::fragstore::fragment_exists_and_valid(fragments_dir, fragment_hash)
 }
 
-/// Shared content-update preparation for both PATCH /files and FileProvider modify_item.
-/// Handles key generation, file processing, and share propagation.
-/// Returns (data_block_id, Option<BlobInsertOp> (None = content is now empty
-/// → inode data_id becomes NULL; RFC-014 B5), incoming_share_updates).
-/// The caller builds the ModifyItemPayload and submits.
-pub async fn prepare_content_update(
-    app_state: &AppState,
-    user_id: i32,
-    inode_id: &crate::db::CustomUUID,
-    field: axum::extract::multipart::Field<'_>,
-    file_size: usize,
-) -> Result<
-    (
-        crate::db::CustomUUID,
-        Option<hopnet_storage::store::BlobInsertOp>,
-        Option<Vec<crate::shares::types::IncomingShareUpdate>>,
-    ),
-    axum::http::StatusCode,
-> {
-    use axum::http::StatusCode;
-    use chacha20poly1305::{ChaCha20Poly1305, aead::KeyInit, aead::OsRng as CryptoOsRng};
-
-    let dataid = crate::db::CustomUUID::new(None);
-
-    // Empty content: no blob, no key, nothing to share — the inode's
-    // data_id becomes NULL and pending shares have nothing to re-wrap.
-    if file_size == 0 {
-        return Ok((dataid, None, None));
-    }
-
-    // Generate new per-file key and the modifier's wrap
-    let per_file_key = ChaCha20Poly1305::generate_key(&mut CryptoOsRng);
-    let file_access = crate::db::types::blob_access_for_user(
-        app_state.db_pool.get(),
-        dataid.clone(),
-        user_id,
-        &per_file_key,
-    )
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    // Process uploaded file through the substrate ingest
-    let mut blob_op = {
-        use tokio_stream::StreamExt;
-        use tokio_util::io::StreamReader;
-        let reader = StreamReader::new(field.map(|r| r.map_err(std::io::Error::other)));
-        super::routes::process_uploaded_file(
-            reader,
-            file_size,
-            dataid.clone(),
-            &per_file_key,
-            &app_state.fragments_dir,
-        )
-        .await?
-    };
-    let mut access = vec![file_access];
-
-    // Build share propagation
-    let conn = app_state
-        .db_pool
-        .get()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let (extra_file_access_entries, incoming_share_updates) =
-        super::routes::build_share_propagation(&conn, inode_id, user_id, &dataid, &per_file_key)?;
-    drop(conn);
-
-    access.extend(extra_file_access_entries);
-    blob_op.access = access;
-
-    Ok((dataid, Some(blob_op), incoming_share_updates))
-}
+// Drive-owned (RFC-015, Stage D4): shared content-update preparation
+// (`prepare_content_update`) lives in hopnet_drive::http::files alongside
+// its only callers (PATCH /files and FileProvider modify_item).
 
 // Fragment cipher primitives live in the substrate crate
 // (hopnet-storage::crypto, format-frozen with golden-vector tests).

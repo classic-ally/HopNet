@@ -1,20 +1,39 @@
 //! File/folder creation primitives shared between `post_files` and per-file
 //! callers (import pipeline). Built out incrementally in Phase 3.2.
+//!
+//! Moved from the host's `files::helpers` (RFC-015 Stage D4): DB access via
+//! the drive's pool, sessions via `SessionAccess`, and consensus submission
+//! via `TxGateway` (signing stays host-side).
 
 use axum::http::StatusCode;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::OsRng};
-use either::Either::{Left, Right};
 use rusqlite::Transaction as RusqliteTransaction;
-use std::collections::HashSet;
 use tokio::io::AsyncRead;
 
-use crate::AppState;
-use crate::auth::SessionEntry;
-use crate::consensus::types::Transaction;
-use crate::db::{Blake3Hash, CustomUUID, DatabaseError, Inode};
-use crate::files::functions::{encrypt_part, encrypt_path};
-use crate::files::routes::process_uploaded_file;
-use crate::files::types::SelfCheckFragments;
+use crate::host::{DriveState, SessionError, TxSigner, TxSpec, UserSession};
+use crate::http::files::process_uploaded_file;
+use crate::model::{Inode, InodeOwner};
+use crate::paths::{encrypt_part, encrypt_path};
+use hopnet_common::{Blake3Hash, CustomUUID};
+use hopnet_projection::DatabaseError;
+use hopnet_storage::SelfCheckFragments;
+
+/// Resolve the caller's session through the host seam, mapping to the same
+/// StatusCodes the host's `AppState::get_session` returned (401 expired,
+/// 428 missing).
+pub(crate) async fn session_or_status(
+    state: &DriveState,
+    user_id: i32,
+) -> Result<UserSession, StatusCode> {
+    state
+        .sessions
+        .user_session(user_id)
+        .await
+        .map_err(|e| match e {
+            SessionError::Unauthorized => StatusCode::UNAUTHORIZED,
+            SessionError::PreconditionRequired => StatusCode::PRECONDITION_REQUIRED,
+        })
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum AttestationError {
@@ -24,8 +43,6 @@ pub enum AttestationError {
     ConsensusHeight(DatabaseError),
     #[error("Serialization failed: {0}")]
     Serialize(#[from] bincode::error::EncodeError),
-    #[error("Signing failed: {0:?}")]
-    Sign(crate::consensus::dispatch::ConsensusError),
 }
 
 /// Find missing ancestors of `inodes` and prepend synthetic folder inodes
@@ -50,7 +67,7 @@ pub fn prepend_missing_parents(
         .into_iter()
         .map(|path| Inode {
             id: CustomUUID::new(None),
-            owner: crate::db::InodeOwner::Id(user_id),
+            owner: InodeOwner::Id(user_id),
             path,
             inode_type: hopnet_common::InodeType::Folder,
             data_id: None,
@@ -72,8 +89,8 @@ pub fn prepend_missing_parents(
 /// Returns the prepared `Inode` and the freshly minted `data_block_id`. The
 /// caller uses the id for downstream distribution scheduling.
 pub async fn assemble_file_inode<R: AsyncRead + Unpin>(
-    app_state: &AppState,
-    session: &SessionEntry,
+    state: &DriveState,
+    session: &UserSession,
     user_id: i32,
     encrypted_parent_path: &str,
     filename: &str,
@@ -92,7 +109,7 @@ pub async fn assemble_file_inode<R: AsyncRead + Unpin>(
     if file_size == 0 {
         let inode = Inode {
             id: CustomUUID::new(None),
-            owner: crate::db::InodeOwner::Id(user_id),
+            owner: InodeOwner::Id(user_id),
             path: encrypted_path,
             inode_type: hopnet_common::InodeType::File,
             data_id: None,
@@ -102,8 +119,8 @@ pub async fn assemble_file_inode<R: AsyncRead + Unpin>(
 
     let per_file_key = ChaCha20Poly1305::generate_key(&mut OsRng);
 
-    let file_access = crate::db::types::blob_access_for_user(
-        app_state.db_pool.get(),
+    let file_access = crate::db::users::blob_access_for_user(
+        state.db_pool.get(),
         dataid.clone(),
         user_id,
         &per_file_key,
@@ -115,14 +132,14 @@ pub async fn assemble_file_inode<R: AsyncRead + Unpin>(
         file_size,
         dataid.clone(),
         &per_file_key,
-        &app_state.fragments_dir,
+        &state.fragments_dir,
     )
     .await?;
     blob_op.access = vec![file_access];
 
     let inode = Inode {
         id: CustomUUID::new(None),
-        owner: crate::db::InodeOwner::Id(user_id),
+        owner: InodeOwner::Id(user_id),
         path: encrypted_path,
         inode_type: hopnet_common::InodeType::File,
         data_id: Some(dataid.clone()),
@@ -137,35 +154,34 @@ pub async fn assemble_file_inode<R: AsyncRead + Unpin>(
 /// site; pass `attestation = None` for folder-only batches or when the
 /// caller already short-circuited attestation building.
 pub async fn submit_inodes(
-    app_state: &AppState,
+    state: &DriveState,
     user_id: i32,
     blob_ops: Vec<hopnet_storage::store::BlobInsertOp>,
     inodes: Vec<Inode>,
-    attestation: Option<Transaction>,
+    attestation: Option<Vec<u8>>,
 ) -> Result<(), StatusCode> {
-    let payload = crate::files::handlers::DriveInsertPayload { blob_ops, inodes };
+    let payload = crate::envelopes::DriveInsertPayload { blob_ops, inodes };
     let encoded_inodes = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
         .map_err(|e| {
             tracing::error!("Bincode encoding error: {:?}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    let insert_files_tx = crate::consensus::dispatch::create_signed_user_transaction(
-        app_state,
-        "insert_files".to_string(),
-        encoded_inodes,
-        user_id,
-    )
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let mut transactions = vec![insert_files_tx];
-    if let Some(attestation_tx) = attestation {
+    let mut transactions = vec![TxSpec {
+        function: "insert_files",
+        payload: encoded_inodes,
+        signer: TxSigner::User(user_id),
+    }];
+    if let Some(attestation_payload) = attestation {
         tracing::debug!("Including fragment attestation in upload consensus batch");
-        transactions.push(attestation_tx);
+        transactions.push(TxSpec {
+            function: "self_check_fragments",
+            payload: attestation_payload,
+            signer: TxSigner::Node,
+        });
     }
 
-    let results = app_state.consensus_queue.submit_batch(transactions).await;
+    let results = state.txs.submit_batch(transactions).await;
     if results.iter().any(|r| r.is_err()) {
         tracing::error!("Failed to submit inodes to consensus");
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
@@ -187,19 +203,20 @@ fn extract_uploaded_fragment_hashes(
         .collect()
 }
 
-/// Build a `self_check_fragments` attestation for fragments freshly written
-/// during an upload. Filters against the node's current `fragment_inventory`
-/// so retries don't trigger PRIMARY KEY violations downstream. Returns `None`
-/// when there's nothing new to attest (folder-only batch or full duplicate).
+/// Build a `self_check_fragments` attestation PAYLOAD for fragments freshly
+/// written during an upload. Filters against the node's current
+/// `fragment_inventory` so retries don't trigger PRIMARY KEY violations
+/// downstream. Returns `None` when there's nothing new to attest
+/// (folder-only batch or full duplicate). The caller wraps the payload in a
+/// node-signed `TxSpec` — signing itself stays host-side (TxGateway).
 ///
 /// Caller threads `tx` so DB lifespan is visible at the call site. The tx is
 /// read-only; caller is responsible for rolling it back (or letting it drop).
 pub(crate) fn build_upload_attestation(
-    app_state: &AppState,
     tx: &RusqliteTransaction,
     node_id: i32,
     blob_ops: &[hopnet_storage::store::BlobInsertOp],
-) -> Result<Option<Transaction>, AttestationError> {
+) -> Result<Option<Vec<u8>>, AttestationError> {
     let uploaded_fragments = extract_uploaded_fragment_hashes(blob_ops);
     if uploaded_fragments.is_empty() {
         tracing::debug!("No fragments to attest (empty upload or folder-only)");
@@ -219,8 +236,8 @@ pub(crate) fn build_upload_attestation(
         return Ok(None);
     }
 
-    let self_verified_height = crate::db::consensus::get_current_consensus_height(tx)
-        .map_err(AttestationError::ConsensusHeight)?;
+    let self_verified_height =
+        crate::db::current_height(tx).map_err(AttestationError::ConsensusHeight)?;
 
     let attestation = SelfCheckFragments {
         node_id,
@@ -232,13 +249,6 @@ pub(crate) fn build_upload_attestation(
 
     let payload = bincode::serde::encode_to_vec(&attestation, bincode::config::standard())?;
 
-    let transaction = crate::consensus::dispatch::create_signed_transaction(
-        app_state,
-        "self_check_fragments".to_string(),
-        payload,
-    )
-    .map_err(AttestationError::Sign)?;
-
     tracing::info!(
         "Built upload attestation: {} new fragments (filtered {} existing), previous_count={}, height={}",
         new_fragments.len(),
@@ -247,7 +257,7 @@ pub(crate) fn build_upload_attestation(
         attestation.self_verified_height
     );
 
-    Ok(Some(transaction))
+    Ok(Some(payload))
 }
 
 /// Top-level per-file submitter. Encrypts parent path, assembles the file
@@ -261,14 +271,14 @@ pub(crate) fn build_upload_attestation(
 ///
 /// Returns the freshly minted `data_block_id`.
 pub async fn create_file_with_fragments<R: AsyncRead + Unpin>(
-    app_state: &AppState,
+    state: &DriveState,
     user_id: i32,
     plaintext_parent_path: &str,
     filename: &str,
     source: R,
     file_size: usize,
 ) -> Result<CustomUUID, StatusCode> {
-    let session = app_state.get_session(user_id).await?;
+    let session = session_or_status(state, user_id).await?;
     let encrypted_parent = encrypt_path(
         plaintext_parent_path.to_string(),
         &session.siv_key,
@@ -278,7 +288,7 @@ pub async fn create_file_with_fragments<R: AsyncRead + Unpin>(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let (inode, dataid, blob_op) = assemble_file_inode(
-        app_state,
+        state,
         &session,
         user_id,
         &encrypted_parent,
@@ -293,7 +303,7 @@ pub async fn create_file_with_fragments<R: AsyncRead + Unpin>(
     let mut inodes = vec![inode];
 
     {
-        let conn = app_state
+        let conn = state
             .db_pool
             .get()
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -303,15 +313,15 @@ pub async fn create_file_with_fragments<R: AsyncRead + Unpin>(
         prepend_missing_parents(&tx, &mut inodes, user_id)?;
     }
 
-    let attestation = if let Ok(node_id) = app_state.get_node_id() {
-        let conn = app_state
+    let attestation = if let Some(node_id) = state.node_id() {
+        let conn = state
             .db_pool
             .get()
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         let tx = conn
             .unchecked_transaction()
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        match build_upload_attestation(app_state, &tx, node_id, &blob_ops) {
+        match build_upload_attestation(&tx, node_id, &blob_ops) {
             Ok(opt) => opt,
             Err(e) => {
                 tracing::warn!(
@@ -325,7 +335,7 @@ pub async fn create_file_with_fragments<R: AsyncRead + Unpin>(
         None
     };
 
-    submit_inodes(app_state, user_id, blob_ops, inodes, attestation).await?;
+    submit_inodes(state, user_id, blob_ops, inodes, attestation).await?;
     Ok(dataid)
 }
 
@@ -333,11 +343,11 @@ pub async fn create_file_with_fragments<R: AsyncRead + Unpin>(
 /// parent backfill, and submits via consensus. No fragments → no
 /// attestation, no distribution.
 pub async fn create_folder(
-    app_state: &AppState,
+    state: &DriveState,
     user_id: i32,
     plaintext_path: &str,
 ) -> Result<(), StatusCode> {
-    let session = app_state.get_session(user_id).await?;
+    let session = session_or_status(state, user_id).await?;
     let encrypted_path = encrypt_path(
         plaintext_path.to_string(),
         &session.siv_key,
@@ -348,7 +358,7 @@ pub async fn create_folder(
 
     let folder_inode = Inode {
         id: CustomUUID::new(None),
-        owner: crate::db::InodeOwner::Id(user_id),
+        owner: InodeOwner::Id(user_id),
         path: encrypted_path,
         inode_type: hopnet_common::InodeType::Folder,
         data_id: None,
@@ -357,7 +367,7 @@ pub async fn create_folder(
     let mut inodes = vec![folder_inode];
 
     {
-        let conn = app_state
+        let conn = state
             .db_pool
             .get()
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -367,5 +377,5 @@ pub async fn create_folder(
         prepend_missing_parents(&tx, &mut inodes, user_id)?;
     }
 
-    submit_inodes(app_state, user_id, Vec::new(), inodes, None).await
+    submit_inodes(state, user_id, Vec::new(), inodes, None).await
 }

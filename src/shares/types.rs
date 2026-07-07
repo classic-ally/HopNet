@@ -1,9 +1,4 @@
 use crate::db::types::XPubKey;
-use chacha20poly1305::{
-    ChaCha20Poly1305,
-    aead::{Aead, KeyInit, OsRng},
-};
-use x25519_dalek::PublicKey as X25519PublicKey;
 
 // --- Consensus payload structs ---
 
@@ -28,79 +23,27 @@ pub use hopnet_common::shares::{
 
 // --- Display name crypto ---
 
-/// Encrypt a display name for a specific recipient using ECDH + Blake3 KDF + ChaCha20-Poly1305.
-/// Returns (ephemeral_pubkey_bytes, ciphertext).
+/// Drive-owned (RFC-015, Stage D4): the display-name crypto moved with the
+/// shares routes to hopnet_drive::http::shares; thin delegation here keeps
+/// the XPubKey-typed signature and unit tests stable.
 pub fn encrypt_display_name(
     plaintext: &str,
     recipient_x25519_pubkey: &XPubKey,
 ) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
-    let ephemeral_secret = x25519_dalek::EphemeralSecret::random_from_rng(OsRng);
-    let ephemeral_public = X25519PublicKey::from(&ephemeral_secret);
-
-    let shared_secret = ephemeral_secret.diffie_hellman(recipient_x25519_pubkey.as_x25519());
-
-    // Derive wrapping key
-    let mut wrap_key_bytes = [0u8; 32];
-    let mut hasher = blake3::Hasher::new_derive_key("hopnet display_name_wrap");
-    hasher.update(shared_secret.as_bytes());
-    hasher.finalize_xof().fill(&mut wrap_key_bytes);
-    let key = chacha20poly1305::Key::from(wrap_key_bytes);
-
-    // Derive nonce from ephemeral pubkey
-    let mut nonce_bytes = [0u8; 12];
-    let mut nonce_hasher = blake3::Hasher::new_derive_key("hopnet display_name_nonce");
-    nonce_hasher.update(ephemeral_public.as_bytes());
-    nonce_hasher.finalize_xof().fill(&mut nonce_bytes);
-    let nonce = chacha20poly1305::Nonce::from(nonce_bytes);
-
-    let cipher = ChaCha20Poly1305::new(&key);
-    let ciphertext = cipher
-        .encrypt(&nonce, plaintext.as_bytes())
-        .map_err(|e| format!("Display name encryption failed: {:?}", e))?;
-
-    Ok((ephemeral_public.as_bytes().to_vec(), ciphertext))
+    hopnet_drive::http::shares::encrypt_display_name(
+        plaintext,
+        recipient_x25519_pubkey.as_x25519(),
+    )
 }
 
 /// Decrypt a display name using the recipient's X25519 private key.
-pub fn decrypt_display_name(
-    ephemeral_pubkey_bytes: &[u8],
-    ciphertext: &[u8],
-    recipient_x25519_privkey: &x25519_dalek::StaticSecret,
-) -> Result<String, Box<dyn std::error::Error>> {
-    if ephemeral_pubkey_bytes.len() != 32 {
-        return Err("Invalid ephemeral pubkey length".into());
-    }
-
-    let mut pubkey_arr = [0u8; 32];
-    pubkey_arr.copy_from_slice(ephemeral_pubkey_bytes);
-    let ephemeral_pubkey = X25519PublicKey::from(pubkey_arr);
-
-    let shared_secret = recipient_x25519_privkey.diffie_hellman(&ephemeral_pubkey);
-
-    let mut wrap_key_bytes = [0u8; 32];
-    let mut hasher = blake3::Hasher::new_derive_key("hopnet display_name_wrap");
-    hasher.update(shared_secret.as_bytes());
-    hasher.finalize_xof().fill(&mut wrap_key_bytes);
-    let key = chacha20poly1305::Key::from(wrap_key_bytes);
-
-    let mut nonce_bytes = [0u8; 12];
-    let mut nonce_hasher = blake3::Hasher::new_derive_key("hopnet display_name_nonce");
-    nonce_hasher.update(ephemeral_pubkey.as_bytes());
-    nonce_hasher.finalize_xof().fill(&mut nonce_bytes);
-    let nonce = chacha20poly1305::Nonce::from(nonce_bytes);
-
-    let cipher = ChaCha20Poly1305::new(&key);
-    let plaintext = cipher
-        .decrypt(&nonce, ciphertext)
-        .map_err(|e| format!("Display name decryption failed: {:?}", e))?;
-
-    String::from_utf8(plaintext).map_err(|e| e.into())
-}
+pub use hopnet_drive::http::shares::decrypt_display_name;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use chacha20poly1305::aead::OsRng;
+    use x25519_dalek::PublicKey as X25519PublicKey;
 
     #[test]
     fn test_display_name_encrypt_decrypt_round_trip() {

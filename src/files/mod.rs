@@ -1,10 +1,11 @@
 use crate::AppState;
 use crate::db::files as db;
 
-pub mod download;
+// Drive-owned (RFC-015, Stage D4): download/upload flows live in
+// hopnet_drive::{download, upload}; the drive routers in
+// hopnet_drive::http. Only maintenance/storage surfaces remain here.
 pub mod functions;
 pub mod handlers;
-pub mod helpers;
 pub mod jobs;
 pub mod placement;
 // Drive-owned (RFC-015, Stage D3): FilesystemReferenceProvider lives in

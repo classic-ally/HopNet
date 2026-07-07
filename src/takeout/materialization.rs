@@ -1,6 +1,9 @@
 use crate::db::{CustomUUID, takeout::MaterializationStatus};
-use crate::files::download::{FileReconstructionError, reconstruct_file_stream};
 use crate::types::Blake3Hash;
+// Drive-owned (RFC-015, Stage D4): reconstruction lives in
+// hopnet_drive::download behind a DriveState the host builds on the fly
+// (cheap Arc clones — see drive_host::drive_state).
+use hopnet_drive::download::{FileReconstructionError, reconstruct_file_stream};
 
 /// Materialize a single file by reconstructing from fragments and writing to staging.
 /// Returns (file_id, status, optional_error_message, manifest_hash) for database
@@ -63,10 +66,9 @@ pub async fn materialize_single_file(
 
     // Use shared file reconstruction logic
     // Get streaming reconstruction (memory-efficient for large files)
+    let drive = crate::drive_host::drive_state(app_state);
     let mut stream =
-        match reconstruct_file_stream(app_state, encrypted_path.clone(), user_id, fragments_dir)
-            .await
-        {
+        match reconstruct_file_stream(&drive, encrypted_path.clone(), user_id).await {
             Ok(stream) => stream,
             Err(e) => {
                 tracing::error!(

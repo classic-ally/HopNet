@@ -523,9 +523,10 @@ pub(crate) async fn run_creation_phase(
     //    slash; a bare "alpha" would collapse to "/" (root placeholder) and
     //    silently misroute the inode.
     let folder_paths = read_pending_paths(state, import_id, InodeType::Folder)?;
+    let drive = crate::drive_host::drive_state(state);
     for path in &folder_paths {
         let absolute = format!("/{}", path.trim_start_matches('/'));
-        match crate::files::helpers::create_folder(state, user_id, &absolute).await {
+        match hopnet_drive::upload::create_folder(&drive, user_id, &absolute).await {
             Ok(()) => mark_imported(state, import_id, path)?,
             Err(status) => {
                 tracing::warn!(
@@ -677,8 +678,13 @@ async fn create_one_file(
         None => unreachable!("absolute path always contains '/'"),
     };
 
-    crate::files::helpers::create_file_with_fragments(
-        state, user_id, &parent, &filename, source, file_size,
+    hopnet_drive::upload::create_file_with_fragments(
+        &crate::drive_host::drive_state(state),
+        user_id,
+        &parent,
+        &filename,
+        source,
+        file_size,
     )
     .await
     .map(|_data_block_id| ())

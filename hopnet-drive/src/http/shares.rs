@@ -1,9 +1,8 @@
-use super::types::*;
-use crate::AppState;
-use crate::consensus::queue::ConsensusSubmitError;
-use crate::db::CustomUUID;
-use crate::db::DatabaseError;
-use crate::db::types::BlobAccess;
+//! /shares routes — sharing surface (create/accept/decline/unshare + reads).
+//! Moved from the host's `shares::routes` (RFC-015 Stage D4), including the
+//! display-name crypto it used locally (the host re-exports it at the old
+//! path for its unit tests).
+
 use axum::{
     Router,
     extract::{Extension, Json, Path, State},
@@ -11,19 +10,26 @@ use axum::{
     response::IntoResponse,
     routing::{delete, get, post},
 };
+use chacha20poly1305::{
+    ChaCha20Poly1305,
+    aead::{Aead, KeyInit, OsRng},
+};
 use std::str::FromStr;
+use x25519_dalek::PublicKey as X25519PublicKey;
 
-fn database_error_to_status(e: DatabaseError) -> StatusCode {
-    match e {
-        DatabaseError::ConflictError => StatusCode::CONFLICT,
-        DatabaseError::NotFound => StatusCode::NOT_FOUND,
-        DatabaseError::AuthorizationError => StatusCode::FORBIDDEN,
-        DatabaseError::InvalidPayload => StatusCode::BAD_REQUEST,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
-    }
-}
+use crate::db;
+use crate::envelopes::{
+    AcceptSharePayload, DeclineSharePayload, ShareFilePayload, UnsharePayload,
+};
+use crate::host::{DriveState, TxSigner, TxSpec, TxSubmitError};
+use crate::paths::{decrypt_part, encrypt_path};
+use hopnet_common::CustomUUID;
+use hopnet_common::shares::{
+    AcceptShareRequest, IncomingShareResponse, ShareCountResponse, ShareDetailResponse,
+    ShareParticipant, ShareRequest,
+};
 
-pub fn router(state: AppState) -> Router<AppState> {
+pub fn router<S: Clone + Send + Sync + 'static>(state: DriveState) -> Router<S> {
     let reads = Router::new()
         .route("/incoming", get(get_incoming_shares))
         .route("/incoming/count", get(get_incoming_share_count))
@@ -35,16 +41,87 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/{id}/accept", post(post_accept_share))
         .route("/file/{inode_id}", delete(delete_unshare))
         .layer(axum::middleware::from_fn_with_state(
-            state,
-            crate::takeout::import_gate::import_gate,
+            state.clone(),
+            super::write_gate,
         ));
 
-    reads.merge(writes)
+    reads.merge(writes).with_state(state)
+}
+
+// --- Display name crypto ---
+
+/// Encrypt a display name for a specific recipient using ECDH + Blake3 KDF + ChaCha20-Poly1305.
+/// Returns (ephemeral_pubkey_bytes, ciphertext).
+pub fn encrypt_display_name(
+    plaintext: &str,
+    recipient_x25519_pubkey: &X25519PublicKey,
+) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
+    let ephemeral_secret = x25519_dalek::EphemeralSecret::random_from_rng(OsRng);
+    let ephemeral_public = X25519PublicKey::from(&ephemeral_secret);
+
+    let shared_secret = ephemeral_secret.diffie_hellman(recipient_x25519_pubkey);
+
+    // Derive wrapping key
+    let mut wrap_key_bytes = [0u8; 32];
+    let mut hasher = blake3::Hasher::new_derive_key("hopnet display_name_wrap");
+    hasher.update(shared_secret.as_bytes());
+    hasher.finalize_xof().fill(&mut wrap_key_bytes);
+    let key = chacha20poly1305::Key::from(wrap_key_bytes);
+
+    // Derive nonce from ephemeral pubkey
+    let mut nonce_bytes = [0u8; 12];
+    let mut nonce_hasher = blake3::Hasher::new_derive_key("hopnet display_name_nonce");
+    nonce_hasher.update(ephemeral_public.as_bytes());
+    nonce_hasher.finalize_xof().fill(&mut nonce_bytes);
+    let nonce = chacha20poly1305::Nonce::from(nonce_bytes);
+
+    let cipher = ChaCha20Poly1305::new(&key);
+    let ciphertext = cipher
+        .encrypt(&nonce, plaintext.as_bytes())
+        .map_err(|e| format!("Display name encryption failed: {:?}", e))?;
+
+    Ok((ephemeral_public.as_bytes().to_vec(), ciphertext))
+}
+
+/// Decrypt a display name using the recipient's X25519 private key.
+pub fn decrypt_display_name(
+    ephemeral_pubkey_bytes: &[u8],
+    ciphertext: &[u8],
+    recipient_x25519_privkey: &x25519_dalek::StaticSecret,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if ephemeral_pubkey_bytes.len() != 32 {
+        return Err("Invalid ephemeral pubkey length".into());
+    }
+
+    let mut pubkey_arr = [0u8; 32];
+    pubkey_arr.copy_from_slice(ephemeral_pubkey_bytes);
+    let ephemeral_pubkey = X25519PublicKey::from(pubkey_arr);
+
+    let shared_secret = recipient_x25519_privkey.diffie_hellman(&ephemeral_pubkey);
+
+    let mut wrap_key_bytes = [0u8; 32];
+    let mut hasher = blake3::Hasher::new_derive_key("hopnet display_name_wrap");
+    hasher.update(shared_secret.as_bytes());
+    hasher.finalize_xof().fill(&mut wrap_key_bytes);
+    let key = chacha20poly1305::Key::from(wrap_key_bytes);
+
+    let mut nonce_bytes = [0u8; 12];
+    let mut nonce_hasher = blake3::Hasher::new_derive_key("hopnet display_name_nonce");
+    nonce_hasher.update(ephemeral_pubkey.as_bytes());
+    nonce_hasher.finalize_xof().fill(&mut nonce_bytes);
+    let nonce = chacha20poly1305::Nonce::from(nonce_bytes);
+
+    let cipher = ChaCha20Poly1305::new(&key);
+    let plaintext = cipher
+        .decrypt(&nonce, ciphertext)
+        .map_err(|e| format!("Display name decryption failed: {:?}", e))?;
+
+    String::from_utf8(plaintext).map_err(|e| e.into())
 }
 
 /// POST /shares — share a file with another user
 pub async fn post_share(
-    State(app_state): State<AppState>,
+    State(state): State<DriveState>,
     Extension(user_id): Extension<i32>,
     Json(payload): Json<ShareRequest>,
 ) -> impl IntoResponse {
@@ -54,34 +131,32 @@ pub async fn post_share(
     };
 
     // Get sender's session
-    let session = match app_state.get_session(user_id).await {
+    let session = match state.sessions.user_session(user_id).await {
         Ok(s) => s,
         Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
     };
 
-    // Look up recipient by username
-    let recipient = match crate::db::users::get_user_by_username(
-        app_state.db_pool.get(),
-        payload.recipient_username.clone(),
-    ) {
-        Ok(Some(u)) => u,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+    // Get a single connection for the remaining lookups
+    let conn = match state.db_pool.get() {
+        Ok(c) => c,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
+
+    // Look up recipient by username
+    let recipient =
+        match db::users::get_recipient_by_username(&conn, &payload.recipient_username) {
+            Ok(Some(u)) => u,
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
 
     // Self-share check
     if recipient.user_id == user_id {
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    // Get a single connection for the remaining lookups
-    let conn = match app_state.db_pool.get() {
-        Ok(c) => c,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-
     // Look up sender's inode → data_block_id + encrypted_path
-    let inode_info = match crate::db::files::get_inode_by_id(&conn, &inode_id, user_id) {
+    let inode_info = match db::files::get_inode_by_id(&conn, &inode_id, user_id) {
         Ok(Some(info)) => info,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -93,24 +168,23 @@ pub async fn post_share(
     };
 
     // Get sender's FileAccess → decrypt per-file key
-    let file_access_entry = match crate::db::files::get_file_access(&conn, &data_block_id, user_id)
-    {
+    let file_access_entry = match db::files::get_file_access(&conn, &data_block_id, user_id) {
         Ok(Some(fa)) => fa,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
-    let x25519_privkey =
-        crate::auth::derive_x25519_privkey_from_user(&session.user_keys.private_key);
-    let per_file_key =
-        match crate::auth::decrypt_wrapped_file_key(&file_access_entry, &x25519_privkey) {
-            Ok(key) => key,
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        };
+    let per_file_key = match hopnet_storage::crypto::unwrap_blob_key(
+        &file_access_entry,
+        &hopnet_storage::crypto::StaticRecipient(session.x25519_privkey.clone()),
+    ) {
+        Ok(key) => key,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
 
     // Create FileAccess for recipient
-    let recipient_file_access = match crate::db::types::blob_access_for_user(
-        app_state.db_pool.get(),
+    let recipient_file_access = match db::users::blob_access_for_user(
+        state.db_pool.get(),
         data_block_id.clone(),
         recipient.user_id,
         &per_file_key,
@@ -121,11 +195,7 @@ pub async fn post_share(
 
     // Extract filename: decrypt last path segment
     let last_segment = encrypted_path.rsplit('/').next().unwrap_or("");
-    let filename = match crate::files::functions::decrypt_part(
-        last_segment,
-        &session.siv_key,
-        &session.siv_nonce,
-    ) {
+    let filename = match decrypt_part(last_segment, &session.siv_key, &session.siv_nonce) {
         Ok(name) => name,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
@@ -160,21 +230,17 @@ pub async fn post_share(
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
-    let transaction = match crate::consensus::dispatch::create_signed_user_transaction(
-        &app_state,
-        "share_file".to_string(),
-        encoded,
-        user_id,
-    )
-    .await
+    match state
+        .txs
+        .submit(TxSpec {
+            function: "share_file",
+            payload: encoded,
+            signer: TxSigner::User(user_id),
+        })
+        .await
     {
-        Ok(tx) => tx,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-
-    match app_state.consensus_queue.submit(transaction).await {
         Ok(()) => StatusCode::OK.into_response(),
-        Err(ConsensusSubmitError::Rejected(r)) => {
+        Err(TxSubmitError::Rejected(r)) => {
             tracing::warn!("Share rejected: {}", r);
             StatusCode::CONFLICT.into_response()
         }
@@ -184,29 +250,25 @@ pub async fn post_share(
 
 /// GET /shares/incoming — list pending incoming shares
 pub async fn get_incoming_shares(
-    State(app_state): State<AppState>,
+    State(state): State<DriveState>,
     Extension(user_id): Extension<i32>,
 ) -> impl IntoResponse {
-    let session = match app_state.get_session(user_id).await {
+    let session = match state.sessions.user_session(user_id).await {
         Ok(s) => s,
         Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
     };
 
-    let x25519_privkey =
-        crate::auth::derive_x25519_privkey_from_user(&session.user_keys.private_key);
-
-    let shares =
-        match crate::db::shares::get_incoming_shares_for_user(app_state.db_pool.get(), user_id) {
-            Ok(s) => s,
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        };
+    let shares = match db::shares::get_incoming_shares_for_user(state.db_pool.get(), user_id) {
+        Ok(s) => s,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
 
     let mut response = Vec::new();
     for (share, sender_username) in shares {
         let display_name = match decrypt_display_name(
             &share.display_ephemeral_pubkey,
             &share.encrypted_display_name,
-            &x25519_privkey,
+            &session.x25519_privkey,
         ) {
             Ok(name) => name,
             Err(_) => continue,
@@ -231,10 +293,10 @@ pub async fn get_incoming_shares(
 
 /// GET /shares/incoming/count — badge count for pending shares
 pub async fn get_incoming_share_count(
-    State(app_state): State<AppState>,
+    State(state): State<DriveState>,
     Extension(user_id): Extension<i32>,
 ) -> impl IntoResponse {
-    match crate::db::shares::get_incoming_share_count(app_state.db_pool.get(), user_id) {
+    match db::shares::get_incoming_share_count(state.db_pool.get(), user_id) {
         Ok(count) => (StatusCode::OK, Json(ShareCountResponse { count })).into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -242,7 +304,7 @@ pub async fn get_incoming_share_count(
 
 /// POST /shares/{id}/accept — accept a pending share and place in filesystem
 pub async fn post_accept_share(
-    State(app_state): State<AppState>,
+    State(state): State<DriveState>,
     Extension(user_id): Extension<i32>,
     Path(share_id): Path<String>,
     Json(payload): Json<AcceptShareRequest>,
@@ -252,13 +314,13 @@ pub async fn post_accept_share(
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
 
-    let session = match app_state.get_session(user_id).await {
+    let session = match state.sessions.user_session(user_id).await {
         Ok(s) => s,
         Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
     };
 
     // Encrypt placement path with recipient's SIV key
-    let encrypted_path = match crate::files::functions::encrypt_path(
+    let encrypted_path = match encrypt_path(
         payload.placement_path,
         &session.siv_key,
         &session.siv_nonce,
@@ -270,7 +332,7 @@ pub async fn post_accept_share(
     };
 
     let parent_folder_inodes: Vec<(CustomUUID, String)> = {
-        let conn = match app_state.db_pool.get() {
+        let conn = match state.db_pool.get() {
             Ok(c) => c,
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         };
@@ -278,8 +340,7 @@ pub async fn post_accept_share(
             Ok(t) => t,
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         };
-        let missing = match crate::db::files::find_missing_parents(&tx, &[encrypted_path.as_str()])
-        {
+        let missing = match db::files::find_missing_parents(&tx, &[encrypted_path.as_str()]) {
             Ok(m) => m,
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         };
@@ -303,21 +364,17 @@ pub async fn post_accept_share(
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
-    let transaction = match crate::consensus::dispatch::create_signed_user_transaction(
-        &app_state,
-        "accept_share".to_string(),
-        encoded,
-        user_id,
-    )
-    .await
+    match state
+        .txs
+        .submit(TxSpec {
+            function: "accept_share",
+            payload: encoded,
+            signer: TxSigner::User(user_id),
+        })
+        .await
     {
-        Ok(tx) => tx,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-
-    match app_state.consensus_queue.submit(transaction).await {
         Ok(()) => StatusCode::OK.into_response(),
-        Err(ConsensusSubmitError::Rejected(r)) => {
+        Err(TxSubmitError::Rejected(r)) => {
             tracing::warn!("Accept share rejected: {}", r);
             StatusCode::CONFLICT.into_response()
         }
@@ -327,7 +384,7 @@ pub async fn post_accept_share(
 
 /// DELETE /shares/incoming/{id} — decline or cancel a pending share
 pub async fn delete_incoming_share(
-    State(app_state): State<AppState>,
+    State(state): State<DriveState>,
     Extension(user_id): Extension<i32>,
     Path(share_id): Path<String>,
 ) -> impl IntoResponse {
@@ -347,21 +404,17 @@ pub async fn delete_incoming_share(
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
-    let transaction = match crate::consensus::dispatch::create_signed_user_transaction(
-        &app_state,
-        "decline_share".to_string(),
-        encoded,
-        user_id,
-    )
-    .await
+    match state
+        .txs
+        .submit(TxSpec {
+            function: "decline_share",
+            payload: encoded,
+            signer: TxSigner::User(user_id),
+        })
+        .await
     {
-        Ok(tx) => tx,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-
-    match app_state.consensus_queue.submit(transaction).await {
         Ok(()) => StatusCode::OK.into_response(),
-        Err(ConsensusSubmitError::Rejected(r)) => {
+        Err(TxSubmitError::Rejected(r)) => {
             tracing::warn!("Decline share rejected: {}", r);
             StatusCode::CONFLICT.into_response()
         }
@@ -371,7 +424,7 @@ pub async fn delete_incoming_share(
 
 /// GET /shares/file/{inode_id} — sharing details for a file
 pub async fn get_share_details(
-    State(app_state): State<AppState>,
+    State(state): State<DriveState>,
     Extension(user_id): Extension<i32>,
     Path(inode_id): Path<String>,
 ) -> impl IntoResponse {
@@ -380,13 +433,13 @@ pub async fn get_share_details(
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
 
-    let conn = match app_state.db_pool.get() {
+    let conn = match state.db_pool.get() {
         Ok(c) => c,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
     // Look up inode to get data_block_id (verify caller owns it)
-    let inode_info = match crate::db::files::get_inode_by_id(&conn, &inode_uuid, user_id) {
+    let inode_info = match db::files::get_inode_by_id(&conn, &inode_uuid, user_id) {
         Ok(Some(info)) => info,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -399,11 +452,10 @@ pub async fn get_share_details(
         }
     };
 
-    let members =
-        match crate::db::shares::get_share_details(app_state.db_pool.get(), &data_block_id) {
-            Ok(m) => m,
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        };
+    let members = match db::shares::get_share_details(state.db_pool.get(), &data_block_id) {
+        Ok(m) => m,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
 
     let users: Vec<ShareParticipant> = members
         .into_iter()
@@ -419,7 +471,7 @@ pub async fn get_share_details(
 
 /// DELETE /shares/file/{inode_id} — unshare (remove self from a shared file, keep current version)
 pub async fn delete_unshare(
-    State(app_state): State<AppState>,
+    State(state): State<DriveState>,
     Extension(user_id): Extension<i32>,
     Path(inode_id): Path<String>,
 ) -> impl IntoResponse {
@@ -439,21 +491,17 @@ pub async fn delete_unshare(
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
-    let transaction = match crate::consensus::dispatch::create_signed_user_transaction(
-        &app_state,
-        "unshare".to_string(),
-        encoded,
-        user_id,
-    )
-    .await
+    match state
+        .txs
+        .submit(TxSpec {
+            function: "unshare",
+            payload: encoded,
+            signer: TxSigner::User(user_id),
+        })
+        .await
     {
-        Ok(tx) => tx,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-
-    match app_state.consensus_queue.submit(transaction).await {
         Ok(()) => StatusCode::OK.into_response(),
-        Err(ConsensusSubmitError::Rejected(r)) => {
+        Err(TxSubmitError::Rejected(r)) => {
             tracing::warn!("Unshare rejected: {}", r);
             StatusCode::CONFLICT.into_response()
         }

@@ -4,7 +4,7 @@ use axum::{
     extract::DefaultBodyLimit,
     http::{HeaderValue, Method, StatusCode},
     middleware,
-    routing::{delete, get, patch, post},
+    routing::{get, post},
     serve,
 };
 use include_dir::{Dir, include_dir};
@@ -426,12 +426,16 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            // Drive host seams (RFC-015 Stage D4): one adapter behind the
+            // drive's routers; built once here, cloned into each nest.
+            let drive_state = drive_host::drive_state(&app_state);
+
             // Protected routes that require authentication
             let protected_routes = Router::new()
                 .nest("/users", users::routes::router())
                 .route("/nodes", get(nodes::routes::get_nodes))
                 .route("/nodes", post(nodes::routes::post_nodes))
-                .nest("/files", files::routes::router(app_state.clone()))
+                .nest("/files", hopnet_drive::http::files::router(drive_state.clone()))
                 .route("/fragments", get(files::routes::get_fragments_count))
                 .route(
                     "/maintenance/cleanup-orphaned",
@@ -480,7 +484,10 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .nest("/takeout", takeout::takeout_routes())
                 .nest("/admin", admin::routes::admin_routes())
-                .nest("/shares", shares::routes::router(app_state.clone()))
+                .nest(
+                    "/shares",
+                    hopnet_drive::http::shares::router(drive_state.clone()),
+                )
                 .route("/logout", post(auth::sign_out))
                 .layer(middleware::from_fn_with_state(
                     app_state.clone(),
@@ -505,31 +512,17 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                     consensus::routes::jwt_or_rpc_auth_middleware,
                 ));
 
-            // FileProvider routes with device token authentication. Reads bypass
-            // the import gate; writes have the gate applied via a sub-router so
-            // attachment is explicit (no in-middleware method peek).
-            let fileprovider_reads = Router::new()
-                .route("/enumerate", get(fileprovider::routes::get_enumerate))
-                .route("/changes", get(fileprovider::routes::get_changes))
-                .route("/download", get(fileprovider::routes::download_file))
-                .route("/item", get(fileprovider::routes::get_item));
-
-            let fileprovider_writes = Router::new()
-                .route("/delete", delete(fileprovider::routes::delete_item))
-                .route("/create", post(fileprovider::routes::create_item))
-                .route("/modify", patch(fileprovider::routes::modify_item))
-                .layer(middleware::from_fn_with_state(
-                    app_state.clone(),
-                    takeout::import_gate::import_gate,
-                ));
-
-            let fileprovider_routes = fileprovider_reads
-                .merge(fileprovider_writes)
-                .layer(DefaultBodyLimit::max(5000 * 1_000_000)) // 5GB limit for file uploads
-                .layer(middleware::from_fn_with_state(
-                    app_state.clone(),
-                    devices::auth::device_token_auth_middleware,
-                ));
+            // FileProvider routes with device token authentication. The data
+            // surface (reads + gated writes) is the drive's router (RFC-015
+            // Stage D4); the host layers the body limit and device-token auth
+            // around it exactly as before.
+            let fileprovider_routes =
+                hopnet_drive::http::fileprovider::router(drive_state.clone())
+                    .layer(DefaultBodyLimit::max(5000 * 1_000_000)) // 5GB limit for file uploads
+                    .layer(middleware::from_fn_with_state(
+                        app_state.clone(),
+                        devices::auth::device_token_auth_middleware,
+                    ));
 
             // Test routes - only available in test mode
             let test_routes = if app_state.test_mode {
@@ -562,7 +555,15 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .nest(
                     "/integrations/documentprovider",
-                    documentprovider::routes::router(app_state.clone()),
+                    // Drive router (RFC-015 Stage D4); the device-token auth
+                    // middleware stays host-side, layered here (it was the
+                    // outermost layer of the old host router too).
+                    hopnet_drive::http::documentprovider::router(drive_state.clone()).layer(
+                        middleware::from_fn_with_state(
+                            app_state.clone(),
+                            devices::auth::device_token_auth_middleware,
+                        ),
+                    ),
                 )
                 .nest("/devices", devices::routes::router(app_state.clone()))
                 .merge(test_routes)
