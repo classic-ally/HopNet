@@ -138,14 +138,11 @@ Every stage: workspace tests + all bins + snapshotter capture/compare
 (IDENTICAL at every stage) + a per-stage orchestrator subset + divergence
 check, committed only when green.
 
-## Adding a projection (the recipe photos follows)
+## Adding a projection
 
-1. New crate depending on hopnet-projection (+ hopnet-storage for
-   blobs): define envelopes, implement + `inventory::submit!` handlers
-   and a DataBlockReferenceProvider, export `TX_FUNCTIONS`.
-2. Ship `db::install_schema/uninstall_schema/TABLES`; host adds it to
-   the install chain and the boot tripwire.
-3. Expose axum routers over a projection state struct wired from the
-   host-implemented seams.
-4. Implement ProjectionExporter; host registers it — takeout support is
-   automatic, including graceful skips on meshes without the projection.
+SUPERSEDED by RFC-016 (projection-host-api.md): the host integration
+points (schema chain, tripwire, mounts, exporter registration, work
+dispatch) all collapsed onto `hopnet_projection::Projection` manifests
+and the `src/projections.rs::manifests()` registry. A projection crate
+implements the manifest; the host diff is ONE `manifests()` entry. See
+RFC-016 §"Adding a projection" for the current recipe.

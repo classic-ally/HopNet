@@ -61,6 +61,13 @@ apply functions inside consensus handlers.
       surface behind five host seams, projection-agnostic takeout with
       manifest v2 + per-projection translators (unknown sections skip
       cleanly — photos-ready)
+- [x] Projection host API ([RFC-016](specs/projection-host-api.md))
+      COMPLETE (stages 1–6, 2026-07-08): HostCapabilities bundle,
+      static Projection manifests + one-line registry
+      (src/projections.rs) driving schema chain / tripwire / router
+      mounts / takeout translators / work dispatch; src/files renamed
+      to src/storage_host. Adding photos = implement Projection + one
+      manifests() entry
 
 Reed-Solomon encoded file storage with encryption, chunked encoding, and fragment management.
 
