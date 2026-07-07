@@ -25,6 +25,7 @@ pub mod metrics;
 pub mod net;
 pub mod nodes;
 pub mod passphrase;
+pub mod projections;
 pub mod reference_providers;
 pub mod setup;
 pub mod shares;
@@ -120,21 +121,26 @@ pub static DISPATCH_TABLE: Lazy<HashMap<&'static str, &'static dyn TransactionHa
         table
     });
 
-/// RFC-015 boot tripwire: cross-crate inventory registrations are a
+/// RFC-015/016 boot tripwire: cross-crate inventory registrations are a
 /// link-time property — a silently dropped registration would make every
-/// node reject the projection's transactions (fail-stop drive outage).
+/// node reject the projection's transactions (fail-stop outage). Loops
+/// the projection registry, plus the host's own storage-substrate
+/// handlers (below the projection seam, so not in a manifest).
 /// Call at startup, after DISPATCH_TABLE is built.
 pub fn assert_projection_registrations() {
-    for f in hopnet_drive::handlers::TX_FUNCTIONS {
-        assert!(
-            DISPATCH_TABLE.contains_key(f),
-            "projection handler '{f}' missing from dispatch table — inventory registration dropped at link time"
-        );
+    for projection in crate::projections::manifests() {
+        for f in projection.tx_functions() {
+            assert!(
+                DISPATCH_TABLE.contains_key(f),
+                "{} handler '{f}' missing from dispatch table — inventory registration dropped at link time",
+                projection.name()
+            );
+        }
     }
-    for f in hopnet_takeout::handlers::TX_FUNCTIONS {
+    for f in crate::files::handlers::TX_FUNCTIONS {
         assert!(
             DISPATCH_TABLE.contains_key(f),
-            "takeout handler '{f}' missing from dispatch table — inventory registration dropped at link time"
+            "storage handler '{f}' missing from dispatch table — inventory registration dropped at link time"
         );
     }
     let providers =

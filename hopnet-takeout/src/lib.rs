@@ -28,6 +28,30 @@ use hopnet_projection::{ProjectionExporter, SessionAccess, TxGateway};
 /// imports + general write traffic eating into the same budget.
 pub const STORAGE_SAFETY_MARGIN_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
+/// Takeout's static manifest (RFC-016 Stage 3): only the static trio —
+/// takeout genuinely has consensus handlers and a schema unit, so the
+/// host's tripwire and install chain cover it through the same loop as
+/// real projections. Its runtime surface (routers, cron, resume hooks,
+/// barriers, TakeoutRuntime) deliberately stays NAMED host wiring: it is
+/// a projection-agnostic service whose state (exporters collected from
+/// OTHER projections, host SQL hooks) is not expressible from generic
+/// capabilities.
+pub struct TakeoutProjection;
+
+impl hopnet_projection::Projection for TakeoutProjection {
+    fn name(&self) -> &'static str {
+        "takeout"
+    }
+
+    fn tx_functions(&self) -> &'static [&'static str] {
+        handlers::TX_FUNCTIONS
+    }
+
+    fn install_schema(&self, conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
+        db::install_schema(conn)
+    }
+}
+
 /// Takeout/import test barriers. The name registry lives here with the
 /// runtime; the host keeps the HTTP test routes + the `BarrierRegistration`
 /// inventory shim pointing into [`TakeoutRuntime::barriers`].

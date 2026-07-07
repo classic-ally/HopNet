@@ -278,3 +278,36 @@ pub trait ProjectionExporter: Send + Sync {
     /// Section-end batch boundary: settle anything `import_entry` deferred.
     fn flush(&self, user_id: i32) -> BoxFuture<'_, Result<(), ImportEntryError>>;
 }
+
+/// A projection's static manifest (RFC-016 Stage 3): the single object a
+/// projection crate exports and the host registers — ONE line in the
+/// host's `projections::manifests()` is the whole host diff for adding a
+/// projection.
+///
+/// Manifests are unit structs (`&'static dyn Projection`): schema install
+/// and the boot tripwire run BEFORE the host's AppState (and therefore
+/// [`host::HostCapabilities`]) exists, so the manifest never stores
+/// capabilities — runtime methods take `&HostCapabilities` per call
+/// (construction is cheap Arc clones, precedented by the host's
+/// per-request state builders).
+pub trait Projection: Send + Sync {
+    /// Manifest/section name ("drive", "takeout", "photos", …).
+    fn name(&self) -> &'static str;
+
+    /// Every consensus tx function this projection's handlers register
+    /// via inventory — the host's boot tripwire asserts each is present
+    /// in the dispatch table (linker-drop guard).
+    fn tx_functions(&self) -> &'static [&'static str];
+
+    /// This projection's schema unit. The host installs units in
+    /// registration order (= FK direction) after the substrate's.
+    fn install_schema(&self, conn: &rusqlite::Connection) -> Result<(), rusqlite::Error>;
+
+    /// The projection's takeout translator, if it has one. Default: none.
+    fn exporter(
+        &self,
+        _caps: &host::HostCapabilities,
+    ) -> Option<std::sync::Arc<dyn ProjectionExporter>> {
+        None
+    }
+}

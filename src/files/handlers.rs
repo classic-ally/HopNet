@@ -13,6 +13,17 @@ pub use hopnet_drive::envelopes::{
     DeleteFilesPayload, DriveContentUpdate, DriveInsertPayload, ModifyItemPayload,
 };
 
+/// The storage substrate's consensus tx functions, registered from the
+/// HOST (not hopnet-storage): the layering is projection → storage, so
+/// storage can't see the handler seam; and delete_orphaned_data_blocks
+/// consults the takeout gate, which storage could never depend on. The
+/// boot tripwire asserts these alongside every manifest's tx_functions.
+pub const TX_FUNCTIONS: &[&str] = &[
+    "update_placement_heights",
+    "delete_orphaned_data_blocks",
+    "self_check_fragments",
+];
+
 pub struct UpdatePlacementHeightsHandler;
 
 impl TransactionHandler for UpdatePlacementHeightsHandler {

@@ -24,3 +24,28 @@ pub mod upload;
 
 pub use error::FileError;
 pub use model::{Inode, InodeOwner};
+
+/// The drive's static manifest (RFC-016 Stage 3) — the host registers
+/// this one value in `projections::manifests()`.
+pub struct DriveProjection;
+
+impl hopnet_projection::Projection for DriveProjection {
+    fn name(&self) -> &'static str {
+        "drive"
+    }
+
+    fn tx_functions(&self) -> &'static [&'static str] {
+        handlers::TX_FUNCTIONS
+    }
+
+    fn install_schema(&self, conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
+        db::install_schema(conn)
+    }
+
+    fn exporter(
+        &self,
+        caps: &hopnet_projection::host::HostCapabilities,
+    ) -> Option<std::sync::Arc<dyn hopnet_projection::ProjectionExporter>> {
+        Some(exporter::drive_exporter(caps.clone()))
+    }
+}

@@ -87,15 +87,20 @@ impl TakeoutHooks for TakeoutHost {
 /// one `DriveHost` + one `TakeoutHost` allocation; callers may construct it
 /// on the fly (the work scheduler and auth hooks do).
 pub fn takeout_state(app_state: &AppState) -> TakeoutState {
-    let drive = crate::drive_host::drive_state(app_state);
+    let caps = crate::drive_host::drive_state(app_state);
+    // Every registered projection contributes its takeout translator
+    // (RFC-016 Stage 3) — a projection without one returns None.
     let exporters: Vec<Arc<dyn hopnet_projection::ProjectionExporter>> =
-        vec![hopnet_drive::exporter::drive_exporter(drive.clone())];
+        crate::projections::manifests()
+            .iter()
+            .filter_map(|m| m.exporter(&caps))
+            .collect();
     TakeoutState {
         db_pool: app_state.db_pool.clone(),
         fragments_dir: app_state.fragments_dir.clone(),
         node_id: app_state.node_id.clone(),
-        sessions: drive.sessions.clone(),
-        txs: drive.txs.clone(),
+        sessions: caps.sessions.clone(),
+        txs: caps.txs.clone(),
         exporters: exporters.into(),
         runtime: app_state.takeout_runtime.clone(),
         hooks: Arc::new(TakeoutHost {

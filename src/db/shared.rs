@@ -437,12 +437,14 @@ pub fn initialize(db: PooledConnection<SqliteConnectionManager>) -> Result<(), D
         other => rusqlite::Error::InvalidParameterName(other.to_string()),
     })?;
 
-    // Schema seam (RFC-015): substrate tables, then each projection's unit.
-    // Order matters — storage FKs the host's nodes table; drive FKs users
-    // (host) and data_blocks (storage).
+    // Schema seam (RFC-015/016): substrate tables (named — storage is
+    // below the projection seam), then every registered projection's unit
+    // in manifest order (= FK direction; storage FKs the host's nodes
+    // table; drive FKs users (host) and data_blocks (storage)).
     hopnet_storage::store::install_schema(&db)?;
-    hopnet_drive::db::install_schema(&db)?;
-    hopnet_takeout::db::install_schema(&db)?;
+    for projection in crate::projections::manifests() {
+        projection.install_schema(&db)?;
+    }
 
     Ok(())
 }
