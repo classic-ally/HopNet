@@ -48,4 +48,33 @@ impl hopnet_projection::Projection for DriveProjection {
     ) -> Option<std::sync::Arc<dyn hopnet_projection::ProjectionExporter>> {
         Some(exporter::drive_exporter(caps.clone()))
     }
+
+    fn mounts(
+        &self,
+        caps: &hopnet_projection::host::HostCapabilities,
+    ) -> Vec<hopnet_projection::Mount> {
+        use hopnet_projection::{AuthClass, Mount};
+        vec![
+            Mount {
+                prefix: "/files",
+                auth: AuthClass::UserJwt,
+                router: http::files::router(caps.clone()),
+            },
+            Mount {
+                prefix: "/shares",
+                auth: AuthClass::UserJwt,
+                router: http::shares::router(caps.clone()),
+            },
+            Mount {
+                prefix: "/integrations/fileprovider",
+                auth: AuthClass::DeviceToken,
+                router: http::fileprovider::router(caps.clone()),
+            },
+            Mount {
+                prefix: "/integrations/documentprovider",
+                auth: AuthClass::DeviceToken,
+                router: http::documentprovider::router(caps.clone()),
+            },
+        ]
+    }
 }

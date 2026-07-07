@@ -43,7 +43,12 @@ pub fn router<S: Clone + Send + Sync + 'static>(state: DriveState) -> Router<S> 
             super::write_gate,
         ));
 
-    reads.merge(writes).with_state(state)
+    // 5GB upload limit, owned by the router (RFC-016 Stage 4 — the host
+    // used to apply the same value at the mount site; files.rs precedent).
+    reads
+        .merge(writes)
+        .layer(axum::extract::DefaultBodyLimit::max(5000 * 1_000_000))
+        .with_state(state)
 }
 
 #[derive(Debug, Deserialize)]

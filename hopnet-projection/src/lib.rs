@@ -279,6 +279,29 @@ pub trait ProjectionExporter: Send + Sync {
     fn flush(&self, user_id: i32) -> BoxFuture<'_, Result<(), ImportEntryError>>;
 }
 
+/// Which host auth middleware wraps a projection's mounted router
+/// (RFC-016 Stage 4). The host owns the middleware implementations; a
+/// projection only declares the class. Both classes insert
+/// `Extension<i32>` (the authenticated user id) that projection routers
+/// and the write gate read.
+pub enum AuthClass {
+    /// The host's JWT session auth (browser/API surface).
+    UserJwt,
+    /// The host's device-token auth (FileProvider/DocumentProvider
+    /// integrations; bootstraps a short-lived session).
+    DeviceToken,
+}
+
+/// One mounted router of a projection's HTTP surface. `prefix` is the
+/// FULL path the host nests at; routers own their internal layers (write
+/// gate, body limits) — the host adds only the declared auth class and
+/// its global layers (overload shedding, tracing).
+pub struct Mount {
+    pub prefix: &'static str,
+    pub auth: AuthClass,
+    pub router: axum::Router,
+}
+
 /// A projection's static manifest (RFC-016 Stage 3): the single object a
 /// projection crate exports and the host registers — ONE line in the
 /// host's `projections::manifests()` is the whole host diff for adding a
@@ -309,5 +332,12 @@ pub trait Projection: Send + Sync {
         _caps: &host::HostCapabilities,
     ) -> Option<std::sync::Arc<dyn ProjectionExporter>> {
         None
+    }
+
+    /// The projection's HTTP surface as (prefix, auth class, router)
+    /// mounts; the host nests each under its declared auth middleware and
+    /// global layers. Default: no HTTP surface.
+    fn mounts(&self, _caps: &host::HostCapabilities) -> Vec<Mount> {
+        Vec::new()
     }
 }

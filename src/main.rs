@@ -431,9 +431,9 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            // Drive host seams (RFC-015 Stage D4): one adapter behind the
-            // drive's routers; built once here, cloned into each nest.
-            let drive_state = drive_host::drive_state(&app_state);
+            // Host capabilities (RFC-016): one seam bundle handed to every
+            // projection's mounts()/exporter(); built once, cheap clones.
+            let host_caps = drive_host::drive_state(&app_state);
 
             // Takeout service state (RFC-015 Stage D5b): registered
             // projection translators (drive today; photos registers here
@@ -445,7 +445,6 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 .nest("/users", users::routes::router())
                 .route("/nodes", get(nodes::routes::get_nodes))
                 .route("/nodes", post(nodes::routes::post_nodes))
-                .nest("/files", hopnet_drive::http::files::router(drive_state.clone()))
                 .route("/fragments", get(files::routes::get_fragments_count))
                 .route(
                     "/maintenance/cleanup-orphaned",
@@ -493,10 +492,6 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .nest("/takeout", hopnet_takeout::routes::router(takeout_state.clone()))
                 .nest("/admin", admin::routes::admin_routes())
-                .nest(
-                    "/shares",
-                    hopnet_drive::http::shares::router(drive_state.clone()),
-                )
                 .route("/logout", post(auth::sign_out))
                 .layer(middleware::from_fn_with_state(
                     app_state.clone(),
@@ -520,18 +515,6 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                     app_state.clone(),
                     consensus::routes::jwt_or_rpc_auth_middleware,
                 ));
-
-            // FileProvider routes with device token authentication. The data
-            // surface (reads + gated writes) is the drive's router (RFC-015
-            // Stage D4); the host layers the body limit and device-token auth
-            // around it exactly as before.
-            let fileprovider_routes =
-                hopnet_drive::http::fileprovider::router(drive_state.clone())
-                    .layer(DefaultBodyLimit::max(5000 * 1_000_000)) // 5GB limit for file uploads
-                    .layer(middleware::from_fn_with_state(
-                        app_state.clone(),
-                        devices::auth::device_token_auth_middleware,
-                    ));
 
             // Test routes - only available in test mode
             let test_routes = if app_state.test_mode {
@@ -557,28 +540,42 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 .fallback_service(admin_service) // routes we don't have get sent to vite frontend
                 .merge(protected_routes)
                 .merge(jwt_or_rpc_routes)
-                .nest("/integrations/fileprovider", fileprovider_routes)
                 .route(
                     "/integrations/fileprovider/health",
                     get(fileprovider::routes::get_health),
-                )
-                .nest(
-                    "/integrations/documentprovider",
-                    // Drive router (RFC-015 Stage D4); the device-token auth
-                    // middleware stays host-side, layered here (it was the
-                    // outermost layer of the old host router too).
-                    hopnet_drive::http::documentprovider::router(drive_state.clone()).layer(
-                        middleware::from_fn_with_state(
-                            app_state.clone(),
-                            devices::auth::device_token_auth_middleware,
-                        ),
-                    ),
                 )
                 .nest("/devices", devices::routes::router(app_state.clone()))
                 .merge(test_routes)
                 .route("/setup", get(setup::get_setup))
                 .route("/setup", post(setup::post_setup))
                 .route("/login", post(auth::sign_in));
+
+            // Projection mounts (RFC-016 Stage 4). Host routes close over
+            // AppState first; each projection's routers are Router<()> and
+            // get nested under their declared auth class. Everything —
+            // host and projection alike — then goes under the global
+            // layers below (overload shedding, tracing, CORS).
+            let mut base_app: Router<()> = base_app.with_state(app_state.clone());
+            for mount in projections::manifests()
+                .iter()
+                .flat_map(|m| m.mounts(&host_caps))
+            {
+                let routed = match mount.auth {
+                    hopnet_projection::AuthClass::UserJwt => {
+                        mount.router.layer(middleware::from_fn_with_state(
+                            app_state.clone(),
+                            auth::auth_middleware,
+                        ))
+                    }
+                    hopnet_projection::AuthClass::DeviceToken => {
+                        mount.router.layer(middleware::from_fn_with_state(
+                            app_state.clone(),
+                            devices::auth::device_token_auth_middleware,
+                        ))
+                    }
+                };
+                base_app = base_app.nest(mount.prefix, routed);
+            }
 
             // Overload shedding, two gates, both answering 503 + Retry-After
             // so CLIENTS own the retry and the server never converts overload
@@ -669,14 +666,10 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                     .max_age(std::time::Duration::from_secs(3600))
                     .allow_credentials(false);
 
-                base_app
-                    .layer(cors)
-                    .layer(trace_layer)
-                    .with_state(app_state)
+                base_app.layer(cors).layer(trace_layer)
             } else {
                 base_app // no CORS in prod
                     .layer(trace_layer)
-                    .with_state(app_state)
             };
 
             serve(listener, app).await?;
