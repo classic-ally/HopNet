@@ -13,13 +13,13 @@ use axum::{
 };
 
 use crate::db::{self, Blake3Hash, DatabaseError};
-use crate::files::functions::encrypt_path;
+use crate::storage_host::functions::encrypt_path;
 use serde::{Deserialize, Serialize};
 
 use super::*;
 
 /// Drive-owned (RFC-015, Stage D4): shared ingest wrapper re-exported at
-/// the old path so call sites (files::tests) don't churn.
+/// the old path so call sites (storage_host::tests) don't churn.
 pub use hopnet_drive::http::files::process_uploaded_file;
 
 #[derive(Deserialize)]

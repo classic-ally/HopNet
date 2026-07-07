@@ -57,7 +57,7 @@ pub async fn get_test(State(app_state): State<AppState>) -> Result<Json<TestResp
     let secret_hex = hex::encode(&secret);
     let api_key_hash = crate::db::Blake3Hash::new(blake3::hash(secret_hex.as_bytes()));
 
-    let encrypted_device_name = crate::files::functions::encrypt_part(
+    let encrypted_device_name = crate::storage_host::functions::encrypt_part(
         "test-fileprovider",
         &session.siv_key,
         &session.siv_nonce,

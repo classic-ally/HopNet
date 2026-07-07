@@ -308,7 +308,7 @@ pub fn spawn_engine(app_state: &AppState) -> Result<(), String> {
 
     // Storage distribution engine (RFC-014): behind the host seams. Data
     // plane on the caller's (main) runtime; placement batcher on queue_rt.
-    crate::files::substrate_host::spawn_storage_engine(app_state);
+    crate::storage_host::substrate_host::spawn_storage_engine(app_state);
 
     let engine = EngineHandle {
         input_tx,

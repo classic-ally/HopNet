@@ -19,7 +19,7 @@ pub mod devices;
 // hopnet_drive::http::documentprovider; the host mounts them in main.rs.
 pub mod drive_host;
 pub mod fileprovider;
-pub mod files;
+pub mod storage_host;
 pub mod handlers;
 pub mod metrics;
 pub mod net;
@@ -51,7 +51,7 @@ pub struct AppState {
     pub fragments_dir: String,
     pub port: u16,
     pub test_mode: bool,
-    pub orphaned_fragment_scan: Arc<std::sync::Mutex<Option<files::jobs::OrphanedFragmentScan>>>,
+    pub orphaned_fragment_scan: Arc<std::sync::Mutex<Option<storage_host::jobs::OrphanedFragmentScan>>>,
     pub iroh_transport: net::IrohTransport,
     pub consensus_barriers: Arc<barriers::Barriers>,
     pub dedup_cache: Arc<net::DedupCache>,
@@ -68,7 +68,7 @@ pub struct AppState {
     /// consensus dispatch answers "not active" meanwhile.
     pub malachite: Arc<OnceCell<consensus::malachite::EngineHandle>>,
     /// Storage distribution engine handle (RFC-014) — set by
-    /// `files::substrate_host::spawn_storage_engine` at consensus engine
+    /// `storage_host::substrate_host::spawn_storage_engine` at consensus engine
     /// start (mirrors `.malachite`). HopNetApplication::on_decided kicks it
     /// with decided blob ids (non-blocking); the engine's workers and
     /// placement batcher run behind the host seams.
@@ -137,7 +137,7 @@ pub fn assert_projection_registrations() {
             );
         }
     }
-    for f in crate::files::handlers::TX_FUNCTIONS {
+    for f in crate::storage_host::handlers::TX_FUNCTIONS {
         assert!(
             DISPATCH_TABLE.contains_key(f),
             "storage handler '{f}' missing from dispatch table — inventory registration dropped at link time"

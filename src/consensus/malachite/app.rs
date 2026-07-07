@@ -224,13 +224,13 @@ impl<C: DerefMut<Target = Connection> + 'static> Application<SqliteStorage<C>>
         for tx in block.data.transactions.iter() {
             let blob_ids: Vec<hopnet_common::CustomUUID> = match tx.rpc.function.as_str() {
                 "insert_files" => bincode::serde::decode_from_slice::<
-                    crate::files::handlers::DriveInsertPayload,
+                    crate::storage_host::handlers::DriveInsertPayload,
                     _,
                 >(&tx.rpc.payload, bincode::config::standard())
                 .map(|(p, _)| p.blob_ops.into_iter().map(|op| op.blob_id).collect())
                 .unwrap_or_default(),
                 "modify_item" => bincode::serde::decode_from_slice::<
-                    crate::files::handlers::ModifyItemPayload,
+                    crate::storage_host::handlers::ModifyItemPayload,
                     _,
                 >(&tx.rpc.payload, bincode::config::standard())
                 .map(|(p, _)| {

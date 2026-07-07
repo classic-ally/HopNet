@@ -68,7 +68,7 @@ pub async fn get_fragment_health_check(
 
         tasks.push(tokio::spawn(async move {
             let start = std::time::Instant::now();
-            match crate::files::rpc::check_fragment_health(&transport, node_id, iroh_node_id, hash)
+            match crate::storage_host::rpc::check_fragment_health(&transport, node_id, iroh_node_id, hash)
                 .await
             {
                 Ok(healthy) => NodeFragmentHealthResult {

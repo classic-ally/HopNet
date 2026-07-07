@@ -1,6 +1,6 @@
 use crate::AppState;
 use crate::db::metrics::{get_all_node_metrics, get_metric};
-use crate::files::placement::{FragmentType, calculate_final_placement_scores};
+use crate::storage_host::placement::{FragmentType, calculate_final_placement_scores};
 use crate::metrics::collector::{CollectionError, collect_all_node_metrics};
 use crate::metrics::types::{Metric, StorageResponse};
 use axum::{

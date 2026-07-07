@@ -1,6 +1,7 @@
 use crate::{
-    db::{CustomUUID, DatabaseError, fragments::delete_orphaned_data_blocks_consensus},
+    db::{CustomUUID, DatabaseError},
     handlers::{HandlerCtx, HandlerResult, TransactionHandler, TxMeta},
+    storage_host::db_apply::delete_orphaned_data_blocks_consensus,
 };
 use serde::{Deserialize, Serialize};
 
@@ -102,7 +103,7 @@ impl TransactionHandler for DeleteOrphanedDataBlocksHandler {
 
                     let mut successfully_deleted = 0;
                     for fragment_hash in &deleted_fragment_hashes {
-                        match crate::files::functions::delete_fragment(
+                        match crate::storage_host::functions::delete_fragment(
                             ctx.fragments_dir,
                             fragment_hash,
                         ) {
@@ -172,7 +173,7 @@ impl TransactionHandler for SelfCheckFragmentsHandler {
                 }
 
                 // Apply the self-check updates using the inventory module
-                crate::db::inventory::apply_self_check_updates(db_tx, &report)?;
+                crate::storage_host::db_apply::apply_self_check_updates(db_tx, &report)?;
 
                 Ok(())
             }

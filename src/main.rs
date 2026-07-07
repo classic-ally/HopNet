@@ -180,7 +180,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             };
 
             // Initialize fragments directory
-            let fragments_dir = files::functions::get_fragments_dir().unwrap_or_else(|_| {
+            let fragments_dir = storage_host::functions::get_fragments_dir().unwrap_or_else(|_| {
                 eprintln!("Failed to get fragments directory, using current directory");
                 "./hopnet/fragments".to_string()
             });
@@ -377,7 +377,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             let self_check_worker = WorkerBuilder::new("fragment-inventory-self-check")
                 .data(app_state.clone())
                 .backend(self_check_cron_stream)
-                .build_fn(files::jobs::handle_fragment_inventory_self_check);
+                .build_fn(storage_host::jobs::handle_fragment_inventory_self_check);
 
             tokio::spawn(async move {
                 self_check_worker.run().await;
@@ -445,38 +445,38 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 .nest("/users", users::routes::router())
                 .route("/nodes", get(nodes::routes::get_nodes))
                 .route("/nodes", post(nodes::routes::post_nodes))
-                .route("/fragments", get(files::routes::get_fragments_count))
+                .route("/fragments", get(storage_host::routes::get_fragments_count))
                 .route(
                     "/maintenance/cleanup-orphaned",
-                    post(files::routes::post_cleanup_orphaned_data_blocks),
+                    post(storage_host::routes::post_cleanup_orphaned_data_blocks),
                 )
                 .route(
                     "/maintenance/rebalance",
-                    post(files::routes::post_rebalance_network),
+                    post(storage_host::routes::post_rebalance_network),
                 )
                 .merge(hopnet_takeout::routes::maintenance_router(
                     takeout_state.clone(),
                 ))
                 .route(
                     "/maintenance/fragment-inventory-self-check",
-                    post(files::routes::post_fragment_inventory_self_check),
+                    post(storage_host::routes::post_fragment_inventory_self_check),
                 )
                 .route(
                     "/maintenance/orphaned-fragments",
-                    get(files::routes::get_orphaned_fragments_scan)
-                        .delete(files::routes::delete_orphaned_fragments),
+                    get(storage_host::routes::get_orphaned_fragments_scan)
+                        .delete(storage_host::routes::delete_orphaned_fragments),
                 )
                 .route(
                     "/diagnostics/fragment-inventory-differential",
-                    get(files::routes::get_fragment_inventory_differential),
+                    get(storage_host::routes::get_fragment_inventory_differential),
                 )
                 .route(
                     "/diagnostics/file-fragments",
-                    get(files::routes::get_file_fragment_distribution),
+                    get(storage_host::routes::get_file_fragment_distribution),
                 )
                 .route(
                     "/diagnostics/network-resilience",
-                    get(files::routes::get_network_resilience_stats),
+                    get(storage_host::routes::get_network_resilience_stats),
                 )
                 .route("/debug/iroh-ping", get(net::routes::debug_iroh_ping))
                 .route("/debug/db-stats", get(consensus::routes::get_db_stats))
@@ -529,7 +529,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                     )
                     .route(
                         "/test/fragment-health-check/{fragment_hash}",
-                        get(files::test_routes::get_fragment_health_check),
+                        get(storage_host::test_routes::get_fragment_health_check),
                     )
                     .nest("/test/barriers", barriers::test_routes())
             } else {

@@ -5,32 +5,11 @@ use std::collections::HashMap;
 use tracing::debug;
 
 use crate::db::DatabaseError;
-use crate::files::types::SelfCheckFragments;
+use hopnet_storage::SelfCheckFragments;
 use crate::types::{Blake3Hash, NodeConnectionInfo};
 
-/// Apply differential fragment inventory updates from a self-check report
-/// Called by consensus middleware when processing SelfCheckFragments transactions
-///
-/// The execute flag controls whether to actually apply changes (true) or just validate (false)
-pub fn apply_self_check_updates(
-    db_tx: &rusqlite::Transaction,
-    report: &SelfCheckFragments,
-) -> Result<(), DatabaseError> {
-    // Substrate-owned apply (RFC-014): count verification + remove /
-    // re-height / add, in-crate.
-    hopnet_storage::store::apply_self_check(
-        db_tx,
-        report.node_id,
-        report.previous_count,
-        report.self_verified_height,
-        &report.fragments_added,
-        &report.fragments_removed,
-    )
-    .map_err(|e| {
-        tracing::error!("apply_self_check failed for node {}: {e}", report.node_id);
-        DatabaseError::ProcessingError
-    })
-}
+// apply_self_check_updates moved to crate::storage_host::db_apply
+// (RFC-016 Stage 6) — it lives beside its consensus-handler caller.
 
 /// Get the current fragment count using a transaction
 fn get_node_fragment_count_tx(tx: &Transaction, node_id: i32) -> Result<u32, DatabaseError> {

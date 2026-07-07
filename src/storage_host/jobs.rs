@@ -172,7 +172,7 @@ async fn cleanup_orphaned_data_blocks(
         );
 
         // Submit consensus transaction to delete these data blocks
-        let payload = crate::files::handlers::DeleteOrphanedDataBlocksPayload {
+        let payload = crate::storage_host::handlers::DeleteOrphanedDataBlocksPayload {
             data_block_ids: data_block_ids.clone(),
         };
 
@@ -746,7 +746,7 @@ pub async fn run_orphaned_fragments_cleanup(
 
     // Delete each orphaned fragment
     for fragment_hash in &scan.orphaned_fragments {
-        match crate::files::functions::delete_fragment(&app_state.fragments_dir, fragment_hash) {
+        match crate::storage_host::functions::delete_fragment(&app_state.fragments_dir, fragment_hash) {
             Ok(_) => {
                 deleted_count += 1;
                 // Calculate approximate size (we don't store individual sizes, use average)

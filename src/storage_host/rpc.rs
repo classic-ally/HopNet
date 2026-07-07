@@ -156,7 +156,7 @@ pub async fn handle_fragment_store(
     app_state: &AppState,
 ) -> IrohResponse {
     use hopnet_storage::serve::StoreOutcome;
-    let sink = crate::files::substrate_host::SubstrateHost::new(app_state.clone());
+    let sink = crate::storage_host::substrate_host::SubstrateHost::new(app_state.clone());
     match hopnet_storage::serve::serve_fragment_store(
         &app_state.fragments_dir,
         &sink,

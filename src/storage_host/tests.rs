@@ -2,12 +2,12 @@
 //! Gated via `#[cfg(test)] mod tests;` in src/files/mod.rs.
 
 use crate::db::{Blake3Hash, ChunkType, CustomUUID, SqliteConnectionManager};
-use crate::files::functions::{
+use crate::storage_host::functions::{
     CHUNK_SIZE, MAX_FRAGMENT_SIZE, ORIGINAL_FRAGMENTS_PER_CHUNK, RECOVERY_FRAGMENTS_PER_CHUNK,
     calculate_chunked_fragments, calculate_padding_and_chunks,
 };
 use hopnet_storage::store::BlobManifest;
-use crate::files::routes::process_uploaded_file;
+use crate::storage_host::routes::process_uploaded_file;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::OsRng as ChaChaOsRng};
 use rand::prelude::*;
 use rusqlite::params;

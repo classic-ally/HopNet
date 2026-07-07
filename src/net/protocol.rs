@@ -1,5 +1,5 @@
 use crate::consensus::rpc as consensus_rpc;
-use crate::files::rpc as files_rpc;
+use crate::storage_host::rpc as files_rpc;
 use crate::metrics::rpc as metrics_rpc;
 use crate::setup;
 use serde::{Deserialize, Serialize};

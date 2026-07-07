@@ -258,7 +258,7 @@ async fn process_request(
                     IrohRequest::Ping { nonce } => IrohResponse::Pong { nonce },
                     IrohRequest::FragmentHealthCheck(req) => {
                         IrohResponse::FragmentHealthCheckResponse(
-                            crate::files::rpc::handle_fragment_health_check(
+                            crate::storage_host::rpc::handle_fragment_health_check(
                                 req,
                                 &app_state.fragments_dir,
                             ),
@@ -266,10 +266,10 @@ async fn process_request(
                     }
                     IrohRequest::TransactionForward(_) => unreachable!("handled above"),
                     IrohRequest::FragmentFetch(req) => IrohResponse::FragmentFetchResponse(
-                        crate::files::rpc::handle_fragment_fetch(req, &app_state.fragments_dir),
+                        crate::storage_host::rpc::handle_fragment_fetch(req, &app_state.fragments_dir),
                     ),
                     IrohRequest::FragmentStore(req) => {
-                        crate::files::rpc::handle_fragment_store(req, &app_state).await
+                        crate::storage_host::rpc::handle_fragment_store(req, &app_state).await
                     }
                     IrohRequest::LatencyPing(req) => {
                         IrohResponse::LatencyPong(crate::metrics::rpc::handle_latency_ping(req))

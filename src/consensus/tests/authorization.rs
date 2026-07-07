@@ -4,7 +4,7 @@ use crate::db::CustomDateTime;
 use crate::db::DatabaseError;
 use crate::db::imports::ImportPayload;
 use crate::db::takeout::TakeoutPayload;
-use crate::files::handlers::{DeleteFilesPayload, ModifyItemPayload};
+use crate::storage_host::handlers::{DeleteFilesPayload, ModifyItemPayload};
 use crate::metrics::types::Metric;
 use either::Either;
 use hopnet_common::{ImportStatus, TakeoutStatus};
@@ -34,7 +34,7 @@ mod authorization_tests {
         };
 
         let payload = bincode::serde::encode_to_vec(
-            &crate::files::handlers::DriveInsertPayload {
+            &crate::storage_host::handlers::DriveInsertPayload {
                 blob_ops: Vec::new(),
                 inodes: vec![inode],
             },
@@ -183,7 +183,7 @@ mod authorization_tests {
         };
 
         let payload = bincode::serde::encode_to_vec(
-            &crate::files::handlers::DriveInsertPayload {
+            &crate::storage_host::handlers::DriveInsertPayload {
                 blob_ops: Vec::new(),
                 inodes: vec![inode],
             },

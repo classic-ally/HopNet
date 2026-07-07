@@ -1,7 +1,7 @@
 //! Host adapter for the drive's HTTP/business seams (RFC-015 Stage D4).
 //!
 //! One `DriveHost` implements all of hopnet-drive's host capabilities
-//! (pattern: `files::substrate_host::SubstrateHost` for the RFC-014
+//! (pattern: `storage_host::substrate_host::SubstrateHost` for the RFC-014
 //! seams): sessions with host-side key derivation, consensus submission
 //! with host-side signing, blob reconstruction over the substrate seams,
 //! and the takeout import gate as write admission.
@@ -107,7 +107,7 @@ impl BlobStreamer for DriveHost {
         range: Option<(u64, u64)>,
     ) -> ByteStream {
         Box::pin(hopnet_storage::api::get(
-            Some(crate::files::substrate_host::get_net(&self.app_state)),
+            Some(crate::storage_host::substrate_host::get_net(&self.app_state)),
             self.app_state.fragments_dir.clone(),
             manifest,
             per_blob_key,

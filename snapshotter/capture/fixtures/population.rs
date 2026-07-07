@@ -8,7 +8,7 @@ use hopnet::db;
 use hopnet::db::types::{
     BlobAccess, CustomUUID, Inode, XPubKey,
 };
-use hopnet::files::types::SelfCheckFragments;
+use hopnet_storage::SelfCheckFragments;
 use hopnet::metrics::types::Metric;
 use hopnet::types::{Blake3Hash, Node, PrivKey, PubKey, User};
 use r2d2::Pool;
@@ -374,7 +374,7 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
                 fragments_added: all_fragment_hashes.clone(),
                 fragments_removed: Vec::new(),
             };
-            db::inventory::apply_self_check_updates(&tx, &report)
+            hopnet::storage_host::db_apply::apply_self_check_updates(&tx, &report)
                 .expect("Failed to apply inventory updates");
         }
         tx.commit().expect("Failed to commit inventory");

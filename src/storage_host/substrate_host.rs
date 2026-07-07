@@ -91,7 +91,7 @@ impl Transport for SubstrateHost {
         data: Vec<u8>,
     ) -> Result<StoreResult, TransportError> {
         let peer_key = peer_iroh_key(peer)?;
-        let result = crate::files::rpc::store_fragment_remote(
+        let result = crate::storage_host::rpc::store_fragment_remote(
             &self.app_state.iroh_transport,
             peer.node_id,
             peer_key,
@@ -120,7 +120,7 @@ impl Transport for SubstrateHost {
         fragment_hash: &Blake3Hash,
     ) -> Result<Vec<u8>, TransportError> {
         let peer_key = peer_iroh_key(peer)?;
-        crate::files::rpc::fetch_fragment(
+        crate::storage_host::rpc::fetch_fragment(
             &self.app_state.iroh_transport,
             peer.node_id,
             peer_key,
@@ -136,7 +136,7 @@ impl Transport for SubstrateHost {
         fragment_hash: &Blake3Hash,
     ) -> Result<bool, TransportError> {
         let peer_key = peer_iroh_key(peer)?;
-        crate::files::rpc::check_fragment_health(
+        crate::storage_host::rpc::check_fragment_health(
             &self.app_state.iroh_transport,
             peer.node_id,
             peer_key,
