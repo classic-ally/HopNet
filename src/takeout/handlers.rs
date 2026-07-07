@@ -1,6 +1,4 @@
 use crate::{
-    AppState,
-    consensus::types::Transaction,
     db::{
         DatabaseError,
         imports::{self, ImportPayload, ImportStatusPayload},
@@ -24,13 +22,6 @@ impl TransactionHandler for CreateTakeoutHandler {
         ctx: &HandlerCtx<'_>,
         db_tx: &rusqlite::Transaction<'_>,
     ) -> HandlerResult {
-        // TEMPORARY (RFC-015, dies at Stage D5): takeout's creation flow
-        // still spawns host-side background work from apply and needs the
-        // full AppState via the ctx.host escape hatch.
-        let Some(state) = ctx.host.and_then(|h| h.downcast_ref::<AppState>()) else {
-            tracing::error!("create_takeout: host state unavailable");
-            return Err(DatabaseError::ProcessingError);
-        };
         match bincode::serde::decode_from_slice::<TakeoutPayload, _>(
             tx.payload,
             bincode::config::standard(),
@@ -62,19 +53,28 @@ impl TransactionHandler for CreateTakeoutHandler {
                     return Err(DatabaseError::AuthorizationError);
                 }
 
-                // Get current node ID
-                let current_node_id = state
-                    .get_node_id()
-                    .map_err(|_| DatabaseError::ProcessingError)?;
+                // This node's consensus id must be initialized to apply.
+                if ctx.node_id.is_none() {
+                    tracing::error!("create_takeout: node id not initialized");
+                    return Err(DatabaseError::ProcessingError);
+                }
 
-                // Process the takeout creation using shared transaction
-                takeout::process_takeout_creation(
-                    state,
-                    &takeout_payload,
-                    current_node_id,
-                    execute,
-                    db_tx,
-                )?;
+                // Pure-DB apply half (validation + insert + owner temp-table
+                // snapshot) on the shared transaction.
+                takeout::apply_takeout_creation(db_tx, &takeout_payload, ctx.node_id, execute)?;
+
+                // Owner node schedules materialization as named background
+                // work — the host routes it post-apply (RFC-015 Stage D5a).
+                if execute && ctx.node_id == Some(takeout_payload.owner_node_id) {
+                    tracing::info!(
+                        "Owner node will trigger materialization for takeout {} after transaction commit",
+                        takeout_payload.takeout_id
+                    );
+                    ctx.work.schedule(
+                        "takeout.materialize",
+                        takeout_payload.takeout_id.to_string(),
+                    );
+                }
 
                 Ok(())
             }
@@ -102,19 +102,43 @@ impl TransactionHandler for UpdateTakeoutStatusHandler {
         ctx: &HandlerCtx<'_>,
         db_tx: &rusqlite::Transaction<'_>,
     ) -> HandlerResult {
-        // TEMPORARY (RFC-015, dies at Stage D5): status updates trigger
-        // host-side materialization work and need AppState via ctx.host.
-        let Some(state) = ctx.host.and_then(|h| h.downcast_ref::<AppState>()) else {
-            tracing::error!("update_takeout_status: host state unavailable");
-            return Err(DatabaseError::ProcessingError);
-        };
         match bincode::serde::decode_from_slice::<TakeoutStatusPayload, _>(
             tx.payload,
             bincode::config::standard(),
         ) {
             Ok((status_payload, _)) => {
-                // Process the takeout status update using shared transaction
-                takeout::process_takeout_status_update(state, &status_payload, execute, db_tx)?;
+                // Pure-DB apply half; returns the owner when an EXECUTED
+                // update reached a terminal state (Expired/Cancelled).
+                let cleanup_owner =
+                    takeout::apply_takeout_status_update(db_tx, &status_payload, execute)?;
+
+                // Owner node schedules local cleanup as named background
+                // work — the host routes it post-apply (RFC-015 Stage D5a).
+                if let Some(owner_node_id) = cleanup_owner {
+                    match ctx.node_id {
+                        Some(node_id) if node_id == owner_node_id => {
+                            tracing::info!(
+                                "Owner node will trigger cleanup for takeout {} (status: {:?})",
+                                status_payload.takeout_id,
+                                status_payload.new_status
+                            );
+                            ctx.work.schedule(
+                                "takeout.cleanup",
+                                status_payload.takeout_id.to_string(),
+                            );
+                        }
+                        Some(_) => {
+                            tracing::debug!(
+                                "Non-owner node ignoring cleanup for takeout {} owned by node {}",
+                                status_payload.takeout_id,
+                                owner_node_id
+                            );
+                        }
+                        None => {
+                            tracing::warn!("Node ID not initialized, skipping cleanup trigger");
+                        }
+                    }
+                }
 
                 Ok(())
             }

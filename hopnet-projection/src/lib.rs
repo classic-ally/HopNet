@@ -12,7 +12,15 @@
 //! type. Signature verification happened host-side before dispatch; the ids
 //! carried here are trusted.
 
+pub mod host;
+
+pub use host::{
+    BoxFuture, SessionAccess, SessionError, TxGateway, TxSigner, TxSpec, TxSubmitError,
+    UserSession,
+};
+
 use serde::{Deserialize, Serialize};
+use std::pin::Pin;
 
 /// Database-layer error taxonomy shared by handlers and projection DB code.
 /// (Moved verbatim from the main crate's db/types.rs — the host re-exports.)
@@ -62,6 +70,20 @@ impl ChangeNotifier for NullNotifier {
     fn files_changed(&self) {}
 }
 
+/// Post-apply background-work scheduling. Handlers may only ENQUEUE named
+/// work (fire-and-forget, non-blocking); the host routes subsystem keys to
+/// its runtime tasks. This is how consensus handlers trigger host-side
+/// work without ever holding host state.
+pub trait WorkScheduler: Send + Sync {
+    fn schedule(&self, subsystem: &'static str, key: String);
+}
+
+/// No-op scheduler for tests and validate-only contexts.
+pub struct NullScheduler;
+impl WorkScheduler for NullScheduler {
+    fn schedule(&self, _subsystem: &'static str, _key: String) {}
+}
+
 /// The slice of host state a handler may need. Deliberately minimal —
 /// verified against every existing handler (only fragments_dir and the
 /// change signal were ever read from the host).
@@ -72,11 +94,9 @@ pub struct HandlerCtx<'a> {
     pub node_id: Option<i32>,
     /// Post-apply change signal (host impl owns test_mode/platform gating).
     pub notifier: &'a dyn ChangeNotifier,
-    /// TEMPORARY escape hatch (RFC-015; dies at Stage D5): the host's full
-    /// state for the two takeout handlers that still spawn host-side
-    /// background work from apply. Projection crates MUST NOT touch this —
-    /// it does not survive the takeout reshape.
-    pub host: Option<&'a (dyn std::any::Any + Send + Sync)>,
+    /// Named background-work scheduler (host impl owns spawning/routing).
+    /// Handlers schedule under `execute` only — validation must be pure.
+    pub work: &'a dyn WorkScheduler,
 }
 
 /// A consensus transaction handler. Implementations register themselves via
@@ -135,4 +155,72 @@ pub struct ExportEntry {
     /// Projection-specific metadata (self-describing, versioned by the
     /// projection).
     pub metadata: serde_json::Value,
+    /// Exporter-private reference so `open()` needs no re-resolve (drive:
+    /// the encrypted path). Never serialized into the manifest.
+    #[serde(skip)]
+    pub export_handle: Option<String>,
+}
+
+/// Content bytes for one export entry, as streamed by `open()`.
+pub type ExportByteStream =
+    Pin<Box<dyn tokio_stream::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>>;
+
+/// A projection's enumeration of its exportable state (paged/streaming —
+/// photos-scale; never materialize the whole listing in memory).
+pub type ExportEntryStream =
+    Pin<Box<dyn tokio_stream::Stream<Item = Result<ExportEntry, ExportError>> + Send>>;
+
+/// Export-side failure (enumerate/open).
+#[derive(Debug)]
+pub struct ExportError(pub String);
+
+/// Import-side failure classification: `Permanent` marks the entry Failed
+/// with a stable code (surfaced in status counts); `Transient` is retried
+/// by the core's resume machinery.
+#[derive(Debug)]
+pub enum ImportEntryError {
+    Permanent { code: &'static str, message: String },
+    Transient(String),
+}
+
+/// Per-projection takeout translator (RFC-015 Stage D5). hopnet-takeout's
+/// core drives export and import; the projection only translates between
+/// its own state and [`ExportEntry`] rows. Registration is
+/// host-constructed (`Vec<Arc<dyn ProjectionExporter>>`) — impls hold
+/// runtime state (drive's holds its DriveState for sessions/blobs).
+///
+/// Sidecar principle (acceptance bar): each entry's `metadata` must carry
+/// everything a FRESH mesh needs to reconstruct the projection's state
+/// from the entries alone — no side lookups into the source mesh.
+///
+/// Import contract: the core stages content and calls `import_entry` once
+/// PER ENTRY (uniform resume/progress per row), then `flush` at the end of
+/// the projection's section — the projection's batch boundary (drive may
+/// batch consensus transactions underneath and settle them at flush).
+pub trait ProjectionExporter: Send + Sync {
+    /// Manifest section name ("drive", "photos", …).
+    fn name(&self) -> &'static str;
+
+    /// Stream every exportable entry for the user. Paths in entries are
+    /// DECRYPTED logical paths.
+    fn enumerate(&self, user_id: i32) -> BoxFuture<'_, Result<ExportEntryStream, ExportError>>;
+
+    /// Open one entry's content for streaming (entries with `blob_id`).
+    fn open(
+        &self,
+        user_id: i32,
+        entry: &ExportEntry,
+    ) -> BoxFuture<'_, Result<ExportByteStream, ExportError>>;
+
+    /// Apply one entry to this projection on import. `staged_content` is
+    /// the core-staged plaintext file (None for folders/containers).
+    fn import_entry<'a>(
+        &'a self,
+        user_id: i32,
+        entry: &'a ExportEntry,
+        staged_content: Option<&'a std::path::Path>,
+    ) -> BoxFuture<'a, Result<(), ImportEntryError>>;
+
+    /// Section-end batch boundary: settle anything `import_entry` deferred.
+    fn flush(&self, user_id: i32) -> BoxFuture<'_, Result<(), ImportEntryError>>;
 }

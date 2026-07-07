@@ -2789,12 +2789,16 @@ dependencies = [
 name = "hopnet-projection"
 version = "0.1.0"
 dependencies = [
+ "aes-siv",
+ "bytes",
  "hopnet-common",
  "inventory",
  "rusqlite",
  "serde",
  "serde_json",
+ "tokio-stream",
  "tracing",
+ "x25519-dalek",
 ]
 
 [[package]]

@@ -73,6 +73,13 @@ pub struct AppState {
     /// with decided blob ids (non-blocking); the engine's workers and
     /// placement batcher run behind the host seams.
     pub storage: Arc<OnceCell<hopnet_storage::engine::EngineHandle>>,
+    /// The MAIN multi-thread runtime's handle, captured at startup.
+    /// Host-side background work scheduled from consensus apply
+    /// (`HostWorkScheduler`) spawns here — apply runs on the consensus
+    /// shell's dedicated `current_thread` runtime (no IO driver, and any
+    /// blocking work there stalls consensus), so `tokio::spawn` from apply
+    /// must not land on the ambient runtime.
+    pub runtime: tokio::runtime::Handle,
 }
 
 impl AppState {

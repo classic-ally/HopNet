@@ -182,11 +182,14 @@ pub fn process_transaction(
         let notifier = crate::handlers::HostNotifier {
             test_mode: app_state.test_mode,
         };
+        let scheduler = crate::handlers::HostWorkScheduler {
+            app_state: app_state.clone(),
+        };
         let ctx = crate::handlers::HandlerCtx {
             fragments_dir: &app_state.fragments_dir,
             node_id: app_state.node_id.get().copied(),
             notifier: &notifier,
-            host: Some(app_state),
+            work: &scheduler,
         };
         handler.process(&meta, execute, &ctx, db_tx)
     } else {

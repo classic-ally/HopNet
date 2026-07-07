@@ -224,6 +224,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 local_state_tx,
                 malachite: Arc::new(OnceCell::new()),
                 storage: Arc::new(OnceCell::new()),
+                runtime: tokio::runtime::Handle::current(),
             };
 
             // If we loaded state from database, populate the OnceCell fields

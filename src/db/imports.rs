@@ -147,7 +147,7 @@ pub fn process_import_creation(
 }
 
 /// Process an import status update through consensus.
-/// Mirrors `process_takeout_status_update`. Pure DB write on `db_tx` state,
+/// Mirrors `apply_takeout_status_update`. Pure DB write on `db_tx` state,
 /// deterministic across phases.
 pub fn process_import_status_update(
     payload: &ImportStatusPayload,

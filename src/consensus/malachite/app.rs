@@ -313,11 +313,16 @@ pub fn build_value(
                     let notifier = crate::handlers::HostNotifier {
                         test_mode: app_state.test_mode,
                     };
+                    // execute=false here — the scheduler is never invoked
+                    // during preflight; constructed for ctx uniformity.
+                    let scheduler = crate::handlers::HostWorkScheduler {
+                        app_state: app_state.clone(),
+                    };
                     let ctx = crate::handlers::HandlerCtx {
                         fragments_dir: &app_state.fragments_dir,
                         node_id: app_state.node_id.get().copied(),
                         notifier: &notifier,
-                        host: Some(app_state),
+                        work: &scheduler,
                     };
                     handler
                         .process(&meta, false, &ctx, &db_tx)

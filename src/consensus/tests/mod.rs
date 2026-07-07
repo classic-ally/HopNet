@@ -441,6 +441,9 @@ pub fn create_test_app_state_with_keys(
         local_state_tx: tokio::sync::mpsc::channel(1).0,
         malachite: Arc::new(once_cell::sync::OnceCell::new()),
         storage: Arc::new(once_cell::sync::OnceCell::new()),
+        // Tests run sync (no ambient runtime) — reuse the shared test
+        // runtime so scheduled work has somewhere real to land.
+        runtime: test_iroh_rt().handle().clone(),
     }
 }
 

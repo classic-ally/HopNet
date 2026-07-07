@@ -91,16 +91,20 @@ impl TakeoutPayload {
     }
 }
 
-/// Process a takeout creation using a shared transaction (for consensus transaction processing)
+/// Apply a takeout creation on the shared block transaction (consensus
+/// transaction processing). Pure DB half — no host state:
 /// - Owner node: Creates temporary inode snapshot table
 /// - Other nodes: Just records the takeout
 /// - execute flag: Handler context manages commit/rollback
-pub fn process_takeout_creation(
-    state: &crate::AppState,
-    payload: &TakeoutPayload,
-    current_node_id: i32,
-    execute: bool,
+///
+/// Materialization scheduling moved to the HANDLER via
+/// `ctx.work.schedule("takeout.materialize", …)` (RFC-015 Stage D5a).
+/// `current_node_id` is `ctx.node_id` (None = uninitialized, never owner).
+pub fn apply_takeout_creation(
     db_tx: &rusqlite::Transaction,
+    payload: &TakeoutPayload,
+    current_node_id: Option<i32>,
+    execute: bool,
 ) -> Result<(), DatabaseError> {
     tracing::debug!(
         "Processing takeout creation for user_id: {} (execute={})",
@@ -132,7 +136,7 @@ pub fn process_takeout_creation(
     tracing::debug!("Takeout record inserted successfully");
 
     // Only the owner node creates the temporary inode snapshot
-    if current_node_id == payload.owner_node_id {
+    if current_node_id == Some(payload.owner_node_id) {
         let temp_table_name = format!("takeout_inodes_{}", payload.takeout_id.simple());
         tracing::debug!("Owner node creating temporary table: {}", temp_table_name);
 
@@ -173,39 +177,9 @@ pub fn process_takeout_creation(
         tracing::debug!("Owner node populated temporary table with user inodes");
     }
 
-    // Only trigger async materialization during execution phase
-    if execute && current_node_id == payload.owner_node_id {
-        let state_clone = state.clone();
-        let takeout_id = payload.takeout_id.clone();
-        let user_id = payload.user_id;
-
-        tracing::info!(
-            "Owner node will trigger materialization for takeout {} after transaction commit",
-            takeout_id
-        );
-
-        // Spawn async task that doesn't block consensus
-        tokio::spawn(async move {
-            if let Err(e) = crate::takeout::routes::execute_takeout_materialization(
-                &state_clone,
-                &takeout_id,
-                user_id,
-            )
-            .await
-            {
-                tracing::error!(
-                    "Failed to trigger materialization for takeout {}: {:?}",
-                    takeout_id,
-                    e
-                );
-                // Don't panic - fallback job will catch this later
-            }
-        });
-    }
-
     if execute {
         tracing::info!(
-            "Node {} processed takeout {} for user {} (owner: node {})",
+            "Node {:?} processed takeout {} for user {} (owner: node {})",
             current_node_id,
             payload.takeout_id,
             payload.user_id,
@@ -554,14 +528,19 @@ pub fn materialize_folders(
     Ok((materialized_count, failed_count))
 }
 
-/// Process a takeout status update using a shared transaction (for consensus transaction processing)
-/// - Handler context manages commit/rollback
-pub fn process_takeout_status_update(
-    state: &crate::AppState,
+/// Apply a takeout status update on the shared block transaction (consensus
+/// transaction processing). Pure DB half — no host state; handler context
+/// manages commit/rollback.
+///
+/// Returns `Some(owner_node_id)` when the update EXECUTED a transition to a
+/// terminal state (Expired/Cancelled) — the handler schedules
+/// `"takeout.cleanup"` via `ctx.work` if this node is the owner (RFC-015
+/// Stage D5a; the cleanup spawn used to live here). `None` otherwise.
+pub fn apply_takeout_status_update(
+    db_tx: &rusqlite::Transaction,
     payload: &TakeoutStatusPayload,
     execute: bool,
-    db_tx: &rusqlite::Transaction,
-) -> Result<(), DatabaseError> {
+) -> Result<Option<i32>, DatabaseError> {
     tracing::debug!(
         "Processing takeout status update for {}: {:?} (execute={})",
         payload.takeout_id,
@@ -597,7 +576,7 @@ pub fn process_takeout_status_update(
             DatabaseError::ProcessingError
         })?;
 
-    // Only trigger cleanup during execution phase
+    // Only surface the cleanup trigger during execution phase
     if execute {
         tracing::info!(
             "Updated takeout {} status to {:?}",
@@ -605,20 +584,13 @@ pub fn process_takeout_status_update(
             payload.new_status
         );
 
-        // If status changed to a terminal state (Expired or Cancelled), trigger local cleanup immediately
+        // If status changed to a terminal state (Expired or Cancelled), the
+        // owner node should trigger local cleanup — report the owner so the
+        // handler can schedule it.
         if matches!(
             payload.new_status,
             hopnet_common::TakeoutStatus::Expired | hopnet_common::TakeoutStatus::Cancelled
         ) {
-            // Get current node ID to check ownership
-            let current_node_id = match state.get_node_id() {
-                Ok(id) => id,
-                Err(_) => {
-                    tracing::warn!("Node ID not initialized, skipping cleanup trigger");
-                    return Ok(()); // Continue, don't fail consensus
-                }
-            };
-
             // Get takeout owner using same transaction
             let owner_node_id: i32 = db_tx
                 .query_row(
@@ -631,41 +603,13 @@ pub fn process_takeout_status_update(
                     DatabaseError::RecallError
                 })?;
 
-            // Only trigger cleanup if this node owns the takeout
-            if current_node_id == owner_node_id {
-                let takeout_id = payload.takeout_id.clone();
-                let fragments_dir = state.fragments_dir.clone();
-                let db_pool = state.db_pool.clone();
-
-                tracing::info!(
-                    "Owner node will trigger cleanup for takeout {} (status: {:?})",
-                    takeout_id,
-                    payload.new_status
-                );
-
-                // Spawn async task that doesn't block consensus
-                tokio::spawn(async move {
-                    if let Err(e) = cleanup_expired_takeout_files(&takeout_id, &fragments_dir).await
-                    {
-                        tracing::error!("Failed to clean up takeout files {}: {:?}", takeout_id, e);
-                    }
-                    if let Err(e) = cleanup_takeout_table(db_pool.get(), &takeout_id) {
-                        tracing::error!("Failed to clean up takeout table {}: {:?}", takeout_id, e);
-                    }
-                });
-            } else {
-                tracing::debug!(
-                    "Non-owner node ignoring cleanup for takeout {} owned by node {}",
-                    payload.takeout_id,
-                    owner_node_id
-                );
-            }
+            return Ok(Some(owner_node_id));
         }
     } else {
         tracing::debug!("Status update validation phase completed");
     }
 
-    Ok(())
+    Ok(None)
 }
 
 /// Warn above this count: in-memory list grows large, consider paginating.
@@ -1119,7 +1063,7 @@ pub fn get_materialized_entries_for_archive(
 
 /// Clean up files associated with an expired or cancelled takeout
 /// This removes both the archive file and any staging directories
-async fn cleanup_expired_takeout_files(
+pub(crate) async fn cleanup_expired_takeout_files(
     takeout_id: &CustomUUID,
     fragments_dir: &str,
 ) -> Result<(), std::io::Error> {
