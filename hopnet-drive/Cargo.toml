@@ -11,6 +11,14 @@ hopnet-common = { path = "../common", features = ["database"] }
 hopnet-projection = { path = "../hopnet-projection" }
 hopnet-storage = { path = "../hopnet-storage", features = ["engine"] }
 
+# Version strings mirror the root Cargo.toml pins (workspace-unified).
+aes-siv = "0.7.0"
+chrono = { version = "0.4.41", features = ["serde"] }
+hex = "0.4.3"
+mime_guess = "2.0.5"
+r2d2 = "0.8.10"
+r2d2_sqlite = "0.32"
+rand = "0.10"
 rusqlite = { version = "0.38", features = ["bundled"] }
 serde = { version = "1.0.219", features = ["derive"] }
 tracing = "0.1"

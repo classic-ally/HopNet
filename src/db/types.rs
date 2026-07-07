@@ -20,49 +20,9 @@ use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, 
 use serde::{Deserialize, Serialize};
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey};
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct CustomDateTime(DateTime<Utc>);
-
-impl CustomDateTime {
-    pub fn new(dt: DateTime<Utc>) -> Self {
-        CustomDateTime(dt)
-    }
-}
-
-impl Deref for CustomDateTime {
-    type Target = DateTime<Utc>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl ToSql for CustomDateTime {
-    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
-        Ok(ToSqlOutput::from(self.to_rfc3339()))
-    }
-}
-
-impl FromSql for CustomDateTime {
-    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
-        match value {
-            ValueRef::Integer(millis) => {
-                // uuid_extract_timestamp returns epoch milliseconds
-                DateTime::from_timestamp_millis(millis)
-                    .map(CustomDateTime)
-                    .ok_or(FromSqlError::InvalidType)
-            }
-            ValueRef::Text(str) => match std::str::from_utf8(str) {
-                Ok(utf_value) => match DateTime::parse_from_rfc3339(utf_value) {
-                    Ok(dt) => Ok(CustomDateTime(dt.with_timezone(&Utc))),
-                    Err(_) => Err(FromSqlError::InvalidType),
-                },
-                Err(_) => Err(FromSqlError::InvalidType),
-            },
-            _ => Err(FromSqlError::InvalidType),
-        }
-    }
-}
+/// Drive-owned (RFC-015): CustomDateTime lives in hopnet-drive's model;
+/// re-exported at the old path so call sites don't churn.
+pub use hopnet_drive::model::CustomDateTime;
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 pub enum ChunkType {

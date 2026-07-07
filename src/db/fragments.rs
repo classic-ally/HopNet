@@ -377,6 +377,80 @@ pub fn get_data_blocks_for_rebalancing(
     Ok(result)
 }
 
+/// Batch-update local storage state for multiple fragments in a single transaction.
+/// Acquires the write lock once instead of once per fragment, avoiding sustained
+/// lock contention with consensus operations.
+pub fn mark_fragments_local_state_batch(
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
+    fragment_hashes: &[crate::types::Blake3Hash],
+    stored_locally: bool,
+) -> Result<usize, DatabaseError> {
+    if fragment_hashes.is_empty() {
+        return Ok(0);
+    }
+    match db_connection {
+        Ok(mut db_lock) => {
+            let tx = db_lock.transaction().map_err(|e| {
+                tracing::error!(
+                    "Failed to begin transaction for batch fragment update: {:?}",
+                    e
+                );
+                DatabaseError::LockError
+            })?;
+            // Substrate-owned write (RFC-014 stored_locally invariant) —
+            // the host owns only the conn + commit telemetry.
+            let total_rows =
+                hopnet_storage::store::mark_local_state_batch(&tx, fragment_hashes, stored_locally)
+                    .map_err(|e| {
+                        tracing::error!("mark_local_state_batch failed: {e}");
+                        DatabaseError::ProcessingError
+                    })?;
+            crate::db::shared::commit_timed(tx).map_err(|e| {
+                tracing::error!("Failed to commit batch fragment update: {:?}", e);
+                DatabaseError::InsertError
+            })?;
+
+            let state_text = if stored_locally {
+                "stored locally"
+            } else {
+                "not stored locally"
+            };
+            tracing::debug!(
+                "Batch-marked {} fragment records ({} hashes) as {}",
+                total_rows,
+                fragment_hashes.len(),
+                state_text
+            );
+            Ok(total_rows)
+        }
+        Err(_) => Err(DatabaseError::LockError),
+    }
+}
+
+/// Get count of fragments stored locally on this node
+pub fn get_local_fragment_count(
+    db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
+) -> Result<i64, DatabaseError> {
+    match db_connection {
+        Ok(db_lock) => {
+            let count = db_lock
+                .query_row(
+                    "SELECT COUNT(*) FROM fragment_hashes WHERE stored_locally = TRUE",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|e| {
+                    tracing::error!("Error querying local fragment count: {:?}", e);
+                    DatabaseError::RecallError
+                })?;
+
+            tracing::debug!("Found {} fragments stored locally", count);
+            Ok(count)
+        }
+        Err(_) => Err(DatabaseError::LockError),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DataBlockRebalanceInfo {
     pub data_block_id: CustomUUID,

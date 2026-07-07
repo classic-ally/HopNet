@@ -5,9 +5,36 @@
 //! the host's `users` and the substrate's `data_blocks` — the host chains
 //! host DDL → consensus → storage → drive.
 
+pub mod documentprovider;
+pub mod fileprovider;
+pub mod files;
+pub mod shares;
+
+use hopnet_projection::DatabaseError;
+
 /// The tables this projection owns, in dependency order (parents first).
 /// Exposed for divergence tooling and the host's boot tripwire.
 pub const TABLES: &[&str] = &["inodes", "modification_log", "incoming_shares", "shares"];
+
+/// Current decided consensus height, read off any connection to the shared
+/// SQLite DB. Reproduces the host's
+/// `db::consensus::get_current_consensus_height` semantics EXACTLY (SQL
+/// copied verbatim): missing row (pre-genesis) reads as 0, any query error
+/// maps to `DatabaseError::RecallError`.
+pub(crate) fn current_height(conn: &rusqlite::Connection) -> Result<i32, DatabaseError> {
+    use rusqlite::OptionalExtension;
+
+    let current_height: Option<i64> = conn
+        .query_row(
+            "SELECT value FROM consensus_meta WHERE key = 'last_decided_height'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| DatabaseError::RecallError)?;
+
+    Ok(current_height.unwrap_or(0) as i32)
+}
 
 /// Install the drive's tables. Requires `users` (host) and `data_blocks`
 /// (hopnet-storage) to exist already.

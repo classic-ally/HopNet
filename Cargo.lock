@@ -2757,9 +2757,16 @@ dependencies = [
 name = "hopnet-drive"
 version = "0.1.0"
 dependencies = [
+ "aes-siv",
+ "chrono",
+ "hex",
  "hopnet-common",
  "hopnet-projection",
  "hopnet-storage",
+ "mime_guess",
+ "r2d2",
+ "r2d2_sqlite",
+ "rand 0.10.1",
  "rusqlite",
  "serde",
  "tracing",

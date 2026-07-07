@@ -9,17 +9,12 @@ use crate::{
 use either::Either;
 use serde::{Deserialize, Serialize};
 
-/// The DRIVE projection's insert envelope: substrate blob registrations
-/// (crate sub-payloads) alongside the inodes that reference them by id.
-/// Both halves apply in ONE handler transaction — blob + first reference
-/// are atomic, so mark-and-sweep never observes a zero-ref blob.
-/// (Envelope ownership: this type belongs to the drive projection and
-/// extracts with it to hopnet-drive.)
-#[derive(Serialize, Deserialize, Debug)]
-pub struct DriveInsertPayload {
-    pub blob_ops: Vec<hopnet_storage::store::BlobInsertOp>,
-    pub inodes: Vec<Inode>,
-}
+/// Drive-owned (RFC-015): the drive tx envelopes live in hopnet-drive;
+/// re-exported here so call sites don't churn. The handlers themselves
+/// stay host-side until Stage D3.
+pub use hopnet_drive::envelopes::{
+    DeleteFilesPayload, DriveContentUpdate, DriveInsertPayload, ModifyItemPayload,
+};
 
 pub struct InsertFilesHandler;
 
@@ -132,12 +127,6 @@ pub struct DeleteOrphanedDataBlocksPayload {
     pub data_block_ids: Vec<CustomUUID>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct DeleteFilesPayload {
-    pub encrypted_path: String,
-    pub user_id: i32,
-}
-
 pub struct DeleteOrphanedDataBlocksHandler;
 
 impl TransactionHandler for DeleteOrphanedDataBlocksHandler {
@@ -207,25 +196,6 @@ impl TransactionHandler for DeleteOrphanedDataBlocksHandler {
 
 inventory::submit! {
     &DeleteOrphanedDataBlocksHandler as &dyn TransactionHandler
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ModifyItemPayload {
-    pub user_id: i32,
-    pub inode_id: crate::db::CustomUUID, // Stable inode identifier
-    pub new_encrypted_path: Option<String>, // New path if renaming/moving
-    /// Content change, when present. `blob_op: None` means the content is
-    /// now EMPTY — the inode's data_id becomes NULL (no blob exists for
-    /// empty content; RFC-014).
-    pub content_update: Option<DriveContentUpdate>,
-    // Phase 2b: Share propagation — pre-computed updates for pending incoming_shares
-    pub incoming_share_updates: Option<Vec<crate::shares::types::IncomingShareUpdate>>,
-}
-
-/// Drive-scoped content-update sub-payload (extracts with the projection).
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct DriveContentUpdate {
-    pub blob_op: Option<hopnet_storage::store::BlobInsertOp>,
 }
 
 pub struct ModifyItemHandler;
