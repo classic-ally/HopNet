@@ -2792,6 +2792,7 @@ name = "hopnet-projection"
 version = "0.1.0"
 dependencies = [
  "aes-siv",
+ "axum",
  "bytes",
  "chacha20poly1305",
  "chrono",
@@ -2801,6 +2802,8 @@ dependencies = [
  "inventory",
  "once_cell",
  "parking_lot",
+ "r2d2",
+ "r2d2_sqlite",
  "rusqlite",
  "serde",
  "serde_json",

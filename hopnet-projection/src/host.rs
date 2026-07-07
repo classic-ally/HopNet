@@ -122,3 +122,56 @@ pub enum WriteCheckError {
 pub trait WriteAdmission: Send + Sync {
     fn check_write(&self, user_id: i32) -> BoxFuture<'_, Result<(), WriteCheckError>>;
 }
+
+/// The full host capability bundle a projection builds its axum state
+/// from (RFC-016 Stage 2): concrete DB access (projections own their SQL)
+/// plus every host seam. Field set is DriveState's, verbatim — drive's
+/// `DriveState` is now an alias of this.
+#[derive(Clone)]
+pub struct HostCapabilities {
+    pub db_pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    pub fragments_dir: String,
+    pub test_mode: bool,
+    pub node_id: std::sync::Arc<once_cell::sync::OnceCell<i32>>,
+    pub sessions: std::sync::Arc<dyn SessionAccess>,
+    pub txs: std::sync::Arc<dyn TxGateway>,
+    pub blobs: std::sync::Arc<dyn BlobStreamer>,
+    pub notify: std::sync::Arc<dyn crate::ChangeNotifier>,
+    pub write_admission: std::sync::Arc<dyn WriteAdmission>,
+}
+
+impl HostCapabilities {
+    pub fn node_id(&self) -> Option<i32> {
+        self.node_id.get().copied()
+    }
+}
+
+/// Per-user write gate. Returns 409 Conflict (empty body) on any request
+/// hitting a route this layer is attached to while the host's write
+/// admission denies the authenticated user (an active takeout import
+/// today). Reads `user_id` from request extensions populated upstream by
+/// the host's auth middleware. Missing user → 401, check failure → 500,
+/// denied → 409.
+///
+/// Attachment is explicit per route (or per write-only sub-router) — the
+/// middleware itself does no method discrimination. Routes that should
+/// bypass the gate simply don't have the layer applied.
+pub async fn write_gate(
+    axum::extract::State(state): axum::extract::State<HostCapabilities>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<axum::response::Response, axum::http::StatusCode> {
+    use axum::http::StatusCode;
+
+    let user_id = req
+        .extensions()
+        .get::<i32>()
+        .copied()
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    match state.write_admission.check_write(user_id).await {
+        Ok(()) => Ok(next.run(req).await),
+        Err(WriteCheckError::Denied(_)) => Err(StatusCode::CONFLICT),
+        Err(WriteCheckError::Internal) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}

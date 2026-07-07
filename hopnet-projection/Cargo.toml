@@ -15,8 +15,11 @@ hopnet-common = { path = "../common", features = ["database"] }
 hopnet-storage = { path = "../hopnet-storage" }
 
 aes-siv = "0.7.0"
+axum = "0.8.4"
 bytes = "1.10.1"
 chacha20poly1305 = { version = "0.10.1", features = ["stream"] }
+r2d2 = "0.8.10"
+r2d2_sqlite = "0.32"
 chrono = { version = "0.4.41", features = ["serde"] }
 # Bounded 1us..60s commit-latency histogram (dbstats); pins mirror the root.
 hdrhistogram = { version = "7.5.4", default-features = false }
