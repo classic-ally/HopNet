@@ -2793,9 +2793,11 @@ version = "0.1.0"
 dependencies = [
  "aes-siv",
  "bytes",
+ "chacha20poly1305",
  "chrono",
  "hdrhistogram",
  "hopnet-common",
+ "hopnet-storage",
  "inventory",
  "once_cell",
  "parking_lot",

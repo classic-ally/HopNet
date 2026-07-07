@@ -79,3 +79,46 @@ pub trait TxGateway: Send + Sync {
         })
     }
 }
+
+pub type ByteStream = Pin<
+    Box<
+        dyn tokio_stream::Stream<Item = Result<bytes::Bytes, hopnet_storage::StorageError>>
+            + Send,
+    >,
+>;
+
+/// Type-erases hopnet_storage::api::get + the host's seam bundle (the
+/// generic GetNet can't cross a dyn boundary). Host impl = api::get over
+/// its SubstrateHost seams. Moved down from hopnet_drive::host at RFC-016
+/// Stage 1 — any projection streams blobs, not just the drive.
+pub trait BlobStreamer: Send + Sync {
+    fn stream(
+        &self,
+        manifest: hopnet_storage::store::BlobManifest,
+        per_blob_key: Option<chacha20poly1305::Key>,
+        range: Option<(u64, u64)>,
+    ) -> ByteStream;
+}
+
+#[derive(Debug)]
+pub struct WriteDenied {
+    /// Human-readable reason (import in progress, …) — maps to HTTP 409.
+    pub reason: String,
+}
+
+#[derive(Debug)]
+pub enum WriteCheckError {
+    /// Writes are gated for this user — HTTP 409 (empty body, matching the
+    /// host's takeout import gate).
+    Denied(WriteDenied),
+    /// The check itself failed host-side (DB error) — HTTP 500.
+    Internal,
+}
+
+/// Write admission for projection mutations (the takeout import gate
+/// today). The host is the composition root: its impl may consult any
+/// service (takeout's per-user import flag); projections only ever see
+/// this trait. Moved down from hopnet_drive::host at RFC-016 Stage 1.
+pub trait WriteAdmission: Send + Sync {
+    fn check_write(&self, user_id: i32) -> BoxFuture<'_, Result<(), WriteCheckError>>;
+}

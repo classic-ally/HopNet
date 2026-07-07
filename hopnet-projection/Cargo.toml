@@ -8,9 +8,15 @@ description = "HopNet projection seam: the transaction-handler contract, change 
 
 [dependencies]
 hopnet-common = { path = "../common", features = ["database"] }
+# Default features only (no engine): BlobStreamer's vocabulary types
+# (BlobManifest, StorageError) are un-gated. RFC-016 layering decision:
+# projection → storage, so blob streaming can live in HostCapabilities;
+# consequence: hopnet-storage must never depend on hopnet-projection.
+hopnet-storage = { path = "../hopnet-storage" }
 
 aes-siv = "0.7.0"
 bytes = "1.10.1"
+chacha20poly1305 = { version = "0.10.1", features = ["stream"] }
 chrono = { version = "0.4.41", features = ["serde"] }
 # Bounded 1us..60s commit-latency histogram (dbstats); pins mirror the root.
 hdrhistogram = { version = "7.5.4", default-features = false }
