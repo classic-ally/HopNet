@@ -340,4 +340,20 @@ pub trait Projection: Send + Sync {
     fn mounts(&self, _caps: &host::HostCapabilities) -> Vec<Mount> {
         Vec::new()
     }
+
+    /// Claim one unit of named background work enqueued from consensus
+    /// apply via [`WorkScheduler::schedule`]. Return `Some(future)` to
+    /// claim; the host spawns it on the MAIN runtime (apply runs on the
+    /// consensus shell's time-only runtime, where IO work must not land).
+    /// schedule() fires before the block's DB transaction commits — the
+    /// future must tolerate not yet seeing applied rows (brief retry).
+    /// Default: claims nothing.
+    fn work(
+        &self,
+        _caps: &host::HostCapabilities,
+        _subsystem: &str,
+        _key: String,
+    ) -> Option<host::BoxFuture<'static, ()>> {
+        None
+    }
 }

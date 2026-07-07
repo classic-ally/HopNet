@@ -150,6 +150,17 @@ impl WorkScheduler for HostWorkScheduler {
                 });
             }
             other => {
+                // Manifest fallthrough (RFC-016 Stage 5): offer the work to
+                // every registered projection; first claimant wins and its
+                // future runs on the main runtime (same invariant as the
+                // named takeout arms above).
+                let caps = crate::drive_host::drive_state(&self.app_state);
+                for projection in crate::projections::manifests() {
+                    if let Some(fut) = projection.work(&caps, other, key.clone()) {
+                        self.app_state.runtime.spawn(fut);
+                        return;
+                    }
+                }
                 tracing::error!(
                     "HostWorkScheduler: unknown work subsystem {:?} (key {:?})",
                     other,
