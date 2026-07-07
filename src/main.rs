@@ -57,6 +57,10 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
     // tracing
     tracing_subscriber::fmt::init();
 
+    // RFC-015 boot tripwire: fail-stop immediately if the linker dropped a
+    // projection's cross-crate inventory registrations.
+    assert_projection_registrations();
+
     let admin_service = ServeDir::new(&ASSETS_DIR);
 
     // Bind before anything else. With `127.0.0.1:0` the kernel assigns a

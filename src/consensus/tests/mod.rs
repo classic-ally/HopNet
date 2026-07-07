@@ -391,6 +391,10 @@ pub fn create_test_app_state_with_keys(
     use r2d2_sqlite::SqliteConnectionManager;
     use std::sync::Arc;
 
+    // RFC-015 boot tripwire (mirrors server startup): tests must see the
+    // same cross-crate handler registrations as production.
+    crate::assert_projection_registrations();
+
     let manager = SqliteConnectionManager::memory();
     let pool = Pool::builder()
         .connection_customizer(Box::new(crate::db::shared::SqliteInitializer))

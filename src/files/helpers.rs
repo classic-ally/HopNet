@@ -187,50 +187,6 @@ fn extract_uploaded_fragment_hashes(
         .collect()
 }
 
-/// Read the node's current inventory count and which of `candidates` are
-/// already present. Returns `(previous_count, existing_set)`.
-fn query_inventory_state(
-    tx: &RusqliteTransaction,
-    node_id: i32,
-    candidates: &[Blake3Hash],
-) -> Result<(u32, HashSet<Blake3Hash>), rusqlite::Error> {
-    let previous_count: u32 = {
-        let mut stmt = tx.prepare("SELECT COUNT(*) FROM fragment_inventory WHERE node_id = ?")?;
-        let count: i64 = stmt.query_row(rusqlite::params![node_id], |row| row.get(0))?;
-        count as u32
-    };
-
-    if candidates.is_empty() {
-        return Ok((previous_count, HashSet::new()));
-    }
-
-    let placeholders = candidates
-        .iter()
-        .map(|_| "?")
-        .collect::<Vec<_>>()
-        .join(", ");
-    let query = format!(
-        "SELECT fragment_hash FROM fragment_inventory \
-         WHERE node_id = ? AND fragment_hash IN ({})",
-        placeholders
-    );
-
-    let mut stmt = tx.prepare(&query)?;
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(node_id)];
-    for hash in candidates {
-        params.push(Box::new(*hash));
-    }
-    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-
-    let mut rows = stmt.query(param_refs.as_slice())?;
-    let mut set = HashSet::new();
-    while let Some(row) = rows.next()? {
-        let hash: Blake3Hash = row.get(0)?;
-        set.insert(hash);
-    }
-    Ok((previous_count, set))
-}
-
 /// Build a `self_check_fragments` attestation for fragments freshly written
 /// during an upload. Filters against the node's current `fragment_inventory`
 /// so retries don't trigger PRIMARY KEY violations downstream. Returns `None`
@@ -251,7 +207,7 @@ pub(crate) fn build_upload_attestation(
     }
 
     let (previous_count, existing_fragments) =
-        query_inventory_state(tx, node_id, &uploaded_fragments)?;
+        hopnet_storage::store::query_inventory_state(tx, node_id, &uploaded_fragments)?;
 
     let new_fragments: Vec<Blake3Hash> = uploaded_fragments
         .into_iter()

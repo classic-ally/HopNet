@@ -7,7 +7,8 @@ pub mod handlers;
 pub mod helpers;
 pub mod jobs;
 pub mod placement;
-pub mod reference_provider;
+// Drive-owned (RFC-015, Stage D3): FilesystemReferenceProvider lives in
+// hopnet_drive::reference_provider and registers cross-crate via inventory.
 pub mod routes;
 pub mod rpc;
 pub mod substrate_host;

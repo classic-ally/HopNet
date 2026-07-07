@@ -54,3 +54,39 @@ pub struct IncomingShareUpdate {
     pub incoming_share_id: CustomUUID,
     pub new_file_access_blob: Vec<u8>,
 }
+
+// --- Share consensus payloads (moved verbatim from the host's
+// `shares::types` at Stage D3; the host re-exports at the old path).
+// Serde field order is bincode-frozen; do not reorder. ---
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ShareFilePayload {
+    pub id: CustomUUID,
+    pub data_block_id: CustomUUID,
+    pub sender_id: i32,
+    pub recipient_id: i32,
+    pub file_access: Vec<u8>, // bincode-encoded FileAccess for recipient
+    pub display_ephemeral_pubkey: Vec<u8>, // 32 bytes X25519 ephemeral public key
+    pub encrypted_display_name: Vec<u8>, // ChaCha20-Poly1305 ciphertext
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AcceptSharePayload {
+    pub incoming_share_id: CustomUUID,
+    pub recipient_id: i32,
+    pub encrypted_path: String,
+    pub inode_id: CustomUUID,
+    pub parent_folder_inodes: Vec<(CustomUUID, String)>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DeclineSharePayload {
+    pub incoming_share_id: CustomUUID,
+    pub user_id: i32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct UnsharePayload {
+    pub inode_id: CustomUUID,
+    pub user_id: i32,
+}

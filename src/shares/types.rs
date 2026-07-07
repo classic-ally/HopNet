@@ -1,50 +1,23 @@
-use crate::db::CustomUUID;
 use crate::db::types::XPubKey;
 use chacha20poly1305::{
     ChaCha20Poly1305,
     aead::{Aead, KeyInit, OsRng},
 };
-use serde::{Deserialize, Serialize};
 use x25519_dalek::PublicKey as X25519PublicKey;
 
 // --- Consensus payload structs ---
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ShareFilePayload {
-    pub id: CustomUUID,
-    pub data_block_id: CustomUUID,
-    pub sender_id: i32,
-    pub recipient_id: i32,
-    pub file_access: Vec<u8>, // bincode-encoded FileAccess for recipient
-    pub display_ephemeral_pubkey: Vec<u8>, // 32 bytes X25519 ephemeral public key
-    pub encrypted_display_name: Vec<u8>, // ChaCha20-Poly1305 ciphertext
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct AcceptSharePayload {
-    pub incoming_share_id: CustomUUID,
-    pub recipient_id: i32,
-    pub encrypted_path: String,
-    pub inode_id: CustomUUID,
-    pub parent_folder_inodes: Vec<(CustomUUID, String)>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct DeclineSharePayload {
-    pub incoming_share_id: CustomUUID,
-    pub user_id: i32,
-}
+/// Drive-owned (RFC-015, Stage D3): the share consensus payloads are drive
+/// wire types and live in hopnet-drive's envelopes (with their handlers);
+/// re-exported here so call sites don't churn.
+pub use hopnet_drive::envelopes::{
+    AcceptSharePayload, DeclineSharePayload, ShareFilePayload, UnsharePayload,
+};
 
 /// Drive-owned (RFC-015): IncomingShareUpdate is a drive wire type and
 /// lives in hopnet-drive's envelopes; re-exported here so call sites
 /// don't churn.
 pub use hopnet_drive::envelopes::IncomingShareUpdate;
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct UnsharePayload {
-    pub inode_id: CustomUUID,
-    pub user_id: i32,
-}
 
 // --- API request/response types (re-exported from common) ---
 

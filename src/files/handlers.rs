@@ -1,84 +1,17 @@
 use crate::{
-    db::Inode,
-    db::{
-        CustomUUID, DatabaseError, files::insert_files,
-        fragments::delete_orphaned_data_blocks_consensus,
-    },
+    db::{CustomUUID, DatabaseError, fragments::delete_orphaned_data_blocks_consensus},
     handlers::{HandlerCtx, HandlerResult, TransactionHandler, TxMeta},
 };
-use either::Either;
 use serde::{Deserialize, Serialize};
 
 /// Drive-owned (RFC-015): the drive tx envelopes live in hopnet-drive;
-/// re-exported here so call sites don't churn. The handlers themselves
-/// stay host-side until Stage D3.
+/// re-exported here so call sites don't churn. The drive's handlers
+/// (insert_files/modify_item/delete_files + shares) moved to
+/// `hopnet_drive::handlers` at Stage D3; only substrate/storage-side
+/// handlers remain here.
 pub use hopnet_drive::envelopes::{
     DeleteFilesPayload, DriveContentUpdate, DriveInsertPayload, ModifyItemPayload,
 };
-
-pub struct InsertFilesHandler;
-
-impl TransactionHandler for InsertFilesHandler {
-    fn name(&self) -> &'static str {
-        "insert_files"
-    }
-
-    fn process(
-        &self,
-        tx: &TxMeta<'_>,
-        execute: bool,
-        ctx: &HandlerCtx<'_>,
-        db_tx: &rusqlite::Transaction<'_>,
-    ) -> HandlerResult {
-        match bincode::serde::decode_from_slice::<DriveInsertPayload, _>(
-            tx.payload,
-            bincode::config::standard(),
-        ) {
-            Ok((payload, _)) => {
-                let DriveInsertPayload { blob_ops, inodes } = payload;
-                // Authorization: verify user owns the files being inserted
-                if let Some(user_id) = tx.user_id {
-                    for inode in &inodes {
-                        // (Owner narrowing, RFC-015: a legacy Either::Right
-                        // payload now fails DECODE above — same rejection,
-                        // one step earlier.)
-                        let owner_id = inode.owner.id();
-                        if owner_id != user_id {
-                            tracing::warn!(
-                                "Authorization failed: user {} attempted to insert file for user {}",
-                                user_id,
-                                owner_id
-                            );
-                            return Err(DatabaseError::AuthorizationError);
-                        }
-                    }
-                } else {
-                    tracing::warn!(
-                        "Authorization failed: insert_files requires user authentication"
-                    );
-                    return Err(DatabaseError::AuthorizationError);
-                }
-
-                // Substrate half: register blobs (stored_locally probed
-                // against this node's disk in-crate), then the projection
-                // half: inodes referencing them by id.
-                insert_files(db_tx, &blob_ops, inodes, ctx.fragments_dir)?;
-
-                // Signal FileProvider to refresh when files are actually inserted (execute=true)
-                if execute {
-                    ctx.notifier.files_changed();
-                }
-
-                Ok(())
-            }
-            Err(_) => Err(DatabaseError::InvalidPayload),
-        }
-    }
-}
-
-inventory::submit! {
-    &InsertFilesHandler as &dyn TransactionHandler
-}
 
 pub struct UpdatePlacementHeightsHandler;
 
@@ -198,152 +131,6 @@ inventory::submit! {
     &DeleteOrphanedDataBlocksHandler as &dyn TransactionHandler
 }
 
-pub struct ModifyItemHandler;
-
-impl TransactionHandler for ModifyItemHandler {
-    fn name(&self) -> &'static str {
-        "modify_item"
-    }
-
-    fn process(
-        &self,
-        tx: &TxMeta<'_>,
-        execute: bool,
-        ctx: &HandlerCtx<'_>,
-        db_tx: &rusqlite::Transaction<'_>,
-    ) -> HandlerResult {
-        match bincode::serde::decode_from_slice::<ModifyItemPayload, _>(
-            tx.payload,
-            bincode::config::standard(),
-        ) {
-            Ok((payload_data, _)) => {
-                // Authorization: verify user matches authenticated user
-                if let Some(user_id) = tx.user_id {
-                    if payload_data.user_id != user_id {
-                        tracing::warn!(
-                            "Authorization failed: user {} attempted to modify item for user {}",
-                            user_id,
-                            payload_data.user_id
-                        );
-                        return Err(DatabaseError::AuthorizationError);
-                    }
-                } else {
-                    tracing::warn!(
-                        "Authorization failed: modify_item requires user authentication"
-                    );
-                    return Err(DatabaseError::AuthorizationError);
-                }
-
-                tracing::debug!(
-                    "ModifyItemHandler processing: inode_id={} user_id={} new_encrypted_path={:?}",
-                    payload_data.inode_id,
-                    payload_data.user_id,
-                    payload_data.new_encrypted_path
-                );
-
-                // stored_locally is probed inside the substrate apply
-                // (apply_blob_insert) — no preprocessing pass needed.
-                crate::db::files::modify_item(
-                    db_tx,
-                    payload_data.user_id,
-                    payload_data.inode_id.clone(),
-                    payload_data.new_encrypted_path.clone(),
-                    payload_data
-                        .content_update
-                        .clone()
-                        .map(|u| u.blob_op),
-                    payload_data.incoming_share_updates.clone(),
-                    ctx.fragments_dir,
-                )?;
-
-                if execute {
-                    tracing::info!("Modified item at path for user {}", payload_data.user_id);
-
-                    // Signal FileProvider to refresh when item is actually modified
-                    ctx.notifier.files_changed();
-                } else {
-                    tracing::debug!(
-                        "Validation passed: item exists for modification for user {}",
-                        payload_data.user_id
-                    );
-                }
-
-                Ok(())
-            }
-            Err(_) => Err(DatabaseError::InvalidPayload),
-        }
-    }
-}
-
-inventory::submit! {
-    &ModifyItemHandler as &dyn TransactionHandler
-}
-
-pub struct DeleteFilesHandler;
-
-impl TransactionHandler for DeleteFilesHandler {
-    fn name(&self) -> &'static str {
-        "delete_files"
-    }
-
-    fn process(
-        &self,
-        tx: &TxMeta<'_>,
-        execute: bool,
-        ctx: &HandlerCtx<'_>,
-        db_tx: &rusqlite::Transaction<'_>,
-    ) -> HandlerResult {
-        match bincode::serde::decode_from_slice::<DeleteFilesPayload, _>(
-            tx.payload,
-            bincode::config::standard(),
-        ) {
-            Ok((payload_data, _)) => {
-                // Authorization: verify user matches authenticated user
-                if let Some(user_id) = tx.user_id {
-                    if payload_data.user_id != user_id {
-                        tracing::warn!(
-                            "Authorization failed: user {} attempted to delete files for user {}",
-                            user_id,
-                            payload_data.user_id
-                        );
-                        return Err(DatabaseError::AuthorizationError);
-                    }
-                } else {
-                    tracing::warn!(
-                        "Authorization failed: delete_files requires user authentication"
-                    );
-                    return Err(DatabaseError::AuthorizationError);
-                }
-
-                // Idempotent delete: NotFound is not an error (file may already be deleted,
-                // or validation snapshot may not see recent moves/renames)
-                match crate::db::files::delete_files(
-                    db_tx,
-                    payload_data.encrypted_path,
-                    payload_data.user_id,
-                ) {
-                    Ok(()) => {}
-                    Err(DatabaseError::NotFound) => {} // Idempotent: already deleted or not found
-                    Err(e) => return Err(e),
-                }
-
-                if execute {
-                    tracing::info!("Deleted files at path for user {}", payload_data.user_id);
-
-                    // Signal FileProvider to refresh when files are actually deleted
-                    ctx.notifier.files_changed();
-                }
-                Ok(())
-            }
-            Err(_) => Err(DatabaseError::InvalidPayload),
-        }
-    }
-}
-
-inventory::submit! {
-    &DeleteFilesHandler as &dyn TransactionHandler
-}
-
 pub struct SelfCheckFragmentsHandler;
 
 impl TransactionHandler for SelfCheckFragmentsHandler {
@@ -358,7 +145,7 @@ impl TransactionHandler for SelfCheckFragmentsHandler {
         _ctx: &HandlerCtx<'_>,
         db_tx: &rusqlite::Transaction<'_>,
     ) -> HandlerResult {
-        match bincode::serde::decode_from_slice::<crate::files::types::SelfCheckFragments, _>(
+        match bincode::serde::decode_from_slice::<hopnet_storage::SelfCheckFragments, _>(
             tx.payload,
             bincode::config::standard(),
         ) {

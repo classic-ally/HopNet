@@ -1,5 +1,11 @@
-use crate::db::DatabaseError;
-use crate::reference_providers::DataBlockReferenceProvider;
+//! Drive GC reference provider (RFC-015, Stage D3).
+//!
+//! Moved verbatim from the host's `files::reference_provider` — declares
+//! which data blocks (blobs) the drive's inodes still reference, so orphan
+//! cleanup never collects a referenced blob. Registered cross-crate via the
+//! hopnet-projection inventory registry.
+
+use hopnet_projection::{DataBlockReferenceProvider, DatabaseError};
 
 pub struct FilesystemReferenceProvider;
 

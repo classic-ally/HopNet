@@ -19,6 +19,7 @@ use crate::types::{BlobAccess, BlobId};
 use hopnet_common::Blake3Hash;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 /// One fragment's replicated metadata (the substrate half of the legacy
 /// FragmentHash — stored_locally is probed at apply, never carried).
@@ -282,6 +283,50 @@ pub fn apply_self_check(
     }
 
     Ok(())
+}
+
+/// Read the node's current inventory count and which of `candidates` are
+/// already present. Returns `(previous_count, existing_set)`.
+pub fn query_inventory_state(
+    tx: &rusqlite::Transaction,
+    node_id: i32,
+    candidates: &[Blake3Hash],
+) -> Result<(u32, HashSet<Blake3Hash>), rusqlite::Error> {
+    let previous_count: u32 = {
+        let mut stmt = tx.prepare("SELECT COUNT(*) FROM fragment_inventory WHERE node_id = ?")?;
+        let count: i64 = stmt.query_row(rusqlite::params![node_id], |row| row.get(0))?;
+        count as u32
+    };
+
+    if candidates.is_empty() {
+        return Ok((previous_count, HashSet::new()));
+    }
+
+    let placeholders = candidates
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!(
+        "SELECT fragment_hash FROM fragment_inventory \
+         WHERE node_id = ? AND fragment_hash IN ({})",
+        placeholders
+    );
+
+    let mut stmt = tx.prepare(&query)?;
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(node_id)];
+    for hash in candidates {
+        params.push(Box::new(*hash));
+    }
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
+    let mut rows = stmt.query(param_refs.as_slice())?;
+    let mut set = HashSet::new();
+    while let Some(row) = rows.next()? {
+        let hash: Blake3Hash = row.get(0)?;
+        set.insert(hash);
+    }
+    Ok((previous_count, set))
 }
 
 /// Delete orphaned blobs: fragment_hashes + blob_access + data_blocks rows,

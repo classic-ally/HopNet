@@ -111,3 +111,24 @@ pub static DISPATCH_TABLE: Lazy<HashMap<&'static str, &'static dyn TransactionHa
         }
         table
     });
+
+/// RFC-015 boot tripwire: cross-crate inventory registrations are a
+/// link-time property — a silently dropped registration would make every
+/// node reject the projection's transactions (fail-stop drive outage).
+/// Call at startup, after DISPATCH_TABLE is built.
+pub fn assert_projection_registrations() {
+    for f in hopnet_drive::handlers::TX_FUNCTIONS {
+        assert!(
+            DISPATCH_TABLE.contains_key(f),
+            "projection handler '{f}' missing from dispatch table — inventory registration dropped at link time"
+        );
+    }
+    let providers =
+        inventory::iter::<&'static dyn crate::reference_providers::DataBlockReferenceProvider>
+            .into_iter()
+            .count();
+    assert!(
+        providers >= 1,
+        "no DataBlockReferenceProvider registered — GC would collect referenced blobs"
+    );
+}

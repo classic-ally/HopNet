@@ -27,4 +27,4 @@ pub mod types;
 pub use error::StorageError;
 pub use hopnet_common::Blake3Hash;
 pub use hopnet_common::CustomUUID;
-pub use types::{BlobAccess, BlobId, MeshKeyGrant, PlacementUpdate};
+pub use types::{BlobAccess, BlobId, MeshKeyGrant, PlacementUpdate, SelfCheckFragments};
