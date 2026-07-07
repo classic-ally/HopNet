@@ -139,8 +139,8 @@ pub async fn device_token_auth_middleware(
             }
         };
         if inserted {
-            tokio::spawn(crate::takeout::jobs::maybe_resume_for_user(
-                app_state.clone(),
+            tokio::spawn(hopnet_takeout::jobs::maybe_resume_for_user(
+                crate::takeout_host::takeout_state(&app_state),
                 device.user_id,
             ));
         }

@@ -1,3 +1,9 @@
+//! Archive assembly (export) and manifest read-back (import). Moved from the
+//! host's `takeout::archive` at RFC-015 Stage D5b; the only reshape is the
+//! v2 layout — entries live under `{projection}/<logical_path>` (callers now
+//! pass the fully projection-prefixed archive path) instead of a global
+//! `files/` prefix, and the version gate accepts exactly v2.
+
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use std::fs::File;
 use std::io::Read;
@@ -6,9 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tar::{Archive, Builder};
 use tracing;
 
-use crate::takeout::manifest::{
-    ARCHIVE_FILES_PREFIX, MANIFEST_FILENAME, MANIFEST_VERSION, TakeoutManifest,
-};
+use crate::manifest::{MANIFEST_FILENAME, MANIFEST_VERSION, TakeoutManifest};
 
 /// Errors raised while reading an import-side archive (read counterpart to
 /// `create_archive`'s write side). Each variant maps cleanly to a route-level
@@ -23,7 +27,7 @@ pub enum ImportArchiveError {
     WrongFirstEntry { found: String, expected: String },
     #[error("manifest JSON parse failed: {0}")]
     JsonParse(#[from] serde_json::Error),
-    #[error("manifest version {found} not supported (max {supported})")]
+    #[error("manifest version {found} not supported (require {supported})")]
     UnknownVersion { found: u32, supported: u32 },
 }
 
@@ -32,9 +36,9 @@ pub enum ImportArchiveError {
 pub struct ArchiveEntry {
     /// Path to the file on disk (staging location)
     pub staging_path: String,
-    /// Path to use inside the archive (user-facing path).
-    /// `create_archive` applies the `ARCHIVE_FILES_PREFIX` wrapper before
-    /// writing to tar, so this should be the raw user path (no `files/` prefix).
+    /// Path to use inside the archive: `{projection}/<logical_path>`.
+    /// Callers build the projection prefix — `create_archive` writes it
+    /// verbatim (v2 has no global prefix).
     pub archive_path: String,
     /// Whether this is a directory
     pub is_directory: bool,
@@ -43,9 +47,8 @@ pub struct ArchiveEntry {
 /// Create a tar.gz archive from a list of file entries.
 ///
 /// `manifest_bytes` is written as the first tar entry at `manifest.json`.
-/// Every subsequent entry is placed under the `files/` prefix so the manifest
-/// and content are cleanly separated (see spec § Manifest Format).
-/// Streams files into archive and optionally deletes source files.
+/// Every subsequent entry is written at its (projection-prefixed) archive
+/// path. Streams files into archive and optionally deletes source files.
 pub fn create_archive(
     manifest_bytes: &[u8],
     entries: Vec<ArchiveEntry>,
@@ -99,12 +102,11 @@ pub fn create_archive(
             continue;
         }
 
-        // Wrap user-facing archive paths under the `files/` prefix.
-        let prefixed_archive_path = format!("{}{}", ARCHIVE_FILES_PREFIX, entry.archive_path);
+        let prefixed_archive_path = &entry.archive_path;
 
         if entry.is_directory {
             // Add directory to archive
-            if let Err(e) = tar_builder.append_dir(&prefixed_archive_path, &entry.staging_path) {
+            if let Err(e) = tar_builder.append_dir(prefixed_archive_path, &entry.staging_path) {
                 tracing::error!(
                     "Failed to add directory {} to archive: {:?}",
                     entry.staging_path,
@@ -125,7 +127,7 @@ pub fn create_archive(
 
             // Add file to tar.gz
             if let Err(e) =
-                tar_builder.append_path_with_name(&entry.staging_path, &prefixed_archive_path)
+                tar_builder.append_path_with_name(&entry.staging_path, prefixed_archive_path)
             {
                 tracing::error!(
                     "Failed to add file {} to archive: {:?}",
@@ -165,7 +167,7 @@ pub fn create_archive(
             }
         }
 
-        if files_archived.is_multiple_of(100) && files_archived > 0 {
+        if files_archived % 100 == 0 && files_archived > 0 {
             tracing::debug!("Archived {} files so far...", files_archived);
         }
     }
@@ -186,7 +188,11 @@ pub fn create_archive(
 
 /// Open a staging tar.gz, pull the first entry expecting `manifest.json`,
 /// parse it, and validate the schema version. Stops after the first entry —
-/// remaining tar payload stays on disk for Phase 3.4 extraction.
+/// remaining tar payload stays on disk for extraction.
+///
+/// v2 gate: `version != MANIFEST_VERSION` → `UnknownVersion` (route maps it
+/// to the same 400 the v1 check gave). v1 manifests parse (the sections map
+/// defaults empty) and are rejected here on version, not on JSON shape.
 ///
 /// Sync I/O — callers in async context should wrap in
 /// `tokio::task::spawn_blocking`.
@@ -213,7 +219,7 @@ pub fn read_manifest_from_archive(
     first_entry.read_to_end(&mut buf)?;
 
     let manifest: TakeoutManifest = serde_json::from_slice(&buf)?;
-    if manifest.version > MANIFEST_VERSION {
+    if manifest.version != MANIFEST_VERSION {
         return Err(ImportArchiveError::UnknownVersion {
             found: manifest.version,
             supported: MANIFEST_VERSION,
@@ -231,8 +237,6 @@ fn cleanup_empty_directories(dir_path: &Path) {
     // Safety boundaries - don't delete these or anything above them
     if !path_str.contains("/takeouts/")
         || path_str.ends_with("/takeouts")
-        || path_str.ends_with("/staging/files")
-        || path_str.ends_with("/staging/folders")
         || path_str.ends_with("/staging")
     {
         return;
@@ -262,6 +266,11 @@ mod tests {
     use std::io::Write;
     use tempfile::TempDir;
 
+    /// Should: write the manifest first, place a file at its
+    /// projection-prefixed archive path, and delete the source when asked.
+    /// Should not: leave the staged source file behind.
+    /// Impact: the archive layout IS the portability wire format — a drifted
+    /// path breaks every importer.
     #[test]
     fn test_create_archive() {
         let temp_dir = TempDir::new().unwrap();
@@ -275,12 +284,12 @@ mod tests {
 
         let entries = vec![ArchiveEntry {
             staging_path: test_file.to_string_lossy().to_string(),
-            archive_path: "test.txt".to_string(),
+            archive_path: "drive/test.txt".to_string(),
             is_directory: false,
         }];
 
         let archive_path = temp_dir.path().join("test.tar.gz");
-        let manifest_bytes = br#"{"version":1}"#;
+        let manifest_bytes = br#"{"version":2}"#;
         let result = create_archive(
             manifest_bytes,
             entries,
@@ -291,5 +300,46 @@ mod tests {
         assert!(result.is_ok());
         assert!(archive_path.exists());
         assert!(!test_file.exists()); // Should be deleted
+
+        // Round-trip: first entry is the manifest, second is drive/test.txt.
+        let gz = GzDecoder::new(File::open(&archive_path).unwrap());
+        let mut ar = Archive::new(gz);
+        let paths: Vec<String> = ar
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(paths, vec!["manifest.json", "drive/test.txt"]);
+    }
+
+    /// Should: reject a manifest whose version differs from v2 (both the
+    /// dead v1 and any future v3) with `UnknownVersion`.
+    /// Should not: choke on v1's missing `projections` field before the
+    /// version gate fires.
+    /// Impact: the version gate is the compat contract for imports.
+    #[test]
+    fn version_gate_rejects_non_v2() {
+        let temp_dir = TempDir::new().unwrap();
+        for version in [1u32, 3] {
+            let manifest_bytes = format!(
+                r#"{{"version":{},"takeout_id":"019807b4-1111-7111-8111-111111111111","created_at":"2026-01-01T00:00:00Z","source_username":"t"}}"#,
+                version
+            );
+            let archive_path = temp_dir.path().join(format!("v{}.tar.gz", version));
+            create_archive(
+                manifest_bytes.as_bytes(),
+                vec![],
+                archive_path.to_str().unwrap(),
+                false,
+            )
+            .unwrap();
+            match read_manifest_from_archive(&archive_path) {
+                Err(ImportArchiveError::UnknownVersion { found, supported }) => {
+                    assert_eq!(found, version);
+                    assert_eq!(supported, MANIFEST_VERSION);
+                }
+                other => panic!("expected UnknownVersion for v{version}, got {other:?}"),
+            }
+        }
     }
 }

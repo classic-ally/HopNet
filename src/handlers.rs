@@ -103,8 +103,8 @@ impl WorkScheduler for HostWorkScheduler {
                         );
                         return;
                     };
-                    if let Err(e) = crate::takeout::routes::execute_takeout_materialization(
-                        &state,
+                    if let Err(e) = hopnet_takeout::export::execute_takeout_materialization(
+                        &crate::takeout_host::takeout_state(&state),
                         &takeout_id,
                         takeout.user_id,
                     )

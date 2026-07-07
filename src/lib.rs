@@ -28,7 +28,7 @@ pub mod passphrase;
 pub mod reference_providers;
 pub mod setup;
 pub mod shares;
-pub mod takeout;
+pub mod takeout_host;
 pub mod types;
 pub mod users;
 
@@ -55,11 +55,10 @@ pub struct AppState {
     pub consensus_barriers: Arc<barriers::Barriers>,
     pub dedup_cache: Arc<net::DedupCache>,
     pub session_store: Arc<auth::SessionStore>,
-    /// Module-owned takeout/import runtime state (resume registry today;
-    /// future Phase 5 worker pool etc.). Single Arc field instead of growing
-    /// AppState's flat list; mirrors the per-module-runtime grouping that
-    /// consensus/net/files will adopt in a follow-up refactor.
-    pub takeout_runtime: Arc<takeout::TakeoutRuntime>,
+    /// Module-owned takeout/import runtime state (resume registry +
+    /// barriers), crate-owned since RFC-015 Stage D5b. Single Arc shared by
+    /// every on-the-fly `takeout_host::takeout_state` construction.
+    pub takeout_runtime: Arc<hopnet_takeout::TakeoutRuntime>,
     pub consensus_queue: consensus::queue::ConsensusQueue,
     pub write_gate: Arc<db::write_gate::WriteGate>,
     pub local_state_tx: tokio::sync::mpsc::Sender<db::write_gate::LocalStateUpdate>,
@@ -130,6 +129,12 @@ pub fn assert_projection_registrations() {
         assert!(
             DISPATCH_TABLE.contains_key(f),
             "projection handler '{f}' missing from dispatch table — inventory registration dropped at link time"
+        );
+    }
+    for f in hopnet_takeout::handlers::TX_FUNCTIONS {
+        assert!(
+            DISPATCH_TABLE.contains_key(f),
+            "takeout handler '{f}' missing from dispatch table — inventory registration dropped at link time"
         );
     }
     let providers =

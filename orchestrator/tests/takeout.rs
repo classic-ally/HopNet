@@ -125,7 +125,7 @@ pub struct ExtractedArchive {
     /// Includes directory entries; manifest is the first item.
     pub entry_order: Vec<String>,
     /// Manifest deserialized into the same type the takeout writer produces.
-    pub manifest: hopnet::takeout::manifest::TakeoutManifest,
+    pub manifest: hopnet_takeout::manifest::TakeoutManifest,
     /// Map of file-entry archive_path -> file bytes. Directory and manifest
     /// entries are omitted from this map.
     pub files: HashMap<String, Vec<u8>>,
@@ -151,7 +151,7 @@ pub fn extract_tar_gz(archive_bytes: &[u8]) -> Result<ExtractedArchive> {
         if entry_type.is_file() {
             let mut buf = Vec::new();
             entry.read_to_end(&mut buf)?;
-            if path == hopnet::takeout::manifest::MANIFEST_FILENAME {
+            if path == hopnet_takeout::manifest::MANIFEST_FILENAME {
                 if manifest_raw.is_some() {
                     anyhow::bail!("Archive contains more than one manifest.json entry");
                 }
@@ -166,7 +166,7 @@ pub fn extract_tar_gz(archive_bytes: &[u8]) -> Result<ExtractedArchive> {
     let first = entry_order
         .first()
         .ok_or_else(|| anyhow::anyhow!("Archive is empty"))?;
-    if first != hopnet::takeout::manifest::MANIFEST_FILENAME {
+    if first != hopnet_takeout::manifest::MANIFEST_FILENAME {
         anyhow::bail!(
             "Expected first archive entry to be manifest.json, got {}",
             first
@@ -175,7 +175,7 @@ pub fn extract_tar_gz(archive_bytes: &[u8]) -> Result<ExtractedArchive> {
 
     let manifest_raw =
         manifest_raw.ok_or_else(|| anyhow::anyhow!("Archive missing manifest.json"))?;
-    let manifest: hopnet::takeout::manifest::TakeoutManifest =
+    let manifest: hopnet_takeout::manifest::TakeoutManifest =
         serde_json::from_slice(&manifest_raw)
             .map_err(|e| anyhow::anyhow!("Failed to parse manifest.json: {}", e))?;
 
@@ -375,17 +375,18 @@ impl TestScenario for TakeoutHappyPath {
             }
         };
 
-        // Step 6: Manifest schema sanity. Pin to spec version 1 with a literal so a
+        // Step 6: Manifest schema sanity. Pin to spec version 2 with a literal so a
         // future MANIFEST_VERSION bump must consciously update this assertion (otherwise
         // checking against the constant is circular — both writer and reader share it).
+        // v2: totals + entries live in the per-projection "drive" section.
         let expected_total_bytes: u64 = files.iter().map(|(_, c)| c.len() as u64).sum();
         let expected_files_count = files.len() as u64;
 
         print_and_add_check(
             &mut result,
             Check {
-                name: "Manifest version == 1 (spec v1)".to_string(),
-                passed: archive.manifest.version == 1,
+                name: "Manifest version == 2 (spec v2)".to_string(),
+                passed: archive.manifest.version == 2,
                 detail: Some(format!("got version {}", archive.manifest.version)),
             },
         );
@@ -402,16 +403,65 @@ impl TestScenario for TakeoutHappyPath {
             },
         );
 
+        let drive = match archive.manifest.projections.get("drive") {
+            Some(section) => section,
+            None => {
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Manifest contains a \"drive\" projection section".to_string(),
+                        passed: false,
+                        detail: Some(format!(
+                            "sections: {:?}",
+                            archive.manifest.projections.keys().collect::<Vec<_>>()
+                        )),
+                    },
+                );
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
+        };
         print_and_add_check(
             &mut result,
             Check {
-                name: format!("Manifest total_files == {}", expected_files_count),
-                passed: archive.manifest.total_files == expected_files_count
-                    && archive.manifest.files.len() as u64 == expected_files_count,
+                name: "Manifest contains a \"drive\" projection section".to_string(),
+                passed: true,
+                detail: None,
+            },
+        );
+
+        let file_entries: Vec<_> = drive
+            .entries
+            .iter()
+            .filter(|e| e.kind == hopnet_takeout::manifest::EntryKind::File)
+            .collect();
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: format!("Drive section total_files == {}", expected_files_count),
+                passed: drive.total_files == expected_files_count
+                    && file_entries.len() as u64 == expected_files_count,
                 detail: Some(format!(
-                    "total_files={}, files.len()={}",
-                    archive.manifest.total_files,
-                    archive.manifest.files.len()
+                    "total_files={}, file entries={}",
+                    drive.total_files,
+                    file_entries.len()
+                )),
+            },
+        );
+
+        let folder_entries = drive
+            .entries
+            .iter()
+            .filter(|e| e.kind == hopnet_takeout::manifest::EntryKind::Folder)
+            .count();
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Drive section total_folders == 0".to_string(),
+                passed: drive.total_folders == 0 && folder_entries == 0,
+                detail: Some(format!(
+                    "total_folders={}, folder entries={}",
+                    drive.total_folders, folder_entries
                 )),
             },
         );
@@ -419,29 +469,16 @@ impl TestScenario for TakeoutHappyPath {
         print_and_add_check(
             &mut result,
             Check {
-                name: "Manifest total_folders == 0".to_string(),
-                passed: archive.manifest.total_folders == 0 && archive.manifest.folders.is_empty(),
-                detail: Some(format!(
-                    "total_folders={}, folders.len()={}",
-                    archive.manifest.total_folders,
-                    archive.manifest.folders.len()
-                )),
-            },
-        );
-
-        print_and_add_check(
-            &mut result,
-            Check {
-                name: format!("Manifest total_bytes == {}", expected_total_bytes),
-                passed: archive.manifest.total_bytes == expected_total_bytes,
-                detail: Some(format!("total_bytes={}", archive.manifest.total_bytes)),
+                name: format!("Drive section total_bytes == {}", expected_total_bytes),
+                passed: drive.total_bytes == expected_total_bytes,
+                detail: Some(format!("total_bytes={}", drive.total_bytes)),
             },
         );
 
         // Step 7: Per-file verification — manifest entry shape, archive layout, content + hash match
         for (filename, expected_contents) in &files {
-            // Find the manifest entry by user-facing path (no `files/` prefix in manifest).
-            let manifest_entry = archive.manifest.files.iter().find(|f| f.path == *filename);
+            // Find the manifest entry by logical path within the drive section.
+            let manifest_entry = drive.entries.iter().find(|f| f.logical_path == *filename);
 
             let manifest_entry = match manifest_entry {
                 Some(e) => e,
@@ -453,11 +490,10 @@ impl TestScenario for TakeoutHappyPath {
                             passed: false,
                             detail: Some(format!(
                                 "manifest paths: {:?}",
-                                archive
-                                    .manifest
-                                    .files
+                                drive
+                                    .entries
                                     .iter()
-                                    .map(|f| &f.path)
+                                    .map(|f| &f.logical_path)
                                     .collect::<Vec<_>>()
                             )),
                         },
@@ -480,38 +516,40 @@ impl TestScenario for TakeoutHappyPath {
                 },
             );
 
-            // file_hash must equal blake3(plaintext || source_data_block_id_bytes).
-            // Reconstructing the formula here catches any drift in the takeout salting logic.
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(expected_contents);
-            hasher.update(manifest_entry.source_data_block_id.as_bytes());
-            let computed = hasher.finalize();
-            let expected_hash_bytes = manifest_entry.file_hash.as_bytes();
+            // content_hash must equal blake3(plaintext || blob_id_bytes) — formula
+            // unchanged from v1. Reconstructing it here catches any drift in the
+            // takeout salting logic. Files must always carry blob_id + content_hash.
+            let hash_matches = match (&manifest_entry.blob_id, &manifest_entry.content_hash) {
+                (Some(blob_id), Some(content_hash)) => {
+                    let mut hasher = blake3::Hasher::new();
+                    hasher.update(expected_contents);
+                    hasher.update(blob_id.as_bytes());
+                    hasher.finalize().as_bytes() == content_hash.as_bytes()
+                }
+                _ => false,
+            };
             print_and_add_check(
                 &mut result,
                 Check {
-                    name: format!("Manifest file_hash matches reconstructed for {}", filename),
-                    passed: computed.as_bytes() == expected_hash_bytes,
+                    name: format!("Manifest content_hash matches reconstructed for {}", filename),
+                    passed: hash_matches,
                     detail: Some(format!(
-                        "expected hash from manifest: {}",
-                        manifest_entry.file_hash
+                        "entry blob_id={:?} content_hash={:?}",
+                        manifest_entry.blob_id, manifest_entry.content_hash
                     )),
                 },
             );
 
-            // Archive layout: file lives under `files/<path>`, NOT at the root.
-            let prefixed_path = format!(
-                "{}{}",
-                hopnet::takeout::manifest::ARCHIVE_FILES_PREFIX,
-                filename
-            );
+            // Archive layout: file lives under `drive/<path>` (its projection
+            // prefix), NOT at the root.
+            let prefixed_path = format!("drive/{}", filename);
             let archived_bytes = match archive.files.get(&prefixed_path) {
                 Some(b) => b,
                 None => {
                     print_and_add_check(
                         &mut result,
                         Check {
-                            name: format!("Archive entry under files/ prefix for {}", filename),
+                            name: format!("Archive entry under drive/ prefix for {}", filename),
                             passed: false,
                             detail: Some(format!(
                                 "expected at {}, archive paths: {:?}",

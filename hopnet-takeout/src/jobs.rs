@@ -1,48 +1,32 @@
-use crate::AppState;
-use crate::consensus::Transaction;
-use crate::db::{CustomUUID, takeout::TakeoutStatusPayload};
-use apalis::prelude::*;
-use apalis_cron::CronContext;
-use chrono::Utc;
-use hopnet_common::TakeoutStatus;
-use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+//! Background job fns (RFC-015 Stage D5b): the periodic maintenance sweep
+//! and the owner-restart import resume machinery. All take [`TakeoutState`];
+//! the apalis cron wiring stays in the host's main.rs (a thin wrapper maps
+//! our `Result<(), String>` onto apalis' error type).
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct TakeoutMaintenanceJob;
+use hopnet_common::{CustomUUID, ImportStatus, TakeoutStatus};
+use hopnet_projection::host::{TxSigner, TxSpec};
 
-/// Handler for takeout maintenance (runs every 4-6 hours with randomization)
-/// Handles expiration checking and orphaned cleanup as a safety net for edge cases
-pub async fn handle_takeout_maintenance(
-    _job: TakeoutMaintenanceJob,
-    _ctx: CronContext<Utc>,
-    data: Data<AppState>,
-) -> Result<(), Error> {
-    let app_state = &*data;
+use crate::TakeoutState;
+use crate::db::import_paths;
+use crate::db::takeout::TakeoutStatusPayload;
 
+/// Takeout maintenance (runs every 4-6 hours with randomization, plus the
+/// manual `/maintenance/takeout` trigger). Handles expiration checking and
+/// orphaned cleanup as a safety net for edge cases.
+pub async fn run_takeout_maintenance(state: &TakeoutState) -> Result<(), String> {
     tracing::info!("Starting takeout maintenance job");
 
-    // Get user ID for consensus submissions
-    let user_id = match app_state.get_user_id() {
-        Ok(id) => id,
-        Err(_) => {
-            tracing::warn!("User ID not initialized, skipping takeout maintenance");
-            return Ok(());
-        }
-    };
+    // Uninitialized node — no consensus identity yet, skip (pre-split this
+    // gated on user_id; node_id/user_id are populated together at init).
+    if state.node_id().is_none() {
+        tracing::warn!("Node not initialized, skipping takeout maintenance");
+        return Ok(());
+    }
 
     // Step 1: Find and mark expired takeouts (network-wide, not just this node's)
-    let expired_takeouts = match crate::db::takeout::get_expired_takeouts_needing_status_update(
-        app_state.db_pool.get(),
-    ) {
-        Ok(takeouts) => takeouts,
-        Err(e) => {
-            tracing::error!("Failed to get expired takeouts: {:?}", e);
-            return Err(Error::Failed(Arc::new(Box::new(std::io::Error::other(
-                format!("Failed to get expired takeouts: {:?}", e),
-            )))));
-        }
-    };
+    let expired_takeouts =
+        crate::db::takeout::get_expired_takeouts_needing_status_update(state.db_pool.get())
+            .map_err(|e| format!("Failed to get expired takeouts: {:?}", e))?;
 
     if expired_takeouts.is_empty() {
         tracing::debug!("No expired takeouts found needing status update");
@@ -74,19 +58,12 @@ pub async fn handle_takeout_maintenance(
                     }
                 };
 
-            transactions.push(
-                crate::consensus::dispatch::create_signed_transaction(
-                    app_state,
-                    "update_takeout_status".to_string(),
-                    encoded_payload,
-                )
-                .map_err(|_| {
-                    Error::Failed(Arc::new(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "Failed to sign transaction",
-                    ))))
-                })?,
-            );
+            // Node-signed, matching the pre-split expiry path.
+            transactions.push(TxSpec {
+                function: "update_takeout_status",
+                payload: encoded_payload,
+                signer: TxSigner::Node,
+            });
         }
 
         if transactions.is_empty() {
@@ -99,7 +76,7 @@ pub async fn handle_takeout_maintenance(
 
             // Submit all expiration updates in one consensus call
             // This triggers cleanup on owner nodes for all expired takeouts
-            let results = app_state.consensus_queue.submit_batch(transactions).await;
+            let results = state.txs.submit_batch(transactions).await;
             let failures: Vec<_> = results.iter().filter(|r| r.is_err()).collect();
             if failures.is_empty() {
                 tracing::info!(
@@ -111,12 +88,10 @@ pub async fn handle_takeout_maintenance(
                     "Failed to submit expiration updates to consensus: {} failures",
                     failures.len()
                 );
-                return Err(Error::Failed(Arc::new(Box::new(std::io::Error::other(
-                    format!(
-                        "Failed to submit expiration updates: {} failures",
-                        failures.len()
-                    ),
-                )))));
+                return Err(format!(
+                    "Failed to submit expiration updates: {} failures",
+                    failures.len()
+                ));
             }
         }
     }
@@ -127,29 +102,6 @@ pub async fn handle_takeout_maintenance(
     tracing::info!("Takeout maintenance job completed");
     Ok(())
 }
-
-#[derive(Debug)]
-pub enum TakeoutMaintenanceError {
-    Database(crate::db::DatabaseError),
-    Consensus(String),
-}
-
-impl From<crate::db::DatabaseError> for TakeoutMaintenanceError {
-    fn from(e: crate::db::DatabaseError) -> Self {
-        TakeoutMaintenanceError::Database(e)
-    }
-}
-
-impl std::fmt::Display for TakeoutMaintenanceError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TakeoutMaintenanceError::Database(e) => write!(f, "Database error: {:?}", e),
-            TakeoutMaintenanceError::Consensus(e) => write!(f, "Consensus error: {}", e),
-        }
-    }
-}
-
-impl std::error::Error for TakeoutMaintenanceError {}
 
 // ============================================================================
 // Owner-restart import resume
@@ -163,8 +115,6 @@ impl std::error::Error for TakeoutMaintenanceError {}
 // `maybe_resume_for_user`: macOS keychain auto-load, POST /login, and
 // device-token middleware lazy bootstrap.
 
-use crate::db::import_paths;
-
 /// Owner-startup scan. Reads `imports` rows in `Pending`/`Importing` status
 /// owned by this node, filters to those whose extraction is far enough along
 /// to resume (status == Importing AND `import_paths_{id}` table exists with
@@ -173,10 +123,14 @@ use crate::db::import_paths;
 /// v1 — user re-uploads.
 ///
 /// Returns the count of registered imports for log output.
-pub async fn scan_at_startup(state: &AppState) -> Result<usize, crate::db::DatabaseError> {
-    let self_node = match state.get_node_id() {
-        Ok(n) => n,
-        Err(_) => {
+pub async fn scan_at_startup(
+    state: &TakeoutState,
+) -> Result<usize, hopnet_projection::DatabaseError> {
+    use hopnet_projection::DatabaseError;
+
+    let self_node = match state.node_id() {
+        Some(n) => n,
+        None => {
             tracing::debug!("scan_at_startup: node_id unset, skipping");
             return Ok(0);
         }
@@ -189,30 +143,29 @@ pub async fn scan_at_startup(state: &AppState) -> Result<usize, crate::db::Datab
         let conn = state
             .db_pool
             .get()
-            .map_err(|_| crate::db::DatabaseError::LockError)?;
+            .map_err(|_| DatabaseError::LockError)?;
 
         let mut stmt = conn
             .prepare(
                 "SELECT id, user_id, status FROM imports
                  WHERE owner_node_id = ? AND status IN (0, 1)",
             )
-            .map_err(|_| crate::db::DatabaseError::RecallError)?;
+            .map_err(|_| DatabaseError::RecallError)?;
         let rows = stmt
             .query_map([self_node], |row| {
                 let id: CustomUUID = row.get(0)?;
                 let user_id: i32 = row.get(1)?;
-                let status: hopnet_common::ImportStatus = row.get(2)?;
+                let status: ImportStatus = row.get(2)?;
                 Ok((id, user_id, status))
             })
-            .map_err(|_| crate::db::DatabaseError::RecallError)?;
+            .map_err(|_| DatabaseError::RecallError)?;
 
         let mut to_register: Vec<(i32, CustomUUID)> = Vec::new();
         for r in rows {
-            let (import_id, user_id, status) =
-                r.map_err(|_| crate::db::DatabaseError::RecallError)?;
+            let (import_id, user_id, status) = r.map_err(|_| DatabaseError::RecallError)?;
             // Only `Importing` is resumable in v1. `Pending` means extraction
             // never reached the Importing flip; user must re-upload.
-            if status != hopnet_common::ImportStatus::Importing {
+            if status != ImportStatus::Importing {
                 tracing::warn!(
                     "Import {} for user {} stranded at {:?}; not resumable in v1",
                     import_id,
@@ -244,7 +197,7 @@ pub async fn scan_at_startup(state: &AppState) -> Result<usize, crate::db::Datab
 
     let count = to_register.len();
     if count > 0 {
-        let mut registry = state.takeout_runtime.resume_registry.lock().await;
+        let mut registry = state.runtime.resume_registry.lock().await;
         for (user_id, import_id) in to_register {
             registry.insert(user_id, import_id);
         }
@@ -256,9 +209,9 @@ pub async fn scan_at_startup(state: &AppState) -> Result<usize, crate::db::Datab
 /// import in the registry, drains it and spawns `run_creation_phase` to
 /// finish the work. No-op when registry has no entry. Idempotent on repeat
 /// auth events because the entry is removed atomically before the spawn.
-pub async fn maybe_resume_for_user(state: AppState, user_id: i32) {
+pub async fn maybe_resume_for_user(state: TakeoutState, user_id: i32) {
     let import_id: CustomUUID = {
-        let mut registry = state.takeout_runtime.resume_registry.lock().await;
+        let mut registry = state.runtime.resume_registry.lock().await;
         match registry.remove(&user_id) {
             Some(id) => id,
             None => return,
@@ -270,12 +223,12 @@ pub async fn maybe_resume_for_user(state: AppState, user_id: i32) {
         import_id,
         user_id
     );
-    let staging = crate::takeout::import::staging_dir(&state, &import_id);
+    let staging = crate::import::staging_dir(&state, &import_id);
 
     let state_for_task = state.clone();
     let import_id_for_task = import_id.clone();
     tokio::spawn(async move {
-        if let Err(e) = crate::takeout::import::run_creation_phase(
+        if let Err(e) = crate::import::run_creation_phase(
             &state_for_task,
             &import_id_for_task,
             user_id,
@@ -291,7 +244,7 @@ pub async fn maybe_resume_for_user(state: AppState, user_id: i32) {
             );
             // On failure, re-stash so the next auth event tries again.
             state_for_task
-                .takeout_runtime
+                .runtime
                 .resume_registry
                 .lock()
                 .await

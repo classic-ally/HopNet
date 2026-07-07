@@ -128,7 +128,7 @@ impl WriteAdmission for DriveHost {
                 .db_pool
                 .get()
                 .map_err(|_| WriteCheckError::Internal)?;
-            let active = crate::db::imports::has_active_import(&conn, user_id)
+            let active = hopnet_takeout::db::imports::has_active_import(&conn, user_id)
                 .map_err(|_| WriteCheckError::Internal)?;
 
             if active {

@@ -1,38 +1,36 @@
 [package]
-name = "hopnet-drive"
+name = "hopnet-takeout"
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-only"
 repository = "https://git.bentley.sh/HopNet/HopNet"
-description = "HopNet fs projection: inodes, encrypted paths, shares, and provider surfaces over the storage + consensus substrates (RFC-015)"
+description = "HopNet projection-agnostic takeout/import service: manifest-v2 archives, per-projection translator dispatch, resume machinery, and the takeout/import consensus handlers (RFC-015)"
 
 [dependencies]
 hopnet-common = { path = "../common", features = ["database"] }
 hopnet-projection = { path = "../hopnet-projection" }
-hopnet-storage = { path = "../hopnet-storage", features = ["engine"] }
+hopnet-storage = { path = "../hopnet-storage" }
 
 # Version strings mirror the root Cargo.toml pins (workspace-unified).
-aes-siv = "0.7.0"
-async-stream = "0.3.6"
 axum = { version = "0.8.4", features = ["multipart", "macros"] }
 bincode = { version = "2.0.1", features = ["serde"] }
 blake3 = { version = "1.8.2", features = ["serde", "rayon"] }
-thiserror = "2.0.18"
-tokio = { version = "1.45.1", features = ["full"] }
-tokio-util = { version = "0.7.16", features = ["io"] }
+bytes = "1.10.1"
 chrono = { version = "0.4.41", features = ["serde"] }
-hex = "0.4.3"
+flate2 = "1.1.2"
 inventory = "0.3.20"
-mime_guess = "2.0.5"
+once_cell = "1.21.3"
 r2d2 = "0.8.10"
 r2d2_sqlite = "0.32"
-rand = "0.10"
 rusqlite = { version = "0.38", features = ["bundled"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0"
-bytes = { version = "1.10.1" }
-chacha20poly1305 = { version = "0.10.1", features = ["stream"] }
-once_cell = "1.21.3"
+tar = "0.4.44"
+thiserror = "2.0.18"
+tokio = { version = "1.45.1", features = ["full"] }
 tokio-stream = "0.1.17"
-x25519-dalek = { version = "2.0.1", features = ["serde", "static_secrets"] }
+tokio-util = { version = "0.7.16", features = ["io"] }
 tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3.22.0"

@@ -1,12 +1,13 @@
 //! Import side of the takeout/portability boundary. Owns the HTTP route
 //! handlers, the upload workflow, and the per-failure error mapping.
 //!
-//! Phase 3.3 landed the multipart upload pipeline (manifest read + quota
-//! check + `create_import`). Phase 3.4 extends `process_upload` to spawn a
-//! background task that flips the import to `Importing`, seeds the per-import
-//! path table from the manifest, and walks remaining tar entries to extract
-//! and hash-verify each file. Phase 3.5 will pick up creation from the same
-//! per-path table.
+//! Reshaped at RFC-015 Stage D5b for manifest v2 + per-projection
+//! translators: extraction stages files under `{staging}/{projection}/…`
+//! and hash-verifies each entry against the manifest; the creation walk
+//! dispatches each section to its registered `ProjectionExporter`
+//! (`import_entry` per Pending row + `flush` at section end). A section
+//! with NO registered translator has all its rows marked Skipped with
+//! `error_code = "no_translator"` — reported, never failed.
 
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, Extension, Multipart, State};
@@ -20,20 +21,22 @@ use std::str::FromStr;
 use tokio_stream::StreamExt;
 use tokio_util::io::StreamReader;
 
-use crate::AppState;
-use crate::auth::SessionEntry;
-use crate::db::CustomUUID;
+use hopnet_common::{
+    Blake3Hash, CustomUUID, ImportPathCounts, ImportPathRow, ImportRecord, ImportStatus, InodeType,
+};
+use hopnet_projection::host::{TxSigner, TxSpec, UserSession};
+use hopnet_projection::{DatabaseError, ExportEntry, ImportEntryError};
+
+use crate::STORAGE_SAFETY_MARGIN_BYTES;
+use crate::TakeoutState;
+use crate::archive::{ImportArchiveError, read_manifest_from_archive};
 use crate::db::import_paths;
 use crate::db::imports::{self, ImportPayload, ImportStatusPayload};
-use crate::takeout::STORAGE_SAFETY_MARGIN_BYTES;
-use crate::takeout::archive::{ImportArchiveError, read_manifest_from_archive};
-use crate::takeout::manifest::{ARCHIVE_FILES_PREFIX, TakeoutManifest};
-use crate::types::Blake3Hash;
-use hopnet_common::{ImportPathCounts, ImportPathRow, ImportRecord, ImportStatus, InodeType};
+use crate::manifest::{EntryKind, ManifestEntry, TakeoutManifest};
 
-/// Router for `/takeout/import` and its children. Mounted from
-/// `takeout_routes()` via `.nest("/import", import::import_routes())`.
-pub fn import_routes() -> Router<AppState> {
+/// Router for `/takeout/import` and its children. Nested from
+/// `routes::router()`.
+pub(crate) fn import_routes() -> Router<TakeoutState> {
     Router::new()
         .route("/", get(get_current_import).post(post_initiate_import))
         .route("/paths", get(get_current_import_paths))
@@ -45,11 +48,11 @@ pub fn import_routes() -> Router<AppState> {
 /// run quota check, submit `create_import` consensus txn. Returns the
 /// freshly created `ImportRecord` on success.
 async fn post_initiate_import(
-    State(app_state): State<AppState>,
+    State(state): State<TakeoutState>,
     Extension(user_id): Extension<i32>,
     multipart: Multipart,
 ) -> Result<(StatusCode, Json<ImportRecord>), StatusCode> {
-    match process_upload(&app_state, user_id, multipart).await {
+    match process_upload(&state, user_id, multipart).await {
         Ok(record) => Ok((StatusCode::CREATED, Json(record))),
         Err(e) => {
             tracing::warn!("Import upload failed for user {}: {}", user_id, e);
@@ -60,10 +63,10 @@ async fn post_initiate_import(
 
 /// GET /takeout/import — return the user's current or most-recent import as a singleton.
 async fn get_current_import(
-    State(app_state): State<AppState>,
+    State(state): State<TakeoutState>,
     Extension(user_id): Extension<i32>,
 ) -> Result<Json<Option<ImportRecord>>, StatusCode> {
-    let conn = app_state
+    let conn = state
         .db_pool
         .get()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -74,13 +77,12 @@ async fn get_current_import(
 }
 
 /// GET /takeout/import/paths — owner-node-local debug view of the per-import
-/// path table. Returns 404 from any non-owner node since the table is local;
-/// 3.7 supersedes with an aggregate status route reachable from any node.
+/// path table. Returns 404 from any non-owner node since the table is local.
 async fn get_current_import_paths(
-    State(app_state): State<AppState>,
+    State(state): State<TakeoutState>,
     Extension(user_id): Extension<i32>,
 ) -> Result<Json<Vec<ImportPathRow>>, StatusCode> {
-    let conn = app_state
+    let conn = state
         .db_pool
         .get()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -88,9 +90,7 @@ async fn get_current_import_paths(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    let self_node = app_state
-        .get_node_id()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let self_node = state.node_id().ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
     if record.owner_node_id != self_node {
         return Err(StatusCode::NOT_FOUND);
     }
@@ -106,10 +106,10 @@ async fn get_current_import_paths(
 /// user's current import. Returns 404 from non-owner nodes (per-import path
 /// table is owner-local). Frontend uses these counts to drive progress.
 async fn get_current_import_status(
-    State(app_state): State<AppState>,
+    State(state): State<TakeoutState>,
     Extension(user_id): Extension<i32>,
 ) -> Result<Json<ImportPathCounts>, StatusCode> {
-    let conn = app_state
+    let conn = state
         .db_pool
         .get()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -117,9 +117,7 @@ async fn get_current_import_status(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    let self_node = app_state
-        .get_node_id()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let self_node = state.node_id().ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
     if record.owner_node_id != self_node {
         return Err(StatusCode::NOT_FOUND);
     }
@@ -150,7 +148,7 @@ pub enum ImportUploadError {
     #[error("filesystem error: {0}")]
     Io(#[from] std::io::Error),
     #[error("database error: {0:?}")]
-    Database(crate::db::DatabaseError),
+    Database(DatabaseError),
     #[error("consensus submission failed")]
     ConsensusFailed,
     #[error("internal error: {0}")]
@@ -175,14 +173,14 @@ impl ImportUploadError {
     }
 }
 
-impl From<crate::db::DatabaseError> for ImportUploadError {
-    fn from(e: crate::db::DatabaseError) -> Self {
+impl From<DatabaseError> for ImportUploadError {
+    fn from(e: DatabaseError) -> Self {
         ImportUploadError::Database(e)
     }
 }
 
-/// Per-import staging path: `{fragments_dir}/imports/{import_id_simple}/`.
-pub(crate) fn staging_dir(state: &AppState, import_id: &CustomUUID) -> PathBuf {
+/// Per-import staging path: `{fragments_dir}/imports/{import_id}/`.
+pub fn staging_dir(state: &TakeoutState, import_id: &CustomUUID) -> PathBuf {
     PathBuf::from(&state.fragments_dir)
         .join("imports")
         .join(import_id.to_string())
@@ -192,20 +190,18 @@ pub(crate) fn staging_dir(state: &AppState, import_id: &CustomUUID) -> PathBuf {
 /// errors — leaving stray staging is preferable to masking the original
 /// failure cause.
 async fn cleanup_staging(staging: &std::path::Path) {
-    if let Err(e) = tokio::fs::remove_dir_all(staging).await
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        tracing::warn!("Failed to clean staging {}: {:?}", staging.display(), e);
+    if let Err(e) = tokio::fs::remove_dir_all(staging).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!("Failed to clean staging {}: {:?}", staging.display(), e);
+        }
     }
 }
 
-/// Drive the full upload-side pipeline. The session clone lives in this
-/// function's scope through return — no global pin map, RAII handles release
-/// on either success or any error path. 3.4+ will extend the workflow with
-/// extraction and per-file iteration; for 3.3 the function returns after
-/// successful consensus submission of the `Pending` row.
+/// Drive the full upload-side pipeline. The session lives in this function's
+/// scope and moves into the spawned extraction task — no global pin map,
+/// RAII handles release on either success or any error path.
 pub async fn process_upload(
-    state: &AppState,
+    state: &TakeoutState,
     user_id: i32,
     mut multipart: Multipart,
 ) -> Result<ImportRecord, ImportUploadError> {
@@ -222,10 +218,11 @@ pub async fn process_upload(
 
     // 2. Capture session locally — moved into the spawned extraction task
     //    below so logout mid-import doesn't break crypto. RAII drops when the
-    //    task ends. Owner-process death still strands the import; 3.7 lands
-    //    persistent session re-establishment.
+    //    task ends. Owner-process death still strands the import; the resume
+    //    registry routes recovery through the next auth event.
     let session = state
-        .get_session(user_id)
+        .sessions
+        .user_session(user_id)
         .await
         .map_err(|_| ImportUploadError::Internal("session unavailable".into()))?;
 
@@ -262,10 +259,10 @@ pub async fn process_upload(
         return Err(e);
     }
 
-    // 7. Submit create_import consensus txn.
+    // 7. Submit create_import consensus txn (user-signed, as before).
     let node_id = state
-        .get_node_id()
-        .map_err(|_| ImportUploadError::Internal("node id unavailable".into()))?;
+        .node_id()
+        .ok_or_else(|| ImportUploadError::Internal("node id unavailable".into()))?;
     let payload = ImportPayload {
         import_id: import_id.clone(),
         user_id,
@@ -274,16 +271,16 @@ pub async fn process_upload(
     };
     let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
         .map_err(|_| ImportUploadError::Internal("payload encode".into()))?;
-    let transaction = crate::consensus::dispatch::create_signed_user_transaction(
-        state,
-        "create_import".to_string(),
-        encoded,
-        user_id,
-    )
-    .await
-    .map_err(|_| ImportUploadError::ConsensusFailed)?;
 
-    if let Err(e) = state.consensus_queue.submit(transaction).await {
+    if let Err(e) = state
+        .txs
+        .submit(TxSpec {
+            function: "create_import",
+            payload: encoded,
+            signer: TxSigner::User(user_id),
+        })
+        .await
+    {
         tracing::error!("Failed to submit create_import for {}: {:?}", import_id, e);
         cleanup_staging(&staging).await;
         return Err(ImportUploadError::ConsensusFailed);
@@ -293,15 +290,15 @@ pub async fn process_upload(
         "Initiated import {} for user {} ({} files, {} bytes manifest)",
         import_id,
         user_id,
-        manifest.total_files,
-        manifest.total_bytes
+        manifest.total_files(),
+        manifest.total_bytes().unwrap_or(u64::MAX)
     );
 
     let record = payload.to_record();
 
-    // 8. Spawn extraction. Session moves into the task; the upload upload.tar.gz
-    //    file in `staging` is consumed by the bg walk. Staging dir lives until
-    //    3.7's terminal sweep (3.5 still needs the per-file extracted bytes).
+    // 8. Spawn extraction. Session moves into the task; the upload.tar.gz
+    //    file in `staging` is consumed by the bg walk. Staging dir lives
+    //    until the terminal sweep.
     let state_clone = state.clone();
     let manifest_clone = manifest.clone();
     let import_id_clone = import_id.clone();
@@ -347,27 +344,24 @@ async fn stream_archive_field(
     Ok(())
 }
 
-/// Apply the spec § 3.3 quota formula:
-/// `manifest.total_bytes × 3 + STORAGE_SAFETY_MARGIN_BYTES ≤ sum(validator_available)`.
+/// Apply the quota formula:
+/// `total_bytes × 3 + STORAGE_SAFETY_MARGIN_BYTES ≤ sum(validator_available)`.
+/// The validator aggregation is host machinery reached through
+/// `TakeoutHooks::available_storage_bytes`; the FORMULA stays here.
 async fn check_quota(
-    state: &AppState,
+    state: &TakeoutState,
     manifest: &TakeoutManifest,
 ) -> Result<(), ImportUploadError> {
-    let height = {
-        let conn = state
-            .db_pool
-            .get()
-            .map_err(|_| ImportUploadError::Internal("db pool".into()))?;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|_| ImportUploadError::Internal("tx open".into()))?;
-        crate::db::consensus::get_current_consensus_height(&tx)?
-    };
+    let available = state
+        .hooks
+        .available_storage_bytes()
+        .await
+        .map_err(ImportUploadError::Internal)?;
 
-    let available = imports::get_total_validator_storage_available(state, height).await?;
-
-    let rs_expanded = manifest
-        .total_bytes
+    let total_bytes = manifest
+        .total_bytes()
+        .ok_or(ImportUploadError::SizeOverflow)?;
+    let rs_expanded = total_bytes
         .checked_mul(3)
         .ok_or(ImportUploadError::SizeOverflow)?;
     let required = rs_expanded
@@ -386,9 +380,9 @@ async fn check_quota(
 /// Errors raised inside the spawned extraction task. The bg task has no HTTP
 /// boundary — these surface only through tracing.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum ImportExtractError {
+pub enum ImportExtractError {
     #[error("DB error: {0:?}")]
-    Database(crate::db::DatabaseError),
+    Database(DatabaseError),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("consensus submission failed")]
@@ -399,35 +393,41 @@ pub(crate) enum ImportExtractError {
     Internal(String),
 }
 
-impl From<crate::db::DatabaseError> for ImportExtractError {
-    fn from(e: crate::db::DatabaseError) -> Self {
+impl From<DatabaseError> for ImportExtractError {
+    fn from(e: DatabaseError) -> Self {
         ImportExtractError::Database(e)
     }
 }
 
-/// Phase 3.4 background task. Owns the cloned session through the entire walk.
-/// Status flips to `Importing` first, the per-import path table is created and
-/// seeded from the manifest, then the staging tar is reopened and walked
-/// entry-by-entry: each file is streamed into `{staging}/files/{user_path}`
-/// while a parallel blake3 hasher computes `blake3(plaintext ∥ data_id)` and
-/// compares it to the manifest entry's expected `file_hash`. Mismatches mark
-/// the row failed; folders stay pending for 3.5 to materialize via consensus.
+/// Background extraction task. Owns the session through the entire walk.
+/// Status flips to `Importing` first, the per-import path table is created
+/// and seeded from the manifest (one row per entry of every section, with
+/// its projection + sidecar metadata), then the staging tar is reopened and
+/// walked entry-by-entry: each file is streamed into
+/// `{staging}/{projection}/{path}` while a parallel blake3 hasher computes
+/// `blake3(plaintext ∥ blob_id)` and compares it to the manifest entry's
+/// expected `content_hash`. Mismatches mark the row failed; surviving rows
+/// stay Pending for the creation walk.
 async fn run_extraction(
-    state: AppState,
-    session: SessionEntry,
+    state: TakeoutState,
+    session: UserSession,
     import_id: CustomUUID,
     user_id: i32,
     manifest: TakeoutManifest,
     staging: PathBuf,
 ) -> Result<(), ImportExtractError> {
-    // Hold the session for the duration of the bg task — same scope guarantee
-    // as Phase 3.3's handler-scoped clone.
+    // Hold the session for the duration of the bg task — the projection
+    // translators re-resolve their own sessions through the seam, but the
+    // upload-scope guarantee (crypto material survives logout mid-import)
+    // rides this clone exactly as before.
     let _session = session;
 
     // 1. Flip imports.status → Importing via consensus.
     submit_status_update(&state, user_id, &import_id, ImportStatus::Importing).await?;
 
-    // 2. Create per-import paths table, seed Pending rows from manifest.
+    // 2. Create per-import paths table, seed Pending rows from manifest —
+    //    every section, translator or not (skip decision happens at the
+    //    creation walk so status counts always cover the full archive).
     {
         let mut conn = state
             .db_pool
@@ -437,27 +437,30 @@ async fn run_extraction(
         let tx = conn
             .transaction()
             .map_err(|_| ImportExtractError::Internal("tx open".into()))?;
-        for folder in &manifest.folders {
-            import_paths::insert_path_pending(
-                &tx,
-                &import_id,
-                &folder.path,
-                &InodeType::Folder,
-                None,
-                None,
-            )?;
+        for (projection, section) in &manifest.projections {
+            for entry in &section.entries {
+                let (path_type, size) = match entry.kind {
+                    EntryKind::Folder => (InodeType::Folder, None),
+                    EntryKind::File => (InodeType::File, Some(entry.size)),
+                };
+                let metadata = if entry.metadata.is_null() {
+                    None
+                } else {
+                    Some(serde_json::to_string(&entry.metadata).unwrap_or_default())
+                };
+                import_paths::insert_path_pending(
+                    &tx,
+                    &import_id,
+                    projection,
+                    &entry.logical_path,
+                    &path_type,
+                    size,
+                    entry.blob_id.as_ref(),
+                    metadata.as_deref(),
+                )?;
+            }
         }
-        for file in &manifest.files {
-            import_paths::insert_path_pending(
-                &tx,
-                &import_id,
-                &file.path,
-                &InodeType::File,
-                Some(file.size),
-                Some(&file.source_data_block_id),
-            )?;
-        }
-        crate::db::shared::commit_timed(tx)
+        hopnet_projection::dbstats::commit_timed(tx)
             .map_err(|_| ImportExtractError::Internal("tx commit".into()))?;
     }
 
@@ -465,7 +468,7 @@ async fn run_extraction(
     //    inner closure also takes a fresh DB connection from the pool to mark
     //    failed rows as it goes — no result threading required.
     let upload_path = staging.join("upload.tar.gz");
-    let files_root = staging.join("files");
+    let staging_root = staging.clone();
     let pool = state.db_pool.clone();
     let manifest_for_blocking = manifest.clone();
     let import_id_for_blocking = import_id.clone();
@@ -475,7 +478,7 @@ async fn run_extraction(
             import_id_for_blocking,
             manifest_for_blocking,
             upload_path,
-            files_root,
+            staging_root,
         )
     })
     .await
@@ -488,23 +491,27 @@ async fn run_extraction(
         user_id
     );
 
-    // 4. Phase 3.5 creation walk: folders (depth-asc) → files → terminal flip.
+    // 4. Creation walk: per projection section → translator (or skip) →
+    //    terminal flip.
     run_creation_phase(&state, &import_id, user_id, &staging).await?;
 
     Ok(())
 }
 
-/// Phase 3.5 creation walk. Reads Pending folder rows in depth-ascending
-/// order, then Pending file rows, calling the existing `create_folder` /
-/// `create_file_with_fragments` helpers. Successful rows flip to Imported;
-/// per-call failures flip to Failed without aborting. Terminal: submit
-/// `update_import_status(Completed)` and remove staging dir.
+/// Creation walk. Per projection section (deterministic name order): when a
+/// translator is registered, Pending folder rows (depth-asc) then Pending
+/// file rows are driven through `import_entry` one at a time (uniform
+/// resume/progress per row) with `flush` at the section end — the
+/// projection's batch boundary. Sections with NO registered translator have
+/// ALL their Pending rows marked Skipped (`error_code = "no_translator"`) —
+/// the import still completes. Terminal: submit
+/// `update_import_status(Completed)`, fire the host's completion hook, and
+/// remove the staging dir.
 ///
-/// Sequential per spec § 3.5; Phase 5 swaps in JoinSet-based parallel-4 with
-/// channel-coordinator fan-in. Idempotent — only walks rows with
-/// `status = Pending` so resumed imports skip already-Imported work.
-pub(crate) async fn run_creation_phase(
-    state: &AppState,
+/// Idempotent — only walks rows with `status = Pending` so resumed imports
+/// skip already-Imported work.
+pub async fn run_creation_phase(
+    state: &TakeoutState,
     import_id: &CustomUUID,
     user_id: i32,
     staging: &Path,
@@ -513,75 +520,118 @@ pub(crate) async fn run_creation_phase(
     // mid-import (after extraction + status flip but before any file/folder
     // creation) and verify resume on re-auth. No-op in production.
     state
-        .takeout_runtime
+        .runtime
         .barriers
-        .wait(crate::takeout::barriers::names::BEFORE_IMPORT_CREATION_WALK)
+        .wait(crate::barriers::names::BEFORE_IMPORT_CREATION_WALK)
         .await;
 
-    // 1. Folders depth-ascending so parents commit before children.
-    //    Prepend "/" — `encrypt_path` only encrypts inputs with at least one
-    //    slash; a bare "alpha" would collapse to "/" (root placeholder) and
-    //    silently misroute the inode.
-    let folder_paths = read_pending_paths(state, import_id, InodeType::Folder)?;
-    let drive = crate::drive_host::drive_state(state);
-    for path in &folder_paths {
-        let absolute = format!("/{}", path.trim_start_matches('/'));
-        match hopnet_drive::upload::create_folder(&drive, user_id, &absolute).await {
-            Ok(()) => mark_imported(state, import_id, path)?,
-            Err(status) => {
-                tracing::warn!(
-                    "create_folder {} failed for import {}: {}",
-                    path,
+    let projections = {
+        let conn = state
+            .db_pool
+            .get()
+            .map_err(|_| ImportExtractError::Internal("db pool".into()))?;
+        import_paths::list_projections(&conn, import_id)?
+    };
+
+    let mut attempted_folders = 0usize;
+    let mut attempted_files = 0usize;
+
+    for projection in &projections {
+        let Some(exporter) = state.exporter(projection).cloned() else {
+            // Skip-unknown-sections contract: no translator → the whole
+            // section is reported skipped, never failed.
+            let skipped = {
+                let mut conn = state
+                    .db_pool
+                    .get()
+                    .map_err(|_| ImportExtractError::Internal("db pool".into()))?;
+                let tx = conn
+                    .transaction()
+                    .map_err(|_| ImportExtractError::Internal("tx open".into()))?;
+                let n = import_paths::mark_projection_skipped(
+                    &tx,
                     import_id,
-                    status
-                );
-                mark_failed(
-                    state,
-                    import_id,
-                    path,
-                    "create_folder",
-                    &format!("status {}", status.as_u16()),
+                    projection,
+                    "no_translator",
                 )?;
+                hopnet_projection::dbstats::commit_timed(tx)
+                    .map_err(|_| ImportExtractError::Internal("tx commit".into()))?;
+                n
+            };
+            tracing::warn!(
+                "Import {}: no translator registered for projection {:?}; {} entries skipped",
+                import_id,
+                projection,
+                skipped
+            );
+            continue;
+        };
+
+        // 1. Folders depth-ascending so parents commit before children.
+        let folder_rows = read_pending(state, import_id, projection, InodeType::Folder)?;
+        attempted_folders += folder_rows.len();
+        for row in &folder_rows {
+            let entry = pending_to_entry(row);
+            match exporter.import_entry(user_id, &entry, None).await {
+                Ok(()) => mark_imported(state, import_id, projection, &row.path)?,
+                Err(e) => {
+                    let (code, message) = entry_error_parts(e);
+                    tracing::warn!(
+                        "import_entry (folder) {} failed for import {}: {} ({})",
+                        row.path,
+                        import_id,
+                        code,
+                        message
+                    );
+                    mark_failed(state, import_id, projection, &row.path, code, &message)?;
+                }
             }
+        }
+
+        // 2. Files: each hands its already-extracted staging file to the
+        //    translator. Sequential — translators await their own commit
+        //    acks so backpressure is implicit.
+        let file_rows = read_pending(state, import_id, projection, InodeType::File)?;
+        attempted_files += file_rows.len();
+        for row in &file_rows {
+            let entry = pending_to_entry(row);
+            let staged = staging.join(projection).join(&row.path);
+            match exporter.import_entry(user_id, &entry, Some(&staged)).await {
+                Ok(()) => mark_imported(state, import_id, projection, &row.path)?,
+                Err(e) => {
+                    let (code, message) = entry_error_parts(e);
+                    tracing::warn!(
+                        "import_entry (file) {} failed for import {}: {} ({})",
+                        row.path,
+                        import_id,
+                        code,
+                        message
+                    );
+                    mark_failed(state, import_id, projection, &row.path, code, &message)?;
+                }
+            }
+        }
+
+        // 3. Section-end batch boundary.
+        if let Err(e) = exporter.flush(user_id).await {
+            let (code, message) = entry_error_parts(e);
+            tracing::error!(
+                "flush({}) failed for import {}: {} ({})",
+                projection,
+                import_id,
+                code,
+                message
+            );
         }
     }
 
-    // 2. Files: each opens its already-extracted staging file and streams it
-    //    through the regular upload helper. Sequential — `submit_inodes`
-    //    awaits commit-ack so backpressure is implicit.
-    let files_root = staging.join("files");
-    let file_paths = read_pending_paths(state, import_id, InodeType::File)?;
-    for path in &file_paths {
-        match create_one_file(state, user_id, &files_root, path).await {
-            Ok(()) => mark_imported(state, import_id, path)?,
-            Err((code, message)) => {
-                tracing::warn!(
-                    "create_file {} failed for import {}: {} ({})",
-                    path,
-                    import_id,
-                    code,
-                    message
-                );
-                mark_failed(state, import_id, path, code, &message)?;
-            }
-        }
-    }
-
-    // 3. Terminal flip — Importing → Completed.
+    // Terminal flip — Importing → Completed.
     submit_status_update(state, user_id, import_id, ImportStatus::Completed).await?;
 
-    // 3b. Onboarding bits — additive only (clear=NONE preserves any other
-    //     bits the user has accumulated on other devices). Best-effort:
-    //     failure here doesn't retract the import.
-    if let Err(e) = crate::users::helpers::submit_onboarding_update(
-        state,
-        user_id,
-        hopnet_common::OnboardingFlags::IMPORT_OFFERED
-            | hopnet_common::OnboardingFlags::IMPORT_COMPLETED,
-        hopnet_common::OnboardingFlags::NONE,
-    )
-    .await
-    {
+    // Onboarding bits via the host hook — best-effort: failure here doesn't
+    // retract the import (host impl submits the same additive-flags tx as
+    // before).
+    if let Err(e) = state.hooks.import_completed(user_id).await {
         tracing::warn!(
             "onboarding flag update for user {} after import {} failed: {}",
             user_id,
@@ -590,111 +640,72 @@ pub(crate) async fn run_creation_phase(
         );
     }
 
-    // 4. Remove staging dir; per-file extracted bytes are no longer needed
-    //    since fragments are committed network-wide. Stray staging is
-    //    preferable to retracting the terminal flip on cleanup error.
-    if let Err(e) = tokio::fs::remove_dir_all(staging).await
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        tracing::warn!("Staging cleanup for {} failed: {:?}", import_id, e);
+    // Remove staging dir; per-file extracted bytes are no longer needed
+    // since fragments are committed network-wide. Stray staging is
+    // preferable to retracting the terminal flip on cleanup error.
+    if let Err(e) = tokio::fs::remove_dir_all(staging).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!("Staging cleanup for {} failed: {:?}", import_id, e);
+        }
     }
 
     tracing::info!(
         "Import {} complete: {} folders + {} files attempted",
         import_id,
-        folder_paths.len(),
-        file_paths.len()
+        attempted_folders,
+        attempted_files
     );
     Ok(())
 }
 
-/// Read paths from `import_paths_{id}` filtered by type and Pending status.
-/// Folders ordered by depth (slash count) then path; files ordered by path.
-fn read_pending_paths(
-    state: &AppState,
+/// Rebuild the translator-facing entry from a work-table row (the sidecar
+/// metadata was persisted at seeding, so a post-restart resume hands the
+/// FULL entry to `import_entry` without the manifest in hand).
+fn pending_to_entry(row: &import_paths::PendingPath) -> ExportEntry {
+    let metadata = row
+        .metadata
+        .as_deref()
+        .and_then(|m| serde_json::from_str(m).ok())
+        .unwrap_or(serde_json::Value::Null);
+    ExportEntry {
+        logical_path: row.path.clone(),
+        blob_id: row.source_data_block_id.clone(),
+        size: row.size_bytes.unwrap_or(0),
+        metadata,
+        export_handle: None,
+    }
+}
+
+/// Split an `ImportEntryError` into the row's structured (code, message).
+/// Transient failures are recorded with a stable code too — automated
+/// re-drive of transient rows is future work; nothing returns it today.
+fn entry_error_parts(e: ImportEntryError) -> (&'static str, String) {
+    match e {
+        ImportEntryError::Permanent { code, message } => (code, message),
+        ImportEntryError::Transient(message) => ("transient", message),
+    }
+}
+
+fn read_pending(
+    state: &TakeoutState,
     import_id: &CustomUUID,
+    projection: &str,
     path_type: InodeType,
-) -> Result<Vec<String>, ImportExtractError> {
+) -> Result<Vec<import_paths::PendingPath>, ImportExtractError> {
     let conn = state
         .db_pool
         .get()
         .map_err(|_| ImportExtractError::Internal("db pool".into()))?;
-    let table = crate::db::import_paths::table_name(import_id);
-    let type_value = match path_type {
-        InodeType::File => 0,
-        InodeType::Folder => 1,
-    };
-    let query = match path_type {
-        InodeType::Folder => format!(
-            "SELECT path FROM {} WHERE type = ? AND status = 0
-             ORDER BY (length(path) - length(replace(path, '/', ''))) ASC, path ASC",
-            table
-        ),
-        InodeType::File => format!(
-            "SELECT path FROM {} WHERE type = ? AND status = 0 ORDER BY path ASC",
-            table
-        ),
-    };
-    let mut stmt = conn
-        .prepare(&query)
-        .map_err(|e| ImportExtractError::Internal(format!("prepare {}: {}", table, e)))?;
-    let rows = stmt
-        .query_map([type_value], |row| row.get::<_, String>(0))
-        .map_err(|e| ImportExtractError::Internal(format!("query {}: {}", table, e)))?;
-    let mut out = Vec::new();
-    for r in rows {
-        out.push(r.map_err(|e| ImportExtractError::Internal(format!("row {}: {}", table, e)))?);
-    }
-    Ok(out)
-}
-
-/// Open the staging file for `path`, query its size, split parent/filename,
-/// and call `create_file_with_fragments`. Returns `(error_code, message)` on
-/// failure for use by `mark_path_failed`.
-async fn create_one_file(
-    state: &AppState,
-    user_id: i32,
-    files_root: &Path,
-    path: &str,
-) -> Result<(), (&'static str, String)> {
-    let staging_file = files_root.join(path);
-    let metadata = tokio::fs::metadata(&staging_file)
-        .await
-        .map_err(|e| ("staging_metadata", e.to_string()))?;
-    let file_size = metadata.len() as usize;
-
-    let source = tokio::fs::File::open(&staging_file)
-        .await
-        .map_err(|e| ("staging_open", e.to_string()))?;
-
-    // Build absolute path then split into parent + filename. `encrypt_path`
-    // requires at least one slash to encrypt segments; any bare relative
-    // input collapses to "/". Top-level files end up with parent = "/" and
-    // a filename — same shape `post_files` produces from `path: "/foo.txt"`.
-    let absolute = format!("/{}", path.trim_start_matches('/'));
-    let (parent, filename) = match absolute.rfind('/') {
-        Some(0) => ("/".to_string(), absolute[1..].to_string()),
-        Some(i) => (absolute[..i].to_string(), absolute[i + 1..].to_string()),
-        None => unreachable!("absolute path always contains '/'"),
-    };
-
-    hopnet_drive::upload::create_file_with_fragments(
-        &crate::drive_host::drive_state(state),
-        user_id,
-        &parent,
-        &filename,
-        source,
-        file_size,
-    )
-    .await
-    .map(|_data_block_id| ())
-    .map_err(|status| ("create_file", format!("status {}", status.as_u16())))
+    Ok(import_paths::read_pending_paths(
+        &conn, import_id, projection, path_type,
+    )?)
 }
 
 /// Open a fresh transaction and stamp a row Imported.
 fn mark_imported(
-    state: &AppState,
+    state: &TakeoutState,
     import_id: &CustomUUID,
+    projection: &str,
     path: &str,
 ) -> Result<(), ImportExtractError> {
     let mut conn = state
@@ -704,16 +715,17 @@ fn mark_imported(
     let tx = conn
         .transaction()
         .map_err(|_| ImportExtractError::Internal("tx open".into()))?;
-    crate::db::import_paths::mark_path_imported(&tx, import_id, path)?;
-    crate::db::shared::commit_timed(tx)
+    import_paths::mark_path_imported(&tx, import_id, projection, path)?;
+    hopnet_projection::dbstats::commit_timed(tx)
         .map_err(|_| ImportExtractError::Internal("tx commit".into()))?;
     Ok(())
 }
 
 /// Open a fresh transaction and stamp a row Failed with structured error info.
 fn mark_failed(
-    state: &AppState,
+    state: &TakeoutState,
     import_id: &CustomUUID,
+    projection: &str,
     path: &str,
     code: &str,
     message: &str,
@@ -725,17 +737,17 @@ fn mark_failed(
     let tx = conn
         .transaction()
         .map_err(|_| ImportExtractError::Internal("tx open".into()))?;
-    crate::db::import_paths::mark_path_failed(&tx, import_id, path, code, Some(message))?;
-    crate::db::shared::commit_timed(tx)
+    import_paths::mark_path_failed(&tx, import_id, projection, path, code, Some(message))?;
+    hopnet_projection::dbstats::commit_timed(tx)
         .map_err(|_| ImportExtractError::Internal("tx commit".into()))?;
     Ok(())
 }
 
 /// Build + sign + submit an `update_import_status` consensus transaction for
-/// `import_id`. Authentication uses the user signing path the create_import
-/// txn already used.
+/// `import_id`. USER-signed — exactly the signing path the pre-split code
+/// used (`create_signed_user_transaction`), now through the gateway.
 async fn submit_status_update(
-    state: &AppState,
+    state: &TakeoutState,
     user_id: i32,
     import_id: &CustomUUID,
     new_status: ImportStatus,
@@ -746,40 +758,74 @@ async fn submit_status_update(
     };
     let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
         .map_err(|_| ImportExtractError::Internal("status payload encode".into()))?;
-    let txn = crate::consensus::dispatch::create_signed_user_transaction(
-        state,
-        "update_import_status".to_string(),
-        encoded,
-        user_id,
-    )
-    .await
-    .map_err(|_| ImportExtractError::ConsensusFailed)?;
-    state.consensus_queue.submit(txn).await.map_err(|e| {
-        tracing::error!(
-            "update_import_status submit failed for {}: {:?}",
-            import_id,
-            e
-        );
-        ImportExtractError::ConsensusFailed
-    })?;
+    state
+        .txs
+        .submit(TxSpec {
+            function: "update_import_status",
+            payload: encoded,
+            signer: TxSigner::User(user_id),
+        })
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                "update_import_status submit failed for {}: {:?}",
+                import_id,
+                e
+            );
+            ImportExtractError::ConsensusFailed
+        })?;
+    Ok(())
+}
+
+/// Mark one path row failed from the sync walk (fresh conn + tx per event).
+fn walk_mark_failed(
+    pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    import_id: &CustomUUID,
+    projection: &str,
+    path: &str,
+    code: &str,
+    message: &str,
+) -> Result<(), ImportExtractError> {
+    let mut conn = pool
+        .get()
+        .map_err(|_| ImportExtractError::Internal("db pool".into()))?;
+    let tx = conn
+        .transaction()
+        .map_err(|_| ImportExtractError::Internal("tx open".into()))?;
+    import_paths::mark_path_failed(&tx, import_id, projection, path, code, Some(message))?;
+    hopnet_projection::dbstats::commit_timed(tx)
+        .map_err(|_| ImportExtractError::Internal("tx commit".into()))?;
     Ok(())
 }
 
 /// Sync entry-by-entry walk of the staging tar.gz. The first entry is the
-/// already-consumed manifest; we discard it and process the rest.
+/// already-consumed manifest; we discard it and process the rest. Every
+/// content entry lives under a `{projection}/` prefix; files are staged to
+/// `{staging}/{projection}/{path}` after hash verification against the
+/// manifest's `content_hash` + `blob_id`.
 fn walk_archive_entries(
     pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
     import_id: CustomUUID,
     manifest: TakeoutManifest,
     upload_path: PathBuf,
-    files_root: PathBuf,
+    staging_root: PathBuf,
 ) -> Result<(), ImportExtractError> {
     use flate2::read::GzDecoder;
     use std::fs::File;
     use tar::Archive;
 
-    let manifest_files: HashMap<String, &crate::takeout::manifest::TakeoutManifestFile> =
-        manifest.files.iter().map(|f| (f.path.clone(), f)).collect();
+    // (projection, logical_path) → manifest entry, for per-file verification.
+    let manifest_files: HashMap<(&str, &str), &ManifestEntry> = manifest
+        .projections
+        .iter()
+        .flat_map(|(projection, section)| {
+            section
+                .entries
+                .iter()
+                .filter(|e| e.kind == EntryKind::File)
+                .map(move |e| ((projection.as_str(), e.logical_path.as_str()), e))
+        })
+        .collect();
 
     let file = File::open(&upload_path)?;
     let gz = GzDecoder::new(file);
@@ -788,7 +834,7 @@ fn walk_archive_entries(
         .entries()
         .map_err(|e| ImportExtractError::ArchiveRead(format!("entries: {}", e)))?;
 
-    // Discard the manifest entry (already validated in 3.3).
+    // Discard the manifest entry (already validated at upload).
     if let Some(first) = entries.next() {
         let _ =
             first.map_err(|e| ImportExtractError::ArchiveRead(format!("first entry: {}", e)))?;
@@ -811,78 +857,65 @@ fn walk_archive_entries(
             }
         };
 
-        let user_path = match path_in_archive.strip_prefix(ARCHIVE_FILES_PREFIX) {
-            Some(rest) => rest.trim_end_matches('/').to_string(),
-            None => {
-                let mut conn = pool
-                    .get()
-                    .map_err(|_| ImportExtractError::Internal("db pool".into()))?;
-                let tx = conn
-                    .transaction()
-                    .map_err(|_| ImportExtractError::Internal("tx open".into()))?;
-                import_paths::mark_path_failed(
-                    &tx,
+        // Split `{projection}/{logical_path}`. Entries not under a manifest
+        // section prefix can't be attributed — mark best-effort (the UPDATE
+        // matches no seeded row; a warn is logged) and continue, matching
+        // the v1 wrong-prefix handling.
+        let (projection, user_path) = match path_in_archive.split_once('/') {
+            Some((top, rest)) if !rest.is_empty() && manifest.projections.contains_key(top) => {
+                (top.to_string(), rest.trim_end_matches('/').to_string())
+            }
+            _ => {
+                walk_mark_failed(
+                    &pool,
                     &import_id,
+                    path_in_archive.split('/').next().unwrap_or(""),
                     &path_in_archive,
                     "wrong_prefix",
-                    Some("entry not under files/"),
+                    "entry not under a projection prefix",
                 )?;
-                crate::db::shared::commit_timed(tx)
-                    .map_err(|_| ImportExtractError::Internal("tx commit".into()))?;
                 continue;
             }
         };
 
         match entry.header().entry_type() {
             tar::EntryType::Directory => {
-                // Folder rows already seeded as Pending; 3.5 picks up.
+                // Folder rows already seeded as Pending; the creation walk
+                // picks them up from the manifest-seeded table.
             }
             tar::EntryType::Regular => {
-                let manifest_file = match manifest_files.get(&user_path) {
-                    Some(f) => *f,
-                    None => {
-                        let mut conn = pool
-                            .get()
-                            .map_err(|_| ImportExtractError::Internal("db pool".into()))?;
-                        let tx = conn
-                            .transaction()
-                            .map_err(|_| ImportExtractError::Internal("tx open".into()))?;
-                        import_paths::mark_path_failed(
-                            &tx,
-                            &import_id,
-                            &user_path,
-                            "not_in_manifest",
-                            Some("file entry not present in manifest.files"),
-                        )?;
-                        crate::db::shared::commit_timed(tx)
-                            .map_err(|_| ImportExtractError::Internal("tx commit".into()))?;
-                        continue;
-                    }
-                };
+                let manifest_file =
+                    match manifest_files.get(&(projection.as_str(), user_path.as_str())) {
+                        Some(f) => *f,
+                        None => {
+                            walk_mark_failed(
+                                &pool,
+                                &import_id,
+                                &projection,
+                                &user_path,
+                                "not_in_manifest",
+                                "file entry not present in its manifest section",
+                            )?;
+                            continue;
+                        }
+                    };
 
-                let staging_file = files_root.join(&user_path);
+                let staging_file = staging_root.join(&projection).join(&user_path);
                 let outcome = extract_and_hash(&mut entry, &staging_file, manifest_file);
                 match outcome {
                     Ok(()) => {
-                        // Hash matched; row stays Pending for 3.5.
+                        // Hash matched; row stays Pending for the creation walk.
                     }
                     Err(reason) => {
                         let _ = std::fs::remove_file(&staging_file);
-                        let mut conn = pool
-                            .get()
-                            .map_err(|_| ImportExtractError::Internal("db pool".into()))?;
-                        let tx = conn
-                            .transaction()
-                            .map_err(|_| ImportExtractError::Internal("tx open".into()))?;
-                        import_paths::mark_path_failed(
-                            &tx,
+                        walk_mark_failed(
+                            &pool,
                             &import_id,
+                            &projection,
                             &user_path,
                             reason.code(),
-                            Some(&reason.message()),
+                            &reason.message(),
                         )?;
-                        crate::db::shared::commit_timed(tx)
-                            .map_err(|_| ImportExtractError::Internal("tx commit".into()))?;
                     }
                 }
             }
@@ -905,6 +938,9 @@ enum ExtractFailure {
         expected: Blake3Hash,
         computed: Blake3Hash,
     },
+    /// The manifest entry lacks the fields verification needs (blob_id /
+    /// content_hash) — real exports always carry both for files.
+    MissingManifestFields,
 }
 
 impl ExtractFailure {
@@ -912,6 +948,7 @@ impl ExtractFailure {
         match self {
             ExtractFailure::Io(_) => "extract_io",
             ExtractFailure::HashMismatch { .. } => "hash_mismatch",
+            ExtractFailure::MissingManifestFields => "missing_manifest_fields",
         }
     }
     fn message(&self) -> String {
@@ -920,20 +957,28 @@ impl ExtractFailure {
             ExtractFailure::HashMismatch { expected, computed } => {
                 format!("expected {} got {}", expected, computed)
             }
+            ExtractFailure::MissingManifestFields => {
+                "file entry missing blob_id/content_hash".to_string()
+            }
         }
     }
 }
 
 /// Stream `entry` into `staging_file` while computing
-/// `blake3(plaintext ∥ source_data_block_id.as_bytes())`. Compares against
-/// `manifest_file.file_hash`. 64 KiB read buffer matches the upload-side
-/// chunking pattern.
+/// `blake3(plaintext ∥ blob_id.as_bytes())`. Compares against
+/// `manifest_entry.content_hash` (formula unchanged from v1). 64 KiB read
+/// buffer matches the upload-side chunking pattern.
 fn extract_and_hash(
     entry: &mut dyn Read,
     staging_file: &Path,
-    manifest_file: &crate::takeout::manifest::TakeoutManifestFile,
+    manifest_entry: &ManifestEntry,
 ) -> Result<(), ExtractFailure> {
     use std::io::Write;
+
+    let (blob_id, expected_hash) = match (&manifest_entry.blob_id, manifest_entry.content_hash) {
+        (Some(blob_id), Some(hash)) => (blob_id, hash),
+        _ => return Err(ExtractFailure::MissingManifestFields),
+    };
 
     if let Some(parent) = staging_file.parent() {
         std::fs::create_dir_all(parent).map_err(ExtractFailure::Io)?;
@@ -952,11 +997,11 @@ fn extract_and_hash(
     }
     out.sync_all().map_err(ExtractFailure::Io)?;
 
-    hasher.update(manifest_file.source_data_block_id.as_bytes());
+    hasher.update(blob_id.as_bytes());
     let computed = Blake3Hash::new(hasher.finalize());
-    if computed != manifest_file.file_hash {
+    if computed != expected_hash {
         return Err(ExtractFailure::HashMismatch {
-            expected: manifest_file.file_hash,
+            expected: expected_hash,
             computed,
         });
     }

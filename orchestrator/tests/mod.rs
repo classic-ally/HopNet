@@ -267,6 +267,11 @@ pub async fn run_test_by_name(
         }
         "import-write-gate" => import::ImportWriteGate.run(mesh_id, nodes, flags).await,
         "import-status-counts" => import::ImportStatusCounts.run(mesh_id, nodes, flags).await,
+        "import-unknown-projection-skipped" => {
+            import::ImportUnknownProjectionSkipped
+                .run(mesh_id, nodes, flags)
+                .await
+        }
         "import-resume-after-restart" => {
             import::ImportResumeAfterRestart
                 .run(mesh_id, nodes, flags)
@@ -333,6 +338,7 @@ pub fn list_test_names() -> Vec<&'static str> {
         "import-creation-mixed-failure",
         "import-write-gate",
         "import-status-counts",
+        "import-unknown-projection-skipped",
         "import-resume-after-restart",
         "post-files-consensus-shape",
         "mixed-files-and-folders-one-request",

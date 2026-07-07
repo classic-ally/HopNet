@@ -214,8 +214,8 @@ pub async fn sign_in(
     }
 
     // Resume any stranded import owned by this node for this user.
-    tokio::spawn(crate::takeout::jobs::maybe_resume_for_user(
-        app_state.clone(),
+    tokio::spawn(hopnet_takeout::jobs::maybe_resume_for_user(
+        crate::takeout_host::takeout_state(&app_state),
         db_user.user_id,
     ));
 

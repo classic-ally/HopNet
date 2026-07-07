@@ -11,6 +11,7 @@
 
 pub mod db;
 pub mod download;
+pub mod exporter;
 pub mod host;
 pub mod http;
 pub mod envelopes;

@@ -2679,6 +2679,7 @@ dependencies = [
  "hopnet-drive",
  "hopnet-projection",
  "hopnet-storage",
+ "hopnet-takeout",
  "image",
  "include_dir",
  "inventory",
@@ -2777,6 +2778,7 @@ dependencies = [
  "rand 0.10.1",
  "rusqlite",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -2791,11 +2793,16 @@ version = "0.1.0"
 dependencies = [
  "aes-siv",
  "bytes",
+ "chrono",
+ "hdrhistogram",
  "hopnet-common",
  "inventory",
+ "once_cell",
+ "parking_lot",
  "rusqlite",
  "serde",
  "serde_json",
+ "tokio",
  "tokio-stream",
  "tracing",
  "x25519-dalek",
@@ -2821,6 +2828,35 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "x25519-dalek",
+]
+
+[[package]]
+name = "hopnet-takeout"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bincode",
+ "blake3",
+ "bytes",
+ "chrono",
+ "flate2",
+ "hopnet-common",
+ "hopnet-projection",
+ "hopnet-storage",
+ "inventory",
+ "once_cell",
+ "r2d2",
+ "r2d2_sqlite",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

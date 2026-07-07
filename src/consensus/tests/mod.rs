@@ -435,7 +435,7 @@ pub fn create_test_app_state_with_keys(
         consensus_barriers: Arc::new(crate::consensus::barriers::new()),
         dedup_cache: Arc::new(crate::net::DedupCache::default()),
         session_store: Arc::new(crate::auth::SessionStore::default()),
-        takeout_runtime: Arc::new(crate::takeout::TakeoutRuntime::default()),
+        takeout_runtime: Arc::new(hopnet_takeout::TakeoutRuntime::default()),
         consensus_queue,
         write_gate: Arc::new(crate::db::write_gate::WriteGate::new()),
         local_state_tx: tokio::sync::mpsc::channel(1).0,

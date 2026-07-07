@@ -1,9 +1,11 @@
-use crate::consensus::types::Transaction;
-use crate::db::{
-    CustomDateTime, CustomUUID, consensus,
-    takeout::{TakeoutPayload, TakeoutStatusPayload},
-};
-use crate::{AppState, auth};
+//! Takeout HTTP surface (RFC-015 Stage D5b). Moved from the host's
+//! `takeout::routes` behind [`TakeoutState`]; route paths, status codes, and
+//! response shapes are preserved EXACTLY. The host mounts these routers and
+//! layers its JWT auth middleware around them.
+
+use crate::TakeoutState;
+use crate::db::takeout::{TakeoutPayload, TakeoutStatusPayload};
+use crate::export::execute_takeout_materialization;
 use axum::{
     Router,
     body::Body,
@@ -13,12 +15,15 @@ use axum::{
     routing::{delete, get, post},
 };
 use chrono::{Duration, Utc};
-use hopnet_common::{TakeoutRecord, TakeoutStatus};
+use hopnet_common::{CustomUUID, TakeoutRecord, TakeoutStatus};
+use hopnet_projection::CustomDateTime;
+use hopnet_projection::host::{TxSigner, TxSpec};
 use std::str::FromStr;
 use tokio::fs::File;
 use tokio_util::io::ReaderStream;
 
-pub fn takeout_routes() -> Router<AppState> {
+/// The `/takeout` router (host nests it under its auth middleware).
+pub fn router<S: Clone + Send + Sync + 'static>(state: TakeoutState) -> Router<S> {
     Router::new()
         .route("/", get(get_takeouts))
         .route("/can-create", get(get_can_create_takeout))
@@ -26,15 +31,24 @@ pub fn takeout_routes() -> Router<AppState> {
         .route("/{id}", delete(delete_takeout))
         .route("/{id}/process", post(post_process_takeout))
         .route("/{id}/download", get(get_download_takeout))
-        .nest("/import", crate::takeout::import::import_routes())
+        .nest("/import", crate::import::import_routes())
+        .with_state(state)
+}
+
+/// The `/maintenance/takeout` router (host merges it into its protected
+/// routes — path preserved exactly).
+pub fn maintenance_router<S: Clone + Send + Sync + 'static>(state: TakeoutState) -> Router<S> {
+    Router::new()
+        .route("/maintenance/takeout", post(post_takeout_maintenance))
+        .with_state(state)
 }
 
 /// GET /takeout - Get all takeouts for the authenticated user
 async fn get_takeouts(
-    State(app_state): State<AppState>,
+    State(state): State<TakeoutState>,
     Extension(user_id): Extension<i32>,
 ) -> Result<Json<Vec<TakeoutRecord>>, StatusCode> {
-    match crate::db::takeout::get_takeouts_by_user(app_state.db_pool.get(), user_id) {
+    match crate::db::takeout::get_takeouts_by_user(state.db_pool.get(), user_id) {
         Ok(takeouts) => Ok(Json(takeouts)),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
@@ -42,12 +56,12 @@ async fn get_takeouts(
 
 /// GET /takeout/can-create - Check if user can create a new takeout
 async fn get_can_create_takeout(
-    State(app_state): State<AppState>,
+    State(state): State<TakeoutState>,
     Extension(user_id): Extension<i32>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     // Check if user already has an active takeout (same logic as creation endpoint)
     let can_create =
-        match crate::db::takeout::has_active_takeout(app_state.db_pool.get(), Some(user_id)) {
+        match crate::db::takeout::has_active_takeout(state.db_pool.get(), Some(user_id)) {
             Ok(true) => false, // Has active takeout, cannot create
             Ok(false) => true, // No active takeout, can create
             Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
@@ -60,39 +74,33 @@ async fn get_can_create_takeout(
 
 /// POST /takeout/initiate - Initiate a new takeout for the authenticated user
 async fn post_initiate_takeout(
-    State(app_state): State<AppState>,
+    State(state): State<TakeoutState>,
     Extension(user_id): Extension<i32>,
 ) -> StatusCode {
     // Check if user already has an active takeout (rate limiting)
-    match crate::db::takeout::has_active_takeout(app_state.db_pool.get(), Some(user_id)) {
+    match crate::db::takeout::has_active_takeout(state.db_pool.get(), Some(user_id)) {
         Ok(true) => return StatusCode::TOO_MANY_REQUESTS,
         Ok(false) => {} // Good to proceed
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
     }
 
     // Get node ID for storage validation
-    let node_id = match app_state.get_node_id() {
-        Ok(id) => id,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+    let node_id = match state.node_id() {
+        Some(id) => id,
+        None => return StatusCode::INTERNAL_SERVER_ERROR,
     };
 
-    // Calculate user's total data size
-    let user_data_size =
-        match crate::db::takeout::calculate_user_data_size(app_state.db_pool.get(), user_id) {
-            Ok(size) => size,
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
-        };
+    // Calculate user's total data size — host hook (projection sizing SQL
+    // stays host-side; a future pass may fold it into the exporter contract).
+    let user_data_size = match state.hooks.user_data_size_bytes(user_id).await {
+        Ok(size) => size,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+    };
 
     // Check if node has enough storage (3x user data size safety factor)
     // Accounts for: fragments + reconstructed files + compressed archive
     let required_storage = user_data_size * 3;
-    match crate::db::takeout::get_node_available_storage(
-        app_state.db_pool.get(),
-        &app_state,
-        node_id,
-    )
-    .await
-    {
+    match state.hooks.node_available_storage_bytes().await {
         Ok(Some(available)) => {
             if available < required_storage {
                 tracing::warn!(
@@ -114,17 +122,11 @@ async fn post_initiate_takeout(
     }
 
     // Build takeout payload for consensus submission
-    let consensus_height = match app_state.db_pool.get() {
-        Ok(mut conn) => {
-            let tx = match conn.transaction() {
-                Ok(tx) => tx,
-                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
-            };
-            match consensus::get_current_consensus_height(&tx) {
-                Ok(height) => height,
-                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
-            }
-        }
+    let consensus_height = match state.db_pool.get() {
+        Ok(conn) => match crate::db::current_height(&conn) {
+            Ok(height) => height,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+        },
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
     };
 
@@ -148,21 +150,16 @@ async fn post_initiate_takeout(
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
         };
 
-    // Create consensus transaction
-    let transaction = match crate::consensus::dispatch::create_signed_user_transaction(
-        &app_state,
-        "create_takeout".to_string(),
-        encoded_payload,
-        user_id,
-    )
-    .await
+    // Sign (user) and submit to consensus via the gateway.
+    match state
+        .txs
+        .submit(TxSpec {
+            function: "create_takeout",
+            payload: encoded_payload,
+            signer: TxSigner::User(user_id),
+        })
+        .await
     {
-        Ok(tx) => tx,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
-    };
-
-    // Submit to consensus
-    match app_state.consensus_queue.submit(transaction).await {
         Ok(()) => {
             tracing::info!(
                 "Initiated takeout {} for user {} via consensus ({} bytes of data)",
@@ -178,7 +175,7 @@ async fn post_initiate_takeout(
 
 /// DELETE /takeout/{id} - Delete/cancel a takeout
 async fn delete_takeout(
-    State(app_state): State<AppState>,
+    State(state): State<TakeoutState>,
     Extension(user_id): Extension<i32>,
     Path(takeout_id_str): Path<String>,
 ) -> StatusCode {
@@ -192,8 +189,7 @@ async fn delete_takeout(
     };
 
     // Get the specific takeout to verify ownership and current status
-    let takeout = match crate::db::takeout::get_takeout_by_id(app_state.db_pool.get(), &takeout_id)
-    {
+    let takeout = match crate::db::takeout::get_takeout_by_id(state.db_pool.get(), &takeout_id) {
         Ok(Some(t)) => t,
         Ok(None) => {
             tracing::error!("Takeout {} not found", takeout_id);
@@ -233,17 +229,16 @@ async fn delete_takeout(
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
         };
 
-    let transaction = match crate::consensus::dispatch::create_signed_transaction(
-        &app_state,
-        "update_takeout_status".to_string(),
-        encoded_payload,
-    ) {
-        Ok(tx) => tx,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
-    };
-
-    // Submit cancellation to consensus
-    match app_state.consensus_queue.submit(transaction).await {
+    // Node-signed, exactly what the pre-split cancel path signed with.
+    match state
+        .txs
+        .submit(TxSpec {
+            function: "update_takeout_status",
+            payload: encoded_payload,
+            signer: TxSigner::Node,
+        })
+        .await
+    {
         Ok(_) => {
             tracing::info!("Takeout {} cancelled by user {}", takeout_id, user_id);
             StatusCode::OK
@@ -257,7 +252,7 @@ async fn delete_takeout(
 
 /// POST /takeout/{id}/process - Manually trigger takeout processing on this node
 async fn post_process_takeout(
-    State(app_state): State<AppState>,
+    State(state): State<TakeoutState>,
     Extension(user_id): Extension<i32>,
     Path(takeout_id_str): Path<String>,
 ) -> StatusCode {
@@ -271,14 +266,13 @@ async fn post_process_takeout(
     };
 
     // Get current node ID to verify ownership
-    let current_node_id = match app_state.get_node_id() {
-        Ok(id) => id,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+    let current_node_id = match state.node_id() {
+        Some(id) => id,
+        None => return StatusCode::INTERNAL_SERVER_ERROR,
     };
 
     // Get the specific takeout
-    let takeout = match crate::db::takeout::get_takeout_by_id(app_state.db_pool.get(), &takeout_id)
-    {
+    let takeout = match crate::db::takeout::get_takeout_by_id(state.db_pool.get(), &takeout_id) {
         Ok(Some(t)) => t,
         Ok(None) => {
             tracing::error!("Takeout {} not found", takeout_id);
@@ -314,7 +308,7 @@ async fn post_process_takeout(
     }
 
     // Use the shared materialization logic
-    match execute_takeout_materialization(&app_state, &takeout_id, user_id).await {
+    match execute_takeout_materialization(&state, &takeout_id, user_id).await {
         Ok(_) => {
             tracing::info!(
                 "Manual takeout processing completed successfully for {}",
@@ -331,7 +325,7 @@ async fn post_process_takeout(
 
 /// GET /takeout/{id}/download - Download the completed takeout archive
 async fn get_download_takeout(
-    State(app_state): State<AppState>,
+    State(state): State<TakeoutState>,
     Extension(user_id): Extension<i32>,
     Path(takeout_id_str): Path<String>,
 ) -> Result<Response, StatusCode> {
@@ -345,8 +339,7 @@ async fn get_download_takeout(
     };
 
     // Get the specific takeout
-    let takeout = match crate::db::takeout::get_takeout_by_id(app_state.db_pool.get(), &takeout_id)
-    {
+    let takeout = match crate::db::takeout::get_takeout_by_id(state.db_pool.get(), &takeout_id) {
         Ok(Some(t)) => t,
         Ok(None) => {
             tracing::error!("Takeout {} not found", takeout_id);
@@ -374,7 +367,7 @@ async fn get_download_takeout(
     // Construct archive file path
     let archive_path = format!(
         "{}/takeouts/{}.tar.gz",
-        app_state.fragments_dir,
+        state.fragments_dir,
         takeout_id.simple()
     );
 
@@ -440,244 +433,10 @@ async fn get_download_takeout(
     Ok(response)
 }
 
-/// Execute the complete takeout materialization process
-/// This is the core logic shared between manual processing and automatic processing
-pub async fn execute_takeout_materialization(
-    app_state: &AppState,
-    takeout_id: &CustomUUID,
-    user_id: i32,
-) -> Result<(), TakeoutMaterializationError> {
-    // Update status to materializing via consensus
-    let status_payload = TakeoutStatusPayload {
-        takeout_id: takeout_id.clone(),
-        new_status: TakeoutStatus::Materializing,
-    };
-
-    let encoded_payload = bincode::serde::encode_to_vec(
-        &status_payload,
-        bincode::config::standard(),
-    )
-    .map_err(|e| {
-        TakeoutMaterializationError::Serialization(format!("Failed to encode status: {:?}", e))
-    })?;
-
-    let transaction = match crate::consensus::dispatch::create_signed_transaction(
-        app_state,
-        "update_takeout_status".to_string(),
-        encoded_payload,
-    ) {
-        Ok(tx) => tx,
-        Err(_) => {
-            return Err(TakeoutMaterializationError::Consensus(
-                "Failed to sign transaction".to_string(),
-            ));
-        }
-    };
-
-    // Submit status update to consensus
-    app_state
-        .consensus_queue
-        .submit(transaction)
-        .await
-        .map_err(|e| {
-            TakeoutMaterializationError::Consensus(format!("Failed to update status: {:?}", e))
-        })?;
-
-    // Resolve session for SIV keys (needed by sync folder/archive functions)
-    let session = app_state.get_session(user_id).await.map_err(|_| {
-        TakeoutMaterializationError::Consensus("Session not found for user".to_string())
-    })?;
-
-    // Reserve a coordinator connection for the rest of the takeout pipeline.
-    // Mirrors the consensus_queue::batch_processor pattern. Sequential phases
-    // (folder materialize, archive entries query, manifest build, per-file
-    // status updates) all use this conn, guaranteeing the orchestrator never
-    // fails mid-takeout due to pool contention from other routes.
-    let mut reserved_conn = app_state
-        .db_pool
-        .get()
-        .map_err(|e| TakeoutMaterializationError::Database(crate::db::DatabaseError::LockError))
-        .map_err(|e| {
-            tracing::error!(
-                "Failed to acquire reserved coordinator conn for takeout {}: {:?}",
-                takeout_id,
-                e
-            );
-            e
-        })?;
-
-    // Start folder materialization
-    let folder_result = crate::db::takeout::materialize_folders(
-        &mut reserved_conn,
-        takeout_id,
-        &app_state.fragments_dir,
-        &session.siv_key,
-        &session.siv_nonce,
-    )
-    .map_err(TakeoutMaterializationError::Database)?;
-
-    tracing::info!(
-        "Folder materialization for takeout {} completed: {} succeeded, {} failed",
-        takeout_id,
-        folder_result.0,
-        folder_result.1
-    );
-
-    // Start file materialization (streaming pipeline; status writes use reserved_conn)
-    let file_result = crate::db::takeout::materialize_all_files(
-        app_state,
-        &mut reserved_conn,
-        takeout_id,
-        &app_state.fragments_dir,
-        user_id,
-    )
-    .await
-    .map_err(TakeoutMaterializationError::Database)?;
-
-    tracing::info!(
-        "Complete takeout materialization for {} finished: {} folders ({} failed), {} files ({} failed)",
-        takeout_id,
-        folder_result.0,
-        folder_result.1,
-        file_result.0,
-        file_result.1
-    );
-
-    // Create archive from materialized files
-    tracing::info!("Starting archive creation for takeout {}", takeout_id);
-
-    // Get list of materialized entries from database
-    let archive_entries = crate::db::takeout::get_materialized_entries_for_archive(
-        &reserved_conn,
-        &app_state.fragments_dir,
-        takeout_id,
-        &session.siv_key,
-        &session.siv_nonce,
-    )
-    .map_err(TakeoutMaterializationError::Database)?;
-
-    // Build the manifest emitted as the first tar entry.
-    let manifest = crate::db::takeout::build_takeout_manifest(
-        &reserved_conn,
-        takeout_id,
-        user_id,
-        &session.siv_key,
-        &session.siv_nonce,
-    )
-    .map_err(TakeoutMaterializationError::Database)?;
-
-    // Reserved conn is no longer needed; release the slot before archive I/O
-    // and the final consensus submit.
-    drop(reserved_conn);
-
-    let manifest_bytes = manifest.to_archive_bytes().map_err(|e| {
-        TakeoutMaterializationError::Serialization(format!("manifest json: {:?}", e))
-    })?;
-
-    // Create archive path
-    let archive_path = format!(
-        "{}/takeouts/{}.tar.gz",
-        app_state.fragments_dir,
-        takeout_id.simple()
-    );
-
-    // Create the archive and clean up staging files
-    let archive_size = crate::takeout::archive::create_archive(
-        &manifest_bytes,
-        archive_entries,
-        &archive_path,
-        true, // delete_source_files = true for cleanup
-    )
-    .map_err(TakeoutMaterializationError::Archive)?;
-
-    tracing::info!(
-        "Archive created successfully for takeout {}: {} bytes at {}",
-        takeout_id,
-        archive_size,
-        archive_path
-    );
-
-    // Clean up the entire takeout directory (staging + uuid folder)
-    let takeout_root = format!(
-        "{}/takeouts/{}",
-        app_state.fragments_dir,
-        takeout_id.simple()
-    );
-    if let Err(e) = std::fs::remove_dir_all(&takeout_root) {
-        tracing::warn!(
-            "Failed to remove takeout directory {}: {:?}",
-            takeout_root,
-            e
-        );
-        // Continue anyway - archive is created
-    } else {
-        tracing::debug!("Cleaned up takeout directory: {}", takeout_root);
-    }
-
-    // Update status to Ready via consensus
-    let ready_payload = TakeoutStatusPayload {
-        takeout_id: takeout_id.clone(),
-        new_status: TakeoutStatus::Ready,
-    };
-
-    let encoded_ready_payload =
-        bincode::serde::encode_to_vec(ready_payload, bincode::config::standard()).map_err(|e| {
-            TakeoutMaterializationError::Serialization(format!(
-                "Failed to encode ready status: {:?}",
-                e
-            ))
-        })?;
-
-    let ready_transaction = crate::consensus::dispatch::create_signed_transaction(
-        app_state,
-        "update_takeout_status".to_string(),
-        encoded_ready_payload,
-    )
-    .map_err(|_| {
-        TakeoutMaterializationError::Consensus("Failed to sign ready transaction".to_string())
-    })?;
-
-    // Submit ready status to consensus
-    app_state
-        .consensus_queue
-        .submit(ready_transaction)
-        .await
-        .map_err(|e| {
-            TakeoutMaterializationError::Consensus(format!("Failed to update to ready: {:?}", e))
-        })?;
-
-    tracing::info!("Takeout {} marked as ready for download", takeout_id);
-
-    Ok(())
-}
-
-#[derive(Debug)]
-pub enum TakeoutMaterializationError {
-    Database(crate::db::DatabaseError),
-    Consensus(String),
-    Serialization(String),
-    Archive(std::io::Error),
-}
-
-impl std::fmt::Display for TakeoutMaterializationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TakeoutMaterializationError::Database(e) => write!(f, "Database error: {:?}", e),
-            TakeoutMaterializationError::Consensus(e) => write!(f, "Consensus error: {}", e),
-            TakeoutMaterializationError::Serialization(e) => {
-                write!(f, "Serialization error: {}", e)
-            }
-            TakeoutMaterializationError::Archive(e) => write!(f, "Archive error: {}", e),
-        }
-    }
-}
-
-impl std::error::Error for TakeoutMaterializationError {}
-
 /// POST /maintenance/takeout
 /// Manual trigger for takeout maintenance (expiration checking and cleanup)
-pub async fn post_takeout_maintenance(
-    State(app_state): State<AppState>,
+async fn post_takeout_maintenance(
+    State(state): State<TakeoutState>,
     Extension(user_id): Extension<i32>,
 ) -> impl axum::response::IntoResponse {
     tracing::info!(
@@ -686,13 +445,7 @@ pub async fn post_takeout_maintenance(
     );
 
     // Call the takeout maintenance job directly
-    match super::jobs::handle_takeout_maintenance(
-        super::jobs::TakeoutMaintenanceJob,
-        apalis_cron::CronContext::default(),
-        apalis::prelude::Data::new(app_state),
-    )
-    .await
-    {
+    match crate::jobs::run_takeout_maintenance(&state).await {
         Ok(_) => {
             tracing::info!("Manual takeout maintenance completed successfully");
             (

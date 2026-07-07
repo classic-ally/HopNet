@@ -16,7 +16,6 @@ pub mod documentprovider;
 pub mod fileprovider;
 pub mod files;
 pub mod fragments;
-pub mod import_paths;
 pub mod imports;
 pub mod inventory;
 pub mod mesh;

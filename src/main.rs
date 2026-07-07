@@ -218,7 +218,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 consensus_barriers: Arc::new(consensus::barriers::new()),
                 dedup_cache: Arc::new(net::DedupCache::default()),
                 session_store: Arc::new(auth::SessionStore::default()),
-                takeout_runtime: Arc::new(takeout::TakeoutRuntime::default()),
+                takeout_runtime: Arc::new(hopnet_takeout::TakeoutRuntime::default()),
                 consensus_queue,
                 write_gate: write_gate.clone(),
                 local_state_tx,
@@ -244,7 +244,11 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
 
                 // Scan for stranded imports owned by this node so that on the
                 // next user authentication event the resume hook can finish them.
-                match takeout::jobs::scan_at_startup(&app_state).await {
+                match hopnet_takeout::jobs::scan_at_startup(&takeout_host::takeout_state(
+                    &app_state,
+                ))
+                .await
+                {
                     Ok(0) => {}
                     Ok(n) => tracing::info!("Import resume registry: {} stranded import(s)", n),
                     Err(e) => tracing::warn!("Import resume scan failed: {:?}", e),
@@ -278,8 +282,8 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                                 .blocking_write()
                                 .insert(kc_user_id, session);
                             tracing::info!("Loaded owner session from keychain (auto-login ready)");
-                            tokio::spawn(takeout::jobs::maybe_resume_for_user(
-                                app_state.clone(),
+                            tokio::spawn(hopnet_takeout::jobs::maybe_resume_for_user(
+                                takeout_host::takeout_state(&app_state),
                                 kc_user_id,
                             ));
                         }
@@ -355,7 +359,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             let takeout_worker = WorkerBuilder::new("takeout-maintenance")
                 .data(app_state.clone())
                 .backend(takeout_cron_stream)
-                .build_fn(takeout::jobs::handle_takeout_maintenance);
+                .build_fn(takeout_host::handle_takeout_maintenance);
 
             tokio::spawn(async move {
                 takeout_worker.run().await;
@@ -431,6 +435,11 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             // drive's routers; built once here, cloned into each nest.
             let drive_state = drive_host::drive_state(&app_state);
 
+            // Takeout service state (RFC-015 Stage D5b): registered
+            // projection translators (drive today; photos registers here
+            // later) + host hooks, over the same DriveHost seam impls.
+            let takeout_state = takeout_host::takeout_state(&app_state);
+
             // Protected routes that require authentication
             let protected_routes = Router::new()
                 .nest("/users", users::routes::router())
@@ -446,10 +455,9 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                     "/maintenance/rebalance",
                     post(files::routes::post_rebalance_network),
                 )
-                .route(
-                    "/maintenance/takeout",
-                    post(takeout::routes::post_takeout_maintenance),
-                )
+                .merge(hopnet_takeout::routes::maintenance_router(
+                    takeout_state.clone(),
+                ))
                 .route(
                     "/maintenance/fragment-inventory-self-check",
                     post(files::routes::post_fragment_inventory_self_check),
@@ -483,7 +491,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                     "/metrics/scores",
                     get(metrics::routes::get_placement_scores),
                 )
-                .nest("/takeout", takeout::takeout_routes())
+                .nest("/takeout", hopnet_takeout::routes::router(takeout_state.clone()))
                 .nest("/admin", admin::routes::admin_routes())
                 .nest(
                     "/shares",

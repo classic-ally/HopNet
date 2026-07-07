@@ -1,11 +1,25 @@
-use crate::{
-    db::{
-        DatabaseError,
-        imports::{self, ImportPayload, ImportStatusPayload},
-        takeout::{self, TakeoutPayload, TakeoutStatusPayload},
-    },
-    handlers::{HandlerCtx, HandlerResult, TransactionHandler, TxMeta},
+//! Takeout/import consensus transaction handlers. Moved from the host at
+//! RFC-015 Stage D5b — they register cross-crate via `inventory::submit!`
+//! (typetag pattern); the host's boot tripwire asserts `TX_FUNCTIONS` all
+//! made it into the dispatch table (linker-drop guard).
+
+use hopnet_projection::{
+    DatabaseError, HandlerCtx, HandlerResult, TransactionHandler, TxMeta,
 };
+
+use crate::db::{
+    imports::{self, ImportPayload, ImportStatusPayload},
+    takeout::{self, TakeoutPayload, TakeoutStatusPayload},
+};
+
+/// Function names this crate registers handlers for — the host's boot
+/// tripwire asserts each is present in the dispatch table.
+pub const TX_FUNCTIONS: &[&str] = &[
+    "create_takeout",
+    "update_takeout_status",
+    "create_import",
+    "update_import_status",
+];
 
 /// Handler for create_takeout consensus transactions
 pub struct CreateTakeoutHandler;
@@ -59,8 +73,9 @@ impl TransactionHandler for CreateTakeoutHandler {
                     return Err(DatabaseError::ProcessingError);
                 }
 
-                // Pure-DB apply half (validation + insert + owner temp-table
-                // snapshot) on the shared transaction.
+                // Pure-DB apply half (validation + takeouts row) on the shared
+                // transaction. Enumeration happens in the scheduled task now
+                // (RFC-015 D5 decision 3) — no in-apply inode snapshot.
                 takeout::apply_takeout_creation(db_tx, &takeout_payload, ctx.node_id, execute)?;
 
                 // Owner node schedules materialization as named background

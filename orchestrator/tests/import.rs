@@ -2,11 +2,11 @@ use anyhow::Result;
 use chrono::Utc;
 use flate2::{Compression, write::GzEncoder};
 use hopnet::db::CustomUUID;
-use hopnet::takeout::manifest::{
-    ARCHIVE_FILES_PREFIX, MANIFEST_FILENAME, TakeoutManifest, TakeoutManifestFile,
-    TakeoutManifestFolder,
-};
 use hopnet::types::Blake3Hash;
+use hopnet_takeout::manifest::{
+    EntryKind, MANIFEST_FILENAME, ManifestEntry, ProjectionSection, TakeoutManifest,
+};
+use std::collections::BTreeMap;
 use hopnet_common::{
     ImportPathCounts, ImportPathRow, ImportPathStatus, ImportRecord, ImportStatus, InodeType,
 };
@@ -25,19 +25,16 @@ use crate::tests::{Check, TestResult, TestScenario, print_and_add_check};
 // Phase 5 without restructuring.
 // ============================================================================
 
-/// Construct a baseline-valid `TakeoutManifest` for upload tests. Scenarios
-/// mutate fields (e.g. version, total_bytes) to exercise rejection paths.
+/// Construct a baseline-valid v2 `TakeoutManifest` for upload tests (no
+/// sections). Scenarios mutate fields (e.g. version, section totals) to
+/// exercise rejection paths.
 pub fn default_test_manifest() -> TakeoutManifest {
     TakeoutManifest {
-        version: 1,
+        version: 2,
         takeout_id: CustomUUID::new(None),
         created_at: Utc::now(),
         source_username: "import-upload-test".to_string(),
-        total_files: 0,
-        total_folders: 0,
-        total_bytes: 0,
-        folders: Vec::<TakeoutManifestFolder>::new(),
-        files: Vec::<TakeoutManifestFile>::new(),
+        projections: BTreeMap::new(),
     }
 }
 
@@ -86,7 +83,7 @@ pub fn build_archive_with_wrong_first_entry() -> Result<Vec<u8>> {
         let mut tar = Builder::new(gz);
         let body = b"surprise non-manifest entry";
         let mut h = Header::new_gnu();
-        h.set_path("files/foo.txt")?;
+        h.set_path("drive/foo.txt")?;
         h.set_size(body.len() as u64);
         h.set_mode(0o644);
         h.set_cksum();
@@ -233,8 +230,8 @@ async fn wait_for_import_paths_count(
     }
 }
 
-/// Compute `blake3(plaintext ∥ source_data_block_id.as_bytes())` matching the
-/// takeout-side formula at `src/takeout/materialization.rs:111`. Tests use
+/// Compute `blake3(plaintext ∥ blob_id.as_bytes())` matching the
+/// takeout-side formula in `hopnet_takeout::export`. Tests use
 /// this both to fabricate manifests with correct hashes (happy path) and to
 /// fabricate manifests whose hashes intentionally diverge from supplied bytes
 /// (mismatch path).
@@ -245,40 +242,57 @@ pub fn compute_archive_file_hash(bytes: &[u8], source_data_block_id: &CustomUUID
     Blake3Hash::new(hasher.finalize())
 }
 
-/// Build a fully-formed import archive: manifest declares supplied folders +
-/// files (each file with size + source_data_block_id + correctly computed
-/// `file_hash`); tar payload writes file bytes under canonical `files/` prefix.
-/// Caller may override individual `file_hash` entries via `file_hash_override`
-/// to exercise mismatch paths.
-pub fn build_import_archive_with_files(
-    folders: Vec<TakeoutManifestFolder>,
-    files: Vec<(TakeoutManifestFile, Vec<u8>)>,
-    file_hash_override: Option<&[(usize, Blake3Hash)]>,
-) -> Result<Vec<u8>> {
-    let total_bytes: u64 = files.iter().map(|(f, _)| f.size).sum();
-    let mut manifest_files: Vec<TakeoutManifestFile> =
-        files.iter().map(|(f, _)| f.clone()).collect();
-    if let Some(overrides) = file_hash_override {
-        for (idx, hash) in overrides {
-            manifest_files[*idx].file_hash = *hash;
-        }
+/// Assemble one v2 projection section from folder paths + (file entry,
+/// bytes) pairs. Totals are computed from the inputs.
+pub fn build_projection_section(
+    folders: &[String],
+    files: &[(ManifestEntry, Vec<u8>)],
+) -> ProjectionSection {
+    let mut entries: Vec<ManifestEntry> = folders
+        .iter()
+        .map(|path| ManifestEntry {
+            logical_path: path.clone(),
+            kind: EntryKind::Folder,
+            size: 0,
+            blob_id: None,
+            content_hash: None,
+            metadata: serde_json::json!({}),
+        })
+        .collect();
+    entries.extend(files.iter().map(|(f, _)| f.clone()));
+    ProjectionSection {
+        total_files: files.len() as u64,
+        total_folders: folders.len() as u64,
+        total_bytes: files.iter().map(|(f, _)| f.size).sum(),
+        entries,
     }
+}
+
+/// Build a fully-formed v2 import archive: the manifest declares a "drive"
+/// section with the supplied folders + files (each file with size + blob_id
+/// + correctly computed `content_hash`); tar payload writes file bytes under
+/// the canonical `drive/` projection prefix.
+pub fn build_import_archive_with_files(
+    folders: Vec<String>,
+    files: Vec<(ManifestEntry, Vec<u8>)>,
+) -> Result<Vec<u8>> {
+    let mut projections = BTreeMap::new();
+    projections.insert(
+        "drive".to_string(),
+        build_projection_section(&folders, &files),
+    );
 
     let manifest = TakeoutManifest {
-        version: 1,
+        version: 2,
         takeout_id: CustomUUID::new(None),
         created_at: Utc::now(),
         source_username: "import-extraction-test".to_string(),
-        total_files: files.len() as u64,
-        total_folders: folders.len() as u64,
-        total_bytes,
-        folders,
-        files: manifest_files,
+        projections,
     };
 
     let payload: Vec<(String, Vec<u8>)> = files
         .into_iter()
-        .map(|(f, bytes)| (format!("{}{}", ARCHIVE_FILES_PREFIX, f.path), bytes))
+        .map(|(f, bytes)| (format!("drive/{}", f.logical_path), bytes))
         .collect();
     build_minimal_import_archive(&manifest, payload)
 }
@@ -617,7 +631,7 @@ impl TestScenario for ImportUploadVersionRejected {
         "import-upload-version-rejected"
     }
     fn description(&self) -> &'static str {
-        "POST /takeout/import with a manifest version higher than supported returns 400 and produces no import row"
+        "POST /takeout/import with a manifest version other than 2 (here: a future v3) returns 400 and produces no import row"
     }
     async fn run(
         &self,
@@ -630,7 +644,7 @@ impl TestScenario for ImportUploadVersionRejected {
         println!("\nRunning checks:");
 
         let mut manifest = default_test_manifest();
-        manifest.version = 999;
+        manifest.version = 3;
         let archive = build_minimal_import_archive(&manifest, vec![])?;
         let resp = upload_import_archive(&nodes[0], archive).await?;
         let status = resp.status();
@@ -715,8 +729,16 @@ impl TestScenario for ImportUploadQuotaExceeded {
 
         let mut manifest = default_test_manifest();
         // 1 PB plaintext × 3 (RS) = 3 PB required; vastly exceeds any realistic
-        // mesh capacity in test infrastructure.
-        manifest.total_bytes = 1_000_000_000_000_000;
+        // mesh capacity in test infrastructure. v2: declared per section.
+        manifest.projections.insert(
+            "drive".to_string(),
+            ProjectionSection {
+                total_files: 0,
+                total_folders: 0,
+                total_bytes: 1_000_000_000_000_000,
+                entries: vec![],
+            },
+        );
         let archive = build_minimal_import_archive(&manifest, vec![])?;
         let resp = upload_import_archive(&nodes[0], archive).await?;
         let status = resp.status();
@@ -744,39 +766,32 @@ impl TestScenario for ImportUploadQuotaExceeded {
 /// Build a 5-entry payload (2 folders, 3 files, all hashes correct) for the
 /// extraction scenarios. Returns `(folders, file_pairs)` so the caller can
 /// pass through unchanged or mutate one entry's bytes for the mismatch test.
-fn extraction_payload() -> (
-    Vec<TakeoutManifestFolder>,
-    Vec<(TakeoutManifestFile, Vec<u8>)>,
-) {
-    let folders = vec![
-        TakeoutManifestFolder {
-            path: "alpha".to_string(),
-        },
-        TakeoutManifestFolder {
-            path: "alpha/beta".to_string(),
-        },
-    ];
-    let files: Vec<(TakeoutManifestFile, Vec<u8>)> = vec![
+fn extraction_payload() -> (Vec<String>, Vec<(ManifestEntry, Vec<u8>)>) {
+    let folders = vec!["alpha".to_string(), "alpha/beta".to_string()];
+    let files: Vec<(ManifestEntry, Vec<u8>)> = vec![
         ("alpha/one.txt", b"first file content".to_vec()),
         ("alpha/two.txt", b"second file content".to_vec()),
         ("alpha/beta/three.txt", b"third file deeper".to_vec()),
     ]
     .into_iter()
-    .map(|(p, bytes)| {
-        let id = CustomUUID::new(None);
-        let hash = compute_archive_file_hash(&bytes, &id);
-        (
-            TakeoutManifestFile {
-                path: p.to_string(),
-                size: bytes.len() as u64,
-                source_data_block_id: id,
-                file_hash: hash,
-            },
-            bytes,
-        )
-    })
+    .map(|(p, bytes)| (make_file_entry(p, bytes.clone()), bytes))
     .collect();
     (folders, files)
+}
+
+/// Build one v2 file entry with a fresh blob id and a correctly computed
+/// `content_hash` for `bytes`.
+fn make_file_entry(path: &str, bytes: Vec<u8>) -> ManifestEntry {
+    let id = CustomUUID::new(None);
+    let hash = compute_archive_file_hash(&bytes, &id);
+    ManifestEntry {
+        logical_path: path.to_string(),
+        kind: EntryKind::File,
+        size: bytes.len() as u64,
+        blob_id: Some(id),
+        content_hash: Some(hash),
+        metadata: serde_json::json!({}),
+    }
 }
 
 /// Happy path: archive with 2 folders + 3 files (all hashes correct). After
@@ -803,7 +818,7 @@ impl TestScenario for ImportExtractionHappyPath {
         println!("\nRunning checks:");
 
         let (folders, files) = extraction_payload();
-        let archive = build_import_archive_with_files(folders, files, None)?;
+        let archive = build_import_archive_with_files(folders, files)?;
 
         let resp = upload_import_archive(&nodes[0], archive).await?;
         let status = resp.status();
@@ -972,10 +987,10 @@ impl TestScenario for ImportExtractionHashMismatch {
         // Build the payload, then corrupt the *bytes* of one file so the bytes-vs-manifest hash
         // diverges. The manifest hash is left correct for the original bytes.
         let (folders, mut files) = extraction_payload();
-        let target_path = files[1].0.path.clone();
+        let target_path = files[1].0.logical_path.clone();
         files[1].1 = b"CORRUPTED CONTENT".to_vec();
         files[1].0.size = files[1].1.len() as u64;
-        let archive = build_import_archive_with_files(folders, files, None)?;
+        let archive = build_import_archive_with_files(folders, files)?;
 
         let resp = upload_import_archive(&nodes[0], archive).await?;
         let status = resp.status();
@@ -1154,9 +1169,9 @@ impl TestScenario for ImportCreationHappyPath {
         let (folders, files) = extraction_payload();
         let expected_files: Vec<(String, Vec<u8>)> = files
             .iter()
-            .map(|(f, bytes)| (f.path.clone(), bytes.clone()))
+            .map(|(f, bytes)| (f.logical_path.clone(), bytes.clone()))
             .collect();
-        let archive = build_import_archive_with_files(folders, files, None)?;
+        let archive = build_import_archive_with_files(folders, files)?;
 
         let resp = upload_import_archive(&nodes[0], archive).await?;
         let status = resp.status();
@@ -1299,16 +1314,16 @@ impl TestScenario for ImportCreationMixedFailure {
         println!("\nRunning checks:");
 
         let (folders, mut files) = extraction_payload();
-        let target_path = files[1].0.path.clone();
+        let target_path = files[1].0.logical_path.clone();
         files[1].1 = b"CORRUPTED CONTENT".to_vec();
         files[1].0.size = files[1].1.len() as u64;
         let surviving: Vec<(String, Vec<u8>)> = files
             .iter()
             .enumerate()
             .filter(|(i, _)| *i != 1)
-            .map(|(_, (f, bytes))| (f.path.clone(), bytes.clone()))
+            .map(|(_, (f, bytes))| (f.logical_path.clone(), bytes.clone()))
             .collect();
-        let archive = build_import_archive_with_files(folders, files, None)?;
+        let archive = build_import_archive_with_files(folders, files)?;
 
         let resp = upload_import_archive(&nodes[0], archive).await?;
         let status = resp.status();
@@ -1500,7 +1515,7 @@ impl TestScenario for ImportWriteGate {
         println!("\nRunning checks:");
 
         let (folders, files) = extraction_payload();
-        let archive = build_import_archive_with_files(folders, files, None)?;
+        let archive = build_import_archive_with_files(folders, files)?;
 
         let resp = upload_import_archive(&nodes[0], archive).await?;
         let status = resp.status();
@@ -1651,7 +1666,7 @@ impl TestScenario for ImportStatusCounts {
         let (folders, mut files) = extraction_payload();
         files[1].1 = b"CORRUPTED CONTENT".to_vec();
         files[1].0.size = files[1].1.len() as u64;
-        let archive = build_import_archive_with_files(folders, files, None)?;
+        let archive = build_import_archive_with_files(folders, files)?;
 
         let resp = upload_import_archive(&nodes[0], archive).await?;
         if resp.status() != StatusCode::CREATED {
@@ -1788,9 +1803,9 @@ impl TestScenario for ImportResumeAfterRestart {
         let (folders, files) = extraction_payload();
         let expected_files: Vec<(String, Vec<u8>)> = files
             .iter()
-            .map(|(f, bytes)| (f.path.clone(), bytes.clone()))
+            .map(|(f, bytes)| (f.logical_path.clone(), bytes.clone()))
             .collect();
-        let archive = build_import_archive_with_files(folders, files, None)?;
+        let archive = build_import_archive_with_files(folders, files)?;
 
         let resp = upload_import_archive(&nodes[0], archive).await?;
         if resp.status() != StatusCode::CREATED {
@@ -2020,6 +2035,191 @@ impl TestScenario for ImportResumeAfterRestart {
                     detail: None,
                 },
             );
+        }
+
+        result.duration = start.elapsed();
+        Ok(result)
+    }
+}
+
+// ============================================================================
+// RFC-015 D5b — skip-unknown-sections contract
+// ============================================================================
+
+/// Archive whose manifest carries a "photos" section (no translator
+/// registered on the mesh) alongside a normal drive section. The drive
+/// section imports fully; every photos row is marked Skipped with
+/// `error_code = "no_translator"`; the import still reaches Completed —
+/// unknown sections are reported, never failed.
+pub struct ImportUnknownProjectionSkipped;
+
+impl TestScenario for ImportUnknownProjectionSkipped {
+    fn name(&self) -> &'static str {
+        "import-unknown-projection-skipped"
+    }
+    fn description(&self) -> &'static str {
+        "Manifest with a drive section + an unknown photos section: drive imports, photos rows Skipped (no_translator), import Completed"
+    }
+    async fn run(
+        &self,
+        _mesh_id: u32,
+        nodes: &[NodeInfo],
+        _flags: &[String],
+    ) -> Result<TestResult> {
+        let start = Instant::now();
+        let mut result = TestResult::new();
+        println!("\nRunning checks:");
+
+        // Drive section: the standard 2-folder + 3-file payload.
+        let (folders, files) = extraction_payload();
+        let expected_files: Vec<(String, Vec<u8>)> = files
+            .iter()
+            .map(|(f, bytes)| (f.logical_path.clone(), bytes.clone()))
+            .collect();
+
+        // Photos section: one file with a correct hash — extraction verifies
+        // it fine; only the creation walk lacks a translator.
+        let photo_path = "album/pic.jpg".to_string();
+        let photo_bytes = b"not actually a jpeg".to_vec();
+        let photo_entry = make_file_entry(&photo_path, photo_bytes.clone());
+
+        let mut projections = BTreeMap::new();
+        projections.insert(
+            "drive".to_string(),
+            build_projection_section(&folders, &files),
+        );
+        projections.insert(
+            "photos".to_string(),
+            build_projection_section(&[], &[(photo_entry.clone(), photo_bytes.clone())]),
+        );
+        let manifest = TakeoutManifest {
+            version: 2,
+            takeout_id: CustomUUID::new(None),
+            created_at: Utc::now(),
+            source_username: "import-unknown-projection-test".to_string(),
+            projections,
+        };
+        let mut payload: Vec<(String, Vec<u8>)> = files
+            .iter()
+            .map(|(f, bytes)| (format!("drive/{}", f.logical_path), bytes.clone()))
+            .collect();
+        payload.push((format!("photos/{}", photo_path), photo_bytes));
+        let archive = build_minimal_import_archive(&manifest, payload)?;
+
+        let resp = upload_import_archive(&nodes[0], archive).await?;
+        let status = resp.status();
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Upload returns 201 Created".to_string(),
+                passed: status == StatusCode::CREATED,
+                detail: Some(format!("got {}", status)),
+            },
+        );
+        if status != StatusCode::CREATED {
+            result.duration = start.elapsed();
+            return Ok(result);
+        }
+
+        // The unknown section must not block completion.
+        match wait_for_import_status(&nodes[0], ImportStatus::Completed, Duration::from_secs(60))
+            .await
+        {
+            Ok(_) => print_and_add_check(
+                &mut result,
+                Check {
+                    name: "Status reaches Completed despite unknown section".to_string(),
+                    passed: true,
+                    detail: None,
+                },
+            ),
+            Err(e) => {
+                print_and_add_check(
+                    &mut result,
+                    Check {
+                        name: "Status reaches Completed despite unknown section".to_string(),
+                        passed: false,
+                        detail: Some(e.to_string()),
+                    },
+                );
+                result.duration = start.elapsed();
+                return Ok(result);
+            }
+        }
+
+        // Photos row Skipped with the structured no_translator code.
+        let rows = get_import_paths(&nodes[0]).await.unwrap_or_default();
+        let photo_row = rows.iter().find(|r| r.path == photo_path);
+        let photo_skipped = matches!(
+            photo_row,
+            Some(r) if r.status == ImportPathStatus::Skipped
+                && r.error_code.as_deref() == Some("no_translator")
+        );
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Photos row marked Skipped with no_translator".to_string(),
+                passed: photo_skipped,
+                detail: Some(format!(
+                    "row: {:?}",
+                    photo_row.map(|r| (&r.status, &r.error_code))
+                )),
+            },
+        );
+
+        // Every drive row Imported.
+        let drive_imported = rows
+            .iter()
+            .filter(|r| r.path != photo_path)
+            .all(|r| r.status == ImportPathStatus::Imported);
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "All drive rows (2 folders + 3 files) Imported".to_string(),
+                passed: drive_imported && rows.len() == 6,
+                detail: Some(format!(
+                    "statuses: {:?}",
+                    rows.iter()
+                        .map(|r| (&r.path, &r.status))
+                        .collect::<Vec<_>>()
+                )),
+            },
+        );
+
+        // Aggregate counts report the skip (never a failure).
+        let counts = get_import_status_counts(&nodes[0])
+            .await
+            .unwrap_or_default();
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Counts: total=6 imported=5 skipped=1 failed=0".to_string(),
+                passed: counts.total == 6
+                    && counts.imported == 5
+                    && counts.skipped == 1
+                    && counts.failed == 0,
+                detail: Some(format!("got {:?}", counts)),
+            },
+        );
+
+        // Drive files queryable + byte-exact on every node.
+        match assert_files_visible_on_all_nodes(nodes, &expected_files).await {
+            Ok(_) => print_and_add_check(
+                &mut result,
+                Check {
+                    name: "Drive files queryable + byte-exact on all nodes".to_string(),
+                    passed: true,
+                    detail: None,
+                },
+            ),
+            Err(e) => print_and_add_check(
+                &mut result,
+                Check {
+                    name: "Drive files queryable + byte-exact on all nodes".to_string(),
+                    passed: false,
+                    detail: Some(e.to_string()),
+                },
+            ),
         }
 
         result.duration = start.elapsed();

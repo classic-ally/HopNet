@@ -12,6 +12,8 @@
 //! type. Signature verification happened host-side before dispatch; the ids
 //! carried here are trusted.
 
+pub mod barriers;
+pub mod dbstats;
 pub mod host;
 
 pub use host::{
@@ -21,6 +23,58 @@ pub use host::{
 
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
+
+/// RFC-3339-in-SQLite datetime newtype. Moved down from hopnet-drive's model
+/// at Stage D5b — both drive and takeout serialize it into consensus
+/// payloads (bincode wire shape unchanged by the move; the serde impl is
+/// derived on the newtype either way). Drive re-exports it.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CustomDateTime(chrono::DateTime<chrono::Utc>);
+
+impl CustomDateTime {
+    pub fn new(dt: chrono::DateTime<chrono::Utc>) -> Self {
+        CustomDateTime(dt)
+    }
+}
+
+impl std::ops::Deref for CustomDateTime {
+    type Target = chrono::DateTime<chrono::Utc>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl rusqlite::types::ToSql for CustomDateTime {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        Ok(rusqlite::types::ToSqlOutput::from(self.to_rfc3339()))
+    }
+}
+
+impl rusqlite::types::FromSql for CustomDateTime {
+    fn column_result(
+        value: rusqlite::types::ValueRef<'_>,
+    ) -> rusqlite::types::FromSqlResult<Self> {
+        use chrono::DateTime;
+        use rusqlite::types::{FromSqlError, ValueRef};
+        match value {
+            ValueRef::Integer(millis) => {
+                // uuid_extract_timestamp returns epoch milliseconds
+                DateTime::from_timestamp_millis(millis)
+                    .map(CustomDateTime)
+                    .ok_or(FromSqlError::InvalidType)
+            }
+            ValueRef::Text(str) => match std::str::from_utf8(str) {
+                Ok(utf_value) => match DateTime::parse_from_rfc3339(utf_value) {
+                    Ok(dt) => Ok(CustomDateTime(dt.with_timezone(&chrono::Utc))),
+                    Err(_) => Err(FromSqlError::InvalidType),
+                },
+                Err(_) => Err(FromSqlError::InvalidType),
+            },
+            _ => Err(FromSqlError::InvalidType),
+        }
+    }
+}
 
 /// Database-layer error taxonomy shared by handlers and projection DB code.
 /// (Moved verbatim from the main crate's db/types.rs — the host re-exports.)

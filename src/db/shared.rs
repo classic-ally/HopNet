@@ -27,26 +27,11 @@ impl DbCounters {
 
 pub static DB_COUNTERS: DbCounters = DbCounters::new();
 
-/// Commit-phase latency in microseconds. Recorded by `commit_timed()` only.
-/// Bounded 1us..60s, 3 significant figures (~10KB memory).
-pub static COMMIT_LATENCY_US: Lazy<Mutex<Histogram<u64>>> = Lazy::new(|| {
-    Mutex::new(
-        Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).expect("hdrhistogram bounds are valid"),
-    )
-});
-
-/// Project-wide replacement for `tx.commit()`: records commit latency into
-/// `COMMIT_LATENCY_US` for benchmarking and prod observability. The registered
-/// commit_hook also increments `DB_COUNTERS.txn_commits` for any commit path.
-/// Same signature as `Transaction::commit`, drop-in.
-pub fn commit_timed(tx: rusqlite::Transaction) -> rusqlite::Result<()> {
-    let start = Instant::now();
-    let result = tx.commit();
-    let elapsed_us = start.elapsed().as_micros() as u64;
-    let mut h = COMMIT_LATENCY_US.lock();
-    let _ = h.record(elapsed_us.max(1));
-    result
-}
+/// Commit-latency instrumentation moved down to hopnet-projection (RFC-015
+/// Stage D5b) so hopnet-takeout's local commits record into the SAME
+/// histogram `/debug/db-stats` reads; re-exported here so every host call
+/// site is unchanged.
+pub use hopnet_projection::dbstats::{COMMIT_LATENCY_US, commit_timed};
 
 /// Get the XDG data directory for storing the database
 pub fn get_database_path() -> String {
@@ -382,33 +367,8 @@ pub fn initialize(db: PooledConnection<SqliteConnectionManager>) -> Result<(), D
             CREATE INDEX idx_metrics_to_node ON metrics(to_node, start_time);
             CREATE INDEX idx_metrics_height ON metrics(height DESC, to_node); -- For placement decisions at specific heights
 
-            -- User data takeout tracking (consensus-tracked for network-wide coordination)
-            CREATE TABLE takeouts (
-                id TEXT PRIMARY KEY,
-                user_id INTEGER NOT NULL REFERENCES users(user_id),
-                owner_node_id INTEGER NOT NULL,         -- Node that owns and processes this takeout
-                status INTEGER NOT NULL DEFAULT 0 CHECK(status IN (0, 1, 2, 3, 4)),  -- 0=pending, 1=materializing, 2=ready, 3=expired, 4=cancelled
-                expires_at TEXT NOT NULL,
-                consensus_height INTEGER NOT NULL
-            );
-
-            -- Index for efficient lookups of active takeouts and cleanup
-            CREATE INDEX idx_takeouts_user_status ON takeouts (user_id, status);
-            CREATE INDEX idx_takeouts_expires ON takeouts (expires_at);
-            CREATE INDEX idx_takeouts_owner_node ON takeouts (owner_node_id);
-
-            -- User data import tracking (consensus-tracked for network-wide coordination)
-            -- status: 0=pending, 1=importing, 2=completed, 3=failed
-            -- created_at is derived from UUIDv7 id via CustomUUID::extract_timestamp()
-            CREATE TABLE imports (
-                id TEXT PRIMARY KEY,
-                user_id INTEGER NOT NULL REFERENCES users(user_id),
-                owner_node_id INTEGER NOT NULL,
-                status INTEGER NOT NULL DEFAULT 0 CHECK(status IN (0, 1, 2, 3))
-            );
-
-            CREATE INDEX idx_imports_user_status ON imports (user_id, status);
-            CREATE INDEX idx_imports_owner_node ON imports (owner_node_id);
+            -- takeouts/imports moved to hopnet_takeout::db::install_schema
+            -- (RFC-015 Stage D5b) — chained below with the other units.
 
             -- Local staging table for fragment request metrics (before consensus submission)
             CREATE TABLE pending_fragment_requests (
@@ -482,6 +442,7 @@ pub fn initialize(db: PooledConnection<SqliteConnectionManager>) -> Result<(), D
     // (host) and data_blocks (storage).
     hopnet_storage::store::install_schema(&db)?;
     hopnet_drive::db::install_schema(&db)?;
+    hopnet_takeout::db::install_schema(&db)?;
 
     Ok(())
 }
