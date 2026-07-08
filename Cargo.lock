@@ -2735,6 +2735,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hopnet-comms"
+version = "0.1.0"
+dependencies = [
+ "iroh",
+ "rand 0.10.1",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "hopnet-consensus"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,27 @@
+[package]
+name = "hopnet-comms"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+repository = "https://git.bentley.sh/HopNet/HopNet"
+description = "HopNet inter-node communication: envelope framing + scoped dispatch vocabulary, with the iroh transport implementation behind the `iroh` feature (RFC-017)"
+
+# Default features are a pure vocabulary: PeerRef, error taxonomy, the
+# Rpc/Broadcast seams, and the scope-handler registration API. Payloads are
+# opaque bytes (each scope owner does its own codec), so there is no serde
+# here; peers are plain data, so there is no iroh here. Sub-crates
+# (hopnet-storage) depend on this face only.
+#
+# The `iroh` feature adds the real transport (IrohComms). ONLY the host
+# links it. The workspace-root [patch.crates-io] entry for the iroh fork
+# must stay in the root manifest (cargo requirement); containment means
+# this crate's [dependencies] is the only one in the workspace naming iroh.
+[dependencies]
+iroh = { version = "0.98.2", optional = true }
+rand = { version = "0.10", optional = true }
+tokio = { version = "1.45.1", features = ["rt-multi-thread", "sync", "time", "io-util", "macros"], optional = true }
+tracing = { version = "0.1", optional = true }
+
+[features]
+default = []
+iroh = ["dep:iroh", "dep:rand", "dep:tokio", "dep:tracing"]
