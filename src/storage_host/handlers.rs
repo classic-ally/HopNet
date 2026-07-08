@@ -5,15 +5,6 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 
-/// Drive-owned (RFC-015): the drive tx envelopes live in hopnet-drive;
-/// re-exported here so call sites don't churn. The drive's handlers
-/// (insert_files/modify_item/delete_files + shares) moved to
-/// `hopnet_drive::handlers` at Stage D3; only substrate/storage-side
-/// handlers remain here.
-pub use hopnet_drive::envelopes::{
-    DeleteFilesPayload, DriveContentUpdate, DriveInsertPayload, ModifyItemPayload,
-};
-
 /// The storage substrate's consensus tx functions, registered from the
 /// HOST (not hopnet-storage): the layering is projection → storage, so
 /// storage can't see the handler seam; and delete_orphaned_data_blocks

@@ -49,6 +49,37 @@ impl hopnet_projection::Projection for DriveProjection {
         Some(exporter::drive_exporter(caps.clone()))
     }
 
+    fn committed_blob_ids(
+        &self,
+        function: &str,
+        payload: &[u8],
+    ) -> Vec<hopnet_storage::BlobId> {
+        // Pure decode of the drive's OWN envelopes for the host's
+        // distribution kick (consensus shell thread — no DB, no IO).
+        // Decode failures yield empty, matching the pre-hook behavior.
+        match function {
+            "insert_files" => bincode::serde::decode_from_slice::<envelopes::DriveInsertPayload, _>(
+                payload,
+                bincode::config::standard(),
+            )
+            .map(|(p, _)| p.blob_ops.into_iter().map(|op| op.blob_id).collect())
+            .unwrap_or_default(),
+            "modify_item" => bincode::serde::decode_from_slice::<envelopes::ModifyItemPayload, _>(
+                payload,
+                bincode::config::standard(),
+            )
+            .map(|(p, _)| {
+                p.content_update
+                    .and_then(|u| u.blob_op)
+                    .map(|op| op.blob_id)
+                    .into_iter()
+                    .collect()
+            })
+            .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
     fn mounts(
         &self,
         caps: &hopnet_projection::host::HostCapabilities,

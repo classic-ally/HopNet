@@ -356,6 +356,20 @@ pub trait Projection: Send + Sync {
     ) -> Option<host::BoxFuture<'static, ()>> {
         None
     }
+
+    /// Blob ids whose content this DECIDED transaction commits — the host
+    /// feeds them to the storage engine's distribution kick (RFC-017
+    /// Stage 4; previously the host decoded drive envelopes itself). Pure
+    /// decode: runs on the consensus shell thread post-decide — no DB, no
+    /// IO, no awaits. Decode failures must yield an empty vec, never
+    /// panic. Default: no blobs.
+    fn committed_blob_ids(
+        &self,
+        _function: &str,
+        _payload: &[u8],
+    ) -> Vec<hopnet_storage::BlobId> {
+        Vec::new()
+    }
 }
 
 /// Current decided consensus height off any connection to the shared DB

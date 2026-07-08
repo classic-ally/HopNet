@@ -213,38 +213,22 @@ impl<C: DerefMut<Target = Connection> + 'static> Application<SqliteStorage<C>>
     fn on_decided(&mut self, height: Height, block: &engine::Block, _cert: &WireCommitCertificate) {
         tracing::debug!(height = height.0, "block decided (malachite engine)");
 
-        // Distribution kick (RFC-014): collect blob ids registered in this
-        // block and push them to the global distribution queue. Runs on the
-        // shell thread — NON-BLOCKING ONLY (unbounded send; no DB, no
-        // awaits). Covers both drive envelopes, so modify content updates
-        // distribute too.
+        // Distribution kick (RFC-014/017): every registered projection
+        // reports which blob ids this decided block commits (a pure decode
+        // of its OWN envelopes — the host no longer knows any payload
+        // shape); each id goes to the global distribution queue. Runs on
+        // the shell thread — NON-BLOCKING ONLY (unbounded send; no DB, no
+        // awaits).
         let Some(storage) = self.app_state.storage.get() else {
             return;
         };
         for tx in block.data.transactions.iter() {
-            let blob_ids: Vec<hopnet_common::CustomUUID> = match tx.rpc.function.as_str() {
-                "insert_files" => bincode::serde::decode_from_slice::<
-                    crate::storage_host::handlers::DriveInsertPayload,
-                    _,
-                >(&tx.rpc.payload, bincode::config::standard())
-                .map(|(p, _)| p.blob_ops.into_iter().map(|op| op.blob_id).collect())
-                .unwrap_or_default(),
-                "modify_item" => bincode::serde::decode_from_slice::<
-                    crate::storage_host::handlers::ModifyItemPayload,
-                    _,
-                >(&tx.rpc.payload, bincode::config::standard())
-                .map(|(p, _)| {
-                    p.content_update
-                        .and_then(|u| u.blob_op)
-                        .map(|op| op.blob_id)
-                        .into_iter()
-                        .collect()
-                })
-                .unwrap_or_default(),
-                _ => Vec::new(),
-            };
-            for blob_id in blob_ids {
-                storage.notify_blob_committed(blob_id);
+            for projection in crate::projections::manifests() {
+                for blob_id in
+                    projection.committed_blob_ids(&tx.rpc.function, &tx.rpc.payload)
+                {
+                    storage.notify_blob_committed(blob_id);
+                }
             }
         }
     }
