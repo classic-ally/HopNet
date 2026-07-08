@@ -6,8 +6,8 @@
 //! [`hopnet_takeout::TakeoutState`] on the fly (cheap Arc clones; the
 //! mutable runtime — resume registry + barriers — is the single instance on
 //! AppState, so every construction shares it). Sessions and consensus
-//! submission reuse the same `DriveHost` seam impls behind
-//! `drive_host::drive_state` — they are hopnet-projection traits now.
+//! submission reuse the same `CapabilityHost` seam impls behind
+//! `capabilities::build_capabilities` — they are hopnet-projection traits now.
 
 use std::sync::Arc;
 
@@ -79,7 +79,7 @@ impl TakeoutHooks for TakeoutHost {
         // RFC-017 Stage 6: every registered projection reports its own
         // sizing; the host only sums (photos contributes automatically).
         Box::pin(async move {
-            let caps = crate::drive_host::drive_state(&self.app_state);
+            let caps = crate::capabilities::build_capabilities(&self.app_state);
             let mut total: u64 = 0;
             for projection in crate::projections::manifests() {
                 total += projection.user_data_size_bytes(&caps, user_id).await?;
@@ -90,10 +90,10 @@ impl TakeoutHooks for TakeoutHost {
 }
 
 /// Build the takeout service state over this host. Cheap — Arc clones plus
-/// one `DriveHost` + one `TakeoutHost` allocation; callers may construct it
+/// one `CapabilityHost` + one `TakeoutHost` allocation; callers may construct it
 /// on the fly (the work scheduler and auth hooks do).
 pub fn takeout_state(app_state: &AppState) -> TakeoutState {
-    let caps = crate::drive_host::drive_state(app_state);
+    let caps = crate::capabilities::build_capabilities(app_state);
     // Every registered projection contributes its takeout translator
     // (RFC-016 Stage 3) — a projection without one returns None.
     let exporters: Vec<Arc<dyn hopnet_projection::ProjectionExporter>> =

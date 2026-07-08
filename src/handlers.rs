@@ -154,7 +154,7 @@ impl WorkScheduler for HostWorkScheduler {
                 // every registered projection; first claimant wins and its
                 // future runs on the main runtime (same invariant as the
                 // named takeout arms above).
-                let caps = crate::drive_host::drive_state(&self.app_state);
+                let caps = crate::capabilities::build_capabilities(&self.app_state);
                 for projection in crate::projections::manifests() {
                     if let Some(fut) = projection.work(&caps, other, key.clone()) {
                         self.app_state.runtime.spawn(fut);

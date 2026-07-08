@@ -17,7 +17,7 @@ pub mod db;
 pub mod devices;
 // Drive-owned (RFC-015, Stage D4): the DocumentProvider routes live in
 // hopnet_drive::http::documentprovider; the host mounts them in main.rs.
-pub mod drive_host;
+pub mod capabilities;
 pub mod fileprovider;
 pub mod storage_host;
 pub mod handlers;

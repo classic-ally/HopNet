@@ -438,7 +438,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
 
             // Host capabilities (RFC-016): one seam bundle handed to every
             // projection's mounts()/exporter(); built once, cheap clones.
-            let host_caps = drive_host::drive_state(&app_state);
+            let host_caps = capabilities::build_capabilities(&app_state);
 
             // Takeout service state (RFC-015 Stage D5b): registered
             // projection translators (drive today; photos registers here

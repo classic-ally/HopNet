@@ -1,26 +1,30 @@
-//! Host adapter for the drive's HTTP/business seams (RFC-015 Stage D4).
+//! The host's capability adapter (RFC-015 Stage D4; renamed from
+//! drive_host at RFC-017 Stage 7 — nothing here is drive-specific).
 //!
-//! One `DriveHost` implements all of hopnet-drive's host capabilities
-//! (pattern: `storage_host::substrate_host::SubstrateHost` for the RFC-014
-//! seams): sessions with host-side key derivation, consensus submission
-//! with host-side signing, blob reconstruction over the substrate seams,
-//! and the takeout import gate as write admission.
+//! One `CapabilityHost` implements the GENERIC hopnet-projection host
+//! capabilities every projection consumes (pattern:
+//! `storage_host::substrate_host::SubstrateHost` for the RFC-014 seams):
+//! sessions with host-side key derivation, consensus submission with
+//! host-side signing, blob reconstruction over the substrate seams, and
+//! the takeout import gate as write admission. `build_capabilities`
+//! assembles the [`HostCapabilities`] bundle handed to every projection's
+//! manifest methods.
 
 use std::sync::Arc;
 
 use axum::http::StatusCode;
 
 use crate::AppState;
-use hopnet_drive::host::{
-    BlobStreamer, BoxFuture, ByteStream, DriveState, SessionAccess, SessionError, TxGateway,
+use hopnet_projection::host::{
+    BlobStreamer, BoxFuture, ByteStream, HostCapabilities, SessionAccess, SessionError, TxGateway,
     TxSigner, TxSpec, TxSubmitError, UserSession, WriteAdmission, WriteCheckError, WriteDenied,
 };
 
-pub struct DriveHost {
+pub struct CapabilityHost {
     app_state: AppState,
 }
 
-impl SessionAccess for DriveHost {
+impl SessionAccess for CapabilityHost {
     fn user_session(&self, user_id: i32) -> BoxFuture<'_, Result<UserSession, SessionError>> {
         Box::pin(async move {
             // AppState::get_session maps expired → 401, missing → 428; the
@@ -48,7 +52,7 @@ impl SessionAccess for DriveHost {
     }
 }
 
-impl TxGateway for DriveHost {
+impl TxGateway for CapabilityHost {
     fn submit_batch(&self, txs: Vec<TxSpec>) -> BoxFuture<'_, Vec<Result<(), TxSubmitError>>> {
         Box::pin(async move {
             let n = txs.len();
@@ -99,7 +103,7 @@ impl TxGateway for DriveHost {
     }
 }
 
-impl BlobStreamer for DriveHost {
+impl BlobStreamer for CapabilityHost {
     fn stream(
         &self,
         manifest: hopnet_storage::store::BlobManifest,
@@ -116,7 +120,7 @@ impl BlobStreamer for DriveHost {
     }
 }
 
-impl WriteAdmission for DriveHost {
+impl WriteAdmission for CapabilityHost {
     fn check_write(&self, user_id: i32) -> BoxFuture<'_, Result<(), WriteCheckError>> {
         Box::pin(async move {
             // The takeout import gate: writes are denied while the user has
@@ -141,15 +145,15 @@ impl WriteAdmission for DriveHost {
     }
 }
 
-/// Build the drive's axum state over this host. Cheap: one `DriveHost`
+/// Build the host capability bundle. Cheap: one `CapabilityHost`
 /// allocation cloned into the seam fields plus pool/OnceCell Arc clones —
 /// callers may construct it on the fly (takeout does, per materialized
 /// batch).
-pub fn drive_state(app_state: &AppState) -> DriveState {
-    let host = Arc::new(DriveHost {
+pub fn build_capabilities(app_state: &AppState) -> HostCapabilities {
+    let host = Arc::new(CapabilityHost {
         app_state: app_state.clone(),
     });
-    DriveState {
+    HostCapabilities {
         db_pool: app_state.db_pool.clone(),
         fragments_dir: app_state.fragments_dir.clone(),
         test_mode: app_state.test_mode,
