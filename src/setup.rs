@@ -11,7 +11,9 @@ use crate::{db::User, db::setup};
 pub use hopnet_common::setup::InitialSetupPayload;
 
 // ============================================================================
-// JoinDeliver RPC types (used by coordinator → joining node over iroh)
+// "setup" scope wire types (coordinator → joining node over the mesh). This
+// module owns the payload codec; the server side lives in
+// `net::scopes::SetupScope`.
 // ============================================================================
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -19,9 +21,19 @@ pub struct JoinDeliverRequest {
     pub join_info: crate::types::JoinInfo,
 }
 
+/// Wire request for the "setup" scope.
 #[derive(Serialize, Deserialize, Debug)]
-pub struct JoinAckResponse {
-    pub success: bool,
+pub enum SetupRequest {
+    /// Deliver JoinInfo to a joining node (coordinator → new node)
+    JoinDeliver(JoinDeliverRequest),
+}
+
+/// Wire response for the "setup" scope.
+#[derive(Serialize, Deserialize, Debug)]
+pub enum SetupResponse {
+    /// Ack for JoinDeliver
+    JoinAck { success: bool },
+    Error { message: String },
 }
 
 pub async fn get_setup(State(app_state): State<AppState>) -> impl IntoResponse {
@@ -63,8 +75,10 @@ pub async fn process_join_info(
     )
     .map_err(|e| format!("Failed to initialize joining node database: {:?}", e))?;
 
-    // Mark setup complete — PeerValidator switches to strict mode
-    app_state.iroh_transport.mark_setup_complete();
+    // Mark setup complete — the peer directory switches to strict mode
+    app_state
+        .setup_complete
+        .store(true, std::sync::atomic::Ordering::Relaxed);
 
     // Spawn the malachite join bootstrap as a background task: trusted
     // height-0 genesis install → engine spawn → decided-value sync to tip →
@@ -199,8 +213,10 @@ pub async fn post_setup(
                     .insert(user_id, session);
             }
 
-            // Mark setup complete — PeerValidator switches to strict mode
-            app_state.iroh_transport.mark_setup_complete();
+            // Mark setup complete — the peer directory switches to strict mode
+            app_state
+                .setup_complete
+                .store(true, std::sync::atomic::Ordering::Relaxed);
 
             // Genesis is installed and identity set — start the consensus
             // engine (paused on-demand at height 1 until work arrives).

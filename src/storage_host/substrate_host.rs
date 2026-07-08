@@ -69,18 +69,22 @@ pub fn get_net(
     }
 }
 
-fn map_iroh_error(e: crate::net::IrohError) -> TransportError {
+fn map_comms_error(e: hopnet_comms::CommsError) -> TransportError {
     match e {
-        crate::net::IrohError::Protocol(crate::net::transport::ProtocolError::PeerError(msg)) => {
+        hopnet_comms::CommsError::Protocol(hopnet_comms::ProtocolError::PeerError(msg)) => {
             TransportError::Peer(msg)
         }
         other => TransportError::Transport(other.to_string()),
     }
 }
 
-fn peer_iroh_key(peer: &PeerRef) -> Result<iroh::PublicKey, TransportError> {
-    iroh::PublicKey::from_bytes(&peer.pubkey)
-        .map_err(|e| TransportError::Transport(format!("invalid peer pubkey: {e}")))
+/// Bridge the substrate's peer vocabulary onto comms' (identical shape; the
+/// crates stay decoupled).
+fn comms_peer(peer: &PeerRef) -> hopnet_comms::PeerRef {
+    hopnet_comms::PeerRef {
+        node_id: peer.node_id,
+        pubkey: peer.pubkey,
+    }
 }
 
 impl Transport for SubstrateHost {
@@ -90,24 +94,22 @@ impl Transport for SubstrateHost {
         fragment_hash: &Blake3Hash,
         data: Vec<u8>,
     ) -> Result<StoreResult, TransportError> {
-        let peer_key = peer_iroh_key(peer)?;
         let result = crate::storage_host::rpc::store_fragment_remote(
-            &self.app_state.iroh_transport,
-            peer.node_id,
-            peer_key,
+            &self.app_state.comms,
+            &comms_peer(peer),
             *fragment_hash,
             data,
         )
         .await
-        .map_err(map_iroh_error)?;
+        .map_err(map_comms_error)?;
         if result.success {
             Ok(StoreResult {
                 already_existed: result.already_existed,
             })
         } else {
             // success=false shouldn't happen (errors come via
-            // IrohResponse::Error) — classify as peer-side so the engine's
-            // domain retry covers it.
+            // StorageNetResponse::Error) — classify as peer-side so the
+            // engine's domain retry covers it.
             Err(TransportError::Peer(
                 "fragment store returned success=false".to_string(),
             ))
@@ -119,15 +121,13 @@ impl Transport for SubstrateHost {
         peer: &PeerRef,
         fragment_hash: &Blake3Hash,
     ) -> Result<Vec<u8>, TransportError> {
-        let peer_key = peer_iroh_key(peer)?;
         crate::storage_host::rpc::fetch_fragment(
-            &self.app_state.iroh_transport,
-            peer.node_id,
-            peer_key,
+            &self.app_state.comms,
+            &comms_peer(peer),
             *fragment_hash,
         )
         .await
-        .map_err(map_iroh_error)
+        .map_err(map_comms_error)
     }
 
     async fn fragment_health(
@@ -135,15 +135,13 @@ impl Transport for SubstrateHost {
         peer: &PeerRef,
         fragment_hash: &Blake3Hash,
     ) -> Result<bool, TransportError> {
-        let peer_key = peer_iroh_key(peer)?;
         crate::storage_host::rpc::check_fragment_health(
-            &self.app_state.iroh_transport,
-            peer.node_id,
-            peer_key,
+            &self.app_state.comms,
+            &comms_peer(peer),
             *fragment_hash,
         )
         .await
-        .map_err(map_iroh_error)
+        .map_err(map_comms_error)
     }
 }
 

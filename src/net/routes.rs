@@ -101,12 +101,15 @@ pub async fn debug_iroh_ping(State(app_state): State<AppState>) -> impl IntoResp
 
     let mut tasks = Vec::new();
     for node in other_nodes {
-        let transport = app_state.iroh_transport.clone();
+        let comms = app_state.comms.clone();
         let node_id = node.node_id;
-        let iroh_node_id = node.pubkey.to_iroh_node_id();
+        let peer = hopnet_comms::PeerRef {
+            node_id,
+            pubkey: node.pubkey.0.to_bytes(),
+        };
 
         tasks.push(tokio::spawn(async move {
-            match transport.ping(node_id, iroh_node_id).await {
+            match comms.ping(&peer).await {
                 Ok(latency_ns) => NodePingResult {
                     node_id,
                     success: true,

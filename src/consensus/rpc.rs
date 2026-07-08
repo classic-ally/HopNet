@@ -1,12 +1,11 @@
 //! Inter-node RPC for the consensus queue: the two-phase transaction-forward
-//! protocol. The bespoke engine's ballot/QC/TC/view-poll RPC was deleted at
-//! Stage 5b — consensus messages now travel as `IrohRequest::ConsensusMsg`
-//! straight to the malachite shell.
+//! protocol over the "txforward" streamed comms scope. This module owns the
+//! scope's wire vocabulary ([`TransactionForwardRequest`] as the request
+//! payload, [`ForwardReply`] frames back); the server side lives in
+//! `net::scopes::TxForwardScope`.
 
 use crate::AppState;
-use crate::net::protocol::{IrohRequest, IrohResponse};
-use crate::net::transport::{ProtocolError, TransportError};
-use crate::net::{IrohError, IrohTransport};
+use hopnet_comms::{Call, CallOptions, CommsError, IrohComms, PeerRef, ProtocolError};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -38,13 +37,26 @@ pub struct TransactionForwardResponse {
     pub results: Vec<TransactionForwardResult>,
 }
 
+/// Frame vocabulary for the "txforward" streamed scope (server → client).
+#[derive(Serialize, Deserialize, Debug)]
+pub enum ForwardReply {
+    /// Rejection: this node is not the proposer for its current (height,
+    /// round). Includes the handler's position so the forwarder can retarget.
+    NotProposer { height: i64, round: u32 },
+    /// Immediate ACK before processing (phase 1).
+    Ack,
+    /// Final result after processing (phase 2).
+    Result(TransactionForwardResponse),
+    Error { message: String },
+}
+
 /// Server: process forwarded transactions by pushing them into the local consensus queue.
 /// The handler's message-driven catch-up already ran before dispatch.
 /// Performs nonce dedup before enqueueing — already-committed transactions get immediate Committed.
 pub async fn handle_transaction_forward(
     req: TransactionForwardRequest,
     app_state: &AppState,
-) -> IrohResponse {
+) -> TransactionForwardResponse {
     // Early nonce dedup: check which transactions were already committed
     let nonces: Vec<_> = req.transactions.iter().map(|tx| tx.nonce.clone()).collect();
     let committed_nonces = match app_state.db_pool.get() {
@@ -88,7 +100,7 @@ pub async fn handle_transaction_forward(
     }
 
     let results = results_map.into_iter().map(|r| r.unwrap()).collect();
-    IrohResponse::TransactionForwardResponse(TransactionForwardResponse { results })
+    TransactionForwardResponse { results }
 }
 
 /// Result from the two-phase forward protocol.
@@ -106,8 +118,6 @@ pub enum ForwardAckResult {
     /// Rejection: handler is not the proposer (includes its position so the
     /// forwarder can retarget)
     NotProposer { height: i64, round: u32 },
-    /// Rejection: node is busy (legacy; malachite path never sends it)
-    Busy,
 }
 
 /// ACK timeout: how long to wait for the immediate ACK from the leader.
@@ -117,7 +127,7 @@ const FORWARD_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 /// blocking the batch processor for a full timeout detection cycle.
 const FORWARD_RESULT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Connect bound for the forward path, tighter than the transport-level
-/// CONNECTION_TIMEOUT (10s). The batch processor is single-threaded: while a
+/// connect budget (10s). The batch processor is single-threaded: while a
 /// dial to an unresponsive proposer hangs, NO transactions move on this node.
 /// Failing fast keeps the stall under one consensus propose timeout, so the
 /// caller's resume-own-engine path advances rounds past the dead proposer
@@ -134,103 +144,80 @@ const FORWARD_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// nonce table instead of retrying). Phase 2 races the decided watch: a
 /// decide that lands before the result means the nonce table already knows.
 pub async fn forward_transactions_with_ack(
-    transport: &IrohTransport,
-    node_id: i32,
-    peer_node_id: iroh::PublicKey,
+    comms: &IrohComms,
+    peer: &PeerRef,
     transactions: Vec<super::types::Transaction>,
     height: i64,
     decided: &mut tokio::sync::watch::Receiver<u64>,
-) -> Result<ForwardAckResult, IrohError> {
+) -> Result<ForwardAckResult, CommsError> {
     // Mark the watch as seen BEFORE any network I/O so only NEW decides win
     // the phase-2 race.
     decided.borrow_and_update();
 
-    let req = IrohRequest::TransactionForward(TransactionForwardRequest {
+    let payload = crate::net::encode_payload(&TransactionForwardRequest {
         transactions,
         height,
     });
+    let mut call: Call = comms
+        .open_call(
+            peer,
+            "txforward",
+            payload,
+            CallOptions {
+                connect_timeout: Some(FORWARD_CONNECT_TIMEOUT),
+            },
+        )
+        .await?;
 
-    let request_id: u64 = rand::random();
-    let conn = tokio::time::timeout(
-        FORWARD_CONNECT_TIMEOUT,
-        transport.get_connection(node_id, peer_node_id),
-    )
-    .await
-    .map_err(|_| {
-        IrohError::Transport(TransportError::ConnectionFailed(format!(
-            "connect to proposer node {node_id} timed out after {FORWARD_CONNECT_TIMEOUT:?}"
-        )))
-    })??;
-
-    let (mut send, mut recv) = conn
-        .open_bi()
-        .await
-        .map_err(|e| IrohError::Transport(TransportError::StreamFailed(e.to_string())))?;
-
-    // Send request with request_id prefix
-    use tokio::io::AsyncWriteExt;
-    send.write_all(&request_id.to_le_bytes())
-        .await
-        .map_err(|e| IrohError::Transport(TransportError::StreamFailed(e.to_string())))?;
-    crate::net::transport::send_message(&mut send, &req).await?;
-    send.finish()
-        .map_err(|e| IrohError::Transport(TransportError::StreamFailed(e.to_string())))?;
-
-    // Phase 1: Wait for ACK or direct response
-    let first_msg: Result<IrohResponse, IrohError> = tokio::time::timeout(
-        FORWARD_ACK_TIMEOUT,
-        crate::net::transport::recv_message(&mut recv),
-    )
-    .await
-    .map_err(|_| IrohError::Transport(TransportError::Timeout))?;
-
-    let first_msg = match first_msg {
-        Ok(msg) => msg,
+    // Phase 1: wait for ACK or rejection. Any recv failure — timeout, stream
+    // error, undecodable frame — means the proposer never acknowledged:
+    // NoAck (the caller evicts the connection and retries).
+    let first_msg: ForwardReply = match call.recv(FORWARD_ACK_TIMEOUT).await {
+        Ok(bytes) => match crate::net::decode_payload(&bytes) {
+            Ok(msg) => msg,
+            Err(_) => return Ok(ForwardAckResult::NoAck),
+        },
         Err(_) => return Ok(ForwardAckResult::NoAck),
     };
 
-    // Check if first message is ACK, rejection, or direct result (backward compat)
     match first_msg {
-        IrohResponse::TransactionForwardNotProposer { height, round } => {
+        ForwardReply::NotProposer { height, round } => {
             Ok(ForwardAckResult::NotProposer { height, round })
         }
-        IrohResponse::TransactionForwardBusy => Ok(ForwardAckResult::Busy),
-        IrohResponse::TransactionForwardAck => {
+        ForwardReply::Ack => {
             // Got ACK — proposer has received and is processing.
             // Phase 2: race the result against the decided watch. A decide
-            // that lands first means the nonce table can already answer.
+            // that lands first means the nonce table can already answer; the
+            // recv timeout is the safety bound for a proposer that never
+            // finishes.
             let result = tokio::select! {
-                msg = crate::net::transport::recv_message(&mut recv) => msg,
+                frame = call.recv(FORWARD_RESULT_TIMEOUT) => frame,
                 _ = decided.changed() => return Ok(ForwardAckResult::AckedDecided),
-                _ = tokio::time::sleep(FORWARD_RESULT_TIMEOUT) => {
-                    return Ok(ForwardAckResult::AckedNoResult)
-                }
             };
 
             match result {
-                Ok(IrohResponse::TransactionForwardResponse(resp)) => {
-                    Ok(ForwardAckResult::AckedWithResult(resp.results))
-                }
-                Ok(IrohResponse::Error { message }) => {
-                    Err(IrohError::Protocol(ProtocolError::PeerError(message)))
-                }
-                Ok(_) => Ok(ForwardAckResult::AckedNoResult),
+                Ok(bytes) => match crate::net::decode_payload::<ForwardReply>(&bytes) {
+                    Ok(ForwardReply::Result(resp)) => {
+                        Ok(ForwardAckResult::AckedWithResult(resp.results))
+                    }
+                    Ok(ForwardReply::Error { message }) => {
+                        Err(CommsError::Protocol(ProtocolError::PeerError(message)))
+                    }
+                    Ok(_) | Err(_) => Ok(ForwardAckResult::AckedNoResult),
+                },
+                // Timeout (the safety bound) or stream failure — nothing
+                // decided yet from our perspective.
                 Err(_) => Ok(ForwardAckResult::AckedNoResult),
             }
         }
-        IrohResponse::TransactionForwardResponse(resp) => {
-            // Backward compat: old leader sent direct result without ACK
-            Ok(ForwardAckResult::AckedWithResult(resp.results))
+        ForwardReply::Error { message } => {
+            Err(CommsError::Protocol(ProtocolError::PeerError(message)))
         }
-        IrohResponse::Error { message } => {
-            Err(IrohError::Protocol(ProtocolError::PeerError(message)))
-        }
-        other => Err(IrohError::Protocol(ProtocolError::MalformedResponse(
+        other => Err(CommsError::Protocol(ProtocolError::MalformedResponse(
             format!("unexpected response to TransactionForward: {:?}", other),
         ))),
     }
 }
-
 
 // ============================================================================
 // Tests

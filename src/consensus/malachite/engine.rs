@@ -169,11 +169,7 @@ pub fn spawn_engine(app_state: &AppState) -> Result<(), String> {
     // flowing when API load starves the main runtime (peer refresh inside is
     // already spawn_blocking; per-peer send tasks inherit the net runtime).
     let (out_tx, out_rx) = mpsc::unbounded_channel();
-    crate::net::transport::net_rt().spawn(gossip::run_publisher(
-        app_state.clone(),
-        node_id,
-        out_rx,
-    ));
+    hopnet_comms::net_rt().spawn(gossip::run_publisher(app_state.clone(), node_id, out_rx));
 
     // --- before_decide commit gate (test_mode) -----------------------------
     // The decide commit runs on the !Send shell thread where async barrier
@@ -344,10 +340,13 @@ pub async fn bootstrap_join(
     app_state: &AppState,
     join_info: &crate::types::JoinInfo,
 ) -> Result<u64, String> {
-    let peers: Vec<(i32, crate::db::PubKey)> = join_info
+    let peers: Vec<hopnet_comms::PeerRef> = join_info
         .bootstrap_validators
         .iter()
-        .map(|n| (n.node_id, n.pubkey.clone()))
+        .map(|n| hopnet_comms::PeerRef {
+            node_id: n.node_id,
+            pubkey: n.pubkey.0.to_bytes(),
+        })
         .collect();
 
     let already_installed = {
@@ -361,7 +360,7 @@ pub async fn bootstrap_join(
         let profile = QuorumProfile::parse(&join_info.quorum_profile)
             .ok_or_else(|| format!("unknown quorum profile {:?}", join_info.quorum_profile))?;
 
-        let (block, cert) = sync::fetch_genesis(&app_state.iroh_transport, &peers)
+        let (block, cert) = sync::fetch_genesis(&app_state.comms, &peers)
             .await
             .map_err(|e| format!("genesis fetch: {e}"))?;
 
@@ -400,14 +399,9 @@ pub async fn bootstrap_join(
         .ok_or("engine missing after spawn")?;
 
     let mut decided = engine.decided.clone();
-    let reached = sync::sync_to_tip(
-        &app_state.iroh_transport,
-        &engine.input_tx,
-        &mut decided,
-        &peers,
-    )
-    .await
-    .map_err(|e| format!("sync to tip: {e:?}"))?;
+    let reached = sync::sync_to_tip(&app_state.comms, &engine.input_tx, &mut decided, &peers)
+        .await
+        .map_err(|e| format!("sync to tip: {e:?}"))?;
 
     tracing::info!("join bootstrap: synced to height {reached}");
     Ok(reached)
@@ -449,7 +443,7 @@ fn spawn_driver(
                             let flag = sync_inflight.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = sync::sync_to_target(
-                                    &app_state.iroh_transport,
+                                    &app_state.comms,
                                     &app_state.db_pool,
                                     node_id,
                                     &input_tx,
@@ -638,14 +632,14 @@ pub fn kick_sync_if_behind(app_state: &AppState, target: u64, hint_peer: i32) {
             return;
         }
     };
-    let transport = app_state.iroh_transport.clone();
+    let comms = app_state.comms.clone();
     let db_pool = app_state.db_pool.clone();
     let input_tx = engine.input_tx.clone();
     let mut decided = engine.decided.clone();
     let flag = engine.sync_inflight.clone();
     crate::consensus::queue::queue_rt().spawn(async move {
         if let Err(e) = sync::sync_to_target(
-            &transport,
+            &comms,
             &db_pool,
             node_id,
             &input_tx,

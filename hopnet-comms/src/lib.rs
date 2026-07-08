@@ -18,7 +18,13 @@ use std::time::Duration;
 #[cfg(feature = "iroh")]
 mod iroh_impl;
 #[cfg(feature = "iroh")]
-pub use iroh_impl::{Call, CallOptions, EndpointAddr, IrohComms, ScopeRegistry};
+pub use iroh_impl::{net_rt, Call, CallOptions, EndpointAddr, IrohComms, ScopeRegistry, HOPNET_ALPN};
+/// The raw iroh crate, for test harnesses that must impersonate a foreign
+/// endpoint (e.g. the orchestrator's reject-unknown probe). Production code
+/// goes through [`IrohComms`]; containment means no other workspace manifest
+/// names iroh.
+#[cfg(feature = "iroh")]
+pub use iroh;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 

@@ -58,32 +58,35 @@ pub async fn collect_all_node_metrics(
         current_height
     );
 
-    let transport = &app_state.iroh_transport;
+    let comms = &app_state.comms;
     let mut metrics = Vec::new();
 
     // Measure each node using iroh RPC
     for node in &target_nodes {
-        let iroh_node_id = node.pubkey.to_iroh_node_id();
+        let peer = hopnet_comms::PeerRef {
+            node_id: node.node_id,
+            pubkey: node.pubkey.0.to_bytes(),
+        };
         tracing::debug!("Measuring node {} via iroh", node.node_id);
 
         // Measure latency using iroh RPC
         let latency_result = timeout(
             measurement_timeout_per_node,
-            rpc::measure_latency(transport, node.node_id, iroh_node_id),
+            rpc::measure_latency(comms, &peer),
         )
         .await;
 
         // Measure throughput using iroh RPC
         let throughput_result = timeout(
             measurement_timeout_per_node,
-            rpc::measure_throughput(transport, node.node_id, iroh_node_id),
+            rpc::measure_throughput(comms, &peer),
         )
         .await;
 
         // Measure storage using iroh RPC
         let storage_result = timeout(
             measurement_timeout_per_node,
-            rpc::query_storage(transport, node.node_id, iroh_node_id),
+            rpc::query_storage(comms, &peer),
         )
         .await;
 

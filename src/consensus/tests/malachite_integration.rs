@@ -2,6 +2,14 @@
 //! loopback iroh — HopNetApplication (dispatch table + Rule-8), SqliteStorage
 //! on the shared app pool, the tokio shell, fire-and-forget gossip, and the
 //! decided-value sync protocol. The bespoke engine is not involved.
+//!
+//! Networking runs through the SAME path as production: the comms accept
+//! loop (started at test-AppState construction) dispatches the "consensus"
+//! scope, which routes into whatever shell `app_state.malachite` holds. A
+//! node that is "down" (engine not started) answers gossip with "engine not
+//! active" — the message is dropped, exactly like a down production node —
+//! and catches up through decided-value sync once live gossip lands above
+//! its height.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -18,7 +26,7 @@ use hopnet_consensus::traits::Application;
 use hopnet_consensus::{HopNetContext, LinearTimeouts, Params, ValuePayload};
 
 use crate::consensus::malachite::app::{build_value, HopNetApplication};
-use crate::consensus::malachite::{gossip, sync};
+use crate::consensus::malachite::{gossip, sync, EngineHandle};
 use crate::consensus::tests::MockNetwork;
 use crate::AppState;
 
@@ -52,34 +60,17 @@ fn cleanup_payload() -> Vec<u8> {
     bincode::serde::encode_to_vec(&cutoff, bincode::config::standard()).unwrap_or_default()
 }
 
-/// Start a node's consensus NETWORK side only: schema install + accept loop
-/// feeding a proxy channel. Runs before any dialing — QUIC handshakes only
-/// complete once the server polls accept() — and before the engine exists
-/// (a late joiner buffers inbound messages until its shell starts).
-async fn start_net(app_state: &AppState) -> mpsc::Receiver<HostInput> {
-    let db_pool = app_state.db_pool.clone();
-    hopnet_consensus::store::install_schema(&db_pool.get().unwrap()).unwrap();
-    let (proxy_tx, proxy_rx) = mpsc::channel::<HostInput>(1024);
-    let server = gossip::ConsensusServer {
-        input_tx: proxy_tx,
-        db_pool,
-        barriers: None, // barrier taps are exercised at the orchestrator layer
-    };
-    tokio::spawn(gossip::run_accept_loop(
-        app_state.iroh_transport.endpoint().clone(),
-        server,
-    ));
-    proxy_rx
+/// Install the consensus schema — the network side (accept loop + consensus
+/// scope) is already live from AppState construction.
+fn install_consensus_schema(app_state: &AppState) {
+    hopnet_consensus::store::install_schema(&app_state.db_pool.get().unwrap()).unwrap();
 }
 
 /// Spawn the full engine stack for one node: publisher, shell (HostCore over
-/// HopNetApplication + pool-backed SqliteStorage), the proxy forwarder from
-/// the accept loop, and the driver task answering NeedValue / SyncNeeded.
-async fn start_engine(
-    app_state: &AppState,
-    node_id: i32,
-    mut proxy_rx: mpsc::Receiver<HostInput>,
-) -> EngineNode {
+/// HopNetApplication + pool-backed SqliteStorage), the driver task answering
+/// NeedValue / SyncNeeded, and the `app_state.malachite` handle that the
+/// comms "consensus" scope routes inbound traffic through.
+async fn start_engine(app_state: &AppState, node_id: i32) -> EngineNode {
     let db_pool = app_state.db_pool.clone();
 
     let (out_tx, out_rx) = mpsc::unbounded_channel();
@@ -130,29 +121,29 @@ async fn start_engine(
     let ConsensusHandle {
         input_tx,
         decided,
+        round,
         mut events,
-        ..
     } = handle;
 
-    // Forward the accept loop's proxy channel (including anything buffered
-    // while this node was "down") into the shell.
-    {
-        let fw_tx = input_tx.clone();
-        tokio::spawn(async move {
-            while let Some(input) = proxy_rx.recv().await {
-                if fw_tx.send(input).await.is_err() {
-                    break;
-                }
-            }
-        });
-    }
+    let sync_inflight = Arc::new(AtomicBool::new(false));
 
-    // Driver: the app-side loop the Stage-5 cutover will formalize.
+    // Route inbound comms traffic into this shell (mirrors spawn_engine's
+    // handle install). The OnceCell set can lose on an engine RESTART within
+    // one AppState — the scope then still points at the dead first shell,
+    // which only matters for tests that need inbound traffic post-restart
+    // (the restart test is a single-node mesh; nothing inbound).
+    let _ = app_state.malachite.set(EngineHandle {
+        input_tx: input_tx.clone(),
+        decided: decided.clone(),
+        round,
+        sync_inflight: sync_inflight.clone(),
+    });
+
+    // Driver: the app-side loop the Stage-5 cutover formalized.
     {
         let app_state = app_state.clone();
         let input_tx = input_tx.clone();
         let decided = decided.clone();
-        let sync_inflight = Arc::new(AtomicBool::new(false));
         tokio::spawn(async move {
             while let Some(ev) = events.recv().await {
                 match ev {
@@ -201,7 +192,7 @@ async fn start_engine(
                         let flag = sync_inflight.clone();
                         tokio::spawn(async move {
                             if let Err(e) = sync::sync_to_target(
-                                &app_state.iroh_transport,
+                                &app_state.comms,
                                 &app_state.db_pool,
                                 node_id,
                                 &input_tx,
@@ -240,44 +231,48 @@ async fn wait_decided(node: &mut EngineNode, target: u64, secs: u64) {
     });
 }
 
+/// Build a directly-dialable address for an in-process endpoint. Addresses
+/// are built from the bound sockets (wildcard → 127.0.0.1) because the
+/// endpoint's self-reported addr may hold no usable direct address until
+/// discovery runs.
+fn loopback_addr(app_state: &AppState) -> hopnet_comms::EndpointAddr {
+    let ep = app_state.comms.endpoint();
+    let mut addr = hopnet_comms::EndpointAddr::new(ep.id());
+    for sock in ep.bound_sockets() {
+        let sock = if sock.ip().is_unspecified() {
+            std::net::SocketAddr::new(
+                match sock {
+                    std::net::SocketAddr::V4(_) => {
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+                    }
+                    std::net::SocketAddr::V6(_) => {
+                        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+                    }
+                },
+                sock.port(),
+            )
+        } else {
+            sock
+        };
+        addr = addr.with_ip_addr(sock);
+    }
+    addr
+}
+
 /// Full-mesh direct connections between the fixture's endpoints — loopback
-/// tests must not depend on external discovery infrastructure. Addresses are
-/// built from the bound sockets (wildcard → 127.0.0.1) because the endpoint's
-/// self-reported addr may hold no usable direct address until discovery runs.
+/// tests must not depend on external discovery infrastructure.
 async fn connect_mesh(network: &MockNetwork) {
-    let addrs: Vec<iroh::EndpointAddr> = network
+    let addrs: Vec<hopnet_comms::EndpointAddr> = network
         .nodes
         .iter()
-        .map(|n| {
-            let ep = n.app_state.iroh_transport.endpoint();
-            let mut addr = iroh::EndpointAddr::new(ep.id());
-            for sock in ep.bound_sockets() {
-                let sock = if sock.ip().is_unspecified() {
-                    std::net::SocketAddr::new(
-                        match sock {
-                            std::net::SocketAddr::V4(_) => {
-                                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-                            }
-                            std::net::SocketAddr::V6(_) => {
-                                std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
-                            }
-                        },
-                        sock.port(),
-                    )
-                } else {
-                    sock
-                };
-                addr = addr.with_ip_addr(sock);
-            }
-            addr
-        })
+        .map(|n| loopback_addr(&n.app_state))
         .collect();
     for i in 0..network.nodes.len() {
         for (j, addr) in addrs.iter().enumerate() {
             if i != j {
                 network.nodes[i]
                     .app_state
-                    .iroh_transport
+                    .comms
                     .connect_to_addr(j as i32, addr.clone())
                     .await
                     .expect("direct loopback connect");
@@ -299,28 +294,29 @@ fn malachite_mesh_decides_and_laggard_syncs_over_loopback_iroh() {
     let network = MockNetwork::setup_with_validators(3);
     let rt = crate::consensus::tests::test_iroh_rt();
     rt.block_on(async move {
-        // Network side first: accept loops must be polling before any dial
-        // (QUIC handshakes complete only when the server accepts).
-        let rx0 = start_net(&network.nodes[0].app_state).await;
-        let rx1 = start_net(&network.nodes[1].app_state).await;
-        let rx2 = start_net(&network.nodes[2].app_state).await;
+        // Schema first; the comms accept loops (with the consensus scope)
+        // have been polling since AppState construction, so dials complete.
+        install_consensus_schema(&network.nodes[0].app_state);
+        install_consensus_schema(&network.nodes[1].app_state);
+        install_consensus_schema(&network.nodes[2].app_state);
         connect_mesh(&network).await;
 
         // Nodes 0 and 1 run the engine; node 2 is a validator but offline
         // (Majority profile: quorum 2 of 3 — heights where node 2 is the
-        // proposer advance by propose-timeout round skip).
-        let mut n0 = start_engine(&network.nodes[0].app_state, 0, rx0).await;
-        let mut n1 = start_engine(&network.nodes[1].app_state, 1, rx1).await;
+        // proposer advance by propose-timeout round skip). Gossip to node 2
+        // is answered "engine not active" and dropped, like any down node.
+        let mut n0 = start_engine(&network.nodes[0].app_state, 0).await;
+        let mut n1 = start_engine(&network.nodes[1].app_state, 1).await;
 
         wait_decided(&mut n0, 4, 300).await;
         wait_decided(&mut n1, 4, 300).await;
 
         // Refresh direct connections (the idle pre-connects may have died
-        // while node 2 was "down"), then bring node 2 up: buffered + live
-        // gossip ahead of its height triggers SyncNeeded → decided-value
-        // sync → live participation.
+        // while node 2 was "down"), then bring node 2 up: live gossip ahead
+        // of its height triggers SyncNeeded → decided-value sync → live
+        // participation.
         connect_mesh(&network).await;
-        let mut n2 = start_engine(&network.nodes[2].app_state, 2, rx2).await;
+        let mut n2 = start_engine(&network.nodes[2].app_state, 2).await;
         wait_decided(&mut n2, 6, 300).await;
 
         // The laggard's decided history is byte-identical to the mesh's.
@@ -362,14 +358,14 @@ fn malachite_mesh_decides_and_laggard_syncs_over_loopback_iroh() {
 // Should: connect two in-process endpoints directly by socket address (no
 // discovery) and round-trip a ping.
 // Should not: require an external discovery service, a relay, or the full
-// engine stack — this isolates `IrohTransport::connect_to_addr` plus the
+// engine stack — this isolates `IrohComms::connect_to_addr` plus the
 // accept-loop requirement (QUIC handshakes complete only under accept()).
 // Impact: the transport-layer regression test for loopback meshes.
 #[test]
 fn probe_loopback_direct_connect() {
     let a = crate::consensus::tests::MockNode::new(0);
     let b = crate::consensus::tests::MockNode::new(1);
-    // PeerValidator requires the dialer's pubkey in the receiver's nodes table.
+    // The peer directory requires the dialer's pubkey in the receiver's nodes table.
     for (me, other) in [(&a, &b), (&b, &a)] {
         let conn = me.app_state.db_pool.get().unwrap();
         conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
@@ -385,42 +381,20 @@ fn probe_loopback_direct_connect() {
     }
     let rt = crate::consensus::tests::test_iroh_rt();
     rt.block_on(async move {
-        // QUIC handshakes only complete once the server polls accept().
-        // The test runtime serves as the app runtime for handed-off requests.
-        tokio::spawn(crate::net::handler::handle_incoming_connections(
-            b.app_state.iroh_transport.endpoint().clone(),
-            b.app_state.clone(),
-            tokio::runtime::Handle::current(),
-        ));
-        let ep_b = b.app_state.iroh_transport.endpoint();
-        eprintln!("b bound sockets: {:?}", ep_b.bound_sockets());
-        let mut addr = iroh::EndpointAddr::new(ep_b.id());
-        for sock in ep_b.bound_sockets() {
-            let sock = if sock.ip().is_unspecified() {
-                std::net::SocketAddr::new(
-                    match sock {
-                        std::net::SocketAddr::V4(_) => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                        std::net::SocketAddr::V6(_) => std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-                    },
-                    sock.port(),
-                )
-            } else {
-                sock
-            };
-            addr = addr.with_ip_addr(sock);
-        }
+        // QUIC handshakes only complete once the server polls accept() — the
+        // comms accept loop has been running since AppState construction.
+        let addr = loopback_addr(&b.app_state);
         eprintln!("dialing addr: {addr:?}");
         a.app_state
-            .iroh_transport
+            .comms
             .connect_to_addr(1, addr)
             .await
             .expect("direct connect");
-        let rtt = a
-            .app_state
-            .iroh_transport
-            .ping(1, ep_b.id())
-            .await
-            .expect("ping");
+        let peer_b = hopnet_comms::PeerRef {
+            node_id: 1,
+            pubkey: b.app_state.comms.local_pubkey(),
+        };
+        let rtt = a.app_state.comms.ping(&peer_b).await.expect("ping");
         eprintln!("ping rtt: {rtt}ns");
     });
 }
@@ -437,11 +411,10 @@ fn malachite_engine_restarts_from_persisted_state() {
     let rt = crate::consensus::tests::test_iroh_rt();
     rt.block_on(async move {
         let state = &network.nodes[0].app_state;
-        hopnet_consensus::store::install_schema(&state.db_pool.get().unwrap()).unwrap();
+        install_consensus_schema(state);
 
         // First engine incarnation: decide a few heights, then shut down.
-        let (_dummy_tx, dummy_rx) = mpsc::channel::<HostInput>(1);
-        let mut n0 = start_engine(state, 0, dummy_rx).await;
+        let mut n0 = start_engine(state, 0).await;
         wait_decided(&mut n0, 3, 120).await;
         let _ = n0.input_tx.send(HostInput::Shutdown).await;
 
@@ -459,8 +432,7 @@ fn malachite_engine_restarts_from_persisted_state() {
 
         // Second incarnation resumes from meta (+ WAL replay if the shutdown
         // landed mid-height) and keeps going.
-        let (_dummy_tx2, dummy_rx2) = mpsc::channel::<HostInput>(1);
-        let mut n0b = start_engine(state, 0, dummy_rx2).await;
+        let mut n0b = start_engine(state, 0).await;
         wait_decided(&mut n0b, stopped_at + 1, 120).await;
         let _ = n0b.input_tx.send(HostInput::Shutdown).await;
 

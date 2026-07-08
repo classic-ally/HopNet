@@ -4,10 +4,11 @@ use axum::{Extension, Json, extract::State, http::StatusCode, response::IntoResp
 use bincode::config;
 use serde::Deserialize;
 
+use hopnet_comms::Rpc;
+
 use crate::AppState;
 use crate::db::{DatabaseError, PubKey};
-use crate::net::protocol::{IrohRequest, IrohResponse};
-use crate::setup::{JoinAckResponse, JoinDeliverRequest};
+use crate::setup::{JoinDeliverRequest, SetupRequest, SetupResponse};
 use crate::{consensus::types::Transaction, db::nodes, types::Node};
 
 /// API payload for adding a new node (no ip/port needed — iroh uses pubkey-based addressing)
@@ -46,12 +47,16 @@ pub async fn post_nodes(
     // 1. Verify new node is reachable via iroh (replaces HTTP ping check).
     //    The iroh connection proves reachability AND pubkey ownership via TLS handshake.
     ///////////////
-    let peer_iroh_id = payload.pubkey.to_iroh_node_id();
+    let peer_pubkey = payload.pubkey.0.to_bytes();
+    let ping_peer = hopnet_comms::PeerRef {
+        node_id: -1,
+        pubkey: peer_pubkey,
+    };
 
     // Retry ping with backoff — iroh discovery (pkarr DNS) can take time for new nodes
     let mut ping_ok = false;
     for attempt in 0..6 {
-        match app_state.iroh_transport.ping(-1, peer_iroh_id).await {
+        match app_state.comms.ping(&ping_peer).await {
             Ok(_rtt) => {
                 tracing::info!("Successfully pinged new node via iroh (pubkey verified by TLS)");
                 ping_ok = true;
@@ -235,24 +240,32 @@ pub async fn post_nodes(
         join_info.bootstrap_validators.len()
     );
 
-    let transport = app_state.iroh_transport.clone();
+    let comms = app_state.comms.clone();
     let node_id = complete_node.node_id;
+    let deliver_peer = hopnet_comms::PeerRef {
+        node_id,
+        pubkey: peer_pubkey,
+    };
     tokio::spawn(async move {
         const ATTEMPTS: u32 = 10;
         const RETRY_DELAY: Duration = Duration::from_secs(15);
-        let req = IrohRequest::JoinDeliver(JoinDeliverRequest { join_info });
+        let payload =
+            crate::net::encode_payload(&SetupRequest::JoinDeliver(JoinDeliverRequest {
+                join_info,
+            }));
         for attempt in 1..=ATTEMPTS {
-            match transport
-                .request(node_id, peer_iroh_id, &req, Duration::from_secs(30))
+            let reply = comms
+                .rpc(&deliver_peer, "setup", payload.clone(), Duration::from_secs(30))
                 .await
-            {
-                Ok(IrohResponse::JoinAck(ack)) if ack.success => {
+                .and_then(|bytes| crate::net::decode_payload::<SetupResponse>(&bytes));
+            match reply {
+                Ok(SetupResponse::JoinAck { success: true }) => {
                     tracing::info!(
                         "Node {node_id} accepted JoinInfo (attempt {attempt}), bootstrap running"
                     );
                     return;
                 }
-                Ok(IrohResponse::Error { message }) => {
+                Ok(SetupResponse::Error { message }) => {
                     // The node answered and refused — retrying won't help.
                     tracing::error!("Node {node_id} rejected JoinInfo: {message}");
                     return;
@@ -266,7 +279,7 @@ pub async fn post_nodes(
                     tracing::warn!(
                         "JoinInfo delivery to node {node_id} failed (attempt {attempt}/{ATTEMPTS}): {e}"
                     );
-                    transport.remove_connection(node_id).await;
+                    comms.remove_connection(node_id).await;
                 }
             }
             tokio::time::sleep(RETRY_DELAY).await;

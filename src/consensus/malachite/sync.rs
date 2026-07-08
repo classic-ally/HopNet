@@ -14,13 +14,12 @@ use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use tokio::sync::{mpsc, watch};
 
+use hopnet_comms::{IrohComms, PeerRef, Rpc};
 use hopnet_consensus::codec::{self, WireCommitCertificate};
 use hopnet_consensus::shell::HostInput;
 use hopnet_consensus::types::Block;
 
-use crate::db::PubKey;
-use crate::net::protocol::{IrohRequest, IrohResponse};
-use crate::net::transport::IrohTransport;
+use super::gossip::{ConsensusNetRequest, ConsensusNetResponse};
 
 /// Heights fetched per request (server caps at 100).
 const CHUNK: i64 = 50;
@@ -42,7 +41,7 @@ pub enum SyncError {
 /// rotates through all known peers; a peer whose data fails structural checks
 /// or does not apply is skipped for the remainder of this sync.
 pub async fn sync_to_target(
-    transport: &IrohTransport,
+    comms: &IrohComms,
     db_pool: &Pool<SqliteConnectionManager>,
     my_node_id: i32,
     input_tx: &mpsc::Sender<HostInput>,
@@ -51,7 +50,7 @@ pub async fn sync_to_target(
     hint_peer: Option<i32>,
 ) -> Result<(), SyncError> {
     let peers = peer_list(db_pool, my_node_id, hint_peer);
-    sync_loop(transport, input_tx, decided, Some(target), &peers).await?;
+    sync_loop(comms, input_tx, decided, Some(target), &peers).await?;
     Ok(())
 }
 
@@ -60,12 +59,12 @@ pub async fn sync_to_target(
 /// height reached. `peers` is explicit — a joining node's `nodes` table only
 /// fills as blocks apply, so callers pass JoinInfo's bootstrap validators.
 pub async fn sync_to_tip(
-    transport: &IrohTransport,
+    comms: &IrohComms,
     input_tx: &mpsc::Sender<HostInput>,
     decided: &mut watch::Receiver<u64>,
-    peers: &[(i32, PubKey)],
+    peers: &[PeerRef],
 ) -> Result<u64, SyncError> {
-    sync_loop(transport, input_tx, decided, None, peers).await
+    sync_loop(comms, input_tx, decided, None, peers).await
 }
 
 /// Shared fetch/feed/apply loop. With `target = Some(h)`: sync until decided
@@ -73,11 +72,11 @@ pub async fn sync_to_tip(
 /// `target = None`: tip mode — every peer EXPLICITLY reporting an empty range
 /// is success; transport failures never count as tip evidence.
 async fn sync_loop(
-    transport: &IrohTransport,
+    comms: &IrohComms,
     input_tx: &mpsc::Sender<HostInput>,
     decided: &mut watch::Receiver<u64>,
     target: Option<u64>,
-    peers: &[(i32, PubKey)],
+    peers: &[PeerRef],
 ) -> Result<u64, SyncError> {
     let mut cursor = 0usize;
     // Peers that failed (transport error, malformed data, chunk didn't apply).
@@ -110,7 +109,7 @@ async fn sync_loop(
                 Some(target) => Err(SyncError::Exhausted { reached, target }),
             };
         }
-        let (peer_node, peer_key) = peers[cursor % peers.len()].clone();
+        let peer = peers[cursor % peers.len()];
         cursor += 1;
 
         let from = (*decided.borrow() as i64) + 1;
@@ -118,7 +117,7 @@ async fn sync_loop(
             Some(t) => (from + CHUNK - 1).min(t as i64),
             None => from + CHUNK - 1,
         };
-        match fetch_chunk(transport, peer_node, &peer_key, from, to).await {
+        match fetch_chunk(comms, &peer, from, to).await {
             Ok(pairs) if !pairs.is_empty() => {
                 let mut last_fed = *decided.borrow();
                 let mut expected = from as u64;
@@ -129,14 +128,14 @@ async fn sync_loop(
                         || block.verify().is_err()
                         || block.block_hash != cert.value_id
                     {
-                        tracing::warn!("sync: node {peer_node} served malformed chunk");
+                        tracing::warn!("sync: node {} served malformed chunk", peer.node_id);
                         break;
                     }
                     expected += 1;
                     last_fed = block.data.height;
                     if input_tx
                         .send(HostInput::SyncValue {
-                            peer_node,
+                            peer_node: peer.node_id,
                             block,
                             cert,
                         })
@@ -166,7 +165,8 @@ async fn sync_loop(
                     }
                     Err(_) => {
                         tracing::warn!(
-                            "sync: chunk from node {peer_node} did not apply (at {}, fed to {last_fed})",
+                            "sync: chunk from node {} did not apply (at {}, fed to {last_fed})",
+                            peer.node_id,
                             *decided.borrow()
                         );
                         failures += 1;
@@ -174,11 +174,11 @@ async fn sync_loop(
                 }
             }
             Ok(_) => {
-                tracing::debug!("sync: node {peer_node} has nothing for [{from}, {to}]");
+                tracing::debug!("sync: node {} has nothing for [{from}, {to}]", peer.node_id);
                 empty_answers += 1;
             }
             Err(e) => {
-                tracing::debug!("sync: fetch from node {peer_node} failed: {e}");
+                tracing::debug!("sync: fetch from node {} failed: {e}", peer.node_id);
                 failures += 1;
             }
         }
@@ -191,15 +191,15 @@ async fn sync_loop(
 /// creates one); only structural checks apply. Everything after height 0 is
 /// engine-verified against the validator sets genesis establishes.
 pub async fn fetch_genesis(
-    transport: &IrohTransport,
-    peers: &[(i32, PubKey)],
+    comms: &IrohComms,
+    peers: &[PeerRef],
 ) -> Result<(Block, WireCommitCertificate), String> {
     let mut last_err = "no bootstrap peers".to_string();
-    for (peer_node, peer_key) in peers {
-        match fetch_chunk(transport, *peer_node, peer_key, 0, 0).await {
+    for peer in peers {
+        match fetch_chunk(comms, peer, 0, 0).await {
             Ok(pairs) => {
                 let Some((block, cert)) = pairs.into_iter().next() else {
-                    last_err = format!("node {peer_node} has no genesis");
+                    last_err = format!("node {} has no genesis", peer.node_id);
                     continue;
                 };
                 if block.data.height != 0
@@ -208,12 +208,12 @@ pub async fn fetch_genesis(
                     || cert.height != 0
                     || cert.value_id != block.block_hash
                 {
-                    last_err = format!("node {peer_node} served a malformed genesis");
+                    last_err = format!("node {} served a malformed genesis", peer.node_id);
                     continue;
                 }
                 return Ok((block, cert));
             }
-            Err(e) => last_err = format!("node {peer_node}: {e}"),
+            Err(e) => last_err = format!("node {}: {e}", peer.node_id),
         }
     }
     Err(last_err)
@@ -223,7 +223,7 @@ fn peer_list(
     db_pool: &Pool<SqliteConnectionManager>,
     my_node_id: i32,
     hint: Option<i32>,
-) -> Vec<(i32, PubKey)> {
+) -> Vec<PeerRef> {
     let Ok(conn) = db_pool.get() else {
         return Vec::new();
     };
@@ -232,40 +232,42 @@ fn peer_list(
         return Vec::new();
     };
     let Ok(rows) = stmt.query_map([my_node_id], |row| {
-        Ok((row.get::<_, i32>(0)?, row.get::<_, PubKey>(1)?))
+        let node_id: i32 = row.get(0)?;
+        let pubkey: crate::db::PubKey = row.get(1)?;
+        Ok(PeerRef {
+            node_id,
+            pubkey: pubkey.0.to_bytes(),
+        })
     }) else {
         return Vec::new();
     };
-    let mut peers: Vec<(i32, PubKey)> = rows.flatten().collect();
+    let mut peers: Vec<PeerRef> = rows.flatten().collect();
     // Hint peer first (it demonstrably has the target height).
     if let Some(h) = hint {
-        peers.sort_by_key(|(id, _)| (*id != h) as u8);
+        peers.sort_by_key(|p| (p.node_id != h) as u8);
     }
     peers
 }
 
 async fn fetch_chunk(
-    transport: &IrohTransport,
-    peer_node: i32,
-    peer_key: &PubKey,
+    comms: &IrohComms,
+    peer: &PeerRef,
     from: i64,
     to: i64,
 ) -> Result<Vec<(Block, WireCommitCertificate)>, String> {
-    let response = transport
-        .request(
-            peer_node,
-            peer_key.to_iroh_node_id(),
-            &IrohRequest::DecidedFetch {
-                from_height: from,
-                to_height: to,
-            },
-            FETCH_TIMEOUT,
-        )
+    let payload = crate::net::encode_payload(&ConsensusNetRequest::DecidedFetch {
+        from_height: from,
+        to_height: to,
+    });
+    let reply = comms
+        .rpc(peer, "consensus", payload, FETCH_TIMEOUT)
         .await
         .map_err(|e| e.to_string())?;
+    let response: ConsensusNetResponse =
+        crate::net::decode_payload(&reply).map_err(|e| e.to_string())?;
 
     match response {
-        IrohResponse::DecidedFetchResponse { items } => {
+        ConsensusNetResponse::Decided { items } => {
             let mut out = Vec::with_capacity(items.len());
             for (block_bytes, cert_bytes) in &items {
                 let block: Block = codec::decode(block_bytes).map_err(|e| e.to_string())?;
@@ -275,7 +277,7 @@ async fn fetch_chunk(
             }
             Ok(out)
         }
-        IrohResponse::Error { message } => Err(message),
+        ConsensusNetResponse::Error { message } => Err(message),
         other => Err(format!("unexpected response: {other:?}")),
     }
 }

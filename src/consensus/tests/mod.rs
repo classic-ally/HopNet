@@ -407,19 +407,26 @@ pub fn create_test_app_state_with_keys(
     let encoding_key = EncodingKey::from_secret(jwt_secret);
     let decoding_key = DecodingKey::from_secret(jwt_secret);
 
-    let iroh_secret = signing_key.to_iroh_secret_key();
-    let iroh_transport = test_iroh_rt()
-        .block_on(crate::net::IrohTransport::new(
-            iroh_secret,
-            pool.clone(),
-            true,
+    // Setup-complete from the start (strict peer directory) — mirrors the
+    // old `is_setup_complete: true` test transport; loopback tests insert
+    // their peers' pubkeys into the nodes table.
+    let setup_complete = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let directory = Arc::new(crate::net::directory::HostPeerDirectory::new(
+        pool.clone(),
+        setup_complete.clone(),
+    ));
+    let comms = test_iroh_rt()
+        .block_on(hopnet_comms::IrohComms::bind(
+            signing_key.0.to_bytes(),
+            directory,
+            None,
         ))
-        .expect("test iroh transport");
+        .expect("test iroh comms");
 
     let (consensus_queue, _consensus_queue_rx) =
         crate::consensus::queue::ConsensusQueue::new(pool.clone(), 256);
 
-    AppState {
+    let app_state = AppState {
         db_pool: pool,
         encoding_key,
         decoding_key,
@@ -431,9 +438,9 @@ pub fn create_test_app_state_with_keys(
         port: 3000,
         test_mode: true,
         orphaned_fragment_scan: Arc::new(std::sync::Mutex::new(None)),
-        iroh_transport,
+        comms,
+        setup_complete,
         consensus_barriers: Arc::new(crate::consensus::barriers::new()),
-        dedup_cache: Arc::new(crate::net::DedupCache::default()),
         session_store: Arc::new(crate::auth::SessionStore::default()),
         takeout_runtime: Arc::new(hopnet_takeout::TakeoutRuntime::default()),
         consensus_queue,
@@ -444,7 +451,13 @@ pub fn create_test_app_state_with_keys(
         // Tests run sync (no ambient runtime) — reuse the shared test
         // runtime so scheduled work has somewhere real to land.
         runtime: test_iroh_rt().handle().clone(),
-    }
+    };
+    // Same scope map as production (build_registry keeps them from
+    // drifting); comms spawns the accept loop on its net runtime.
+    app_state
+        .comms
+        .start(crate::net::scopes::build_registry(&app_state));
+    app_state
 }
 
 pub fn create_test_app_state() -> AppState {

@@ -443,7 +443,7 @@ enum DispatchOutcome {
 /// runtime they starve under API burst load right along with the HTTP
 /// handlers — engines sat idle-paused with full pools because the driver's
 /// Resume send never got polled. Unlike the iroh net runtime (see
-/// net::transport::net_rt), blocking DB work is ALLOWED here — these tasks
+/// hopnet_comms::net_rt), blocking DB work is ALLOWED here — these tasks
 /// own dedicated connections and do SAVEPOINT preflights by design; they get
 /// their own threads precisely so that blocking never competes with anything
 /// liveness-critical.
@@ -605,7 +605,10 @@ async fn handle_as_forwarder(
             }
         }
     };
-    let proposer_iroh_id = proposer_pubkey.to_iroh_node_id();
+    let proposer_ref = hopnet_comms::PeerRef {
+        node_id: proposer,
+        pubkey: proposer_pubkey.0.to_bytes(),
+    };
 
     let transactions: Vec<Transaction> = batch.iter().map(|q| q.tx.clone()).collect();
 
@@ -636,9 +639,8 @@ async fn handle_as_forwarder(
 
     let mut decided_rx = engine.decided.clone();
     let forward_result = super::rpc::forward_transactions_with_ack(
-        &app_state.iroh_transport,
-        proposer,
-        proposer_iroh_id,
+        &app_state.comms,
+        &proposer_ref,
         transactions,
         height as i64,
         &mut decided_rx,
@@ -651,7 +653,7 @@ async fn handle_as_forwarder(
                 "No ACK from proposer node {} — evicting connection and retrying",
                 proposer
             );
-            app_state.iroh_transport.remove_connection(proposer).await;
+            app_state.comms.remove_connection(proposer).await;
             resume_own_engine();
             (batch, DispatchOutcome::RetryAfterDelay)
         }
@@ -715,10 +717,6 @@ async fn handle_as_forwarder(
             }
             resume_own_engine();
             (batch, DispatchOutcome::RetryNow)
-        }
-        Ok(super::rpc::ForwardAckResult::Busy) => {
-            tracing::debug!("Proposer node {} busy — waiting for progress", proposer);
-            (batch, DispatchOutcome::WaitForProgress)
         }
         Err(e) => {
             tracing::warn!("Failed to forward transactions to proposer: {:?}", e);

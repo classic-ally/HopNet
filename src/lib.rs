@@ -52,9 +52,12 @@ pub struct AppState {
     pub port: u16,
     pub test_mode: bool,
     pub orphaned_fragment_scan: Arc<std::sync::Mutex<Option<storage_host::jobs::OrphanedFragmentScan>>>,
-    pub iroh_transport: net::IrohTransport,
+    pub comms: hopnet_comms::IrohComms,
+    /// Whether this node has completed setup (genesis or JoinInfo received).
+    /// Shared with the comms peer directory — when false, all incoming
+    /// connections are allowed (the brief pre-init window).
+    pub setup_complete: Arc<std::sync::atomic::AtomicBool>,
     pub consensus_barriers: Arc<barriers::Barriers>,
-    pub dedup_cache: Arc<net::DedupCache>,
     pub session_store: Arc<auth::SessionStore>,
     /// Module-owned takeout/import runtime state (resume registry +
     /// barriers), crate-owned since RFC-015 Stage D5b. Single Arc shared by

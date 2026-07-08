@@ -30,6 +30,7 @@ skip-frontend = []  # Skip frontend build (for orchestrator-only builds)
 
 [dependencies]
 hopnet-common = { path = "common", features = ["database"] }
+hopnet-comms = { path = "hopnet-comms", features = ["iroh"] }
 hopnet-consensus = { path = "hopnet-consensus", features = ["shell"] }
 hopnet-storage = { path = "hopnet-storage", features = ["engine"] }
 hopnet-projection = { path = "hopnet-projection" }
@@ -94,7 +95,6 @@ base64 = "0.22"
 
 # Tauri dependencies (optional for GUI mode)
 tauri = { version = "2.7.0", features = ["tray-icon", "image-png"], optional = true }
-iroh = "0.98.2"
 thiserror = "2.0.18"
 parking_lot = "0.12.5"
 hdrhistogram = { version = "7.5.4", default-features = false }

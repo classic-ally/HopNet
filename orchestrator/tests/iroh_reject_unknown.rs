@@ -1,13 +1,11 @@
 use anyhow::Result;
-use iroh::Endpoint;
+use hopnet_comms::iroh::{self, Endpoint};
+use hopnet_comms::HOPNET_ALPN;
 use reqwest::Client;
 use serde::Deserialize;
 use std::time::{Duration, Instant};
 
 use crate::tests::{Check, NodeInfo, TestResult, TestScenario, print_and_add_check};
-
-/// ALPN protocol identifier for HopNet (must match src/net/transport.rs)
-const HOPNET_ALPN: &[u8] = b"hopnet/1.0";
 
 /// Test that verifies unknown nodes are rejected when attempting iroh connections
 pub struct IrohRejectUnknown;

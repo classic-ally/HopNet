@@ -186,13 +186,26 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             });
             std::fs::create_dir_all(&fragments_dir).expect("Failed to create fragments directory");
 
-            // Create iroh transport
-            let iroh_secret = PrivKey(privatekey.clone()).to_iroh_secret_key();
-            let iroh_transport =
-                net::IrohTransport::new(iroh_secret, pool.clone(), startup_state_opt.is_some())
-                    .await
-                    .expect("Failed to create iroh transport");
-            tracing::info!("iroh endpoint ready, node_id: {}", iroh_transport.node_id());
+            // Create the comms transport: host-injected peer directory (the
+            // nodes table + setup-mode bypass) over the node's Ed25519 key.
+            let setup_complete = Arc::new(std::sync::atomic::AtomicBool::new(
+                startup_state_opt.is_some(),
+            ));
+            let directory = Arc::new(net::directory::HostPeerDirectory::new(
+                pool.clone(),
+                setup_complete.clone(),
+            ));
+            let comms = hopnet_comms::IrohComms::bind(
+                privatekey.to_bytes(),
+                directory,
+                std::env::var("HOPNET_RELAY_URL").ok(),
+            )
+            .await
+            .expect("Failed to create iroh comms");
+            tracing::info!(
+                "iroh endpoint ready, node_id: {}",
+                hex::encode(comms.local_pubkey())
+            );
 
             // Create consensus queue (channel + submit handle)
             let (consensus_queue, consensus_queue_rx) =
@@ -214,9 +227,9 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 port,
                 test_mode: cfg!(debug_assertions) || std::env::var("HOPNET_TEST_MODE").is_ok(),
                 orphaned_fragment_scan: Arc::new(std::sync::Mutex::new(None)),
-                iroh_transport: iroh_transport.clone(),
+                comms,
+                setup_complete,
                 consensus_barriers: Arc::new(consensus::barriers::new()),
-                dedup_cache: Arc::new(net::DedupCache::default()),
                 session_store: Arc::new(auth::SessionStore::default()),
                 takeout_runtime: Arc::new(hopnet_takeout::TakeoutRuntime::default()),
                 consensus_queue,
@@ -407,19 +420,11 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 });
             }
 
-            // Start iroh accept loop for incoming connections — on the
-            // dedicated net runtime (see net::transport::net_rt), with the
-            // main runtime's Handle threaded through so DB-touching requests
-            // hand back off. Mesh liveness must not depend on API load.
-            {
-                let endpoint = iroh_transport.endpoint().clone();
-                let app_state_clone = app_state.clone();
-                let app_rt = tokio::runtime::Handle::current();
-                net::transport::net_rt().spawn(async move {
-                    net::handler::handle_incoming_connections(endpoint, app_state_clone, app_rt)
-                        .await;
-                });
-            }
+            // Install the scope handlers and start the comms accept loop —
+            // comms spawns it on its dedicated net runtime (see
+            // hopnet_comms::net_rt); each scope handler hops DB-touching work
+            // to its own runtime. Mesh liveness must not depend on API load.
+            app_state.comms.start(net::scopes::build_registry(&app_state));
 
             // Restart path: an initialized node starts the consensus engine
             // now — AFTER the accept loop (QUIC handshakes only complete under

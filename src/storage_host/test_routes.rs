@@ -61,15 +61,17 @@ pub async fn get_fragment_health_check(
     let mut tasks = Vec::new();
 
     for node in &nodes {
-        let transport = app_state.iroh_transport.clone();
+        let comms = app_state.comms.clone();
         let node_id = node.node_id;
-        let iroh_node_id = node.pubkey.to_iroh_node_id();
+        let peer = hopnet_comms::PeerRef {
+            node_id,
+            pubkey: node.pubkey.0.to_bytes(),
+        };
         let hash = fragment_hash;
 
         tasks.push(tokio::spawn(async move {
             let start = std::time::Instant::now();
-            match crate::storage_host::rpc::check_fragment_health(&transport, node_id, iroh_node_id, hash)
-                .await
+            match crate::storage_host::rpc::check_fragment_health(&comms, &peer, hash).await
             {
                 Ok(healthy) => NodeFragmentHealthResult {
                     node_id,

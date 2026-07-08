@@ -1,7 +1,9 @@
+//! Metrics measurement RPC over the "metrics" comms scope. This module owns
+//! the scope's wire vocabulary ([`MetricsRequest`]/[`MetricsResponse`]); the
+//! server side lives in `net::scopes::MetricsScope`.
+
 use crate::AppState;
-use crate::net::protocol::{IrohRequest, IrohResponse};
-use crate::net::transport::ProtocolError;
-use crate::net::{IrohError, IrohTransport};
+use hopnet_comms::{CommsError, IrohComms, PeerRef, ProtocolError, Rpc};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -22,6 +24,29 @@ const THROUGHPUT_TEST_DURATION: Duration = Duration::from_secs(10);
 
 /// Size of throughput upload chunks (~4MB, matches fragment transfer size, within 8MB MAX_MESSAGE_SIZE)
 const THROUGHPUT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+
+/// Wire request for the "metrics" scope.
+#[derive(Serialize, Deserialize, Debug)]
+pub enum MetricsRequest {
+    /// Latency ping (echo timestamp back for RTT measurement)
+    Latency(LatencyPingRequest),
+    /// Upload throughput data chunk (server acks, client measures speed)
+    Throughput(ThroughputUploadRequest),
+    /// Query remote node's storage usage
+    Storage,
+}
+
+/// Wire response for the "metrics" scope.
+#[derive(Serialize, Deserialize, Debug)]
+pub enum MetricsResponse {
+    /// Latency pong (echoed timestamp)
+    Latency(LatencyPongResponse),
+    /// Ack for a throughput upload chunk
+    ThroughputAck,
+    /// Storage query result
+    Storage { total_gb: u32, used_gb: u32 },
+    Error { message: String },
+}
 
 // ============================================================================
 // Latency Measurement
@@ -44,13 +69,12 @@ pub fn handle_latency_ping(req: LatencyPingRequest) -> LatencyPongResponse {
     }
 }
 
-/// Client-side: measure latency to a remote node over iroh.
+/// Client-side: measure latency to a remote node over the mesh.
 /// Sends pings for ~5 seconds, discards the first sample, returns (avg_rtt, variance, jitter) in ms.
 pub async fn measure_latency(
-    transport: &IrohTransport,
-    node_id: i32,
-    peer_pubkey: iroh::PublicKey,
-) -> Result<(f64, f64, f64), IrohError> {
+    comms: &IrohComms,
+    peer: &PeerRef,
+) -> Result<(f64, f64, f64), CommsError> {
     let start = std::time::Instant::now();
     let mut rtts: Vec<Duration> = Vec::new();
 
@@ -60,26 +84,24 @@ pub async fn measure_latency(
             .unwrap_or_default()
             .as_nanos() as u64;
 
-        let req = IrohRequest::LatencyPing(LatencyPingRequest {
+        let payload = crate::net::encode_payload(&MetricsRequest::Latency(LatencyPingRequest {
             timestamp_nanos: ts,
-        });
+        }));
         let send_time = std::time::Instant::now();
-        let response = transport
-            .request(node_id, peer_pubkey, &req, LATENCY_TIMEOUT)
-            .await?;
+        let reply = comms.rpc(peer, "metrics", payload, LATENCY_TIMEOUT).await?;
 
-        match response {
-            IrohResponse::LatencyPong(resp) if resp.timestamp_nanos == ts => {
+        match crate::net::decode_payload::<MetricsResponse>(&reply)? {
+            MetricsResponse::Latency(resp) if resp.timestamp_nanos == ts => {
                 rtts.push(send_time.elapsed());
             }
-            IrohResponse::LatencyPong(_) => {
+            MetricsResponse::Latency(_) => {
                 // Timestamp mismatch — skip this sample
             }
-            IrohResponse::Error { message } => {
-                return Err(IrohError::Protocol(ProtocolError::PeerError(message)));
+            MetricsResponse::Error { message } => {
+                return Err(CommsError::Protocol(ProtocolError::PeerError(message)));
             }
             other => {
-                return Err(IrohError::Protocol(ProtocolError::MalformedResponse(
+                return Err(CommsError::Protocol(ProtocolError::MalformedResponse(
                     format!("unexpected response to LatencyPing: {:?}", other),
                 )));
             }
@@ -144,35 +166,30 @@ pub struct ThroughputUploadRequest {
     pub data: Vec<u8>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-pub struct ThroughputAckResponse;
-
-/// Client-side: measure upload throughput to a remote node over iroh.
+/// Client-side: measure upload throughput to a remote node over the mesh.
 /// Sends ~4MB chunks for ~10 seconds, measures round-trip time client-side.
-pub async fn measure_throughput(
-    transport: &IrohTransport,
-    node_id: i32,
-    peer_pubkey: iroh::PublicKey,
-) -> Result<i64, IrohError> {
+pub async fn measure_throughput(comms: &IrohComms, peer: &PeerRef) -> Result<i64, CommsError> {
     let start = std::time::Instant::now();
     let data = vec![0u8; THROUGHPUT_CHUNK_SIZE]; // zeros are fine — we're measuring transport speed
     let mut total_bytes: usize = 0;
 
     while start.elapsed() < THROUGHPUT_TEST_DURATION {
-        let req = IrohRequest::ThroughputUpload(ThroughputUploadRequest { data: data.clone() });
-        let response = transport
-            .request(node_id, peer_pubkey, &req, THROUGHPUT_TIMEOUT)
+        let payload = crate::net::encode_payload(&MetricsRequest::Throughput(
+            ThroughputUploadRequest { data: data.clone() },
+        ));
+        let reply = comms
+            .rpc(peer, "metrics", payload, THROUGHPUT_TIMEOUT)
             .await?;
 
-        match response {
-            IrohResponse::ThroughputAck(_) => {
+        match crate::net::decode_payload::<MetricsResponse>(&reply)? {
+            MetricsResponse::ThroughputAck => {
                 total_bytes += THROUGHPUT_CHUNK_SIZE;
             }
-            IrohResponse::Error { message } => {
-                return Err(IrohError::Protocol(ProtocolError::PeerError(message)));
+            MetricsResponse::Error { message } => {
+                return Err(CommsError::Protocol(ProtocolError::PeerError(message)));
             }
             other => {
-                return Err(IrohError::Protocol(ProtocolError::MalformedResponse(
+                return Err(CommsError::Protocol(ProtocolError::MalformedResponse(
                     format!("unexpected response to ThroughputUpload: {:?}", other),
                 )));
             }
@@ -193,45 +210,30 @@ pub async fn measure_throughput(
 // Storage Query
 // ============================================================================
 
-#[derive(Serialize, Deserialize, Debug)]
-pub struct StorageQueryRequest;
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct StorageResultResponse {
-    pub total_gb: u32,
-    pub used_gb: u32,
-}
-
 /// Server-side: handle a storage query from a peer node.
-pub async fn handle_storage_query(app_state: &AppState) -> IrohResponse {
+pub async fn handle_storage_query(app_state: &AppState) -> MetricsResponse {
     match crate::metrics::routes::calculate_storage_usage(&app_state.fragments_dir).await {
-        Ok(storage) => IrohResponse::StorageResult(StorageResultResponse {
+        Ok(storage) => MetricsResponse::Storage {
             total_gb: storage.total_gb,
             used_gb: storage.used_gb,
-        }),
-        Err(e) => IrohResponse::Error {
+        },
+        Err(e) => MetricsResponse::Error {
             message: format!("storage query failed: {}", e),
         },
     }
 }
 
-/// Client-side: query a remote node's storage usage over iroh.
-pub async fn query_storage(
-    transport: &IrohTransport,
-    node_id: i32,
-    peer_pubkey: iroh::PublicKey,
-) -> Result<(u32, u32), IrohError> {
-    let req = IrohRequest::StorageQuery(StorageQueryRequest);
-    let response = transport
-        .request(node_id, peer_pubkey, &req, STORAGE_TIMEOUT)
-        .await?;
+/// Client-side: query a remote node's storage usage over the mesh.
+pub async fn query_storage(comms: &IrohComms, peer: &PeerRef) -> Result<(u32, u32), CommsError> {
+    let payload = crate::net::encode_payload(&MetricsRequest::Storage);
+    let reply = comms.rpc(peer, "metrics", payload, STORAGE_TIMEOUT).await?;
 
-    match response {
-        IrohResponse::StorageResult(result) => Ok((result.total_gb, result.used_gb)),
-        IrohResponse::Error { message } => {
-            Err(IrohError::Protocol(ProtocolError::PeerError(message)))
+    match crate::net::decode_payload::<MetricsResponse>(&reply)? {
+        MetricsResponse::Storage { total_gb, used_gb } => Ok((total_gb, used_gb)),
+        MetricsResponse::Error { message } => {
+            Err(CommsError::Protocol(ProtocolError::PeerError(message)))
         }
-        other => Err(IrohError::Protocol(ProtocolError::MalformedResponse(
+        other => Err(CommsError::Protocol(ProtocolError::MalformedResponse(
             format!("unexpected response to StorageQuery: {:?}", other),
         ))),
     }
