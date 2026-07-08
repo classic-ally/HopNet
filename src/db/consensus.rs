@@ -254,18 +254,10 @@ pub fn get_startup_state(
 
 
 pub fn get_current_consensus_height(conn: &rusqlite::Connection) -> Result<i32, DatabaseError> {
-    use rusqlite::OptionalExtension;
-
-    let current_height: Option<i64> = conn
-        .query_row(
-            "SELECT value FROM consensus_meta WHERE key = 'last_decided_height'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|_| DatabaseError::RecallError)?;
-
-    Ok(current_height.unwrap_or(0) as i32)
+    // RFC-017 Stage 3: delegates to the projection layer's canonical reader
+    // (hopnet-consensus's SQL underneath). Host entry point kept — the
+    // snapshotter captures this function by label.
+    hopnet_projection::current_height(conn)
 }
 
 /// Check if a node is active at a given height

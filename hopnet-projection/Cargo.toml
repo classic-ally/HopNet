@@ -13,6 +13,10 @@ hopnet-common = { path = "../common", features = ["database"] }
 # projection → storage, so blob streaming can live in HostCapabilities;
 # consequence: hopnet-storage must never depend on hopnet-projection.
 hopnet-storage = { path = "../hopnet-storage" }
+# Default features only (no shell/tokio): the canonical consensus-height
+# read, exposed here so projections dep ONLY hopnet-projection (RFC-017
+# north star) instead of growing their own consensus edges.
+hopnet-consensus = { path = "../hopnet-consensus" }
 
 aes-siv = "0.7.0"
 axum = "0.8.4"

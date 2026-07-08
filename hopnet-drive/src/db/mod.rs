@@ -11,31 +11,15 @@ pub mod files;
 pub mod shares;
 pub mod users;
 
-use hopnet_projection::DatabaseError;
 
 /// The tables this projection owns, in dependency order (parents first).
 /// Exposed for divergence tooling and the host's boot tripwire.
 pub const TABLES: &[&str] = &["inodes", "modification_log", "incoming_shares", "shares"];
 
-/// Current decided consensus height, read off any connection to the shared
-/// SQLite DB. Reproduces the host's
-/// `db::consensus::get_current_consensus_height` semantics EXACTLY (SQL
-/// copied verbatim): missing row (pre-genesis) reads as 0, any query error
-/// maps to `DatabaseError::RecallError`.
-pub(crate) fn current_height(conn: &rusqlite::Connection) -> Result<i32, DatabaseError> {
-    use rusqlite::OptionalExtension;
-
-    let current_height: Option<i64> = conn
-        .query_row(
-            "SELECT value FROM consensus_meta WHERE key = 'last_decided_height'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|_| DatabaseError::RecallError)?;
-
-    Ok(current_height.unwrap_or(0) as i32)
-}
+/// Current decided consensus height — the projection layer's canonical
+/// reader (RFC-017 Stage 3; this crate's verbatim SQL copy died with it,
+/// same 0-pre-genesis / RecallError semantics).
+pub(crate) use hopnet_projection::current_height;
 
 /// Install the drive's tables. Requires `users` (host) and `data_blocks`
 /// (hopnet-storage) to exist already.

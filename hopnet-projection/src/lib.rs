@@ -357,3 +357,17 @@ pub trait Projection: Send + Sync {
         None
     }
 }
+
+/// Current decided consensus height off any connection to the shared DB
+/// (RFC-017 Stage 3 — the single replacement for three identical copies in
+/// the host, drive, and takeout). Conn-based rather than a HostCapabilities
+/// method because projections read the height INSIDE consensus-apply
+/// transactions, where an async request-scoped seam would break
+/// read-your-writes and the sync context. Pre-genesis (missing row) reads
+/// as 0; errors map to `RecallError` — the previous copies' semantics, with
+/// hopnet-consensus's SQL as the single source of truth.
+pub fn current_height(conn: &rusqlite::Connection) -> Result<i32, DatabaseError> {
+    hopnet_consensus::store::last_decided_height(conn)
+        .map(|h| h.map_or(0, |h| h.as_db() as i32))
+        .map_err(|_| DatabaseError::RecallError)
+}

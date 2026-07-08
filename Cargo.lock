@@ -2808,6 +2808,7 @@ dependencies = [
  "chrono",
  "hdrhistogram",
  "hopnet-common",
+ "hopnet-consensus",
  "hopnet-storage",
  "inventory",
  "once_cell",
