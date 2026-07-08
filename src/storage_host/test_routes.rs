@@ -70,9 +70,10 @@ pub async fn get_fragment_health_check(
         let hash = fragment_hash;
 
         tasks.push(tokio::spawn(async move {
+            use hopnet_storage::traits::Transport;
             let start = std::time::Instant::now();
-            match crate::storage_host::rpc::check_fragment_health(&comms, &peer, hash).await
-            {
+            let transport = hopnet_storage::rpc::RpcTransport { rpc: comms };
+            match transport.fragment_health(&peer, &hash).await {
                 Ok(healthy) => NodeFragmentHealthResult {
                     node_id,
                     healthy: Some(healthy),

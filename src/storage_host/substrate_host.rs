@@ -1,10 +1,12 @@
 //! Host implementations of the hopnet-storage engine seams (RFC-014).
 //!
-//! One adapter over AppState implements all four traits: `Transport` (iroh
-//! fragment RPC), `StateReader` (scoped pool checkouts over replicated
-//! state), `TxSubmitter` (sign + consensus queue), and `LocalStateSink`
-//! (write-gate drain channel). The substrate never sees iroh, r2d2, or
-//! consensus types — everything narrows to the seam vocabulary here.
+//! One adapter over AppState implements `StateReader` (scoped pool checkouts
+//! over replicated state), `TxSubmitter` (sign + consensus queue), and
+//! `LocalStateSink` (write-gate drain channel). The `Transport` seam is no
+//! longer host code (RFC-017 Stage 2): the substrate's own
+//! `rpc::RpcTransport` implements it over comms — the host contributes only
+//! the comms handle. The substrate never sees iroh, r2d2, or consensus
+//! types — everything narrows to the seam vocabulary here.
 
 use crate::AppState;
 use crate::consensus::queue::ConsensusSubmitError;
@@ -13,10 +15,10 @@ use crate::types::Blake3Hash;
 use hopnet_storage::BlobId;
 use hopnet_storage::StorageError;
 use hopnet_storage::engine::{EngineConfig, EngineHandle, Seams};
+use hopnet_storage::rpc::RpcTransport;
 use hopnet_storage::store::DistributableBlob;
 use hopnet_storage::traits::{
-    LocalStateSink, PeerRef, PlacementInputs, StateReader, StoreResult, SubmitError, Transport,
-    TransportError, TxSubmitter,
+    LocalStateSink, PeerRef, PlacementInputs, StateReader, SubmitError, TxSubmitter,
 };
 use std::sync::Arc;
 
@@ -41,7 +43,9 @@ pub fn spawn_storage_engine(app_state: &AppState) {
     let host = Arc::new(SubstrateHost::new(app_state.clone()));
     let handle = EngineHandle::spawn(
         Seams {
-            transport: host.clone(),
+            transport: Arc::new(RpcTransport {
+                rpc: app_state.comms.clone(),
+            }),
             state: host.clone(),
             submitter: host.clone(),
             local_state: host,
@@ -60,88 +64,15 @@ pub fn spawn_storage_engine(app_state: &AppState) {
 /// behind all three capabilities.
 pub fn get_net(
     app_state: &AppState,
-) -> hopnet_storage::api::GetNet<SubstrateHost, SubstrateHost, SubstrateHost> {
+) -> hopnet_storage::api::GetNet<RpcTransport<hopnet_comms::IrohComms>, SubstrateHost, SubstrateHost>
+{
     let host = Arc::new(SubstrateHost::new(app_state.clone()));
     hopnet_storage::api::GetNet {
-        transport: host.clone(),
+        transport: Arc::new(RpcTransport {
+            rpc: app_state.comms.clone(),
+        }),
         state: host.clone(),
         local_state: host,
-    }
-}
-
-fn map_comms_error(e: hopnet_comms::CommsError) -> TransportError {
-    match e {
-        hopnet_comms::CommsError::Protocol(hopnet_comms::ProtocolError::PeerError(msg)) => {
-            TransportError::Peer(msg)
-        }
-        other => TransportError::Transport(other.to_string()),
-    }
-}
-
-/// Bridge the substrate's peer vocabulary onto comms' (identical shape; the
-/// crates stay decoupled).
-fn comms_peer(peer: &PeerRef) -> hopnet_comms::PeerRef {
-    hopnet_comms::PeerRef {
-        node_id: peer.node_id,
-        pubkey: peer.pubkey,
-    }
-}
-
-impl Transport for SubstrateHost {
-    async fn store_fragment(
-        &self,
-        peer: &PeerRef,
-        fragment_hash: &Blake3Hash,
-        data: Vec<u8>,
-    ) -> Result<StoreResult, TransportError> {
-        let result = crate::storage_host::rpc::store_fragment_remote(
-            &self.app_state.comms,
-            &comms_peer(peer),
-            *fragment_hash,
-            data,
-        )
-        .await
-        .map_err(map_comms_error)?;
-        if result.success {
-            Ok(StoreResult {
-                already_existed: result.already_existed,
-            })
-        } else {
-            // success=false shouldn't happen (errors come via
-            // StorageNetResponse::Error) — classify as peer-side so the
-            // engine's domain retry covers it.
-            Err(TransportError::Peer(
-                "fragment store returned success=false".to_string(),
-            ))
-        }
-    }
-
-    async fn fetch_fragment(
-        &self,
-        peer: &PeerRef,
-        fragment_hash: &Blake3Hash,
-    ) -> Result<Vec<u8>, TransportError> {
-        crate::storage_host::rpc::fetch_fragment(
-            &self.app_state.comms,
-            &comms_peer(peer),
-            *fragment_hash,
-        )
-        .await
-        .map_err(map_comms_error)
-    }
-
-    async fn fragment_health(
-        &self,
-        peer: &PeerRef,
-        fragment_hash: &Blake3Hash,
-    ) -> Result<bool, TransportError> {
-        crate::storage_host::rpc::check_fragment_health(
-            &self.app_state.comms,
-            &comms_peer(peer),
-            *fragment_hash,
-        )
-        .await
-        .map_err(map_comms_error)
     }
 }
 

@@ -18,13 +18,11 @@ use crate::types::BlobId;
 use hopnet_common::Blake3Hash;
 use std::future::Future;
 
-/// A peer as the substrate sees it: consensus node id plus the 32-byte
-/// ed25519 pubkey the host's transport dials by. No transport types leak in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PeerRef {
-    pub node_id: i32,
-    pub pubkey: [u8; 32],
-}
+/// A peer as the substrate sees it — the comms vocabulary type (RFC-017
+/// Stage 2 unified the previously-identical shapes; no iroh leaks in, the
+/// comms default face is dependency-free). Re-exported so existing
+/// `hopnet_storage::PeerRef` paths keep compiling.
+pub use hopnet_comms::PeerRef;
 
 impl PlacementNode for PeerRef {
     fn node_id(&self) -> i32 {

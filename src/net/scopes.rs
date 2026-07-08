@@ -32,7 +32,6 @@ use crate::consensus::malachite::gossip::{ConsensusNetRequest, ConsensusNetRespo
 use crate::consensus::rpc::{ForwardReply, TransactionForwardRequest};
 use crate::metrics::rpc::{MetricsRequest, MetricsResponse};
 use crate::setup::{SetupRequest, SetupResponse};
-use crate::storage_host::rpc::{StorageNetRequest, StorageNetResponse};
 use crate::AppState;
 
 /// The host's full scope map — one construction shared by `main.rs` and the
@@ -302,40 +301,31 @@ pub struct StorageScope {
 impl RpcHandler for StorageScope {
     fn handle(&self, _peer: PeerRef, payload: Vec<u8>) -> BoxFuture<'_, Vec<u8>> {
         // App plane: fragments touch disk and the DB — the MAIN runtime;
-        // degrades under API overload by design.
+        // degrades under API overload by design. The protocol itself is
+        // crate-owned (RFC-017 Stage 2): this shell only decodes the request
+        // and hands the substrate its LocalStateSink.
         let app_state = self.app_state.clone();
         Box::pin(async move {
             self.app_state
                 .runtime
                 .spawn(async move {
-                    let response = serve_storage(&app_state, payload).await;
+                    use hopnet_storage::rpc::{FragmentRequest, FragmentResponse};
+                    let response = match decode_payload::<FragmentRequest>(&payload) {
+                        Ok(req) => {
+                            let sink = crate::storage_host::substrate_host::SubstrateHost::new(
+                                app_state.clone(),
+                            );
+                            hopnet_storage::rpc::serve(&app_state.fragments_dir, &sink, req)
+                        }
+                        Err(e) => FragmentResponse::Error {
+                            message: format!("bad storage request: {e}"),
+                        },
+                    };
                     encode_payload(&response)
                 })
                 .await
                 .expect("storage task panicked")
         })
-    }
-}
-
-async fn serve_storage(app_state: &AppState, payload: Vec<u8>) -> StorageNetResponse {
-    let request: StorageNetRequest = match decode_payload(&payload) {
-        Ok(r) => r,
-        Err(e) => {
-            return StorageNetResponse::Error {
-                message: format!("bad storage request: {e}"),
-            };
-        }
-    };
-    match request {
-        StorageNetRequest::Health(req) => StorageNetResponse::Health(
-            crate::storage_host::rpc::handle_fragment_health_check(req, &app_state.fragments_dir),
-        ),
-        StorageNetRequest::Fetch(req) => StorageNetResponse::Fetch(
-            crate::storage_host::rpc::handle_fragment_fetch(req, &app_state.fragments_dir),
-        ),
-        StorageNetRequest::Store(req) => {
-            crate::storage_host::rpc::handle_fragment_store(req, app_state).await
-        }
     }
 }
 
