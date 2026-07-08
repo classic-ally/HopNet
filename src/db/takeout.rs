@@ -11,25 +11,17 @@ use crate::db::DatabaseError;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{OptionalExtension, params};
 
-/// Calculate total user data size in bytes
+/// Calculate total user data size in bytes. RFC-017 Stage 6: the SQL is
+/// drive-owned now (`hopnet_drive::db::files::user_data_size`); this thin
+/// wrapper stays as the snapshotter's capture point. Runtime quota sizing
+/// goes through the `Projection::user_data_size_bytes` hook instead
+/// (summed across all registered projections).
 pub fn calculate_user_data_size(
     db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     user_id: i32,
 ) -> Result<u64, DatabaseError> {
     match db_connection {
-        Ok(db_lock) => {
-            let total_size: Option<i64> = db_lock
-                .query_row(
-                    "SELECT COALESCE(SUM(db.file_size), 0) FROM inodes i
-                 INNER JOIN data_blocks db ON i.data_id = db.id
-                 WHERE i.owner_id = ? AND i.type = 0",
-                    params![user_id],
-                    |row| row.get(0),
-                )
-                .map_err(|_| DatabaseError::RecallError)?;
-
-            Ok(total_size.unwrap_or(0) as u64)
-        }
+        Ok(conn) => hopnet_drive::db::files::user_data_size(&conn, user_id),
         Err(_) => Err(DatabaseError::LockError),
     }
 }

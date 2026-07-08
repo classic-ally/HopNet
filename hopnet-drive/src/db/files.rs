@@ -952,3 +952,21 @@ pub fn get_file_access(
     hopnet_storage::store::get_blob_access(conn, data_block_id, &pubkey)
         .map_err(|_| DatabaseError::RecallError)
 }
+
+/// Total bytes of this user's drive content (file inodes joined to their
+/// blobs). RFC-017 Stage 6: moved from host takeout-quota SQL — the drive
+/// owns its sizing, the host sums across projections via the
+/// `Projection::user_data_size_bytes` hook.
+pub fn user_data_size(conn: &rusqlite::Connection, user_id: i32) -> Result<u64, DatabaseError> {
+    let total_size: Option<i64> = conn
+        .query_row(
+            "SELECT COALESCE(SUM(db.file_size), 0) FROM inodes i
+                 INNER JOIN data_blocks db ON i.data_id = db.id
+                 WHERE i.owner_id = ? AND i.type = 0",
+            rusqlite::params![user_id],
+            |row| row.get(0),
+        )
+        .map_err(|_| DatabaseError::RecallError)?;
+
+    Ok(total_size.unwrap_or(0) as u64)
+}

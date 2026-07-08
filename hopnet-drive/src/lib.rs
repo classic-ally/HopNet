@@ -80,6 +80,19 @@ impl hopnet_projection::Projection for DriveProjection {
         }
     }
 
+    fn user_data_size_bytes(
+        &self,
+        caps: &hopnet_projection::host::HostCapabilities,
+        user_id: i32,
+    ) -> hopnet_projection::host::BoxFuture<'static, Result<u64, String>> {
+        let pool = caps.db_pool.clone();
+        Box::pin(async move {
+            let conn = pool.get().map_err(|e| format!("db pool: {e}"))?;
+            db::files::user_data_size(&conn, user_id)
+                .map_err(|e| format!("drive user data size: {e:?}"))
+        })
+    }
+
     fn mounts(
         &self,
         caps: &hopnet_projection::host::HostCapabilities,

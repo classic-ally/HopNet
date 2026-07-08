@@ -76,9 +76,15 @@ impl TakeoutHooks for TakeoutHost {
     }
 
     fn user_data_size_bytes(&self, user_id: i32) -> BoxFuture<'_, Result<u64, String>> {
+        // RFC-017 Stage 6: every registered projection reports its own
+        // sizing; the host only sums (photos contributes automatically).
         Box::pin(async move {
-            crate::db::takeout::calculate_user_data_size(self.app_state.db_pool.get(), user_id)
-                .map_err(|e| format!("user data size: {:?}", e))
+            let caps = crate::drive_host::drive_state(&self.app_state);
+            let mut total: u64 = 0;
+            for projection in crate::projections::manifests() {
+                total += projection.user_data_size_bytes(&caps, user_id).await?;
+            }
+            Ok(total)
         })
     }
 }

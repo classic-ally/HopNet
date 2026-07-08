@@ -370,6 +370,19 @@ pub trait Projection: Send + Sync {
     ) -> Vec<hopnet_storage::BlobId> {
         Vec::new()
     }
+
+    /// Bytes of user content this projection stores for `user_id`, summed
+    /// across all manifests by the host for takeout/import quota sizing
+    /// (RFC-017 Stage 6; previously host SQL read the drive's inodes
+    /// directly). Capabilities are cloned into the future (precedent:
+    /// [`Projection::work`]). Default: none.
+    fn user_data_size_bytes(
+        &self,
+        _caps: &host::HostCapabilities,
+        _user_id: i32,
+    ) -> host::BoxFuture<'static, Result<u64, String>> {
+        Box::pin(std::future::ready(Ok(0)))
+    }
 }
 
 /// Current decided consensus height off any connection to the shared DB
