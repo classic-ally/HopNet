@@ -1,5 +1,12 @@
 # RFC-003: Node Communication System
 
+> **SUPERSEDED in part by [RFC-017](hopnet-comms.md)** (2026-07-08): the
+> transport layer described here now lives in the `hopnet-comms` crate —
+> envelope framing, scoped dispatch, peer validation, dedup, and the
+> dedicated net runtime. Each subsystem owns its payload vocabulary
+> behind a comms scope. This document remains for the authentication
+> model and historical design rationale.
+
 ## Overview
 
 The HopNet Node Communication System provides secure, authenticated inter-node communication for distributed consensus operations, file fragment transfer, and network coordination. The system prioritizes security and auditability through cryptographic authentication while maintaining performance suitable for small-to-medium networks.

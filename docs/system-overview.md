@@ -68,6 +68,17 @@ apply functions inside consensus handlers.
       mounts / takeout translators / work dispatch; src/files renamed
       to src/storage_host. Adding photos = implement Projection + one
       manifests() entry
+- [x] hopnet-comms + seam completion ([RFC-017](specs/hopnet-comms.md))
+      COMPLETE (2026-07-08): inter-node communication extracted to the
+      hopnet-comms crate (envelope + scoped dispatch; iroh + the fork
+      contained to one manifest; per-subsystem payload enums); fragment
+      protocol owned end-to-end by hopnet-storage over comms::Rpc;
+      committed_blob_ids + user_data_size_bytes manifest hooks (zero
+      drive knowledge left in host consensus/SQL paths); maintenance
+      decision logic descended into hopnet-storage; canonical height
+      reader in hopnet-projection. Deferred north star recorded:
+      projection crates dep only hopnet-projection (blob-put vocabulary
+      re-export is a future RFC)
 
 Reed-Solomon encoded file storage with encryption, chunked encoding, and fragment management.
 

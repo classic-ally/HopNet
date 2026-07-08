@@ -66,8 +66,20 @@ pub trait Projection: Send + Sync {
     fn mounts(&self, caps: &HostCapabilities) -> Vec<Mount>;
     fn work(&self, caps: &HostCapabilities, subsystem: &str, key: String)
         -> Option<BoxFuture<'static, ()>>;
+    // RFC-017 additions:
+    fn committed_blob_ids(&self, function: &str, payload: &[u8]) -> Vec<BlobId>;
+        // distribution kick — pure decode of the projection's OWN envelopes
+    fn user_data_size_bytes(&self, caps: &HostCapabilities, user_id: i32)
+        -> BoxFuture<'static, Result<u64, String>>;
+        // takeout/import quota sizing, summed across manifests
 }
 ```
+
+RFC-017 also added `hopnet_projection::current_height(conn)` — the
+canonical consensus-height reader (wraps hopnet-consensus's SQL); the
+host adapter is now `src/capabilities.rs` (`CapabilityHost` /
+`build_capabilities()` — renamed from drive_host: nothing in it is
+drive-specific). See [RFC-017](hopnet-comms.md).
 
 Manifests are **unit structs** (`&'static dyn Projection`). This is
 load-bearing: schema install and the boot tripwire run BEFORE the host's
