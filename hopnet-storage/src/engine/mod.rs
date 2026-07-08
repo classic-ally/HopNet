@@ -99,6 +99,15 @@ pub enum RepairOutcome {
     Failed { fragments_pulled: usize },
 }
 
+/// Aggregate outcome of a tier-1 repair sweep over many blobs.
+#[derive(Debug, Default)]
+pub struct RepairStats {
+    pub checked: usize,
+    pub repaired: usize,
+    pub failed: usize,
+    pub fragments_pulled: usize,
+}
+
 /// Handle to the running engine. Cheap to clone; the host stores one in its
 /// app state (mirrors the consensus EngineHandle pattern).
 #[derive(Clone)]
@@ -125,6 +134,44 @@ impl EngineHandle {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.repair_tx.send((blob_id, tx)).ok()?;
         rx.await.ok()
+    }
+
+    /// Tier-1 repair for a batch of blobs, serialized on the repair worker;
+    /// aggregates the per-blob outcomes. Engine-gone counts as a failure —
+    /// a later scan retries the blob.
+    pub async fn repair_blobs(
+        &self,
+        blob_ids: impl IntoIterator<Item = BlobId> + Send,
+    ) -> RepairStats {
+        let mut stats = RepairStats::default();
+        for blob_id in blob_ids {
+            stats.checked += 1;
+            match self.repair_blob(blob_id.clone()).await {
+                Some(RepairOutcome::Unchanged) => {}
+                Some(RepairOutcome::Repaired {
+                    fragments_pulled,
+                    recommitted,
+                }) => {
+                    stats.repaired += 1;
+                    stats.fragments_pulled += fragments_pulled;
+                    tracing::info!(
+                        "repair: blob {} pulled {} fragments (recommitted: {})",
+                        blob_id,
+                        fragments_pulled,
+                        recommitted
+                    );
+                }
+                Some(RepairOutcome::Failed { fragments_pulled }) => {
+                    stats.failed += 1;
+                    stats.fragments_pulled += fragments_pulled;
+                }
+                None => {
+                    stats.failed += 1;
+                    tracing::error!("repair: engine gone while repairing {}", blob_id);
+                }
+            }
+        }
+        stats
     }
 
     /// Spawn the engine: the global distribution worker pool on `data_rt`

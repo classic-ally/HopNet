@@ -1,9 +1,9 @@
 use crate::{
-    db::{CustomUUID, DatabaseError},
+    db::DatabaseError,
     handlers::{HandlerCtx, HandlerResult, TransactionHandler, TxMeta},
     storage_host::db_apply::delete_orphaned_data_blocks_consensus,
 };
-use serde::{Deserialize, Serialize};
+use hopnet_storage::DeleteOrphanedDataBlocksPayload;
 
 /// The storage substrate's consensus tx functions, registered from the
 /// HOST (not hopnet-storage): the layering is projection → storage, so
@@ -56,11 +56,6 @@ impl TransactionHandler for UpdatePlacementHeightsHandler {
 
 inventory::submit! {
     &UpdatePlacementHeightsHandler as &dyn TransactionHandler
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct DeleteOrphanedDataBlocksPayload {
-    pub data_block_ids: Vec<CustomUUID>,
 }
 
 pub struct DeleteOrphanedDataBlocksHandler;

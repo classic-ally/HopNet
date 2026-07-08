@@ -30,6 +30,14 @@ pub struct PlacementUpdate {
     pub placement_height: i32,
 }
 
+/// Batch of orphaned blob ids for consensus deletion (storage-owned tx
+/// payload). Liveness gates (takeout in flight, reference providers) are
+/// the HOST's responsibility before submitting.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DeleteOrphanedDataBlocksPayload {
+    pub data_block_ids: Vec<BlobId>,
+}
+
 /// Differential self-attestation report for fragment inventory synchronization
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SelfCheckFragments {

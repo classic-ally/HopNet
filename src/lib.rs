@@ -51,7 +51,8 @@ pub struct AppState {
     pub fragments_dir: String,
     pub port: u16,
     pub test_mode: bool,
-    pub orphaned_fragment_scan: Arc<std::sync::Mutex<Option<storage_host::jobs::OrphanedFragmentScan>>>,
+    pub orphaned_fragment_scan:
+        Arc<std::sync::Mutex<Option<hopnet_storage::maintenance::OrphanedFragmentScan>>>,
     pub comms: hopnet_comms::IrohComms,
     /// Whether this node has completed setup (genesis or JoinInfo received).
     /// Shared with the comms peer directory — when false, all incoming

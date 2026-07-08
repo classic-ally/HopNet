@@ -127,6 +127,21 @@ impl CustomUUID {
         self.0.as_bytes()
     }
 
+    /// UUIDv7 cutoff for retention scans: `days` before now.
+    ///
+    /// Preserves sub-second precision: UUIDv7 ordering is millisecond-granular,
+    /// so a seconds-truncated cutoff makes anything created in the current
+    /// second invisible to `days = 0` scans.
+    pub fn retention_cutoff(days: i64) -> CustomUUID {
+        let cutoff_time = Utc::now() - chrono::Duration::days(days);
+        let timestamp = Timestamp::from_unix(
+            uuid::timestamp::context::NoContext,
+            cutoff_time.timestamp() as u64,
+            cutoff_time.timestamp_subsec_nanos(),
+        );
+        CustomUUID::new(Some(&timestamp))
+    }
+
     /// Extract timestamp from UUIDv7
     pub fn extract_timestamp(&self) -> Option<DateTime<Utc>> {
         // UUIDv7 encodes timestamp in the first 48 bits

@@ -104,6 +104,82 @@ pub fn read_fragment(
     fs::read(&full_file_path).map_err(StorageError::Io)
 }
 
+/// Walk the 2-level fragment store and return every fragment file whose
+/// mtime is older than `older_than_unix`, as (hash, size) pairs. The
+/// hash-named flat files under `AB/CD/` are this store's own on-disk format
+/// (see `create_fragment_path`). A missing root directory scans as empty.
+pub fn scan_fragments(
+    fragments_dir: &str,
+    older_than_unix: u64,
+) -> Result<Vec<(Blake3Hash, u64)>, StorageError> {
+    use std::time::SystemTime;
+
+    let fragments_path = std::path::Path::new(fragments_dir);
+    if !fragments_path.exists() {
+        tracing::warn!("Fragments directory does not exist: {}", fragments_dir);
+        return Ok(Vec::new());
+    }
+
+    let mut disk_fragments = Vec::new();
+
+    // Iterate through first-level directories (00-ff)
+    for first_level_entry in fs::read_dir(fragments_path)? {
+        let first_level_entry = first_level_entry?;
+        if !first_level_entry.file_type()?.is_dir() {
+            continue;
+        }
+
+        // Iterate through second-level directories (00-ff)
+        for second_level_entry in fs::read_dir(first_level_entry.path())? {
+            let second_level_entry = second_level_entry?;
+            if !second_level_entry.file_type()?.is_dir() {
+                continue;
+            }
+
+            // Iterate through fragment files
+            for file_entry in fs::read_dir(second_level_entry.path())? {
+                let file_entry = file_entry?;
+                let metadata = file_entry.metadata()?;
+                if !metadata.is_file() {
+                    continue;
+                }
+
+                // Only consider files whose modification time is old enough
+                let mtime = metadata
+                    .modified()?
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map_err(|_| {
+                        StorageError::Io(io::Error::other("Invalid file modification time"))
+                    })?
+                    .as_secs();
+                if mtime >= older_than_unix {
+                    continue;
+                }
+
+                // Parse filename as Blake3 hash (64 hex characters)
+                let filename = file_entry.file_name();
+                let filename_str = filename.to_string_lossy();
+                if filename_str.len() != 64 {
+                    tracing::warn!("Unexpected fragment filename: {}", filename_str);
+                    continue;
+                }
+                match hex::decode(&*filename_str) {
+                    Ok(bytes) if bytes.len() == 32 => {
+                        let mut array = [0u8; 32];
+                        array.copy_from_slice(&bytes);
+                        disk_fragments.push((Blake3Hash::from_bytes(array), metadata.len()));
+                    }
+                    _ => {
+                        tracing::warn!("Invalid fragment hash filename: {}", filename_str);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(disk_fragments)
+}
+
 /// Fetch and verify a fragment from local storage
 /// Returns the fragment data if found locally and hash matches, otherwise returns an error
 pub fn fetch_and_verify_fragment(

@@ -17,6 +17,7 @@ pub mod crypto;
 pub mod engine;
 pub mod error;
 pub mod fragstore;
+pub mod maintenance;
 pub mod placement;
 pub mod rpc;
 pub mod rs;
@@ -28,4 +29,7 @@ pub mod types;
 pub use error::StorageError;
 pub use hopnet_common::Blake3Hash;
 pub use hopnet_common::CustomUUID;
-pub use types::{BlobAccess, BlobId, MeshKeyGrant, PlacementUpdate, SelfCheckFragments};
+pub use types::{
+    BlobAccess, BlobId, DeleteOrphanedDataBlocksPayload, MeshKeyGrant, PlacementUpdate,
+    SelfCheckFragments,
+};

@@ -15,7 +15,7 @@
 
 use crate::error::StorageError;
 use crate::fragstore;
-use crate::types::{BlobAccess, BlobId};
+use crate::types::{BlobAccess, BlobId, SelfCheckFragments};
 use hopnet_common::Blake3Hash;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
@@ -54,7 +54,7 @@ pub struct ApplyCtx<'a> {
     pub fragments_dir: &'a str,
 }
 
-fn db_err(what: &'static str) -> impl Fn(rusqlite::Error) -> StorageError {
+pub(crate) fn db_err(what: &'static str) -> impl Fn(rusqlite::Error) -> StorageError {
     move |e| {
         tracing::error!("apply: failed to {what}: {e:?}");
         StorageError::Io(std::io::Error::other(format!("{what}: {e}")))
@@ -329,6 +329,66 @@ pub fn query_inventory_state(
     Ok((previous_count, set))
 }
 
+/// Get the current fragment count using a transaction
+fn get_node_fragment_count_tx(
+    tx: &rusqlite::Transaction<'_>,
+    node_id: i32,
+) -> Result<u32, rusqlite::Error> {
+    let mut stmt = tx.prepare("SELECT COUNT(*) FROM fragment_inventory WHERE node_id = ?")?;
+    let count: i64 = stmt.query_row(params![node_id], |row| row.get(0))?;
+    Ok(count as u32)
+}
+
+/// Compute the differential between inventory and local fragments for a node.
+/// Returns a complete SelfCheckFragments struct ready for consensus
+/// submission. Uses high-performance EXCEPT queries; the caller supplies the
+/// transaction (consistent snapshot) and the consensus height read inside it.
+pub fn compute_inventory_differential(
+    tx: &rusqlite::Transaction<'_>,
+    node_id: i32,
+    self_verified_height: i32,
+) -> Result<SelfCheckFragments, rusqlite::Error> {
+    // Get current inventory count
+    let previous_count = get_node_fragment_count_tx(tx, node_id)?;
+
+    // Fragments we have locally but not in inventory (to be added)
+    let fragments_added = {
+        let mut stmt = tx.prepare(
+            "SELECT DISTINCT fragment_hash FROM fragment_hashes WHERE stored_locally = true
+                     EXCEPT
+                     SELECT fragment_hash FROM fragment_inventory WHERE node_id = ?",
+        )?;
+        let rows = stmt.query_map(params![node_id], |row| {
+            let fragment_hash: Blake3Hash = row.get(0)?;
+            Ok(fragment_hash)
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+
+    // Fragments in inventory but not stored locally (to be removed)
+    let fragments_removed = {
+        let mut stmt = tx.prepare(
+            "SELECT fragment_hash FROM fragment_inventory WHERE node_id = ?
+                     EXCEPT
+                     SELECT DISTINCT fragment_hash FROM fragment_hashes WHERE stored_locally = true",
+        )?;
+        let rows = stmt.query_map(params![node_id], |row| {
+            let fragment_hash: Blake3Hash = row.get(0)?;
+            Ok(fragment_hash)
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+
+    // Assemble complete SelfCheckFragments struct
+    Ok(SelfCheckFragments {
+        node_id,
+        self_verified_height,
+        previous_count,
+        fragments_added,
+        fragments_removed,
+    })
+}
+
 /// Delete orphaned blobs: fragment_hashes + blob_access + data_blocks rows,
 /// child-first. Returns the locally-stored fragment hashes so the host can
 /// opportunistically remove the files post-commit. LIVENESS GATES (takeout
@@ -601,6 +661,97 @@ pub fn get_distributable_blob(
             fragments,
         }))
     }
+}
+
+/// A rebalance candidate: one placed blob with its full fragment layout.
+#[derive(Debug, Clone)]
+pub struct DataBlockRebalanceInfo {
+    pub data_block_id: BlobId,
+    pub placement_height: i32,
+    pub fragments: Vec<FragmentInfo>,
+}
+
+/// One fragment of a rebalance candidate: hash + decoded chunk-type label.
+#[derive(Debug, Clone)]
+pub struct FragmentInfo {
+    pub fragment_hash: Blake3Hash,
+    pub chunk_type: String,
+}
+
+/// Get data blocks that need rebalancing (distributed before a certain
+/// height). Returns data blocks with their fragments, ordered by
+/// placement_height (oldest first); blobs with an incomplete fragment set
+/// are skipped.
+pub fn get_data_blocks_for_rebalancing(
+    conn: &rusqlite::Connection,
+    max_placement_height: i32,
+    limit: i32,
+) -> Result<Vec<DataBlockRebalanceInfo>, rusqlite::Error> {
+    // Get data blocks that were placed before the specified height
+    let query = "SELECT DISTINCT db.id, db.placement_height, db.fragment_count
+         FROM data_blocks db
+         WHERE db.placement_height IS NOT NULL 
+           AND db.placement_height < ?
+         ORDER BY db.placement_height ASC
+         LIMIT ?";
+    let mut stmt = conn.prepare(query)?;
+    let data_blocks: Vec<(BlobId, i32, i32)> = stmt
+        .query_map(params![max_placement_height, limit], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<Result<_, _>>()?;
+
+    // For each data block, get all its fragments
+    let fragment_query = "SELECT fragment_hash, chunk_type
+             FROM fragment_hashes
+             WHERE data_block_id = ?
+             ORDER BY chunk_number";
+    let mut fragment_stmt = conn.prepare(fragment_query)?;
+
+    let mut result = Vec::new();
+    for (data_block_id, placement_height, total_fragments) in data_blocks {
+        let fragments: Vec<FragmentInfo> = fragment_stmt
+            .query_map(params![&data_block_id], |row| {
+                let fragment_hash: Blake3Hash = row.get(0)?;
+                // fragment_hashes.chunk_type is the storage schema's 0/1
+                // encoding (see install_schema) — decoded to its label here.
+                let chunk_type = match row.get::<_, i32>(1)? {
+                    0 => "original".to_string(),
+                    1 => "recovery".to_string(),
+                    other => {
+                        return Err(rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Integer,
+                            format!("invalid chunk_type {other}").into(),
+                        ));
+                    }
+                };
+                Ok(FragmentInfo {
+                    fragment_hash,
+                    chunk_type,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+
+        // Only include data blocks where we have all fragments
+        if fragments.len() == total_fragments as usize {
+            result.push(DataBlockRebalanceInfo {
+                data_block_id,
+                placement_height,
+                fragments,
+            });
+        } else {
+            tracing::warn!(
+                "Data block {} has {} fragments but expected {}, skipping",
+                data_block_id,
+                fragments.len(),
+                total_fragments
+            );
+        }
+    }
+
+    tracing::info!("Found {} complete data blocks for rebalancing", result.len());
+    Ok(result)
 }
 
 #[cfg(test)]

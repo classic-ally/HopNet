@@ -1,85 +1,17 @@
 use r2d2::PooledConnection;
 use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::{Transaction, params};
 use std::collections::HashMap;
 use tracing::debug;
 
 use crate::db::DatabaseError;
-use hopnet_storage::SelfCheckFragments;
 use crate::types::{Blake3Hash, NodeConnectionInfo};
+use hopnet_storage::SelfCheckFragments;
 
 // apply_self_check_updates moved to crate::storage_host::db_apply
 // (RFC-016 Stage 6) — it lives beside its consensus-handler caller.
 
-/// Get the current fragment count using a transaction
-fn get_node_fragment_count_tx(tx: &Transaction, node_id: i32) -> Result<u32, DatabaseError> {
-    let mut stmt = tx
-        .prepare("SELECT COUNT(*) FROM fragment_inventory WHERE node_id = ?")
-        .map_err(|_| DatabaseError::ProcessingError)?;
-
-    let count: i64 = stmt
-        .query_row(params![node_id], |row| row.get(0))
-        .map_err(|_| DatabaseError::RecallError)?;
-
-    Ok(count as u32)
-}
-
-/// Insert fragments into inventory using a transaction
-fn insert_fragments_tx(
-    tx: &Transaction,
-    node_id: i32,
-    fragments: &[Blake3Hash],
-    verified_height: i32,
-) -> Result<(), DatabaseError> {
-    for fragment_hash in fragments {
-        tx.execute(
-            "INSERT INTO fragment_inventory (fragment_hash, node_id, self_verified_height)
-             VALUES (?, ?, ?)",
-            params![fragment_hash, node_id, verified_height],
-        )
-        .map_err(|_| DatabaseError::InsertError)?;
-    }
-
-    Ok(())
-}
-
-/// Remove fragments from inventory using a transaction
-fn remove_fragments_tx(
-    tx: &Transaction,
-    node_id: i32,
-    fragments: &[Blake3Hash],
-) -> Result<(), DatabaseError> {
-    for fragment_hash in fragments {
-        tx.execute(
-            "DELETE FROM fragment_inventory WHERE fragment_hash = ? AND node_id = ?",
-            params![fragment_hash, node_id],
-        )
-        .map_err(|_| DatabaseError::ProcessingError)?;
-    }
-
-    Ok(())
-}
-
-/// Update verified height for all fragments of a node using a transaction
-fn update_verified_height_tx(
-    tx: &Transaction,
-    node_id: i32,
-    verified_height: i32,
-) -> Result<(), DatabaseError> {
-    tx.execute(
-        "UPDATE fragment_inventory
-         SET self_verified_height = ?
-         WHERE node_id = ?",
-        params![verified_height, node_id],
-    )
-    .map_err(|_| DatabaseError::ProcessingError)?;
-
-    Ok(())
-}
-
 /// Compute the differential between inventory and local fragments for a node
 /// Returns a complete SelfCheckFragments struct ready for consensus submission
-/// Uses high-performance EXCEPT queries optimized for DuckDB's columnar architecture
 /// Uses transaction semantics for consistency guarantees in distributed environment
 pub fn compute_inventory_differential(
     db_connection: Result<PooledConnection<SqliteConnectionManager>, r2d2::Error>,
@@ -90,53 +22,21 @@ pub fn compute_inventory_differential(
             // Use transaction for consistent snapshot
             let tx = conn.transaction().map_err(|_| DatabaseError::LockError)?;
 
-            // Get current inventory count and consensus height
-            let previous_count = get_node_fragment_count_tx(&tx, node_id)?;
+            // The consensus height is host state, read inside the same
+            // snapshot; the EXCEPT queries + previous-count read are
+            // substrate-owned (RFC-017 Stage 5).
             let self_verified_height = crate::db::consensus::get_current_consensus_height(&tx)?;
-
-            // Fragments we have locally but not in inventory (to be added)
-            let fragments_added = {
-                let mut stmt = tx.prepare(
-                    "SELECT DISTINCT fragment_hash FROM fragment_hashes WHERE stored_locally = true
-                     EXCEPT
-                     SELECT fragment_hash FROM fragment_inventory WHERE node_id = ?"
-                ).map_err(|_| DatabaseError::ProcessingError)?;
-                stmt.query_map(params![node_id], |row| {
-                    let fragment_hash: Blake3Hash = row.get(0)?;
-                    Ok(fragment_hash)
-                })
-                .map_err(|_| DatabaseError::RecallError)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| DatabaseError::RecallError)?
-            };
-
-            // Fragments in inventory but not stored locally (to be removed)
-            let fragments_removed = {
-                let mut stmt = tx.prepare(
-                    "SELECT fragment_hash FROM fragment_inventory WHERE node_id = ?
-                     EXCEPT
-                     SELECT DISTINCT fragment_hash FROM fragment_hashes WHERE stored_locally = true"
-                ).map_err(|_| DatabaseError::ProcessingError)?;
-                stmt.query_map(params![node_id], |row| {
-                    let fragment_hash: Blake3Hash = row.get(0)?;
-                    Ok(fragment_hash)
-                })
-                .map_err(|_| DatabaseError::RecallError)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| DatabaseError::RecallError)?
-            };
+            let differential = hopnet_storage::store::compute_inventory_differential(
+                &tx,
+                node_id,
+                self_verified_height,
+            )
+            .map_err(|_| DatabaseError::RecallError)?;
 
             // Read-only transaction — auto-rollback on drop
             drop(tx);
 
-            // Assemble complete SelfCheckFragments struct
-            Ok(SelfCheckFragments {
-                node_id,
-                self_verified_height,
-                previous_count,
-                fragments_added,
-                fragments_removed,
-            })
+            Ok(differential)
         }
         Err(_) => Err(DatabaseError::LockError),
     }
@@ -145,6 +45,9 @@ pub fn compute_inventory_differential(
 /// Batch query fragment inventory to find nodes that claim to have specific fragments
 /// Returns a map from fragment hash to list of nodes, ordered by verification recency
 /// Optimized for minimal database round-trips when looking up many fragments at once
+///
+/// Stays host: joins the host-owned nodes table for connection info; consumed
+/// behind StateReader::fragment_sources.
 ///
 /// # Parameters
 /// * `max_nodes_per_fragment` - Limit nodes returned per fragment (default: 3 most recent)

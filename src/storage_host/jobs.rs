@@ -1,31 +1,19 @@
 use crate::{
     AppState,
     db::{
-        CustomUUID, DatabaseError,
+        CustomUUID,
         fragments::{
             AvailabilityClass, find_orphaned_data_blocks, get_node_availability_classification,
         },
     },
+    storage_host::substrate_host::SubstrateHost,
 };
 use apalis::prelude::*;
-use chrono::Utc;
+use hopnet_storage::maintenance::{OrphanedFragmentCleanupResult, OrphanedFragmentScan};
+use hopnet_storage::traits::TxSubmitter;
 use std::sync::Arc;
-use uuid::{Timestamp, timestamp::context::NoContext};
 
-#[derive(Debug)]
-pub enum MaintenanceError {
-    Database(DatabaseError),
-    Storage(String),
-    Configuration(String),
-}
-
-impl From<DatabaseError> for MaintenanceError {
-    fn from(e: DatabaseError) -> Self {
-        MaintenanceError::Database(e)
-    }
-}
-
-/// Manual trigger for orphaned data block cleanup  
+/// Manual trigger for orphaned data block cleanup
 /// Initially only supports manual trigger - threshold checking and scheduling to be added later
 pub async fn handle_orphaned_data_block_cleanup(
     job: TaskId,
@@ -130,13 +118,7 @@ async fn cleanup_orphaned_data_blocks(
     let mut total_cleaned = 0;
 
     // Generate cutoff UUID for retention policy
-    let cutoff_uuid = generate_cutoff_uuid(retention_days).map_err(|e| {
-        tracing::error!("Failed to generate cutoff UUID: {:?}", e);
-        Error::Failed(Arc::new(Box::new(std::io::Error::other(format!(
-            "Failed to generate cutoff UUID: {:?}",
-            e
-        )))))
-    })?;
+    let cutoff_uuid = CustomUUID::retention_cutoff(retention_days);
 
     tracing::info!(
         "Using {}-day retention policy, batch size: {}, cutoff UUID: {}",
@@ -144,6 +126,9 @@ async fn cleanup_orphaned_data_blocks(
         batch_size,
         cutoff_uuid
     );
+
+    // Storage-owned tx submission rides the TxSubmitter seam (sign + queue).
+    let submitter = SubstrateHost::new(app_state.clone());
 
     loop {
         // Get database connection for this batch
@@ -172,9 +157,8 @@ async fn cleanup_orphaned_data_blocks(
         );
 
         // Submit consensus transaction to delete these data blocks
-        let payload = crate::storage_host::handlers::DeleteOrphanedDataBlocksPayload {
-            data_block_ids: data_block_ids.clone(),
-        };
+        let batch_len = data_block_ids.len();
+        let payload = hopnet_storage::DeleteOrphanedDataBlocksPayload { data_block_ids };
 
         let serialized_payload =
             match bincode::serde::encode_to_vec(&payload, bincode::config::standard()) {
@@ -187,37 +171,17 @@ async fn cleanup_orphaned_data_blocks(
                 }
             };
 
-        let transaction = crate::consensus::dispatch::create_signed_transaction(
-            app_state,
-            "delete_orphaned_data_blocks".to_string(),
-            serialized_payload,
-        )
-        .map_err(|_| {
-            Error::Failed(Arc::new(Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Failed to sign transaction",
-            ))))
-        })?;
-
-        // Get user ID for consensus submission
-        let user_id = match app_state.get_user_id() {
-            Ok(id) => id,
-            Err(_) => {
-                tracing::error!("User ID not initialized, cannot submit consensus transaction");
-                return Err(Error::Failed(Arc::new(Box::new(std::io::Error::other(
-                    "User ID not initialized",
-                )))));
-            }
-        };
-
         // Submit to consensus
-        match app_state.consensus_queue.submit(transaction).await {
-            Ok(_) => {
+        match submitter
+            .submit("delete_orphaned_data_blocks", serialized_payload)
+            .await
+        {
+            Ok(()) => {
                 tracing::info!(
                     "Successfully submitted consensus transaction to delete {} data blocks",
-                    data_block_ids.len()
+                    batch_len
                 );
-                total_cleaned += data_block_ids.len();
+                total_cleaned += batch_len;
             }
             Err(e) => {
                 tracing::error!("Failed to submit consensus transaction: {:?}", e);
@@ -229,21 +193,6 @@ async fn cleanup_orphaned_data_blocks(
     }
 
     Ok(total_cleaned)
-}
-
-fn generate_cutoff_uuid(retention_days: i64) -> Result<CustomUUID, MaintenanceError> {
-    let cutoff_time = Utc::now() - chrono::Duration::days(retention_days);
-
-    // Preserve sub-second precision: UUIDv7 ordering is millisecond-granular,
-    // so a seconds-truncated cutoff makes anything created in the current
-    // second invisible to retention_days=0 scans.
-    let timestamp = Timestamp::from_unix(
-        NoContext,
-        cutoff_time.timestamp() as u64,
-        cutoff_time.timestamp_subsec_nanos(),
-    );
-
-    Ok(CustomUUID::new(Some(&timestamp)))
 }
 
 /// Network rebalancing job (tier-1 repair, RFC-014): for blobs whose
@@ -284,23 +233,34 @@ pub async fn run_network_rebalancing(
         max_placement_height
     );
 
-    // Get data blocks that need rebalancing
-    let data_blocks_to_rebalance = match crate::db::fragments::get_data_blocks_for_rebalancing(
-        app_state.db_pool.get(),
-        max_placement_height,
-        max_data_blocks,
-    ) {
-        Ok(blocks) => blocks,
-        Err(e) => {
+    // Get data blocks that need rebalancing — scoped checkout, dropped
+    // before the engine's data plane runs.
+    let data_blocks_to_rebalance = {
+        let conn = app_state.db_pool.get().map_err(|e| {
+            tracing::error!("Failed to get database connection for rebalancing: {:?}", e);
+            Error::Failed(Arc::new(Box::new(std::io::Error::other(format!(
+                "Failed to get database connection: {:?}",
+                e
+            )))))
+        })?;
+        hopnet_storage::store::get_data_blocks_for_rebalancing(
+            &conn,
+            max_placement_height,
+            max_data_blocks,
+        )
+        .map_err(|e| {
             tracing::error!("Failed to get data blocks for rebalancing: {:?}", e);
-            return Err(Error::Failed(Arc::new(Box::new(std::io::Error::other(
-                format!("Failed to get data blocks: {:?}", e),
-            )))));
-        }
+            Error::Failed(Arc::new(Box::new(std::io::Error::other(format!(
+                "Failed to get data blocks: {:?}",
+                e
+            )))))
+        })?
     };
 
-    let total_data_blocks = data_blocks_to_rebalance.len();
-    tracing::info!("Found {} data blocks to check for repair", total_data_blocks);
+    tracing::info!(
+        "Found {} data blocks to check for repair",
+        data_blocks_to_rebalance.len()
+    );
 
     // Tier-1 repair (RFC-014): the storage engine recomputes the seeded
     // placement at the current height (blob_id seed — computable again since
@@ -313,43 +273,20 @@ pub async fn run_network_rebalancing(
         )))));
     };
 
-    let mut rebalanced = 0usize;
-    let mut failed = 0usize;
-    let mut migrated = 0usize;
-    for block in &data_blocks_to_rebalance {
-        use hopnet_storage::engine::RepairOutcome;
-        match storage.repair_blob(block.data_block_id.clone()).await {
-            Some(RepairOutcome::Unchanged) => {}
-            Some(RepairOutcome::Repaired {
-                fragments_pulled,
-                recommitted,
-            }) => {
-                rebalanced += 1;
-                migrated += fragments_pulled;
-                tracing::info!(
-                    "repair: blob {} pulled {} fragments (recommitted: {})",
-                    block.data_block_id,
-                    fragments_pulled,
-                    recommitted
-                );
-            }
-            Some(RepairOutcome::Failed { fragments_pulled }) => {
-                failed += 1;
-                migrated += fragments_pulled;
-            }
-            None => {
-                failed += 1;
-                tracing::error!("repair: engine gone while repairing {}", block.data_block_id);
-            }
-        }
-    }
+    let stats = storage
+        .repair_blobs(
+            data_blocks_to_rebalance
+                .into_iter()
+                .map(|block| block.data_block_id),
+        )
+        .await;
 
     let result = NetworkRebalancingResult {
         consensus_height,
-        data_blocks_checked: total_data_blocks,
-        data_blocks_rebalanced: rebalanced,
-        data_blocks_failed: failed,
-        total_fragments_migrated: migrated,
+        data_blocks_checked: stats.checked,
+        data_blocks_rebalanced: stats.repaired,
+        data_blocks_failed: stats.failed,
+        total_fragments_migrated: stats.fragments_pulled,
     };
 
     tracing::info!("Network rebalancing completed: {:?}", result);
@@ -413,22 +350,12 @@ pub async fn run_fragment_inventory_self_check(app_state: &AppState) -> Result<(
             }
         };
 
-    // Create signed transaction for consensus
-    let transaction = crate::consensus::dispatch::create_signed_transaction(
-        app_state,
-        "self_check_fragments".to_string(),
-        serialized_payload,
-    )
-    .map_err(|_| {
-        Error::Failed(Arc::new(Box::new(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "Failed to sign transaction",
-        ))))
-    })?;
-
-    // Submit to consensus
-    match app_state.consensus_queue.submit(transaction).await {
-        Ok(_) => Ok(()),
+    // Submit through the TxSubmitter seam (sign + consensus queue)
+    match SubstrateHost::new(app_state.clone())
+        .submit("self_check_fragments", serialized_payload)
+        .await
+    {
+        Ok(()) => Ok(()),
         Err(e) => {
             tracing::error!("Failed to submit self-check to consensus: {:?}", e);
             Err(Error::Failed(Arc::new(Box::new(std::io::Error::other(
@@ -441,24 +368,9 @@ pub async fn run_fragment_inventory_self_check(app_state: &AppState) -> Result<(
 // =============================================================================
 // ORPHANED FRAGMENT CLEANUP
 // Filesystem garbage collection for fragments not in database
+// (scan/cleanup logic lives in hopnet_storage::maintenance — RFC-017 Stage 5;
+// the host keeps the conn checkout, clock reads, and the scan cache)
 // =============================================================================
-
-/// Result of scanning filesystem for orphaned fragments
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct OrphanedFragmentScan {
-    pub scanned_at: i64, // Unix timestamp
-    pub total_fragments: usize,
-    pub orphaned_fragments: Vec<crate::db::Blake3Hash>,
-    pub total_bytes: u64,
-}
-
-/// Result of cleaning up orphaned fragments
-#[derive(Debug, serde::Serialize)]
-pub struct OrphanedFragmentCleanupResult {
-    pub deleted_count: usize,
-    pub failed_count: usize,
-    pub bytes_freed: u64,
-}
 
 /// Scan filesystem for fragments that don't exist in database
 /// Only considers fragments older than grace_period_hours to avoid race conditions
@@ -466,8 +378,6 @@ pub async fn run_orphaned_fragments_scan(
     app_state: &AppState,
     grace_period_hours: i64,
 ) -> Result<OrphanedFragmentScan, Error> {
-    use std::fs;
-    use std::path::Path;
     use std::time::SystemTime;
 
     tracing::info!(
@@ -475,8 +385,6 @@ pub async fn run_orphaned_fragments_scan(
         grace_period_hours
     );
 
-    let fragments_dir = &app_state.fragments_dir;
-    let grace_period_secs = grace_period_hours * 3600;
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_err(|_| {
@@ -486,206 +394,25 @@ pub async fn run_orphaned_fragments_scan(
         })?
         .as_secs();
 
-    let cutoff_time = now - grace_period_secs as u64;
-
-    // Walk directory structure to collect all fragment hashes on disk
-    let mut disk_fragments: Vec<(crate::db::Blake3Hash, u64, u64)> = Vec::new(); // (hash, size, mtime)
-
-    // Fragments are stored in 2-level directory structure: fragments_dir/AB/CD/ABCD...hash
-    let fragments_path = Path::new(fragments_dir);
-
-    if !fragments_path.exists() {
-        tracing::warn!("Fragments directory does not exist: {}", fragments_dir);
-        return Ok(OrphanedFragmentScan {
-            scanned_at: now as i64,
-            total_fragments: 0,
-            orphaned_fragments: Vec::new(),
-            total_bytes: 0,
-        });
-    }
-
-    // Iterate through first-level directories (00-ff)
-    for first_level_entry in
-        fs::read_dir(fragments_path).map_err(|e| Error::Failed(Arc::new(Box::new(e))))?
-    {
-        let first_level_entry =
-            first_level_entry.map_err(|e| Error::Failed(Arc::new(Box::new(e))))?;
-
-        if !first_level_entry
-            .file_type()
-            .map_err(|e| Error::Failed(Arc::new(Box::new(e))))?
-            .is_dir()
-        {
-            continue;
-        }
-
-        // Iterate through second-level directories (00-ff)
-        for second_level_entry in fs::read_dir(first_level_entry.path())
-            .map_err(|e| Error::Failed(Arc::new(Box::new(e))))?
-        {
-            let second_level_entry =
-                second_level_entry.map_err(|e| Error::Failed(Arc::new(Box::new(e))))?;
-
-            if !second_level_entry
-                .file_type()
-                .map_err(|e| Error::Failed(Arc::new(Box::new(e))))?
-                .is_dir()
-            {
-                continue;
-            }
-
-            // Iterate through fragment files
-            for file_entry in fs::read_dir(second_level_entry.path())
-                .map_err(|e| Error::Failed(Arc::new(Box::new(e))))?
-            {
-                let file_entry = file_entry.map_err(|e| Error::Failed(Arc::new(Box::new(e))))?;
-
-                let metadata = file_entry
-                    .metadata()
-                    .map_err(|e| Error::Failed(Arc::new(Box::new(e))))?;
-
-                if !metadata.is_file() {
-                    continue;
-                }
-
-                // Get modification time
-                let mtime = metadata
-                    .modified()
-                    .map_err(|e| Error::Failed(Arc::new(Box::new(e))))?
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .map_err(|_| {
-                        Error::Failed(Arc::new(Box::new(std::io::Error::other(
-                            "Invalid file modification time",
-                        ))))
-                    })?
-                    .as_secs();
-
-                // Only consider files older than grace period
-                if mtime >= cutoff_time {
-                    continue;
-                }
-
-                // Parse filename as Blake3 hash (64 hex characters)
-                let filename = file_entry.file_name();
-                let filename_str = filename.to_string_lossy();
-
-                if filename_str.len() != 64 {
-                    tracing::warn!("Unexpected fragment filename: {}", filename_str);
-                    continue;
-                }
-
-                // Parse hex to Blake3Hash
-                match hex::decode(&*filename_str) {
-                    Ok(bytes) if bytes.len() == 32 => {
-                        let mut array = [0u8; 32];
-                        array.copy_from_slice(&bytes);
-                        let hash = crate::db::Blake3Hash::from_bytes(array);
-                        disk_fragments.push((hash, metadata.len(), mtime));
-                    }
-                    _ => {
-                        tracing::warn!("Invalid fragment hash filename: {}", filename_str);
-                        continue;
-                    }
-                }
-            }
-        }
-    }
-
-    tracing::info!(
-        "Found {} fragments on disk (older than {} hours)",
-        disk_fragments.len(),
-        grace_period_hours
-    );
-
-    if disk_fragments.is_empty() {
-        return Ok(OrphanedFragmentScan {
-            scanned_at: now as i64,
-            total_fragments: 0,
-            orphaned_fragments: Vec::new(),
-            total_bytes: 0,
-        });
-    }
-
-    // Check which fragments exist in database (batch query for efficiency)
     let db_conn = app_state.db_pool.get().map_err(|e| {
         Error::Failed(Arc::new(Box::new(std::io::Error::other(format!(
             "Failed to get database connection: {:?}",
             e
         )))))
     })?;
-    let batch_size = 1000;
-    let mut orphaned_fragments = Vec::new();
-    let mut total_bytes = 0u64;
 
-    for chunk in disk_fragments.chunks(batch_size) {
-        let hashes: Vec<crate::db::Blake3Hash> = chunk.iter().map(|(h, _, _)| *h).collect();
-
-        // Build parameterized query to check which hashes exist in fragment_hashes table
-        let placeholders = hashes.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
-        let query = format!(
-            "SELECT fragment_hash FROM fragment_hashes WHERE fragment_hash IN ({})",
-            placeholders
-        );
-
-        let mut stmt = db_conn.prepare(&query).map_err(|e| {
-            Error::Failed(Arc::new(Box::new(std::io::Error::other(format!(
-                "Database query failed: {:?}",
-                e
-            )))))
-        })?;
-
-        // Execute query with hash parameters
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        for hash in &hashes {
-            params.push(Box::new(*hash));
-        }
-        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-
-        let mut rows = stmt.query(param_refs.as_slice()).map_err(|e| {
-            Error::Failed(Arc::new(Box::new(std::io::Error::other(format!(
-                "Database query execution failed: {:?}",
-                e
-            )))))
-        })?;
-
-        // Collect hashes that exist in database
-        let mut db_hashes = std::collections::HashSet::new();
-        while let Some(row) = rows.next().map_err(|e| {
-            Error::Failed(Arc::new(Box::new(std::io::Error::other(format!(
-                "Failed to read query results: {:?}",
-                e
-            )))))
-        })? {
-            let hash: crate::db::Blake3Hash = row.get(0).map_err(|e| {
-                Error::Failed(Arc::new(Box::new(std::io::Error::other(format!(
-                    "Failed to parse hash from row: {:?}",
-                    e
-                )))))
-            })?;
-            db_hashes.insert(hash);
-        }
-
-        // Find orphaned fragments (on disk but not in database)
-        for (hash, size, _mtime) in chunk {
-            if !db_hashes.contains(hash) {
-                orphaned_fragments.push(*hash);
-                total_bytes += size;
-            }
-        }
-    }
-
-    tracing::info!(
-        "Scan complete: {} orphaned fragments found ({} bytes)",
-        orphaned_fragments.len(),
-        total_bytes
-    );
-
-    let scan_result = OrphanedFragmentScan {
-        scanned_at: now as i64,
-        total_fragments: disk_fragments.len(),
-        orphaned_fragments,
-        total_bytes,
-    };
+    let scan_result = hopnet_storage::maintenance::scan_orphaned_fragments(
+        &db_conn,
+        &app_state.fragments_dir,
+        grace_period_hours,
+        now,
+    )
+    .map_err(|e| {
+        Error::Failed(Arc::new(Box::new(std::io::Error::other(format!(
+            "Scan failed: {}",
+            e
+        )))))
+    })?;
 
     // Store scan result in app state
     *app_state.orphaned_fragment_scan.lock().unwrap() = Some(scan_result.clone());
@@ -715,7 +442,6 @@ pub async fn run_orphaned_fragments_cleanup(
         ))))
     })?;
 
-    // Validate scan isn't stale (> 1 hour old)
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_err(|_| {
@@ -725,59 +451,11 @@ pub async fn run_orphaned_fragments_cleanup(
         })?
         .as_secs() as i64;
 
-    let scan_age_seconds = now - scan.scanned_at;
-    if scan_age_seconds > 3600 {
-        return Err(Error::Failed(Arc::new(Box::new(std::io::Error::other(
-            format!(
+    hopnet_storage::maintenance::cleanup_orphaned_fragments(&app_state.fragments_dir, scan, now)
+        .map_err(|stale| {
+            Error::Failed(Arc::new(Box::new(std::io::Error::other(format!(
                 "Scan is stale ({} seconds old). Run a new scan first",
-                scan_age_seconds
-            ),
-        )))));
-    }
-
-    tracing::info!(
-        "Deleting {} orphaned fragments",
-        scan.orphaned_fragments.len()
-    );
-
-    let mut deleted_count = 0;
-    let mut failed_count = 0;
-    let mut bytes_freed = 0u64;
-
-    // Delete each orphaned fragment
-    for fragment_hash in &scan.orphaned_fragments {
-        match crate::storage_host::functions::delete_fragment(&app_state.fragments_dir, fragment_hash) {
-            Ok(_) => {
-                deleted_count += 1;
-                // Calculate approximate size (we don't store individual sizes, use average)
-                let avg_size = if !scan.orphaned_fragments.is_empty() {
-                    scan.total_bytes / scan.orphaned_fragments.len() as u64
-                } else {
-                    0
-                };
-                bytes_freed += avg_size;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to delete fragment {}: {:?}",
-                    fragment_hash.to_hex(),
-                    e
-                );
-                failed_count += 1;
-            }
-        }
-    }
-
-    tracing::info!(
-        "Cleanup complete: {} deleted, {} failed, {} bytes freed",
-        deleted_count,
-        failed_count,
-        bytes_freed
-    );
-
-    Ok(OrphanedFragmentCleanupResult {
-        deleted_count,
-        failed_count,
-        bytes_freed,
-    })
+                stale.age_seconds
+            )))))
+        })
 }
