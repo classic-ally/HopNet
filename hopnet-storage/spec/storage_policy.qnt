@@ -82,10 +82,33 @@ module placement {
       })._2
   }
 
+  // Balanced capped rendezvous: each class goes to the best-scoring
+  // member among the CURRENTLY LEAST-LOADED (load-tiered, rendezvous
+  // within the tier). Pins loads to the pigeonhole-optimal profile —
+  // exactly (nfrags mod |members|... i.e. nfrags - v*(c-1)) members at
+  // cap c, the rest at c-1 — which both bounds adversarial burst loss
+  // tightly (no zero-load members) and makes W(v) closed-form.
+  pure def placeBalancedAll(nfrags: int, members: Set[int], w: int -> int): int -> int =
+    range(0, nfrags).foldl(
+      (members.mapBy(n => 0), 0.to(nfrags - 1).mapBy(f => -1)),
+      (acc, f) => {
+        val counts = acc._1
+        val minLoad = members.fold(nfrags, (a, m) =>
+          if (counts.get(m) < a) counts.get(m) else a)
+        val eligible = members.filter(m => counts.get(m) == minLoad)
+        val chosen = eligible.fold(-1, (best, n) =>
+          if (best == -1) n
+          else if (hrwScore(n, f, w) < hrwScore(best, f, w)) n
+          else if (hrwScore(n, f, w) == hrwScore(best, f, w) and n < best) n
+          else best)
+        (counts.set(chosen, counts.get(chosen) + 1), acc._2.set(f, chosen))
+      })._2
+
   pure def placeVariant(v: int, f: int, nfrags: int, members: Set[int], w: int -> int): int =
     if (v == 0) placeModulo(f, members)
     else if (v == 1) placeHrw(f, members, w)
-    else placeCappedAll(nfrags, members, w).get(f)
+    else if (v == 2) placeCappedAll(nfrags, members, w).get(f)
+    else placeBalancedAll(nfrags, members, w).get(f)
 
   // Build the injected lookup: every non-empty member subset -> its
   // (class -> responsible node) map. Consumed by config modules; on the
@@ -438,35 +461,36 @@ module scaled_hrw {
       .expect(conformant and durable)
 }
 
-// Target policy, scaled, CAPPED HRW — the adoption candidate: minimal
-// movement (modulo tax gone) AND the spread lemma restored.
-module scaled_chrw {
+// Target policy, scaled, BALANCED capped rendezvous — the ADOPTED
+// variant: near-minimal movement, INV-SPREAD max AND min (loads are
+// the tightest integer split: max - min <= 1, no zero-load members),
+// closed-form burst bound / derived W.
+module scaled_bal {
   import placement.*
   import scaled_params.*
   import storage_policy(
     NODES = NODES4, N_FRAGS = 6, K = 2,
-    PLACE = buildTable(2, 6, NODES4, WEIGHT4),
+    PLACE = buildTable(3, 6, NODES4, WEIGHT4),
     AUTO_PULL = true, AUTO_REENCODE = true,
     MAX_GONE = 1, MAX_CORRUPT = 1, CALM_BOUND = 13, DELTA = 3, W = 3
   ).*
 
-  run healsAfterDepartChrwTest =
+  run healsAfterDepartBalTest =
     init.then(envDepart).then(18.reps(_ => engineTick))
       .expect(conformant and durable)
 
-  run sleepWakeZeroCostChrwTest =
+  run sleepWakeZeroCostBalTest =
     init.then(envSleep).then(2.reps(_ => engineTick)).then(envWake)
       .then(6.reps(_ => engineTick))
       .expect(conformant and durable and repairCost == 0)
 
-  // COST-BOUND for capped HRW: same exact-cost accounting as modulo's
-  // witness — the doc compares the two movedSurvivors terms.
-  run departCostExactChrwTest = {
-    val owned1 = 0.to(5).filter(f => placeVariant(2, f, 6, Set(1, 2, 3, 4), WEIGHT4) == 1)
+  // COST-BOUND for the balanced variant: exact repair-cost accounting.
+  run departCostExactBalTest = {
+    val owned1 = 0.to(5).filter(f => placeVariant(3, f, 6, Set(1, 2, 3, 4), WEIGHT4) == 1)
     val movedSurvivors = 0.to(5).filter(f =>
-      placeVariant(2, f, 6, Set(1, 2, 3, 4), WEIGHT4) != 1
-        and placeVariant(2, f, 6, Set(2, 3, 4), WEIGHT4)
-          != placeVariant(2, f, 6, Set(1, 2, 3, 4), WEIGHT4))
+      placeVariant(3, f, 6, Set(1, 2, 3, 4), WEIGHT4) != 1
+        and placeVariant(3, f, 6, Set(2, 3, 4), WEIGHT4)
+          != placeVariant(3, f, 6, Set(1, 2, 3, 4), WEIGHT4))
     init.then(envDepartN(1)).then(18.reps(_ => engineTick))
       .expect(conformant and repairCost == 2 * owned1.size() + movedSurvivors.size())
   }
@@ -521,35 +545,36 @@ module scaled_tier1 {
         isUp(resp(f)) and copies.get(f).intersect(upNodes).size() == 0))
 }
 
-// EXHAUSTIVE VERIFICATION config (Apalache). Placement is a LITERAL
-// capped-HRW table (VARIANT 2 over Set(1,2,3,4), WEIGHT 3/2/1/1),
-// precomputed offline — no arithmetic for the SMT backend. Keep this
-// table in sync with placement::buildTable(2, 6, Set(1,2,3,4), W): if
-// the placement functions change, regenerate (see spec/README.md).
+// EXHAUSTIVE VERIFICATION table (Apalache). Placement is a LITERAL
+// balanced-capped-rendezvous table (VARIANT 3 over Set(1,2,3,4),
+// WEIGHT 3/2/1/1), precomputed offline — no arithmetic for the SMT
+// backend. Keep in sync with placement::buildTable(3, 6, Set(1,2,3,4),
+// W): if the placement functions change, regenerate (see
+// spec/README.md); table_guard asserts equality.
 module verify_table {
-  pure val CHRW_TABLE: Set[int] -> (int -> int) = Map(
+  pure val BAL_TABLE: Set[int] -> (int -> int) = Map(
     Set(1)          -> Map(0->1, 1->1, 2->1, 3->1, 4->1, 5->1),
     Set(2)          -> Map(0->2, 1->2, 2->2, 3->2, 4->2, 5->2),
     Set(3)          -> Map(0->3, 1->3, 2->3, 3->3, 4->3, 5->3),
     Set(4)          -> Map(0->4, 1->4, 2->4, 3->4, 4->4, 5->4),
-    Set(1,2)        -> Map(0->2, 1->1, 2->1, 3->1, 4->2, 5->2),
-    Set(1,3)        -> Map(0->1, 1->1, 2->1, 3->3, 4->3, 5->3),
-    Set(1,4)        -> Map(0->1, 1->4, 2->1, 3->1, 4->4, 5->4),
-    Set(2,3)        -> Map(0->2, 1->2, 2->2, 3->3, 4->3, 5->3),
-    Set(2,4)        -> Map(0->2, 1->4, 2->2, 3->2, 4->4, 5->4),
-    Set(3,4)        -> Map(0->3, 1->4, 2->4, 3->4, 4->3, 5->3),
-    Set(1,2,3)      -> Map(0->2, 1->1, 2->1, 3->2, 4->3, 5->3),
+    Set(1,2)        -> Map(0->2, 1->1, 2->1, 3->2, 4->1, 5->2),
+    Set(1,3)        -> Map(0->1, 1->3, 2->1, 3->3, 4->1, 5->3),
+    Set(1,4)        -> Map(0->1, 1->4, 2->1, 3->4, 4->1, 5->4),
+    Set(2,3)        -> Map(0->2, 1->3, 2->2, 3->3, 4->3, 5->2),
+    Set(2,4)        -> Map(0->2, 1->4, 2->2, 3->4, 4->2, 5->4),
+    Set(3,4)        -> Map(0->3, 1->4, 2->4, 3->3, 4->3, 5->4),
+    Set(1,2,3)      -> Map(0->2, 1->1, 2->3, 3->1, 4->3, 5->2),
     Set(1,2,4)      -> Map(0->2, 1->4, 2->1, 3->1, 4->2, 5->4),
-    Set(1,3,4)      -> Map(0->1, 1->4, 2->1, 3->4, 4->3, 5->3),
-    Set(2,3,4)      -> Map(0->2, 1->4, 2->2, 3->4, 4->3, 5->3),
-    Set(1,2,3,4)    -> Map(0->2, 1->4, 2->1, 3->1, 4->3, 5->2)
+    Set(1,3,4)      -> Map(0->1, 1->4, 2->3, 3->1, 4->3, 5->4),
+    Set(2,3,4)      -> Map(0->2, 1->4, 2->3, 3->2, 4->3, 5->4),
+    Set(1,2,3,4)    -> Map(0->2, 1->4, 2->1, 3->3, 4->1, 5->2)
   )
 }
 
 module scaled_verify {
   import verify_table.*
   import storage_policy(
-    NODES = Set(1, 2, 3, 4), N_FRAGS = 6, K = 2, PLACE = CHRW_TABLE,
+    NODES = Set(1, 2, 3, 4), N_FRAGS = 6, K = 2, PLACE = BAL_TABLE,
     AUTO_PULL = true, AUTO_REENCODE = true,
     MAX_GONE = 1, MAX_CORRUPT = 1, CALM_BOUND = 13, DELTA = 3, W = 3
   ).*
@@ -565,8 +590,8 @@ module table_guard {
   action init = tick' = 0
   action step = tick' = tick + 1
   run tableMatchesGeneratorTest =
-    init.expect(CHRW_TABLE
-      == buildTable(2, 6, Set(1, 2, 3, 4), Map(1 -> 3, 2 -> 2, 3 -> 1, 4 -> 1)))
+    init.expect(BAL_TABLE
+      == buildTable(3, 6, Set(1, 2, 3, 4), Map(1 -> 3, 2 -> 2, 3 -> 1, 4 -> 1)))
 
   // BRIDGE lemma, proved by COMPLETE enumeration (all member views V,
   // all online subsets U with |U| >= 2/3 |V|) — stronger than a
@@ -580,18 +605,82 @@ module table_guard {
     init.expect(
       Set(1, 2, 3, 4).powerset().exclude(Set(Set())).forall(v =>
         v.powerset().filter(u => u.size() * 3 >= v.size() * 2).forall(u =>
-          0.to(5).filter(f => u.contains(CHRW_TABLE.get(v).get(f))).size() >= 2)))
+          0.to(5).filter(f => u.contains(BAL_TABLE.get(v).get(f))).size() >= 2)))
 
   // Same lemma at REAL parameters (K=10, 30 classes, 10 nodes,
-  // capped-HRW): every view, every 2/3-online subset.
+  // balanced placement): every view, every 2/3-online subset.
   run bridgeLemmaFullTest = {
     val w10 = Map(1 -> 3, 2 -> 3, 3 -> 2, 4 -> 2, 5 -> 1,
                   6 -> 1, 7 -> 1, 8 -> 1, 9 -> 1, 10 -> 1)
-    val table = buildTable(2, 30, 1.to(10), w10)
+    val table = buildTable(3, 30, 1.to(10), w10)
     init.expect(
       1.to(10).powerset().exclude(Set(Set())).forall(v =>
         v.powerset().filter(u => u.size() * 3 >= v.size() * 2).forall(u =>
           0.to(29).filter(f => u.contains(table.get(v).get(f))).size() >= 10)))
+  }
+
+  // SPREAD lemmas, both sides, by complete enumeration: balanced
+  // placement pins every view's loads to the tightest integer split —
+  // max <= ceil(N/|v|) AND min >= floor(N/|v|) (no zero-load members).
+  run spreadTightScaledTest =
+    init.expect(
+      Set(1, 2, 3, 4).powerset().exclude(Set(Set())).forall(v =>
+        v.forall(m => {
+          val load = 0.to(5).filter(f => BAL_TABLE.get(v).get(f) == m).size()
+          load <= (6 + v.size() - 1) / v.size() and load >= 6 / v.size()
+        })))
+
+  run spreadTightFullTest = {
+    val w10 = Map(1 -> 3, 2 -> 3, 3 -> 2, 4 -> 2, 5 -> 1,
+                  6 -> 1, 7 -> 1, 8 -> 1, 9 -> 1, 10 -> 1)
+    val table = buildTable(3, 30, 1.to(10), w10)
+    init.expect(
+      1.to(10).powerset().exclude(Set(Set())).forall(v =>
+        v.forall(m => {
+          val load = 0.to(29).filter(f => table.get(v).get(f) == m).size()
+          load <= (30 + v.size() - 1) / v.size() and load >= 30 / v.size()
+        })))
+  }
+
+  // BURST lemma (derived watermark), by complete enumeration: at
+  // maximum laziness (live = W(v)), a burst of b(v) = floor(|v|/3)
+  // members — the worst the control plane survives under the crash
+  // quorum profile — leaves >= K live classes.
+  //   W(v) = K + maxBurstLoss(v),
+  //   maxBurstLoss = sum of the b(v) largest member loads.
+  // With balanced loads this is closed-form: b*(c-1) + min(b, f) for
+  // c = ceil(N/|v|), f = N - |v|*(c-1); the test checks the actual
+  // tables against it.
+  run burstLemmaScaledTest =
+    init.expect(
+      Set(1, 2, 3, 4).powerset().exclude(Set(Set())).forall(v => {
+        val b = v.size() / 3
+        val c = (6 + v.size() - 1) / v.size()
+        val fcap = 6 - v.size() * (c - 1)
+        val closedForm = b * (c - 1) + (if (b < fcap) b else fcap)
+        val worst = v.map(m => 0.to(5).filter(f => BAL_TABLE.get(v).get(f) == m).size())
+          .fold(0, (a, x) => if (x > a) x else a)
+        // every b-subset's loss <= closed form, and one achieves it:
+        v.powerset().filter(bs => bs.size() == b).forall(bs =>
+          bs.fold(0, (a, m) => a + 0.to(5).filter(f => BAL_TABLE.get(v).get(f) == m).size())
+            <= closedForm)
+          and worst <= c
+      }))
+
+  run burstLemmaFullTest = {
+    val w10 = Map(1 -> 3, 2 -> 3, 3 -> 2, 4 -> 2, 5 -> 1,
+                  6 -> 1, 7 -> 1, 8 -> 1, 9 -> 1, 10 -> 1)
+    val table = buildTable(3, 30, 1.to(10), w10)
+    init.expect(
+      1.to(10).powerset().exclude(Set(Set())).filter(v => v.size() >= 2).forall(v => {
+        val b = v.size() / 3
+        val c = (30 + v.size() - 1) / v.size()
+        val fcap = 30 - v.size() * (c - 1)
+        val closedForm = b * (c - 1) + (if (b < fcap) b else fcap)
+        v.powerset().filter(bs => bs.size() == b).forall(bs =>
+          bs.fold(0, (a, m) => a + 0.to(29).filter(f => table.get(v).get(f) == m).size())
+            <= closedForm)
+      }))
   }
 }
 
@@ -604,7 +693,7 @@ module full {
                           6 -> 1, 7 -> 1, 8 -> 1, 9 -> 1, 10 -> 1)
   import storage_policy(
     NODES = NODES10, N_FRAGS = 30, K = 10,
-    PLACE = buildTable(2, 30, NODES10, WEIGHT10),
+    PLACE = buildTable(3, 30, NODES10, WEIGHT10),
     AUTO_PULL = true, AUTO_REENCODE = true,
     MAX_GONE = 2, MAX_CORRUPT = 3, CALM_BOUND = 50, DELTA = 5, W = 20
   ).*
