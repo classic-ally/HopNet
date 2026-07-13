@@ -1,8 +1,8 @@
-# Formal spec — storage durability & placement policy (RFC-018)
+# Formal spec — storage durability & placement policy (RFC-STORAGE-001)
 
 `storage_policy.qnt` is the normative model of the storage layer's
-placement/repair/GC policy. The prose contract lives in
-`docs/specs/storage-durability-policy.md`; where they disagree, the
+placement/repair/GC policy. The prose contract is RFC-STORAGE-001,
+`durability-policy.md` in this directory; where they disagree, the
 model wins.
 
 ## Module map
