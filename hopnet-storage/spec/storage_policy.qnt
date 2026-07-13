@@ -567,6 +567,32 @@ module table_guard {
   run tableMatchesGeneratorTest =
     init.expect(CHRW_TABLE
       == buildTable(2, 6, Set(1, 2, 3, 4), Map(1 -> 3, 2 -> 2, 3 -> 1, 4 -> 1)))
+
+  // BRIDGE lemma, proved by COMPLETE enumeration (all member views V,
+  // all online subsets U with |U| >= 2/3 |V|) — stronger than a
+  // reachable-state check: consensus-live membership + conformant
+  // placement keeps >= K classes reconstructible from online nodes.
+  // This is the 1/3-vs-2/3 slack that lets storage lag membership: any
+  // trajectory that keeps consensus live keeps data available, however
+  // stale the storage layer's reaction is, PROVIDED conformance was
+  // reached for the current view (surplus copies only strengthen it).
+  run bridgeLemmaScaledTest =
+    init.expect(
+      Set(1, 2, 3, 4).powerset().exclude(Set(Set())).forall(v =>
+        v.powerset().filter(u => u.size() * 3 >= v.size() * 2).forall(u =>
+          0.to(5).filter(f => u.contains(CHRW_TABLE.get(v).get(f))).size() >= 2)))
+
+  // Same lemma at REAL parameters (K=10, 30 classes, 10 nodes,
+  // capped-HRW): every view, every 2/3-online subset.
+  run bridgeLemmaFullTest = {
+    val w10 = Map(1 -> 3, 2 -> 3, 3 -> 2, 4 -> 2, 5 -> 1,
+                  6 -> 1, 7 -> 1, 8 -> 1, 9 -> 1, 10 -> 1)
+    val table = buildTable(2, 30, 1.to(10), w10)
+    init.expect(
+      1.to(10).powerset().exclude(Set(Set())).forall(v =>
+        v.powerset().filter(u => u.size() * 3 >= v.size() * 2).forall(u =>
+          0.to(29).filter(f => u.contains(table.get(v).get(f))).size() >= 10)))
+  }
 }
 
 // Full-scale parameters (K=10, 30 classes, 10 nodes) for `quint run`.
