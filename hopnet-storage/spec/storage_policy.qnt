@@ -642,15 +642,14 @@ module table_guard {
         })))
   }
 
-  // BURST lemma (derived watermark), by complete enumeration: at
-  // maximum laziness (live = W(v)), a burst of b(v) = floor(|v|/3)
-  // members — the worst the control plane survives under the crash
-  // quorum profile — leaves >= K live classes.
-  //   W(v) = K + maxBurstLoss(v),
-  //   maxBurstLoss = sum of the b(v) largest member loads.
-  // With balanced loads this is closed-form: b*(c-1) + min(b, f) for
-  // c = ceil(N/|v|), f = N - |v|*(c-1); the test checks the actual
-  // tables against it.
+  // BURST lemma (derived watermark; RFC-STORAGE-001 "Watermark"): the
+  // adversarial ceiling — no b(v)-subset's loss exceeds
+  //   advMax = min(b,f)*c + max(0, b-f)*(c-1)
+  // for c = ceil(N/|v|), f = N - |v|*(c-1), b = floor(|v|/3). The
+  // implementation's reserve is min(ceil(b*N/|v|) + sigma, advMax)
+  // with b capped at B_max; B_max binds only above enumerable table
+  // sizes (v > 15), where the argument is closed-form over the
+  // spread-lemma-pinned load profile.
   run burstLemmaScaledTest =
     init.expect(
       Set(1, 2, 3, 4).powerset().exclude(Set(Set())).forall(v => {
@@ -682,6 +681,33 @@ module table_guard {
             <= closedForm)
       }))
   }
+
+  // SIGMA-TAIL lemma: quantifies the risk accepted by the expected-load
+  // reserve (sigma = 1). For every view of size >= 6, the fraction of
+  // b(v)-subsets whose loss exceeds reserve(v) is <= 2% (measured worst:
+  // 1/84 at v = 9 — the burst that hits all three cap-loaded members).
+  // This is the number behind the spec's load-diverse power-domain
+  // assumption: physical bursts uncorrelated with load hit a bad subset
+  // with at most this probability.
+  run sigmaTailExposureFullTest = {
+    val w10 = Map(1 -> 3, 2 -> 3, 3 -> 2, 4 -> 2, 5 -> 1,
+                  6 -> 1, 7 -> 1, 8 -> 1, 9 -> 1, 10 -> 1)
+    val table = buildTable(3, 30, 1.to(10), w10)
+    init.expect(
+      1.to(10).powerset().filter(v => v.size() >= 6).forall(v => {
+        val b = v.size() / 3
+        val c = (30 + v.size() - 1) / v.size()
+        val fcap = 30 - v.size() * (c - 1)
+        val expReserve = (b * 30 + v.size() - 1) / v.size() + 1
+        val advMax = (if (b < fcap) b else fcap) * c
+          + (if (b > fcap) (b - fcap) * (c - 1) else 0)
+        val reserve = if (expReserve < advMax) expReserve else advMax
+        val loads = v.mapBy(m => 0.to(29).filter(f => table.get(v).get(f) == m).size())
+        val subs = v.powerset().filter(bs => bs.size() == b)
+        val bad = subs.filter(bs => bs.fold(0, (a, m) => a + loads.get(m)) > reserve)
+        bad.size() * 50 <= subs.size()
+      }))
+  }
 }
 
 // Full-scale parameters (K=10, 30 classes, 10 nodes) for `quint run`.
@@ -695,6 +721,6 @@ module full {
     NODES = NODES10, N_FRAGS = 30, K = 10,
     PLACE = buildTable(3, 30, NODES10, WEIGHT10),
     AUTO_PULL = true, AUTO_REENCODE = true,
-    MAX_GONE = 2, MAX_CORRUPT = 3, CALM_BOUND = 50, DELTA = 5, W = 20
+    MAX_GONE = 2, MAX_CORRUPT = 3, CALM_BOUND = 50, DELTA = 5, W = 19
   ).*
 }

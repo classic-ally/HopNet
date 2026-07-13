@@ -79,6 +79,17 @@ apply functions inside consensus handlers.
       reader in hopnet-projection. Deferred north star recorded:
       projection crates dep only hopnet-projection (blob-put vocabulary
       re-export is a future RFC)
+- [x] Storage durability & placement policy — SPECIFIED
+      ([RFC-STORAGE-001](../hopnet-storage/spec/durability-policy.md),
+      2026-07-13; first module-scoped spec, formally modeled + checked
+      in `hopnet-storage/spec/storage_policy.qnt`): copy classes
+      (responsible/surplus + projection pins) with decentralized
+      watermark GC, per-node decay tiers from absence history,
+      capped-HRW placement (spread + minimal movement, quantified),
+      re-encode as the core repair loop (keyless, chunk-flat,
+      mesh-sharded), watermark urgency floor. Implementation =
+      RFC-STORAGE-002 (not started); consensus deactivation spec owes
+      the membership rely condition
 
 Reed-Solomon encoded file storage with encryption, chunked encoding, and fragment management.
 

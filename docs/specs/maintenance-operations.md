@@ -1,5 +1,13 @@
 # RFC-007: Maintenance and Operations System
 
+> **SUPERSEDED (2026-07-13)** for storage maintenance policy: repair,
+> rebalancing, fragment lifecycle, and GC are specified by
+> **RFC-STORAGE-001** (`hopnet-storage/spec/durability-policy.md`,
+> formally modeled in `hopnet-storage/spec/storage_policy.qnt`).
+> This document remains for the non-storage maintenance surfaces
+> (metrics retention, job infrastructure) until they move to their
+> own module specs.
+
 ## Overview
 
 The HopNet Maintenance and Operations System provides automated background processes to ensure network health, storage efficiency, and operational reliability. Built on the existing `apalis` job infrastructure with randomized scheduling, the system handles fragment lifecycle management, network rebalancing, capacity monitoring, and historical data retention while preserving Time Machine functionality.

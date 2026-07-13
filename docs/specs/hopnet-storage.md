@@ -1,11 +1,15 @@
 # RFC-014: Distribution Substrate (hopnet-storage)
 
-Status: DESIGN APPROVED (2026-07-06) — extraction IN PROGRESS on the
-`consensus-malachite` branch, pre-merge (nothing deployed; fresh genesis makes
-schema/format changes free). Living implementation plan:
-`~/.claude/plans/storage-substrate-extraction.md`. Supersedes the 2026-07-06
-draft of this RFC where they conflict (encryption ownership inverted,
-placement seed changed, key custody added).
+Status: IMPLEMENTED (extraction complete, merged to master 2026-07-13).
+Supersedes the 2026-07-06 draft of this RFC where they conflict
+(encryption ownership inverted, placement seed changed, key custody
+added).
+
+> **Durability/placement/repair/GC policy** is specified separately by
+> **RFC-STORAGE-001** (`hopnet-storage/spec/durability-policy.md`, with
+> the normative Quint model in `hopnet-storage/spec/storage_policy.qnt`)
+> — the first module-scoped spec; new storage RFCs number
+> RFC-STORAGE-NNN and live beside the crate.
 
 ## Purpose
 
