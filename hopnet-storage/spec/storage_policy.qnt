@@ -22,46 +22,16 @@
 // within fault budgets. Repair work sharding across chunks (decision
 // 10) is invisible in a one-chunk model — see the prose spec.
 
-module storage_policy {
-  // === Constants (fixed per config instance) ===
-  const NODES: Set[int]           // node id universe
-  const N_FRAGS: int              // fragment classes per chunk (30 real)
-  const K: int                    // RS reconstruction threshold (10 real)
-  const WEIGHT: int -> int        // damped placement weights (quantized metrics)
-  const VARIANT: int              // 0 = select+modulo, 1 = plain HRW, 2 = capped HRW
-  const AUTO_PULL: bool           // policy: automatic tier-1 pull repair
-  const AUTO_REENCODE: bool       // policy: scrub re-encode of dead classes
-  const MAX_GONE: int             // fault budget: permanent node losses
-  const MAX_CORRUPT: int          // fault budget: single-copy corruptions
-  const CALM_BOUND: int           // recovery deadline in engine ticks
-  const DELTA: int                // decay gate: ticks down before view drops a node
-  const W: int                    // urgency watermark: live classes below W => re-encode now
-
-  type Status = int               // 0 = Up, 1 = Down (copies intact), 2 = Gone (disk lost)
-  pure val UP = 0
-  pure val DOWN = 1
-  pure val GONE = 2
-
-  // === State ===
-  var status: int -> Status       // ground truth per node
-  var downFor: int -> int         // engine ticks each node has been non-Up (capped at DELTA)
-  var memberView: Set[int]        // consensus's damped membership view (lags status)
-  var copies: int -> Set[int]     // frag class -> nodes holding a live copy
-  var invView: int -> Set[int]    // stale inventory snapshot (drives eviction guards)
-  var deleted: bool               // blob deleted at consensus (one-way)
-  var calm: int                   // consecutive engine ticks without env interference
-  var repairCost: int             // pulls x1, re-encodes xK (bandwidth-shaped units)
-  var goneCnt: int
-  var corruptCnt: int
-
-  // === Derived ===
-  val frags = 0.to(N_FRAGS - 1)
-  def isUp(n: int): bool = status.get(n) == UP
-  val upNodes = NODES.filter(n => isUp(n))
-  val extant = NODES.filter(n => status.get(n) != GONE)
-
-  // --- Placement variant 0: current select-then-modulo (small-net
-  // path: all members, sorted by id, class f -> members[f mod len]) ---
+// Placement functions — PURE, stateless. Kept in their own module so
+// they are referenced only where a config builds a placement TABLE
+// (Rust backend, run/test). The control logic below never calls them —
+// it reads an injected lookup — so `quint verify` (Apalache) never sees
+// this nonlinear integer arithmetic (modulo / divide-by-node-count),
+// which it rejects. The verify config passes a precomputed literal
+// table instead. See spec/README.md.
+module placement {
+  // Variant 0: current select-then-modulo (all members sorted by id,
+  // class f -> members[f mod len]).
   pure def minOf(s: Set[int]): int = s.fold(1000000, (a, x) => if (x < a) x else a)
 
   pure def nthSmallest(s: Set[int], n: int): int =
@@ -73,10 +43,10 @@ module storage_policy {
   pure def placeModulo(f: int, members: Set[int]): int =
     nthSmallest(members, f % members.size())
 
-  // --- Variants 1/2: weighted rendezvous (HRW). Deterministic integer
-  // mix stands in for blake3; the properties under check depend only on
+  // Variants 1/2: weighted rendezvous (HRW). Deterministic integer mix
+  // stands in for blake3; properties under check depend only on
   // determinism, not hash quality. Lower score wins; higher weight
-  // shrinks score (more responsibility). ---
+  // shrinks score (more responsibility).
   pure def mix(n: int, f: int): int = {
     val a = (n * 1103515245 + 12345) % 2147483647
     val b = (a * 31 + f * 1103515245 + 54321) % 2147483647
@@ -117,7 +87,64 @@ module storage_policy {
     else if (v == 1) placeHrw(f, members, w)
     else placeCappedAll(nfrags, members, w).get(f)
 
-  def resp(f: int): int = placeVariant(VARIANT, f, N_FRAGS, memberView, WEIGHT)
+  // Build the injected lookup: every non-empty member subset -> its
+  // (class -> responsible node) map. Consumed by config modules; on the
+  // Rust backend this is computed once. `members` is always non-empty
+  // in the control logic (init = NODES, engine syncs to a non-empty
+  // viewTarget), so the empty set is excluded.
+  pure def buildTable(v: int, nfrags: int, allNodes: Set[int], w: int -> int): Set[int] -> (int -> int) =
+    allNodes.powerset().exclude(Set(Set())).mapBy(s =>
+      range(0, nfrags).foldl(Map(), (acc, f) => acc.put(f, placeVariant(v, f, nfrags, s, w))))
+}
+
+module storage_policy {
+  // === Constants (fixed per config instance) ===
+  const NODES: Set[int]           // node id universe
+  const N_FRAGS: int              // fragment classes per chunk (30 real)
+  const K: int                    // RS reconstruction threshold (10 real)
+  const AUTO_PULL: bool           // policy: automatic tier-1 pull repair
+  const AUTO_REENCODE: bool       // policy: scrub re-encode of dead classes
+  const MAX_GONE: int             // fault budget: permanent node losses
+  const MAX_CORRUPT: int          // fault budget: single-copy corruptions
+  const CALM_BOUND: int           // recovery deadline in engine ticks
+  const DELTA: int                // decay gate: ticks down before view drops a node
+  const W: int                    // urgency watermark: live classes below W => re-encode now
+  // Injected placement lookup: member subset -> (class -> resp node).
+  // Decouples the control logic from placement arithmetic (see module
+  // `placement`), so Apalache can verify this model.
+  const PLACE: Set[int] -> (int -> int)
+
+  type Status = int               // 0 = Up, 1 = Down (copies intact), 2 = Gone (disk lost)
+  pure val UP = 0
+  pure val DOWN = 1
+  pure val GONE = 2
+
+  // === State ===
+  var status: int -> Status       // ground truth per node
+  var downFor: int -> int         // engine ticks each node has been non-Up (capped at DELTA)
+  var memberView: Set[int]        // consensus's damped membership view (lags status)
+  var copies: int -> Set[int]     // frag class -> nodes holding a live copy
+  var invView: int -> Set[int]    // stale inventory snapshot (drives eviction guards)
+  var deleted: bool               // blob deleted at consensus (one-way)
+  var calm: int                   // consecutive engine ticks without env interference
+  var repairCost: int             // pulls x1, re-encodes xK (bandwidth-shaped units)
+  var goneCnt: int
+  var corruptCnt: int
+
+  // === Derived ===
+  val frags = 0.to(N_FRAGS - 1)
+  def isUp(n: int): bool = status.get(n) == UP
+  val upNodes = NODES.filter(n => isUp(n))
+  val extant = NODES.filter(n => status.get(n) != GONE)
+
+  // Responsible node for class f = injected-table lookup. The table is
+  // total over non-empty subsets; memberView is always non-empty.
+  def resp(f: int): int = PLACE.get(memberView).get(f)
+
+  // Smallest element — deterministic pick for the single item repaired
+  // per tick. Linear (no arithmetic Apalache dislikes). Named distinctly
+  // from placement::minOf so a config importing both has no clash.
+  pure def least(s: Set[int]): int = s.fold(1000000, (a, x) => if (x < a) x else a)
 
   // === Invariant vocabulary ===
   // Durable: enough classes survive on intact disks to reconstruct.
@@ -132,8 +159,8 @@ module storage_policy {
     status' = NODES.mapBy(n => UP),
     downFor' = NODES.mapBy(n => 0),
     memberView' = NODES,
-    copies' = 0.to(N_FRAGS - 1).mapBy(f => Set(placeVariant(VARIANT, f, N_FRAGS, NODES, WEIGHT))),
-    invView' = 0.to(N_FRAGS - 1).mapBy(f => Set(placeVariant(VARIANT, f, N_FRAGS, NODES, WEIGHT))),
+    copies' = 0.to(N_FRAGS - 1).mapBy(f => Set(PLACE.get(NODES).get(f))),
+    invView' = 0.to(N_FRAGS - 1).mapBy(f => Set(PLACE.get(NODES).get(f))),
     deleted' = false,
     calm' = 0,
     repairCost' = 0,
@@ -282,14 +309,14 @@ module storage_policy {
       invView' = copies,
       memberView' = memberView, copies' = copies, repairCost' = repairCost,
     } else if (AUTO_PULL and not(deleted) and pullNeedy.size() > 0) all {
-      copies' = copies.set(minOf(pullNeedy),
-        copies.get(minOf(pullNeedy)).union(Set(resp(minOf(pullNeedy))))),
+      copies' = copies.set(least(pullNeedy),
+        copies.get(least(pullNeedy)).union(Set(resp(least(pullNeedy))))),
       repairCost' = repairCost + 1,
       memberView' = memberView, invView' = invView,
     } else if (AUTO_REENCODE and not(deleted)
         and reencodeReady.size() > 0 and liveClassCount >= K) all {
-      copies' = copies.set(minOf(reencodeReady),
-        copies.get(minOf(reencodeReady)).union(Set(resp(minOf(reencodeReady))))),
+      copies' = copies.set(least(reencodeReady),
+        copies.get(least(reencodeReady)).union(Set(resp(least(reencodeReady))))),
       repairCost' = repairCost + K,
       memberView' = memberView, invView' = invView,
     } else all {
@@ -324,27 +351,30 @@ module storage_policy {
 }
 
 // ============================================================
-// Config instances. `scaled_*` = exhaustive verification size
-// (K=2, R=4 — preserves the 1:2 RS ratio). `full` = real
-// parameters for deep random simulation.
-// DELTA=3, W=3 scaled; CALM_BOUND covers decay + full re-heal.
+// Config instances. Placement is injected as a lookup table (const
+// PLACE). `run`/`test` configs BUILD the table with placement::
+// buildTable (Rust backend computes the arithmetic once). The `verify`
+// config passes a LITERAL table so Apalache never touches the
+// arithmetic. `scaled_*` = exhaustive size (K=2, R=4 — 1:2 RS ratio);
+// `full` = real parameters (K=10, 30 classes) for deep simulation.
 // ============================================================
+
+// Shared scaled parameters (Rust-backend configs).
+module scaled_params {
+  import placement.*
+  pure val NODES4 = Set(1, 2, 3, 4)
+  pure val WEIGHT4 = Map(1 -> 3, 2 -> 2, 3 -> 1, 4 -> 1)
+}
 
 // Target policy, scaled, modulo placement.
 module scaled {
+  import placement.*
+  import scaled_params.*
   import storage_policy(
-    NODES = Set(1, 2, 3, 4),
-    N_FRAGS = 6,
-    K = 2,
-    WEIGHT = Map(1 -> 3, 2 -> 2, 3 -> 1, 4 -> 1),
-    VARIANT = 0,
-    AUTO_PULL = true,
-    AUTO_REENCODE = true,
-    MAX_GONE = 1,
-    MAX_CORRUPT = 1,
-    CALM_BOUND = 13,
-    DELTA = 3,
-    W = 3
+    NODES = NODES4, N_FRAGS = 6, K = 2,
+    PLACE = buildTable(0, 6, NODES4, WEIGHT4),
+    AUTO_PULL = true, AUTO_REENCODE = true,
+    MAX_GONE = 1, MAX_CORRUPT = 1, CALM_BOUND = 13, DELTA = 3, W = 3
   ).*
 
   // WITNESS: permanent node loss heals fully (view decays the ghost,
@@ -365,11 +395,11 @@ module scaled {
   // K per class the departed node owned PLUS 1 per surviving class the
   // placement function needlessly renumbered — the modulo tax.
   run departCostExactTest = {
-    val owned1 = 0.to(5).filter(f => placeVariant(0, f, 6, Set(1, 2, 3, 4), WEIGHT) == 1)
+    val owned1 = 0.to(5).filter(f => placeVariant(0, f, 6, Set(1, 2, 3, 4), WEIGHT4) == 1)
     val movedSurvivors = 0.to(5).filter(f =>
-      placeVariant(0, f, 6, Set(1, 2, 3, 4), WEIGHT) != 1
-        and placeVariant(0, f, 6, Set(2, 3, 4), WEIGHT)
-          != placeVariant(0, f, 6, Set(1, 2, 3, 4), WEIGHT))
+      placeVariant(0, f, 6, Set(1, 2, 3, 4), WEIGHT4) != 1
+        and placeVariant(0, f, 6, Set(2, 3, 4), WEIGHT4)
+          != placeVariant(0, f, 6, Set(1, 2, 3, 4), WEIGHT4))
     init.then(envDepartN(1)).then(18.reps(_ => engineTick))
       .expect(conformant and repairCost == 2 * owned1.size() + movedSurvivors.size())
   }
@@ -378,36 +408,30 @@ module scaled {
   // when the member set shrinks (the cost capped-HRW avoids).
   run moduloRenumberingTest =
     init.expect(0.to(5).exists(f =>
-      placeVariant(0, f, 6, Set(1, 2, 3, 4), WEIGHT) != 2
-        and placeVariant(0, f, 6, Set(1, 3, 4), WEIGHT)
-          != placeVariant(0, f, 6, Set(1, 2, 3, 4), WEIGHT)))
+      placeVariant(0, f, 6, Set(1, 2, 3, 4), WEIGHT4) != 2
+        and placeVariant(0, f, 6, Set(1, 3, 4), WEIGHT4)
+          != placeVariant(0, f, 6, Set(1, 2, 3, 4), WEIGHT4)))
 }
 
 // Target policy, scaled, plain HRW placement (kept for the spread
 // counterexample — NOT an adoption candidate).
 module scaled_hrw {
+  import placement.*
+  import scaled_params.*
   import storage_policy(
-    NODES = Set(1, 2, 3, 4),
-    N_FRAGS = 6,
-    K = 2,
-    WEIGHT = Map(1 -> 3, 2 -> 2, 3 -> 1, 4 -> 1),
-    VARIANT = 1,
-    AUTO_PULL = true,
-    AUTO_REENCODE = true,
-    MAX_GONE = 1,
-    MAX_CORRUPT = 1,
-    CALM_BOUND = 13,
-    DELTA = 3,
-    W = 3
+    NODES = NODES4, N_FRAGS = 6, K = 2,
+    PLACE = buildTable(1, 6, NODES4, WEIGHT4),
+    AUTO_PULL = true, AUTO_REENCODE = true,
+    MAX_GONE = 1, MAX_CORRUPT = 1, CALM_BOUND = 13, DELTA = 3, W = 3
   ).*
 
   // WITNESS: HRW moves NOTHING whose owner survived a member removal
   // (minimal-movement property, by construction of rendezvous hashing).
   run hrwMinimalMovementTest =
     init.expect(0.to(5).forall(f =>
-      placeVariant(1, f, 6, Set(1, 2, 3, 4), WEIGHT) != 2
-        implies placeVariant(1, f, 6, Set(1, 3, 4), WEIGHT)
-          == placeVariant(1, f, 6, Set(1, 2, 3, 4), WEIGHT)))
+      placeVariant(1, f, 6, Set(1, 2, 3, 4), WEIGHT4) != 2
+        implies placeVariant(1, f, 6, Set(1, 3, 4), WEIGHT4)
+          == placeVariant(1, f, 6, Set(1, 2, 3, 4), WEIGHT4)))
 
   run healsAfterDepartHrwTest =
     init.then(envDepart).then(18.reps(_ => engineTick))
@@ -417,19 +441,13 @@ module scaled_hrw {
 // Target policy, scaled, CAPPED HRW — the adoption candidate: minimal
 // movement (modulo tax gone) AND the spread lemma restored.
 module scaled_chrw {
+  import placement.*
+  import scaled_params.*
   import storage_policy(
-    NODES = Set(1, 2, 3, 4),
-    N_FRAGS = 6,
-    K = 2,
-    WEIGHT = Map(1 -> 3, 2 -> 2, 3 -> 1, 4 -> 1),
-    VARIANT = 2,
-    AUTO_PULL = true,
-    AUTO_REENCODE = true,
-    MAX_GONE = 1,
-    MAX_CORRUPT = 1,
-    CALM_BOUND = 13,
-    DELTA = 3,
-    W = 3
+    NODES = NODES4, N_FRAGS = 6, K = 2,
+    PLACE = buildTable(2, 6, NODES4, WEIGHT4),
+    AUTO_PULL = true, AUTO_REENCODE = true,
+    MAX_GONE = 1, MAX_CORRUPT = 1, CALM_BOUND = 13, DELTA = 3, W = 3
   ).*
 
   run healsAfterDepartChrwTest =
@@ -444,11 +462,11 @@ module scaled_chrw {
   // COST-BOUND for capped HRW: same exact-cost accounting as modulo's
   // witness — the doc compares the two movedSurvivors terms.
   run departCostExactChrwTest = {
-    val owned1 = 0.to(5).filter(f => placeVariant(2, f, 6, Set(1, 2, 3, 4), WEIGHT) == 1)
+    val owned1 = 0.to(5).filter(f => placeVariant(2, f, 6, Set(1, 2, 3, 4), WEIGHT4) == 1)
     val movedSurvivors = 0.to(5).filter(f =>
-      placeVariant(2, f, 6, Set(1, 2, 3, 4), WEIGHT) != 1
-        and placeVariant(2, f, 6, Set(2, 3, 4), WEIGHT)
-          != placeVariant(2, f, 6, Set(1, 2, 3, 4), WEIGHT))
+      placeVariant(2, f, 6, Set(1, 2, 3, 4), WEIGHT4) != 1
+        and placeVariant(2, f, 6, Set(2, 3, 4), WEIGHT4)
+          != placeVariant(2, f, 6, Set(1, 2, 3, 4), WEIGHT4))
     init.then(envDepartN(1)).then(18.reps(_ => engineTick))
       .expect(conformant and repairCost == 2 * owned1.size() + movedSurvivors.size())
   }
@@ -457,19 +475,13 @@ module scaled_chrw {
 // NEG: the currently-shipped policy — no automatic repair of any kind.
 // Expected: safety holds within budget, recovery VIOLATED.
 module scaled_neg {
+  import placement.*
+  import scaled_params.*
   import storage_policy(
-    NODES = Set(1, 2, 3, 4),
-    N_FRAGS = 6,
-    K = 2,
-    WEIGHT = Map(1 -> 3, 2 -> 2, 3 -> 1, 4 -> 1),
-    VARIANT = 0,
-    AUTO_PULL = false,
-    AUTO_REENCODE = false,
-    MAX_GONE = 1,
-    MAX_CORRUPT = 1,
-    CALM_BOUND = 13,
-    DELTA = 3,
-    W = 3
+    NODES = NODES4, N_FRAGS = 6, K = 2,
+    PLACE = buildTable(0, 6, NODES4, WEIGHT4),
+    AUTO_PULL = false, AUTO_REENCODE = false,
+    MAX_GONE = 1, MAX_CORRUPT = 1, CALM_BOUND = 13, DELTA = 3, W = 3
   ).*
 
   // NEG WITNESS: with the shipped policy a permanent loss NEVER heals —
@@ -482,19 +494,13 @@ module scaled_neg {
 // Tier-1 only: pull repair without re-encode (the RFC-014 engine if it
 // were automated). Expected: recovery VIOLATED on permanent loss.
 module scaled_tier1 {
+  import placement.*
+  import scaled_params.*
   import storage_policy(
-    NODES = Set(1, 2, 3, 4),
-    N_FRAGS = 6,
-    K = 2,
-    WEIGHT = Map(1 -> 3, 2 -> 2, 3 -> 1, 4 -> 1),
-    VARIANT = 0,
-    AUTO_PULL = true,
-    AUTO_REENCODE = false,
-    MAX_GONE = 1,
-    MAX_CORRUPT = 1,
-    CALM_BOUND = 13,
-    DELTA = 3,
-    W = 3
+    NODES = NODES4, N_FRAGS = 6, K = 2,
+    PLACE = buildTable(0, 6, NODES4, WEIGHT4),
+    AUTO_PULL = true, AUTO_REENCODE = false,
+    MAX_GONE = 1, MAX_CORRUPT = 1, CALM_BOUND = 13, DELTA = 3, W = 3
   ).*
 
   // NEG WITNESS: pull-only repair heals membership moves but CANNOT
@@ -515,21 +521,65 @@ module scaled_tier1 {
         isUp(resp(f)) and copies.get(f).intersect(upNodes).size() == 0))
 }
 
-// Full-scale parameters (K=10, 30 classes, 10 nodes) for `quint run`.
-module full {
+// EXHAUSTIVE VERIFICATION config (Apalache). Placement is a LITERAL
+// capped-HRW table (VARIANT 2 over Set(1,2,3,4), WEIGHT 3/2/1/1),
+// precomputed offline — no arithmetic for the SMT backend. Keep this
+// table in sync with placement::buildTable(2, 6, Set(1,2,3,4), W): if
+// the placement functions change, regenerate (see spec/README.md).
+module verify_table {
+  pure val CHRW_TABLE: Set[int] -> (int -> int) = Map(
+    Set(1)          -> Map(0->1, 1->1, 2->1, 3->1, 4->1, 5->1),
+    Set(2)          -> Map(0->2, 1->2, 2->2, 3->2, 4->2, 5->2),
+    Set(3)          -> Map(0->3, 1->3, 2->3, 3->3, 4->3, 5->3),
+    Set(4)          -> Map(0->4, 1->4, 2->4, 3->4, 4->4, 5->4),
+    Set(1,2)        -> Map(0->2, 1->1, 2->1, 3->1, 4->2, 5->2),
+    Set(1,3)        -> Map(0->1, 1->1, 2->1, 3->3, 4->3, 5->3),
+    Set(1,4)        -> Map(0->1, 1->4, 2->1, 3->1, 4->4, 5->4),
+    Set(2,3)        -> Map(0->2, 1->2, 2->2, 3->3, 4->3, 5->3),
+    Set(2,4)        -> Map(0->2, 1->4, 2->2, 3->2, 4->4, 5->4),
+    Set(3,4)        -> Map(0->3, 1->4, 2->4, 3->4, 4->3, 5->3),
+    Set(1,2,3)      -> Map(0->2, 1->1, 2->1, 3->2, 4->3, 5->3),
+    Set(1,2,4)      -> Map(0->2, 1->4, 2->1, 3->1, 4->2, 5->4),
+    Set(1,3,4)      -> Map(0->1, 1->4, 2->1, 3->4, 4->3, 5->3),
+    Set(2,3,4)      -> Map(0->2, 1->4, 2->2, 3->4, 4->3, 5->3),
+    Set(1,2,3,4)    -> Map(0->2, 1->4, 2->1, 3->1, 4->3, 5->2)
+  )
+}
+
+module scaled_verify {
+  import verify_table.*
   import storage_policy(
-    NODES = 1.to(10),
-    N_FRAGS = 30,
-    K = 10,
-    WEIGHT = Map(1 -> 3, 2 -> 3, 3 -> 2, 4 -> 2, 5 -> 1,
-                 6 -> 1, 7 -> 1, 8 -> 1, 9 -> 1, 10 -> 1),
-    VARIANT = 2,
-    AUTO_PULL = true,
-    AUTO_REENCODE = true,
-    MAX_GONE = 2,
-    MAX_CORRUPT = 3,
-    CALM_BOUND = 50,
-    DELTA = 5,
-    W = 20
+    NODES = Set(1, 2, 3, 4), N_FRAGS = 6, K = 2, PLACE = CHRW_TABLE,
+    AUTO_PULL = true, AUTO_REENCODE = true,
+    MAX_GONE = 1, MAX_CORRUPT = 1, CALM_BOUND = 13, DELTA = 3, W = 3
+  ).*
+}
+
+// Drift guard: the hand-pasted verify table MUST equal what the
+// placement functions generate. Run on the Rust backend (`quint test
+// --main table_guard`); if it fails, regenerate CHRW_TABLE.
+module table_guard {
+  import placement.*
+  import verify_table.*
+  var tick: int
+  action init = tick' = 0
+  action step = tick' = tick + 1
+  run tableMatchesGeneratorTest =
+    init.expect(CHRW_TABLE
+      == buildTable(2, 6, Set(1, 2, 3, 4), Map(1 -> 3, 2 -> 2, 3 -> 1, 4 -> 1)))
+}
+
+// Full-scale parameters (K=10, 30 classes, 10 nodes) for `quint run`.
+// Capped-HRW table over the powerset (built once on the Rust backend).
+module full {
+  import placement.*
+  pure val NODES10 = 1.to(10)
+  pure val WEIGHT10 = Map(1 -> 3, 2 -> 3, 3 -> 2, 4 -> 2, 5 -> 1,
+                          6 -> 1, 7 -> 1, 8 -> 1, 9 -> 1, 10 -> 1)
+  import storage_policy(
+    NODES = NODES10, N_FRAGS = 30, K = 10,
+    PLACE = buildTable(2, 30, NODES10, WEIGHT10),
+    AUTO_PULL = true, AUTO_REENCODE = true,
+    MAX_GONE = 2, MAX_CORRUPT = 3, CALM_BOUND = 50, DELTA = 5, W = 20
   ).*
 }
