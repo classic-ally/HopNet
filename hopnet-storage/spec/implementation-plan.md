@@ -1,6 +1,6 @@
 # RFC-STORAGE-002: Durability Policy Implementation
 
-**Status**: In progress.
+**Status**: Implemented (2026-07-15).
 **Contract**: RFC-STORAGE-001 (`spec/durability-policy.md`) — where this
 plan and the policy disagree, the policy wins. Model:
 `spec/storage_policy.qnt`.
@@ -49,6 +49,7 @@ key/value shape means that transaction needs no schema migration.
 | `burst_cap` (B_max) | 5 |
 | `reserve_slack` (σ) | 1 |
 | `climb_back` (ε) | 0 |
+| `availability_step_secs` | 600 |
 
 Orchestrator tests configure tiny tiers through genesis at mesh
 creation — the test path is the production path.
@@ -131,8 +132,24 @@ proven pieces. S1–S2 are dark (no production call sites).
   corrupt fragment → delete + attest → repair regenerates. Gate: new
   orchestrator `re-encode-after-departure`; `tier-membership`
   asserts view resync; restart-persistence green.
-- [ ] **S7 — docs + closeout.** system-overview sync; Deferred
+- [x] **S7 — docs + closeout.** system-overview sync; Deferred
   recorded.
+
+## Deviations from plan (recorded at closeout)
+
+- `watermark(v)` lives in `membership.rs`, not `engine/policy.rs` — the
+  engine module is behind the opt-in `engine` feature and pure math
+  must not be feature-gated.
+- The tick does not own self-check staleness; the existing self-check
+  cron remains the attestation owner (spec's tick-order deviation).
+- `EngineHandle::repair_blob` kept its name (rename to `pull_migration`
+  judged pure churn).
+- No pin HTTP route yet — the API is in-process for projections; a
+  route lands with the first projection consumer.
+- `availability_step_secs` added to mesh policy (not in the original
+  plan): bucket width is determinism-bearing, and seeding it tiny at
+  genesis makes decay tests seconds-scale — the availability window is
+  bounded in buckets (4320) so the grid stays constant-size.
 
 ## Risks
 

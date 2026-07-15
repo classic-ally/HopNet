@@ -87,9 +87,22 @@ apply functions inside consensus handlers.
       watermark GC, per-node decay tiers from absence history,
       capped-HRW placement (spread + minimal movement, quantified),
       re-encode as the core repair loop (keyless, chunk-flat,
-      mesh-sharded), watermark urgency floor. Implementation =
-      RFC-STORAGE-002 (not started); consensus deactivation spec owes
-      the membership rely condition
+      mesh-sharded), watermark urgency floor. Consensus deactivation
+      spec owes the membership rely condition
+- [x] Storage durability policy — IMPLEMENTED
+      ([RFC-STORAGE-002](../hopnet-storage/spec/implementation-plan.md),
+      2026-07-15): balanced capped rendezvous placement live (modulo
+      deleted; single responsible node per class); metrics-derived
+      decay-tier membership view (height-anchored scoring — no wall
+      clock in any derivation) with genesis-seeded
+      `hopnet_storage_policy` mesh config + `this_node` node settings;
+      ciphertext re-encode repair (byte-verified against manifest
+      hashes, repairer elected per chunk, urgent/lazy watermark
+      urgency); pins + decentralized watermark eviction (disk ground
+      truth, guard-carried safety); 5-min policy tick (view sync,
+      repair scan, migration pull, eviction, weekly rolling scrub).
+      Orchestrator: tier-membership, eviction-under-pressure,
+      re-encode-after-departure (kill → decay → regenerate → download)
 
 Reed-Solomon encoded file storage with encryption, chunked encoding, and fragment management.
 
