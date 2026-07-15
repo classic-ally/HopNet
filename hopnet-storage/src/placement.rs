@@ -200,6 +200,118 @@ pub struct Phase2Candidate {
 /// RFC-004 scoring weights: availability, throughput, latency, stability
 const PLACEMENT_WEIGHTS: (f64, f64, f64, f64) = (0.4, 0.3, 0.2, 0.1);
 
+/// One row's final placement score in [0, 1]: RFC-004 weighted base,
+/// trust-factor blend for new nodes, storage multiplier.
+fn score_row(metrics: &MetricsRow, fragment_type: FragmentType) -> f64 {
+    let base_score = match fragment_type {
+        FragmentType::Original => {
+            // Standard scoring: higher performance = higher score
+            metrics.availability_score * PLACEMENT_WEIGHTS.0
+                + metrics.throughput_score * PLACEMENT_WEIGHTS.1
+                + metrics.latency_score * PLACEMENT_WEIGHTS.2
+                + metrics.stability_score * PLACEMENT_WEIGHTS.3
+        }
+        FragmentType::Recovery => {
+            // Inverse scoring for geographic diversity and load distribution
+            metrics.availability_score * PLACEMENT_WEIGHTS.0 +
+            (1.0 - metrics.throughput_score) * PLACEMENT_WEIGHTS.1 + // Prefer lower throughput nodes
+            (1.0 - metrics.latency_score) * PLACEMENT_WEIGHTS.2 +    // Prefer higher latency (distant) nodes
+            (1.0 - metrics.stability_score) * PLACEMENT_WEIGHTS.3 // Prefer less stable nodes for diversity
+        }
+    };
+
+    // Blend measured score with a conservative fallback (0.5) for new nodes
+    let trusted_score = if metrics.trust_factor < 1.0 {
+        base_score * metrics.trust_factor + 0.5 * (1.0 - metrics.trust_factor)
+    } else {
+        base_score
+    };
+
+    // Storage multiplier (e^(-5 * utilization))
+    trusted_score * metrics.storage_multiplier
+}
+
+/// Quantized placement weight (RFC-STORAGE-001 Placement): the RFC-004
+/// Original-path score bucketed to 16 levels, never zero (rendezvous
+/// scores divide by it). Coarse buckets mean placement shifts only on real
+/// metric change, and every node derives the same weight from the same
+/// replicated rows.
+pub fn quantized_weight(metrics: &MetricsRow) -> u64 {
+    let score = score_row(metrics, FragmentType::Original);
+    ((score * 16.0).round() as i64).clamp(1, 16) as u64
+}
+
+/// Balanced capped rendezvous over an arbitrary score function
+/// (RFC-STORAGE-001 Placement; mirrors `placeBalancedAll` in
+/// `spec/storage_policy.qnt` — the drift-guard test reproduces the model's
+/// literal tables through this fold).
+///
+/// Classes in index order; each goes to the lowest-scoring member among
+/// those at the CURRENT minimum load, ties to the smaller node id. Loads
+/// end at the tightest integer split (max − min ≤ 1, no zero-load members
+/// while classes ≥ members). Member order cannot matter: selection is a
+/// minimum over a totally ordered key.
+///
+/// Score contract: lower wins, already weight-divided.
+pub fn assign_classes_by_score(
+    members: &[i32],
+    n_classes: u32,
+    score: impl Fn(i32, u32) -> u64,
+) -> Vec<i32> {
+    if members.is_empty() {
+        return Vec::new();
+    }
+    let mut loads: std::collections::HashMap<i32, u32> =
+        members.iter().map(|&m| (m, 0)).collect();
+    let mut assignment = Vec::with_capacity(n_classes as usize);
+    for class in 0..n_classes {
+        let min_load = *loads.values().min().expect("members non-empty");
+        let chosen = members
+            .iter()
+            .copied()
+            .filter(|m| loads[m] == min_load)
+            .min_by_key(|&m| (score(m, class), m))
+            .expect("min-load tier non-empty");
+        *loads.get_mut(&chosen).expect("chosen is a member") += 1;
+        assignment.push(chosen);
+    }
+    assignment
+}
+
+/// Production placement: class → responsible node for one blob.
+/// Score = first 8 bytes (BE) of blake3(seed ‖ class ‖ node_id), divided
+/// by the node's quantized weight (integer division, like the model's
+/// `hrwScore = mix / w`). Weights default to 1 when absent.
+pub fn assign_fragment_classes(
+    seed: &[u8; 32],
+    members: &[i32],
+    weights: &std::collections::HashMap<i32, u64>,
+    n_classes: u32,
+) -> Vec<i32> {
+    assign_classes_by_score(members, n_classes, |node, class| {
+        let mut input = [0u8; 32 + 4 + 4];
+        input[..32].copy_from_slice(seed);
+        input[32..36].copy_from_slice(&class.to_be_bytes());
+        input[36..].copy_from_slice(&node.to_be_bytes());
+        let hash = blake3::hash(&input);
+        let raw = u64::from_be_bytes(hash.as_bytes()[..8].try_into().expect("8 bytes"));
+        raw / weights.get(&node).copied().unwrap_or(1).max(1)
+    })
+}
+
+/// Single responsible node for one class (None on an empty member set).
+pub fn responsible_node(
+    seed: &[u8; 32],
+    class: u32,
+    members: &[i32],
+    weights: &std::collections::HashMap<i32, u64>,
+    n_classes: u32,
+) -> Option<i32> {
+    assign_fragment_classes(seed, members, weights, n_classes)
+        .get(class as usize)
+        .copied()
+}
+
 /// Phase 2: Calculate final placement scores using RFC-compliant weights
 /// Takes metrics rows and applies fragment-type-specific scoring
 pub fn calculate_final_placement_scores(
@@ -208,40 +320,9 @@ pub fn calculate_final_placement_scores(
 ) -> Vec<Phase2Candidate> {
     let mut candidates: Vec<Phase2Candidate> = node_metrics
         .into_iter()
-        .map(|metrics| {
-            // Calculate base score using fragment-type-specific weights
-            let base_score = match fragment_type {
-                FragmentType::Original => {
-                    // Standard scoring: higher performance = higher score
-                    metrics.availability_score * PLACEMENT_WEIGHTS.0
-                        + metrics.throughput_score * PLACEMENT_WEIGHTS.1
-                        + metrics.latency_score * PLACEMENT_WEIGHTS.2
-                        + metrics.stability_score * PLACEMENT_WEIGHTS.3
-                }
-                FragmentType::Recovery => {
-                    // Inverse scoring for geographic diversity and load distribution
-                    metrics.availability_score * PLACEMENT_WEIGHTS.0 +
-                    (1.0 - metrics.throughput_score) * PLACEMENT_WEIGHTS.1 + // Prefer lower throughput nodes
-                    (1.0 - metrics.latency_score) * PLACEMENT_WEIGHTS.2 +    // Prefer higher latency (distant) nodes
-                    (1.0 - metrics.stability_score) * PLACEMENT_WEIGHTS.3 // Prefer less stable nodes for diversity
-                }
-            };
-
-            // Apply trust factor blending for new nodes
-            let trusted_score = if metrics.trust_factor < 1.0 {
-                // Blend measured score with conservative fallback (0.5)
-                base_score * metrics.trust_factor + 0.5 * (1.0 - metrics.trust_factor)
-            } else {
-                base_score
-            };
-
-            // Apply storage multiplier (e^(-5 * utilization))
-            let final_score = trusted_score * metrics.storage_multiplier;
-
-            Phase2Candidate {
-                node_id: metrics.node_id,
-                final_score,
-            }
+        .map(|metrics| Phase2Candidate {
+            node_id: metrics.node_id,
+            final_score: score_row(&metrics, fragment_type),
         })
         .collect();
 
@@ -477,6 +558,130 @@ mod tests {
         // Verify total is 30
         let total: i32 = primary_counts.iter().sum();
         assert_eq!(total, 30);
+    }
+
+    // Should: land the tightest integer split at every member count —
+    // max − min ≤ 1, every member responsible for ≥ ⌊N/v⌋ ≥ 1 classes,
+    // total N — for uniform AND skewed weights (the cap binds; weights
+    // choose which classes, never the count).
+    // Should not: leave a zero-load member (the greedy capped-HRW failure
+    // the model witnessed at v=9).
+    // Impact: INV-SPREAD is what makes the derived watermark's burst
+    // bound two-sided; a zero-load member is wasted fault tolerance.
+    #[test]
+    fn balanced_spread_tight_at_every_size() {
+        for v in 3..=30i32 {
+            let members: Vec<i32> = (1..=v).collect();
+            for weights in [
+                std::collections::HashMap::new(),
+                members.iter().map(|&m| (m, (m as u64 % 3) + 1)).collect(),
+            ] {
+                let assignment = assign_fragment_classes(&seed(7), &members, &weights, 30);
+                let mut counts = std::collections::HashMap::new();
+                for node in &assignment {
+                    *counts.entry(*node).or_insert(0u32) += 1;
+                }
+                assert_eq!(counts.len(), v as usize, "v={v}: zero-load member");
+                let max = counts.values().max().unwrap();
+                let min = counts.values().min().unwrap();
+                assert!(max - min <= 1, "v={v}: loads {counts:?}");
+                assert_eq!(assignment.len(), 30);
+            }
+        }
+    }
+
+    // Should: produce the identical assignment regardless of member input
+    // order (selection is a minimum over a total order).
+    // Impact: nodes build their member lists from independently ordered
+    // queries; order sensitivity would silently diverge placement
+    // mesh-wide.
+    #[test]
+    fn balanced_member_order_independent() {
+        let forward: Vec<i32> = (1..=9).collect();
+        let mut reversed = forward.clone();
+        reversed.reverse();
+        let shuffled = vec![4, 9, 1, 7, 3, 8, 2, 6, 5];
+        let weights = forward.iter().map(|&m| (m, (m as u64 % 4) + 1)).collect();
+        let a = assign_fragment_classes(&seed(9), &forward, &weights, 30);
+        let b = assign_fragment_classes(&seed(9), &reversed, &weights, 30);
+        let c = assign_fragment_classes(&seed(9), &shuffled, &weights, 30);
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+    }
+
+    /// The model's deterministic integer hash stand-in, ported verbatim
+    /// from spec/storage_policy.qnt `mix` (staged mod-multiply).
+    fn qnt_mix(n: i64, f: i64) -> i64 {
+        let a = (n * 1103515245 + 12345) % 2147483647;
+        let b = (a * 31 + f * 1103515245 + 54321) % 2147483647;
+        (b * 65539 + a * (f + 7)) % 2147483647
+    }
+
+    // Should: reproduce the literal BAL_TABLE from the verified model
+    // (spec/storage_policy.qnt module verify_table — the exact table
+    // Apalache exhaustively checked INV-DURABLE/INV-SPREAD against) when
+    // driven by the model's own mix()/weight scoring, for every member
+    // subset.
+    // Should not: differ in fold order, min-load tier selection, or
+    // tie-break — those ARE the verified algorithm.
+    // Impact: this is the drift guard that transfers the model's
+    // verification to the Rust fold; blake3 vs mix is outside the verified
+    // properties (the model states hash quality is non-load-bearing).
+    #[test]
+    fn balanced_matches_qnt_verify_table() {
+        let weights: std::collections::HashMap<i32, i64> =
+            [(1, 3), (2, 2), (3, 1), (4, 1)].into();
+        let table: &[(&[i32], [i32; 6])] = &[
+            (&[1], [1, 1, 1, 1, 1, 1]),
+            (&[2], [2, 2, 2, 2, 2, 2]),
+            (&[3], [3, 3, 3, 3, 3, 3]),
+            (&[4], [4, 4, 4, 4, 4, 4]),
+            (&[1, 2], [2, 1, 1, 2, 1, 2]),
+            (&[1, 3], [1, 3, 1, 3, 1, 3]),
+            (&[1, 4], [1, 4, 1, 4, 1, 4]),
+            (&[2, 3], [2, 3, 2, 3, 3, 2]),
+            (&[2, 4], [2, 4, 2, 4, 2, 4]),
+            (&[3, 4], [3, 4, 4, 3, 3, 4]),
+            (&[1, 2, 3], [2, 1, 3, 1, 3, 2]),
+            (&[1, 2, 4], [2, 4, 1, 1, 2, 4]),
+            (&[1, 3, 4], [1, 4, 3, 1, 3, 4]),
+            (&[2, 3, 4], [2, 4, 3, 2, 3, 4]),
+            (&[1, 2, 3, 4], [2, 4, 1, 3, 1, 2]),
+        ];
+        for (members, expected) in table {
+            let got = assign_classes_by_score(members, 6, |n, f| {
+                (qnt_mix(n as i64, f as i64) / weights[&n]) as u64
+            });
+            assert_eq!(&got, expected, "members {members:?}");
+        }
+    }
+
+    // Should: bucket the RFC-004 score into 1..=16, never zero, and move
+    // only when the underlying score crosses a bucket edge.
+    // Impact: a zero weight would divide-by-zero the rendezvous score; a
+    // fine-grained weight would re-place blobs on every metrics jitter.
+    #[test]
+    fn quantized_weight_bounds_and_coarseness() {
+        let mut row = MetricsRow {
+            node_id: 1,
+            trust_factor: 1.0,
+            availability_score: 0.0,
+            throughput_score: 0.0,
+            latency_score: 0.0,
+            stability_score: 0.0,
+            storage_multiplier: 1.0,
+        };
+        assert_eq!(quantized_weight(&row), 1); // floor never 0
+        row.availability_score = 1.0;
+        row.throughput_score = 1.0;
+        row.latency_score = 1.0;
+        row.stability_score = 1.0;
+        assert_eq!(quantized_weight(&row), 16); // ceiling clamped
+        // Jitter within one bucket does not move the weight.
+        row.availability_score = 0.80;
+        let w1 = quantized_weight(&row);
+        row.availability_score = 0.81;
+        assert_eq!(quantized_weight(&row), w1);
     }
 
     #[test]

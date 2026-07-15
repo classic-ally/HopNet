@@ -18,6 +18,7 @@ pub mod engine;
 pub mod error;
 pub mod fragstore;
 pub mod maintenance;
+pub mod membership;
 pub mod placement;
 pub mod rpc;
 pub mod rs;

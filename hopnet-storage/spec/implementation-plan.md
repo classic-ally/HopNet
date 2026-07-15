@@ -75,7 +75,7 @@ evictable may lack a regeneration path), and the tick wires only
 proven pieces. S1–S2 are dark (no production call sites).
 
 - [x] **S0 — this document.**
-- [ ] **S1 — pure policy math, dark.** `placement.rs`:
+- [x] **S1 — pure policy math, dark.** `placement.rs`:
   `quantized_weight` (small-int buckets), `assign_fragment_classes`
   (balanced capped rendezvous, integer scoring, must reproduce the
   `.qnt` `buildTable` literal tables as test vectors),
