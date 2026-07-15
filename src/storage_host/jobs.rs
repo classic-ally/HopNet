@@ -459,3 +459,174 @@ pub async fn run_orphaned_fragments_cleanup(
             )))))
         })
 }
+
+/// Watermark eviction (RFC-STORAGE-001 GC, RFC-STORAGE-002 S5): under
+/// disk pressure, evict SURPLUS fragments oldest-blob-first from the high
+/// watermark down to the low. The guard — never responsible, never
+/// pinned, another member must attest a copy — carries the safety
+/// invariant; watermarks only decide when pressure acts.
+///
+/// `override_watermarks` is a test hook replacing the this_node settings
+/// for one run (e.g. (0, 0) forces maximal eviction of evictable surplus).
+pub async fn run_watermark_eviction(
+    app_state: &AppState,
+    override_watermarks: Option<(u8, u8)>,
+    grace_secs: Option<u64>,
+) -> Result<serde_json::Value, Error> {
+    use hopnet_storage::eviction::{DiskPressure, EvictionCandidate, plan_evictions};
+    use hopnet_storage::traits::{LocalStateSink, StateReader};
+
+    let fragments_dir = crate::storage_host::functions::get_fragments_dir()
+        .map_err(|e| Error::Failed(Arc::new(format!("fragments dir: {e:?}").into())))?;
+
+    // Disk pressure from the filesystem itself (statvfs).
+    let dir = fragments_dir.clone();
+    let (total_bytes, used_bytes) = tokio::task::spawn_blocking(move || {
+        let stats = fs4::statvfs(&dir)?;
+        Ok::<_, std::io::Error>((stats.total_space(), stats.total_space() - stats.available_space()))
+    })
+    .await
+    .map_err(|e| Error::Failed(Arc::new(format!("statvfs join: {e}").into())))?
+    .map_err(|e| Error::Failed(Arc::new(format!("statvfs: {e}").into())))?;
+
+    let my_node_id = app_state
+        .get_node_id()
+        .map_err(|_| Error::Failed(Arc::new("node id not set".to_string().into())))?;
+
+    let (high_pct, low_pct) = match override_watermarks {
+        Some(marks) => marks,
+        None => {
+            let conn = app_state
+                .db_pool
+                .get()
+                .map_err(|e| Error::Failed(Arc::new(format!("pool: {e}").into())))?;
+            let settings = crate::db::shared::read_storage_node_settings(&conn)
+                .map_err(|e| Error::Failed(Arc::new(format!("settings: {e:?}").into())))?;
+            (settings.gc_high_pct, settings.gc_low_pct)
+        }
+    };
+
+    let pressure = DiskPressure {
+        used_bytes,
+        total_bytes,
+        high_pct,
+        low_pct,
+    };
+    let high_bytes = total_bytes / 100 * high_pct as u64;
+    if used_bytes <= high_bytes {
+        return Ok(serde_json::json!({
+            "evicted": 0, "bytes_freed": 0,
+            "used_bytes": used_bytes, "total_bytes": total_bytes,
+            "high_pct": high_pct, "low_pct": low_pct,
+            "reason": "below high watermark",
+        }));
+    }
+
+    // Member view + on-disk fragments (grace period avoids racing
+    // in-flight stores, mirroring the orphan scan).
+    let host = SubstrateHost::new(app_state.clone());
+    let view = tokio::task::spawn_blocking(move || host.storage_view())
+        .await
+        .map_err(|e| Error::Failed(Arc::new(format!("view join: {e}").into())))?
+        .map_err(|e| Error::Failed(Arc::new(format!("storage view: {e}").into())))?;
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let disk = hopnet_storage::fragstore::scan_fragments(
+        &fragments_dir,
+        now_unix - grace_secs.unwrap_or(3600),
+    )
+        .map_err(|e| Error::Failed(Arc::new(format!("disk scan: {e}").into())))?;
+    if disk.is_empty() {
+        return Ok(serde_json::json!({
+            "evicted": 0, "bytes_freed": 0,
+            "used_bytes": used_bytes, "total_bytes": total_bytes,
+            "reason": "no eligible on-disk fragments",
+        }));
+    }
+
+    let member_ids: std::collections::HashSet<i32> =
+        view.members.iter().map(|p| p.node_id).collect();
+    let hashes: Vec<crate::types::Blake3Hash> = disk.iter().map(|(h, _)| *h).collect();
+
+    let (info, holder_counts, pinned) = {
+        let conn = app_state
+            .db_pool
+            .get()
+            .map_err(|e| Error::Failed(Arc::new(format!("pool: {e}").into())))?;
+        let info = crate::db::fragments::lookup_disk_fragments(&conn, &hashes)
+            .map_err(|e| Error::Failed(Arc::new(format!("fragment lookup: {e:?}").into())))?;
+        let holder_counts =
+            crate::db::fragments::member_holder_counts(&conn, &hashes, &member_ids, my_node_id)
+                .map_err(|e| Error::Failed(Arc::new(format!("holder counts: {e:?}").into())))?;
+        let pinned = hopnet_storage::pins::pinned_blob_ids(&conn)
+            .map_err(|e| Error::Failed(Arc::new(format!("pins: {e}").into())))?;
+        (info, holder_counts, pinned)
+    };
+
+    // Per-blob class assignment under the current view — responsibility is
+    // computed, never stored.
+    let mut assignments: std::collections::HashMap<String, Vec<i32>> = Default::default();
+    let mut candidates = Vec::new();
+    for (hash, size) in &disk {
+        // Not in fragment_hashes = orphan; the orphan GC flow owns it.
+        let Some(frag) = info.get(hash) else { continue };
+        let assignment = assignments
+            .entry(frag.blob_id.clone())
+            .or_insert_with(|| {
+                use std::str::FromStr;
+                let seed = hopnet_storage::BlobId::from_str(&frag.blob_id)
+                    .map(|id| hopnet_storage::placement::placement_seed(&id))
+                    .unwrap_or([0u8; 32]);
+                hopnet_storage::engine::assign_for_blob(
+                    &seed,
+                    view.members.clone(),
+                    view.metrics.clone(),
+                    &view.weights,
+                )
+                .1
+            });
+        candidates.push(EvictionCandidate {
+            fragment_hash: *hash,
+            blob_id: frag.blob_id.clone(),
+            size_bytes: *size,
+            responsible: assignment.get(frag.local_index as usize).copied()
+                == Some(my_node_id),
+            pinned: pinned.contains(&frag.blob_id),
+            other_member_holders: holder_counts.get(hash).copied().unwrap_or(0),
+        });
+    }
+
+    let planned = plan_evictions(candidates, &pressure);
+    let mut bytes_freed = 0u64;
+    let sizes: std::collections::HashMap<_, _> = disk.into_iter().collect();
+    let mut deleted = Vec::new();
+    for hash in &planned {
+        match hopnet_storage::fragstore::delete_fragment(&fragments_dir, hash) {
+            Ok(()) => {
+                bytes_freed += sizes.get(hash).copied().unwrap_or(0);
+                deleted.push(*hash);
+            }
+            Err(e) => tracing::warn!("eviction: delete {} failed: {e}", hash.to_hex()),
+        }
+    }
+    if !deleted.is_empty() {
+        let host = SubstrateHost::new(app_state.clone());
+        host.mark_remote_batch(deleted.clone());
+    }
+
+    tracing::info!(
+        "watermark eviction: {} fragments evicted, {} bytes freed ({}% used, high {}%, low {}%)",
+        deleted.len(),
+        bytes_freed,
+        used_bytes * 100 / total_bytes.max(1),
+        high_pct,
+        low_pct
+    );
+    Ok(serde_json::json!({
+        "evicted": deleted.len(), "bytes_freed": bytes_freed,
+        "used_bytes": used_bytes, "total_bytes": total_bytes,
+        "high_pct": high_pct, "low_pct": low_pct,
+    }))
+}

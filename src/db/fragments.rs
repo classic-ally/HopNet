@@ -213,3 +213,80 @@ pub fn get_local_fragment_count(
         Err(_) => Err(DatabaseError::LockError),
     }
 }
+
+/// One disk fragment's control-plane facts for eviction classification
+/// (RFC-STORAGE-002 S5).
+#[derive(Debug)]
+pub struct DiskFragmentInfo {
+    pub blob_id: String,
+    pub local_index: u32,
+}
+
+/// Look up (blob, class) for on-disk fragment hashes. Hashes absent from
+/// fragment_hashes are orphans — the orphan GC flow owns those, not
+/// eviction.
+pub fn lookup_disk_fragments(
+    conn: &rusqlite::Connection,
+    hashes: &[crate::types::Blake3Hash],
+) -> Result<std::collections::HashMap<crate::types::Blake3Hash, DiskFragmentInfo>, DatabaseError> {
+    let mut out = std::collections::HashMap::new();
+    for chunk in hashes.chunks(500) {
+        let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let query = format!(
+            "SELECT fragment_hash, data_block_id, local_index
+             FROM fragment_hashes WHERE fragment_hash IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&query).map_err(|_| DatabaseError::RecallError)?;
+        let params: Vec<&dyn rusqlite::ToSql> =
+            chunk.iter().map(|h| h as &dyn rusqlite::ToSql).collect();
+        let mut rows = stmt
+            .query(params.as_slice())
+            .map_err(|_| DatabaseError::RecallError)?;
+        while let Some(row) = rows.next().map_err(|_| DatabaseError::RecallError)? {
+            let hash: crate::types::Blake3Hash =
+                row.get(0).map_err(|_| DatabaseError::ProcessingError)?;
+            out.insert(
+                hash,
+                DiskFragmentInfo {
+                    blob_id: row.get(1).map_err(|_| DatabaseError::ProcessingError)?,
+                    local_index: row.get(2).map_err(|_| DatabaseError::ProcessingError)?,
+                },
+            );
+        }
+    }
+    Ok(out)
+}
+
+/// Per-hash count of OTHER member nodes attesting a copy in the replicated
+/// inventory — the eviction guard's input. Filtered by the member view:
+/// departed nodes' lingering rows must never count as holders.
+pub fn member_holder_counts(
+    conn: &rusqlite::Connection,
+    hashes: &[crate::types::Blake3Hash],
+    member_nodes: &std::collections::HashSet<i32>,
+    my_node_id: i32,
+) -> Result<std::collections::HashMap<crate::types::Blake3Hash, usize>, DatabaseError> {
+    let mut out = std::collections::HashMap::new();
+    for chunk in hashes.chunks(500) {
+        let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let query = format!(
+            "SELECT fragment_hash, node_id FROM fragment_inventory
+             WHERE fragment_hash IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&query).map_err(|_| DatabaseError::RecallError)?;
+        let params: Vec<&dyn rusqlite::ToSql> =
+            chunk.iter().map(|h| h as &dyn rusqlite::ToSql).collect();
+        let mut rows = stmt
+            .query(params.as_slice())
+            .map_err(|_| DatabaseError::RecallError)?;
+        while let Some(row) = rows.next().map_err(|_| DatabaseError::RecallError)? {
+            let hash: crate::types::Blake3Hash =
+                row.get(0).map_err(|_| DatabaseError::ProcessingError)?;
+            let node: i32 = row.get(1).map_err(|_| DatabaseError::ProcessingError)?;
+            if node != my_node_id && member_nodes.contains(&node) {
+                *out.entry(hash).or_insert(0) += 1;
+            }
+        }
+    }
+    Ok(out)
+}

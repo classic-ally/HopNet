@@ -144,6 +144,19 @@ pub fn install_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
+
+        -- Pins (RFC-STORAGE-001 Copy classes): substrate state, projection
+        -- meaning — owner is an opaque projection tag. NODE-LOCAL, never
+        -- replicated (host lists it in LOCAL_ONLY_TABLES). Deliberately no
+        -- FK to data_blocks: a pin may outlive a raced delete; eviction
+        -- ignores pins on deleted blobs.
+        CREATE TABLE hopnet_storage_pins (
+            blob_id   TEXT NOT NULL,
+            owner     TEXT NOT NULL,
+            pinned_at TEXT NOT NULL,  -- informational only
+            PRIMARY KEY (blob_id, owner)
+        );
+        CREATE INDEX idx_hopnet_storage_pins_blob ON hopnet_storage_pins(blob_id);
         ",
     )
 }

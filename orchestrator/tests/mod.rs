@@ -14,6 +14,7 @@ pub mod files;
 mod consensus_queue;
 mod db_pragma_bench;
 mod device_tokens;
+mod eviction;
 mod documentprovider_write;
 mod file_upload;
 mod fileprovider_device_token;
@@ -186,6 +187,11 @@ pub async fn run_test_by_name(
                 .await
         }
         "metrics-collection" => metrics::MetricsCollection.run(mesh_id, nodes, flags).await,
+        "eviction-under-pressure" => {
+            eviction::EvictionUnderPressure
+                .run(mesh_id, nodes, flags)
+                .await
+        }
         "tier-membership" => {
             tier_membership::TierMembership
                 .run(mesh_id, nodes, flags)
@@ -335,6 +341,7 @@ pub fn list_test_names() -> Vec<&'static str> {
         "consensus-barrier-proposal-hold",
         "metrics-collection",
         "tier-membership",
+        "eviction-under-pressure",
         "multi-user-isolation",
         "multi-user-sharing",
         "multi-user-sharing-live-link",

@@ -258,7 +258,7 @@ impl EngineHandle {
 /// members at ≤30, scored top-30 above), then the balanced assignment over
 /// the selected ids. Returns the selected peers (pull-candidate pool)
 /// alongside the class map.
-fn assign_for_blob(
+pub fn assign_for_blob(
     seed: &[u8; 32],
     members: Vec<PeerRef>,
     metrics: Vec<crate::placement::MetricsRow>,

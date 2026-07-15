@@ -16,9 +16,11 @@ pub mod crypto;
 #[cfg(feature = "engine")]
 pub mod engine;
 pub mod error;
+pub mod eviction;
 pub mod fragstore;
 pub mod maintenance;
 pub mod membership;
+pub mod pins;
 pub mod placement;
 pub mod rpc;
 pub mod rs;

@@ -472,6 +472,10 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                         .delete(storage_host::routes::delete_orphaned_fragments),
                 )
                 .route(
+                    "/maintenance/watermark-eviction",
+                    post(storage_host::routes::post_watermark_eviction),
+                )
+                .route(
                     "/diagnostics/fragment-inventory-differential",
                     get(storage_host::routes::get_fragment_inventory_differential),
                 )

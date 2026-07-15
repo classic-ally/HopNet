@@ -47,6 +47,35 @@ pub struct FileFragmentsResponse {
 
 /// GET /fragments
 /// Get count of fragments stored locally on this node
+#[derive(Deserialize)]
+pub struct EvictionQueryParams {
+    high_pct: Option<u8>,
+    low_pct: Option<u8>,
+    grace_secs: Option<u64>,
+}
+
+/// POST /maintenance/watermark-eviction — run one eviction cycle
+/// (RFC-STORAGE-002 S5). Optional high_pct/low_pct override the node
+/// settings for this run (test hook; (0,0) forces maximal surplus
+/// eviction).
+pub async fn post_watermark_eviction(
+    State(app_state): State<AppState>,
+    Query(params): Query<EvictionQueryParams>,
+) -> impl IntoResponse {
+    let overrides = match (params.high_pct, params.low_pct) {
+        (Some(h), Some(l)) => Some((h, l)),
+        _ => None,
+    };
+    match super::jobs::run_watermark_eviction(&app_state, overrides, params.grace_secs).await {
+        Ok(summary) => (StatusCode::OK, Json(summary)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("watermark eviction: {e}"),
+        )
+            .into_response(),
+    }
+}
+
 /// GET /storage/view — the decay-tiered storage membership view
 /// (RFC-STORAGE-002 S2 observability): members, per-node tiers/weights,
 /// derived watermark. Every node must report the same view at the same

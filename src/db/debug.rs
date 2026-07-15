@@ -5,7 +5,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Tables to skip entirely (local-only state)
-const LOCAL_ONLY_TABLES: &[&str] = &["this_node", "modification_log", "pending_fragment_requests"];
+const LOCAL_ONLY_TABLES: &[&str] = &[
+    "this_node",
+    "modification_log",
+    "pending_fragment_requests",
+    "hopnet_storage_pins",
+];
 
 /// Columns to exclude from consensus-tracked tables
 const EXCLUDED_COLUMNS: &[(&str, &[&str])] = &[

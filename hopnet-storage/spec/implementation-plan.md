@@ -116,7 +116,7 @@ proven pieces. S1–S2 are dark (no production call sites).
   holder within tier). Gate: byte-identity round-trip tests (real
   `put` output, deleted shards, both original and recovery classes);
   fragment-health-check green.
-- [ ] **S5 — pins + watermark eviction.** `hopnet_storage_pins`
+- [x] **S5 — pins + watermark eviction.** `hopnet_storage_pins`
   table (local-only registry entry); substrate `pins.rs` API; pure
   `eviction.rs` planner — surplus-only, unpinned, oldest first,
   guard = another live holder or blob deleted, stop at low watermark;

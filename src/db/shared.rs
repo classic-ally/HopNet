@@ -455,3 +455,36 @@ pub fn initialize(db: PooledConnection<SqliteConnectionManager>) -> Result<(), D
 
     Ok(())
 }
+
+/// Node-local storage settings from the this_node singleton
+/// (RFC-STORAGE-002 Configuration; surfaced in node settings UI later).
+#[derive(Debug, Clone, Copy)]
+pub struct StorageNodeSettings {
+    pub gc_high_pct: u8,
+    pub gc_low_pct: u8,
+    pub reencode_enabled: bool,
+    pub repair_budget_pct: u8,
+}
+
+pub fn read_storage_node_settings(
+    conn: &rusqlite::Connection,
+) -> Result<StorageNodeSettings, DatabaseError> {
+    conn.query_row(
+        "SELECT hopnet_storage_gc_high_pct, hopnet_storage_gc_low_pct,
+                hopnet_storage_reencode_enabled, hopnet_storage_repair_budget_pct
+         FROM this_node WHERE internal_id = 1",
+        [],
+        |row| {
+            Ok(StorageNodeSettings {
+                gc_high_pct: row.get::<_, i64>(0)? as u8,
+                gc_low_pct: row.get::<_, i64>(1)? as u8,
+                reencode_enabled: row.get::<_, i64>(2)? != 0,
+                repair_budget_pct: row.get::<_, i64>(3)? as u8,
+            })
+        },
+    )
+    .map_err(|e| {
+        tracing::error!("read storage node settings: {e:?}");
+        DatabaseError::RecallError
+    })
+}
