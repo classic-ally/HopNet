@@ -396,6 +396,26 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 self_check_worker.run().await;
             });
 
+            // Storage policy tick (RFC-STORAGE-002 S6): view sync, repair
+            // scan (urgent + one lazy re-encode), one migration pull,
+            // eviction check, daily scrub slice. Randomized ~5 min cadence.
+            let random_second = rand::rng().random_range(5..55);
+            let random_minute = rand::rng().random_range(0..5);
+            let policy_tick_cron_expression =
+                format!("{} {}/5 * * * *", random_second, random_minute);
+            let policy_tick_schedule =
+                apalis_cron::Schedule::from_str(&policy_tick_cron_expression).unwrap();
+            let policy_tick_cron_stream = apalis_cron::CronStream::new(policy_tick_schedule);
+
+            let policy_tick_worker = WorkerBuilder::new("storage-policy-tick")
+                .data(app_state.clone())
+                .backend(policy_tick_cron_stream)
+                .build_fn(storage_host::jobs::handle_storage_policy_tick);
+
+            tokio::spawn(async move {
+                policy_tick_worker.run().await;
+            });
+
             // Spawn consensus queue batch processor — on the dedicated queue
             // runtime (see consensus::queue::queue_rt) so consensus keeps
             // draining when API load starves the main runtime.
@@ -474,6 +494,10 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 .route(
                     "/maintenance/watermark-eviction",
                     post(storage_host::routes::post_watermark_eviction),
+                )
+                .route(
+                    "/maintenance/policy-tick",
+                    post(storage_host::routes::post_policy_tick),
                 )
                 .route(
                     "/diagnostics/fragment-inventory-differential",

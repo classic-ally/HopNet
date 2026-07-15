@@ -246,3 +246,30 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 }
+
+/// Deep-verify one slice of the local fragment store (rolling scrub,
+/// RFC-STORAGE-001 scrub period): slices selected by the first hash byte,
+/// so a full walk completes every `slices` calls. Returns the hashes whose
+/// on-disk bytes no longer match — the caller deletes them and lets the
+/// self-check attest the loss; the repair loop regenerates.
+pub fn verify_slice(
+    fragments_dir: &str,
+    slice: u8,
+    slices: u8,
+) -> Result<Vec<Blake3Hash>, StorageError> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let all = scan_fragments(fragments_dir, now)?;
+    let mut corrupted = Vec::new();
+    for (hash, _) in all {
+        if hash.as_bytes()[0] % slices.max(1) != slice {
+            continue;
+        }
+        if fetch_and_verify_fragment(&hash, fragments_dir).is_err() {
+            corrupted.push(hash);
+        }
+    }
+    Ok(corrupted)
+}

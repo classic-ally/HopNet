@@ -122,7 +122,7 @@ proven pieces. S1–S2 are dark (no production call sites).
   guard = another live holder or blob deleted, stop at low watermark;
   host statvfs loop reading `this_node` watermarks. Gate: planner
   unit tests + new orchestrator `eviction-under-pressure`.
-- [ ] **S6 — engine policy tick + scrub.** Host cron (~5 min
+- [x] **S6 — engine policy tick + scrub.** Host cron (~5 min
   randomized): view sync → self-check staleness trigger → one
   migration pull → re-encode (urgent queue unbounded, one lazy per
   tick) → eviction check. Serial repair worker generalized to

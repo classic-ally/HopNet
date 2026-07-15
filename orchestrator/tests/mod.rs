@@ -34,6 +34,7 @@ mod post_files_mixed;
 mod post_files_shape;
 mod range_download;
 mod recents;
+mod reencode;
 mod sharing;
 mod takeout;
 mod tier_membership;
@@ -100,6 +101,15 @@ pub fn mesh_creation_env(test_name: &str) -> Vec<(&'static str, &'static str)> {
             "HOPNET_GENESIS_STORAGE_POLICY",
             "decay_tiers=60,120,180,240",
         )],
+        "re-encode-after-departure" => vec![
+            (
+                "HOPNET_GENESIS_STORAGE_POLICY",
+                "decay_tiers=15,30,60,120;availability_step_secs=5",
+            ),
+            // The test kills a node and needs consensus to keep
+            // committing metrics/self-check txs with 2 of 3 alive.
+            ("HOPNET_QUORUM_PROFILE", "majority"),
+        ],
         _ => vec![],
     }
 }
@@ -189,6 +199,11 @@ pub async fn run_test_by_name(
         "metrics-collection" => metrics::MetricsCollection.run(mesh_id, nodes, flags).await,
         "eviction-under-pressure" => {
             eviction::EvictionUnderPressure
+                .run(mesh_id, nodes, flags)
+                .await
+        }
+        "re-encode-after-departure" => {
+            reencode::ReencodeAfterDeparture
                 .run(mesh_id, nodes, flags)
                 .await
         }
@@ -342,6 +357,7 @@ pub fn list_test_names() -> Vec<&'static str> {
         "metrics-collection",
         "tier-membership",
         "eviction-under-pressure",
+        "re-encode-after-departure",
         "multi-user-isolation",
         "multi-user-sharing",
         "multi-user-sharing-live-link",

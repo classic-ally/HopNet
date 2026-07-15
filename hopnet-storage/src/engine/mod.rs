@@ -109,12 +109,23 @@ pub struct RepairStats {
     pub fragments_pulled: usize,
 }
 
+/// One re-encode work item for the serial repair worker
+/// (RFC-STORAGE-001 Repair: this node was elected repairer of the chunk).
+#[derive(Debug)]
+pub struct ReencodeCmd {
+    pub blob_id: BlobId,
+    pub chunk_number: u32,
+    pub missing_classes: Vec<u32>,
+}
+
 /// Handle to the running engine. Cheap to clone; the host stores one in its
 /// app state (mirrors the consensus EngineHandle pattern).
 #[derive(Clone)]
 pub struct EngineHandle {
     distribution_tx: mpsc::UnboundedSender<BlobId>,
     repair_tx: mpsc::UnboundedSender<(BlobId, tokio::sync::oneshot::Sender<RepairOutcome>)>,
+    reencode_urgent_tx: mpsc::UnboundedSender<ReencodeCmd>,
+    reencode_lazy_tx: mpsc::UnboundedSender<ReencodeCmd>,
 }
 
 impl EngineHandle {
@@ -135,6 +146,21 @@ impl EngineHandle {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.repair_tx.send((blob_id, tx)).ok()?;
         rx.await.ok()
+    }
+
+    /// Enqueue one chunk re-encode on the serial repair worker. Urgent
+    /// (live classes below the watermark) preempts migration pulls and
+    /// lazy work; lazy items drain one at a time behind everything else.
+    /// The single worker bounds re-encode memory and bandwidth mesh-wide.
+    pub fn enqueue_reencode(&self, cmd: ReencodeCmd, urgent: bool) {
+        let tx = if urgent {
+            &self.reencode_urgent_tx
+        } else {
+            &self.reencode_lazy_tx
+        };
+        if tx.send(cmd).is_err() {
+            tracing::error!("re-encode: engine gone — command dropped");
+        }
     }
 
     /// Tier-1 repair for a batch of blobs, serialized on the repair worker;
@@ -193,30 +219,48 @@ impl EngineHandle {
         let (placement_tx, placement_rx) = mpsc::unbounded_channel::<PlacementUpdate>();
         let (repair_tx, mut repair_rx) =
             mpsc::unbounded_channel::<(BlobId, tokio::sync::oneshot::Sender<RepairOutcome>)>();
+        let (reencode_urgent_tx, mut reencode_urgent_rx) = mpsc::unbounded_channel::<ReencodeCmd>();
+        let (reencode_lazy_tx, mut reencode_lazy_rx) = mpsc::unbounded_channel::<ReencodeCmd>();
 
         control_rt.spawn(placement_batcher(placement_rx, seams.submitter.clone()));
 
-        // Tier-1 repair worker: serial, background-priority. Pull-only —
-        // fetches land through the same SEND-free fetch path as gets; the
-        // placement re-commit rides the shared batcher.
+        // Serial repair worker (RFC-STORAGE-001 Repair): ONE worker for
+        // migration pulls and re-encodes so repair memory (~one 40MB chunk
+        // of shards in flight) and bandwidth stay bounded. Priority is
+        // biased: urgent re-encode (below watermark) > migration pulls >
+        // lazy re-encode.
         {
             let seams = seams.clone();
             let fragments_dir = config.fragments_dir.clone();
             let placement_tx = placement_tx.clone();
             data_rt.spawn(async move {
-                while let Some((blob_id, reply)) = repair_rx.recv().await {
-                    let outcome =
-                        repair_one(&seams, &fragments_dir, &placement_tx, &blob_id).await;
-                    let outcome = match outcome {
-                        Ok(o) => o,
-                        Err(e) => {
-                            tracing::warn!("repair: blob {blob_id} failed: {e}");
-                            RepairOutcome::Failed {
-                                fragments_pulled: 0,
-                            }
+                loop {
+                    tokio::select! {
+                        biased;
+                        cmd = reencode_urgent_rx.recv() => {
+                            let Some(cmd) = cmd else { break };
+                            run_reencode_cmd(&seams, &fragments_dir, cmd).await;
                         }
-                    };
-                    let _ = reply.send(outcome);
+                        item = repair_rx.recv() => {
+                            let Some((blob_id, reply)) = item else { break };
+                            let outcome =
+                                repair_one(&seams, &fragments_dir, &placement_tx, &blob_id).await;
+                            let outcome = match outcome {
+                                Ok(o) => o,
+                                Err(e) => {
+                                    tracing::warn!("repair: blob {blob_id} failed: {e}");
+                                    RepairOutcome::Failed {
+                                        fragments_pulled: 0,
+                                    }
+                                }
+                            };
+                            let _ = reply.send(outcome);
+                        }
+                        cmd = reencode_lazy_rx.recv() => {
+                            let Some(cmd) = cmd else { break };
+                            run_reencode_cmd(&seams, &fragments_dir, cmd).await;
+                        }
+                    }
                 }
             });
         }
@@ -249,7 +293,40 @@ impl EngineHandle {
         EngineHandle {
             distribution_tx,
             repair_tx,
+            reencode_urgent_tx,
+            reencode_lazy_tx,
         }
+    }
+}
+
+/// Run one re-encode command on the serial worker (errors logged, not
+/// propagated — the next tick's scan re-elects and retries).
+async fn run_reencode_cmd<T, S, X, L>(
+    seams: &Seams<T, S, X, L>,
+    fragments_dir: &str,
+    cmd: ReencodeCmd,
+) where
+    T: Transport + 'static,
+    S: StateReader,
+    X: TxSubmitter,
+    L: LocalStateSink,
+{
+    if let Err(e) = reencode::reencode_chunk(
+        &seams.transport,
+        seams.state.as_ref(),
+        seams.local_state.as_ref(),
+        fragments_dir,
+        &cmd.blob_id,
+        cmd.chunk_number,
+        &cmd.missing_classes,
+    )
+    .await
+    {
+        tracing::warn!(
+            "re-encode: blob {} chunk {} failed: {e}",
+            cmd.blob_id,
+            cmd.chunk_number
+        );
     }
 }
 

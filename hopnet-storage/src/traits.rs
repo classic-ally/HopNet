@@ -106,6 +106,9 @@ pub struct StorageView {
     pub weights: std::collections::HashMap<i32, u64>,
     /// W(|members|) under the mesh policy.
     pub watermark: usize,
+    /// Members whose current absence is zero (newest bucket saw them) —
+    /// the repair tick's liveness set for class counting.
+    pub online: Vec<i32>,
     /// Score rows for the >30-member selection stage — read on the SAME
     /// checkout as the rest of the view so selection and assignment see
     /// one consistent state.
@@ -134,6 +137,7 @@ pub trait StateReader: Send + Sync {
             watermark: crate::membership::watermark(inputs.validators.len()),
             tiers: std::collections::HashMap::new(),
             weights,
+            online: inputs.validators.iter().map(|p| p.node_id).collect(),
             members: inputs.validators,
             metrics: inputs.metrics,
         })

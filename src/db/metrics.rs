@@ -383,8 +383,6 @@ pub struct AvailabilityGrid {
     pub per_node: std::collections::HashMap<i32, Vec<(i64, bool)>>,
 }
 
-const AVAILABILITY_STEP_SECS: i64 = 600; // metrics collection ~10 min
-
 /// Bucketed availability history per node, from replicated metrics rows at
 /// or below `height`. A node is available in a bucket if ANY reporter saw
 /// it (MAX over reporters — biases toward presence, which biases tiers
@@ -401,7 +399,8 @@ const AVAILABILITY_STEP_SECS: i64 = 600; // metrics collection ~10 min
 pub fn get_availability_history_with_conn(
     conn: &rusqlite::Connection,
     height: i32,
-    lookback_days: i64,
+    lookback_buckets: i64,
+    step_secs: i64,
 ) -> Result<AvailabilityGrid, DatabaseError> {
     let anchor: Option<i64> = conn
         .query_row(
@@ -417,12 +416,15 @@ pub fn get_availability_history_with_conn(
     let Some(anchor_ts) = anchor else {
         return Ok(AvailabilityGrid {
             anchor: None,
-            step_secs: AVAILABILITY_STEP_SECS,
+            step_secs: step_secs,
             per_node: Default::default(),
         });
     };
-    let anchor_bucket = (anchor_ts / AVAILABILITY_STEP_SECS) * AVAILABILITY_STEP_SECS;
-    let window_start = anchor_bucket - lookback_days * 24 * 3600;
+    let anchor_bucket = (anchor_ts / step_secs) * step_secs;
+    // Window is bounded in BUCKETS, not wall time, so a test-shrunk step
+    // keeps the grid (and this loop) the same size: 4320 buckets = 30 days
+    // at the default 10-minute step.
+    let window_start = anchor_bucket - lookback_buckets * step_secs;
 
     let mut stmt = conn
         .prepare(
@@ -441,7 +443,7 @@ pub fn get_availability_history_with_conn(
         })?;
     let sparse: Vec<(i32, i64, bool)> = stmt
         .query_map(
-            rusqlite::params![height, AVAILABILITY_STEP_SECS, window_start],
+            rusqlite::params![height, step_secs, window_start],
             |row| {
                 Ok((
                     row.get::<_, i32>(0)?,
@@ -478,14 +480,14 @@ pub fn get_availability_history_with_conn(
                 state = observed;
             }
             grid.push((t, state));
-            t += AVAILABILITY_STEP_SECS;
+            t += step_secs;
         }
         per_node.insert(node, grid);
     }
 
     Ok(AvailabilityGrid {
         anchor: Some(anchor_bucket),
-        step_secs: AVAILABILITY_STEP_SECS,
+        step_secs: step_secs,
         per_node,
     })
 }
@@ -566,7 +568,7 @@ mod tests {
             insert_availability(&conn, 2, m, false);
         }
 
-        let grid = get_availability_history_with_conn(&conn, 10, 1).unwrap();
+        let grid = get_availability_history_with_conn(&conn, 10, 144, 600).unwrap();
         let samples = &grid.per_node[&2];
         let spans = hopnet_storage::membership::offline_spans(samples, grid.step_secs);
         // One closed run: 170..110 inclusive = 7 buckets (gap carried) = 4200s.

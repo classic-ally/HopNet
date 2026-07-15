@@ -36,6 +36,11 @@ pub struct StoragePolicy {
     pub b_max: usize,
     pub sigma: usize,
     pub epsilon: usize,
+    /// Availability grid bucket width (seconds). Mesh-identical because
+    /// membership derivation depends on it; tests seed a tiny step so
+    /// decay is exercisable in seconds. Default matches the ~10-min
+    /// metrics collection cadence.
+    pub availability_step_secs: i64,
 }
 
 impl Default for StoragePolicy {
@@ -45,6 +50,7 @@ impl Default for StoragePolicy {
             b_max: 5,
             sigma: 1,
             epsilon: 0,
+            availability_step_secs: 600,
         }
     }
 }
@@ -80,6 +86,13 @@ impl StoragePolicy {
                 "climb_back" => {
                     if let Ok(v) = value.parse() {
                         policy.epsilon = v;
+                    }
+                }
+                "availability_step_secs" => {
+                    if let Ok(v) = value.parse::<i64>() {
+                        if v > 0 {
+                            policy.availability_step_secs = v;
+                        }
                     }
                 }
                 _ => {}

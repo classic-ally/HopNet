@@ -76,6 +76,19 @@ pub async fn post_watermark_eviction(
     }
 }
 
+/// POST /maintenance/policy-tick — run one storage policy tick now
+/// (RFC-STORAGE-002 S6 test hook; the cron runs the same body ~5-min).
+pub async fn post_policy_tick(State(app_state): State<AppState>) -> impl IntoResponse {
+    match super::jobs::run_storage_policy_tick(&app_state).await {
+        Ok(summary) => (StatusCode::OK, Json(summary)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("policy tick: {e}"),
+        )
+            .into_response(),
+    }
+}
+
 /// GET /storage/view — the decay-tiered storage membership view
 /// (RFC-STORAGE-002 S2 observability): members, per-node tiers/weights,
 /// derived watermark. Every node must report the same view at the same

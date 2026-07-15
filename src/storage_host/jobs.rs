@@ -630,3 +630,161 @@ pub async fn run_watermark_eviction(
         "high_pct": high_pct, "low_pct": low_pct,
     }))
 }
+
+/// Last-seen storage view summary — INFO logging only on change.
+static LAST_VIEW_SUMMARY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// Day stamp of the last scrub slice (one slice per day, full walk weekly).
+static LAST_SCRUB_DAY: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+
+pub async fn handle_storage_policy_tick(_job: TaskId, ctx: Data<AppState>) -> Result<(), Error> {
+    run_storage_policy_tick(&ctx).await.map(|_| ())
+}
+
+/// The engine policy tick (RFC-STORAGE-001 Repair; RFC-STORAGE-002 S6):
+/// view sync → repair scan (urgent below-watermark re-encodes + one lazy
+/// hopeless re-encode, elected by lowest-missing-class) → one migration
+/// pull → eviction check → daily scrub slice. Inventory attestation stays
+/// with its own self-check cron.
+pub async fn run_storage_policy_tick(app_state: &AppState) -> Result<serde_json::Value, Error> {
+    use hopnet_storage::engine::{ReencodeCmd, assign_for_blob, reencode::repairer_for_chunk};
+    use hopnet_storage::traits::StateReader;
+
+    let my_node_id = app_state
+        .get_node_id()
+        .map_err(|_| Error::Failed(Arc::new("node id not set".to_string().into())))?;
+
+    // (1) View sync — derived fresh each tick; INFO only on change.
+    let host = SubstrateHost::new(app_state.clone());
+    let view = tokio::task::spawn_blocking(move || host.storage_view())
+        .await
+        .map_err(|e| Error::Failed(Arc::new(format!("view join: {e}").into())))?
+        .map_err(|e| Error::Failed(Arc::new(format!("storage view: {e}").into())))?;
+    let mut member_ids: Vec<i32> = view.members.iter().map(|p| p.node_id).collect();
+    member_ids.sort_unstable();
+    let tiers_sorted: std::collections::BTreeMap<i32, i64> =
+        view.tiers.iter().map(|(k, v)| (*k, *v)).collect();
+    let summary = format!(
+        "members={member_ids:?} online={} W={} tiers={tiers_sorted:?}",
+        view.online.len(),
+        view.watermark
+    );
+    {
+        let mut last = LAST_VIEW_SUMMARY.lock().unwrap();
+        if last.as_deref() != Some(summary.as_str()) {
+            tracing::info!("storage view: {summary}");
+            *last = Some(summary);
+        }
+    }
+
+    // (2) Repair scan: this node re-encodes the chunks it was elected for.
+    let settings = {
+        let conn = app_state
+            .db_pool
+            .get()
+            .map_err(|e| Error::Failed(Arc::new(format!("pool: {e}").into())))?;
+        crate::db::shared::read_storage_node_settings(&conn)
+            .map_err(|e| Error::Failed(Arc::new(format!("settings: {e:?}").into())))?
+    };
+    let mut urgent_enqueued = 0usize;
+    let mut lazy_enqueued = 0usize;
+    if settings.reencode_enabled {
+        let online: std::collections::HashSet<i32> = view.online.iter().copied().collect();
+        let members: std::collections::HashSet<i32> = member_ids.iter().copied().collect();
+        let candidates = {
+            let conn = app_state
+                .db_pool
+                .get()
+                .map_err(|e| Error::Failed(Arc::new(format!("pool: {e}").into())))?;
+            crate::db::inventory::find_chunks_with_missing_classes(&conn, &online, &members)
+                .map_err(|e| Error::Failed(Arc::new(format!("repair scan: {e:?}").into())))?
+        };
+        if let Some(engine) = app_state.storage.get() {
+            let mut lazy_pick: Option<ReencodeCmd> = None;
+            for cand in candidates {
+                let missing: Vec<u32> = cand.missing.iter().map(|(c, _)| *c).collect();
+                let seed = hopnet_storage::placement::placement_seed(&cand.blob_id);
+                let (_, assignment) = assign_for_blob(
+                    &seed,
+                    view.members.clone(),
+                    view.metrics.clone(),
+                    &view.weights,
+                );
+                if repairer_for_chunk(&assignment, &missing) != Some(my_node_id) {
+                    continue;
+                }
+                let urgent = cand.live_classes < view.watermark;
+                let hopeless = cand
+                    .missing
+                    .iter()
+                    .any(|(_, s)| *s == crate::db::inventory::MissingHolderState::Hopeless);
+                let cmd = ReencodeCmd {
+                    blob_id: cand.blob_id,
+                    chunk_number: cand.chunk_number,
+                    missing_classes: missing,
+                };
+                if urgent {
+                    engine.enqueue_reencode(cmd, true);
+                    urgent_enqueued += 1;
+                } else if hopeless && lazy_pick.is_none() {
+                    lazy_pick = Some(cmd);
+                }
+            }
+            if let Some(cmd) = lazy_pick {
+                engine.enqueue_reencode(cmd, false);
+                lazy_enqueued = 1;
+            }
+        }
+    }
+
+    // (3) One migration pull per tick (per-class placement diff no-ops on
+    // unmoved blobs).
+    let migration_repaired = run_network_rebalancing(app_state, 1, 0)
+        .await
+        .map(|r| r.data_blocks_rebalanced)
+        .unwrap_or(0);
+
+    // (4) Eviction check (statvfs no-op below the high watermark).
+    let eviction = run_watermark_eviction(app_state, None, None).await?;
+
+    // (5) Daily scrub slice (full walk weekly): corrupt bytes are deleted
+    // and un-attested; the next repair scan regenerates them.
+    let day = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        / 86400) as i64;
+    let mut scrubbed_corrupt = 0usize;
+    if LAST_SCRUB_DAY.swap(day, std::sync::atomic::Ordering::SeqCst) != day {
+        let fragments_dir = crate::storage_host::functions::get_fragments_dir()
+            .map_err(|e| Error::Failed(Arc::new(format!("fragments dir: {e:?}").into())))?;
+        let slice = (day % 7) as u8;
+        let dir = fragments_dir.clone();
+        let corrupted =
+            tokio::task::spawn_blocking(move || {
+                hopnet_storage::fragstore::verify_slice(&dir, slice, 7)
+            })
+            .await
+            .map_err(|e| Error::Failed(Arc::new(format!("scrub join: {e}").into())))?
+            .map_err(|e| Error::Failed(Arc::new(format!("scrub: {e}").into())))?;
+        if !corrupted.is_empty() {
+            tracing::warn!("scrub: {} corrupt fragments on slice {slice}", corrupted.len());
+            for hash in &corrupted {
+                let _ = hopnet_storage::fragstore::delete_fragment(&fragments_dir, hash);
+            }
+            use hopnet_storage::traits::LocalStateSink;
+            SubstrateHost::new(app_state.clone()).mark_remote_batch(corrupted.clone());
+            scrubbed_corrupt = corrupted.len();
+        }
+    }
+
+    Ok(serde_json::json!({
+        "members": member_ids,
+        "online": view.online.len(),
+        "watermark": view.watermark,
+        "urgent_reencodes": urgent_enqueued,
+        "lazy_reencodes": lazy_enqueued,
+        "migration_repaired": migration_repaired,
+        "eviction": eviction,
+        "scrub_corrupt": scrubbed_corrupt,
+    }))
+}

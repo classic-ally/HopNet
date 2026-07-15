@@ -145,8 +145,13 @@ impl StateReader for SubstrateHost {
             .map_err(|e| StorageError::Host(format!("storage policy: {e}")))?;
         let node_metrics = crate::db::metrics::get_all_node_metrics_with_conn(&conn, height)
             .map_err(|e| StorageError::Host(format!("node metrics: {e:?}")))?;
-        let grid = crate::db::metrics::get_availability_history_with_conn(&conn, height, 30)
-            .map_err(|e| StorageError::Host(format!("availability history: {e:?}")))?;
+        let grid = crate::db::metrics::get_availability_history_with_conn(
+            &conn,
+            height,
+            4320, // 30 days of buckets at the default step
+            policy.availability_step_secs,
+        )
+        .map_err(|e| StorageError::Host(format!("availability history: {e:?}")))?;
         drop(conn);
 
         let cold_tier = policy.decay_tiers[policy.decay_tiers.len().saturating_sub(2)];
@@ -174,6 +179,11 @@ impl StateReader for SubstrateHost {
         // cold tier.
         let node_ids: Vec<i32> = node_metrics.iter().map(|m| m.node_id).collect();
         let member_ids = membership::storage_members(&node_ids, &absence, &tiers, cold_tier);
+        let online: Vec<i32> = node_ids
+            .iter()
+            .copied()
+            .filter(|n| absence.get(n).copied().unwrap_or(0) == 0)
+            .collect();
         let member_set: std::collections::HashSet<i32> = member_ids.iter().copied().collect();
         let watermark =
             membership::watermark_with(member_ids.len(), &policy.watermark_params());
@@ -198,6 +208,7 @@ impl StateReader for SubstrateHost {
             tiers,
             weights,
             watermark,
+            online,
             metrics: rows,
         })
     }
