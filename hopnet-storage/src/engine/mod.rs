@@ -252,13 +252,35 @@ impl EngineHandle {
     }
 }
 
-/// Tier-1 repair for one placed blob (MINIMAL by design — RFC-014 v1):
-/// recompute the seeded selection at the current height; if it differs from
-/// the selection at the blob's placement height, PULL every fragment this
-/// node should now hold (inventory sources → the OLD holders as
-/// candidates), and let the new primary (fragment 0's first target)
+/// Class → responsible node for one blob under the balanced capped
+/// rendezvous placement (RFC-STORAGE-001): seeded selection first (all
+/// members at ≤30, scored top-30 above), then the balanced assignment over
+/// the selected ids. Returns the selected peers (pull-candidate pool)
+/// alongside the class map.
+fn assign_for_blob(
+    seed: &[u8; 32],
+    members: Vec<PeerRef>,
+    metrics: Vec<crate::placement::MetricsRow>,
+    weights: &std::collections::HashMap<i32, u64>,
+) -> (Vec<PeerRef>, Vec<i32>) {
+    let selected: Vec<PeerRef> = placement::select_nodes_for_blob(members, metrics, seed);
+    let ids: Vec<i32> = selected.iter().map(|p| p.node_id).collect();
+    let assignment = placement::assign_fragment_classes(
+        seed,
+        &ids,
+        weights,
+        crate::rs::TOTAL_FRAGMENTS_PER_CHUNK as u32,
+    );
+    (selected, assignment)
+}
+
+/// Tier-1 repair for one placed blob (RFC-STORAGE-001 pull-migration):
+/// diff the PER-CLASS responsible targets between the blob's placement
+/// height and the current member view; if any class moved, PULL every
+/// fragment this node is newly responsible for (inventory sources → the
+/// OLD holders as candidates), and let the responsible node of class 0
 /// re-commit the placement through the batcher. No pushes, no deletions —
-/// stale copies stay until orphan/self-check flows account for them.
+/// stale copies become surplus until eviction/self-check account for them.
 async fn repair_one<T, S, X, L>(
     seams: &Seams<T, S, X, L>,
     fragments_dir: &str,
@@ -285,30 +307,46 @@ where
         .ok_or_else(|| EngineError::Transfer("local node id not set".to_string()))?;
 
     let seed = placement::placement_seed(blob_id);
+    // Old side: validators at the placement height approximate the member
+    // view the placement was computed against (candidates + diff baseline);
+    // weights re-derived from the same historical metrics.
     let old_inputs = seams.state.placement_inputs_at(old_height)?;
-    let new_inputs = seams.state.placement_inputs()?;
-    let old_selected: Vec<PeerRef> =
-        placement::select_nodes_for_blob(old_inputs.validators, old_inputs.metrics, &seed);
-    let new_selected: Vec<PeerRef> =
-        placement::select_nodes_for_blob(new_inputs.validators, new_inputs.metrics, &seed);
+    let old_weights: std::collections::HashMap<i32, u64> = old_inputs
+        .metrics
+        .iter()
+        .map(|m| (m.node_id, placement::quantized_weight(m)))
+        .collect();
+    let (old_selected, old_assignment) = assign_for_blob(
+        &seed,
+        old_inputs.validators,
+        old_inputs.metrics,
+        &old_weights,
+    );
+    // New side: the decay-tiered member view.
+    let view = seams.state.storage_view()?;
+    let new_height = view.height;
+    let (_, new_assignment) = assign_for_blob(&seed, view.members, view.metrics, &view.weights);
 
-    // Same ordered node set → same modulo targets → nothing moved.
-    let old_ids: Vec<i32> = old_selected.iter().map(|p| p.node_id).collect();
-    let new_ids: Vec<i32> = new_selected.iter().map(|p| p.node_id).collect();
-    if old_ids == new_ids {
+    // Per-class diff — a selected-set comparison is blind to assignment
+    // moves when the set is unchanged (always, on ≤30-node meshes).
+    if old_assignment == new_assignment {
         return Ok(RepairOutcome::Unchanged);
     }
 
     tracing::info!(
-        "repair: blob {} placement moved ({} → {} at height {})",
+        "repair: blob {} placement moved ({} → {}, {} classes renumbered)",
         blob_id,
         old_height,
-        new_inputs.height,
-        new_inputs.height
+        new_height,
+        old_assignment
+            .iter()
+            .zip(&new_assignment)
+            .filter(|(a, b)| a != b)
+            .count()
     );
 
-    // Pull phase: fragments whose NEW targets include this node but which
-    // are not on local disk.
+    // Pull phase: fragments whose class this node is NEWLY responsible for
+    // and which are not on local disk.
     let mut wanted: Vec<(u32, Blake3Hash)> = Vec::new();
     for (originals, recovery) in manifest.chunks.values() {
         for map in [originals, recovery] {
@@ -316,9 +354,7 @@ where
                 if *stored_locally {
                     continue;
                 }
-                let targets =
-                    placement::get_fragment_placement(*local_index as u32, &new_selected);
-                if targets.iter().any(|p| p.node_id == my_node_id) {
+                if new_assignment.get(*local_index as usize).copied() == Some(my_node_id) {
                     wanted.push((*local_index as u32, *hash));
                 }
             }
@@ -360,17 +396,15 @@ where
         });
     }
 
-    // Re-commit: exactly one deterministic submitter — the new primary of
-    // fragment index 0. (If it is down, a later scan on the next primary
-    // epoch re-runs; gets fall back through the ladder meanwhile.)
-    let recommitted = placement::get_fragment_placement(0, &new_selected)
-        .first()
-        .is_some_and(|p| p.node_id == my_node_id);
+    // Re-commit: exactly one deterministic submitter — the responsible
+    // node of class 0. (If it is down, a later scan on the next epoch
+    // re-runs; gets fall back through the ladder meanwhile.)
+    let recommitted = new_assignment.first().copied() == Some(my_node_id);
     if recommitted
         && placement_tx
             .send(PlacementUpdate {
                 blob_id: blob_id.clone(),
-                placement_height: new_inputs.height,
+                placement_height: new_height,
             })
             .is_err()
     {
@@ -450,20 +484,24 @@ where
         .local_node_id()
         .ok_or_else(|| EngineError::Transfer("local node id not set".to_string()))?;
 
-    // One consistent snapshot of height/validators/metrics (the host reads
-    // all three on one scoped checkout, dropped before any network send).
-    let inputs = seams.state.placement_inputs()?;
+    // One consistent snapshot of the decay-tiered member view (the host
+    // reads everything on one scoped checkout, dropped before any send).
+    let view = seams.state.storage_view()?;
+    let view_height = view.height;
 
     // Placement seeds from the blob id (RFC-014): deterministic, public,
-    // zero plaintext-derived input.
+    // zero plaintext-derived input. Balanced capped rendezvous assigns one
+    // responsible node per class (RFC-STORAGE-001) — no backup fallbacks:
+    // a failed send keeps the fragment origin-held as surplus, and the
+    // responsible node pulls it through the migration rung later.
     let seed = placement::placement_seed(&blob.blob_id);
-    let selected_nodes: Vec<PeerRef> =
-        placement::select_nodes_for_blob(inputs.validators, inputs.metrics, &seed);
+    let (selected_nodes, assignment) =
+        assign_for_blob(&seed, view.members, view.metrics, &view.weights);
 
     tracing::debug!(
         "Fragment distribution using {} selected nodes at consensus height {} for blob {}",
         selected_nodes.len(),
-        inputs.height,
+        view_height,
         blob.blob_id
     );
 
@@ -485,14 +523,21 @@ where
     let (remote_tx, mut remote_rx) = mpsc::unbounded_channel::<Blake3Hash>();
     let successful_placements = Arc::new(AtomicUsize::new(0));
 
-    let selected_nodes = Arc::new(selected_nodes);
+    // class → responsible peer, resolved once for all workers.
+    let targets: std::collections::HashMap<i32, PeerRef> = selected_nodes
+        .iter()
+        .map(|p| (p.node_id, p.clone()))
+        .collect();
+    let assignment = Arc::new(assignment);
+    let targets = Arc::new(targets);
     let mut worker_handles = Vec::new();
     for worker_id in 0..num_workers {
         let failure_tx = failure_tx.clone();
         let remote_tx = remote_tx.clone();
         let queue = work_queue.clone();
         let transport = seams.transport.clone();
-        let selected_nodes = selected_nodes.clone();
+        let assignment = assignment.clone();
+        let targets = targets.clone();
         let successes = successful_placements.clone();
         let fragments_dir = config.fragments_dir.clone();
 
@@ -508,64 +553,63 @@ where
                     break;
                 };
 
-                // Modulo placement: primary + 2 backups, tried in order.
-                let candidates =
-                    placement::get_fragment_placement(local_index, &selected_nodes);
-
-                let mut placed = false;
-                for candidate in candidates {
-                    if candidate.node_id == my_node_id {
-                        tracing::debug!(
-                            "Fragment {} best placed on local node {}, keeping locally",
-                            fragment_hash,
-                            my_node_id
-                        );
-                        placed = true;
-                        break;
-                    }
-
-                    // Process-wide send bound (held across the send's
-                    // domain retries; no DB conn is held here).
-                    let _permit = SEND_PERMITS.acquire().await;
-                    match send_fragment_to_peer(
-                        transport.as_ref(),
-                        candidate,
-                        &fragment_hash,
-                        &fragments_dir,
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            let _ = remote_tx.send(fragment_hash);
-                            tracing::debug!(
-                                "Successfully sent fragment {} to node {}",
-                                fragment_hash,
-                                candidate.node_id
-                            );
-                            placed = true;
-                            break;
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                                "Worker {} failed to send fragment {} to node {}: {}, trying next candidate",
-                                worker_id,
-                                fragment_hash,
-                                candidate.node_id,
-                                e
-                            );
-                        }
-                    }
-                }
-
-                if placed {
-                    successes.fetch_add(1, Ordering::Relaxed);
-                } else {
+                // Single responsible node per class (balanced capped
+                // rendezvous) — no backup fallbacks.
+                let Some(responsible) = assignment
+                    .get(local_index as usize)
+                    .and_then(|id| targets.get(id))
+                else {
                     tracing::warn!(
-                        "Worker {} failed to place fragment {} on any candidate node, keeping locally",
+                        "Worker {} has no responsible node for class {} — keeping locally",
                         worker_id,
-                        fragment_hash
+                        local_index
                     );
                     let _ = failure_tx.send(fragment_hash);
+                    continue;
+                };
+
+                if responsible.node_id == my_node_id {
+                    tracing::debug!(
+                        "Fragment {} placed on local node {}, keeping locally",
+                        fragment_hash,
+                        my_node_id
+                    );
+                    successes.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+
+                // Process-wide send bound (held across the send's
+                // domain retries; no DB conn is held here).
+                let _permit = SEND_PERMITS.acquire().await;
+                match send_fragment_to_peer(
+                    transport.as_ref(),
+                    responsible,
+                    &fragment_hash,
+                    &fragments_dir,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        let _ = remote_tx.send(fragment_hash);
+                        tracing::debug!(
+                            "Successfully sent fragment {} to node {}",
+                            fragment_hash,
+                            responsible.node_id
+                        );
+                        successes.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        // Origin keeps the fragment as surplus; the
+                        // responsible node pulls it via the migration rung.
+                        tracing::warn!(
+                            "Worker {} failed to send fragment {} to responsible node {}: {} — keeping locally",
+                            worker_id,
+                            fragment_hash,
+                            responsible.node_id,
+                            e
+                        );
+                        let _ = failure_tx.send(fragment_hash);
+                    }
                 }
             }
             tracing::debug!("Worker {} completed", worker_id);
@@ -618,7 +662,7 @@ where
         total_fragments,
         (successful as f64 / total_fragments as f64) * 100.0
     );
-    Ok(inputs.height)
+    Ok(view_height)
 }
 
 /// Send one fragment to one peer with domain-level retry. Peer-side errors

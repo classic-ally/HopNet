@@ -180,6 +180,7 @@ impl StateReader for SubstrateHost {
 
         let mut members = Vec::with_capacity(member_ids.len());
         let mut weights = std::collections::HashMap::new();
+        let mut rows = Vec::with_capacity(node_metrics.len());
         for m in node_metrics {
             let node_id = m.node_id;
             let pubkey = m.pubkey.0.to_bytes();
@@ -188,6 +189,7 @@ impl StateReader for SubstrateHost {
             if member_set.contains(&node_id) {
                 members.push(PeerRef { node_id, pubkey });
             }
+            rows.push(row);
         }
 
         Ok(StorageView {
@@ -196,6 +198,7 @@ impl StateReader for SubstrateHost {
             tiers,
             weights,
             watermark,
+            metrics: rows,
         })
     }
 

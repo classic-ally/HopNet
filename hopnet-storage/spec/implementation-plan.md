@@ -96,7 +96,7 @@ proven pieces. S1–S2 are dark (no production call sites).
   seeded-metrics unit tests (tier archetypes from realistic
   histories; identical derivation from identical rows) + orchestrator
   `tier-membership` (observe-only, tiny genesis tiers).
-- [ ] **S3 — placement cutover.** Balanced replaces modulo:
+- [x] **S3 — placement cutover.** Balanced replaces modulo:
   distribution sends each class to its single responsible node
   (backup-triple deleted; failed sends leave origin-held surplus for
   the migration rung); `repair_one` compares per-class targets

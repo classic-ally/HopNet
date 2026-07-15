@@ -106,6 +106,10 @@ pub struct StorageView {
     pub weights: std::collections::HashMap<i32, u64>,
     /// W(|members|) under the mesh policy.
     pub watermark: usize,
+    /// Score rows for the >30-member selection stage — read on the SAME
+    /// checkout as the rest of the view so selection and assignment see
+    /// one consistent state.
+    pub metrics: Vec<MetricsRow>,
 }
 
 /// Replicated-state reads the engine needs. Sync — implementations read from
@@ -131,6 +135,7 @@ pub trait StateReader: Send + Sync {
             tiers: std::collections::HashMap::new(),
             weights,
             members: inputs.validators,
+            metrics: inputs.metrics,
         })
     }
 

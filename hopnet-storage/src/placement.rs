@@ -159,37 +159,6 @@ fn deterministic_shuffle<N>(nodes: &mut [N], seed: &[u8; 32]) {
     }
 }
 
-/// Get fragment placement candidates using modulo distribution
-///
-/// Returns primary placement node plus 2 backup nodes in preference order.
-/// Uses simple modulo arithmetic to ensure:
-/// - Same local_index always maps to same node (across all chunks)
-/// - Even distribution across all selected nodes (±1 fragment max imbalance)
-/// - Deterministic backup selection with wraparound
-///
-/// # Arguments
-/// * `local_index` - Fragment's position within its chunk (0-29 for 30-fragment chunks)
-/// * `selected_nodes` - Nodes selected for this file (from select_nodes_for_blob)
-///
-/// # Returns
-/// * Vector of up to 3 node references: [primary, backup1, backup2]
-pub fn get_fragment_placement<N>(local_index: u32, selected_nodes: &[N]) -> Vec<&N> {
-    if selected_nodes.is_empty() {
-        return Vec::new();
-    }
-
-    let len = selected_nodes.len();
-    let primary_idx = (local_index as usize) % len;
-    let backup1_idx = (local_index as usize + 1) % len;
-    let backup2_idx = (local_index as usize + 2) % len;
-
-    vec![
-        &selected_nodes[primary_idx],
-        &selected_nodes[backup1_idx],
-        &selected_nodes[backup2_idx],
-    ]
-}
-
 /// Phase 2: Scored candidate ready for placement decision
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Phase2Candidate {
@@ -465,101 +434,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_get_fragment_placement_basic() {
-        let nodes = create_test_nodes(10);
-
-        // Fragment 0 should go to node 0 (primary), 1 (backup1), 2 (backup2)
-        let placement = get_fragment_placement(0, &nodes);
-        assert_eq!(placement.len(), 3);
-        assert_eq!(placement[0].node_id, 1); // nodes[0]
-        assert_eq!(placement[1].node_id, 2); // nodes[1]
-        assert_eq!(placement[2].node_id, 3); // nodes[2]
-
-        // Fragment 5 should go to node 5 (primary), 6 (backup1), 7 (backup2)
-        let placement = get_fragment_placement(5, &nodes);
-        assert_eq!(placement.len(), 3);
-        assert_eq!(placement[0].node_id, 6); // nodes[5]
-        assert_eq!(placement[1].node_id, 7); // nodes[6]
-        assert_eq!(placement[2].node_id, 8); // nodes[7]
-    }
-
-    #[test]
-    fn test_get_fragment_placement_wraparound() {
-        let nodes = create_test_nodes(10);
-
-        // Fragment 9 (last) should wrap around for backups
-        let placement = get_fragment_placement(9, &nodes);
-        assert_eq!(placement.len(), 3);
-        assert_eq!(placement[0].node_id, 10); // nodes[9] - primary
-        assert_eq!(placement[1].node_id, 1); // nodes[0] - wraparound backup1
-        assert_eq!(placement[2].node_id, 2); // nodes[1] - wraparound backup2
-
-        // Fragment 8 should have one wraparound backup
-        let placement = get_fragment_placement(8, &nodes);
-        assert_eq!(placement.len(), 3);
-        assert_eq!(placement[0].node_id, 9); // nodes[8] - primary
-        assert_eq!(placement[1].node_id, 10); // nodes[9] - backup1
-        assert_eq!(placement[2].node_id, 1); // nodes[0] - wraparound backup2
-    }
-
-    #[test]
-    fn test_get_fragment_placement_deterministic() {
-        // Same local_index should always map to same node (critical for RS properties)
-        let nodes = create_test_nodes(30);
-
-        let placement1 = get_fragment_placement(15, &nodes);
-        let placement2 = get_fragment_placement(15, &nodes);
-
-        assert_eq!(placement1.len(), placement2.len());
-        for (p1, p2) in placement1.iter().zip(placement2.iter()) {
-            assert_eq!(p1.node_id, p2.node_id);
-        }
-    }
-
-    #[test]
-    fn test_get_fragment_placement_even_distribution() {
-        // With 30 fragments and 30 nodes, each node should get exactly 1 primary placement
-        let nodes = create_test_nodes(30);
-        let mut primary_counts = vec![0; 30];
-
-        for local_index in 0..30 {
-            let placement = get_fragment_placement(local_index, &nodes);
-            let primary_node_id = placement[0].node_id;
-            primary_counts[(primary_node_id - 1) as usize] += 1;
-        }
-
-        // Each node should be primary for exactly 1 fragment
-        for count in primary_counts {
-            assert_eq!(count, 1);
-        }
-    }
-
-    #[test]
-    fn test_get_fragment_placement_imbalance_non_divisible() {
-        // With 30 fragments and 7 nodes, distribution should be ±1 fragment
-        let nodes = create_test_nodes(7);
-        let mut primary_counts = [0; 7];
-
-        for local_index in 0..30 {
-            let placement = get_fragment_placement(local_index, &nodes);
-            let primary_node_id = placement[0].node_id;
-            primary_counts[(primary_node_id - 1) as usize] += 1;
-        }
-
-        // Expected: 30/7 = 4.28, so nodes get 4 or 5 fragments
-        let min_count = *primary_counts.iter().min().unwrap();
-        let max_count = *primary_counts.iter().max().unwrap();
-        assert!(
-            max_count - min_count <= 1,
-            "Max imbalance should be ±1 fragment"
-        );
-
-        // Verify total is 30
-        let total: i32 = primary_counts.iter().sum();
-        assert_eq!(total, 30);
-    }
-
     // Should: land the tightest integer split at every member count —
     // max − min ≤ 1, every member responsible for ≥ ⌊N/v⌋ ≥ 1 classes,
     // total N — for uniform AND skewed weights (the cap binds; weights
@@ -684,22 +558,16 @@ mod tests {
         assert_eq!(quantized_weight(&row), w1);
     }
 
+    // Should: return an empty assignment for an empty member set and put
+    // every class on the sole member of a one-node mesh.
+    // Impact: degenerate views occur during bootstrap; a panic here would
+    // take the distribution worker down with it.
     #[test]
-    fn test_get_fragment_placement_empty_nodes() {
-        let nodes: Vec<TestNode> = vec![];
-        let placement = get_fragment_placement(0, &nodes);
-        assert_eq!(placement.len(), 0);
-    }
-
-    #[test]
-    fn test_get_fragment_placement_single_node() {
-        // With only 1 node, all fragments (primary + backups) go to same node
-        let nodes = create_test_nodes(1);
-
-        let placement = get_fragment_placement(0, &nodes);
-        assert_eq!(placement.len(), 3);
-        assert_eq!(placement[0].node_id, 1);
-        assert_eq!(placement[1].node_id, 1); // Wraparound to same node
-        assert_eq!(placement[2].node_id, 1); // Wraparound to same node
+    fn balanced_degenerate_member_sets() {
+        let weights = std::collections::HashMap::new();
+        assert!(assign_fragment_classes(&seed(1), &[], &weights, 30).is_empty());
+        let solo = assign_fragment_classes(&seed(1), &[7], &weights, 30);
+        assert_eq!(solo.len(), 30);
+        assert!(solo.iter().all(|&n| n == 7));
     }
 }

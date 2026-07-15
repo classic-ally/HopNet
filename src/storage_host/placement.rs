@@ -43,12 +43,6 @@ pub fn select_nodes_for_blob_id(
     hopnet_storage::placement::select_nodes_for_blob(validators, metrics, &seed)
 }
 
-/// Get fragment placement candidates using modulo distribution
-/// (primary + 2 backups; see hopnet-storage::placement).
-pub fn get_fragment_placement(local_index: u32, selected_nodes: &[Node]) -> Vec<&Node> {
-    hopnet_storage::placement::get_fragment_placement(local_index, selected_nodes)
-}
-
 /// Score node metrics for placement ranking (RFC-004 weights).
 pub fn calculate_final_placement_scores(
     node_metrics: Vec<NodeMetrics>,
