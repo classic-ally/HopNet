@@ -13,6 +13,7 @@
 //! tunables and pure batching decisions live in `policy`.
 
 pub mod policy;
+pub mod reencode;
 
 use crate::error::StorageError;
 use crate::fragstore;

@@ -107,7 +107,7 @@ proven pieces. S1–S2 are dark (no production call sites).
   single-target), file-upload-consistency, multi-size-file-
   consistency, restart-persistence + divergence; INV-SPREAD property
   check (per-node responsible counts ≤ ⌈N/v⌉).
-- [ ] **S4 — re-encode core.** Extract `decode_chunk_ciphertext`
+- [x] **S4 — re-encode core.** Extract `decode_chunk_ciphertext`
   from the GET path; `engine/reencode.rs`: fetch any K live shards,
   decode, regenerate missing classes, verify against manifest hashes
   (mismatch = store nothing, loud), settle via `mark_local` +
