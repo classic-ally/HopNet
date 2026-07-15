@@ -210,20 +210,29 @@ pub fn get_all_node_metrics_with_conn(
             // SQLite replacements for DuckDB-specific functions:
             // - STDDEV(x) → sqrt(AVG(x*x) - AVG(x)*AVG(x))  (population stddev)
             // - PERCENTILE_CONT(0.5) → AVG() as approximation for median
-            // - INTERVAL → datetime('now', '-N units')
             // - LEAST(a,b) → MIN(a,b)  (scalar)
             // - LOG(x)/LOG(10) → log10(x)
             // - POWER(x,y) → pow(x,y)
+            //
+            // Time windows are anchored to the NEWEST replicated metrics row
+            // at or below the requested height — never the wall clock — so
+            // every node derives identical scores from identical rows
+            // (RFC-STORAGE-002: scores feed quantized placement weights,
+            // which must be mesh-deterministic).
             let query =
                 "WITH
+                anchor AS (
+                    SELECT COALESCE(MAX(start_time), '1970-01-01 00:00:00') AS t
+                    FROM metrics WHERE height <= ?1
+                ),
                 -- Aggregate metrics for nodes that have data
                 node_metrics AS (
                     SELECT
                         m.to_node as node_id,
                         -- 24-hour metrics
-                        COUNT(CASE WHEN m.start_time >= datetime('now', '-24 hours') THEN 1 END) as sample_count_24h,
-                        AVG(CASE WHEN m.available AND m.start_time >= datetime('now', '-24 hours') THEN 1.0 ELSE 0.0 END) as availability_24h,
-                        AVG(CASE WHEN m.start_time >= datetime('now', '-24 hours') THEN m.rtt_latency END) as avg_latency_24h,
+                        COUNT(CASE WHEN m.start_time >= datetime((SELECT t FROM anchor), '-24 hours') THEN 1 END) as sample_count_24h,
+                        AVG(CASE WHEN m.available AND m.start_time >= datetime((SELECT t FROM anchor), '-24 hours') THEN 1.0 ELSE 0.0 END) as availability_24h,
+                        AVG(CASE WHEN m.start_time >= datetime((SELECT t FROM anchor), '-24 hours') THEN m.rtt_latency END) as avg_latency_24h,
                         -- 7-day metrics
                         COUNT(*) as sample_count_7d,
                         AVG(CASE WHEN m.available THEN 1.0 ELSE 0.0 END) as availability_7d,
@@ -243,8 +252,8 @@ pub fn get_all_node_metrics_with_conn(
                         MAX(m.storage_total_gb) as storage_total_gb,
                         MAX(m.storage_used_gb) as storage_used_gb
                     FROM metrics m
-                    WHERE m.height <= ?
-                      AND m.start_time >= datetime('now', '-7 days')
+                    WHERE m.height <= ?1
+                      AND m.start_time >= datetime((SELECT t FROM anchor), '-7 days')
                     GROUP BY m.to_node
                 ),
                 -- Calculate network-wide fallback statistics per RFC requirements
@@ -359,5 +368,250 @@ pub fn get_all_node_metrics_with_conn(
 
             Ok(metrics)
         }
+    }
+}
+
+/// Per-node availability grid for decay-tier derivation
+/// (RFC-STORAGE-002 S2): dense 10-minute buckets over the lookback
+/// window, anchored to the newest replicated metrics row.
+#[derive(Debug)]
+pub struct AvailabilityGrid {
+    /// Unix seconds of the newest (anchor) bucket. None = no metrics yet.
+    pub anchor: Option<i64>,
+    pub step_secs: i64,
+    /// node_id → ascending (bucket_start, available).
+    pub per_node: std::collections::HashMap<i32, Vec<(i64, bool)>>,
+}
+
+const AVAILABILITY_STEP_SECS: i64 = 600; // metrics collection ~10 min
+
+/// Bucketed availability history per node, from replicated metrics rows at
+/// or below `height`. A node is available in a bucket if ANY reporter saw
+/// it (MAX over reporters — biases toward presence, which biases tiers
+/// long, matching the policy's asymmetric-cost bias; RFC-STORAGE-002).
+///
+/// The grid is densified by carry-forward: a bucket nobody reported (cron
+/// jitter, mesh-wide gap) inherits the previous bucket's state, so a
+/// missed round can neither split a real absence run into two short ones
+/// nor invent one. State before a node's first sample is `available`.
+///
+/// Window and buckets are anchored to the newest row's start_time, never
+/// the wall clock. NOTE: the metrics table has no pruning today; this read
+/// is bounded by the window but the table grows unbounded (deferred).
+pub fn get_availability_history_with_conn(
+    conn: &rusqlite::Connection,
+    height: i32,
+    lookback_days: i64,
+) -> Result<AvailabilityGrid, DatabaseError> {
+    let anchor: Option<i64> = conn
+        .query_row(
+            "SELECT CAST(strftime('%s', MAX(start_time)) AS INTEGER)
+             FROM metrics WHERE height <= ?1",
+            rusqlite::params![height],
+            |row| row.get(0),
+        )
+        .map_err(|e| {
+            tracing::error!("availability anchor query failed: {e:?}");
+            DatabaseError::RecallError
+        })?;
+    let Some(anchor_ts) = anchor else {
+        return Ok(AvailabilityGrid {
+            anchor: None,
+            step_secs: AVAILABILITY_STEP_SECS,
+            per_node: Default::default(),
+        });
+    };
+    let anchor_bucket = (anchor_ts / AVAILABILITY_STEP_SECS) * AVAILABILITY_STEP_SECS;
+    let window_start = anchor_bucket - lookback_days * 24 * 3600;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT m.to_node,
+                    (CAST(strftime('%s', m.start_time) AS INTEGER) / ?2) * ?2 AS bucket,
+                    MAX(m.available) AS available
+             FROM metrics m
+             WHERE m.height <= ?1
+               AND CAST(strftime('%s', m.start_time) AS INTEGER) >= ?3
+             GROUP BY m.to_node, bucket
+             ORDER BY m.to_node, bucket",
+        )
+        .map_err(|e| {
+            tracing::error!("availability history prepare failed: {e:?}");
+            DatabaseError::RecallError
+        })?;
+    let sparse: Vec<(i32, i64, bool)> = stmt
+        .query_map(
+            rusqlite::params![height, AVAILABILITY_STEP_SECS, window_start],
+            |row| {
+                Ok((
+                    row.get::<_, i32>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)? != 0,
+                ))
+            },
+        )
+        .map_err(|e| {
+            tracing::error!("availability history query failed: {e:?}");
+            DatabaseError::RecallError
+        })?
+        .collect::<Result<_, _>>()
+        .map_err(|e| {
+            tracing::error!("availability history rows failed: {e:?}");
+            DatabaseError::ProcessingError
+        })?;
+
+    let mut per_node: std::collections::HashMap<i32, Vec<(i64, bool)>> = Default::default();
+    let mut sparse_by_node: std::collections::HashMap<i32, std::collections::HashMap<i64, bool>> =
+        Default::default();
+    for (node, bucket, available) in sparse {
+        sparse_by_node
+            .entry(node)
+            .or_default()
+            .insert(bucket, available);
+    }
+    for (node, buckets) in sparse_by_node {
+        let mut grid = Vec::new();
+        let mut state = true; // before first sample: presence bias
+        let mut t = window_start;
+        while t <= anchor_bucket {
+            if let Some(&observed) = buckets.get(&t) {
+                state = observed;
+            }
+            grid.push((t, state));
+            t += AVAILABILITY_STEP_SECS;
+        }
+        per_node.insert(node, grid);
+    }
+
+    Ok(AvailabilityGrid {
+        anchor: Some(anchor_bucket),
+        step_secs: AVAILABILITY_STEP_SECS,
+        per_node,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::SqliteConnectionManager;
+    use rusqlite::params;
+
+    fn setup_test_db() -> r2d2::Pool<SqliteConnectionManager> {
+        let manager = SqliteConnectionManager::memory();
+        let pool = r2d2::Pool::builder()
+            .max_size(1)
+            .connection_customizer(Box::new(crate::db::shared::SqliteInitializer))
+            .build(manager)
+            .unwrap();
+        crate::db::shared::initialize(pool.get().unwrap()).unwrap();
+        pool
+    }
+
+    fn insert_fixture_nodes(conn: &rusqlite::Connection, count: i32) {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let pubkey = crate::db::PubKey(key.verifying_key());
+        conn.execute(
+            "INSERT INTO users (user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            params![1, "test", &pubkey, &vec![0u8; 32], &vec![0u8; 44], &vec![0u8; 16]],
+        )
+        .unwrap();
+        for n in 1..=count {
+            conn.execute(
+                "INSERT INTO nodes (node_id, name, owner, pubkey) VALUES (?, ?, ?, ?)",
+                params![n, format!("node{n}"), 1, &pubkey],
+            )
+            .unwrap();
+        }
+    }
+
+    /// Insert one availability observation at `minutes_before` the fixed
+    /// anchor "2026-07-01 12:00:00" (10-minute aligned).
+    fn insert_availability(conn: &rusqlite::Connection, to_node: i32, minutes_before: i64, available: bool) {
+        conn.execute(
+            "INSERT INTO metrics (from_node, to_node, start_time, height, available)
+             VALUES (1, ?1, datetime('2026-07-01 12:00:00', '-' || ?2 || ' minutes'), 5, ?3)",
+            params![to_node, minutes_before, available],
+        )
+        .unwrap();
+    }
+
+    // Should: bucket replicated availability rows onto a dense 10-minute
+    // grid where a reporting gap carries the previous state forward, so a
+    // missed collection round can neither split a real absence run nor
+    // invent one; closed runs and the trailing (current) absence come out
+    // through the membership helpers.
+    // Should not: count the trailing run as a closed span.
+    // Impact: run-splitting would shift P95 down and assign too-short
+    // decay tiers — false departures every weekend.
+    #[test]
+    fn availability_grid_carry_forward_runs() {
+        let pool = setup_test_db();
+        let conn = pool.get().unwrap();
+        insert_fixture_nodes(&conn, 2);
+
+        // Node 2 timeline (minutes before anchor):
+        // 240..=180 available; 170..=110 absent WITH a gap at 140 (no row);
+        // 100..=60 available; 50..=0 absent (trailing).
+        for m in [240, 230, 220, 210, 200, 190, 180] {
+            insert_availability(&conn, 2, m, true);
+        }
+        for m in [170, 160, 150, 130, 120, 110] {
+            insert_availability(&conn, 2, m, false); // 140 deliberately missing
+        }
+        for m in [100, 90, 80, 70, 60] {
+            insert_availability(&conn, 2, m, true);
+        }
+        for m in [50, 40, 30, 20, 10, 0] {
+            insert_availability(&conn, 2, m, false);
+        }
+
+        let grid = get_availability_history_with_conn(&conn, 10, 1).unwrap();
+        let samples = &grid.per_node[&2];
+        let spans = hopnet_storage::membership::offline_spans(samples, grid.step_secs);
+        // One closed run: 170..110 inclusive = 7 buckets (gap carried) = 4200s.
+        assert_eq!(spans, vec![4200]);
+        // Trailing run: 50..0 inclusive = 6 buckets = 3600s.
+        assert_eq!(
+            hopnet_storage::membership::current_absence(samples, grid.step_secs),
+            3600
+        );
+    }
+
+    // Should: anchor scoring windows to the newest replicated row, not the
+    // wall clock — rows from any calendar time score identically on every
+    // node and at every real-world moment.
+    // Impact: datetime('now') windows made scores node-divergent; balanced
+    // rendezvous makes weights placement-relevant, so divergent scores
+    // would silently diverge placement mesh-wide.
+    #[test]
+    fn node_metrics_anchored_to_newest_row() {
+        let pool = setup_test_db();
+        let conn = pool.get().unwrap();
+        insert_fixture_nodes(&conn, 2);
+
+        // Rows far in the wall-clock past: within the 24h/7d windows
+        // relative to their own newest row, outside them relative to now().
+        conn.execute(
+            "INSERT INTO metrics (from_node, to_node, start_time, height, available, rtt_latency, throughput)
+             VALUES (1, 2, '2020-01-01 00:00:00', 5, 1, 20.0, 1000000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO metrics (from_node, to_node, start_time, height, available, rtt_latency, throughput)
+             VALUES (1, 2, '2020-01-01 01:00:00', 5, 1, 20.0, 1000000)",
+            [],
+        )
+        .unwrap();
+
+        let metrics = get_all_node_metrics_with_conn(&conn, 10).unwrap();
+        let node2 = metrics.iter().find(|m| m.node_id == 2).unwrap();
+        assert_eq!(node2.sample_count_7d, 2, "anchored window must see the rows");
+        assert!(
+            node2.availability_score > 0.9,
+            "available rows inside the anchored 24h window must score: {}",
+            node2.availability_score
+        );
     }
 }

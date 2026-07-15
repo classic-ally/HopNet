@@ -340,7 +340,14 @@ pub fn initialize(db: PooledConnection<SqliteConnectionManager>) -> Result<(), D
             CREATE TABLE this_node (
                 internal_id             INTEGER PRIMARY KEY DEFAULT 1,
                 node_id                 INTEGER NOT NULL UNIQUE,
-                privkey                 BLOB NOT NULL
+                privkey                 BLOB NOT NULL,
+                -- Node-local storage settings (RFC-STORAGE-002
+                -- Configuration): per-node values touching nobody's
+                -- determinism; surfaced in node settings UI later.
+                hopnet_storage_gc_high_pct       INTEGER NOT NULL DEFAULT 90,
+                hopnet_storage_gc_low_pct        INTEGER NOT NULL DEFAULT 80,
+                hopnet_storage_reencode_enabled  INTEGER NOT NULL DEFAULT 1,
+                hopnet_storage_repair_budget_pct INTEGER NOT NULL DEFAULT 10
             );
 
             CREATE TABLE metrics (

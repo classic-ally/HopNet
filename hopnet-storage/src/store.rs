@@ -134,8 +134,42 @@ pub fn install_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error
         -- Indexes for fragment discovery optimization
         CREATE INDEX idx_fragment_inventory_node ON fragment_inventory (node_id, fragment_hash);  -- Node-specific fragment lookup
         CREATE INDEX idx_fragment_inventory_height ON fragment_inventory (self_verified_height, node_id);  -- Height-based queries
+
+        -- Mesh policy config (RFC-STORAGE-002 Configuration):
+        -- consensus-replicated key/value, seeded through the genesis
+        -- payload; membership::StoragePolicy::from_rows resolves it with
+        -- code defaults for absent keys. Consensus-tracked (host lists it
+        -- in CONSENSUS_TABLES).
+        CREATE TABLE hopnet_storage_policy (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
         ",
     )
+}
+
+/// Seed/overwrite mesh policy rows (genesis apply; later a settings tx).
+pub fn apply_policy_rows(
+    db_tx: &rusqlite::Transaction,
+    rows: &[(String, String)],
+) -> Result<(), rusqlite::Error> {
+    let mut stmt = db_tx
+        .prepare("INSERT OR REPLACE INTO hopnet_storage_policy (key, value) VALUES (?1, ?2)")?;
+    for (key, value) in rows {
+        stmt.execute(rusqlite::params![key, value])?;
+    }
+    Ok(())
+}
+
+/// Resolve the replicated mesh policy (code defaults for absent keys).
+pub fn read_policy(
+    conn: &rusqlite::Connection,
+) -> Result<crate::membership::StoragePolicy, rusqlite::Error> {
+    let mut stmt = conn.prepare("SELECT key, value FROM hopnet_storage_policy")?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    Ok(crate::membership::StoragePolicy::from_rows(&rows))
 }
 
 /// Register a blob: data_blocks row + fragment_hashes rows (stored_locally
@@ -779,6 +813,41 @@ mod tests {
         )
         .unwrap();
         conn
+    }
+
+    // Should: resolve code defaults from an empty table, and genesis-seeded
+    // rows once applied (INSERT OR REPLACE semantics for later settings tx).
+    // Impact: nodes resolving different policies from the same replicated
+    // rows would derive divergent member views — silent placement
+    // divergence.
+    #[test]
+    fn policy_rows_roundtrip() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE hopnet_storage_policy (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_policy(&conn).unwrap(),
+            crate::membership::StoragePolicy::default()
+        );
+
+        let tx = conn.transaction().unwrap();
+        apply_policy_rows(
+            &tx,
+            &[
+                ("decay_tiers".to_string(), "60,120,180,240".to_string()),
+                ("burst_cap".to_string(), "2".to_string()),
+            ],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let policy = read_policy(&conn).unwrap();
+        assert_eq!(policy.decay_tiers, vec![60, 120, 180, 240]);
+        assert_eq!(policy.b_max, 2);
+        assert_eq!(policy.sigma, 1); // unseeded key stays code default
     }
 
     #[test]

@@ -77,12 +77,30 @@ pub fn post_initial_setup(
         wrapped_privkey: mesh_wrapped,
     };
 
+    // Mesh storage policy seed (RFC-STORAGE-002): mesh-creation-time input,
+    // NOT runtime config — the rows land in replicated state, so every node
+    // resolves the same policy regardless of its own environment. Format:
+    // "key=value;key=value" (e.g. "decay_tiers=60,120,180,240" for
+    // orchestrator tests). Empty/absent = code defaults.
+    let storage_policy: Vec<(String, String)> = std::env::var("HOPNET_GENESIS_STORAGE_POLICY")
+        .ok()
+        .map(|spec| {
+            spec.split(';')
+                .filter_map(|pair| {
+                    let (k, v) = pair.split_once('=')?;
+                    Some((k.trim().to_string(), v.trim().to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     // Create genesis payload with user, node, and mesh key material
     let genesis_payload = GenesisPayload {
         user: user.clone(),
         node: node.clone(),
         mesh_pubkey: *mesh_pubkey.as_bytes(),
         mesh_grant,
+        storage_policy,
     };
 
     // Encode the payload

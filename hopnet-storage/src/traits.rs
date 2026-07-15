@@ -92,11 +92,47 @@ pub struct PlacementInputs {
     pub metrics: Vec<MetricsRow>,
 }
 
+/// The decay-tiered storage membership view (RFC-STORAGE-001 Membership):
+/// registered nodes minus those absent beyond their tier, with quantized
+/// placement weights and the derived watermark for this view size. Every
+/// node derives the same view from the same replicated rows.
+#[derive(Debug, Clone)]
+pub struct StorageView {
+    pub height: i32,
+    pub members: Vec<PeerRef>,
+    /// node_id → decay tier (seconds).
+    pub tiers: std::collections::HashMap<i32, i64>,
+    /// node_id → quantized placement weight (1..=16).
+    pub weights: std::collections::HashMap<i32, u64>,
+    /// W(|members|) under the mesh policy.
+    pub watermark: usize,
+}
+
 /// Replicated-state reads the engine needs. Sync — implementations read from
 /// the host's DB pool on the calling task.
 pub trait StateReader: Send + Sync {
     /// Snapshot of placement inputs at the current committed height.
     fn placement_inputs(&self) -> Result<PlacementInputs, StorageError>;
+
+    /// The decay-tiered membership view. Default falls back to the raw
+    /// validator set with no tier gating (most conservative membership —
+    /// nobody decayed) and default-policy watermark; hosts override with
+    /// the metrics-derived view.
+    fn storage_view(&self) -> Result<StorageView, StorageError> {
+        let inputs = self.placement_inputs()?;
+        let weights = inputs
+            .metrics
+            .iter()
+            .map(|m| (m.node_id, crate::placement::quantized_weight(m)))
+            .collect();
+        Ok(StorageView {
+            height: inputs.height,
+            watermark: crate::membership::watermark(inputs.validators.len()),
+            tiers: std::collections::HashMap::new(),
+            weights,
+            members: inputs.validators,
+        })
+    }
 
     /// Snapshot of placement inputs at a HISTORICAL height — the get path's
     /// placement-directed discovery rung reads the validator set the blob's

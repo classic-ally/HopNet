@@ -130,6 +130,9 @@ pub struct GenesisPayload {
     /// Mesh privkey wrapped to user 0's pubkey — in the payload (not
     /// recomputed) so joining nodes reproduce it via deterministic replay.
     pub mesh_grant: hopnet_storage::MeshKeyGrant,
+    /// Mesh storage policy seed rows (RFC-STORAGE-002 Configuration):
+    /// key/value pairs for `hopnet_storage_policy`. Empty = code defaults.
+    pub storage_policy: Vec<(String, String)>,
 }
 
 pub struct InsertGenesisHandler;
@@ -231,6 +234,15 @@ impl TransactionHandler for InsertGenesisHandler {
         crate::db::mesh::insert_mesh_key_tx(db_tx, &genesis_data.mesh_pubkey)?;
         crate::db::mesh::insert_mesh_grant_tx(db_tx, &genesis_data.mesh_grant)?;
         tracing::debug!("InsertGenesisHandler: Installed mesh keypair + genesis grant");
+
+        // 6. Seed the mesh storage policy (absent keys resolve to code
+        // defaults; see hopnet_storage::membership::StoragePolicy).
+        hopnet_storage::store::apply_policy_rows(db_tx, &genesis_data.storage_policy).map_err(
+            |e| {
+                tracing::error!("InsertGenesisHandler: Failed to seed storage policy: {e}");
+                DatabaseError::ProcessingError
+            },
+        )?;
 
         // === EXECUTION PHASE ===
         if execute {

@@ -25,6 +25,79 @@ pub const DEFAULT_DECAY_TIERS: [i64; 4] = [
 /// tier.
 pub const TIER_MIN_HISTORY: usize = 5;
 
+/// Mesh policy config (RFC-STORAGE-002 Configuration): the
+/// determinism-bearing tunables, replicated via the genesis-seeded
+/// `hopnet_storage_policy` key/value table. Absent or unparsable keys fall
+/// back to these code defaults — every node must resolve the same policy
+/// from the same rows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoragePolicy {
+    pub decay_tiers: Vec<i64>,
+    pub b_max: usize,
+    pub sigma: usize,
+    pub epsilon: usize,
+}
+
+impl Default for StoragePolicy {
+    fn default() -> Self {
+        Self {
+            decay_tiers: DEFAULT_DECAY_TIERS.to_vec(),
+            b_max: 5,
+            sigma: 1,
+            epsilon: 0,
+        }
+    }
+}
+
+impl StoragePolicy {
+    /// Resolve policy from replicated key/value rows. Keys:
+    /// `decay_tiers` (comma-separated seconds, ascending), `burst_cap`,
+    /// `reserve_slack`, `climb_back`. Unknown keys are ignored (forward
+    /// compatibility); malformed values fall back per key.
+    pub fn from_rows(rows: &[(String, String)]) -> Self {
+        let mut policy = Self::default();
+        for (key, value) in rows {
+            match key.as_str() {
+                "decay_tiers" => {
+                    let tiers: Option<Vec<i64>> =
+                        value.split(',').map(|t| t.trim().parse().ok()).collect();
+                    if let Some(tiers) = tiers.filter(|t| {
+                        !t.is_empty() && t.windows(2).all(|w| w[0] < w[1]) && t[0] > 0
+                    }) {
+                        policy.decay_tiers = tiers;
+                    }
+                }
+                "burst_cap" => {
+                    if let Ok(v) = value.parse() {
+                        policy.b_max = v;
+                    }
+                }
+                "reserve_slack" => {
+                    if let Ok(v) = value.parse() {
+                        policy.sigma = v;
+                    }
+                }
+                "climb_back" => {
+                    if let Ok(v) = value.parse() {
+                        policy.epsilon = v;
+                    }
+                }
+                _ => {}
+            }
+        }
+        policy
+    }
+
+    pub fn watermark_params(&self) -> WatermarkParams {
+        WatermarkParams {
+            b_max: self.b_max,
+            sigma: self.sigma,
+            epsilon: self.epsilon,
+            ..WatermarkParams::default()
+        }
+    }
+}
+
 /// Closed offline spans (seconds) from a node's dense availability grid.
 ///
 /// `samples` are `(bucket_start, available)` in ascending bucket order at
@@ -338,6 +411,34 @@ mod tests {
             derive_tier(&aged_out, &DEFAULT_DECAY_TIERS, TIER_MIN_HISTORY),
             24 * H
         );
+    }
+
+    // Should: resolve replicated key/value rows to the policy, ignore
+    // unknown keys, and fall back per-key on malformed values.
+    // Should not: accept a non-ascending or non-positive tier list.
+    // Impact: nodes resolving different policies from the same rows would
+    // derive divergent member views and watermarks — silent placement
+    // divergence.
+    #[test]
+    fn policy_from_rows_resolution() {
+        let rows = vec![
+            ("decay_tiers".to_string(), "60,120,180,240".to_string()),
+            ("burst_cap".to_string(), "3".to_string()),
+            ("future_knob".to_string(), "whatever".to_string()),
+            ("reserve_slack".to_string(), "not a number".to_string()),
+        ];
+        let p = StoragePolicy::from_rows(&rows);
+        assert_eq!(p.decay_tiers, vec![60, 120, 180, 240]);
+        assert_eq!(p.b_max, 3);
+        assert_eq!(p.sigma, 1); // malformed → default
+        assert_eq!(p.epsilon, 0);
+
+        let bad = vec![("decay_tiers".to_string(), "240,120".to_string())];
+        assert_eq!(
+            StoragePolicy::from_rows(&bad).decay_tiers,
+            DEFAULT_DECAY_TIERS.to_vec()
+        );
+        assert_eq!(StoragePolicy::from_rows(&[]), StoragePolicy::default());
     }
 
     // Should: drop a node whose current absence outlived its tier, keep

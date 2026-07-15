@@ -85,7 +85,7 @@ proven pieces. S1–S2 are dark (no production call sites).
   All time arithmetic anchored to the newest sample, never wall
   clock. Gate: crate tests — spread bounds for v ∈ 3..=30, qnt table
   equality, W(v) spot values, tier archetypes, hysteresis anti-flap.
-- [ ] **S2 — config + membership view, dark.**
+- [x] **S2 — config + membership view, dark.**
   `hopnet_storage_policy` table + genesis seeding + code defaults;
   `this_node` `hopnet_storage_*` fields; availability-history query
   (10-min buckets, MAX over reporters, window anchored to the newest

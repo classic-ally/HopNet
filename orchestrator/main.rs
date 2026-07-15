@@ -208,6 +208,16 @@ async fn main() -> Result<()> {
                         "Auto-creating mesh {} with {} nodes for test",
                         auto_mesh_id, auto_nodes
                     );
+                    // Genesis-seeded config some tests require (lands in the
+                    // forwarded HOPNET_GENESIS_* env at container creation).
+                    if let Some(name) = test.as_deref() {
+                        for (k, v) in tests::mesh_creation_env(name) {
+                            println!("Seeding mesh-creation env {}={}", k, v);
+                            // SAFETY: single-threaded CLI setup phase — no
+                            // concurrent env readers yet.
+                            unsafe { std::env::set_var(k, v) };
+                        }
+                    }
                     create_mesh(&docker, auto_mesh_id, *auto_nodes, false, runtime).await?;
 
                     let test_result = tests::handle_test_command(
@@ -905,14 +915,16 @@ async fn create_hopnet_container(
                 // Self-hosted relay: no n0 public relay/discovery dependency.
                 format!("HOPNET_RELAY_URL={}", relay_url(mesh_id)),
             ];
-            // Forward HOPNET_DB_* (pragma tuning) and HOPNET_CONSENSUS_*/
-            // HOPNET_QUORUM_* (timeouts, quorum profile) from the
-            // orchestrator process so tests can configure meshes without
-            // rebuilding the image.
+            // Forward HOPNET_DB_* (pragma tuning), HOPNET_CONSENSUS_*/
+            // HOPNET_QUORUM_* (timeouts, quorum profile), and
+            // HOPNET_GENESIS_* (mesh-creation inputs, e.g. the storage
+            // policy seed) from the orchestrator process so tests can
+            // configure meshes without rebuilding the image.
             for (k, v) in std::env::vars() {
                 if k.starts_with("HOPNET_DB_")
                     || k.starts_with("HOPNET_CONSENSUS_")
                     || k.starts_with("HOPNET_QUORUM_")
+                    || k.starts_with("HOPNET_GENESIS_")
                 {
                     e.push(format!("{}={}", k, v));
                 }

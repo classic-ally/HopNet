@@ -485,6 +485,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .route("/debug/iroh-ping", get(net::routes::debug_iroh_ping))
                 .route("/debug/db-stats", get(consensus::routes::get_db_stats))
+                .route("/storage/view", get(storage_host::routes::get_storage_view))
                 .route("/validators", get(consensus::routes::get_validators))
                 .route("/metrics", get(metrics::routes::get_metrics))
                 .route(

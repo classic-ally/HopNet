@@ -18,7 +18,7 @@ use hopnet_storage::engine::{EngineConfig, EngineHandle, Seams};
 use hopnet_storage::rpc::RpcTransport;
 use hopnet_storage::store::DistributableBlob;
 use hopnet_storage::traits::{
-    LocalStateSink, PeerRef, PlacementInputs, StateReader, SubmitError, TxSubmitter,
+    LocalStateSink, PeerRef, PlacementInputs, StateReader, StorageView, SubmitError, TxSubmitter,
 };
 use std::sync::Arc;
 
@@ -125,6 +125,77 @@ impl StateReader for SubstrateHost {
                 })
                 .collect(),
             metrics: metrics.into_iter().map(Into::into).collect(),
+        })
+    }
+
+    fn storage_view(&self) -> Result<StorageView, StorageError> {
+        use hopnet_storage::membership;
+        // One scoped checkout: height, mesh policy, node universe + weights
+        // (via the anchored metrics scoring), and availability history all
+        // read against one consistent state — the derivation below is pure,
+        // so every node computes the same view from the same rows.
+        let conn = self
+            .app_state
+            .db_pool
+            .get()
+            .map_err(|e| StorageError::Host(format!("pool checkout: {e}")))?;
+        let height = crate::db::consensus::get_current_consensus_height(&conn)
+            .map_err(|e| StorageError::Host(format!("current height: {e:?}")))?;
+        let policy = hopnet_storage::store::read_policy(&conn)
+            .map_err(|e| StorageError::Host(format!("storage policy: {e}")))?;
+        let node_metrics = crate::db::metrics::get_all_node_metrics_with_conn(&conn, height)
+            .map_err(|e| StorageError::Host(format!("node metrics: {e:?}")))?;
+        let grid = crate::db::metrics::get_availability_history_with_conn(&conn, height, 30)
+            .map_err(|e| StorageError::Host(format!("availability history: {e:?}")))?;
+        drop(conn);
+
+        let cold_tier = policy.decay_tiers[policy.decay_tiers.len().saturating_sub(2)];
+        let mut tiers = std::collections::HashMap::new();
+        let mut absence = std::collections::HashMap::new();
+        for (node_id, samples) in &grid.per_node {
+            let spans = membership::offline_spans(samples, grid.step_secs);
+            tiers.insert(
+                *node_id,
+                membership::derive_tier(
+                    &spans,
+                    &policy.decay_tiers,
+                    membership::TIER_MIN_HISTORY,
+                ),
+            );
+            absence.insert(
+                *node_id,
+                membership::current_absence(samples, grid.step_secs),
+            );
+        }
+
+        // Node universe = every registered node (the metrics scoring query
+        // is FROM nodes, so unmeasured nodes appear with defaults). Nodes
+        // with no availability grid have absence 0 (presence bias) and the
+        // cold tier.
+        let node_ids: Vec<i32> = node_metrics.iter().map(|m| m.node_id).collect();
+        let member_ids = membership::storage_members(&node_ids, &absence, &tiers, cold_tier);
+        let member_set: std::collections::HashSet<i32> = member_ids.iter().copied().collect();
+        let watermark =
+            membership::watermark_with(member_ids.len(), &policy.watermark_params());
+
+        let mut members = Vec::with_capacity(member_ids.len());
+        let mut weights = std::collections::HashMap::new();
+        for m in node_metrics {
+            let node_id = m.node_id;
+            let pubkey = m.pubkey.0.to_bytes();
+            let row: hopnet_storage::placement::MetricsRow = m.into();
+            weights.insert(node_id, hopnet_storage::placement::quantized_weight(&row));
+            if member_set.contains(&node_id) {
+                members.push(PeerRef { node_id, pubkey });
+            }
+        }
+
+        Ok(StorageView {
+            height,
+            members,
+            tiers,
+            weights,
+            watermark,
         })
     }
 

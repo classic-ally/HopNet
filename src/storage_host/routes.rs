@@ -47,6 +47,50 @@ pub struct FileFragmentsResponse {
 
 /// GET /fragments
 /// Get count of fragments stored locally on this node
+/// GET /storage/view — the decay-tiered storage membership view
+/// (RFC-STORAGE-002 S2 observability): members, per-node tiers/weights,
+/// derived watermark. Every node must report the same view at the same
+/// height; orchestrator tests assert that cross-node.
+pub async fn get_storage_view(State(app_state): State<AppState>) -> impl IntoResponse {
+    use hopnet_storage::traits::StateReader;
+    let host = super::substrate_host::SubstrateHost::new(app_state);
+    // DB reads on a blocking thread — same discipline as the engine seams.
+    let view = tokio::task::spawn_blocking(move || host.storage_view()).await;
+    match view {
+        Ok(Ok(view)) => {
+            #[derive(Serialize)]
+            struct StorageViewResponse {
+                height: i32,
+                watermark: usize,
+                members: Vec<i32>,
+                tiers: std::collections::HashMap<i32, i64>,
+                weights: std::collections::HashMap<i32, u64>,
+            }
+            (
+                StatusCode::OK,
+                Json(StorageViewResponse {
+                    height: view.height,
+                    watermark: view.watermark,
+                    members: view.members.iter().map(|p| p.node_id).collect(),
+                    tiers: view.tiers,
+                    weights: view.weights,
+                }),
+            )
+                .into_response()
+        }
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("storage view: {e}"),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("storage view join: {e}"),
+        )
+            .into_response(),
+    }
+}
+
 pub async fn get_fragments_count(
     State(app_state): State<AppState>,
     Extension(user_id): Extension<i32>, // Extract user_id from JWT via auth middleware

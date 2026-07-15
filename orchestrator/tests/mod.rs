@@ -35,6 +35,7 @@ mod range_download;
 mod recents;
 mod sharing;
 mod takeout;
+mod tier_membership;
 
 /// Represents the result of a test scenario execution
 #[derive(Debug)]
@@ -87,6 +88,19 @@ pub trait TestScenario: Send + Sync {
     fn name(&self) -> &'static str;
     fn description(&self) -> &'static str;
     async fn run(&self, mesh_id: u32, nodes: &[NodeInfo], flags: &[String]) -> Result<TestResult>;
+}
+
+/// Mesh-creation env for tests needing genesis-seeded config (applied by
+/// the auto-managed runner BEFORE create_mesh; caller-managed meshes must
+/// export these before `orchestrator create` for the same checks).
+pub fn mesh_creation_env(test_name: &str) -> Vec<(&'static str, &'static str)> {
+    match test_name {
+        "tier-membership" => vec![(
+            "HOPNET_GENESIS_STORAGE_POLICY",
+            "decay_tiers=60,120,180,240",
+        )],
+        _ => vec![],
+    }
 }
 
 /// Run a test by name
@@ -172,6 +186,11 @@ pub async fn run_test_by_name(
                 .await
         }
         "metrics-collection" => metrics::MetricsCollection.run(mesh_id, nodes, flags).await,
+        "tier-membership" => {
+            tier_membership::TierMembership
+                .run(mesh_id, nodes, flags)
+                .await
+        }
         "multi-user-isolation" => {
             multi_user::MultiUserIsolation
                 .run(mesh_id, nodes, flags)
@@ -315,6 +334,7 @@ pub fn list_test_names() -> Vec<&'static str> {
         "consensus-barrier-decide-window",
         "consensus-barrier-proposal-hold",
         "metrics-collection",
+        "tier-membership",
         "multi-user-isolation",
         "multi-user-sharing",
         "multi-user-sharing-live-link",
