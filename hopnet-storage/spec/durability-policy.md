@@ -1,6 +1,7 @@
 # RFC-STORAGE-001: Durability & Placement Policy
 
-**Status**: Specified. Implementation: RFC-STORAGE-002 (not started).
+**Status**: Specified. Implementation: RFC-STORAGE-002
+(`spec/implementation-plan.md`, in progress).
 **Normative model**: `spec/storage_policy.qnt` — where prose and model
 disagree, the model wins. Commands: `spec/README.md`.
 
