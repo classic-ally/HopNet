@@ -1,6 +1,7 @@
 # RFC-CONSENSUS-001: Validator Membership Policy
 
-**Status**: Draft.
+**Status**: Specified + model-checked (2026-07-16). Implementation
+pending.
 **Normative model**: `spec/validator_membership.qnt` — where prose and
 model disagree, the model wins. Commands: `spec/README.md`.
 
@@ -52,10 +53,12 @@ preserves live′ ≥ quorum(v′): no admission, leave, or vote-out stalls
 a mesh that was live. Vote-out of a dark node strictly grows H (live
 unchanged, quorum shrinks); admission of a caught-up node cannot
 shrink it; voluntary leave is the one transition that can, and
-carries a guard (Departure classes). Exposure is capped by headroom:
-no seating may borrow more quorum than the mesh could survive losing
-— e ≤ H at seating — so even a batch's complete failure never stalls
-the mesh (Admission & readmission).
+carries a guard (Departure classes). Exposure is capped by the proven
+cushion: no seating may inflate quorum beyond what the live PROVEN
+members cover, so even the joint death of every not-yet-proven seat
+never stalls the mesh (Admission & readmission — the proven-quorum
+ceiling, which the model substituted for this section's original
+per-batch bound after finding the latter does not compose).
 
 **INV-FLOOR** (safety) — the validator set never empties: v′ ≥ 1.
 
@@ -176,6 +179,27 @@ approvers will observe as fresh contact. But a veto would make an
 unresponsive-but-scheming node immortal; the quorum rule alone
 decides.
 
+**Affirmative quorum, and what it buys.** Approval counts only
+affirmative attestations — quorum(v) yes-votes; absence, abstention,
+and the target's dissent are never yes. The model derives a theorem
+from this counting rule alone: a wrongful vote-out of a live node
+requires quorum(v) OTHER live validators, so the survivors retain
+quorum — even with the freshness contract fully broken, wrongful
+removal can steal one point of headroom, never stall the mesh
+(model: negF1HeadroomTheftTest + 10k adversarial traces). The
+freshness contract's load-bearing job is therefore blocking the
+theft; stall-safety comes from the counting rule.
+
+**Fairness assumption (asymmetric darkness).** Removal liveness
+assumes every live observer's evidence about a dark target eventually
+goes stale. A node answering probes from a single validator while
+contributing nothing to quorum blocks its own removal — at the cliff,
+permanently, not slowly (model: negF2AsymmetricBlockTest — the
+removal is blocked until the asymmetric half-link itself decays).
+Real links that carry nothing but probe answers do decay; the model
+checks RECOVERY under exactly that fairness and exhibits the
+permanent block without it.
+
 A node that votes in consensus but refuses every other duty
 therefore keeps its seat: vote-out judges quorum contribution only,
 and a node whose votes land in certificates is contributing. Other
@@ -287,32 +311,49 @@ shift parity in its favour.
 quorum points inflated on the promise the batch stays alive.
 Exposure-free seatings (Δquorum = 0) are free options — if the node
 dies at once, H returns exactly to its prior value, and the eventual
-vote-out recoups the seat. Exposed seatings can kill: at H = 0, a
-batch of three weak candidates (exposure 2) that flaps out within
-one removal window leaves H = −2 — stalled, the deflating vote-outs
-unable to commit — where the unbatched mesh would still be alive.
-Hence:
+vote-out recoups the seat. Exposed seatings lean on their members
+staying alive, and the model corrected this section's original
+per-batch bound (e ≤ H at seating): it does not compose. Two
+sequential batches, each individually legal, jointly die into a stall
+the unbatched mesh would have survived (model:
+ceilingCompositionNegTest). The load-bearing rules:
 
-- **Exposure ceiling: e ≤ H at seating.** A batch's complete failure
-  takes the mesh to H − e; the ceiling guarantees that worst case
-  stays alive. At the cliff only exposure-free seatings exist —
-  "calm-weather tool" is a theorem, not advice. The V_bft crossing,
-  always exposed, needs H ≥ 1.
+- **The proven-quorum ceiling.** A member is UNPROVEN until it has
+  survived P_prove in seat — genesis seats are proven by fiat, and a
+  pre-seat bright span does not count: reachability evidence is not
+  survival. A seating may inflate quorum only within the proven
+  cushion: quorum(v+b) − quorum(v) ≤ max(0, live_proven − quorum(v)).
+  Unproven members are never load-bearing — the joint death of every
+  unproven seat still leaves a live proven quorum. The per-batch
+  e ≤ H bound is the special case with no unproven seats
+  outstanding; the cushion self-accounts for stacked seatings (each
+  one's quorum inflation shrinks it) and re-opens as members prove.
+  At the cliff only exposure-free seatings pass — "calm-weather
+  tool" is a theorem, not advice — and the V_bft crossing, always
+  exposed, needs one point of proven cushion.
+- **Zero-tolerance waiver.** A set that already stalls on any single
+  death (tol(v) = 0, i.e. v ≤ 2) has no tolerance to protect — and
+  without a waiver could never grow, since any growth from v = 1
+  inflates quorum. Growth from there bets on the batch, and the bet
+  strictly dominates: the death count needed to stall never
+  decreases on a posture-legal seating. Full S_min still gates the
+  evidence.
 - **Exposure-free: S_min scales with H**, mirroring T_out — full
-  span when comfortable (it buys only churn hygiene; registration is
-  owner-gated, seat-spam is not the threat model), floor when H ≤ 1.
-  Refusing free headroom at the cliff would be malpractice.
-- **Exposed: full S_min from every member, at every H.** The mesh is
-  leaning on these nodes; it does not lean on strangers. Since the
+  span when comfortable, floor when H ≤ 1. Refusing free headroom at
+  the cliff would be malpractice.
+- **Exposed: full S_min from every member, at every H.** Since the
   V_bft crossing is always exposed, the security upgrade never rides
-  relaxed evidence.
+  relaxed evidence. Re-characterized by the model: under the
+  proven-quorum ceiling a batch's death cannot stall the mesh, so
+  S_min carries churn hygiene and evidence quality — the structural
+  stall-safety lives in the ceiling.
 - **Voluntary leavers are exempt from S_min on exposure-free
   seatings** — a graceful exit is not a fault, and hysteresis exists
   to damp faults. No one is exempt on exposed seatings.
 
 One principle covers both directions: urgency compresses evidence
 windows — T_out on removal, S_min on exposure-free admission — and
-never buys exposure.
+never buys exposure beyond the proven cushion.
 
 **Selection.** Candidates outnumbering the batch: proposers pick the
 brightest they observe (longest span, ties by node_id); approvers
@@ -396,6 +437,7 @@ seed it small and everything compresses proportionally).
 | T_lazy | 10·T_probe (5 min) | removal window at H ≥ 2 |
 | S_floor | 1·T_probe | admission span, exposure-free at H ≤ 1 — one observed probe |
 | S_full | 60·T_probe (30 min) | admission span, comfortable H and all exposed seatings |
+| P_prove | 60·T_probe (30 min) | in-seat survival before a member is proven (ceiling cushion) |
 | V_bft | 7 | AUTO profile switch point |
 | quorum_profile | auto | auto \| bft \| majority (pinned) |
 | catch-up tolerance | 10 heights | existing activation gate, unchanged |
@@ -425,13 +467,14 @@ values are judgment inside them:
   is theater: the flapper re-seats before proving anything), and
   validator standing must recover faster than storage standing
   decays or the timescale ordering inverts.
-- **V_bft = 7**, doubly principled: the smallest v where the
-  Byzantine budget survives one crash (f_eq = ⌊(v−1)/3⌋ ≥ 2 — below
-  that, the first ordinary crash spends the whole budget and the
-  defense is theater), and the unique crash-neutral crossing:
-  majority tolerance ⌈v/2⌉−1 and BFT tolerance ⌊(v−1)/3⌋ meet only
-  at v = 7 (2 = 2). Crossing earlier or later drops crash tolerance
-  at the seam.
+- **V_bft = 7**, doubly principled — as corrected by the model
+  (seamLemmaTest): the crash-neutral crossings, where
+  tol_maj(v−1) = tol_bft(v), are exactly {4, 5, 7}, not 7 alone.
+  What is unique about 7 is being crash-neutral AND
+  Byzantine-meaningful at once: f_eq = ⌊(v−1)/3⌋ ≥ 2 first holds at
+  7. At 4 and 5 the whole Byzantine budget is one fault, which the
+  first ordinary crash spends — theater; crossing at 6 or 8 drops
+  crash tolerance at the seam.
 
 Crash tolerance across the AUTO composite is monotone non-decreasing
 in v (1, 2, 2, 2, 2, 2, 3, …): growth never makes the mesh more
@@ -443,27 +486,57 @@ redundant (pinning remains for exercising BFT at small v).
 
 ## Evidence
 
-To check (Quint/Apalache; results recorded here when green):
+All green 2026-07-16. Model: `spec/validator_membership.qnt`;
+commands and runtimes: `spec/README.md`. Layers: [lemma] = complete
+enumeration v = 1..30, all three quorum modes; [ind] = Apalache
+inductive, depth-free; [bounded] = Apalache bounded; [wit] =
+scripted witness/NEG run.
 
-- INV-NO-HARM, including the exposure ceiling, over all transition
-  interleavings — majority, BFT, and AUTO composite quorum.
-- INV-FLOOR; INV-NO-EXILE (pool standing + eventual seating in
-  fault-bearing runs).
-- Partition safety: no minority partition commits a removal.
-- RECOVERY under fairness (failure inter-arrival > one
-  detect-and-commit cycle), including adversarial band disagreement
-  (slowest-attestor delays, never blocks) and across the V_bft seam
-  (graceful shrink, then re-upgrade).
-- One-removal-per-height suffices: mass-dark converges without
-  batch removal.
-- Exposure NEG witnesses: (a) a relaxed exposed batch at H = 0 dies
-  ⇒ stall — proves full-S_min-on-exposure load-bearing; (b) a V_bft
-  crossing at H = 0 dies ⇒ stall — proves the exposure ceiling
-  load-bearing.
-- Parity and posture tables: ΔH and Δf_eq for single and batch
-  seatings, v = 1..30, all three quorum modes — the closed forms and
-  seam claims quoted in Admission & readmission.
-- Crash-tolerance monotonicity of the AUTO composite.
+- INV-NO-HARM incl. the proven-quorum ceiling — [ind] NoError on
+  small (1..5), seam (1..9 AUTO), bft/maj pinned, and ten (1..10)
+  configs, 6–57 s each. The wrongful-removal case (evidence contract
+  broken): [bounded] no-stall theorem on the per-attestor evidence
+  machine, depth 10, plus 10k adversarial traces — wrongful vote-out
+  steals headroom, never stalls (see Evidence & validation,
+  affirmative quorum).
+- INV-FLOOR; INV-NO-EXILE enabledness half — [ind]. NO-EXILE
+  liveness half — [wit] seam round-trip + scheduler self-heal
+  (unbounded temporal property; witness-grade by design).
+- Partition safety — [lemma] DISJOINT-QUORUM (2q > v everywhere) +
+  [wit] minority impotence and a block-relative heal round-trip that
+  crosses the seam both ways (BFT shed under split, restored by the
+  crossing batch after heal and re-proving).
+- RECOVERY under fairness — [wit] recovery, mass-dark with the
+  worked table's intermediate H values asserted, multi-kill
+  same-cycle, slowest-attestor delay. Fairness NEGs: kills outrun
+  windows ⇒ stall with the machinery blameless; asymmetric refresh ⇒
+  removal BLOCKED until the half-link decays (the stated fairness
+  assumption).
+- GUAR-HONEST-SET + longest-dark-first — [wit] + 5k traces on the
+  deterministic scheduler config (calm-bound invariant clean).
+- One-removal-per-height mass-dark convergence — [wit].
+- Exposure NEGs — per-batch ceiling non-composition [wit]; cliff
+  crossing dies ⇒ stall with the ceiling off, refused with it on
+  [wit]. The originally-planned NEG (a) (relaxed S_min ⇒ stall) is
+  SUBSUMED: under the proven-quorum ceiling a batch's death cannot
+  stall regardless of S_min — S_min's role is re-characterized in
+  Admission & readmission.
+- Parity, batch (incl. the B_max = 5 licence), seam ({4,5,7}
+  correction, f_eq(7) = 2), tolerance monotonicity + the literal
+  0,1,1,2,2,2,2,2,3 sequence, posture surgical-clause, free-option
+  identity, complementary parity — [lemma]. Literal-table drift
+  guards + scaled-constant ordering guards in every config.
+
+**Non-obligations** (assumed, not model-checked): wall-clock probe
+semantics and the T_probe blip census; the evidence mechanism beyond
+the freshness/independence contract (probe transport, certificate
+parsing); proposer-side brightest-first ranking (the model
+over-approximates with any eligible batch — the safe direction);
+duplicate-proposal harmlessness; catch-up sync dynamics (an unsynced
+admittee is dominated by the modeled dies-at-seating case); the
+cross-RFC ordering S_full ≪ smallest storage decay tier; Byzantine
+equivocation itself (f_eq is arithmetic — the BFT safety theorem is
+imported from Tendermint/Malachite); genesis composition.
 
 ## Deferred
 

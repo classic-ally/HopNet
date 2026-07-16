@@ -30,7 +30,16 @@ an audit found a view-change safety hole. See RFC-013 for the full design
 - [~] Post-extraction gates: bench trio + full app-suite (streaming 36.6 MB/s and
       pragma benches pass; consensus-queue-throughput 68.7% vs the 80% bar —
       admission tuning is the open follow-up)
-- [ ] Node health monitoring and automatic validator management
+- [~] Node health monitoring and automatic validator management —
+      SPECIFIED + MODEL-CHECKED as
+      [RFC-CONSENSUS-001](../hopnet-consensus/spec/validator-membership.md)
+      (2026-07-16): full membership lifecycle (leave / vote-out /
+      batch readmission), headroom-scheduled removal windows,
+      proven-quorum exposure ceiling, AUTO quorum profile (majority
+      < 7 ≤ BFT, crash-neutral crossing); Quint model green
+      (Apalache inductive + enumeration lemmas + witness/NEG runs,
+      `hopnet-consensus/spec/validator_membership.qnt`).
+      Implementation pending (RFC-CONSENSUS-002).
 
 ### 2. Storage Substrate ([RFC-014](specs/hopnet-storage.md)) + File Storage ([RFC-002](specs/file-storage.md))
 **Status**: Substrate extraction COMPLETE (stages A–F, 2026-07-07) — the `hopnet-storage`
