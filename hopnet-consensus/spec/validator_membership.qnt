@@ -884,3 +884,357 @@ module cfg_neg_fairness {
       // mesh stalls with the removal machinery healthy and blameless.
       .expect(stalled and invNoHarm and invCeiling and invFloor)
 }
+
+// ============================================================
+// Evidence-contract machine (per-attestor staleness). Checks the
+// freshness contract itself — the thing the main machine axiomatizes.
+// obsDark[(y, x)] = ticks since observer y last had contact with
+// target x. Contact: self, an adversary-controlled direct link, or —
+// when CERT_CHANNEL — x's signature in a committed certificate, which
+// refreshes EVERY observer at once (replicated evidence).
+//
+// A vote-out commits only with >= q(v) AFFIRMATIVE attestors among
+// the live seated, and a node never attests against itself. That
+// yes-quorum rule carries a model-found theorem: even with the
+// freshness contract BROKEN (CERT_CHANNEL off, adversarial links), a
+// wrongful removal of a live node needs q(v) OTHER live validators,
+// so the survivor set keeps quorum — wrongful vote-out can steal
+// headroom, never stall the mesh. The freshness contract's real job
+// is blocking the theft, not preventing the stall.
+// ============================================================
+module evidence_policy {
+  const REGISTERED: Set[int]
+  const Q_TABLE: int -> int
+  const T_CLIFF: int
+  const T_CAP: int
+  const CERT_CHANNEL: bool
+
+  var seated: Set[int]
+  var alive: Set[int]
+  var obsDark: (int, int) -> int
+  var linkUp: (int, int) -> bool
+  var harmedByPolicy: bool
+
+  val vSize = seated.size()
+  def q(v: int): int = Q_TABLE.get(v)
+  val liveSeated = alive.intersect(seated)
+  val stalled = liveSeated.size() < q(vSize)
+  val headroom = liveSeated.size() - q(vSize)
+  val pairs = tuples(REGISTERED, REGISTERED)
+
+  def contact(y: int, x: int): bool = and {
+    alive.contains(x),
+    or {
+      y == x,
+      linkUp.get((y, x)),
+      CERT_CHANNEL and seated.contains(x),
+    }
+  }
+
+  def attestors(x: int): Set[int] =
+    liveSeated.exclude(Set(x)).filter(y => obsDark.get((y, x)) >= T_CLIFF)
+
+  def voteOutEnabled(x: int): bool = and {
+    seated.contains(x),
+    attestors(x).size() >= q(vSize),
+    not(stalled),
+  }
+
+  action init = all {
+    seated' = REGISTERED,
+    alive' = REGISTERED,
+    obsDark' = pairs.mapBy(p => 0),
+    linkUp' = pairs.mapBy(p => true),
+    harmedByPolicy' = false,
+  }
+
+  action envKillN(n: int): bool = all {
+    alive.contains(n),
+    alive' = alive.exclude(Set(n)),
+    seated' = seated, obsDark' = obsDark, linkUp' = linkUp,
+    harmedByPolicy' = harmedByPolicy,
+  }
+
+  action envLinkN(y: int, x: int, up: bool): bool = all {
+    linkUp' = linkUp.set((y, x), up),
+    seated' = seated, alive' = alive, obsDark' = obsDark,
+    harmedByPolicy' = harmedByPolicy,
+  }
+  action envLink = all {
+    { nondet p = pairs.oneOf()
+      nondet up = Set(true, false).oneOf()
+      envLinkN(p._1, p._2, up) }
+  }
+
+  action envTick = all {
+    obsDark' = pairs.mapBy(p =>
+      if (contact(p._1, p._2)) 0
+      else if (obsDark.get(p) < T_CAP) obsDark.get(p) + 1 else T_CAP),
+    seated' = seated, alive' = alive, linkUp' = linkUp,
+    harmedByPolicy' = harmedByPolicy,
+  }
+
+  action commitVoteOutN(x: int): bool = all {
+    voteOutEnabled(x),
+    seated' = seated.exclude(Set(x)),
+    harmedByPolicy' = (harmedByPolicy or
+      alive.intersect(seated.exclude(Set(x))).size() < q(vSize - 1)),
+    alive' = alive, obsDark' = obsDark, linkUp' = linkUp,
+  }
+  action commitVoteOut = all {
+    seated.exists(x => voteOutEnabled(x)),
+    { nondet x = seated.filter(x => voteOutEnabled(x)).oneOf()
+      commitVoteOutN(x) }
+  }
+
+  action step = any { envKillN(4), envLink, envTick, commitVoteOut }
+
+  val invNoHarm = not(harmedByPolicy)
+}
+
+// POS: with the cert channel honored, a live seated node's evidence
+// never goes stale anywhere — wrongful attestation is impossible.
+module cfg_evidence_pos {
+  import q_tables.*
+  import evidence_policy(
+    REGISTERED = 1.to(4), Q_TABLE = Q_BFT_TABLE,
+    T_CLIFF = 2, T_CAP = 6, CERT_CHANNEL = true
+  ).*
+
+  run posNoWrongfulAttestTest =
+    init
+      // adversary severs every direct link
+      .then(envLinkN(1, 4, false)).then(envLinkN(2, 4, false))
+      .then(envLinkN(3, 4, false))
+      .then(6.reps(_ => envTick))
+      // cert participation kept every observer fresh: 4 not removable
+      .expect(not(voteOutEnabled(4)))
+      // a genuinely dead node IS removable — certs stop refreshing
+      .then(envKillN(4)).then(2.reps(_ => envTick))
+      .then(commitVoteOutN(4))
+      .expect(vSize == 3 and invNoHarm)
+}
+
+// NEG-F1 (freshness contract broken): a quorum's evidence goes stale
+// against a LIVE node and removes it. The theorem holds — no stall —
+// but headroom is stolen: the mesh pays one tolerance point for the
+// broken contract.
+module cfg_evidence_neg_theft {
+  import q_tables.*
+  import evidence_policy(
+    REGISTERED = 1.to(4), Q_TABLE = Q_BFT_TABLE,
+    T_CLIFF = 2, T_CAP = 6, CERT_CHANNEL = false
+  ).*
+
+  run negF1HeadroomTheftTest =
+    init
+      .then(envLinkN(1, 4, false)).then(envLinkN(2, 4, false))
+      .then(envLinkN(3, 4, false))
+      .then(2.reps(_ => envTick))
+      .expect(headroom == 1 and voteOutEnabled(4))   // wrongful, enabled
+      .then(commitVoteOutN(4))
+      // stolen: live node lost, q(3)=3 under BFT — headroom 1 -> 0.
+      // NOT stalled: the yes-quorum needed 3 OTHER live validators.
+      .expect(vSize == 3 and headroom == 0 and not(stalled) and invNoHarm)
+
+  // The theorem under full adversarial schedule: links flap, nodes
+  // die, wrongful removals fire — the mesh never stalls by policy.
+  // (Random-sim gate; also Apalache-checkable at this size.)
+}
+
+// NEG-F2 (asymmetric refresh): a single healthy half-link keeps one
+// observer perpetually fresh; at attestor-quorum sizes the removal is
+// BLOCKED, not delayed, until the refresher's link decays — the
+// fairness assumption the spec must state.
+module cfg_evidence_neg_asym {
+  import q_tables.*
+  import evidence_policy(
+    REGISTERED = 1.to(4), Q_TABLE = Q_BFT_TABLE,
+    T_CLIFF = 2, T_CAP = 6, CERT_CHANNEL = false
+  ).*
+
+  run negF2AsymmetricBlockTest =
+    init
+      // node 4 answers ONLY observer 3; certs disabled
+      .then(envLinkN(1, 4, false)).then(envLinkN(2, 4, false))
+      .then(6.reps(_ => envTick))
+      // attestors = {1, 2} — two short of nothing: q(4) = 3. Blocked
+      // FOREVER while 3's half-link survives.
+      .expect(attestors(4).size() == 2 and not(voteOutEnabled(4)))
+      // fairness: the asymmetric link decays; evidence goes commonly
+      // stale; removal proceeds.
+      .then(envLinkN(3, 4, false))
+      .then(2.reps(_ => envTick))
+      .then(commitVoteOutN(4))
+      .expect(vSize == 3 and invNoHarm)
+}
+
+// ============================================================
+// Partition machine: block-relative quorum and evidence. During a
+// split only the block holding >= q(v) live seated members commits
+// anything; its evidence about the other block goes stale together.
+// live/stalled are measured against the COMMITTING BLOCK.
+// ============================================================
+module partition_policy {
+  const REGISTERED: Set[int]
+  const INIT_SEATED: Set[int]
+  const Q_TABLE: int -> int
+  const FEQ_TABLE: int -> int
+  const T_CLIFF: int
+  const S_FULL: int
+
+  var seated: Set[int]
+  var alive: Set[int]
+  var blockA: Set[int]        // the (potential) majority block
+  var split: bool
+  var darkToA: int -> int     // A's staleness evidence per node
+  var brightToA: int -> int   // A's bright-span evidence per node
+
+  val vSize = seated.size()
+  def q(v: int): int = Q_TABLE.get(v)
+  def feq(v: int): int = FEQ_TABLE.get(v)
+  // Who A can currently reach: its own alive members, plus everyone
+  // alive once healed.
+  val reachableByA = if (split) blockA.intersect(alive) else alive
+  val liveForA = reachableByA.intersect(seated)
+  val stalledForA = liveForA.size() < q(vSize)
+
+  def voteOutEnabled(x: int): bool = and {
+    seated.contains(x),
+    not(reachableByA.contains(x)),
+    darkToA.get(x) >= T_CLIFF,
+    not(stalledForA),
+  }
+  // Crossing/batch seating from A's side, spans per A's evidence.
+  def seatEnabled(bs: Set[int]): bool = and {
+    bs.size() > 0,
+    bs.subseteq(reachableByA.exclude(seated)),
+    not(stalledForA),
+    { val d = bs.size() - (q(vSize + bs.size()) - q(vSize))
+      or { d >= 1, d == 0 and feq(vSize + bs.size()) > feq(vSize) } },
+    bs.forall(n => brightToA.get(n) >= S_FULL),
+  }
+
+  action init = all {
+    seated' = INIT_SEATED,
+    alive' = REGISTERED,
+    blockA' = REGISTERED,
+    split' = false,
+    darkToA' = REGISTERED.mapBy(n => 0),
+    brightToA' = REGISTERED.mapBy(n => S_FULL),
+  }
+
+  action envSplitS(a: Set[int]): bool = all {
+    not(split),
+    split' = true,
+    blockA' = a,
+    seated' = seated, alive' = alive, darkToA' = darkToA, brightToA' = brightToA,
+  }
+  action envHeal = all {
+    split,
+    split' = false,
+    blockA' = REGISTERED,
+    seated' = seated, alive' = alive, darkToA' = darkToA, brightToA' = brightToA,
+  }
+
+  action envTick = all {
+    darkToA' = REGISTERED.mapBy(n =>
+      if (reachableByA.contains(n)) 0
+      else if (darkToA.get(n) < T_CLIFF) darkToA.get(n) + 1 else T_CLIFF),
+    brightToA' = REGISTERED.mapBy(n =>
+      if (not(reachableByA.contains(n))) 0
+      else if (brightToA.get(n) < S_FULL) brightToA.get(n) + 1 else S_FULL),
+    seated' = seated, alive' = alive, blockA' = blockA, split' = split,
+  }
+
+  action commitVoteOutN(x: int): bool = all {
+    voteOutEnabled(x),
+    seated' = seated.exclude(Set(x)),
+    alive' = alive, blockA' = blockA, split' = split,
+    darkToA' = darkToA, brightToA' = brightToA,
+  }
+  action commitSeatBatchB(bs: Set[int]): bool = all {
+    seatEnabled(bs),
+    seated' = seated.union(bs),
+    alive' = alive, blockA' = blockA, split' = split,
+    darkToA' = darkToA, brightToA' = brightToA,
+  }
+}
+
+module cfg_partition {
+  import q_tables.*
+  import partition_policy(
+    REGISTERED = 1.to(8), INIT_SEATED = 1.to(8),
+    Q_TABLE = Q_AUTO_TABLE, FEQ_TABLE = FEQ_AUTO_TABLE,
+    T_CLIFF = 2, S_FULL = 5
+  ).*
+
+  // WITNESS (minority impotence): under an even-ish split NEITHER
+  // block holds q(8) = 6 — nothing commits anywhere. The
+  // disjoint-quorum lemma says both-commit is impossible at ANY
+  // split; this shows the common case is neither.
+  run minorityImpotenceTest =
+    init.then(envSplitS(Set(1, 2, 3, 4, 5)))
+      .then(4.reps(_ => envTick))
+      .expect(stalledForA and 6.to(8).forall(x => not(voteOutEnabled(x))))
+
+  // WITNESS (heal round-trip across the seam): a 6-member majority
+  // block removes the 2-node minority during a split — shedding BFT
+  // at the seam — the partition heals, the removed nodes re-prove,
+  // and the crossing batch restores BFT. The full life cycle of a
+  // partition under this policy.
+  run healRoundTripTest =
+    init.then(envSplitS(1.to(6)))
+      .then(2.reps(_ => envTick))
+      .expect(not(stalledForA))                 // 6 >= q(8) = 6: A commits
+      .then(commitVoteOutN(7))
+      .expect(vSize == 7 and q(vSize) == 5)     // still BFT at 7
+      .then(commitVoteOutN(8))
+      .expect(vSize == 6 and q(vSize) == 4 and feq(vSize) == 0) // majority
+      .then(envHeal)
+      .then(5.reps(_ => envTick))               // spans re-prove post-heal
+      .then(commitSeatBatchB(Set(7, 8)))        // crossing batch: BFT back
+      .expect(vSize == 8 and q(vSize) == 6 and feq(vSize) == 2)
+}
+
+// ============================================================
+// Scheduler config: the deterministic policyTick drives removal and
+// mandatory seating — GUAR-HONEST-SET and longest-dark-first are
+// bounded-checkable here, not just adversarially possible.
+// ============================================================
+module cfg_sched {
+  import q_tables.*
+  import membership_policy(
+    REGISTERED = 1.to(7), INIT_SEATED = 1.to(7),
+    Q_TABLE = Q_AUTO_TABLE, FEQ_TABLE = FEQ_AUTO_TABLE,
+    T_CLIFF = 2, T_FAST = 3, T_LAZY = 4, S_FLOOR = 1, S_FULL = 5,
+    P_PROVE = 5, B_MAX = 5, CEILING_MODE = 0, ENFORCE_SMIN = true
+  ).*
+
+  // WITNESS (longest-dark first): with two dark members the scheduler
+  // removes the longer-dark one first.
+  run longestDarkFirstTest =
+    init.then(envKillN(6)).then(policyTick)
+      .then(envKillN(7)).then(2.reps(_ => policyTick))
+      .then(policyTick)                          // first removal fires here
+      .expect(not(seated.contains(6)) and seated.contains(7))
+      .then(policyTick)
+      .expect(not(seated.contains(7)) and vSize == 5 and invNoHarm)
+
+  // WITNESS (GUAR-HONEST-SET + self-heal): kills are absorbed within
+  // the calm bound — no removable dark node survives sustained calm —
+  // and a healed node is re-seated by the scheduler at gain parity
+  // with no human action.
+  run guarSelfHealTest =
+    init.then(envKillN(6)).then(envKillN(7))
+      .then(8.reps(_ => policyTick))
+      .expect(and {
+        removableNow.size() == 0, vSize == 5, headroom == 2,
+        invHonestSet, invNoHarm,
+      })
+      .then(envKillN(5)).then(4.reps(_ => policyTick))
+      .expect(vSize == 4 and headroom == 1)      // v=4: next seat is a gain
+      .then(envReviveN(5)).then(7.reps(_ => policyTick))
+      // span re-proved (5 ticks) then mandatory seating fired
+      .expect(seated.contains(5) and vSize == 5 and invNoHarm and invCeiling)
+}
