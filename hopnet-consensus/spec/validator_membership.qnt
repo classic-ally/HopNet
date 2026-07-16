@@ -97,27 +97,27 @@ module quorum_math {
 module q_tables {
   pure val Q_AUTO_TABLE: int -> int = Map(
     1 -> 1, 2 -> 2, 3 -> 2, 4 -> 3, 5 -> 3, 6 -> 4,
-    7 -> 5, 8 -> 6, 9 -> 7, 10 -> 7, 11 -> 8, 12 -> 9, 13 -> 9, 14 -> 10
+    7 -> 5, 8 -> 6, 9 -> 7, 10 -> 7, 11 -> 8, 12 -> 9, 13 -> 9, 14 -> 10, 15 -> 11
   )
   pure val Q_MAJ_TABLE: int -> int = Map(
     1 -> 1, 2 -> 2, 3 -> 2, 4 -> 3, 5 -> 3, 6 -> 4,
-    7 -> 4, 8 -> 5, 9 -> 5, 10 -> 6, 11 -> 6, 12 -> 7, 13 -> 7, 14 -> 8
+    7 -> 4, 8 -> 5, 9 -> 5, 10 -> 6, 11 -> 6, 12 -> 7, 13 -> 7, 14 -> 8, 15 -> 8
   )
   pure val Q_BFT_TABLE: int -> int = Map(
     1 -> 1, 2 -> 2, 3 -> 3, 4 -> 3, 5 -> 4, 6 -> 5,
-    7 -> 5, 8 -> 6, 9 -> 7, 10 -> 7, 11 -> 8, 12 -> 9, 13 -> 9, 14 -> 10
+    7 -> 5, 8 -> 6, 9 -> 7, 10 -> 7, 11 -> 8, 12 -> 9, 13 -> 9, 14 -> 10, 15 -> 11
   )
   pure val FEQ_AUTO_TABLE: int -> int = Map(
     1 -> 0, 2 -> 0, 3 -> 0, 4 -> 0, 5 -> 0, 6 -> 0,
-    7 -> 2, 8 -> 2, 9 -> 2, 10 -> 3, 11 -> 3, 12 -> 3, 13 -> 4, 14 -> 4
+    7 -> 2, 8 -> 2, 9 -> 2, 10 -> 3, 11 -> 3, 12 -> 3, 13 -> 4, 14 -> 4, 15 -> 4
   )
   pure val FEQ_MAJ_TABLE: int -> int = Map(
     1 -> 0, 2 -> 0, 3 -> 0, 4 -> 0, 5 -> 0, 6 -> 0,
-    7 -> 0, 8 -> 0, 9 -> 0, 10 -> 0, 11 -> 0, 12 -> 0, 13 -> 0, 14 -> 0
+    7 -> 0, 8 -> 0, 9 -> 0, 10 -> 0, 11 -> 0, 12 -> 0, 13 -> 0, 14 -> 0, 15 -> 0
   )
   pure val FEQ_BFT_TABLE: int -> int = Map(
     1 -> 0, 2 -> 0, 3 -> 0, 4 -> 1, 5 -> 1, 6 -> 1,
-    7 -> 2, 8 -> 2, 9 -> 2, 10 -> 3, 11 -> 3, 12 -> 3, 13 -> 4, 14 -> 4
+    7 -> 2, 8 -> 2, 9 -> 2, 10 -> 3, 11 -> 3, 12 -> 3, 13 -> 4, 14 -> 4, 15 -> 4
   )
 }
 
@@ -137,7 +137,7 @@ module math_guard {
 
   // DRIFT GUARD: literal tables == closed forms over their domain.
   run tableDriftGuardTest =
-    init.expect(1.to(14).forall(v => and {
+    init.expect(1.to(15).forall(v => and {
       Q_AUTO_TABLE.get(v) == quorum(AUTO, v),
       Q_MAJ_TABLE.get(v) == quorum(MAJ, v),
       Q_BFT_TABLE.get(v) == quorum(BFT, v),
@@ -536,6 +536,28 @@ module membership_policy {
   // per tick for every possible dark member.
   val invHonestSet = calm < T_LAZY + REGISTERED.size() or removableNow.size() == 0
   val safetyInv = invNoHarm and invCeiling and invFloor and invNoExile
+  // Inductive form, in Apalache-assignable shape (every variable
+  // constrained by `.in` / `==` so the invariant doubles as the
+  // arbitrary-state generator): wellFormed + no-harm ghosts clear +
+  // calm pinned (the adversarial `step` never advances it). One step
+  // from ANY state satisfying this preserves it — no depth bound.
+  val indInv = and {
+    seated.in(REGISTERED.powerset()),
+    alive.in(REGISTERED.powerset()),
+    darkFor.in(REGISTERED.setOfMaps(0.to(T_LAZY))),
+    brightFor.in(REGISTERED.setOfMaps(0.to(S_FULL))),
+    seatedFor.in(REGISTERED.setOfMaps(0.to(P_PROVE))),
+    lastDeparture.in(REGISTERED.setOfMaps(Set(D_NONE, D_VOLUNTARY, D_VOTEDOUT))),
+    harmedByPolicy == false,
+    ceilingHarm == false,
+    calm == 0,
+    vSize >= 1,
+    REGISTERED.forall(n => and {
+      alive.contains(n) implies darkFor.get(n) == 0,
+      not(alive.contains(n)) implies brightFor.get(n) == 0,
+      not(seated.contains(n)) implies seatedFor.get(n) == 0,
+    }),
+  }
 
   // Well-formedness (auxiliary strengthening for inductive checking).
   val wellFormed = and {
