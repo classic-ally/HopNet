@@ -148,21 +148,40 @@ evidence — mechanism belongs to the implementation RFC:
   observations; verdicts are never forwarded or delegated. Quorum
   approval is meaningful (and partition safety holds) only because
   attestations share no fate.
-- **Freshness on contact, direct or proven** — any authenticated
-  exchange with X (RPC completion, consensus vote received from X,
-  sync serve) refutes darkness and resets X's window. So does X's
-  signature inside a committed certificate: cryptographic proof of a
-  live vote at that height, visible even to validators X cannot
-  reach. This is load-bearing for INV-NO-HARM — a node whose votes
-  are landing in certificates is contributing live quorum weight,
-  and removing it would not be harmless; certificate participation
-  is exactly the replicated evidence that stops a partition-blinded
-  quorum from doing so.
-- **Bounded staleness** — evidence must not rely on consensus
-  traffic alone: an idle mesh pauses heights, and a dark node would
-  otherwise go unnoticed indefinitely. Each validator refreshes its
-  evidence about every other validator at least every T_probe
-  (active probe or equivalent).
+- **Freshness on contact — exactly two evidence classes refresh.**
+  (1) REACHABILITY evidence: my own authenticated exchanges with X —
+  probe answers, RPC completions, votes received first-hand, sync
+  serves. My own evidence contradicts my attestation. (2)
+  CONTRIBUTION evidence: X's signature inside a committed
+  certificate, however it reached me — locally verified against the
+  valset, unforgeable, identical at every node. It is not proof that
+  X is reachable; it is the mesh's own ledger entry that X's vote
+  counted, and removing a contributing node is precisely the harm
+  INV-NO-HARM forbids — this is the replicated evidence that stops a
+  partition-blinded quorum. NOTHING ELSE refreshes: relayed
+  artifacts — gossip X originated arriving via Y, transactions X
+  signed, however cryptographically valid — prove X is alive
+  SOMEWHERE, which is the wrong property. A validator that files
+  transactions through a friend but whose votes never land is
+  missing from every quorum: dark for the only metric vote-out
+  polices. Were relayed artifacts to refresh, one relay path would
+  make such a node unremovable for the whole mesh — the asymmetric
+  block generalized to every observer. Participation in consensus is
+  the only defense, exactly as unresponsiveness is the only crime.
+- **Bounded staleness — the probe is a deadline, not a schedule.**
+  Evidence must not rely on consensus traffic alone: an idle mesh
+  pauses heights, and a dark node would otherwise go unnoticed
+  indefinitely. The contract: a probe fires at X exactly when X's
+  evidence age reaches T_probe(band) — so a busy mesh probes almost
+  never (traffic refreshes everyone), and an idle mesh is watched at
+  the band's cadence. Suspicion attaches to the UNANSWERED probe,
+  never to the deadline: X leaves the observer's live estimate only
+  at T_unresponsive = T_probe + g (g = the probe response grace),
+  so silence alone never compresses anything — a healthy silent mesh
+  cycles synchronized probe rounds and stays calm. Classification
+  must be a pure function of recorded evidence (ages and probe
+  attempts), never of in-flight probe state; the attestation floor
+  is two probe attempts since last contact.
 - **Corroboration is optional, never sufficient** — replicated
   signals toward darkness exist for free (commit certificates record
   the commit round, and the round-0 proposer is deterministic, so
@@ -212,17 +231,20 @@ validator estimates H = live − quorum(v) from its own evidence — the
 same evidence the predicate reads — and derives its removal window
 T_out from the band it believes the mesh is in:
 
-| band | condition | window | stance |
-|---|---|---|---|
-| lazy | H ≥ 2 | T_lazy | grace for blips; hysteresis fully applies |
-| fast | H = 1 | T_fast | one failure from the cliff |
-| cliff | H = 0 | T_cliff | next failure stalls the mesh; act within ~one probe cycle |
+| band | condition | T_probe | T_out = 2·T_probe + g | stance |
+|---|---|---|---|---|
+| lazy | H ≥ 2 | T_probe_lazy | ~2·T_probe_lazy | grace for blips; hysteresis fully applies |
+| fast | H = 1 | T_probe_fast | ~2·T_probe_fast | one failure from the cliff |
+| cliff | H = 0 | T_probe_cliff | ~2·T_probe_cliff | next failure stalls the mesh |
 
 T_out is the duration parameter of dark(X): the span over which
 every piece of evidence about X — direct exchange, received votes,
 certificate signatures, own probes — must be stale before a
-validator may attest. Its floor is one probe cycle: a window you
-have not probed is a window you cannot attest.
+validator may attest. Urgency scales the probe cadence itself; the
+window is pinned at its floor, two probe cycles plus one response
+grace — a window you have not probed twice is a window you cannot
+attest, and the second probe gets its grace before the boundary
+(one missed probe never triggers, in every band).
 
 Values in Constants. The trade is explicit: shrinking the window
 raises false-positive risk — cheap, one readmission round trip — to
@@ -423,46 +445,61 @@ worst case). They are replicated anyway for band alignment:
 defaults when absent, following the `hopnet_storage_policy`
 precedent and the module-prefix convention.
 
-T_probe is the single clock; every window is a count of probe
-cycles — a removal window of N is N consecutive missed probes, an
-admission span of N is N consecutive answered ones. Rescaling
-T_probe rescales the whole policy coherently (orchestrator tests
-seed it small and everything compresses proportionally).
+The probe base B is the single clock: per-band probe deadlines are a
+doubling ladder on B, the removal window is everywhere pinned at two
+probe cycles plus one grace, and admission spans are wall-time.
+Rescaling B rescales the whole policy coherently (orchestrator tests
+seed it small and everything compresses proportionally). Urgency
+lives in the CADENCE, not the multiplier: a mesh with comfortable
+headroom watches lazily; only distance from the stall buys chatter.
+Probes fire as deadlines (age reaching T_probe), so a busy mesh
+probes almost never and an idle healthy mesh cycles quiet
+synchronized rounds without ever raising suspicion.
 
 | constant | default | role |
 |---|---|---|
-| T_probe | 30 s | the evidence clock; every validator probes every other at least this often |
-| T_cliff | 2·T_probe (60 s) | removal window at H = 0 — two missed probes |
-| T_fast | 4·T_probe (2 min) | removal window at H = 1 |
-| T_lazy | 10·T_probe (5 min) | removal window at H ≥ 2 |
-| S_floor | 1·T_probe | admission span, exposure-free at H ≤ 1 — one observed probe |
-| S_full | 60·T_probe (30 min) | admission span, comfortable H and all exposed seatings |
-| P_prove | 60·T_probe (30 min) | in-seat survival before a member is proven (ceiling cushion) |
+| B | 30 s | probe base; T_probe_cliff = B, fast = 2B, lazy = 4B |
+| g | 5 s | probe response grace (= the probe RPC timeout) |
+| T_probe(band) | 30 s / 60 s / 2 min | max tolerated silence before the deadline probe fires |
+| T_unresponsive(band) | T_probe + g | age at which X leaves the observer's live estimate |
+| T_out(band) | 2·T_probe + g (65 s / 2 m 5 s / 4 m 5 s) | removal window — two probed misses, each with its grace |
+| S_floor | one probe cycle | admission span, exposure-free at H ≤ 1 |
+| S_full | 30 min | admission span, comfortable H and all exposed seatings |
+| P_prove | 30 min | in-seat survival before a member is proven (ceiling cushion) |
 | V_bft | 7 | AUTO profile switch point |
 | quorum_profile | auto | auto \| bft \| majority (pinned) |
 | catch-up tolerance | 10 heights | existing activation gate, unchanged |
 | set floor | v′ ≥ 1 | INV-FLOOR |
 
-The orderings and multiplier structure are load-bearing; the point
-values are judgment inside them:
+The orderings and ratio structure are load-bearing; the point values
+are judgment inside them:
 
-- **T_cliff = 2 cycles** — the smallest window that both contains a
-  probe attempt and preserves "one missed probe never triggers" at
-  the cliff. Derived, not tuned.
-- **T_probe = 30 s** sits above transient noise that is not absence
-  — wifi roam, congestion, sleep-wake blips, all seconds-scale — and
-  an order of magnitude below the minutes mandate (RFC-STORAGE-001,
-  Membership timescales). The census arguments below assume this
-  default; a production change to T_probe should re-check them.
-- **T_lazy = 10 cycles** sits above the blip census (AP reboot
-  ~1–2 min, ISP re-auth, lid-close-and-move-rooms) and low enough
-  that GUAR-HONEST-SET stays a minutes-grade bound. Refinable later
-  from fleet availability data — static mesh-wide tuning, not the
-  per-node adaptation Hysteresis rejects.
-- **2 < 4 < 10 cycles as steps**, not a continuous T(H): steps
-  quantize band disagreement between validators; a continuous
-  schedule maximizes the slowest-attestor spread.
-- **T_lazy ≪ S_full ≪ smallest storage decay tier (6 h)** — a
+- **The window multiplier is pinned at its floor (2, plus g)** in
+  every band — the smallest window containing two probe attempts
+  with the second's grace elapsed before the boundary ("one missed
+  probe never triggers", race-free). Derived, not tuned. All urgency
+  dynamics live in T_probe(band).
+- **Eviction latency decomposes as max(notice, window)** because
+  dark age counts from last contact, not from discovery. Calm case
+  (mesh stays lazy): eviction ≈ T_out_lazy ≈ 4 min, identical to a
+  fixed-cadence design. Emergency case (failures drop the band):
+  first lazy deadline probe discovers, the band compresses, deadlines
+  shorten automatically — eviction ≈ T_probe_lazy + T_probe_cliff ≈
+  2.5–3 min. The lazy cadence costs latency only in multi-failure
+  emergencies, and only ~one lazy interval; independent-failure
+  stacking inside that interval is negligible at home-mesh failure
+  rates, and correlated failure is cadence-immune.
+- **B = 30 s** sits above transient noise that is not absence —
+  wifi roam, congestion, sleep-wake blips, all seconds-scale — and
+  well below the minutes mandate. T_out_lazy ≈ 4 min sits above the
+  blip census (AP reboot ~1–2 min, ISP re-auth,
+  lid-close-and-move-rooms); refinable later from fleet availability
+  data — static mesh-wide tuning, not the per-node adaptation
+  Hysteresis rejects.
+- **Doubling steps, not a continuous T(H)**: steps quantize band
+  disagreement between validators; a continuous schedule maximizes
+  the slowest-attestor spread.
+- **T_out_lazy ≪ S_full ≪ smallest storage decay tier (6 h)** — a
   removal must outlast the window that triggered it (else vote-out
   is theater: the flapper re-seats before proving anything), and
   validator standing must recover faster than storage standing
@@ -528,9 +565,13 @@ scripted witness/NEG run.
   guards + scaled-constant ordering guards in every config.
 
 **Non-obligations** (assumed, not model-checked): wall-clock probe
-semantics and the T_probe blip census; the evidence mechanism beyond
-the freshness/independence contract (probe transport, certificate
-parsing); proposer-side brightest-first ranking (the model
+semantics — the per-band cadence ladder, the response grace g, the
+deadline-not-schedule firing rule, and the evidence-record purity
+contract all live below the model's tick abstraction (its windows
+are abstract ordered tick counts; the invariants are
+value-agnostic); the T_probe blip census; the evidence mechanism
+beyond the freshness/independence contract (probe transport,
+certificate parsing); proposer-side brightest-first ranking (the model
 over-approximates with any eligible batch — the safe direction);
 duplicate-proposal harmlessness; catch-up sync dynamics (an unsynced
 admittee is dominated by the modeled dies-at-seating case); the
