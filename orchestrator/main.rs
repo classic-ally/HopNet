@@ -218,7 +218,11 @@ async fn main() -> Result<()> {
                             unsafe { std::env::set_var(k, v) };
                         }
                     }
-                    create_mesh(&docker, auto_mesh_id, *auto_nodes, false, runtime).await?;
+                    let node_count = test
+                        .as_deref()
+                        .and_then(tests::preferred_auto_nodes)
+                        .unwrap_or(*auto_nodes);
+                    create_mesh(&docker, auto_mesh_id, node_count, false, runtime).await?;
 
                     let test_result = tests::handle_test_command(
                         &docker,

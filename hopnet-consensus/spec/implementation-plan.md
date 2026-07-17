@@ -143,7 +143,7 @@ engine-touching stage.
   S6, tiny genesis probe_base). Gate: + divergent-evidence block
   test + fresh-node-syncs-vote-out-chain replay test
   (malachite_integration.rs) + regressions + divergence.
-- [ ] **S5 — mesh-initiated seating.** Activation payload →
+- [x] **S5 — mesh-initiated seating.** Activation payload →
   proposer-signed `Vec<node_id>`; joint posture + ceiling + waiver
   validation; auto-reseat scheduler (the only initiator: eligible =
   bright ≥ req ∧ caught up per last_known_height; brightest-first
@@ -167,6 +167,21 @@ engine-touching stage.
 
 ## Deviations from plan (recorded at stage exits)
 
+- **S5**: pre-S6 pinned default flipped Bft → Majority — a
+  default-BFT mesh below 4 nodes cannot FORM once self-request seating
+  is deleted (BFT v=1 grows only by a batch of 3; a 3-node mesh has 2
+  candidates). AUTO, the S6 default, is majority at v < 7 anyway.
+  consensus-bft-quorum-loss redesigned: pinned bft, 4 nodes, kill 2.
+- **S5**: the orchestrator seeds s_full=6;p_prove=6 for every mesh
+  (the v=1 formation batch is exposed) and create_mesh waits for
+  seating to converge; even-majority meshes seat N−1 with one pooled
+  spare (the last lateral refused — spec-correct). A test setting its
+  own HOPNET_GENESIS_CONSENSUS_POLICY drops the global seed, so
+  evidence-observe re-seeds s_full explicitly.
+- **S5**: proven(X) approximated as activation_height ≤ boot_height ∨
+  bright_span ≥ p_prove (the span arm credits pre-seat brightness;
+  tightening candidate seated_since is an S7 note). boot_height set at
+  the first scheduler pass.
 - **S4**: subjective checks live host-side in
   `src/consensus/membership_guards.rs`, called from validate_inner's
   Live block and build_value's preflight — NOT via a HandlerCtx

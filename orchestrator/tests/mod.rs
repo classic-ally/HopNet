@@ -101,6 +101,12 @@ pub trait TestScenario: Send + Sync {
 /// export these before `orchestrator create` for the same checks).
 pub fn mesh_creation_env(test_name: &str) -> Vec<(&'static str, &'static str)> {
     match test_name {
+        "consensus-bft-quorum-loss" => vec![
+            ("HOPNET_QUORUM_PROFILE", "bft"),
+            // 1->4 formation batch is exposed; seed a small span so the
+            // 4-node BFT mesh forms.
+            ("HOPNET_GENESIS_CONSENSUS_POLICY", "s_full=6;p_prove=6"),
+        ],
         "mesh-growth" => vec![
             ("HOPNET_GENESIS_CONSENSUS_POLICY", "probe_base=2;grace=1;s_full=6;p_prove=6"),
             ("HOPNET_QUORUM_PROFILE", "majority"),
@@ -148,6 +154,18 @@ pub fn mesh_creation_env(test_name: &str) -> Vec<(&'static str, &'static str)> {
             ("HOPNET_QUORUM_PROFILE", "majority"),
         ],
         _ => vec![],
+    }
+}
+
+/// Preferred auto-mesh node count for tests whose premise needs a specific
+/// size (RFC-CONSENSUS-002: BFT meshes form 1->4->7; even-majority meshes
+/// keep a pooled spare). None = use the CLI --auto-nodes default.
+pub fn preferred_auto_nodes(test_name: &str) -> Option<u32> {
+    match test_name {
+        // 4-node BFT: forms via a batch of 3 (1->4); quorum(4)=3, so
+        // killing 2 loses quorum.
+        "consensus-bft-quorum-loss" => Some(4),
+        _ => None,
     }
 }
 

@@ -339,10 +339,11 @@ impl TestScenario for ConsensusLaggingCatchUp {
 // consensus-bft-quorum-loss
 // ============================================================================
 
-/// Negative control for the DEFAULT (BFT) profile: a 3-node BFT mesh needs
-/// all three validators (strict >2/3), so with one down nothing may decide —
-/// and progress must resume once it returns. Run WITHOUT
-/// HOPNET_QUORUM_PROFILE.
+/// Negative control for the PINNED BFT profile: a 4-node BFT mesh has
+/// quorum(4)=3, so with TWO down nothing may decide — and progress must
+/// resume once they return. (Pinned bft + 4 nodes because a default-majority
+/// mesh continues below full membership, and a 3-node BFT mesh cannot form
+/// under mesh-initiated seating — RFC-CONSENSUS-002 S5.)
 pub struct ConsensusBftQuorumLoss;
 
 impl TestScenario for ConsensusBftQuorumLoss {
@@ -350,18 +351,19 @@ impl TestScenario for ConsensusBftQuorumLoss {
         "consensus-bft-quorum-loss"
     }
     fn description(&self) -> &'static str {
-        "BFT 3-node mesh must NOT decide with one node down (default profile)"
+        "BFT 4-node mesh must NOT decide with two nodes down (pinned bft)"
     }
 
     async fn run(&self, mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
         let mut result = TestResult::new();
         let start = Instant::now();
-        anyhow::ensure!(nodes.len() >= 3, "needs a 3-node mesh");
+        anyhow::ensure!(nodes.len() >= 4, "needs a 4-node BFT mesh");
         let docker = Docker::connect_with_local_defaults()?;
 
         let decided_before = decided_height(&nodes[0]).await?;
-        let victim = nodes.last().unwrap();
-        stop_node(&docker, mesh_id, victim.node_id).await?;
+        // Kill two of four: quorum(4) = 3 (BFT), so two down loses quorum.
+        stop_node(&docker, mesh_id, nodes[3].node_id).await?;
+        stop_node(&docker, mesh_id, nodes[2].node_id).await?;
 
         // Submit with a bounded wait: the upload must NOT commit (2-of-3 is
         // below the BFT quorum). The queue holds it; we only sample for 30s.
@@ -393,10 +395,13 @@ impl TestScenario for ConsensusBftQuorumLoss {
             },
         );
 
-        // Restore the third validator: the held transaction (or a retry)
-        // must now commit.
-        start_node(&docker, mesh_id, victim.node_id).await?;
-        wait_for_node_ready(victim, Duration::from_secs(30)).await?;
+        // Restore both validators: the held transaction (or a retry) must
+        // now commit. (Below quorum, the vote-out scan itself cannot commit,
+        // so the dead nodes are not removed — the mesh genuinely stalls.)
+        start_node(&docker, mesh_id, nodes[2].node_id).await?;
+        start_node(&docker, mesh_id, nodes[3].node_id).await?;
+        wait_for_node_ready(&nodes[2], Duration::from_secs(30)).await?;
+        wait_for_node_ready(&nodes[3], Duration::from_secs(30)).await?;
         let resumed = wait_decided(&nodes[0], decided_before + 1, Duration::from_secs(120)).await?;
         print_and_add_check(
             &mut result,
