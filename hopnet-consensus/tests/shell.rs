@@ -38,6 +38,7 @@ fn spawn_node(
                 common::chain_id(),
                 common::key(node_id),
                 Address(node_id),
+                profile,
                 common::params(node_id, profile),
                 Height::INITIAL,
                 valset.clone(),

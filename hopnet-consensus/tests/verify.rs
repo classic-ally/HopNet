@@ -52,7 +52,7 @@ fn commit_cert(signers: &[i32]) -> CommitCertificate<HopNetContext> {
 // is the difference between 2f+1 safety and a forgeable quorum.
 #[test]
 fn bft_quorum_boundaries() {
-    let q = QuorumProfile::Bft.thresholds().quorum;
+    let q = QuorumProfile::Bft.thresholds_for(1).quorum;
     // (n, smallest passing weight)
     let expected = [
         (1, 1),
@@ -82,7 +82,7 @@ fn bft_quorum_boundaries() {
 // one crash, n=4 needs 3 (no 2-2 split decisions).
 #[test]
 fn majority_quorum_boundaries() {
-    let q = QuorumProfile::Majority.thresholds().quorum;
+    let q = QuorumProfile::Majority.thresholds_for(1).quorum;
     let expected = [(1, 1), (2, 2), (3, 2), (4, 3), (5, 3), (6, 4), (7, 4)];
     for (n, min_pass) in expected {
         assert!(
@@ -101,7 +101,7 @@ fn majority_quorum_boundaries() {
 fn commit_certificate_valid_quorum_passes() {
     let vs = valset(4);
     let cert = commit_cert(&[0, 1, 2]);
-    verify_commit_certificate(&chain_id(), &cert, &vs, QuorumProfile::Bft.thresholds()).unwrap();
+    verify_commit_certificate(&chain_id(), &cert, &vs, QuorumProfile::Bft.thresholds_for(1)).unwrap();
 }
 
 // Should: reject a certificate below quorum with NotEnoughVotingPower.
@@ -112,7 +112,7 @@ fn commit_certificate_valid_quorum_passes() {
 fn commit_certificate_sub_quorum_fails() {
     let vs = valset(4);
     let cert = commit_cert(&[0, 1]);
-    let err = verify_commit_certificate(&chain_id(), &cert, &vs, QuorumProfile::Bft.thresholds())
+    let err = verify_commit_certificate(&chain_id(), &cert, &vs, QuorumProfile::Bft.thresholds_for(1))
         .unwrap_err();
     assert!(matches!(
         err,
@@ -136,7 +136,7 @@ fn commit_certificate_duplicate_signer_rejected() {
     cert.commit_signatures.push(dup.clone());
     cert.commit_signatures.push(dup);
 
-    let err = verify_commit_certificate(&chain_id(), &cert, &vs, QuorumProfile::Bft.thresholds())
+    let err = verify_commit_certificate(&chain_id(), &cert, &vs, QuorumProfile::Bft.thresholds_for(1))
         .unwrap_err();
     assert!(matches!(err, CertificateError::DuplicateVote(a) if a.0 == 0));
 }
@@ -150,7 +150,7 @@ fn commit_certificate_duplicate_signer_rejected() {
 fn commit_certificate_unknown_validator_rejected() {
     let vs = valset(3);
     let cert = commit_cert(&[0, 1, 7]); // node 7 not in the set
-    let err = verify_commit_certificate(&chain_id(), &cert, &vs, QuorumProfile::Bft.thresholds())
+    let err = verify_commit_certificate(&chain_id(), &cert, &vs, QuorumProfile::Bft.thresholds_for(1))
         .unwrap_err();
     assert!(matches!(err, CertificateError::UnknownValidator(a) if a.0 == 7));
 }
@@ -173,7 +173,7 @@ fn commit_certificate_forged_signature_rejected() {
     );
     cert.commit_signatures[2].signature = sign_vote(&chain_id(), &key(3), &vote);
 
-    let err = verify_commit_certificate(&chain_id(), &cert, &vs, QuorumProfile::Bft.thresholds())
+    let err = verify_commit_certificate(&chain_id(), &cert, &vs, QuorumProfile::Bft.thresholds_for(1))
         .unwrap_err();
     assert!(matches!(err, CertificateError::InvalidCommitSignature(_)));
 }
@@ -191,7 +191,7 @@ fn commit_certificate_wrong_chain_rejected() {
         &other_chain,
         &cert,
         &vs,
-        QuorumProfile::Majority.thresholds(),
+        QuorumProfile::Majority.thresholds_for(1),
     )
     .unwrap_err();
     assert!(matches!(err, CertificateError::InvalidCommitSignature(_)));
@@ -210,11 +210,11 @@ fn profile_boundary_two_of_three() {
         &chain_id(),
         &cert,
         &vs,
-        QuorumProfile::Majority.thresholds(),
+        QuorumProfile::Majority.thresholds_for(1),
     )
     .unwrap();
     assert!(
-        verify_commit_certificate(&chain_id(), &cert, &vs, QuorumProfile::Bft.thresholds())
+        verify_commit_certificate(&chain_id(), &cert, &vs, QuorumProfile::Bft.thresholds_for(1))
             .is_err()
     );
 }

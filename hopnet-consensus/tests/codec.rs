@@ -160,7 +160,7 @@ fn wire_commit_certificate_roundtrip() {
         &chain_id(),
         &back,
         &vs,
-        hopnet_consensus::QuorumProfile::Bft.thresholds(),
+        hopnet_consensus::QuorumProfile::Bft.thresholds_for(1),
     )
     .unwrap();
 }

@@ -11,6 +11,7 @@ description = "HopNet consensus engine: Malachite (Tendermint) host, Application
 # default-features = false drops the prometheus metrics dep (Metrics = ()).
 malachitebft-core-types = { package = "arc-malachitebft-core-types", version = "=0.7.0-pre" }
 malachitebft-core-consensus = { package = "arc-malachitebft-core-consensus", version = "=0.7.0-pre", default-features = false, features = ["std"] }
+malachitebft-core-driver = { package = "arc-malachitebft-core-driver", version = "=0.7.0-pre" }
 
 hopnet-common = { path = "../common", features = ["database"] }
 

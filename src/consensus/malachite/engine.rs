@@ -159,7 +159,7 @@ pub fn spawn_engine(app_state: &AppState) -> Result<(), String> {
                 QuorumProfile::parse(&s)
                     .ok_or_else(|| format!("spawn_engine: unknown quorum profile {s:?}"))?
             }
-            None => QuorumProfile::Bft,
+            None => QuorumProfile::Auto,
         };
         (Height(last_decided.0 + 1), chain_id, profile)
     };
@@ -212,7 +212,7 @@ pub fn spawn_engine(app_state: &AppState) -> Result<(), String> {
     let signer = hopnet_consensus::types::PrivKey(app_state.private_key.0.clone());
     let params = Params {
         address: Address(node_id),
-        threshold_params: profile.thresholds(),
+        threshold_params: profile.thresholds_for(1), // placeholder — HostCore overwrites from the boot valset
         value_payload: ValuePayload::PartsOnly,
         enabled: true,
     };
@@ -230,6 +230,7 @@ pub fn spawn_engine(app_state: &AppState) -> Result<(), String> {
                 chain_id,
                 signer,
                 Address(node_id),
+                profile,
                 params,
                 start_height,
                 valset,

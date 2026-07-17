@@ -313,7 +313,7 @@ pub fn subjective_membership_check(
     .flatten()
     .and_then(|b| String::from_utf8(b).ok())
     .and_then(|s| QuorumProfile::parse(&s))
-    .unwrap_or(QuorumProfile::Bft);
+    .unwrap_or(QuorumProfile::Auto);
     let committed = crate::db::consensus::get_current_consensus_height(db_tx)
         .map_err(|e| format!("{e:?}"))?;
     let pending = committed.saturating_add(1);

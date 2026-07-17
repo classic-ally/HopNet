@@ -118,6 +118,7 @@ async fn start_engine_with_candidates(
                 chain_id(),
                 signer,
                 Address(node_id),
+                hopnet_consensus::config::QuorumProfile::Majority,
                 engine_params(node_id),
                 start_height,
                 valset,

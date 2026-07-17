@@ -396,7 +396,7 @@ pub fn spawn_probe_scheduler(app_state: crate::AppState) {
                 .flatten()
                 .and_then(|b| String::from_utf8(b).ok())
                 .and_then(|s| QuorumProfile::parse(&s))
-                .unwrap_or(QuorumProfile::Bft);
+                .unwrap_or(QuorumProfile::Auto);
                 let pending = i32::try_from(decided.saturating_add(1)).unwrap_or(i32::MAX);
                 let seated: Vec<i32> =
                     crate::db::consensus::get_validators_with_conn(&conn, pending)
@@ -640,7 +640,7 @@ pub async fn get_evidence(State(app_state): State<crate::AppState>) -> impl Into
         .flatten()
         .and_then(|b| String::from_utf8(b).ok())
         .and_then(|s| QuorumProfile::parse(&s))
-        .unwrap_or(QuorumProfile::Bft);
+        .unwrap_or(QuorumProfile::Auto);
         let pending = i32::try_from(decided.saturating_add(1)).unwrap_or(i32::MAX);
         let seated: Vec<i32> = crate::db::consensus::get_validators_with_conn(&conn, pending)
             .map(|v| v.into_iter().map(|n| n.node_id).collect())

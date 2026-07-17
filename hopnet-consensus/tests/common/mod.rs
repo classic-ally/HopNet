@@ -37,7 +37,7 @@ pub fn chain_id() -> Blake3Hash {
 pub fn params(node_id: i32, profile: QuorumProfile) -> Params<HopNetContext> {
     Params {
         address: Address(node_id),
-        threshold_params: profile.thresholds(),
+        threshold_params: profile.thresholds_for(1),
         value_payload: ValuePayload::PartsOnly,
         enabled: true,
     }

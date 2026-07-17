@@ -323,6 +323,28 @@ mod tests {
         }
     }
 
+    // Should: the AUTO composite math the guards consume — the four
+    // consecutive lateral steps at the seam (v=5..8), and posture admitting
+    // ONLY the V_bft crossing (v=6->7, f_eq 0->2) among them.
+    // Impact: near-seam seating (plan_seating_batch) and every guard under
+    // the AUTO default.
+    #[test]
+    fn auto_composite_drift() {
+        let a = QuorumProfile::Auto;
+        // Four laterals in a row, then a gain.
+        for v in 5..=8 {
+            assert_eq!(delta_h(a, v, 1), 0, "v={v} should be lateral");
+        }
+        assert_eq!(delta_h(a, 9, 1), 1, "v=9 gains");
+        // Posture admits only the crossing among the laterals.
+        assert!(posture_ok(a, 6, 1), "V_bft crossing seats (f_eq 0->2)");
+        assert!(!posture_ok(a, 5, 1), "pre-seam lateral refused");
+        assert!(!posture_ok(a, 7, 1), "post-seam lateral refused");
+        assert!(!posture_ok(a, 8, 1), "post-seam lateral refused");
+        // A batch of 3 gains at the seam (forms/crosses).
+        assert!(delta_h(a, 4, 3) >= 1);
+    }
+
     // Should: the proven-quorum ceiling refuse a stacked exposed batch
     // while the first is unproven and unlock once it proves — the model's
     // compositionRefusedThenProvenTest (cfg_maj7), which is exactly the

@@ -20,6 +20,7 @@ mod file_upload;
 mod fileprovider_device_token;
 mod fragment_distribution;
 mod evidence_observe;
+mod auto_seam;
 mod mesh_growth;
 pub(crate) mod graceful_leave;
 mod vote_out;
@@ -107,18 +108,21 @@ pub fn mesh_creation_env(test_name: &str) -> Vec<(&'static str, &'static str)> {
             // 4-node BFT mesh forms.
             ("HOPNET_GENESIS_CONSENSUS_POLICY", "s_full=6;p_prove=6"),
         ],
+        "auto-seam" => vec![
+            ("HOPNET_GENESIS_CONSENSUS_POLICY", "probe_base=2;grace=1;s_full=6;p_prove=6"),
+        ],
         "mesh-growth" => vec![
             ("HOPNET_GENESIS_CONSENSUS_POLICY", "probe_base=2;grace=1;s_full=6;p_prove=6"),
-            ("HOPNET_QUORUM_PROFILE", "majority"),
+            // AUTO (default): majority below v=7 — the growth stays in the
+            // majority region, no forcing.
         ],
         "vote-out-after-kill" => vec![
             (
                 "HOPNET_GENESIS_CONSENSUS_POLICY",
                 "probe_base=2;grace=1;s_full=6;p_prove=6",
             ),
-            // Forced until S6's AUTO profile: BFT v=3 with a dead node
-            // commits nothing.
-            ("HOPNET_QUORUM_PROFILE", "majority"),
+            // AUTO (default): majority at v=3, so the kill leaves a live
+            // quorum — no forcing needed.
         ],
         // REGRESSION FIX (S4): the S_min gate makes the BFT rejoin seat
         // EXPOSED (quorum(3)-quorum(2)=1) => req_span = s_full; the
@@ -135,10 +139,8 @@ pub fn mesh_creation_env(test_name: &str) -> Vec<(&'static str, &'static str)> {
                 // global default seed.
                 "probe_base=2;grace=1;s_full=6;p_prove=6",
             ),
-            // Majority: 3 nodes -> quorum 2, H 1 (Fast) -> kill one -> H 0
-            // (Cliff). Under default BFT quorum(3)=3 the mesh starts at the
-            // Cliff and no band SHIFT would be observable.
-            ("HOPNET_QUORUM_PROFILE", "majority"),
+            // AUTO (default) is majority at v=3: quorum 2, H=1 (Fast) ->
+            // kill one -> H=0 (Cliff), an observable band shift.
         ],
         "tier-membership" => vec![(
             "HOPNET_GENESIS_STORAGE_POLICY",
@@ -149,9 +151,8 @@ pub fn mesh_creation_env(test_name: &str) -> Vec<(&'static str, &'static str)> {
                 "HOPNET_GENESIS_STORAGE_POLICY",
                 "decay_tiers=15,30,60,120;availability_step_secs=5",
             ),
-            // The test kills a node and needs consensus to keep
-            // committing metrics/self-check txs with 2 of 3 alive.
-            ("HOPNET_QUORUM_PROFILE", "majority"),
+            // AUTO (default) is majority at v=3: 2 of 3 alive keeps
+            // committing metrics/self-check txs.
         ],
         _ => vec![],
     }
@@ -165,6 +166,8 @@ pub fn preferred_auto_nodes(test_name: &str) -> Option<u32> {
         // 4-node BFT: forms via a batch of 3 (1->4); quorum(4)=3, so
         // killing 2 loses quorum.
         "consensus-bft-quorum-loss" => Some(4),
+        // 7 nodes so AUTO crosses the V_bft seam (v=7 = BFT region).
+        "auto-seam" => Some(7),
         _ => None,
     }
 }
@@ -261,6 +264,9 @@ pub async fn run_test_by_name(
             reencode::ReencodeAfterDeparture
                 .run(mesh_id, nodes, flags)
                 .await
+        }
+        "auto-seam" => {
+            auto_seam::AutoSeam.run(mesh_id, nodes, flags).await
         }
         "mesh-growth" => {
             mesh_growth::MeshGrowth.run(mesh_id, nodes, flags).await
@@ -422,6 +428,7 @@ pub fn list_test_names() -> Vec<&'static str> {
         "evidence-observe",
         "vote-out-after-kill",
         "mesh-growth",
+        "auto-seam",
         "device-token-consistency",
         "documentprovider-write-consistency",
         "iroh-ping",

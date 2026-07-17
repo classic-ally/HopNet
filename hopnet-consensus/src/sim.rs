@@ -883,6 +883,7 @@ impl Sim {
             self.chain_id,
             self.keys[node].clone(),
             Address(self.nodes[node].node_id),
+            self.profile,
             params,
             resume,
             self.valset.clone(),
@@ -967,7 +968,7 @@ impl Sim {
 fn params_for(address: Address, profile: QuorumProfile) -> Params<crate::context::HopNetContext> {
     Params {
         address,
-        threshold_params: profile.thresholds(),
+        threshold_params: profile.thresholds_for(1),
         value_payload: ValuePayload::PartsOnly,
         enabled: true,
     }
@@ -988,6 +989,7 @@ fn build_node(
         chain_id,
         signer.clone(),
         Address(node_id),
+        profile,
         params_for(Address(node_id), profile),
         Height::INITIAL,
         valset.clone(),

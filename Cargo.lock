@@ -2749,6 +2749,7 @@ name = "hopnet-consensus"
 version = "0.1.0"
 dependencies = [
  "arc-malachitebft-core-consensus",
+ "arc-malachitebft-core-driver",
  "arc-malachitebft-core-types",
  "bincode",
  "blake3",

@@ -92,6 +92,13 @@ pub enum HostError<E> {
 /// production share this exact driver.
 pub struct HostCore<A, S, G, T> {
     state: State<HopNetContext>,
+    /// Quorum profile (RFC-CONSENSUS-002 S6). Under AUTO the effective
+    /// thresholds are a per-height function of the committed set size; this
+    /// core installs them at each StartHeight.
+    profile: crate::config::QuorumProfile,
+    /// Set size the currently-installed thresholds were computed for — the
+    /// cheap change detector (profile_at(prev) vs profile_at(new)).
+    last_val_count: usize,
     chain_id: Blake3Hash,
     signer: PrivKey,
     my_addr: Address,
@@ -147,7 +154,8 @@ where
         chain_id: Blake3Hash,
         signer: PrivKey,
         my_addr: Address,
-        params: Params<HopNetContext>,
+        profile: crate::config::QuorumProfile,
+        mut params: Params<HopNetContext>,
         initial_height: Height,
         initial_valset: HopNetValidatorSet,
         app: A,
@@ -155,6 +163,10 @@ where
         gossip: G,
         timers: T,
     ) -> Self {
+        // Install per-height thresholds for the boot valset (the caller's
+        // params.threshold_params is a placeholder — this core owns them).
+        let init_count = malachitebft_core_types::ValidatorSet::count(&initial_valset);
+        params.threshold_params = profile.thresholds_for(init_count as u64);
         let state = State::new(
             HopNetContext,
             initial_height,
@@ -164,6 +176,8 @@ where
         );
         Self {
             state,
+            profile,
+            last_val_count: init_count,
             chain_id,
             signer,
             my_addr,
@@ -513,7 +527,48 @@ where
         Ok(())
     }
 
+    /// Install the per-height quorum thresholds before a height starts
+    /// (RFC-CONSENSUS-002 S6). Under AUTO the effective profile flips at the
+    /// V_bft seam; malachite bakes thresholds into the Driver at
+    /// construction (no setter), so a profile change means replacing the
+    /// Driver AND updating state.params (cert verification reads params, not
+    /// the driver's private copy). No-op when the effective profile is
+    /// unchanged — every pinned mesh and every non-seam height.
+    fn apply_height_thresholds(&mut self, height: Height, valset: &HopNetValidatorSet) {
+        let count = malachitebft_core_types::ValidatorSet::count(valset);
+        if self.profile.profile_at(count as u64)
+            == self.profile.profile_at(self.last_val_count as u64)
+            && count != self.last_val_count
+        {
+            // Same effective profile — thresholds identical; skip.
+            self.last_val_count = count;
+            return;
+        }
+        if count == self.last_val_count {
+            return;
+        }
+        let want = self.profile.thresholds_for(count as u64);
+        self.state.params.threshold_params = want;
+        // Replace the Driver (its threshold_params is private). The
+        // StartHeight about to process re-runs move_to_height on this fresh
+        // driver — idempotent.
+        self.state.driver = malachitebft_core_driver::Driver::new(
+            HopNetContext,
+            height,
+            valset.clone(),
+            self.my_addr,
+            want,
+        );
+        self.last_val_count = count;
+    }
+
     fn drive_once(&mut self, input: Input<HopNetContext>) -> Result<(), HostError<S::Error>> {
+        // AUTO per-height thresholds (RFC-CONSENSUS-002 S6): the sole
+        // StartHeight choke point — covers boot, decide-advance, on-demand
+        // resume, and sync jumps.
+        if let Input::StartHeight(h, ref vs, _, _) = input {
+            self.apply_height_thresholds(h, vs);
+        }
         // Disjoint field borrows so the effect handler can touch app/storage/
         // gossip/timers while the macro holds `&mut state`.
         let Self {
@@ -534,6 +589,8 @@ where
             on_demand,
             deferred_start,
             stashed_proposals: _,
+            profile,
+            last_val_count: _,
         } = self;
 
         let metrics = ();
@@ -556,6 +613,7 @@ where
                 last_decided,
                 on_demand: *on_demand,
                 deferred_start,
+                profile: *profile,
             }, effect)
         );
         result.map_err(HostError::Engine)
@@ -578,6 +636,7 @@ struct HandlerCtx<'a, A, S, G, T> {
     last_decided: &'a mut Option<Height>,
     on_demand: bool,
     deferred_start: &'a mut Option<Height>,
+    profile: crate::config::QuorumProfile,
 }
 
 fn handle_effect<A, S, G, T>(
@@ -684,16 +743,32 @@ where
             let ok = verify_consensus_signature(ctx.chain_id, &signed, &pubkey);
             Ok(r.resume_with(ok))
         }
-        Effect::VerifyCommitCertificate(cert, valset, thresholds, r) => {
-            let res = verify::verify_commit_certificate(ctx.chain_id, &cert, &valset, thresholds);
+        // Certificate thresholds derived from the effect's OWN valset
+        // (RFC-CONSENSUS-002 S6): the load-bearing sync-across-seam
+        // mechanism — every cert verified at its own height's composite
+        // threshold, independent of the live driver/params state. Malachite
+        // passes state.params.threshold_params; under AUTO we recompute from
+        // the valset size so a 4-of-6 cert below the seam and a 5-of-7 above
+        // are each checked correctly.
+        Effect::VerifyCommitCertificate(cert, valset, _thresholds, r) => {
+            let th = ctx
+                .profile
+                .thresholds_for(malachitebft_core_types::ValidatorSet::count(&valset) as u64);
+            let res = verify::verify_commit_certificate(ctx.chain_id, &cert, &valset, th);
             Ok(r.resume_with(res))
         }
-        Effect::VerifyPolkaCertificate(cert, valset, thresholds, r) => {
-            let res = verify::verify_polka_certificate(ctx.chain_id, &cert, &valset, thresholds);
+        Effect::VerifyPolkaCertificate(cert, valset, _thresholds, r) => {
+            let th = ctx
+                .profile
+                .thresholds_for(malachitebft_core_types::ValidatorSet::count(&valset) as u64);
+            let res = verify::verify_polka_certificate(ctx.chain_id, &cert, &valset, th);
             Ok(r.resume_with(res))
         }
-        Effect::VerifyRoundCertificate(cert, valset, thresholds, r) => {
-            let res = verify::verify_round_certificate(ctx.chain_id, &cert, &valset, thresholds);
+        Effect::VerifyRoundCertificate(cert, valset, _thresholds, r) => {
+            let th = ctx
+                .profile
+                .thresholds_for(malachitebft_core_types::ValidatorSet::count(&valset) as u64);
+            let res = verify::verify_round_certificate(ctx.chain_id, &cert, &valset, th);
             Ok(r.resume_with(res))
         }
 

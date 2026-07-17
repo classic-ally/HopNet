@@ -207,7 +207,7 @@ pub fn post_initial_setup(
         let quorum_profile = match std::env::var("HOPNET_QUORUM_PROFILE") {
             Ok(s) => hopnet_consensus::config::QuorumProfile::parse(&s).ok_or_else(|| {
                 tracing::error!(
-                    "post_initial_setup: invalid HOPNET_QUORUM_PROFILE {:?} (expected 'bft' or 'majority')",
+                    "post_initial_setup: invalid HOPNET_QUORUM_PROFILE {:?} (expected 'bft', 'majority', or 'auto')",
                     s
                 );
                 DatabaseError::ProcessingError
@@ -217,7 +217,7 @@ pub fn post_initial_setup(
             // seating is gone (BFT v=1 grows only by a batch of 3, and a
             // 3-node mesh has 2 candidates). AUTO — the S6 default — is
             // majority at v < 7 anyway, so this is where AUTO already lands.
-            Err(_) => hopnet_consensus::config::QuorumProfile::Majority,
+            Err(_) => hopnet_consensus::config::QuorumProfile::Auto,
         };
 
         let engine_txs = crate::consensus::malachite::app::to_engine_transactions(
