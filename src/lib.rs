@@ -77,6 +77,9 @@ pub struct AppState {
     /// with decided blob ids (non-blocking); the engine's workers and
     /// placement batcher run behind the host seams.
     pub storage: Arc<OnceCell<hopnet_storage::engine::EngineHandle>>,
+    /// Per-peer liveness evidence (RFC-CONSENSUS-002 S3). One writer lock
+    /// per authenticated exchange; classification is pure over snapshots.
+    pub evidence: Arc<consensus::evidence::EvidenceMap>,
     /// The MAIN multi-thread runtime's handle, captured at startup.
     /// Host-side background work scheduled from consensus apply
     /// (`HostWorkScheduler`) spawns here — apply runs on the consensus

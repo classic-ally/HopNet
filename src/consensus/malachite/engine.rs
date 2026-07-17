@@ -323,6 +323,10 @@ pub fn spawn_engine(app_state: &AppState) -> Result<(), String> {
     // one indexed validators lookup per tick, then sleep.
     spawn_tip_poll(app_state.clone());
 
+    // Evidence probe scheduler (RFC-CONSENSUS-002 S3): the deadline scan
+    // that keeps every registered peer's evidence bounded-stale.
+    crate::consensus::evidence::spawn_probe_scheduler(app_state.clone());
+
     tracing::info!(
         start_height = start_height.0,
         profile = profile.as_str(),
@@ -377,7 +381,14 @@ fn spawn_tip_poll(app_state: AppState) {
             let peers = sync::peer_list(&app_state.db_pool, node_id, None);
             let mut decided = engine.decided.clone();
             if let Err(e) =
-                sync::sync_to_tip(&app_state.comms, &engine.input_tx, &mut decided, &peers).await
+                sync::sync_to_tip(
+                    &app_state.comms,
+                    &engine.input_tx,
+                    &mut decided,
+                    &peers,
+                    Some(app_state.evidence.clone()),
+                )
+                .await
             {
                 tracing::debug!("tip-poll sync: {e:?}");
             }
@@ -461,7 +472,13 @@ pub async fn bootstrap_join(
         .ok_or("engine missing after spawn")?;
 
     let mut decided = engine.decided.clone();
-    let reached = sync::sync_to_tip(&app_state.comms, &engine.input_tx, &mut decided, &peers)
+    let reached = sync::sync_to_tip(
+        &app_state.comms,
+        &engine.input_tx,
+        &mut decided,
+        &peers,
+        None, // bootstrap: nodes table still filling; evidence starts post-join
+    )
         .await
         .map_err(|e| format!("sync to tip: {e:?}"))?;
 
@@ -512,6 +529,7 @@ fn spawn_driver(
                                     &mut decided,
                                     target.0,
                                     Some(hint_peer),
+                                    Some(app_state.evidence.clone()),
                                 )
                                 .await
                                 {
@@ -713,6 +731,7 @@ pub fn kick_sync_if_behind(app_state: &AppState, target: u64, hint_peer: i32) {
     let input_tx = engine.input_tx.clone();
     let mut decided = engine.decided.clone();
     let flag = engine.sync_inflight.clone();
+    let evidence = app_state.evidence.clone();
     crate::consensus::queue::queue_rt().spawn(async move {
         if let Err(e) = sync::sync_to_target(
             &comms,
@@ -722,6 +741,7 @@ pub fn kick_sync_if_behind(app_state: &AppState, target: u64, hint_peer: i32) {
             &mut decided,
             target,
             Some(hint_peer),
+            Some(evidence),
         )
         .await
         {

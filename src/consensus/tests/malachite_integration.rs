@@ -199,6 +199,7 @@ async fn start_engine(app_state: &AppState, node_id: i32) -> EngineNode {
                                 &mut decided,
                                 target.0,
                                 Some(hint_peer),
+                                Some(app_state.evidence.clone()),
                             )
                             .await
                             {

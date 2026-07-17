@@ -48,9 +48,10 @@ pub async fn sync_to_target(
     decided: &mut watch::Receiver<u64>,
     target: u64,
     hint_peer: Option<i32>,
+    evidence: Option<std::sync::Arc<crate::consensus::evidence::EvidenceMap>>,
 ) -> Result<(), SyncError> {
     let peers = peer_list(db_pool, my_node_id, hint_peer);
-    sync_loop(comms, input_tx, decided, Some(target), &peers).await?;
+    sync_loop(comms, input_tx, decided, Some(target), &peers, evidence).await?;
     Ok(())
 }
 
@@ -63,8 +64,9 @@ pub async fn sync_to_tip(
     input_tx: &mpsc::Sender<HostInput>,
     decided: &mut watch::Receiver<u64>,
     peers: &[PeerRef],
+    evidence: Option<std::sync::Arc<crate::consensus::evidence::EvidenceMap>>,
 ) -> Result<u64, SyncError> {
-    sync_loop(comms, input_tx, decided, None, peers).await
+    sync_loop(comms, input_tx, decided, None, peers, evidence).await
 }
 
 /// Shared fetch/feed/apply loop. With `target = Some(h)`: sync until decided
@@ -77,6 +79,7 @@ async fn sync_loop(
     decided: &mut watch::Receiver<u64>,
     target: Option<u64>,
     peers: &[PeerRef],
+    evidence: Option<std::sync::Arc<crate::consensus::evidence::EvidenceMap>>,
 ) -> Result<u64, SyncError> {
     let mut cursor = 0usize;
     // Peers that failed (transport error, malformed data, chunk didn't apply).
@@ -119,6 +122,11 @@ async fn sync_loop(
         };
         match fetch_chunk(comms, &peer, from, to).await {
             Ok(pairs) if !pairs.is_empty() => {
+                // Reachability evidence (RFC-CONSENSUS-002): the peer served
+                // us an authenticated chunk.
+                if let Some(ref ev) = evidence {
+                    ev.record_contact(peer.node_id);
+                }
                 let mut last_fed = *decided.borrow();
                 let mut expected = from as u64;
                 for (block, cert) in pairs {
@@ -219,7 +227,7 @@ pub async fn fetch_genesis(
     Err(last_err)
 }
 
-pub(super) fn peer_list(
+pub(crate) fn peer_list(
     db_pool: &Pool<SqliteConnectionManager>,
     my_node_id: i32,
     hint: Option<i32>,

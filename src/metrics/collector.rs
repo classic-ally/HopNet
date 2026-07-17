@@ -165,6 +165,12 @@ pub async fn collect_all_node_metrics(
             }
         };
 
+        // Reachability evidence (RFC-CONSENSUS-002): any successful
+        // measurement RPC proved an authenticated exchange with the node.
+        if available || throughput_value.is_some() || storage_total_gb.is_some() {
+            app_state.evidence.record_contact(node.node_id);
+        }
+
         // Create single Metric struct with extracted data
         let metric = Metric {
             from_node: source_node_id,

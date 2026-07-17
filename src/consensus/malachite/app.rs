@@ -216,8 +216,19 @@ impl<C: DerefMut<Target = Connection> + 'static> Application<SqliteStorage<C>>
         )
     }
 
-    fn on_decided(&mut self, height: Height, block: &engine::Block, _cert: &WireCommitCertificate) {
+    fn on_decided(&mut self, height: Height, block: &engine::Block, cert: &WireCommitCertificate) {
         tracing::debug!(height = height.0, "block decided (malachite engine)");
+
+        // Contribution evidence (RFC-CONSENSUS-001 Evidence & validation):
+        // each signature in a committed certificate is the mesh's ledger
+        // entry that this node's vote counted. A signer at height h has
+        // decided h, so the certificate height doubles as
+        // last_known_height. Shell thread: lock-only, no await, no DB.
+        for (node_id, _sig) in cert.signatures.iter() {
+            self.app_state
+                .evidence
+                .record_contact_with_height(*node_id, cert.height as i64);
+        }
 
         // Distribution kick (RFC-014/017): every registered projection
         // reports which blob ids this decided block commits (a pure decode

@@ -19,6 +19,7 @@ mod documentprovider_write;
 mod file_upload;
 mod fileprovider_device_token;
 mod fragment_distribution;
+mod evidence_observe;
 mod graceful_leave;
 mod fragment_health_check;
 mod import;
@@ -98,6 +99,16 @@ pub trait TestScenario: Send + Sync {
 /// export these before `orchestrator create` for the same checks).
 pub fn mesh_creation_env(test_name: &str) -> Vec<(&'static str, &'static str)> {
     match test_name {
+        "evidence-observe" => vec![
+            (
+                "HOPNET_GENESIS_CONSENSUS_POLICY",
+                "probe_base=2;grace=1",
+            ),
+            // Majority: 3 nodes -> quorum 2, H 1 (Fast) -> kill one -> H 0
+            // (Cliff). Under default BFT quorum(3)=3 the mesh starts at the
+            // Cliff and no band SHIFT would be observable.
+            ("HOPNET_QUORUM_PROFILE", "majority"),
+        ],
         "tier-membership" => vec![(
             "HOPNET_GENESIS_STORAGE_POLICY",
             "decay_tiers=60,120,180,240",
@@ -205,6 +216,11 @@ pub async fn run_test_by_name(
         }
         "re-encode-after-departure" => {
             reencode::ReencodeAfterDeparture
+                .run(mesh_id, nodes, flags)
+                .await
+        }
+        "evidence-observe" => {
+            evidence_observe::EvidenceObserve
                 .run(mesh_id, nodes, flags)
                 .await
         }
@@ -352,6 +368,7 @@ pub fn list_test_names() -> Vec<&'static str> {
         "chunked-streaming-performance",
         "restart-persistence",
         "graceful-leave",
+        "evidence-observe",
         "device-token-consistency",
         "documentprovider-write-consistency",
         "iroh-ping",

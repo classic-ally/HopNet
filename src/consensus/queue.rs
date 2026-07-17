@@ -647,6 +647,16 @@ async fn handle_as_forwarder(
     )
     .await;
 
+    // Reachability evidence (RFC-CONSENSUS-002): any reply — including a
+    // NotProposer rejection — proves an authenticated exchange with the
+    // proposer. NoAck and transport errors prove nothing.
+    if !matches!(
+        forward_result,
+        Err(_) | Ok(super::rpc::ForwardAckResult::NoAck)
+    ) {
+        app_state.evidence.record_contact(proposer);
+    }
+
     match forward_result {
         Ok(super::rpc::ForwardAckResult::NoAck) => {
             tracing::warn!(

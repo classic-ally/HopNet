@@ -236,6 +236,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 write_gate: write_gate.clone(),
                 local_state_tx,
                 malachite: Arc::new(OnceCell::new()),
+                evidence: std::sync::Arc::new(consensus::evidence::EvidenceMap::new()),
                 storage: Arc::new(OnceCell::new()),
                 runtime: tokio::runtime::Handle::current(),
             };
@@ -547,6 +548,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 .route("/consensus/view", post(consensus::routes::debug_view_state))
                 .route("/consensus/leave", post(consensus::routes::post_leave))
                 .route("/consensus/activate", post(consensus::routes::post_activate))
+                .route("/consensus/evidence", get(consensus::evidence::get_evidence))
                 .layer(middleware::from_fn_with_state(
                     app_state.clone(),
                     consensus::routes::jwt_or_rpc_auth_middleware,

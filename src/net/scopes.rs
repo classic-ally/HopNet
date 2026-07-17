@@ -68,6 +68,12 @@ pub fn build_registry(app_state: &AppState) -> ScopeRegistry {
             app_state: app_state.clone(),
         }),
     );
+    scopes.rpc(
+        "status",
+        Arc::new(crate::consensus::evidence::StatusScope {
+            app_state: app_state.clone(),
+        }),
+    );
     scopes
 }
 
@@ -92,6 +98,10 @@ impl ConsensusScope {
                 };
             }
         };
+        // Reachability evidence (RFC-CONSENSUS-002 S3): an authenticated,
+        // well-formed exchange from this peer — covers gossip (votes
+        // received first-hand) and decided-fetch serving.
+        self.app_state.evidence.record_contact(peer.node_id);
         // Malachite-engine traffic → the consensus shell (and the decided-
         // block store for sync serving). "Not active" until spawn_engine
         // installs the handle (pre-setup).
@@ -237,6 +247,9 @@ async fn serve_tx_forward(
         }
     };
 
+    // Reachability evidence: the forwarder reached us (RFC-CONSENSUS-002).
+    app_state.evidence.record_contact(peer.node_id);
+
     // Validate proposer status before ACKing — avoids multi-hop
     // forwarding. Best-effort: if the target is unreadable, ACK and
     // let the local queue route (it forwards onward if needed).
@@ -299,13 +312,16 @@ pub struct StorageScope {
 }
 
 impl RpcHandler for StorageScope {
-    fn handle(&self, _peer: PeerRef, payload: Vec<u8>) -> BoxFuture<'_, Vec<u8>> {
+    fn handle(&self, peer: PeerRef, payload: Vec<u8>) -> BoxFuture<'_, Vec<u8>> {
         // App plane: fragments touch disk and the DB — the MAIN runtime;
         // degrades under API overload by design. The protocol itself is
         // crate-owned (RFC-017 Stage 2): this shell only decodes the request
         // and hands the substrate its LocalStateSink.
         let app_state = self.app_state.clone();
         Box::pin(async move {
+            // Reachability evidence (RFC-CONSENSUS-002): fragment traffic
+            // keeps pool nodes passively bright.
+            app_state.evidence.record_contact(peer.node_id);
             self.app_state
                 .runtime
                 .spawn(async move {
@@ -338,8 +354,11 @@ pub struct MetricsScope {
 }
 
 impl RpcHandler for MetricsScope {
-    fn handle(&self, _peer: PeerRef, payload: Vec<u8>) -> BoxFuture<'_, Vec<u8>> {
+    fn handle(&self, peer: PeerRef, payload: Vec<u8>) -> BoxFuture<'_, Vec<u8>> {
+        let app_state = self.app_state.clone();
         Box::pin(async move {
+            // Reachability evidence (RFC-CONSENSUS-002).
+            app_state.evidence.record_contact(peer.node_id);
             let response = match decode_payload::<MetricsRequest>(&payload) {
                 Err(e) => MetricsResponse::Error {
                     message: format!("bad metrics request: {e}"),
@@ -376,10 +395,14 @@ pub struct SetupScope {
 }
 
 impl RpcHandler for SetupScope {
-    fn handle(&self, _peer: PeerRef, payload: Vec<u8>) -> BoxFuture<'_, Vec<u8>> {
+    fn handle(&self, peer: PeerRef, payload: Vec<u8>) -> BoxFuture<'_, Vec<u8>> {
         // App plane: join processing writes the DB — the MAIN runtime.
         let app_state = self.app_state.clone();
         Box::pin(async move {
+            // Reachability evidence; a joining peer may not be registered
+            // yet — stray entries are harmless (the estimator iterates
+            // registered ids, never map keys).
+            app_state.evidence.record_contact(peer.node_id);
             self.app_state
                 .runtime
                 .spawn(async move {
