@@ -40,10 +40,10 @@ pub enum ConsensusNetResponse {
 /// Per-publish send timeout (matches the old broadcast paths' 3s).
 const PUBLISH_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// All known peers, excluding ourselves.
-///
-/// TODO(stage-5): restrict to the validator set at the current height; today
-/// every node is a validator so the sets coincide.
+/// Validators at the pending height, excluding ourselves
+/// (RFC-CONSENSUS-002 S1: consensus gossip goes to the valset, not all
+/// registered nodes — departed/pool nodes follow the chain via the
+/// tip-poll instead; decided-value sync serving stays open to everyone).
 fn peers(
     db_pool: &Pool<SqliteConnectionManager>,
     my_node_id: i32,
@@ -53,20 +53,22 @@ fn peers(
     // real error visible; pool starvation under API load is a live failure
     // mode and the publisher's cache is what rides it out.
     let conn = db_pool.get().map_err(|e| format!("db pool: {e}"))?;
-    let mut stmt = conn
-        .prepare_cached("SELECT node_id, pubkey FROM nodes WHERE node_id != ?")
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map([my_node_id], |row| {
-            let node_id: i32 = row.get(0)?;
-            let pubkey: crate::db::PubKey = row.get(1)?;
-            Ok(PeerRef {
-                node_id,
-                pubkey: pubkey.0.to_bytes(),
-            })
+    let pending = hopnet_consensus::store::last_decided_height(&conn)
+        .map_err(|e| e.to_string())?
+        .map_or(0i64, |h| h.as_db().saturating_add(1));
+    let validators = crate::db::consensus::get_validators_with_conn(
+        &conn,
+        i32::try_from(pending).unwrap_or(i32::MAX),
+    )
+    .map_err(|e| format!("validators: {e:?}"))?;
+    Ok(validators
+        .into_iter()
+        .filter(|n| n.node_id != my_node_id)
+        .map(|n| PeerRef {
+            node_id: n.node_id,
+            pubkey: n.pubkey.0.to_bytes(),
         })
-        .map_err(|e| e.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+        .collect())
 }
 
 /// How long the publisher trusts its cached peer list before re-reading the

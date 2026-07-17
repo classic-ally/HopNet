@@ -92,6 +92,12 @@ impl HopNetApplication {
             ));
         }
 
+        // Solo-block rule (RFC-CONSENSUS-002): structural, both origins.
+        check_solo_membership(
+            block.data.transactions.iter().map(|t| t.rpc.function.as_str()),
+            block.data.transactions.len(),
+        )?;
+
         // Parent linkage: must extend the last decided block exactly.
         let last: Option<Vec<u8>> = db_tx
             .query_row(
@@ -238,10 +244,47 @@ impl<C: DerefMut<Target = Connection> + 'static> Application<SqliteStorage<C>>
 // Value builder (proposer path)
 
 /// Result of building a proposal value.
+/// Solo-block selection (proposer side): if any membership transition is
+/// among the candidates, keep the FIRST one alone; every other candidate
+/// (membership or not) is deferred to a later height — restaged, not
+/// rejected (RFC-CONSENSUS-002: joint constraints are invisible to per-tx
+/// validation, so the block shape carries them).
+pub fn solo_block_deferrals(functions: &[&str]) -> Vec<usize> {
+    match functions
+        .iter()
+        .position(|f| crate::consensus::handlers::is_membership_tx(f))
+    {
+        Some(keep) => (0..functions.len()).filter(|&i| i != keep).collect(),
+        None => Vec::new(),
+    }
+}
+
+/// Solo-block shape check (validation side): structural and deterministic —
+/// BOTH origins. A proposer that packs a membership transition with anything
+/// else (or two of them) is rejected outright.
+pub fn check_solo_membership<'a>(
+    functions: impl Iterator<Item = &'a str>,
+    total: usize,
+) -> Result<(), String> {
+    let n = functions
+        .filter(|f| crate::consensus::handlers::is_membership_tx(f))
+        .count();
+    if n > 1 {
+        return Err("more than one membership transition in block".into());
+    }
+    if n == 1 && total > 1 {
+        return Err("membership transition must ride alone".into());
+    }
+    Ok(())
+}
+
 pub struct BuiltValue {
     pub block: engine::Block,
     /// (index into `candidates`, reason) for transactions dropped by preflight.
     pub rejected: Vec<(usize, String)>,
+    /// Candidate indices deferred by the solo-block rule (restage, don't
+    /// reject: they are valid, just not allowed to share this block).
+    pub deferred: Vec<usize>,
 }
 
 /// Build the proposer's block for (height, round) from candidate transactions:
@@ -268,6 +311,31 @@ pub fn build_value(
             rejected.push((i, "already committed".into()));
         } else {
             survivors.push((i, tx));
+        }
+    }
+
+    // Solo-block rule: a membership transition proposes alone; everything
+    // else waits for the next height (restaged by the caller). Before the
+    // preflight so deferred txs cost no SAVEPOINT dry-runs and are judged
+    // fresh at their own height.
+    let mut deferred: Vec<usize> = Vec::new();
+    {
+        let funcs: Vec<&str> = survivors
+            .iter()
+            .map(|(_, t)| t.rpc.function.as_str())
+            .collect();
+        let slots = solo_block_deferrals(&funcs);
+        if !slots.is_empty() {
+            let slot_set: std::collections::HashSet<usize> = slots.into_iter().collect();
+            let mut kept = Vec::with_capacity(1);
+            for (slot, entry) in survivors.into_iter().enumerate() {
+                if slot_set.contains(&slot) {
+                    deferred.push(entry.0);
+                } else {
+                    kept.push(entry);
+                }
+            }
+            survivors = kept;
         }
     }
 
@@ -360,5 +428,43 @@ pub fn build_value(
     })
     .map_err(|e| format!("block build: {e:?}"))?;
 
-    Ok(BuiltValue { block, rejected })
+    Ok(BuiltValue { block, rejected, deferred })
+}
+
+#[cfg(test)]
+mod solo_block_tests {
+    use super::*;
+
+    // Should: defer every other candidate when a membership transition is
+    // present, keeping only the FIRST membership tx; no membership -> no
+    // deferrals.
+    // Impact: joint membership constraints (one transition per block) are
+    // carried by the block shape — per-tx validation cannot see siblings.
+    #[test]
+    fn solo_block_defers_everything_else() {
+        assert_eq!(
+            solo_block_deferrals(&["files.create", "validator_leave", "files.create"]),
+            vec![0, 2]
+        );
+        assert_eq!(
+            solo_block_deferrals(&["validator_activation", "validator_leave"]),
+            vec![1]
+        );
+        assert!(solo_block_deferrals(&["files.create", "submit_metrics"]).is_empty());
+        assert!(solo_block_deferrals(&[]).is_empty());
+    }
+
+    // Should: reject blocks with two membership transitions or a membership
+    // transition sharing the block; accept a solo membership tx and blocks
+    // of ordinary txs.
+    // Should not: depend on origin — the check is structural.
+    #[test]
+    fn solo_shape_rejects() {
+        let check = |fs: &[&str]| check_solo_membership(fs.iter().copied(), fs.len());
+        assert!(check(&["validator_leave", "validator_activation"]).is_err());
+        assert!(check(&["validator_leave", "files.create"]).is_err());
+        assert!(check(&["validator_leave"]).is_ok());
+        assert!(check(&["files.create", "submit_metrics"]).is_ok());
+        assert!(check(&[]).is_ok());
+    }
 }

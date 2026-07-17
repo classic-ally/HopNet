@@ -103,6 +103,32 @@ const SCHEMA: &str = "
         key         TEXT PRIMARY KEY,
         value       BLOB NOT NULL
     );
+
+    -- Validator membership (RFC-CONSENSUS-002): height-versioned
+    -- activation/deactivation rows, descended from the host schema. The
+    -- host's nodes table is a documented interface (get_validators JOINs
+    -- it) — deliberately NO foreign key: this crate installs standalone
+    -- (crate tests, SqliteStorage self-install), and validator rows are
+    -- written only by consensus handlers whose submitters are
+    -- signature-verified against nodes before dispatch.
+    CREATE TABLE IF NOT EXISTS validators (
+        effective_height    INTEGER NOT NULL,   -- height at which the state change takes effect
+        node_id             INTEGER NOT NULL,
+        is_active           INTEGER NOT NULL,
+        -- Departure class (RFC-CONSENSUS-001 'Departure classes'):
+        -- NULL on activation rows; lastDeparture = latest is_active=0 row.
+        -- NULL-proofed: SQLite CHECKs pass on NULL, so the deactivation
+        -- disjunct must assert IS NOT NULL explicitly.
+        departure_kind      TEXT
+            CHECK ((is_active = 1 AND departure_kind IS NULL)
+                OR (is_active = 0 AND departure_kind IS NOT NULL
+                    AND departure_kind IN ('voluntary', 'voted_out'))),
+        PRIMARY KEY (effective_height, node_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_validator_height ON validators(effective_height DESC);
+    CREATE INDEX IF NOT EXISTS idx_validator_active ON validators(effective_height, is_active);
+    CREATE INDEX IF NOT EXISTS idx_validator_node ON validators(node_id, effective_height DESC);
 ";
 
 const META_LAST_DECIDED: &str = "last_decided_height";

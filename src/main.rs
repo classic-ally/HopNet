@@ -545,6 +545,8 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                     get(consensus::routes::get_consensus_history),
                 )
                 .route("/consensus/view", post(consensus::routes::debug_view_state))
+                .route("/consensus/leave", post(consensus::routes::post_leave))
+                .route("/consensus/activate", post(consensus::routes::post_activate))
                 .layer(middleware::from_fn_with_state(
                     app_state.clone(),
                     consensus::routes::jwt_or_rpc_auth_middleware,

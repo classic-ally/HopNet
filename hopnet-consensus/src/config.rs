@@ -45,6 +45,17 @@ impl QuorumProfile {
         }
     }
 
+    /// Minimum vote count for quorum over `v` uniformly-weighted validators —
+    /// the closed form of `thresholds().quorum.is_met(q, v)` with voting
+    /// power 1 per validator (RFC-CONSENSUS-001 `quorum(v)`). The single
+    /// source of truth for the membership policy's headroom/parity math.
+    pub fn quorum(&self, v: u64) -> u64 {
+        match self {
+            QuorumProfile::Bft => v * 2 / 3 + 1,  // smallest q with 3q > 2v
+            QuorumProfile::Majority => v / 2 + 1, // smallest q with 2q > v
+        }
+    }
+
     /// Stable string form for persistence (consensus_meta) and config files.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -58,6 +69,34 @@ impl QuorumProfile {
             "bft" => Some(QuorumProfile::Bft),
             "majority" => Some(QuorumProfile::Majority),
             _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Should: the closed-form quorum(v) agree with malachite's
+    // ThresholdParam::is_met at every mesh size we care about, both
+    // profiles — quorum(v) is the smallest count meeting the threshold.
+    // Should not: drift if ThresholdParams defaults ever change upstream.
+    // Impact: the membership policy's headroom/parity math (RFC-CONSENSUS-002)
+    // is computed from quorum(v); disagreement with the engine's actual vote
+    // counting would silently corrupt every guard.
+    #[test]
+    fn quorum_matches_threshold_param() {
+        for profile in [QuorumProfile::Bft, QuorumProfile::Majority] {
+            let t = profile.thresholds().quorum;
+            for v in 1..=12u64 {
+                let q = profile.quorum(v);
+                assert!(t.is_met(q, v), "{profile:?} q={q} v={v} should meet");
+                assert!(
+                    !t.is_met(q - 1, v),
+                    "{profile:?} q-1={} v={v} should not meet",
+                    q - 1
+                );
+            }
         }
     }
 }

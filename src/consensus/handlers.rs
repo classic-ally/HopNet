@@ -103,6 +103,125 @@ inventory::submit! {
 }
 
 // ============================================================================
+// Membership-transition registry (solo-block rule keys off this)
+// ============================================================================
+
+/// Function names that mutate the validator set. `build_value` and
+/// `validate_inner` enforce at most one per block, riding alone
+/// (RFC-CONSENSUS-002: joint constraints — one-removal-per-height, joint
+/// leave safety — are invisible to per-tx validation, so the block shape
+/// carries them).
+pub const MEMBERSHIP_TX_FUNCTIONS: &[&str] = &["validator_activation", "validator_leave"];
+
+pub fn is_membership_tx(function: &str) -> bool {
+    MEMBERSHIP_TX_FUNCTIONS.contains(&function)
+}
+
+// ============================================================================
+// Voluntary leave (RFC-CONSENSUS-002 S1) — the departure twin of activation
+// ============================================================================
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct LeaveRequest {
+    pub node_id: i32,
+}
+
+pub struct ValidatorLeaveHandler;
+
+impl TransactionHandler for ValidatorLeaveHandler {
+    fn name(&self) -> &'static str {
+        "validator_leave"
+    }
+
+    fn process(
+        &self,
+        tx: &TxMeta<'_>,
+        execute: bool,
+        _ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
+    ) -> HandlerResult {
+        let (req, _) = bincode::serde::decode_from_slice::<LeaveRequest, _>(
+            tx.payload,
+            bincode::config::standard(),
+        )
+        .map_err(|_| DatabaseError::InvalidPayload)?;
+
+        // Authorization (objective, both phases): only self-leave — the
+        // departing node's signature is the consent (spec: Departure
+        // classes, LEAVE).
+        if req.node_id != tx.submitter_node {
+            tracing::warn!(
+                "Authorization failed: node {} attempted to remove node {}",
+                tx.submitter_node,
+                req.node_id
+            );
+            return Err(DatabaseError::AuthorizationError);
+        }
+
+        let committed_height = get_current_consensus_height(db_tx)?;
+
+        if !execute {
+            // Target must currently be seated.
+            if !crate::db::consensus::is_node_active(db_tx, req.node_id, committed_height)? {
+                tracing::warn!("leave refused: node {} is not active", req.node_id);
+                return Err(DatabaseError::ProcessingError);
+            }
+
+            // INTERIM S1 guard (tightened to the evidence-based live
+            // estimate in S4): live ≈ seated. The set must survive the
+            // departure — v > 1 and v−1 ≥ quorum(v−1) under the mesh's
+            // pinned profile. Deterministic over committed state, so this
+            // validates identically at both ValidationOrigins.
+            let v = hopnet_consensus::validators::count_active_validators(
+                db_tx,
+                committed_height,
+            )
+            .map_err(|_| DatabaseError::RecallError)?;
+            let profile = match hopnet_consensus::store::meta_get(
+                db_tx,
+                hopnet_consensus::store::META_QUORUM_PROFILE,
+            )
+            .map_err(|_| DatabaseError::RecallError)?
+            {
+                Some(bytes) => String::from_utf8(bytes)
+                    .ok()
+                    .and_then(|s| hopnet_consensus::config::QuorumProfile::parse(&s))
+                    .ok_or(DatabaseError::ProcessingError)?,
+                // spawn_engine's default when the meta key is absent.
+                None => hopnet_consensus::config::QuorumProfile::Bft,
+            };
+            if v < 2 || (v - 1) < profile.quorum(v - 1) {
+                tracing::warn!(
+                    "leave refused for node {}: set would not survive (v={v})",
+                    req.node_id
+                );
+                return Err(DatabaseError::ProcessingError);
+            }
+            return Ok(());
+        }
+
+        // Execute: deterministic deactivation at the committed height —
+        // the same effective-height computation as activation.
+        crate::db::consensus::deactivate_validator(
+            db_tx,
+            req.node_id,
+            committed_height,
+            crate::db::consensus::DepartureKind::Voluntary,
+        )?;
+        tracing::info!(
+            "Node {} voluntarily left the validator set at height {}",
+            req.node_id,
+            committed_height
+        );
+        Ok(())
+    }
+}
+
+inventory::submit! {
+    &ValidatorLeaveHandler as &dyn TransactionHandler
+}
+
+// ============================================================================
 // Genesis Handler - Creates initial network state from genesis transaction
 // ============================================================================
 //
@@ -305,4 +424,234 @@ impl TransactionHandler for CleanupNoncesHandler {
 
 inventory::submit! {
     &CleanupNoncesHandler as &dyn TransactionHandler
+}
+
+#[cfg(test)]
+mod leave_tests {
+    use super::*;
+    use crate::handlers::{NullNotifier, NullScheduler};
+    use ed25519_dalek::SigningKey;
+
+    fn setup_pool(n_validators: i32, profile: &str) -> r2d2::Pool<crate::db::SqliteConnectionManager> {
+        let manager = crate::db::SqliteConnectionManager::memory();
+        let pool = r2d2::Pool::builder()
+            .max_size(1)
+            .connection_customizer(Box::new(crate::db::shared::SqliteInitializer))
+            .build(manager)
+            .unwrap();
+        crate::db::shared::initialize(pool.get().unwrap()).unwrap();
+
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "INSERT INTO users (user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt)
+             VALUES (1, 'allison', X'00', X'00', X'00', X'00')",
+            [],
+        )
+        .unwrap();
+        for id in 1..=n_validators {
+            let key = SigningKey::from_bytes(&[id as u8; 32]);
+            let pubkey = crate::types::PubKey(key.verifying_key());
+            conn.execute(
+                "INSERT INTO nodes (node_id, name, owner, pubkey) VALUES (?, ?, 1, ?)",
+                rusqlite::params![id, format!("node-{id}"), &pubkey],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO validators (effective_height, node_id, is_active) VALUES (10, ?, true)",
+                rusqlite::params![id],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO consensus_meta (key, value) VALUES ('last_decided_height', ?)",
+            rusqlite::params![100i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO consensus_meta (key, value) VALUES ('quorum_profile', ?)",
+            rusqlite::params![profile.as_bytes()],
+        )
+        .unwrap();
+        pool
+    }
+
+    fn run_leave(
+        pool: &r2d2::Pool<crate::db::SqliteConnectionManager>,
+        target: i32,
+        submitter: i32,
+        execute: bool,
+    ) -> HandlerResult {
+        let payload =
+            bincode::serde::encode_to_vec(&LeaveRequest { node_id: target }, bincode::config::standard())
+                .unwrap();
+        let meta = TxMeta {
+            function: "validator_leave",
+            payload: &payload,
+            submitter_node: submitter,
+            user_id: None,
+        };
+        let notifier = NullNotifier;
+        let scheduler = NullScheduler;
+        let ctx = HandlerCtx {
+            fragments_dir: "",
+            node_id: Some(submitter),
+            notifier: &notifier,
+            work: &scheduler,
+        };
+        let mut conn = pool.get().unwrap();
+        let db_tx = conn.transaction().unwrap();
+        let result = ValidatorLeaveHandler.process(&meta, execute, &ctx, &db_tx);
+        if result.is_ok() && execute {
+            db_tx.commit().unwrap();
+        }
+        result
+    }
+
+    // Should: refuse the last active validator's leave (v > 1 fails).
+    // Impact: INV-FLOOR — the set never empties.
+    #[test]
+    fn leave_v1_refused() {
+        let pool = setup_pool(1, "bft");
+        assert!(run_leave(&pool, 1, 1, false).is_err());
+    }
+
+    // Should: refuse a leave from a node that is not seated.
+    #[test]
+    fn leave_not_active_refused() {
+        let pool = setup_pool(2, "bft");
+        // node 3 is registered nowhere — not seated.
+        let payload = bincode::serde::encode_to_vec(
+            &LeaveRequest { node_id: 3 },
+            bincode::config::standard(),
+        )
+        .unwrap();
+        let meta = TxMeta {
+            function: "validator_leave",
+            payload: &payload,
+            submitter_node: 3,
+            user_id: None,
+        };
+        let notifier = NullNotifier;
+        let scheduler = NullScheduler;
+        let ctx = HandlerCtx {
+            fragments_dir: "",
+            node_id: Some(3),
+            notifier: &notifier,
+            work: &scheduler,
+        };
+        let mut conn = pool.get().unwrap();
+        let db_tx = conn.transaction().unwrap();
+        assert!(
+            ValidatorLeaveHandler
+                .process(&meta, false, &ctx, &db_tx)
+                .is_err()
+        );
+    }
+
+    // Should not: let one node remove another via leave — the signature is
+    // the consent (both phases).
+    #[test]
+    fn leave_not_self_refused() {
+        let pool = setup_pool(3, "bft");
+        assert!(matches!(
+            run_leave(&pool, 2, 1, false),
+            Err(DatabaseError::AuthorizationError)
+        ));
+        assert!(matches!(
+            run_leave(&pool, 2, 1, true),
+            Err(DatabaseError::AuthorizationError)
+        ));
+    }
+
+    // Should: a 3-validator BFT mesh allow a leave (v−1 = 2 ≥ quorum(2) = 2)
+    // and record the voluntary departure at the committed height.
+    // Impact: the leave -> deactivation execute path end to end.
+    #[test]
+    fn leave_v3_bft_allowed_then_executes() {
+        let pool = setup_pool(3, "bft");
+        assert!(run_leave(&pool, 2, 2, false).is_ok());
+        assert!(run_leave(&pool, 2, 2, true).is_ok());
+
+        let conn = pool.get().unwrap();
+        let validators =
+            hopnet_consensus::validators::get_validators(&conn, 101).unwrap();
+        let ids: Vec<i32> = validators.iter().map(|v| v.node_id).collect();
+        assert_eq!(ids, vec![1, 3]);
+        assert_eq!(
+            hopnet_consensus::validators::last_departure(&conn, 2, 101).unwrap(),
+            Some(hopnet_consensus::validators::DepartureKind::Voluntary)
+        );
+    }
+
+    // Should: a 2-validator mesh allow a leave — quorum(1) = 1 under both
+    // profiles; a solo mesh is degenerate but legitimate.
+    #[test]
+    fn leave_v2_allowed() {
+        let pool = setup_pool(2, "majority");
+        assert!(run_leave(&pool, 2, 2, false).is_ok());
+    }
+
+    // Should: leave then reactivate round-trip through both handlers at
+    // increasing committed heights.
+    // Impact: the S1 rejoin path (legacy self-request activation).
+    #[test]
+    fn leave_then_reactivate_roundtrip() {
+        let pool = setup_pool(3, "bft");
+        assert!(run_leave(&pool, 3, 3, false).is_ok());
+        assert!(run_leave(&pool, 3, 3, true).is_ok());
+
+        // Mesh advances, node 3 requests activation again.
+        {
+            let conn = pool.get().unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO consensus_meta (key, value) VALUES ('last_decided_height', ?)",
+                rusqlite::params![110i64],
+            )
+            .unwrap();
+        }
+        let payload = bincode::serde::encode_to_vec(
+            &ActivationRequest {
+                node_id: 3,
+                current_height: 110,
+            },
+            bincode::config::standard(),
+        )
+        .unwrap();
+        let meta = TxMeta {
+            function: "validator_activation",
+            payload: &payload,
+            submitter_node: 3,
+            user_id: None,
+        };
+        let notifier = NullNotifier;
+        let scheduler = NullScheduler;
+        let ctx = HandlerCtx {
+            fragments_dir: "",
+            node_id: Some(3),
+            notifier: &notifier,
+            work: &scheduler,
+        };
+        let mut conn = pool.get().unwrap();
+        let db_tx = conn.transaction().unwrap();
+        assert!(
+            ValidatorActivationHandler
+                .process(&meta, false, &ctx, &db_tx)
+                .is_ok()
+        );
+        assert!(
+            ValidatorActivationHandler
+                .process(&meta, true, &ctx, &db_tx)
+                .is_ok()
+        );
+        db_tx.commit().unwrap();
+        drop(conn); // max_size-1 pool: release before the assert checkout
+
+        let conn = pool.get().unwrap();
+        let ids: Vec<i32> = hopnet_consensus::validators::get_validators(&conn, 120)
+            .unwrap()
+            .iter()
+            .map(|v| v.node_id)
+            .collect();
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
 }

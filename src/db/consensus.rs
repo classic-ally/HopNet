@@ -2,60 +2,28 @@ use super::*;
 use crate::consensus::types::*;
 use rusqlite::TransactionBehavior;
 
+// Validator-set state descended into hopnet-consensus (RFC-CONSENSUS-002
+// S1): the crate owns the table, the queries, and the writes; these shims
+// keep host signatures stable so call sites don't churn.
+pub use hopnet_consensus::validators::DepartureKind;
+
 pub fn get_validators_with_conn(
     db_lock: &r2d2::PooledConnection<SqliteConnectionManager>,
     height: i32,
 ) -> Result<Vec<Node>, DatabaseError> {
-    let mut stmt = db_lock
-        .prepare(
-            "
-        WITH latest_effective AS (
-            SELECT
-                node_id,
-                MAX(effective_height) AS max_eff
-            FROM validators
-            WHERE effective_height <= ?
-            GROUP BY node_id
-        ),
-        active_validators AS (
-            SELECT
-                v.node_id,
-                v.is_active
-            FROM validators v
-            JOIN latest_effective le
-                ON v.node_id = le.node_id
-                AND v.effective_height = le.max_eff
-            WHERE v.is_active = true
-        )
-        SELECT n.node_id, n.name, n.owner, n.pubkey
-        FROM active_validators av
-        JOIN nodes n ON av.node_id = n.node_id;
-        ",
-        )
-        .map_err(|_| DatabaseError::RecallError)?;
-
-    let results = stmt.query_map([height], |row| {
-        Ok(Node {
-            node_id: row.get(0)?,
-            name: row.get(1)?,
-            owner: row.get(2)?,
-            pubkey: row.get(3)?,
+    let rows = hopnet_consensus::validators::get_validators(db_lock, height).map_err(|e| {
+        tracing::error!("validators query: {e}");
+        DatabaseError::RecallError
+    })?;
+    Ok(rows
+        .into_iter()
+        .map(|v| Node {
+            node_id: v.node_id,
+            name: v.name,
+            owner: v.owner,
+            pubkey: crate::types::PubKey(v.pubkey.0),
         })
-    });
-
-    match results {
-        Ok(rows) => {
-            let nodes: Vec<Node> = rows.collect::<Result<_, _>>().map_err(|e| {
-                tracing::debug!("Error collecting validator rows: {:?}", e);
-                DatabaseError::ProcessingError
-            })?;
-            Ok(nodes)
-        }
-        Err(e) => {
-            tracing::error!("Failed to query validators: {:?}", e);
-            Err(DatabaseError::RecordError)
-        }
-    }
+        .collect())
 }
 
 pub fn get_validators(
@@ -260,88 +228,47 @@ pub fn get_current_consensus_height(conn: &rusqlite::Connection) -> Result<i32, 
     hopnet_projection::current_height(conn)
 }
 
-/// Check if a node is active at a given height
-/// Returns true if the node has an active validator entry effective at or before the given height
+/// Check if a node is active at a given height (crate shim).
 pub fn is_node_active(
     tx: &rusqlite::Transaction,
     node_id: i32,
     height: i32,
 ) -> Result<bool, DatabaseError> {
-    use rusqlite::OptionalExtension;
-
-    // Get the most recent validator record at or before this height
-    let is_active: Option<bool> = tx
-        .query_row(
-            "SELECT is_active FROM validators
-         WHERE node_id = ? AND effective_height <= ?
-         ORDER BY effective_height DESC
-         LIMIT 1",
-            params![node_id, height],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|_| DatabaseError::RecallError)?;
-
-    // If no record found, node is not active
-    Ok(is_active.unwrap_or(false))
+    hopnet_consensus::validators::is_node_active(tx, node_id, height)
+        .map_err(|_| DatabaseError::RecallError)
 }
 
-/// Activate a validator at a specific effective height
-/// If the node already has a future activation (after current height), it will be updated
-/// This enables hot-swap operations where validator-elect activation can be moved forward
+/// Activate a validator at a specific effective height (crate shim; the
+/// future-activation hot-swap branch lives in the crate).
 pub fn activate_validator(
     tx: &rusqlite::Transaction,
     node_id: i32,
     effective_height: i32,
 ) -> Result<(), DatabaseError> {
-    use rusqlite::OptionalExtension;
+    hopnet_consensus::validators::activate_validator(tx, node_id, effective_height)
+        .map_err(|_| DatabaseError::InsertError)
+}
 
-    let current_height = get_current_consensus_height(tx)?;
+/// Deactivate a validator — the shared execute path of LEAVE and VOTE-OUT
+/// (crate shim; RFC-CONSENSUS-001 "Departure classes").
+pub fn deactivate_validator(
+    tx: &rusqlite::Transaction,
+    node_id: i32,
+    effective_height: i32,
+    kind: DepartureKind,
+) -> Result<(), DatabaseError> {
+    hopnet_consensus::validators::deactivate_validator(tx, node_id, effective_height, kind)
+        .map_err(|_| DatabaseError::InsertError)
+}
 
-    // Check if node already has the NEXT future activation (earliest after current height)
-    let existing_future_activation: Option<i32> = tx
-        .query_row(
-            "SELECT effective_height FROM validators
-         WHERE node_id = ? AND effective_height > ? AND is_active = true
-         ORDER BY effective_height ASC
-         LIMIT 1",
-            params![node_id, current_height],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|_| DatabaseError::RecallError)?;
-
-    if let Some(old_height) = existing_future_activation {
-        // UPDATE the existing next activation to new height
-        tx.execute(
-            "UPDATE validators SET effective_height = ?
-             WHERE node_id = ? AND effective_height = ?",
-            params![effective_height, node_id, old_height],
-        )
-        .map_err(|_| DatabaseError::InsertError)?;
-
-        tracing::info!(
-            "Updated activation for node {} from height {} to height {}",
-            node_id,
-            old_height,
-            effective_height
-        );
-    } else {
-        // INSERT new activation record
-        tx.execute(
-            "INSERT INTO validators (effective_height, node_id, is_active) VALUES (?, ?, ?)",
-            params![effective_height, node_id, true],
-        )
-        .map_err(|_| DatabaseError::InsertError)?;
-
-        tracing::info!(
-            "Scheduled activation for node {} at height {}",
-            node_id,
-            effective_height
-        );
-    }
-
-    Ok(())
+/// lastDeparture(node) as of `height` (crate shim).
+pub fn last_departure(
+    conn: &rusqlite::Connection,
+    node_id: i32,
+    height: i32,
+) -> Result<Option<DepartureKind>, DatabaseError> {
+    hopnet_consensus::validators::last_departure(conn, node_id, height)
+        .map_err(|_| DatabaseError::RecallError)
 }
 
 #[cfg(test)]
@@ -440,201 +367,25 @@ mod tests {
         assert_eq!(validators[1].node_id, 2);
     }
 
+    // Should: the crate's install (via shared::initialize) produce the
+    // departure_kind column and the per-node index — the shadowing gate's
+    // test twin (a stray host CREATE TABLE would silently shadow the crate
+    // DDL and lose the column).
+    // Impact: departure kinds gate readmission (RFC-CONSENSUS-002).
     #[test]
-    fn test_get_validators_with_deactivation() {
+    fn validators_schema_installed_by_crate() {
         let pool = setup_test_db();
         let conn = pool.get().unwrap();
-
-        let user_pubkey = generate_test_pubkey();
-        let node_pubkey = generate_test_pubkey();
-
-        // Insert test user and node
-        conn.execute(
-            "INSERT INTO users (user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt)
-             VALUES (?, ?, ?, ?, ?, ?)",
-            params![1, "test", &user_pubkey, &vec![0u8; 32], &vec![0u8; 44], &vec![0u8; 16]]
-        ).unwrap();
-
-        conn.execute(
-            "INSERT INTO nodes (node_id, name, owner, pubkey)
-             VALUES (?, ?, ?, ?)",
-            params![1, "node1", 1, &node_pubkey],
-        )
-        .unwrap();
-
-        // Activate at height 10, deactivate at height 30
-        conn.execute(
-            "INSERT INTO validators (effective_height, node_id, is_active) VALUES (10, 1, true)",
-            [],
-        )
-        .unwrap();
-
-        conn.execute(
-            "INSERT INTO validators (effective_height, node_id, is_active) VALUES (30, 1, false)",
-            [],
-        )
-        .unwrap();
-
-        drop(conn);
-
-        // At height 20: active
-        let validators = get_validators(pool.get(), 20).unwrap();
-        assert_eq!(validators.len(), 1);
-        assert_eq!(validators[0].node_id, 1);
-
-        // At height 35: deactivated
-        let validators = get_validators(pool.get(), 35).unwrap();
-        assert_eq!(validators.len(), 0);
-    }
-
-    #[test]
-    fn test_get_validators_reactivation() {
-        let pool = setup_test_db();
-        let conn = pool.get().unwrap();
-
-        let user_pubkey = generate_test_pubkey();
-        let node_pubkey = generate_test_pubkey();
-
-        // Insert test user and node
-        conn.execute(
-            "INSERT INTO users (user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt)
-             VALUES (?, ?, ?, ?, ?, ?)",
-            params![1, "test", &user_pubkey, &vec![0u8; 32], &vec![0u8; 44], &vec![0u8; 16]]
-        ).unwrap();
-
-        conn.execute(
-            "INSERT INTO nodes (node_id, name, owner, pubkey)
-             VALUES (?, ?, ?, ?)",
-            params![1, "node1", 1, &node_pubkey],
-        )
-        .unwrap();
-
-        // Activate, deactivate, reactivate
-        conn.execute(
-            "INSERT INTO validators (effective_height, node_id, is_active) VALUES (10, 1, true)",
-            [],
-        )
-        .unwrap();
-
-        conn.execute(
-            "INSERT INTO validators (effective_height, node_id, is_active) VALUES (30, 1, false)",
-            [],
-        )
-        .unwrap();
-
-        conn.execute(
-            "INSERT INTO validators (effective_height, node_id, is_active) VALUES (50, 1, true)",
-            [],
-        )
-        .unwrap();
-
-        drop(conn);
-
-        // At height 20: active (first activation)
-        let validators = get_validators(pool.get(), 20).unwrap();
-        assert_eq!(validators.len(), 1);
-
-        // At height 40: inactive (deactivated)
-        let validators = get_validators(pool.get(), 40).unwrap();
-        assert_eq!(validators.len(), 0);
-
-        // At height 60: active again (reactivated)
-        let validators = get_validators(pool.get(), 60).unwrap();
-        assert_eq!(validators.len(), 1);
-    }
-
-    #[test]
-    fn test_get_validators_multiple_nodes() {
-        let pool = setup_test_db();
-        let conn = pool.get().unwrap();
-
-        let user_pubkey = generate_test_pubkey();
-
-        // Insert test user
-        conn.execute(
-            "INSERT INTO users (user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt)
-             VALUES (?, ?, ?, ?, ?, ?)",
-            params![1, "test", &user_pubkey, &vec![0u8; 32], &vec![0u8; 44], &vec![0u8; 16]]
-        ).unwrap();
-
-        // Insert 5 test nodes
-        for i in 1..=5 {
-            let node_pubkey = generate_test_pubkey();
-            conn.execute(
-                "INSERT INTO nodes (node_id, name, owner, pubkey)
-                 VALUES (?, ?, ?, ?)",
-                params![i, format!("node{}", i), 1, &node_pubkey],
+        conn.prepare("SELECT departure_kind FROM validators LIMIT 0")
+            .unwrap();
+        let idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_validator_node'",
+                [],
+                |row| row.get(0),
             )
             .unwrap();
-
-            // All activate at height 10
-            conn.execute(
-                "INSERT INTO validators (effective_height, node_id, is_active) VALUES (10, ?, true)",
-                params![i]
-            ).unwrap();
-        }
-
-        // Deactivate nodes 2 and 4 at height 30
-        conn.execute(
-            "INSERT INTO validators (effective_height, node_id, is_active) VALUES (30, 2, false)",
-            [],
-        )
-        .unwrap();
-
-        conn.execute(
-            "INSERT INTO validators (effective_height, node_id, is_active) VALUES (30, 4, false)",
-            [],
-        )
-        .unwrap();
-
-        drop(conn);
-
-        // At height 20: all 5 nodes active
-        let validators = get_validators(pool.get(), 20).unwrap();
-        assert_eq!(validators.len(), 5);
-
-        // At height 40: only nodes 1, 3, 5 active (2 and 4 deactivated)
-        let validators = get_validators(pool.get(), 40).unwrap();
-        assert_eq!(validators.len(), 3);
-        assert_eq!(validators[0].node_id, 1);
-        assert_eq!(validators[1].node_id, 3);
-        assert_eq!(validators[2].node_id, 5);
-    }
-
-    #[test]
-    fn test_get_validators_query_past_height() {
-        let pool = setup_test_db();
-        let conn = pool.get().unwrap();
-
-        let user_pubkey = generate_test_pubkey();
-        let node_pubkey = generate_test_pubkey();
-
-        // Insert test user and node
-        conn.execute(
-            "INSERT INTO users (user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt)
-             VALUES (?, ?, ?, ?, ?, ?)",
-            params![1, "test", &user_pubkey, &vec![0u8; 32], &vec![0u8; 44], &vec![0u8; 16]]
-        ).unwrap();
-
-        conn.execute(
-            "INSERT INTO nodes (node_id, name, owner, pubkey)
-             VALUES (?, ?, ?, ?)",
-            params![1, "node1", 1, &node_pubkey],
-        )
-        .unwrap();
-
-        // Activate at height 10
-        conn.execute(
-            "INSERT INTO validators (effective_height, node_id, is_active) VALUES (10, 1, true)",
-            [],
-        )
-        .unwrap();
-
-        drop(conn);
-
-        // Query at height 100 (far in future): should still return node 1 as active
-        let validators = get_validators(pool.get(), 100).unwrap();
-        assert_eq!(validators.len(), 1);
-        assert_eq!(validators[0].node_id, 1);
+        assert_eq!(idx, 1);
     }
 }

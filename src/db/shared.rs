@@ -312,28 +312,11 @@ pub fn initialize(db: PooledConnection<SqliteConnectionManager>) -> Result<(), D
             -- 1. user owns what nodes?
             CREATE INDEX idx_nodes_owner ON nodes(owner);
 
-            -- Consensus: decided chain + engine WAL live in the crate-owned
-            -- tables (decided_blocks, decided_certificates, consensus_wal,
-            -- consensus_meta — installed below via hopnet_consensus).
-
-            -- Track validators that are acceptable at any given time
-            -- Not using views (nodes can be in different views due to network partitions)
-            -- Not using timestamps (time sync requirement)
-            -- Using height (deterministic, directly tied to the block being committed)
-            CREATE TABLE validators (
-                effective_height    INTEGER NOT NULL,   -- Height when this validator changes state
-                node_id             INTEGER NOT NULL,
-                is_active           INTEGER NOT NULL,
-
-                PRIMARY KEY (effective_height, node_id),
-                FOREIGN KEY (node_id) REFERENCES nodes(node_id)
-            );
-
-            -- Common query patterns:
-            -- 1. Give me current validators (e.g. latest effective height for leave/rejoin)
-            -- 2. For consensus rebuild, give me nodes active at a given height
-            CREATE INDEX idx_validator_height ON validators(effective_height DESC); 
-            CREATE INDEX idx_validator_active ON validators(effective_height, is_active);
+            -- Consensus: decided chain + engine WAL + VALIDATORS live in the
+            -- crate-owned tables (decided_blocks, decided_certificates,
+            -- consensus_wal, consensus_meta, validators — installed below via
+            -- hopnet_consensus::store::install_schema; RFC-CONSENSUS-002 S1
+            -- descended the validators DDL into the crate).
 
             -- This node's identity. Consensus progress lives in the engine's
             -- WAL + consensus_meta, not here.
@@ -437,12 +420,18 @@ pub fn initialize(db: PooledConnection<SqliteConnectionManager>) -> Result<(), D
     )?;
 
     // Malachite engine tables (consensus_wal, decided_blocks,
-    // decided_certificates, consensus_meta) — owned by hopnet-consensus.
+    // decided_certificates, consensus_meta, validators) — owned by
+    // hopnet-consensus.
     hopnet_consensus::store::install_schema(&db).map_err(|e| match e {
         hopnet_consensus::store::StoreError::Db(db_err) => db_err,
         // install_schema only executes DDL — non-Db variants are unreachable
         other => rusqlite::Error::InvalidParameterName(other.to_string()),
     })?;
+
+    // Shadowing gate (RFC-CONSENSUS-002 S1): the crate owns validators; a
+    // stray host CREATE TABLE above would make the crate's IF NOT EXISTS
+    // silently no-op and lose departure_kind. Fail loudly at install.
+    db.prepare("SELECT departure_kind FROM validators LIMIT 0")?;
 
     // Schema seam (RFC-015/016): substrate tables (named — storage is
     // below the projection seam), then every registered projection's unit

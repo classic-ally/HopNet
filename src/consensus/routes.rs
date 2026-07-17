@@ -246,6 +246,98 @@ pub async fn get_consensus_history(State(app_state): State<AppState>) -> impl In
     }
 }
 
+/// Voluntary leave (RFC-CONSENSUS-002 S1): submit a self-signed
+/// validator_leave transaction and await the commit. Under BFT the leave
+/// block needs this node's own precommit (e.g. quorum(3) = 3), so an
+/// orderly shutdown must await this response BEFORE stopping the node.
+pub async fn post_leave(State(app_state): State<AppState>) -> impl IntoResponse {
+    use crate::consensus::dispatch::create_signed_transaction;
+    use crate::consensus::handlers::LeaveRequest;
+    use crate::consensus::queue::ConsensusSubmitError;
+
+    let Ok(node_id) = app_state.get_node_id() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "node identity not initialized",
+        )
+            .into_response();
+    };
+    let payload = match bincode::serde::encode_to_vec(
+        &LeaveRequest { node_id },
+        bincode::config::standard(),
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("encode: {e}")).into_response();
+        }
+    };
+    let tx = match create_signed_transaction(&app_state, "validator_leave".to_string(), payload) {
+        Ok(t) => t,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("sign: {e:?}")).into_response();
+        }
+    };
+    // submit() awaits the consensus commit (queue-internal 120 s bound);
+    // cap the HTTP response at 60 s.
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        app_state.consensus_queue.submit(tx),
+    )
+    .await
+    {
+        Ok(Ok(())) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "left": true, "node_id": node_id })),
+        )
+            .into_response(),
+        Ok(Err(ConsensusSubmitError::Rejected(r))) => {
+            (StatusCode::CONFLICT, format!("leave refused: {r}")).into_response()
+        }
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("leave failed: {e:?}"),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "leave not committed within 60s",
+        )
+            .into_response(),
+    }
+}
+
+/// Re-activation trigger (legacy self-request path, kept through S1–S4;
+/// RFC-CONSENSUS-002 S5 replaces it with mesh-initiated seating): submit a
+/// validator_activation for this node at its current decided height.
+pub async fn post_activate(State(app_state): State<AppState>) -> impl IntoResponse {
+    let Ok(node_id) = app_state.get_node_id() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "node identity not initialized",
+        )
+            .into_response();
+    };
+    let current = match app_state
+        .db_pool
+        .get()
+        .ok()
+        .and_then(|c| db::get_current_consensus_height(&c).ok())
+    {
+        Some(h) => h,
+        None => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "height unavailable").into_response();
+        }
+    };
+    match request_activation(&app_state, node_id, current).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "activated": true, "node_id": node_id })),
+        )
+            .into_response(),
+        Err(e) => (StatusCode::CONFLICT, format!("activation failed: {e}")).into_response(),
+    }
+}
+
 /// Submit a validator-activation transaction through the consensus queue.
 /// Called at the end of the join bootstrap (and by re-activation flows).
 pub(crate) async fn request_activation(

@@ -19,6 +19,7 @@ mod documentprovider_write;
 mod file_upload;
 mod fileprovider_device_token;
 mod fragment_distribution;
+mod graceful_leave;
 mod fragment_health_check;
 mod import;
 mod iroh_ping;
@@ -207,6 +208,11 @@ pub async fn run_test_by_name(
                 .run(mesh_id, nodes, flags)
                 .await
         }
+        "graceful-leave" => {
+            graceful_leave::GracefulLeave
+                .run(mesh_id, nodes, flags)
+                .await
+        }
         "tier-membership" => {
             tier_membership::TierMembership
                 .run(mesh_id, nodes, flags)
@@ -345,6 +351,7 @@ pub fn list_test_names() -> Vec<&'static str> {
         "multi-size-file-consistency",
         "chunked-streaming-performance",
         "restart-persistence",
+        "graceful-leave",
         "device-token-consistency",
         "documentprovider-write-consistency",
         "iroh-ping",

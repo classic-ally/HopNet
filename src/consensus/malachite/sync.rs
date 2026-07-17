@@ -219,7 +219,7 @@ pub async fn fetch_genesis(
     Err(last_err)
 }
 
-fn peer_list(
+pub(super) fn peer_list(
     db_pool: &Pool<SqliteConnectionManager>,
     my_node_id: i32,
     hint: Option<i32>,

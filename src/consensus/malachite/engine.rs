@@ -316,12 +316,74 @@ pub fn spawn_engine(app_state: &AppState) -> Result<(), String> {
         .malachite
         .set(engine)
         .map_err(|_| "spawn_engine: raced another spawn".to_string())?;
+
+    // Non-validator tip-poll (RFC-CONSENSUS-002 S1): a node outside the
+    // valset receives no consensus gossip (gossip::peers is valset-only),
+    // so it polls peers' decided tips and feeds sync. Cheap when seated:
+    // one indexed validators lookup per tick, then sleep.
+    spawn_tip_poll(app_state.clone());
+
     tracing::info!(
         start_height = start_height.0,
         profile = profile.as_str(),
         "malachite engine started (on-demand heights)"
     );
     Ok(())
+}
+
+/// Base cadence of the non-validator tip-poll; jittered ±20% so a departed
+/// cohort doesn't poll in lockstep.
+const TIP_POLL_BASE: Duration = Duration::from_secs(5);
+
+fn spawn_tip_poll(app_state: AppState) {
+    crate::consensus::queue::queue_rt().spawn(async move {
+        loop {
+            let jitter_ns = (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+                % 1000) as f64
+                / 1000.0;
+            let delay = TIP_POLL_BASE.mul_f64(0.8 + 0.4 * jitter_ns);
+            tokio::time::sleep(delay).await;
+
+            let Some(engine) = app_state.malachite.get() else {
+                continue;
+            };
+            let Ok(node_id) = app_state.get_node_id() else {
+                continue;
+            };
+            let pending = engine.decided.borrow().saturating_add(1);
+            let am_active = {
+                let Ok(conn) = app_state.db_pool.get() else {
+                    continue;
+                };
+                // Fail closed: on a query error assume seated and skip —
+                // gossip is then feeding us anyway or the node is broken
+                // in ways a poll won't fix.
+                hopnet_consensus::validators::is_node_active(
+                    &conn,
+                    node_id,
+                    i32::try_from(pending).unwrap_or(i32::MAX),
+                )
+                .unwrap_or(true)
+            };
+            if am_active {
+                continue;
+            }
+            if engine.sync_inflight.swap(true, Ordering::SeqCst) {
+                continue; // one sync at a time
+            }
+            let peers = sync::peer_list(&app_state.db_pool, node_id, None);
+            let mut decided = engine.decided.clone();
+            if let Err(e) =
+                sync::sync_to_tip(&app_state.comms, &engine.input_tx, &mut decided, &peers).await
+            {
+                tracing::debug!("tip-poll sync: {e:?}");
+            }
+            engine.sync_inflight.store(false, Ordering::SeqCst);
+        }
+    });
 }
 
 /// Join bootstrap: bring a freshly-initialized node (this_node only — empty
@@ -577,10 +639,21 @@ async fn handle_need_value(
     match built {
         Ok(built) => {
             // Resolve preflight verdicts for the queue-backed entries.
+            // Solo-block deferrals restage (valid txs that may not share a
+            // block with a membership transition); deferred indices beyond
+            // entries.len() (the appended system candidate) have no pool
+            // entry and are naturally dropped.
             let mut rejected_by_idx: std::collections::HashMap<usize, String> =
                 built.rejected.into_iter().collect();
+            let deferred_idx: std::collections::HashSet<usize> =
+                built.deferred.into_iter().collect();
             let mut inflight = Vec::new();
+            let mut restage = Vec::new();
             for (i, entry) in entries.into_iter().enumerate() {
+                if deferred_idx.contains(&i) {
+                    restage.push(entry);
+                    continue;
+                }
                 match rejected_by_idx.remove(&i) {
                     Some(reason) if reason == "already committed" => {
                         pool.resolve_committed(entry);
@@ -588,6 +661,9 @@ async fn handle_need_value(
                     Some(reason) => pool.reject(entry, reason),
                     None => inflight.push(entry),
                 }
+            }
+            if !restage.is_empty() {
+                pool.restage(restage);
             }
             pool.mark_inflight(inflight, height.0);
 

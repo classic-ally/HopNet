@@ -25,6 +25,7 @@ pub mod sim;
 pub mod store;
 pub mod traits;
 pub mod types;
+pub mod validators;
 pub mod verify;
 
 pub use config::QuorumProfile;

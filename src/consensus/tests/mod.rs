@@ -281,17 +281,23 @@ impl MockNetwork {
             })?;
         eprintln!("sync_node_state: Sequences copied successfully");
 
-        // Copy validators
-        source_db.prepare("SELECT effective_height, node_id, is_active FROM validators")
+        // Copy validators (departure_kind included — deactivation rows
+        // without it violate the crate schema's CHECK)
+        source_db.prepare("SELECT effective_height, node_id, is_active, departure_kind FROM validators")
             .and_then(|mut stmt| {
                 let rows = stmt.query_map([], |row| {
-                    Ok((row.get::<_, i32>(0)?, row.get::<_, i32>(1)?, row.get::<_, bool>(2)?))
+                    Ok((
+                        row.get::<_, i32>(0)?,
+                        row.get::<_, i32>(1)?,
+                        row.get::<_, bool>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
                 })?;
                 for row in rows {
-                    let (effective_height, node_id, is_active) = row?;
+                    let (effective_height, node_id, is_active, departure_kind) = row?;
                     dest_db.execute(
-                        "INSERT INTO validators (effective_height, node_id, is_active) VALUES (?, ?, ?)",
-                        rusqlite::params![effective_height, node_id, is_active]
+                        "INSERT INTO validators (effective_height, node_id, is_active, departure_kind) VALUES (?, ?, ?, ?)",
+                        rusqlite::params![effective_height, node_id, is_active, departure_kind]
                     )?;
                 }
                 Ok(())
