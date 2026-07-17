@@ -315,12 +315,15 @@ pub async fn status_probe(
 
 const PROBE_SCAN_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Deterministic per-peer deadline jitter in ±10%: desynchronizes peers
-/// from each other with zero mutable state (a synchronized refresh — e.g.
-/// a cert sweep touching everyone — fans out again on the next cycle).
+/// Deterministic per-peer deadline jitter, DOWNWARD only (0.85–0.95 of
+/// T_probe): desynchronizes peers with zero mutable state while
+/// guaranteeing the probe fires strictly BEFORE the un-jittered deadline —
+/// an upward jitter would push worst-case evidence age (deadline + scan
+/// quantization + RTT) past T_unresponsive = T_probe + g, making live
+/// nodes flicker unresponsive once per probe cycle.
 fn jitter(node_id: i32) -> f64 {
     let h = (node_id as u32).wrapping_mul(2654435761);
-    0.9 + 0.2 * f64::from(h % 1024) / 1024.0
+    0.85 + 0.1 * f64::from(h % 1024) / 1024.0
 }
 
 pub fn spawn_probe_scheduler(app_state: crate::AppState) {
