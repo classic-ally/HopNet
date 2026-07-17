@@ -94,7 +94,7 @@ evidence); the full seating policy precedes the AUTO profile (seam
 crossings need batch admission); AUTO lands last as the only
 engine-touching stage.
 
-- [ ] **S1 — voluntary leave, end to end.** Crate descent:
+- [x] **S1 — voluntary leave, end to end.** Crate descent:
   validators DDL (+ `departure_kind`, + `idx_validator_node`) into
   `hopnet-consensus/src/store.rs` install_schema; host DDL deleted
   (shadowing hazard — gate asserts the column exists);
