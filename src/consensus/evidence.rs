@@ -248,7 +248,13 @@ pub fn live_estimate(
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub enum StatusRequest {
-    Ping,
+    /// Carries the PROBER's decided height: a probe teaches both sides —
+    /// the responder learns the prober's height here, the prober learns
+    /// the responder's from the Pong. Without this, steady-state probe
+    /// circularity (each side's probes keeping the other's view fresh)
+    /// leaves exactly one probe direction per pair and the responder
+    /// heightless.
+    Ping { decided_height: u64 },
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -272,8 +278,19 @@ impl hopnet_comms::RpcHandler for StatusScope {
     ) -> hopnet_comms::BoxFuture<'_, Vec<u8>> {
         let app_state = self.app_state.clone();
         Box::pin(async move {
-            // An inbound probe is itself an authenticated exchange.
-            app_state.evidence.record_contact(peer.node_id);
+            // An inbound probe is itself an authenticated exchange — and it
+            // carries the prober's height (see StatusRequest::Ping).
+            match bincode::serde::decode_from_slice::<StatusRequest, _>(
+                &_payload,
+                bincode::config::standard(),
+            ) {
+                Ok((StatusRequest::Ping { decided_height }, _)) => {
+                    app_state
+                        .evidence
+                        .record_contact_with_height(peer.node_id, decided_height as i64);
+                }
+                Err(_) => app_state.evidence.record_contact(peer.node_id),
+            }
             let decided_height = app_state
                 .malachite
                 .get()
@@ -293,10 +310,16 @@ impl hopnet_comms::RpcHandler for StatusScope {
 pub async fn status_probe(
     comms: &hopnet_comms::IrohComms,
     peer: &hopnet_comms::PeerRef,
+    my_decided_height: u64,
     timeout: Duration,
 ) -> Result<u64, String> {
-    let payload = bincode::serde::encode_to_vec(&StatusRequest::Ping, bincode::config::standard())
-        .map_err(|e| format!("encode: {e}"))?;
+    let payload = bincode::serde::encode_to_vec(
+        &StatusRequest::Ping {
+            decided_height: my_decided_height,
+        },
+        bincode::config::standard(),
+    )
+    .map_err(|e| format!("encode: {e}"))?;
     let raw = comms
         .rpc(peer, "status", payload, timeout)
         .await
@@ -411,7 +434,7 @@ pub fn spawn_probe_scheduler(app_state: crate::AppState) {
                 let evidence = app_state.evidence.clone();
                 let g = policy.grace;
                 tokio::spawn(async move {
-                    if let Ok(h) = status_probe(&comms, &peer, g).await {
+                    if let Ok(h) = status_probe(&comms, &peer, decided, g).await {
                         evidence.record_contact_with_height(peer.node_id, h as i64);
                     }
                     // Failure: the silence is already recorded as the
