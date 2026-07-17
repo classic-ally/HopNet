@@ -130,7 +130,7 @@ engine-touching stage.
   validators. Gate: unit tests; orchestrator `evidence-observe`;
   metrics-collection regression; queue-throughput bench (hook
   overhead).
-- [ ] **S4 — vote-out.** VoteOutHandler: subjective dark(target)
+- [x] **S4 — vote-out.** VoteOutHandler: subjective dark(target)
   validate, Live-origin only; objective checks (signature,
   submitter seated, target seated) origin-independent; execute =
   deactivate_validator(VotedOut). HandlerCtx gains the evidence
@@ -164,6 +164,33 @@ engine-touching stage.
   thresholds flip). Gate: crate + sims + full orchestrator suite.
 - [ ] **S7 — soak + closeout.** Docs sync (system-overview, spec
   status → implemented), memory, Deferred recorded.
+
+## Deviations from plan (recorded at stage exits)
+
+- **S4**: subjective checks live host-side in
+  `src/consensus/membership_guards.rs`, called from validate_inner's
+  Live block and build_value's preflight — NOT via a HandlerCtx
+  evidence handle as this plan originally wrote. One structural choke
+  point makes the fresh-node sync-replay wedge unreachable by
+  construction (the guard physically cannot run at Sync); handlers
+  stay objective and replayable forever. S5's batch checks join the
+  same guard module.
+- **S4**: the reactivation retry loop excludes voluntary leavers (an
+  operator-requested leave must not self-undo); their return path
+  stays POST /consensus/activate until S5. The S_min gate is scoped
+  to candidates with a committed prior departure — never-seated
+  candidates keep the S1 join path until S5's mesh-initiated seating
+  (else mesh creation would demand 30-minute spans).
+- **S4**: S1's interim leave guard quorum clause was vacuous
+  (v−1 < quorum(v−1) is false at every v) — the real survivor guard
+  arrived here as membership_guards::check_leave.
+- **S3**: probe deadline jitter is downward-only (0.85–0.95), not
+  ±10% — upward jitter pushes worst-case evidence age past
+  T_unresponsive and flickers live nodes once per cycle.
+- **S3**: the status Ping carries the PROBER's decided height —
+  steady-state probe circularity leaves one probe direction per pair,
+  and quorum-only cert signatures would leave the third validator's
+  height unknown forever.
 
 ## Risks
 

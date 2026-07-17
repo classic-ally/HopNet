@@ -70,7 +70,21 @@ fn install_consensus_schema(app_state: &AppState) {
 /// HopNetApplication + pool-backed SqliteStorage), the driver task answering
 /// NeedValue / SyncNeeded, and the `app_state.malachite` handle that the
 /// comms "consensus" scope routes inbound traffic through.
+type ExtraCandidates =
+    std::sync::Arc<std::sync::Mutex<Vec<crate::consensus::types::Transaction>>>;
+
 async fn start_engine(app_state: &AppState, node_id: i32) -> EngineNode {
+    start_engine_with_candidates(app_state, node_id, ExtraCandidates::default()).await
+}
+
+/// start_engine with injectable extra proposal candidates (cloned every
+/// NeedValue, never drained — the committed-nonce dedup retires them after
+/// commit; the solo-block rule strips siblings from a membership block).
+async fn start_engine_with_candidates(
+    app_state: &AppState,
+    node_id: i32,
+    extra: ExtraCandidates,
+) -> EngineNode {
     let db_pool = app_state.db_pool.clone();
 
     let (out_tx, out_rx) = mpsc::unbounded_channel();
@@ -144,6 +158,7 @@ async fn start_engine(app_state: &AppState, node_id: i32) -> EngineNode {
         let app_state = app_state.clone();
         let input_tx = input_tx.clone();
         let decided = decided.clone();
+        let extra_for_build_outer = extra.clone();
         tokio::spawn(async move {
             while let Some(ev) = events.recv().await {
                 match ev {
@@ -154,8 +169,9 @@ async fn start_engine(app_state: &AppState, node_id: i32) -> EngineNode {
                         // build_value blocks (write gate + Immediate tx
                         // preflight) — keep it off the async workers.
                         let build_state = app_state.clone();
+                        let extra_for_build = extra_for_build_outer.clone();
                         let built = tokio::task::spawn_blocking(move || {
-                            let candidates =
+                            let mut candidates =
                                 match crate::consensus::dispatch::create_signed_transaction(
                                     &build_state,
                                     "system.cleanup_nonces".to_string(),
@@ -164,6 +180,7 @@ async fn start_engine(app_state: &AppState, node_id: i32) -> EngineNode {
                                     Ok(tx) => vec![tx],
                                     Err(_) => Vec::new(),
                                 };
+                            candidates.extend(extra_for_build.lock().unwrap().iter().cloned());
                             let mut conn = build_state.db_pool.get().unwrap();
                             build_value(&build_state, &mut conn, height, round, candidates)
                         })
@@ -451,5 +468,160 @@ fn malachite_engine_restarts_from_persisted_state() {
             assert_eq!(*h, i as i64, "decided history must be contiguous from 0");
         }
         assert!(heights.len() as u64 > stopped_at + 1);
+    });
+}
+
+// Should: a fresh/late node replay a chain CONTAINING a committed vote-out
+// without wedging — the vote-out block validates at ValidationOrigin::Sync,
+// where the subjective membership guard is structurally skipped (it lives
+// in validate_inner's Live block only). The replaying node's own evidence
+// says everyone is live (it just booted), and it IS the target: were the
+// guard consulted at Sync, it would judge the block invalid and the host
+// would hold it at that height forever (SyncInvalid).
+// Should not: depend on the replaying node's evidence, wall clock, or its
+// own opinion of the removal.
+// Impact: the RT1 rule — the single biggest integration risk of subjective
+// validation. A regression here permanently bricks every new joiner of any
+// mesh whose history contains a vote-out.
+#[test]
+fn fresh_node_syncs_vote_out_chain_without_wedging() {
+    let network = MockNetwork::setup_with_validators(3);
+    let rt = crate::consensus::tests::test_iroh_rt();
+    rt.block_on(async move {
+        for node in &network.nodes {
+            install_consensus_schema(&node.app_state);
+            // Tiny windows so node 2's synthetic age crosses t_out fast:
+            // probe_base=1, grace=1 -> t_out(Cliff) = 3 s.
+            let conn = node.app_state.db_pool.get().unwrap();
+            hopnet_consensus::store::apply_policy_rows(
+                &conn,
+                &[
+                    ("probe_base".to_string(), "1".to_string()),
+                    ("grace".to_string(), "1".to_string()),
+                ],
+            )
+            .unwrap();
+        }
+        connect_mesh(&network).await;
+
+        // Nodes 0 and 1 run engines; node 2 never starts (dark from the
+        // observers' map origins).
+        let extra = ExtraCandidates::default();
+        let mut n0 =
+            start_engine_with_candidates(&network.nodes[0].app_state, 0, extra.clone()).await;
+        let mut n1 = start_engine(&network.nodes[1].app_state, 1).await;
+
+        wait_decided(&mut n0, 2, 300).await;
+
+        // Age node 2 past t_out on both observers and meet the attestation
+        // floor (>= 2 probe attempts since contact).
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        for node in &network.nodes[..2] {
+            node.app_state.evidence.record_probe_sent(2);
+            node.app_state.evidence.record_probe_sent(2);
+        }
+
+        // Inject the vote-out, signed by node 0.
+        let payload = bincode::serde::encode_to_vec(
+            &crate::consensus::handlers::VoteOutRequest { node_id: 2 },
+            bincode::config::standard(),
+        )
+        .unwrap();
+        let tx = crate::consensus::dispatch::create_signed_transaction(
+            &network.nodes[0].app_state,
+            "validator_vote_out".to_string(),
+            payload,
+        )
+        .unwrap();
+        extra.lock().unwrap().push(tx);
+
+        // The mesh commits the removal (node 1's Live guard attests too —
+        // quorum 2 of the 2 live validators).
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            {
+                let conn = network.nodes[0].app_state.db_pool.get().unwrap();
+                let pending = (*n0.decided.borrow() as i32) + 1;
+                if !hopnet_consensus::validators::is_node_active(&conn, 2, pending).unwrap() {
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "vote-out of node 2 never committed"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let voteout_tip = *n0.decided.borrow();
+
+        // A couple more heights on top so the replay crosses the vote-out.
+        wait_decided(&mut n0, voteout_tip + 2, 300).await;
+        wait_decided(&mut n1, voteout_tip + 2, 300).await;
+        let mesh_tip = *n0.decided.borrow();
+
+        // Bring node 2 up. It is OUT of the valset, so consensus gossip
+        // never reaches it — drive sync explicitly, exactly as the
+        // production tip-poll does.
+        connect_mesh(&network).await;
+        let mut n2 = start_engine(&network.nodes[2].app_state, 2).await;
+        let peers = vec![
+            hopnet_comms::PeerRef {
+                node_id: 0,
+                pubkey: network.nodes[0].verifying_key.0.to_bytes(),
+            },
+            hopnet_comms::PeerRef {
+                node_id: 1,
+                pubkey: network.nodes[1].verifying_key.0.to_bytes(),
+            },
+        ];
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            let mut decided = n2.decided.clone();
+            let _ = sync::sync_to_tip(
+                &network.nodes[2].app_state.comms,
+                &n2.input_tx,
+                &mut decided,
+                &peers,
+                None,
+            )
+            .await;
+            if *n2.decided.borrow() >= mesh_tip {
+                break; // NON-WEDGE: replayed the vote-out block at Sync
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node 2 wedged replaying the vote-out chain (decided {} < tip {mesh_tip})",
+                *n2.decided.borrow()
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        // Byte-identical histories through the mesh tip.
+        let rows = |st: &AppState| -> Vec<(i64, Vec<u8>)> {
+            let conn = st.db_pool.get().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT height, block_hash FROM decided_blocks WHERE height <= ? ORDER BY height",
+                )
+                .unwrap();
+            let r = stmt
+                .query_map([mesh_tip as i64], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap();
+            r.collect::<Result<_, _>>().unwrap()
+        };
+        assert_eq!(
+            rows(&network.nodes[0].app_state),
+            rows(&network.nodes[2].app_state),
+            "replayed history must match the mesh exactly"
+        );
+
+        // The replayed chain told node 2 about its own removal.
+        let conn = network.nodes[2].app_state.db_pool.get().unwrap();
+        let pending = (mesh_tip as i32) + 1;
+        assert!(!hopnet_consensus::validators::is_node_active(&conn, 2, pending).unwrap());
+        assert_eq!(
+            hopnet_consensus::validators::last_departure(&conn, 2, pending).unwrap(),
+            Some(hopnet_consensus::validators::DepartureKind::VotedOut)
+        );
     });
 }
