@@ -20,13 +20,15 @@ use crate::tests::{get_max_view, wait_for_minimum_view};
 pub struct GracefulLeave;
 
 #[derive(Debug, Deserialize)]
-struct ViewState {
-    node_id: i32,
-    is_active_at_height: bool,
-    validators_at_height: Vec<serde_json::Value>,
+pub(crate) struct ViewState {
+    pub(crate) node_id: i32,
+    pub(crate) is_active_at_height: bool,
+    #[serde(default)]
+    pub(crate) last_departure_kind: Option<String>,
+    pub(crate) validators_at_height: Vec<serde_json::Value>,
 }
 
-async fn view_state(client: &Client, node: &NodeInfo, height: i64) -> Result<ViewState> {
+pub(crate) async fn view_state(client: &Client, node: &NodeInfo, height: i64) -> Result<ViewState> {
     let url = format!("http://{}:{}/consensus/view", node.ip_address, node.port);
     let resp = client
         .post(&url)
@@ -41,7 +43,7 @@ async fn view_state(client: &Client, node: &NodeInfo, height: i64) -> Result<Vie
 
 /// Poll until EVERY node reports `expect` validators at the current tip,
 /// with `absent` (consensus id) missing from the set when given.
-async fn wait_validator_count(
+pub(crate) async fn wait_validator_count(
     client: &Client,
     nodes: &[NodeInfo],
     expect: usize,

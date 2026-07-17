@@ -14,6 +14,11 @@ use std::time::Duration;
 use crate::config::QuorumProfile;
 use crate::validators::DepartureKind;
 
+/// Attestation floor: probe attempts fired since last contact before
+/// dark(X) may be attested (spec: Evidence & validation — a window you
+/// have not probed twice you cannot attest).
+pub const ATTESTATION_PROBE_FLOOR: u32 = 2;
+
 // --- Policy keys (hopnet_consensus_policy rows; setup docs reference) ---
 pub const KEY_PROBE_BASE: &str = "probe_base";
 pub const KEY_GRACE: &str = "grace";

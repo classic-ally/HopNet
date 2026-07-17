@@ -20,7 +20,8 @@ mod file_upload;
 mod fileprovider_device_token;
 mod fragment_distribution;
 mod evidence_observe;
-mod graceful_leave;
+pub(crate) mod graceful_leave;
+mod vote_out;
 mod fragment_health_check;
 mod import;
 mod iroh_ping;
@@ -99,6 +100,22 @@ pub trait TestScenario: Send + Sync {
 /// export these before `orchestrator create` for the same checks).
 pub fn mesh_creation_env(test_name: &str) -> Vec<(&'static str, &'static str)> {
     match test_name {
+        "vote-out-after-kill" => vec![
+            (
+                "HOPNET_GENESIS_CONSENSUS_POLICY",
+                "probe_base=2;grace=1;s_full=6;p_prove=6",
+            ),
+            // Forced until S6's AUTO profile: BFT v=3 with a dead node
+            // commits nothing.
+            ("HOPNET_QUORUM_PROFILE", "majority"),
+        ],
+        // REGRESSION FIX (S4): the S_min gate makes the BFT rejoin seat
+        // EXPOSED (quorum(3)-quorum(2)=1) => req_span = s_full; the
+        // default 30 min would refuse the rejoin inside the test window.
+        "graceful-leave" => vec![(
+            "HOPNET_GENESIS_CONSENSUS_POLICY",
+            "s_full=6",
+        )],
         "evidence-observe" => vec![
             (
                 "HOPNET_GENESIS_CONSENSUS_POLICY",
@@ -216,6 +233,11 @@ pub async fn run_test_by_name(
         }
         "re-encode-after-departure" => {
             reencode::ReencodeAfterDeparture
+                .run(mesh_id, nodes, flags)
+                .await
+        }
+        "vote-out-after-kill" => {
+            vote_out::VoteOutAfterKill
                 .run(mesh_id, nodes, flags)
                 .await
         }
@@ -369,6 +391,7 @@ pub fn list_test_names() -> Vec<&'static str> {
         "restart-persistence",
         "graceful-leave",
         "evidence-observe",
+        "vote-out-after-kill",
         "device-token-consistency",
         "documentprovider-write-consistency",
         "iroh-ping",

@@ -97,6 +97,10 @@ pub struct DebugViewState {
     pub queried_view: i32,
     pub height_at_view: i32,
     pub is_active_at_height: bool,
+    /// This node's own latest departure kind at the queried height
+    /// (height-scoped: stays "voted_out" at pre-readmission heights even
+    /// after a later reactivation).
+    pub last_departure_kind: Option<String>,
     pub validators_at_height: Vec<crate::types::Node>,
     pub leader_for_view: Option<crate::types::Node>,
 }
@@ -105,7 +109,7 @@ pub async fn debug_view_state(
     State(app_state): State<AppState>,
     Json(view): Json<i32>,
 ) -> impl IntoResponse {
-    let (node_id, is_active) = {
+    let (node_id, is_active, last_departure_kind) = {
         let mut conn = match app_state.db_pool.get() {
             Ok(conn) => conn,
             Err(_) => {
@@ -138,7 +142,11 @@ pub async fn debug_view_state(
             }
         };
         let is_active = db::is_node_active(&tx, node_id, view).unwrap_or(false);
-        (node_id, is_active)
+        let last_departure_kind = db::last_departure(&tx, node_id, view)
+            .ok()
+            .flatten()
+            .map(|k| k.as_str().to_string());
+        (node_id, is_active, last_departure_kind)
     };
 
     let validators = match db::get_validators(app_state.db_pool.get(), view) {
@@ -168,6 +176,7 @@ pub async fn debug_view_state(
         queried_view: view,
         height_at_view: view,
         is_active_at_height: is_active,
+        last_departure_kind,
         validators_at_height: validators,
         leader_for_view,
     };

@@ -150,6 +150,23 @@ impl HopNetApplication {
                     return Err("already-committed nonce (leader replay)".into());
                 }
             }
+
+            // Subjective membership guards (RFC-CONSENSUS-002 S4): each
+            // Live approver attests from its OWN evidence. Never at Sync —
+            // a fresh node must not wedge on a vote-out it cannot
+            // re-derive.
+            for tx in old_txs.0.iter() {
+                if crate::consensus::handlers::is_membership_tx(&tx.rpc.function) {
+                    crate::consensus::membership_guards::subjective_membership_check(
+                        &self.app_state,
+                        db_tx,
+                        &tx.rpc.function,
+                        &tx.rpc.payload,
+                        tx.submitter.id,
+                    )
+                    .map_err(|e| format!("membership guard ({}): {e}", tx.rpc.function))?;
+                }
+            }
         }
 
         // Handler dry-run (execute=false) — deterministic, both origins.
@@ -358,6 +375,24 @@ pub fn build_value(
             .map_err(|e| format!("preflight tx: {e}"))?;
         let mut failed = Vec::new();
         for (slot, (i, tx)) in survivors.iter().enumerate() {
+            // Proposer-side subjective membership guard (RFC-CONSENSUS-002
+            // S4): the proposer never re-validates its own block through
+            // validate_inner, so this is its Live attestation — and it
+            // keeps us from proposing blocks the mesh would nil-vote.
+            if crate::consensus::handlers::is_membership_tx(&tx.rpc.function) {
+                if let Err(reason) =
+                    crate::consensus::membership_guards::subjective_membership_check(
+                        app_state,
+                        &db_tx,
+                        &tx.rpc.function,
+                        &tx.rpc.payload,
+                        tx.submitter.id,
+                    )
+                {
+                    failed.push((*i, format!("membership guard: {reason}")));
+                    continue;
+                }
+            }
             let sp = format!("preflight_{slot}");
             if db_tx.execute_batch(&format!("SAVEPOINT {sp}")).is_err() {
                 failed.push((*i, "savepoint error".to_string()));
@@ -461,6 +496,10 @@ mod solo_block_tests {
             solo_block_deferrals(&["validator_activation", "validator_leave"]),
             vec![1]
         );
+        assert_eq!(
+            solo_block_deferrals(&["files.create", "validator_vote_out"]),
+            vec![0]
+        );
         assert!(solo_block_deferrals(&["files.create", "submit_metrics"]).is_empty());
         assert!(solo_block_deferrals(&[]).is_empty());
     }
@@ -474,6 +513,8 @@ mod solo_block_tests {
         let check = |fs: &[&str]| check_solo_membership(fs.iter().copied(), fs.len());
         assert!(check(&["validator_leave", "validator_activation"]).is_err());
         assert!(check(&["validator_leave", "files.create"]).is_err());
+        assert!(check(&["validator_vote_out", "files.create"]).is_err());
+        assert!(check(&["validator_vote_out"]).is_ok());
         assert!(check(&["validator_leave"]).is_ok());
         assert!(check(&["files.create", "submit_metrics"]).is_ok());
         assert!(check(&[]).is_ok());

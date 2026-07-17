@@ -111,7 +111,8 @@ inventory::submit! {
 /// (RFC-CONSENSUS-002: joint constraints — one-removal-per-height, joint
 /// leave safety — are invisible to per-tx validation, so the block shape
 /// carries them).
-pub const MEMBERSHIP_TX_FUNCTIONS: &[&str] = &["validator_activation", "validator_leave"];
+pub const MEMBERSHIP_TX_FUNCTIONS: &[&str] =
+    &["validator_activation", "validator_leave", "validator_vote_out"];
 
 pub fn is_membership_tx(function: &str) -> bool {
     MEMBERSHIP_TX_FUNCTIONS.contains(&function)
@@ -167,32 +168,19 @@ impl TransactionHandler for ValidatorLeaveHandler {
                 return Err(DatabaseError::ProcessingError);
             }
 
-            // INTERIM S1 guard (tightened to the evidence-based live
-            // estimate in S4): live ≈ seated. The set must survive the
-            // departure — v > 1 and v−1 ≥ quorum(v−1) under the mesh's
-            // pinned profile. Deterministic over committed state, so this
-            // validates identically at both ValidationOrigins.
+            // Objective floor (both origins): INV-FLOOR — the set never
+            // empties. (S1's interim quorum clause was vacuous:
+            // v−1 < quorum(v−1) is false at every v.) The real leave-safety
+            // guard — survivors-I-see-live ≥ quorum(v−1) — is subjective
+            // and lives in membership_guards::check_leave, Live-origin only.
             let v = hopnet_consensus::validators::count_active_validators(
                 db_tx,
                 committed_height,
             )
             .map_err(|_| DatabaseError::RecallError)?;
-            let profile = match hopnet_consensus::store::meta_get(
-                db_tx,
-                hopnet_consensus::store::META_QUORUM_PROFILE,
-            )
-            .map_err(|_| DatabaseError::RecallError)?
-            {
-                Some(bytes) => String::from_utf8(bytes)
-                    .ok()
-                    .and_then(|s| hopnet_consensus::config::QuorumProfile::parse(&s))
-                    .ok_or(DatabaseError::ProcessingError)?,
-                // spawn_engine's default when the meta key is absent.
-                None => hopnet_consensus::config::QuorumProfile::Bft,
-            };
-            if v < 2 || (v - 1) < profile.quorum(v - 1) {
+            if v < 2 {
                 tracing::warn!(
-                    "leave refused for node {}: set would not survive (v={v})",
+                    "leave refused for node {}: set floor (v={v})",
                     req.node_id
                 );
                 return Err(DatabaseError::ProcessingError);
@@ -219,6 +207,81 @@ impl TransactionHandler for ValidatorLeaveHandler {
 
 inventory::submit! {
     &ValidatorLeaveHandler as &dyn TransactionHandler
+}
+
+// ============================================================================
+// Unreachability vote-out (RFC-CONSENSUS-002 S4). OBJECTIVE checks only —
+// the subjective dark(target) attestation lives host-side in
+// membership_guards (Live origin only), so this handler is replayable at
+// ValidationOrigin::Sync forever.
+// ============================================================================
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct VoteOutRequest {
+    /// The dark target (never the submitter — self-removal is leave's job).
+    pub node_id: i32,
+}
+
+pub struct ValidatorVoteOutHandler;
+
+impl TransactionHandler for ValidatorVoteOutHandler {
+    fn name(&self) -> &'static str {
+        "validator_vote_out"
+    }
+
+    fn process(
+        &self,
+        tx: &TxMeta<'_>,
+        execute: bool,
+        _ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
+    ) -> HandlerResult {
+        let (req, _) = bincode::serde::decode_from_slice::<VoteOutRequest, _>(
+            tx.payload,
+            bincode::config::standard(),
+        )
+        .map_err(|_| DatabaseError::InvalidPayload)?;
+
+        // Objective, both phases: self-removal is leave's job.
+        if req.node_id == tx.submitter_node {
+            return Err(DatabaseError::AuthorizationError);
+        }
+
+        let committed_height = get_current_consensus_height(db_tx)?;
+
+        if !execute {
+            // Objective (deterministic over committed state — replay-safe):
+            // target seated (duplicate proposals die here), submitter
+            // seated (only validators propose removals; TxMeta's submitter
+            // is the signature-verified node identity).
+            if !crate::db::consensus::is_node_active(db_tx, req.node_id, committed_height)? {
+                return Err(DatabaseError::ProcessingError);
+            }
+            if !crate::db::consensus::is_node_active(db_tx, tx.submitter_node, committed_height)?
+            {
+                return Err(DatabaseError::AuthorizationError);
+            }
+            return Ok(());
+        }
+
+        crate::db::consensus::deactivate_validator(
+            db_tx,
+            req.node_id,
+            committed_height,
+            crate::db::consensus::DepartureKind::VotedOut,
+        )?;
+        tracing::info!(
+            "Node {} voted out of the validator set at height {} (proposed by {})",
+            req.node_id,
+            committed_height,
+            tx.submitter_node
+        );
+        Ok(())
+    }
+}
+
+inventory::submit! {
+    &ValidatorVoteOutHandler as &dyn TransactionHandler
 }
 
 // ============================================================================
@@ -769,5 +832,136 @@ mod genesis_tests {
         // Storage-policy seeding still resolves (field-addition regression).
         let storage = hopnet_storage::store::read_policy(&conn).unwrap();
         assert_eq!(storage.b_max, 3);
+    }
+}
+
+#[cfg(test)]
+mod vote_out_tests {
+    use super::*;
+    use crate::handlers::{NullNotifier, NullScheduler};
+    use ed25519_dalek::SigningKey;
+
+    fn setup_pool(n_validators: i32) -> r2d2::Pool<crate::db::SqliteConnectionManager> {
+        let manager = crate::db::SqliteConnectionManager::memory();
+        let pool = r2d2::Pool::builder()
+            .max_size(1)
+            .connection_customizer(Box::new(crate::db::shared::SqliteInitializer))
+            .build(manager)
+            .unwrap();
+        crate::db::shared::initialize(pool.get().unwrap()).unwrap();
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "INSERT INTO users (user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt)
+             VALUES (1, 'allison', X'00', X'00', X'00', X'00')",
+            [],
+        )
+        .unwrap();
+        for id in 1..=n_validators {
+            let key = SigningKey::from_bytes(&[id as u8; 32]);
+            let pubkey = crate::types::PubKey(key.verifying_key());
+            conn.execute(
+                "INSERT INTO nodes (node_id, name, owner, pubkey) VALUES (?, ?, 1, ?)",
+                rusqlite::params![id, format!("node-{id}"), &pubkey],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO validators (effective_height, node_id, is_active) VALUES (10, ?, true)",
+                rusqlite::params![id],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO consensus_meta (key, value) VALUES ('last_decided_height', ?)",
+            rusqlite::params![100i64],
+        )
+        .unwrap();
+        pool
+    }
+
+    fn run_vote_out(
+        pool: &r2d2::Pool<crate::db::SqliteConnectionManager>,
+        target: i32,
+        submitter: i32,
+        execute: bool,
+    ) -> HandlerResult {
+        let payload = bincode::serde::encode_to_vec(
+            &VoteOutRequest { node_id: target },
+            bincode::config::standard(),
+        )
+        .unwrap();
+        let meta = TxMeta {
+            function: "validator_vote_out",
+            payload: &payload,
+            submitter_node: submitter,
+            user_id: None,
+        };
+        let notifier = NullNotifier;
+        let scheduler = NullScheduler;
+        let ctx = HandlerCtx {
+            fragments_dir: "",
+            node_id: Some(submitter),
+            notifier: &notifier,
+            work: &scheduler,
+        };
+        let mut conn = pool.get().unwrap();
+        let db_tx = conn.transaction().unwrap();
+        let result = ValidatorVoteOutHandler.process(&meta, execute, &ctx, &db_tx);
+        if result.is_ok() && execute {
+            db_tx.commit().unwrap();
+        }
+        result
+    }
+
+    // Should: refuse self-removal in both phases — that is leave's job.
+    #[test]
+    fn vote_out_self_refused() {
+        let pool = setup_pool(3);
+        assert!(matches!(
+            run_vote_out(&pool, 1, 1, false),
+            Err(DatabaseError::AuthorizationError)
+        ));
+        assert!(matches!(
+            run_vote_out(&pool, 1, 1, true),
+            Err(DatabaseError::AuthorizationError)
+        ));
+    }
+
+    // Should: refuse an unseated target (duplicate proposals die here)
+    // and an unseated submitter (only validators propose removals).
+    #[test]
+    fn vote_out_objective_refusals() {
+        let pool = setup_pool(2);
+        assert!(run_vote_out(&pool, 9, 1, false).is_err()); // target unseated
+        assert!(matches!(
+            run_vote_out(&pool, 2, 9, false),
+            Err(DatabaseError::AuthorizationError) // submitter unseated
+        ));
+    }
+
+    // Should: execute record the voted_out departure at the committed
+    // height; a replayed proposal then fails validation (target gone).
+    // Impact: the shared deactivation path + the duplicate-harmlessness
+    // property the spec relies on.
+    #[test]
+    fn vote_out_executes_and_replay_refused() {
+        let pool = setup_pool(3);
+        assert!(run_vote_out(&pool, 3, 1, false).is_ok());
+        assert!(run_vote_out(&pool, 3, 1, true).is_ok());
+
+        {
+            let conn = pool.get().unwrap();
+            let ids: Vec<i32> = hopnet_consensus::validators::get_validators(&conn, 101)
+                .unwrap()
+                .iter()
+                .map(|v| v.node_id)
+                .collect();
+            assert_eq!(ids, vec![1, 2]);
+            assert_eq!(
+                hopnet_consensus::validators::last_departure(&conn, 3, 101).unwrap(),
+                Some(hopnet_consensus::validators::DepartureKind::VotedOut)
+            );
+        }
+        // Replay: target no longer seated -> validation refuses.
+        assert!(run_vote_out(&pool, 3, 1, false).is_err());
     }
 }

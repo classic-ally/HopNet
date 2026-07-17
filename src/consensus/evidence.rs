@@ -351,6 +351,8 @@ fn jitter(node_id: i32) -> f64 {
 
 pub fn spawn_probe_scheduler(app_state: crate::AppState) {
     crate::consensus::queue::queue_rt().spawn(async move {
+        // Vote-out proposal cooldown anchor (RFC-CONSENSUS-002 S4).
+        let mut last_voteout_at: Option<Instant> = None;
         loop {
             tokio::time::sleep(PROBE_SCAN_INTERVAL).await;
 
@@ -440,6 +442,70 @@ pub fn spawn_probe_scheduler(app_state: crate::AppState) {
                     // Failure: the silence is already recorded as the
                     // unanswered probe.
                 });
+            }
+
+            // Vote-out proposer scan (RFC-CONSENSUS-002 S4): longest-dark
+            // first, one at a time. Duplicates are harmless (committed-
+            // nonce dedup + the target-not-seated objective check kill
+            // replays); the cooldown just avoids spamming. Satisfies
+            // RECOVERY's fairness obligation — at least one live validator
+            // eventually proposes — with no coordination protocol.
+            if seated.contains(&my_id) {
+                let t_out = policy.t_out(est.band);
+                let cooled = last_voteout_at
+                    .is_none_or(|t| now.saturating_duration_since(t) >= t_out / 2);
+                if cooled {
+                    let target = seated
+                        .iter()
+                        .filter(|id| **id != my_id)
+                        .filter_map(|id| {
+                            let view = snap
+                                .binary_search_by_key(id, |(k, _)| *k)
+                                .ok()
+                                .map(|i| snap[i].1);
+                            let age =
+                                contact_age(view.as_ref(), app_state.evidence.origin(), now);
+                            let probes =
+                                view.map(|v| v.probes_since_contact).unwrap_or(0);
+                            (age >= t_out
+                                && probes
+                                    >= hopnet_consensus::membership::ATTESTATION_PROBE_FLOOR)
+                                .then_some((*id, age))
+                        })
+                        .max_by_key(|(_, age)| *age);
+                    if let Some((target, age)) = target {
+                        last_voteout_at = Some(now);
+                        let payload = bincode::serde::encode_to_vec(
+                            &crate::consensus::handlers::VoteOutRequest { node_id: target },
+                            bincode::config::standard(),
+                        )
+                        .unwrap_or_default();
+                        match crate::consensus::dispatch::create_signed_transaction(
+                            &app_state,
+                            "validator_vote_out".to_string(),
+                            payload,
+                        ) {
+                            Ok(tx) => {
+                                // submit awaits the commit (120s bound) —
+                                // and the target being dead may mean the
+                                // mesh is stalled. Fire-and-forget so the
+                                // scan never blocks.
+                                let queue = app_state.consensus_queue.clone();
+                                tokio::spawn(async move {
+                                    match queue.submit(tx).await {
+                                        Ok(()) => tracing::info!(
+                                            "vote-out of node {target} committed (dark {age:?})"
+                                        ),
+                                        Err(e) => tracing::debug!(
+                                            "vote-out of node {target} not committed: {e}"
+                                        ),
+                                    }
+                                });
+                            }
+                            Err(e) => tracing::warn!("vote-out sign failed: {e:?}"),
+                        }
+                    }
+                }
             }
         }
     });
