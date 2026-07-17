@@ -1,6 +1,6 @@
 # RFC-CONSENSUS-002: Validator Membership Implementation
 
-**Status**: Draft.
+**Status**: Implemented (2026-07-17, S0–S6). All orchestrator gates green.
 **Contract**: RFC-CONSENSUS-001 (`spec/validator-membership.md`) —
 where this plan and the policy disagree, the policy wins. Normative
 model: `spec/validator_membership.qnt`.
@@ -153,7 +153,7 @@ engine-touching stage.
   revive → noticed → re-seated without any request) + `mesh-growth`
   (add nodes → batch-seated at gain parity). Gate: + suite +
   divergence.
-- [ ] **S6 — AUTO quorum profile.** config.rs Auto/V_BFT/
+- [x] **S6 — AUTO quorum profile.** config.rs Auto/V_BFT/
   thresholds_for/quorum; HostCore feed-loop StartHeight
   interception + driver replacement; HandlerCtx profile;
   Effect::Verify*Certificate thresholds derived from the effect's
@@ -167,6 +167,14 @@ engine-touching stage.
 
 ## Deviations from plan (recorded at stage exits)
 
+- **S6**: per-height thresholds via replacing malachite's Driver at the
+  drive_once StartHeight choke point (no fork — State.params/driver are
+  pub). The load-bearing sync-across-seam mechanism is deriving cert
+  thresholds from the effect's OWN valset (Verify*Certificate reads
+  state.params, not the driver's copy). Default flipped to Auto
+  everywhere. Orchestrator auto-seam observes formation crossing the
+  seam + graceful shrink (the pure BFT-threshold stall is sim-only, as
+  the live vote-out scan turns a v=7 triple-kill into graceful shrink).
 - **S5**: pre-S6 pinned default flipped Bft → Majority — a
   default-BFT mesh below 4 nodes cannot FORM once self-request seating
   is deleted (BFT v=1 grows only by a batch of 3; a 3-node mesh has 2
