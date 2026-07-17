@@ -56,6 +56,17 @@ impl QuorumProfile {
         }
     }
 
+    /// Equivocation tolerance at set size `v` (RFC-CONSENSUS-001
+    /// Definitions): Tendermint's f = ⌊(v−1)/3⌋ under BFT, 0 under
+    /// majority (its safety proof assumes no equivocation). The AUTO
+    /// composite (RFC-CONSENSUS-002 S6) selects per v.
+    pub fn f_eq(&self, v: u64) -> u64 {
+        match self {
+            QuorumProfile::Bft => v.saturating_sub(1) / 3,
+            QuorumProfile::Majority => 0,
+        }
+    }
+
     /// Stable string form for persistence (consensus_meta) and config files.
     pub fn as_str(&self) -> &'static str {
         match self {

@@ -42,6 +42,7 @@ const CONSENSUS_TABLES: &[&str] = &[
     "fragment_inventory",
     "device_tokens",
     "hopnet_storage_policy",
+    "hopnet_consensus_policy",
 ];
 
 /// Internal state snapshot with rich types (Blake3Hash)

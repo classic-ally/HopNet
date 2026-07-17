@@ -110,7 +110,7 @@ engine-touching stage.
   `graceful-leave`: leave → v−1 → consensus continues → rejoin →
   v restored. Gate: cargo tests, graceful-leave,
   restart-persistence, file-upload-consistency, divergence.
-- [ ] **S2 — config + policy math, dark.** `hopnet_consensus_policy`
+- [x] **S2 — config + policy math, dark.** `hopnet_consensus_policy`
   table + genesis seeding + defaults; crate `membership.rs`: ΔH /
   exposure / posture / proven-quorum ceiling / zero-tolerance
   waiver / band + window math over `QuorumProfile::quorum(v)`

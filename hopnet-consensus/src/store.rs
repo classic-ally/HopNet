@@ -129,6 +129,18 @@ const SCHEMA: &str = "
     CREATE INDEX IF NOT EXISTS idx_validator_height ON validators(effective_height DESC);
     CREATE INDEX IF NOT EXISTS idx_validator_active ON validators(effective_height, is_active);
     CREATE INDEX IF NOT EXISTS idx_validator_node ON validators(node_id, effective_height DESC);
+
+    -- Consensus membership policy (RFC-CONSENSUS-002 Configuration):
+    -- consensus-replicated key/value, seeded at genesis through the host's
+    -- GenesisPayload (HOPNET_GENESIS_CONSENSUS_POLICY at mesh creation);
+    -- membership::ConsensusPolicy::from_rows resolves it with code defaults
+    -- for absent keys. Values parameterize SUBJECTIVE votes only, so
+    -- per-node disagreement degrades latency, never safety; replicated for
+    -- band alignment. Host lists it in CONSENSUS_TABLES.
+    CREATE TABLE IF NOT EXISTS hopnet_consensus_policy (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
 ";
 
 const META_LAST_DECIDED: &str = "last_decided_height";
@@ -179,6 +191,26 @@ pub fn meta_put(conn: &Connection, key: &str, value: &[u8]) -> Result<(), StoreE
         rusqlite::params![key, value],
     )?;
     Ok(())
+}
+
+/// Seed/overwrite membership policy rows (genesis apply; later a settings
+/// transaction — RFC-CONSENSUS-001 Deferred).
+pub fn apply_policy_rows(conn: &Connection, rows: &[(String, String)]) -> Result<(), StoreError> {
+    let mut stmt = conn
+        .prepare("INSERT OR REPLACE INTO hopnet_consensus_policy (key, value) VALUES (?1, ?2)")?;
+    for (key, value) in rows {
+        stmt.execute(rusqlite::params![key, value])?;
+    }
+    Ok(())
+}
+
+/// Resolve the replicated membership policy (code defaults for absent keys).
+pub fn read_policy(conn: &Connection) -> Result<crate::membership::ConsensusPolicy, StoreError> {
+    let mut stmt = conn.prepare("SELECT key, value FROM hopnet_consensus_policy")?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    Ok(crate::membership::ConsensusPolicy::from_rows(&rows))
 }
 
 /// Install a decided (block, certificate) pair outside the engine's decide

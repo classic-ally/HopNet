@@ -252,6 +252,10 @@ pub struct GenesisPayload {
     /// Mesh storage policy seed rows (RFC-STORAGE-002 Configuration):
     /// key/value pairs for `hopnet_storage_policy`. Empty = code defaults.
     pub storage_policy: Vec<(String, String)>,
+    /// Consensus membership policy seed rows (RFC-CONSENSUS-002
+    /// Configuration): key/value pairs for `hopnet_consensus_policy`.
+    /// Empty = code defaults.
+    pub consensus_policy: Vec<(String, String)>,
 }
 
 pub struct InsertGenesisHandler;
@@ -362,6 +366,14 @@ impl TransactionHandler for InsertGenesisHandler {
                 DatabaseError::ProcessingError
             },
         )?;
+
+        // 7. Seed the consensus membership policy (absent keys resolve to
+        // code defaults; see hopnet_consensus::membership::ConsensusPolicy).
+        hopnet_consensus::store::apply_policy_rows(db_tx, &genesis_data.consensus_policy)
+            .map_err(|e| {
+                tracing::error!("InsertGenesisHandler: Failed to seed consensus policy: {e}");
+                DatabaseError::ProcessingError
+            })?;
 
         // === EXECUTION PHASE ===
         if execute {
@@ -653,5 +665,109 @@ mod leave_tests {
             .map(|v| v.node_id)
             .collect();
         assert_eq!(ids, vec![1, 2, 3]);
+    }
+}
+
+#[cfg(test)]
+mod genesis_tests {
+    use super::*;
+    use crate::handlers::{NullNotifier, NullScheduler};
+    use ed25519_dalek::SigningKey;
+
+    // Should: the genesis handler seed hopnet_consensus_policy rows from
+    // the payload, resolving absent keys to defaults, without disturbing
+    // the storage-policy seeding (field-addition regression).
+    // Impact: the genesis path IS the orchestrator test path — tiny
+    // seeded windows are how membership tests run at seconds-scale.
+    #[test]
+    fn genesis_seeds_consensus_policy() {
+        let manager = crate::db::SqliteConnectionManager::memory();
+        let pool = r2d2::Pool::builder()
+            .max_size(1)
+            .connection_customizer(Box::new(crate::db::shared::SqliteInitializer))
+            .build(manager)
+            .unwrap();
+        crate::db::shared::initialize(pool.get().unwrap()).unwrap();
+
+        // Real user key material (the handler inserts the user + node).
+        let signing_key = crate::types::PrivKey(SigningKey::from_bytes(&[7u8; 32]));
+        let x25519_pubkey = crate::auth::derive_x25519_pubkey_from_user(&signing_key);
+        let (encrypted_privkey, key_salt) =
+            crate::auth::wrap_user_privkey(&signing_key, "password").unwrap();
+        let user = crate::types::User::new(
+            0,
+            "genesis_user".to_string(),
+            crate::types::PubKey(signing_key.0.verifying_key()),
+            x25519_pubkey,
+            encrypted_privkey,
+            key_salt,
+        );
+        let node_key = SigningKey::from_bytes(&[8u8; 32]);
+        let node = crate::types::Node {
+            node_id: 0,
+            name: "node_0".to_string(),
+            owner: 0,
+            pubkey: crate::types::PubKey(node_key.verifying_key()),
+        };
+
+        // Mesh keypair + user-0 grant, exactly as post_initial_setup.
+        let mesh_secret =
+            x25519_dalek::StaticSecret::random_from_rng(chacha20poly1305::aead::OsRng);
+        let mesh_pubkey = x25519_dalek::PublicKey::from(&mesh_secret);
+        let (mesh_eph, mesh_wrapped) = hopnet_storage::crypto::wrap_mesh_privkey(
+            &mesh_pubkey,
+            &mesh_secret,
+            user.x25519_pubkey.as_x25519(),
+        )
+        .unwrap();
+        let payload = GenesisPayload {
+            user,
+            node,
+            mesh_pubkey: *mesh_pubkey.as_bytes(),
+            mesh_grant: hopnet_storage::MeshKeyGrant {
+                recipient_pubkey: [0u8; 32],
+                ephemeral_pubkey: mesh_eph,
+                wrapped_privkey: mesh_wrapped,
+            },
+            storage_policy: vec![("burst_cap".to_string(), "3".to_string())],
+            consensus_policy: vec![
+                ("probe_base".to_string(), "2".to_string()),
+                ("s_full".to_string(), "6".to_string()),
+            ],
+        };
+
+        let encoded =
+            bincode::serde::encode_to_vec(&payload, bincode::config::standard()).unwrap();
+        let meta = TxMeta {
+            function: "insert_genesis",
+            payload: &encoded,
+            submitter_node: 0,
+            user_id: None,
+        };
+        let notifier = NullNotifier;
+        let scheduler = NullScheduler;
+        let ctx = crate::handlers::HandlerCtx {
+            fragments_dir: "",
+            node_id: Some(0),
+            notifier: &notifier,
+            work: &scheduler,
+        };
+
+        let mut conn = pool.get().unwrap();
+        let db_tx = conn.transaction().unwrap();
+        InsertGenesisHandler
+            .process(&meta, true, &ctx, &db_tx)
+            .unwrap();
+        db_tx.commit().unwrap();
+
+        let policy = hopnet_consensus::store::read_policy(&conn).unwrap();
+        assert_eq!(policy.probe_base, std::time::Duration::from_secs(2));
+        assert_eq!(policy.s_full, std::time::Duration::from_secs(6));
+        assert_eq!(policy.grace, std::time::Duration::from_secs(5)); // default
+        assert_eq!(policy.p_prove, std::time::Duration::from_secs(1800)); // default
+
+        // Storage-policy seeding still resolves (field-addition regression).
+        let storage = hopnet_storage::store::read_policy(&conn).unwrap();
+        assert_eq!(storage.b_max, 3);
     }
 }

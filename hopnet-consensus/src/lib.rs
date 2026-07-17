@@ -18,6 +18,7 @@ pub mod codec;
 pub mod config;
 pub mod context;
 pub mod host;
+pub mod membership;
 #[cfg(feature = "shell")]
 pub mod shell;
 pub mod signing;

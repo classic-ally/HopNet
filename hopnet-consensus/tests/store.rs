@@ -383,3 +383,46 @@ fn two_node_crash_midheight_replays_wal_without_equivocation() {
     let _ = std::fs::remove_file(&path0);
     let _ = std::fs::remove_file(&path1);
 }
+
+// Should: hopnet_consensus_policy roundtrip — defaults when empty, per-key
+// resolution on partial seeds, INSERT OR REPLACE overwrite semantics.
+// Impact: genesis-seeded policy is how orchestrator membership tests run
+// at seconds-scale (the genesis path is the test path).
+#[test]
+fn consensus_policy_rows_roundtrip() {
+    use hopnet_consensus::membership::ConsensusPolicy;
+    use std::time::Duration;
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    hopnet_consensus::store::install_schema(&conn).unwrap();
+
+    assert_eq!(
+        hopnet_consensus::store::read_policy(&conn).unwrap(),
+        ConsensusPolicy::default()
+    );
+
+    hopnet_consensus::store::apply_policy_rows(
+        &conn,
+        &[
+            ("probe_base".to_string(), "2".to_string()),
+            ("grace".to_string(), "1".to_string()),
+            ("s_full".to_string(), "6".to_string()),
+        ],
+    )
+    .unwrap();
+    let p = hopnet_consensus::store::read_policy(&conn).unwrap();
+    assert_eq!(p.probe_base, Duration::from_secs(2));
+    assert_eq!(p.grace, Duration::from_secs(1));
+    assert_eq!(p.s_full, Duration::from_secs(6));
+    assert_eq!(p.p_prove, Duration::from_secs(1800)); // unseeded -> default
+
+    // Overwrite (INSERT OR REPLACE).
+    hopnet_consensus::store::apply_policy_rows(
+        &conn,
+        &[("probe_base".to_string(), "4".to_string())],
+    )
+    .unwrap();
+    let p = hopnet_consensus::store::read_policy(&conn).unwrap();
+    assert_eq!(p.probe_base, Duration::from_secs(4));
+    assert_eq!(p.grace, Duration::from_secs(1)); // untouched
+}

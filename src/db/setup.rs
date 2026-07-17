@@ -1,6 +1,17 @@
 use super::*;
 use axum::http::StatusCode;
 
+/// Parse a "k=v;k=v" genesis policy spec (mesh-creation input, not runtime
+/// config). Pairs without '=' are skipped; keys/values are trimmed.
+fn parse_policy_spec(spec: &str) -> Vec<(String, String)> {
+    spec.split(';')
+        .filter_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            Some((k.trim().to_string(), v.trim().to_string()))
+        })
+        .collect()
+}
+
 pub fn get_initial_setup(
     db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
 ) -> Result<StatusCode, DatabaseError> {
@@ -82,17 +93,14 @@ pub fn post_initial_setup(
     // resolves the same policy regardless of its own environment. Format:
     // "key=value;key=value" (e.g. "decay_tiers=60,120,180,240" for
     // orchestrator tests). Empty/absent = code defaults.
-    let storage_policy: Vec<(String, String)> = std::env::var("HOPNET_GENESIS_STORAGE_POLICY")
-        .ok()
-        .map(|spec| {
-            spec.split(';')
-                .filter_map(|pair| {
-                    let (k, v) = pair.split_once('=')?;
-                    Some((k.trim().to_string(), v.trim().to_string()))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let storage_policy: Vec<(String, String)> =
+        std::env::var("HOPNET_GENESIS_STORAGE_POLICY")
+            .map(|s| parse_policy_spec(&s))
+            .unwrap_or_default();
+    let consensus_policy: Vec<(String, String)> =
+        std::env::var("HOPNET_GENESIS_CONSENSUS_POLICY")
+            .map(|s| parse_policy_spec(&s))
+            .unwrap_or_default();
 
     // Create genesis payload with user, node, and mesh key material
     let genesis_payload = GenesisPayload {
@@ -101,6 +109,7 @@ pub fn post_initial_setup(
         mesh_pubkey: *mesh_pubkey.as_bytes(),
         mesh_grant,
         storage_policy,
+        consensus_policy,
     };
 
     // Encode the payload
@@ -334,5 +343,31 @@ pub fn initialize_joining_node(
             );
             Err(DatabaseError::LockError)
         }
+    }
+}
+
+#[cfg(test)]
+mod policy_spec_tests {
+    use super::parse_policy_spec;
+
+    // Should: parse "k=v;k=v" with trimming; skip pairs without '=';
+    // tolerate trailing separators and empty input.
+    // Impact: HOPNET_GENESIS_*_POLICY is the mesh-creation input for both
+    // the storage and consensus policy tables.
+    #[test]
+    fn parse_policy_spec_shapes() {
+        assert_eq!(
+            parse_policy_spec("a=1; b = 2 ;c=3;"),
+            vec![
+                ("a".to_string(), "1".to_string()),
+                ("b".to_string(), "2".to_string()),
+                ("c".to_string(), "3".to_string()),
+            ]
+        );
+        assert_eq!(parse_policy_spec("noequals;x=9"), vec![(
+            "x".to_string(),
+            "9".to_string()
+        )]);
+        assert!(parse_policy_spec("").is_empty());
     }
 }
