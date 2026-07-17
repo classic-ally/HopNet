@@ -124,7 +124,10 @@ pub fn mesh_creation_env(test_name: &str) -> Vec<(&'static str, &'static str)> {
         "evidence-observe" => vec![
             (
                 "HOPNET_GENESIS_CONSENSUS_POLICY",
-                "probe_base=2;grace=1",
+                // s_full/p_prove seeded so the 3-node mesh FORMS (the
+                // formation batch is exposed) — a self-set policy drops the
+                // global default seed.
+                "probe_base=2;grace=1;s_full=6;p_prove=6",
             ),
             // Majority: 3 nodes -> quorum 2, H 1 (Fast) -> kill one -> H 0
             // (Cliff). Under default BFT quorum(3)=3 the mesh starts at the
