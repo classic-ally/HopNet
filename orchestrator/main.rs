@@ -499,6 +499,58 @@ async fn cleanup_mesh_resources(
     let _ = docker.remove_network(network_id).await;
 }
 
+/// Wait for mesh-initiated seating to converge (RFC-CONSENSUS-002 S5):
+/// nodes never request seats, so a fresh mesh forms only as the validators'
+/// seat-proposal scan runs. Poll node 0's validator count until it is stable
+/// across two reads (the seating fixpoint reached) or the timeout elapses.
+/// Robust to the profile's parity (odd majority meshes seat all N; even seat
+/// N-1 with one pooled spare) without reimplementing the math here.
+async fn wait_for_formation(
+    docker: &Docker,
+    mesh_id: u32,
+    runtime: sys::ContainerRuntime,
+    timeout: std::time::Duration,
+) -> Result<u32> {
+    let client = reqwest::Client::new();
+    let token = get_jwt_token(docker, mesh_id, 0, runtime).await?;
+    let addrs = get_external_addresses(docker, mesh_id, runtime).await?;
+    let (host, port) = addrs
+        .iter()
+        .find(|(id, _, _)| *id == 0)
+        .map(|(_, h, p)| (h.clone(), *p))
+        .ok_or_else(|| anyhow::anyhow!("node 0 address"))?;
+    let url = format!("http://{}:{}/consensus/view", host, port);
+
+    let start = std::time::Instant::now();
+    let mut prev: Option<u32> = None;
+    while start.elapsed() < timeout {
+        // Query the pending height's validator set via the debug view.
+        if let Ok(resp) = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .json(&i32::MAX) // any height >= tip resolves to the latest set
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+        {
+            if let Ok(doc) = resp.json::<serde_json::Value>().await {
+                let count = doc["validators_at_height"]
+                    .as_array()
+                    .map(|a| a.len() as u32)
+                    .unwrap_or(0);
+                if count >= 2 && prev == Some(count) {
+                    println!("Mesh {} seated to {} validators", mesh_id, count);
+                    return Ok(count);
+                }
+                prev = Some(count);
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    }
+    // Non-fatal: tests do their own baseline waits; report what we saw.
+    Ok(prev.unwrap_or(0))
+}
+
 async fn create_mesh(
     docker: &Docker,
     mesh_id: u32,
@@ -634,6 +686,18 @@ async fn create_mesh(
                     }
                 }
             }
+
+            // Wait for mesh-initiated seating to converge before returning
+            // (nodes no longer self-request; the mesh seats them).
+            if node_count > 1 {
+                let _ = wait_for_formation(
+                    docker,
+                    mesh_id,
+                    runtime,
+                    std::time::Duration::from_secs(120),
+                )
+                .await;
+            }
         }
         Err(e) => {
             println!("Failed to create network: {}", e);
@@ -643,7 +707,7 @@ async fn create_mesh(
     Ok(())
 }
 
-async fn add_nodes_to_mesh(
+pub(crate) async fn add_nodes_to_mesh(
     docker: &Docker,
     mesh_id: u32,
     node_count: u32,
@@ -928,6 +992,15 @@ async fn create_hopnet_container(
                 {
                     e.push(format!("{}={}", k, v));
                 }
+            }
+            // Default consensus-policy seed (RFC-CONSENSUS-002 S5): mesh
+            // FORMATION under mesh-initiated seating needs a small s_full
+            // (the v=1 formation batch is exposed) and p_prove (stacked
+            // batches need proven members). Only when a test hasn't set its
+            // own HOPNET_GENESIS_CONSENSUS_POLICY. NOT probe_base/grace —
+            // t_out stays >= 65s so stop/start tests keep kill windows.
+            if std::env::var("HOPNET_GENESIS_CONSENSUS_POLICY").is_err() {
+                e.push("HOPNET_GENESIS_CONSENSUS_POLICY=s_full=6;p_prove=6".to_string());
             }
             e
         }),

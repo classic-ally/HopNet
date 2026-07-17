@@ -212,7 +212,12 @@ pub fn post_initial_setup(
                 );
                 DatabaseError::ProcessingError
             })?,
-            Err(_) => hopnet_consensus::config::QuorumProfile::Bft,
+            // Majority is the pre-S6 default (RFC-CONSENSUS-002): a
+            // default-BFT mesh below 4 nodes cannot FORM once self-request
+            // seating is gone (BFT v=1 grows only by a batch of 3, and a
+            // 3-node mesh has 2 candidates). AUTO — the S6 default — is
+            // majority at v < 7 anyway, so this is where AUTO already lands.
+            Err(_) => hopnet_consensus::config::QuorumProfile::Majority,
         };
 
         let engine_txs = crate::consensus::malachite::app::to_engine_transactions(

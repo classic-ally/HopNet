@@ -20,6 +20,7 @@ mod file_upload;
 mod fileprovider_device_token;
 mod fragment_distribution;
 mod evidence_observe;
+mod mesh_growth;
 pub(crate) mod graceful_leave;
 mod vote_out;
 mod fragment_health_check;
@@ -100,6 +101,10 @@ pub trait TestScenario: Send + Sync {
 /// export these before `orchestrator create` for the same checks).
 pub fn mesh_creation_env(test_name: &str) -> Vec<(&'static str, &'static str)> {
     match test_name {
+        "mesh-growth" => vec![
+            ("HOPNET_GENESIS_CONSENSUS_POLICY", "probe_base=2;grace=1;s_full=6;p_prove=6"),
+            ("HOPNET_QUORUM_PROFILE", "majority"),
+        ],
         "vote-out-after-kill" => vec![
             (
                 "HOPNET_GENESIS_CONSENSUS_POLICY",
@@ -114,7 +119,7 @@ pub fn mesh_creation_env(test_name: &str) -> Vec<(&'static str, &'static str)> {
         // default 30 min would refuse the rejoin inside the test window.
         "graceful-leave" => vec![(
             "HOPNET_GENESIS_CONSENSUS_POLICY",
-            "s_full=6",
+            "probe_base=2;grace=1;s_full=6",
         )],
         "evidence-observe" => vec![
             (
@@ -235,6 +240,9 @@ pub async fn run_test_by_name(
             reencode::ReencodeAfterDeparture
                 .run(mesh_id, nodes, flags)
                 .await
+        }
+        "mesh-growth" => {
+            mesh_growth::MeshGrowth.run(mesh_id, nodes, flags).await
         }
         "vote-out-after-kill" => {
             vote_out::VoteOutAfterKill
@@ -392,6 +400,7 @@ pub fn list_test_names() -> Vec<&'static str> {
         "graceful-leave",
         "evidence-observe",
         "vote-out-after-kill",
+        "mesh-growth",
         "device-token-consistency",
         "documentprovider-write-consistency",
         "iroh-ping",

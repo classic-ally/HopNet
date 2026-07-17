@@ -151,35 +151,57 @@ impl TestScenario for GracefulLeave {
             },
         );
 
-        // 3. Every node — including the leaver — reports v = 2 without it.
-        let shrunk = wait_validator_count(
-            &client,
-            nodes,
-            2,
-            Some(leaver_id),
-            Duration::from_secs(30),
-        )
-        .await
-        .unwrap_or(false);
-        // And the leaver's own view of itself agrees.
-        let tip = get_max_view(nodes).await.unwrap_or(0);
-        let self_inactive = view_state(&client, leaver, tip as i64 + 1)
-            .await
-            .map(|vs| !vs.is_active_at_height)
-            .unwrap_or(false);
+        // 3. Height-scoped assertion at the leave height (race-immune vs
+        // the auto-reseat that follows): find the height where v dropped to
+        // 2 and assert the leaver is absent with departure_kind voluntary.
+        // Under the majority default a healthy voluntary leaver is
+        // re-seated within seconds (exposure-free => zero required span),
+        // so tip-state v=2 assertions would race the reseat — walk history
+        // instead.
+        let mut leave_height: Option<i64> = None;
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while std::time::Instant::now() < deadline && leave_height.is_none() {
+            let tip = get_max_view(nodes).await.unwrap_or(0) as i64;
+            for h in (1..=tip + 1).rev() {
+                if let Ok(vs) = view_state(&client, &stayers[0], h).await {
+                    let ids: Vec<i64> = vs
+                        .validators_at_height
+                        .iter()
+                        .filter_map(|v| v["node_id"].as_i64())
+                        .collect();
+                    if ids.len() == 2 && !ids.contains(&(leaver_id as i64)) {
+                        leave_height = Some(h);
+                        break;
+                    }
+                }
+            }
+            if leave_height.is_none() {
+                sleep(Duration::from_secs(2)).await;
+            }
+        }
+        let kind_ok = if let Some(h) = leave_height {
+            view_state(&client, leaver, h)
+                .await
+                .ok()
+                .and_then(|vs| vs.last_departure_kind)
+                .as_deref()
+                == Some("voluntary")
+        } else {
+            false
+        };
         print_and_add_check(
             &mut result,
             Check {
-                name: "All nodes report v=2 without the leaver; leaver sees itself inactive"
+                name: "Leave committed: v=2 without leaver, departure_kind voluntary (height-scoped)"
                     .to_string(),
-                passed: shrunk && self_inactive,
+                passed: leave_height.is_some() && kind_ok,
                 detail: None,
             },
         );
 
-        // 4. Consensus continues at v=2: upload through a stayer, verify on
-        // both stayers (2-of-2 quorum under BFT).
-        let content = b"graceful-leave: consensus continues at v-1".to_vec();
+        // 4. Consensus proceeded during the v=2 window: a file uploaded at
+        // the leave height is retrievable from the stayers.
+        let content = b"graceful-leave: consensus continues".to_vec();
         let upload_ok = upload_file(&stayers[0], "/", "leave_test.txt", content.clone())
             .await
             .is_ok();
@@ -195,68 +217,37 @@ impl TestScenario for GracefulLeave {
         print_and_add_check(
             &mut result,
             Check {
-                name: "Consensus continues at v=2 (upload + download on stayers)".to_string(),
+                name: "Consensus continues while shrunk (upload + download on stayers)".to_string(),
                 passed: upload_ok && download_ok,
                 detail: None,
             },
         );
 
-        // 5. Tip-poll: the departed node reaches the new tip with NO
-        // consensus gossip (gossip is valset-only now). Window covers
-        // several 5s poll ticks.
-        let tip_after_upload = get_max_view(&stayers).await.unwrap_or(0);
-        let leaver_synced = wait_for_minimum_view(
-            std::slice::from_ref(leaver),
-            tip_after_upload,
-            Duration::from_secs(30),
-        )
-        .await
-        .unwrap_or(false);
-        print_and_add_check(
-            &mut result,
-            Check {
-                name: format!("Departed node tip-polls to height {tip_after_upload}"),
-                passed: leaver_synced,
-                detail: None,
-            },
-        );
-
-        // 6. Rejoin via the legacy self-request trigger.
-        let activate_url = format!(
-            "http://{}:{}/consensus/activate",
-            leaver.ip_address, leaver.port
-        );
-        let activate_ok = client
-            .post(&activate_url)
-            .header("Authorization", format!("Bearer {}", leaver.jwt_token))
-            .timeout(Duration::from_secs(90))
-            .send()
-            .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false);
-        let restored = activate_ok
-            && wait_validator_count(&client, nodes, 3, None, Duration::from_secs(30))
+        // 5. MONEY: v=3 restored on every node with NO request anywhere —
+        // mesh-initiated auto-reseat. This transitively proves the leaver
+        // caught up (seating requires it) and was noticed by the mesh.
+        let restored =
+            wait_validator_count(&client, nodes, 3, None, Duration::from_secs(60))
                 .await
                 .unwrap_or(false);
         print_and_add_check(
             &mut result,
             Check {
-                name: "Rejoin: POST /consensus/activate restores v=3 on every node".to_string(),
+                name: "Auto-reseat restores v=3 on every node (no request)".to_string(),
                 passed: restored,
                 detail: None,
             },
         );
 
-        // 7. The rejoined node participates: second upload, downloadable
-        // from all three (including the returnee).
-        let content2 = b"graceful-leave: rejoined and serving".to_vec();
-        let upload2_ok = upload_file(&nodes[0], "/", "rejoin_test.txt", content2.clone())
+        // 6. Full-mesh participation post-reseat.
+        let content2 = b"graceful-leave: reseated and serving".to_vec();
+        let upload2 = upload_file(&nodes[0], "/", "reseat_test.txt", content2.clone())
             .await
             .is_ok();
-        let download2_ok = upload2_ok
+        let download2 = upload2
             && download_file_from_all_nodes_with_timeout(
                 nodes,
-                "/rejoin_test.txt",
+                "/reseat_test.txt",
                 Duration::from_secs(45),
             )
             .await
@@ -265,8 +256,8 @@ impl TestScenario for GracefulLeave {
         print_and_add_check(
             &mut result,
             Check {
-                name: "Rejoined node participates (upload visible on all 3)".to_string(),
-                passed: upload2_ok && download2_ok,
+                name: "Reseated node participates (upload visible on all 3)".to_string(),
+                passed: upload2 && download2,
                 detail: None,
             },
         );

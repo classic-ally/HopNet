@@ -51,6 +51,9 @@ pub struct EvidenceMap {
     /// Map creation instant: nodes with no entry age from here
     /// (live-until-first-deadline).
     origin: Instant,
+    /// Decided height when the evidence began (first scheduler pass wins);
+    /// the proven-quorum ceiling's pre-boot arm.
+    boot_height: once_cell::sync::OnceCell<i64>,
     /// bright_since reset gap in millis: the band-independent upper bound
     /// t_unresponsive(Lazy). Initialized from the default policy; the
     /// probe scheduler refreshes it from the replicated policy each scan.
@@ -69,6 +72,7 @@ impl EvidenceMap {
         let default_gap = ConsensusPolicy::default().t_unresponsive(Band::Lazy);
         Self {
             origin: Instant::now(),
+            boot_height: once_cell::sync::OnceCell::new(),
             reset_gap_ms: AtomicU64::new(default_gap.as_millis() as u64),
             inner: Mutex::new(HashMap::new()),
         }
@@ -76,6 +80,15 @@ impl EvidenceMap {
 
     pub fn origin(&self) -> Instant {
         self.origin
+    }
+
+    /// Set once by the probe scheduler's first pass (idempotent).
+    pub fn set_boot_height(&self, h: i64) {
+        let _ = self.boot_height.set(h);
+    }
+
+    pub fn boot_height(&self) -> Option<i64> {
+        self.boot_height.get().copied()
     }
 
     /// Scheduler-maintained: t_unresponsive(Lazy) from the replicated
@@ -353,6 +366,7 @@ pub fn spawn_probe_scheduler(app_state: crate::AppState) {
     crate::consensus::queue::queue_rt().spawn(async move {
         // Vote-out proposal cooldown anchor (RFC-CONSENSUS-002 S4).
         let mut last_voteout_at: Option<Instant> = None;
+        let mut last_seat_at: Option<Instant> = None;
         loop {
             tokio::time::sleep(PROBE_SCAN_INTERVAL).await;
 
@@ -363,8 +377,9 @@ pub fn spawn_probe_scheduler(app_state: crate::AppState) {
                 continue;
             };
             let decided = *engine.decided.borrow();
+            app_state.evidence.set_boot_height(decided as i64);
 
-            let (policy, profile, seated) = {
+            let (policy, profile, seated, seat_starts, pool) = {
                 let Ok(conn) = app_state.db_pool.get() else {
                     continue;
                 };
@@ -387,7 +402,36 @@ pub fn spawn_probe_scheduler(app_state: crate::AppState) {
                     crate::db::consensus::get_validators_with_conn(&conn, pending)
                         .map(|v| v.into_iter().map(|n| n.node_id).collect())
                         .unwrap_or_default();
-                (policy, profile, seated)
+                // Seat starts (proven pre-boot arm) + the candidate pool
+                // (registered minus seated, with each one's last departure).
+                let mut seat_starts: Vec<(i32, i32)> = Vec::with_capacity(seated.len());
+                for id in &seated {
+                    if let Ok(Some(h)) =
+                        hopnet_consensus::validators::activation_height(&conn, *id, pending)
+                    {
+                        seat_starts.push((*id, h));
+                    }
+                }
+                let registered: Vec<i32> = conn
+                    .prepare_cached("SELECT node_id FROM nodes ORDER BY node_id")
+                    .and_then(|mut st| {
+                        st.query_map([], |row| row.get::<_, i32>(0))
+                            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+                    })
+                    .unwrap_or_default();
+                let pool: Vec<(i32, Option<hopnet_consensus::validators::DepartureKind>)> =
+                    registered
+                        .iter()
+                        .filter(|id| !seated.contains(id) && **id != my_id)
+                        .map(|id| {
+                            let dep = hopnet_consensus::validators::last_departure(
+                                &conn, *id, pending,
+                            )
+                            .unwrap_or(None);
+                            (*id, dep)
+                        })
+                        .collect();
+                (policy, profile, seated, seat_starts, pool)
             };
             if seated.is_empty() {
                 continue; // pre-genesis / mid-bootstrap
@@ -503,6 +547,61 @@ pub fn spawn_probe_scheduler(app_state: crate::AppState) {
                                 });
                             }
                             Err(e) => tracing::warn!("vote-out sign failed: {e:?}"),
+                        }
+                    }
+                }
+            }
+
+            // Seat-proposal scan (RFC-CONSENSUS-002 S5): a seated validator
+            // proposes the largest brightest-first gaining batch from the
+            // pool. Nodes never request seats — this is the only initiator.
+            if seated.contains(&my_id) && !pool.is_empty() {
+                let seat_cooldown = policy.t_probe(est.band);
+                let cooled = last_seat_at
+                    .is_none_or(|t| now.saturating_duration_since(t) >= seat_cooldown);
+                if cooled {
+                    let inp = crate::consensus::membership_guards::GuardInputs {
+                        snapshot: &snap,
+                        origin: app_state.evidence.origin(),
+                        now,
+                        policy: &policy,
+                        profile,
+                        seated: &seated,
+                        my_id,
+                        boot_height: app_state.evidence.boot_height(),
+                        seat_starts: &seat_starts,
+                        pending_height: decided.saturating_add(1) as i64,
+                    };
+                    if let Some(batch) =
+                        crate::consensus::membership_guards::plan_seating_batch(&inp, &pool)
+                    {
+                        last_seat_at = Some(now);
+                        let payload = bincode::serde::encode_to_vec(
+                            &crate::consensus::handlers::ActivationRequest {
+                                members: batch.clone(),
+                            },
+                            bincode::config::standard(),
+                        )
+                        .unwrap_or_default();
+                        match crate::consensus::dispatch::create_signed_transaction(
+                            &app_state,
+                            "validator_activation".to_string(),
+                            payload,
+                        ) {
+                            Ok(tx) => {
+                                let queue = app_state.consensus_queue.clone();
+                                tokio::spawn(async move {
+                                    match queue.submit(tx).await {
+                                        Ok(()) => tracing::info!(
+                                            "seated batch {batch:?}"
+                                        ),
+                                        Err(e) => tracing::debug!(
+                                            "seat batch {batch:?} not committed: {e}"
+                                        ),
+                                    }
+                                });
+                            }
+                            Err(e) => tracing::warn!("seat sign failed: {e:?}"),
                         }
                     }
                 }

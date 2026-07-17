@@ -107,23 +107,13 @@ pub async fn process_join_info(
             }
         };
 
-        match crate::consensus::routes::request_activation(
-            &app_state_clone,
-            join_info_clone.node_id,
-            i32::try_from(reached).unwrap_or(i32::MAX),
-        )
-        .await
-        {
-            Ok(()) => tracing::info!(
-                "Join bootstrap complete for node {} (height {reached}), activation submitted",
-                join_info_clone.node_id
-            ),
-            Err(e) => tracing::error!(
-                "Activation request failed for node {}: {:?}",
-                join_info_clone.node_id,
-                e
-            ),
-        }
+        // Mesh-initiated seating (RFC-CONSENSUS-002 S5): the joining node
+        // never requests a seat — it registers, syncs, answers probes, and
+        // waits to be noticed by the seat-proposal scan on the validators.
+        tracing::info!(
+            "Join bootstrap complete for node {} (height {reached}); pooled, awaiting mesh seating",
+            join_info_clone.node_id
+        );
     });
 
     tracing::info!(

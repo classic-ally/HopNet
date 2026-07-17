@@ -13,9 +13,12 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ActivationRequest {
-    pub node_id: i32,
-    pub current_height: i32, // Proof node is caught up
-                             // Activation height computed automatically during execution as committed_height + 1
+    /// Strictly increasing candidate node ids — a PROPOSER-signed batch
+    /// (RFC-CONSENSUS-002 S5, mesh-initiated seating: a seated validator
+    /// proposes; nodes never request seats). The catch-up proof moved
+    /// evidence-side: each approver checks its own last_known_height for
+    /// every member (membership_guards::check_activation, Live only).
+    pub members: Vec<i32>,
 }
 
 pub struct ValidatorActivationHandler;
@@ -32,68 +35,64 @@ impl TransactionHandler for ValidatorActivationHandler {
         _ctx: &HandlerCtx<'_>,
         db_tx: &rusqlite::Transaction<'_>,
     ) -> HandlerResult {
-        // Decode activation request payload
-        let (activation_req, _) = bincode::serde::decode_from_slice::<ActivationRequest, _>(
+        let (req, _) = bincode::serde::decode_from_slice::<ActivationRequest, _>(
             tx.payload,
             bincode::config::standard(),
         )
         .map_err(|_| DatabaseError::InvalidPayload)?;
 
-        // Authorization: Only the node itself can request its own activation
-        // This check happens regardless of execute flag (determines vote)
-        if activation_req.node_id != tx.submitter_node {
-            tracing::warn!(
-                "Authorization failed: node {} attempted to activate node {}",
-                tx.submitter_node,
-                activation_req.node_id
-            );
-            return Err(DatabaseError::AuthorizationError);
+        // Objective shape checks, both phases: non-empty, within the batch
+        // licence, strictly increasing (sorted + deduped — determinism).
+        if req.members.is_empty()
+            || req.members.len() > hopnet_consensus::membership::B_MAX
+            || !req.members.windows(2).all(|w| w[0] < w[1])
+        {
+            return Err(DatabaseError::InvalidPayload);
         }
 
-        // Validation phase: checks determine vote (YES/NO) but don't affect execution
-        if !execute {
-            // Synchronization check: Node must be caught up (within 10 views tolerance)
-            let consensus_height = get_current_consensus_height(db_tx)?;
-            if activation_req.current_height < consensus_height - 10 {
-                tracing::warn!(
-                    "Node {} activation failed validation: not caught up (reported height {}, consensus height {})",
-                    activation_req.node_id,
-                    activation_req.current_height,
-                    consensus_height
-                );
-                return Err(DatabaseError::ProcessingError);
-            }
+        let committed_height = get_current_consensus_height(db_tx)?;
 
-            // Validation passed - vote YES
-            tracing::debug!(
-                "Node {} activation request validated (current_height={}, consensus_height={})",
-                activation_req.node_id,
-                activation_req.current_height,
-                consensus_height
-            );
+        if !execute {
+            // Mesh-initiated: the SUBMITTER must be seated (this also
+            // structurally excludes submitter ∈ members — members must be
+            // unseated below).
+            if !crate::db::consensus::is_node_active(db_tx, tx.submitter_node, committed_height)?
+            {
+                return Err(DatabaseError::AuthorizationError);
+            }
+            for m in &req.members {
+                // Registered…
+                let registered: bool = db_tx
+                    .query_row(
+                        "SELECT 1 FROM nodes WHERE node_id = ?",
+                        rusqlite::params![m],
+                        |_| Ok(true),
+                    )
+                    .unwrap_or(false);
+                if !registered {
+                    return Err(DatabaseError::ProcessingError);
+                }
+                // …and not currently seated (overlapping/duplicate batches
+                // die here, whole-batch).
+                if crate::db::consensus::is_node_active(db_tx, *m, committed_height)? {
+                    return Err(DatabaseError::ProcessingError);
+                }
+            }
+            // The subjective batch checks — joint posture, proven-quorum
+            // ceiling, per-member S_min/liveness/catch-up — run HOST-side
+            // (membership_guards), Live origin only.
             return Ok(());
         }
 
-        // Execution phase: always execute if consensus succeeded (≥2/3 voted YES)
-        // This ensures all nodes perform identical state changes regardless of individual validation
-        if execute {
-            // Compute activation height deterministically during execution
-            // All nodes are synchronized to same committed height by Lock QC insertion
-            let committed_height = get_current_consensus_height(db_tx)?;
-            let effective_height = committed_height; // Activate immediately.
-
-            tracing::info!(
-                "Activating node {} at effective height {} (committed_height={}, next_block={})",
-                activation_req.node_id,
-                effective_height,
-                committed_height,
-                committed_height + 1
-            );
-
-            // Activate the validator (INSERT or UPDATE future activation)
-            activate_validator(db_tx, activation_req.node_id, effective_height)?;
+        for m in &req.members {
+            activate_validator(db_tx, *m, committed_height)?;
         }
-
+        tracing::info!(
+            "Batch-activated {:?} at effective height {} (proposed by {})",
+            req.members,
+            committed_height,
+            tx.submitter_node
+        );
         Ok(())
     }
 }
@@ -685,17 +684,15 @@ mod leave_tests {
             .unwrap();
         }
         let payload = bincode::serde::encode_to_vec(
-            &ActivationRequest {
-                node_id: 3,
-                current_height: 110,
-            },
+            &ActivationRequest { members: vec![3] },
             bincode::config::standard(),
         )
         .unwrap();
+        // Mesh-initiated: a seated validator (node 1) proposes the batch.
         let meta = TxMeta {
             function: "validator_activation",
             payload: &payload,
-            submitter_node: 3,
+            submitter_node: 1,
             user_id: None,
         };
         let notifier = NullNotifier;
@@ -963,5 +960,129 @@ mod vote_out_tests {
         }
         // Replay: target no longer seated -> validation refuses.
         assert!(run_vote_out(&pool, 3, 1, false).is_err());
+    }
+}
+
+#[cfg(test)]
+mod activation_batch_tests {
+    use super::*;
+    use crate::handlers::{NullNotifier, NullScheduler};
+    use ed25519_dalek::SigningKey;
+
+    // Seat validators 1..=seated; register (but don't seat) extra..
+    fn setup_pool(seated: i32, registered_extra: &[i32]) -> r2d2::Pool<crate::db::SqliteConnectionManager> {
+        let manager = crate::db::SqliteConnectionManager::memory();
+        let pool = r2d2::Pool::builder()
+            .max_size(1)
+            .connection_customizer(Box::new(crate::db::shared::SqliteInitializer))
+            .build(manager)
+            .unwrap();
+        crate::db::shared::initialize(pool.get().unwrap()).unwrap();
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "INSERT INTO users (user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt)
+             VALUES (1, 'allison', X'00', X'00', X'00', X'00')",
+            [],
+        )
+        .unwrap();
+        let add_node = |id: i32| {
+            let key = SigningKey::from_bytes(&[id as u8; 32]);
+            let pk = crate::types::PubKey(key.verifying_key());
+            conn.execute(
+                "INSERT INTO nodes (node_id, name, owner, pubkey) VALUES (?, ?, 1, ?)",
+                rusqlite::params![id, format!("node-{id}"), &pk],
+            )
+            .unwrap();
+        };
+        for id in 1..=seated {
+            add_node(id);
+            conn.execute(
+                "INSERT INTO validators (effective_height, node_id, is_active) VALUES (10, ?, true)",
+                rusqlite::params![id],
+            )
+            .unwrap();
+        }
+        for id in registered_extra {
+            add_node(*id);
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO consensus_meta (key, value) VALUES ('last_decided_height', ?)",
+            rusqlite::params![100i64],
+        )
+        .unwrap();
+        pool
+    }
+
+    fn run_batch(
+        pool: &r2d2::Pool<crate::db::SqliteConnectionManager>,
+        members: Vec<i32>,
+        submitter: i32,
+        execute: bool,
+    ) -> HandlerResult {
+        let payload = bincode::serde::encode_to_vec(
+            &ActivationRequest { members },
+            bincode::config::standard(),
+        )
+        .unwrap();
+        let meta = TxMeta {
+            function: "validator_activation",
+            payload: &payload,
+            submitter_node: submitter,
+            user_id: None,
+        };
+        let notifier = NullNotifier;
+        let scheduler = NullScheduler;
+        let ctx = HandlerCtx {
+            fragments_dir: "",
+            node_id: Some(submitter),
+            notifier: &notifier,
+            work: &scheduler,
+        };
+        let mut conn = pool.get().unwrap();
+        let db_tx = conn.transaction().unwrap();
+        let result = ValidatorActivationHandler.process(&meta, execute, &ctx, &db_tx);
+        if result.is_ok() && execute {
+            db_tx.commit().unwrap();
+        }
+        result
+    }
+
+    // Should: refuse malformed batches (empty, oversize, unsorted).
+    #[test]
+    fn batch_shape_refusals() {
+        let pool = setup_pool(3, &[4, 5, 6, 7, 8, 9]);
+        assert!(run_batch(&pool, vec![], 1, false).is_err());
+        assert!(run_batch(&pool, vec![4, 5, 6, 7, 8, 9], 1, false).is_err()); // > B_MAX
+        assert!(run_batch(&pool, vec![5, 4], 1, false).is_err()); // unsorted
+        assert!(run_batch(&pool, vec![4, 4], 1, false).is_err()); // dup (not strictly increasing)
+    }
+
+    // Should: refuse an unseated submitter, an unregistered member, and an
+    // already-seated member (whole batch).
+    #[test]
+    fn batch_objective_refusals() {
+        let pool = setup_pool(3, &[4, 5]);
+        assert!(matches!(
+            run_batch(&pool, vec![4], 9, false), // submitter 9 not seated
+            Err(DatabaseError::AuthorizationError)
+        ));
+        assert!(run_batch(&pool, vec![99], 1, false).is_err()); // unregistered
+        assert!(run_batch(&pool, vec![2, 4], 1, false).is_err()); // 2 already seated
+    }
+
+    // Should: activate every member of a valid batch at the committed
+    // height; the set grows by the whole batch.
+    #[test]
+    fn batch_executes() {
+        let pool = setup_pool(3, &[4, 5]);
+        assert!(run_batch(&pool, vec![4, 5], 1, false).is_ok());
+        assert!(run_batch(&pool, vec![4, 5], 1, true).is_ok());
+        let conn = pool.get().unwrap();
+        let ids: Vec<i32> = hopnet_consensus::validators::get_validators(&conn, 101)
+            .unwrap()
+            .iter()
+            .map(|v| v.node_id)
+            .collect();
+        assert_eq!(ids, vec![1, 2, 3, 4, 5]);
     }
 }

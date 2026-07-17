@@ -188,6 +188,27 @@ pub fn deactivate_validator(
     Ok(())
 }
 
+/// Start height of the current seat: the latest activation row at or
+/// before `height`. Meaningful only for members of the valset at that
+/// height (the proven-quorum ceiling's pre-boot arm reads it).
+pub fn activation_height(
+    conn: &Connection,
+    node_id: i32,
+    height: i32,
+) -> Result<Option<i32>, StoreError> {
+    let h: Option<i32> = conn
+        .query_row(
+            "SELECT effective_height FROM validators
+             WHERE node_id = ? AND effective_height <= ? AND is_active = true
+             ORDER BY effective_height DESC
+             LIMIT 1",
+            params![node_id, height],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(h)
+}
+
 /// lastDeparture(node) as of `height`: the latest deactivation row at or
 /// before the height, `None` if the node never departed (genesis members
 /// and never-departed nodes need no sentinel).
@@ -381,6 +402,30 @@ mod tests {
             .map(|v| v.node_id)
             .collect();
         assert_eq!(at_60, vec![1]);
+    }
+
+    // Should: activation_height report the CURRENT seat's start —
+    // latest-wins across reactivation, height-scoped, None when never
+    // activated.
+    // Impact: the proven-quorum ceiling's pre-boot arm.
+    #[test]
+    fn activation_height_semantics() {
+        let conn = test_conn();
+        add_node(&conn, 1);
+        assert_eq!(activation_height(&conn, 1, 100).unwrap(), None);
+
+        activate_validator(&conn, 1, 10).unwrap();
+        assert_eq!(activation_height(&conn, 1, 100).unwrap(), Some(10));
+
+        deactivate_validator(&conn, 1, 30, DepartureKind::Voluntary).unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO consensus_meta (key, value) VALUES ('last_decided_height', ?)",
+            params![45i64],
+        )
+        .unwrap();
+        activate_validator(&conn, 1, 50).unwrap();
+        assert_eq!(activation_height(&conn, 1, 100).unwrap(), Some(50));
+        assert_eq!(activation_height(&conn, 1, 40).unwrap(), Some(10));
     }
 
     // Should: count_active_validators agree with get_validators().len()

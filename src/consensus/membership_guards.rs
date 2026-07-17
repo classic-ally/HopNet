@@ -29,6 +29,13 @@ pub struct GuardInputs<'a> {
     /// Valset at the pending height.
     pub seated: &'a [i32],
     pub my_id: i32,
+    /// Decided height when my evidence began (proven pre-boot arm);
+    /// None before the first scheduler pass.
+    pub boot_height: Option<i64>,
+    /// (node_id, activation effective_height) for every seated member.
+    pub seat_starts: &'a [(i32, i32)],
+    /// committed + 1 — the catch-up anchor.
+    pub pending_height: i64,
 }
 
 fn lookup<'a>(snap: &'a [(i32, PeerEvidenceView)], id: i32) -> Option<&'a PeerEvidenceView> {
@@ -104,20 +111,58 @@ pub fn check_leave(inp: &GuardInputs<'_>, leaver: i32) -> Result<(), String> {
     Ok(())
 }
 
-/// Readmission S_min gate for the LEGACY single activation (batch is S5).
-///
-/// SCOPE (transitional): only candidates with a committed prior departure
-/// are gated — a never-seated candidate keeps the S1 join path (catch-up
-/// check in the handler), because the legacy self-request IS the join
-/// bootstrap until S5's mesh-initiated seating replaces it.
+/// |alive ∩ proven| among the seated set, by MY evidence — the
+/// proven-quorum ceiling's input. proven(X) = seated since before my
+/// evidence began (activation height ≤ my boot height) ∨ continuously
+/// bright ≥ p_prove by my own observation. Genesis seats are pre-boot
+/// for everyone — proven by fiat. Self counts via process uptime.
+pub fn proven_live(inp: &GuardInputs<'_>, current_band: hopnet_consensus::membership::Band) -> u64 {
+    inp.seated
+        .iter()
+        .filter(|id| {
+            let view = lookup(inp.snapshot, **id);
+            let alive = **id == inp.my_id
+                || contact_age(view, inp.origin, inp.now)
+                    <= inp.policy.t_unresponsive(current_band);
+            if !alive {
+                return false;
+            }
+            let pre_boot = match (
+                inp.boot_height,
+                inp.seat_starts.iter().find(|(n, _)| n == *id),
+            ) {
+                (Some(boot), Some((_, start))) => i64::from(*start) <= boot,
+                _ => false,
+            };
+            if pre_boot {
+                return true;
+            }
+            let span = if **id == inp.my_id {
+                // Own seat: process uptime approximates the span.
+                inp.now.saturating_duration_since(inp.origin)
+            } else {
+                bright_span(view, inp.origin, inp.policy, current_band, inp.now)
+            };
+            span >= inp.policy.p_prove
+        })
+        .count() as u64
+}
+
+/// One batch member as the guard sees it.
+pub struct BatchMember {
+    pub node_id: i32,
+    pub last_departure: Option<DepartureKind>,
+}
+
+/// Batch admission gate (RFC-CONSENSUS-001 Admission & readmission):
+/// joint posture, joint proven-quorum ceiling (waiver inside), and per
+/// member the liveness floor, the S_min span, and the catch-up bound.
+/// ELIGIBILITY ONLY — never ranking: any eligible batch passes
+/// regardless of which candidates the proposer picked (spec Selection).
 pub fn check_activation(
     inp: &GuardInputs<'_>,
-    candidate: i32,
-    last_dep: Option<DepartureKind>,
+    members: &[BatchMember],
 ) -> Result<(), String> {
-    let Some(dep) = last_dep else {
-        return Ok(());
-    };
     let est = live_estimate(
         inp.snapshot,
         inp.origin,
@@ -128,24 +173,123 @@ pub fn check_activation(
         inp.now,
     );
     let v = inp.seated.len() as u64;
-    let exposed = exposure(inp.profile, v, 1) > 0;
-    let required = inp.policy.req_span(exposed, Some(dep), est.headroom);
-    // bright_span reads zero for a currently-dark candidate, so the
-    // "answers my probe now" floor rides for free.
-    let span = bright_span(
-        lookup(inp.snapshot, candidate),
-        inp.origin,
-        inp.policy,
-        est.band,
-        inp.now,
-    );
-    if span < required {
+    let b = members.len() as u64;
+
+    if !hopnet_consensus::membership::posture_ok(inp.profile, v, b) {
         return Err(format!(
-            "bright span {span:?} < required {required:?} (exposed={exposed}, dep={dep:?}, H={})",
-            est.headroom
+            "posture: seating {b} at v={v} is lateral with no equivocation gain"
         ));
     }
+    let proven = proven_live(inp, est.band);
+    if !hopnet_consensus::membership::ceiling_ok(inp.profile, v, b, proven) {
+        return Err(format!(
+            "ceiling: quorum inflation exceeds the proven cushion (proven_live {proven}, v={v}, b={b})"
+        ));
+    }
+
+    let exposed = exposure(inp.profile, v, b) > 0;
+    for m in members {
+        let view = lookup(inp.snapshot, m.node_id);
+        // Liveness floor — explicit: a voluntary exposure-free member's
+        // required span is zero, so dark-reads-zero no longer covers it.
+        let age = contact_age(view, inp.origin, inp.now);
+        if age > inp.policy.t_unresponsive(est.band) {
+            return Err(format!("member {} is not currently live", m.node_id));
+        }
+        let required = inp
+            .policy
+            .req_span(exposed, m.last_departure, est.headroom);
+        let span = bright_span(view, inp.origin, inp.policy, est.band, inp.now);
+        if span < required {
+            return Err(format!(
+                "member {}: bright span {span:?} < required {required:?} (exposed={exposed}, dep={:?}, H={})",
+                m.node_id, m.last_departure, est.headroom
+            ));
+        }
+        // Catch-up: I must have OBSERVED the member near the tip.
+        let known = view.and_then(|vw| vw.last_known_height);
+        match known {
+            Some(h)
+                if h >= inp
+                    .pending_height
+                    .saturating_sub(hopnet_consensus::membership::CATCH_UP_TOLERANCE) => {}
+            _ => {
+                return Err(format!(
+                    "member {}: not caught up by my evidence (known {known:?}, pending {})",
+                    m.node_id, inp.pending_height
+                ));
+            }
+        }
+    }
     Ok(())
+}
+
+/// Proposer-side planner: the brightest-first largest-gaining batch
+/// (spec Selection + Seating rule). Ranking lives ONLY here — approvers
+/// verify eligibility. Returns payload members sorted ascending.
+pub fn plan_seating_batch(
+    inp: &GuardInputs<'_>,
+    pool: &[(i32, Option<DepartureKind>)],
+) -> Option<Vec<i32>> {
+    let est = live_estimate(
+        inp.snapshot,
+        inp.origin,
+        inp.policy,
+        inp.profile,
+        inp.seated,
+        inp.my_id,
+        inp.now,
+    );
+    let v = inp.seated.len() as u64;
+
+    // Viable: alive now + caught up by my evidence, with the span attached.
+    let mut viable: Vec<(i32, Option<DepartureKind>, std::time::Duration)> = pool
+        .iter()
+        .filter_map(|(id, dep)| {
+            let view = lookup(inp.snapshot, *id);
+            let alive = contact_age(view, inp.origin, inp.now)
+                <= inp.policy.t_unresponsive(est.band);
+            let caught_up = view
+                .and_then(|vw| vw.last_known_height)
+                .is_some_and(|h| {
+                    h >= inp
+                        .pending_height
+                        .saturating_sub(hopnet_consensus::membership::CATCH_UP_TOLERANCE)
+                });
+            if !alive || !caught_up {
+                return None;
+            }
+            let span = bright_span(view, inp.origin, inp.policy, est.band, inp.now);
+            Some((*id, *dep, span))
+        })
+        .collect();
+    // Brightest first, ties by node_id.
+    viable.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+
+    let max_b = viable.len().min(hopnet_consensus::membership::B_MAX);
+    let proven = proven_live(inp, est.band);
+    for b in (1..=max_b).rev() {
+        let bu = b as u64;
+        if !hopnet_consensus::membership::posture_ok(inp.profile, v, bu)
+            || !hopnet_consensus::membership::ceiling_ok(inp.profile, v, bu, proven)
+        {
+            continue;
+        }
+        let exposed = exposure(inp.profile, v, bu) > 0;
+        let eligible: Vec<i32> = viable
+            .iter()
+            .filter(|(_, dep, span)| {
+                *span >= inp.policy.req_span(exposed, *dep, est.headroom)
+            })
+            .map(|(id, _, _)| *id)
+            .collect();
+        if eligible.len() >= b {
+            let mut batch: Vec<i32> = eligible[..b].to_vec();
+            batch.sort_unstable();
+            return Some(batch);
+        }
+    }
+    None
 }
 
 /// Assembler: committed-state context + an evidence snapshot, dispatched
@@ -178,6 +322,13 @@ pub fn subjective_membership_check(
         .into_iter()
         .map(|v| v.node_id)
         .collect();
+    let mut seat_starts: Vec<(i32, i32)> = Vec::with_capacity(seated.len());
+    for id in &seated {
+        if let Ok(Some(h)) = hopnet_consensus::validators::activation_height(db_tx, *id, pending)
+        {
+            seat_starts.push((*id, h));
+        }
+    }
     let snapshot = app_state.evidence.snapshot();
     let inp = GuardInputs {
         snapshot: &snapshot,
@@ -187,6 +338,9 @@ pub fn subjective_membership_check(
         profile,
         seated: &seated,
         my_id,
+        boot_height: app_state.evidence.boot_height(),
+        seat_starts: &seat_starts,
+        pending_height: i64::from(pending),
     };
     let cfg = bincode::config::standard();
     match function {
@@ -212,9 +366,17 @@ pub fn subjective_membership_check(
                 _,
             >(payload, cfg)
             .map_err(|_| "activation payload".to_string())?;
-            let last_dep = crate::db::consensus::last_departure(db_tx, req.node_id, pending)
-                .map_err(|e| format!("{e:?}"))?;
-            check_activation(&inp, req.node_id, last_dep)
+            let mut members = Vec::with_capacity(req.members.len());
+            for m in &req.members {
+                let last_departure =
+                    crate::db::consensus::last_departure(db_tx, *m, pending)
+                        .map_err(|e| format!("{e:?}"))?;
+                members.push(BatchMember {
+                    node_id: *m,
+                    last_departure,
+                });
+            }
+            check_activation(&inp, &members)
         }
         _ => Ok(()),
     }
@@ -242,7 +404,9 @@ mod tests {
             last_probe_at: None,
             probes_since_contact: probes,
             bright_since,
-            last_known_height: None,
+            // Fresh height so the catch-up gate passes; tests overriding
+            // catch-up set this explicitly.
+            last_known_height: Some(200),
         }
     }
 
@@ -274,6 +438,9 @@ mod tests {
             profile: QuorumProfile::Majority,
             seated,
             my_id: 1,
+            boot_height: None,
+            seat_starts: &[],
+            pending_height: 100,
         }
     }
 
@@ -331,68 +498,66 @@ mod tests {
         assert!(check_leave(&inp2, 2).is_ok());
     }
 
-    // Should: gate readmission by departure kind and span — never-seated
-    // ungated; voted-out pays the floor at the cliff and s_full when
-    // comfortable; voluntary pays nothing exposure-free; a currently-dark
-    // candidate always fails (span reads zero).
-    // Impact: the S_min gate — the flap bound and the pool's evidence
-    // quality.
+    // Should: gate a BATCH by joint posture + proven ceiling and per
+    // member span/liveness/catch-up; approve any eligible batch without
+    // ranking.
+    // Impact: the mesh-initiated seating gate.
+    fn member(id: i32, dep: Option<DepartureKind>) -> BatchMember {
+        BatchMember { node_id: id, last_departure: dep }
+    }
+
     #[test]
-    fn activation_gate_matrix() {
+    fn activation_batch_gate_matrix() {
         let f = fixture();
-        // Majority v=2 seated [1,2]: candidate 3 seating is 2->3, quorum
-        // flat (2) => exposure-free.
-        let seated = [1, 2];
 
-        // Never-seated: ungated regardless of evidence.
-        let empty: Vec<(i32, PeerEvidenceView)> = Vec::new();
-        let inp = inputs(&f, &empty, &seated);
-        assert!(check_activation(&inp, 3, None).is_ok());
+        // Majority v=3: a single seat (3->4) is lateral => posture refuses.
+        let seated3 = [1, 2, 3];
+        let bright: Vec<(i32, PeerEvidenceView)> = (2..=5)
+            .map(|id| (id, view_at(f.now - Duration::from_secs(1), 0, Some(f.origin))))
+            .collect();
+        let inp3 = inputs(&f, &bright, &seated3);
+        assert!(
+            check_activation(&inp3, &[member(4, None)]).is_err(),
+            "lateral single refused"
+        );
+        // A batch of 2 (3->5) gains under majority => posture ok.
+        assert!(check_activation(&inp3, &[member(4, None), member(5, None)]).is_ok());
 
-        // Voted-out, bright 3s at cliff/fast floors: H(live 2, q 2) = 0
-        // => floor = s_floor(Cliff) = 2s; span 3s passes.
+        // Majority v=2 (waiver tol(2)=0): exposure-free 2->3, voted-out
+        // member needs the cliff floor 2s; 3s bright passes, 1s fails.
+        let seated2 = [1, 2];
+        let ok = vec![
+            (2, view_at(f.now - Duration::from_secs(1), 0, Some(f.origin))),
+            (3, view_at(f.now - Duration::from_secs(1), 0, Some(f.now - Duration::from_secs(3)))),
+        ];
+        let inp = inputs(&f, &ok, &seated2);
+        assert!(check_activation(&inp, &[member(3, Some(DepartureKind::VotedOut))]).is_ok());
+
+        let short = vec![
+            (2, view_at(f.now - Duration::from_secs(1), 0, Some(f.origin))),
+            (3, view_at(f.now - Duration::from_secs(1), 0, Some(f.now - Duration::from_secs(1)))),
+        ];
+        let inp = inputs(&f, &short, &seated2);
+        assert!(check_activation(&inp, &[member(3, Some(DepartureKind::VotedOut))]).is_err());
+        // Voluntary + exposure-free: zero required, passes with a short span.
+        assert!(check_activation(&inp, &[member(3, Some(DepartureKind::Voluntary))]).is_ok());
+
+        // Currently-dark member: liveness floor refuses even at required 0.
+        let dark = vec![
+            (2, view_at(f.now - Duration::from_secs(1), 0, Some(f.origin))),
+            (3, view_at(f.now - Duration::from_secs(120), 4, Some(f.origin))),
+        ];
+        let inp = inputs(&f, &dark, &seated2);
+        assert!(check_activation(&inp, &[member(3, Some(DepartureKind::Voluntary))]).is_err());
+
+        // Catch-up: a member whose height I never learned is refused.
+        let mut unknown = view_at(f.now - Duration::from_secs(1), 0, Some(f.origin));
+        unknown.last_known_height = None;
         let snap = vec![
             (2, view_at(f.now - Duration::from_secs(1), 0, Some(f.origin))),
-            (
-                3,
-                view_at(
-                    f.now - Duration::from_secs(1),
-                    0,
-                    Some(f.now - Duration::from_secs(3)),
-                ),
-            ),
+            (3, unknown),
         ];
-        let inp = inputs(&f, &snap, &seated);
-        assert!(check_activation(&inp, 3, Some(DepartureKind::VotedOut)).is_ok());
-
-        // Voted-out but span 1s < floor 2s: refused.
-        let snap2 = vec![
-            (2, view_at(f.now - Duration::from_secs(1), 0, Some(f.origin))),
-            (
-                3,
-                view_at(
-                    f.now - Duration::from_secs(1),
-                    0,
-                    Some(f.now - Duration::from_secs(1)),
-                ),
-            ),
-        ];
-        let inp2 = inputs(&f, &snap2, &seated);
-        assert!(check_activation(&inp2, 3, Some(DepartureKind::VotedOut)).is_err());
-
-        // Voluntary, exposure-free: zero span required.
-        assert!(check_activation(&inp2, 3, Some(DepartureKind::Voluntary)).is_ok());
-
-        // Currently-dark candidate: span reads zero — refused for
-        // voted-out even with an old bright_since.
-        let snap3 = vec![
-            (2, view_at(f.now - Duration::from_secs(1), 0, Some(f.origin))),
-            (
-                3,
-                view_at(f.now - Duration::from_secs(120), 4, Some(f.origin)),
-            ),
-        ];
-        let inp3 = inputs(&f, &snap3, &seated);
-        assert!(check_activation(&inp3, 3, Some(DepartureKind::VotedOut)).is_err());
+        let inp = inputs(&f, &snap, &seated2);
+        assert!(check_activation(&inp, &[member(3, None)]).is_err());
     }
 }

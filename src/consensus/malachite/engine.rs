@@ -327,9 +327,6 @@ pub fn spawn_engine(app_state: &AppState) -> Result<(), String> {
     // that keeps every registered peer's evidence bounded-stale.
     crate::consensus::evidence::spawn_probe_scheduler(app_state.clone());
 
-    // Legacy self-request reactivation with retry/backoff (S4; deleted at
-    // S5 with the rest of the self-request path).
-    spawn_reactivation_retry(app_state.clone());
 
     tracing::info!(
         start_height = start_height.0,
@@ -337,79 +334,6 @@ pub fn spawn_engine(app_state: &AppState) -> Result<(), String> {
         "malachite engine started (on-demand heights)"
     );
     Ok(())
-}
-
-/// Legacy self-request reactivation with retry/backoff (RFC-CONSENSUS-002
-/// S4; replaced by mesh-initiated seating at S5). While the node is
-/// registered but unseated — and its last departure was NOT voluntary —
-/// periodically submit validator_activation. Refusals are the normal path:
-/// the S_min gate refuses until the bright span accrues. The never-return
-/// loop re-arms after a later wrongful vote-out (the spec's one-round-trip
-/// recovery). Voluntary leavers are excluded — an operator-requested leave
-/// must not self-undo; their return path stays POST /consensus/activate
-/// until S5's pool policy.
-fn spawn_reactivation_retry(app_state: AppState) {
-    crate::consensus::queue::queue_rt().spawn(async move {
-        let mut backoff: Option<Duration> = None;
-        loop {
-            let Ok(my_id) = app_state.get_node_id() else {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                continue;
-            };
-            let Some(engine) = app_state.malachite.get() else {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                continue;
-            };
-            let pending = engine.decided.borrow().saturating_add(1);
-            let (base, am_active, last_dep) = {
-                let Ok(conn) = app_state.db_pool.get() else {
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    continue;
-                };
-                let policy = hopnet_consensus::store::read_policy(&conn).unwrap_or_default();
-                // Base cadence from the replicated policy so orchestrator
-                // meshes (tiny probe_base) retry in seconds.
-                let base = policy
-                    .probe_base
-                    .saturating_mul(4)
-                    .clamp(Duration::from_secs(5), Duration::from_secs(30));
-                let h = i32::try_from(pending).unwrap_or(i32::MAX);
-                let am_active =
-                    hopnet_consensus::validators::is_node_active(&conn, my_id, h)
-                        .unwrap_or(true);
-                let last_dep = hopnet_consensus::validators::last_departure(&conn, my_id, h)
-                    .unwrap_or(None);
-                (base, am_active, last_dep)
-            };
-            if am_active {
-                backoff = None;
-                tokio::time::sleep(base).await;
-                continue;
-            }
-            if last_dep == Some(hopnet_consensus::validators::DepartureKind::Voluntary) {
-                tokio::time::sleep(base).await;
-                continue;
-            }
-            let wait = backoff.unwrap_or(base);
-            tokio::time::sleep(wait).await;
-            backoff = Some((wait * 2).min(Duration::from_secs(300)));
-            let current = {
-                let Ok(conn) = app_state.db_pool.get() else {
-                    continue;
-                };
-                match crate::db::consensus::get_current_consensus_height(&conn) {
-                    Ok(h) => h,
-                    Err(_) => continue,
-                }
-            };
-            if let Err(e) =
-                crate::consensus::routes::request_activation(&app_state, my_id, current).await
-            {
-                // Expected until the bright span accrues (S_min gate).
-                tracing::debug!("reactivation attempt refused/failed: {e}");
-            }
-        }
-    });
 }
 
 /// Base cadence of the non-validator tip-poll; jittered ±20% so a departed
