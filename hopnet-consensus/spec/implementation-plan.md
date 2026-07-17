@@ -118,7 +118,7 @@ engine-touching stage.
   tables ported as drift-guard test vectors. Verify whether decided
   blocks carry timestamps (P_prove tightening). Gate: crate tests,
   both feature sets.
-- [ ] **S3 — evidence layer.** `EvidenceMap` in AppState
+- [x] **S3 — evidence layer.** `EvidenceMap` in AppState
   (parking_lot, pure-function classification): per-node
   {last_contact, last_probe_at, probes_since_contact, bright_since,
   last_known_height}; record_contact hooks on all RPC scopes +
