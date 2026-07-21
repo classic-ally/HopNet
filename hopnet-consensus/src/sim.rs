@@ -31,7 +31,7 @@ use malachitebft_core_consensus::Params;
 use malachitebft_core_types::{LinearTimeouts, Timeout, Validity, ValuePayload};
 
 use crate::codec::{WireCommitCertificate, WireConsensusMsg, WireVote, WireVoteType, WireWalEntry};
-use crate::config::QuorumProfile;
+use crate::config::{MalachiteThresholds, QuorumProfile};
 use crate::context::{Address, Height, HopNetValidatorSet, Validator};
 use crate::host::{HostCore, HostError, HostOutput};
 use crate::traits::{Application, ApplyError, Gossip, Storage, Timers, ValidationOrigin};

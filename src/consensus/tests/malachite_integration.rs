@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, watch};
 
-use hopnet_consensus::config::QuorumProfile;
+use hopnet_consensus::config::{MalachiteThresholds, QuorumProfile};
 use hopnet_consensus::context::{Address, Height};
 use hopnet_consensus::host::HostCore;
 use hopnet_consensus::shell::{self, ConsensusHandle, HostEvent, HostInput};
@@ -40,7 +40,7 @@ struct EngineNode {
 fn engine_params(node_id: i32) -> Params<HopNetContext> {
     Params {
         address: Address(node_id),
-        threshold_params: QuorumProfile::Majority.thresholds(),
+        threshold_params: QuorumProfile::Majority.thresholds_for(1),
         value_payload: ValuePayload::PartsOnly,
         enabled: true,
     }

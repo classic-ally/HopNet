@@ -28,6 +28,7 @@ use malachitebft_core_types::{
 };
 
 use crate::codec::{self, WireCommitCertificate, WireConsensusMsg, WireWalEntry};
+use crate::config::MalachiteThresholds;
 use crate::context::{Address, ConsensusVote, Height, HopNetContext, HopNetValidatorSet};
 use crate::signing;
 use crate::traits::{Application, Gossip, Storage, Timers, ValidationOrigin};

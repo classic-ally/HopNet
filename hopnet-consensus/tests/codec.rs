@@ -6,6 +6,7 @@
 mod common;
 
 use common::{chain_id, key, valset};
+use hopnet_consensus::MalachiteThresholds;
 use hopnet_consensus::codec::{
     decode, encode, SignedProposal, SignedVote, WireCommitCertificate, WireConsensusMsg,
     WireProposal, WireProposedValue, WireVote, WireWalEntry,

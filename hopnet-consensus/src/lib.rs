@@ -29,7 +29,7 @@ pub mod types;
 pub mod validators;
 pub mod verify;
 
-pub use config::QuorumProfile;
+pub use config::{MalachiteThresholds, QuorumProfile};
 pub use context::{
     Address, ConsensusProposal, ConsensusVote, Height, HopNetContext, HopNetValidatorSet, Validator,
 };

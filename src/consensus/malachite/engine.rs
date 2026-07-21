@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use hopnet_consensus::config::QuorumProfile;
+use hopnet_consensus::config::{MalachiteThresholds, QuorumProfile};
 use hopnet_consensus::context::{Address, Height};
 use hopnet_consensus::host::HostCore;
 use hopnet_consensus::shell::{self, HostEvent, HostInput};

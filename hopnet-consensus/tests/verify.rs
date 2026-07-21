@@ -8,7 +8,7 @@ use common::{chain_id, key, valset};
 use hopnet_consensus::signing::sign_vote;
 use hopnet_consensus::types::Blake3Hash;
 use hopnet_consensus::verify::verify_commit_certificate;
-use hopnet_consensus::{Height, HopNetContext, QuorumProfile};
+use hopnet_consensus::{Height, HopNetContext, MalachiteThresholds, QuorumProfile};
 use malachitebft_core_types::{
     CertificateError, CommitCertificate, CommitSignature, Context, NilOrVal, Round,
 };

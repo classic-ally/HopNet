@@ -6,7 +6,7 @@ use malachitebft_core_consensus::Params;
 use malachitebft_core_types::{Round, Validity, ValuePayload};
 
 use hopnet_consensus::codec::WireCommitCertificate;
-use hopnet_consensus::config::QuorumProfile;
+use hopnet_consensus::config::{MalachiteThresholds, QuorumProfile};
 use hopnet_consensus::context::{Address, Height, HopNetContext, Validator};
 use hopnet_consensus::store::SqliteStorage;
 use hopnet_consensus::traits::{Application, ApplyError, ValidationOrigin};
