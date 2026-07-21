@@ -589,6 +589,19 @@ module table_guard {
   var tick: int
   action init = tick' = 0
   action step = tick' = tick + 1
+
+  // Fault budget b(v) = |v| - quorum(profile, |v|), keyed off the ACTIVE
+  // quorum profile the mesh runs at this set size (RFC-CONSENSUS-002 AUTO
+  // seam: majority below V_BFT=7, BFT at and above). This replaces the
+  // former floor(|v|/3) placeholder, which matched neither the code's BFT
+  // budget nor the majority arm the mesh actually runs below the seam.
+  // Basis: MEMBER-COUNT variant (b sized off the storage member view |v|,
+  // the same view the reserve/spread use). The alternative VALIDATOR-SET
+  // variant (b sized off the committed validator count, which the three-
+  // timescale design lets diverge from |v|) is the open modelling item —
+  // it needs a validator-count parameter introduced into these lemmas.
+  pure def quorumOf(vn: int): int = if (vn >= 7) 2 * vn / 3 + 1 else vn / 2 + 1
+  pure def bBudget(vn: int): int = vn - quorumOf(vn)
   run tableMatchesGeneratorTest =
     init.expect(BAL_TABLE
       == buildTable(3, 6, Set(1, 2, 3, 4), Map(1 -> 3, 2 -> 2, 3 -> 1, 4 -> 1)))
@@ -645,15 +658,18 @@ module table_guard {
   // BURST lemma (derived watermark; RFC-STORAGE-001 "Watermark"): the
   // adversarial ceiling — no b(v)-subset's loss exceeds
   //   advMax = min(b,f)*c + max(0, b-f)*(c-1)
-  // for c = ceil(N/|v|), f = N - |v|*(c-1), b = floor(|v|/3). The
-  // implementation's reserve is min(ceil(b*N/|v|) + sigma, advMax)
-  // with b capped at B_max; B_max binds only above enumerable table
-  // sizes (v > 15), where the argument is closed-form over the
-  // spread-lemma-pinned load profile.
+  // for c = ceil(N/|v|), f = N - |v|*(c-1), b = bBudget(|v|) =
+  // |v| - quorum(profile, |v|) (the active-profile fault budget; see
+  // bBudget above). The implementation's reserve is
+  // min(ceil(b*N/|v|) + sigma, advMax) with b capped at B_max; B_max binds
+  // only above enumerable table sizes (v > 15), where the argument is
+  // closed-form over the spread-lemma-pinned load profile. The member-count
+  // basis is certified here (all lemmas pass at the active-profile b,
+  // including the sigma tail); the validator-set basis remains open.
   run burstLemmaScaledTest =
     init.expect(
       Set(1, 2, 3, 4).powerset().exclude(Set(Set())).forall(v => {
-        val b = v.size() / 3
+        val b = bBudget(v.size())
         val c = (6 + v.size() - 1) / v.size()
         val fcap = 6 - v.size() * (c - 1)
         val closedForm = b * (c - 1) + (if (b < fcap) b else fcap)
@@ -672,7 +688,7 @@ module table_guard {
     val table = buildTable(3, 30, 1.to(10), w10)
     init.expect(
       1.to(10).powerset().exclude(Set(Set())).filter(v => v.size() >= 2).forall(v => {
-        val b = v.size() / 3
+        val b = bBudget(v.size())
         val c = (30 + v.size() - 1) / v.size()
         val fcap = 30 - v.size() * (c - 1)
         val closedForm = b * (c - 1) + (if (b < fcap) b else fcap)
@@ -695,7 +711,7 @@ module table_guard {
     val table = buildTable(3, 30, 1.to(10), w10)
     init.expect(
       1.to(10).powerset().filter(v => v.size() >= 6).forall(v => {
-        val b = v.size() / 3
+        val b = bBudget(v.size())
         val c = (30 + v.size() - 1) / v.size()
         val fcap = 30 - v.size() * (c - 1)
         val expReserve = (b * 30 + v.size() - 1) / v.size() + 1

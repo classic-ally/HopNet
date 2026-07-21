@@ -9,6 +9,8 @@
 
 use std::collections::HashMap;
 
+use hopnet_common::quorum::QuorumProfile;
+
 /// Default decay tiers in seconds (RFC-STORAGE-001 Decay tiers table):
 /// 6 h always-on, 24 h daily driver, 72 h weekday-only, 7 d ceiling.
 /// Deliberately no 48 h tier — it would fire Sunday evening on every
@@ -243,21 +245,26 @@ impl Default for WatermarkParams {
 /// ```text
 /// W(v)       = K + reserve(v) + ε
 /// reserve(v) = min( ⌈B·N/v⌉ + σ ,  advMax(v) )
-/// B(v)       = min( v − quorum(v), B_max )
+/// B(v)       = min( v − quorum(profile, v), B_max )
 /// advMax(v)  = min(B,f)·c + max(0, B−f)·(c−1),  c = ⌈N/v⌉, f = N − v(c−1)
 /// ```
 ///
 /// Meaning: at maximum laziness, storage survives the worst burst the
-/// control plane survives, capped at B_max.
-pub fn watermark(v: usize) -> usize {
-    watermark_with(v, &WatermarkParams::default())
+/// control plane survives, capped at B_max. The fault budget `B(v)` is keyed
+/// off the ACTIVE quorum profile (RFC-CONSENSUS-002 AUTO seam) — a mesh
+/// running the majority profile (below `V_BFT`) tolerates more loss than BFT,
+/// so it must buffer the larger burst. Sizing `B` off BFT unconditionally
+/// under-provisions a majority mesh at small `v` (v∈{3,5,6}), where a burst
+/// consensus survives could drop live fragments below K = permanent loss.
+pub fn watermark(v: usize, profile: QuorumProfile) -> usize {
+    watermark_with(v, profile, &WatermarkParams::default())
 }
 
-pub fn watermark_with(v: usize, p: &WatermarkParams) -> usize {
+pub fn watermark_with(v: usize, profile: QuorumProfile, p: &WatermarkParams) -> usize {
     if v == 0 {
         return p.k + p.epsilon;
     }
-    let quorum = 2 * v / 3 + 1;
+    let quorum = profile.quorum(v as u64) as usize;
     let b = v.saturating_sub(quorum).min(p.b_max);
     let c = p.n.div_ceil(v);
     let f = p.n - v * (c - 1);
@@ -275,6 +282,84 @@ pub fn watermark_floor(v: usize) -> usize {
         return p.k;
     }
     p.k + p.n.div_ceil(v)
+}
+
+/// A node's already-read placement inputs, host-agnostic. The host reads the
+/// rows from its DB and maps them to this; [`derive_view`] is then pure.
+#[derive(Debug, Clone)]
+pub struct ViewNode {
+    pub node_id: i32,
+    pub pubkey: [u8; 32],
+    pub metrics: crate::placement::MetricsRow,
+}
+
+/// Derive the decay-tiered storage view from already-read rows — the pure
+/// kernel of the host's `storage_view()`. Sans-io: same inputs → same view on
+/// every node.
+///
+/// Crucially, the view is a function of the STORAGE inputs only — the node
+/// universe (`nodes`), their availability (`grid_per_node`), the mesh policy,
+/// and the active quorum `profile`. The consensus VALIDATOR set is not an
+/// input: membership is derived from availability, not from who validates
+/// (RFC-STORAGE-001 three-timescale design / RFC-CONSENSUS-002 §"Hysteresis":
+/// "validator churn moves zero bytes"). `profile` is the sole consensus-
+/// derived input and it touches only the watermark's fault budget, never the
+/// member set or placement.
+pub fn derive_view(
+    height: i32,
+    nodes: Vec<ViewNode>,
+    grid_per_node: &HashMap<i32, Vec<(i64, bool)>>,
+    grid_step_secs: i64,
+    policy: &StoragePolicy,
+    profile: QuorumProfile,
+) -> crate::traits::StorageView {
+    let cold_tier = policy.decay_tiers[policy.decay_tiers.len().saturating_sub(2)];
+    let mut tiers = HashMap::new();
+    let mut absence = HashMap::new();
+    for (node_id, samples) in grid_per_node {
+        let spans = offline_spans(samples, grid_step_secs);
+        tiers.insert(
+            *node_id,
+            derive_tier(&spans, &policy.decay_tiers, TIER_MIN_HISTORY),
+        );
+        absence.insert(*node_id, current_absence(samples, grid_step_secs));
+    }
+
+    // Node universe = every registered node (unmeasured nodes appear with
+    // defaults: absence 0, cold tier).
+    let node_ids: Vec<i32> = nodes.iter().map(|n| n.node_id).collect();
+    let member_ids = storage_members(&node_ids, &absence, &tiers, cold_tier);
+    let online: Vec<i32> = node_ids
+        .iter()
+        .copied()
+        .filter(|n| absence.get(n).copied().unwrap_or(0) == 0)
+        .collect();
+    let member_set: std::collections::HashSet<i32> = member_ids.iter().copied().collect();
+    let watermark = watermark_with(member_ids.len(), profile, &policy.watermark_params());
+
+    let mut members = Vec::with_capacity(member_ids.len());
+    let mut weights = HashMap::new();
+    let mut rows = Vec::with_capacity(nodes.len());
+    for n in nodes {
+        weights.insert(n.node_id, crate::placement::quantized_weight(&n.metrics));
+        if member_set.contains(&n.node_id) {
+            members.push(hopnet_comms::PeerRef {
+                node_id: n.node_id,
+                pubkey: n.pubkey,
+            });
+        }
+        rows.push(n.metrics);
+    }
+
+    crate::traits::StorageView {
+        height,
+        members,
+        tiers,
+        weights,
+        watermark,
+        online,
+        metrics: rows,
+    }
 }
 
 #[cfg(test)]
@@ -467,34 +552,50 @@ mod tests {
         assert_eq!(members, vec![2, 3]);
     }
 
-    // Should: reproduce the hand-computed W(v) values from the
-    // RFC-STORAGE-001 derivation at the real K=10/N=30 geometry,
-    // including the non-monotone band (ceiling-load asymmetry) and the
-    // B=0 degenerate at v=3.
+    // Should: reproduce the hand-computed W(v) values at the real
+    // K=10/N=30 geometry under the default AUTO profile — majority below
+    // V_BFT (so v∈{3,5,6} carry a real reserve), BFT at/above the seam
+    // (v≥7 unchanged from the old BFT-only formula).
+    // Should not: let a pinned-BFT mesh silently under-buffer at small v —
+    // the last assertion pins the gap the active-profile fix closes.
     // Impact: W is the safety/laziness split; a drifted formula silently
     // converts margin into risk at every mesh size at once.
     #[test]
     fn watermark_spot_values() {
-        assert_eq!(watermark(3), 10); // quorum=3, B=0: no reserve buys anything
-        assert_eq!(watermark(5), 16);
-        assert_eq!(watermark(10), 19); // spec session table value
-        assert_eq!(watermark(15), 18);
-        assert_eq!(watermark(30), 15);
+        use QuorumProfile::{Auto, Bft};
+        // AUTO / majority arm below the seam — B(v) = v − (v/2+1).
+        assert_eq!(watermark(3, Auto), 20); // majority B=1, reserve caps at advMax=10
+        assert_eq!(watermark(5, Auto), 22); // majority B=2
+        assert_eq!(watermark(6, Auto), 20); // majority B=2
+        // AUTO / BFT arm at and above the seam — identical to the old formula.
+        assert_eq!(watermark(10, Auto), 19); // spec session table value
+        assert_eq!(watermark(15, Auto), 18);
+        assert_eq!(watermark(30, Auto), 15);
+        // Pinned BFT under-buffers below the seam — the durability bug the
+        // active-profile fix closes (16 < AUTO's 22 at v=5).
+        assert_eq!(watermark(5, Bft), 16);
+        assert_eq!(watermark(3, Bft), 10); // BFT B=0: no reserve at all
     }
 
     // Should: keep the operating watermark at or above the durability
-    // cliff wherever consensus tolerates at least one fault (v ≥ 4), so
-    // urgency always fires while the control plane is still live.
-    // Should not: extend that claim to v=3 — B(3)=0, the cliff sits in
-    // consensus-already-dead territory and no watermark can insure it.
+    // cliff wherever the ACTIVE profile tolerates at least one fault
+    // (B(v) ≥ 1), so urgency always fires while the control plane is still
+    // live. Under AUTO/majority that boundary is v ≥ 3 (majority tolerates
+    // one loss at v=3), not v ≥ 4 — the old BFT-only claim understated it.
     // Impact: a W below the floor at fault-tolerant sizes would mark
     // chunks lazy while one member from unreconstructable.
     #[test]
     fn watermark_at_or_above_floor_when_fault_tolerant() {
-        for v in 4..=30 {
-            let w = watermark(v);
-            let floor = watermark_floor(v);
-            assert!(w >= floor, "v={v}: W={w} < floor={floor}");
+        for profile in [QuorumProfile::Auto, QuorumProfile::Bft, QuorumProfile::Majority] {
+            for v in 1..=30usize {
+                let tolerant = v.saturating_sub(profile.quorum(v as u64) as usize) >= 1;
+                if !tolerant {
+                    continue;
+                }
+                let w = watermark(v, profile);
+                let floor = watermark_floor(v);
+                assert!(w >= floor, "{profile:?} v={v}: W={w} < floor={floor}");
+            }
         }
     }
 }

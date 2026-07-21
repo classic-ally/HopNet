@@ -141,6 +141,18 @@ impl StateReader for SubstrateHost {
             .map_err(|e| StorageError::Host(format!("pool checkout: {e}")))?;
         let height = crate::db::consensus::get_current_consensus_height(&conn)
             .map_err(|e| StorageError::Host(format!("current height: {e:?}")))?;
+        // Active quorum profile (consensus_meta) — sizes the watermark fault
+        // budget so a majority-profile mesh buffers the burst consensus
+        // actually survives. Defaults to AUTO, matching the mesh default.
+        let profile = hopnet_consensus::store::meta_get(
+            &conn,
+            hopnet_consensus::store::META_QUORUM_PROFILE,
+        )
+        .ok()
+        .flatten()
+        .and_then(|b| String::from_utf8(b).ok())
+        .and_then(|s| hopnet_consensus::QuorumProfile::parse(&s))
+        .unwrap_or(hopnet_consensus::QuorumProfile::Auto);
         let policy = hopnet_storage::store::read_policy(&conn)
             .map_err(|e| StorageError::Host(format!("storage policy: {e}")))?;
         let node_metrics = crate::db::metrics::get_all_node_metrics_with_conn(&conn, height)
@@ -154,63 +166,28 @@ impl StateReader for SubstrateHost {
         .map_err(|e| StorageError::Host(format!("availability history: {e:?}")))?;
         drop(conn);
 
-        let cold_tier = policy.decay_tiers[policy.decay_tiers.len().saturating_sub(2)];
-        let mut tiers = std::collections::HashMap::new();
-        let mut absence = std::collections::HashMap::new();
-        for (node_id, samples) in &grid.per_node {
-            let spans = membership::offline_spans(samples, grid.step_secs);
-            tiers.insert(
-                *node_id,
-                membership::derive_tier(
-                    &spans,
-                    &policy.decay_tiers,
-                    membership::TIER_MIN_HISTORY,
-                ),
-            );
-            absence.insert(
-                *node_id,
-                membership::current_absence(samples, grid.step_secs),
-            );
-        }
-
-        // Node universe = every registered node (the metrics scoring query
-        // is FROM nodes, so unmeasured nodes appear with defaults). Nodes
-        // with no availability grid have absence 0 (presence bias) and the
-        // cold tier.
-        let node_ids: Vec<i32> = node_metrics.iter().map(|m| m.node_id).collect();
-        let member_ids = membership::storage_members(&node_ids, &absence, &tiers, cold_tier);
-        let online: Vec<i32> = node_ids
-            .iter()
-            .copied()
-            .filter(|n| absence.get(n).copied().unwrap_or(0) == 0)
+        // Map the DB rows to the host-agnostic kernel input, then derive the
+        // view with a pure function (membership::derive_view) — same rows
+        // yield the same view on every node. The validator set is NOT read
+        // here: storage membership derives from availability, not from who
+        // validates (RFC-STORAGE-001 three-timescale design).
+        let nodes: Vec<membership::ViewNode> = node_metrics
+            .into_iter()
+            .map(|m| membership::ViewNode {
+                node_id: m.node_id,
+                pubkey: m.pubkey.0.to_bytes(),
+                metrics: m.into(),
+            })
             .collect();
-        let member_set: std::collections::HashSet<i32> = member_ids.iter().copied().collect();
-        let watermark =
-            membership::watermark_with(member_ids.len(), &policy.watermark_params());
 
-        let mut members = Vec::with_capacity(member_ids.len());
-        let mut weights = std::collections::HashMap::new();
-        let mut rows = Vec::with_capacity(node_metrics.len());
-        for m in node_metrics {
-            let node_id = m.node_id;
-            let pubkey = m.pubkey.0.to_bytes();
-            let row: hopnet_storage::placement::MetricsRow = m.into();
-            weights.insert(node_id, hopnet_storage::placement::quantized_weight(&row));
-            if member_set.contains(&node_id) {
-                members.push(PeerRef { node_id, pubkey });
-            }
-            rows.push(row);
-        }
-
-        Ok(StorageView {
+        Ok(membership::derive_view(
             height,
-            members,
-            tiers,
-            weights,
-            watermark,
-            online,
-            metrics: rows,
-        })
+            nodes,
+            &grid.per_node,
+            grid.step_secs,
+            &policy,
+            profile,
+        ))
     }
 
     fn fragment_sources(

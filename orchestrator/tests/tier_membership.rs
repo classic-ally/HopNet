@@ -178,9 +178,15 @@ impl TestScenario for TierMembership {
             },
         );
 
-        // 6. Derived watermark: at v=3 with K=10, B(3)=0 so W=K=10.
+        // 6. Derived watermark. The mesh runs the AUTO profile (the genesis
+        // default with no HOPNET_QUORUM_PROFILE), which is majority below
+        // V_BFT=7. At v=3 majority tolerates one fault, so B(3)=1 and the
+        // reserve caps at advMax=10 → W=K+10=20 (K=10, N=30). Keying the
+        // watermark off the ACTIVE profile is the durability fix; under the
+        // old hard-coded BFT formula this was W=10 (B(3)=0), which
+        // under-buffered a majority mesh.
         let w_ok = if views[0].members.len() == 3 {
-            views[0].watermark == 10
+            views[0].watermark == 20
         } else {
             views[0].watermark >= 10
         };

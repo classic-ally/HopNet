@@ -206,10 +206,23 @@ W is **derived from the current member view**, not a constant:
 W(v) = K + reserve(v) + ε(μ)
 
 reserve(v) = min( ⌈B(v)·N/v⌉ + σ ,  advMax(v) )
-B(v)       = min( v − quorum(v), B_max )        — burst design target
+B(v)       = min( v − quorum(profile, v), B_max )  — burst design target
 advMax(v)  = min(B,f)·c + max(0, B−f)·(c−1)     — adversarial ceiling
   c = ⌈N/v⌉,  f = N − v·(c−1)                   — balanced load profile
 ```
+
+`quorum(profile, v)` is the SAME function the consensus engine uses
+(`hopnet_common::quorum::QuorumProfile::quorum`), keyed off the mesh's
+**active** profile — majority below `V_BFT`, BFT at and above, per the
+RFC-CONSENSUS-002 AUTO seam. Keying `B` off BFT unconditionally
+under-provisions a majority-profile mesh at small `v` (v∈{3,5,6}),
+where consensus survives a burst that would drop live fragments below
+K = permanent loss; the majority arm is the conservative watermark arm
+(larger fault budget → larger reserve). Basis: `v` is the storage
+member count — the **member-count** variant, certified by the burst /
+σ-tail lemmas at the active-profile `b` (`storage_policy.qnt`
+`bBudget`). The validator-set-count variant is the recorded open
+alternative.
 
 Meaning: at maximum laziness, storage survives a burst of B(v)
 simultaneously lost members. B(v) tracks the control plane's own
@@ -277,7 +290,7 @@ All in `spec/storage_policy.qnt`; four legs:
 | Apalache `verify`, depth 6 | complete over interleavings of fault budget + eviction/GC/repair | INV-DURABLE, INV-SPREAD: no violation |
 | scripted witnesses | 18–20-tick schedules, 10k traces each | heal-after-depart; zero-cost sleep/wake; exact repair-cost accounting; no-repair and pull-only counterexamples |
 | random simulation | real parameters, 8–10k traces × 60 steps | no violation |
-| complete enumeration | all views, both scales | BRIDGE (all ≥2/3-online subsets); BURST (all ⌊v/3⌋-subsets vs closed form); SPREAD max+min; verify-table drift guard |
+| complete enumeration | all views, both scales | BRIDGE (all ≥2/3-online subsets); BURST (all b(v)-subsets vs closed form, b = active-profile fault budget); SPREAD max+min; verify-table drift guard |
 
 Limits: the model checker is depth-bounded; long-horizon evidence is
 witness/simulation-grade; configs are small (small-scope argument);

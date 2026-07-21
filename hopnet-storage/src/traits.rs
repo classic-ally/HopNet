@@ -16,6 +16,7 @@ use crate::placement::{MetricsRow, PlacementNode};
 use crate::store::DistributableBlob;
 use crate::types::BlobId;
 use hopnet_common::Blake3Hash;
+use hopnet_common::quorum::QuorumProfile;
 use std::future::Future;
 
 /// A peer as the substrate sees it — the comms vocabulary type (RFC-017
@@ -123,8 +124,10 @@ pub trait StateReader: Send + Sync {
 
     /// The decay-tiered membership view. Default falls back to the raw
     /// validator set with no tier gating (most conservative membership —
-    /// nobody decayed) and default-policy watermark; hosts override with
-    /// the metrics-derived view.
+    /// nobody decayed) and a default-policy watermark sized off the Majority
+    /// profile (the larger-reserve arm — conservative, never under-buffers,
+    /// since this fallback has no committed profile to consult); hosts
+    /// override with the metrics-derived, active-profile view.
     fn storage_view(&self) -> Result<StorageView, StorageError> {
         let inputs = self.placement_inputs()?;
         let weights = inputs
@@ -134,7 +137,10 @@ pub trait StateReader: Send + Sync {
             .collect();
         Ok(StorageView {
             height: inputs.height,
-            watermark: crate::membership::watermark(inputs.validators.len()),
+            watermark: crate::membership::watermark(
+                inputs.validators.len(),
+                QuorumProfile::Majority,
+            ),
             tiers: std::collections::HashMap::new(),
             weights,
             online: inputs.validators.iter().map(|p| p.node_id).collect(),

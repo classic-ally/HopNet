@@ -116,6 +116,16 @@ apply functions inside consensus handlers.
       repair scan, migration pull, eviction, weekly rolling scrub).
       Orchestrator: tier-membership, eviction-under-pressure,
       re-encode-after-departure (kill → decay → regenerate → download)
+- [x] Consensus↔storage quorum single-sourced + active-profile watermark
+      (2026-07-21): quorum math extracted to `hopnet_common::quorum`
+      (one source of truth for both the consensus engine and the storage
+      durability watermark — no duplication); the watermark fault budget
+      `B(v) = v − quorum(profile, v)` now keys off the mesh's ACTIVE
+      quorum profile (was hard-coded BFT, which under-buffered a
+      majority/AUTO mesh at small v∈{3,5,6} — a real durability gap). The
+      member-count basis is certified by the `storage_policy.qnt` burst /
+      σ-tail lemmas; a sans-io `consensus_contract` test locks the parity,
+      the seam, and the "consensus churn moves zero bytes" decoupling.
 
 Reed-Solomon encoded file storage with encryption, chunked encoding, and fragment management.
 
