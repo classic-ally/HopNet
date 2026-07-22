@@ -18,7 +18,7 @@ use crate::tests::{Check, NodeInfo, TestResult, TestScenario, print_and_add_chec
 /// default BFT quorum(3) = 3 the mesh would already sit at the Cliff.
 pub struct EvidenceObserve;
 
-async fn fetch_evidence(client: &Client, node: &NodeInfo) -> Result<serde_json::Value> {
+pub(crate) async fn fetch_evidence(client: &Client, node: &NodeInfo) -> Result<serde_json::Value> {
     let url = format!(
         "http://{}:{}/consensus/evidence",
         node.ip_address, node.port
@@ -33,7 +33,7 @@ async fn fetch_evidence(client: &Client, node: &NodeInfo) -> Result<serde_json::
     Ok(resp.json().await?)
 }
 
-fn node_entry<'a>(doc: &'a serde_json::Value, node_id: i64) -> Option<&'a serde_json::Value> {
+pub(crate) fn node_entry<'a>(doc: &'a serde_json::Value, node_id: i64) -> Option<&'a serde_json::Value> {
     doc["nodes"]
         .as_array()?
         .iter()

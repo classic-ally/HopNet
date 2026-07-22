@@ -17,7 +17,7 @@ use crate::tests::{Check, NodeInfo, TestResult, TestScenario, get_max_view, prin
 /// the seating policy.
 pub struct MeshGrowth;
 
-async fn rebuild_nodes(
+pub(crate) async fn rebuild_nodes(
     docker: &Docker,
     mesh_id: u32,
 ) -> Result<Vec<NodeInfo>> {

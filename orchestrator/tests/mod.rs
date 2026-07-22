@@ -16,13 +16,15 @@ mod db_pragma_bench;
 mod device_tokens;
 mod eviction;
 mod documentprovider_write;
+mod evidence_voteout;
 mod file_upload;
 mod fileprovider_device_token;
 mod fragment_distribution;
-mod evidence_observe;
+pub(crate) mod evidence_observe;
 mod auto_seam;
-mod mesh_growth;
+pub(crate) mod mesh_growth;
 pub(crate) mod graceful_leave;
+mod three_timescales;
 mod vote_out;
 mod fragment_health_check;
 mod import;
@@ -39,7 +41,7 @@ mod post_files_mixed;
 mod post_files_shape;
 mod range_download;
 mod recents;
-mod reencode;
+pub(crate) mod reencode;
 mod sharing;
 mod takeout;
 mod tier_membership;
@@ -154,6 +156,26 @@ pub fn mesh_creation_env(test_name: &str) -> Vec<(&'static str, &'static str)> {
             // AUTO (default) is majority at v=3: 2 of 3 alive keeps
             // committing metrics/self-check txs.
         ],
+        // Both planes on one kill: consensus knobs match vote-out (fast
+        // vote-out); storage cold tier = 90s (second-largest) — larger than
+        // the vote-out budget, so the decoupling snapshot is race-immune even
+        // if a background metrics round starts the absence clock at kill time.
+        "three-timescales" => vec![
+            (
+                "HOPNET_GENESIS_CONSENSUS_POLICY",
+                "probe_base=2;grace=1;s_full=6;p_prove=6",
+            ),
+            (
+                "HOPNET_GENESIS_STORAGE_POLICY",
+                "decay_tiers=15,30,90,180;availability_step_secs=5",
+            ),
+        ],
+        // Wider probe base (3 vs the sibling 2) widens the observation
+        // window between first-visible compression and removal to ~4-5s.
+        "evidence-drives-voteout" => vec![(
+            "HOPNET_GENESIS_CONSENSUS_POLICY",
+            "probe_base=3;grace=1;s_full=6;p_prove=6",
+        )],
         _ => vec![],
     }
 }
@@ -166,8 +188,9 @@ pub fn preferred_auto_nodes(test_name: &str) -> Option<u32> {
         // 4-node BFT: forms via a batch of 3 (1->4); quorum(4)=3, so
         // killing 2 loses quorum.
         "consensus-bft-quorum-loss" => Some(4),
-        // 7 nodes so AUTO crosses the V_bft seam (v=7 = BFT region).
-        "auto-seam" => Some(7),
+        // 6 nodes: forms in the majority region (seats 5 + pooled spare, or
+        // 6); the test adds the 7th itself to watch the seam get crossed.
+        "auto-seam" => Some(6),
         _ => None,
     }
 }
@@ -270,6 +293,16 @@ pub async fn run_test_by_name(
         }
         "mesh-growth" => {
             mesh_growth::MeshGrowth.run(mesh_id, nodes, flags).await
+        }
+        "three-timescales" => {
+            three_timescales::ThreeTimescales
+                .run(mesh_id, nodes, flags)
+                .await
+        }
+        "evidence-drives-voteout" => {
+            evidence_voteout::EvidenceDrivesVoteout
+                .run(mesh_id, nodes, flags)
+                .await
         }
         "vote-out-after-kill" => {
             vote_out::VoteOutAfterKill
@@ -429,6 +462,8 @@ pub fn list_test_names() -> Vec<&'static str> {
         "vote-out-after-kill",
         "mesh-growth",
         "auto-seam",
+        "three-timescales",
+        "evidence-drives-voteout",
         "device-token-consistency",
         "documentprovider-write-consistency",
         "iroh-ping",

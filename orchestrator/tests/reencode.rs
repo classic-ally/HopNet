@@ -26,7 +26,7 @@ use crate::tests::{Check, TestResult, TestScenario, print_and_add_check};
 /// the genesis policy, so departure is seconds-scale.
 pub struct ReencodeAfterDeparture;
 
-async fn trigger_metrics(client: &Client, node: &NodeInfo) {
+pub(crate) async fn trigger_metrics(client: &Client, node: &NodeInfo) {
     let url = format!(
         "http://{}:{}/metrics/trigger",
         node.ip_address, node.port
@@ -42,7 +42,7 @@ async fn trigger_metrics(client: &Client, node: &NodeInfo) {
         .await;
 }
 
-async fn trigger_tick(client: &Client, node: &NodeInfo) {
+pub(crate) async fn trigger_tick(client: &Client, node: &NodeInfo) {
     let url = format!(
         "http://{}:{}/maintenance/policy-tick",
         node.ip_address, node.port
@@ -55,7 +55,7 @@ async fn trigger_tick(client: &Client, node: &NodeInfo) {
         .await;
 }
 
-async fn view_members(client: &Client, node: &NodeInfo) -> Result<Vec<i32>> {
+pub(crate) async fn view_members(client: &Client, node: &NodeInfo) -> Result<Vec<i32>> {
     #[derive(serde::Deserialize)]
     struct View {
         members: Vec<i32>,
