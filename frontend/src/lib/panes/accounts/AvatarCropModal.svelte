@@ -239,7 +239,8 @@
             const blob = await new Promise<Blob>((resolve, reject) => {
                 offscreen.toBlob(
                     (b) => b ? resolve(b) : reject(new Error('Canvas export failed')),
-                    'image/png'
+                    'image/jpeg',
+                    0.85
                 );
             });
 
