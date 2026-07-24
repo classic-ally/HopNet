@@ -9,6 +9,7 @@ pub mod quorum;
 pub mod setup;
 pub mod shares;
 pub mod users;
+pub mod views;
 
 // Database implementations (only when database feature is enabled)
 #[cfg(feature = "database")]

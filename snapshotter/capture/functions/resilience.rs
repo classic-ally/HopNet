@@ -12,12 +12,28 @@ pub fn capture(
 ) {
     use hopnet::db::resilience;
 
-    results.insert("db::resilience::compute_network_resilience_stats".into(), {
-        match resilience::compute_network_resilience_stats(pool.get()) {
-            Ok(mut stats) => {
-                stats.computation_time_ms = 0;
-                FunctionResult::Ok {
-                    value: serde_json::to_value(&stats).unwrap(),
+    // Replaces the old compute_network_resilience_stats capture. Member ids
+    // come from the storage view rather than a metrics.available subquery, so
+    // this exercises the durable predicate. Still deterministic given the DB:
+    // the availability grid is anchored to the newest replicated
+    // metrics.start_time, never to wall clock.
+    //
+    // Deliberately NOT capturing unattested_age_buckets — its cutoffs are
+    // derived from Utc::now(), so it would diff on every run and tell you
+    // nothing about a commit.
+    results.insert("db::resilience::resilience_level_rows".into(), {
+        match pool.get() {
+            Ok(conn) => {
+                let members = hopnet::storage_host::substrate_host::storage_view_with_conn(&conn)
+                    .map(|v| v.members.iter().map(|p| p.node_id).collect::<Vec<_>>())
+                    .unwrap_or_default();
+                match resilience::resilience_level_rows(&conn, &members) {
+                    Ok(levels) => FunctionResult::Ok {
+                        value: serde_json::to_value(&levels).unwrap(),
+                    },
+                    Err(e) => FunctionResult::Error {
+                        error_variant: format!("{:?}", e),
+                    },
                 }
             }
             Err(e) => FunctionResult::Error {

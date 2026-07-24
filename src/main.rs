@@ -508,10 +508,6 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                     "/diagnostics/file-fragments",
                     get(storage_host::routes::get_file_fragment_distribution),
                 )
-                .route(
-                    "/diagnostics/network-resilience",
-                    get(storage_host::routes::get_network_resilience_stats),
-                )
                 .route("/debug/iroh-ping", get(net::routes::debug_iroh_ping))
                 .route("/debug/db-stats", get(consensus::routes::get_db_stats))
                 .route("/storage/view", get(storage_host::routes::get_storage_view))
@@ -527,6 +523,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .nest("/takeout", hopnet_takeout::routes::router(takeout_state.clone()))
                 .nest("/admin", admin::routes::admin_routes())
+                .nest("/views", views::routes::router())
                 .route("/logout", post(auth::sign_out))
                 .layer(middleware::from_fn_with_state(
                     app_state.clone(),

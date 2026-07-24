@@ -129,7 +129,6 @@ impl StateReader for SubstrateHost {
     }
 
     fn storage_view(&self) -> Result<StorageView, StorageError> {
-        use hopnet_storage::membership;
         // One scoped checkout: height, mesh policy, node universe + weights
         // (via the anchored metrics scoring), and availability history all
         // read against one consistent state — the derivation below is pure,
@@ -139,56 +138,9 @@ impl StateReader for SubstrateHost {
             .db_pool
             .get()
             .map_err(|e| StorageError::Host(format!("pool checkout: {e}")))?;
-        let height = crate::db::consensus::get_current_consensus_height(&conn)
-            .map_err(|e| StorageError::Host(format!("current height: {e:?}")))?;
-        // Active quorum profile (consensus_meta) — sizes the watermark fault
-        // budget so a majority-profile mesh buffers the burst consensus
-        // actually survives. Defaults to AUTO, matching the mesh default.
-        let profile = hopnet_consensus::store::meta_get(
-            &conn,
-            hopnet_consensus::store::META_QUORUM_PROFILE,
-        )
-        .ok()
-        .flatten()
-        .and_then(|b| String::from_utf8(b).ok())
-        .and_then(|s| hopnet_consensus::QuorumProfile::parse(&s))
-        .unwrap_or(hopnet_consensus::QuorumProfile::Auto);
-        let policy = hopnet_storage::store::read_policy(&conn)
-            .map_err(|e| StorageError::Host(format!("storage policy: {e}")))?;
-        let node_metrics = crate::db::metrics::get_all_node_metrics_with_conn(&conn, height)
-            .map_err(|e| StorageError::Host(format!("node metrics: {e:?}")))?;
-        let grid = crate::db::metrics::get_availability_history_with_conn(
-            &conn,
-            height,
-            4320, // 30 days of buckets at the default step
-            policy.availability_step_secs,
-        )
-        .map_err(|e| StorageError::Host(format!("availability history: {e:?}")))?;
-        drop(conn);
-
-        // Map the DB rows to the host-agnostic kernel input, then derive the
-        // view with a pure function (membership::derive_view) — same rows
-        // yield the same view on every node. The validator set is NOT read
-        // here: storage membership derives from availability, not from who
-        // validates (RFC-STORAGE-001 three-timescale design).
-        let nodes: Vec<membership::ViewNode> = node_metrics
-            .into_iter()
-            .map(|m| membership::ViewNode {
-                node_id: m.node_id,
-                pubkey: m.pubkey.0.to_bytes(),
-                metrics: m.into(),
-            })
-            .collect();
-
-        Ok(membership::derive_view(
-            height,
-            nodes,
-            &grid.per_node,
-            grid.step_secs,
-            &policy,
-            profile,
-        ))
+        storage_view_with_conn(&conn)
     }
+
 
     fn fragment_sources(
         &self,
@@ -307,4 +259,63 @@ impl LocalStateSink for SubstrateHost {
             tracing::warn!("Local state queue full, dropping mark-remote batch: {}", e);
         }
     }
+}
+
+/// Derive the storage member view from an already-checked-out connection.
+///
+/// Extracted verbatim from `SubstrateHost::storage_view` so callers holding a
+/// pool but no `AppState` — the snapshotter, and the read-only diagnostics
+/// views — can reach the same derivation. This feeds `select_nodes_for_blob`,
+/// so it is a behaviour-preserving move and nothing more.
+pub fn storage_view_with_conn(
+    conn: &rusqlite::Connection,
+) -> Result<StorageView, StorageError> {
+    use hopnet_storage::membership;
+
+    let height = crate::db::consensus::get_current_consensus_height(conn)
+        .map_err(|e| StorageError::Host(format!("current height: {e:?}")))?;
+    // Active quorum profile (consensus_meta) — sizes the watermark fault
+    // budget so a majority-profile mesh buffers the burst consensus
+    // actually survives. Defaults to AUTO, matching the mesh default.
+    let profile =
+        hopnet_consensus::store::meta_get(conn, hopnet_consensus::store::META_QUORUM_PROFILE)
+            .ok()
+            .flatten()
+            .and_then(|b| String::from_utf8(b).ok())
+            .and_then(|s| hopnet_consensus::QuorumProfile::parse(&s))
+            .unwrap_or(hopnet_consensus::QuorumProfile::Auto);
+    let policy = hopnet_storage::store::read_policy(conn)
+        .map_err(|e| StorageError::Host(format!("storage policy: {e}")))?;
+    let node_metrics = crate::db::metrics::get_all_node_metrics_with_conn(conn, height)
+        .map_err(|e| StorageError::Host(format!("node metrics: {e:?}")))?;
+    let grid = crate::db::metrics::get_availability_history_with_conn(
+        conn,
+        height,
+        4320, // 30 days of buckets at the default step
+        policy.availability_step_secs,
+    )
+    .map_err(|e| StorageError::Host(format!("availability history: {e:?}")))?;
+
+    // Map the DB rows to the host-agnostic kernel input, then derive the
+    // view with a pure function (membership::derive_view) — same rows
+    // yield the same view on every node. The validator set is NOT read
+    // here: storage membership derives from availability, not from who
+    // validates (RFC-STORAGE-001 three-timescale design).
+    let nodes: Vec<membership::ViewNode> = node_metrics
+        .into_iter()
+        .map(|m| membership::ViewNode {
+            node_id: m.node_id,
+            pubkey: m.pubkey.0.to_bytes(),
+            metrics: m.into(),
+        })
+        .collect();
+
+    Ok(membership::derive_view(
+        height,
+        nodes,
+        &grid.per_node,
+        grid.step_secs,
+        &policy,
+        profile,
+    ))
 }

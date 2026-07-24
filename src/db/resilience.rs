@@ -3,244 +3,215 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::params;
 
 use crate::db::DatabaseError;
-use hopnet_common::db::{
-    FaultToleranceCurvePoint, NetworkResilienceStats, NodeStorageBaseline, ResilienceLevel,
-};
+use hopnet_common::db::{CustomUUID, FaultToleranceCurvePoint, NodeStorageBaseline};
 
-/// Compute network-wide file resilience statistics using OLAP-optimized query
-/// Returns distribution of files across fault tolerance levels
-pub fn compute_network_resilience_stats(
-    db_connection: Result<PooledConnection<SqliteConnectionManager>, r2d2::Error>,
-) -> Result<NetworkResilienceStats, DatabaseError> {
+/// Raw user bytes sitting at each distinct worst-case tolerance level.
+///
+/// `-2` is unknown (no attestation anywhere) and `-1` unrecoverable (fewer than
+/// K classes survive on member disks). Levels are UNCAPPED — the old
+/// `>= 3 THEN 3` clamp made everything above 3 unrepresentable, which destroyed
+/// exactly the range the ideal curve is plotted over.
+///
+/// `member_ids` is the current storage member view. There is no membership
+/// table — `derive_view` is a pure Rust function — so ids are bound as
+/// parameters, following the placeholder pattern in `db::inventory`. Filtering
+/// on membership rather than on `metrics.available` is what makes this the
+/// `durable` predicate the storage spec names, and it drops the dependency on
+/// the ~10-minute metrics cron.
+pub fn resilience_level_rows(
+    conn: &PooledConnection<SqliteConnectionManager>,
+    member_ids: &[i32],
+) -> Result<Vec<(i32, f64)>, DatabaseError> {
     let start_time = std::time::Instant::now();
 
-    match db_connection {
-        Ok(conn) => {
-            let query = r#"
-                WITH
-                -- Step 1: Get original_chunks count for each data block from fragment_hashes
-                data_block_original_chunks AS (
-                    SELECT
-                        data_block_id,
-                        COUNT(*) as original_chunks
-                    FROM fragment_hashes
-                    WHERE chunk_type = 0
-                    GROUP BY data_block_id
-                ),
+    // An empty member set is legitimate (fresh mesh): `IN (NULL)` matches
+    // nothing, so every attested block correctly falls to -1.
+    let placeholders = if member_ids.is_empty() {
+        "NULL".to_string()
+    } else {
+        member_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ")
+    };
 
-                -- Step 2: Vectorized fragment distribution (columnar friendly)
-                fragment_node_counts AS (
-                    SELECT
-                        fh.data_block_id,
-                        fi.node_id,
-                        COUNT(*) as fragments_on_node,
-                        dbo.original_chunks
-                    FROM fragment_hashes fh
-                    JOIN data_block_original_chunks dbo ON fh.data_block_id = dbo.data_block_id
-                    LEFT JOIN fragment_inventory fi ON fh.fragment_hash = fi.fragment_hash
-                        AND (
-                            -- Include nodes that are either available in metrics OR have no metrics data
-                            fi.node_id IN (
-                                SELECT DISTINCT from_node FROM metrics
-                                WHERE available = true
-                                AND height IN (
-                                    SELECT MAX(height)
-                                    FROM metrics m2
-                                    WHERE m2.from_node = metrics.from_node
-                                )
-                            )
-                            OR NOT EXISTS (SELECT 1 FROM metrics WHERE from_node = fi.node_id)
-                        )
-                    WHERE fi.node_id IS NOT NULL  -- Only include rows with valid inventory data
-                    GROUP BY fh.data_block_id, fi.node_id, dbo.original_chunks
-                ),
+    // Anchored on data_blocks, not fragment_hashes, so a block with no fragment
+    // rows at all is still counted rather than silently dropped.
+    //
+    // The three-way split below fixes a real bug in the previous query: it put
+    // the liveness predicate in a LEFT JOIN ... ON followed by
+    // `WHERE fi.node_id IS NOT NULL`, so a block whose inventory rows were ALL
+    // on excluded nodes vanished from the counts entirely — and the
+    // no-attestation CTE could not catch it either, since it joined unfiltered
+    // and required NULL. Harmless while the filter was availability-based;
+    // serious once it is membership-based, because departed nodes' inventory
+    // rows persist indefinitely (pruning is deferred), so blocks stranded on
+    // departed nodes would disappear instead of reporting as lost.
+    let query = format!(
+        r#"
+        WITH
+        block_k AS (
+            SELECT data_block_id, COUNT(*) AS k
+            FROM fragment_hashes
+            WHERE chunk_type = 0
+            GROUP BY data_block_id
+        ),
 
-                -- Step 3: Window function ranking (vectorized, no arrays needed)
-                ranked_nodes AS (
-                    SELECT
-                        data_block_id,
-                        original_chunks,
-                        fragments_on_node,
-                        ROW_NUMBER() OVER (PARTITION BY data_block_id ORDER BY fragments_on_node DESC) as node_rank,
-                        SUM(fragments_on_node) OVER (PARTITION BY data_block_id) as total_fragments,
-                        -- Running sum of largest nodes (for fault tolerance calc)
-                        SUM(fragments_on_node) OVER (
-                            PARTITION BY data_block_id
-                            ORDER BY fragments_on_node DESC
-                            ROWS UNBOUNDED PRECEDING
-                        ) as cumulative_largest_fragments
-                    FROM fragment_node_counts
-                ),
+        -- Attested anywhere, member or not: separates "never placed" (-2)
+        -- from "placed, but nothing survives on a member" (-1).
+        block_attested AS (
+            SELECT DISTINCT fh.data_block_id
+            FROM fragment_hashes fh
+            JOIN fragment_inventory fi ON fi.fragment_hash = fh.fragment_hash
+        ),
 
-                -- Step 4: Vectorized fault tolerance calculation
-                file_fault_tolerance AS (
-                    SELECT
-                        data_block_id,
-                        original_chunks,
-                        total_fragments,
-                        -- Calculate how many nodes can fail before unrecoverable
-                        COALESCE(
-                            MAX(
-                                CASE
-                                    WHEN (total_fragments - cumulative_largest_fragments + fragments_on_node) >= original_chunks
-                                    THEN node_rank - 1
-                                    ELSE NULL
-                                END
-                            ),
-                            -1  -- Unrecoverable if no case matches
-                        ) as fault_tolerance_level
-                    FROM ranked_nodes
-                    GROUP BY data_block_id, original_chunks, total_fragments
-                ),
+        member_counts AS (
+            SELECT fh.data_block_id, fi.node_id, COUNT(*) AS on_node, bk.k
+            FROM fragment_hashes fh
+            JOIN block_k bk ON bk.data_block_id = fh.data_block_id
+            JOIN fragment_inventory fi ON fi.fragment_hash = fh.fragment_hash
+            WHERE fi.node_id IN ({placeholders})
+            GROUP BY fh.data_block_id, fi.node_id, bk.k
+        ),
 
-                -- Step 5: Files without attestation data (unknown status)
-                files_without_attestation AS (
-                    SELECT DISTINCT
-                        fh.data_block_id,
-                        -2 as classified_level  -- Special code for "unknown"
-                    FROM fragment_hashes fh
-                    LEFT JOIN fragment_inventory fi ON fh.fragment_hash = fi.fragment_hash
-                    WHERE fi.fragment_hash IS NULL  -- No attestation data at all
-                ),
+        -- Adversarial ordering: largest holders lost first, so the level is a
+        -- worst case rather than an average.
+        ranked AS (
+            SELECT
+                data_block_id, k, on_node,
+                ROW_NUMBER() OVER (
+                    PARTITION BY data_block_id ORDER BY on_node DESC
+                ) AS node_rank,
+                SUM(on_node) OVER (PARTITION BY data_block_id) AS total,
+                SUM(on_node) OVER (
+                    PARTITION BY data_block_id ORDER BY on_node DESC
+                    ROWS UNBOUNDED PRECEDING
+                ) AS cumulative
+            FROM member_counts
+        ),
 
-                -- Step 6: Classify fault tolerance levels
-                fault_tolerance_classified AS (
-                    SELECT
-                        data_block_id,
-                        CASE
-                            WHEN total_fragments < original_chunks THEN -1  -- Unrecoverable
-                            WHEN fault_tolerance_level = -1 THEN -1         -- Also unrecoverable
-                            WHEN fault_tolerance_level >= 3 THEN 3          -- Cap at 3+ for display
-                            ELSE fault_tolerance_level
-                        END as classified_level
-                    FROM file_fault_tolerance
+        tolerance AS (
+            SELECT
+                data_block_id, k, total,
+                COALESCE(
+                    MAX(CASE
+                        WHEN (total - cumulative + on_node) >= k THEN node_rank - 1
+                    END),
+                    -1
+                ) AS level
+            FROM ranked
+            GROUP BY data_block_id, k, total
+        )
 
-                    UNION ALL
+        SELECT
+            CASE
+                WHEN ba.data_block_id IS NULL THEN -2
+                WHEN t.data_block_id IS NULL THEN -1
+                WHEN t.total < t.k THEN -1
+                ELSE t.level
+            END AS fault_tolerance_level,
+            SUM(db.file_size) AS raw_bytes
+        FROM data_blocks db
+        LEFT JOIN block_attested ba ON ba.data_block_id = db.id
+        LEFT JOIN tolerance t ON t.data_block_id = db.id
+        GROUP BY fault_tolerance_level
+        ORDER BY fault_tolerance_level DESC
+        "#
+    );
 
-                    SELECT data_block_id, classified_level FROM files_without_attestation
-                )
+    let mut stmt = conn
+        .prepare(&query)
+        .map_err(|_| DatabaseError::ProcessingError)?;
 
-                -- Step 7: Final aggregation (DuckDB's sweet spot)
-                SELECT
-                    classified_level as fault_tolerance_level,
-                    COUNT(*) as file_count,
-                    ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 2) as percentage
-                FROM fault_tolerance_classified
-                GROUP BY classified_level
-                ORDER BY classified_level DESC
-            "#;
+    let bound: Vec<&dyn rusqlite::ToSql> = member_ids
+        .iter()
+        .map(|id| id as &dyn rusqlite::ToSql)
+        .collect();
 
-            let mut stmt = conn
-                .prepare(query)
-                .map_err(|_| DatabaseError::ProcessingError)?;
+    let rows = stmt
+        .query_map(bound.as_slice(), |row| {
+            let level: i32 = row.get(0)?;
+            let bytes: i64 = row.get(1).unwrap_or(0);
+            Ok((level, bytes as f64))
+        })
+        .map_err(|_| DatabaseError::RecallError)?;
 
-            let rows = stmt
-                .query_map(params![], |row| {
-                    let level: i32 = row.get(0)?;
-                    let count: i64 = row.get(1)?;
-                    let percentage: f64 = row.get(2)?;
-                    Ok((level, count as u32, percentage))
-                })
-                .map_err(|_| DatabaseError::RecallError)?;
+    let levels = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| DatabaseError::RecallError)?;
 
-            // Initialize all levels to zero
-            let mut unknown = ResilienceLevel {
-                file_count: 0,
-                percentage: 0.0,
-            };
-            let mut unrecoverable = ResilienceLevel {
-                file_count: 0,
-                percentage: 0.0,
-            };
-            let mut critical = ResilienceLevel {
-                file_count: 0,
-                percentage: 0.0,
-            };
-            let mut good = ResilienceLevel {
-                file_count: 0,
-                percentage: 0.0,
-            };
-            let mut excellent = ResilienceLevel {
-                file_count: 0,
-                percentage: 0.0,
-            };
-            let mut exceptional = ResilienceLevel {
-                file_count: 0,
-                percentage: 0.0,
-            };
-            let mut total_files = 0u32;
+    tracing::debug!(
+        "resilience levels computed: {} distinct in {}ms",
+        levels.len(),
+        start_time.elapsed().as_millis()
+    );
 
-            // Process results
-            for row_result in rows {
-                let (level, count, percentage) =
-                    row_result.map_err(|_| DatabaseError::RecallError)?;
-                total_files += count;
-
-                match level {
-                    -2 => {
-                        unknown = ResilienceLevel {
-                            file_count: count,
-                            percentage,
-                        }
-                    }
-                    -1 => {
-                        unrecoverable = ResilienceLevel {
-                            file_count: count,
-                            percentage,
-                        }
-                    }
-                    0 => {
-                        critical = ResilienceLevel {
-                            file_count: count,
-                            percentage,
-                        }
-                    }
-                    1 => {
-                        good = ResilienceLevel {
-                            file_count: count,
-                            percentage,
-                        }
-                    }
-                    2 => {
-                        excellent = ResilienceLevel {
-                            file_count: count,
-                            percentage,
-                        }
-                    }
-                    3 => {
-                        exceptional = ResilienceLevel {
-                            file_count: count,
-                            percentage,
-                        }
-                    }
-                    _ => {
-                        tracing::warn!("Unexpected fault tolerance level: {}", level);
-                    }
-                }
-            }
-
-            let computation_time_ms = start_time.elapsed().as_millis() as u64;
-
-            tracing::debug!(
-                "Network resilience computed: {} files total in {}ms",
-                total_files,
-                computation_time_ms
-            );
-
-            Ok(NetworkResilienceStats {
-                unknown,
-                unrecoverable,
-                critical,
-                good,
-                excellent,
-                exceptional,
-                total_files,
-                computation_time_ms,
-            })
-        }
-        Err(_) => Err(DatabaseError::LockError),
-    }
+    Ok(levels)
 }
+
+/// Age decades for data that has been placed but never attested.
+///
+/// Returns `(label, raw_bytes)` youngest first. Transient unattested data is
+/// normal — the diagnostic is the SHAPE: a healthy mesh decays toward nothing,
+/// while a tail that refuses to decay is attestation that will never land. A
+/// flat threshold cannot express that, because a large blob legitimately takes
+/// longer to distribute and would false-positive.
+///
+/// Age comes from `data_blocks.id` being a UUIDv7: the creation timestamp is
+/// the leading 48 bits and the ids are stored as lowercase hyphenated text, so
+/// lexicographic comparison against cutoff UUIDs orders chronologically on the
+/// primary-key index — no timestamp parsing, no extra column.
+pub fn unattested_age_buckets(
+    conn: &PooledConnection<SqliteConnectionManager>,
+) -> Result<Vec<(&'static str, f64)>, DatabaseError> {
+    use chrono::Duration;
+
+    let c1m = CustomUUID::cutoff_before(Duration::minutes(1)).to_string();
+    let c10m = CustomUUID::cutoff_before(Duration::minutes(10)).to_string();
+    let c1h = CustomUUID::cutoff_before(Duration::hours(1)).to_string();
+    let c1d = CustomUUID::cutoff_before(Duration::days(1)).to_string();
+
+    // Anchored on data_blocks so blocks with zero fragment_hashes rows are
+    // included; that keeps the sum here equal to the unknown total reported by
+    // resilience_level_rows.
+    let query = r#"
+        SELECT
+            SUM(CASE WHEN db.id >= ?1 THEN db.file_size ELSE 0 END),
+            SUM(CASE WHEN db.id >= ?2 AND db.id < ?1 THEN db.file_size ELSE 0 END),
+            SUM(CASE WHEN db.id >= ?3 AND db.id < ?2 THEN db.file_size ELSE 0 END),
+            SUM(CASE WHEN db.id >= ?4 AND db.id < ?3 THEN db.file_size ELSE 0 END),
+            SUM(CASE WHEN db.id < ?4 THEN db.file_size ELSE 0 END)
+        FROM data_blocks db
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM fragment_hashes fh
+            JOIN fragment_inventory fi ON fi.fragment_hash = fh.fragment_hash
+            WHERE fh.data_block_id = db.id
+        )
+    "#;
+
+    let mut stmt = conn
+        .prepare(query)
+        .map_err(|_| DatabaseError::ProcessingError)?;
+
+    let sums: [f64; 5] = stmt
+        .query_row(params![c1m, c10m, c1h, c1d], |row| {
+            Ok([
+                row.get::<_, Option<i64>>(0)?.unwrap_or(0) as f64,
+                row.get::<_, Option<i64>>(1)?.unwrap_or(0) as f64,
+                row.get::<_, Option<i64>>(2)?.unwrap_or(0) as f64,
+                row.get::<_, Option<i64>>(3)?.unwrap_or(0) as f64,
+                row.get::<_, Option<i64>>(4)?.unwrap_or(0) as f64,
+            ])
+        })
+        .map_err(|_| DatabaseError::RecallError)?;
+
+    Ok(vec![
+        ("<1m", sums[0]),
+        ("1-10m", sums[1]),
+        ("10m-1h", sums[2]),
+        ("1h-1d", sums[3]),
+        (">1d", sums[4]),
+    ])
+}
+
 
 /// Get node storage baselines for fault tolerance curve generation
 /// Returns each node's total capacity and baseline usage for simulation
@@ -443,59 +414,6 @@ pub fn generate_fault_tolerance_curve(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_resilience_level_serialization() {
-        let level = ResilienceLevel {
-            file_count: 42,
-            percentage: 15.7,
-        };
-
-        let json = serde_json::to_string(&level).unwrap();
-        let deserialized: ResilienceLevel = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(level.file_count, deserialized.file_count);
-        assert_eq!(level.percentage, deserialized.percentage);
-    }
-
-    #[test]
-    fn test_network_stats_serialization() {
-        let stats = NetworkResilienceStats {
-            unknown: ResilienceLevel {
-                file_count: 0,
-                percentage: 0.0,
-            },
-            unrecoverable: ResilienceLevel {
-                file_count: 5,
-                percentage: 2.1,
-            },
-            critical: ResilienceLevel {
-                file_count: 15,
-                percentage: 6.3,
-            },
-            good: ResilienceLevel {
-                file_count: 80,
-                percentage: 33.6,
-            },
-            excellent: ResilienceLevel {
-                file_count: 100,
-                percentage: 42.0,
-            },
-            exceptional: ResilienceLevel {
-                file_count: 38,
-                percentage: 16.0,
-            },
-            total_files: 238,
-            computation_time_ms: 156,
-        };
-
-        let json = serde_json::to_string(&stats).unwrap();
-        let deserialized: NetworkResilienceStats = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(stats.total_files, deserialized.total_files);
-        assert_eq!(stats.computation_time_ms, deserialized.computation_time_ms);
-    }
-
     #[test]
     fn test_fault_tolerance_curve_generation() {
         // Test basic 3-node case

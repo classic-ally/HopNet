@@ -6,8 +6,48 @@
     import { formatStorageCapacity } from '../../utils/formatters';
 
     export let data: FaultToleranceCurvePoint[] = [];
-    export let onPlanClick: (() => void) | undefined = undefined;
-    export let planButtonText: string = "Plan...";
+
+    // Actual placement as a sorted resilience frontier. One entry per
+    // distinct tolerance level, from GROUP BY on the diagnostics query — the
+    // curve is reconstructed by cumulative-summing in DESCENDING tolerance
+    // order, which places every step at exactly the right x. Sorting means the
+    // result is a pure step function: nothing is interleaved, so any slope
+    // would be a bucketing artifact rather than a real intermediate state.
+    //
+    // rawGb must be raw user bytes, not post-erasure-coding, to share the
+    // curve's x-axis (expansion factor N/K = 3).
+    export let observedLevels: { tolerance: number; rawGb: number }[] = [];
+
+    // Already lost, and not a low point on the resilience continuum — kept off
+    // the curve so it cannot read as merely fragile.
+    export let unrecoverableGb = 0;
+    // No attestation data: an observability gap, not a durability state.
+    export let unknownGb = 0;
+
+    // F — nodes still in the storage member view but unreachable right now.
+    // They are intact by the decay-tier definition, so their fragments still
+    // count toward the frontier, which makes it optimistic about this instant.
+    // Deliberately NOT departed nodes: those are already excluded from the
+    // inventory, so counting them here would subtract the same loss twice.
+    export let unreachableMembers = 0;
+
+    // Descending, so cumulative x is "how much data is at least this resilient".
+    $: frontier = [...observedLevels].sort((a, b) => b.tolerance - a.tolerance);
+    $: hasObserved = frontier.length > 0;
+
+    // INV-DURABLE is a min-property: the worst block decides whether data is
+    // lost, however healthy the rest are. On a sorted frontier that is simply
+    // the last step.
+    $: worstTolerance = hasObserved ? frontier[frontier.length - 1].tolerance : null;
+
+    // Not guaranteed reconstructible while F holders are away. An upper bound
+    // on damage, not a measurement: tolerance is the adversarial worst case.
+    $: atRiskGb =
+        unreachableMembers > 0
+            ? frontier
+                  .filter(s => s.tolerance < unreachableMembers)
+                  .reduce((a, s) => a + s.rawGb, 0)
+            : 0;
 
     let chartContainer: HTMLDivElement;
     let chart: uPlot | null = null;
@@ -71,7 +111,6 @@
 
                     // Check which series are visible
                     const tolerableFailuresVisible = u.series[1]?.show !== false;
-                    const activeNodesVisible = u.series[2]?.show !== false;
 
                     const relevantPoints = [];
 
@@ -90,10 +129,6 @@
                                 shouldShow = true;
                             }
 
-                            // Show if active nodes changed and that series is visible
-                            if (activeNodesVisible && point.active_nodes !== prevPoint.active_nodes) {
-                                shouldShow = true;
-                            }
                         }
 
                         if (shouldShow) {
@@ -143,7 +178,7 @@
             },
             {
                 // Tolerable Failures line - step function (custom drawn)
-                label: "Tolerable Failures",
+                label: "Theoretical",
                 stroke: "transparent", // Hide default stroke, we draw our own
                 width: 0,
                 fill: (u, seriesIdx) => {
@@ -241,31 +276,6 @@
                     },
                 },
             },
-            {
-                // Active Nodes line - step function
-                label: "Active Nodes",
-                stroke: '#a6e3a1', // green for secondary curve
-                width: 2,
-                dash: [5, 5], // dashed line
-                paths: uPlot.paths.stepped!({ align: 1 }), // Right-aligned steps
-                points: {
-                    show: true,
-                    size: (u, seriesIdx, dataIdx) => {
-                        // Make hovered point larger
-                        if (u.cursor.idx === dataIdx) return 10;
-                        return 4;
-                    },
-                    stroke: '#a6e3a1',
-                    fill: (u, seriesIdx, dataIdx) => {
-                        if (u.cursor.idx === dataIdx) {
-                            // Bright green fill when hovered
-                            return '#a6e3a1';
-                        }
-                        return '#313244'; // surface0 for point centers
-                    },
-                },
-                show: false, // Hidden by default, can be toggled via legend
-            }
         ],
 
         hooks: {
@@ -314,12 +324,184 @@
                     }
 
                     ctx.restore();
+                },
+
+                // The observed resilience frontier: data sorted best-placed
+                // first, so the curve reads "this much data is at least this
+                // resilient". Drawn last so the ideal curve's own segments
+                // cannot paint over it, and reading props directly rather than
+                // a derived flag so closure timing is not in question.
+                u => {
+                    if (!observedLevels || observedLevels.length === 0) return;
+
+                    const steps = [...observedLevels].sort((a, b) => b.tolerance - a.tolerance);
+                    const ctx = u.ctx;
+                    ctx.save();
+
+                    // Resolve each step's pixel extent once — both the frontier
+                    // line and the at-risk band need the same geometry.
+                    let cumulative = 0;
+                    const spans: {
+                        x0: number;
+                        x1: number;
+                        y: number;
+                        tolerance: number;
+                        rawGb: number;
+                    }[] = [];
+                    for (const step of steps) {
+                        const x0 = u.valToPos(cumulative, 'x', true);
+                        cumulative += step.rawGb;
+                        const x1 = u.valToPos(cumulative, 'x', true);
+                        const y = u.valToPos(step.tolerance, 'y', true);
+                        if (!isFinite(x0) || !isFinite(x1) || !isFinite(y)) continue;
+                        spans.push({ x0, x1, y, tolerance: step.tolerance, rawGb: step.rawGb });
+                    }
+
+                    // At-risk band: F holders are unreachable right now, so any
+                    // block whose worst-case tolerance is below F is not
+                    // GUARANTEED reconstructible until they return. Not a
+                    // measurement of loss — tolerance is adversarial, so the
+                    // specific offline nodes may hold few of a block's classes.
+                    // The sound direction is the converse: tolerance >= F is
+                    // definitely fine.
+                    if (unreachableMembers > 0) {
+                        const atRisk = spans.filter(s => s.tolerance < unreachableMembers);
+                        if (atRisk.length > 0) {
+                            // Clamp to the plot top: F can exceed the y-scale,
+                            // which the Theoretical series alone determines.
+                            const yF = Math.max(
+                                u.bbox.top,
+                                u.valToPos(unreachableMembers, 'y', true)
+                            );
+
+                            const tile = document.createElement('canvas');
+                            tile.width = tile.height = 6;
+                            const tctx = tile.getContext('2d');
+                            if (tctx) {
+                                tctx.strokeStyle = 'rgba(243, 139, 168, 0.55)';
+                                tctx.lineWidth = 1;
+                                tctx.beginPath();
+                                tctx.moveTo(0, 6);
+                                tctx.lineTo(6, 0);
+                                tctx.stroke();
+                            }
+                            const pattern = ctx.createPattern(tile, 'repeat');
+
+                            for (const s of atRisk) {
+                                ctx.fillStyle = pattern ?? 'rgba(243, 139, 168, 0.2)';
+                                ctx.fillRect(s.x0, yF, s.x1 - s.x0, s.y - yF);
+                            }
+
+                            // The F line itself, dashed so it never reads as a
+                            // data series.
+                            ctx.strokeStyle = '#f38ba8';
+                            ctx.lineWidth = 1.5;
+                            ctx.setLineDash([5, 4]);
+                            ctx.beginPath();
+                            ctx.moveTo(u.bbox.left, yF);
+                            ctx.lineTo(u.bbox.left + u.bbox.width, yF);
+                            ctx.stroke();
+                            ctx.setLineDash([]);
+
+                            // The band's WIDTH is the quantity; its area would
+                            // be GB x nodes, which means nothing.
+                            const gb = atRisk.reduce((a, s) => a + s.rawGb, 0);
+                            ctx.font = '11px Red Hat Mono, monospace';
+                            ctx.textAlign = 'center';
+                            ctx.textBaseline = 'middle';
+
+                            // Centre in the band: horizontally across its full
+                            // extent, vertically between the F line and whatever
+                            // step of the frontier sits under that midpoint —
+                            // the region's floor is a staircase, not a flat edge.
+                            const bandLeft = atRisk[0].x0;
+                            const bandRight = atRisk[atRisk.length - 1].x1;
+                            const midX = (bandLeft + bandRight) / 2;
+                            const under =
+                                atRisk.find(s => midX >= s.x0 && midX <= s.x1) ??
+                                atRisk[atRisk.length - 1];
+                            const midY = (yF + under.y) / 2;
+
+                            // Break onto two lines when the band is too narrow
+                            // to hold the whole phrase, so a thin band does not
+                            // spill its label across the neighbouring curve.
+                            const amount = formatStorageCapacity(gb);
+                            const oneLine = `${amount} at risk`;
+                            const lines =
+                                ctx.measureText(oneLine).width + 10 > bandRight - bandLeft
+                                    ? [amount, 'at risk']
+                                    : [oneLine];
+
+                            const lh = 13;
+                            const boxH = lines.length * lh;
+                            const boxW = Math.max(...lines.map(l => ctx.measureText(l).width));
+
+                            // Knock the hatch out behind the text — at 11px the
+                            // diagonals cut straight through the glyphs.
+                            ctx.fillStyle = '#313244';
+                            ctx.fillRect(midX - boxW / 2 - 4, midY - boxH / 2 - 2, boxW + 8, boxH + 4);
+
+                            ctx.fillStyle = '#f38ba8';
+                            lines.forEach((line, i) => {
+                                ctx.fillText(line, midX, midY - boxH / 2 + lh * (i + 0.5));
+                            });
+
+                            ctx.textAlign = 'left';
+                            ctx.textBaseline = 'alphabetic';
+                        }
+                    }
+
+                    ctx.strokeStyle = '#cba6f7';
+                    ctx.lineWidth = 2;
+                    ctx.beginPath();
+
+                    let prevY: number | null = null;
+                    let endX: number | null = null;
+                    let endY: number | null = null;
+
+                    for (const s of spans) {
+                        // Vertical drop into this level, then its run. Explicit
+                        // rather than relying on a line-join, so a zero-width
+                        // level still shows as a tick.
+                        if (prevY === null) ctx.moveTo(s.x0, s.y);
+                        else ctx.lineTo(s.x0, s.y);
+                        ctx.lineTo(s.x1, s.y);
+                        prevY = s.y;
+                        endX = s.x1;
+                        endY = s.y;
+                    }
+
+                    ctx.stroke();
+
+                    // Terminus: where the frontier ends IS the total raw data
+                    // on the network, so the dot doubles as that readout. Its
+                    // y is the worst-placed block — the INV-DURABLE figure.
+                    if (endX !== null && endY !== null) {
+                        ctx.beginPath();
+                        ctx.arc(endX, endY, 4, 0, Math.PI * 2);
+                        ctx.fillStyle = '#cba6f7';
+                        ctx.fill();
+
+                        const label = formatStorageCapacity(cumulative);
+                        ctx.font = '11px Red Hat Mono, monospace';
+                        ctx.fillStyle = '#cdd6f4';
+                        ctx.textBaseline = 'bottom';
+
+                        // Flip the label inward near the right edge so it can
+                        // never be clipped by the plot bounds.
+                        const plotRight = u.bbox.left + u.bbox.width;
+                        const w = ctx.measureText(label).width;
+                        ctx.textAlign = endX + w + 10 > plotRight ? 'right' : 'left';
+                        ctx.fillText(label, endX + (ctx.textAlign === 'right' ? -8 : 8), endY - 6);
+                    }
+
+                    ctx.restore();
                 }
             ]
         },
 
         legend: {
-            show: true,
+            show: false,
             live: false,
         },
 
@@ -378,7 +560,6 @@
 
                             // Check which series are visible
                             const tolerableFailuresVisible = u.series[1].show !== false;
-                            const activeNodesVisible = u.series[2].show !== false;
 
                             // Find the appropriate data point based on cursor X position
                             const cursorX = u.cursor.left;
@@ -408,20 +589,13 @@
                                 beyondFinalPoint = true;
                             }
 
-                            // Check which series is closest to cursor Y position for that X point
-                            const cursorY = u.cursor.top;
-                            const tolerableFailuresY = u.valToPos(targetPoint.nodes_can_fail, 'y');
-                            const activeNodesY = u.valToPos(targetPoint.active_nodes, 'y');
-
-                            const distToTolerable = tolerableFailuresVisible ? Math.abs(cursorY - tolerableFailuresY) : Infinity;
-                            const distToActive = activeNodesVisible ? Math.abs(cursorY - activeNodesY) : Infinity;
 
                             let content = '';
 
                             if (beyondFinalPoint) {
                                 // Beyond the final data point - no storage available
                                 content = `> ${formatStorageCapacity(finalPoint.user_data_gb)}\n\nOut of Storage`;
-                            } else if (distToTolerable <= distToActive && tolerableFailuresVisible) {
+                            } else if (tolerableFailuresVisible) {
                                 // Hovering over tolerable failures line - ongoing state
                                 content = `> ${formatStorageCapacity(targetPoint.user_data_gb)}\n\n`;
                                 const activeNodes = targetPoint.participating_nodes;
@@ -432,44 +606,6 @@
                                     activeDisplay = activeNodes.map(n => n.display_name).join(', ');
                                 }
                                 content += `Can Fail: ${targetPoint.nodes_can_fail}\nActive: ${activeDisplay}`;
-                            } else if (activeNodesVisible) {
-                                // Hovering over active nodes line - transition event
-                                content = `@ ${formatStorageCapacity(targetPoint.user_data_gb)}\n\n`;
-
-                                if (targetIdx > 0) {
-                                    const prevPoint = data[targetIdx - 1];
-                                    const removedNodes = prevPoint.participating_nodes.filter(
-                                        prevNode => !targetPoint.participating_nodes.find(
-                                            currNode => currNode.node_id === prevNode.node_id
-                                        )
-                                    );
-
-                                    if (removedNodes.length > 0) {
-                                        let saturatedDisplay;
-                                        if (removedNodes.length > 5) {
-                                            saturatedDisplay = `${removedNodes.length} nodes`;
-                                        } else {
-                                            saturatedDisplay = removedNodes.map(n => n.display_name).join(', ');
-                                        }
-                                        content += `Saturated: ${saturatedDisplay}`;
-                                    } else {
-                                        let activeDisplay;
-                                        if (targetPoint.participating_nodes.length > 5) {
-                                            activeDisplay = `\n${targetPoint.participating_nodes.length} nodes`;
-                                        } else {
-                                            activeDisplay = targetPoint.participating_nodes.map(n => n.display_name).join(', ');
-                                        }
-                                        content += `Active: ${activeDisplay}`;
-                                    }
-                                } else {
-                                    let activeDisplay;
-                                    if (targetPoint.participating_nodes.length > 5) {
-                                        activeDisplay = `\n${targetPoint.participating_nodes.length} nodes`;
-                                    } else {
-                                        activeDisplay = targetPoint.participating_nodes.map(n => n.display_name).join(', ');
-                                    }
-                                    content += `Active: ${activeDisplay}`;
-                                }
                             } else {
                                 // No visible series to show tooltip for
                                 tooltip.style.display = 'none';
@@ -504,9 +640,7 @@
 
         const xData = points.map(p => p.user_data_gb);
         const yData1 = points.map(p => p.nodes_can_fail); // Tolerable failures
-        const yData2 = points.map(p => p.active_nodes); // Active nodes
-
-        return [xData, yData1, yData2];
+        return [xData, yData1];
     }
 
     // Detect over-capacity condition (network cannot accept new data)
@@ -533,6 +667,16 @@
         }
     }
 
+    // The observed marker lives in a draw hook, so a change to it needs an
+    // explicit repaint — setData alone would not fire when only these move.
+    //
+    // Both args must be false. redraw()'s defaults are (true, true), and
+    // recalcAxes re-runs the x range fn with null bounds, which returns
+    // [null, NaN] and wipes the x scale — blanking the whole chart.
+    $: if (chart && (observedLevels, unreachableMembers, true)) {
+        chart.redraw(false, false);
+    }
+
     // Reactive update when data changes
     $: if (chartContainer && data && data.length > 0 && !isOverCapacity(data)) {
         updateChart();
@@ -554,18 +698,9 @@
     });
 </script>
 
-<!-- Chart container with themed styling -->
-<div class="bg-surface0 rounded-lg p-4 border border-overlay0">
-    <div class="flex items-center justify-between mb-3">
-        <h4 class="text-lg font-semibold text-primary">Storage Resilience</h4>
-        <button
-            class="text-sm bg-blue text-base px-3 py-1 rounded hover:bg-blue/80"
-            onclick={onPlanClick}
-        >
-            {planButtonText}
-        </button>
-    </div>
-
+<!-- Just the plot: the box, title and headline stat belong to StoragePanel,
+     which composes this alongside UnattestedByAge. -->
+<div>
     <!-- Chart container - always present but hidden when not needed -->
     <div class="flex justify-center" class:hidden={data.length === 0 || isOverCapacity(data)}>
         <div bind:this={chartContainer} class="chart-container"></div>
@@ -575,12 +710,40 @@
     <div class="mt-3 text-sm text-muted space-y-1" class:hidden={data.length === 0 || isOverCapacity(data)}>
         <div class="flex items-center gap-2">
             <div class="w-3 h-0.5 bg-blue"></div>
-            <span>Number of tolerable node failures before data loss</span>
+            <span>Theoretical — tolerable node failures under ideal even spread</span>
         </div>
-        <div class="flex items-center gap-2">
-            <div class="w-3 h-0.5 bg-green border-dashed border-t-2 border-green bg-transparent"></div>
-            <span>Total active nodes in the network</span>
-        </div>
+        {#if hasObserved}
+            <div class="flex items-center gap-2">
+                <div class="w-3 h-0.5 bg-mauve"></div>
+                <span>Actual — data sorted best-placed first, on intact disks</span>
+            </div>
+        {/if}
+        {#if atRiskGb > 0}
+            <div class="flex items-center gap-2">
+                <div class="w-3 h-0.5 border-t-2 border-dashed border-red"></div>
+                <span>
+                    {unreachableMembers} holder{unreachableMembers === 1 ? '' : 's'} unreachable —
+                    hatched data is not guaranteed reconstructible
+                </span>
+            </div>
+        {/if}
+        {#if unrecoverableGb > 0 || unknownGb > 0}
+            <div class="flex items-center gap-3 pt-1 font-mono text-xs">
+                {#if unrecoverableGb > 0}
+                    <span class="text-red">
+                        {formatStorageCapacity(unrecoverableGb)} unrecoverable
+                    </span>
+                {/if}
+                {#if unknownGb > 0}
+                    <span
+                        class="text-subtitle"
+                        title="No attestation data — an observability gap, not a durability state"
+                    >
+                        {formatStorageCapacity(unknownGb)} unattested
+                    </span>
+                {/if}
+            </div>
+        {/if}
     </div>
 
     <!-- Over-capacity state -->

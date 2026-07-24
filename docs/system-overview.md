@@ -202,7 +202,17 @@ Cross-platform desktop application providing file management and network adminis
 - [ ] File preview system with secure thumbnail generation
 - [ ] Native OS integration (Apple FileProvider, Windows Cloud Files API)
 - [ ] Advanced file operations (multi-select, context menus, drag-drop)
-- [ ] Network health dashboard and metrics visualization
+- [x] Network health dashboard — invariant-derived resilience pane (2026-07-25): the
+      Network Resilience pane reports margins to the model-checked invariants rather than
+      raw counters. **State Machine Replication** renders INV-NO-HARM as the identity
+      `B(v) − (v − live) = headroom`, plus the seated/standby/unreachable split and the
+      headroom bands from `membership::band`. **Data Replication** plots the observed
+      durability frontier (blocks sorted by worst-case tolerance, cumulative raw bytes)
+      against the even-spread ideal, so the gap is the measured cost of non-conformance —
+      BRIDGE's precondition. Served by `GET /views/network-resilience`, a view-model route
+      that owns no arithmetic: every figure comes from `hopnet_common::quorum`,
+      `live_estimate`, `derive_view` or `db::resilience`. Replaces a pane that had drifted
+      to `ceil(2v/3)` for quorum, wrong at every `v` divisible by 3.
 - [x] Advanced file sharing controls and permissions (Phase 2a+2b backend, Phase 2c frontend)
 - [ ] Responsive mobile interface for thin client operations
 
@@ -437,7 +447,13 @@ Interim daemon archiving an Apple Photos library (personal + iCloud Shared Photo
 4. **Node performance monitoring** - Foundation for reliability scoring
    - Implement comprehensive node metrics collection
    - Add automatic node health scoring for placement decisions
-   - Build monitoring dashboard for network health
+   - [x] Build monitoring dashboard for network health (2026-07-25) — see the UI section.
+     Two gaps remain deliberately unaddressed: **RECOVERY** (a validator dark past `t_out`
+     and still seated means self-healing is stuck) has no time-axis surface, and
+     **liveness** is unrepresented, so a mesh that stopped deciding still renders green.
+     The latter needs the on-demand engine's own wake rules — `round.height > decided`
+     together with `PendingPool::staged_len()` — since a quiescent mesh legitimately does
+     not advance height and a rate metric alone cannot tell it from a wedged one.
 
 ### Phase 2: Performance & Reliability
 - Advanced node reliability scoring with predictive capabilities

@@ -142,6 +142,22 @@ impl CustomUUID {
         CustomUUID::new(Some(&timestamp))
     }
 
+    /// UUIDv7 cutoff `ago` before now, at whatever granularity the caller needs.
+    ///
+    /// Deliberately NOT the implementation behind `retention_cutoff`, despite the
+    /// overlap: that one selects rows for deletion, and those deletions are
+    /// transactions, so a drift in its rounding changes what gets removed.
+    /// Diagnostics wanting sub-day windows use this; retention keeps its own.
+    pub fn cutoff_before(ago: chrono::Duration) -> CustomUUID {
+        let cutoff_time = Utc::now() - ago;
+        let timestamp = Timestamp::from_unix(
+            uuid::timestamp::context::NoContext,
+            cutoff_time.timestamp() as u64,
+            cutoff_time.timestamp_subsec_nanos(),
+        );
+        CustomUUID::new(Some(&timestamp))
+    }
+
     /// Extract timestamp from UUIDv7
     pub fn extract_timestamp(&self) -> Option<DateTime<Utc>> {
         // UUIDv7 encodes timestamp in the first 48 bits
@@ -195,29 +211,6 @@ pub struct FileItem {
     pub modification_date: Option<DateTime<Utc>>, // From data_id UUIDv7 for files
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shared_with_count: Option<u32>,
-}
-
-/// Network resilience statistics for cliff chart display
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[typeshare]
-pub struct NetworkResilienceStats {
-    pub unknown: ResilienceLevel,       // -2: Files without attestation data
-    pub unrecoverable: ResilienceLevel, // -1: Files that cannot be recovered
-    pub critical: ResilienceLevel,      //  0: No fault tolerance (single point of failure)
-    pub good: ResilienceLevel,          //  1: Can survive 1 node failure
-    pub excellent: ResilienceLevel,     //  2: Can survive 2 node failures
-    pub exceptional: ResilienceLevel,   // 3+: Can survive 3+ node failures
-    pub total_files: u32,
-    #[typeshare(serialized_as = "number")]
-    pub computation_time_ms: u64,
-}
-
-/// Individual resilience level statistics
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[typeshare]
-pub struct ResilienceLevel {
-    pub file_count: u32,
-    pub percentage: f64,
 }
 
 /// Data source for node storage baseline

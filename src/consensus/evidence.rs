@@ -614,6 +614,55 @@ pub fn spawn_probe_scheduler(app_state: crate::AppState) {
 // Debug route: GET /consensus/evidence
 // ============================================================================
 
+/// The DB-side inputs `live_estimate` needs, read in one scoped checkout.
+pub struct EvidenceInputs {
+    pub policy: ConsensusPolicy,
+    /// The CONFIGURED profile from consensus_meta — still Auto if unpinned.
+    /// Resolve with `profile.profile_at(v)` where the effective one is wanted.
+    pub profile: QuorumProfile,
+    pub seated: Vec<i32>,
+    pub registered: Vec<i32>,
+}
+
+/// Read policy, quorum profile, seated validators and the registered node
+/// universe together.
+///
+/// Shared so the evidence route and the resilience view cannot read a
+/// different set of inputs and then disagree about the same mesh. Errors are
+/// swallowed into defaults exactly as the route did before extraction — this
+/// is diagnostics, and a missing policy row should not 500 the pane.
+pub fn evidence_inputs(
+    conn: &r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>,
+    decided: u64,
+) -> EvidenceInputs {
+    let policy = hopnet_consensus::store::read_policy(conn).unwrap_or_default();
+    let profile =
+        hopnet_consensus::store::meta_get(conn, hopnet_consensus::store::META_QUORUM_PROFILE)
+            .ok()
+            .flatten()
+            .and_then(|b| String::from_utf8(b).ok())
+            .and_then(|s| QuorumProfile::parse(&s))
+            .unwrap_or(QuorumProfile::Auto);
+    let pending = i32::try_from(decided.saturating_add(1)).unwrap_or(i32::MAX);
+    let seated: Vec<i32> = crate::db::consensus::get_validators_with_conn(conn, pending)
+        .map(|v| v.into_iter().map(|n| n.node_id).collect())
+        .unwrap_or_default();
+    let registered: Vec<i32> = conn
+        .prepare_cached("SELECT node_id FROM nodes ORDER BY node_id")
+        .and_then(|mut s| {
+            s.query_map([], |row| row.get::<_, i32>(0))
+                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+        })
+        .unwrap_or_default();
+
+    EvidenceInputs {
+        policy,
+        profile,
+        seated,
+        registered,
+    }
+}
+
 pub async fn get_evidence(State(app_state): State<crate::AppState>) -> impl IntoResponse {
     use axum::http::StatusCode;
 
@@ -627,32 +676,16 @@ pub async fn get_evidence(State(app_state): State<crate::AppState>) -> impl Into
         .map(|e| *e.decided.borrow())
         .unwrap_or(0);
 
-    let (policy, profile, seated, registered) = {
+    let EvidenceInputs {
+        policy,
+        profile,
+        seated,
+        registered,
+    } = {
         let Ok(conn) = app_state.db_pool.get() else {
             return (StatusCode::INTERNAL_SERVER_ERROR, "db pool").into_response();
         };
-        let policy = hopnet_consensus::store::read_policy(&conn).unwrap_or_default();
-        let profile = hopnet_consensus::store::meta_get(
-            &conn,
-            hopnet_consensus::store::META_QUORUM_PROFILE,
-        )
-        .ok()
-        .flatten()
-        .and_then(|b| String::from_utf8(b).ok())
-        .and_then(|s| QuorumProfile::parse(&s))
-        .unwrap_or(QuorumProfile::Auto);
-        let pending = i32::try_from(decided.saturating_add(1)).unwrap_or(i32::MAX);
-        let seated: Vec<i32> = crate::db::consensus::get_validators_with_conn(&conn, pending)
-            .map(|v| v.into_iter().map(|n| n.node_id).collect())
-            .unwrap_or_default();
-        let registered: Vec<i32> = conn
-            .prepare_cached("SELECT node_id FROM nodes ORDER BY node_id")
-            .and_then(|mut s| {
-                s.query_map([], |row| row.get::<_, i32>(0))
-                    .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-            })
-            .unwrap_or_default();
-        (policy, profile, seated, registered)
+        evidence_inputs(&conn, decided)
     };
 
     let now = Instant::now();

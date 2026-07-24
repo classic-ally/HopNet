@@ -141,13 +141,17 @@
         control: false,
         description: 'Array of fault tolerance curve points'
       },
-      onPlanClick: {
+      observedLevels: {
         control: false,
-        description: 'Callback function when plan button is clicked'
+        description: 'One entry per distinct tolerance level; GROUP BY from the diagnostics query'
       },
-      planButtonText: {
-        control: 'text',
-        description: 'Text displayed on the plan button'
+      unrecoverableGb: {
+        control: { type: 'number' },
+        description: 'Already below K — shown as a stat, not a point on the curve'
+      },
+      unknownGb: {
+        control: { type: 'number' },
+        description: 'No attestation data — an observability gap'
       }
     }
   });
@@ -161,8 +165,7 @@
   name="Empty State"
   {template}
   args={{
-    data: [],
-    planButtonText: "Plan..."
+    data: []
   }}
 />
 
@@ -170,8 +173,7 @@
   name="Small Network (3 nodes)"
   {template}
   args={{
-    data: smallNetworkData,
-    planButtonText: "Plan..."
+    data: smallNetworkData
   }}
 />
 
@@ -179,8 +181,7 @@
   name="Medium Network (7 nodes)"
   {template}
   args={{
-    data: mediumNetworkData,
-    planButtonText: "Optimize Network"
+    data: mediumNetworkData
   }}
 />
 
@@ -188,26 +189,111 @@
   name="Large Network (15 nodes)"
   {template}
   args={{
-    data: largeNetworkData,
-    planButtonText: "Scale Network"
+    data: largeNetworkData
   }}
 />
 
+<!--
+  Observed frontier tracking the ideal. Sorted best-placed first, so the curve
+  reads "this much data is at least this resilient" — and because sorting
+  removes all interleaving it is a pure step function, never a slope.
+-->
 <Story
-  name="With Plan Callback"
+  name="Observed - tracking the ideal"
   {template}
   args={{
     data: mediumNetworkData,
-    planButtonText: "Interactive Plan",
-    onPlanClick: () => alert('Plan button clicked!')
+    observedLevels: [
+      { tolerance: 3, rawGb: 460 },
+      { tolerance: 2, rawGb: 240 }
+    ]
+  }}
+/>
+
+<!-- Repair backlog: the whole frontier sits below what even spread would give -->
+<Story
+  name="Observed - drifted below ideal"
+  {template}
+  args={{
+    data: mediumNetworkData,
+    observedLevels: [
+      { tolerance: 2, rawGb: 180 },
+      { tolerance: 1, rawGb: 400 }
+    ]
+  }}
+/>
+
+<!--
+  The step at y=0 is the point of this shape: its WIDTH is how many GB are one
+  failure from unrecoverable. Averaging into x-buckets is exactly what would
+  erase it.
+-->
+<Story
+  name="Observed - a step at zero"
+  {template}
+  args={{
+    data: mediumNetworkData,
+    observedLevels: [
+      { tolerance: 3, rawGb: 300 },
+      { tolerance: 2, rawGb: 260 },
+      { tolerance: 0, rawGb: 90 }
+    ]
+  }}
+/>
+
+<!-- Already-lost and unattested data are stats, never points on the curve -->
+<Story
+  name="Observed - with unrecoverable and unattested"
+  {template}
+  args={{
+    data: mediumNetworkData,
+    observedLevels: [
+      { tolerance: 3, rawGb: 320 },
+      { tolerance: 1, rawGb: 210 }
+    ],
+    unrecoverableGb: 12,
+    unknownGb: 45
   }}
 />
 
 <Story
-  name="Planning Mode"
+  name="Curve only - no observed data"
   {template}
   args={{
-    data: smallNetworkData,
-    planButtonText: "Done Planning"
+    data: smallNetworkData
+  }}
+/>
+
+<!--
+  F = holders unreachable right now but still storage members. Their fragments
+  still count toward the frontier, so it is optimistic about this instant; the
+  hatched band is data whose worst-case tolerance sits below F. An upper bound
+  on damage, not a measurement — tolerance is adversarial.
+-->
+<Story
+  name="At risk - two holders unreachable"
+  {template}
+  args={{
+    data: mediumNetworkData,
+    observedLevels: [
+      { tolerance: 3, rawGb: 300 },
+      { tolerance: 2, rawGb: 200 },
+      { tolerance: 1, rawGb: 120 }
+    ],
+    unreachableMembers: 2
+  }}
+/>
+
+<!-- F above every tolerance: the whole frontier is at risk -->
+<Story
+  name="At risk - all data below F"
+  {template}
+  args={{
+    data: mediumNetworkData,
+    observedLevels: [
+      { tolerance: 1, rawGb: 260 },
+      { tolerance: 0, rawGb: 140 }
+    ],
+    unreachableMembers: 3
   }}
 />

@@ -32,6 +32,7 @@ pub mod shares;
 pub mod takeout_host;
 pub mod types;
 pub mod users;
+pub mod views;
 
 #[derive(Clone, Debug)]
 pub struct UserKeys {
