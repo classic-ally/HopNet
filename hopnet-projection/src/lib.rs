@@ -78,7 +78,7 @@ impl rusqlite::types::FromSql for CustomDateTime {
 
 /// Database-layer error taxonomy shared by handlers and projection DB code.
 /// (Moved verbatim from the main crate's db/types.rs — the host re-exports.)
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum DatabaseError {
     LockError,
     InsertError,

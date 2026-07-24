@@ -7,7 +7,7 @@ use serde::Deserialize;
 use hopnet_comms::Rpc;
 
 use crate::AppState;
-use crate::db::{DatabaseError, PubKey};
+use crate::db::PubKey;
 use crate::setup::{JoinDeliverRequest, SetupRequest, SetupResponse};
 use crate::{consensus::types::Transaction, db::nodes, types::Node};
 
@@ -81,22 +81,34 @@ pub async fn post_nodes(
     }
 
     ///////////////
-    // 2. Get next node ID and create complete node object
+    // 2. Validate uniqueness and get next node ID — single connection checkout
+    //    to avoid pool contention.
     ///////////////
-    let next_node_id = match nodes::get_next_node_id(app_state.db_pool.get()) {
-        Ok(id) => id,
-        Err(DatabaseError::LockError) => {
-            tracing::warn!("Database connection pool exhausted during get_next_node_id");
-            return StatusCode::TOO_MANY_REQUESTS;
+    let (next_node_id, complete_node) = {
+        let conn = match app_state.db_pool.get() {
+            Ok(c) => c,
+            Err(_) => return StatusCode::TOO_MANY_REQUESTS,
+        };
+        if nodes::pubkey_exists(&conn, &payload.pubkey) {
+            tracing::warn!(
+                "Rejecting node registration: pubkey {:?} already registered",
+                payload.pubkey
+            );
+            return StatusCode::CONFLICT;
         }
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
-    };
-
-    let complete_node = Node {
-        node_id: next_node_id,
-        name: payload.name.clone(),
-        owner: payload.owner,
-        pubkey: payload.pubkey,
+        let next_id = match nodes::get_next_node_id_conn(&conn) {
+            Ok(id) => id,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        (
+            next_id,
+            Node {
+                node_id: next_id,
+                name: payload.name.clone(),
+                owner: payload.owner,
+                pubkey: payload.pubkey,
+            },
+        )
     };
 
     ///////////////
@@ -178,8 +190,9 @@ pub async fn post_nodes(
     // 4. Post-consensus: Create JoinInfo and send to joining node via iroh
     ///////////////
 
-    // Get current consensus height + the mesh's quorum profile
-    let (current_height, quorum_profile) = {
+    // Get current consensus height, quorum profile, and bootstrap validators
+    // on a single connection checkout.
+    let (current_height, quorum_profile, bootstrap_validators) = {
         let mut conn = match app_state.db_pool.get() {
             Ok(c) => c,
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
@@ -192,30 +205,27 @@ pub async fn post_nodes(
         .flatten()
         .and_then(|b| String::from_utf8(b).ok())
         .unwrap_or_else(|| "bft".to_string());
-        let tx = match conn.transaction() {
-            Ok(tx) => tx,
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+        let height = {
+            let tx = match conn.transaction() {
+                Ok(tx) => tx,
+                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            match crate::db::consensus::get_current_consensus_height(&tx) {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::error!("Failed to get consensus height: {:?}", e);
+                    return StatusCode::INTERNAL_SERVER_ERROR;
+                }
+            }
         };
-        let height = match crate::db::consensus::get_current_consensus_height(&tx) {
-            Ok(h) => h,
+        let validators = match crate::db::consensus::get_validators_with_conn(&conn, height) {
+            Ok(v) => v,
             Err(e) => {
-                tracing::error!("Failed to get consensus height: {:?}", e);
+                tracing::error!("Failed to get validators for bootstrap: {:?}", e);
                 return StatusCode::INTERNAL_SERVER_ERROR;
             }
         };
-        (height, profile)
-    };
-
-    // Get all active validators for bootstrap list
-    let bootstrap_validators = match crate::db::consensus::get_validators(
-        app_state.db_pool.get(),
-        current_height,
-    ) {
-        Ok(validators) => validators,
-        Err(e) => {
-            tracing::error!("Failed to get validators for bootstrap: {:?}", e);
-            return StatusCode::INTERNAL_SERVER_ERROR;
-        }
+        (height, profile, validators)
     };
 
     // Create JoinInfo structure

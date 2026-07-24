@@ -43,18 +43,20 @@ pub fn get_next_node_id(
     db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
 ) -> Result<i32, DatabaseError> {
     match db_connection {
-        Ok(db_lock) => {
-            let next_id = db_lock
-                .query_row(
-                    "SELECT next_id FROM sequences WHERE name = 'nodes'",
-                    [],
-                    |row| row.get::<_, i32>(0),
-                )
-                .map_err(|_| DatabaseError::RecallError)?;
-            Ok(next_id)
-        }
+        Ok(db_lock) => get_next_node_id_conn(&db_lock),
         Err(_) => Err(DatabaseError::LockError),
     }
+}
+
+/// Same as `get_next_node_id` but takes an already-open `&Connection`
+/// so callers managing their own connection lifecycle can avoid a second checkout.
+pub fn get_next_node_id_conn(conn: &rusqlite::Connection) -> Result<i32, DatabaseError> {
+    conn.query_row(
+        "SELECT next_id FROM sequences WHERE name = 'nodes'",
+        [],
+        |row| row.get::<_, i32>(0),
+    )
+    .map_err(|_| DatabaseError::RecallError)
 }
 
 pub fn node_exists(
@@ -74,6 +76,17 @@ pub fn node_exists(
         }
         Err(_) => Err(DatabaseError::LockError),
     }
+}
+
+/// True if any node row already holds this pubkey.
+/// Takes `&Connection` so both pooled connections and transactions pass through.
+pub fn pubkey_exists(conn: &rusqlite::Connection, pubkey: &crate::types::PubKey) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM nodes WHERE pubkey = ?",
+        params![pubkey],
+        |_| Ok(()),
+    )
+    .is_ok()
 }
 
 /// Core node insertion logic - operates within provided transaction for atomicity

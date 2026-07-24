@@ -303,7 +303,7 @@ pub fn initialize(db: PooledConnection<SqliteConnectionManager>) -> Result<(), D
                 node_id         INTEGER PRIMARY KEY,
                 name            TEXT NOT NULL,
                 owner           INTEGER NOT NULL,
-                pubkey          BLOB NOT NULL,
+                pubkey          BLOB NOT NULL UNIQUE,
 
                 FOREIGN KEY (owner) REFERENCES users(user_id)
             );
