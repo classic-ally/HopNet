@@ -350,7 +350,7 @@
                                 padding: 8px 12px;
                                 border-radius: 6px;
                                 border: 1px solid #6c7086;
-                                font-family: 'Red Hat Display';
+                                font-family: 'Red Hat Display Variable', ui-sans-serif, system-ui, sans-serif;
                                 font-size: 12px;
                                 pointer-events: none;
                                 z-index: 100;
@@ -621,7 +621,7 @@
         border: 1px solid #6c7086 !important; /* overlay0 */
         border-radius: 0.375rem !important;
         color: #cdd6f4 !important; /* primary */
-        font-family: 'Red Hat Display' !important;
+        font-family: 'Red Hat Display Variable', ui-sans-serif, system-ui, sans-serif !important;
     }
 
     :global(.chart-container .u-legend .u-marker) {

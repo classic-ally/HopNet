@@ -67,7 +67,7 @@
               version = "0.1.0";
               src = ./frontend;
               fetcherVersion = 3;
-              hash = "sha256-TKz2TdQcNkBNjMgp3ES8fLbu+7hy5thwAPSJ9gv1ITA=";
+              hash = "sha256-JzfiIihYxpXVjFYbVxDaz3jUNJK6RXC3suFje6aMay0=";
             };
 
             nativeBuildInputs = [ pkgs.nodejs pkgs.pnpm_10 pkgs.pnpmConfigHook ];
@@ -196,7 +196,9 @@
               # this package with a nixpkgs whose pnpm_10 is < 10.34.
               hash =
                 {
-                  "3" = "sha256-4q2p9Qq3fPlOC80gAb/GhmOnM1pcLbNdsbuR7ULSF+Y=";
+                  "3" = "sha256-1k12pSoM6rgaNXhl6rUT7X5h3oTNiQuqeFMZx6UdOZU=";
+                  # STALE: not recomputed after the fontsource dep change (needs
+                  # pnpm >= 10.34 to produce, and that path is broken per above).
                   "4" = "sha256-rVTjvm5YduXQov0pB3biMh8plNtz7OylJ7rTg77CEug=";
                 }.${toString fetcherVersion} or pkgs.lib.fakeHash;
             };

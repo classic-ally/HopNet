@@ -1,10 +1,15 @@
 import presetMini from '@unocss/preset-mini'
 import presetIcons from '@unocss/preset-icons'
 
-import presetWebFonts from '@unocss/preset-web-fonts'
-import { createLocalFontProcessor } from '@unocss/preset-web-fonts/local'
-
 import { defineConfig } from 'unocss'
+
+// Font families must stay in sync with the @fontsource-variable imports in
+// src/main.ts and the :root rule in src/app.css. These are self-hosted from
+// node_modules rather than fetched from Google at build time: the Nix build
+// sandbox has no network, so a fetching setup silently emits zero @font-face
+// rules and the deployed app falls back to the browser default.
+const fontSans = '"Red Hat Display Variable", ui-sans-serif, system-ui, sans-serif'
+const fontMono = '"Red Hat Mono Variable", ui-monospace, SFMono-Regular, Menlo, monospace'
 
 const themeColors = {
     // Background Colors (Semantic Names)
@@ -75,23 +80,15 @@ export default defineConfig({
         }
     },
     presets: [
-        presetWebFonts({
-            provider: 'google',
-            fonts: {
-                sans: 'Red Hat Display',
-                mono: 'Red Hat Mono',
-            },
-            processors: createLocalFontProcessor({
-                cacheDir: 'node_modules/.cache/unocss/fonts',
-                fontAssetsDir: 'public/assets/fonts',
-                fontServeBaseUrl: '/assets/fonts'
-            })
-        }),
         presetIcons(),
         presetMini(),
     ],
     theme: {
-        colors: themeColors
+        colors: themeColors,
+        fontFamily: {
+            sans: fontSans,
+            mono: fontMono,
+        }
     },
     safelist: colorSafelist
 })

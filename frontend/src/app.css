@@ -1,6 +1,6 @@
 :root {
-  font-family: 'Red Hat Display';
-  background-color: #11111b; 
+  font-family: 'Red Hat Display Variable', ui-sans-serif, system-ui, sans-serif;
+  background-color: #11111b;
 
   font-synthesis: none;
   text-rendering: optimizeLegibility;

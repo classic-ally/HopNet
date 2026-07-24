@@ -1,5 +1,5 @@
 :root {
-  font-family: 'Red Hat Display';
+  font-family: 'Red Hat Display Variable', ui-sans-serif, system-ui, sans-serif;
   background-color: #11111b; /* crust */
   color: #cdd6f4; /* text */
 
