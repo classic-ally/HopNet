@@ -4,7 +4,7 @@ import { writable } from 'svelte/store';
 // from the same axum origin in every mode, so `fetch('/api/...')` resolves
 // against whichever port the server bound (fixed in headless, kernel-assigned
 // in GUI). Vite dev proxies API routes back to the headless backend.
-export const API_BASE_URL = '';
+export const API_BASE_URL = '/api';
 
 // Current browse path store
 export const currentPathStore = writable('/');

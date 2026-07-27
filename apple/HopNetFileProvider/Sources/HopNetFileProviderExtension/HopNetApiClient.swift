@@ -80,7 +80,7 @@ public class HopNetApiClient {
     // MARK: - Health Check
     
     public func healthCheck() async throws -> HealthStatus {
-        let urlString = "\(config.baseUrl)/integrations/fileprovider/health"
+        let urlString = "\(config.baseUrl)/api/integrations/fileprovider/health"
         logger.debug("Checking health at: \(urlString)")
         
         guard let url = URL(string: urlString) else {
@@ -120,7 +120,7 @@ public class HopNetApiClient {
     // MARK: - Enumerate
     
     public func enumerate(parentPath: String? = nil, pageToken: String? = nil) async throws -> EnumerateResponse {
-        let urlString = "\(config.baseUrl)/integrations/fileprovider/enumerate"
+        let urlString = "\(config.baseUrl)/api/integrations/fileprovider/enumerate"
         
         guard var urlComponents = URLComponents(string: urlString) else {
             throw ApiError.invalidUrl
@@ -176,7 +176,7 @@ public class HopNetApiClient {
     
     // Identifier-based enumerate function for FileProvider
     public func enumerate(parentItemIdentifier: String, pageToken: String? = nil) async throws -> EnumerateResponse {
-        let urlString = "\(config.baseUrl)/integrations/fileprovider/enumerate"
+        let urlString = "\(config.baseUrl)/api/integrations/fileprovider/enumerate"
         
         guard var urlComponents = URLComponents(string: urlString) else {
             throw ApiError.invalidUrl
@@ -229,7 +229,7 @@ public class HopNetApiClient {
     // MARK: - Changes
     
     public func getChanges(parentPath: String? = nil, sinceHeight: Int32? = nil) async throws -> ChangesResponse {
-        let urlString = "\(config.baseUrl)/integrations/fileprovider/changes"
+        let urlString = "\(config.baseUrl)/api/integrations/fileprovider/changes"
         
         guard var urlComponents = URLComponents(string: urlString) else {
             throw ApiError.invalidUrl
@@ -286,7 +286,7 @@ public class HopNetApiClient {
     // MARK: - Delete
     
     public func deleteItem(identifier: String, recursive: Bool) async throws {
-        let urlString = "\(config.baseUrl)/integrations/fileprovider/delete"
+        let urlString = "\(config.baseUrl)/api/integrations/fileprovider/delete"
         logger.debug("Deleting item with identifier: \(identifier), recursive: \(recursive)")
         
         guard let url = URL(string: urlString) else {
@@ -347,7 +347,7 @@ public class HopNetApiClient {
     // MARK: - Download
     
     public func downloadFile(identifier: String, progressHandler: @escaping (Double) -> Void = { _ in }) async throws -> URL {
-        let urlString = "\(config.baseUrl)/integrations/fileprovider/download"
+        let urlString = "\(config.baseUrl)/api/integrations/fileprovider/download"
         
         guard var urlComponents = URLComponents(string: urlString) else {
             throw ApiError.invalidUrl
@@ -436,7 +436,7 @@ public class HopNetApiClient {
     // MARK: - Create
     
     public func createItem(parentItemIdentifier: String, filename: String, fileUrl: URL? = nil) async throws {
-        let urlString = "\(config.baseUrl)/integrations/fileprovider/create"
+        let urlString = "\(config.baseUrl)/api/integrations/fileprovider/create"
         logger.debug("Creating item at: \(urlString)")
         
         guard let url = URL(string: urlString) else {
@@ -528,7 +528,7 @@ public class HopNetApiClient {
     // MARK: - Modify
     
     public func modifyItem(identifier: String, filename: String? = nil, parentItemIdentifier: String? = nil) async throws -> ModifyItemResponse {
-        let urlString = "\(config.baseUrl)/integrations/fileprovider/modify"
+        let urlString = "\(config.baseUrl)/api/integrations/fileprovider/modify"
         logger.debug("Modifying item with identifier: \(identifier)")
         
         guard let url = URL(string: urlString) else {
@@ -618,7 +618,7 @@ public class HopNetApiClient {
     
     /// Phase 4b: Modify item with content update
     public func modifyItemWithContent(identifier: String, filename: String? = nil, parentItemIdentifier: String? = nil, contentUrl: URL, progressHandler: @escaping (Double) -> Void = { _ in }) async throws -> ModifyItemResponse {
-        let urlString = "\(config.baseUrl)/integrations/fileprovider/modify"
+        let urlString = "\(config.baseUrl)/api/integrations/fileprovider/modify"
         logger.debug("Modifying item with content: \(identifier)")
         
         guard let url = URL(string: urlString) else {
@@ -727,7 +727,7 @@ public class HopNetApiClient {
     // MARK: - Item
     
     public func getItem(identifier: String) async throws -> FileProviderItem {
-        let urlString = "\(config.baseUrl)/integrations/fileprovider/item"
+        let urlString = "\(config.baseUrl)/api/integrations/fileprovider/item"
         
         guard var urlComponents = URLComponents(string: urlString) else {
             throw ApiError.invalidUrl

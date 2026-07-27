@@ -18,7 +18,7 @@ use crate::tests::{get_max_view, wait_for_minimum_view};
 /// Returns Ok(status_code) so callers can assert on 200 vs 409 etc.
 async fn share_file(node: &NodeInfo, inode_id: &str, recipient_username: &str) -> Result<u16> {
     let client = Client::new();
-    let url = format!("http://{}:{}/shares", node.ip_address, node.port);
+    let url = format!("http://{}:{}/api/shares", node.ip_address, node.port);
 
     let response = client
         .post(&url)
@@ -38,7 +38,7 @@ async fn share_file(node: &NodeInfo, inode_id: &str, recipient_username: &str) -
 /// GET /shares/incoming — list pending incoming shares.
 async fn get_incoming_shares(node: &NodeInfo) -> Result<Vec<serde_json::Value>> {
     let client = Client::new();
-    let url = format!("http://{}:{}/shares/incoming", node.ip_address, node.port);
+    let url = format!("http://{}:{}/api/shares/incoming", node.ip_address, node.port);
 
     let response = client
         .get(&url)
@@ -64,7 +64,7 @@ async fn get_incoming_shares(node: &NodeInfo) -> Result<Vec<serde_json::Value>> 
 async fn get_incoming_share_count(node: &NodeInfo) -> Result<i64> {
     let client = Client::new();
     let url = format!(
-        "http://{}:{}/shares/incoming/count",
+        "http://{}:{}/api/shares/incoming/count",
         node.ip_address, node.port
     );
 
@@ -95,7 +95,7 @@ async fn get_incoming_share_count(node: &NodeInfo) -> Result<i64> {
 async fn accept_share(node: &NodeInfo, share_id: &str, placement_path: &str) -> Result<u16> {
     let client = Client::new();
     let url = format!(
-        "http://{}:{}/shares/{}/accept",
+        "http://{}:{}/api/shares/{}/accept",
         node.ip_address, node.port, share_id
     );
 
@@ -117,7 +117,7 @@ async fn accept_share(node: &NodeInfo, share_id: &str, placement_path: &str) -> 
 async fn decline_share(node: &NodeInfo, share_id: &str) -> Result<u16> {
     let client = Client::new();
     let url = format!(
-        "http://{}:{}/shares/incoming/{}",
+        "http://{}:{}/api/shares/incoming/{}",
         node.ip_address, node.port, share_id
     );
 
@@ -135,7 +135,7 @@ async fn decline_share(node: &NodeInfo, share_id: &str) -> Result<u16> {
 async fn get_share_details(node: &NodeInfo, inode_id: &str) -> Result<serde_json::Value> {
     let client = Client::new();
     let url = format!(
-        "http://{}:{}/shares/file/{}",
+        "http://{}:{}/api/shares/file/{}",
         node.ip_address, node.port, inode_id
     );
 
@@ -164,7 +164,7 @@ async fn get_share_details(node: &NodeInfo, inode_id: &str) -> Result<serde_json
 async fn unshare_file(node: &NodeInfo, inode_id: &str) -> Result<u16> {
     let client = Client::new();
     let url = format!(
-        "http://{}:{}/shares/file/{}",
+        "http://{}:{}/api/shares/file/{}",
         node.ip_address, node.port, inode_id
     );
 

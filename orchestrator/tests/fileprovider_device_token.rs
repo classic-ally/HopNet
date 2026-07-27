@@ -778,7 +778,7 @@ async fn register_device(
     node: &NodeInfo,
     device_name: &str,
 ) -> Result<RegisterDeviceResponse> {
-    let url = format!("http://{}:{}/devices/register", node.ip_address, node.port);
+    let url = format!("http://{}:{}/api/devices/register", node.ip_address, node.port);
 
     let response = client
         .post(&url)
@@ -800,7 +800,7 @@ async fn register_device(
 
 async fn revoke_device(client: &Client, node: &NodeInfo, device_id: &str) -> Result<()> {
     let url = format!(
-        "http://{}:{}/devices/{}",
+        "http://{}:{}/api/devices/{}",
         node.ip_address, node.port, device_id
     );
 
@@ -831,7 +831,7 @@ async fn fp_enumerate(
     parent_item_identifier: Option<&str>,
 ) -> Result<FPEnumerateResponse> {
     let mut url = format!(
-        "http://{}:{}/integrations/fileprovider/enumerate",
+        "http://{}:{}/api/integrations/fileprovider/enumerate",
         node.ip_address, node.port
     );
     if let Some(pid) = parent_item_identifier {
@@ -862,7 +862,7 @@ async fn fp_create_folder(
     folder_name: &str,
 ) -> Result<()> {
     let url = format!(
-        "http://{}:{}/integrations/fileprovider/create",
+        "http://{}:{}/api/integrations/fileprovider/create",
         node.ip_address, node.port
     );
 
@@ -896,7 +896,7 @@ async fn fp_create_file(
     content: &[u8],
 ) -> Result<()> {
     let url = format!(
-        "http://{}:{}/integrations/fileprovider/create",
+        "http://{}:{}/api/integrations/fileprovider/create",
         node.ip_address, node.port
     );
 
@@ -932,7 +932,7 @@ async fn fp_download(
     identifier: &str,
 ) -> Result<Vec<u8>> {
     let url = format!(
-        "http://{}:{}/integrations/fileprovider/download?identifier={}",
+        "http://{}:{}/api/integrations/fileprovider/download?identifier={}",
         node.ip_address, node.port, identifier
     );
 
@@ -959,7 +959,7 @@ async fn fp_changes(
     since_height: i32,
 ) -> Result<FPChangesResponse> {
     let url = format!(
-        "http://{}:{}/integrations/fileprovider/changes?since_height={}",
+        "http://{}:{}/api/integrations/fileprovider/changes?since_height={}",
         node.ip_address, node.port, since_height
     );
 
@@ -1000,7 +1000,7 @@ async fn dp_upload_file(
     content: &[u8],
 ) -> Result<()> {
     let url = format!(
-        "http://{}:{}/integrations/documentprovider/upload",
+        "http://{}:{}/api/integrations/documentprovider/upload",
         node.ip_address, node.port
     );
 
@@ -1039,7 +1039,7 @@ async fn dp_download_file(
     file_id: &str,
 ) -> Result<Vec<u8>> {
     let url = format!(
-        "http://{}:{}/integrations/documentprovider/download?id={}",
+        "http://{}:{}/api/integrations/documentprovider/download?id={}",
         node.ip_address, node.port, file_id
     );
 
@@ -1066,7 +1066,7 @@ async fn dp_enumerate(
     parent_id: Option<&str>,
 ) -> Result<Vec<DocumentProviderItem>> {
     let mut url = format!(
-        "http://{}:{}/integrations/documentprovider/enumerate",
+        "http://{}:{}/api/integrations/documentprovider/enumerate",
         node.ip_address, node.port
     );
     if let Some(pid) = parent_id {
@@ -1209,7 +1209,7 @@ async fn poll_until_token_rejected(
         let mut all_rejected = true;
         for node in nodes {
             let url = format!(
-                "http://{}:{}/integrations/fileprovider/enumerate",
+                "http://{}:{}/api/integrations/fileprovider/enumerate",
                 node.ip_address, node.port
             );
             match client

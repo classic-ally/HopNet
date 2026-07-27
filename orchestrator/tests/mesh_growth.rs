@@ -39,7 +39,7 @@ pub(crate) async fn rebuild_nodes(
 }
 
 async fn seated_count(client: &Client, node: &NodeInfo, height: i64) -> usize {
-    let url = format!("http://{}:{}/consensus/view", node.ip_address, node.port);
+    let url = format!("http://{}:{}/api/consensus/view", node.ip_address, node.port);
     let Ok(resp) = client
         .post(&url)
         .header("Authorization", format!("Bearer {}", node.jwt_token))

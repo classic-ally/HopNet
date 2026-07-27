@@ -20,8 +20,7 @@ export default defineConfig({
   server: {
     proxy: {
       // Proxy all API requests to the Rust backend in dev mode.
-      // The SPA only serves / (index.html) and /assets/*; everything else is an API route.
-      '^/(login|logout|setup|nodes|files|fragments|users|shares|metrics|devices|consensus|takeout|admin|maintenance|diagnostics|debug|validators|integrations|test)': {
+      '/api': {
         target: devProxyTarget,
         changeOrigin: true,
       }

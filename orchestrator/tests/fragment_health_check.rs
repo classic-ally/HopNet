@@ -162,7 +162,7 @@ impl TestScenario for FragmentHealthCheck {
 
         for source in nodes {
             let url = format!(
-                "http://{}:{}/test/fragment-health-check/{}",
+                "http://{}:{}/api/test/fragment-health-check/{}",
                 source.ip_address, source.port, fragment_hash
             );
 

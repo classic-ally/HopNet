@@ -386,7 +386,7 @@ impl TestScenario for RecentsOrdering {
 async fn list_recent_files(node: &NodeInfo, limit: u32) -> Result<serde_json::Value> {
     let client = reqwest::Client::new();
     let url = format!(
-        "http://{}:{}/files/recent?limit={}",
+        "http://{}:{}/api/files/recent?limit={}",
         node.ip_address, node.port, limit
     );
 

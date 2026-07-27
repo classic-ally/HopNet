@@ -24,7 +24,7 @@ pub(crate) fn node_with_token(node: &NodeInfo, token: &str) -> NodeInfo {
 /// POST /users to create a new user, returns the generated passphrase.
 pub(crate) async fn create_user(node: &NodeInfo, username: &str) -> Result<String> {
     let client = Client::new();
-    let url = format!("http://{}:{}/users", node.ip_address, node.port);
+    let url = format!("http://{}:{}/api/users", node.ip_address, node.port);
 
     let response = client
         .post(&url)
@@ -55,7 +55,7 @@ pub(crate) async fn login_user(
     passphrase: &str,
 ) -> Result<String> {
     let client = Client::new();
-    let url = format!("http://{}:{}/login", node.ip_address, node.port);
+    let url = format!("http://{}:{}/api/login", node.ip_address, node.port);
 
     let response = client
         .post(&url)
@@ -91,7 +91,7 @@ pub(crate) async fn try_download_file(
 
     let path_trimmed = path.strip_prefix('/').unwrap_or(path);
     let url = format!(
-        "http://{}:{}/files/{}",
+        "http://{}:{}/api/files/{}",
         node.ip_address, node.port, path_trimmed
     );
 
@@ -118,7 +118,7 @@ pub(crate) async fn fetch_state_snapshots(
     for node in nodes {
         let node = node.clone();
         handles.push(tokio::spawn(async move {
-            let response = crate::call_node_api(&node, "/debug/state", true).await?;
+            let response = crate::call_node_api(&node, "/api/debug/state", true).await?;
             if !response.status().is_success() {
                 anyhow::bail!("HTTP {}", response.status());
             }

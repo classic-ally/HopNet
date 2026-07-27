@@ -41,7 +41,7 @@ impl TestScenario for IrohRejectUnknown {
 
         // Get node list from the first node to obtain pubkeys
         let first_node = &nodes[0];
-        let nodes_url = format!("http://{}:{}/nodes", first_node.ip_address, first_node.port);
+        let nodes_url = format!("http://{}:{}/api/nodes", first_node.ip_address, first_node.port);
 
         let mesh_nodes: Vec<Node> = client
             .get(&nodes_url)

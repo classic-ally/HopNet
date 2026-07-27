@@ -358,7 +358,7 @@ pub async fn check_divergence(
 
     for node_info in nodes {
         let handle = tokio::spawn(async move {
-            let response = crate::call_node_api(&node_info, "/debug/state", true).await?;
+            let response = crate::call_node_api(&node_info, "/api/debug/state", true).await?;
             if !response.status().is_success() {
                 anyhow::bail!("HTTP {}", response.status());
             }

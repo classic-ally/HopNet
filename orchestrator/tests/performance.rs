@@ -93,7 +93,7 @@ async fn download_file_with_ttfb(
     let client = Client::new();
     let path_trimmed = path.strip_prefix('/').unwrap_or(path);
     let url = format!(
-        "http://{}:{}/files/{}",
+        "http://{}:{}/api/files/{}",
         node.ip_address, node.port, path_trimmed
     );
 

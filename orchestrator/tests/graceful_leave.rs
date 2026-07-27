@@ -29,7 +29,7 @@ pub(crate) struct ViewState {
 }
 
 pub(crate) async fn view_state(client: &Client, node: &NodeInfo, height: i64) -> Result<ViewState> {
-    let url = format!("http://{}:{}/consensus/view", node.ip_address, node.port);
+    let url = format!("http://{}:{}/api/consensus/view", node.ip_address, node.port);
     let resp = client
         .post(&url)
         .header("Authorization", format!("Bearer {}", node.jwt_token))
@@ -131,7 +131,7 @@ impl TestScenario for GracefulLeave {
 
         // 2. Leave: the response returns only after the commit.
         let leave_url = format!(
-            "http://{}:{}/consensus/leave",
+            "http://{}:{}/api/consensus/leave",
             leaver.ip_address, leaver.port
         );
         let leave_ok = client

@@ -58,7 +58,7 @@ where
 
 async fn update_user_profile(node: &NodeInfo, first_name: &str, last_name: &str) -> Result<()> {
     let client = Client::new();
-    let url = format!("http://{}:{}/users/me/profile", node.ip_address, node.port);
+    let url = format!("http://{}:{}/api/users/me/profile", node.ip_address, node.port);
 
     let response = client
         .put(&url)
@@ -91,7 +91,7 @@ struct RegisterDeviceResponse {
 /// POST /devices/register
 async fn register_device(node: &NodeInfo, device_name: &str) -> Result<RegisterDeviceResponse> {
     let client = Client::new();
-    let url = format!("http://{}:{}/devices/register", node.ip_address, node.port);
+    let url = format!("http://{}:{}/api/devices/register", node.ip_address, node.port);
 
     let response = client
         .post(&url)
@@ -119,7 +119,7 @@ async fn register_device(node: &NodeInfo, device_name: &str) -> Result<RegisterD
 async fn revoke_device(node: &NodeInfo, device_id: &str) -> Result<()> {
     let client = Client::new();
     let url = format!(
-        "http://{}:{}/devices/{}",
+        "http://{}:{}/api/devices/{}",
         node.ip_address, node.port, device_id
     );
 

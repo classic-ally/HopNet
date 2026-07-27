@@ -98,7 +98,7 @@ pub fn build_archive_with_wrong_first_entry() -> Result<Vec<u8>> {
 /// bytes. Caller inspects the returned `Response` for status + body.
 pub async fn upload_import_archive(node: &NodeInfo, bytes: Vec<u8>) -> Result<reqwest::Response> {
     let client = Client::new();
-    let url = format!("http://{}:{}/takeout/import", node.ip_address, node.port);
+    let url = format!("http://{}:{}/api/takeout/import", node.ip_address, node.port);
     let part = reqwest::multipart::Part::bytes(bytes).file_name("archive.tar.gz");
     let form = reqwest::multipart::Form::new().part("archive", part);
     let resp = client
@@ -118,7 +118,7 @@ async fn initiate_import_status(node: &NodeInfo, bytes: Vec<u8>) -> Result<Statu
 /// GET /takeout/import — fetch the user's current import (singleton).
 async fn get_current_import(node: &NodeInfo) -> Result<Option<ImportRecord>> {
     let client = Client::new();
-    let url = format!("http://{}:{}/takeout/import", node.ip_address, node.port);
+    let url = format!("http://{}:{}/api/takeout/import", node.ip_address, node.port);
     let resp = client
         .get(&url)
         .header("Authorization", format!("Bearer {}", node.jwt_token))
@@ -188,7 +188,7 @@ async fn wait_for_import_status(
 pub async fn get_import_paths(node: &NodeInfo) -> Result<Vec<ImportPathRow>> {
     let client = Client::new();
     let url = format!(
-        "http://{}:{}/takeout/import/paths",
+        "http://{}:{}/api/takeout/import/paths",
         node.ip_address, node.port
     );
     let resp = client
@@ -938,7 +938,7 @@ impl TestScenario for ImportExtractionHappyPath {
         if nodes.len() >= 2 {
             let client = Client::new();
             let url = format!(
-                "http://{}:{}/takeout/import/paths",
+                "http://{}:{}/api/takeout/import/paths",
                 nodes[1].ip_address, nodes[1].port
             );
             let resp = client
@@ -1450,7 +1450,7 @@ impl TestScenario for ImportCreationMixedFailure {
 async fn get_import_status_counts(node: &NodeInfo) -> Result<ImportPathCounts> {
     let client = Client::new();
     let url = format!(
-        "http://{}:{}/takeout/import/status",
+        "http://{}:{}/api/takeout/import/status",
         node.ip_address, node.port
     );
     let resp = client
@@ -1477,7 +1477,7 @@ async fn upload_file_status(
     contents: Vec<u8>,
 ) -> Result<StatusCode> {
     let client = Client::new();
-    let url = format!("http://{}:{}/files", node.ip_address, node.port);
+    let url = format!("http://{}:{}/api/files", node.ip_address, node.port);
     let len = contents.len();
     let part = reqwest::multipart::Part::bytes(contents).file_name(filename.to_string());
     let form = reqwest::multipart::Form::new()
@@ -1733,7 +1733,7 @@ impl TestScenario for ImportStatusCounts {
         if nodes.len() >= 2 {
             let client = Client::new();
             let url = format!(
-                "http://{}:{}/takeout/import/status",
+                "http://{}:{}/api/takeout/import/status",
                 nodes[1].ip_address, nodes[1].port
             );
             let resp = client
@@ -1779,7 +1779,7 @@ impl TestScenario for ImportResumeAfterRestart {
         // deterministic mid-import state to stop on.
         let client = Client::new();
         let hold_url = format!(
-            "http://{}:{}/test/barriers/takeout/before_import_creation_walk/hold",
+            "http://{}:{}/api/test/barriers/takeout/before_import_creation_walk/hold",
             nodes[0].ip_address, nodes[0].port
         );
         let hold_resp = client

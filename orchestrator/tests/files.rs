@@ -24,7 +24,7 @@ pub async fn upload_file(
     contents: Vec<u8>,
 ) -> Result<()> {
     let client = Client::new();
-    let url = format!("http://{}:{}/files", node.ip_address, node.port);
+    let url = format!("http://{}:{}/api/files", node.ip_address, node.port);
 
     let contents_len = contents.len();
 
@@ -66,7 +66,7 @@ pub async fn upload_files_multi(
     files: Vec<(String, Vec<u8>)>,
 ) -> Result<()> {
     let client = Client::new();
-    let url = format!("http://{}:{}/files", node.ip_address, node.port);
+    let url = format!("http://{}:{}/api/files", node.ip_address, node.port);
 
     let mut form = reqwest::multipart::Form::new().text("path", path.to_string());
     for (filename, contents) in files {
@@ -106,7 +106,7 @@ pub async fn upload_files_multi(
 /// * `new_contents` - The new file contents as bytes
 pub async fn modify_file(node: &NodeInfo, inode_id: &str, new_contents: Vec<u8>) -> Result<()> {
     let client = Client::new();
-    let url = format!("http://{}:{}/files", node.ip_address, node.port);
+    let url = format!("http://{}:{}/api/files", node.ip_address, node.port);
 
     let contents_len = new_contents.len();
 
@@ -174,7 +174,7 @@ pub async fn download_file_with_timeout(
         // Strip leading slash if present for URL construction
         let path_trimmed = path.strip_prefix('/').unwrap_or(path);
         let url = format!(
-            "http://{}:{}/files/{}",
+            "http://{}:{}/api/files/{}",
             node.ip_address, node.port, path_trimmed
         );
 
@@ -324,7 +324,7 @@ pub fn verify_all_identical(data: &[Vec<u8>]) -> Result<()> {
 pub async fn list_files(node: &NodeInfo, path: &str) -> Result<serde_json::Value> {
     let client = Client::new();
     let url = format!(
-        "http://{}:{}/files?path={}",
+        "http://{}:{}/api/files?path={}",
         node.ip_address, node.port, path
     );
 
@@ -423,7 +423,7 @@ pub fn verify_listings_identical(listings: &[serde_json::Value]) -> Result<()> {
 pub async fn delete_file(node: &NodeInfo, path: &str) -> Result<()> {
     let client = Client::new();
     let url = format!(
-        "http://{}:{}/files?path={}",
+        "http://{}:{}/api/files?path={}",
         node.ip_address, node.port, path
     );
 
@@ -482,7 +482,7 @@ pub struct FileFragmentDistribution {
 pub async fn trigger_fragment_inventory_sync(node: &NodeInfo) -> Result<()> {
     let client = Client::new();
     let url = format!(
-        "http://{}:{}/maintenance/fragment-inventory-self-check",
+        "http://{}:{}/api/maintenance/fragment-inventory-self-check",
         node.ip_address, node.port
     );
 
@@ -546,7 +546,7 @@ pub async fn get_fragment_distribution(
 ) -> Result<FileFragmentDistribution> {
     let client = Client::new();
     let url = format!(
-        "http://{}:{}/diagnostics/file-fragments?path={}",
+        "http://{}:{}/api/diagnostics/file-fragments?path={}",
         node.ip_address,
         node.port,
         urlencoding::encode(path)
@@ -836,7 +836,7 @@ pub async fn download_file_headers(
         .build()?;
     let path_trimmed = path.strip_prefix('/').unwrap_or(path);
     let url = format!(
-        "http://{}:{}/files/{}",
+        "http://{}:{}/api/files/{}",
         node.ip_address, node.port, path_trimmed
     );
 
@@ -886,7 +886,7 @@ pub async fn download_file_range(
         .build()?;
     let path_trimmed = path.strip_prefix('/').unwrap_or(path);
     let url = format!(
-        "http://{}:{}/files/{}",
+        "http://{}:{}/api/files/{}",
         node.ip_address, node.port, path_trimmed
     );
 

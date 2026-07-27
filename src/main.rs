@@ -1,9 +1,11 @@
 use apalis::prelude::*;
 use axum::{
     Router,
-    extract::DefaultBodyLimit,
-    http::{HeaderValue, Method, StatusCode},
+    body::Body,
+    extract::{DefaultBodyLimit, Request},
+    http::{header, HeaderValue, Method, StatusCode},
     middleware,
+    response::Response,
     routing::{get, post},
     serve,
 };
@@ -26,8 +28,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use tower_serve_static::ServeDir;
-
+use bytes::Bytes;
 use hopnet::db::{PrivKey, PubKey};
 use hopnet::*;
 
@@ -48,6 +49,33 @@ static ACTUAL_BACKEND_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::At
 static GUI_APP_STATE: Lazy<tokio::sync::RwLock<Option<AppState>>> =
     Lazy::new(|| tokio::sync::RwLock::new(None));
 
+/// SPA-aware static file server. Serves files from the embedded
+/// frontend/dist/ directory when they exist, falling back to index.html for
+/// any unknown path so client-side routing works (e.g. /browse, /settings).
+async fn serve_spa(request: Request) -> Response<Body> {
+    let path = request.uri().path().trim_start_matches('/');
+    let path = if path.is_empty() { "index.html" } else { path };
+
+    if let Some(file) = ASSETS_DIR.get_file(path) {
+        let mime = mime_guess::from_path(path)
+            .first_raw()
+            .unwrap_or("application/octet-stream");
+        return Response::builder()
+            .header(header::CONTENT_TYPE, HeaderValue::from_static(mime))
+            .body(Body::from(Bytes::copy_from_slice(file.contents())))
+            .unwrap();
+    }
+
+    let index = ASSETS_DIR.get_file("index.html").unwrap();
+    Response::builder()
+        .header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        )
+        .body(Body::from(Bytes::copy_from_slice(index.contents())))
+        .unwrap()
+}
+
 /// Run the axum server.
 ///
 /// `bind_addr` is the address to bind. Headless: `0.0.0.0:34632` (publicly
@@ -60,8 +88,6 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
     // RFC-015 boot tripwire: fail-stop immediately if the linker dropped a
     // projection's cross-crate inventory registrations.
     assert_projection_registrations();
-
-    let admin_service = ServeDir::new(&ASSETS_DIR);
 
     // Bind before anything else. With `127.0.0.1:0` the kernel assigns a
     // free port; we need to capture the result and thread it into AppState
@@ -570,8 +596,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 Router::new() // Empty router when not in test mode
             };
 
-            let base_app = Router::new()
-                .fallback_service(admin_service) // routes we don't have get sent to vite frontend
+            let api_routes = Router::new()
                 .merge(protected_routes)
                 .merge(jwt_or_rpc_routes)
                 .route(
@@ -587,9 +612,9 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             // Projection mounts (RFC-016 Stage 4). Host routes close over
             // AppState first; each projection's routers are Router<()> and
             // get nested under their declared auth class. Everything —
-            // host and projection alike — then goes under the global
-            // layers below (overload shedding, tracing, CORS).
-            let mut base_app: Router<()> = base_app.with_state(app_state.clone());
+            // host and projection alike — then goes under the /api nest
+            // below.
+            let mut api_routes: Router<()> = api_routes.with_state(app_state.clone());
             for mount in projections::manifests()
                 .iter()
                 .flat_map(|m| m.mounts(&host_caps))
@@ -608,7 +633,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                         ))
                     }
                 };
-                base_app = base_app.nest(mount.prefix, routed);
+                api_routes = api_routes.nest(mount.prefix, routed);
             }
 
             // Overload shedding, two gates, both answering 503 + Retry-After
@@ -621,7 +646,9 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             //     non-gated paths (settler, metrics, peer refresh) supplied.
             //  2. Concurrency limit (coarse): catastrophic upper bound on
             //     in-flight requests, far above the DB gate's trip point.
-            let base_app = base_app.layer(middleware::from_fn_with_state(
+            // Applied inside the /api nest so the SPA fallback (index.html)
+            // is never shed — a 503 on the bootstrap HTML would brick the app.
+            let api_routes = api_routes.layer(middleware::from_fn_with_state(
                 app_state.clone(),
                 |axum::extract::State(state): axum::extract::State<AppState>,
                  req: axum::extract::Request,
@@ -639,7 +666,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                     next.run(req).await
                 },
             ));
-            let base_app = base_app.layer(
+            let api_routes = api_routes.layer(
                 tower::ServiceBuilder::new()
                     .layer(axum::error_handling::HandleErrorLayer::new(
                         |_e: tower::BoxError| async {
@@ -689,6 +716,12 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                     },
                 );
 
+            // Root router: /api for all endpoints, SPA fallback serves
+            // index.html for any remaining path so client-side routing works.
+            let app = Router::new()
+                .nest("/api", api_routes)
+                .fallback(serve_spa);
+
             let app = if cfg!(debug_assertions) {
                 let cors = CorsLayer::new()
                     .allow_origin("http://localhost:5173".parse::<HeaderValue>().unwrap()) // allow vite dev
@@ -700,9 +733,9 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                     .max_age(std::time::Duration::from_secs(3600))
                     .allow_credentials(false);
 
-                base_app.layer(cors).layer(trace_layer)
+                app.layer(cors).layer(trace_layer)
             } else {
-                base_app // no CORS in prod
+                app // no CORS in prod
                     .layer(trace_layer)
             };
 

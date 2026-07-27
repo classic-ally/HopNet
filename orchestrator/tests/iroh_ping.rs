@@ -50,7 +50,7 @@ impl TestScenario for IrohPing {
         // Each node pings all other nodes
         for source in nodes {
             let url = format!(
-                "http://{}:{}/debug/iroh-ping",
+                "http://{}:{}/api/debug/iroh-ping",
                 source.ip_address, source.port
             );
 

@@ -444,7 +444,7 @@ async fn trigger_cleanup(
 ) -> Result<CleanupResponse> {
     let client = Client::new();
     let url = format!(
-        "http://{}:{}/maintenance/cleanup-orphaned?batch_size={}&retention_days={}",
+        "http://{}:{}/api/maintenance/cleanup-orphaned?batch_size={}&retention_days={}",
         node.ip_address, node.port, batch_size, retention_days
     );
 

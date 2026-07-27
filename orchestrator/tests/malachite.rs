@@ -31,7 +31,7 @@ use crate::tests::{Check, TestResult, TestScenario, print_and_add_check};
 /// node_id, last decided height).
 async fn consensus_status(node: &NodeInfo) -> Result<(u64, u32, u64)> {
     let client = Client::new();
-    let url = format!("http://{}:{}/consensus", node.ip_address, node.port);
+    let url = format!("http://{}:{}/api/consensus", node.ip_address, node.port);
     let resp = client
         .get(&url)
         .header("Authorization", format!("Bearer {}", node.jwt_token))
@@ -127,7 +127,7 @@ async fn wait_caught_up_to_tip(
 async fn set_barrier(node: &NodeInfo, name: &str, action: &str) -> Result<()> {
     let client = Client::new();
     let url = format!(
-        "http://{}:{}/test/barriers/consensus/{}/{}",
+        "http://{}:{}/api/test/barriers/consensus/{}/{}",
         node.ip_address, node.port, name, action
     );
     let resp = client

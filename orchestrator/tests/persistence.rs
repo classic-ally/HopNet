@@ -84,7 +84,7 @@ pub async fn wait_for_node_ready(node: &NodeInfo, timeout: Duration) -> Result<b
         }
 
         // Use unauthenticated /setup endpoint since JWT tokens expire after restart
-        let url = format!("http://{}:{}/setup", node.ip_address, node.port);
+        let url = format!("http://{}:{}/api/setup", node.ip_address, node.port);
         let response = client
             .get(&url)
             .timeout(Duration::from_secs(2))
@@ -102,7 +102,7 @@ pub async fn wait_for_node_ready(node: &NodeInfo, timeout: Duration) -> Result<b
 /// Get a node's public key from the setup endpoint
 pub async fn get_node_pubkey(node: &NodeInfo) -> Result<String> {
     let client = Client::new();
-    let url = format!("http://{}:{}/setup", node.ip_address, node.port);
+    let url = format!("http://{}:{}/api/setup", node.ip_address, node.port);
 
     let response = client
         .get(&url)

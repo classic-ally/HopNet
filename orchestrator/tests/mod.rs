@@ -530,7 +530,7 @@ pub async fn get_max_view(nodes: &[NodeInfo]) -> Result<u64> {
         let client = client.clone();
         let node = node.clone();
         let task = tokio::spawn(async move {
-            let url = format!("http://{}:{}/consensus", node.ip_address, node.port);
+            let url = format!("http://{}:{}/api/consensus", node.ip_address, node.port);
             let response = client
                 .get(&url)
                 .header("Authorization", format!("Bearer {}", node.jwt_token))
@@ -587,7 +587,7 @@ pub async fn wait_for_minimum_view(
             let client = client.clone();
             let node = node.clone();
             let task = tokio::spawn(async move {
-                let url = format!("http://{}:{}/consensus", node.ip_address, node.port);
+                let url = format!("http://{}:{}/api/consensus", node.ip_address, node.port);
                 let response = client
                     .get(&url)
                     .header("Authorization", format!("Bearer {}", node.jwt_token))

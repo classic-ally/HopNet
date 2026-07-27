@@ -523,7 +523,7 @@ async fn wait_for_formation(
         .find(|(id, _, _)| *id == 0)
         .map(|(_, h, p)| (h.clone(), *p))
         .ok_or_else(|| anyhow::anyhow!("node 0 address"))?;
-    let url = format!("http://{}:{}/consensus/view", host, port);
+    let url = format!("http://{}:{}/api/consensus/view", host, port);
 
     let start = std::time::Instant::now();
     let mut prev: Option<u32> = None;
@@ -1074,7 +1074,7 @@ async fn setup_node_0(
         .map(|(_, h, p)| (h.clone(), *p))
         .ok_or_else(|| anyhow::anyhow!("Node 0 not found"))?;
 
-    let url = format!("http://{}:{}/setup", host, port);
+    let url = format!("http://{}:{}/api/setup", host, port);
 
     let setup_data = json!({
         "username": "allison",
@@ -1174,7 +1174,7 @@ pub async fn get_jwt_token(
         .map(|(_, h, p)| (h.clone(), *p))
         .ok_or_else(|| anyhow::anyhow!("Node {} not found", node_id))?;
 
-    let login_url = format!("http://{}:{}/login", host, port);
+    let login_url = format!("http://{}:{}/api/login", host, port);
 
     let passphrase = load_mesh_passphrase(docker, mesh_id).await?;
 
@@ -1236,7 +1236,7 @@ async fn register_node_with_node_0(
         .ok_or_else(|| anyhow::anyhow!("Node {} not found", node_id))?;
 
     // Step 1: Get the public key from the node's /setup GET route
-    let get_setup_url = format!("http://{}:{}/setup", node_host, node_port);
+    let get_setup_url = format!("http://{}:{}/api/setup", node_host, node_port);
     println!("  Getting public key from: {}", get_setup_url);
 
     let start_time = std::time::Instant::now();
@@ -1306,7 +1306,7 @@ async fn register_node_with_node_0(
         .find(|(id, _, _)| *id == 0)
         .map(|(_, h, p)| (h.clone(), *p))
         .ok_or_else(|| anyhow::anyhow!("Node 0 not found"))?;
-    let register_url = format!("http://{}:{}/nodes", node_0_host, node_0_port);
+    let register_url = format!("http://{}:{}/api/nodes", node_0_host, node_0_port);
     let node_data = json!({
         "name": node_name,
         "owner": 0,
@@ -1889,7 +1889,7 @@ async fn show_node_history(
         );
         println!("{}", "=".repeat(60));
 
-        let url = format!("http://{}:{}/consensus/view", host, port);
+        let url = format!("http://{}:{}/api/consensus/view", host, port);
         let response = client
             .post(&url)
             .header("Authorization", format!("Bearer {}", jwt_token))
@@ -1953,7 +1953,7 @@ async fn show_node_history(
         // Show full history table (existing behavior)
         println!("Node {} Consensus History (Mesh {})", node_id, mesh_id);
 
-        let url = format!("http://{}:{}/consensus/history", host, port);
+        let url = format!("http://{}:{}/api/consensus/history", host, port);
         let response = client
             .get(&url)
             .header("Authorization", format!("Bearer {}", jwt_token))
@@ -2027,7 +2027,7 @@ async fn get_node_status(
     };
 
     // Query consensus state with JWT
-    let consensus_url = format!("http://{}:{}/consensus", host, port);
+    let consensus_url = format!("http://{}:{}/api/consensus", host, port);
 
     match client
         .get(&consensus_url)
@@ -2260,13 +2260,20 @@ async fn load_mesh_passphrase(docker: &Docker, mesh_id: u32) -> Result<String> {
     ))
 }
 
+/// Centralised URL builder. Every API-path construction in tests must
+/// flow through this function so a URL-scheme change (e.g. prefixing all
+/// routes with /api) is a single-site edit.
+pub fn node_url(node: &NodeInfo, path: &str) -> String {
+    format!("http://{}:{}{}", node.ip_address, node.port, path)
+}
+
 /// Call a HopNet node API with authentication and optional retry
 pub async fn call_node_api(
     node_info: &NodeInfo,
     path: &str,
     retry: bool,
 ) -> Result<reqwest::Response> {
-    let url = format!("http://{}:{}{}", node_info.ip_address, node_info.port, path);
+    let url = node_url(node_info, path);
     let client = reqwest::Client::new();
 
     let make_request = || async {

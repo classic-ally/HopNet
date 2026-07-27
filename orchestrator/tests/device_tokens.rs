@@ -242,7 +242,7 @@ async fn register_device(
     node: &NodeInfo,
     device_name: &str,
 ) -> Result<RegisterDeviceResponse> {
-    let url = format!("http://{}:{}/devices/register", node.ip_address, node.port);
+    let url = format!("http://{}:{}/api/devices/register", node.ip_address, node.port);
 
     let response = client
         .post(&url)
@@ -266,7 +266,7 @@ async fn register_device(
 /// Revoke a device on a node
 async fn revoke_device(client: &Client, node: &NodeInfo, device_id: &str) -> Result<()> {
     let url = format!(
-        "http://{}:{}/devices/{}",
+        "http://{}:{}/api/devices/{}",
         node.ip_address, node.port, device_id
     );
 
@@ -290,7 +290,7 @@ async fn revoke_device(client: &Client, node: &NodeInfo, device_id: &str) -> Res
 /// Returns true if accepted, false if rejected (401/403)
 async fn test_device_token_auth(client: &Client, node: &NodeInfo, api_key: &str) -> Result<bool> {
     let url = format!(
-        "http://{}:{}/integrations/documentprovider/enumerate",
+        "http://{}:{}/api/integrations/documentprovider/enumerate",
         node.ip_address, node.port
     );
 

@@ -582,7 +582,7 @@ async fn register_device(
     node: &NodeInfo,
     device_name: &str,
 ) -> Result<RegisterDeviceResponse> {
-    let url = format!("http://{}:{}/devices/register", node.ip_address, node.port);
+    let url = format!("http://{}:{}/api/devices/register", node.ip_address, node.port);
 
     let response = client
         .post(&url)
@@ -621,7 +621,7 @@ async fn upload_file(
     content: &[u8],
 ) -> Result<()> {
     let url = format!(
-        "http://{}:{}/integrations/documentprovider/upload",
+        "http://{}:{}/api/integrations/documentprovider/upload",
         node.ip_address, node.port
     );
 
@@ -662,7 +662,7 @@ async fn create_folder(
     folder_name: &str,
 ) -> Result<()> {
     let url = format!(
-        "http://{}:{}/integrations/documentprovider/upload",
+        "http://{}:{}/api/integrations/documentprovider/upload",
         node.ip_address, node.port
     );
 
@@ -698,7 +698,7 @@ async fn enumerate(
     parent_id: Option<&str>,
 ) -> Result<Vec<DocumentProviderItem>> {
     let mut url = format!(
-        "http://{}:{}/integrations/documentprovider/enumerate",
+        "http://{}:{}/api/integrations/documentprovider/enumerate",
         node.ip_address, node.port
     );
 
@@ -747,7 +747,7 @@ async fn rename_item(
     new_name: &str,
 ) -> Result<()> {
     let url = format!(
-        "http://{}:{}/integrations/documentprovider/item",
+        "http://{}:{}/api/integrations/documentprovider/item",
         node.ip_address, node.port
     );
 
@@ -781,7 +781,7 @@ async fn move_item(
     new_parent_id: &str,
 ) -> Result<()> {
     let url = format!(
-        "http://{}:{}/integrations/documentprovider/item",
+        "http://{}:{}/api/integrations/documentprovider/item",
         node.ip_address, node.port
     );
 
@@ -809,7 +809,7 @@ async fn move_item(
 /// Delete an item via DELETE
 async fn delete_item(client: &Client, node: &NodeInfo, api_key: &str, item_id: &str) -> Result<()> {
     let url = format!(
-        "http://{}:{}/integrations/documentprovider/item?id={}",
+        "http://{}:{}/api/integrations/documentprovider/item?id={}",
         node.ip_address, node.port, item_id
     );
 

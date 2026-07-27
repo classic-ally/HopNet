@@ -31,7 +31,7 @@ struct StorageViewResponse {
 }
 
 async fn fetch_view(client: &Client, node: &NodeInfo) -> Result<StorageViewResponse> {
-    let url = format!("http://{}:{}/storage/view", node.ip_address, node.port);
+    let url = format!("http://{}:{}/api/storage/view", node.ip_address, node.port);
     let resp = client
         .get(&url)
         .header("Authorization", format!("Bearer {}", node.jwt_token))
@@ -70,7 +70,7 @@ impl TestScenario for TierMembership {
         // replicated rows to derive from (empty history is also valid —
         // cold tiers, everyone present — but rows exercise the real path).
         let trigger = format!(
-            "http://{}:{}/metrics/trigger",
+            "http://{}:{}/api/metrics/trigger",
             nodes[0].ip_address, nodes[0].port
         );
         let trigger_ok = client

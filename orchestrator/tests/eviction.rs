@@ -30,7 +30,7 @@ struct EvictionSummary {
 async fn trigger_eviction(node: &NodeInfo) -> Result<EvictionSummary> {
     let client = Client::new();
     let url = format!(
-        "http://{}:{}/maintenance/watermark-eviction?high_pct=0&low_pct=0&grace_secs=0",
+        "http://{}:{}/api/maintenance/watermark-eviction?high_pct=0&low_pct=0&grace_secs=0",
         node.ip_address, node.port
     );
     let resp = client

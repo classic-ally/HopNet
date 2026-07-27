@@ -20,7 +20,7 @@ pub struct EvidenceObserve;
 
 pub(crate) async fn fetch_evidence(client: &Client, node: &NodeInfo) -> Result<serde_json::Value> {
     let url = format!(
-        "http://{}:{}/consensus/evidence",
+        "http://{}:{}/api/consensus/evidence",
         node.ip_address, node.port
     );
     let resp = client

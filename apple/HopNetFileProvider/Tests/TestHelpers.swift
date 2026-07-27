@@ -352,7 +352,7 @@ public struct TestHelpers {
     
     /// Get current signal count from backend (unprotected test route)
     public static func getSignalCount(config: FileProviderConfig) async throws -> Int {
-        let urlString = "\(config.baseUrl)/integrations/fileprovider/test/signals"
+        let urlString = "\(config.baseUrl)/api/integrations/fileprovider/test/signals"
         
         guard let url = URL(string: urlString) else {
             throw TestError.setupFailed("Invalid signal count URL")
