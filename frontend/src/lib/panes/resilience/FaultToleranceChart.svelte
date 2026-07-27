@@ -2,6 +2,7 @@
     import { onMount, onDestroy } from 'svelte';
     import uPlot from 'uplot';
     import 'uplot/dist/uPlot.min.css';
+    import Button from '../../Button.svelte';
     import type { FaultToleranceCurvePoint } from '../../types';
     import { formatStorageCapacity } from '../../utils/formatters';
 
@@ -30,6 +31,14 @@
     // Deliberately NOT departed nodes: those are already excluded from the
     // inventory, so counting them here would subtract the same loss twice.
     export let unreachableMembers = 0;
+
+    // Zoom the x-axis to the current stored data volume rather than showing
+    // the full ideal curve. Makes the observed frontier fill more of the
+    // chart width, useful when stored data is far below capacity.
+    export let zoomToData = false;
+
+    // Total stored user bytes, derived from the observed frontier.
+    $: consumedGb = frontier.reduce((a, s) => a + s.rawGb, 0);
 
     // Descending, so cumulative x is "how much data is at least this resilient".
     $: frontier = [...observedLevels].sort((a, b) => b.tolerance - a.tolerance);
@@ -65,9 +74,9 @@
             x: {
                 time: false,
                 range: (u, dataMin, dataMax) => {
-                    const range = dataMax - dataMin;
-                    const padding = range / 20; // 1/20th of the range
-                    return [dataMin, dataMax + padding];
+                    const max = zoomToData && consumedGb > 0 ? consumedGb : dataMax;
+                    if (max <= 0 || !isFinite(max)) return [0, 1];
+                    return [0, max + max / 20];
                 },
             },
             y: {
@@ -109,31 +118,31 @@
                 splits: (u, axisIdx, scaleMin, scaleMax, foundIncr, foundSpace) => {
                     if (data.length === 0) return [];
 
-                    // Check which series are visible
                     const tolerableFailuresVisible = u.series[1]?.show !== false;
-
                     const relevantPoints = [];
 
                     for (let i = 0; i < data.length; i++) {
                         const point = data[i];
+                        if (point.user_data_gb < scaleMin || point.user_data_gb > scaleMax) continue;
+
                         let shouldShow = false;
 
                         if (i === 0 || i === data.length - 1) {
-                            // Always show first and last points
                             shouldShow = true;
                         } else {
                             const prevPoint = data[i - 1];
-
-                            // Show if tolerable failures changed and that series is visible
                             if (tolerableFailuresVisible && point.nodes_can_fail !== prevPoint.nodes_can_fail) {
                                 shouldShow = true;
                             }
-
                         }
 
                         if (shouldShow) {
                             relevantPoints.push(point.user_data_gb);
                         }
+                    }
+
+                    if (zoomToData && consumedGb > 0 && consumedGb < scaleMax) {
+                        relevantPoints.push(consumedGb);
                     }
 
                     return relevantPoints;
@@ -227,10 +236,10 @@
                             if (i < data.length - 1 && isFinite(xData[i + 1])) {
                                 const nextXPixel = u.valToPos(xData[i + 1], 'x', true);
                                 if (isFinite(nextXPixel)) {
-                                    const nextGradientPos = (nextXPixel - plotLeft) / u.bbox.width;
+                                    const nextGradientPos = Math.min(1, (nextXPixel - plotLeft) / u.bbox.width);
                                     if (isFinite(nextGradientPos)) {
-                                        const beforeNext = nextGradientPos - 0.001;
-                                        if (beforeNext > gradientPos && beforeNext >= 0 && beforeNext <= 1) {
+                                        const beforeNext = Math.max(gradientPos, nextGradientPos - 0.001);
+                                        if (beforeNext > gradientPos && beforeNext <= 1) {
                                             gradient.addColorStop(beforeNext, color);
                                         }
                                     }
@@ -290,6 +299,13 @@
                     if (u.series[1].show === false) return;
 
                     ctx.save();
+
+                    // Clip to plot area so off-screen segments under zoom
+                    // do not bleed into the padding.
+                    ctx.beginPath();
+                    ctx.rect(u.bbox.left, u.bbox.top, u.bbox.width, u.bbox.height);
+                    ctx.clip();
+
                     ctx.lineWidth = 3;
 
                     for (let i = 0; i < data[1].length - 1; i++) {
@@ -674,7 +690,11 @@
     // recalcAxes re-runs the x range fn with null bounds, which returns
     // [null, NaN] and wipes the x scale — blanking the whole chart.
     $: if (chart && (observedLevels, unreachableMembers, true)) {
-        chart.redraw(false, false);
+        if (zoomToData && consumedGb > 0) {
+            updateChart();
+        } else {
+            chart.redraw(false, false);
+        }
     }
 
     // Reactive update when data changes
@@ -699,7 +719,7 @@
 </script>
 
 <!-- Just the plot: the box, title and headline stat belong to StoragePanel,
-     which composes this alongside UnattestedByAge. -->
+     which composes this alongside UnplacedByAge. -->
 <div>
     <!-- Chart container - always present but hidden when not needed -->
     <div class="flex justify-center" class:hidden={data.length === 0 || isOverCapacity(data)}>
@@ -725,6 +745,16 @@
                     {unreachableMembers} holder{unreachableMembers === 1 ? '' : 's'} unreachable —
                     hatched data is not guaranteed reconstructible
                 </span>
+            </div>
+        {/if}
+        {#if hasObserved}
+            <div class="flex justify-end pt-1">
+                <Button
+                    icon="i-carbon-zoom-fit"
+                    text={zoomToData ? 'Full view' : 'Fit to data'}
+                    onClick={() => { zoomToData = !zoomToData; updateChart(); }}
+                    tooltip={zoomToData ? 'Show full capacity range' : 'Fit x-axis to stored data'}
+                />
             </div>
         {/if}
         {#if unrecoverableGb > 0 || unknownGb > 0}

@@ -152,6 +152,10 @@
       unknownGb: {
         control: { type: 'number' },
         description: 'No attestation data — an observability gap'
+      },
+      zoomToData: {
+        control: { type: 'boolean' },
+        description: 'Zoom x-axis to current stored data volume'
       }
     }
   });
@@ -295,5 +299,57 @@
       { tolerance: 0, rawGb: 140 }
     ],
     unreachableMembers: 3
+  }}
+/>
+
+<!--
+  Zoomed to data: x-axis clamped to consumedGb so the frontier fills the width.
+  Stored volume (180 GB) is far below capacity (800 GB) — the dramatic case.
+-->
+<Story
+  name="Zoomed to data - small footprint"
+  {template}
+  args={{
+    data: mediumNetworkData,
+    observedLevels: [
+      { tolerance: 3, rawGb: 120 },
+      { tolerance: 2, rawGb: 60 }
+    ],
+    zoomToData: true
+  }}
+/>
+
+<!-- Zoomed with at-risk band at the right edge -->
+<Story
+  name="Zoomed - at risk band at right edge"
+  {template}
+  args={{
+    data: mediumNetworkData,
+    observedLevels: [
+      { tolerance: 2, rawGb: 80 },
+      { tolerance: 1, rawGb: 40 },
+      { tolerance: 0, rawGb: 30 }
+    ],
+    unreachableMembers: 2,
+    zoomToData: true
+  }}
+/>
+
+<!--
+  Zoomed and over capacity: consumedGb (950 GB) exceeds capacity (800 GB).
+  The full curve is revealed; zoom frames what is stored, including the
+  frontier past the ideal curve's end.
+-->
+<Story
+  name="Zoomed - over capacity"
+  {template}
+  args={{
+    data: mediumNetworkData,
+    observedLevels: [
+      { tolerance: 3, rawGb: 400 },
+      { tolerance: 2, rawGb: 300 },
+      { tolerance: 1, rawGb: 250 }
+    ],
+    zoomToData: true
   }}
 />
