@@ -59,13 +59,6 @@ CREATE TABLE photos (
     encrypted_metadata       BLOB NOT NULL,-- ChaCha20-Poly1305 encrypted metadata
     metadata_nonce           BLOB NOT NULL,-- 12-byte nonce for metadata decryption
 
-    -- Cross-asset grouping (burst, stack, panorama frames, HDR bracket).
-    -- Each frame is its own photo; group_id links them.
-    group_id         TEXT,
-    group_type       INTEGER,              -- see Group Types below
-    group_index      INTEGER,              -- ordering within group
-    is_group_pick    INTEGER NOT NULL DEFAULT 0,  -- 1 = key/representative frame
-
     -- Soft delete: NULL = active, set = tombstoned, 30-day retention window.
     -- Periodic cleanup hard-deletes the row and cascades to photo_resources
     -- once retention expires.
@@ -78,13 +71,12 @@ CREATE TABLE photos (
 );
 
 CREATE INDEX idx_photos_library ON photos(library_id);
-CREATE INDEX idx_photos_group ON photos(group_id) WHERE group_id IS NOT NULL;
 CREATE INDEX idx_photos_deleted ON photos(deleted_at) WHERE deleted_at IS NOT NULL;
 ```
 
-The `encrypted_metadata` blob contains all photo metadata: date taken, dimensions, orientation, media type, duration, camera make/model, GPS coordinates, EXIF data. None of this is queryable at the consensus level. The photo ID (UUIDv7) encodes upload timestamp, which is the only temporal signal visible to nodes.
+The `encrypted_metadata` blob contains all photo metadata: date taken, dimensions, orientation, media type, duration, camera make/model, GPS coordinates, EXIF data, **and cross-asset grouping** (`group_id`, `group_type`, `group_index`, `is_group_pick`). None of this is queryable at the consensus level. The photo ID (UUIDv7) encodes upload timestamp, which is the only temporal signal visible to nodes.
 
-Bytes for a photo (original, edited variant, paired Live Photo video, thumbnails, etc.) live in `photo_resources` (below). A photo has at minimum one resource (the original). The `photos` row carries identity, grouping, and tombstone state only.
+Bytes for a photo (original, edited variant, paired Live Photo video, thumbnails, etc.) live in `photo_resources` (below). A photo has at minimum one resource (the original). The `photos` row carries identity and tombstone state only.
 
 ##### Group Types
 
@@ -95,7 +87,7 @@ Bytes for a photo (original, edited variant, paired Live Photo video, thumbnails
 | 2 | `panorama_frames` | Source frames of a panorama |
 | 3 | `hdr_bracket` | Bracketed exposures of an HDR composite |
 
-A photo not part of any group has `group_id = NULL`. Group membership is observable at the consensus level (group_id is a plaintext UUID), but this leaks only the existence of related photos, not their content. Future work may encrypt group_id if even this is too much exposure.
+A photo not part of any group has `group_id = NULL` (inside the encrypted blob). Group membership is NOT observable at the consensus level — `group_id`, `group_type`, `group_index`, and `is_group_pick` are all inside `encrypted_metadata` (amended from the original plaintext design: no consensus query needs group awareness — deletion expands to a batch tx constructed client-side from sidecar queries, and burst rollup is a sidecar-only query at `idx_sidecar_group` — so the plaintext columns leaked structural correlation and photography habits via `group_type` without any offsetting consensus use). The original "future work may encrypt group_id" hedge is done.
 
 #### Photo Metadata Access
 
@@ -225,18 +217,28 @@ CREATE TABLE photo_favorites (
 -- Enables undo, audit trail, and retention-aware cleanup.
 CREATE TABLE photo_operations (
     id                    TEXT PRIMARY KEY,  -- UUIDv7 (encodes timestamp)
-    library_id            TEXT,              -- NULL = personal operation
+    library_id            TEXT,              -- denormalized filter, NOT FK
     photo_id              TEXT NOT NULL,
     operation_type        INTEGER NOT NULL,  -- see Operation Types below
     resource_type         INTEGER,           -- which resource (content ops only); NULL otherwise
-    prior_data_block_id   TEXT,              -- previous data_block for the resource (content ops only)
-    new_data_block_id     TEXT,              -- new data_block for the resource (content ops only)
+    prior_data_block_id   TEXT,              -- soft pointer (NOT FK) — previous data_block (content ops only)
+    new_data_block_id     TEXT,              -- soft pointer (NOT FK) — new data_block (content ops only)
     operation_data        BLOB,              -- payload for non-content ops (encrypted metadata diff, album_id, etc.)
     performed_by          INTEGER NOT NULL,
 
     FOREIGN KEY (photo_id) REFERENCES photos(id),
     FOREIGN KEY (performed_by) REFERENCES users(user_id)
 );
+
+-- `prior_data_block_id` and `new_data_block_id` are deliberately NOT
+-- FK-constrained: operation rows are retained indefinitely for audit
+-- (see Retention), but the blobs they reference become collectable after
+-- the edit-history window. The PhotosReferenceProvider enforces the
+-- window via UUIDv7 timestamp filtering — a hard FK would raise
+-- SQLITE_CONSTRAINT on every orphan-cleanup pass once the first edit
+-- ages out, and that cleanup runs inside a consensus tx, so the failure
+-- would replay on every validator, forever. Soft-pointer-policed-by-
+-- provider is the design.
 
 CREATE INDEX idx_photo_ops_photo ON photo_operations(photo_id);
 CREATE INDEX idx_photo_ops_prior_data ON photo_operations(prior_data_block_id) WHERE prior_data_block_id IS NOT NULL;
@@ -709,11 +711,11 @@ If the module is not compiled, no photos tables are created, no handlers are reg
 
 ## Implementation Phases
 
-### Phase 1: photos-core Crate and Schema [ ]
+### Phase 1: photos-core Crate and Schema [~]
 - Extract `crates/photos-core/` with crypto, metadata, thumbnail, payload, and dispatch trait
-- Consensus-tracked photo tables (photos, photo_resources, photo_metadata_access)
+- [x] Consensus-tracked photo tables (photos, photo_metadata_access, photo_resources, photo_operations, shared_libraries, shared_library_members, photo_albums, photo_album_entries, photo_favorites) — `hopnet-photos` crate, RFC-016 projection registry
 - `photo_add` / `photo_delete` consensus handlers in `src/photos/` (soft-delete model)
-- `DataBlockReferenceProvider` integration with orphan cleanup
+- [x] `DataBlockReferenceProvider` integration with orphan cleanup — `PhotosReferenceProvider` with UUIDv7-timestamp-filtered edit-history retention; 10 tests covering both surfaces, the retention boundary, the over-exclusion leak direction, and Rust↔SQL implementation agreement
 - Periodic cleanup job for expired soft-deleted photos
 - `dispatch_local` implementation for node clients
 - Basic HTTP API: upload, submit transaction, list photo IDs, delete, restore

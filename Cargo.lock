@@ -2678,6 +2678,7 @@ dependencies = [
  "hopnet-comms",
  "hopnet-consensus",
  "hopnet-drive",
+ "hopnet-photos",
  "hopnet-projection",
  "hopnet-storage",
  "hopnet-takeout",
@@ -2796,6 +2797,18 @@ dependencies = [
  "tokio-util",
  "tracing",
  "x25519-dalek",
+]
+
+[[package]]
+name = "hopnet-photos"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hopnet-common",
+ "hopnet-projection",
+ "hopnet-storage",
+ "inventory",
+ "rusqlite",
 ]
 
 [[package]]

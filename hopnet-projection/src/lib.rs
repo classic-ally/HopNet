@@ -326,6 +326,17 @@ pub trait Projection: Send + Sync {
     /// registration order (= FK direction) after the substrate's.
     fn install_schema(&self, conn: &rusqlite::Connection) -> Result<(), rusqlite::Error>;
 
+    /// The tables this projection owns and that are consensus-tracked
+    /// (mutations replicated across all nodes). The host's divergence
+    /// checker hashes each in addition to the host-owned
+    /// `CONSENSUS_TABLES` list. Single source of truth: the projection's
+    /// `db::TABLES` const feeds both `install_schema`'s uninstall test
+    /// and this method, so the schema and the divergence coverage cannot
+    /// drift. Default: empty (a projection with no consensus tables).
+    fn tables(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// The projection's takeout translator, if it has one. Default: none.
     fn exporter(
         &self,

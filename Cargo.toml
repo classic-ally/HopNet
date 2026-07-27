@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "common", "hopnet-comms", "hopnet-consensus", "hopnet-storage", "hopnet-projection", "hopnet-drive", "hopnet-takeout"]
+members = [".", "common", "hopnet-comms", "hopnet-consensus", "hopnet-storage", "hopnet-projection", "hopnet-drive", "hopnet-photos", "hopnet-takeout"]
 # crates/ingress-core is deliberately NOT a member: its sqlx 0.9 dependency
 # (via optional sqlx-mysql) requires sha2 ^0.11.0, which cannot unify with
 # iroh-base's sha2 =0.11.0-rc.5 pin. It is a standalone workspace with its
@@ -35,6 +35,7 @@ hopnet-consensus = { path = "hopnet-consensus", features = ["shell"] }
 hopnet-storage = { path = "hopnet-storage", features = ["engine"] }
 hopnet-projection = { path = "hopnet-projection" }
 hopnet-drive = { path = "hopnet-drive" }
+hopnet-photos = { path = "hopnet-photos" }
 hopnet-takeout = { path = "hopnet-takeout" }
 axum = { version = "0.8.4", features = ["multipart", "macros"] }
 chrono = { version = "0.4.41", features = ["serde"] }

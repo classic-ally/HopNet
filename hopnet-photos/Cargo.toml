@@ -1,0 +1,18 @@
+[package]
+name = "hopnet-photos"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+repository = "https://git.bentley.sh/HopNet/HopNet"
+description = "HopNet photos projection: encrypted consensus-tracked photo metadata + resources over the storage + consensus substrates (RFC-011 Phase 1: schema + GC reference provider)"
+
+[dependencies]
+hopnet-common = { path = "../common", features = ["database"] }
+hopnet-projection = { path = "../hopnet-projection" }
+hopnet-storage = { path = "../hopnet-storage" }
+
+rusqlite = { version = "0.38", features = ["bundled", "functions"] }
+inventory = "0.3.20"
+
+[dev-dependencies]
+chrono = "0.4"
