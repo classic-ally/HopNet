@@ -14,8 +14,6 @@ hopnet-storage = { path = "../hopnet-storage" }
 serde = { version = "1.0.219", features = ["derive"] }
 bincode = { version = "2.0.1", features = ["serde"] }
 tracing = "0.1.41"
+chrono = "0.4"
 rusqlite = { version = "0.38", features = ["bundled", "functions"] }
 inventory = "0.3.20"
-
-[dev-dependencies]
-chrono = "0.4"

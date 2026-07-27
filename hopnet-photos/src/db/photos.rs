@@ -173,6 +173,125 @@ pub fn restore_photo(
     Ok(())
 }
 
+/// Hard-delete a tombstoned photo and all its children (FK order:
+/// photo_operations → photo_resources → photo_metadata_access →
+/// photo_favorites → photo_album_entries → photos). Called by the
+/// `photo_cleanup_expired` consensus handler; the wall-clock 30-day
+/// expiry predicate runs only host-side in the scan query.
+///
+/// The `photo_operations` FK to `photos` (db/mod.rs:156) forces deletion
+/// despite the spec's "retained indefinitely" claim — operation rows
+/// must be deleted before the photos row, and retaining audit history of
+/// a permanently-erased photo has no value.
+///
+/// Returns NotFound if the photo row doesn't exist (idempotent skip).
+/// Skips silently if deleted_at IS NULL (active photo — another node's
+/// restore beat this cleanup tx).
+pub fn hard_delete_expired_photo(
+    db_tx: &rusqlite::Transaction,
+    photo_id: &CustomUUID,
+    scan_cutoff: &str,
+) -> Result<(), DatabaseError> {
+    let deleted_at: Option<String> = db_tx
+        .query_row(
+            "SELECT deleted_at FROM photos WHERE id = ?1",
+            rusqlite::params![photo_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => DatabaseError::NotFound,
+            _ => {
+                tracing::error!(
+                    "photo_cleanup: query photos row {} failed: {e}",
+                    photo_id,
+                );
+                DatabaseError::RecallError
+            }
+        })?;
+
+    if deleted_at.is_none() {
+        return Ok(()); // Active photo — restore beat cleanup.
+    }
+
+    // Validate the 30-day window deterministically. The scan_cutoff
+    // rides the payload, so all validators apply the same predicate.
+    // On replay, the cutoff is payload data, not wall-clock, and
+    // `datetime()` is deterministic given the same operands. If the
+    // window hasn't elapsed, skip — the next scan will catch it.
+    let expired: bool = db_tx
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM photos
+             WHERE id = ?1
+               AND deleted_at IS NOT NULL
+               AND datetime(deleted_at, '+30 days') < datetime(?2)",
+            rusqlite::params![photo_id, scan_cutoff],
+            |r| r.get(0),
+        )
+        .map_err(|e| {
+            tracing::error!(
+                "photo_cleanup: datetime check for {} failed: {e}",
+                photo_id,
+            );
+            DatabaseError::RecallError
+        })?;
+
+    if !expired {
+        return Ok(()); // Window not yet elapsed — still in recovery.
+    }
+
+    // Children first, then the photos row (PRAGMA foreign_keys = ON).
+    db_tx.execute(
+        "DELETE FROM photo_operations WHERE photo_id = ?1",
+        rusqlite::params![photo_id],
+    )
+    .map_err(|e| {
+        tracing::error!("photo_cleanup: delete photo_operations for {} failed: {e}", photo_id);
+        DatabaseError::InsertError
+    })?;
+    db_tx.execute(
+        "DELETE FROM photo_resources WHERE photo_id = ?1",
+        rusqlite::params![photo_id],
+    )
+    .map_err(|e| {
+        tracing::error!("photo_cleanup: delete photo_resources for {} failed: {e}", photo_id);
+        DatabaseError::InsertError
+    })?;
+    db_tx.execute(
+        "DELETE FROM photo_metadata_access WHERE photo_id = ?1",
+        rusqlite::params![photo_id],
+    )
+    .map_err(|e| {
+        tracing::error!("photo_cleanup: delete photo_metadata_access for {} failed: {e}", photo_id);
+        DatabaseError::InsertError
+    })?;
+    db_tx.execute(
+        "DELETE FROM photo_favorites WHERE photo_id = ?1",
+        rusqlite::params![photo_id],
+    )
+    .map_err(|e| {
+        tracing::error!("photo_cleanup: delete photo_favorites for {} failed: {e}", photo_id);
+        DatabaseError::InsertError
+    })?;
+    db_tx.execute(
+        "DELETE FROM photo_album_entries WHERE photo_id = ?1",
+        rusqlite::params![photo_id],
+    )
+    .map_err(|e| {
+        tracing::error!("photo_cleanup: delete photo_album_entries for {} failed: {e}", photo_id);
+        DatabaseError::InsertError
+    })?;
+    db_tx.execute(
+        "DELETE FROM photos WHERE id = ?1",
+        rusqlite::params![photo_id],
+    )
+    .map_err(|e| {
+        tracing::error!("photo_cleanup: delete photos row {} failed: {e}", photo_id);
+        DatabaseError::InsertError
+    })?;
+
+    Ok(())
+}
+
 // --- Private helpers ---
 
 fn insert_metadata_access_row(
@@ -538,5 +657,134 @@ mod tests {
             &CustomUUID::retention_cutoff(3),
         );
         assert!(result.is_err(), "restore on active photo must fail");
+    }
+
+    /// hard_delete removes all six row types for a tombstoned photo,
+    /// but leaves data_blocks + blob_access untouched (orphan sweep owns
+    /// those).
+    #[test]
+    fn hard_delete_removes_all_child_rows() {
+        let conn = fixture();
+        let photo_id = CustomUUID::retention_cutoff(0);
+        let blob_id = CustomUUID::retention_cutoff(1);
+        let entry = PhotoAddEntry {
+            photo_id: photo_id.clone(),
+            library_id: None,
+            uploaded_by: 1,
+            encrypted_metadata: b"enc_meta".to_vec(),
+            metadata_nonce: [0u8; 12],
+            resources: vec![PhotoResourceOp {
+                resource_type: 0,
+                op: make_blob_op(blob_id.clone()),
+            }],
+            metadata_access: vec![crate::envelopes::MetadataAccessEntry {
+                user_id: 1,
+                ephemeral_pubkey: [0x42; 32],
+                encrypted_metadata_key: vec![0xFF; 48],
+            }],
+            operation_id: CustomUUID::retention_cutoff(2),
+        };
+        let tx = conn.unchecked_transaction().unwrap();
+        insert_photo_entry(&tx, &entry, "/tmp/fragments").unwrap();
+        tx.commit().unwrap();
+
+        // Soft-delete first.
+        let tx = conn.unchecked_transaction().unwrap();
+        soft_delete_photo(
+            &tx,
+            &photo_id,
+            1,
+            "2025-06-01T00:00:00Z",
+            None,
+            &CustomUUID::retention_cutoff(3),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        // Hard-delete.
+        let tx = conn.unchecked_transaction().unwrap();
+        hard_delete_expired_photo(&tx, &photo_id, "2099-01-01T00:00:00Z").unwrap();
+        tx.commit().unwrap();
+
+        // All projection rows gone.
+        for (table, col) in [
+            ("photos", "id"),
+            ("photo_resources", "photo_id"),
+            ("photo_metadata_access", "photo_id"),
+            ("photo_favorites", "photo_id"),
+            ("photo_album_entries", "photo_id"),
+            ("photo_operations", "photo_id"),
+        ] {
+            let count: i32 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE {col} = ?1"),
+                    rusqlite::params![photo_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "{table} rows must be empty after hard-delete");
+        }
+        // data_blocks row survives (orphan sweep owns it).
+        let blob_count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM data_blocks WHERE id = ?1",
+                rusqlite::params![blob_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(blob_count, 1, "data_blocks row survives hard-delete");
+    }
+
+    /// Double hard-delete: second call returns NotFound, no side effects.
+    #[test]
+    fn hard_delete_missing_photo_is_notfound() {
+        let conn = fixture();
+        let tx = conn.unchecked_transaction().unwrap();
+        let result = hard_delete_expired_photo(
+            &tx,
+            &CustomUUID::retention_cutoff(99),
+            "2099-01-01T00:00:00Z",
+        );
+        assert!(matches!(result, Err(DatabaseError::NotFound)));
+    }
+
+    /// Active (non-tombstoned) photo is skipped silently.
+    #[test]
+    fn hard_delete_active_photo_is_noop() {
+        let conn = fixture();
+        let photo_id = CustomUUID::retention_cutoff(0);
+        let entry = PhotoAddEntry {
+            photo_id: photo_id.clone(),
+            library_id: None,
+            uploaded_by: 1,
+            encrypted_metadata: b"enc_meta".to_vec(),
+            metadata_nonce: [0u8; 12],
+            resources: vec![PhotoResourceOp {
+                resource_type: 0,
+                op: make_blob_op(CustomUUID::retention_cutoff(1)),
+            }],
+            metadata_access: vec![crate::envelopes::MetadataAccessEntry {
+                user_id: 1,
+                ephemeral_pubkey: [0x42; 32],
+                encrypted_metadata_key: vec![0xFF; 48],
+            }],
+            operation_id: CustomUUID::retention_cutoff(2),
+        };
+        let tx = conn.unchecked_transaction().unwrap();
+        insert_photo_entry(&tx, &entry, "/tmp/fragments").unwrap();
+        tx.commit().unwrap();
+
+        let tx = conn.unchecked_transaction().unwrap();
+        hard_delete_expired_photo(&tx, &photo_id, "2099-01-01T00:00:00Z").unwrap(); // no error
+        tx.commit().unwrap();
+
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM photos WHERE id = ?1",
+                rusqlite::params![photo_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(exists, "active photo must survive cleanup attempt");
     }
 }

@@ -112,6 +112,21 @@ pub struct PhotoRestoreEntry {
     pub operation_id: CustomUUID,
 }
 
+// --- photo_cleanup_expired ---
+
+/// System-maintenance batch hard-delete of expired tombstones. Submitted
+/// by the periodic cleanup cron (TxSigner::Node, no user auth). The
+/// handler deterministically checks `datetime(deleted_at, '+30 days') <
+/// datetime(scan_cutoff)` — the cutoff rides the payload, so all
+/// validators apply the same predicate regardless of their local clock.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PhotoCleanupExpiredPayload {
+    pub photo_ids: Vec<CustomUUID>,
+    /// The scan's `datetime('now')` — wall-clock on the submitting node,
+    /// deterministic across replicas because it's payload data.
+    pub scan_cutoff: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,5 +270,36 @@ mod tests {
         let encoded2 = bincode::serde::encode_to_vec(&decoded, bincode::config::standard())
             .expect("re-encode must succeed");
         assert_eq!(encoded, encoded2, "bincode round-trip must be byte-identical");
+    }
+
+    /// Golden bytes for PhotoCleanupExpiredPayload — pins the Vec of UUID
+    /// encoding plus the scan_cutoff String.
+    #[test]
+    fn photo_cleanup_expired_payload_golden_bytes() {
+        let payload = PhotoCleanupExpiredPayload {
+            photo_ids: vec![
+                "00000000-0000-0000-0000-00000000000a".parse().unwrap(),
+                "00000000-0000-0000-0000-00000000000b".parse().unwrap(),
+            ],
+            scan_cutoff: "2025-01-01T00:00:00Z".into(),
+        };
+        let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
+            .expect("golden encode must succeed");
+        // Vec<CustomUUID>: varint(2) + 2 × (varint(16) + 16 bytes)
+        // String scan_cutoff: varint(20) + "2025-01-01T00:00:00Z"
+        let mut expected = vec![0x02u8]; // vec len 2
+        expected.push(0x10); // varint(16) — first UUID
+        expected.extend_from_slice(&[
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a,
+        ]);
+        expected.push(0x10); // varint(16) — second UUID
+        expected.extend_from_slice(&[
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0b,
+        ]);
+        expected.push(0x14); // varint(20) — string len
+        expected.extend_from_slice(b"2025-01-01T00:00:00Z");
+        assert_eq!(encoded, expected, "PhotoCleanupExpiredPayload wire format changed");
     }
 }

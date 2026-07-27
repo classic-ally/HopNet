@@ -443,6 +443,10 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 policy_tick_worker.run().await;
             });
 
+            // Photo tombstone cleanup — randomized daily scan, 30-day
+            // recovery window. Every node runs independently.
+            photos_host::spawn_tombstone_cleanup_worker(app_state.clone());
+
             // Spawn consensus queue batch processor — on the dedicated queue
             // runtime (see consensus::queue::queue_rt) so consensus keeps
             // draining when API load starves the main runtime.

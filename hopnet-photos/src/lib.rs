@@ -15,6 +15,7 @@
 pub mod db;
 pub mod envelopes;
 pub mod handlers;
+pub mod jobs;
 pub mod reference_provider;
 
 use hopnet_projection::Projection;

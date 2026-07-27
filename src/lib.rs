@@ -26,6 +26,7 @@ pub mod net;
 pub mod nodes;
 pub mod passphrase;
 pub mod projections;
+pub mod photos_host;
 pub mod reference_providers;
 pub mod setup;
 pub mod shares;

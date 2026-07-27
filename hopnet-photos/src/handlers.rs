@@ -5,9 +5,9 @@
 //! nothing was dropped at link time. DB mutations run in BOTH validate and
 //! execute passes; side effects (notifier, work) fire only under execute.
 
-use crate::db::photos::{insert_photo_entry, restore_photo, soft_delete_photo};
+use crate::db::photos::{hard_delete_expired_photo, insert_photo_entry, restore_photo, soft_delete_photo};
 use crate::envelopes::{
-    PhotoAddPayload, PhotoDeletePayload, PhotoRestorePayload,
+    PhotoAddPayload, PhotoCleanupExpiredPayload, PhotoDeletePayload, PhotoRestorePayload,
 };
 use hopnet_projection::{DatabaseError, HandlerCtx, HandlerResult, TransactionHandler, TxMeta};
 
@@ -18,6 +18,7 @@ pub const TX_FUNCTIONS: &[&str] = &[
     "photo_add",
     "photo_delete",
     "photo_restore",
+    "photo_cleanup_expired",
 ];
 
 // --- photo_add ---
@@ -241,6 +242,65 @@ inventory::submit! {
     &PhotoRestoreHandler as &dyn TransactionHandler
 }
 
+// --- photo_cleanup_expired ---
+
+pub struct PhotoCleanupExpiredHandler;
+
+impl TransactionHandler for PhotoCleanupExpiredHandler {
+    fn name(&self) -> &'static str {
+        "photo_cleanup_expired"
+    }
+
+    fn process(
+        &self,
+        tx: &TxMeta<'_>,
+        _execute: bool,
+        _ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
+    ) -> HandlerResult {
+        let (payload, _) =
+            bincode::serde::decode_from_slice::<PhotoCleanupExpiredPayload, _>(
+                tx.payload,
+                bincode::config::standard(),
+            )
+            .map_err(|_| DatabaseError::InvalidPayload)?;
+
+        // Node-signed only — a user-signed submission could hard-delete
+        // another member's tombstoned photo within the recovery window.
+        // TODO(Phase 3): scan_cutoff is payload data — a malicious or
+        // skewed-clock node can submit a far-future cutoff to bypass the
+        // 30-day window. Clamp against the consensus block timestamp when
+        // dispatch exposes one. Symmetric with the operation_id backdating
+        // TODO at photo_delete.
+        if tx.user_id.is_some() {
+            tracing::warn!(
+                "photo_cleanup_expired: user-signed submissions rejected"
+            );
+            return Err(DatabaseError::AuthorizationError);
+        }
+
+        for photo_id in &payload.photo_ids {
+            match hard_delete_expired_photo(db_tx, photo_id, &payload.scan_cutoff) {
+                Ok(()) | Err(DatabaseError::NotFound) => {}
+                Err(e) => {
+                    tracing::error!(
+                        "photo_cleanup_expired: hard-delete {} failed: {:?}",
+                        photo_id,
+                        e,
+                    );
+                    return Err(e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+inventory::submit! {
+    &PhotoCleanupExpiredHandler as &dyn TransactionHandler
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,14 +402,14 @@ mod tests {
         handler: &dyn TransactionHandler,
         function: &str,
         payload: &[u8],
-        user_id: i32,
+        user_id: Option<i32>,
     ) -> HandlerResult {
         let tx = conn.unchecked_transaction().unwrap();
         let meta = TxMeta {
             function,
             payload,
             submitter_node: 0,
-            user_id: Some(user_id),
+            user_id,
         };
         handler.process(&meta, false, &ctx("/tmp/fragments"), &tx)
     }
@@ -360,14 +420,14 @@ mod tests {
         handler: &dyn TransactionHandler,
         function: &str,
         payload: &[u8],
-        user_id: i32,
+        user_id: Option<i32>,
     ) {
         let tx = conn.unchecked_transaction().unwrap();
         let meta = TxMeta {
             function,
             payload,
             submitter_node: 0,
-            user_id: Some(user_id),
+            user_id,
         };
         handler
             .process(&meta, true, &ctx("/tmp/fragments"), &tx)
@@ -388,8 +448,8 @@ mod tests {
             CustomUUID::retention_cutoff(2),
             None,
         );
-        validate(&conn, &PhotoAddHandler, "photo_add", &bytes, 1).unwrap();
-        apply(&conn, &PhotoAddHandler, "photo_add", &bytes, 1);
+        validate(&conn, &PhotoAddHandler, "photo_add", &bytes, Some(1)).unwrap();
+        apply(&conn, &PhotoAddHandler, "photo_add", &bytes, Some(1));
 
         let count: i32 = conn
             .query_row("SELECT COUNT(*) FROM photos", [], |r| r.get(0))
@@ -408,7 +468,7 @@ mod tests {
             CustomUUID::retention_cutoff(2),
             None,
         );
-        let result = validate(&conn, &PhotoAddHandler, "photo_add", &bytes, 1);
+        let result = validate(&conn, &PhotoAddHandler, "photo_add", &bytes, Some(1));
         assert!(matches!(result, Err(DatabaseError::AuthorizationError)));
     }
 
@@ -424,7 +484,7 @@ mod tests {
             CustomUUID::retention_cutoff(2),
             Some(CustomUUID::retention_cutoff(99)),
         );
-        let result = validate(&conn, &PhotoAddHandler, "photo_add", &bytes, 1);
+        let result = validate(&conn, &PhotoAddHandler, "photo_add", &bytes, Some(1));
         assert!(result.is_err(), "non-NULL library_id without library row must fail");
     }
 
@@ -440,7 +500,7 @@ mod tests {
             CustomUUID::retention_cutoff(2),
             None,
         );
-        apply(&conn, &PhotoAddHandler, "photo_add", &add_bytes, 1);
+        apply(&conn, &PhotoAddHandler, "photo_add", &add_bytes, Some(1));
 
         let del_payload = PhotoDeletePayload {
             entries: vec![PhotoDeleteEntry {
@@ -450,8 +510,8 @@ mod tests {
         };
         let del_bytes =
             bincode::serde::encode_to_vec(&del_payload, bincode::config::standard()).unwrap();
-        validate(&conn, &PhotoDeleteHandler, "photo_delete", &del_bytes, 1).unwrap();
-        apply(&conn, &PhotoDeleteHandler, "photo_delete", &del_bytes, 1);
+        validate(&conn, &PhotoDeleteHandler, "photo_delete", &del_bytes, Some(1)).unwrap();
+        apply(&conn, &PhotoDeleteHandler, "photo_delete", &del_bytes, Some(1));
 
         let deleted_at: Option<String> = conn
             .query_row(
@@ -475,7 +535,7 @@ mod tests {
             CustomUUID::retention_cutoff(2),
             None,
         );
-        apply(&conn, &PhotoAddHandler, "photo_add", &add_bytes, 1);
+        apply(&conn, &PhotoAddHandler, "photo_add", &add_bytes, Some(1));
 
         let del_payload = PhotoDeletePayload {
             entries: vec![PhotoDeleteEntry {
@@ -485,7 +545,7 @@ mod tests {
         };
         let del_bytes =
             bincode::serde::encode_to_vec(&del_payload, bincode::config::standard()).unwrap();
-        let result = validate(&conn, &PhotoDeleteHandler, "photo_delete", &del_bytes, 2);
+        let result = validate(&conn, &PhotoDeleteHandler, "photo_delete", &del_bytes, Some(2));
         assert!(matches!(result, Err(DatabaseError::AuthorizationError)));
     }
 
@@ -501,7 +561,7 @@ mod tests {
             CustomUUID::retention_cutoff(2),
             None,
         );
-        apply(&conn, &PhotoAddHandler, "photo_add", &add_bytes, 1);
+        apply(&conn, &PhotoAddHandler, "photo_add", &add_bytes, Some(1));
 
         let restore_payload = PhotoRestorePayload {
             entries: vec![PhotoRestoreEntry {
@@ -511,7 +571,7 @@ mod tests {
         };
         let restore_bytes =
             bincode::serde::encode_to_vec(&restore_payload, bincode::config::standard()).unwrap();
-        let result = validate(&conn, &PhotoRestoreHandler, "photo_restore", &restore_bytes, 1);
+        let result = validate(&conn, &PhotoRestoreHandler, "photo_restore", &restore_bytes, Some(1));
         assert!(result.is_err(), "restore of active photo must fail");
     }
 
@@ -527,7 +587,7 @@ mod tests {
             CustomUUID::retention_cutoff(2),
             None,
         );
-        apply(&conn, &PhotoAddHandler, "photo_add", &add_bytes, 1);
+        apply(&conn, &PhotoAddHandler, "photo_add", &add_bytes, Some(1));
         let tx = conn.unchecked_transaction().unwrap();
         soft_delete_photo(
             &tx,
@@ -548,7 +608,7 @@ mod tests {
         };
         let restore_bytes =
             bincode::serde::encode_to_vec(&restore_payload, bincode::config::standard()).unwrap();
-        let result = validate(&conn, &PhotoRestoreHandler, "photo_restore", &restore_bytes, 2);
+        let result = validate(&conn, &PhotoRestoreHandler, "photo_restore", &restore_bytes, Some(2));
         assert!(matches!(result, Err(DatabaseError::AuthorizationError)));
     }
 
@@ -566,7 +626,7 @@ mod tests {
             CustomUUID::retention_cutoff(2),
             None,
         );
-        apply(&conn, &PhotoAddHandler, "photo_add", &add_bytes, 1);
+        apply(&conn, &PhotoAddHandler, "photo_add", &add_bytes, Some(1));
 
         let del_payload = PhotoDeletePayload {
             entries: vec![PhotoDeleteEntry {
@@ -576,7 +636,7 @@ mod tests {
         };
         let del_bytes =
             bincode::serde::encode_to_vec(&del_payload, bincode::config::standard()).unwrap();
-        apply(&conn, &PhotoDeleteHandler, "photo_delete", &del_bytes, 1);
+        apply(&conn, &PhotoDeleteHandler, "photo_delete", &del_bytes, Some(1));
 
         let parsed: Option<String> = conn
             .query_row(
@@ -686,7 +746,7 @@ mod tests {
             CustomUUID::retention_cutoff(2),
             None,
         );
-        apply(&conn, &PhotoAddHandler, "photo_add", &bytes, 1);
+        apply(&conn, &PhotoAddHandler, "photo_add", &bytes, Some(1));
 
         let count: i32 = conn
             .query_row(
@@ -696,5 +756,167 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1, "uploader must have a photo_metadata_access row");
+    }
+
+    /// photo_cleanup_expired hard-deletes a tombstoned photo beyond the
+    /// 30-day window. The scan_cutoff rides the payload — all validators
+    /// apply the same predicate.
+    #[test]
+    fn cleanup_expired_hard_deletes() {
+        let conn = fixture();
+        let photo_id = CustomUUID::retention_cutoff(0);
+        let add_bytes = add_payload_bytes(
+            photo_id.clone(),
+            1,
+            CustomUUID::retention_cutoff(1),
+            CustomUUID::retention_cutoff(2),
+            None,
+        );
+        apply(&conn, &PhotoAddHandler, "photo_add", &add_bytes, Some(1));
+
+        // Soft-delete with a date 40 days ago (well beyond 30d window).
+        let del_payload = PhotoDeletePayload {
+            entries: vec![PhotoDeleteEntry {
+                photo_id: photo_id.clone(),
+                operation_id: CustomUUID::retention_cutoff(3),
+            }],
+        };
+        let del_bytes =
+            bincode::serde::encode_to_vec(&del_payload, bincode::config::standard()).unwrap();
+        apply(&conn, &PhotoDeleteHandler, "photo_delete", &del_bytes, Some(1));
+
+        // Hard-set deleted_at to 40 days ago so the cutoff check passes.
+        conn.execute(
+            "UPDATE photos SET deleted_at = '2025-06-01T00:00:00Z' WHERE id = ?1",
+            rusqlite::params![photo_id],
+        )
+        .unwrap();
+
+        // Cleanup with a cutoff after the 30-day window.
+        let cleanup_payload = PhotoCleanupExpiredPayload {
+            photo_ids: vec![photo_id.clone()],
+            scan_cutoff: "2099-01-01T00:00:00Z".into(),
+        };
+        let cleanup_bytes =
+            bincode::serde::encode_to_vec(&cleanup_payload, bincode::config::standard()).unwrap();
+        validate(
+            &conn,
+            &PhotoCleanupExpiredHandler,
+            "photo_cleanup_expired",
+            &cleanup_bytes,
+            None,
+        )
+        .unwrap();
+        apply(
+            &conn,
+            &PhotoCleanupExpiredHandler,
+            "photo_cleanup_expired",
+            &cleanup_bytes,
+            None,
+        );
+
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM photos WHERE id = ?1",
+                rusqlite::params![photo_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!exists, "expired photo must be hard-deleted");
+    }
+
+    /// cleanup skips a photo whose 30-day window hasn't elapsed yet.
+    #[test]
+    fn cleanup_skips_within_window() {
+        let conn = fixture();
+        let photo_id = CustomUUID::retention_cutoff(0);
+        let add_bytes = add_payload_bytes(
+            photo_id.clone(),
+            1,
+            CustomUUID::retention_cutoff(1),
+            CustomUUID::retention_cutoff(2),
+            None,
+        );
+        apply(&conn, &PhotoAddHandler, "photo_add", &add_bytes, Some(1));
+
+        // Tombstone with a date only 5 days ago — still within the 30d window.
+        conn.execute(
+            "UPDATE photos SET deleted_at = '2026-07-23T00:00:00Z' WHERE id = ?1",
+            rusqlite::params![photo_id],
+        )
+        .unwrap();
+
+        // Cutoff also 5 days ago — window not elapsed.
+        let cleanup_payload = PhotoCleanupExpiredPayload {
+            photo_ids: vec![photo_id.clone()],
+            scan_cutoff: "2026-07-23T00:00:00Z".into(),
+        };
+        let cleanup_bytes =
+            bincode::serde::encode_to_vec(&cleanup_payload, bincode::config::standard()).unwrap();
+        apply(
+            &conn,
+            &PhotoCleanupExpiredHandler,
+            "photo_cleanup_expired",
+            &cleanup_bytes,
+            None,
+        );
+
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM photos WHERE id = ?1",
+                rusqlite::params![photo_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(exists, "within-window photo must survive cleanup");
+    }
+
+    /// cleanup idempotently skips a missing photo (another node's earlier
+    /// tx already deleted it).
+    #[test]
+    fn cleanup_skips_missing_photo() {
+        let conn = fixture();
+        let cleanup_payload = PhotoCleanupExpiredPayload {
+            photo_ids: vec![CustomUUID::retention_cutoff(99)],
+            scan_cutoff: "2099-01-01T00:00:00Z".into(),
+        };
+        let cleanup_bytes =
+            bincode::serde::encode_to_vec(&cleanup_payload, bincode::config::standard()).unwrap();
+        validate(
+            &conn,
+            &PhotoCleanupExpiredHandler,
+            "photo_cleanup_expired",
+            &cleanup_bytes,
+            None,
+        )
+        .unwrap();
+        apply(
+            &conn,
+            &PhotoCleanupExpiredHandler,
+            "photo_cleanup_expired",
+            &cleanup_bytes,
+            None,
+        );
+        // No error, no side effects.
+    }
+
+    /// User-signed cleanup must be rejected.
+    #[test]
+    fn cleanup_rejects_user_signed() {
+        let conn = fixture();
+        let cleanup_payload = PhotoCleanupExpiredPayload {
+            photo_ids: vec![CustomUUID::retention_cutoff(0)],
+            scan_cutoff: "2099-01-01T00:00:00Z".into(),
+        };
+        let cleanup_bytes =
+            bincode::serde::encode_to_vec(&cleanup_payload, bincode::config::standard()).unwrap();
+        let result = validate(
+            &conn,
+            &PhotoCleanupExpiredHandler,
+            "photo_cleanup_expired",
+            &cleanup_bytes,
+            Some(1),
+        );
+        assert!(matches!(result, Err(DatabaseError::AuthorizationError)));
     }
 }

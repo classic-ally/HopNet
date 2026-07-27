@@ -67,18 +67,19 @@ apply functions inside consensus handlers.
       workers, batched placement commits) + fragment RPC serve half
 - [x] api::get + blob manifest reads + tier-1 repair (rebalancer re-enabled)
 - [~] Photos ingress as projection #2 (post-merge; encryption for free) —
-      Phase 1 schema + handlers + distribution hook landed 2026-07-27:
-      `hopnet-photos` crate (RFC-016 manifest) installs 9 consensus-tracked
-      tables with zero plaintext photo metadata (group fields folded into
-      `encrypted_metadata`); `photo_add`/`photo_delete`/`photo_restore`
-      consensus handlers (6 tests covering authz, tombstone, validate-vs-
-      apply separation, nonexistent-library rejection for Phase 1);
-      `committed_blob_ids` hook for fragment distribution. 24 total tests.
-      `PhotosReferenceProvider` pins blobs with UUIDv7-timestamp-filtered
-      edit-history retention. `Projection::tables` trait method feeds the
-      divergence checker from each crate's `db::TABLES` const — no
-      hardcoded table list to drift. `register_uuid_extract_timestamp`
-      moved to `hopnet-common::db_impl`.
+      Phase 1 schema + handlers + distribution hook + cleanup landed
+      2026-07-28: `hopnet-photos` crate (RFC-016 manifest) installs 9
+      consensus-tracked tables with zero plaintext photo metadata (group
+      fields folded into `encrypted_metadata`); `photo_add`/`photo_delete`/
+      `photo_restore`/`photo_cleanup_expired` consensus handlers;
+      `committed_blob_ids` hook for fragment distribution; `PhotosReferenceProvider`
+      pins blobs with UUIDv7-timestamp-filtered edit-history retention;
+      daily randomized apalis cron (`photos_host::spawn_tombstone_cleanup_worker`)
+      scans expired tombstones, batches 50 IDs per tx, handler verifies 30d
+      window deterministically via `scan_cutoff` in payload. 39 total tests.
+      `Projection::tables` trait method feeds the divergence checker from
+      each crate's `db::TABLES` const — no hardcoded table list to drift.
+      `register_uuid_extract_timestamp` moved to `hopnet-common::db_impl`.
 - [x] hopnet-drive + hopnet-projection + hopnet-takeout extraction
       ([RFC-015](specs/hopnet-drive.md)) COMPLETE (stages D0–D5,
       2026-07-08): narrowed handler seam, per-projection schema units,
