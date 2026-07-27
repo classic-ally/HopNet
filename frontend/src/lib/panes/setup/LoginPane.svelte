@@ -6,6 +6,7 @@
     import StatusSpinner from '../../primitives/StatusSpinner.svelte';
     import { mergeStatusWords, AUTH } from '../../primitives/statusWords';
     import { tokenStore, API_BASE_URL } from '../../stores';
+    import { router } from '../../router.svelte';
 
     export let username = '';
     export let passphrase = '';
@@ -34,6 +35,7 @@
             if (response.ok) {
                 const data = await response.json();
                 tokenStore.set(data.token);
+                router.redirectToIntended();
                 // Drop the raw passphrase from component state once we have a
                 // token. Binding propagates the clear back to App.svelte and
                 // resets PassphraseInput's word fields. Doesn't guarantee V8

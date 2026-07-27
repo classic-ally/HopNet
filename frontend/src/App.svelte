@@ -8,6 +8,7 @@
   import { mergeStatusWords } from './lib/primitives/statusWords';
   import { ANIM_PANE, ANIM_ROUTE } from './lib/primitives/animation';
   import { tokenStore, API_BASE_URL } from './lib/stores';
+  import { router, paneForPath } from './lib/router.svelte';
   import Interface from './lib/Interface/Interface.svelte';
 
   // 'loading' suppresses any chrome until the /setup probe resolves so the
@@ -32,6 +33,7 @@
 
   // are we set up?
   onMount(async () => {
+    router.init();
     const splashTimer = setTimeout(() => { showSplash = true; }, SPLASH_AFTER_MS);
     const controller = new AbortController();
     const probeTimer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
@@ -41,6 +43,7 @@
 
       if (response.status === 404) {
         currentComponent = 'setup';
+        router.replace('/setup');
       } else if (response.status === 200) {
         // Try Tauri IPC auto-login (GUI mode only)
         if ((window as any).__TAURI__) {
@@ -51,6 +54,13 @@
           } catch (e) { /* auto-login not available, show login pane */ }
         }
         currentComponent = 'operation';
+
+        // Navigate to intended path after login, or redirect from root
+        if (router.path === '/' || router.path === '/login') {
+          router.redirectToIntended();
+        } else if (router.path !== '/setup' && !paneForPath(router.path)) {
+          router.replace('/recent');
+        }
       } else {
         currentComponent = 'error';
       }

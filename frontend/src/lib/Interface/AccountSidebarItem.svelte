@@ -1,5 +1,6 @@
 <script lang="ts">
     import { tokenStore, currentUserStore } from '../stores';
+    import { router } from '../router.svelte';
     import Button from '../Button.svelte';
 
     export let selected: Boolean;
@@ -7,6 +8,7 @@
     export let onBack: () => void;
 
     function handleLogout() {
+        router.replace('/login');
         tokenStore.set(null);
     }
 

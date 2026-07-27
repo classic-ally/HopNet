@@ -15,11 +15,11 @@
     import MaintenancePane from "../panes/maintenance/MaintenancePane.svelte";
     import IncomingSharesPane from "../panes/shares/IncomingSharesPane.svelte";
     import { incomingShareCountStore, importStatusStore, currentUserStore } from "../stores";
+    import { router, paneForPath, ACCOUNT_PATH_PREFIX } from "../router.svelte";
 
-    // State to track which sidebar item is selected
-    let selectedItem = "browse"; // Can be "recents", "browse", "shared", "account", "nodes", "takeout", "devices", "resilience", "maintenance"
-    // State to track if we're in account mode (sticky)
-    let inAccountMode = false;
+    // Derive pane id and sidebar mode from URL — single source of truth.
+    let selectedItem  = $derived(paneForPath(router.path) ?? 'browse');
+    let inAccountMode = $derived(router.path.startsWith(ACCOUNT_PATH_PREFIX));
 
     // Welcome / onboarding modal — auto-opens once per Interface mount when
     // any onboarding step is incomplete; reopens when user clicks the
@@ -59,92 +59,28 @@
         showWelcomeModal = false;
     }
 
-    $: importActive = $importStatusStore.record?.status === 'Importing'
-        || $importStatusStore.record?.status === 'Pending';
+    let importActive = $derived($importStatusStore.record?.status === 'Importing'
+        || $importStatusStore.record?.status === 'Pending');
 
-    $: incompleteCount = $currentUserStore
+    let incompleteCount = $derived($currentUserStore
         ? computeIncompleteSteps($currentUserStore, $importStatusStore).length
-        : 0;
-    $: showOnboardingBanner = !importActive && incompleteCount > 0;
+        : 0);
+    let showOnboardingBanner = $derived(!importActive && incompleteCount > 0);
     
     // State for mobile sidebar toggle
     let isSidebarOpen = false;
 
-    // Click handlers for sidebar items
-    function handleRecentsClick() {
-        selectedItem = "recents";
-        // Close sidebar on mobile after selection
-        if (window.innerWidth < 768) {
-            isSidebarOpen = false;
-        }
+    function nav(url) {
+        router.navigate(url);
+        if (window.innerWidth < 768) isSidebarOpen = false;
     }
 
-    function handleBrowseClick() {
-        selectedItem = "browse";
-        // Close sidebar on mobile after selection
-        if (window.innerWidth < 768) {
-            isSidebarOpen = false;
-        }
-    }
-
-    function handleSharedClick() {
-        selectedItem = "shared";
-        // Close sidebar on mobile after selection
-        if (window.innerWidth < 768) {
-            isSidebarOpen = false;
-        }
-    }
-
-    function handleAccountClick() {
-        inAccountMode = true;
-        selectedItem = "account";
-        // Don't close sidebar on mobile since user may want to navigate to other settings pages
-    }
-
-    function handleNodesClick() {
-        selectedItem = "nodes";
-        // Close sidebar on mobile after selection
-        if (window.innerWidth < 768) {
-            isSidebarOpen = false;
-        }
-    }
-
-    function handleTakeoutClick() {
-        selectedItem = "takeout";
-        // Close sidebar on mobile after selection
-        if (window.innerWidth < 768) {
-            isSidebarOpen = false;
-        }
-    }
-
-    function handleResilienceClick() {
-        selectedItem = "resilience";
-        // Close sidebar on mobile after selection
-        if (window.innerWidth < 768) {
-            isSidebarOpen = false;
-        }
-    }
-
-    function handleMaintenanceClick() {
-        selectedItem = "maintenance";
-        // Close sidebar on mobile after selection
-        if (window.innerWidth < 768) {
-            isSidebarOpen = false;
-        }
-    }
-
-    function handleDevicesClick() {
-        selectedItem = "devices";
-        // Close sidebar on mobile after selection
-        if (window.innerWidth < 768) {
-            isSidebarOpen = false;
-        }
+    function navStayOpen(url) {
+        router.navigate(url);
     }
 
     function handleAccountBack() {
-        // When back is clicked from account, exit account mode and go back to recents
-        inAccountMode = false;
-        selectedItem = "recents";
+        router.navigate('/recent');
     }
 
     let isNodeAddOpen = false;
@@ -184,37 +120,37 @@
                         icon="i-carbon-user"
                         title="Accounts"
                         selected={selectedItem === "account"}
-                        onClick={handleAccountClick}
+                        onClick={() => navStayOpen('/settings/accounts')}
                     />
                     <SidebarItem
                         icon="i-carbon-cloud-download"
                         title="Takeouts"
                         selected={selectedItem === "takeout"}
-                        onClick={handleTakeoutClick}
+                        onClick={() => navStayOpen('/settings/takeout')}
                     />
                     <SidebarItem
                         icon="i-carbon-phone"
                         title="Devices"
                         selected={selectedItem === "devices"}
-                        onClick={handleDevicesClick}
+                        onClick={() => navStayOpen('/settings/devices')}
                     />
                     <SidebarItem
                         icon="i-carbon-ibm-vsi-on-vpc-for-regulated-industries"
                         title="Nodes"
                         selected={selectedItem === "nodes"}
-                        onClick={handleNodesClick}
+                        onClick={() => navStayOpen('/settings/nodes')}
                     />
                     <SidebarItem
                         icon="i-carbon-analytics"
                         title="Resilience"
                         selected={selectedItem === "resilience"}
-                        onClick={handleResilienceClick}
+                        onClick={() => navStayOpen('/settings/resilience')}
                     />
                     <SidebarItem
                         icon="i-carbon-clean"
                         title="Maintenance"
                         selected={selectedItem === "maintenance"}
-                        onClick={handleMaintenanceClick}
+                        onClick={() => navStayOpen('/settings/maintenance')}
                     />
                 {:else}
                     <!-- Default mode: Show Recents and Browse -->
@@ -222,26 +158,26 @@
                         icon="i-carbon-time"
                         title="Recents"
                         selected={selectedItem === "recents"}
-                        onClick={handleRecentsClick}
+                        onClick={() => nav('/recent')}
                     />
                     <SidebarItem
                         icon="i-carbon-folder"
                         title="Browse"
                         selected={selectedItem === "browse"}
-                        onClick={handleBrowseClick}
+                        onClick={() => nav('/browse')}
                     />
                     <SidebarItem
                         icon="i-carbon-collaborate"
                         title="Shared With Me"
                         selected={selectedItem === "shared"}
-                        onClick={handleSharedClick}
+                        onClick={() => nav('/shared')}
                         badge={$incomingShareCountStore}
                     />
                 {/if}
             </div>
             <AccountSidebarItem
                 selected={inAccountMode}
-                onClick={handleAccountClick}
+                onClick={() => navStayOpen('/settings/accounts')}
                 onBack={handleAccountBack}
             />
         </div>
