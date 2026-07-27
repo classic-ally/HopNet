@@ -714,8 +714,9 @@ If the module is not compiled, no photos tables are created, no handlers are reg
 ### Phase 1: photos-core Crate and Schema [~]
 - Extract `crates/photos-core/` with crypto, metadata, thumbnail, payload, and dispatch trait
 - [x] Consensus-tracked photo tables (photos, photo_metadata_access, photo_resources, photo_operations, shared_libraries, shared_library_members, photo_albums, photo_album_entries, photo_favorites) — `hopnet-photos` crate, RFC-016 projection registry
-- `photo_add` / `photo_delete` consensus handlers in `src/photos/` (soft-delete model)
+- [x] `photo_add` / `photo_delete` / `photo_restore` consensus handlers — `PhotoAddHandler` (batch, per-entry `uploaded_by` authz, rejected non-NULL `library_id` until Phase 3), `PhotoDeleteHandler` (per-entry ownership check, `deleted_at` derived from `operation_id.extract_timestamp()` — no clocks in handlers), `PhotoRestoreHandler`. 6 handler tests covering authz, tombstone, restore-on-active rejection, nonexistent-library rejection, and validate-vs-apply transaction separation.
 - [x] `DataBlockReferenceProvider` integration with orphan cleanup — `PhotosReferenceProvider` with UUIDv7-timestamp-filtered edit-history retention; 10 tests covering both surfaces, the retention boundary, the over-exclusion leak direction, and Rust↔SQL implementation agreement
+- [x] `committed_blob_ids` distribution hook — `photo_add` arm extracts blob ids from resources for the storage engine's distribution kick
 - Periodic cleanup job for expired soft-deleted photos
 - `dispatch_local` implementation for node clients
 - Basic HTTP API: upload, submit transaction, list photo IDs, delete, restore

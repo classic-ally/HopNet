@@ -2803,12 +2803,15 @@ dependencies = [
 name = "hopnet-photos"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "chrono",
  "hopnet-common",
  "hopnet-projection",
  "hopnet-storage",
  "inventory",
  "rusqlite",
+ "serde",
+ "tracing",
 ]
 
 [[package]]

@@ -7,30 +7,29 @@
 //! queryable metadata lives in a client-side sidecar, populated by
 //! decrypting consensus-tracked encrypted blobs.
 //!
-//! Phase 1 (this crate, schema-only): the consensus-tracked tables +
-//! `DataBlockReferenceProvider` for GC integration. Handlers, routes,
+//! Phase 1: consensus-tracked tables + `DataBlockReferenceProvider` for GC
+//! integration + `photo_add`/`photo_delete`/`photo_restore` consensus
+//! transaction handlers + fragment distribution hook. Routes, HTTP surface,
 //! and crypto come in later phases.
 
 pub mod db;
+pub mod envelopes;
+pub mod handlers;
 pub mod reference_provider;
+
+use hopnet_projection::Projection;
 
 /// The photos projection's static manifest (RFC-016 Stage 3) — the host
 /// registers this one value in `projections::manifests()`.
 pub struct PhotosProjection;
 
-impl hopnet_projection::Projection for PhotosProjection {
+impl Projection for PhotosProjection {
     fn name(&self) -> &'static str {
         "photos"
     }
 
     fn tx_functions(&self) -> &'static [&'static str] {
-        // Phase 2: photo_add, photo_delete, photo_edit_content,
-        // photo_edit_metadata, photo_restore, photo_undo,
-        // create_shared_library, join_shared_library, leave_shared_library,
-        // album_create, album_add_photo, album_remove_photo.
-        // Empty for Phase 1 — the boot tripwire accepts an empty slice
-        // (src/lib.rs::assert_projection_registrations loops zero times).
-        &[]
+        handlers::TX_FUNCTIONS
     }
 
     fn install_schema(&self, conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
@@ -39,5 +38,34 @@ impl hopnet_projection::Projection for PhotosProjection {
 
     fn tables(&self) -> &'static [&'static str] {
         db::TABLES
+    }
+
+    /// Blob ids committed by this projection's transactions — the host
+    /// feeds them to the storage engine's distribution kick. Without this
+    /// override, photo fragments would never replicate beyond the upload
+    /// node. Pure decode (no DB, no IO — runs on the consensus shell
+    /// thread post-decide).
+    fn committed_blob_ids(
+        &self,
+        function: &str,
+        payload: &[u8],
+    ) -> Vec<hopnet_storage::BlobId> {
+        match function {
+            "photo_add" => {
+                bincode::serde::decode_from_slice::<envelopes::PhotoAddPayload, _>(
+                    payload,
+                    bincode::config::standard(),
+                )
+                .map(|(p, _)| {
+                    p.entries
+                        .iter()
+                        .flat_map(|e| &e.resources)
+                        .map(|r| r.op.blob_id.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+            }
+            _ => Vec::new(),
+        }
     }
 }

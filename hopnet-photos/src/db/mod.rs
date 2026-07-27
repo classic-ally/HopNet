@@ -27,6 +27,8 @@ pub const TABLES: &[&str] = &[
     "photo_favorites",
 ];
 
+pub mod photos;
+
 /// Edit-history retention window (days). Operation-log rows older than
 /// this stop pinning their `prior`/`new_data_block_id` blobs, allowing
 /// orphan cleanup to collect superseded edits. The window is enforced

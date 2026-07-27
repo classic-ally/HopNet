@@ -67,16 +67,18 @@ apply functions inside consensus handlers.
       workers, batched placement commits) + fragment RPC serve half
 - [x] api::get + blob manifest reads + tier-1 repair (rebalancer re-enabled)
 - [~] Photos ingress as projection #2 (post-merge; encryption for free) —
-      Phase 1 schema landed 2026-07-27: `hopnet-photos` crate (RFC-016
-      manifest) installs 9 consensus-tracked tables with zero plaintext
-      photo metadata (group fields folded into `encrypted_metadata` —
-      amended the spec to close the structural-correlation leak); the
-      `PhotosReferenceProvider` pins blobs against `photo_resources` +
-      UUIDv7-timestamp-filtered `photo_operations` (10 tests cover the
-      retention boundary and Rust↔SQL agreement). The `Projection::tables`
-      trait method now feeds the divergence checker from each crate's
-      single source of truth — no hardcoded table list to drift.
-      `register_uuid_extract_timestamp` moved to `hopnet-common::db_impl`
+      Phase 1 schema + handlers + distribution hook landed 2026-07-27:
+      `hopnet-photos` crate (RFC-016 manifest) installs 9 consensus-tracked
+      tables with zero plaintext photo metadata (group fields folded into
+      `encrypted_metadata`); `photo_add`/`photo_delete`/`photo_restore`
+      consensus handlers (6 tests covering authz, tombstone, validate-vs-
+      apply separation, nonexistent-library rejection for Phase 1);
+      `committed_blob_ids` hook for fragment distribution. 24 total tests.
+      `PhotosReferenceProvider` pins blobs with UUIDv7-timestamp-filtered
+      edit-history retention. `Projection::tables` trait method feeds the
+      divergence checker from each crate's `db::TABLES` const — no
+      hardcoded table list to drift. `register_uuid_extract_timestamp`
+      moved to `hopnet-common::db_impl`.
 - [x] hopnet-drive + hopnet-projection + hopnet-takeout extraction
       ([RFC-015](specs/hopnet-drive.md)) COMPLETE (stages D0–D5,
       2026-07-08): narrowed handler seam, per-projection schema units,
