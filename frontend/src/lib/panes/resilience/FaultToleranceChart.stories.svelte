@@ -243,7 +243,7 @@
 
 <!-- Already-lost and unattested data are stats, never points on the curve -->
 <Story
-  name="Observed - with unrecoverable and unattested"
+  name="Observed - with unrecoverable and never attested"
   {template}
   args={{
     data: mediumNetworkData,

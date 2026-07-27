@@ -1,7 +1,7 @@
 <script lang="ts">
     import { formatStorageCapacity } from '../../utils/formatters';
 
-    // Unattested data bucketed by age. Age comes from data_blocks.id, which is
+    // Unplaced data bucketed by age. Age comes from data_blocks.id, which is
     // a UUIDv7 — the creation timestamp is embedded, replicated as part of the
     // primary key, so every node reads the same value and it cannot diverge the
     // way an apply-time now() column would.
@@ -10,7 +10,7 @@
     // bound false-positives on large blobs, which legitimately take longer to
     // distribute. Here a large blob just shifts right — the diagnosis is the
     // SHAPE. Healthy decays toward nothing; a plateau or bump at the right end
-    // is data that is never going to be attested.
+    // is data whose distribution is stuck.
     // `severity` is set by the caller, not inferred from position, so where the
     // warn/stale lines fall stays a backend decision derived from the storage
     // engine's cadence rather than a number invented in a component.
@@ -32,13 +32,13 @@
     const INK = { warn: 'text-yellow', stale: 'text-red' } as const;
 
     $: ariaLabel =
-        `Unattested data by age: ` +
+        `Unplaced data by age: ` +
         buckets.map(b => `${b.label} ${formatStorageCapacity(b.gb)}`).join(', ');
 </script>
 
 <div>
     <div class="flex items-baseline justify-between mb-3">
-        <div class="text-xs text-subtitle font-medium">Unattested by age</div>
+        <div class="text-xs text-subtitle font-medium">Unplaced by age</div>
         <div class="text-xs font-mono">
             {#if staleGb > 0}
                 <span class="text-red">{formatStorageCapacity(staleGb)}</span>
@@ -56,7 +56,7 @@
 
     {#if total === 0}
         <div class="text-xs text-subtitle py-6 text-center">
-            All placed data is attested.
+            All committed data is placed.
         </div>
     {:else}
         <div class="flex items-end gap-2 h-24" role="img" aria-label={ariaLabel}>

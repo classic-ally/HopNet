@@ -18,7 +18,7 @@ pub fn capture(
     // the availability grid is anchored to the newest replicated
     // metrics.start_time, never to wall clock.
     //
-    // Deliberately NOT capturing unattested_age_buckets — its cutoffs are
+    // Deliberately NOT capturing unplaced_age_buckets — its cutoffs are
     // derived from Utc::now(), so it would diff on every run and tell you
     // nothing about a commit.
     results.insert("db::resilience::resilience_level_rows".into(), {

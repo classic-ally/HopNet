@@ -739,7 +739,7 @@
                         class="text-subtitle"
                         title="No attestation data — an observability gap, not a durability state"
                     >
-                        {formatStorageCapacity(unknownGb)} unattested
+                        {formatStorageCapacity(unknownGb)} never attested
                     </span>
                 {/if}
             </div>

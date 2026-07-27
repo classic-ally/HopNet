@@ -84,8 +84,8 @@ pub struct StoragePanelView {
     /// frontier optimistic about this instant.
     pub unreachable_members: u32,
 
-    /// Unattested volume by age, youngest first.
-    pub unattested_buckets: Vec<UnattestedBucket>,
+    /// Unplaced volume by age, youngest first.
+    pub unplaced_buckets: Vec<UnplacedBucket>,
 }
 
 /// Raw user bytes sitting at one worst-case tolerance level.
@@ -101,22 +101,22 @@ pub struct ResilienceLevelBytes {
     pub raw_gb: f64,
 }
 
-/// One age decade of unattested data.
+/// One age decade of unplaced data.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[typeshare]
-pub struct UnattestedBucket {
+pub struct UnplacedBucket {
     pub label: String,
     pub gb: f64,
     /// Absent means "explainable as in flight".
-    pub severity: Option<UnattestedSeverity>,
+    pub severity: Option<UnplacedSeverity>,
 }
 
-/// How far past explainable a bucket is. Transient unattested data is normal —
-/// only a tail that fails to decay indicates attestation is stuck.
+/// How far past explainable a bucket is. Transient unplaced data is normal —
+/// only a tail that fails to decay indicates distribution is stuck.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[typeshare]
 #[serde(rename_all = "lowercase")]
-pub enum UnattestedSeverity {
+pub enum UnplacedSeverity {
     Warn,
     Stale,
 }

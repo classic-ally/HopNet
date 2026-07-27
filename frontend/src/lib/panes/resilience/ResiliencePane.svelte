@@ -86,7 +86,7 @@
         unrecoverableGb: view.storage.unrecoverable_gb,
         unknownGb: view.storage.unknown_gb,
         unreachableMembers: view.storage.unreachable_members,
-        unattestedBuckets: view.storage.unattested_buckets.map(b => ({
+        unplacedBuckets: view.storage.unplaced_buckets.map(b => ({
             label: b.label,
             gb: b.gb,
             severity: b.severity

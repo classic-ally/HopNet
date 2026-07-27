@@ -10,8 +10,8 @@ use r2d2::PooledConnection;
 use r2d2_sqlite::SqliteConnectionManager;
 
 use hopnet_common::views::{
-    ConsensusPanelView, ResilienceLevelBytes, StoragePanelView, UnattestedBucket,
-    UnattestedSeverity,
+    ConsensusPanelView, ResilienceLevelBytes, StoragePanelView, UnplacedBucket,
+    UnplacedSeverity,
 };
 
 const BYTES_PER_GB: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -19,10 +19,10 @@ const BYTES_PER_GB: f64 = 1024.0 * 1024.0 * 1024.0;
 /// Which age decades count as past explainable. Kept here rather than in the
 /// component so the line stays a backend decision; it should eventually be
 /// derived from the storage engine's own repair cadence rather than fixed.
-fn severity_for(label: &str) -> Option<UnattestedSeverity> {
+fn severity_for(label: &str) -> Option<UnplacedSeverity> {
     match label {
-        "1h-1d" => Some(UnattestedSeverity::Warn),
-        ">1d" => Some(UnattestedSeverity::Stale),
+        "1h-1d" => Some(UnplacedSeverity::Warn),
+        ">1d" => Some(UnplacedSeverity::Stale),
         _ => None,
     }
 }
@@ -146,10 +146,10 @@ pub fn storage_view(
         }
     }
 
-    let unattested_buckets = resilience::unattested_age_buckets(conn)
+    let unplaced_buckets = resilience::unplaced_age_buckets(conn)
         .unwrap_or_default()
         .into_iter()
-        .map(|(label, bytes)| UnattestedBucket {
+        .map(|(label, bytes)| UnplacedBucket {
             label: label.to_string(),
             gb: bytes / BYTES_PER_GB,
             severity: severity_for(label),
@@ -176,7 +176,7 @@ pub fn storage_view(
         unrecoverable_gb,
         unknown_gb,
         unreachable_members,
-        unattested_buckets,
+        unplaced_buckets,
     }
 }
 

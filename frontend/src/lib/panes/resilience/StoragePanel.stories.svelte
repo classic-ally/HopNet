@@ -46,18 +46,18 @@
       { tolerance: 3, rawGb: 300 },
       { tolerance: 2, rawGb: 220 }
     ],
-    unattestedBuckets: buckets(0, 0)
+    unplacedBuckets: buckets(0, 0)
   }} />
 
-<!-- Attestation overdue but not stale: Unattested goes yellow -->
-<Story name="Unattested overdue" {template}
+<!-- Distribution overdue but not stale: Unplaced goes yellow -->
+<Story name="Distribution overdue" {template}
   args={{
     curve,
     observedLevels: [
       { tolerance: 3, rawGb: 300 },
       { tolerance: 2, rawGb: 220 }
     ],
-    unattestedBuckets: buckets(22, 0)
+    unplacedBuckets: buckets(22, 0)
   }} />
 
 <!-- Stale tail plus real loss: both stats red -->
@@ -69,7 +69,7 @@
       { tolerance: 1, rawGb: 180 }
     ],
     unrecoverableGb: 14,
-    unattestedBuckets: buckets(19, 33)
+    unplacedBuckets: buckets(19, 33)
   }} />
 
 <!--
@@ -85,5 +85,5 @@
       { tolerance: 1, rawGb: 190 }
     ],
     unreachableMembers: 2,
-    unattestedBuckets: buckets(0, 0)
+    unplacedBuckets: buckets(0, 0)
   }} />

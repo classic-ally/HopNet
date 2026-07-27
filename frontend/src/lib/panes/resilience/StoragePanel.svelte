@@ -1,6 +1,6 @@
 <script lang="ts">
     import FaultToleranceChart from './FaultToleranceChart.svelte';
-    import UnattestedByAge from './UnattestedByAge.svelte';
+    import UnplacedByAge from './UnplacedByAge.svelte';
     import StorageSummary from './StorageSummary.svelte';
     import type { FaultToleranceCurvePoint } from '../../types';
 
@@ -13,7 +13,7 @@
     export let unknownGb = 0;
     export let unreachableMembers = 0;
 
-    export let unattestedBuckets: {
+    export let unplacedBuckets: {
         label: string;
         gb: number;
         severity?: 'warn' | 'stale';
@@ -64,7 +64,7 @@
         {/if}
     </div>
 
-    <StorageSummary {consumedGb} {capacityGb} {unrecoverableGb} {unattestedBuckets} />
+    <StorageSummary {consumedGb} {capacityGb} {unrecoverableGb} {unplacedBuckets} />
 
     <div class="my-4 border-t border-overlay0"></div>
 
@@ -78,5 +78,5 @@
 
     <div class="my-4 border-t border-overlay0"></div>
 
-    <UnattestedByAge buckets={unattestedBuckets} />
+    <UnplacedByAge buckets={unplacedBuckets} />
 </div>

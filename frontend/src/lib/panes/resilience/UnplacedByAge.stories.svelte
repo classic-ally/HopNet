@@ -1,10 +1,10 @@
 <script module lang="ts">
   import { defineMeta } from '@storybook/addon-svelte-csf';
-  import UnattestedByAge from './UnattestedByAge.svelte';
+  import UnplacedByAge from './UnplacedByAge.svelte';
 
   const { Story } = defineMeta({
-    title: 'Components/UnattestedByAge',
-    component: UnattestedByAge,
+    title: 'Components/UnplacedByAge',
+    component: UnplacedByAge,
     argTypes: {
       buckets: {
         control: false,
@@ -16,7 +16,7 @@
 
 {#snippet template(args: { buckets?: { label: string; gb: number; severity?: 'warn' | 'stale' }[] })}
   <div class="p-4 bg-surface0 max-w-lg">
-    <UnattestedByAge buckets={args.buckets ?? []} />
+    <UnplacedByAge buckets={args.buckets ?? []} />
   </div>
 {/snippet}
 
@@ -40,11 +40,11 @@
 
 <!--
   The failure shape: a tail that does not decay. Those blocks are never going
-  to be attested, and no single-threshold check would separate them from a
+  to be placed, and no single-threshold check would separate them from a
   large blob still legitimately in transit.
 -->
 <Story
-  name="Stale tail - attestation is stuck"
+  name="Stale tail - distribution is stuck"
   {template}
   args={{
     buckets: [
@@ -73,7 +73,7 @@
 />
 
 <Story
-  name="Nothing unattested"
+  name="Nothing unplaced"
   {template}
   args={{
     buckets: [

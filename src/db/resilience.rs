@@ -146,19 +146,21 @@ pub fn resilience_level_rows(
     Ok(levels)
 }
 
-/// Age decades for data that has been placed but never attested.
+/// Age decades for committed blocks whose fragments have not yet been placed.
 ///
-/// Returns `(label, raw_bytes)` youngest first. Transient unattested data is
-/// normal — the diagnostic is the SHAPE: a healthy mesh decays toward nothing,
-/// while a tail that refuses to decay is attestation that will never land. A
-/// flat threshold cannot express that, because a large blob legitimately takes
-/// longer to distribute and would false-positive.
+/// Returns `(label, raw_bytes)` youngest first. This measures distribution
+/// pipeline latency: a block is committed (`data_blocks` row exists) but no
+/// `placement_height` has been set, meaning the engine has not yet finished
+/// distributing its fragments to storage members. Transient unplaced data is
+/// normal (upload just completed); the diagnostic is the SHAPE — a healthy
+/// mesh decays toward nothing as the engine works through the queue, while a
+/// tail that refuses to decay indicates stalled or failed distribution.
 ///
 /// Age comes from `data_blocks.id` being a UUIDv7: the creation timestamp is
 /// the leading 48 bits and the ids are stored as lowercase hyphenated text, so
 /// lexicographic comparison against cutoff UUIDs orders chronologically on the
 /// primary-key index — no timestamp parsing, no extra column.
-pub fn unattested_age_buckets(
+pub fn unplaced_age_buckets(
     conn: &PooledConnection<SqliteConnectionManager>,
 ) -> Result<Vec<(&'static str, f64)>, DatabaseError> {
     use chrono::Duration;
@@ -168,9 +170,6 @@ pub fn unattested_age_buckets(
     let c1h = CustomUUID::cutoff_before(Duration::hours(1)).to_string();
     let c1d = CustomUUID::cutoff_before(Duration::days(1)).to_string();
 
-    // Anchored on data_blocks so blocks with zero fragment_hashes rows are
-    // included; that keeps the sum here equal to the unknown total reported by
-    // resilience_level_rows.
     let query = r#"
         SELECT
             SUM(CASE WHEN db.id >= ?1 THEN db.file_size ELSE 0 END),
@@ -179,12 +178,7 @@ pub fn unattested_age_buckets(
             SUM(CASE WHEN db.id >= ?4 AND db.id < ?3 THEN db.file_size ELSE 0 END),
             SUM(CASE WHEN db.id < ?4 THEN db.file_size ELSE 0 END)
         FROM data_blocks db
-        WHERE NOT EXISTS (
-            SELECT 1
-            FROM fragment_hashes fh
-            JOIN fragment_inventory fi ON fi.fragment_hash = fh.fragment_hash
-            WHERE fh.data_block_id = db.id
-        )
+        WHERE db.placement_height IS NULL
     "#;
 
     let mut stmt = conn

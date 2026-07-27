@@ -104,7 +104,7 @@
             cargoVendorDir = craneLib.vendorCargoDeps {
               src = ./.;
               outputHashes = {
-                "iroh-0.96.1" = "sha256-+nasc9F8OsegyrdDGN/WsZ4niIZEz7Qe44qPN82sKKU=";
+                "iroh-0.96.1" = "sha256-DeIK89ULzQzK2Qvkje8oGxU9sN9sIN0GkCys9DXZtCg=";
               };
             };
 
@@ -140,7 +140,7 @@
               owner = "classic-ally";
               repo = "iroh";
               rev = "d97650851c16d002c6b8cb87e64b9b906889171c";
-              hash = "sha256-+nasc9F8OsegyrdDGN/WsZ4niIZEz7Qe44qPN82sKKU=";
+              hash = "sha256-DeIK89ULzQzK2Qvkje8oGxU9sN9sIN0GkCys9DXZtCg=";
             };
             strictDeps = true;
             cargoExtraArgs = "-p iroh-relay --features server --bin iroh-relay";

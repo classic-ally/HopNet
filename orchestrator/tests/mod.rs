@@ -45,6 +45,7 @@ pub(crate) mod reencode;
 mod sharing;
 mod takeout;
 mod tier_membership;
+mod upload_and_confirm_placement;
 
 /// Represents the result of a test scenario execution
 #[derive(Debug)]
@@ -444,6 +445,11 @@ pub async fn run_test_by_name(
                 .run(mesh_id, nodes, flags)
                 .await
         }
+        "upload-and-confirm-placement" => {
+            upload_and_confirm_placement::UploadAndConfirmPlacement
+                .run(mesh_id, nodes, flags)
+                .await
+        }
         _ => Err(anyhow::anyhow!("Unknown test: {}", name)),
     }
 }
@@ -505,6 +511,7 @@ pub fn list_test_names() -> Vec<&'static str> {
         "post-files-consensus-shape",
         "mixed-files-and-folders-one-request",
         "db-pragma-bench",
+        "upload-and-confirm-placement",
     ]
 }
 

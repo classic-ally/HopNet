@@ -13,17 +13,17 @@
 
     // Severity is read off the buckets rather than recomputed, so this strip
     // and the age chart below can never disagree about which ranges count.
-    export let unattestedBuckets: {
+    export let unplacedBuckets: {
         label: string;
         gb: number;
         severity?: 'warn' | 'stale';
     }[] = [];
 
-    $: unattestedGb = unattestedBuckets.reduce((a, b) => a + b.gb, 0);
-    $: hasStale = unattestedBuckets.some(b => b.severity === 'stale' && b.gb > 0);
-    $: hasWarn = unattestedBuckets.some(b => b.severity === 'warn' && b.gb > 0);
+    $: unplacedGb = unplacedBuckets.reduce((a, b) => a + b.gb, 0);
+    $: hasStale = unplacedBuckets.some(b => b.severity === 'stale' && b.gb > 0);
+    $: hasWarn = unplacedBuckets.some(b => b.severity === 'warn' && b.gb > 0);
 
-    $: unattestedTone = hasStale ? 'text-red' : hasWarn ? 'text-yellow' : 'text-muted';
+    $: unplacedTone = hasStale ? 'text-red' : hasWarn ? 'text-yellow' : 'text-muted';
 
     // Any unrecoverable data is loss that already happened — RS cannot rebuild
     // from fewer than K classes even with a perfectly healthy control plane.
@@ -49,11 +49,11 @@
     </div>
 
     <div class="flex-1 text-center">
-        <div class="text-xs text-subtitle mb-1" title="Placed, but no node has attested to holding it">
-            Unattested
+        <div class="text-xs text-subtitle mb-1" title="Committed, but fragments not yet placed on storage members">
+            Unplaced
         </div>
-        <div class="font-mono text-2xl font-semibold leading-none {unattestedTone}">
-            {formatStorageCapacity(unattestedGb)}
+        <div class="font-mono text-2xl font-semibold leading-none {unplacedTone}">
+            {formatStorageCapacity(unplacedGb)}
         </div>
     </div>
 
