@@ -5,9 +5,11 @@
 //! nothing was dropped at link time. DB mutations run in BOTH validate and
 //! execute passes; side effects (notifier, work) fire only under execute.
 
-use crate::db::photos::{hard_delete_expired_photo, insert_photo_entry, restore_photo, soft_delete_photo};
+use crate::db::photos::{delete_favorite, edit_photo_content, edit_photo_metadata, hard_delete_expired_photo, insert_favorite, insert_photo_entry, lookup_photo_owner, restore_photo, soft_delete_photo, undo_content_edit};
 use crate::envelopes::{
-    PhotoAddPayload, PhotoCleanupExpiredPayload, PhotoDeletePayload, PhotoRestorePayload,
+    PhotoAddPayload, PhotoCleanupExpiredPayload, PhotoDeletePayload,
+    PhotoEditContentPayload, PhotoEditMetadataPayload, PhotoFavoritePayload,
+    PhotoRestorePayload, PhotoUndoPayload, PhotoUnfavoritePayload,
 };
 use hopnet_projection::{DatabaseError, HandlerCtx, HandlerResult, TransactionHandler, TxMeta};
 
@@ -19,6 +21,11 @@ pub const TX_FUNCTIONS: &[&str] = &[
     "photo_delete",
     "photo_restore",
     "photo_cleanup_expired",
+    "photo_edit_content",
+    "photo_edit_metadata",
+    "photo_undo",
+    "photo_favorite",
+    "photo_unfavorite",
 ];
 
 // --- photo_add ---
@@ -301,12 +308,214 @@ inventory::submit! {
     &PhotoCleanupExpiredHandler as &dyn TransactionHandler
 }
 
+// --- photo_edit_content ---
+
+pub struct PhotoEditContentHandler;
+
+impl TransactionHandler for PhotoEditContentHandler {
+    fn name(&self) -> &'static str { "photo_edit_content" }
+
+    fn process(
+        &self,
+        tx: &TxMeta<'_>,
+        _execute: bool,
+        ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
+    ) -> HandlerResult {
+        let (payload, _) = bincode::serde::decode_from_slice::<PhotoEditContentPayload, _>(
+            tx.payload, bincode::config::standard(),
+        ).map_err(|_| DatabaseError::InvalidPayload)?;
+        let user_id = tx.user_id.ok_or(DatabaseError::AuthorizationError)?;
+
+        for entry in &payload.entries {
+            if entry.resources.is_empty() {
+                return Err(DatabaseError::InvalidPayload);
+            }
+            let owner = lookup_photo_owner(db_tx, &entry.photo_id)?
+                .ok_or(DatabaseError::NotFound)?;
+            if owner.0 != user_id {
+                return Err(DatabaseError::AuthorizationError);
+            }
+            if owner.1.is_some() {
+                // Tombstoned — reject edits.
+                return Err(DatabaseError::ConflictError);
+            }
+            edit_photo_content(db_tx, entry, ctx.fragments_dir, user_id)?;
+        }
+        Ok(())
+    }
+}
+
+inventory::submit! { &PhotoEditContentHandler as &dyn TransactionHandler }
+
+// --- photo_edit_metadata ---
+
+pub struct PhotoEditMetadataHandler;
+
+impl TransactionHandler for PhotoEditMetadataHandler {
+    fn name(&self) -> &'static str { "photo_edit_metadata" }
+
+    fn process(
+        &self,
+        tx: &TxMeta<'_>,
+        _execute: bool,
+        _ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
+    ) -> HandlerResult {
+        let (payload, _) = bincode::serde::decode_from_slice::<PhotoEditMetadataPayload, _>(
+            tx.payload, bincode::config::standard(),
+        ).map_err(|_| DatabaseError::InvalidPayload)?;
+        let user_id = tx.user_id.ok_or(DatabaseError::AuthorizationError)?;
+
+        for entry in &payload.entries {
+            let owner = lookup_photo_owner(db_tx, &entry.photo_id)?
+                .ok_or(DatabaseError::NotFound)?;
+            if owner.0 != user_id {
+                return Err(DatabaseError::AuthorizationError);
+            }
+            if owner.1.is_some() {
+                return Err(DatabaseError::ConflictError);
+            }
+            edit_photo_metadata(db_tx, entry, user_id)?;
+        }
+        Ok(())
+    }
+}
+
+inventory::submit! { &PhotoEditMetadataHandler as &dyn TransactionHandler }
+
+// --- photo_undo ---
+
+pub struct PhotoUndoHandler;
+
+impl TransactionHandler for PhotoUndoHandler {
+    fn name(&self) -> &'static str { "photo_undo" }
+
+    fn process(
+        &self,
+        tx: &TxMeta<'_>,
+        _execute: bool,
+        _ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
+    ) -> HandlerResult {
+        let (payload, _) = bincode::serde::decode_from_slice::<PhotoUndoPayload, _>(
+            tx.payload, bincode::config::standard(),
+        ).map_err(|_| DatabaseError::InvalidPayload)?;
+        let user_id = tx.user_id.ok_or(DatabaseError::AuthorizationError)?;
+
+        for entry in &payload.entries {
+            let owner = lookup_photo_owner(db_tx, &entry.photo_id)?
+                .ok_or(DatabaseError::NotFound)?;
+            if owner.0 != user_id {
+                return Err(DatabaseError::AuthorizationError);
+            }
+            if owner.1.is_some() {
+                return Err(DatabaseError::ConflictError);
+            }
+            undo_content_edit(
+                db_tx,
+                &entry.photo_id,
+                &entry.target_operation_id,
+                &entry.operation_id,
+                user_id,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+inventory::submit! { &PhotoUndoHandler as &dyn TransactionHandler }
+
+// --- photo_favorite ---
+
+pub struct PhotoFavoriteHandler;
+
+impl TransactionHandler for PhotoFavoriteHandler {
+    fn name(&self) -> &'static str { "photo_favorite" }
+
+    fn process(
+        &self,
+        tx: &TxMeta<'_>,
+        _execute: bool,
+        _ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
+    ) -> HandlerResult {
+        let (payload, _) = bincode::serde::decode_from_slice::<PhotoFavoritePayload, _>(
+            tx.payload, bincode::config::standard(),
+        ).map_err(|_| DatabaseError::InvalidPayload)?;
+        let user_id = tx.user_id.ok_or(DatabaseError::AuthorizationError)?;
+
+        for entry in &payload.entries {
+            let Some(owner) = lookup_photo_owner(db_tx, &entry.photo_id)? else {
+                continue; // hard-deleted — idempotent skip
+            };
+            if owner.1.is_some() {
+                return Err(DatabaseError::ConflictError);
+            }
+            // Any user can favorite any photo — no ownership check needed
+            // (photos.md:218 — favorites are per-user, user_id is the actor).
+            insert_favorite(db_tx, &entry.photo_id, user_id)?;
+            crate::db::photos::upsert_photo_changes(db_tx, &entry.photo_id)?;
+            crate::db::photos::insert_operation_row(
+                db_tx, &entry.operation_id, None, &entry.photo_id,
+                6, user_id, None, None, None, None,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+inventory::submit! { &PhotoFavoriteHandler as &dyn TransactionHandler }
+
+// --- photo_unfavorite ---
+
+pub struct PhotoUnfavoriteHandler;
+
+impl TransactionHandler for PhotoUnfavoriteHandler {
+    fn name(&self) -> &'static str { "photo_unfavorite" }
+
+    fn process(
+        &self,
+        tx: &TxMeta<'_>,
+        _execute: bool,
+        _ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
+    ) -> HandlerResult {
+        let (payload, _) = bincode::serde::decode_from_slice::<PhotoUnfavoritePayload, _>(
+            tx.payload, bincode::config::standard(),
+        ).map_err(|_| DatabaseError::InvalidPayload)?;
+        let user_id = tx.user_id.ok_or(DatabaseError::AuthorizationError)?;
+
+        for entry in &payload.entries {
+            // Skip missing or tombstoned photos. soft_delete_photo already
+            // clears favorites, so the delete is a no-op, but rejecting
+            // tombstoned avoids logging a spurious operation.
+            let Some(owner) = lookup_photo_owner(db_tx, &entry.photo_id)? else {
+                continue;
+            };
+            if owner.1.is_some() {
+                continue;
+            }
+            delete_favorite(db_tx, &entry.photo_id, user_id)?;
+            crate::db::photos::upsert_photo_changes(db_tx, &entry.photo_id)?;
+            crate::db::photos::insert_operation_row(
+                db_tx, &entry.operation_id, None, &entry.photo_id,
+                7, user_id, None, None, None, None,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+inventory::submit! { &PhotoUnfavoriteHandler as &dyn TransactionHandler }
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::envelopes::{
-        MetadataAccessEntry, PhotoAddEntry, PhotoDeleteEntry, PhotoResourceOp,
-        PhotoRestoreEntry,
+        MetadataAccessEntry, PhotoAddEntry, PhotoCleanupExpiredPayload,
+        PhotoDeleteEntry, PhotoEditContentEntry,
+        PhotoFavoriteEntry, PhotoResourceOp, PhotoRestoreEntry, PhotoUnfavoriteEntry,
     };
     use hopnet_common::{Blake3Hash, CustomUUID};
     use hopnet_projection::Projection;
@@ -316,7 +525,8 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
         conn.execute_batch(
-            "CREATE TABLE users (user_id INTEGER PRIMARY KEY, x25519_pubkey BLOB);",
+            "CREATE TABLE users (user_id INTEGER PRIMARY KEY, x25519_pubkey BLOB);
+             CREATE TABLE consensus_meta (key TEXT PRIMARY KEY, value BLOB);",
         )
         .unwrap();
         hopnet_storage::store::install_schema(&conn).unwrap();
@@ -735,6 +945,28 @@ mod tests {
             .is_empty());
     }
 
+    /// committed_blob_ids on PhotosProjection extracts blob ids from
+    /// a photo_edit_content payload (both primary edit + thumbnails).
+    #[test]
+    fn committed_blob_ids_photo_edit_content() {
+        let payload = crate::envelopes::PhotoEditContentPayload {
+            entries: vec![PhotoEditContentEntry {
+                photo_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                resources: vec![
+                    PhotoResourceOp { resource_type: 1, op: make_blob_op("00000000-0000-0000-0000-000000000e01".parse().unwrap()) },
+                    PhotoResourceOp { resource_type: 5, op: make_blob_op("00000000-0000-0000-0000-000000000e05".parse().unwrap()) },
+                ],
+                encrypted_metadata: None, metadata_nonce: None,
+                operation_id: "00000000-0000-0000-0000-000000000002".parse().unwrap(),
+            }],
+        };
+        let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard()).unwrap();
+        let ids = crate::PhotosProjection.committed_blob_ids("photo_edit_content", &encoded);
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0].to_string(), "00000000-0000-0000-0000-000000000e01");
+        assert_eq!(ids[1].to_string(), "00000000-0000-0000-0000-000000000e05");
+    }
+
     /// photo_add writes a photo_metadata_access row for the uploader.
     #[test]
     fn photo_add_writes_metadata_access_row() {
@@ -918,5 +1150,92 @@ mod tests {
             Some(1),
         );
         assert!(matches!(result, Err(DatabaseError::AuthorizationError)));
+    }
+
+    // --- edit handler tests ---
+
+    #[test]
+    fn photo_edit_content_applies() {
+        let conn = fixture();
+        let photo_id = CustomUUID::retention_cutoff(0);
+        let add_bytes = add_payload_bytes(photo_id.clone(), 1, CustomUUID::retention_cutoff(1), CustomUUID::retention_cutoff(2), None);
+        apply(&conn, &PhotoAddHandler, "photo_add", &add_bytes, Some(1));
+
+        let new_blob_id = CustomUUID::retention_cutoff(3);
+        let edit_payload = crate::envelopes::PhotoEditContentPayload {
+            entries: vec![PhotoEditContentEntry {
+                photo_id: photo_id.clone(),
+                resources: vec![PhotoResourceOp { resource_type: 1, op: make_blob_op(new_blob_id.clone()) }],
+                encrypted_metadata: None, metadata_nonce: None,
+                operation_id: CustomUUID::retention_cutoff(4),
+            }],
+        };
+        let edit_bytes = bincode::serde::encode_to_vec(&edit_payload, bincode::config::standard()).unwrap();
+        validate(&conn, &PhotoEditContentHandler, "photo_edit_content", &edit_bytes, Some(1)).unwrap();
+        apply(&conn, &PhotoEditContentHandler, "photo_edit_content", &edit_bytes, Some(1));
+
+        let res: String = conn.query_row("SELECT data_block_id FROM photo_resources WHERE photo_id=?1 AND resource_type=1", rusqlite::params![photo_id], |r| r.get(0)).unwrap();
+        assert_eq!(res, new_blob_id.to_string());
+    }
+
+    #[test]
+    fn photo_edit_content_rejects_tombstoned() {
+        let conn = fixture();
+        let photo_id = CustomUUID::retention_cutoff(0);
+        let add_bytes = add_payload_bytes(photo_id.clone(), 1, CustomUUID::retention_cutoff(1), CustomUUID::retention_cutoff(2), None);
+        apply(&conn, &PhotoAddHandler, "photo_add", &add_bytes, Some(1));
+        // Tombstone.
+        let del_payload = crate::envelopes::PhotoDeletePayload { entries: vec![PhotoDeleteEntry { photo_id: photo_id.clone(), operation_id: CustomUUID::retention_cutoff(5) }] };
+        let del_bytes = bincode::serde::encode_to_vec(&del_payload, bincode::config::standard()).unwrap();
+        apply(&conn, &PhotoDeleteHandler, "photo_delete", &del_bytes, Some(1));
+
+        let edit_payload = crate::envelopes::PhotoEditContentPayload { entries: vec![PhotoEditContentEntry { photo_id: photo_id.clone(), resources: vec![PhotoResourceOp { resource_type: 1, op: make_blob_op(CustomUUID::retention_cutoff(6)) }], encrypted_metadata: None, metadata_nonce: None, operation_id: CustomUUID::retention_cutoff(7) }] };
+        let edit_bytes = bincode::serde::encode_to_vec(&edit_payload, bincode::config::standard()).unwrap();
+        let result = validate(&conn, &PhotoEditContentHandler, "photo_edit_content", &edit_bytes, Some(1));
+        assert!(matches!(result, Err(DatabaseError::ConflictError)));
+    }
+
+    #[test]
+    fn photo_favorite_inserts() {
+        let conn = fixture();
+        let photo_id = CustomUUID::retention_cutoff(0);
+        let add_bytes = add_payload_bytes(photo_id.clone(), 1, CustomUUID::retention_cutoff(1), CustomUUID::retention_cutoff(2), None);
+        apply(&conn, &PhotoAddHandler, "photo_add", &add_bytes, Some(1));
+
+        let fav_payload = crate::envelopes::PhotoFavoritePayload { entries: vec![PhotoFavoriteEntry { photo_id: photo_id.clone(), operation_id: CustomUUID::retention_cutoff(3) }] };
+        let fav_bytes = bincode::serde::encode_to_vec(&fav_payload, bincode::config::standard()).unwrap();
+        apply(&conn, &PhotoFavoriteHandler, "photo_favorite", &fav_bytes, Some(1));
+
+        let count: i32 = conn.query_row("SELECT COUNT(*) FROM photo_favorites WHERE photo_id=?1 AND user_id=1", rusqlite::params![photo_id], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn photo_favorite_rejects_tombstoned() {
+        let conn = fixture();
+        let photo_id = CustomUUID::retention_cutoff(0);
+        let add_bytes = add_payload_bytes(photo_id.clone(), 1, CustomUUID::retention_cutoff(1), CustomUUID::retention_cutoff(2), None);
+        apply(&conn, &PhotoAddHandler, "photo_add", &add_bytes, Some(1));
+        let del_payload = crate::envelopes::PhotoDeletePayload { entries: vec![PhotoDeleteEntry { photo_id: photo_id.clone(), operation_id: CustomUUID::retention_cutoff(4) }] };
+        apply(&conn, &PhotoDeleteHandler, "photo_delete", &bincode::serde::encode_to_vec(&del_payload, bincode::config::standard()).unwrap(), Some(1));
+
+        let fav_payload = crate::envelopes::PhotoFavoritePayload { entries: vec![PhotoFavoriteEntry { photo_id: photo_id.clone(), operation_id: CustomUUID::retention_cutoff(5) }] };
+        let fav_bytes = bincode::serde::encode_to_vec(&fav_payload, bincode::config::standard()).unwrap();
+        let result = validate(&conn, &PhotoFavoriteHandler, "photo_favorite", &fav_bytes, Some(1));
+        assert!(matches!(result, Err(DatabaseError::ConflictError)));
+    }
+
+    #[test]
+    fn photo_unfavorite_is_idempotent() {
+        let conn = fixture();
+        let photo_id = CustomUUID::retention_cutoff(0);
+        let add_bytes = add_payload_bytes(photo_id.clone(), 1, CustomUUID::retention_cutoff(1), CustomUUID::retention_cutoff(2), None);
+        apply(&conn, &PhotoAddHandler, "photo_add", &add_bytes, Some(1));
+
+        let unfav_payload = crate::envelopes::PhotoUnfavoritePayload { entries: vec![PhotoUnfavoriteEntry { photo_id: photo_id.clone(), operation_id: CustomUUID::retention_cutoff(3) }] };
+        let unfav_bytes = bincode::serde::encode_to_vec(&unfav_payload, bincode::config::standard()).unwrap();
+        // Delete non-existent favorite (idempotent).
+        validate(&conn, &PhotoUnfavoriteHandler, "photo_unfavorite", &unfav_bytes, Some(1)).unwrap();
+        apply(&conn, &PhotoUnfavoriteHandler, "photo_unfavorite", &unfav_bytes, Some(1));
     }
 }

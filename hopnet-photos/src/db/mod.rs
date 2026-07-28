@@ -25,6 +25,7 @@ pub const TABLES: &[&str] = &[
     "photo_albums",
     "photo_album_entries",
     "photo_favorites",
+    "photo_changes",
 ];
 
 pub mod photos;
@@ -164,6 +165,16 @@ pub fn install_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error
             WHERE new_data_block_id IS NOT NULL;
         CREATE INDEX idx_photo_ops_library ON photo_operations(library_id);
 
+        -- Incremental sync feed: upserted by every handler (add, delete,
+        -- restore, edit, cleanup) so clients can poll for changes by
+        -- consensus height. NO FK — the feed row must survive hard-delete
+        -- so offline clients learn of the tombstone expiry.
+        CREATE TABLE photo_changes (
+            photo_id             TEXT PRIMARY KEY,
+            changed_at_height    INTEGER NOT NULL
+        );
+        CREATE INDEX idx_photo_changes_height ON photo_changes(changed_at_height);
+
         -- Albums: lightweight groupings (photos.md:178-205). A photo can
         -- belong to multiple albums. Personal or shared.
         CREATE TABLE photo_albums (
@@ -208,6 +219,7 @@ pub fn uninstall_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Err
     conn.execute_batch(
         "
         DROP TABLE IF EXISTS photo_favorites;
+        DROP TABLE IF EXISTS photo_changes;
         DROP TABLE IF EXISTS photo_album_entries;
         DROP TABLE IF EXISTS photo_albums;
         DROP TABLE IF EXISTS photo_operations;
@@ -236,6 +248,7 @@ mod tests {
         conn.execute_batch(
             "PRAGMA foreign_keys = ON;
              CREATE TABLE users (user_id INTEGER PRIMARY KEY, username TEXT);
+             CREATE TABLE consensus_meta (key TEXT PRIMARY KEY, value BLOB);
              CREATE TABLE nodes (node_id INTEGER PRIMARY KEY);",
         )
         .unwrap();

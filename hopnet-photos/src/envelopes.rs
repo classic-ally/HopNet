@@ -112,7 +112,93 @@ pub struct PhotoRestoreEntry {
     pub operation_id: CustomUUID,
 }
 
-// --- photo_cleanup_expired ---
+// --- photo_edit_content ---
+
+/// Batch content edit: replace a resource's data block (original →
+/// edited, or edited → new edited). The handler reads the current
+/// `data_block_id` from `photo_resources` at execution time as the prior
+/// value (LWW contract: photos.md:544-547). Thumbnail resource ops
+/// (types 5/6) ride alongside the primary edited resource.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PhotoEditContentPayload {
+    pub entries: Vec<PhotoEditContentEntry>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PhotoEditContentEntry {
+    pub photo_id: CustomUUID,
+    /// Resources to upsert — the first entry is the primary edited
+    /// resource (logged in photo_operations with prior/new); additional
+    /// entries are thumbnails (upserted without individual logging).
+    pub resources: Vec<PhotoResourceOp>,
+    /// Optional metadata update (e.g. dimensions changed by crop).
+    pub encrypted_metadata: Option<Vec<u8>>,
+    pub metadata_nonce: Option<[u8; 12]>,
+    /// UUIDv7 for the photo_operations row.
+    pub operation_id: CustomUUID,
+}
+
+// --- photo_edit_metadata ---
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PhotoEditMetadataPayload {
+    pub entries: Vec<PhotoEditMetadataEntry>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PhotoEditMetadataEntry {
+    pub photo_id: CustomUUID,
+    pub encrypted_metadata: Vec<u8>,
+    pub metadata_nonce: [u8; 12],
+    pub operation_id: CustomUUID,
+}
+
+// --- photo_undo ---
+
+/// Content-only undo: swap a resource back to its prior blob. Metadata
+/// undo is client-side (handler can't read encrypted operation_data);
+/// album/favorite undo uses dedicated handlers.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PhotoUndoPayload {
+    pub entries: Vec<PhotoUndoEntry>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PhotoUndoEntry {
+    pub photo_id: CustomUUID,
+    /// The operation to revert — validated as the latest revertible
+    /// content edit.
+    pub target_operation_id: CustomUUID,
+    /// UUIDv7 for the new photo_operations row (logs the undo itself as
+    /// type=1 with prior/new swapped).
+    pub operation_id: CustomUUID,
+}
+
+// --- photo_favorite ---
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PhotoFavoritePayload {
+    pub entries: Vec<PhotoFavoriteEntry>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PhotoFavoriteEntry {
+    pub photo_id: CustomUUID,
+    pub operation_id: CustomUUID,
+}
+
+// --- photo_unfavorite ---
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PhotoUnfavoritePayload {
+    pub entries: Vec<PhotoUnfavoriteEntry>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PhotoUnfavoriteEntry {
+    pub photo_id: CustomUUID,
+    pub operation_id: CustomUUID,
+}
 
 /// System-maintenance batch hard-delete of expired tombstones. Submitted
 /// by the periodic cleanup cron (TxSigner::Node, no user auth). The
@@ -301,5 +387,40 @@ mod tests {
         expected.push(0x14); // varint(20) — string len
         expected.extend_from_slice(b"2025-01-01T00:00:00Z");
         assert_eq!(encoded, expected, "PhotoCleanupExpiredPayload wire format changed");
+    }
+
+    /// Golden bytes for PhotoFavoriteEntry — two UUIDs.
+    #[test]
+    fn photo_favorite_entry_golden_bytes() {
+        let entry = PhotoFavoriteEntry {
+            photo_id: "00000000-0000-0000-0000-0000000000ff".parse().unwrap(),
+            operation_id: "00000000-0000-0000-0000-0000000000fe".parse().unwrap(),
+        };
+        let mut expected = vec![0x10u8]; // varint(16) — photo_id
+        expected.extend_from_slice(&[0u8; 15]);
+        expected.push(0xff);
+        expected.push(0x10); // varint(16) — operation_id
+        expected.extend_from_slice(&[0u8; 15]);
+        expected.push(0xfe);
+        let encoded = bincode::serde::encode_to_vec(&entry, bincode::config::standard()).unwrap();
+        assert_eq!(encoded, expected, "PhotoFavoriteEntry wire format changed");
+    }
+
+    /// Golden round-trip for photo_edit_metadata (batch of one).
+    #[test]
+    fn photo_edit_metadata_bincode_round_trip() {
+        let payload = PhotoEditMetadataPayload {
+            entries: vec![PhotoEditMetadataEntry {
+                photo_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                encrypted_metadata: b"updated_meta".to_vec(),
+                metadata_nonce: [0xA1; 12],
+                operation_id: "00000000-0000-0000-0000-000000000002".parse().unwrap(),
+            }],
+        };
+        let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard()).unwrap();
+        let (decoded, _): (PhotoEditMetadataPayload, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        let encoded2 = bincode::serde::encode_to_vec(&decoded, bincode::config::standard()).unwrap();
+        assert_eq!(encoded, encoded2, "bincode round-trip must be byte-identical");
     }
 }

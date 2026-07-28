@@ -89,7 +89,13 @@ pub fn insert_photo_entry(
         &entry.photo_id,
         0, // add
         entry.uploaded_by,
+        None,
+        None,
+        None,
+        None,
     )?;
+
+    upsert_photo_changes(db_tx, &entry.photo_id)?;
 
     Ok(())
 }
@@ -139,7 +145,8 @@ pub fn soft_delete_photo(
     })?;
 
     // Log operation (type = 2 = delete).
-    insert_operation_row(db_tx, operation_id, library_id, photo_id, 2, deleted_by)?;
+    insert_operation_row(db_tx, operation_id, library_id, photo_id, 2, deleted_by, None, None, None, None)?;
+    upsert_photo_changes(db_tx, photo_id)?;
 
     Ok(())
 }
@@ -168,7 +175,8 @@ pub fn restore_photo(
     }
 
     // Log operation (type = 8 = restore).
-    insert_operation_row(db_tx, operation_id, library_id, photo_id, 8, restored_by)?;
+    insert_operation_row(db_tx, operation_id, library_id, photo_id, 8, restored_by, None, None, None, None)?;
+    upsert_photo_changes(db_tx, photo_id)?;
 
     Ok(())
 }
@@ -238,6 +246,8 @@ pub fn hard_delete_expired_photo(
     if !expired {
         return Ok(()); // Window not yet elapsed — still in recovery.
     }
+
+    upsert_photo_changes(db_tx, photo_id)?;
 
     // Children first, then the photos row (PRAGMA foreign_keys = ON).
     db_tx.execute(
@@ -320,30 +330,339 @@ fn insert_metadata_access_row(
     Ok(())
 }
 
-fn insert_operation_row(
+pub fn insert_operation_row(
     db_tx: &rusqlite::Transaction,
     operation_id: &CustomUUID,
     library_id: Option<&CustomUUID>,
     photo_id: &CustomUUID,
     operation_type: i32,
     performed_by: i32,
+    resource_type: Option<i32>,
+    prior_data_block_id: Option<&CustomUUID>,
+    new_data_block_id: Option<&CustomUUID>,
+    operation_data: Option<&[u8]>,
 ) -> Result<(), DatabaseError> {
     db_tx.execute(
-        "INSERT INTO photo_operations (id, library_id, photo_id, operation_type, performed_by)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO photo_operations
+           (id, library_id, photo_id, operation_type, resource_type,
+            prior_data_block_id, new_data_block_id, operation_data, performed_by)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             operation_id,
             library_id,
             photo_id,
             operation_type,
+            resource_type,
+            prior_data_block_id,
+            new_data_block_id,
+            operation_data,
             performed_by,
         ],
     )
     .map_err(|e| {
         tracing::error!(
-            "photo_add/delete/restore: insert photo_operations row {} failed: {e}",
+            "insert photo_operations row {} failed: {e}",
             operation_id,
         );
+        DatabaseError::InsertError
+    })?;
+    Ok(())
+}
+
+/// UPSERT the `photo_changes` feed row for incremental sync. Called from
+/// every handler that mutates a photo. The feed table has NO FK — the row
+/// survives hard-delete so offline clients learn of the tombstone expiry.
+pub fn upsert_photo_changes(
+    db_tx: &rusqlite::Transaction,
+    photo_id: &CustomUUID,
+) -> Result<(), DatabaseError> {
+    let height = hopnet_projection::current_height(db_tx)?;
+    db_tx.execute(
+        "INSERT OR REPLACE INTO photo_changes (photo_id, changed_at_height)
+         VALUES (?1, ?2)",
+        params![photo_id, height],
+    )
+    .map_err(|e| {
+        tracing::error!("upsert photo_changes for {} failed: {e}", photo_id);
+        DatabaseError::InsertError
+    })?;
+    Ok(())
+}
+
+/// Look up a photo's owner + tombstone state. Returns None if the photo
+/// doesn't exist. Used by edit handlers for authz + tombstone gating.
+pub fn lookup_photo_owner(
+    db_tx: &rusqlite::Transaction,
+    photo_id: &CustomUUID,
+) -> Result<Option<(i32, Option<String>)>, DatabaseError> {
+    match db_tx.query_row(
+        "SELECT uploaded_by, deleted_at FROM photos WHERE id = ?1",
+        rusqlite::params![photo_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ) {
+        Ok(row) => Ok(Some(row)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => {
+            tracing::error!("lookup_photo_owner {} failed: {e}", photo_id);
+            Err(DatabaseError::RecallError)
+        }
+    }
+}
+
+/// Content edit: replace a resource's blob + optionally update metadata.
+/// Looks up the current data_block_id as prior (LWW contract). Returns
+/// NotFound if the photo doesn't exist; the handler rejects tombstoned
+/// photos before calling this.
+pub fn edit_photo_content(
+    db_tx: &rusqlite::Transaction,
+    entry: &crate::envelopes::PhotoEditContentEntry,
+    fragments_dir: &str,
+    performed_by: i32,
+) -> Result<(), DatabaseError> {
+    // Substrate half: register new blobs (primary edit + thumbnails).
+    for resource in &entry.resources {
+        hopnet_storage::store::apply_blob_insert(
+            db_tx,
+            &resource.op,
+            &hopnet_storage::store::ApplyCtx { fragments_dir },
+        )
+        .map_err(|e| {
+            tracing::error!(
+                "photo_edit_content: apply_blob_insert {} failed: {e}",
+                resource.op.blob_id,
+            );
+            DatabaseError::InsertError
+        })?;
+    }
+
+    // LWW: read current data_block_id from photo_resources. The resource
+    // may not exist yet (first edit for a photo that only had original).
+    let primary = &entry.resources[0];
+    let prior: Option<CustomUUID> = db_tx
+        .query_row(
+            "SELECT data_block_id FROM photo_resources
+             WHERE photo_id = ?1 AND resource_type = ?2",
+            rusqlite::params![entry.photo_id, primary.resource_type],
+            |r| r.get(0),
+        )
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            _ => {
+                tracing::error!(
+                    "photo_edit_content: lookup prior for {} failed: {e}",
+                    entry.photo_id,
+                );
+                Err(DatabaseError::RecallError)
+            }
+        })?;
+
+    // Upsert all resources (primary edit + thumbnails).
+    for resource in &entry.resources {
+        db_tx.execute(
+            "INSERT INTO photo_resources (photo_id, resource_type, data_block_id)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(photo_id, resource_type) DO UPDATE SET data_block_id = ?3",
+            params![entry.photo_id, resource.resource_type, resource.op.blob_id],
+        )
+        .map_err(|e| {
+            tracing::error!(
+                "photo_edit_content: upsert resource ({}, {}) failed: {e}",
+                entry.photo_id,
+                resource.resource_type,
+            );
+            DatabaseError::InsertError
+        })?;
+    }
+
+    // Optional metadata update.
+    if let (Some(meta), Some(nonce)) = (&entry.encrypted_metadata, &entry.metadata_nonce) {
+        db_tx.execute(
+            "UPDATE photos SET encrypted_metadata = ?1, metadata_nonce = ?2 WHERE id = ?3",
+            params![meta, nonce, entry.photo_id],
+        )
+        .map_err(|e| {
+            tracing::error!("photo_edit_content: update metadata {} failed: {e}", entry.photo_id);
+            DatabaseError::InsertError
+        })?;
+    }
+
+    upsert_photo_changes(db_tx, &entry.photo_id)?;
+
+    // Log operation — type=1 with prior/new.
+    insert_operation_row(
+        db_tx,
+        &entry.operation_id,
+        None, // library_id — denormalized, not computed here
+        &entry.photo_id,
+        1, // content_edit
+        performed_by,
+        Some(primary.resource_type),
+        prior.as_ref(),
+        Some(&primary.op.blob_id),
+        None,
+    )?;
+
+    Ok(())
+}
+
+/// Metadata-only edit.
+pub fn edit_photo_metadata(
+    db_tx: &rusqlite::Transaction,
+    entry: &crate::envelopes::PhotoEditMetadataEntry,
+    performed_by: i32,
+) -> Result<(), DatabaseError> {
+    let prior_meta: Option<Vec<u8>> = db_tx
+        .query_row(
+            "SELECT encrypted_metadata FROM photos WHERE id = ?1",
+            rusqlite::params![entry.photo_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => DatabaseError::NotFound,
+            _ => {
+                tracing::error!("edit_metadata lookup {} failed: {e}", entry.photo_id);
+                DatabaseError::RecallError
+            }
+        })?;
+
+    db_tx.execute(
+        "UPDATE photos SET encrypted_metadata = ?1, metadata_nonce = ?2 WHERE id = ?3",
+        params![entry.encrypted_metadata, entry.metadata_nonce, entry.photo_id],
+    )
+    .map_err(|e| {
+        tracing::error!("edit_metadata update {} failed: {e}", entry.photo_id);
+        DatabaseError::InsertError
+    })?;
+
+    upsert_photo_changes(db_tx, &entry.photo_id)?;
+
+    insert_operation_row(
+        db_tx,
+        &entry.operation_id,
+        None,
+        &entry.photo_id,
+        3, // metadata_edit
+        performed_by,
+        None,
+        None,
+        None,
+        Some(prior_meta.as_deref().unwrap_or(&[])), // log prior metadata as operation_data
+    )?;
+
+    Ok(())
+}
+
+/// Content undo: swap a resource back to its prior blob.
+pub fn undo_content_edit(
+    db_tx: &rusqlite::Transaction,
+    photo_id: &CustomUUID,
+    target_operation_id: &CustomUUID,
+    operation_id: &CustomUUID,
+    performed_by: i32,
+) -> Result<(), DatabaseError> {
+    // Read the target operation — must be a content_edit with a prior.
+    let (resource_type, prior_id, current_id): (i32, Option<CustomUUID>, Option<CustomUUID>) = db_tx
+        .query_row(
+            "SELECT resource_type, prior_data_block_id, new_data_block_id
+             FROM photo_operations
+             WHERE id = ?1 AND photo_id = ?2 AND operation_type = 1",
+            rusqlite::params![target_operation_id, photo_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => DatabaseError::NotFound,
+            _ => {
+                tracing::error!("undo lookup op {} failed: {e}", target_operation_id);
+                DatabaseError::RecallError
+            }
+        })?;
+
+    let prior_id = prior_id.ok_or_else(|| {
+        tracing::warn!("undo: op {} has no prior — nothing to revert", target_operation_id);
+        DatabaseError::NotFound
+    })?;
+
+    // Verify the prior blob still exists (soft pointer — may have been
+    // collected by the orphan sweep after 30d).
+    let blob_exists: bool = db_tx
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM data_blocks WHERE id = ?1",
+            rusqlite::params![prior_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| {
+            tracing::error!("undo blob-exists check {} failed: {e}", prior_id);
+            DatabaseError::RecallError
+        })?;
+    if !blob_exists {
+        tracing::warn!(
+            "undo: prior blob {} for photo {} has been collected",
+            prior_id,
+            photo_id,
+        );
+        return Err(DatabaseError::NotFound);
+    }
+
+    // Swap back.
+    db_tx.execute(
+        "UPDATE photo_resources
+         SET data_block_id = ?1
+         WHERE photo_id = ?2 AND resource_type = ?3",
+        params![prior_id, photo_id, resource_type],
+    )
+    .map_err(|e| {
+        tracing::error!("undo UPDATE photo_resources ({}, {}) failed: {e}", photo_id, resource_type);
+        DatabaseError::InsertError
+    })?;
+
+    upsert_photo_changes(db_tx, photo_id)?;
+
+    // Log undo as type=1 with prior/new swapped.
+    insert_operation_row(
+        db_tx,
+        operation_id,
+        None,
+        photo_id,
+        1, // content_edit — LWW chain stays contiguous
+        performed_by,
+        Some(resource_type),
+        current_id.as_ref(),
+        Some(&prior_id),
+        None,
+    )?;
+
+    Ok(())
+}
+
+/// Insert a favorite row (INSERT OR IGNORE — PK collision is idempotent).
+pub fn insert_favorite(
+    db_tx: &rusqlite::Transaction,
+    photo_id: &CustomUUID,
+    user_id: i32,
+) -> Result<(), DatabaseError> {
+    db_tx.execute(
+        "INSERT OR IGNORE INTO photo_favorites (photo_id, user_id) VALUES (?1, ?2)",
+        params![photo_id, user_id],
+    )
+    .map_err(|e| {
+        tracing::error!("insert_favorite ({}, {}) failed: {e}", photo_id, user_id);
+        DatabaseError::InsertError
+    })?;
+    Ok(())
+}
+
+/// Remove a favorite row (DELETE with 0 rows OK — idempotent).
+pub fn delete_favorite(
+    db_tx: &rusqlite::Transaction,
+    photo_id: &CustomUUID,
+    user_id: i32,
+) -> Result<(), DatabaseError> {
+    db_tx.execute(
+        "DELETE FROM photo_favorites WHERE photo_id = ?1 AND user_id = ?2",
+        params![photo_id, user_id],
+    )
+    .map_err(|e| {
+        tracing::error!("delete_favorite ({}, {}) failed: {e}", photo_id, user_id);
         DatabaseError::InsertError
     })?;
     Ok(())
@@ -360,7 +679,8 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
         conn.execute_batch(
-            "CREATE TABLE users (user_id INTEGER PRIMARY KEY, x25519_pubkey BLOB);",
+            "CREATE TABLE users (user_id INTEGER PRIMARY KEY, x25519_pubkey BLOB);
+             CREATE TABLE consensus_meta (key TEXT PRIMARY KEY, value BLOB);",
         )
         .unwrap();
         hopnet_storage::store::install_schema(&conn).unwrap();

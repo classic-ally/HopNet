@@ -74,12 +74,19 @@ impl Projection for PhotosProjection {
         match function {
             "photo_add" => {
                 bincode::serde::decode_from_slice::<envelopes::PhotoAddPayload, _>(
-                    payload,
-                    bincode::config::standard(),
+                    payload, bincode::config::standard(),
                 )
                 .map(|(p, _)| {
-                    p.entries
-                        .iter()
+                    p.entries.iter().flat_map(|e| &e.resources).map(|r| r.op.blob_id.clone()).collect()
+                })
+                .unwrap_or_default()
+            }
+            "photo_edit_content" => {
+                bincode::serde::decode_from_slice::<envelopes::PhotoEditContentPayload, _>(
+                    payload, bincode::config::standard(),
+                )
+                .map(|(p, _)| {
+                    p.entries.iter()
                         .flat_map(|e| &e.resources)
                         .map(|r| r.op.blob_id.clone())
                         .collect()
