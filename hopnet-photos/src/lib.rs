@@ -8,17 +8,15 @@
 //! decrypting consensus-tracked encrypted blobs.
 //!
 //! Phase 1: consensus-tracked tables + `DataBlockReferenceProvider` for GC
-//! integration + `photo_add`/`photo_delete`/`photo_restore` consensus
-//! transaction handlers + fragment distribution hook. Routes, HTTP surface,
-//! and crypto come in later phases.
+//! integration + `photo_add`/`photo_delete`/`photo_restore`/`photo_cleanup`
+//! consensus transaction handlers + fragment distribution hook.
+//!
+//! The `projection` feature (default-on) gates the server half — handlers,
+//! DB, GC, cron, and the `Projection` trait impl. Without it (photos-core
+//! builds), only the envelope wire types and `METADATA_KEY_WRAP_DOMAIN`
+//! are exported.
 
-pub mod db;
 pub mod envelopes;
-pub mod handlers;
-pub mod jobs;
-pub mod reference_provider;
-
-use hopnet_projection::Projection;
 
 /// Domain-separation constant for per-photo metadata key wrapping.
 /// New context strings give clean separation from the substrate's blob-key
@@ -28,10 +26,24 @@ pub const METADATA_KEY_WRAP_DOMAIN: hopnet_storage::WrapDomain = hopnet_storage:
     nonce_context: "hopnet-photos metadata_nonce v1",
 };
 
+#[cfg(feature = "projection")]
+pub mod db;
+#[cfg(feature = "projection")]
+pub mod handlers;
+#[cfg(feature = "projection")]
+pub mod jobs;
+#[cfg(feature = "projection")]
+pub mod reference_provider;
+
+#[cfg(feature = "projection")]
+use hopnet_projection::Projection;
+
+#[cfg(feature = "projection")]
 /// The photos projection's static manifest (RFC-016 Stage 3) — the host
 /// registers this one value in `projections::manifests()`.
 pub struct PhotosProjection;
 
+#[cfg(feature = "projection")]
 impl Projection for PhotosProjection {
     fn name(&self) -> &'static str {
         "photos"
