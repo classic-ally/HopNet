@@ -20,6 +20,14 @@ pub mod reference_provider;
 
 use hopnet_projection::Projection;
 
+/// Domain-separation constant for per-photo metadata key wrapping.
+/// New context strings give clean separation from the substrate's blob-key
+/// domain (BLOB_WRAP_DOMAIN), preventing cross-domain key transplantation.
+pub const METADATA_KEY_WRAP_DOMAIN: hopnet_storage::WrapDomain = hopnet_storage::WrapDomain {
+    key_context: "hopnet-photos metadata_key v1",
+    nonce_context: "hopnet-photos metadata_nonce v1",
+};
+
 /// The photos projection's static manifest (RFC-016 Stage 3) — the host
 /// registers this one value in `projections::manifests()`.
 pub struct PhotosProjection;
