@@ -20,4 +20,7 @@ pub enum PhotosCoreError {
 
     #[error("dispatch error: {0}")]
     Dispatch(String),
+
+    #[error("invalid photo asset: {0}")]
+    InvalidAsset(#[from] crate::asset::AssetValidationError),
 }

@@ -721,6 +721,7 @@ If the module is not compiled, no photos tables are created, no handlers are reg
 - [x] `committed_blob_ids` distribution hook — `photo_add` arm extracts blob ids from resources for the storage engine's distribution kick
 - [x] Periodic cleanup job for expired soft-deleted photos — `photo_cleanup_expired` consensus handler (node-signed, wall-clock predicate host-side in scan query, deterministic `datetime(deleted_at, '+30 days') < datetime(scan_cutoff)` check in handler); `run_photo_tombstone_cleanup` scan job batching 50 IDs per tx via `TxGateway::submit_batch`; daily randomized apalis cron registered via `photos_host::spawn_tombstone_cleanup_worker`. 4 handler tests + 3 DB tests covering hard-delete, within-window skip, missing-photo idempotency, user-signed rejection, and active-photo skip.
 - [x] `dispatch_local` implementation for node clients — signs user transactions through the local consensus queue and reads the local encrypted sync feed
+- [x] Source-independent asset model in `hopnet-photos-core::asset` — namespaced source identities, typed resource kinds, resource descriptors, and validation; publisher, byte transport, and ingress adapters remain deferred
 - [~] Basic HTTP API — transaction submission, gallery/detail queries, recently-deleted view, and per-user sidecar lifecycle are mounted; content upload/fetch routes remain deferred
 - [x] Metadata sync endpoint — user-scoped encrypted photo state + `photo_resources` rows with monotonic high-water marks
 - [ ] ECDH per-photo performance validation

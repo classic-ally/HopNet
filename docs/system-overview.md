@@ -86,6 +86,10 @@ apply functions inside consensus handlers.
       sidecars and runs a 30 s sync worker over `read_photo_changes`;
       axum routes: `/api/photos/{gallery,recently-deleted,{id},
       transaction,sync,sidecar/{status,enable,disable,reinit}}`.
+- [x] Photos shared ingest model: `hopnet-photos-core::asset` defines
+      source-independent identities, RFC-011 resource kinds, resource
+      descriptors, and validation. HopNet publishing, byte transport, and
+      macOS ingress integration remain deferred.
 - [x] hopnet-drive + hopnet-projection + hopnet-takeout extraction
       ([RFC-015](specs/hopnet-drive.md)) COMPLETE (stages D0–D5,
       2026-07-08): narrowed handler seam, per-projection schema units,
