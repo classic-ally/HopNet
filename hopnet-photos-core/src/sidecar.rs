@@ -1,9 +1,9 @@
 #[cfg(feature = "sidecar")]
+use crate::crypto::{decrypt_metadata, unwrap_metadata_key};
+#[cfg(feature = "sidecar")]
 use crate::dispatch::{EncryptedPhotoState, PhotoChange, SyncBatch};
 #[cfg(feature = "sidecar")]
 use crate::error::PhotosCoreError;
-#[cfg(feature = "sidecar")]
-use crate::crypto::{decrypt_metadata, unwrap_metadata_key};
 #[cfg(feature = "sidecar")]
 use crate::metadata::PhotoMetadata;
 #[cfg(feature = "sidecar")]
@@ -17,7 +17,7 @@ use std::path::PathBuf;
 
 /// Photo gallery row — decrypted metadata from `photo_index`.
 #[cfg(feature = "sidecar")]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PhotoRow {
     pub photo_id: CustomUUID,
     pub library_id: Option<CustomUUID>,
@@ -151,8 +151,9 @@ pub fn list_recently_deleted(
                 deleted_at, expires_at, undecryptable
          FROM photo_index
          WHERE deleted_at IS NOT NULL
+           AND undecryptable = 0
            AND (expires_at IS NULL OR expires_at > datetime('now'))
-         ORDER BY expires_at ASC
+         ORDER BY expires_at ASC, photo_id ASC
          LIMIT ? OFFSET ?",
     )?;
     map_rows(stmt.query_map(rusqlite::params![limit, offset], map_row)?)
@@ -224,15 +225,16 @@ pub struct SidecarDb<R: RecipientKey> {
 
 #[cfg(feature = "sidecar")]
 impl<R: RecipientKey> SidecarDb<R> {
-    pub fn open<P: AsRef<std::path::Path>>(
-        path: P,
-        reader: R,
-    ) -> Result<Self, PhotosCoreError> {
+    pub fn open<P: AsRef<std::path::Path>>(path: P, reader: R) -> Result<Self, PhotosCoreError> {
         let conn = Connection::open(path.as_ref())?;
         hopnet_common::db_impl::register_uuid_extract_timestamp(&conn)
             .map_err(|e| PhotosCoreError::Dispatch(format!("register functions: {e}")))?;
         install_schema(&conn)?;
-        Ok(Self { conn, reader, _path: path.as_ref().to_path_buf() })
+        Ok(Self {
+            conn,
+            reader,
+            _path: path.as_ref().to_path_buf(),
+        })
     }
 
     pub fn open_in_memory(reader: R) -> Result<Self, PhotosCoreError> {
@@ -240,11 +242,16 @@ impl<R: RecipientKey> SidecarDb<R> {
         hopnet_common::db_impl::register_uuid_extract_timestamp(&conn)
             .map_err(|e| PhotosCoreError::Dispatch(format!("register functions: {e}")))?;
         install_schema(&conn)?;
-        Ok(Self { conn, reader, _path: PathBuf::from(":memory:") })
+        Ok(Self {
+            conn,
+            reader,
+            _path: PathBuf::from(":memory:"),
+        })
     }
 
     pub fn cursor(&self) -> Result<u64, PhotosCoreError> {
-        let value: Option<Vec<u8>> = self.conn
+        let value: Option<Vec<u8>> = self
+            .conn
             .query_row(
                 "SELECT value FROM sidecar_meta WHERE key = 'cursor'",
                 [],
@@ -276,27 +283,29 @@ impl<R: RecipientKey> SidecarDb<R> {
     /// only applies the data.
     pub fn sync_from_batch(&self, batch: SyncBatch) -> Result<(), PhotosCoreError> {
         let new_cursor = batch.high_water_mark;
+        let tx = self.conn.unchecked_transaction()?;
         for change in &batch.changes {
-            self.apply_change(change)?;
+            self.apply_change(&tx, change)?;
         }
-        self.set_cursor(new_cursor)?;
+        Self::set_cursor(&tx, new_cursor)?;
+        tx.commit()?;
         Ok(())
     }
 
-    fn apply_change(&self, change: &PhotoChange) -> Result<(), PhotosCoreError> {
+    fn apply_change(&self, conn: &Connection, change: &PhotoChange) -> Result<(), PhotosCoreError> {
         match &change.state {
             None => {
-                self.conn.execute(
+                conn.execute(
                     "DELETE FROM photo_index WHERE photo_id = ?",
                     rusqlite::params![change.photo_id],
                 )?;
-                self.conn.execute(
+                conn.execute(
                     "DELETE FROM photo_resources_cache WHERE photo_id = ?",
                     rusqlite::params![change.photo_id],
                 )?;
             }
             Some(state) => {
-                self.upsert_photo(&change.photo_id, change.changed_at_height, state)?;
+                self.upsert_photo(conn, &change.photo_id, change.changed_at_height, state)?;
             }
         }
         Ok(())
@@ -304,6 +313,7 @@ impl<R: RecipientKey> SidecarDb<R> {
 
     fn upsert_photo(
         &self,
+        conn: &Connection,
         photo_id: &CustomUUID,
         changed_at_height: u64,
         state: &EncryptedPhotoState,
@@ -311,22 +321,25 @@ impl<R: RecipientKey> SidecarDb<R> {
         let meta = match (&state.ephemeral_pubkey, &state.encrypted_metadata_key) {
             (Some(eph), Some(wrapped)) => {
                 match unwrap_metadata_key(photo_id, eph, wrapped, &self.reader)
-                    .and_then(|key| decrypt_metadata(&key, &state.metadata_nonce, &state.encrypted_metadata).map_err(Into::into))
+                    .and_then(|key| {
+                        decrypt_metadata(&key, &state.metadata_nonce, &state.encrypted_metadata)
+                            .map_err(Into::into)
+                    })
                     .and_then(|pt| PhotoMetadata::from_json(&pt).map_err(Into::into))
                 {
-                Ok(m) => Some(m),
-                Err(_e) => {
-                    // Metadata decrypt failed — record as undecryptable
-                    // and let the next sync retry.
-                    None
-                }
+                    Ok(m) => Some(m),
+                    Err(_e) => {
+                        // Metadata decrypt failed — record as undecryptable
+                        // until a later change or explicit re-sync retries it.
+                        None
+                    }
                 }
             }
             _ => None,
         };
 
         let undecryptable = if meta.is_some() { 0 } else { 1 };
-        self.conn.execute(
+        conn.execute(
             "INSERT OR REPLACE INTO photo_index (
                 photo_id, library_id, date_taken, upload_date, media_type,
                 width, height, orientation, duration_ms,
@@ -368,12 +381,12 @@ impl<R: RecipientKey> SidecarDb<R> {
         )?;
 
         // Rebuild resource cache: delete all then insert current set.
-        self.conn.execute(
+        conn.execute(
             "DELETE FROM photo_resources_cache WHERE photo_id = ?",
             rusqlite::params![photo_id],
         )?;
         for (rt, block_id) in &state.resources {
-            self.conn.execute(
+            conn.execute(
                 "INSERT INTO photo_resources_cache (photo_id, resource_type, data_block_id)
                  VALUES (?1, ?2, ?3)",
                 rusqlite::params![photo_id, rt, block_id],
@@ -391,12 +404,16 @@ impl<R: RecipientKey> SidecarDb<R> {
         list_active(&self.conn, limit, offset)
     }
 
-    pub fn list_recently_deleted(&self, limit: i64, offset: i64) -> Result<Vec<PhotoRow>, PhotosCoreError> {
+    pub fn list_recently_deleted(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<PhotoRow>, PhotosCoreError> {
         list_recently_deleted(&self.conn, limit, offset)
     }
 
-    fn set_cursor(&self, cursor: u64) -> Result<(), PhotosCoreError> {
-        self.conn.execute(
+    fn set_cursor(conn: &Connection, cursor: u64) -> Result<(), PhotosCoreError> {
+        conn.execute(
             "INSERT OR REPLACE INTO sidecar_meta (key, value) VALUES ('cursor', ?)",
             rusqlite::params![cursor.to_be_bytes().to_vec()],
         )?;
@@ -457,9 +474,14 @@ mod tests {
         let state = make_encrypted_state(&photo_id, &reader, None);
 
         db.hydrate(SyncBatch {
-            changes: vec![PhotoChange { photo_id: photo_id.clone(), changed_at_height: 1, state: Some(state) }],
+            changes: vec![PhotoChange {
+                photo_id: photo_id.clone(),
+                changed_at_height: 1,
+                state: Some(state),
+            }],
             high_water_mark: 1,
-        }).unwrap();
+        })
+        .unwrap();
 
         let rows = db.list_active(10, 0).unwrap();
         assert_eq!(rows.len(), 1);
@@ -476,14 +498,24 @@ mod tests {
         let state = make_encrypted_state(&photo_id, &reader, None);
 
         db.hydrate(SyncBatch {
-            changes: vec![PhotoChange { photo_id: photo_id.clone(), changed_at_height: 1, state: Some(state) }],
+            changes: vec![PhotoChange {
+                photo_id: photo_id.clone(),
+                changed_at_height: 1,
+                state: Some(state),
+            }],
             high_water_mark: 1,
-        }).unwrap();
+        })
+        .unwrap();
 
         db.sync_from_batch(SyncBatch {
-            changes: vec![PhotoChange { photo_id: photo_id.clone(), changed_at_height: 2, state: None }],
+            changes: vec![PhotoChange {
+                photo_id: photo_id.clone(),
+                changed_at_height: 2,
+                state: None,
+            }],
             high_water_mark: 2,
-        }).unwrap();
+        })
+        .unwrap();
 
         assert!(db.list_active(10, 0).unwrap().is_empty());
         assert_eq!(db.cursor().unwrap(), 2);
@@ -496,17 +528,23 @@ mod tests {
 
         db.hydrate(SyncBatch {
             changes: vec![PhotoChange {
-                photo_id: photo_id.clone(), changed_at_height: 1,
+                photo_id: photo_id.clone(),
+                changed_at_height: 1,
                 state: Some(EncryptedPhotoState {
-                    library_id: None, uploaded_by: 1,
-                    encrypted_metadata: vec![], metadata_nonce: [0u8; 12],
-                    deleted_at: None, deleted_by: None,
-                    ephemeral_pubkey: None, encrypted_metadata_key: None,
+                    library_id: None,
+                    uploaded_by: 1,
+                    encrypted_metadata: vec![],
+                    metadata_nonce: [0u8; 12],
+                    deleted_at: None,
+                    deleted_by: None,
+                    ephemeral_pubkey: None,
+                    encrypted_metadata_key: None,
                     resources: vec![],
                 }),
             }],
             high_water_mark: 1,
-        }).unwrap();
+        })
+        .unwrap();
 
         assert!(db.list_active(10, 0).unwrap().is_empty());
         let photo = db.get_photo(&photo_id).unwrap().unwrap();
@@ -520,7 +558,15 @@ mod tests {
         let reader = new_reader();
         let state = make_encrypted_state(&photo_id, &reader, None);
 
-        db.hydrate(SyncBatch { changes: vec![PhotoChange { photo_id, changed_at_height: 5, state: Some(state) }], high_water_mark: 5 }).unwrap();
+        db.hydrate(SyncBatch {
+            changes: vec![PhotoChange {
+                photo_id,
+                changed_at_height: 5,
+                state: Some(state),
+            }],
+            high_water_mark: 5,
+        })
+        .unwrap();
         db.conn.execute("DELETE FROM photo_index", []).unwrap();
         assert_eq!(db.cursor().unwrap(), 5);
     }
@@ -532,7 +578,15 @@ mod tests {
         let reader = new_reader();
         let state = make_encrypted_state(&photo_id, &reader, Some("2099-01-01T00:00:00Z"));
 
-        db.hydrate(SyncBatch { changes: vec![PhotoChange { photo_id, changed_at_height: 1, state: Some(state) }], high_water_mark: 1 }).unwrap();
+        db.hydrate(SyncBatch {
+            changes: vec![PhotoChange {
+                photo_id,
+                changed_at_height: 1,
+                state: Some(state),
+            }],
+            high_water_mark: 1,
+        })
+        .unwrap();
         let deleted = db.list_recently_deleted(10, 0).unwrap();
         assert_eq!(deleted.len(), 1);
         assert!(deleted[0].expires_at.is_some());
@@ -565,16 +619,32 @@ mod tests {
 
         db.hydrate(SyncBatch {
             changes: vec![
-                PhotoChange { photo_id: photo_ok, changed_at_height: 1, state: Some(state_ok) },
-                PhotoChange { photo_id: photo_bad.clone(), changed_at_height: 1, state: Some(bad_state) },
+                PhotoChange {
+                    photo_id: photo_ok,
+                    changed_at_height: 1,
+                    state: Some(state_ok),
+                },
+                PhotoChange {
+                    photo_id: photo_bad.clone(),
+                    changed_at_height: 1,
+                    state: Some(bad_state),
+                },
             ],
             high_water_mark: 1,
-        }).unwrap();
+        })
+        .unwrap();
 
         let rows = db.list_active(10, 0).unwrap();
         assert_eq!(rows.len(), 1, "only decryptable photo in active gallery");
         let bad = db.get_photo(&photo_bad).unwrap().unwrap();
-        assert!(bad.undecryptable, "decrypt-failure photo marked undecryptable");
-        assert_eq!(db.cursor().unwrap(), 1, "cursor advanced despite decrypt failure");
+        assert!(
+            bad.undecryptable,
+            "decrypt-failure photo marked undecryptable"
+        );
+        assert_eq!(
+            db.cursor().unwrap(),
+            1,
+            "cursor advanced despite decrypt failure"
+        );
     }
 }

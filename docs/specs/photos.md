@@ -273,6 +273,8 @@ A content edit on a Live Photo emits **two** operation entries (one for the `edi
 
 The sidecar is a local, non-replicated SQLite database maintained by each client. It holds the decrypted photo metadata that enables all query patterns. The sidecar is ephemeral — it can be deleted and rebuilt from consensus state at any time.
 
+Because it contains plaintext dates, locations, and camera metadata, the host creates the sidecar with mode `0600` on Unix. Sign-out drops the in-memory recipient key and stops synchronization but preserves the file and cursor for an incremental resume; the UI reports this paused-on-disk state explicitly. Choosing **Remove** deletes the file, while **Re-sync** deletes and rebuilds it from consensus.
+
 #### Sidecar Schema
 
 ```sql
@@ -712,25 +714,25 @@ If the module is not compiled, no photos tables are created, no handlers are reg
 ## Implementation Phases
 
 ### Phase 1: photos-core Crate and Schema [~]
-- Extract `crates/photos-core/` with crypto, metadata, thumbnail, payload, and dispatch trait
+- [~] Extract `hopnet-photos-core` with crypto, metadata, payload, dispatch trait, and optional sidecar; thumbnail generation remains deferred
 - [x] Consensus-tracked photo tables (photos, photo_metadata_access, photo_resources, photo_operations, shared_libraries, shared_library_members, photo_albums, photo_album_entries, photo_favorites) — `hopnet-photos` crate, RFC-016 projection registry
 - [x] `photo_add` / `photo_delete` / `photo_restore` consensus handlers — `PhotoAddHandler` (batch, per-entry `uploaded_by` authz, rejected non-NULL `library_id` until Phase 3), `PhotoDeleteHandler` (per-entry ownership check, `deleted_at` derived from `operation_id.extract_timestamp()` — no clocks in handlers), `PhotoRestoreHandler`. 6 handler tests covering authz, tombstone, restore-on-active rejection, nonexistent-library rejection, and validate-vs-apply transaction separation.
 - [x] `DataBlockReferenceProvider` integration with orphan cleanup — `PhotosReferenceProvider` with UUIDv7-timestamp-filtered edit-history retention; 10 tests covering both surfaces, the retention boundary, the over-exclusion leak direction, and Rust↔SQL implementation agreement
 - [x] `committed_blob_ids` distribution hook — `photo_add` arm extracts blob ids from resources for the storage engine's distribution kick
 - [x] Periodic cleanup job for expired soft-deleted photos — `photo_cleanup_expired` consensus handler (node-signed, wall-clock predicate host-side in scan query, deterministic `datetime(deleted_at, '+30 days') < datetime(scan_cutoff)` check in handler); `run_photo_tombstone_cleanup` scan job batching 50 IDs per tx via `TxGateway::submit_batch`; daily randomized apalis cron registered via `photos_host::spawn_tombstone_cleanup_worker`. 4 handler tests + 3 DB tests covering hard-delete, within-window skip, missing-photo idempotency, user-signed rejection, and active-photo skip.
-- `dispatch_local` implementation for node clients
-- Basic HTTP API: upload, submit transaction, list photo IDs, delete, restore
-- Metadata sync endpoint (return encrypted blobs + photo_resources rows for sidecar hydration)
-- ECDH per-photo performance validation
+- [x] `dispatch_local` implementation for node clients — signs user transactions through the local consensus queue and reads the local encrypted sync feed
+- [~] Basic HTTP API — transaction submission, gallery/detail queries, recently-deleted view, and per-user sidecar lifecycle are mounted; content upload/fetch routes remain deferred
+- [x] Metadata sync endpoint — user-scoped encrypted photo state + `photo_resources` rows with monotonic high-water marks
+- [ ] ECDH per-photo performance validation
 
-### Phase 2: Sidecar and History [ ]
-- Sidecar database schema and sync logic in `photos-core` (no framework dependency)
-- Initial hydration flow (full library decrypt)
-- Incremental sync (process new consensus transactions)
-- Operation log: content edits with undo
-- Metadata edit operations with undo
-- Deletion with 30-day retention and restore
-- Periodic cleanup job for expired deletions
+### Phase 2: Sidecar and History [x]
+- [x] Sidecar database schema and sync logic in `photos-core` (no framework dependency)
+- [x] Initial hydration flow (full library decrypt)
+- [x] Incremental sync (process new consensus transactions)
+- [x] Operation log: content edits with undo
+- [x] Metadata edit operations with undo
+- [x] Deletion with 30-day retention and restore
+- [x] Periodic cleanup job for expired deletions
 
 ### Phase 3: Shared Libraries [ ]
 - Library creation and membership management
@@ -745,10 +747,10 @@ If the module is not compiled, no photos tables are created, no handlers are reg
 - Shared albums with non-library-members (per-photo metadata key wrapping)
 - Per-user favorites
 
-### Phase 5: Desktop Frontend [ ]
+### Phase 5: Desktop Frontend [~]
 - *Deferred — separate RFC for gallery UI, timeline view, shared library management*
 - Tauri command bindings to `photos-core`
-- Svelte gallery components
+- [~] Svelte metadata gallery, sidecar opt-in/resume/remove flow, pagination, and photo detail modal; thumbnail/content rendering remains deferred
 
 ### Phase 6: Mobile Clients [ ]
 - *Deferred — UniFFI bindings for `photos-core`, thin client dispatch implementation*

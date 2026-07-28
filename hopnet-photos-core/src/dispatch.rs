@@ -34,16 +34,13 @@ pub trait PhotoDispatch: Send + Sync {
     /// a cleanup batch can drop every row above the cursor, leaving the
     /// client replaying stale tombstones forever. The node-level cursor is
     /// monotonic.
-    async fn fetch_photos_since(
-        &self,
-        height: u64,
-    ) -> Result<SyncBatch, PhotosCoreError>;
+    async fn fetch_photos_since(&self, height: u64) -> Result<SyncBatch, PhotosCoreError>;
 }
 
 /// One incremental sync response. Carries the changed photos since the
 /// client's last cursor PLUS the node's current decided height, which the
 /// client adopts as its new cursor.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SyncBatch {
     /// Photos with `photo_changes.changed_at_height > cursor`. Ordered
     /// ascending by `changed_at_height` for deterministic replay.
@@ -57,7 +54,7 @@ pub struct SyncBatch {
 /// was hard-deleted (tombstone expired + cleanup ran) — the `photo_changes`
 /// row survives the cascade (NO FK), so offline clients still learn
 /// the deletion.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PhotoChange {
     pub photo_id: CustomUUID,
     /// The consensus height at which the `photo_changes` row was last
@@ -74,7 +71,7 @@ pub struct PhotoChange {
 /// to the consensus DB's `photos` / `photo_metadata_access` /
 /// `photo_resources` tables. `photo_id` is NOT duplicated here — it
 /// lives on the parent `PhotoChange`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct EncryptedPhotoState {
     // --- `photos` columns ---
     /// NULL = personal library.

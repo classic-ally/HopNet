@@ -25,8 +25,9 @@ pub mod metrics;
 pub mod net;
 pub mod nodes;
 pub mod passphrase;
-pub mod projections;
+pub mod photos;
 pub mod photos_host;
+pub mod projections;
 pub mod reference_providers;
 pub mod setup;
 pub mod shares;
@@ -82,6 +83,7 @@ pub struct AppState {
     /// Per-peer liveness evidence (RFC-CONSENSUS-002 S3). One writer lock
     /// per authenticated exchange; classification is pure over snapshots.
     pub evidence: Arc<consensus::evidence::EvidenceMap>,
+    pub photos_host: Arc<photos::PhotosHost>,
     /// The MAIN multi-thread runtime's handle, captured at startup.
     /// Host-side background work scheduled from consensus apply
     /// (`HostWorkScheduler`) spawns here — apply runs on the consensus

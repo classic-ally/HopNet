@@ -36,6 +36,8 @@ hopnet-storage = { path = "hopnet-storage", features = ["engine"] }
 hopnet-projection = { path = "hopnet-projection" }
 hopnet-drive = { path = "hopnet-drive" }
 hopnet-photos = { path = "hopnet-photos" }
+hopnet-photos-core = { path = "hopnet-photos-core", features = ["sidecar"] }
+async-trait = "0.1"
 hopnet-takeout = { path = "hopnet-takeout" }
 axum = { version = "0.8.4", features = ["multipart", "macros"] }
 chrono = { version = "0.4.41", features = ["serde"] }

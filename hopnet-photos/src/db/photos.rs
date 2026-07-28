@@ -39,41 +39,42 @@ pub fn insert_photo_entry(
     }
 
     // --- Projection half: photos row (identity + encrypted metadata).
-    db_tx.execute(
-        "INSERT INTO photos (id, library_id, uploaded_by, encrypted_metadata, metadata_nonce)
+    db_tx
+        .execute(
+            "INSERT INTO photos (id, library_id, uploaded_by, encrypted_metadata, metadata_nonce)
          VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![
-            entry.photo_id,
-            entry.library_id,
-            entry.uploaded_by,
-            entry.encrypted_metadata,
-            entry.metadata_nonce,
-        ],
-    )
-    .map_err(|e| {
-        tracing::error!("photo_add: insert photos row {} failed: {e}", entry.photo_id);
-        DatabaseError::InsertError
-    })?;
-
-    // photo_resources — one row per resource.
-    for resource in &entry.resources {
-        db_tx.execute(
-            "INSERT INTO photo_resources (photo_id, resource_type, data_block_id)
-             VALUES (?1, ?2, ?3)",
             params![
                 entry.photo_id,
-                resource.resource_type,
-                resource.op.blob_id,
+                entry.library_id,
+                entry.uploaded_by,
+                entry.encrypted_metadata,
+                entry.metadata_nonce,
             ],
         )
         .map_err(|e| {
             tracing::error!(
-                "photo_add: insert photo_resources row ({}, {}) failed: {e}",
-                entry.photo_id,
-                resource.resource_type,
+                "photo_add: insert photos row {} failed: {e}",
+                entry.photo_id
             );
             DatabaseError::InsertError
         })?;
+
+    // photo_resources — one row per resource.
+    for resource in &entry.resources {
+        db_tx
+            .execute(
+                "INSERT INTO photo_resources (photo_id, resource_type, data_block_id)
+             VALUES (?1, ?2, ?3)",
+                params![entry.photo_id, resource.resource_type, resource.op.blob_id,],
+            )
+            .map_err(|e| {
+                tracing::error!(
+                    "photo_add: insert photo_resources row ({}, {}) failed: {e}",
+                    entry.photo_id,
+                    resource.resource_type,
+                );
+                DatabaseError::InsertError
+            })?;
     }
 
     // photo_metadata_access — per-user metadata key wraps.
@@ -112,40 +113,57 @@ pub fn soft_delete_photo(
     library_id: Option<&CustomUUID>,
     operation_id: &CustomUUID,
 ) -> Result<(), DatabaseError> {
-    let rows = db_tx.execute(
-        "UPDATE photos SET deleted_at = ?2, deleted_by = ?3
+    let rows = db_tx
+        .execute(
+            "UPDATE photos SET deleted_at = ?2, deleted_by = ?3
          WHERE id = ?1 AND deleted_at IS NULL",
-        params![photo_id, deleted_at, deleted_by],
-    )
-    .map_err(|e| {
-        tracing::error!("photo_delete: update photos row {} failed: {e}", photo_id);
-        DatabaseError::InsertError
-    })?;
+            params![photo_id, deleted_at, deleted_by],
+        )
+        .map_err(|e| {
+            tracing::error!("photo_delete: update photos row {} failed: {e}", photo_id);
+            DatabaseError::InsertError
+        })?;
     if rows == 0 {
         // Already tombstoned or not found — idempotent, not an error.
         // (The handler still logs the operation for audit.)
     }
 
     // Clear album entries + favorites (photo disappears from active views).
-    db_tx.execute(
-        "DELETE FROM photo_album_entries WHERE photo_id = ?1",
-        params![photo_id],
-    )
-    .map_err(|e| {
-        tracing::error!("photo_delete: clear album_entries for {} failed: {e}", photo_id);
-        DatabaseError::InsertError
-    })?;
-    db_tx.execute(
-        "DELETE FROM photo_favorites WHERE photo_id = ?1",
-        params![photo_id],
-    )
-    .map_err(|e| {
-        tracing::error!("photo_delete: clear favorites for {} failed: {e}", photo_id);
-        DatabaseError::InsertError
-    })?;
+    db_tx
+        .execute(
+            "DELETE FROM photo_album_entries WHERE photo_id = ?1",
+            params![photo_id],
+        )
+        .map_err(|e| {
+            tracing::error!(
+                "photo_delete: clear album_entries for {} failed: {e}",
+                photo_id
+            );
+            DatabaseError::InsertError
+        })?;
+    db_tx
+        .execute(
+            "DELETE FROM photo_favorites WHERE photo_id = ?1",
+            params![photo_id],
+        )
+        .map_err(|e| {
+            tracing::error!("photo_delete: clear favorites for {} failed: {e}", photo_id);
+            DatabaseError::InsertError
+        })?;
 
     // Log operation (type = 2 = delete).
-    insert_operation_row(db_tx, operation_id, library_id, photo_id, 2, deleted_by, None, None, None, None)?;
+    insert_operation_row(
+        db_tx,
+        operation_id,
+        library_id,
+        photo_id,
+        2,
+        deleted_by,
+        None,
+        None,
+        None,
+        None,
+    )?;
     upsert_photo_changes(db_tx, photo_id)?;
 
     Ok(())
@@ -159,15 +177,16 @@ pub fn restore_photo(
     library_id: Option<&CustomUUID>,
     operation_id: &CustomUUID,
 ) -> Result<(), DatabaseError> {
-    let rows = db_tx.execute(
-        "UPDATE photos SET deleted_at = NULL, deleted_by = NULL
+    let rows = db_tx
+        .execute(
+            "UPDATE photos SET deleted_at = NULL, deleted_by = NULL
          WHERE id = ?1 AND deleted_at IS NOT NULL",
-        params![photo_id],
-    )
-    .map_err(|e| {
-        tracing::error!("photo_restore: update photos row {} failed: {e}", photo_id);
-        DatabaseError::InsertError
-    })?;
+            params![photo_id],
+        )
+        .map_err(|e| {
+            tracing::error!("photo_restore: update photos row {} failed: {e}", photo_id);
+            DatabaseError::InsertError
+        })?;
     if rows == 0 {
         // Not tombstoned — caller should validate. If the photo was
         // hard-deleted (tombstone expired), the row is gone entirely.
@@ -175,7 +194,18 @@ pub fn restore_photo(
     }
 
     // Log operation (type = 8 = restore).
-    insert_operation_row(db_tx, operation_id, library_id, photo_id, 8, restored_by, None, None, None, None)?;
+    insert_operation_row(
+        db_tx,
+        operation_id,
+        library_id,
+        photo_id,
+        8,
+        restored_by,
+        None,
+        None,
+        None,
+        None,
+    )?;
     upsert_photo_changes(db_tx, photo_id)?;
 
     Ok(())
@@ -209,10 +239,7 @@ pub fn hard_delete_expired_photo(
         .map_err(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => DatabaseError::NotFound,
             _ => {
-                tracing::error!(
-                    "photo_cleanup: query photos row {} failed: {e}",
-                    photo_id,
-                );
+                tracing::error!("photo_cleanup: query photos row {} failed: {e}", photo_id,);
                 DatabaseError::RecallError
             }
         })?;
@@ -236,10 +263,7 @@ pub fn hard_delete_expired_photo(
             |r| r.get(0),
         )
         .map_err(|e| {
-            tracing::error!(
-                "photo_cleanup: datetime check for {} failed: {e}",
-                photo_id,
-            );
+            tracing::error!("photo_cleanup: datetime check for {} failed: {e}", photo_id,);
             DatabaseError::RecallError
         })?;
 
@@ -250,54 +274,75 @@ pub fn hard_delete_expired_photo(
     upsert_photo_changes(db_tx, photo_id)?;
 
     // Children first, then the photos row (PRAGMA foreign_keys = ON).
-    db_tx.execute(
-        "DELETE FROM photo_operations WHERE photo_id = ?1",
-        rusqlite::params![photo_id],
-    )
-    .map_err(|e| {
-        tracing::error!("photo_cleanup: delete photo_operations for {} failed: {e}", photo_id);
-        DatabaseError::InsertError
-    })?;
-    db_tx.execute(
-        "DELETE FROM photo_resources WHERE photo_id = ?1",
-        rusqlite::params![photo_id],
-    )
-    .map_err(|e| {
-        tracing::error!("photo_cleanup: delete photo_resources for {} failed: {e}", photo_id);
-        DatabaseError::InsertError
-    })?;
-    db_tx.execute(
-        "DELETE FROM photo_metadata_access WHERE photo_id = ?1",
-        rusqlite::params![photo_id],
-    )
-    .map_err(|e| {
-        tracing::error!("photo_cleanup: delete photo_metadata_access for {} failed: {e}", photo_id);
-        DatabaseError::InsertError
-    })?;
-    db_tx.execute(
-        "DELETE FROM photo_favorites WHERE photo_id = ?1",
-        rusqlite::params![photo_id],
-    )
-    .map_err(|e| {
-        tracing::error!("photo_cleanup: delete photo_favorites for {} failed: {e}", photo_id);
-        DatabaseError::InsertError
-    })?;
-    db_tx.execute(
-        "DELETE FROM photo_album_entries WHERE photo_id = ?1",
-        rusqlite::params![photo_id],
-    )
-    .map_err(|e| {
-        tracing::error!("photo_cleanup: delete photo_album_entries for {} failed: {e}", photo_id);
-        DatabaseError::InsertError
-    })?;
-    db_tx.execute(
-        "DELETE FROM photos WHERE id = ?1",
-        rusqlite::params![photo_id],
-    )
-    .map_err(|e| {
-        tracing::error!("photo_cleanup: delete photos row {} failed: {e}", photo_id);
-        DatabaseError::InsertError
-    })?;
+    db_tx
+        .execute(
+            "DELETE FROM photo_operations WHERE photo_id = ?1",
+            rusqlite::params![photo_id],
+        )
+        .map_err(|e| {
+            tracing::error!(
+                "photo_cleanup: delete photo_operations for {} failed: {e}",
+                photo_id
+            );
+            DatabaseError::InsertError
+        })?;
+    db_tx
+        .execute(
+            "DELETE FROM photo_resources WHERE photo_id = ?1",
+            rusqlite::params![photo_id],
+        )
+        .map_err(|e| {
+            tracing::error!(
+                "photo_cleanup: delete photo_resources for {} failed: {e}",
+                photo_id
+            );
+            DatabaseError::InsertError
+        })?;
+    db_tx
+        .execute(
+            "DELETE FROM photo_metadata_access WHERE photo_id = ?1",
+            rusqlite::params![photo_id],
+        )
+        .map_err(|e| {
+            tracing::error!(
+                "photo_cleanup: delete photo_metadata_access for {} failed: {e}",
+                photo_id
+            );
+            DatabaseError::InsertError
+        })?;
+    db_tx
+        .execute(
+            "DELETE FROM photo_favorites WHERE photo_id = ?1",
+            rusqlite::params![photo_id],
+        )
+        .map_err(|e| {
+            tracing::error!(
+                "photo_cleanup: delete photo_favorites for {} failed: {e}",
+                photo_id
+            );
+            DatabaseError::InsertError
+        })?;
+    db_tx
+        .execute(
+            "DELETE FROM photo_album_entries WHERE photo_id = ?1",
+            rusqlite::params![photo_id],
+        )
+        .map_err(|e| {
+            tracing::error!(
+                "photo_cleanup: delete photo_album_entries for {} failed: {e}",
+                photo_id
+            );
+            DatabaseError::InsertError
+        })?;
+    db_tx
+        .execute(
+            "DELETE FROM photos WHERE id = ?1",
+            rusqlite::params![photo_id],
+        )
+        .map_err(|e| {
+            tracing::error!("photo_cleanup: delete photos row {} failed: {e}", photo_id);
+            DatabaseError::InsertError
+        })?;
 
     Ok(())
 }
@@ -342,30 +387,28 @@ pub fn insert_operation_row(
     new_data_block_id: Option<&CustomUUID>,
     operation_data: Option<&[u8]>,
 ) -> Result<(), DatabaseError> {
-    db_tx.execute(
-        "INSERT INTO photo_operations
+    db_tx
+        .execute(
+            "INSERT INTO photo_operations
            (id, library_id, photo_id, operation_type, resource_type,
             prior_data_block_id, new_data_block_id, operation_data, performed_by)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![
-            operation_id,
-            library_id,
-            photo_id,
-            operation_type,
-            resource_type,
-            prior_data_block_id,
-            new_data_block_id,
-            operation_data,
-            performed_by,
-        ],
-    )
-    .map_err(|e| {
-        tracing::error!(
-            "insert photo_operations row {} failed: {e}",
-            operation_id,
-        );
-        DatabaseError::InsertError
-    })?;
+            params![
+                operation_id,
+                library_id,
+                photo_id,
+                operation_type,
+                resource_type,
+                prior_data_block_id,
+                new_data_block_id,
+                operation_data,
+                performed_by,
+            ],
+        )
+        .map_err(|e| {
+            tracing::error!("insert photo_operations row {} failed: {e}", operation_id,);
+            DatabaseError::InsertError
+        })?;
     Ok(())
 }
 
@@ -376,16 +419,17 @@ pub fn upsert_photo_changes(
     db_tx: &rusqlite::Transaction,
     photo_id: &CustomUUID,
 ) -> Result<(), DatabaseError> {
-    let height = hopnet_projection::current_height(db_tx)?;
-    db_tx.execute(
-        "INSERT OR REPLACE INTO photo_changes (photo_id, changed_at_height)
+    let height = hopnet_projection::current_height(db_tx)? + 1;
+    db_tx
+        .execute(
+            "INSERT OR REPLACE INTO photo_changes (photo_id, changed_at_height)
          VALUES (?1, ?2)",
-        params![photo_id, height],
-    )
-    .map_err(|e| {
-        tracing::error!("upsert photo_changes for {} failed: {e}", photo_id);
-        DatabaseError::InsertError
-    })?;
+            params![photo_id, height],
+        )
+        .map_err(|e| {
+            tracing::error!("upsert photo_changes for {} failed: {e}", photo_id);
+            DatabaseError::InsertError
+        })?;
     Ok(())
 }
 
@@ -458,32 +502,37 @@ pub fn edit_photo_content(
 
     // Upsert all resources (primary edit + thumbnails).
     for resource in &entry.resources {
-        db_tx.execute(
-            "INSERT INTO photo_resources (photo_id, resource_type, data_block_id)
+        db_tx
+            .execute(
+                "INSERT INTO photo_resources (photo_id, resource_type, data_block_id)
              VALUES (?1, ?2, ?3)
              ON CONFLICT(photo_id, resource_type) DO UPDATE SET data_block_id = ?3",
-            params![entry.photo_id, resource.resource_type, resource.op.blob_id],
-        )
-        .map_err(|e| {
-            tracing::error!(
-                "photo_edit_content: upsert resource ({}, {}) failed: {e}",
-                entry.photo_id,
-                resource.resource_type,
-            );
-            DatabaseError::InsertError
-        })?;
+                params![entry.photo_id, resource.resource_type, resource.op.blob_id],
+            )
+            .map_err(|e| {
+                tracing::error!(
+                    "photo_edit_content: upsert resource ({}, {}) failed: {e}",
+                    entry.photo_id,
+                    resource.resource_type,
+                );
+                DatabaseError::InsertError
+            })?;
     }
 
     // Optional metadata update.
     if let (Some(meta), Some(nonce)) = (&entry.encrypted_metadata, &entry.metadata_nonce) {
-        db_tx.execute(
-            "UPDATE photos SET encrypted_metadata = ?1, metadata_nonce = ?2 WHERE id = ?3",
-            params![meta, nonce, entry.photo_id],
-        )
-        .map_err(|e| {
-            tracing::error!("photo_edit_content: update metadata {} failed: {e}", entry.photo_id);
-            DatabaseError::InsertError
-        })?;
+        db_tx
+            .execute(
+                "UPDATE photos SET encrypted_metadata = ?1, metadata_nonce = ?2 WHERE id = ?3",
+                params![meta, nonce, entry.photo_id],
+            )
+            .map_err(|e| {
+                tracing::error!(
+                    "photo_edit_content: update metadata {} failed: {e}",
+                    entry.photo_id
+                );
+                DatabaseError::InsertError
+            })?;
     }
 
     upsert_photo_changes(db_tx, &entry.photo_id)?;
@@ -525,14 +574,19 @@ pub fn edit_photo_metadata(
             }
         })?;
 
-    db_tx.execute(
-        "UPDATE photos SET encrypted_metadata = ?1, metadata_nonce = ?2 WHERE id = ?3",
-        params![entry.encrypted_metadata, entry.metadata_nonce, entry.photo_id],
-    )
-    .map_err(|e| {
-        tracing::error!("edit_metadata update {} failed: {e}", entry.photo_id);
-        DatabaseError::InsertError
-    })?;
+    db_tx
+        .execute(
+            "UPDATE photos SET encrypted_metadata = ?1, metadata_nonce = ?2 WHERE id = ?3",
+            params![
+                entry.encrypted_metadata,
+                entry.metadata_nonce,
+                entry.photo_id
+            ],
+        )
+        .map_err(|e| {
+            tracing::error!("edit_metadata update {} failed: {e}", entry.photo_id);
+            DatabaseError::InsertError
+        })?;
 
     upsert_photo_changes(db_tx, &entry.photo_id)?;
 
@@ -561,24 +615,28 @@ pub fn undo_content_edit(
     performed_by: i32,
 ) -> Result<(), DatabaseError> {
     // Read the target operation — must be a content_edit with a prior.
-    let (resource_type, prior_id, current_id): (i32, Option<CustomUUID>, Option<CustomUUID>) = db_tx
-        .query_row(
-            "SELECT resource_type, prior_data_block_id, new_data_block_id
+    let (resource_type, prior_id, current_id): (i32, Option<CustomUUID>, Option<CustomUUID>) =
+        db_tx
+            .query_row(
+                "SELECT resource_type, prior_data_block_id, new_data_block_id
              FROM photo_operations
              WHERE id = ?1 AND photo_id = ?2 AND operation_type = 1",
-            rusqlite::params![target_operation_id, photo_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => DatabaseError::NotFound,
-            _ => {
-                tracing::error!("undo lookup op {} failed: {e}", target_operation_id);
-                DatabaseError::RecallError
-            }
-        })?;
+                rusqlite::params![target_operation_id, photo_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => DatabaseError::NotFound,
+                _ => {
+                    tracing::error!("undo lookup op {} failed: {e}", target_operation_id);
+                    DatabaseError::RecallError
+                }
+            })?;
 
     let prior_id = prior_id.ok_or_else(|| {
-        tracing::warn!("undo: op {} has no prior — nothing to revert", target_operation_id);
+        tracing::warn!(
+            "undo: op {} has no prior — nothing to revert",
+            target_operation_id
+        );
         DatabaseError::NotFound
     })?;
 
@@ -604,16 +662,21 @@ pub fn undo_content_edit(
     }
 
     // Swap back.
-    db_tx.execute(
-        "UPDATE photo_resources
+    db_tx
+        .execute(
+            "UPDATE photo_resources
          SET data_block_id = ?1
          WHERE photo_id = ?2 AND resource_type = ?3",
-        params![prior_id, photo_id, resource_type],
-    )
-    .map_err(|e| {
-        tracing::error!("undo UPDATE photo_resources ({}, {}) failed: {e}", photo_id, resource_type);
-        DatabaseError::InsertError
-    })?;
+            params![prior_id, photo_id, resource_type],
+        )
+        .map_err(|e| {
+            tracing::error!(
+                "undo UPDATE photo_resources ({}, {}) failed: {e}",
+                photo_id,
+                resource_type
+            );
+            DatabaseError::InsertError
+        })?;
 
     upsert_photo_changes(db_tx, photo_id)?;
 
@@ -640,14 +703,15 @@ pub fn insert_favorite(
     photo_id: &CustomUUID,
     user_id: i32,
 ) -> Result<(), DatabaseError> {
-    db_tx.execute(
-        "INSERT OR IGNORE INTO photo_favorites (photo_id, user_id) VALUES (?1, ?2)",
-        params![photo_id, user_id],
-    )
-    .map_err(|e| {
-        tracing::error!("insert_favorite ({}, {}) failed: {e}", photo_id, user_id);
-        DatabaseError::InsertError
-    })?;
+    db_tx
+        .execute(
+            "INSERT OR IGNORE INTO photo_favorites (photo_id, user_id) VALUES (?1, ?2)",
+            params![photo_id, user_id],
+        )
+        .map_err(|e| {
+            tracing::error!("insert_favorite ({}, {}) failed: {e}", photo_id, user_id);
+            DatabaseError::InsertError
+        })?;
     Ok(())
 }
 
@@ -657,15 +721,206 @@ pub fn delete_favorite(
     photo_id: &CustomUUID,
     user_id: i32,
 ) -> Result<(), DatabaseError> {
-    db_tx.execute(
-        "DELETE FROM photo_favorites WHERE photo_id = ?1 AND user_id = ?2",
-        params![photo_id, user_id],
-    )
-    .map_err(|e| {
-        tracing::error!("delete_favorite ({}, {}) failed: {e}", photo_id, user_id);
-        DatabaseError::InsertError
-    })?;
+    db_tx
+        .execute(
+            "DELETE FROM photo_favorites WHERE photo_id = ?1 AND user_id = ?2",
+            params![photo_id, user_id],
+        )
+        .map_err(|e| {
+            tracing::error!("delete_favorite ({}, {}) failed: {e}", photo_id, user_id);
+            DatabaseError::InsertError
+        })?;
     Ok(())
+}
+
+// --- Read-only queries for sidecar sync ---
+
+/// One row from the `photo_changes` incremental feed, joined with `photos`
+/// and `photo_metadata_access`. Callers (host, dispatch) map these raw rows
+/// into `hopnet_photos_core::dispatch::SyncBatch`.
+pub struct ChangeRow {
+    pub photo_id: CustomUUID,
+    pub changed_at_height: i64,
+    pub row_exists: bool,
+    pub library_id: Option<CustomUUID>,
+    pub uploaded_by: Option<i32>,
+    pub encrypted_metadata: Option<Vec<u8>>,
+    pub metadata_nonce: Option<[u8; 12]>,
+    pub deleted_at: Option<String>,
+    pub deleted_by: Option<i32>,
+    pub eph_pubkey: Option<[u8; 32]>,
+    pub enc_meta_key: Option<Vec<u8>>,
+}
+
+fn map_change_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChangeRow> {
+    let nonce_blob: Option<Vec<u8>> = row.get(6)?;
+    let eph_blob: Option<Vec<u8>> = row.get(9)?;
+    Ok(ChangeRow {
+        photo_id: row.get(0)?,
+        changed_at_height: row.get(1)?,
+        row_exists: row.get::<_, Option<CustomUUID>>(2)?.is_some(),
+        library_id: row.get(3)?,
+        uploaded_by: row.get(4)?,
+        encrypted_metadata: row.get(5)?,
+        metadata_nonce: nonce_blob.and_then(|b| b.try_into().ok()),
+        deleted_at: row.get(7)?,
+        deleted_by: row.get(8)?,
+        eph_pubkey: eph_blob.and_then(|b| b.try_into().ok()),
+        enc_meta_key: row.get(10)?,
+    })
+}
+
+/// Query `photo_changes` since a given height, joined with photo row and
+/// per-user metadata access. Returns rows ordered by `changed_at_height` ASC.
+/// Capped at `limit` rows to avoid unbounded sync batches; callers paginate
+/// by advancing `since_height` from the last returned `changed_at_height`.
+pub fn query_changes(
+    conn: &rusqlite::Connection,
+    user_id: i32,
+    since_height: u64,
+    limit: u64,
+) -> Result<Vec<ChangeRow>, DatabaseError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT pc.photo_id, pc.changed_at_height,
+                    p.id, p.library_id, p.uploaded_by, p.encrypted_metadata,
+                    p.metadata_nonce, p.deleted_at, p.deleted_by,
+                    pma.ephemeral_pubkey, pma.encrypted_metadata_key
+             FROM photo_changes pc
+             LEFT JOIN photos p ON p.id = pc.photo_id
+             LEFT JOIN photo_metadata_access pma
+                 ON pma.photo_id = pc.photo_id AND pma.user_id = ?
+             WHERE pc.changed_at_height > ?
+               -- Active photos: scoped to users with a metadata_access row.
+               -- Hard-deleted photos (p.id IS NULL): the photo + access rows
+               -- are gone (FK cascade in hard_delete_expired_photo), but the
+               -- photo_changes row survives so offline clients learn of the
+               -- tombstone expiry. photo_id alone (a UUIDv7 handle) carries
+               -- no content — the encrypted metadata and resources were
+               -- deleted.
+               AND (pma.photo_id IS NOT NULL OR p.id IS NULL)
+             ORDER BY pc.changed_at_height ASC, pc.photo_id ASC
+             LIMIT ?3",
+        )
+        .map_err(|e| {
+            tracing::error!("query_changes prepare: {e}");
+            DatabaseError::RecallError
+        })?;
+
+    let mut rows = stmt
+        .query_map(
+            params![user_id, since_height as i64, limit as i64],
+            map_change_row,
+        )
+        .map_err(|e| {
+            tracing::error!("query_changes: {e}");
+            DatabaseError::RecallError
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| {
+            tracing::error!("query_changes collect: {e}");
+            DatabaseError::RecallError
+        })?;
+
+    // Never split a consensus height: every mutation in one decided block
+    // shares changed_at_height. Extend a capped batch through the complete
+    // boundary height so a height-only cursor cannot skip tied rows.
+    if rows.len() == limit as usize && !rows.is_empty() {
+        let Some(boundary) = rows.last() else {
+            return Ok(rows);
+        };
+        let boundary_height = boundary.changed_at_height;
+        let boundary_photo_id = boundary.photo_id.clone();
+        let mut boundary_stmt = conn
+            .prepare(
+                "SELECT pc.photo_id, pc.changed_at_height,
+                        p.id, p.library_id, p.uploaded_by, p.encrypted_metadata,
+                        p.metadata_nonce, p.deleted_at, p.deleted_by,
+                        pma.ephemeral_pubkey, pma.encrypted_metadata_key
+                 FROM photo_changes pc
+                 LEFT JOIN photos p ON p.id = pc.photo_id
+                 LEFT JOIN photo_metadata_access pma
+                     ON pma.photo_id = pc.photo_id AND pma.user_id = ?1
+                 WHERE pc.changed_at_height = ?2
+                   AND pc.photo_id > ?3
+                   AND (pma.photo_id IS NOT NULL OR p.id IS NULL)
+                 ORDER BY pc.photo_id ASC",
+            )
+            .map_err(|e| {
+                tracing::error!("query_changes boundary prepare: {e}");
+                DatabaseError::RecallError
+            })?;
+        let boundary_rows = boundary_stmt
+            .query_map(
+                params![user_id, boundary_height, boundary_photo_id],
+                map_change_row,
+            )
+            .map_err(|e| {
+                tracing::error!("query_changes boundary: {e}");
+                DatabaseError::RecallError
+            })?;
+        for row in boundary_rows {
+            rows.push(row.map_err(|e| {
+                tracing::error!("query_changes boundary row: {e}");
+                DatabaseError::RecallError
+            })?);
+        }
+    }
+
+    Ok(rows)
+}
+
+/// Batch-fetch `photo_resources` for a set of photo IDs.
+pub fn query_resources(
+    conn: &rusqlite::Connection,
+    photo_ids: &[&CustomUUID],
+) -> Result<std::collections::HashMap<CustomUUID, Vec<(i32, CustomUUID)>>, DatabaseError> {
+    use std::collections::HashMap;
+    let mut map: HashMap<CustomUUID, Vec<(i32, CustomUUID)>> = HashMap::new();
+    if photo_ids.is_empty() {
+        return Ok(map);
+    }
+    for chunk in photo_ids.chunks(500) {
+        let placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("?{i}")).collect();
+        let sql = format!(
+            "SELECT photo_id, resource_type, data_block_id FROM photo_resources WHERE photo_id IN ({})",
+            placeholders.join(",")
+        );
+        let mut stmt = conn.prepare(&sql).map_err(|e| {
+            tracing::error!("query_resources prepare: {e}");
+            DatabaseError::RecallError
+        })?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = chunk
+            .iter()
+            .map(|id| *id as &dyn rusqlite::types::ToSql)
+            .collect();
+        let rows = stmt
+            .query_map(params.as_slice(), |row| {
+                Ok((
+                    row.get::<_, CustomUUID>(0)?,
+                    row.get::<_, i32>(1)?,
+                    row.get::<_, CustomUUID>(2)?,
+                ))
+            })
+            .map_err(|e| {
+                tracing::error!("query_resources: {e}");
+                DatabaseError::RecallError
+            })?;
+        for row in rows {
+            let (pid, rt, bid) = row.map_err(|e| {
+                tracing::error!("query_resources row: {e}");
+                DatabaseError::RecallError
+            })?;
+            map.entry(pid).or_default().push((rt, bid));
+        }
+    }
+    Ok(map)
+}
+
+/// Current decided consensus height, cast to u64. Pre-genesis reads as 0.
+pub fn read_current_height(conn: &rusqlite::Connection) -> Result<u64, DatabaseError> {
+    let h: i32 = hopnet_projection::current_height(conn)?;
+    Ok(if h > 0 { h as u64 } else { 0 })
 }
 
 #[cfg(test)]
@@ -778,9 +1033,9 @@ mod tests {
         soft_delete_photo(
             &tx,
             &entry.photo_id,
-            1,             // deleted_by
+            1, // deleted_by
             "2025-06-01T00:00:00Z",
-            None,          // personal library
+            None, // personal library
             &CustomUUID::retention_cutoff(3),
         )
         .unwrap();
@@ -794,7 +1049,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(deleted.is_some(), "deleted_at must be set after soft-delete");
+        assert!(
+            deleted.is_some(),
+            "deleted_at must be set after soft-delete"
+        );
 
         // photo_resources still present (pins blob for GC).
         let res_count: i32 = conn
@@ -804,7 +1062,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(res_count, 1, "photo_resources retained during tombstone window");
+        assert_eq!(
+            res_count, 1,
+            "photo_resources retained during tombstone window"
+        );
     }
 
     /// restore clears the tombstone.
@@ -1106,5 +1367,56 @@ mod tests {
             )
             .unwrap();
         assert!(exists, "active photo must survive cleanup attempt");
+    }
+
+    #[test]
+    fn query_changes_extends_through_boundary_height() {
+        let conn = fixture();
+        for i in 0..600 {
+            let photo_id = CustomUUID::new(None);
+            conn.execute(
+                "INSERT INTO photos
+                    (id, library_id, uploaded_by, encrypted_metadata, metadata_nonce)
+                 VALUES (?1, NULL, 1, ?2, ?3)",
+                rusqlite::params![photo_id, vec![i as u8], [0u8; 12]],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO photo_metadata_access
+                    (photo_id, user_id, ephemeral_pubkey, encrypted_metadata_key)
+                 VALUES (?1, 1, ?2, ?3)",
+                rusqlite::params![photo_id, [1u8; 32], vec![2u8; 48]],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO photo_changes (photo_id, changed_at_height) VALUES (?1, 7)",
+                rusqlite::params![photo_id],
+            )
+            .unwrap();
+        }
+
+        let rows = query_changes(&conn, 1, 0, 500).unwrap();
+        assert_eq!(
+            rows.len(),
+            600,
+            "a page must not split one consensus height"
+        );
+        assert!(rows.iter().all(|row| row.changed_at_height == 7));
+    }
+
+    #[test]
+    fn photo_changes_stamps_next_apply_height() {
+        let conn = fixture();
+        let photo_id = CustomUUID::new(None);
+        let tx = conn.unchecked_transaction().unwrap();
+        upsert_photo_changes(&tx, &photo_id).unwrap();
+        let height: i64 = tx
+            .query_row(
+                "SELECT changed_at_height FROM photo_changes WHERE photo_id = ?1",
+                rusqlite::params![photo_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(height, 1, "pre-genesis apply height is current_height + 1");
     }
 }

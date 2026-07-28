@@ -265,6 +265,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 evidence: std::sync::Arc::new(consensus::evidence::EvidenceMap::new()),
                 storage: Arc::new(OnceCell::new()),
                 runtime: tokio::runtime::Handle::current(),
+                photos_host: Arc::new(photos::PhotosHost::new()),
             };
 
             // If we loaded state from database, populate the OnceCell fields
@@ -552,6 +553,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                     get(metrics::routes::get_placement_scores),
                 )
                 .nest("/takeout", hopnet_takeout::routes::router(takeout_state.clone()))
+                .merge(photos::routes::router(app_state.clone()))
                 .nest("/admin", admin::routes::admin_routes())
                 .nest("/views", views::routes::router())
                 .route("/logout", post(auth::sign_out))

@@ -2655,6 +2655,7 @@ dependencies = [
  "apalis-cron",
  "argon2",
  "async-stream",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "bincode",
@@ -2679,6 +2680,7 @@ dependencies = [
  "hopnet-consensus",
  "hopnet-drive",
  "hopnet-photos",
+ "hopnet-photos-core",
  "hopnet-projection",
  "hopnet-storage",
  "hopnet-takeout",
@@ -2812,6 +2814,22 @@ dependencies = [
  "rusqlite",
  "serde",
  "tracing",
+]
+
+[[package]]
+name = "hopnet-photos-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bincode",
+ "chacha20poly1305",
+ "hopnet-common",
+ "hopnet-photos",
+ "hopnet-storage",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

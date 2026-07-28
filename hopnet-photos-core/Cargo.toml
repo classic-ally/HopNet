@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-only"
 repository = "https://git.bentley.sh/HopNet/HopNet"
-description = "HopNet photos core: pure crypto, metadata, and payload builders for the photos projection (RFC-011). Standalone, fully testable — no networking, no dispatch, no sidecar."
+description = "HopNet photos core: crypto, metadata, payload builders, dispatch seam, and optional local sidecar for RFC-011"
 
 [dependencies]
 hopnet-common = { path = "../common" }

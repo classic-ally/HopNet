@@ -285,6 +285,7 @@ pub async fn sign_out(
     }
 
     app_state.session_store.write().await.remove(&uid);
+    app_state.photos_host.shutdown(uid).await;
     StatusCode::OK
 }
 

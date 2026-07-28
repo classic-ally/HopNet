@@ -80,6 +80,12 @@ apply functions inside consensus handlers.
       `Projection::tables` trait method feeds the divergence checker from
       each crate's `db::TABLES` const — no hardcoded table list to drift.
       `register_uuid_extract_timestamp` moved to `hopnet-common::db_impl`.
+- [~] Photos server-side wiring (Track C, 2026-07-28): per-user sidecar
+      (`hopnet-photos-core::sidecar::SidecarDb`) with X25519-recipient
+      metadata decryption; `src/photos::PhotosHost` enables/disables
+      sidecars and runs a 30 s sync worker over `read_photo_changes`;
+      axum routes: `/api/photos/{gallery,recently-deleted,{id},
+      transaction,sync,sidecar/{status,enable,disable,reinit}}`.
 - [x] hopnet-drive + hopnet-projection + hopnet-takeout extraction
       ([RFC-015](specs/hopnet-drive.md)) COMPLETE (stages D0–D5,
       2026-07-08): narrowed handler seam, per-projection schema units,
