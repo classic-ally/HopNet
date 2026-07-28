@@ -2,15 +2,16 @@
 //!
 //! Pure, sync, fully testable photos primitives: metadata-key + blob-key
 //! crypto, the encrypted PhotoMetadata JSON shape, payload builders over
-//! the photos projection's frozen envelope wire types, and the
-//! PhotoDispatch trait (Commit 2 — unimplemented here; impls live
-//! downstream). The sidecar DB is deferred to Commit 3.
+//! the photos projection's frozen envelope wire types, the PhotoDispatch
+//! trait, and the local sidecar SQLite for decrypted gallery queries.
 
 pub mod crypto;
 pub mod dispatch;
 pub mod error;
 pub mod metadata;
 pub mod payloads;
+#[cfg(feature = "sidecar")]
+pub mod sidecar;
 
 use hopnet_storage::WrapDomain;
 
@@ -24,3 +25,5 @@ pub const METADATA_KEY_WRAP_DOMAIN: WrapDomain = WrapDomain {
 
 pub use error::PhotosCoreError;
 pub use metadata::PhotoMetadata;
+#[cfg(feature = "sidecar")]
+pub use sidecar::install_schema;
