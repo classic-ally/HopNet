@@ -1,12 +1,13 @@
-//! HopNet photos core (RFC-011 Track B, Commit 1).
+//! HopNet photos core (RFC-011 Track B).
 //!
 //! Pure, sync, fully testable photos primitives: metadata-key + blob-key
-//! crypto, the encrypted PhotoMetadata JSON shape, and payload builders
-//! over the photos projection's frozen envelope wire types. No networking,
-//! no dispatch (Commit 2), no sidecar DB (Commit 3) — this crate is the
-//! shared core beneath `hopnet-photos`'s projection layer.
+//! crypto, the encrypted PhotoMetadata JSON shape, payload builders over
+//! the photos projection's frozen envelope wire types, and the
+//! PhotoDispatch trait (Commit 2 — unimplemented here; impls live
+//! downstream). The sidecar DB is deferred to Commit 3.
 
 pub mod crypto;
+pub mod dispatch;
 pub mod error;
 pub mod metadata;
 pub mod payloads;
