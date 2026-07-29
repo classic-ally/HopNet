@@ -767,7 +767,7 @@ If the module is not compiled, no photos tables are created, no handlers are reg
 ### Phase 5: Desktop Frontend [~]
 - *Deferred — separate RFC for gallery UI, timeline view, shared library management*
 - Tauri command bindings to `photos-core`
-- [~] Svelte metadata gallery, sidecar opt-in/resume/remove flow, pagination, and photo detail modal; thumbnail/content rendering remains deferred
+- [x] Svelte photo gallery — ingress viewer components folded into the main frontend (windowed keyset browse grid with day headers and hover preview, month histogram rail with jump-to-month, media filters, lightbox with info panel and authenticated downloads); content rendered through a module-scope blob cache (authenticated fetch → object URL keyed by data_block_id, LRU-evicted, flushed on logout); sidecar opt-in/resume/remove flow retained; recently-deleted view rendered through the same grid. Favorites filter and shared-library dropdown deferred (Phases 3-4); lightbox video is full-buffer (no Range streaming through object URLs)
 
 ### Phase 6: Mobile Clients [ ]
 - *Deferred — UniFFI bindings for `photos-core`, thin client dispatch implementation*

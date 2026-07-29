@@ -89,13 +89,16 @@ apply functions inside consensus handlers.
 - [x] Photos shared ingest model: `hopnet-photos-core::asset` defines
       source-independent identities, RFC-011 resource kinds, resource
       descriptors, and validation.
-- [~] Photos content serving (2026-07-30): `GET /api/photos/{id}/resource/
-      {type}` streams decrypted resource bytes — blob_access wrap as the
-      read grant (404/403 split), soft-deleted photos still serve during
-      the 30-day window, Range/206 support, ETag `"{data_block_id}"` +
-      private/immutable caching with 304 revalidation; gallery/detail
-      payloads now carry per-photo `resources` lists from the sidecar
-      cache. Frontend thumbnail rendering remains deferred (next phase).
+- [x] Photos content serving + gallery (2026-07-30): `GET /api/photos/
+      {id}/resource/{type}` streams decrypted resource bytes — blob_access
+      wrap as the read grant (404/403 split), soft-deleted photos still
+      serve during the 30-day window, Range/206 support, ETag
+      `"{data_block_id}"` + private/immutable caching with 304
+      revalidation; keyset browse page + month histogram endpoints;
+      ingress viewer components folded into the main frontend (windowed
+      grid, histogram rail, filters, lightbox) over a module-scope
+      authenticated blob cache keyed by data_block_id. Deferred: shared
+      libraries (Phase 3), favorites (Phase 4), video Range streaming.
 - [x] Photo publisher (2026-07-30): `hopnet-photos-core::publisher`
       turns a validated `PhotoAsset` + byte streams into an encrypted
       `photo_add` — exact-length streaming upload (no staging copy),
