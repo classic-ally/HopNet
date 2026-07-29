@@ -107,6 +107,74 @@ pub fn read_photo_changes(
     })
 }
 
+/// Everything the content route needs to serve one resource: the blob id
+/// (ETag), the caller's key wrap, and the manifest (fragments + file_size).
+pub struct ResourceGrant {
+    pub data_block_id: hopnet_common::CustomUUID,
+    pub access: hopnet_storage::BlobAccess,
+    pub manifest: hopnet_storage::store::BlobManifest,
+}
+
+#[derive(Debug)]
+pub enum ResourceGrantError {
+    /// Photo or resource type doesn't exist (or was hard-deleted).
+    NotFound,
+    /// No blob_access wrap for this user — the wrap is the read grant.
+    Forbidden,
+    Internal(String),
+}
+
+impl From<ResourceGrantError> for axum::http::StatusCode {
+    fn from(e: ResourceGrantError) -> Self {
+        match e {
+            ResourceGrantError::NotFound => axum::http::StatusCode::NOT_FOUND,
+            ResourceGrantError::Forbidden => axum::http::StatusCode::FORBIDDEN,
+            ResourceGrantError::Internal(msg) => {
+                tracing::error!("resource grant failed: {msg}");
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            }
+        }
+    }
+}
+
+/// Resolve + authorize one photo resource for `user_id`. Sync (rusqlite);
+/// callers run it under spawn_blocking. 404-vs-403 reveals photo existence
+/// to authenticated users — acceptable, ids are unguessable UUIDv7.
+pub fn read_resource_grant(
+    pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    user_id: i32,
+    photo_id: &hopnet_common::CustomUUID,
+    kind: hopnet_photos_core::asset::ResourceKind,
+) -> Result<ResourceGrant, ResourceGrantError> {
+    let conn = pool
+        .get()
+        .map_err(|e| ResourceGrantError::Internal(format!("pool: {e}")))?;
+
+    let data_block_id = photos::lookup_resource_block(&conn, photo_id, kind.as_wire())
+        .map_err(|e| ResourceGrantError::Internal(format!("resource lookup: {e:?}")))?
+        .ok_or(ResourceGrantError::NotFound)?;
+
+    let access = photos::get_blob_access_for_user(&conn, &data_block_id, user_id)
+        .map_err(|e| ResourceGrantError::Internal(format!("access lookup: {e:?}")))?
+        .ok_or(ResourceGrantError::Forbidden)?;
+
+    // Asset validation rejects zero-byte resources, so a resource row whose
+    // blob has no manifest is corruption, not a client-visible 404.
+    let manifest = hopnet_storage::store::blob_manifest(&conn, &data_block_id)
+        .map_err(|e| ResourceGrantError::Internal(format!("manifest: {e:?}")))?
+        .ok_or_else(|| {
+            ResourceGrantError::Internal(format!(
+                "resource row references unknown blob {data_block_id}"
+            ))
+        })?;
+
+    Ok(ResourceGrant {
+        data_block_id,
+        access,
+        manifest,
+    })
+}
+
 fn pubkey_from_blob(blob: Vec<u8>) -> Result<hopnet_storage::x25519_dalek::PublicKey, String> {
     let arr: [u8; 32] = blob
         .try_into()
@@ -184,5 +252,158 @@ mod tests {
     #[test]
     fn complete_batch_advances_to_chain_tip() {
         assert_eq!(select_high_water_mark(499, Some(7), 0, 10), 10);
+    }
+
+    fn test_pool() -> r2d2::Pool<r2d2_sqlite::SqliteConnectionManager> {
+        let manager = r2d2_sqlite::SqliteConnectionManager::memory();
+        let pool = r2d2::Pool::builder()
+            .max_size(1)
+            .connection_customizer(Box::new(crate::db::shared::SqliteInitializer))
+            .build(manager)
+            .unwrap();
+        crate::db::shared::initialize(pool.get().unwrap()).unwrap();
+        pool
+    }
+
+    fn insert_user(
+        pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+        user_id: i32,
+        pubkey: &hopnet_storage::x25519_dalek::PublicKey,
+    ) {
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO users (user_id, username, pubkey, x25519_pubkey, \
+                 encrypted_privkey, key_salt) VALUES (?, ?, ?, ?, ?, ?)",
+                rusqlite::params![
+                    user_id,
+                    format!("user{user_id}"),
+                    vec![0u8; 32],
+                    pubkey.as_bytes().to_vec(),
+                    vec![0u8; 32],
+                    vec![0u8; 16],
+                ],
+            )
+            .unwrap();
+    }
+
+    // Impact: pins the full write-to-read contract across the storage put,
+    // the consensus apply, and the grant layer — bytes published for a user
+    // must come back byte-identical through the serving path.
+    // Should: resolve, authorize, unwrap, and stream back exactly the
+    // published plaintext, and honor inclusive byte ranges.
+    // Should not: grant access to a wrap-less user, an unpublished resource
+    // kind, or an unknown photo.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn publisher_to_serve_round_trip() {
+        use hopnet_photos_core::asset::ResourceKind;
+        use std::io::Cursor;
+        use tokio_stream::StreamExt;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let fragments_dir = temp_dir.path().to_str().unwrap().to_string();
+        let pool = test_pool();
+
+        let owner_secret = hopnet_storage::x25519_dalek::StaticSecret::from([0xD4; 32]);
+        let owner_pubkey = hopnet_storage::x25519_dalek::PublicKey::from(&owner_secret);
+        insert_user(&pool, 7, &owner_pubkey);
+        let bystander_pubkey = hopnet_storage::x25519_dalek::PublicKey::from(
+            &hopnet_storage::x25519_dalek::StaticSecret::from([0xE5; 32]),
+        );
+        insert_user(&pool, 8, &bystander_pubkey);
+
+        let plaintext: Vec<u8> = (0..100 * 1024).map(|i| (i % 251) as u8).collect();
+        let blob_id = hopnet_common::CustomUUID::new(None);
+        let per_blob_key = chacha20poly1305::Key::from([0x55; 32]);
+        let mut blob_op = crate::storage_host::routes::process_uploaded_file(
+            Cursor::new(plaintext.clone()),
+            plaintext.len(),
+            blob_id.clone(),
+            &per_blob_key,
+            &fragments_dir,
+        )
+        .await
+        .unwrap();
+        blob_op.access = vec![
+            hopnet_storage::crypto::wrap_blob_key(&blob_id, &owner_pubkey, &per_blob_key).unwrap(),
+        ];
+
+        let photo_id = hopnet_common::CustomUUID::new(None);
+        let entry = hopnet_photos::envelopes::PhotoAddEntry {
+            photo_id: photo_id.clone(),
+            library_id: None,
+            uploaded_by: 7,
+            encrypted_metadata: b"meta".to_vec(),
+            metadata_nonce: [0u8; 12],
+            resources: vec![hopnet_photos::envelopes::PhotoResourceOp {
+                resource_type: ResourceKind::Original.as_wire(),
+                op: blob_op,
+            }],
+            metadata_access: vec![hopnet_photos::envelopes::MetadataAccessEntry {
+                user_id: 7,
+                ephemeral_pubkey: [0x42; 32],
+                encrypted_metadata_key: vec![0xFF; 48],
+            }],
+            operation_id: hopnet_common::CustomUUID::new(None),
+        };
+        {
+            let conn = pool.get().unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
+            hopnet_photos::db::photos::insert_photo_entry(&tx, &entry, &fragments_dir).unwrap();
+            crate::db::shared::commit_timed(tx).unwrap();
+        }
+
+        let grant = read_resource_grant(&pool, 7, &photo_id, ResourceKind::Original)
+            .ok()
+            .expect("owner grant");
+        let key = hopnet_storage::crypto::unwrap_blob_key(
+            &grant.access,
+            &hopnet_storage::StaticRecipient(owner_secret),
+        )
+        .unwrap();
+        assert_eq!(key.as_slice(), per_blob_key.as_slice());
+
+        let stream =
+            hopnet_storage::api::get_local(fragments_dir.clone(), grant.manifest, Some(key), None);
+        tokio::pin!(stream);
+        let mut out = Vec::with_capacity(plaintext.len());
+        while let Some(chunk) = stream.next().await {
+            out.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(out, plaintext);
+
+        let grant = read_resource_grant(&pool, 7, &photo_id, ResourceKind::Original)
+            .ok()
+            .expect("owner grant for range read");
+        let stream = hopnet_storage::api::get_local(
+            fragments_dir.clone(),
+            grant.manifest,
+            Some(per_blob_key),
+            Some((10, 99)),
+        );
+        tokio::pin!(stream);
+        let mut ranged = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            ranged.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(ranged, &plaintext[10..=99]);
+
+        let err = read_resource_grant(&pool, 8, &photo_id, ResourceKind::Original)
+            .err()
+            .expect("wrap-less user must be refused");
+        assert!(matches!(err, ResourceGrantError::Forbidden));
+        let err = read_resource_grant(&pool, 7, &photo_id, ResourceKind::ThumbnailSmall)
+            .err()
+            .expect("unpublished kind must miss");
+        assert!(matches!(err, ResourceGrantError::NotFound));
+        let err = read_resource_grant(
+            &pool,
+            7,
+            &hopnet_common::CustomUUID::new(None),
+            ResourceKind::Original,
+        )
+        .err()
+        .expect("unknown photo must miss");
+        assert!(matches!(err, ResourceGrantError::NotFound));
     }
 }

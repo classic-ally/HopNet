@@ -2806,6 +2806,7 @@ name = "hopnet-photos"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "chacha20poly1305",
  "chrono",
  "hopnet-common",
  "hopnet-projection",

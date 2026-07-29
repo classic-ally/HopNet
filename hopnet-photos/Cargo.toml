@@ -18,6 +18,10 @@ chrono = { version = "0.4", optional = true }
 rusqlite = { version = "0.38", features = ["bundled", "functions"], optional = true }
 inventory = { version = "0.3.20", optional = true }
 
+[dev-dependencies]
+# content-serving tests wrap/unwrap real per-blob keys
+chacha20poly1305 = "0.10.1"
+
 [features]
 default = ["projection"]
 projection = ["dep:hopnet-projection", "dep:rusqlite", "dep:tracing", "dep:chrono", "dep:inventory"]

@@ -453,6 +453,64 @@ pub fn lookup_photo_owner(
     }
 }
 
+/// Resolve one resource of one photo to its backing data block. Returns
+/// None if the photo has no resource of that type (or no photo at all).
+///
+/// Tombstone-agnostic by design: soft-deleted photos still serve content
+/// (the recently-deleted UI needs thumbnails and the blobs stay pinned for
+/// the 30-day window); hard-deleted rows are gone, so None -> 404 upstream.
+pub fn lookup_resource_block(
+    conn: &rusqlite::Connection,
+    photo_id: &CustomUUID,
+    resource_type: i32,
+) -> Result<Option<CustomUUID>, DatabaseError> {
+    match conn.query_row(
+        "SELECT data_block_id FROM photo_resources
+         WHERE photo_id = ?1 AND resource_type = ?2",
+        params![photo_id, resource_type],
+        |r| r.get(0),
+    ) {
+        Ok(id) => Ok(Some(id)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => {
+            tracing::error!("lookup_resource_block {photo_id}/{resource_type} failed: {e}");
+            Err(DatabaseError::RecallError)
+        }
+    }
+}
+
+/// Look up a user's blob_access wrap for a photo resource's data block.
+/// None = no wrap for this user -> the caller treats it as forbidden; the
+/// wrap is cryptographically required to decrypt, so its existence IS the
+/// read grant.
+pub fn get_blob_access_for_user(
+    conn: &rusqlite::Connection,
+    data_block_id: &CustomUUID,
+    user_id: i32,
+) -> Result<Option<hopnet_storage::BlobAccess>, DatabaseError> {
+    // Projection half: user → pubkey; substrate half: pubkey-keyed wrap.
+    // The users table is HOST-owned; photos SQL may READ it (same SQLite DB —
+    // the ownership boundary is code, not schema), so this is a local lookup
+    // rather than a call into the host's users module.
+    use rusqlite::OptionalExtension;
+    let pubkey: Option<[u8; 32]> = conn
+        .query_row(
+            "SELECT x25519_pubkey FROM users WHERE user_id = ?",
+            params![user_id],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .map_err(|_| DatabaseError::RecallError)?
+        .map(|blob| <[u8; 32]>::try_from(blob).map_err(|_| DatabaseError::RecallError))
+        .transpose()?;
+    let pubkey = match pubkey {
+        Some(pubkey) => pubkey,
+        None => return Ok(None),
+    };
+    hopnet_storage::store::get_blob_access(conn, data_block_id, &pubkey)
+        .map_err(|_| DatabaseError::RecallError)
+}
+
 /// Content edit: replace a resource's blob + optionally update metadata.
 /// Looks up the current data_block_id as prior (LWW contract). Returns
 /// NotFound if the photo doesn't exist; the handler rejects tombstoned
@@ -1418,5 +1476,148 @@ mod tests {
             )
             .unwrap();
         assert_eq!(height, 1, "pre-genesis apply height is current_height + 1");
+    }
+
+    // --- content-serving lookups ---
+
+    fn insert_user_with_pubkey(
+        conn: &Connection,
+        user_id: i32,
+        pubkey: &hopnet_storage::x25519_dalek::PublicKey,
+    ) {
+        conn.execute(
+            "INSERT INTO users (user_id, x25519_pubkey) VALUES (?1, ?2)",
+            rusqlite::params![user_id, pubkey.as_bytes().to_vec()],
+        )
+        .unwrap();
+    }
+
+    fn insert_photo_with_access(
+        conn: &Connection,
+        photo_id: &CustomUUID,
+        blob_id: &CustomUUID,
+        access: Vec<hopnet_storage::BlobAccess>,
+    ) {
+        let mut op = make_blob_op(blob_id.clone());
+        op.access = access;
+        let entry = PhotoAddEntry {
+            photo_id: photo_id.clone(),
+            library_id: None,
+            uploaded_by: 1,
+            encrypted_metadata: b"enc_meta".to_vec(),
+            metadata_nonce: [0u8; 12],
+            resources: vec![PhotoResourceOp {
+                resource_type: 0,
+                op,
+            }],
+            metadata_access: vec![crate::envelopes::MetadataAccessEntry {
+                user_id: 1,
+                ephemeral_pubkey: [0x42; 32],
+                encrypted_metadata_key: vec![0xFF; 48],
+            }],
+            operation_id: CustomUUID::new(None),
+        };
+        let tx = conn.unchecked_transaction().unwrap();
+        insert_photo_entry(&tx, &entry, "/tmp/fragments").unwrap();
+        tx.commit().unwrap();
+    }
+
+    // Should: resolve a declared (photo, resource type) pair to its data block.
+    // Should not: report a data block for an undeclared type or unknown photo.
+    #[test]
+    fn lookup_resource_block_resolves_and_misses() {
+        let conn = fixture();
+        let photo_id = CustomUUID::retention_cutoff(10);
+        let blob_id = CustomUUID::retention_cutoff(11);
+        insert_photo_with_access(&conn, &photo_id, &blob_id, vec![]);
+
+        assert_eq!(
+            lookup_resource_block(&conn, &photo_id, 0).unwrap(),
+            Some(blob_id)
+        );
+        assert_eq!(lookup_resource_block(&conn, &photo_id, 5).unwrap(), None);
+        assert_eq!(
+            lookup_resource_block(&conn, &CustomUUID::retention_cutoff(99), 0).unwrap(),
+            None
+        );
+    }
+
+    // Impact: the recently-deleted UI needs content during the 30-day window,
+    // so a tombstone must not sever resource resolution.
+    // Should: keep resolving a soft-deleted photo's resources.
+    #[test]
+    fn lookup_resource_block_survives_soft_delete() {
+        let conn = fixture();
+        let photo_id = CustomUUID::retention_cutoff(20);
+        let blob_id = CustomUUID::retention_cutoff(21);
+        insert_photo_with_access(&conn, &photo_id, &blob_id, vec![]);
+
+        let tx = conn.unchecked_transaction().unwrap();
+        soft_delete_photo(
+            &tx,
+            &photo_id,
+            1,
+            "2025-06-01T00:00:00Z",
+            None,
+            &CustomUUID::retention_cutoff(22),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(
+            lookup_resource_block(&conn, &photo_id, 0).unwrap(),
+            Some(blob_id)
+        );
+    }
+
+    // Impact: the blob_access wrap is the sole read-authorization gate for
+    // photo content — its presence IS the grant.
+    // Should: return the access row only for a user holding a wrap for the blob.
+    // Should not: return a row for a wrap-less user or an unknown user.
+    #[test]
+    fn blob_access_lookup_gates_on_wrap() {
+        let conn = fixture();
+        let granted_secret = hopnet_storage::x25519_dalek::StaticSecret::from([0xA1; 32]);
+        let granted_pubkey = hopnet_storage::x25519_dalek::PublicKey::from(&granted_secret);
+        let bystander_secret = hopnet_storage::x25519_dalek::StaticSecret::from([0xB2; 32]);
+        let bystander_pubkey = hopnet_storage::x25519_dalek::PublicKey::from(&bystander_secret);
+        insert_user_with_pubkey(&conn, 2, &granted_pubkey);
+        insert_user_with_pubkey(&conn, 3, &bystander_pubkey);
+
+        let photo_id = CustomUUID::retention_cutoff(30);
+        let blob_id = CustomUUID::retention_cutoff(31);
+        let per_blob_key = chacha20poly1305::Key::from([0x11; 32]);
+        let wrap =
+            hopnet_storage::crypto::wrap_blob_key(&blob_id, &granted_pubkey, &per_blob_key)
+                .unwrap();
+        insert_photo_with_access(&conn, &photo_id, &blob_id, vec![wrap]);
+
+        assert!(get_blob_access_for_user(&conn, &blob_id, 2).unwrap().is_some());
+        assert!(get_blob_access_for_user(&conn, &blob_id, 3).unwrap().is_none());
+        assert!(get_blob_access_for_user(&conn, &blob_id, 99).unwrap().is_none());
+    }
+
+    // Should: recover the exact per-blob key by unwrapping the stored access
+    // row with the recipient's private key.
+    #[test]
+    fn blob_access_round_trips_through_unwrap() {
+        let conn = fixture();
+        let secret = hopnet_storage::x25519_dalek::StaticSecret::from([0xC3; 32]);
+        let pubkey = hopnet_storage::x25519_dalek::PublicKey::from(&secret);
+        insert_user_with_pubkey(&conn, 2, &pubkey);
+
+        let photo_id = CustomUUID::retention_cutoff(40);
+        let blob_id = CustomUUID::retention_cutoff(41);
+        let per_blob_key = chacha20poly1305::Key::from([0x77; 32]);
+        let wrap = hopnet_storage::crypto::wrap_blob_key(&blob_id, &pubkey, &per_blob_key).unwrap();
+        insert_photo_with_access(&conn, &photo_id, &blob_id, vec![wrap]);
+
+        let access = get_blob_access_for_user(&conn, &blob_id, 2).unwrap().unwrap();
+        let unwrapped = hopnet_storage::crypto::unwrap_blob_key(
+            &access,
+            &hopnet_storage::StaticRecipient(secret),
+        )
+        .unwrap();
+        assert_eq!(unwrapped.as_slice(), per_blob_key.as_slice());
     }
 }

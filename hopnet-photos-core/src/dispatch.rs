@@ -11,8 +11,9 @@ use crate::error::PhotosCoreError;
 ///
 /// The sync/hydration surface (fetch_photos_since, submit_transaction) and
 /// the upload pipe (upload_data_block, fetch_library_members) are shipped.
-/// The download pipe (fetch_data_block, thumbnail fetch) is deferred to the
-/// content-serving commit.
+/// The download pipe (fetch_data_block) is deferred to the thin-client
+/// dispatch commit — node-side clients read content through the host's
+/// `GET /api/photos/{id}/resource/{type}` route instead of the trait.
 #[async_trait::async_trait]
 pub trait PhotoDispatch: Send + Sync {
     /// Submit a fully-formed, bincode-encoded photo transaction envelope

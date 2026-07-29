@@ -39,6 +39,11 @@ pub struct PhotoRow {
     pub deleted_at: Option<String>,
     pub expires_at: Option<String>,
     pub undecryptable: bool,
+    /// `(resource_type, data_block_id)` pairs from `photo_resources_cache`,
+    /// ordered by type. Same wire shape as `EncryptedPhotoState::resources`.
+    /// The frontend uses these to pick a display kind and to key its content
+    /// cache by blob id (content edits swap the blob under the same URL).
+    pub resources: Vec<(i32, CustomUUID)>,
 }
 
 /// Install the sidecar's local (non-consensus) tables. Idempotent — uses
@@ -133,7 +138,9 @@ pub fn list_active(
          ORDER BY date_taken DESC, photo_id DESC
          LIMIT ? OFFSET ?",
     )?;
-    map_rows(stmt.query_map(rusqlite::params![limit, offset], map_row)?)
+    let mut rows = map_rows(stmt.query_map(rusqlite::params![limit, offset], map_row)?)?;
+    attach_resources(conn, &mut rows)?;
+    Ok(rows)
 }
 
 /// Recently deleted — photos within the 30-day recovery window.
@@ -156,7 +163,9 @@ pub fn list_recently_deleted(
          ORDER BY expires_at ASC, photo_id ASC
          LIMIT ? OFFSET ?",
     )?;
-    map_rows(stmt.query_map(rusqlite::params![limit, offset], map_row)?)
+    let mut rows = map_rows(stmt.query_map(rusqlite::params![limit, offset], map_row)?)?;
+    attach_resources(conn, &mut rows)?;
+    Ok(rows)
 }
 
 /// Single photo lookup by id.
@@ -174,6 +183,7 @@ pub fn get_photo(
          FROM photo_index WHERE photo_id = ?",
     )?;
     let mut rows = map_rows(stmt.query_map(rusqlite::params![photo_id], map_row)?)?;
+    attach_resources(conn, &mut rows)?;
     Ok(rows.pop())
 }
 
@@ -200,6 +210,7 @@ fn map_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PhotoRow> {
         deleted_at: r.get(17)?,
         expires_at: r.get(18)?,
         undecryptable: r.get::<_, i32>(19)? != 0,
+        resources: Vec::new(),
     })
 }
 
@@ -208,6 +219,54 @@ fn map_rows(
     iter: impl Iterator<Item = rusqlite::Result<PhotoRow>>,
 ) -> Result<Vec<PhotoRow>, PhotosCoreError> {
     iter.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+/// Batch read of `photo_resources_cache` for a set of photos. 500-id chunks
+/// keep the IN list well below SQLITE_MAX_VARIABLE_NUMBER.
+#[cfg(feature = "sidecar")]
+pub fn resources_for(
+    conn: &Connection,
+    photo_ids: &[&CustomUUID],
+) -> Result<std::collections::HashMap<CustomUUID, Vec<(i32, CustomUUID)>>, PhotosCoreError> {
+    let mut out: std::collections::HashMap<CustomUUID, Vec<(i32, CustomUUID)>> =
+        std::collections::HashMap::new();
+    for chunk in photo_ids.chunks(500) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!(
+            "SELECT photo_id, resource_type, data_block_id
+             FROM photo_resources_cache
+             WHERE photo_id IN ({placeholders})
+             ORDER BY photo_id, resource_type"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+            Ok((
+                r.get::<_, CustomUUID>(0)?,
+                r.get::<_, i32>(1)?,
+                r.get::<_, CustomUUID>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (photo_id, resource_type, data_block_id) = row?;
+            out.entry(photo_id)
+                .or_default()
+                .push((resource_type, data_block_id));
+        }
+    }
+    Ok(out)
+}
+
+/// Fills `PhotoRow::resources` for rows returned by the list/get queries.
+#[cfg(feature = "sidecar")]
+fn attach_resources(conn: &Connection, rows: &mut [PhotoRow]) -> Result<(), PhotosCoreError> {
+    let ids: Vec<&CustomUUID> = rows.iter().map(|r| &r.photo_id).collect();
+    let mut by_photo = resources_for(conn, &ids)?;
+    for row in rows.iter_mut() {
+        if let Some(resources) = by_photo.remove(&row.photo_id) {
+            row.resources = resources;
+        }
+    }
+    Ok(())
 }
 
 // --- SidecarDb ---
@@ -646,5 +705,74 @@ mod tests {
             1,
             "cursor advanced despite decrypt failure"
         );
+    }
+
+    // Should: expose each photo's synced resource pairs, ordered by type, on
+    // both gallery and detail rows.
+    #[test]
+    fn gallery_rows_carry_resources() {
+        let db = SidecarDb::open_in_memory(new_reader()).unwrap();
+        let photo_id = CustomUUID::retention_cutoff(50);
+        let reader = new_reader();
+        let original_blob = CustomUUID::retention_cutoff(51);
+        let thumb_blob = CustomUUID::retention_cutoff(52);
+        let mut state = make_encrypted_state(&photo_id, &reader, None);
+        state.resources = vec![(5, thumb_blob.clone()), (0, original_blob.clone())];
+
+        db.hydrate(SyncBatch {
+            changes: vec![PhotoChange {
+                photo_id: photo_id.clone(),
+                changed_at_height: 1,
+                state: Some(state),
+            }],
+            high_water_mark: 1,
+        })
+        .unwrap();
+
+        let expected = vec![(0, original_blob), (5, thumb_blob)];
+        let rows = db.list_active(10, 0).unwrap();
+        assert_eq!(rows[0].resources, expected);
+        let detail = db.get_photo(&photo_id).unwrap().unwrap();
+        assert_eq!(detail.resources, expected);
+    }
+
+    // Impact: stale blob ids resurfacing in payloads after a hard delete
+    // would point clients at content that no longer exists.
+    // Should not: keep resource-cache rows for a hard-deleted photo.
+    #[test]
+    fn resources_cleared_on_hard_delete() {
+        let db = SidecarDb::open_in_memory(new_reader()).unwrap();
+        let photo_id = CustomUUID::retention_cutoff(60);
+        let reader = new_reader();
+        let state = make_encrypted_state(&photo_id, &reader, None);
+
+        db.hydrate(SyncBatch {
+            changes: vec![PhotoChange {
+                photo_id: photo_id.clone(),
+                changed_at_height: 1,
+                state: Some(state),
+            }],
+            high_water_mark: 1,
+        })
+        .unwrap();
+        assert!(!resources_for(&db.conn, &[&photo_id]).unwrap().is_empty());
+
+        db.sync_from_batch(SyncBatch {
+            changes: vec![PhotoChange {
+                photo_id: photo_id.clone(),
+                changed_at_height: 2,
+                state: None,
+            }],
+            high_water_mark: 2,
+        })
+        .unwrap();
+        assert!(resources_for(&db.conn, &[&photo_id]).unwrap().is_empty());
+    }
+
+    // Should: return an empty map for an empty photo set without erroring.
+    #[test]
+    fn resources_for_empty_input_is_empty() {
+        let db = SidecarDb::open_in_memory(new_reader()).unwrap();
+        assert!(resources_for(&db.conn, &[]).unwrap().is_empty());
     }
 }

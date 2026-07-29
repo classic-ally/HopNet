@@ -367,6 +367,8 @@ The incremental path processes only changes since the last sync, so ongoing cost
 
 Thumbnails are encrypted data blocks fetched and decrypted on demand as the user scrolls. Decrypted thumbnails are cached locally (in-memory LRU and/or on-disk cache) since they're immutable — the same `data_block_id` always produces the same bytes. The client prefetches thumbnails ahead of the scroll position to maintain smooth rendering.
 
+The node's content route serves `ETag: "{data_block_id}"` with `Cache-Control: private, immutable, max-age=31536000` and answers `If-None-Match` with 304. Because a content edit swaps the blob under the same `(photo_id, resource_type)` URL, clients must key caches by `data_block_id` (carried in the gallery/detail payloads' `resources` field); the ETag is the revalidation fallback.
+
 ### Deletion Lifecycle
 
 Deletion is soft. The `photos` row and all `photo_resources` rows stay in place; only the tombstone columns flip. This avoids snapshotting multi-resource state into a separate table for the recovery window.
@@ -659,8 +661,10 @@ pub trait PhotoDispatch {
 }
 ```
 
-Content fetch (`fetch_data_block`, thumbnail fetch) remains deferred to the
-content-serving commit.
+Content fetch (`fetch_data_block`) remains deferred to the thin-client
+dispatch commit; node clients fetch decrypted resource bytes via
+`GET /api/photos/{id}/resource/{type}` (blob_access-gated, Range-capable,
+ETag/immutable-cached).
 
 **Node client dispatch** (`src/photos/dispatch_local.rs`): calls directly into the local consensus submission pipeline and reads from the local database. Transaction submission is a function call, not an HTTP round-trip.
 
@@ -734,7 +738,7 @@ If the module is not compiled, no photos tables are created, no handlers are reg
 - [x] `dispatch_local` implementation for node clients — signs user transactions through the local consensus queue and reads the local encrypted sync feed
 - [x] Source-independent asset model in `hopnet-photos-core::asset` — namespaced source identities, typed resource kinds, resource descriptors, and validation
 - [x] Photo publisher — `hopnet-photos-core::publisher::publish_photo_add`: exact-length streaming upload via the dispatch (`ExactLen` adapter, no staging copy), per-recipient blob/metadata key wrapping, `PartialPublish` reconciliation contract; `PhotoDispatch` upload pipe (`upload_data_block`, `fetch_library_members`) implemented on the node-local `Submitter` with `uploaded_by` derived from the authenticated dispatch state, never the caller. 17 publisher tests. Byte-transport HTTP routes and ingress adapters remain deferred
-- [~] Basic HTTP API — transaction submission, gallery/detail queries, recently-deleted view, and per-user sidecar lifecycle are mounted; content upload/fetch routes remain deferred
+- [~] Basic HTTP API — transaction submission, gallery/detail queries, recently-deleted view, and per-user sidecar lifecycle are mounted; content fetch route `GET /photos/{id}/resource/{type}` shipped (blob_access-gated, soft-delete-agnostic, Range support, ETag `"{data_block_id}"` + private/immutable caching with 304 revalidation; gallery/detail payloads carry per-photo `resources` lists from the sidecar cache); content upload routes remain deferred to the thin-client phase
 - [x] Metadata sync endpoint — user-scoped encrypted photo state + `photo_resources` rows with monotonic high-water marks
 - [ ] ECDH per-photo performance validation
 
