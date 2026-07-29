@@ -124,7 +124,11 @@ impl fmt::Display for ResourceKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceContent {
     pub byte_len: u64,
+    /// Optional in JSON descriptors (HTTP ingest clients omit it).
+    #[serde(default)]
     pub content_hash: Option<Blake3Hash>,
+    /// Optional in JSON descriptors (HTTP ingest clients omit it).
+    #[serde(default)]
     pub format_hint: Option<String>,
 }
 
@@ -424,5 +428,32 @@ mod tests {
             SourceIdentity::new("photokit", "asset-1"),
             SourceIdentity::new("upload", "asset-1")
         );
+    }
+
+    // Should: deserialize a descriptor that omits content_hash and
+    // format_hint entirely — the shape HTTP ingest clients naturally send.
+    #[test]
+    fn resource_content_tolerates_omitted_optional_fields() {
+        let content: ResourceContent = serde_json::from_str(r#"{"byte_len":123}"#).unwrap();
+        assert_eq!(content.byte_len, 123);
+        assert_eq!(content.content_hash, None);
+        assert_eq!(content.format_hint, None);
+    }
+
+    // Should not: break serializers that emit explicit nulls (the pre-default
+    // wire shape keeps round-tripping).
+    #[test]
+    fn resource_content_still_accepts_explicit_nulls() {
+        let content: ResourceContent = serde_json::from_str(
+            r#"{"byte_len":7,"content_hash":null,"format_hint":null}"#,
+        )
+        .unwrap();
+        assert_eq!(content.byte_len, 7);
+        assert_eq!(content.content_hash, None);
+        assert_eq!(content.format_hint, None);
+
+        let round: ResourceContent =
+            serde_json::from_slice(&serde_json::to_vec(&content).unwrap()).unwrap();
+        assert_eq!(round, content);
     }
 }

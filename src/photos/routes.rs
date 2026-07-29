@@ -14,8 +14,11 @@ use hopnet_storage::crypto::StaticRecipient;
 use super::dispatch_local::Submitter;
 use hopnet_photos_core::dispatch::PhotoDispatch;
 
+/// Images + client-side thumbnails; video ingest (larger) is deferred.
+const PHOTO_INGEST_BODY_LIMIT: usize = 64 * 1024 * 1024;
+
 pub fn router<S: Clone + Send + Sync + 'static>(app_state: AppState) -> Router<S> {
-    Router::new()
+    let reads_and_tx = Router::new()
         .route("/photos/sidecar/status", get(get_sidecar_status))
         .route("/photos/sidecar/enable", post(post_sidecar_enable))
         .route("/photos/sidecar/disable", post(post_sidecar_disable))
@@ -27,8 +30,13 @@ pub fn router<S: Clone + Send + Sync + 'static>(app_state: AppState) -> Router<S
         .route("/photos/{id}/resource/{type}", get(get_photo_resource))
         .route("/photos/recently-deleted", get(get_recently_deleted))
         .route("/photos/transaction", post(post_transaction))
-        .route("/photos/sync", get(get_sync_feed))
-        .with_state(app_state)
+        .route("/photos/sync", get(get_sync_feed));
+    // Separate sub-router so the raised body limit applies only to ingest
+    // (the rest of the surface keeps axum's 2 MB default).
+    let ingest = Router::new()
+        .route("/photos", post(post_photo_ingest))
+        .layer(axum::extract::DefaultBodyLimit::max(PHOTO_INGEST_BODY_LIMIT));
+    reads_and_tx.merge(ingest).with_state(app_state)
 }
 
 #[derive(Serialize)]
@@ -178,6 +186,131 @@ async fn get_recently_deleted(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(rows))
+}
+
+#[derive(Serialize)]
+struct IngestResponse {
+    photo_id: String,
+    operation_id: String,
+}
+
+fn map_publish_error(e: hopnet_photos_core::PhotosCoreError) -> (StatusCode, String) {
+    use hopnet_photos_core::PhotosCoreError as E;
+    match &e {
+        E::InvalidAsset(_) | E::InvalidPublishRequest(_) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, e.to_string())
+        }
+        E::PartialPublish {
+            photo_id,
+            uploaded_blob_ids,
+            ..
+        } => {
+            tracing::error!(
+                %photo_id,
+                ?uploaded_blob_ids,
+                "partial photo publish; uploaded blobs are reconciliation candidates"
+            );
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        }
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// Manual photo ingest (multipart): first part `asset` = JSON PhotoAsset
+/// descriptor, then one part per declared resource named by its ResourceKind
+/// ("original", "thumbnail_small", ...). The publisher validates the
+/// name<->descriptor bijection and exact byte lengths, so mismatches surface
+/// as 422s.
+///
+/// Multipart parts arrive sequentially and each must be drained before
+/// next_field(), but publish_photo_add wants all byte sources upfront — so
+/// each resource part is buffered in memory (bounded by
+/// PHOTO_INGEST_BODY_LIMIT). Streaming multi-resource ingest is future work;
+/// it matters once video resources land.
+///
+/// Idempotency: a fresh UUIDv7 photo_id is minted per request, so a
+/// duplicate POST creates a duplicate photo. asset.source (SourceIdentity)
+/// never reaches consensus — the publisher encrypts metadata only — so
+/// server-side dedup would need new persistence (future work).
+///
+/// No write gating: the photos surface is ungated today (drive's write_gate
+/// needs HostCapabilities, which these routes don't hold). Align when photos
+/// moves to projection mounts.
+async fn post_photo_ingest(
+    State(state): State<AppState>,
+    Extension(uid): Extension<i32>,
+    mut multipart: axum::extract::Multipart,
+) -> Result<(StatusCode, Json<IngestResponse>), (StatusCode, String)> {
+    use hopnet_photos_core::asset::{PhotoAsset, ResourceKind};
+    use hopnet_photos_core::publisher::{ByteSource, PublishRequest, publish_photo_add};
+
+    let first = multipart
+        .next_field()
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("multipart: {e}")))?
+        .ok_or((StatusCode::BAD_REQUEST, "empty multipart body".to_string()))?;
+    if first.name() != Some("asset") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "first part must be `asset`".to_string(),
+        ));
+    }
+    let asset: PhotoAsset = serde_json::from_str(
+        &first
+            .text()
+            .await
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("asset part: {e}")))?,
+    )
+    .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, format!("asset descriptor: {e}")))?;
+
+    let mut byte_sources: Vec<(ResourceKind, ByteSource)> = Vec::new();
+    while let Some(part) = multipart
+        .next_field()
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("multipart: {e}")))?
+    {
+        let name = part
+            .name()
+            .ok_or((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unnamed resource part".to_string(),
+            ))?
+            .to_string();
+        let kind = ResourceKind::from_name(&name).ok_or((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("unknown resource kind `{name}`"),
+        ))?;
+        let bytes = part
+            .bytes()
+            .await
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("resource `{name}`: {e}")))?;
+        byte_sources.push((
+            kind,
+            ByteSource::Stream(Box::new(std::io::Cursor::new(bytes))),
+        ));
+    }
+
+    let photo_id = hopnet_common::CustomUUID::new(None);
+    let sub = Submitter::new(std::sync::Arc::new(state), uid);
+    let outcome = publish_photo_add(
+        &sub,
+        PublishRequest {
+            asset: &asset,
+            photo_id,
+            library_id: None, // personal library only until Phase 3
+            byte_sources,
+        },
+    )
+    .await
+    .map_err(map_publish_error)?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(IngestResponse {
+            photo_id: outcome.photo_id.to_string(),
+            operation_id: outcome.operation_id.to_string(),
+        }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -536,5 +669,55 @@ mod tests {
         assert_eq!(decode_cursor(&b64("abc:id")), None);
         assert_eq!(decode_cursor(&b64(":id")), None);
         assert_eq!(decode_cursor(""), None);
+    }
+
+    // Impact: a client sending a bad descriptor must get an actionable 4xx,
+    // never a retryable-looking 500.
+    // Should: map InvalidAsset and InvalidPublishRequest to 422 carrying the
+    // message; Dispatch and PartialPublish to 500.
+    #[test]
+    fn publish_errors_map_to_client_or_server_status() {
+        use hopnet_photos_core::{PhotosCoreError, PublishValidationError};
+
+        let (status, message) = map_publish_error(PhotosCoreError::InvalidAsset(
+            hopnet_photos_core::AssetValidationError::NoResources,
+        ));
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(message.contains("no resources"), "message: {message}");
+
+        let (status, _) = map_publish_error(PhotosCoreError::InvalidPublishRequest(
+            PublishValidationError::NoRecipients,
+        ));
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let (status, _) =
+            map_publish_error(PhotosCoreError::Dispatch("queue unavailable".into()));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+        let (status, _) = map_publish_error(PhotosCoreError::PartialPublish {
+            photo_id: hopnet_common::CustomUUID::retention_cutoff(1),
+            uploaded_blob_ids: vec![hopnet_common::CustomUUID::retention_cutoff(2)],
+            source: Box::new(PhotosCoreError::Dispatch("submit failed".into())),
+        });
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // Should: serialize photo_id and operation_id as strings — the exact
+    // contract the seeder parses.
+    #[test]
+    fn ingest_response_serializes_ids() {
+        let response = IngestResponse {
+            photo_id: "0198aaaa-bbbb-7ccc-8ddd-eeeeffff0000".into(),
+            operation_id: "0198aaaa-bbbb-7ccc-8ddd-eeeeffff0001".into(),
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            json["photo_id"],
+            serde_json::json!("0198aaaa-bbbb-7ccc-8ddd-eeeeffff0000")
+        );
+        assert_eq!(
+            json["operation_id"],
+            serde_json::json!("0198aaaa-bbbb-7ccc-8ddd-eeeeffff0001")
+        );
     }
 }
