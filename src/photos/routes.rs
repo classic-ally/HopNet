@@ -21,6 +21,8 @@ pub fn router<S: Clone + Send + Sync + 'static>(app_state: AppState) -> Router<S
         .route("/photos/sidecar/disable", post(post_sidecar_disable))
         .route("/photos/sidecar/reinit", post(post_sidecar_reinit))
         .route("/photos/gallery", get(get_gallery))
+        .route("/photos/page", get(get_photo_page))
+        .route("/photos/histogram", get(get_photo_histogram))
         .route("/photos/{id}", get(get_photo))
         .route("/photos/{id}/resource/{type}", get(get_photo_resource))
         .route("/photos/recently-deleted", get(get_recently_deleted))
@@ -221,6 +223,107 @@ async fn get_sync_feed(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
+#[derive(Deserialize)]
+struct PageQuery {
+    /// base64url(no-pad) of `sort_ms:photo_id`; photo_id may be empty for a
+    /// month-boundary anchor.
+    cursor: Option<String>,
+    /// "older" (default) | "newer". Newer requires a cursor.
+    dir: Option<String>,
+    limit: Option<i64>,
+    video: Option<bool>,
+    live: Option<bool>,
+    raw: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct PhotoPage {
+    items: Vec<hopnet_photos_core::sidecar::PhotoPageItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
+}
+
+fn encode_cursor(sort_ms: i64, photo_id: &str) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("{sort_ms}:{photo_id}"))
+}
+
+fn decode_cursor(cursor: &str) -> Option<(i64, String)> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cursor)
+        .ok()?;
+    let text = String::from_utf8(bytes).ok()?;
+    let (ms, photo_id) = text.split_once(':')?;
+    Some((ms.parse().ok()?, photo_id.to_string()))
+}
+
+async fn get_photo_page(
+    State(state): State<AppState>,
+    Extension(uid): Extension<i32>,
+    axum::extract::Query(q): axum::extract::Query<PageQuery>,
+) -> Result<Json<PhotoPage>, StatusCode> {
+    use hopnet_photos_core::sidecar::{MediaFilter, PageDir};
+
+    let cursor = match &q.cursor {
+        Some(raw) => Some(decode_cursor(raw).ok_or(StatusCode::BAD_REQUEST)?),
+        None => None,
+    };
+    let dir = match q.dir.as_deref() {
+        None | Some("older") => PageDir::Older,
+        Some("newer") if cursor.is_some() => PageDir::Newer,
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+    let limit = q.limit.unwrap_or(100).clamp(1, 200);
+    let filter = MediaFilter {
+        video: q.video,
+        live: q.live,
+        raw: q.raw,
+    };
+
+    let db = state
+        .photos_host
+        .get_db(uid)
+        .await
+        .ok_or(StatusCode::PRECONDITION_REQUIRED)?;
+    let (items, has_more) = tokio::task::spawn_blocking(move || {
+        db.blocking_lock().list_page(cursor, dir, &filter, limit)
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // The client only checks presence, but hand back a real edge cursor.
+    let next_cursor = has_more
+        .then(|| items.last())
+        .flatten()
+        .map(|last| encode_cursor(last.sort_ms, &last.row.photo_id.to_string()));
+    Ok(Json(PhotoPage { items, next_cursor }))
+}
+
+async fn get_photo_histogram(
+    State(state): State<AppState>,
+    Extension(uid): Extension<i32>,
+    axum::extract::Query(q): axum::extract::Query<PageQuery>,
+) -> Result<Json<Vec<hopnet_photos_core::sidecar::MonthBucket>>, StatusCode> {
+    use hopnet_photos_core::sidecar::MediaFilter;
+    let filter = MediaFilter {
+        video: q.video,
+        live: q.live,
+        raw: q.raw,
+    };
+    let db = state
+        .photos_host
+        .get_db(uid)
+        .await
+        .ok_or(StatusCode::PRECONDITION_REQUIRED)?;
+    tokio::task::spawn_blocking(move || db.blocking_lock().month_histogram(&filter))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map(Json)
+}
+
 /// Blob content is immutable per data_block_id, hence `immutable`. A content
 /// edit swaps the blob UNDER the same (photo_id, resource_type) URL, so
 /// clients must key caches by data_block_id (the gallery payload's
@@ -402,5 +505,36 @@ mod tests {
         let h = headers_with(axum::http::header::IF_NONE_MATCH, "\"other\"");
         assert!(!if_none_match_matches(&h, "\"abc\""));
         assert!(!if_none_match_matches(&HeaderMap::new(), "\"abc\""));
+    }
+
+    // Should: round-trip keyset cursors, including the empty-photo_id
+    // month-boundary form.
+    #[test]
+    fn cursor_round_trips() {
+        let encoded = encode_cursor(1748736000000, "0198f3a2-aaaa-bbbb-cccc-dddddddddddd");
+        assert_eq!(
+            decode_cursor(&encoded),
+            Some((
+                1748736000000,
+                "0198f3a2-aaaa-bbbb-cccc-dddddddddddd".to_string()
+            ))
+        );
+        let boundary = encode_cursor(1748736000000, "");
+        assert_eq!(decode_cursor(&boundary), Some((1748736000000, String::new())));
+        let negative = encode_cursor(-5, "id");
+        assert_eq!(decode_cursor(&negative), Some((-5, "id".to_string())));
+    }
+
+    // Should not: decode malformed cursors — bad base64, missing separator,
+    // or a non-numeric sort key.
+    #[test]
+    fn cursor_rejects_malformed() {
+        use base64::Engine;
+        let b64 = |s: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s);
+        assert_eq!(decode_cursor("!!!not-base64!!!"), None);
+        assert_eq!(decode_cursor(&b64("no-separator")), None);
+        assert_eq!(decode_cursor(&b64("abc:id")), None);
+        assert_eq!(decode_cursor(&b64(":id")), None);
+        assert_eq!(decode_cursor(""), None);
     }
 }

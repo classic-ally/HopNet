@@ -139,7 +139,7 @@ pub fn list_active(
          LIMIT ? OFFSET ?",
     )?;
     let mut rows = map_rows(stmt.query_map(rusqlite::params![limit, offset], map_row)?)?;
-    attach_resources(conn, &mut rows)?;
+    attach_resources(conn, rows.iter_mut())?;
     Ok(rows)
 }
 
@@ -164,7 +164,7 @@ pub fn list_recently_deleted(
          LIMIT ? OFFSET ?",
     )?;
     let mut rows = map_rows(stmt.query_map(rusqlite::params![limit, offset], map_row)?)?;
-    attach_resources(conn, &mut rows)?;
+    attach_resources(conn, rows.iter_mut())?;
     Ok(rows)
 }
 
@@ -183,7 +183,7 @@ pub fn get_photo(
          FROM photo_index WHERE photo_id = ?",
     )?;
     let mut rows = map_rows(stmt.query_map(rusqlite::params![photo_id], map_row)?)?;
-    attach_resources(conn, &mut rows)?;
+    attach_resources(conn, rows.iter_mut())?;
     Ok(rows.pop())
 }
 
@@ -258,7 +258,11 @@ pub fn resources_for(
 
 /// Fills `PhotoRow::resources` for rows returned by the list/get queries.
 #[cfg(feature = "sidecar")]
-fn attach_resources(conn: &Connection, rows: &mut [PhotoRow]) -> Result<(), PhotosCoreError> {
+fn attach_resources<'a>(
+    conn: &Connection,
+    rows: impl Iterator<Item = &'a mut PhotoRow>,
+) -> Result<(), PhotosCoreError> {
+    let mut rows: Vec<&'a mut PhotoRow> = rows.collect();
     let ids: Vec<&CustomUUID> = rows.iter().map(|r| &r.photo_id).collect();
     let mut by_photo = resources_for(conn, &ids)?;
     for row in rows.iter_mut() {
@@ -267,6 +271,156 @@ fn attach_resources(conn: &Connection, rows: &mut [PhotoRow]) -> Result<(), Phot
         }
     }
     Ok(())
+}
+
+// --- keyset browse page + histogram ---
+
+/// Media-type filter pushed into the browse SQL. Each `Some` flag appends a
+/// fixed literal clause; `favorite` is absent until the sidecar grows a
+/// favorites column (Phase 4).
+#[cfg(feature = "sidecar")]
+#[derive(Debug, Clone, Default)]
+pub struct MediaFilter {
+    pub video: Option<bool>,
+    pub live: Option<bool>,
+    pub raw: Option<bool>,
+}
+
+#[cfg(feature = "sidecar")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageDir {
+    Older,
+    Newer,
+}
+
+/// One browse-page row: `PhotoRow` plus the server-computed sort key the
+/// client echoes back verbatim in keyset cursors. A wrapper (not a PhotoRow
+/// field) so the existing gallery/detail payloads stay byte-identical.
+#[cfg(feature = "sidecar")]
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PhotoPageItem {
+    pub sort_ms: i64,
+    #[serde(flatten)]
+    pub row: PhotoRow,
+}
+
+/// One month of the browse timeline, for the histogram rail.
+#[cfg(feature = "sidecar")]
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MonthBucket {
+    pub month: String,
+    pub count: i64,
+}
+
+#[cfg(feature = "sidecar")]
+fn media_clauses(filter: &MediaFilter) -> String {
+    let mut sql = String::new();
+    for (flag, media_type) in [(filter.video, 1), (filter.live, 2), (filter.raw, 3)] {
+        match flag {
+            Some(true) => sql.push_str(&format!(" AND media_type = {media_type}")),
+            Some(false) => sql.push_str(&format!(" AND media_type != {media_type}")),
+            None => {}
+        }
+    }
+    sql
+}
+
+/// The active set with a computed keyset sort key. Second-precision
+/// truncation is fine: ties break on photo_id, and clients echo this exact
+/// value back in cursors. IFNULL guards unparseable date strings (can't
+/// happen in practice — upload_date is machine-generated).
+#[cfg(feature = "sidecar")]
+const PAGE_INNER_SELECT: &str = "SELECT photo_id, library_id, date_taken, upload_date, media_type,
+            width, height, orientation, duration_ms,
+            camera_make, camera_model, latitude, longitude,
+            group_id, group_type, group_index, is_group_pick,
+            deleted_at, expires_at, undecryptable,
+            IFNULL(CAST(strftime('%s', COALESCE(date_taken, upload_date)) AS INTEGER) * 1000, 0)
+                AS sort_ms
+     FROM photo_index
+     WHERE deleted_at IS NULL AND undecryptable = 0";
+
+/// One keyset page of the browse timeline. `cursor` is the decoded
+/// `(sort_ms, photo_id)` edge; the photo_id may be `""` for a month-boundary
+/// anchor (TEXT comparison puts the boundary strictly between months).
+/// Returns `(items, has_more)`; items are ALWAYS newest-first — for
+/// `Newer` the block nearest the cursor is fetched ascending and reversed,
+/// so the client can prepend it verbatim.
+#[cfg(feature = "sidecar")]
+pub fn list_page(
+    conn: &Connection,
+    cursor: Option<(i64, String)>,
+    dir: PageDir,
+    filter: &MediaFilter,
+    limit: i64,
+) -> Result<(Vec<PhotoPageItem>, bool), PhotosCoreError> {
+    let (predicate, order) = match dir {
+        PageDir::Older => (
+            "(?1 IS NULL OR sort_ms < ?1 OR (sort_ms = ?1 AND photo_id < ?2))",
+            "DESC",
+        ),
+        // Newer without a cursor is a caller error; ?1 = NULL then matches
+        // nothing, which is the safe degenerate outcome.
+        PageDir::Newer => ("(sort_ms > ?1 OR (sort_ms = ?1 AND photo_id > ?2))", "ASC"),
+    };
+    let sql = format!(
+        "SELECT * FROM ({inner}{media}) WHERE {predicate}
+         ORDER BY sort_ms {order}, photo_id {order}
+         LIMIT ?3",
+        inner = PAGE_INNER_SELECT,
+        media = media_clauses(filter),
+    );
+
+    let (cursor_ms, cursor_id) = match &cursor {
+        Some((ms, id)) => (Some(*ms), Some(id.clone())),
+        None => (None, None),
+    };
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        rusqlite::params![cursor_ms, cursor_id, limit + 1],
+        |r| {
+            Ok(PhotoPageItem {
+                sort_ms: r.get(20)?,
+                row: map_row(r)?,
+            })
+        },
+    )?;
+    let mut items = rows.collect::<Result<Vec<_>, _>>()?;
+
+    let has_more = items.len() as i64 > limit;
+    items.truncate(limit as usize);
+    if matches!(dir, PageDir::Newer) {
+        items.reverse();
+    }
+    attach_resources(conn, items.iter_mut().map(|i| &mut i.row))?;
+    Ok((items, has_more))
+}
+
+/// UTC month buckets of the active set, newest month first, honoring the
+/// same media filters as the browse page. Months align with the client's
+/// `toISOString().slice(0, 7)` / `Date.UTC` boundary math.
+#[cfg(feature = "sidecar")]
+pub fn month_histogram(
+    conn: &Connection,
+    filter: &MediaFilter,
+) -> Result<Vec<MonthBucket>, PhotosCoreError> {
+    let sql = format!(
+        "SELECT strftime('%Y-%m', COALESCE(date_taken, upload_date)) AS month, COUNT(*) AS count
+         FROM photo_index
+         WHERE deleted_at IS NULL AND undecryptable = 0{media}
+         GROUP BY month
+         HAVING month IS NOT NULL
+         ORDER BY month DESC",
+        media = media_clauses(filter),
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], |r| {
+        Ok(MonthBucket {
+            month: r.get(0)?,
+            count: r.get(1)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
 // --- SidecarDb ---
@@ -469,6 +623,20 @@ impl<R: RecipientKey> SidecarDb<R> {
         offset: i64,
     ) -> Result<Vec<PhotoRow>, PhotosCoreError> {
         list_recently_deleted(&self.conn, limit, offset)
+    }
+
+    pub fn list_page(
+        &self,
+        cursor: Option<(i64, String)>,
+        dir: PageDir,
+        filter: &MediaFilter,
+        limit: i64,
+    ) -> Result<(Vec<PhotoPageItem>, bool), PhotosCoreError> {
+        list_page(&self.conn, cursor, dir, filter, limit)
+    }
+
+    pub fn month_histogram(&self, filter: &MediaFilter) -> Result<Vec<MonthBucket>, PhotosCoreError> {
+        month_histogram(&self.conn, filter)
     }
 
     fn set_cursor(conn: &Connection, cursor: u64) -> Result<(), PhotosCoreError> {
@@ -774,5 +942,378 @@ mod tests {
     fn resources_for_empty_input_is_empty() {
         let db = SidecarDb::open_in_memory(new_reader()).unwrap();
         assert!(resources_for(&db.conn, &[]).unwrap().is_empty());
+    }
+
+    // --- keyset browse page + histogram ---
+
+    fn make_state_with(
+        photo_id: &CustomUUID,
+        reader: &StaticRecipient,
+        date_taken: &str,
+        media_type: i32,
+        resources: Vec<(i32, CustomUUID)>,
+    ) -> EncryptedPhotoState {
+        let meta = PhotoMetadata {
+            date_taken: date_taken.into(),
+            media_type,
+            ..Default::default()
+        };
+        let key = generate_metadata_key();
+        let (encrypted, nonce) = encrypt_metadata(&key, &meta.to_json().unwrap()).unwrap();
+        let (eph, wrapped) = wrap_metadata_key(photo_id, &reader.pubkey(), &key).unwrap();
+        EncryptedPhotoState {
+            library_id: None,
+            uploaded_by: 1,
+            encrypted_metadata: encrypted,
+            metadata_nonce: nonce,
+            deleted_at: None,
+            deleted_by: None,
+            ephemeral_pubkey: Some(eph),
+            encrypted_metadata_key: Some(wrapped),
+            resources,
+        }
+    }
+
+    fn hydrate_all(
+        db: &SidecarDb<StaticRecipient>,
+        states: Vec<(CustomUUID, EncryptedPhotoState)>,
+    ) {
+        db.hydrate(SyncBatch {
+            changes: states
+                .into_iter()
+                .map(|(photo_id, state)| PhotoChange {
+                    photo_id,
+                    changed_at_height: 1,
+                    state: Some(state),
+                })
+                .collect(),
+            high_water_mark: 1,
+        })
+        .unwrap();
+    }
+
+    fn dated_photos(
+        reader: &StaticRecipient,
+        specs: &[(i64, &str)],
+    ) -> Vec<(CustomUUID, EncryptedPhotoState)> {
+        specs
+            .iter()
+            .map(|(seed, date)| {
+                let id = CustomUUID::retention_cutoff(*seed);
+                let state = make_state_with(&id, reader, date, 0, vec![]);
+                (id, state)
+            })
+            .collect()
+    }
+
+    fn page_ids(items: &[PhotoPageItem]) -> Vec<CustomUUID> {
+        items.iter().map(|i| i.row.photo_id.clone()).collect()
+    }
+
+    fn edge_cursor(item: &PhotoPageItem) -> (i64, String) {
+        (item.sort_ms, item.row.photo_id.to_string())
+    }
+
+    // Should: return the first page newest-first, flipping has_more exactly
+    // when more rows exist beyond the limit.
+    #[test]
+    fn page_orders_newest_first_with_has_more() {
+        let db = SidecarDb::open_in_memory(new_reader()).unwrap();
+        let reader = new_reader();
+        hydrate_all(
+            &db,
+            dated_photos(
+                &reader,
+                &[
+                    (1, "2025-01-01T00:00:00Z"),
+                    (2, "2025-01-02T00:00:00Z"),
+                    (3, "2025-01-03T00:00:00Z"),
+                    (4, "2025-01-04T00:00:00Z"),
+                    (5, "2025-01-05T00:00:00Z"),
+                ],
+            ),
+        );
+
+        let (items, has_more) =
+            list_page(&db.conn, None, PageDir::Older, &MediaFilter::default(), 3).unwrap();
+        assert!(has_more);
+        assert_eq!(items.len(), 3);
+        let dates: Vec<_> = items
+            .iter()
+            .map(|i| i.row.date_taken.clone().unwrap())
+            .collect();
+        assert_eq!(
+            dates,
+            vec![
+                "2025-01-05T00:00:00Z",
+                "2025-01-04T00:00:00Z",
+                "2025-01-03T00:00:00Z"
+            ]
+        );
+
+        let (all, has_more) =
+            list_page(&db.conn, None, PageDir::Older, &MediaFilter::default(), 5).unwrap();
+        assert!(!has_more);
+        assert_eq!(all.len(), 5);
+    }
+
+    // Impact: a duplicate or skipped photo at a page seam silently corrupts
+    // the browse window.
+    // Should: visit every photo exactly once when walking pages by edge
+    // cursor, including photos sharing one date_taken.
+    #[test]
+    fn pages_continue_without_overlap_or_gap() {
+        let db = SidecarDb::open_in_memory(new_reader()).unwrap();
+        let reader = new_reader();
+        hydrate_all(
+            &db,
+            dated_photos(
+                &reader,
+                &[
+                    (1, "2025-06-01T12:00:00Z"),
+                    (2, "2025-06-01T12:00:00Z"),
+                    (3, "2025-06-01T12:00:00Z"),
+                    (4, "2025-06-02T00:00:00Z"),
+                    (5, "2025-06-03T00:00:00Z"),
+                    (6, "2025-06-04T00:00:00Z"),
+                    (7, "2025-06-05T00:00:00Z"),
+                ],
+            ),
+        );
+
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        loop {
+            let (items, has_more) =
+                list_page(&db.conn, cursor.clone(), PageDir::Older, &MediaFilter::default(), 2)
+                    .unwrap();
+            seen.extend(page_ids(&items));
+            if !has_more {
+                break;
+            }
+            cursor = Some(edge_cursor(items.last().unwrap()));
+        }
+
+        assert_eq!(seen.len(), 7, "every photo visited exactly once");
+        let unique: std::collections::HashSet<_> = seen.iter().collect();
+        assert_eq!(unique.len(), 7, "no duplicates across page seams");
+    }
+
+    // Impact: the client prepends dir=newer blocks verbatim; wrong ordering
+    // corrupts the window silently.
+    // Should: return the nearest-newer block newest-first.
+    #[test]
+    fn newer_pages_arrive_newest_first() {
+        let db = SidecarDb::open_in_memory(new_reader()).unwrap();
+        let reader = new_reader();
+        hydrate_all(
+            &db,
+            dated_photos(
+                &reader,
+                &[
+                    (1, "2025-02-01T00:00:00Z"),
+                    (2, "2025-02-02T00:00:00Z"),
+                    (3, "2025-02-03T00:00:00Z"),
+                    (4, "2025-02-04T00:00:00Z"),
+                    (5, "2025-02-05T00:00:00Z"),
+                ],
+            ),
+        );
+        let (all, _) =
+            list_page(&db.conn, None, PageDir::Older, &MediaFilter::default(), 5).unwrap();
+
+        // Anchor at the second-oldest item; the two nearest-newer photos are
+        // all[1] and all[2], and the block must arrive in that (DESC) order.
+        let (items, has_more) = list_page(
+            &db.conn,
+            Some(edge_cursor(&all[3])),
+            PageDir::Newer,
+            &MediaFilter::default(),
+            2,
+        )
+        .unwrap();
+        assert!(has_more, "all[0] remains beyond the newer block");
+        assert_eq!(page_ids(&items), vec![
+            all[1].row.photo_id.clone(),
+            all[2].row.photo_id.clone()
+        ]);
+    }
+
+    // Impact: histogram month jumps land on the wrong month if the boundary
+    // falls on the wrong side of the anchor.
+    // Should: split exactly at a month boundary for an empty-photo_id anchor
+    // cursor — older admits the anchor month and older, newer everything
+    // above, including a photo at exactly the boundary instant.
+    #[test]
+    fn boundary_cursor_splits_months() {
+        let db = SidecarDb::open_in_memory(new_reader()).unwrap();
+        let reader = new_reader();
+        hydrate_all(
+            &db,
+            dated_photos(
+                &reader,
+                &[
+                    (1, "2025-05-10T00:00:00Z"),
+                    (2, "2025-05-20T00:00:00Z"),
+                    (3, "2025-06-01T00:00:00Z"), // exactly at the boundary
+                    (4, "2025-06-15T00:00:00Z"),
+                ],
+            ),
+        );
+        // First ms of June 2025 UTC — the anchor for jumping to May.
+        let boundary = (1748736000i64) * 1000;
+        let anchor = Some((boundary, String::new()));
+
+        let (older, _) =
+            list_page(&db.conn, anchor.clone(), PageDir::Older, &MediaFilter::default(), 10)
+                .unwrap();
+        let older_dates: Vec<_> = older
+            .iter()
+            .map(|i| i.row.date_taken.clone().unwrap())
+            .collect();
+        assert_eq!(older_dates, vec!["2025-05-20T00:00:00Z", "2025-05-10T00:00:00Z"]);
+
+        let (newer, _) =
+            list_page(&db.conn, anchor, PageDir::Newer, &MediaFilter::default(), 10).unwrap();
+        let newer_dates: Vec<_> = newer
+            .iter()
+            .map(|i| i.row.date_taken.clone().unwrap())
+            .collect();
+        assert_eq!(newer_dates, vec!["2025-06-15T00:00:00Z", "2025-06-01T00:00:00Z"]);
+    }
+
+    // Should: push media filters into SQL — video only/exclude, live only,
+    // and raw only each select the right media types.
+    #[test]
+    fn media_filters_push_into_sql() {
+        let db = SidecarDb::open_in_memory(new_reader()).unwrap();
+        let reader = new_reader();
+        let mut states = Vec::new();
+        for (seed, media_type) in [(1, 0), (2, 1), (3, 2), (4, 3)] {
+            let id = CustomUUID::retention_cutoff(seed);
+            let date = format!("2025-03-0{seed}T00:00:00Z");
+            states.push((id.clone(), make_state_with(&id, &reader, &date, media_type, vec![])));
+        }
+        hydrate_all(&db, states);
+
+        let types_for = |filter: MediaFilter| -> Vec<i32> {
+            let (items, _) = list_page(&db.conn, None, PageDir::Older, &filter, 10).unwrap();
+            let mut t: Vec<i32> = items.iter().map(|i| i.row.media_type).collect();
+            t.sort();
+            t
+        };
+
+        assert_eq!(types_for(MediaFilter { video: Some(true), ..Default::default() }), vec![1]);
+        assert_eq!(
+            types_for(MediaFilter { video: Some(false), ..Default::default() }),
+            vec![0, 2, 3]
+        );
+        assert_eq!(types_for(MediaFilter { live: Some(true), ..Default::default() }), vec![2]);
+        assert_eq!(types_for(MediaFilter { raw: Some(true), ..Default::default() }), vec![3]);
+    }
+
+    // Should not: include soft-deleted or undecryptable photos in any page.
+    #[test]
+    fn page_excludes_tombstones_and_undecryptable() {
+        let db = SidecarDb::open_in_memory(new_reader()).unwrap();
+        let reader = new_reader();
+        let active = CustomUUID::retention_cutoff(1);
+        let deleted = CustomUUID::retention_cutoff(2);
+        let opaque = CustomUUID::retention_cutoff(3);
+
+        let mut deleted_state =
+            make_state_with(&deleted, &reader, "2025-04-02T00:00:00Z", 0, vec![]);
+        deleted_state.deleted_at = Some("2025-04-10T00:00:00Z".into());
+        deleted_state.deleted_by = Some(1);
+        let mut opaque_state =
+            make_state_with(&opaque, &reader, "2025-04-03T00:00:00Z", 0, vec![]);
+        opaque_state.ephemeral_pubkey = None;
+        opaque_state.encrypted_metadata_key = None;
+
+        hydrate_all(
+            &db,
+            vec![
+                (
+                    active.clone(),
+                    make_state_with(&active, &reader, "2025-04-01T00:00:00Z", 0, vec![]),
+                ),
+                (deleted, deleted_state),
+                (opaque, opaque_state),
+            ],
+        );
+
+        let (items, _) =
+            list_page(&db.conn, None, PageDir::Older, &MediaFilter::default(), 10).unwrap();
+        assert_eq!(page_ids(&items), vec![active]);
+    }
+
+    // Should: attach resource pairs to page items, same shape as list_active.
+    #[test]
+    fn page_items_carry_resources() {
+        let db = SidecarDb::open_in_memory(new_reader()).unwrap();
+        let reader = new_reader();
+        let id = CustomUUID::retention_cutoff(1);
+        let original = CustomUUID::retention_cutoff(10);
+        let thumb = CustomUUID::retention_cutoff(11);
+        hydrate_all(
+            &db,
+            vec![(
+                id.clone(),
+                make_state_with(
+                    &id,
+                    &reader,
+                    "2025-07-01T00:00:00Z",
+                    0,
+                    vec![(5, thumb.clone()), (0, original.clone())],
+                ),
+            )],
+        );
+
+        let (items, _) =
+            list_page(&db.conn, None, PageDir::Older, &MediaFilter::default(), 10).unwrap();
+        assert_eq!(items[0].row.resources, vec![(0, original), (5, thumb)]);
+    }
+
+    // Should: bucket the histogram by UTC month of the sort date, newest
+    // month first, honoring the same media filters.
+    // Should not: count soft-deleted photos in histogram buckets.
+    #[test]
+    fn histogram_buckets_by_utc_month() {
+        let db = SidecarDb::open_in_memory(new_reader()).unwrap();
+        let reader = new_reader();
+        let mut states = dated_photos(
+            &reader,
+            &[
+                (1, "2025-05-05T00:00:00Z"),
+                (2, "2025-05-25T00:00:00Z"),
+                (3, "2025-06-10T00:00:00Z"),
+                (4, "2025-06-20T00:00:00Z"),
+            ],
+        );
+        // A June video (filterable) and a deleted May photo (never counted).
+        let video = CustomUUID::retention_cutoff(5);
+        states.push((
+            video.clone(),
+            make_state_with(&video, &reader, "2025-06-25T00:00:00Z", 1, vec![]),
+        ));
+        let tombstoned = CustomUUID::retention_cutoff(6);
+        let mut tomb_state =
+            make_state_with(&tombstoned, &reader, "2025-05-30T00:00:00Z", 0, vec![]);
+        tomb_state.deleted_at = Some("2025-06-01T00:00:00Z".into());
+        tomb_state.deleted_by = Some(1);
+        states.push((tombstoned, tomb_state));
+        hydrate_all(&db, states);
+
+        let buckets = month_histogram(&db.conn, &MediaFilter::default()).unwrap();
+        let flat: Vec<_> = buckets.iter().map(|b| (b.month.as_str(), b.count)).collect();
+        assert_eq!(flat, vec![("2025-06", 3), ("2025-05", 2)]);
+
+        let no_video = month_histogram(
+            &db.conn,
+            &MediaFilter { video: Some(false), ..Default::default() },
+        )
+        .unwrap();
+        let flat: Vec<_> = no_video.iter().map(|b| (b.month.as_str(), b.count)).collect();
+        assert_eq!(flat, vec![("2025-06", 2), ("2025-05", 2)]);
     }
 }

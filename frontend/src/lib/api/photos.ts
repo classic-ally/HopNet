@@ -22,9 +22,28 @@ export interface PhotoRow {
     camera_model: string | null;
     latitude: number | null;
     longitude: number | null;
+    group_id: string | null;
+    group_type: number | null;
+    group_index: number | null;
+    is_group_pick: number;
     deleted_at: string | null;
     expires_at: string | null;
     undecryptable: boolean;
+    /** (resource_type, data_block_id) pairs; key content caches by the blob id. */
+    resources: [number, string][];
+}
+
+/** One keyset browse-page row: PhotoRow plus the server-computed sort key. */
+export type PhotoPageItem = PhotoRow & { sort_ms: number };
+
+export interface PhotoPage {
+    items: PhotoPageItem[];
+    next_cursor?: string;
+}
+
+export interface MonthBucket {
+    month: string;
+    count: number;
 }
 
 export interface SyncBatch {
@@ -93,6 +112,32 @@ export async function fetchRecentlyDeleted(limit = 100, offset = 0): Promise<Pho
     const q = new URLSearchParams({ limit: String(limit), offset: String(offset) });
     const r = await authenticatedFetch(`${API_BASE_URL}/photos/recently-deleted?${q}`);
     if (!r.ok) throw new Error(`deleted: ${r.status}`);
+    return r.json();
+}
+
+import { filterQuery, type Filter } from '../panes/photos/filters';
+
+export async function fetchPhotoPage(params: {
+    cursor?: string;
+    dir?: 'older' | 'newer';
+    limit?: number;
+    filter: Filter;
+}): Promise<PhotoPage> {
+    const q = new URLSearchParams();
+    filterQuery(params.filter, q);
+    if (params.cursor) q.set('cursor', params.cursor);
+    if (params.dir) q.set('dir', params.dir);
+    q.set('limit', String(params.limit ?? 100));
+    const r = await authenticatedFetch(`${API_BASE_URL}/photos/page?${q}`);
+    if (!r.ok) throw new Error(`page: ${r.status}`);
+    return r.json();
+}
+
+export async function fetchHistogram(filter: Filter): Promise<MonthBucket[]> {
+    const q = new URLSearchParams();
+    filterQuery(filter, q);
+    const r = await authenticatedFetch(`${API_BASE_URL}/photos/histogram?${q}`);
+    if (!r.ok) throw new Error(`histogram: ${r.status}`);
     return r.json();
 }
 
