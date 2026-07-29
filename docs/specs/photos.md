@@ -634,22 +634,33 @@ The dispatch trait abstracts the boundary between client logic and transaction s
 ```rust
 #[async_trait]
 pub trait PhotoDispatch {
-    /// Upload encrypted data block bytes to the network
-    async fn upload_data_block(&self, ...) -> Result<DataBlockId>;
+    /// Encrypt and store one resource's bytes as a data block
+    async fn upload_data_block(
+        &self,
+        blob_id: BlobId,
+        source: Box<dyn AsyncRead + Unpin + Send>,
+        file_size: usize,
+        per_blob_key: chacha20poly1305::Key,
+    ) -> Result<UploadedDataBlock>;
 
     /// Submit a fully-formed photo transaction for consensus
-    async fn submit_transaction(&self, payload: Vec<u8>, tx_type: &str) -> Result<()>;
+    async fn submit_transaction(&self, tx_type: &str, payload: Vec<u8>) -> Result<()>;
 
-    /// Fetch library members' public keys (needed for key wrapping)
-    async fn fetch_library_members(&self, library_id: &str) -> Result<Vec<MemberInfo>>;
+    /// Resolve publish recipients. The dispatch derives the acting user
+    /// (`LibraryMembership::uploaded_by`) from its own authenticated state —
+    /// callers never supply an identity. None = personal library.
+    async fn fetch_library_members(
+        &self,
+        library_id: Option<CustomUUID>,
+    ) -> Result<LibraryMembership>;
 
     /// Fetch encrypted photo rows for sidecar hydration/sync
-    async fn fetch_photos_since(&self, height: u64) -> Result<Vec<EncryptedPhotoRow>>;
-
-    /// Fetch encrypted thumbnail data block
-    async fn fetch_thumbnail(&self, data_block_id: &str) -> Result<Vec<u8>>;
+    async fn fetch_photos_since(&self, height: u64) -> Result<SyncBatch>;
 }
 ```
+
+Content fetch (`fetch_data_block`, thumbnail fetch) remains deferred to the
+content-serving commit.
 
 **Node client dispatch** (`src/photos/dispatch_local.rs`): calls directly into the local consensus submission pipeline and reads from the local database. Transaction submission is a function call, not an HTTP round-trip.
 
@@ -721,7 +732,8 @@ If the module is not compiled, no photos tables are created, no handlers are reg
 - [x] `committed_blob_ids` distribution hook — `photo_add` arm extracts blob ids from resources for the storage engine's distribution kick
 - [x] Periodic cleanup job for expired soft-deleted photos — `photo_cleanup_expired` consensus handler (node-signed, wall-clock predicate host-side in scan query, deterministic `datetime(deleted_at, '+30 days') < datetime(scan_cutoff)` check in handler); `run_photo_tombstone_cleanup` scan job batching 50 IDs per tx via `TxGateway::submit_batch`; daily randomized apalis cron registered via `photos_host::spawn_tombstone_cleanup_worker`. 4 handler tests + 3 DB tests covering hard-delete, within-window skip, missing-photo idempotency, user-signed rejection, and active-photo skip.
 - [x] `dispatch_local` implementation for node clients — signs user transactions through the local consensus queue and reads the local encrypted sync feed
-- [x] Source-independent asset model in `hopnet-photos-core::asset` — namespaced source identities, typed resource kinds, resource descriptors, and validation; publisher, byte transport, and ingress adapters remain deferred
+- [x] Source-independent asset model in `hopnet-photos-core::asset` — namespaced source identities, typed resource kinds, resource descriptors, and validation
+- [x] Photo publisher — `hopnet-photos-core::publisher::publish_photo_add`: exact-length streaming upload via the dispatch (`ExactLen` adapter, no staging copy), per-recipient blob/metadata key wrapping, `PartialPublish` reconciliation contract; `PhotoDispatch` upload pipe (`upload_data_block`, `fetch_library_members`) implemented on the node-local `Submitter` with `uploaded_by` derived from the authenticated dispatch state, never the caller. 17 publisher tests. Byte-transport HTTP routes and ingress adapters remain deferred
 - [~] Basic HTTP API — transaction submission, gallery/detail queries, recently-deleted view, and per-user sidecar lifecycle are mounted; content upload/fetch routes remain deferred
 - [x] Metadata sync endpoint — user-scoped encrypted photo state + `photo_resources` rows with monotonic high-water marks
 - [ ] ECDH per-photo performance validation

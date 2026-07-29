@@ -88,8 +88,16 @@ apply functions inside consensus handlers.
       transaction,sync,sidecar/{status,enable,disable,reinit}}`.
 - [x] Photos shared ingest model: `hopnet-photos-core::asset` defines
       source-independent identities, RFC-011 resource kinds, resource
-      descriptors, and validation. HopNet publishing, byte transport, and
-      macOS ingress integration remain deferred.
+      descriptors, and validation.
+- [x] Photo publisher (2026-07-30): `hopnet-photos-core::publisher`
+      turns a validated `PhotoAsset` + byte streams into an encrypted
+      `photo_add` — exact-length streaming upload (no staging copy),
+      per-recipient key wrapping, `PartialPublish` reconciliation
+      contract; `PhotoDispatch` gains the upload pipe
+      (`upload_data_block`, `fetch_library_members`), implemented on the
+      node-local `Submitter` with `uploaded_by` derived from
+      authenticated dispatch state. Byte-transport HTTP routes and the
+      macOS ingress adapter remain deferred.
 - [x] hopnet-drive + hopnet-projection + hopnet-takeout extraction
       ([RFC-015](specs/hopnet-drive.md)) COMPLETE (stages D0–D5,
       2026-07-08): narrowed handler seam, per-projection schema units,

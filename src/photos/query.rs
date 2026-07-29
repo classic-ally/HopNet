@@ -1,4 +1,6 @@
-use hopnet_photos_core::dispatch::{EncryptedPhotoState, PhotoChange, SyncBatch};
+use hopnet_photos_core::dispatch::{
+    EncryptedPhotoState, LibraryMember, LibraryMembership, PhotoChange, SyncBatch,
+};
 
 use hopnet_photos::db::photos;
 
@@ -102,6 +104,71 @@ pub fn read_photo_changes(
     Ok(SyncBatch {
         changes,
         high_water_mark,
+    })
+}
+
+fn pubkey_from_blob(blob: Vec<u8>) -> Result<hopnet_storage::x25519_dalek::PublicKey, String> {
+    let arr: [u8; 32] = blob
+        .try_into()
+        .map_err(|_| "x25519_pubkey not 32 bytes".to_string())?;
+    Ok(hopnet_storage::x25519_dalek::PublicKey::from(arr))
+}
+
+/// Recipients for a publish by `user_id`. `library_id == None` is the
+/// personal library: exactly the acting user. For shared libraries the
+/// member set comes from `shared_library_members`; an unknown library yields
+/// an empty set, which the publisher rejects as NoRecipients.
+pub fn read_library_membership(
+    pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    user_id: i32,
+    library_id: Option<hopnet_common::CustomUUID>,
+) -> Result<LibraryMembership, String> {
+    let conn = pool.get().map_err(|e| format!("pool: {e}"))?;
+
+    let members = match &library_id {
+        None => {
+            let blob: Vec<u8> = conn
+                .query_row(
+                    "SELECT x25519_pubkey FROM users WHERE user_id = ?",
+                    rusqlite::params![user_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("uploader pubkey: {e:?}"))?;
+            vec![LibraryMember {
+                user_id,
+                pubkey: pubkey_from_blob(blob)?,
+            }]
+        }
+        Some(lib) => {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT m.user_id, u.x25519_pubkey
+                     FROM shared_library_members m
+                     JOIN users u ON u.user_id = m.user_id
+                     WHERE m.library_id = ?
+                     ORDER BY m.user_id",
+                )
+                .map_err(|e| format!("prepare members: {e:?}"))?;
+            let rows = stmt
+                .query_map(rusqlite::params![lib], |row| {
+                    Ok((row.get::<_, i32>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(|e| format!("members: {e:?}"))?;
+            let mut members = Vec::new();
+            for row in rows {
+                let (uid, blob) = row.map_err(|e| format!("member row: {e:?}"))?;
+                members.push(LibraryMember {
+                    user_id: uid,
+                    pubkey: pubkey_from_blob(blob)?,
+                });
+            }
+            members
+        }
+    };
+
+    Ok(LibraryMembership {
+        uploaded_by: user_id,
+        members,
     })
 }
 

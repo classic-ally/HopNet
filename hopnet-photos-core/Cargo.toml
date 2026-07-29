@@ -17,8 +17,15 @@ bincode = { version = "2.0.1", features = ["serde"] }
 chacha20poly1305 = { version = "0.10.1", features = ["stream"] }
 thiserror = "2.0.18"
 async-trait = "0.1"
+tokio = { version = "1", features = ["io-util"] }
 
 rusqlite = { version = "0.38", features = ["bundled", "functions"], optional = true }
+
+[dev-dependencies]
+# publisher tests drive the real storage engine put path
+hopnet-storage = { path = "../hopnet-storage", features = ["engine"] }
+tokio = { version = "1", features = ["io-util", "macros", "rt", "rt-multi-thread"] }
+tempfile = "3"
 
 [features]
 default = []

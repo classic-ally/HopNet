@@ -9,10 +9,10 @@ use crate::error::PhotosCoreError;
 /// straight into the consensus submit pipeline + local DB, and a thin-
 /// client dispatch that POSTs over HTTP. photos-core itself is impl-agnostic.
 ///
-/// Commit 2 ships the sync/hydration surface (fetch_photos_since,
-/// submit_transaction). The upload pipe (upload_data_block, fetch_data_block,
-/// fetch_library_members) is deferred to a later commit — the sidecar
-/// hydration path (Commit 3) only needs these two methods.
+/// The sync/hydration surface (fetch_photos_since, submit_transaction) and
+/// the upload pipe (upload_data_block, fetch_library_members) are shipped.
+/// The download pipe (fetch_data_block, thumbnail fetch) is deferred to the
+/// content-serving commit.
 #[async_trait::async_trait]
 pub trait PhotoDispatch: Send + Sync {
     /// Submit a fully-formed, bincode-encoded photo transaction envelope
@@ -35,6 +35,67 @@ pub trait PhotoDispatch: Send + Sync {
     /// client replaying stale tombstones forever. The node-level cursor is
     /// monotonic.
     async fn fetch_photos_since(&self, height: u64) -> Result<SyncBatch, PhotosCoreError>;
+
+    /// Encrypt and store one resource's bytes as a data block on the storage
+    /// substrate. `source` yields exactly `file_size` plaintext bytes (the
+    /// publisher enforces this); the dispatch encrypts with `per_blob_key`,
+    /// fragments, and persists. Fragment distribution is the substrate's
+    /// concern, not the caller's.
+    async fn upload_data_block(
+        &self,
+        blob_id: hopnet_storage::BlobId,
+        source: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+        file_size: usize,
+        per_blob_key: chacha20poly1305::Key,
+    ) -> Result<UploadedDataBlock, PhotosCoreError>;
+
+    /// Resolve the recipients of a publish. The dispatch derives the acting
+    /// user (`LibraryMembership::uploaded_by`) from its own authenticated
+    /// state — callers never supply an identity. `library_id == None` is the
+    /// personal library: membership is exactly `[uploaded_by]`.
+    async fn fetch_library_members(
+        &self,
+        library_id: Option<CustomUUID>,
+    ) -> Result<LibraryMembership, PhotosCoreError>;
+}
+
+/// One stored fragment of an uploaded data block. Mirrors the storage
+/// engine's put outcome 1:1 so the trait stays free of the substrate's
+/// `engine` feature.
+#[derive(Debug, Clone)]
+pub struct UploadedFragment {
+    pub chunk_number: u32,
+    pub local_index: u32,
+    pub fragment_id: CustomUUID,
+    pub fragment_hash: hopnet_common::Blake3Hash,
+    pub recovery: bool,
+}
+
+/// Outcome of `PhotoDispatch::upload_data_block` — everything the publisher
+/// needs to assemble a `BlobInsertOp` for the photo_add payload.
+#[derive(Debug)]
+pub struct UploadedDataBlock {
+    pub integrity_hash: hopnet_common::Blake3Hash,
+    pub fragments: Vec<UploadedFragment>,
+    pub added_bytes: u8,
+}
+
+/// A recipient of a publish: consensus user id plus the X25519 public key
+/// blob and metadata keys are wrapped to.
+#[derive(Debug, Clone)]
+pub struct LibraryMember {
+    pub user_id: i32,
+    pub pubkey: hopnet_storage::x25519_dalek::PublicKey,
+}
+
+/// Recipients of a publish plus the dispatch-derived acting user.
+/// `uploaded_by` comes from the dispatch's authenticated state (node-local:
+/// the session behind the Submitter; thin client: the session key holder),
+/// never from the publish caller.
+#[derive(Debug, Clone)]
+pub struct LibraryMembership {
+    pub uploaded_by: i32,
+    pub members: Vec<LibraryMember>,
 }
 
 /// One incremental sync response. Carries the changed photos since the

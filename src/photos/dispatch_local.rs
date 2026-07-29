@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use hopnet_photos_core::PhotosCoreError;
-use hopnet_photos_core::dispatch::{PhotoDispatch, SyncBatch};
+use hopnet_photos_core::dispatch::{
+    LibraryMembership, PhotoDispatch, SyncBatch, UploadedDataBlock, UploadedFragment,
+};
 
 use crate::consensus::dispatch::create_signed_user_transaction;
 
@@ -43,5 +45,46 @@ impl PhotoDispatch for Submitter {
     async fn fetch_photos_since(&self, height: u64) -> Result<SyncBatch, PhotosCoreError> {
         super::query::read_photo_changes(&self.app_state.db_pool, self.user_id, height)
             .map_err(|e| PhotosCoreError::Dispatch(e))
+    }
+
+    async fn upload_data_block(
+        &self,
+        blob_id: hopnet_storage::BlobId,
+        source: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+        file_size: usize,
+        per_blob_key: chacha20poly1305::Key,
+    ) -> Result<UploadedDataBlock, PhotosCoreError> {
+        let outcome = hopnet_storage::api::put(
+            source,
+            file_size,
+            blob_id,
+            &per_blob_key,
+            &self.app_state.fragments_dir,
+        )
+        .await?;
+
+        Ok(UploadedDataBlock {
+            integrity_hash: outcome.integrity_hash,
+            fragments: outcome
+                .fragments
+                .into_iter()
+                .map(|f| UploadedFragment {
+                    chunk_number: f.chunk_number,
+                    local_index: f.local_index,
+                    fragment_id: f.fragment_id,
+                    fragment_hash: f.fragment_hash,
+                    recovery: f.recovery,
+                })
+                .collect(),
+            added_bytes: outcome.added_bytes,
+        })
+    }
+
+    async fn fetch_library_members(
+        &self,
+        library_id: Option<hopnet_common::CustomUUID>,
+    ) -> Result<LibraryMembership, PhotosCoreError> {
+        super::query::read_library_membership(&self.app_state.db_pool, self.user_id, library_id)
+            .map_err(PhotosCoreError::Dispatch)
     }
 }

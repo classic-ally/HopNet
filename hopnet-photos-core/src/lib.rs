@@ -12,6 +12,7 @@ pub mod dispatch;
 pub mod error;
 pub mod metadata;
 pub mod payloads;
+pub mod publisher;
 #[cfg(feature = "sidecar")]
 pub mod sidecar;
 
@@ -28,7 +29,8 @@ pub const METADATA_KEY_WRAP_DOMAIN: WrapDomain = WrapDomain {
 pub use asset::{
     AssetValidationError, PhotoAsset, PhotoResource, ResourceContent, ResourceKind, SourceIdentity,
 };
-pub use error::PhotosCoreError;
+pub use error::{PhotosCoreError, PublishValidationError};
 pub use metadata::PhotoMetadata;
+pub use publisher::{ByteSource, IngestOutcome, PublishRequest, publish_photo_add};
 #[cfg(feature = "sidecar")]
 pub use sidecar::install_schema;
