@@ -110,6 +110,13 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 tracing::warn!("FileProvider keychain base_url refresh failed: {:?}", e);
             }
         }
+        // Same refresh for the photo-ingress daemon's credentials.
+        if keychain::load_photo_ingress_config().is_ok() {
+            let url = format!("http://127.0.0.1:{}", port);
+            if let Err(e) = keychain::update_photo_ingress_base_url(&url) {
+                tracing::warn!("photo-ingress keychain base_url refresh failed: {:?}", e);
+            }
+        }
     }
 
     let (encodingkey, decodingkey) = auth::generate_jwt_key();

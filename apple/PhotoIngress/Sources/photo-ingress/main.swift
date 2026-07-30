@@ -283,6 +283,15 @@ func runDaemon() throws {
         observer.stop()
     }
 
+    // Publish credentials: explicit flags (dev/soak) win over the keychain
+    // service the HopNet app provisions. Neither present = ingest-only.
+    let flagUrl = flagValue(args, "--node-url")
+    let flagToken = flagValue(args, "--device-token")
+    let keychain = (flagUrl == nil || flagToken == nil) ? PublishCredentials.load() : nil
+    let nodeUrl = flagUrl ?? keychain?.baseUrl
+    let deviceToken = flagToken ?? keychain?.deviceToken
+    let publishing = nodeUrl != nil && deviceToken != nil
+
     let options = FfiDaemonOptions(
         fetchConcurrency: UInt32(intFlag("--fetch-concurrency", default: 4)),
         retryCap: retryCap,
@@ -292,8 +301,17 @@ func runDaemon() throws {
         pressurePauseSecs: intFlag("--pressure-pause-secs", default: 60),
         storagePollSecs: intFlag("--storage-poll-secs", default: 15),
         cleanupIntervalSecs: intFlag("--cleanup-interval-secs", default: 3600),
-        replicationIntervalSecs: intFlag("--replication-interval-secs", default: 60)
+        replicationIntervalSecs: intFlag("--replication-interval-secs", default: 60),
+        publishNodeUrl: publishing ? nodeUrl : nil,
+        publishDeviceToken: publishing ? deviceToken : nil,
+        publishIntervalSecs: intFlag("--publish-interval-secs", default: 60)
     )
+    if publishing {
+        print("publishing to \(nodeUrl!) (device token \(deviceToken!.prefix(8))…)")
+    } else {
+        print("publishing OFF — no --node-url/--device-token and no keychain " +
+              "credentials (\(PublishCredentials.service))")
+    }
     print("daemon running (scan interval \(scanInterval)s) — SIGTERM/SIGINT to stop")
     let report = try session.runDaemon(fetcher: fetcher, options: options)
     print("daemon report:")
@@ -312,6 +330,16 @@ func runDaemon() throws {
     print("  gave up:              \(report.drain.gaveUp)")
     print("  lifecycle:")
     printCleanup(report.cleanup, indent: "    ")
+    if publishing {
+        print("  publish:")
+        print("    published:          \(report.publish.published) " +
+              "(already \(report.publish.alreadyPublished))")
+        print("    failed:             \(report.publish.failed) " +
+              "(gave up \(report.publish.gaveUp), missing sidecar \(report.publish.missingSidecar))")
+        if report.publish.parked {
+            print("    PARKED — node unreachable at last pass")
+        }
+    }
 }
 
 // Never block the main thread on PhotoKit (spike lesson): work on a

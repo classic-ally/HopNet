@@ -452,9 +452,13 @@ impl IngressSession {
             replication_interval: std::time::Duration::from_secs(
                 options.replication_interval_secs.max(1),
             ),
+            publish: ingress_core::publish::PublishConfig {
+                interval: std::time::Duration::from_secs(options.publish_interval_secs.max(1)),
+                ..ingress_core::publish::PublishConfig::default()
+            },
             ..SchedulerConfig::default()
         };
-        let scheduler = Scheduler::new(
+        let mut scheduler = Scheduler::new(
             self.inner.store.clone(),
             self.inner.data_dir.clone(),
             Arc::new(crate::fetcher::ForeignFetcher { inner: fetcher }),
@@ -462,6 +466,19 @@ impl IngressSession {
             config,
             self.inner.cancel.clone(),
         );
+        // Publishing is opt-in: both credentials present. The NodePublisher
+        // constructor only builds the HTTP client — reachability is probed
+        // lazily by the tick (park semantics), so a down node at daemon
+        // start is not an error.
+        if let (Some(node_url), Some(device_token)) =
+            (&options.publish_node_url, &options.publish_device_token)
+        {
+            let publisher = ingress_publisher::NodePublisher::new(node_url, device_token)
+                .map_err(|msg| FfiError::Invariant {
+                    msg: format!("publisher init: {msg}"),
+                })?;
+            scheduler = scheduler.with_publisher(Arc::new(publisher));
+        }
         let report = self
             .runtime
             .block_on(scheduler.run_daemon(rx, self.inner.daemon.clone()))?;
@@ -485,6 +502,14 @@ impl IngressSession {
             transitions: report.transitions,
             resources_reopened: report.resources_reopened,
             cleanup: cleanup_report_to_ffi(&report.cleanup, &report.replication),
+            publish: crate::types::FfiPublishReport {
+                published: report.publish.published,
+                already_published: report.publish.already_published,
+                failed: report.publish.failed,
+                gave_up: report.publish.gave_up,
+                missing_sidecar: report.publish.missing_sidecar,
+                parked: report.publish.parked,
+            },
         })
     }
 

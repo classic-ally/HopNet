@@ -16,6 +16,9 @@ const HOPNET_SERVICE: &str = "com.hopnet.desktop.fileprovider";
 const HOPNET_TEST_SERVICE: &str = "com.hopnet.desktop.fileprovider.test";
 const SESSION_SERVICE: &str = "com.hopnet.desktop.session";
 const SESSION_TEST_SERVICE: &str = "com.hopnet.desktop.session.test";
+/// Photo-ingress daemon credentials (read Swift-side by
+/// `PhotoIngressKit/PublishCredentials.swift`).
+const PHOTO_INGRESS_SERVICE: &str = "com.hopnet.desktop.photo-ingress";
 
 /// Keychain account names
 const API_KEY_ACCOUNT: &str = "api_key";
@@ -190,6 +193,32 @@ fn load_keychain_item(env: KeychainEnvironment, account: &str) -> Result<String,
 #[cfg(target_os = "macos")]
 pub fn update_base_url(base_url: &str, env: KeychainEnvironment) -> Result<(), KeychainError> {
     store_keychain_item(env, BASE_URL_ACCOUNT, base_url)
+}
+
+/// Store the photo-ingress daemon's publish credentials (device token +
+/// node base URL). Same account names as the FileProvider service so the
+/// Swift reader stays symmetric.
+#[cfg(target_os = "macos")]
+pub fn store_photo_ingress_config(api_key: &str, base_url: &str) -> Result<(), KeychainError> {
+    store_keychain_item_with_service(PHOTO_INGRESS_SERVICE, API_KEY_ACCOUNT, api_key.as_bytes())?;
+    store_keychain_item_with_service(PHOTO_INGRESS_SERVICE, BASE_URL_ACCOUNT, base_url.as_bytes())
+}
+
+/// Load the photo-ingress credentials: `(api_key, base_url)`.
+#[cfg(target_os = "macos")]
+pub fn load_photo_ingress_config() -> Result<(String, String), KeychainError> {
+    let api_key = load_keychain_item_bytes_with_service(PHOTO_INGRESS_SERVICE, API_KEY_ACCOUNT)?;
+    let base_url = load_keychain_item_bytes_with_service(PHOTO_INGRESS_SERVICE, BASE_URL_ACCOUNT)?;
+    Ok((
+        String::from_utf8(api_key).map_err(|_| KeychainError::InvalidData)?,
+        String::from_utf8(base_url).map_err(|_| KeychainError::InvalidData)?,
+    ))
+}
+
+/// Refresh only the photo-ingress base URL (GUI ephemeral-port startup).
+#[cfg(target_os = "macos")]
+pub fn update_photo_ingress_base_url(base_url: &str) -> Result<(), KeychainError> {
+    store_keychain_item_with_service(PHOTO_INGRESS_SERVICE, BASE_URL_ACCOUNT, base_url.as_bytes())
 }
 
 /// Remove FileProvider configuration from keychain

@@ -174,6 +174,15 @@ pub struct FfiDaemonOptions {
     pub cleanup_interval_secs: u64,
     /// Dirty-sidecar replication cadence (faster, batch-capped).
     pub replication_interval_secs: u64,
+    /// HopNet publish tick: node base URL (WITHOUT `/api`) + RFC-012 device
+    /// token (`{device_id}.{secret}`). Both set = publishing on; either
+    /// absent = ingest-only daemon (the pre-integration behavior). The
+    /// platform side owns credential storage (keychain) — the core never
+    /// reads secrets itself.
+    pub publish_node_url: Option<String>,
+    pub publish_device_token: Option<String>,
+    /// Publish tick cadence (seconds); same class as replication.
+    pub publish_interval_secs: u64,
 }
 
 /// Lifecycle knobs for the one-shot `cleanup` subcommand.
@@ -198,6 +207,18 @@ pub struct FfiCleanupReport {
     pub replication_stalled: bool,
 }
 
+/// Publish-tick aggregates (mirrors `publish::PublishReport`).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiPublishReport {
+    pub published: u64,
+    pub already_published: u64,
+    pub failed: u64,
+    pub gave_up: u64,
+    pub missing_sidecar: u64,
+    /// The last pass aborted because the node was unreachable.
+    pub parked: bool,
+}
+
 /// Daemon outcome (mirrors `daemon::DaemonReport`): drain counters plus the
 /// event side and the lifecycle-tick aggregates.
 #[derive(Debug, Clone, uniffi::Record)]
@@ -210,6 +231,7 @@ pub struct FfiDaemonReport {
     pub transitions: u64,
     pub resources_reopened: u64,
     pub cleanup: FfiCleanupReport,
+    pub publish: FfiPublishReport,
 }
 
 /// How the original's hash resolved (mirrors `resolve::HashResolution`).

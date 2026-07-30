@@ -136,6 +136,43 @@ pub async fn ensure_fileprovider_device_token(
     Ok(())
 }
 
+/// Ensure a photo-ingress device token exists in the macOS Keychain
+/// (service `com.hopnet.desktop.photo-ingress`, read by the ingress
+/// daemon's Swift shell). Mirrors `ensure_fileprovider_device_token`:
+/// re-registers when the stored token's device row no longer exists
+/// (revoked), otherwise leaves it untouched.
+#[cfg(target_os = "macos")]
+pub async fn ensure_photo_ingress_device_token(
+    app_state: &AppState,
+    user_id: i32,
+) -> Result<(), StatusCode> {
+    use crate::db::devices::get_device_by_id;
+    use crate::fileprovider::keychain;
+
+    if let Ok((api_key, _base_url)) = keychain::load_photo_ingress_config()
+        && let Some(dot_pos) = api_key.find('.')
+        && let Ok(device_id) = CustomUUID::from_str(&api_key[..dot_pos])
+    {
+        let db_lock = app_state
+            .db_pool
+            .get()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if let Ok(Some(_)) = get_device_by_id(&db_lock, &device_id) {
+            return Ok(()); // Token still valid
+        }
+    }
+
+    let (_device_id, api_key) =
+        register_device_internal(app_state, user_id, "Photo Ingress").await?;
+    keychain::store_photo_ingress_config(
+        &api_key,
+        &format!("http://localhost:{}", app_state.port),
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(())
+}
+
 /// GET /devices
 /// List user's devices (decrypted names, no API keys)
 async fn get_devices(
