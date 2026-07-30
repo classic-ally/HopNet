@@ -578,7 +578,9 @@ pub async fn post_files(
         None
     };
 
-    crate::upload::submit_inodes(&state, user_id, blob_ops, inodes, attestation).await
+    crate::upload::submit_inodes(&state, user_id, blob_ops, inodes, attestation)
+        .await
+        .map(|_| ())
 }
 
 pub async fn delete_files(

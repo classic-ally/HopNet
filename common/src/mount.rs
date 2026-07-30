@@ -45,3 +45,34 @@ pub struct MountChangesResponse {
     pub deleted_ids: Vec<CustomUUID>,
     pub height: i32,
 }
+
+/// Response to every mount mutation (RFC-018 S6). Sent only after the
+/// transaction is decided AND applied on this node; `item` is the fresh
+/// post-apply state (None for deletes), `height` the read anchor the
+/// daemon may fast-forward to.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MountMutationResponse {
+    pub item: Option<MountItem>,
+    pub height: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MountModifyRequest {
+    pub id: CustomUUID,
+    /// New parent folder; None = unchanged, Some(None) is not expressible —
+    /// moving to root is `new_parent_id: Some(None)`… kept simple instead:
+    /// `new_parent_root: true` moves to root.
+    pub new_parent_id: Option<CustomUUID>,
+    /// Move to the root folder (new_parent_id must be None).
+    #[serde(default)]
+    pub new_parent_root: bool,
+    /// New name; None = unchanged.
+    pub new_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MountDeleteRequest {
+    pub id: CustomUUID,
+    #[serde(default)]
+    pub recursive: bool,
+}

@@ -156,9 +156,16 @@ New mount `/api/integrations/mount`, `AuthClass::DeviceToken`, declared in
     - consequence: a displaced blob under an open handle races RFC-007
       orphan cleanup — same keep-set family as pins/version retention
       (issues #23/#26)
-  - `POST /create`, `PATCH /modify`, `DELETE /delete`
+  - `POST /create` (multipart: parent_id + folder_name | file_{size}),
+    `PATCH /modify` (JSON rename/move), `DELETE /delete` (JSON)
     - strict consistency: respond only after the transaction is decided
-      by consensus and applied locally (existing barrier infra)
+      by consensus and applied locally — implemented on the queue's
+      per-tx oneshot (settled from local committed_tx_nonces), NOT the
+      test barriers (S6 correction: those are pause points, not height
+      waiters)
+    - responses carry the fresh post-apply item + decided height, the
+      daemon's read anchor (fast-forward without treating its own write
+      as a remote change)
     - no fire-and-forget variant on this surface — one behavior to
       validate, no divergence risk from premature success
   - `GET /health` — unauthenticated readiness (same contract as the
@@ -334,7 +341,16 @@ implements that contract. Each slice is PR-sized and lands green.
       fix — deciding block height, not lagging last_decided)
 - [x] S5 — content reads: sparse cache, whole-file fast path,
       snapshot-at-open, disk-pressure eviction (2026-07-30)
-- [ ] S6 — submit-and-wait-decided + strict mutation routes (node-side)
+- [x] S6 — submit-and-wait-decided + strict mutation routes (node-side)
+      (2026-07-30). The pipeline's per-tx oneshot already waited for the
+      local commit on the proposer path; S6 threads the decided height
+      through it (TxGateway::submit_batch_decided) and FIXES the
+      forwarder path, which resolved on the remote proposer's Committed
+      ACK before local apply — mutations now respond only after applied
+      HERE, on every path. Timeout is a distinct outcome-unknown error
+      (504), never success. Follow-up noted: fileprovider/
+      documentprovider mutations still use the legacy non-height wait;
+      migrating them is a small, separate change.
 - [ ] S7 — writes: staging, copy-up, release/fsync tiers, conflict
       logging, startup recovery
 - [ ] S8 — provisioning & lifecycle: secrets, login, endpoint file,

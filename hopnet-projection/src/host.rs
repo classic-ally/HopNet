@@ -58,7 +58,11 @@ pub enum TxSubmitError {
     /// Business-logic rejection (permanent) with the engine's reason —
     /// distinct so the shares routes can keep their 409 mapping.
     Rejected(String),
-    /// Consensus failed the transaction (timeout / queue full / internal).
+    /// Consensus wait timed out — the outcome is UNKNOWN (the tx may
+    /// still commit later). Strict-consistency routes map this to 504,
+    /// never to success. (RFC-018 S6; previously flattened into Submit.)
+    Timeout,
+    /// Consensus failed the transaction (queue full / internal).
     Submit,
 }
 
@@ -68,9 +72,29 @@ pub trait TxGateway: Send + Sync {
     /// insert_files with a node-signed self-check attestation.
     fn submit_batch(&self, txs: Vec<TxSpec>) -> BoxFuture<'_, Vec<Result<(), TxSubmitError>>>;
 
+    /// Like submit_batch, but success carries the decided height and is
+    /// only reported once the transaction is decided AND applied on THIS
+    /// node (RFC-018 S6). The height is an upper bound on the applying
+    /// block: reads anchored at it observe the transaction's effects.
+    fn submit_batch_decided(
+        &self,
+        txs: Vec<TxSpec>,
+    ) -> BoxFuture<'_, Vec<Result<i32, TxSubmitError>>>;
+
     /// Convenience: single transaction.
     fn submit(&self, tx: TxSpec) -> BoxFuture<'_, Result<(), TxSubmitError>> {
         let fut = self.submit_batch(vec![tx]);
+        Box::pin(async move {
+            fut.await
+                .into_iter()
+                .next()
+                .unwrap_or(Err(TxSubmitError::Submit))
+        })
+    }
+
+    /// Convenience: single transaction, strict (decided + applied here).
+    fn submit_decided(&self, tx: TxSpec) -> BoxFuture<'_, Result<i32, TxSubmitError>> {
+        let fut = self.submit_batch_decided(vec![tx]);
         Box::pin(async move {
             fut.await
                 .into_iter()

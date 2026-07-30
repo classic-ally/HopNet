@@ -70,6 +70,93 @@ impl TxGateway for NoTx {
     fn submit_batch(&self, txs: Vec<TxSpec>) -> BoxFuture<'_, Vec<Result<(), TxSubmitError>>> {
         Box::pin(async move { txs.iter().map(|_| Err(TxSubmitError::Submit)).collect() })
     }
+    fn submit_batch_decided(
+        &self,
+        txs: Vec<TxSpec>,
+    ) -> BoxFuture<'_, Vec<Result<i32, TxSubmitError>>> {
+        Box::pin(async move { txs.iter().map(|_| Err(TxSubmitError::Submit)).collect() })
+    }
+}
+
+/// Mini-consensus for mutation route tests (RFC-018 S6): looks the
+/// function up in the drive's inventory-registered handlers and applies
+/// it synchronously at a monotonically bumped fake height — the same
+/// execute=true path the real dispatch runs, minus the mesh.
+struct ApplyTx {
+    pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    fragments_dir: String,
+    height: std::sync::atomic::AtomicI32,
+}
+
+impl TxGateway for ApplyTx {
+    fn submit_batch(&self, txs: Vec<TxSpec>) -> BoxFuture<'_, Vec<Result<(), TxSubmitError>>> {
+        let fut = self.submit_batch_decided(txs);
+        Box::pin(async move { fut.await.into_iter().map(|r| r.map(|_| ())).collect() })
+    }
+    fn submit_batch_decided(
+        &self,
+        txs: Vec<TxSpec>,
+    ) -> BoxFuture<'_, Vec<Result<i32, TxSubmitError>>> {
+        Box::pin(async move {
+            let height = self
+                .height
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            let mut results = Vec::new();
+            for spec in txs {
+                let handler = inventory::iter::<&'static dyn hopnet_projection::TransactionHandler>
+                    .into_iter()
+                    .find(|h| h.name() == spec.function);
+                let Some(handler) = handler else {
+                    results.push(Err(TxSubmitError::Rejected(format!(
+                        "no handler {}",
+                        spec.function
+                    ))));
+                    continue;
+                };
+                let conn = self.pool.get().expect("applytx conn");
+                let db_tx = conn.unchecked_transaction().expect("applytx tx");
+                let meta = hopnet_projection::TxMeta {
+                    function: spec.function,
+                    payload: &spec.payload,
+                    submitter_node: 0,
+                    user_id: match spec.signer {
+                        crate::host::TxSigner::User(uid) => Some(uid),
+                        crate::host::TxSigner::Node => None,
+                    },
+                };
+                let ctx = hopnet_projection::HandlerCtx {
+                    fragments_dir: &self.fragments_dir,
+                    node_id: Some(0),
+                    height,
+                    notifier: &hopnet_projection::NullNotifier,
+                    work: &hopnet_projection::NullScheduler,
+                };
+                match handler.process(&meta, true, &ctx, &db_tx) {
+                    Ok(()) => {
+                        db_tx.commit().expect("applytx commit");
+                        results.push(Ok(height));
+                    }
+                    Err(e) => results.push(Err(TxSubmitError::Rejected(format!("{e:?}")))),
+                }
+            }
+            results
+        })
+    }
+}
+
+/// Every submission times out — the outcome-unknown path.
+struct TimeoutTx;
+impl TxGateway for TimeoutTx {
+    fn submit_batch(&self, txs: Vec<TxSpec>) -> BoxFuture<'_, Vec<Result<(), TxSubmitError>>> {
+        Box::pin(async move { txs.iter().map(|_| Err(TxSubmitError::Timeout)).collect() })
+    }
+    fn submit_batch_decided(
+        &self,
+        txs: Vec<TxSpec>,
+    ) -> BoxFuture<'_, Vec<Result<i32, TxSubmitError>>> {
+        Box::pin(async move { txs.iter().map(|_| Err(TxSubmitError::Timeout)).collect() })
+    }
 }
 
 struct AllowWrites;
@@ -353,6 +440,303 @@ fn setup_env_with_watch(blob_bytes: Vec<u8>) -> (TestEnv, tokio::sync::broadcast
     let tx = tokio::sync::broadcast::channel(16).0;
     env.state.notify = Arc::new(BroadcastNotifier { tx: tx.clone() });
     (env, tx)
+}
+
+fn setup_env_apply(blob_bytes: Vec<u8>) -> TestEnv {
+    let mut env = setup_env(blob_bytes);
+    env.state.txs = Arc::new(ApplyTx {
+        pool: env.state.db_pool.clone(),
+        fragments_dir: env.state.fragments_dir.clone(),
+        height: std::sync::atomic::AtomicI32::new(10),
+    });
+    // No node id → the create route skips attestation (best-effort by
+    // design); its self_check_fragments handler is host-registered and
+    // invisible to this crate's inventory.
+    env.state.node_id = Arc::new(once_cell::sync::OnceCell::new());
+    env
+}
+
+const BOUNDARY: &str = "hopnet-mount-test-boundary";
+
+fn multipart_body(parts: &[(&str, Option<&str>, &[u8])]) -> (String, Vec<u8>) {
+    let mut body = Vec::new();
+    for (name, filename, bytes) in parts {
+        body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+        match filename {
+            Some(filename) => body.extend_from_slice(
+                format!(
+                    "Content-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\n\r\n"
+                )
+                .as_bytes(),
+            ),
+            None => body.extend_from_slice(
+                format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+            ),
+        }
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
+    (
+        format!("multipart/form-data; boundary={BOUNDARY}"),
+        body,
+    )
+}
+
+async fn send_json<T: serde::de::DeserializeOwned>(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    body: serde_json::Value,
+) -> (StatusCode, Option<T>) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    (status, serde_json::from_slice(&bytes).ok())
+}
+
+async fn send_multipart<T: serde::de::DeserializeOwned>(
+    app: &Router,
+    uri: &str,
+    parts: &[(&str, Option<&str>, &[u8])],
+) -> (StatusCode, Option<T>) {
+    let (content_type, body) = multipart_body(parts);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(header::CONTENT_TYPE, content_type)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    (status, serde_json::from_slice(&bytes).ok())
+}
+
+use hopnet_common::mount::MountMutationResponse;
+
+// ---------- mutations (S6: strict — respond only after applied) ----------
+
+// Should: create a folder and have it immediately visible to lookup and
+// enumerate on the same node — the mkdir && cd contract.
+// Impact: this is the whole point of S6; a 201 before local apply makes
+// shells and file managers observe their own mkdir missing.
+#[tokio::test]
+async fn create_folder_is_immediately_visible() {
+    let env = setup_env_apply(vec![]);
+    let app = env.app();
+
+    let (status, response) = send_multipart::<MountMutationResponse>(
+        &app,
+        "/create",
+        &[("folder_name", None, b"Projets")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let response = response.unwrap();
+    let item = response.item.expect("created item read back");
+    assert_eq!(item.name, "Projets");
+    assert!(response.height >= 10);
+    assert_eq!(item.height, Some(response.height), "modification stamped at decided height");
+
+    let (status, found) = get_json::<MountItem>(&app, "/lookup?name=Projets").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(found.unwrap().id, item.id);
+}
+
+// Should: create a file from multipart content with its blob registered
+// and size correct.
+#[tokio::test]
+async fn create_file_registers_blob() {
+    let env = setup_env_apply(vec![]);
+    let app = env.app();
+
+    let content = b"file body for s6";
+    let (status, response) = send_multipart::<MountMutationResponse>(
+        &app,
+        "/create",
+        &[(
+            &format!("file_{}", content.len()),
+            Some("notes.txt"),
+            content.as_slice(),
+        )],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let item = response.unwrap().item.unwrap();
+    assert_eq!(item.name, "notes.txt");
+    assert_eq!(item.size, Some(content.len() as u64));
+    assert!(item.blob_id.is_some(), "non-empty file must register a blob");
+}
+
+// Should: reject a create whose name already exists under the parent.
+#[tokio::test]
+async fn create_collision_is_409() {
+    let env = setup_env_apply(vec![]);
+    let app = env.app();
+    let (status, _) = send_multipart::<MountMutationResponse>(
+        &app,
+        "/create",
+        &[("folder_name", None, b"Dup")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = send_multipart::<MountMutationResponse>(
+        &app,
+        "/create",
+        &[("folder_name", None, b"Dup")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+// Should: rename and move via /modify with the old name gone and the new
+// resolvable immediately.
+#[tokio::test]
+async fn modify_renames_and_moves() {
+    let env = setup_env_apply(vec![]);
+    let app = env.app();
+
+    let (_, folder) = send_multipart::<MountMutationResponse>(
+        &app,
+        "/create",
+        &[("folder_name", None, b"Dossier")],
+    )
+    .await;
+    let folder_id = folder.unwrap().item.unwrap().id.unwrap();
+
+    let content = b"move me";
+    let (_, file) = send_multipart::<MountMutationResponse>(
+        &app,
+        "/create",
+        &[
+            ("parent_id", None, folder_id.to_string().as_bytes()),
+            (&format!("file_{}", content.len()), Some("old.txt"), content.as_slice()),
+        ],
+    )
+    .await;
+    let file_id = file.unwrap().item.unwrap().id.unwrap();
+
+    // Rename in place.
+    let (status, renamed) = send_json::<MountMutationResponse>(
+        &app,
+        "PATCH",
+        "/modify",
+        serde_json::json!({ "id": file_id, "new_name": "new.txt" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(renamed.unwrap().item.unwrap().name, "new.txt");
+
+    let (status, _) =
+        get_json::<MountItem>(&app, &format!("/lookup?parent_id={folder_id}&name=old.txt")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "old name must be gone");
+
+    // Move to root.
+    let (status, moved) = send_json::<MountMutationResponse>(
+        &app,
+        "PATCH",
+        "/modify",
+        serde_json::json!({ "id": file_id, "new_parent_root": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(moved.unwrap().item.unwrap().parent_id.is_none());
+
+    let (status, found) = get_json::<MountItem>(&app, "/lookup?name=new.txt").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(found.unwrap().id, Some(file_id));
+}
+
+// Should: refuse deleting a non-empty folder without recursive, delete it
+// with recursive, and report the deletion in /changes.
+#[tokio::test]
+async fn delete_respects_recursive_and_feeds_changes() {
+    let env = setup_env_apply(vec![]);
+    let app = env.app();
+
+    let (_, folder) = send_multipart::<MountMutationResponse>(
+        &app,
+        "/create",
+        &[("folder_name", None, b"Doomed")],
+    )
+    .await;
+    let folder_id = folder.unwrap().item.unwrap().id.unwrap();
+    let content = b"x";
+    send_multipart::<MountMutationResponse>(
+        &app,
+        "/create",
+        &[
+            ("parent_id", None, folder_id.to_string().as_bytes()),
+            (&format!("file_{}", content.len()), Some("child.txt"), content.as_slice()),
+        ],
+    )
+    .await;
+
+    let (status, _) = send_json::<MountMutationResponse>(
+        &app,
+        "DELETE",
+        "/delete",
+        serde_json::json!({ "id": folder_id, "recursive": false }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    let (status, deleted) = send_json::<MountMutationResponse>(
+        &app,
+        "DELETE",
+        "/delete",
+        serde_json::json!({ "id": folder_id, "recursive": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let height = deleted.unwrap().height;
+
+    let (status, _) = get_json::<MountItem>(&app, &format!("/item?id={folder_id}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "deleted immediately invisible");
+
+    let (_, changes) = get_json::<hopnet_common::mount::MountChangesResponse>(
+        &app,
+        &format!("/changes?since_height={}", height - 1),
+    )
+    .await;
+    assert!(
+        changes.unwrap().deleted_ids.contains(&folder_id),
+        "deletion must appear in the delta feed"
+    );
+}
+
+// Should: map a consensus wait timeout to 504 — outcome unknown, never
+// claimed as success.
+// Impact: a 2xx on timeout would report durability that may not exist.
+#[tokio::test]
+async fn consensus_timeout_maps_to_504() {
+    let mut env = setup_env(vec![]);
+    env.state.txs = Arc::new(TimeoutTx);
+    let app = env.app();
+    let (status, _) = send_multipart::<MountMutationResponse>(
+        &app,
+        "/create",
+        &[("folder_name", None, b"Never")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
 }
 
 // ---------- watch ----------

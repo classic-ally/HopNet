@@ -332,6 +332,122 @@ async fn watch_pokes_flow_end_to_end() {
     assert!(delta.height > anchor);
 }
 
+// Should: return from every mount mutation only after the transaction is
+// applied on this node — an IMMEDIATE follow-up read (no sleeps, no
+// polling) observes the effect. Create folder, create file with content,
+// rename, delete — the full mkdir && cd contract over real consensus.
+// Impact: S6's reason to exist; before it, 2xx preceded local apply.
+#[tokio::test]
+async fn mutations_are_strict_read_your_writes() {
+    let node = boot_node().await;
+    let (api_key, _jwt) = provision(&node).await;
+    let transport = HttpTransport::new(&node.base(), &api_key).unwrap();
+    let client = reqwest::Client::new();
+    let base = format!("{}/api/integrations/mount", node.base());
+
+    // Create folder — strict.
+    let form = reqwest::multipart::Form::new().text("folder_name", "StrictDir");
+    let response: serde_json::Value = client
+        .post(format!("{base}/create"))
+        .bearer_auth(&api_key)
+        .multipart(form)
+        .send()
+        .await
+        .expect("create folder")
+        .json()
+        .await
+        .expect("create response json");
+    let folder_id = response["item"]["id"].as_str().expect("folder id").to_string();
+    let create_height = response["height"].as_i64().expect("height");
+    assert!(create_height > 0);
+
+    // IMMEDIATELY visible — no sleeps.
+    let found = transport
+        .lookup(ItemId::Root, "StrictDir".to_string())
+        .await
+        .unwrap()
+        .expect("folder visible in the same breath as the 201");
+    let ItemId::Inode(found_uuid) = &found.id else {
+        panic!("folder resolved to root");
+    };
+    assert_eq!(found_uuid.to_string(), folder_id);
+
+    // Create file with content under it — strict; content immediately
+    // readable through real RS reconstruction.
+    let content = b"strict content";
+    let part = reqwest::multipart::Part::bytes(content.to_vec()).file_name("s6.txt");
+    let form = reqwest::multipart::Form::new()
+        .text("parent_id", folder_id.clone())
+        .part(format!("file_{}", content.len()), part);
+    let response: serde_json::Value = client
+        .post(format!("{base}/create"))
+        .bearer_auth(&api_key)
+        .multipart(form)
+        .send()
+        .await
+        .expect("create file")
+        .json()
+        .await
+        .expect("file response json");
+    let blob_id: hopnet_common::CustomUUID = response["item"]["blob_id"]
+        .as_str()
+        .expect("blob id")
+        .parse()
+        .unwrap();
+    let bytes = transport
+        .read_blob(blob_id, 0, content.len() as u64)
+        .await
+        .expect("immediate content read");
+    assert_eq!(bytes, content);
+
+    let file_id = response["item"]["id"].as_str().unwrap().to_string();
+
+    // Rename — strict.
+    let response = client
+        .patch(format!("{base}/modify"))
+        .bearer_auth(&api_key)
+        .json(&serde_json::json!({ "id": file_id, "new_name": "renamed.txt" }))
+        .send()
+        .await
+        .expect("modify");
+    assert!(response.status().is_success());
+    let folder_item_id = found.id.clone();
+    assert!(
+        transport
+            .lookup(folder_item_id.clone(), "renamed.txt".to_string())
+            .await
+            .unwrap()
+            .is_some(),
+        "new name immediately resolvable"
+    );
+    assert!(
+        transport
+            .lookup(folder_item_id.clone(), "s6.txt".to_string())
+            .await
+            .unwrap()
+            .is_none(),
+        "old name immediately gone"
+    );
+
+    // Delete recursively — strict.
+    let response = client
+        .delete(format!("{base}/delete"))
+        .bearer_auth(&api_key)
+        .json(&serde_json::json!({ "id": folder_id, "recursive": true }))
+        .send()
+        .await
+        .expect("delete");
+    assert!(response.status().is_success());
+    assert!(
+        transport
+            .lookup(ItemId::Root, "StrictDir".to_string())
+            .await
+            .unwrap()
+            .is_none(),
+        "deleted folder immediately gone"
+    );
+}
+
 // Should: expose a live node's tree through a real kernel mount — ls and
 // stat via std::fs observe the seeded namespace with sane metadata — and
 // reflect a REMOTE content modification in stat within seconds (the
