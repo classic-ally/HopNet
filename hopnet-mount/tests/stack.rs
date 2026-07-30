@@ -448,12 +448,75 @@ async fn mutations_are_strict_read_your_writes() {
     );
 }
 
+// Should: round-trip the transport write methods against a live node —
+// streamed file creation, content replacement (new blob), and delete,
+// each strictly visible on return.
+#[tokio::test]
+async fn transport_write_methods_roundtrip() {
+    let node = boot_node().await;
+    let (api_key, _jwt) = provision(&node).await;
+    let transport = HttpTransport::new(&node.base(), &api_key).unwrap();
+
+    let folder = transport
+        .create_folder(ItemId::Root, "Writes".to_string())
+        .await
+        .expect("create folder")
+        .item
+        .unwrap();
+
+    let content = b"streamed up".to_vec();
+    let source: hopnet_mount::transport::ByteSource =
+        Box::pin(tokio_stream::once(Ok(bytes::Bytes::from(content.clone()))));
+    let created = transport
+        .create_file(folder.id.clone(), "s7.txt".to_string(), content.len() as u64, source)
+        .await
+        .expect("create file")
+        .item
+        .unwrap();
+    let blob_v1 = created.blob.clone().expect("blob");
+    assert_eq!(
+        transport.read_blob(blob_v1.clone(), 0, content.len() as u64).await.unwrap(),
+        content
+    );
+
+    let v2 = b"replaced content entirely".to_vec();
+    let source: hopnet_mount::transport::ByteSource =
+        Box::pin(tokio_stream::once(Ok(bytes::Bytes::from(v2.clone()))));
+    let ItemId::Inode(inode_uuid) = created.id.clone() else {
+        panic!()
+    };
+    let updated = transport
+        .update_content(inode_uuid.clone(), v2.len() as u64, source)
+        .await
+        .expect("update content")
+        .item
+        .unwrap();
+    let blob_v2 = updated.blob.clone().unwrap();
+    assert_ne!(blob_v2, blob_v1, "content update mints a new blob");
+    assert_eq!(
+        transport.read_blob(blob_v2, 0, v2.len() as u64).await.unwrap(),
+        v2
+    );
+
+    transport.delete(inode_uuid, false).await.expect("delete");
+    assert!(
+        transport
+            .lookup(folder.id, "s7.txt".to_string())
+            .await
+            .unwrap()
+            .is_none(),
+        "deleted immediately"
+    );
+}
+
 // Should: expose a live node's tree through a real kernel mount — ls and
-// stat via std::fs observe the seeded namespace with sane metadata — and
+// stat via std::fs observe the seeded namespaces with sane metadata — and
 // reflect a REMOTE content modification in stat within seconds (the
 // inval_inode path busting the kernel's 60s attr cache), not after TTL.
 // (Closes S1's smoke-test gap; #[ignore] because it needs /dev/fuse.)
-#[tokio::test]
+// Multi-thread flavor matches the production daemon runtime — kernel
+// notify writes and FUSE replies must be able to progress concurrently.
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires /dev/fuse and a built hopnet binary"]
 async fn fuse_mount_smoke_against_live_node() {
     use hopnet_mount::attrs::DEFAULT_TTL;
@@ -487,14 +550,18 @@ async fn fuse_mount_smoke_against_live_node() {
         )
         .unwrap(),
     );
-    let core = Arc::new(MountCore::new(transport.clone(), DEFAULT_TTL).with_cache(cache));
+    let staging = Arc::new(
+        hopnet_mount::staging::Staging::new(cache_dir.path().join("staging")).unwrap(),
+    );
+    let core = Arc::new(
+        MountCore::new(transport.clone(), DEFAULT_TTL)
+            .with_cache(cache)
+            .with_staging(staging),
+    );
     let fs = HopFs::new(core.clone(), tokio::runtime::Handle::current());
     let mountpoint = tempfile::tempdir().unwrap();
     let mut config = fuser::Config::default();
-    config.mount_options = vec![
-        fuser::MountOption::RO,
-        fuser::MountOption::FSName("hopnet-test".to_string()),
-    ];
+    config.mount_options = vec![fuser::MountOption::FSName("hopnet-test".to_string())];
     let session = fuser::spawn_mount(fs, mountpoint.path(), &config).unwrap();
 
     // S4: watch loop with the real kernel invalidator.
@@ -662,6 +729,111 @@ async fn fuse_mount_smoke_against_live_node() {
     .await
     .unwrap();
     snapshot_ok.expect("held fd version consistency");
+
+    eprintln!("SMOKE: S7 section start");
+    // ---- S7: kernel-level writes ----
+    let root = mountpoint.path().to_path_buf();
+
+    // mkdir + write + close (write-back tier).
+    tokio::task::spawn_blocking({
+        let root = root.clone();
+        move || {
+            std::fs::create_dir(root.join("Kernel")).unwrap();
+            std::fs::write(root.join("Kernel/note.txt"), b"written through the kernel").unwrap();
+        }
+    })
+    .await
+    .unwrap();
+
+    eprintln!("SMOKE: write+close done");
+    // Prove the background upload landed by reading back through the
+    // TRANSPORT (the page cache would satisfy a mount read trivially).
+    let kernel_dir = transport
+        .lookup(ItemId::Root, "Kernel".to_string())
+        .await
+        .unwrap()
+        .expect("mkdir strict");
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let uploaded = loop {
+        if let Some(item) = transport
+            .lookup(kernel_dir.id.clone(), "note.txt".to_string())
+            .await
+            .unwrap()
+        {
+            if let Some(blob) = item.blob.clone() {
+                let bytes = transport.read_blob(blob, 0, 64).await.unwrap();
+                if bytes == b"written through the kernel" {
+                    break true;
+                }
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            break false;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    assert!(uploaded, "close-tier upload must land on the node");
+
+    eprintln!("SMOKE: close-tier upload verified");
+    // fsync tier: sync_all returns only after decided upload.
+    tokio::task::spawn_blocking({
+        let root = root.clone();
+        move || {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(root.join("Kernel/note.txt"))
+                .unwrap();
+            f.write_all(b"FSYNCED DATA").unwrap();
+            f.sync_all().unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    eprintln!("SMOKE: fsync returned");
+    // Immediately (no polling) visible via the transport — the strict tier.
+    let item = transport
+        .lookup(kernel_dir.id.clone(), "note.txt".to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    let bytes = transport
+        .read_blob(item.blob.clone().unwrap(), 0, 64)
+        .await
+        .unwrap();
+    assert_eq!(
+        bytes, b"FSYNCED DATAugh the kernel",
+        "fsync must have uploaded the copy-up-merged content strictly"
+    );
+
+    eprintln!("SMOKE: fsync verified");
+    // rename + rm, strict through the kernel.
+    tokio::task::spawn_blocking({
+        let root = root.clone();
+        move || {
+            eprintln!("SMOKE: renaming");
+            std::fs::rename(root.join("Kernel/note.txt"), root.join("Kernel/renamed.txt"))
+                .unwrap();
+            eprintln!("SMOKE: rename done");
+            assert!(root.join("Kernel/renamed.txt").exists());
+            assert!(!root.join("Kernel/note.txt").exists());
+            std::fs::remove_file(root.join("Kernel/renamed.txt")).unwrap();
+            eprintln!("SMOKE: unlink done");
+            std::fs::remove_dir(root.join("Kernel")).unwrap();
+            eprintln!("SMOKE: rmdir done");
+            assert!(!root.join("Kernel").exists());
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        transport
+            .lookup(ItemId::Root, "Kernel".to_string())
+            .await
+            .unwrap()
+            .is_none(),
+        "rmdir strict on the node too"
+    );
 
     watcher.abort();
     drop(session);

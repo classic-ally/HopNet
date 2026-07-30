@@ -12,6 +12,7 @@ pub mod cache;
 pub mod http_transport;
 pub mod idmap;
 pub mod mock;
+pub mod staging;
 pub mod transport;
 pub mod vfs;
 pub mod watch;

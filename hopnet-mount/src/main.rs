@@ -52,6 +52,21 @@ mod linux {
         /// Content cache directory (default: $XDG_CACHE_HOME/hopnet/content)
         #[arg(long)]
         cache_dir: Option<PathBuf>,
+
+        /// Write staging directory — DURABLE, survives restarts
+        /// (default: $XDG_DATA_HOME/hopnet/staging)
+        #[arg(long)]
+        staging_dir: Option<PathBuf>,
+    }
+
+    fn default_staging_dir() -> PathBuf {
+        let base = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share"))
+            })
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        base.join("hopnet").join("staging")
     }
 
     fn default_cache_dir() -> PathBuf {
@@ -130,14 +145,29 @@ mod linux {
             }
         };
 
-        let core = Arc::new(MountCore::new(transport.clone(), DEFAULT_TTL).with_cache(cache));
+        let staging = match hopnet_mount::staging::Staging::new(
+            args.staging_dir.clone().unwrap_or_else(default_staging_dir),
+        ) {
+            Ok(staging) => Arc::new(staging),
+            Err(e) => {
+                eprintln!("staging setup failed: {e}");
+                std::process::exit(1);
+            }
+        };
+
+        let core = Arc::new(
+            MountCore::new(transport.clone(), DEFAULT_TTL)
+                .with_cache(cache)
+                .with_staging(staging),
+        );
+
+        // Recover dirty content a previous run left staged (S7).
+        rt.block_on(core.recover());
+
         let fs = HopFs::new(core.clone(), rt.handle().clone());
 
         let mut config = fuser::Config::default();
-        config.mount_options = vec![
-            fuser::MountOption::RO,
-            fuser::MountOption::FSName("hopnet".to_string()),
-        ];
+        config.mount_options = vec![fuser::MountOption::FSName("hopnet".to_string())];
         let session = match fuser::spawn_mount(fs, &args.mountpoint, &config) {
             Ok(session) => session,
             Err(e) => {

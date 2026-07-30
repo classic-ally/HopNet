@@ -687,6 +687,307 @@ fn core_cache_bytes(core: &MountCore) -> u64 {
     core.cache_stats().unwrap_or(0)
 }
 
+// ---------- S7: writes — staging, copy-up, upload tiers, recovery ----------
+
+use crate::staging::Staging;
+use hopnet_common::CustomUUID;
+
+/// Core with cache AND staging attached (the full write-capable daemon
+/// core). Returns the staging dir path for on-disk assertions.
+fn setup_writable() -> (Arc<MountCore>, MockHandle, tempfile::TempDir) {
+    let (transport, handle) = MockTransport::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cache = Arc::new(
+        CacheManager::new(
+            CacheConfig {
+                root: dir.path().join("content"),
+                segment_size: 64,
+                policy: EvictionPolicy::MaxBytes { bytes: 1 << 20 },
+            },
+            transport.clone(),
+        )
+        .expect("cache"),
+    );
+    let staging = Arc::new(Staging::new(dir.path().join("staging")).expect("staging"));
+    let core = Arc::new(
+        MountCore::new(transport, DEFAULT_TTL)
+            .with_cache(cache)
+            .with_staging(staging),
+    );
+    (core, handle, dir)
+}
+
+fn upload_records(handle: &MockHandle) -> Vec<Vec<u8>> {
+    handle
+        .calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            CallRecord::UpdateContent { bytes, .. } => Some(bytes),
+            _ => None,
+        })
+        .collect()
+}
+
+fn staging_pairs(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir.join("staging"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("data"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+// Should: create a folder strictly — visible via lookup before mkdir
+// returns to the caller.
+#[tokio::test]
+async fn mkdir_is_strict_and_visible() {
+    let (core, _handle, _dir) = setup_writable();
+    let node = core.mkdir(ROOT_INO, "NewDir").await.unwrap();
+    assert_eq!(node.item.name, "NewDir");
+    let found = core.lookup(ROOT_INO, "NewDir").await.unwrap();
+    assert_eq!(found.ino, node.ino);
+
+    match core.mkdir(ROOT_INO, "NewDir").await {
+        Err(CoreError::AlreadyExists) => {}
+        other => panic!("expected AlreadyExists, got {other:?}"),
+    }
+}
+
+// Should: upload exactly the staged bytes on release and delete the
+// staging pair after success.
+// Impact: the write-back tier — bytes the kernel handed us MUST reach
+// the node byte-identical, and durable staging must not leak.
+#[tokio::test]
+async fn create_write_release_uploads_exact_bytes() {
+    let (core, handle, dir) = setup_writable();
+    let (node, fh) = core.create(ROOT_INO, "out.txt").await.unwrap();
+    assert_eq!(node.item.kind, ItemKind::File { size: 0 }, "created empty on node");
+
+    core.write(fh, 0, b"hello ").await.unwrap();
+    core.write(fh, 6, b"staged world").await.unwrap();
+    assert_eq!(staging_pairs(dir.path()), 1, "dirty session has a staging pair");
+
+    core.release(fh);
+    assert!(
+        wait_until(3000, || upload_records(&handle) == vec![b"hello staged world".to_vec()]).await,
+        "release must upload the exact staged bytes, got {:?}",
+        upload_records(&handle)
+    );
+    assert!(
+        wait_until(2000, || staging_pairs(dir.path()) == 0).await,
+        "staging pair must be deleted after successful upload"
+    );
+}
+
+// Should: preserve untouched regions when partially overwriting an
+// existing file (whole-file copy-up before the first write).
+// Impact: without copy-up, a 4-byte edit would upload a 4-byte file.
+#[tokio::test]
+async fn copy_up_preserves_untouched_bytes() {
+    let (core, handle, _dir) = setup_writable();
+    handle.add_file_with_content(ItemId::Root, "base.txt", b"0123456789");
+    let node = core.lookup(ROOT_INO, "base.txt").await.unwrap();
+
+    let fh = core.open_rw(node.ino, false).await.unwrap();
+    core.write(fh, 2, b"abcd").await.unwrap();
+    core.release(fh);
+
+    assert!(
+        wait_until(3000, || upload_records(&handle) == vec![b"01abcd6789".to_vec()]).await,
+        "copy-up must preserve untouched bytes, got {:?}",
+        upload_records(&handle)
+    );
+}
+
+// Should: serve reads from staging on a dirty handle and report the
+// staged size via the getattr overlay before any upload happens.
+#[tokio::test]
+async fn dirty_handles_read_their_own_writes() {
+    let (core, handle, _dir) = setup_writable();
+    handle.add_file_with_content(ItemId::Root, "doc.txt", b"original");
+    let node = core.lookup(ROOT_INO, "doc.txt").await.unwrap();
+
+    let fh = core.open_rw(node.ino, false).await.unwrap();
+    core.write(fh, 0, b"REWRITTEN LONGER").await.unwrap();
+
+    assert_eq!(core.read(fh, 0, 64).await.unwrap(), b"REWRITTEN LONGER");
+    assert_eq!(core.staged_size(node.ino).await, Some(16));
+    assert!(upload_records(&handle).is_empty(), "nothing uploaded yet");
+    core.release(fh);
+}
+
+// Should: make fsync block until the upload is recorded while release
+// alone returns immediately with the upload still parked.
+// Impact: the two-tier durability contract — only fsync promises
+// persistence; close must not freeze apps on big uploads.
+#[tokio::test(flavor = "multi_thread")]
+async fn fsync_blocks_release_does_not() {
+    let (core, handle, _dir) = setup_writable();
+    let (_, fh) = core.create(ROOT_INO, "tiered.txt").await.unwrap();
+    core.write(fh, 0, b"tier test").await.unwrap();
+
+    handle.hold_uploads();
+
+    // fsync with uploads held must NOT complete.
+    let fsync_core = core.clone();
+    let fsync_task = tokio::spawn(async move { fsync_core.fsync(fh).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!fsync_task.is_finished(), "fsync must block while upload is parked");
+
+    handle.release_uploads();
+    tokio::time::timeout(Duration::from_secs(5), fsync_task)
+        .await
+        .expect("fsync completes after release of the gate")
+        .unwrap()
+        .unwrap();
+    assert_eq!(upload_records(&handle).len(), 1);
+
+    // A clean release after fsync uploads nothing further.
+    core.release(fh);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(upload_records(&handle).len(), 1, "clean close re-uploads nothing");
+}
+
+// Should: stage a truncate and upload the shortened content.
+#[tokio::test]
+async fn truncate_stages_and_uploads() {
+    let (core, handle, _dir) = setup_writable();
+    handle.add_file_with_content(ItemId::Root, "trunc.txt", b"0123456789");
+    let node = core.lookup(ROOT_INO, "trunc.txt").await.unwrap();
+
+    let fh = core.open_rw(node.ino, false).await.unwrap();
+    core.truncate(fh, 4).await.unwrap();
+    core.release(fh);
+
+    assert!(
+        wait_until(3000, || upload_records(&handle) == vec![b"0123".to_vec()]).await,
+        "truncated content must upload, got {:?}",
+        upload_records(&handle)
+    );
+}
+
+// Should: rename strictly (old gone, new resolvable) and refuse rmdir of
+// a non-empty folder with NotEmpty.
+#[tokio::test]
+async fn rename_and_rmdir_semantics() {
+    let (core, handle, _dir) = setup_writable();
+    let folder = core.mkdir(ROOT_INO, "Dir").await.unwrap();
+    handle.add_file_with_content(ItemId::Root, "a.txt", b"x");
+    core.lookup(ROOT_INO, "a.txt").await.unwrap();
+
+    core.rename(ROOT_INO, "a.txt", folder.ino, "b.txt").await.unwrap();
+    match core.lookup(ROOT_INO, "a.txt").await {
+        Err(CoreError::NotFound) => {}
+        other => panic!("old name must be gone, got {other:?}"),
+    }
+    let moved = core.lookup(folder.ino, "b.txt").await.unwrap();
+    assert_eq!(moved.item.name, "b.txt");
+
+    match core.remove(ROOT_INO, "Dir", true).await {
+        Err(CoreError::NotEmpty) => {}
+        other => panic!("expected NotEmpty, got {other:?}"),
+    }
+    core.remove(folder.ino, "b.txt", false).await.unwrap();
+    core.remove(ROOT_INO, "Dir", true).await.unwrap();
+    match core.lookup(ROOT_INO, "Dir").await {
+        Err(CoreError::NotFound) => {}
+        other => panic!("deleted dir must be gone, got {other:?}"),
+    }
+}
+
+// Should: detect a remote modification that raced a local write session,
+// bump the conflict gauge, and proceed last-writer-wins.
+// Impact: silent clobbering would hide exactly the events issue #26's
+// rollback exists for; the gauge is the paper trail.
+#[tokio::test]
+async fn conflict_is_detected_and_lww_proceeds() {
+    let (core, handle, _dir) = setup_writable();
+    let (id, _) = handle.add_file_with_content(ItemId::Root, "shared.txt", b"base");
+    let node = core.lookup(ROOT_INO, "shared.txt").await.unwrap();
+
+    let fh = core.open_rw(node.ino, false).await.unwrap();
+    core.write(fh, 0, b"mine").await.unwrap();
+
+    // Remote writer lands first.
+    handle.update_file_content(&id, b"theirs");
+
+    core.fsync(fh).await.unwrap();
+    assert_eq!(core.conflicts(), 1, "conflict gauge must bump");
+    let uploads = upload_records(&handle);
+    assert_eq!(uploads.last().unwrap(), b"mine", "LWW: our content wins");
+    core.release(fh);
+}
+
+// Should: re-upload staging pairs left by a previous run, and park pairs
+// whose inode no longer exists under orphaned/ without deleting bytes.
+// Impact: the durability story for crash-before-upload — user data may
+// never be lost silently.
+#[tokio::test]
+async fn recovery_uploads_leftover_staging() {
+    let (core, handle, dir) = setup_writable();
+    let (id, _) = handle.add_file_with_content(ItemId::Root, "recover.txt", b"old");
+    let ItemId::Inode(inode_uuid) = id.clone() else {
+        panic!()
+    };
+
+    // Simulate a previous run: staging pair on disk, daemon died.
+    let staging = Staging::new(dir.path().join("staging")).unwrap();
+    let staged = staging
+        .begin(crate::staging::StagedMeta {
+            inode_id: inode_uuid,
+            base_height: 1,
+        })
+        .unwrap();
+    staged.write_at(0, b"recovered content".to_vec()).await.unwrap();
+
+    // A second pair whose inode is gone.
+    let ghost = staging
+        .begin(crate::staging::StagedMeta {
+            inode_id: CustomUUID::new(None),
+            base_height: 1,
+        })
+        .unwrap();
+    ghost.write_at(0, b"orphan bytes".to_vec()).await.unwrap();
+
+    core.recover().await;
+
+    let uploads = upload_records(&handle);
+    assert_eq!(uploads, vec![b"recovered content".to_vec()]);
+    assert_eq!(staging_pairs(dir.path()), 0, "recovered pair cleaned up");
+    let orphaned: Vec<_> = std::fs::read_dir(dir.path().join("staging/orphaned"))
+        .unwrap()
+        .flatten()
+        .collect();
+    assert_eq!(orphaned.len(), 2, "ghost pair parked, not deleted");
+}
+
+// Should: keep the staging pair when the upload fails and succeed on a
+// later retry.
+#[tokio::test(flavor = "multi_thread")]
+async fn upload_failure_retains_staging_then_retries() {
+    let (core, handle, dir) = setup_writable();
+    let (_, fh) = core.create(ROOT_INO, "flaky.txt").await.unwrap();
+    core.write(fh, 0, b"eventually").await.unwrap();
+
+    handle.set_upload_fail(true);
+    core.release(fh);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(staging_pairs(dir.path()), 1, "failed upload must retain staging");
+
+    handle.set_upload_fail(false);
+    // The background retry loop (1s backoff) picks it up.
+    assert!(
+        wait_until(5000, || upload_records(&handle)
+            .last()
+            .is_some_and(|b| b == b"eventually"))
+        .await,
+        "retry must eventually upload"
+    );
+    assert!(wait_until(2000, || staging_pairs(dir.path()) == 0).await);
+}
+
 // Should: emit exactly one lookup per component and one enumerate walk
 // per opendir for an `ls`-shaped sequence — nothing more.
 // Impact: the boundary-emission contract; accidental N+1 patterns against

@@ -351,8 +351,13 @@ implements that contract. Each slice is PR-sized and lands green.
       (504), never success. Follow-up noted: fileprovider/
       documentprovider mutations still use the legacy non-height wait;
       migrating them is a small, separate change.
-- [ ] S7 — writes: staging, copy-up, release/fsync tiers, conflict
-      logging, startup recovery
+- [x] S7 — writes: staging, copy-up, release/fsync tiers, conflict
+      logging, startup recovery (2026-07-31). The mount is read-write:
+      namespace ops strict-synchronous, content write-back through
+      durable staging. Also fixed an S4 latent deadlock the write
+      traffic exposed: kernel notify (inval_*) is a synchronous
+      /dev/fuse write that can wait on an in-flight FUSE request — it
+      now runs via spawn_blocking, never on async workers.
 - [ ] S8 — provisioning & lifecycle: secrets, login, endpoint file,
       systemd unit, statfs
 - [ ] S9 — passthrough quarantine module + measurement

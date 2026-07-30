@@ -23,6 +23,11 @@ pub enum CallRecord {
     Changes { since: i64 },
     Watch,
     ReadBlob { blob: CustomUUID, offset: u64, len: u64 },
+    CreateFolder { parent: ItemId, name: String },
+    CreateFile { parent: ItemId, name: String, bytes: Vec<u8> },
+    UpdateContent { id: CustomUUID, bytes: Vec<u8> },
+    Rename { id: CustomUUID, new_parent: Option<ItemId>, new_name: Option<String> },
+    Delete { id: CustomUUID, recursive: bool },
     Health,
 }
 
@@ -45,6 +50,11 @@ struct MockState {
     /// While true, read_blob calls park on the gate (deterministic
     /// single-flight tests).
     fetch_hold: tokio::sync::watch::Sender<bool>,
+    /// While true, content uploads (create_file/update_content) park —
+    /// the release-vs-fsync tier tests.
+    upload_hold: tokio::sync::watch::Sender<bool>,
+    /// When true, content uploads fail with Unavailable.
+    upload_fail: bool,
 }
 
 impl MockState {
@@ -84,6 +94,8 @@ impl MockTransport {
             watch_tx: None,
             blobs: HashMap::new(),
             fetch_hold: tokio::sync::watch::channel(false).0,
+            upload_hold: tokio::sync::watch::channel(false).0,
+            upload_fail: false,
         }));
         (
             Arc::new(MockTransport {
@@ -277,6 +289,30 @@ impl MockHandle {
             .send_replace(false);
     }
 
+    /// Park content uploads until release_uploads (fsync-tier tests).
+    pub fn hold_uploads(&self) {
+        let _ = self
+            .state
+            .lock()
+            .expect("mock poisoned")
+            .upload_hold
+            .send_replace(true);
+    }
+
+    pub fn release_uploads(&self) {
+        let _ = self
+            .state
+            .lock()
+            .expect("mock poisoned")
+            .upload_hold
+            .send_replace(false);
+    }
+
+    /// Make content uploads fail (retry/recovery tests).
+    pub fn set_upload_fail(&self, fail: bool) {
+        self.state.lock().expect("mock poisoned").upload_fail = fail;
+    }
+
     /// Page size for enumerate — small values force multi-page listings.
     pub fn set_page_size(&self, n: usize) {
         self.state.lock().expect("mock poisoned").page_size = n.max(1);
@@ -461,6 +497,185 @@ impl NodeTransport for MockTransport {
         })
     }
 
+    fn create_folder(
+        &self,
+        parent: ItemId,
+        name: String,
+    ) -> BoxFuture<'_, Result<crate::transport::Mutated, TransportError>> {
+        let state = self.state.clone();
+        Box::pin(async move {
+            {
+                let mut locked = state.lock().expect("mock poisoned");
+                locked.calls.push(CallRecord::CreateFolder {
+                    parent: parent.clone(),
+                    name: name.clone(),
+                });
+                if child_by_name(&locked, &parent, &name).is_some() {
+                    return Err(TransportError::Conflict);
+                }
+            }
+            let handle = MockHandle {
+                state: state.clone(),
+            };
+            let id = handle.add_folder(parent, &name);
+            let locked = state.lock().expect("mock poisoned");
+            Ok(crate::transport::Mutated {
+                item: locked.items.get(&id).cloned(),
+                height: locked.height,
+            })
+        })
+    }
+
+    fn create_file(
+        &self,
+        parent: ItemId,
+        name: String,
+        size: u64,
+        content: crate::transport::ByteSource,
+    ) -> BoxFuture<'_, Result<crate::transport::Mutated, TransportError>> {
+        let state = self.state.clone();
+        Box::pin(async move {
+            let bytes = collect_source(content).await?;
+            if bytes.len() as u64 != size {
+                return Err(TransportError::Protocol("size mismatch".to_string()));
+            }
+            {
+                let mut locked = state.lock().expect("mock poisoned");
+                locked.calls.push(CallRecord::CreateFile {
+                    parent: parent.clone(),
+                    name: name.clone(),
+                    bytes: bytes.clone(),
+                });
+                if child_by_name(&locked, &parent, &name).is_some() {
+                    return Err(TransportError::Conflict);
+                }
+            }
+            let handle = MockHandle {
+                state: state.clone(),
+            };
+            let (id, _blob) = handle.add_file_with_content(parent, &name, &bytes);
+            let locked = state.lock().expect("mock poisoned");
+            Ok(crate::transport::Mutated {
+                item: locked.items.get(&id).cloned(),
+                height: locked.height,
+            })
+        })
+    }
+
+    fn update_content(
+        &self,
+        id: CustomUUID,
+        size: u64,
+        content: crate::transport::ByteSource,
+    ) -> BoxFuture<'_, Result<crate::transport::Mutated, TransportError>> {
+        let state = self.state.clone();
+        Box::pin(async move {
+            let bytes = collect_source(content).await?;
+            if bytes.len() as u64 != size {
+                return Err(TransportError::Protocol("size mismatch".to_string()));
+            }
+            let mut gate = {
+                let mut locked = state.lock().expect("mock poisoned");
+                locked.calls.push(CallRecord::UpdateContent {
+                    id: id.clone(),
+                    bytes: bytes.clone(),
+                });
+                if locked.upload_fail {
+                    return Err(TransportError::Unavailable("scripted failure".to_string()));
+                }
+                locked.upload_hold.subscribe()
+            };
+            let _ = gate.wait_for(|held| !held).await;
+
+            let item_id = ItemId::Inode(id);
+            {
+                let locked = state.lock().expect("mock poisoned");
+                if !locked.items.contains_key(&item_id) {
+                    return Err(TransportError::Protocol("item gone".to_string()));
+                }
+            }
+            let handle = MockHandle {
+                state: state.clone(),
+            };
+            handle.update_file_content(&item_id, &bytes);
+            let locked = state.lock().expect("mock poisoned");
+            Ok(crate::transport::Mutated {
+                item: locked.items.get(&item_id).cloned(),
+                height: locked.height,
+            })
+        })
+    }
+
+    fn rename(
+        &self,
+        id: CustomUUID,
+        new_parent: Option<ItemId>,
+        new_name: Option<String>,
+    ) -> BoxFuture<'_, Result<crate::transport::Mutated, TransportError>> {
+        let state = self.state.clone();
+        Box::pin(async move {
+            let item_id = ItemId::Inode(id.clone());
+            let (target_parent, target_name) = {
+                let mut locked = state.lock().expect("mock poisoned");
+                locked.calls.push(CallRecord::Rename {
+                    id,
+                    new_parent: new_parent.clone(),
+                    new_name: new_name.clone(),
+                });
+                let Some(current) = locked.items.get(&item_id) else {
+                    return Err(TransportError::Protocol("item gone".to_string()));
+                };
+                let target_parent = new_parent.unwrap_or_else(|| current.parent.clone());
+                let target_name = new_name.unwrap_or_else(|| current.name.clone());
+                if let Some(existing) = child_by_name(&locked, &target_parent, &target_name) {
+                    if existing != item_id {
+                        return Err(TransportError::Conflict);
+                    }
+                }
+                (target_parent, target_name)
+            };
+            let handle = MockHandle {
+                state: state.clone(),
+            };
+            handle.rename(&item_id, target_parent, &target_name);
+            let locked = state.lock().expect("mock poisoned");
+            Ok(crate::transport::Mutated {
+                item: locked.items.get(&item_id).cloned(),
+                height: locked.height,
+            })
+        })
+    }
+
+    fn delete(
+        &self,
+        id: CustomUUID,
+        recursive: bool,
+    ) -> BoxFuture<'_, Result<crate::transport::Height, TransportError>> {
+        let state = self.state.clone();
+        Box::pin(async move {
+            let item_id = ItemId::Inode(id.clone());
+            {
+                let mut locked = state.lock().expect("mock poisoned");
+                locked.calls.push(CallRecord::Delete { id, recursive });
+                if !locked.items.contains_key(&item_id) {
+                    return Err(TransportError::Protocol("item gone".to_string()));
+                }
+                let has_children = locked
+                    .children
+                    .get(&item_id)
+                    .is_some_and(|c| !c.is_empty());
+                if has_children && !recursive {
+                    return Err(TransportError::Conflict);
+                }
+            }
+            let handle = MockHandle {
+                state: state.clone(),
+            };
+            handle.remove(&item_id);
+            Ok(state.lock().expect("mock poisoned").height)
+        })
+    }
+
     fn health(&self) -> BoxFuture<'_, Result<Health, TransportError>> {
         let state = self.state.clone();
         Box::pin(async move {
@@ -472,4 +687,25 @@ impl NodeTransport for MockTransport {
             Ok(Health::Ready)
         })
     }
+}
+
+fn child_by_name(state: &MockState, parent: &ItemId, name: &str) -> Option<ItemId> {
+    state
+        .children
+        .get(parent)?
+        .iter()
+        .find(|id| state.items.get(id).is_some_and(|i| i.name == name))
+        .cloned()
+}
+
+async fn collect_source(
+    mut source: crate::transport::ByteSource,
+) -> Result<Vec<u8>, TransportError> {
+    use tokio_stream::StreamExt;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = source.next().await {
+        let chunk = chunk.map_err(|e| TransportError::Protocol(e.to_string()))?;
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }

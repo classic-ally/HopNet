@@ -54,6 +54,7 @@ pub fn router<S: Clone + Send + Sync + 'static>(state: DriveState) -> Router<S> 
     let writes = Router::new()
         .route("/create", axum::routing::post(post_create))
         .route("/modify", axum::routing::patch(patch_modify))
+        .route("/content", axum::routing::put(put_content))
         .route("/delete", axum::routing::delete(delete_item))
         .layer(DefaultBodyLimit::max(5 * 1024 * 1024 * 1024))
         .layer(axum::middleware::from_fn_with_state(
@@ -613,6 +614,70 @@ pub async fn patch_modify(
         .map_err(|e| tx_error_status(&e))?;
 
     let item = read_back_item(&state, user_id, &request.id, &session.siv_key, &session.siv_nonce)?;
+    Ok(Json(MountMutationResponse {
+        item: Some(item),
+        height,
+    }))
+}
+
+/// PUT /integrations/mount/content — multipart content replacement,
+/// strict (RFC-018 S7). Fields: `inode_id` (text) then one `file_{size}`
+/// part. Whole-file rewrite (mints a new blob — issue #25 tracks deltas).
+pub async fn put_content(
+    State(state): State<DriveState>,
+    Extension(user_id): Extension<i32>,
+    mut multipart: Multipart,
+) -> Result<Json<MountMutationResponse>, StatusCode> {
+    let session = session_or_status(&state, user_id).await?;
+
+    let inode_id = match multipart
+        .next_field()
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?
+    {
+        Some(field) if field.name() == Some("inode_id") => {
+            let text = field.text().await.map_err(|_| StatusCode::BAD_REQUEST)?;
+            CustomUUID::from_str(&text).map_err(|_| StatusCode::BAD_REQUEST)?
+        }
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+
+    let field = multipart
+        .next_field()
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let field_name = field.name().ok_or(StatusCode::BAD_REQUEST)?.to_string();
+    let file_size: usize = field_name
+        .strip_prefix("file_")
+        .and_then(|s| s.parse().ok())
+        .ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+
+    let (_data_id, blob_op, incoming_share_updates) =
+        crate::http::files::prepare_content_update(&state, user_id, &inode_id, field, file_size)
+            .await?;
+
+    let payload = crate::envelopes::ModifyItemPayload {
+        user_id,
+        inode_id: inode_id.clone(),
+        new_encrypted_path: None,
+        content_update: Some(crate::envelopes::DriveContentUpdate { blob_op }),
+        incoming_share_updates,
+    };
+    let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let height = state
+        .txs
+        .submit_decided(TxSpec {
+            function: "modify_item",
+            payload: encoded,
+            signer: TxSigner::User(user_id),
+        })
+        .await
+        .map_err(|e| tx_error_status(&e))?;
+
+    let item = read_back_item(&state, user_id, &inode_id, &session.siv_key, &session.siv_nonce)?;
     Ok(Json(MountMutationResponse {
         item: Some(item),
         height,

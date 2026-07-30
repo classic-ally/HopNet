@@ -94,7 +94,10 @@ fn errno(e: &CoreError) -> Errno {
         CoreError::NotFound => Errno::ENOENT,
         CoreError::NotADirectory => Errno::ENOTDIR,
         CoreError::IsADirectory => Errno::EISDIR,
+        CoreError::AlreadyExists => Errno::EEXIST,
+        CoreError::NotEmpty => Errno::ENOTEMPTY,
         CoreError::StaleHandle => Errno::EBADF,
+        CoreError::Staging(_) => Errno::EIO,
         CoreError::Transport(_) => Errno::EIO,
         CoreError::Cache(_) => Errno::EIO,
     }
@@ -122,7 +125,14 @@ impl Filesystem for HopFs {
         let attr_of = self.attr_of();
         self.rt.spawn(async move {
             match core.getattr(ino.0).await {
-                Ok(node) => reply.attr(&KERNEL_TTL, &attr_of(&node)),
+                Ok(node) => {
+                    let mut attr = attr_of(&node);
+                    // Dirty write sessions overlay the freshest size.
+                    if let Some(staged) = core.staged_size(ino.0).await {
+                        attr.size = staged;
+                    }
+                    reply.attr(&KERNEL_TTL, &attr);
+                }
                 Err(e) => reply.error(errno(&e)),
             }
         });
@@ -182,11 +192,234 @@ impl Filesystem for HopFs {
         reply.ok();
     }
 
-    fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        let core = self.core.clone();
+        let write_intent = !matches!(flags.acc_mode(), fuser::OpenAccMode::O_RDONLY);
+        self.rt.spawn(async move {
+            // O_TRUNC never reaches open (kernel sends setattr(size=0)).
+            let result = if write_intent {
+                core.open_rw(ino.0, false).await
+            } else {
+                core.open(ino.0).await
+            };
+            match result {
+                Ok(fh) => reply.opened(FileHandle(fh), fuser::FopenFlags::empty()),
+                Err(e) => reply.error(errno(&e)),
+            }
+        });
+    }
+
+    fn create(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        _flags: i32,
+        reply: fuser::ReplyCreate,
+    ) {
+        let Some(name) = name.to_str().map(String::from) else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        let core = self.core.clone();
+        let attr_of = self.attr_of();
+        self.rt.spawn(async move {
+            match core.create(parent.0, &name).await {
+                Ok((node, fh)) => reply.created(
+                    &KERNEL_TTL,
+                    &attr_of(&node),
+                    Generation(0),
+                    FileHandle(fh),
+                    fuser::FopenFlags::empty(),
+                ),
+                Err(e) => reply.error(errno(&e)),
+            }
+        });
+    }
+
+    fn mkdir(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
+        let Some(name) = name.to_str().map(String::from) else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        let core = self.core.clone();
+        let attr_of = self.attr_of();
+        self.rt.spawn(async move {
+            match core.mkdir(parent.0, &name).await {
+                Ok(node) => reply.entry(&KERNEL_TTL, &attr_of(&node), Generation(0)),
+                Err(e) => reply.error(errno(&e)),
+            }
+        });
+    }
+
+    fn write(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        data: &[u8],
+        _write_flags: fuser::WriteFlags,
+        _flags: OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
+        reply: fuser::ReplyWrite,
+    ) {
+        let core = self.core.clone();
+        let data = data.to_vec();
+        self.rt.spawn(async move {
+            match core.write(fh.0, offset, &data).await {
+                Ok(written) => reply.written(written),
+                Err(e) => reply.error(errno(&e)),
+            }
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn setattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<fuser::TimeOrNow>,
+        _mtime: Option<fuser::TimeOrNow>,
+        _ctime: Option<std::time::SystemTime>,
+        fh: Option<FileHandle>,
+        _crtime: Option<std::time::SystemTime>,
+        _chgtime: Option<std::time::SystemTime>,
+        _bkuptime: Option<std::time::SystemTime>,
+        _flags: Option<fuser::BsdFileFlags>,
+        reply: ReplyAttr,
+    ) {
+        let core = self.core.clone();
+        let attr_of = self.attr_of();
+        self.rt.spawn(async move {
+            // Size is the only attribute we persist; mode/uid/times are
+            // synthesized (accepted and ignored — keeps cp/rsync happy).
+            if let Some(size) = size {
+                let result = match fh {
+                    Some(fh) => core.truncate(fh.0, size).await,
+                    None => match core.open_rw(ino.0, size == 0).await {
+                        // Truncate without an open handle: synthesize a
+                        // session; release uploads in the background.
+                        Ok(tmp_fh) => {
+                            let r = core.truncate(tmp_fh, size).await;
+                            core.release(tmp_fh);
+                            r
+                        }
+                        Err(e) => Err(e),
+                    },
+                };
+                if let Err(e) = result {
+                    reply.error(errno(&e));
+                    return;
+                }
+            }
+            match core.getattr(ino.0).await {
+                Ok(node) => {
+                    let mut attr = attr_of(&node);
+                    if let Some(staged) = core.staged_size(ino.0).await {
+                        attr.size = staged;
+                    }
+                    reply.attr(&KERNEL_TTL, &attr);
+                }
+                Err(e) => reply.error(errno(&e)),
+            }
+        });
+    }
+
+    fn fsync(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
         let core = self.core.clone();
         self.rt.spawn(async move {
-            match core.open(ino.0).await {
-                Ok(fh) => reply.opened(FileHandle(fh), fuser::FopenFlags::empty()),
+            // The strict tier: returns only after decided upload.
+            match core.fsync(fh.0).await {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(errno(&e)),
+            }
+        });
+    }
+
+    fn flush(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _lock_owner: fuser::LockOwner,
+        reply: ReplyEmpty,
+    ) {
+        // close(2) semantics: durability is fsync's job; release uploads
+        // in the background off durable staging.
+        reply.ok();
+    }
+
+    fn rename(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        _flags: fuser::RenameFlags,
+        reply: ReplyEmpty,
+    ) {
+        let (Some(name), Some(newname)) = (
+            name.to_str().map(String::from),
+            newname.to_str().map(String::from),
+        ) else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        let core = self.core.clone();
+        self.rt.spawn(async move {
+            match core.rename(parent.0, &name, newparent.0, &newname).await {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(errno(&e)),
+            }
+        });
+    }
+
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let Some(name) = name.to_str().map(String::from) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let core = self.core.clone();
+        self.rt.spawn(async move {
+            match core.remove(parent.0, &name, false).await {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(errno(&e)),
+            }
+        });
+    }
+
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let Some(name) = name.to_str().map(String::from) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let core = self.core.clone();
+        self.rt.spawn(async move {
+            match core.remove(parent.0, &name, true).await {
+                Ok(()) => reply.ok(),
                 Err(e) => reply.error(errno(&e)),
             }
         });
@@ -224,8 +457,12 @@ impl Filesystem for HopFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        self.core.release(fh.0);
-        reply.ok();
+        // Must run on the runtime: release spawns the background upload.
+        let core = self.core.clone();
+        self.rt.spawn(async move {
+            core.release(fh.0);
+            reply.ok();
+        });
     }
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {

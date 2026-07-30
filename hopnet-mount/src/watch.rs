@@ -66,13 +66,25 @@ impl Watcher {
     pub async fn sync(&mut self) -> Result<(), crate::transport::TransportError> {
         let changes = self.transport.changes(self.anchor).await?;
         let invalidations = self.core.apply_changes(&changes);
-        for invalidation in &invalidations {
-            match invalidation {
-                Invalidation::Entry { parent_ino, name } => {
-                    self.invalidator.inval_entry(*parent_ino, name)
+        if !invalidations.is_empty() {
+            // Kernel notifications are SYNCHRONOUS /dev/fuse writes and can
+            // block until the kernel processes them — which may require an
+            // in-flight FUSE request (whose reply needs this runtime) to
+            // finish first. Off the async workers, always: blocking a
+            // worker here deadlocks single-threaded runtimes outright and
+            // steals workers on multi-threaded ones.
+            let invalidator = self.invalidator.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                for invalidation in &invalidations {
+                    match invalidation {
+                        Invalidation::Entry { parent_ino, name } => {
+                            invalidator.inval_entry(*parent_ino, name)
+                        }
+                        Invalidation::Inode { ino } => invalidator.inval_inode(*ino),
+                    }
                 }
-                Invalidation::Inode { ino } => self.invalidator.inval_inode(*ino),
-            }
+            })
+            .await;
         }
         self.anchor = changes.height;
         Ok(())

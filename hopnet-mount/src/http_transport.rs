@@ -14,8 +14,8 @@ use hopnet_common::fileprovider::{HealthResponse, HealthStatus};
 use hopnet_common::mount::{MountChangesResponse, MountEnumerateResponse, MountItem};
 
 use crate::transport::{
-    BoxFuture, Changes, Cursor, Health, Height, Item, ItemId, ItemKind, NodeTransport, Page,
-    TransportError, WatchEvent, WatchStream,
+    BoxFuture, Changes, Cursor, Health, Height, Item, ItemId, ItemKind, Mutated, NodeTransport,
+    Page, TransportError, WatchEvent, WatchStream,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -23,6 +23,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct HttpTransport {
     client: reqwest::Client,
+    /// Connect-timeout only — content uploads and consensus waits outlive
+    /// any fixed request timeout (a 100 GB upload, a 120 s decide).
+    upload_client: reqwest::Client,
     base: String,
     token: String,
 }
@@ -34,8 +37,13 @@ impl HttpTransport {
             .timeout(REQUEST_TIMEOUT)
             .build()
             .map_err(|e| TransportError::Protocol(e.to_string()))?;
+        let upload_client = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()
+            .map_err(|e| TransportError::Protocol(e.to_string()))?;
         Ok(HttpTransport {
             client,
+            upload_client,
             base: base_url.trim_end_matches('/').to_string(),
             token: token.to_string(),
         })
@@ -127,6 +135,39 @@ pub(crate) fn item_from_wire(wire: MountItem) -> Item {
         height: wire.height.map(i64::from).unwrap_or(0),
         blob: wire.blob_id,
     }
+}
+
+/// Shared mutation-response handling: strict-route status mapping, then
+/// MountMutationResponse → Mutated.
+async fn parse_mutation(response: reqwest::Response) -> Result<Mutated, TransportError> {
+    let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED
+        || status == reqwest::StatusCode::PRECONDITION_REQUIRED
+    {
+        return Err(TransportError::Unauthorized);
+    }
+    if status == reqwest::StatusCode::CONFLICT {
+        return Err(TransportError::Conflict);
+    }
+    if status == reqwest::StatusCode::GATEWAY_TIMEOUT {
+        return Err(TransportError::OutcomeUnknown);
+    }
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Err(TransportError::Protocol("item gone".to_string()));
+    }
+    if !status.is_success() {
+        return Err(TransportError::Protocol(format!(
+            "unexpected status {status}"
+        )));
+    }
+    let wire = response
+        .json::<hopnet_common::mount::MountMutationResponse>()
+        .await
+        .map_err(|e| TransportError::Protocol(e.to_string()))?;
+    Ok(Mutated {
+        item: wire.item.map(item_from_wire),
+        height: Height::from(wire.height),
+    })
 }
 
 async fn parse_json<T: serde::de::DeserializeOwned>(
@@ -312,6 +353,135 @@ impl NodeTransport for HttpTransport {
                 return Ok(body.to_vec());
             }
             unreachable!("loop returns on second attempt")
+        })
+    }
+
+    fn create_folder(
+        &self,
+        parent: ItemId,
+        name: String,
+    ) -> BoxFuture<'_, Result<Mutated, TransportError>> {
+        Box::pin(async move {
+            let mut form = reqwest::multipart::Form::new().text("folder_name", name);
+            if let ItemId::Inode(uuid) = &parent {
+                form = form.text("parent_id", uuid.to_string());
+            }
+            let response = self
+                .upload_client
+                .post(self.url("create"))
+                .bearer_auth(&self.token)
+                .multipart(form)
+                .send()
+                .await
+                .map_err(map_reqwest_err)?;
+            parse_mutation(response).await
+        })
+    }
+
+    fn create_file(
+        &self,
+        parent: ItemId,
+        name: String,
+        size: u64,
+        content: crate::transport::ByteSource,
+    ) -> BoxFuture<'_, Result<Mutated, TransportError>> {
+        Box::pin(async move {
+            let part = reqwest::multipart::Part::stream_with_length(
+                reqwest::Body::wrap_stream(content),
+                size,
+            )
+            .file_name(name);
+            let mut form = reqwest::multipart::Form::new();
+            if let ItemId::Inode(uuid) = &parent {
+                form = form.text("parent_id", uuid.to_string());
+            }
+            let form = form.part(format!("file_{size}"), part);
+            let response = self
+                .upload_client
+                .post(self.url("create"))
+                .bearer_auth(&self.token)
+                .multipart(form)
+                .send()
+                .await
+                .map_err(map_reqwest_err)?;
+            parse_mutation(response).await
+        })
+    }
+
+    fn update_content(
+        &self,
+        id: CustomUUID,
+        size: u64,
+        content: crate::transport::ByteSource,
+    ) -> BoxFuture<'_, Result<Mutated, TransportError>> {
+        Box::pin(async move {
+            let part = reqwest::multipart::Part::stream_with_length(
+                reqwest::Body::wrap_stream(content),
+                size,
+            )
+            .file_name("content");
+            let form = reqwest::multipart::Form::new()
+                .text("inode_id", id.to_string())
+                .part(format!("file_{size}"), part);
+            let response = self
+                .upload_client
+                .put(self.url("content"))
+                .bearer_auth(&self.token)
+                .multipart(form)
+                .send()
+                .await
+                .map_err(map_reqwest_err)?;
+            parse_mutation(response).await
+        })
+    }
+
+    fn rename(
+        &self,
+        id: CustomUUID,
+        new_parent: Option<ItemId>,
+        new_name: Option<String>,
+    ) -> BoxFuture<'_, Result<Mutated, TransportError>> {
+        Box::pin(async move {
+            let (new_parent_id, new_parent_root) = match new_parent {
+                Some(ItemId::Inode(uuid)) => (Some(uuid), false),
+                Some(ItemId::Root) => (None, true),
+                None => (None, false),
+            };
+            let body = serde_json::json!({
+                "id": id,
+                "new_parent_id": new_parent_id,
+                "new_parent_root": new_parent_root,
+                "new_name": new_name,
+            });
+            // Mutations wait on consensus (bounded by the node's 120 s);
+            // use the upload client so 30 s doesn't cut the wait short.
+            let response = self
+                .upload_client
+                .patch(self.url("modify"))
+                .bearer_auth(&self.token)
+                .json(&body)
+                .send()
+                .await
+                .map_err(map_reqwest_err)?;
+            parse_mutation(response).await
+        })
+    }
+
+    fn delete(
+        &self,
+        id: CustomUUID,
+        recursive: bool,
+    ) -> BoxFuture<'_, Result<Height, TransportError>> {
+        Box::pin(async move {
+            let response = self
+                .upload_client
+                .delete(self.url("delete"))
+                .bearer_auth(&self.token)
+                .json(&serde_json::json!({ "id": id, "recursive": recursive }))
+                .send()
+                .await
+                .map_err(map_reqwest_err)?;
+            parse_mutation(response).await.map(|m| m.height)
         })
     }
 

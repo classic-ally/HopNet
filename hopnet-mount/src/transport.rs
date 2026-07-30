@@ -74,6 +74,12 @@ pub enum TransportError {
     Protocol(String),
     /// Credentials rejected.
     Unauthorized,
+    /// Mutation conflicts with current state (name taken, folder not
+    /// empty) — maps to EEXIST/ENOTEMPTY by op context.
+    Conflict,
+    /// Consensus wait timed out — outcome UNKNOWN; callers must not
+    /// assume either applied or not.
+    OutcomeUnknown,
 }
 
 impl std::fmt::Display for TransportError {
@@ -82,6 +88,8 @@ impl std::fmt::Display for TransportError {
             TransportError::Unavailable(why) => write!(f, "node unavailable: {why}"),
             TransportError::Protocol(why) => write!(f, "protocol error: {why}"),
             TransportError::Unauthorized => write!(f, "credentials rejected"),
+            TransportError::Conflict => write!(f, "conflicts with current state"),
+            TransportError::OutcomeUnknown => write!(f, "consensus wait timed out"),
         }
     }
 }
@@ -110,6 +118,17 @@ pub enum WatchEvent {
 
 /// Stream of watch events. Stream end = the connection dropped.
 pub type WatchStream = Pin<Box<dyn tokio_stream::Stream<Item = WatchEvent> + Send>>;
+
+/// Streaming upload source (staged files never buffer whole in memory).
+pub type ByteSource =
+    Pin<Box<dyn tokio_stream::Stream<Item = std::io::Result<bytes::Bytes>> + Send>>;
+
+/// Result of a strict mutation: fresh post-apply state + read anchor.
+#[derive(Debug, Clone)]
+pub struct Mutated {
+    pub item: Option<Item>,
+    pub height: Height,
+}
 
 pub trait NodeTransport: Send + Sync {
     /// Resolve one child of `parent` by name. `Ok(None)` = no such child.
@@ -149,6 +168,47 @@ pub trait NodeTransport: Send + Sync {
         offset: u64,
         len: u64,
     ) -> BoxFuture<'_, Result<Vec<u8>, TransportError>>;
+
+    // ---- mutations (RFC-018 S7): strict — resolve only after the
+    // transaction is decided AND applied on the node; `Mutated.height`
+    // is the read anchor, `item` the fresh post-apply state. ----
+
+    fn create_folder(
+        &self,
+        parent: ItemId,
+        name: String,
+    ) -> BoxFuture<'_, Result<Mutated, TransportError>>;
+
+    fn create_file(
+        &self,
+        parent: ItemId,
+        name: String,
+        size: u64,
+        content: ByteSource,
+    ) -> BoxFuture<'_, Result<Mutated, TransportError>>;
+
+    /// Whole-file content replacement (mints a new blob node-side).
+    fn update_content(
+        &self,
+        id: CustomUUID,
+        size: u64,
+        content: ByteSource,
+    ) -> BoxFuture<'_, Result<Mutated, TransportError>>;
+
+    /// Rename and/or move. `new_parent: None` = unchanged parent;
+    /// `new_name: None` = unchanged name.
+    fn rename(
+        &self,
+        id: CustomUUID,
+        new_parent: Option<ItemId>,
+        new_name: Option<String>,
+    ) -> BoxFuture<'_, Result<Mutated, TransportError>>;
+
+    fn delete(
+        &self,
+        id: CustomUUID,
+        recursive: bool,
+    ) -> BoxFuture<'_, Result<Height, TransportError>>;
 
     /// Node readiness — distinguishes "not running" from "not set up".
     fn health(&self) -> BoxFuture<'_, Result<Health, TransportError>>;

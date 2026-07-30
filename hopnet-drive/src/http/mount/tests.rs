@@ -722,6 +722,55 @@ async fn delete_respects_recursive_and_feeds_changes() {
     );
 }
 
+// Should: replace file content strictly — new size and a NEW blob id
+// visible in the response and on immediate re-read (whole-blob rewrite).
+#[tokio::test]
+async fn content_put_replaces_blob_strictly() {
+    let env = setup_env_apply(vec![]);
+    let app = env.app();
+
+    let v1 = b"first version";
+    let (_, created) = send_multipart::<MountMutationResponse>(
+        &app,
+        "/create",
+        &[(&format!("file_{}", v1.len()), Some("doc.txt"), v1.as_slice())],
+    )
+    .await;
+    let created = created.unwrap().item.unwrap();
+    let file_id = created.id.clone().unwrap();
+    let old_blob = created.blob_id.clone().unwrap();
+
+    let v2 = b"second version, longer than the first";
+    let (status, updated) = {
+        let (content_type, body) = multipart_body(&[
+            ("inode_id", None, file_id.to_string().as_bytes()),
+            (&format!("file_{}", v2.len()), Some("doc.txt"), v2.as_slice()),
+        ]);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/content")
+                    .header(header::CONTENT_TYPE, content_type)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        (status, serde_json::from_slice::<MountMutationResponse>(&bytes).ok())
+    };
+    assert_eq!(status, StatusCode::OK);
+    let updated = updated.unwrap().item.unwrap();
+    assert_eq!(updated.size, Some(v2.len() as u64));
+    assert_ne!(updated.blob_id.as_ref().unwrap(), &old_blob, "modify mints a new blob");
+
+    let (_, fresh) = get_json::<MountItem>(&app, &format!("/item?id={file_id}")).await;
+    assert_eq!(fresh.unwrap().size, Some(v2.len() as u64), "immediately visible");
+}
+
 // Should: map a consensus wait timeout to 504 — outcome unknown, never
 // claimed as success.
 // Impact: a 2xx on timeout would report durability that may not exist.
