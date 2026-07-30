@@ -251,9 +251,12 @@ mod tests {
         )
         .unwrap();
         for n in 1..=3 {
+            // nodes.pubkey is UNIQUE — each fixture node needs its own key.
+            let node_key = ed25519_dalek::SigningKey::from_bytes(&[n as u8; 32]);
+            let node_pubkey = crate::db::PubKey(node_key.verifying_key());
             conn.execute(
                 "INSERT INTO nodes (node_id, name, owner, pubkey) VALUES (?, ?, 1, ?)",
-                params![n, format!("n{n}"), &pubkey],
+                params![n, format!("n{n}"), &node_pubkey],
             )
             .unwrap();
         }
