@@ -305,8 +305,8 @@ Boundary authored from the FUSE seat: S1 shapes the transport trait by
 writing real FUSE callbacks against a mock; the node surface then
 implements that contract. Each slice is PR-sized and lands green.
 
-- [ ] S1 — crate + transport trait + mock + fuser namespace skeleton;
-      async bridge decided
+- [x] S1 — crate + transport trait + mock + fuser namespace skeleton;
+      async bridge decided (2026-07-30)
 - [ ] S2 — node read surface: enumerate/lookup/item/blob download/
       changes/health
 - [ ] S3 — HTTP transport joins the halves; real tree browses read-only
