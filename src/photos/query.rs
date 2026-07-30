@@ -175,6 +175,31 @@ pub fn read_resource_grant(
     })
 }
 
+/// Committed-state probe for the thin-client confirm-then-retry contract
+/// (publisher idempotency: after an ambiguous submit failure the client MUST
+/// query committed state before re-submitting the same photo_id). Reads the
+/// CONSENSUS `photos` table deliberately — the per-user sidecar requires
+/// opt-in enablement (428 on the read routes), which a headless daemon must
+/// not depend on. Returns `Some(uploaded_by)` only when the row exists AND
+/// belongs to `user_id`; anything else is None (no existence leak).
+pub fn read_photo_committed(
+    pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    user_id: i32,
+    photo_id: &hopnet_common::CustomUUID,
+) -> Result<Option<i32>, String> {
+    use rusqlite::OptionalExtension;
+    let conn = pool.get().map_err(|e| format!("pool: {e}"))?;
+    let uploaded_by: Option<i32> = conn
+        .query_row(
+            "SELECT uploaded_by FROM photos WHERE id = ?",
+            rusqlite::params![photo_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("photo lookup: {e:?}"))?;
+    Ok(uploaded_by.filter(|&owner| owner == user_id))
+}
+
 fn pubkey_from_blob(blob: Vec<u8>) -> Result<hopnet_storage::x25519_dalek::PublicKey, String> {
     let arr: [u8; 32] = blob
         .try_into()
@@ -405,5 +430,58 @@ mod tests {
         .err()
         .expect("unknown photo must miss");
         assert!(matches!(err, ResourceGrantError::NotFound));
+    }
+
+    fn insert_photo_row(
+        pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+        photo_id: &hopnet_common::CustomUUID,
+        uploaded_by: i32,
+    ) {
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO photos (id, library_id, uploaded_by, encrypted_metadata, \
+                 metadata_nonce) VALUES (?, NULL, ?, ?, ?)",
+                rusqlite::params![photo_id, uploaded_by, vec![0u8; 4], vec![0u8; 12]],
+            )
+            .unwrap();
+    }
+
+    // Should: report the committed photo's owner when the caller uploaded it.
+    #[test]
+    fn committed_probe_reports_own_photo() {
+        let pool = test_pool();
+        let pubkey = hopnet_storage::x25519_dalek::PublicKey::from(
+            &hopnet_storage::x25519_dalek::StaticSecret::from([0x11; 32]),
+        );
+        insert_user(&pool, 7, &pubkey);
+        let photo_id = hopnet_common::CustomUUID::new(None);
+        insert_photo_row(&pool, &photo_id, 7);
+
+        assert_eq!(read_photo_committed(&pool, 7, &photo_id), Ok(Some(7)));
+    }
+
+    // Impact: the probe's None is the daemon's "safe to retry the same
+    // photo_id" signal in the confirm-then-retry contract — reporting another
+    // user's photo would both leak existence and wrongly mark a foreign photo
+    // as the caller's own published work.
+    // Should not: report a photo uploaded by a different user, or a photo
+    // that never committed.
+    #[test]
+    fn committed_probe_hides_foreign_and_absent_photos() {
+        let pool = test_pool();
+        let pubkey = hopnet_storage::x25519_dalek::PublicKey::from(
+            &hopnet_storage::x25519_dalek::StaticSecret::from([0x22; 32]),
+        );
+        insert_user(&pool, 7, &pubkey);
+        insert_user(&pool, 8, &pubkey);
+        let photo_id = hopnet_common::CustomUUID::new(None);
+        insert_photo_row(&pool, &photo_id, 8);
+
+        assert_eq!(read_photo_committed(&pool, 7, &photo_id), Ok(None));
+        assert_eq!(
+            read_photo_committed(&pool, 7, &hopnet_common::CustomUUID::new(None)),
+            Ok(None)
+        );
     }
 }

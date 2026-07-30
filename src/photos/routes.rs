@@ -39,6 +39,27 @@ pub fn router<S: Clone + Send + Sync + 'static>(app_state: AppState) -> Router<S
     reads_and_tx.merge(ingest).with_state(app_state)
 }
 
+/// Blob uploads carry one resource per request; drive-sized ceiling
+/// (hopnet-drive/src/http/files.rs) so multi-GB video originals stream through.
+const DATA_BLOCK_BODY_LIMIT: usize = 5000 * 1_000_000;
+
+/// Thin-client dispatch surface (photos.md §Upload Flow): the byte-transport
+/// half of `PhotoDispatch` for clients that run the publisher locally and
+/// reach the node over HTTP (the macOS photo-ingress daemon today). Mounted
+/// at `/api/photos/client/*` under DEVICE-TOKEN auth (RFC-012) — the
+/// middleware's bootstrapped session is what lets `submit_transaction` sign
+/// and derives `uploaded_by`; callers never supply an identity.
+pub fn device_router<S: Clone + Send + Sync + 'static>(app_state: AppState) -> Router<S> {
+    let small = Router::new()
+        .route("/membership", get(get_client_membership))
+        .route("/transaction", post(post_client_transaction))
+        .route("/committed/{photo_id}", get(get_client_committed));
+    let upload = Router::new()
+        .route("/data-block/{blob_id}", post(post_client_data_block))
+        .layer(axum::extract::DefaultBodyLimit::max(DATA_BLOCK_BODY_LIMIT));
+    small.merge(upload).with_state(app_state)
+}
+
 #[derive(Serialize)]
 struct SidecarStatus {
     enabled: bool,
@@ -319,10 +340,12 @@ struct TransactionBody {
     payload: Vec<u8>,
 }
 
-async fn post_transaction(
-    State(state): State<AppState>,
-    Extension(uid): Extension<i32>,
-    Json(body): Json<TransactionBody>,
+/// Shared by the JWT route and the device-token thin-client route — the
+/// contract (USER_TX_FUNCTIONS gate, block-until-decided submit) is identical.
+async fn submit_photos_transaction(
+    state: AppState,
+    uid: i32,
+    body: TransactionBody,
 ) -> Result<StatusCode, (StatusCode, String)> {
     if !hopnet_photos::handlers::USER_TX_FUNCTIONS.contains(&body.tx_type.as_str()) {
         return Err((
@@ -335,6 +358,14 @@ async fn post_transaction(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(StatusCode::OK)
+}
+
+async fn post_transaction(
+    State(state): State<AppState>,
+    Extension(uid): Extension<i32>,
+    Json(body): Json<TransactionBody>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    submit_photos_transaction(state, uid, body).await
 }
 
 #[derive(Deserialize)]
@@ -354,6 +385,245 @@ async fn get_sync_feed(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .map(Json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+// ---------------------------------------------------------------------------
+// Thin-client dispatch handlers (`/api/photos/client/*`, device-token auth).
+// Wire mirrors of the PhotoDispatch upload pipe for clients that run the
+// publisher locally (the macOS photo-ingress daemon) and reach the node over
+// HTTP with an RFC-012 device token.
+// ---------------------------------------------------------------------------
+
+const BLOB_KEY_HEADER: &str = "x-hopnet-blob-key";
+const FILE_SIZE_HEADER: &str = "x-hopnet-file-size";
+
+fn parse_blob_key_header(
+    headers: &axum::http::HeaderMap,
+) -> Result<chacha20poly1305::Key, String> {
+    let raw = headers
+        .get(BLOB_KEY_HEADER)
+        .ok_or_else(|| format!("missing {BLOB_KEY_HEADER} header"))?
+        .to_str()
+        .map_err(|_| format!("{BLOB_KEY_HEADER} is not valid ASCII"))?;
+    let bytes = hex::decode(raw).map_err(|_| format!("{BLOB_KEY_HEADER} is not valid hex"))?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| format!("{BLOB_KEY_HEADER} must be 32 bytes (64 hex chars)"))?;
+    Ok(chacha20poly1305::Key::from(arr))
+}
+
+/// The declared plaintext length travels as a header because streaming
+/// clients send chunked transfer encoding (no Content-Length).
+fn parse_file_size_header(headers: &axum::http::HeaderMap) -> Result<usize, String> {
+    let size: u64 = headers
+        .get(FILE_SIZE_HEADER)
+        .ok_or_else(|| format!("missing {FILE_SIZE_HEADER} header"))?
+        .to_str()
+        .map_err(|_| format!("{FILE_SIZE_HEADER} is not valid ASCII"))?
+        .parse()
+        .map_err(|_| format!("{FILE_SIZE_HEADER} is not a decimal byte count"))?;
+    if size == 0 {
+        return Err(format!("{FILE_SIZE_HEADER} must be > 0"));
+    }
+    usize::try_from(size).map_err(|_| format!("{FILE_SIZE_HEADER} exceeds platform limits"))
+}
+
+/// Typed payload inside the io::Error `ExactBody` raises, recovered by
+/// downcast after the put fails (same pattern as the publisher's ExactLen).
+#[derive(Debug)]
+struct BodyLenError {
+    expected: u64,
+    /// `Some(actual)` = body ended early; `None` = body exceeds the header.
+    actual: Option<u64>,
+}
+
+impl std::fmt::Display for BodyLenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.actual {
+            Some(actual) => write!(f, "body ended at {actual} of {} bytes", self.expected),
+            None => write!(f, "body exceeds declared {} bytes", self.expected),
+        }
+    }
+}
+
+impl std::error::Error for BodyLenError {}
+
+/// Enforces the declared byte length on the streamed body INLINE. api::put
+/// reads to EOF and never cross-checks `file_size` — without this wrapper a
+/// network-truncated body would be encoded short and returned as a valid-
+/// looking data block.
+struct ExactBody<R> {
+    inner: R,
+    expected: u64,
+    consumed: u64,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for ExactBody<R> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+
+        if this.consumed == this.expected {
+            // Probe one extra read: clean EOF passes, any byte is too long.
+            let mut probe_storage = [0u8; 1];
+            let mut probe = tokio::io::ReadBuf::new(&mut probe_storage);
+            std::task::ready!(std::pin::Pin::new(&mut this.inner).poll_read(cx, &mut probe))?;
+            return std::task::Poll::Ready(if probe.filled().is_empty() {
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    BodyLenError {
+                        expected: this.expected,
+                        actual: None,
+                    },
+                ))
+            });
+        }
+
+        let remaining = usize::try_from(this.expected - this.consumed)
+            .unwrap_or(usize::MAX)
+            .min(buf.remaining());
+        let mut sub = buf.take(remaining);
+        std::task::ready!(std::pin::Pin::new(&mut this.inner).poll_read(cx, &mut sub))?;
+        let n = sub.filled().len();
+        if n == 0 {
+            return std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                BodyLenError {
+                    expected: this.expected,
+                    actual: Some(this.consumed),
+                },
+            )));
+        }
+        // SAFETY: `sub` borrows `buf`'s unfilled region, so its first `n`
+        // bytes are now initialized (standard tokio `Take` pattern).
+        unsafe { buf.assume_init(n) };
+        buf.advance(n);
+        this.consumed += n as u64;
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// Upload failures split three ways: a length mismatch our wrapper caught is
+/// the client's declaration being wrong (422), any other read error is the
+/// client's stream breaking (400), and everything else is the substrate (500).
+fn map_upload_error(e: hopnet_photos_core::PhotosCoreError) -> (StatusCode, String) {
+    if let hopnet_photos_core::PhotosCoreError::Storage(hopnet_storage::StorageError::Read(
+        ref io_err,
+    )) = e
+    {
+        if let Some(b) = io_err.get_ref().and_then(|b| b.downcast_ref::<BodyLenError>()) {
+            return (StatusCode::UNPROCESSABLE_ENTITY, b.to_string());
+        }
+        return (StatusCode::BAD_REQUEST, format!("body read: {io_err}"));
+    }
+    (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+}
+
+#[derive(Deserialize)]
+struct MembershipQuery {
+    library_id: Option<hopnet_common::CustomUUID>,
+}
+
+/// Recipients of a publish; `uploaded_by` derives from the authenticated
+/// device's user, never from the caller.
+async fn get_client_membership(
+    State(state): State<AppState>,
+    Extension(uid): Extension<i32>,
+    axum::extract::Query(q): axum::extract::Query<MembershipQuery>,
+) -> Result<Json<hopnet_photos_core::dispatch::LibraryMembership>, (StatusCode, String)> {
+    let sub = Submitter::new(std::sync::Arc::new(state), uid);
+    sub.fetch_library_members(q.library_id)
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// Streaming wire mirror of `PhotoDispatch::upload_data_block`: raw
+/// octet-stream body of exactly `X-Hopnet-File-Size` plaintext bytes, plus
+/// the client-minted per-blob key in `X-Hopnet-Blob-Key` (64 hex chars).
+/// Encryption is node-side by design (photos.md §Upload Flow): key custody
+/// stays client-side while the encrypt/RS pipeline stays in one impl.
+///
+/// The blob_id is client-minted. A colliding or replayed id only produces
+/// orphaned fragments (the substrate's orphan sweep owns them) — a blob
+/// becomes reachable only via a committed photo_add manifest, and duplicate
+/// photo ids are rejected by the proposer preflight.
+async fn post_client_data_block(
+    State(state): State<AppState>,
+    Extension(uid): Extension<i32>,
+    axum::extract::Path(blob_id): axum::extract::Path<hopnet_common::CustomUUID>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Body,
+) -> Result<
+    (
+        StatusCode,
+        Json<hopnet_photos_core::dispatch::UploadedDataBlock>,
+    ),
+    (StatusCode, String),
+> {
+    use tokio_stream::StreamExt;
+
+    let key = parse_blob_key_header(&headers).map_err(|m| (StatusCode::BAD_REQUEST, m))?;
+    let file_size = parse_file_size_header(&headers).map_err(|m| (StatusCode::BAD_REQUEST, m))?;
+
+    let reader = tokio_util::io::StreamReader::new(
+        body.into_data_stream()
+            .map(|r| r.map_err(std::io::Error::other)),
+    );
+    let source = ExactBody {
+        inner: reader,
+        expected: file_size as u64,
+        consumed: 0,
+    };
+
+    let sub = Submitter::new(std::sync::Arc::new(state), uid);
+    let uploaded = sub
+        .upload_data_block(blob_id, Box::new(source), file_size, key)
+        .await
+        .map_err(map_upload_error)?;
+    Ok((StatusCode::CREATED, Json(uploaded)))
+}
+
+async fn post_client_transaction(
+    State(state): State<AppState>,
+    Extension(uid): Extension<i32>,
+    Json(body): Json<TransactionBody>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    submit_photos_transaction(state, uid, body).await
+}
+
+#[derive(Serialize)]
+struct CommittedResponse {
+    photo_id: String,
+    uploaded_by: i32,
+}
+
+/// Confirm probe for the publisher's idempotency contract: after an
+/// ambiguous submit failure the client asks here before retrying. 404 ⇒ not
+/// committed for this user, re-submitting the same photo_id is safe; 200 ⇒ a
+/// previous attempt committed, mark published and never re-submit.
+async fn get_client_committed(
+    State(state): State<AppState>,
+    Extension(uid): Extension<i32>,
+    axum::extract::Path(photo_id): axum::extract::Path<hopnet_common::CustomUUID>,
+) -> Result<Json<CommittedResponse>, StatusCode> {
+    let pool = state.db_pool.clone();
+    let id = photo_id.clone();
+    let uploaded_by =
+        tokio::task::spawn_blocking(move || super::query::read_photo_committed(&pool, uid, &id))
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(CommittedResponse {
+        photo_id: photo_id.to_string(),
+        uploaded_by,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -719,5 +989,138 @@ mod tests {
             json["operation_id"],
             serde_json::json!("0198aaaa-bbbb-7ccc-8ddd-eeeeffff0001")
         );
+    }
+
+    fn key_headers(value: &str) -> HeaderMap {
+        headers_with(
+            axum::http::HeaderName::from_static(BLOB_KEY_HEADER),
+            value,
+        )
+    }
+
+    // Impact: a mis-parsed key would encrypt the blob under the wrong key —
+    // the manifest commits fine but every later read fails integrity.
+    // Should: accept exactly 64 hex chars and recover the 32 key bytes.
+    #[test]
+    fn blob_key_header_parses_64_hex_chars() {
+        let hex_key = "ab".repeat(32);
+        let key = parse_blob_key_header(&key_headers(&hex_key)).unwrap();
+        assert_eq!(key.as_slice(), &[0xABu8; 32]);
+    }
+
+    // Should not: accept a missing, short, overlong, or non-hex key header.
+    #[test]
+    fn blob_key_header_rejects_malformed() {
+        assert!(parse_blob_key_header(&HeaderMap::new()).is_err());
+        for value in [
+            &"ab".repeat(31),          // 62 chars: too short
+            &"ab".repeat(33),          // 66 chars: too long
+            &format!("{}q", "ab".repeat(31)), // 63 chars: odd length
+            &format!("zz{}", "ab".repeat(31)), // non-hex
+        ] {
+            assert!(
+                parse_blob_key_header(&key_headers(value)).is_err(),
+                "value {value:?} must be rejected"
+            );
+        }
+    }
+
+    // Should: parse a decimal byte count from the file-size header.
+    // Should not: accept zero, non-numeric, or missing sizes.
+    #[test]
+    fn file_size_header_requires_positive_decimal() {
+        let name = axum::http::HeaderName::from_static(FILE_SIZE_HEADER);
+        let h = headers_with(name.clone(), "1048576");
+        assert_eq!(parse_file_size_header(&h), Ok(1_048_576));
+
+        assert!(parse_file_size_header(&HeaderMap::new()).is_err());
+        for value in ["0", "-1", "abc", "1.5", ""] {
+            let h = headers_with(name.clone(), value);
+            assert!(
+                parse_file_size_header(&h).is_err(),
+                "value {value:?} must be rejected"
+            );
+        }
+    }
+
+    // Should: pass through a body of exactly the declared length.
+    #[tokio::test]
+    async fn exact_body_passes_exact_length() {
+        use tokio::io::AsyncReadExt;
+        let mut reader = ExactBody {
+            inner: std::io::Cursor::new(vec![7u8; 1000]),
+            expected: 1000,
+            consumed: 0,
+        };
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, vec![7u8; 1000]);
+    }
+
+    // Impact: api::put reads to EOF without cross-checking file_size, so a
+    // network-truncated body would otherwise be encoded short and returned
+    // as a valid-looking data block whose manifest consensus then commits.
+    // Should: error mid-read when the body ends before the declared length.
+    #[tokio::test]
+    async fn exact_body_rejects_truncated_body() {
+        use tokio::io::AsyncReadExt;
+        let mut reader = ExactBody {
+            inner: std::io::Cursor::new(vec![7u8; 400]),
+            expected: 1000,
+            consumed: 0,
+        };
+        let mut out = Vec::new();
+        let err = reader.read_to_end(&mut out).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        let inner = err.get_ref().unwrap().downcast_ref::<BodyLenError>().unwrap();
+        assert_eq!(inner.expected, 1000);
+        assert_eq!(inner.actual, Some(400));
+    }
+
+    // Should not: accept a body longer than the declared length.
+    #[tokio::test]
+    async fn exact_body_rejects_overlong_body() {
+        use tokio::io::AsyncReadExt;
+        let mut reader = ExactBody {
+            inner: std::io::Cursor::new(vec![7u8; 1001]),
+            expected: 1000,
+            consumed: 0,
+        };
+        let mut out = Vec::new();
+        let err = reader.read_to_end(&mut out).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let inner = err.get_ref().unwrap().downcast_ref::<BodyLenError>().unwrap();
+        assert_eq!(inner.actual, None);
+    }
+
+    // Impact: the daemon keys its retry classification on these statuses — a
+    // length mismatch surfacing as 500 would look retryable forever.
+    // Should: map a declared-length violation to 422, other body-read
+    // failures to 400, and substrate errors to 500.
+    #[test]
+    fn upload_errors_split_client_and_server_status() {
+        let len_err = hopnet_photos_core::PhotosCoreError::Storage(
+            hopnet_storage::StorageError::Read(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                BodyLenError {
+                    expected: 10,
+                    actual: Some(4),
+                },
+            )),
+        );
+        let (status, message) = map_upload_error(len_err);
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(message.contains("4 of 10"), "message: {message}");
+
+        let broken_stream = hopnet_photos_core::PhotosCoreError::Storage(
+            hopnet_storage::StorageError::Read(std::io::Error::other("connection reset")),
+        );
+        let (status, _) = map_upload_error(broken_stream);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, _) = map_upload_error(hopnet_photos_core::PhotosCoreError::Dispatch(
+            "engine".into(),
+        ));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

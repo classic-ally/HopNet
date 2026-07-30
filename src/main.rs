@@ -610,6 +610,18 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                     get(fileprovider::routes::get_health),
                 )
                 .nest("/devices", devices::routes::router(app_state.clone()))
+                // Thin-client photos dispatch surface (photo-ingress daemon):
+                // device-token auth class, host-mounted because the handlers
+                // close over AppState (photos declares no projection mounts).
+                .nest(
+                    "/photos/client",
+                    photos::routes::device_router(app_state.clone()).layer(
+                        middleware::from_fn_with_state(
+                            app_state.clone(),
+                            devices::auth::device_token_auth_middleware,
+                        ),
+                    ),
+                )
                 .merge(test_routes)
                 .route("/setup", get(setup::get_setup))
                 .route("/setup", post(setup::post_setup))

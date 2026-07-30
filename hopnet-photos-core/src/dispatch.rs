@@ -62,8 +62,9 @@ pub trait PhotoDispatch: Send + Sync {
 
 /// One stored fragment of an uploaded data block. Mirrors the storage
 /// engine's put outcome 1:1 so the trait stays free of the substrate's
-/// `engine` feature.
-#[derive(Debug, Clone)]
+/// `engine` feature. Serde: these DTOs are the wire shapes of the
+/// thin-client dispatch routes (`/api/photos/client/*`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UploadedFragment {
     pub chunk_number: u32,
     pub local_index: u32,
@@ -74,7 +75,7 @@ pub struct UploadedFragment {
 
 /// Outcome of `PhotoDispatch::upload_data_block` — everything the publisher
 /// needs to assemble a `BlobInsertOp` for the photo_add payload.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct UploadedDataBlock {
     pub integrity_hash: hopnet_common::Blake3Hash,
     pub fragments: Vec<UploadedFragment>,
@@ -83,7 +84,7 @@ pub struct UploadedDataBlock {
 
 /// A recipient of a publish: consensus user id plus the X25519 public key
 /// blob and metadata keys are wrapped to.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LibraryMember {
     pub user_id: i32,
     pub pubkey: hopnet_storage::x25519_dalek::PublicKey,
@@ -93,7 +94,7 @@ pub struct LibraryMember {
 /// `uploaded_by` comes from the dispatch's authenticated state (node-local:
 /// the session behind the Submitter; thin client: the session key holder),
 /// never from the publish caller.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LibraryMembership {
     pub uploaded_by: i32,
     pub members: Vec<LibraryMember>,
@@ -102,7 +103,7 @@ pub struct LibraryMembership {
 /// One incremental sync response. Carries the changed photos since the
 /// client's last cursor PLUS the node's current decided height, which the
 /// client adopts as its new cursor.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SyncBatch {
     /// Photos with `photo_changes.changed_at_height > cursor`. Ordered
     /// ascending by `changed_at_height` for deterministic replay.
@@ -116,7 +117,7 @@ pub struct SyncBatch {
 /// was hard-deleted (tombstone expired + cleanup ran) — the `photo_changes`
 /// row survives the cascade (NO FK), so offline clients still learn
 /// the deletion.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PhotoChange {
     pub photo_id: CustomUUID,
     /// The consensus height at which the `photo_changes` row was last
@@ -133,7 +134,7 @@ pub struct PhotoChange {
 /// to the consensus DB's `photos` / `photo_metadata_access` /
 /// `photo_resources` tables. `photo_id` is NOT duplicated here — it
 /// lives on the parent `PhotoChange`.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EncryptedPhotoState {
     // --- `photos` columns ---
     /// NULL = personal library.
@@ -158,4 +159,63 @@ pub struct EncryptedPhotoState {
     /// (transient mid-cleanup state where resources cascade-deleted
     /// before the photo row).
     pub resources: Vec<(i32, CustomUUID)>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Impact: these DTOs are the wire contract of the thin-client dispatch
+    // routes — a silently changed field shape strands every daemon-side
+    // deserializer at once.
+    // Should: round-trip an uploaded data block through JSON with fragment
+    // identity, hashes, and flags intact.
+    #[test]
+    fn uploaded_data_block_round_trips_through_json() {
+        let block = UploadedDataBlock {
+            integrity_hash: hopnet_common::Blake3Hash::from_bytes([0xAA; 32]),
+            fragments: vec![UploadedFragment {
+                chunk_number: 3,
+                local_index: 11,
+                fragment_id: CustomUUID::new(None),
+                fragment_hash: hopnet_common::Blake3Hash::from_bytes([0xBB; 32]),
+                recovery: true,
+            }],
+            added_bytes: 2,
+        };
+
+        let json = serde_json::to_string(&block).unwrap();
+        let back: UploadedDataBlock = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(back.integrity_hash, block.integrity_hash);
+        assert_eq!(back.added_bytes, block.added_bytes);
+        assert_eq!(back.fragments.len(), 1);
+        assert_eq!(back.fragments[0].chunk_number, 3);
+        assert_eq!(back.fragments[0].local_index, 11);
+        assert_eq!(back.fragments[0].fragment_id, block.fragments[0].fragment_id);
+        assert_eq!(
+            back.fragments[0].fragment_hash,
+            block.fragments[0].fragment_hash
+        );
+        assert!(back.fragments[0].recovery);
+    }
+
+    // Should: round-trip library membership with the recipient X25519 key
+    // bytes and the dispatch-derived uploader intact.
+    #[test]
+    fn library_membership_round_trips_through_json() {
+        let pubkey = hopnet_storage::x25519_dalek::PublicKey::from([0x42u8; 32]);
+        let membership = LibraryMembership {
+            uploaded_by: 7,
+            members: vec![LibraryMember { user_id: 7, pubkey }],
+        };
+
+        let json = serde_json::to_string(&membership).unwrap();
+        let back: LibraryMembership = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(back.uploaded_by, 7);
+        assert_eq!(back.members.len(), 1);
+        assert_eq!(back.members[0].user_id, 7);
+        assert_eq!(back.members[0].pubkey.as_bytes(), pubkey.as_bytes());
+    }
 }
