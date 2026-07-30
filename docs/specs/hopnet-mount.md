@@ -116,7 +116,9 @@ New mount `/api/integrations/mount`, `AuthClass::DeviceToken`, declared in
     index hit server-side
   - the changes feed is already id-based
 - routes:
-  - `GET /enumerate?parent_id=` — children, paged
+  - `GET /enumerate?parent_id=&cursor=` — children; stable cursor
+    pagination (last-seen id, not page numbers), so FUSE readdir
+    cookies resume sanely across concurrent mutation
   - `GET /lookup?parent_id=&name=` — single-child resolution; avoids
     enumerating large directories for one lookup
   - `GET /item?id=`
@@ -125,9 +127,17 @@ New mount `/api/integrations/mount`, `AuthClass::DeviceToken`, declared in
     - content-free "something changed" poke; daemon follows with /changes
     - heartbeat comment frames; on drop/reconnect the daemon resyncs from
       its last anchor height (no divergence window)
-  - `GET /download?id=` — MUST honor HTTP Range
+  - `GET /download?blob_id=` — blob-addressed, MUST honor HTTP Range
     (`reconstruct_file_range` already supports it; unlike the
     fileprovider route, this surface uses it)
+    - blob-addressed (authorized via blob_access), not inode-addressed:
+      POSIX open-handle semantics require snapshot-at-open — an open fd
+      keeps reading the blob current at open() even if a (possibly
+      remote) modify swaps the inode's data_id mid-read;
+      inode-addressed download would tear content under the handle
+    - consequence: a displaced blob under an open handle races RFC-007
+      orphan cleanup — same keep-set family as pins/version retention
+      (issues #23/#26)
   - `POST /create`, `PATCH /modify`, `DELETE /delete`
     - strict consistency: respond only after the transaction is decided
       by consensus and applied locally (existing barrier infra)
@@ -289,27 +299,35 @@ Each tracked, not forgotten:
 - trash semantics (macOS parity: unsupported)
 - share invitation management (SPA concern)
 
-## Implementation Phases
+## Implementation Slices
 
-- [ ] Phase 1 — node surface: `/api/integrations/mount` routes, `/watch`
-      SSE + ChangeNotifier subscribe seam, strict mutation barrier
-- [ ] Phase 2 — read-only mount: fuser skeleton, id map/attr cache,
-      daemon-mediated Range reads, sparse cache + whole-file fast path,
-      disk-pressure eviction, poke-invalidation test suite
-- [ ] Phase 3 — writes: durable staging, copy-up, background upload +
-      fsync barrier, conflict detection/logging
-- [ ] Phase 4 — provisioning & lifecycle: Secret Service + `login`,
-      endpoint file, systemd user unit, statfs
-- [ ] Phase 5 — passthrough acceleration, measured against the Phase 2
-      baseline
-- [ ] Phase 6 — desktop polish: Nautilus/Dolphin badges, context menus;
-      packaging (Flatpak, deb, rpm, nix module)
+Boundary authored from the FUSE seat: S1 shapes the transport trait by
+writing real FUSE callbacks against a mock; the node surface then
+implements that contract. Each slice is PR-sized and lands green.
+
+- [ ] S1 — crate + transport trait + mock + fuser namespace skeleton;
+      async bridge decided
+- [ ] S2 — node read surface: enumerate/lookup/item/blob download/
+      changes/health
+- [ ] S3 — HTTP transport joins the halves; real tree browses read-only
+- [ ] S4 — /watch SSE + subscribe seam + kernel invalidation + poke
+      test suite
+- [ ] S5 — content reads: sparse cache, whole-file fast path,
+      snapshot-at-open, disk-pressure eviction
+- [ ] S6 — submit-and-wait-decided + strict mutation routes (node-side)
+- [ ] S7 — writes: staging, copy-up, release/fsync tiers, conflict
+      logging, startup recovery
+- [ ] S8 — provisioning & lifecycle: secrets, login, endpoint file,
+      systemd unit, statfs
+- [ ] S9 — passthrough quarantine module + measurement
+- [ ] S10 — desktop badges, context menus, packaging
 
 Testing mirrors RFC-010: `HOPNET_EPHEMERAL_DB=1`, a test-mode route
 minting a throwaway device token, poke counters (the signal-count
 pattern); integration tests against a live mountpoint; pjdfstest subset
 later. The poke-invalidation suite from the Architecture section is the
-load-bearing one and lands with Phase 2, not later.
+load-bearing one and lands with S4, deliberately before the content
+machinery.
 
 Both sides of the daemon⇄node boundary are testable in isolation, plus
 together as a stack:
