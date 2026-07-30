@@ -75,3 +75,20 @@
     <PhotoGridView items={[]} {onOpen} thumbUrl={placeholderThumb} />
   {/snippet}
 </Story>
+
+<!-- Decode failure: the URL getter returns bytes the browser cannot decode
+     (an HEIC original served as the thumb fallback for photos without
+     rendition resources). Cells must degrade to the styled placeholder,
+     never a broken-image glyph. -->
+<Story name="Decode failure">
+  {#snippet template()}
+    <div style="height: 100vh; overflow-y: auto;">
+      <PhotoGridView
+        items={mockPhotos}
+        {onOpen}
+        thumbUrl={() => 'data:image/jpeg;base64,AAAA'}
+        displayUrl={() => 'data:image/jpeg;base64,AAAA'}
+      />
+    </div>
+  {/snippet}
+</Story>

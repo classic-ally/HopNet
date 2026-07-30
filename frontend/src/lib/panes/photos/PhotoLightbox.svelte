@@ -33,6 +33,10 @@
 
   let detail = $state<PhotoDetailVM | null>(null);
   let showInfo = $state(false);
+  // Photo whose display resource failed to DECODE (undecodable fallback,
+  // e.g. an HEIC original). Self-resetting: compared against the current id,
+  // so navigating away needs no effect to clear it.
+  let failedId = $state<string | null>(null);
 
   // Load full metadata whenever the visible photo changes.
   $effect(() => {
@@ -119,11 +123,17 @@
               <span class="i-carbon-circle-dash text-3xl spin"></span>
             </div>
           {/if}
+        {:else if failedId === current.photo_id}
+          <div class="stage-wait text-muted flex-col gap-2">
+            <span class="i-carbon-no-image text-3xl"></span>
+            <span class="text-sm">preview unavailable — download below</span>
+          </div>
         {:else if displayUrl(current.photo_id)}
           <img
             class="stage-media"
             src={displayUrl(current.photo_id)}
             alt=""
+            onerror={() => (failedId = current.photo_id)}
           />
         {:else}
           <div class="stage-wait text-muted">

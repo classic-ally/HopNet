@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { SvelteSet } from 'svelte/reactivity';
   import type { Snippet } from 'svelte';
   import type { PhotoSummary } from './viewmodel';
 
@@ -38,6 +39,11 @@
   } = $props();
 
   const isShared = (p: PhotoSummary) => sharedLibs.includes(p.library_id);
+
+  // Photos whose blob fetched but failed to DECODE (e.g. an HEIC original
+  // served as the thumb fallback for a photo without rendition resources) —
+  // the cell degrades to the placeholder instead of a broken-image glyph.
+  const decodeFailed = new SvelteSet<string>();
 
   type Row =
     | { kind: 'header'; label: string; key: string; month: string | null }
@@ -251,8 +257,15 @@
         onmouseleave={cellLeave}
         aria-label={`Open photo from ${dayLabel(row.photo.captured_at)}`}
       >
-        {#if thumbUrl(row.photo.photo_id)}
-          <img class="thumb" src={thumbUrl(row.photo.photo_id)} alt="" loading="lazy" decoding="async" />
+        {#if thumbUrl(row.photo.photo_id) && !decodeFailed.has(row.photo.photo_id)}
+          <img
+            class="thumb"
+            src={thumbUrl(row.photo.photo_id)}
+            alt=""
+            loading="lazy"
+            decoding="async"
+            onerror={() => decodeFailed.add(row.photo.photo_id)}
+          />
         {:else}
           <div class="thumb thumb-placeholder"></div>
         {/if}
@@ -287,11 +300,17 @@
       <!-- Two layers: the thumb (already decoded by the grid) is never removed;
            the sharp rendition stacks on top once loaded. Swapping src on one
            img instead flashes the backdrop for a decode frame. -->
-      {#if thumbUrl(preview.photo_id)}
+      {#if thumbUrl(preview.photo_id) && !decodeFailed.has(preview.photo_id)}
         <img class="preview-img" src={thumbUrl(preview.photo_id)} alt="" />
       {/if}
       {#if previewSharp && displayUrl(preview.photo_id)}
-        <img class="preview-img preview-sharp" src={displayUrl(preview.photo_id)} alt="" />
+        <!-- A sharp-layer decode failure just leaves the thumb visible. -->
+        <img
+          class="preview-img preview-sharp"
+          src={displayUrl(preview.photo_id)}
+          alt=""
+          onerror={() => (previewSharp = false)}
+        />
       {/if}
       {#if isShared(preview)}
         <span class="preview-shared i-carbon-user-multiple text-white badge-shadow"></span>

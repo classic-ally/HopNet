@@ -142,7 +142,9 @@ CREATE INDEX idx_photo_resources_data_block ON photo_resources(data_block_id);
 
 The "primary display" resource for gallery view is `edited` if present, otherwise `original`. Clients enforce this at query time against the sidecar.
 
-All resources except thumbnails are required to be supplied by the client at upload time when they exist on the source asset — the daemon ingesting from PhotoKit must enumerate `PHAsset.assetResources` and submit every applicable resource. Thumbnails are generated client-side from whichever resource is the primary display. Each resource is encrypted with its own per-data-block key and replicated via the standard fragment distribution path. The server never sees raw image data.
+All resources are supplied by the ingesting client at upload time when they exist on the source asset — the daemon ingesting from PhotoKit enumerates `PHAsset.assetResources` and submits every applicable resource, and **generates the thumbnail resources itself** (~256px/~1024px JPEG renditions via `PHImageManager` at ingest; video assets get poster frames). Thumbnails are what keep the gallery renderable for formats browsers cannot decode (HEIC, HEVC). Each resource is encrypted with its own per-data-block key and replicated via the standard fragment distribution path.
+
+**Deferred: non-PhotoKit ingest paths must supply thumbnails too.** When manual/import upload of arbitrary image files lands (e.g. a user importing a HEIC without Apple Photos involved), that path needs its own rendition generation — either import-time generation in the ingesting client, or a node-side fallback renderer (a port of the interim viewer's `render.rs` decode cache). Recorded here so the HEIC-blank-cell gap doesn't silently recur on a new ingest surface.
 
 #### Shared Libraries
 

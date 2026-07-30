@@ -123,9 +123,19 @@ apply functions inside consensus handlers.
       deferral); `crates/ingress-publisher` (sidecar→PhotoAsset mapping,
       `HttpDispatch`, confirm-then-retry `NodePublisher`, e2e driver
       bin); `photos-ingress-publish` orchestrator scenario. Swift/FFI
-      wiring + SMAppService packaging remain for the Mac phase; buffer-
-      mode retention (delete local blobs after confirmed publish) is the
-      follow-up phase.
+      wiring landed 2026-07-30 (publish credentials via FfiDaemonOptions,
+      keychain provisioning from the app, soak-verified on a real
+      library); SMAppService packaging remains; buffer-mode retention
+      (delete local blobs after confirmed publish) is the follow-up phase.
+- [x] Thumbnail renditions (2026-07-30): the ingress daemon generates
+      ~256px/~1024px JPEG renditions per photo (PHImageManager,
+      synchronous delivery + ImageIO fallback; video poster frames) as
+      RFC-011 resources 5/6 via synthetic sentinel descriptors
+      (1005/1006); written thumbnails reopen on edit-set changes; backfill
+      migration re-queues pre-rendition archives. Gallery cells degrade to
+      placeholders on img decode errors. Soak-verified end-to-end with a
+      real library (HEIC + video cells render). Deferred: non-PhotoKit
+      import paths must generate their own thumbnails when import lands.
 - [x] hopnet-drive + hopnet-projection + hopnet-takeout extraction
       ([RFC-015](specs/hopnet-drive.md)) COMPLETE (stages D0–D5,
       2026-07-08): narrowed handler seam, per-projection schema units,

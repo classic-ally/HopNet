@@ -410,7 +410,8 @@ Notes:
 CREATE TABLE photo_resources (
     photo_id         TEXT NOT NULL,        -- FK photos
     resource_type    INTEGER NOT NULL,     -- RFC-011 values: 0=original, 1=edited, 2=paired_video,
-                                           --   3=adjustment_data, 4=raw_alternate, 7=edited_paired_video
+                                           --   3=adjustment_data, 4=raw_alternate, 5=thumbnail_small,
+                                           --   6=thumbnail_medium, 7=edited_paired_video
     content_hash     TEXT,                 -- BLAKE3 hex of resource bytes; NULL until fetched+hashed
     ext              TEXT,                 -- canonical extension for the resource's UTI (heic, jpg, mov, dng)
     size_bytes       INTEGER,              -- recorded at write time; data_block creation needs it at migration
@@ -430,7 +431,7 @@ CREATE INDEX idx_photo_resources_hash ON photo_resources(content_hash) WHERE con
 
 Notes:
 
-- **`resource_type` uses RFC-011's enum values verbatim** (see `photos.md` Resource Types). Thumbnail types (5, 6) are deliberately never stored — thumbnails are generated client-side from the primary display resource after migration, not archived by the daemon.
+- **`resource_type` uses RFC-011's enum values verbatim** (see `photos.md` Resource Types). Thumbnail types (5, 6) are **daemon-generated JPEG renditions** (~256px small, ~1024px medium, video assets get poster frames), requested from `PHImageManager` — Apple decodes HEIC/video for free and the renditions come from the local preview cache (no iCloud round trip). They exist so gallery clients (which cannot decode HEIC in a browser) always have a decodable resource, and they flow the normal pipeline: blob store, sidecar, publish.
 - **PhotoKit → ingress resource mapping** (spike-verified against a real library):
 
   | `PHAssetResourceType` | Ingress `resource_type` |
@@ -440,7 +441,11 @@ Notes:
   | `pairedVideo` (9) | `paired_video` (2) |
   | `adjustmentData` (7) | `adjustment_data` (3) |
   | `alternatePhoto` (4) | `raw_alternate` (4) |
+  | HopNet sentinel (1005)¹ | `thumbnail_small` (5) |
+  | HopNet sentinel (1006)¹ | `thumbnail_medium` (6) |
   | `fullSizePairedVideo` (10) | `edited_paired_video` (7) |
+
+  ¹ Synthetic, not `PHAssetResource`-backed: `DescriptorExtraction.swift` appends the two sentinel descriptors to every asset, and the fetcher renders them via `PHImageManager` (synchronous delivery — async returns nil-image/nil-error in the daemon's non-app context — with an ImageIO downscale fallback). Sentinels live at 1000 + RFC value because Apple's real namespace (1–12) collides with the RFC integers: PH 5/6 mean `fullSizePhoto`/`Video`. Their descriptor `fileSize` is a constant admission estimate (64 KiB / 512 KiB), never a re-edit signal.
 
   Edits never mutate the `photo`/`pairedVideo` resources — edited renders appear as separate `fullSize*` resources, and the presence of `adjustmentData` is the "this asset has edits" signal. An edited Live Photo therefore carries five resources (original still, original motion, adjustment plist, edited still, edited motion).
 - **No `status` column.** Per-resource pipeline state is derivable: `content_hash IS NULL` = not yet fetched; `written_at IS NULL AND next_retry_at IS NOT NULL` = failed, awaiting backoff; `written_at IS NOT NULL` = durably written. The CLI computes human-readable status from these columns; a stored enum would be a second source of truth that can drift.
@@ -450,6 +455,9 @@ Notes:
   - *Re-edit* (asset's edited rendition is replaced): the `edited` row is updated in place with the new `content_hash`. In the same transaction — the **write-commit transaction of the replacement bytes**, not the classification event (the new bytes must be fetched first; between classification and commit the row sits in the superseded-pending state, see §Per-resource state machine) — the superseded blob's refcount is decremented (deleting the file if it reaches 0) and the new blob's refcount is incremented. Detection is a `fileSize` compare (descriptor vs stored `size_bytes`) on written edit-mutable rows; equal or absent sizes are assumed unchanged, and a false positive (changed size, identical bytes) nets to a refcount no-op. Superseded edit renditions are not retained — the daemon archives the current iCloud state; version history is RFC-011's operation log's job post-migration.
   - *Revert to original* (user discards edits): the `edited` row (and `adjustment_data` row, if PhotoKit drops it) is deleted, with the same refcount decrement semantics.
   - The `original` row is never overwritten in any of these flows.
+  - *Thumbnail regeneration*: written thumbnail rows (5, 6) reopen whenever the photo's edit-mutable set changes — first edit, re-edit, or revert — because the renditions render the *current* primary display. They are deliberately excluded from the `fileSize` re-edit compare (their descriptor size is a constant admission estimate; comparing it against real stored bytes would reopen them on every delivery). Metadata-only refreshes never touch them.
+  - *Backfill*: photos ingested before the daemon generated renditions never re-deliver descriptors (the reconciliation scan probes unchanged photos `Done`), so a schema migration mints pending 5/6 rows for materialized, library-bound, PhotoKit-addressable photos and clears their `materialized_at`. Tombstoned photos are skipped (the restore delivery heals them); unmapped-scope photos heal at adoption. Already-**published** photos re-materialize with thumbnails but do not re-publish — `published_at` is terminal until content-update propagation lands (future phase).
+  - *Thumbnail failure blocks materialization* (and therefore publish) at the retry cap, the same policy as any resource; the next scan's gave-up reset re-arms them.
 - **`adjustment_data` (type 3) is captured.** `PHAdjustmentData` is the reversible-edit recipe and cannot be re-derived once the Photos library is gone; RFC-011 expects it for edit reconstruction. The payload is a small non-image blob; it flows through the same content-addressed write path with an extension derived from its UTI.
 - A resource row is created for every resource enumerated on the asset at discovery time, before any bytes are fetched — mirroring the `photos` row's mint-before-materialize rule, so inflight per-resource progress is queryable.
 
@@ -838,9 +846,10 @@ thin read shim; most of the work is frontend.
 - **The REST contract is the seam.** The frontend asks "list / thumbnail / full asset / metadata"
   and never knows an ingress sits behind it. At fold-in these routes move into HopNet's server and
   the pane into HopNet's frontend; the contract is shaped to match HopNet's existing file API.
-- **Thumbnails/renditions are a viewer-side cache, never blobs.** Consistent with the rule that
-  thumbnail resource types (5, 6) are never stored: the viewer decodes on demand (HEIC→JPEG via
-  libheif; video poster via ffmpeg) and caches by content_hash. The blob store stays RFC-011-pure.
+- **Thumbnails/renditions.** Since the daemon began generating thumbnail resources (5, 6),
+  stored renditions are the preferred gallery source; the viewer's on-demand decode cache
+  (HEIC→JPEG via libheif; video poster via ffmpeg, keyed by content_hash) remains the fallback
+  for archives predating the backfill and for display-class renditions of RAW.
   RAW (RAF/DNG) is download-only — never decoded, since every RAW asset carries a display-friendly
   original.
 - **Auth diverges deliberately.** The viewer uses OIDC (pocket-id) with a server-side session,
