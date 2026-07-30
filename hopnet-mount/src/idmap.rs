@@ -54,6 +54,13 @@ impl IdMap {
     pub fn get(&self, ino: u64) -> Option<ItemId> {
         self.inner.lock().expect("idmap poisoned").by_ino.get(&ino).cloned()
     }
+
+    /// The inode number for `id` ONLY if one was already allocated.
+    /// Kernel invalidation must not mint numbers for items the kernel has
+    /// never seen (RFC-018 S4).
+    pub fn peek(&self, id: &ItemId) -> Option<u64> {
+        self.inner.lock().expect("idmap poisoned").by_id.get(id).copied()
+    }
 }
 
 impl Default for IdMap {

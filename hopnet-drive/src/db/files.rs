@@ -212,6 +212,7 @@ pub fn insert_files(
     blob_ops: &[hopnet_storage::store::BlobInsertOp],
     inodes: Vec<Inode>,
     fragments_dir: &str,
+    block_height: i32,
 ) -> Result<(), DatabaseError> {
     // Substrate half first: blobs must exist before inodes reference them.
     for op in blob_ops {
@@ -231,8 +232,9 @@ pub fn insert_files(
 
     let inode_count = inodes.len();
 
-    // Get consensus height once for modification logging
-    let current_height = crate::db::current_height(db_tx)?;
+    // Modification heights stamp the DECIDING block (ctx.height), never
+    // last_decided_height — the meta row lags the block being applied.
+    let current_height = block_height;
 
     for inode in inodes {
         let data_id: Option<CustomUUID> = inode.data_id.clone();
@@ -369,9 +371,9 @@ pub fn delete_files(
     db_tx: &rusqlite::Transaction,
     path: String,
     user_id: i32,
+    block_height: i32,
 ) -> Result<(), DatabaseError> {
-    // Get current consensus height for modification tracking
-    let current_height = crate::db::current_height(db_tx)?;
+    let current_height = block_height;
 
     // Log ancestor folder modifications (reusing existing logic)
     log_ancestor_modifications(db_tx, &path, user_id, current_height)?;
@@ -465,6 +467,7 @@ pub fn modify_item(
     content_update: Option<Option<hopnet_storage::store::BlobInsertOp>>,
     incoming_share_updates: Option<Vec<crate::envelopes::IncomingShareUpdate>>,
     fragments_dir: &str,
+    block_height: i32,
 ) -> Result<(), DatabaseError> {
     // Check if the item exists and get its type and current path using inode_id
     tracing::debug!(
@@ -671,7 +674,7 @@ pub fn modify_item(
                 // inode reference set above; there is no key to re-wrap).
                 if let Some(ref nid) = new_data_id {
                     // Log modification for each affected sharer's inode
-                    let current_height = crate::db::current_height(db_tx)?;
+                    let current_height = block_height;
                     let mut stmt = db_tx
                         .prepare(
                             "SELECT id, owner_id, path FROM inodes WHERE data_id = ? AND owner_id != ?",
@@ -719,7 +722,7 @@ pub fn modify_item(
     // The modification time comes from data_block.id UUIDv7 timestamp, which only changes with content
 
     // Log modification for FileProvider change tracking
-    let current_height = crate::db::current_height(db_tx)?;
+    let current_height = block_height;
     // For moves: pass old path and new path. For content updates: only new path (current location).
     let old_path_ref = if new_encrypted_path.is_some() {
         Some(current_encrypted_path.as_str())

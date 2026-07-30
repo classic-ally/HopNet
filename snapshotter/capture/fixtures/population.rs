@@ -278,10 +278,10 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
             },
         ];
         // Insert root folder first (before subfolder, to avoid conflict with auto-created parents)
-        db::files::insert_files(&tx, &[], vec![folder_inodes.remove(0)], "/tmp/hopnet-snapshotter-fragments")
+        db::files::insert_files(&tx, &[], vec![folder_inodes.remove(0)], "/tmp/hopnet-snapshotter-fragments", 1)
             .expect("Failed to insert root folder");
         // Then insert subfolder (its parent /root now exists)
-        db::files::insert_files(&tx, &[], folder_inodes, "/tmp/hopnet-snapshotter-fragments").expect("Failed to insert subfolder");
+        db::files::insert_files(&tx, &[], folder_inodes, "/tmp/hopnet-snapshotter-fragments", 1).expect("Failed to insert subfolder");
 
         // Insert files referencing the blobs by id (blob ops apply first)
         let file_inodes = vec![
@@ -307,7 +307,7 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
                 data_id: Some(data_block_ids[2].clone()),
             },
         ];
-        db::files::insert_files(&tx, &blob_ops, file_inodes, "/tmp/hopnet-snapshotter-fragments").expect("Failed to insert files");
+        db::files::insert_files(&tx, &blob_ops, file_inodes, "/tmp/hopnet-snapshotter-fragments", 1).expect("Failed to insert files");
 
         // Insert a file for user 1 (file3 in subfolder, no data block - just inode)
         let user1_folder_id = uuid_from_index(102);
@@ -318,7 +318,7 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
             inode_type: hopnet_common::InodeType::Folder,
             data_id: None,
         }];
-        db::files::insert_files(&tx, &[], user1_file_inodes, "/tmp/hopnet-snapshotter-fragments").expect("Failed to insert user 1 folder");
+        db::files::insert_files(&tx, &[], user1_file_inodes, "/tmp/hopnet-snapshotter-fragments", 1).expect("Failed to insert user 1 folder");
 
         tx.commit().expect("Failed to commit files");
     }

@@ -448,7 +448,7 @@ pub async fn bootstrap_join(
         // nonce insert — the genesis node has no nonce row either, keeping
         // committed_tx_nonces byte-identical across the mesh).
         for t in old_txs.iter() {
-            crate::consensus::dispatch::process_transaction(t, app_state, true, &tx_db)
+            crate::consensus::dispatch::process_transaction(t, app_state, true, 1, &tx_db)
                 .map_err(|e| format!("genesis apply: {e:?}"))?;
         }
         store::install_genesis(&tx_db, &block, &cert).map_err(|e| e.to_string())?;

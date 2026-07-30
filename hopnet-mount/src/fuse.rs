@@ -69,6 +69,26 @@ impl HopFs {
     }
 }
 
+/// fuser-backed kernel invalidation (RFC-018 S4). Obtained from
+/// `BackgroundSession::notifier()` after mount; Clone+Send+Sync per fuser.
+/// Errors are logged, not propagated — ENOENT ("kernel didn't have it
+/// cached") is the common, harmless case.
+pub struct FuserInvalidator(pub fuser::Notifier);
+
+impl crate::watch::KernelInvalidator for FuserInvalidator {
+    fn inval_entry(&self, parent_ino: u64, name: &str) {
+        if let Err(e) = self.0.inval_entry(INodeNo(parent_ino), std::ffi::OsStr::new(name)) {
+            tracing::debug!("inval_entry({parent_ino}, {name}): {e}");
+        }
+    }
+    fn inval_inode(&self, ino: u64) {
+        // Whole-inode: attrs + full data range.
+        if let Err(e) = self.0.inval_inode(INodeNo(ino), 0, -1) {
+            tracing::debug!("inval_inode({ino}): {e}");
+        }
+    }
+}
+
 fn errno(e: &CoreError) -> Errno {
     match e {
         CoreError::NotFound => Errno::ENOENT,

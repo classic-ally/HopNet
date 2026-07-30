@@ -85,6 +85,7 @@ pub fn process_transactions(
     transactions: &Option<Transactions>,
     app_state: &AppState,
     execute: bool,
+    block_height: i32,
     db_tx: &rusqlite::Transaction,
 ) -> HandlerResult {
     if let Some(transactions) = transactions {
@@ -128,7 +129,7 @@ pub fn process_transactions(
 
         let mut nonces = Vec::new();
         for tx in transactions.iter() {
-            match process_transaction(tx, app_state, execute, db_tx) {
+            match process_transaction(tx, app_state, execute, block_height, db_tx) {
                 Ok(_) => {
                     tracing::debug!(
                         "Transaction {} successfully: {}",
@@ -167,6 +168,7 @@ pub fn process_transaction(
     tx: &Transaction,
     app_state: &AppState,
     execute: bool,
+    block_height: i32,
     db_tx: &rusqlite::Transaction,
 ) -> HandlerResult {
     if let Some(handler) = DISPATCH_TABLE.get(tx.rpc.function.as_str()) {
@@ -181,6 +183,7 @@ pub fn process_transaction(
         };
         let notifier = crate::handlers::HostNotifier {
             test_mode: app_state.test_mode,
+            change_tx: app_state.change_tx.clone(),
         };
         let scheduler = crate::handlers::HostWorkScheduler {
             app_state: app_state.clone(),
@@ -188,6 +191,7 @@ pub fn process_transaction(
         let ctx = crate::handlers::HandlerCtx {
             fragments_dir: &app_state.fragments_dir,
             node_id: app_state.node_id.get().copied(),
+            height: block_height,
             notifier: &notifier,
             work: &scheduler,
         };

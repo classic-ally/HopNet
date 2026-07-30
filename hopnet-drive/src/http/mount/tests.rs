@@ -334,6 +334,97 @@ async fn body_bytes(response: axum::http::Response<Body>) -> bytes::Bytes {
     axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap()
 }
 
+/// Broadcast-backed notifier standing in for the host's (S4): the test
+/// holds the sender, the /watch route subscribes.
+struct BroadcastNotifier {
+    tx: tokio::sync::broadcast::Sender<()>,
+}
+impl hopnet_projection::ChangeNotifier for BroadcastNotifier {
+    fn files_changed(&self) {
+        let _ = self.tx.send(());
+    }
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<()> {
+        self.tx.subscribe()
+    }
+}
+
+fn setup_env_with_watch(blob_bytes: Vec<u8>) -> (TestEnv, tokio::sync::broadcast::Sender<()>) {
+    let mut env = setup_env(blob_bytes);
+    let tx = tokio::sync::broadcast::channel(16).0;
+    env.state.notify = Arc::new(BroadcastNotifier { tx: tx.clone() });
+    (env, tx)
+}
+
+// ---------- watch ----------
+
+// Should: deliver an SSE event for every poke sent on the notifier
+// channel while the connection is open.
+// Impact: the poke path is the daemon's only low-latency change signal —
+// a dropped poke means staleness until the TTL backstop.
+#[tokio::test]
+async fn watch_streams_pokes_as_sse_events() {
+    let (env, tx) = setup_env_with_watch(vec![]);
+    let app = env.app();
+
+    let response = app
+        .clone()
+        .oneshot(Request::builder().uri("/watch").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("text/event-stream")
+    );
+
+    let mut body = response.into_body().into_data_stream();
+    use tokio_stream::StreamExt;
+
+    tx.send(()).unwrap();
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(5), body.next())
+        .await
+        .expect("poke frame within timeout")
+        .expect("stream open")
+        .expect("frame ok");
+    let text = String::from_utf8_lossy(&frame).into_owned();
+    assert!(text.contains("data:"), "expected SSE data frame, got {text:?}");
+
+    tx.send(()).unwrap();
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(5), body.next())
+        .await
+        .expect("second poke frame")
+        .expect("stream open")
+        .expect("frame ok");
+    assert!(String::from_utf8_lossy(&frame).contains("data:"));
+}
+
+// Should: end the SSE stream when the notifier channel is closed —
+// NullNotifier's subscribe hands out a dead receiver, so the stream ends
+// immediately instead of hanging.
+#[tokio::test]
+async fn watch_ends_on_closed_channel() {
+    let env = setup_env(vec![]);
+    let app = env.app();
+
+    let response = app
+        .clone()
+        .oneshot(Request::builder().uri("/watch").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let mut body = response.into_body().into_data_stream();
+    use tokio_stream::StreamExt;
+
+    let end = tokio::time::timeout(std::time::Duration::from_secs(5), body.next())
+        .await
+        .expect("stream should end promptly");
+    assert!(end.is_none(), "expected immediate end-of-stream on dead channel");
+}
+
 // ---------- enumerate ----------
 
 // Should: list the children of the root and of a nested folder, carrying

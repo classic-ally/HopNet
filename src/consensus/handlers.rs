@@ -569,6 +569,7 @@ mod leave_tests {
         let ctx = HandlerCtx {
             fragments_dir: "",
             node_id: Some(submitter),
+            height: 1,
             notifier: &notifier,
             work: &scheduler,
         };
@@ -610,6 +611,7 @@ mod leave_tests {
         let ctx = HandlerCtx {
             fragments_dir: "",
             node_id: Some(3),
+            height: 1,
             notifier: &notifier,
             work: &scheduler,
         };
@@ -700,6 +702,7 @@ mod leave_tests {
         let ctx = HandlerCtx {
             fragments_dir: "",
             node_id: Some(3),
+            height: 1,
             notifier: &notifier,
             work: &scheduler,
         };
@@ -809,6 +812,7 @@ mod genesis_tests {
         let ctx = crate::handlers::HandlerCtx {
             fragments_dir: "",
             node_id: Some(0),
+            height: 1,
             notifier: &notifier,
             work: &scheduler,
         };
@@ -897,6 +901,7 @@ mod vote_out_tests {
         let ctx = HandlerCtx {
             fragments_dir: "",
             node_id: Some(submitter),
+            height: 1,
             notifier: &notifier,
             work: &scheduler,
         };
@@ -1035,6 +1040,7 @@ mod activation_batch_tests {
         let ctx = HandlerCtx {
             fragments_dir: "",
             node_id: Some(submitter),
+            height: 1,
             notifier: &notifier,
             work: &scheduler,
         };

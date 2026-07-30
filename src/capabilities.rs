@@ -163,6 +163,7 @@ pub fn build_capabilities(app_state: &AppState) -> HostCapabilities {
         blobs: host.clone(),
         notify: Arc::new(crate::handlers::HostNotifier {
             test_mode: app_state.test_mode,
+            change_tx: app_state.change_tx.clone(),
         }),
         write_admission: host,
     }

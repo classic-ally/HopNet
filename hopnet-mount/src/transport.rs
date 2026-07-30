@@ -88,6 +88,29 @@ impl std::fmt::Display for TransportError {
 
 impl std::error::Error for TransportError {}
 
+/// One delta batch: latest state per touched item strictly after the
+/// anchor, plus ids that no longer exist, plus the new anchor height.
+#[derive(Debug, Clone)]
+pub struct Changes {
+    pub items: Vec<Item>,
+    pub deleted: Vec<CustomUUID>,
+    pub height: Height,
+}
+
+/// What a live watch connection yields. Heartbeats carry no meaning
+/// beyond "the connection is alive" — the watch loop's liveness timeout
+/// resets on ANY item, so an idle-but-healthy connection survives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchEvent {
+    /// Something changed — run changes from your anchor.
+    Poke,
+    /// Server keepalive.
+    Heartbeat,
+}
+
+/// Stream of watch events. Stream end = the connection dropped.
+pub type WatchStream = Pin<Box<dyn tokio_stream::Stream<Item = WatchEvent> + Send>>;
+
 pub trait NodeTransport: Send + Sync {
     /// Resolve one child of `parent` by name. `Ok(None)` = no such child.
     fn lookup(
@@ -107,6 +130,15 @@ pub trait NodeTransport: Send + Sync {
         parent: ItemId,
         cursor: Option<Cursor>,
     ) -> BoxFuture<'_, Result<Page, TransportError>>;
+
+    /// Everything that changed strictly after `since` (RFC-018 S4).
+    /// `since = i32::MAX as Height` is the cheap anchor-init: guaranteed
+    /// empty rows, current height returned.
+    fn changes(&self, since: Height) -> BoxFuture<'_, Result<Changes, TransportError>>;
+
+    /// Subscribe to change pokes. The returned stream ends when the
+    /// connection drops; callers reconnect and resync from their anchor.
+    fn watch(&self) -> BoxFuture<'_, Result<WatchStream, TransportError>>;
 
     /// Node readiness — distinguishes "not running" from "not set up".
     fn health(&self) -> BoxFuture<'_, Result<Health, TransportError>>;

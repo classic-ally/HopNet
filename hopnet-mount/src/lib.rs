@@ -13,6 +13,7 @@ pub mod idmap;
 pub mod mock;
 pub mod transport;
 pub mod vfs;
+pub mod watch;
 
 #[cfg(target_os = "linux")]
 pub mod fuse;

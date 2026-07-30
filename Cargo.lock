@@ -2825,6 +2825,7 @@ dependencies = [
 name = "hopnet-mount"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "clap",
  "fuser",
  "hopnet-common",
@@ -2834,6 +2835,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "tracing",
  "tracing-subscriber",
 ]

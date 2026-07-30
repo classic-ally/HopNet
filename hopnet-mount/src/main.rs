@@ -103,8 +103,8 @@ mod linux {
             transport
         };
 
-        let core = Arc::new(MountCore::new(transport, DEFAULT_TTL));
-        let fs = HopFs::new(core, rt.handle().clone());
+        let core = Arc::new(MountCore::new(transport.clone(), DEFAULT_TTL));
+        let fs = HopFs::new(core.clone(), rt.handle().clone());
 
         let mut config = fuser::Config::default();
         config.mount_options = vec![
@@ -122,6 +122,12 @@ mod linux {
             mountpoint = %args.mountpoint.display(),
             source = %if args.mock { "mock".to_string() } else { args.url.clone() },
             "mounted"
+        );
+
+        // Watch loop (RFC-018 S4): pokes → delta sync → kernel busting.
+        let invalidator = Arc::new(hopnet_mount::fuse::FuserInvalidator(session.notifier()));
+        rt.spawn(
+            hopnet_mount::watch::Watcher::new(core.clone(), transport.clone(), invalidator).run(),
         );
 
         rt.block_on(async {

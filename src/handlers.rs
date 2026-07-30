@@ -9,14 +9,22 @@ pub use hopnet_projection::{
 };
 
 /// Host change notifier: owns platform gating and spawning for post-apply
-/// side effects (macOS FileProvider refresh). Handlers signal intent via
+/// side effects (macOS FileProvider refresh) plus the platform-neutral
+/// change-poke broadcast (RFC-018 S4). Handlers signal intent via
 /// `ctx.notifier.files_changed()`; everything platform-specific stays here.
+/// The sender is AppState's — this struct is constructed per-transaction.
 pub struct HostNotifier {
     pub test_mode: bool,
+    pub change_tx: tokio::sync::broadcast::Sender<()>,
 }
 
 impl ChangeNotifier for HostNotifier {
     fn files_changed(&self) {
+        // Platform-neutral poke first: /watch subscribers (Linux mount
+        // daemon) get it on every platform. send() is sync/non-blocking;
+        // no-subscriber errors are expected and ignored.
+        let _ = self.change_tx.send(());
+
         #[cfg(target_os = "macos")]
         {
             let test_mode = self.test_mode;
@@ -32,6 +40,10 @@ impl ChangeNotifier for HostNotifier {
         {
             let _ = self.test_mode;
         }
+    }
+
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<()> {
+        self.change_tx.subscribe()
     }
 }
 

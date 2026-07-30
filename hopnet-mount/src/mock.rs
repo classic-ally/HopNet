@@ -20,6 +20,8 @@ pub enum CallRecord {
     Lookup { parent: ItemId, name: String },
     Item { id: ItemId },
     Enumerate { parent: ItemId, cursor: Option<String> },
+    Changes { since: i64 },
+    Watch,
     Health,
 }
 
@@ -30,6 +32,12 @@ struct MockState {
     calls: Vec<CallRecord>,
     page_size: usize,
     height: i64,
+    /// Mutation journal — (height, id, latest state | None=deleted); the
+    /// mock's modification_log, driving changes(since).
+    journal: Vec<(i64, ItemId, Option<Item>)>,
+    /// Live watch connection, if any; dropping it (drop_watch) is the
+    /// scripted-disconnect failure mode.
+    watch_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::transport::WatchEvent>>,
 }
 
 impl MockState {
@@ -65,6 +73,8 @@ impl MockTransport {
             calls: Vec::new(),
             page_size: 100,
             height: 1,
+            journal: Vec::new(),
+            watch_tx: None,
         }));
         (
             Arc::new(MockTransport {
@@ -109,11 +119,13 @@ impl MockHandle {
             height: state.height,
             blob,
         };
-        state.items.insert(id.clone(), item);
+        state.items.insert(id.clone(), item.clone());
         state.children.entry(parent).or_default().push(id.clone());
         if matches!(kind, ItemKind::Folder) {
             state.children.entry(id.clone()).or_default();
         }
+        let height = state.height;
+        state.journal.push((height, id.clone(), Some(item)));
         id
     }
 
@@ -134,6 +146,59 @@ impl MockHandle {
             }
         }
         state.children.remove(id);
+        let height = state.height;
+        state.journal.push((height, id.clone(), None));
+    }
+
+    /// Remote content modification: new size (and height bump + journal).
+    pub fn update_file_size(&self, id: &ItemId, size: u64) {
+        let mut state = self.state.lock().expect("mock poisoned");
+        state.height += 1;
+        let height = state.height;
+        if let Some(item) = state.items.get_mut(id) {
+            item.kind = ItemKind::File { size };
+            item.height = height;
+            let snapshot = item.clone();
+            state.journal.push((height, id.clone(), Some(snapshot)));
+        }
+    }
+
+    /// Remote rename/move.
+    pub fn rename(&self, id: &ItemId, new_parent: ItemId, new_name: &str) {
+        let mut state = self.state.lock().expect("mock poisoned");
+        state.height += 1;
+        let height = state.height;
+        let Some(mut item) = state.items.remove(id) else {
+            return;
+        };
+        if let Some(siblings) = state.children.get_mut(&item.parent) {
+            siblings.retain(|c| c != id);
+        }
+        item.parent = new_parent.clone();
+        item.name = new_name.to_string();
+        item.height = height;
+        state.items.insert(id.clone(), item.clone());
+        state.children.entry(new_parent).or_default().push(id.clone());
+        state.journal.push((height, id.clone(), Some(item)));
+    }
+
+    /// Send a content-free poke on the live watch connection.
+    pub fn poke(&self) {
+        let state = self.state.lock().expect("mock poisoned");
+        if let Some(tx) = &state.watch_tx {
+            let _ = tx.send(crate::transport::WatchEvent::Poke);
+        }
+    }
+
+    /// Scripted disconnect: drop the live watch connection's sender — the
+    /// daemon's stream ends as if the node vanished.
+    pub fn drop_watch(&self) {
+        self.state.lock().expect("mock poisoned").watch_tx = None;
+    }
+
+    /// Whether a watch connection is currently held open.
+    pub fn watch_connected(&self) -> bool {
+        self.state.lock().expect("mock poisoned").watch_tx.is_some()
     }
 
     /// Page size for enumerate — small values force multi-page listings.
@@ -235,6 +300,58 @@ impl NodeTransport for MockTransport {
                 None
             };
             Ok(Page { items, next })
+        })
+    }
+
+    fn changes(
+        &self,
+        since: crate::transport::Height,
+    ) -> BoxFuture<'_, Result<crate::transport::Changes, TransportError>> {
+        let state = self.state.clone();
+        Box::pin(async move {
+            let mut state = state.lock().expect("mock poisoned");
+            state.calls.push(CallRecord::Changes { since });
+
+            // Latest journal entry per id, strictly after `since` — the
+            // same semantics as the node's modification_log query.
+            let mut latest: HashMap<ItemId, (i64, Option<Item>)> = HashMap::new();
+            for (height, id, item) in state.journal.iter().filter(|(h, _, _)| *h > since) {
+                let entry = latest.entry(id.clone()).or_insert((*height, item.clone()));
+                if *height >= entry.0 {
+                    *entry = (*height, item.clone());
+                }
+            }
+            let mut items = Vec::new();
+            let mut deleted = Vec::new();
+            for (id, (_, item)) in latest {
+                match item {
+                    Some(item) => items.push(item),
+                    None => {
+                        if let ItemId::Inode(uuid) = id {
+                            deleted.push(uuid);
+                        }
+                    }
+                }
+            }
+            Ok(crate::transport::Changes {
+                items,
+                deleted,
+                height: state.height,
+            })
+        })
+    }
+
+    fn watch(
+        &self,
+    ) -> BoxFuture<'_, Result<crate::transport::WatchStream, TransportError>> {
+        let state = self.state.clone();
+        Box::pin(async move {
+            let mut state = state.lock().expect("mock poisoned");
+            state.calls.push(CallRecord::Watch);
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            state.watch_tx = Some(tx);
+            Ok(Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx))
+                as crate::transport::WatchStream)
         })
     }
 

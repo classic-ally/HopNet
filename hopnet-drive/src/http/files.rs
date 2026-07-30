@@ -735,6 +735,7 @@ pub async fn patch_files(
             payload.content_update.clone().map(|u| u.blob_op),
             None,
             &state.fragments_dir,
+            0, // validation only — rolled back, height never persisted
         )
         .map_err(|e| match e {
             hopnet_projection::DatabaseError::NotFound => StatusCode::NOT_FOUND,

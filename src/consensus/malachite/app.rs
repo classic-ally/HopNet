@@ -170,8 +170,9 @@ impl HopNetApplication {
         }
 
         // Handler dry-run (execute=false) — deterministic, both origins.
+        let candidate_height = i32::try_from(height.as_db()).unwrap_or(i32::MAX);
         for tx in old_txs.0.iter() {
-            process_transaction(tx, &self.app_state, false, db_tx)
+            process_transaction(tx, &self.app_state, false, candidate_height, db_tx)
                 .map_err(|e| format!("handler validation ({}): {e:?}", tx.rpc.function))?;
         }
         Ok(())
@@ -218,7 +219,8 @@ impl<C: DerefMut<Target = Connection> + 'static> Application<SqliteStorage<C>>
         // execute=true: dispatch-table application + nonce insertion, in the
         // host's decide transaction. Staleness/dedup checks are validation-
         // time only (execute skips them so sync can replay old blocks).
-        process_transactions(&Some(old_txs), &self.app_state, true, tx)
+        let decided_height = i32::try_from(height.as_db()).unwrap_or(i32::MAX);
+        process_transactions(&Some(old_txs), &self.app_state, true, decided_height, tx)
             .map_err(|e| ApplyError(format!("apply at height {}: {e:?}", height.0)))
     }
 
@@ -410,6 +412,7 @@ pub fn build_value(
                     };
                     let notifier = crate::handlers::HostNotifier {
                         test_mode: app_state.test_mode,
+                        change_tx: app_state.change_tx.clone(),
                     };
                     // execute=false here — the scheduler is never invoked
                     // during preflight; constructed for ctx uniformity.
@@ -419,6 +422,8 @@ pub fn build_value(
                     let ctx = crate::handlers::HandlerCtx {
                         fragments_dir: &app_state.fragments_dir,
                         node_id: app_state.node_id.get().copied(),
+                        // Mempool preflight — no block context.
+                        height: 0,
                         notifier: &notifier,
                         work: &scheduler,
                     };

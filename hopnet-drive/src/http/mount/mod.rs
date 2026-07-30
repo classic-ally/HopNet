@@ -41,7 +41,41 @@ pub fn router<S: Clone + Send + Sync + 'static>(state: DriveState) -> Router<S> 
         .route("/item", get(get_item))
         .route("/changes", get(get_changes))
         .route("/download", get(get_download))
+        .route("/watch", get(get_watch))
         .with_state(state)
+}
+
+/// SSE heartbeat interval; the daemon treats ~3 missed heartbeats as a
+/// dead connection.
+const WATCH_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// GET /integrations/mount/watch — SSE change push (RFC-018 S4).
+///
+/// Content-free pokes: "something changed, run /changes from your anchor".
+/// Node-scoped, not user-scoped — /changes does the per-user filtering.
+/// Lagged receivers emit a poke too (pokes are idempotent, missed ones
+/// coalesce). Note: a /watch connection holds one slot of the host's
+/// API concurrency limit for its lifetime — fine at desktop scale.
+pub async fn get_watch(
+    State(state): State<DriveState>,
+    Extension(_user_id): Extension<i32>,
+) -> axum::response::sse::Sse<
+    impl tokio_stream::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+> {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+
+    let mut rx = state.notify.subscribe();
+    let stream = async_stream::stream! {
+        loop {
+            match rx.recv().await {
+                Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    yield Ok(Event::default().data(""));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(WATCH_KEEPALIVE))
 }
 
 fn status_of(e: DatabaseError) -> StatusCode {

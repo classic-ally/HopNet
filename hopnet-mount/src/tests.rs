@@ -3,14 +3,15 @@
 //! assertions cover both what the core returns and what it emits across
 //! the boundary (call recording).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::attrs::DEFAULT_TTL;
 use crate::idmap::ROOT_INO;
 use crate::mock::{CallRecord, MockHandle, MockTransport};
-use crate::transport::{ItemId, ItemKind};
-use crate::vfs::{CoreError, MountCore};
+use crate::transport::{ItemId, ItemKind, NodeTransport};
+use crate::vfs::{CoreError, Invalidation, MountCore};
+use crate::watch::{KernelInvalidator, Watcher};
 
 fn setup() -> (Arc<MountCore>, MockHandle) {
     let (transport, handle) = MockTransport::new();
@@ -195,6 +196,293 @@ async fn ttl_expiry_forces_refetch() {
     handle.clear_calls();
     core.getattr(node.ino).await.unwrap();
     assert!(!handle.calls().is_empty(), "expired attr must re-fetch");
+}
+
+// ---------- S4: pokes, deltas, kernel invalidation ----------
+
+/// Records the kernel busts the watch loop fires, for assertion.
+#[derive(Default)]
+struct RecordingInvalidator {
+    seen: Mutex<Vec<Invalidation>>,
+}
+impl KernelInvalidator for RecordingInvalidator {
+    fn inval_entry(&self, parent_ino: u64, name: &str) {
+        self.seen.lock().unwrap().push(Invalidation::Entry {
+            parent_ino,
+            name: name.to_string(),
+        });
+    }
+    fn inval_inode(&self, ino: u64) {
+        self.seen
+            .lock()
+            .unwrap()
+            .push(Invalidation::Inode { ino });
+    }
+}
+impl RecordingInvalidator {
+    fn snapshot(&self) -> Vec<Invalidation> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+fn changes_calls(handle: &MockHandle) -> Vec<i64> {
+    handle
+        .calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            CallRecord::Changes { since } => Some(since),
+            _ => None,
+        })
+        .collect()
+}
+
+async fn wait_until(deadline_ms: u64, mut cond: impl FnMut() -> bool) -> bool {
+    for _ in 0..(deadline_ms / 10) {
+        if cond() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    cond()
+}
+
+/// Spawn a watcher over the given core+mock, wait for the watch
+/// connection and the post-connect sync.
+async fn spawn_watcher(
+    core: Arc<MountCore>,
+    transport: Arc<MockTransport>,
+    handle: &MockHandle,
+) -> Arc<RecordingInvalidator> {
+    let invalidator = Arc::new(RecordingInvalidator::default());
+    tokio::spawn(
+        Watcher::new(core, transport as Arc<dyn NodeTransport>, invalidator.clone()).run(),
+    );
+    assert!(
+        wait_until(2000, || handle.watch_connected() && !changes_calls(handle).is_empty()).await,
+        "watcher never connected + synced"
+    );
+    invalidator
+}
+
+// Should: follow a poke with exactly one changes(anchor) sync.
+// Should not: sync again without a further poke.
+// Impact: this is the freshness mechanism — the TTLs are only backstops.
+#[tokio::test]
+async fn poke_triggers_exactly_one_sync() {
+    let (transport, handle) = MockTransport::new();
+    let core = Arc::new(MountCore::new(transport.clone(), DEFAULT_TTL));
+    spawn_watcher(core, transport, &handle).await;
+    let baseline = changes_calls(&handle).len();
+
+    handle.add_file(ItemId::Root, "new.txt", 5);
+    handle.poke();
+    assert!(
+        wait_until(2000, || changes_calls(&handle).len() == baseline + 1).await,
+        "expected one sync after poke, saw {:?}",
+        changes_calls(&handle)
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        changes_calls(&handle).len(),
+        baseline + 1,
+        "no further sync without a further poke"
+    );
+}
+
+// Should: coalesce a burst of pokes into a single sync.
+#[tokio::test]
+async fn poke_burst_coalesces_into_one_sync() {
+    let (transport, handle) = MockTransport::new();
+    let core = Arc::new(MountCore::new(transport.clone(), DEFAULT_TTL));
+    spawn_watcher(core, transport, &handle).await;
+    let baseline = changes_calls(&handle).len();
+
+    for _ in 0..5 {
+        handle.poke();
+    }
+    assert!(wait_until(2000, || changes_calls(&handle).len() > baseline).await);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        changes_calls(&handle).len(),
+        baseline + 1,
+        "burst must coalesce to one sync"
+    );
+}
+
+// Should: refresh the attr cache from a delta so a subsequent stat is
+// served fresh with no transport round-trip, and bust the kernel's inode
+// + parent-entry caches for items the kernel has seen.
+#[tokio::test]
+async fn remote_modify_refreshes_cache_and_busts_kernel() {
+    let (transport, handle) = MockTransport::new();
+    let core = Arc::new(MountCore::new(transport.clone(), DEFAULT_TTL));
+    handle.add_file(ItemId::Root, "doc.txt", 100);
+    let node = core.lookup(ROOT_INO, "doc.txt").await.unwrap();
+
+    let invalidator = spawn_watcher(core.clone(), transport, &handle).await;
+
+    handle.update_file_size(&node.item.id, 999);
+    handle.poke();
+
+    assert!(
+        wait_until(2000, || {
+            invalidator
+                .snapshot()
+                .contains(&Invalidation::Inode { ino: node.ino })
+        })
+        .await,
+        "kernel inode bust for a known item"
+    );
+    assert!(invalidator.snapshot().contains(&Invalidation::Entry {
+        parent_ino: ROOT_INO,
+        name: "doc.txt".to_string()
+    }));
+
+    handle.clear_calls();
+    let fresh = core.getattr(node.ino).await.unwrap();
+    assert_eq!(fresh.item.kind, ItemKind::File { size: 999 });
+    assert!(
+        handle.calls().is_empty(),
+        "delta-refreshed attr must be cache-served"
+    );
+}
+
+// Should not: mint inode numbers (or fire kernel busts) for changed items
+// the kernel has never looked up.
+#[tokio::test]
+async fn unseen_items_get_no_kernel_invalidation() {
+    let (transport, handle) = MockTransport::new();
+    let core = Arc::new(MountCore::new(transport.clone(), DEFAULT_TTL));
+    let invalidator = spawn_watcher(core, transport, &handle).await;
+
+    handle.add_file(ItemId::Root, "never-seen.txt", 1);
+    handle.poke();
+    let baseline_calls = changes_calls(&handle).len();
+    assert!(wait_until(2000, || changes_calls(&handle).len() >= baseline_calls).await);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        invalidator.snapshot().is_empty(),
+        "no kernel state exists for unseen items, got {:?}",
+        invalidator.snapshot()
+    );
+}
+
+// Should: bust both the old and new parent entries on a remote rename.
+// Impact: a stale dentry under the old name is a phantom file — worse
+// than staleness, it's wrong namespace.
+#[tokio::test]
+async fn remote_rename_busts_old_and_new_entries() {
+    let (transport, handle) = MockTransport::new();
+    let core = Arc::new(MountCore::new(transport.clone(), DEFAULT_TTL));
+    let docs = handle.add_folder(ItemId::Root, "Documents");
+    handle.add_file(docs.clone(), "old-name.txt", 5);
+
+    let docs_node = core.lookup(ROOT_INO, "Documents").await.unwrap();
+    let file_node = core.lookup(docs_node.ino, "old-name.txt").await.unwrap();
+    let invalidator = spawn_watcher(core.clone(), transport, &handle).await;
+
+    handle.rename(&file_node.item.id, ItemId::Root, "new-name.txt");
+    handle.poke();
+
+    assert!(
+        wait_until(2000, || {
+            let seen = invalidator.snapshot();
+            seen.contains(&Invalidation::Entry {
+                parent_ino: docs_node.ino,
+                name: "old-name.txt".to_string(),
+            }) && seen.contains(&Invalidation::Entry {
+                parent_ino: ROOT_INO,
+                name: "new-name.txt".to_string(),
+            }) && seen.contains(&Invalidation::Inode { ino: file_node.ino })
+        })
+        .await,
+        "rename must bust old entry, new entry, and the inode: {:?}",
+        invalidator.snapshot()
+    );
+}
+
+// Should: on remote delete, bust the parent entry and inode and forget
+// the cached attrs — a subsequent getattr reports NotFound.
+#[tokio::test]
+async fn remote_delete_busts_and_forgets() {
+    let (transport, handle) = MockTransport::new();
+    let core = Arc::new(MountCore::new(transport.clone(), DEFAULT_TTL));
+    handle.add_file(ItemId::Root, "doomed.txt", 5);
+    let node = core.lookup(ROOT_INO, "doomed.txt").await.unwrap();
+    let invalidator = spawn_watcher(core.clone(), transport, &handle).await;
+
+    handle.remove(&node.item.id);
+    handle.poke();
+
+    assert!(
+        wait_until(2000, || {
+            let seen = invalidator.snapshot();
+            seen.contains(&Invalidation::Entry {
+                parent_ino: ROOT_INO,
+                name: "doomed.txt".to_string(),
+            }) && seen.contains(&Invalidation::Inode { ino: node.ino })
+        })
+        .await
+    );
+    match core.getattr(node.ino).await {
+        Err(CoreError::NotFound) => {}
+        other => panic!("deleted item must be NotFound, got {other:?}"),
+    }
+}
+
+// Should: reconnect after a dropped watch connection and resync from the
+// anchor, so mutations made during the gap propagate.
+// Should not: leave a divergence window — the post-reconnect sync happens
+// before any new poke is needed.
+// Impact: the RFC's no-divergence-on-reconnect MUST.
+#[tokio::test]
+async fn disconnect_resyncs_without_divergence() {
+    let (transport, handle) = MockTransport::new();
+    let core = Arc::new(MountCore::new(transport.clone(), DEFAULT_TTL));
+    handle.add_file(ItemId::Root, "gap.txt", 10);
+    let node = core.lookup(ROOT_INO, "gap.txt").await.unwrap();
+    let invalidator = spawn_watcher(core.clone(), transport, &handle).await;
+
+    handle.drop_watch();
+    // Mutation while no watch connection exists — no poke is possible.
+    handle.update_file_size(&node.item.id, 777);
+
+    assert!(
+        wait_until(3000, || {
+            invalidator
+                .snapshot()
+                .contains(&Invalidation::Inode { ino: node.ino })
+        })
+        .await,
+        "gap mutation must propagate via post-reconnect sync"
+    );
+    let fresh = core.getattr(node.ino).await.unwrap();
+    assert_eq!(fresh.item.kind, ItemKind::File { size: 777 });
+}
+
+// Should: pass strictly non-decreasing anchors to changes() across syncs.
+// Impact: a regressing anchor re-applies old deltas; a skipping anchor
+// loses changes silently.
+#[tokio::test]
+async fn sync_anchor_is_monotonic() {
+    let (transport, handle) = MockTransport::new();
+    let core = Arc::new(MountCore::new(transport.clone(), DEFAULT_TTL));
+    spawn_watcher(core, transport, &handle).await;
+
+    for i in 0..3 {
+        handle.add_file(ItemId::Root, &format!("m{i}.txt"), 1);
+        handle.poke();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    let seen = changes_calls(&handle);
+    assert!(seen.len() >= 3);
+    // First call is the ANCHOR_INIT sentinel; later anchors are real
+    // heights and must never decrease.
+    for pair in seen[1..].windows(2) {
+        assert!(pair[1] >= pair[0], "anchor regressed: {seen:?}");
+    }
 }
 
 // Should: emit exactly one lookup per component and one enumerate walk

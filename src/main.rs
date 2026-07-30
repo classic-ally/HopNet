@@ -265,6 +265,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 evidence: std::sync::Arc::new(consensus::evidence::EvidenceMap::new()),
                 storage: Arc::new(OnceCell::new()),
                 runtime: tokio::runtime::Handle::current(),
+                change_tx: tokio::sync::broadcast::channel(16).0,
             };
 
             // If we loaded state from database, populate the OnceCell fields

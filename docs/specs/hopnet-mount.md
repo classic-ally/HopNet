@@ -88,10 +88,13 @@ boundaries but is not a deliverable.
     `/changes?since_height=N`, drop/refresh affected attr entries, issue
     kernel invalidations (fuser notify) for touched inodes and parent dirs
 - cache policy: generous, cache-until-poked
-  - long kernel entry/attr TTLs; proactive invalidation on the changes feed
-  - interim (S3, pre-S4): no /watch yet — remote-change staleness is
-    TTL-bounded (60 s attr + kernel TTLs); S4 replaces this with
-    poke-driven invalidation
+  - long kernel entry/attr TTLs; proactive invalidation on the changes
+    feed. As of S4 the TTLs are pure backstops: freshness is poke-driven
+    (consensus commit → broadcast → SSE poke → /changes sync → attr-cache
+    refresh + kernel inval_entry/inval_inode)
+  - poke coalescing (resolved open question): server side, a lagged SSE
+    subscriber gets one poke (pokes are idempotent); daemon side, bursts
+    drain into a single /changes sync
   - poke correctness is therefore load-bearing
   - test suite MUST cover poke-driven invalidation end-to-end: mutation on
     node → poke → kernel cache invalidated → fresh stat/readdir observes
@@ -126,6 +129,12 @@ New mount `/api/integrations/mount`, `AuthClass::DeviceToken`, declared in
     enumerating large directories for one lookup
   - `GET /item?id=`
   - `GET /changes?since_height=N` — existing height-anchored delta feed
+    - S4 fixed a pre-existing node bug this contract exposed: mutation
+      handlers stamped modification_log from last_decided_height read
+      DURING apply (lags the deciding block; also node-local, so
+      live-apply vs catch-up could diverge). Heights now stamp the
+      deciding block via HandlerCtx.height. Replicated-state derivation
+      change: all mesh nodes must upgrade together
   - `GET /watch` — SSE change push
     - content-free "something changed" poke; daemon follows with /changes
     - heartbeat comment frames; on drop/reconnect the daemon resyncs from
@@ -314,8 +323,9 @@ implements that contract. Each slice is PR-sized and lands green.
       changes/health (2026-07-30)
 - [x] S3 — HTTP transport joins the halves; real tree browses read-only
       (2026-07-30)
-- [ ] S4 — /watch SSE + subscribe seam + kernel invalidation + poke
-      test suite
+- [x] S4 — /watch SSE + subscribe seam + kernel invalidation + poke
+      test suite (2026-07-30; includes the modification-height stamping
+      fix — deciding block height, not lagging last_decided)
 - [ ] S5 — content reads: sparse cache, whole-file fast path,
       snapshot-at-open, disk-pressure eviction
 - [ ] S6 — submit-and-wait-decided + strict mutation routes (node-side)
@@ -354,8 +364,7 @@ together as a stack:
 
 1. `/watch` auth over long-lived SSE — device-token bootstrap sessions
    are short-TTL; reconnect-with-reauth cadence vs keepalive semantics.
-2. Poke coalescing — a burst of consensus commits should not produce N
-   pokes; debounce server-side or client-side.
-3. Prefetch depth for sequential-access detection — measure, don't guess.
-4. Pin/unpin surfaced through the mount (xattr command, sidecar CLI, or
+   (S4 v1: auth at request time only; connection outlives the session.)
+2. Prefetch depth for sequential-access detection — measure, don't guess.
+3. Pin/unpin surfaced through the mount (xattr command, sidecar CLI, or
    file-manager action) once issue #23 lands.

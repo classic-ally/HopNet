@@ -262,8 +262,67 @@ async fn http_transport_full_read_contract() {
     }
 }
 
+// Should: deliver a poke over a live /watch connection when a mutation
+// commits, interleaved with server heartbeats, and expose the mutation
+// through changes(anchor).
+// Impact: proves HostNotifier's platform-neutral broadcast arm actually
+// fires on Linux — the poke path's reason to exist.
+#[tokio::test]
+async fn watch_pokes_flow_end_to_end() {
+    use hopnet_mount::transport::WatchEvent;
+    use tokio_stream::StreamExt;
+
+    let node = boot_node().await;
+    let (api_key, jwt) = provision(&node).await;
+    let transport = HttpTransport::new(&node.base(), &api_key).unwrap();
+
+    let anchor = transport
+        .changes(i32::MAX as i64)
+        .await
+        .expect("anchor init")
+        .height;
+
+    let mut stream = transport.watch().await.expect("watch connect");
+
+    // Consume events in the background; record what arrives.
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_writer = seen.clone();
+    let consumer = tokio::spawn(async move {
+        while let Some(event) = stream.next().await {
+            seen_writer.lock().unwrap().push(event);
+        }
+    });
+
+    seed_file(&node, &jwt, &transport, "/Watched", "ping.txt", b"poke me").await;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(25);
+    let mut got_poke = false;
+    let mut got_heartbeat = false;
+    while std::time::Instant::now() < deadline && !(got_poke && got_heartbeat) {
+        {
+            let seen = seen.lock().unwrap();
+            got_poke = seen.contains(&WatchEvent::Poke);
+            got_heartbeat = seen.contains(&WatchEvent::Heartbeat);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(got_poke, "no poke observed after committed mutation");
+    assert!(got_heartbeat, "no heartbeat within 25s (keepalive is 15s)");
+    consumer.abort();
+
+    let delta = transport.changes(anchor).await.expect("delta");
+    let names: Vec<&str> = delta.items.iter().map(|i| i.name.as_str()).collect();
+    assert!(
+        names.contains(&"ping.txt") && names.contains(&"Watched"),
+        "changes since pre-mutation anchor must include the new file+folder, got {names:?}"
+    );
+    assert!(delta.height > anchor);
+}
+
 // Should: expose a live node's tree through a real kernel mount — ls and
-// stat via std::fs observe the seeded namespace with sane metadata.
+// stat via std::fs observe the seeded namespace with sane metadata — and
+// reflect a REMOTE content modification in stat within seconds (the
+// inval_inode path busting the kernel's 60s attr cache), not after TTL.
 // (Closes S1's smoke-test gap; #[ignore] because it needs /dev/fuse.)
 #[tokio::test]
 #[ignore = "requires /dev/fuse and a built hopnet binary"]
@@ -287,8 +346,8 @@ async fn fuse_mount_smoke_against_live_node() {
     )
     .await;
 
-    let core = Arc::new(MountCore::new(transport, DEFAULT_TTL));
-    let fs = HopFs::new(core, tokio::runtime::Handle::current());
+    let core = Arc::new(MountCore::new(transport.clone(), DEFAULT_TTL));
+    let fs = HopFs::new(core.clone(), tokio::runtime::Handle::current());
     let mountpoint = tempfile::tempdir().unwrap();
     let mut config = fuser::Config::default();
     config.mount_options = vec![
@@ -297,16 +356,30 @@ async fn fuse_mount_smoke_against_live_node() {
     ];
     let session = fuser::spawn_mount(fs, mountpoint.path(), &config).unwrap();
 
+    // S4: watch loop with the real kernel invalidator.
+    let invalidator = Arc::new(hopnet_mount::fuse::FuserInvalidator(session.notifier()));
+    let watcher = tokio::spawn(
+        hopnet_mount::watch::Watcher::new(
+            core,
+            transport.clone() as Arc<dyn NodeTransport>,
+            invalidator,
+        )
+        .run(),
+    );
+
     // std::fs is blocking; keep it off the runtime threads the FUSE
     // callbacks need.
     let dir = mountpoint.path().to_path_buf();
-    let observed = tokio::task::spawn_blocking(move || {
-        let names: Vec<String> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        let meta = std::fs::metadata(dir.join("Docs/hello.txt")).unwrap();
-        (names, meta.len(), meta.is_file())
+    let observed = tokio::task::spawn_blocking({
+        let dir = dir.clone();
+        move || {
+            let names: Vec<String> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            let meta = std::fs::metadata(dir.join("Docs/hello.txt")).unwrap();
+            (names, meta.len(), meta.is_file())
+        }
     })
     .await
     .unwrap();
@@ -315,5 +388,58 @@ async fn fuse_mount_smoke_against_live_node() {
     assert_eq!(observed.1, 11);
     assert!(observed.2);
 
+    // The stat above put hello.txt's attrs in the KERNEL cache (60s TTL).
+    // Modify content remotely; the poke → inval_inode path must make stat
+    // reflect the new size within seconds, not after the TTL.
+    let docs = transport
+        .lookup(ItemId::Root, "Docs".to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    let file = transport
+        .lookup(docs.id.clone(), "hello.txt".to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    let ItemId::Inode(inode_uuid) = &file.id else {
+        panic!("file id")
+    };
+    let new_content = b"mount smoke, now considerably longer".to_vec();
+    let part = reqwest::multipart::Part::bytes(new_content.clone()).file_name("hello.txt");
+    let form = reqwest::multipart::Form::new()
+        .text("inode_id", inode_uuid.to_string())
+        .part(format!("file_{}", new_content.len()), part);
+    let status = reqwest::Client::new()
+        .patch(format!("{}/api/files", node.base()))
+        .bearer_auth(&jwt)
+        .multipart(form)
+        .send()
+        .await
+        .expect("patch")
+        .status();
+    assert!(status.is_success(), "content patch failed: {status}");
+
+    let target = new_content.len() as u64;
+    let fresh = tokio::task::spawn_blocking(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let len = std::fs::metadata(dir.join("Docs/hello.txt")).unwrap().len();
+            if len == target {
+                return true;
+            }
+            if std::time::Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        fresh,
+        "stat must reflect remote modify within 10s (kernel TTL is 60s) — inval_inode failed"
+    );
+
+    watcher.abort();
     drop(session);
 }

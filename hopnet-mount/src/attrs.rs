@@ -54,4 +54,15 @@ impl AttrCache {
     pub fn invalidate(&self, id: &ItemId) {
         self.inner.lock().expect("attr cache poisoned").remove(id);
     }
+
+    /// Cached state for `id` IGNORING the TTL. Expired entries still name
+    /// the old parent/name — exactly what invalidation targeting needs
+    /// when a change arrives (RFC-018 S4).
+    pub fn get_stale(&self, id: &ItemId) -> Option<Item> {
+        self.inner
+            .lock()
+            .expect("attr cache poisoned")
+            .get(id)
+            .map(|e| e.item.clone())
+    }
 }

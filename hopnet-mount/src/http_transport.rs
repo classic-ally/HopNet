@@ -10,10 +10,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hopnet_common::db::InodeType;
 use hopnet_common::fileprovider::{HealthResponse, HealthStatus};
-use hopnet_common::mount::{MountEnumerateResponse, MountItem};
+use hopnet_common::mount::{MountChangesResponse, MountEnumerateResponse, MountItem};
 
 use crate::transport::{
-    BoxFuture, Cursor, Health, Item, ItemId, ItemKind, NodeTransport, Page, TransportError,
+    BoxFuture, Changes, Cursor, Health, Height, Item, ItemId, ItemKind, NodeTransport, Page,
+    TransportError, WatchEvent, WatchStream,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -194,6 +195,70 @@ impl NodeTransport for HttpTransport {
                 items: wire.items.into_iter().map(item_from_wire).collect(),
                 next: wire.next_cursor.map(Cursor),
             })
+        })
+    }
+
+    fn changes(&self, since: Height) -> BoxFuture<'_, Result<Changes, TransportError>> {
+        Box::pin(async move {
+            // Wire heights are i32; clamp the anchor-init sentinel.
+            let since_wire = since.clamp(0, i32::MAX as Height) as i32;
+            let query = vec![("since_height", since_wire.to_string())];
+            let response = self.get_authed("changes", &query).await?;
+            let wire = parse_json::<MountChangesResponse>(response).await?;
+            Ok(Changes {
+                items: wire.items.into_iter().map(item_from_wire).collect(),
+                deleted: wire.deleted_ids,
+                height: Height::from(wire.height),
+            })
+        })
+    }
+
+    fn watch(&self) -> BoxFuture<'_, Result<WatchStream, TransportError>> {
+        Box::pin(async move {
+            // Separate client: the normal 30 s request timeout would kill
+            // a long-lived SSE stream. Connect timeout still applies;
+            // liveness is the watch loop's job (heartbeat-bounded).
+            let client = reqwest::Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .build()
+                .map_err(|e| TransportError::Protocol(e.to_string()))?;
+            let response = client
+                .get(self.url("watch"))
+                .bearer_auth(&self.token)
+                .send()
+                .await
+                .map_err(map_reqwest_err)?;
+            let response = check_status(response)?;
+            if !response.status().is_success() {
+                return Err(TransportError::Protocol(format!(
+                    "unexpected status {}",
+                    response.status()
+                )));
+            }
+
+            // Minimal SSE parse over the byte stream: `data:` lines are
+            // pokes, `:` comment lines are heartbeats, everything else
+            // (event/id fields, blank separators) is ignored.
+            let mut bytes = response.bytes_stream();
+            let stream = async_stream::stream! {
+                let mut buffer: Vec<u8> = Vec::new();
+                use tokio_stream::StreamExt;
+                while let Some(chunk) = bytes.next().await {
+                    let Ok(chunk) = chunk else { break };
+                    buffer.extend_from_slice(&chunk);
+                    while let Some(pos) = buffer.iter().position(|b| *b == b'\n') {
+                        let line: Vec<u8> = buffer.drain(..=pos).collect();
+                        let line = String::from_utf8_lossy(&line);
+                        let line = line.trim_end();
+                        if line.starts_with("data:") {
+                            yield WatchEvent::Poke;
+                        } else if line.starts_with(':') {
+                            yield WatchEvent::Heartbeat;
+                        }
+                    }
+                }
+            };
+            Ok(Box::pin(stream) as WatchStream)
         })
     }
 

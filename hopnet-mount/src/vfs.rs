@@ -185,4 +185,69 @@ impl MountCore {
     pub fn invalidate(&self, id: &ItemId) {
         self.attrs.invalidate(id);
     }
+
+    /// Apply a /changes delta (RFC-018 S4): refresh the attr cache and
+    /// compute the kernel invalidations the watch loop must fire.
+    ///
+    /// Kernel state is only busted for items the kernel has seen (idmap
+    /// peek — never allocates); everything else is cache-refresh only,
+    /// since directory listings are re-enumerated per opendir anyway.
+    pub fn apply_changes(&self, changes: &crate::transport::Changes) -> Vec<Invalidation> {
+        let mut invalidations = Vec::new();
+
+        for item in &changes.items {
+            let old = self.attrs.get_stale(&item.id);
+            if let Some(ino) = self.ids.peek(&item.id) {
+                invalidations.push(Invalidation::Inode { ino });
+                // Entry invalidation on the (parent, name) pairs the
+                // kernel may hold: the old location (if we knew it and it
+                // moved) and the current one.
+                if let Some(old) = &old {
+                    let moved = old.parent != item.parent || old.name != item.name;
+                    if moved {
+                        if let Some(old_parent_ino) = self.ids.peek(&old.parent) {
+                            invalidations.push(Invalidation::Entry {
+                                parent_ino: old_parent_ino,
+                                name: old.name.clone(),
+                            });
+                        }
+                    }
+                }
+                if let Some(parent_ino) = self.ids.peek(&item.parent) {
+                    invalidations.push(Invalidation::Entry {
+                        parent_ino,
+                        name: item.name.clone(),
+                    });
+                }
+            }
+            // Fresh state into the cache — this is what makes the TTL a
+            // backstop rather than the freshness mechanism.
+            self.attrs.insert(item.clone());
+        }
+
+        for gone in &changes.deleted {
+            let id = ItemId::Inode(gone.clone());
+            if let Some(old) = self.attrs.get_stale(&id) {
+                if let Some(parent_ino) = self.ids.peek(&old.parent) {
+                    invalidations.push(Invalidation::Entry {
+                        parent_ino,
+                        name: old.name.clone(),
+                    });
+                }
+            }
+            if let Some(ino) = self.ids.peek(&id) {
+                invalidations.push(Invalidation::Inode { ino });
+            }
+            self.attrs.invalidate(&id);
+        }
+
+        invalidations
+    }
+}
+
+/// A kernel cache bust the watch loop must fire after applying changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Invalidation {
+    Entry { parent_ino: u64, name: String },
+    Inode { ino: u64 },
 }
