@@ -131,6 +131,10 @@ path = "orchestrator/main.rs"
 name = "snapshotter"
 path = "snapshotter/main.rs"
 
+[[bin]]
+name = "photo-seeder"
+path = "seeder/main.rs"
+
 [patch.crates-io]
 iroh = { git = "https://github.com/classic-ally/iroh", branch = "auth-before-register-v0.98" }
 

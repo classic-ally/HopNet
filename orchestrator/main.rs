@@ -69,6 +69,12 @@ enum Commands {
         #[arg(short = 'y', long)]
         yes: bool,
     },
+    /// Print mesh sign-in credentials and per-node URLs for browser access
+    Creds {
+        /// Mesh network ID
+        #[arg(short, long)]
+        mesh_id: u32,
+    },
     /// Show detailed status of a mesh and its nodes
     Status {
         /// Mesh network ID to examine
@@ -151,6 +157,20 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Cleanup { yes }) => {
             cleanup_orphaned_networks(&docker, *yes).await?;
+        }
+        Some(Commands::Creds { mesh_id }) => {
+            // Username is fixed by setup_node_0; the passphrase is persisted
+            // in node 0's volume at mesh creation.
+            let passphrase = load_mesh_passphrase(&docker, *mesh_id).await?;
+            let addresses = get_external_addresses(&docker, *mesh_id, runtime).await?;
+            println!("mesh {} credentials:", mesh_id);
+            println!("  username:   allison");
+            println!("  passphrase: {}", passphrase);
+            println!("  nodes:");
+            for (node_id, host, port) in addresses {
+                println!("    node {}: http://{}:{}", node_id, host, port);
+            }
+            println!("open a node URL in a browser and sign in with the above.");
         }
         Some(Commands::Status { mesh_id }) => {
             show_mesh_status(&docker, *mesh_id, runtime).await?;

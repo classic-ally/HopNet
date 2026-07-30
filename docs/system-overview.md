@@ -99,8 +99,13 @@ apply functions inside consensus handlers.
       grid, histogram rail, filters, lightbox) over a module-scope
       authenticated blob cache keyed by data_block_id; manual multipart
       ingest route `POST /api/photos` runs the full publisher server-side
-      (2026-07-30). Deferred: shared libraries (Phase 3), favorites
-      (Phase 4), video Range streaming.
+      (2026-07-30). Seeding suite (2026-07-30): `photo-seeder` bin +
+      `hopnet::dev_seed` (deterministic synthetic photos over HTTP,
+      targets a dev node or mesh nodes), `photos-upload-consistency`
+      orchestrator test (first cross-node validation of the photos
+      pipeline), `orchestrator creds` for browser sign-in. Deferred:
+      shared libraries (Phase 3), favorites (Phase 4), video Range
+      streaming.
 - [x] Photo publisher (2026-07-30): `hopnet-photos-core::publisher`
       turns a validated `PhotoAsset` + byte streams into an encrypted
       `photo_add` — exact-length streaming upload (no staging copy),
