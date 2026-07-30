@@ -12,9 +12,10 @@ async-stream = "0.3.6"
 hopnet-common = { path = "../common" }
 reqwest = { version = "0.12.19", features = ["json", "stream"] }
 serde = { version = "1.0.219", features = ["derive"] }
-# sync/time only — no runtime linked; the platform-neutral core (watch
-# loop, mock streams) needs channels and timeouts, not an executor.
-tokio = { version = "1.45.1", features = ["sync", "time"] }
+# sync/time/rt only — no IO driver linked; the platform-neutral core
+# (watch loop, mock streams, cache spawn_blocking) needs channels,
+# timeouts, and blocking offload, not a full executor.
+tokio = { version = "1.45.1", features = ["sync", "time", "rt"] }
 tokio-stream = { version = "0.1.17", features = ["sync"] }
 tracing = "0.1"
 
@@ -23,7 +24,7 @@ fuser = "0.18"
 tokio = { version = "1.45.1", features = ["rt-multi-thread", "sync", "time", "macros", "signal"] }
 clap = { version = "4.5.41", features = ["derive"] }
 tracing-subscriber = "0.3.19"
-rustix = { version = "1.0", features = ["process"] }
+rustix = { version = "1.0", features = ["process", "fs"] }
 
 [dev-dependencies]
 reqwest = { version = "0.12.19", features = ["json", "multipart"] }

@@ -8,6 +8,7 @@
 //! behind `transport::NodeTransport` (mock in S1, HTTP in S3).
 
 pub mod attrs;
+pub mod cache;
 pub mod http_transport;
 pub mod idmap;
 pub mod mock;

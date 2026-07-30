@@ -22,6 +22,7 @@ pub enum CallRecord {
     Enumerate { parent: ItemId, cursor: Option<String> },
     Changes { since: i64 },
     Watch,
+    ReadBlob { blob: CustomUUID, offset: u64, len: u64 },
     Health,
 }
 
@@ -38,6 +39,12 @@ struct MockState {
     /// Live watch connection, if any; dropping it (drop_watch) is the
     /// scripted-disconnect failure mode.
     watch_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::transport::WatchEvent>>,
+    /// Blob plaintext store; keyed by blob id. Old blobs stay readable
+    /// after content updates (node semantics — snapshot-at-open).
+    blobs: HashMap<CustomUUID, Vec<u8>>,
+    /// While true, read_blob calls park on the gate (deterministic
+    /// single-flight tests).
+    fetch_hold: tokio::sync::watch::Sender<bool>,
 }
 
 impl MockState {
@@ -75,6 +82,8 @@ impl MockTransport {
             height: 1,
             journal: Vec::new(),
             watch_tx: None,
+            blobs: HashMap::new(),
+            fetch_hold: tokio::sync::watch::channel(false).0,
         }));
         (
             Arc::new(MockTransport {
@@ -199,6 +208,73 @@ impl MockHandle {
     /// Whether a watch connection is currently held open.
     pub fn watch_connected(&self) -> bool {
         self.state.lock().expect("mock poisoned").watch_tx.is_some()
+    }
+
+    /// A file whose content the mock can serve via read_blob.
+    pub fn add_file_with_content(
+        &self,
+        parent: ItemId,
+        name: &str,
+        content: &[u8],
+    ) -> (ItemId, CustomUUID) {
+        let id = self.insert(parent, name, ItemKind::File { size: content.len() as u64 });
+        let mut state = self.state.lock().expect("mock poisoned");
+        let blob = match state.items.get(&id).and_then(|i| i.blob.clone()) {
+            Some(blob) => blob,
+            None => {
+                // Zero-length content still needs no blob (node semantics).
+                let blob = CustomUUID::new(None);
+                if let Some(item) = state.items.get_mut(&id) {
+                    item.blob = Some(blob.clone());
+                }
+                blob
+            }
+        };
+        state.blobs.insert(blob.clone(), content.to_vec());
+        (id, blob)
+    }
+
+    /// Remote content replacement: mints a NEW blob id (node modify
+    /// semantics); the old blob's content stays readable so open handles
+    /// keep their snapshot.
+    pub fn update_file_content(&self, id: &ItemId, content: &[u8]) -> CustomUUID {
+        let mut state = self.state.lock().expect("mock poisoned");
+        state.height += 1;
+        let height = state.height;
+        let new_blob = CustomUUID::new(None);
+        state.blobs.insert(new_blob.clone(), content.to_vec());
+        if let Some(item) = state.items.get_mut(id) {
+            item.kind = ItemKind::File { size: content.len() as u64 };
+            item.blob = Some(new_blob.clone());
+            item.height = height;
+            let snapshot = item.clone();
+            state.journal.push((height, id.clone(), Some(snapshot)));
+        }
+        new_blob
+    }
+
+    /// Delete a blob's content outright (scripted GC race).
+    pub fn drop_blob(&self, blob: &CustomUUID) {
+        self.state.lock().expect("mock poisoned").blobs.remove(blob);
+    }
+
+    /// Park subsequent read_blob calls until release_fetches.
+    pub fn hold_fetches(&self) {
+        let _ = self
+            .state
+            .lock()
+            .expect("mock poisoned")
+            .fetch_hold
+            .send_replace(true);
+    }
+
+    pub fn release_fetches(&self) {
+        let _ = self
+            .state
+            .lock()
+            .expect("mock poisoned")
+            .fetch_hold
+            .send_replace(false);
     }
 
     /// Page size for enumerate — small values force multi-page listings.
@@ -352,6 +428,36 @@ impl NodeTransport for MockTransport {
             state.watch_tx = Some(tx);
             Ok(Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx))
                 as crate::transport::WatchStream)
+        })
+    }
+
+    fn read_blob(
+        &self,
+        blob: CustomUUID,
+        offset: u64,
+        len: u64,
+    ) -> BoxFuture<'_, Result<Vec<u8>, TransportError>> {
+        let state = self.state.clone();
+        Box::pin(async move {
+            let mut gate = {
+                let mut locked = state.lock().expect("mock poisoned");
+                locked.calls.push(CallRecord::ReadBlob {
+                    blob: blob.clone(),
+                    offset,
+                    len,
+                });
+                locked.fetch_hold.subscribe()
+            };
+            // Park while held (lock released above — mutations proceed).
+            let _ = gate.wait_for(|held| !held).await;
+
+            let locked = state.lock().expect("mock poisoned");
+            let Some(content) = locked.blobs.get(&blob) else {
+                return Err(TransportError::Protocol("blob gone".to_string()));
+            };
+            let start = (offset as usize).min(content.len());
+            let end = ((offset + len) as usize).min(content.len());
+            Ok(content[start..end].to_vec())
         })
     }
 

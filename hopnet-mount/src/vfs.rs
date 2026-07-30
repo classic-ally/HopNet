@@ -20,10 +20,14 @@ pub enum CoreError {
     NotFound,
     /// Directory op on a non-directory. (ENOTDIR)
     NotADirectory,
+    /// File open() on a folder. (EISDIR)
+    IsADirectory,
     /// Directory handle not (or no longer) open. (EBADF)
     StaleHandle,
     /// Transport failure — node unreachable, protocol error. (EIO)
     Transport(TransportError),
+    /// Content cache failure. (EIO)
+    Cache(crate::cache::CacheError),
 }
 
 impl std::fmt::Display for CoreError {
@@ -31,8 +35,10 @@ impl std::fmt::Display for CoreError {
         match self {
             CoreError::NotFound => write!(f, "not found"),
             CoreError::NotADirectory => write!(f, "not a directory"),
-            CoreError::StaleHandle => write!(f, "stale directory handle"),
+            CoreError::IsADirectory => write!(f, "is a directory"),
+            CoreError::StaleHandle => write!(f, "stale handle"),
             CoreError::Transport(e) => write!(f, "transport: {e}"),
+            CoreError::Cache(e) => write!(f, "cache: {e}"),
         }
     }
 }
@@ -60,12 +66,30 @@ pub struct DirEntry {
     pub is_dir: bool,
 }
 
+/// Snapshot taken at open(): the blob and size the handle serves for its
+/// whole life, regardless of concurrent remote modifies (RFC-018
+/// snapshot-at-open — the reason downloads are blob-addressed).
+///
+/// Scope note: this pins what the DAEMON serves per handle. The kernel
+/// page cache is per-inode, so after an inval_inode a concurrent fresh
+/// read can populate pages an older fd will then see — the same
+/// visibility semantics as overwriting a local file in place. What the
+/// snapshot rules out is the daemon mixing blobs under one handle (and
+/// the GC race on a displaced blob, issue #26).
+struct OpenFile {
+    blob: Option<hopnet_common::CustomUUID>,
+    size: u64,
+}
+
 pub struct MountCore {
     transport: Arc<dyn NodeTransport>,
     ids: IdMap,
     attrs: AttrCache,
     dirs: Mutex<HashMap<u64, Arc<Vec<DirEntry>>>>,
     next_dir_handle: AtomicU64,
+    cache: Option<Arc<crate::cache::CacheManager>>,
+    files: Mutex<HashMap<u64, OpenFile>>,
+    next_file_handle: AtomicU64,
 }
 
 impl MountCore {
@@ -76,7 +100,16 @@ impl MountCore {
             attrs: AttrCache::new(attr_ttl),
             dirs: Mutex::new(HashMap::new()),
             next_dir_handle: AtomicU64::new(1),
+            cache: None,
+            files: Mutex::new(HashMap::new()),
+            next_file_handle: AtomicU64::new(1),
         }
+    }
+
+    /// Attach the content cache (S5). Reads fail with EIO until attached.
+    pub fn with_cache(mut self, cache: Arc<crate::cache::CacheManager>) -> Self {
+        self.cache = Some(cache);
+        self
     }
 
     pub async fn lookup(&self, parent_ino: u64, name: &str) -> Result<NodeAttr, CoreError> {
@@ -178,6 +211,54 @@ impl MountCore {
 
     pub fn releasedir(&self, fh: u64) {
         self.dirs.lock().expect("dir table poisoned").remove(&fh);
+    }
+
+    /// Open a file for reading (RFC-018 S5): captures (blob, size) at
+    /// open — the handle's snapshot. Folders are EISDIR.
+    pub async fn open(&self, ino: u64) -> Result<u64, CoreError> {
+        let attr = self.getattr(ino).await?;
+        let size = match attr.item.kind {
+            ItemKind::Folder => return Err(CoreError::IsADirectory),
+            ItemKind::File { size } => size,
+        };
+        let fh = self.next_file_handle.fetch_add(1, Ordering::Relaxed);
+        self.files.lock().expect("file table poisoned").insert(
+            fh,
+            OpenFile {
+                blob: attr.item.blob.clone(),
+                size,
+            },
+        );
+        Ok(fh)
+    }
+
+    /// Read from an open handle. Short only at EOF; empty files (no
+    /// blob) are all-EOF.
+    pub async fn read(&self, fh: u64, offset: u64, len: u64) -> Result<Vec<u8>, CoreError> {
+        let (blob, size) = {
+            let files = self.files.lock().expect("file table poisoned");
+            let open = files.get(&fh).ok_or(CoreError::StaleHandle)?;
+            (open.blob.clone(), open.size)
+        };
+        let Some(blob) = blob else {
+            return Ok(Vec::new());
+        };
+        let cache = self.cache.as_ref().ok_or_else(|| {
+            CoreError::Cache(crate::cache::CacheError::Io("no cache attached".to_string()))
+        })?;
+        cache
+            .read(&blob, size, offset, len)
+            .await
+            .map_err(CoreError::Cache)
+    }
+
+    pub fn release(&self, fh: u64) {
+        self.files.lock().expect("file table poisoned").remove(&fh);
+    }
+
+    /// Cached-bytes gauge (tests, future metrics). None without a cache.
+    pub fn cache_stats(&self) -> Option<u64> {
+        self.cache.as_ref().map(|c| c.cached_bytes())
     }
 
     /// Poke-driven invalidation entry point (wired to /watch in S4; used

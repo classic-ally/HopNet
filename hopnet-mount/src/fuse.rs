@@ -93,8 +93,10 @@ fn errno(e: &CoreError) -> Errno {
     match e {
         CoreError::NotFound => Errno::ENOENT,
         CoreError::NotADirectory => Errno::ENOTDIR,
+        CoreError::IsADirectory => Errno::EISDIR,
         CoreError::StaleHandle => Errno::EBADF,
         CoreError::Transport(_) => Errno::EIO,
+        CoreError::Cache(_) => Errno::EIO,
     }
 }
 
@@ -177,6 +179,52 @@ impl Filesystem for HopFs {
         reply: ReplyEmpty,
     ) {
         self.core.releasedir(fh.0);
+        reply.ok();
+    }
+
+    fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        let core = self.core.clone();
+        self.rt.spawn(async move {
+            match core.open(ino.0).await {
+                Ok(fh) => reply.opened(FileHandle(fh), fuser::FopenFlags::empty()),
+                Err(e) => reply.error(errno(&e)),
+            }
+        });
+    }
+
+    fn read(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        size: u32,
+        _flags: OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
+        reply: fuser::ReplyData,
+    ) {
+        let core = self.core.clone();
+        self.rt.spawn(async move {
+            match core.read(fh.0, offset, size as u64).await {
+                // Short only at EOF (fuser zero-fills otherwise, which is
+                // exactly the EOF contract we want here).
+                Ok(bytes) => reply.data(&bytes),
+                Err(e) => reply.error(errno(&e)),
+            }
+        });
+    }
+
+    fn release(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        self.core.release(fh.0);
         reply.ok();
     }
 

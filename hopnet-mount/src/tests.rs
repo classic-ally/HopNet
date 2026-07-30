@@ -485,6 +485,208 @@ async fn sync_anchor_is_monotonic() {
     }
 }
 
+// ---------- S5: content reads through the sparse cache ----------
+
+use crate::cache::{CacheConfig, CacheManager, EvictionPolicy};
+
+/// Core + mock + attached cache with tiny segments and a deterministic
+/// byte-cap policy. The tempdir guard must outlive the core.
+fn setup_cached(
+    segment_size: u64,
+    policy: EvictionPolicy,
+) -> (Arc<MountCore>, MockHandle, tempfile::TempDir) {
+    let (transport, handle) = MockTransport::new();
+    let dir = tempfile::tempdir().expect("cache tempdir");
+    let cache = Arc::new(
+        CacheManager::new(
+            CacheConfig {
+                root: dir.path().join("content"),
+                segment_size,
+                policy,
+            },
+            transport.clone(),
+        )
+        .expect("cache"),
+    );
+    let core = Arc::new(MountCore::new(transport, DEFAULT_TTL).with_cache(cache));
+    (core, handle, dir)
+}
+
+fn read_blob_calls(handle: &MockHandle) -> Vec<(u64, u64)> {
+    handle
+        .calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            CallRecord::ReadBlob { offset, len, .. } => Some((offset, len)),
+            _ => None,
+        })
+        .collect()
+}
+
+// Should: serve exact bytes across segment boundaries, clamp at EOF, and
+// return empty for zero-length and past-EOF reads.
+#[tokio::test]
+async fn cache_reads_exact_bytes_across_segments() {
+    let (core, handle, _dir) = setup_cached(16, EvictionPolicy::MaxBytes { bytes: 1 << 20 });
+    let content: Vec<u8> = (0..=99u8).collect();
+    handle.add_file_with_content(ItemId::Root, "data.bin", &content);
+    let node = core.lookup(ROOT_INO, "data.bin").await.unwrap();
+    let fh = core.open(node.ino).await.unwrap();
+
+    assert_eq!(core.read(fh, 0, 100).await.unwrap(), content);
+    assert_eq!(core.read(fh, 10, 20).await.unwrap(), &content[10..30]);
+    assert_eq!(core.read(fh, 90, 50).await.unwrap(), &content[90..]);
+    assert_eq!(core.read(fh, 100, 10).await.unwrap(), Vec::<u8>::new());
+    assert_eq!(core.read(fh, 5, 0).await.unwrap(), Vec::<u8>::new());
+}
+
+// Should: serve empty files as immediate EOF with no blob fetch.
+#[tokio::test]
+async fn empty_file_reads_eof_without_fetch() {
+    let (core, handle, _dir) = setup_cached(16, EvictionPolicy::MaxBytes { bytes: 1 << 20 });
+    handle.add_file(ItemId::Root, "empty.txt", 0);
+    let node = core.lookup(ROOT_INO, "empty.txt").await.unwrap();
+    let fh = core.open(node.ino).await.unwrap();
+    assert_eq!(core.read(fh, 0, 4096).await.unwrap(), Vec::<u8>::new());
+    assert!(read_blob_calls(&handle).is_empty());
+}
+
+// Should: coalesce concurrent reads of one segment into exactly one
+// transport fetch, with every reader getting the bytes.
+// Impact: without single-flight, a kernel readahead burst multiplies a
+// 40 MB chunk reconstruction by the number of outstanding reads.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_reads_single_flight_one_fetch() {
+    let (core, handle, _dir) = setup_cached(64, EvictionPolicy::MaxBytes { bytes: 1 << 20 });
+    let content = vec![7u8; 64];
+    handle.add_file_with_content(ItemId::Root, "hot.bin", &content);
+    let node = core.lookup(ROOT_INO, "hot.bin").await.unwrap();
+    let fh = core.open(node.ino).await.unwrap();
+
+    handle.clear_calls();
+    handle.hold_fetches();
+    let mut tasks = Vec::new();
+    for i in 0..8u64 {
+        let core = core.clone();
+        tasks.push(tokio::spawn(async move {
+            core.read(fh, (i * 8) % 64, 8).await
+        }));
+    }
+    // Give every reader time to reach the segment gate.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    handle.release_fetches();
+
+    for task in tasks {
+        let bytes = task.await.unwrap().unwrap();
+        assert!(bytes.iter().all(|b| *b == 7));
+    }
+    assert_eq!(
+        read_blob_calls(&handle).len(),
+        1,
+        "one segment, eight readers, one fetch"
+    );
+}
+
+// Should: keep serving the blob captured at open() after a remote content
+// replacement, while a fresh open serves the new content.
+// Impact: POSIX open-handle semantics — without the snapshot, a reader
+// gets the first half of one version and the second half of another.
+#[tokio::test]
+async fn snapshot_at_open_survives_remote_replace() {
+    let (core, handle, _dir) = setup_cached(16, EvictionPolicy::MaxBytes { bytes: 1 << 20 });
+    let (id, _blob) = handle.add_file_with_content(ItemId::Root, "doc.txt", b"version one!");
+    let node = core.lookup(ROOT_INO, "doc.txt").await.unwrap();
+    let old_fh = core.open(node.ino).await.unwrap();
+    assert_eq!(core.read(old_fh, 0, 64).await.unwrap(), b"version one!");
+
+    handle.update_file_content(&id, b"VERSION TWO IS LONGER");
+    core.invalidate(&id); // the S4 poke path in miniature
+
+    assert_eq!(
+        core.read(old_fh, 0, 64).await.unwrap(),
+        b"version one!",
+        "open handle keeps its snapshot"
+    );
+
+    let new_fh = core.open(node.ino).await.unwrap();
+    assert_eq!(core.read(new_fh, 0, 64).await.unwrap(), b"VERSION TWO IS LONGER");
+}
+
+// Should: hold cached bytes at or under the cap while walking a file
+// larger than the cache, and refetch (correctly) a segment that was
+// evicted behind the read head.
+// Should not: ever change the cache file's logical size while punching.
+// Impact: the rolling-window behavior — huge files stream through a
+// bounded cache.
+#[tokio::test]
+async fn eviction_rolls_window_and_refetches() {
+    let seg = 16u64;
+    let cap = 3 * seg;
+    let (core, handle, dir) = setup_cached(seg, EvictionPolicy::MaxBytes { bytes: cap });
+    let content: Vec<u8> = (0..160u32).map(|i| (i % 251) as u8).collect();
+    let (_, blob) = handle.add_file_with_content(ItemId::Root, "big.bin", &content);
+    let node = core.lookup(ROOT_INO, "big.bin").await.unwrap();
+    let fh = core.open(node.ino).await.unwrap();
+
+    for offset in (0..160).step_by(16) {
+        let bytes = core.read(fh, offset as u64, seg).await.unwrap();
+        assert_eq!(bytes, &content[offset..offset + 16]);
+        assert!(
+            core_cache_bytes(&core) <= cap,
+            "cache exceeded cap: {} > {cap}",
+            core_cache_bytes(&core)
+        );
+    }
+
+    handle.clear_calls();
+    let bytes = core.read(fh, 0, seg).await.unwrap();
+    assert_eq!(bytes, &content[0..16]);
+    assert_eq!(
+        read_blob_calls(&handle),
+        vec![(0, 16)],
+        "evicted head segment must refetch"
+    );
+
+    let cache_file = dir.path().join("content").join(blob.to_string());
+    assert_eq!(
+        std::fs::metadata(&cache_file).unwrap().len(),
+        160,
+        "punching must never change logical size"
+    );
+}
+
+// Should: fail all concurrent readers of a segment promptly when the
+// fetch fails — no hangs, no zombie waiters.
+#[tokio::test(flavor = "multi_thread")]
+async fn fetch_failure_fails_all_waiters() {
+    let (core, handle, _dir) = setup_cached(64, EvictionPolicy::MaxBytes { bytes: 1 << 20 });
+    let (_, blob) = handle.add_file_with_content(ItemId::Root, "doomed.bin", &[1u8; 64]);
+    let node = core.lookup(ROOT_INO, "doomed.bin").await.unwrap();
+    let fh = core.open(node.ino).await.unwrap();
+
+    handle.hold_fetches();
+    let mut tasks = Vec::new();
+    for _ in 0..4 {
+        let core = core.clone();
+        tasks.push(tokio::spawn(async move { core.read(fh, 0, 8).await }));
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    handle.drop_blob(&blob);
+    handle.release_fetches();
+
+    for task in tasks {
+        let result = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("reader must not hang")
+            .unwrap();
+        assert!(result.is_err(), "reader of a vanished blob must error");
+    }
+}
+
+fn core_cache_bytes(core: &MountCore) -> u64 {
+    core.cache_stats().unwrap_or(0)
+}
+
 // Should: emit exactly one lookup per component and one enumerate walk
 // per opendir for an `ls`-shaped sequence — nothing more.
 // Impact: the boundary-emission contract; accidental N+1 patterns against

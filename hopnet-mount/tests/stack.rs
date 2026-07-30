@@ -242,6 +242,19 @@ async fn http_transport_full_read_contract() {
         "miss is Ok(None), not an error"
     );
 
+    // S5: ranged blob reads through the transport (exercises the S2
+    // Range header path end to end — real RS reconstruction under it).
+    let blob = file.blob.clone().expect("seeded file has a blob");
+    let full = transport
+        .read_blob(blob.clone(), 0, b"stack contract content".len() as u64)
+        .await
+        .unwrap();
+    assert_eq!(full, b"stack contract content");
+    let slice = transport.read_blob(blob.clone(), 6, 8).await.unwrap();
+    assert_eq!(slice, b"contract");
+    let past_eof = transport.read_blob(blob, 500, 8).await.unwrap();
+    assert!(past_eof.is_empty(), "past-EOF range read must be empty");
+
     // Well-formed token (uuid.secret_hex) for a device that doesn't exist —
     // a malformed one is rejected as 400 before auth even runs.
     let unknown_device = format!(
@@ -346,7 +359,19 @@ async fn fuse_mount_smoke_against_live_node() {
     )
     .await;
 
-    let core = Arc::new(MountCore::new(transport.clone(), DEFAULT_TTL));
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache = Arc::new(
+        hopnet_mount::cache::CacheManager::new(
+            hopnet_mount::cache::CacheConfig {
+                root: cache_dir.path().join("content"),
+                segment_size: hopnet_mount::cache::DEFAULT_SEGMENT_SIZE,
+                policy: hopnet_mount::cache::EvictionPolicy::MaxBytes { bytes: 1 << 30 },
+            },
+            transport.clone() as Arc<dyn NodeTransport>,
+        )
+        .unwrap(),
+    );
+    let core = Arc::new(MountCore::new(transport.clone(), DEFAULT_TTL).with_cache(cache));
     let fs = HopFs::new(core.clone(), tokio::runtime::Handle::current());
     let mountpoint = tempfile::tempdir().unwrap();
     let mut config = fuser::Config::default();
@@ -439,6 +464,88 @@ async fn fuse_mount_smoke_against_live_node() {
         fresh,
         "stat must reflect remote modify within 10s (kernel TTL is 60s) — inval_inode failed"
     );
+
+    // S5: content reads through the kernel — whole file and a mid-file
+    // slice must match what the node stores (real RS reconstruction).
+    let file_path = mountpoint.path().join("Docs/hello.txt");
+    let (whole, slice, held_content) = tokio::task::spawn_blocking({
+        let file_path = file_path.clone();
+        let expected = new_content.clone();
+        move || {
+            use std::io::{Read, Seek, SeekFrom};
+            let whole = std::fs::read(&file_path).unwrap();
+
+            let mut f = std::fs::File::open(&file_path).unwrap();
+            f.seek(SeekFrom::Start(6)).unwrap();
+            let mut slice = vec![0u8; 5];
+            f.read_exact(&mut slice).unwrap();
+
+            // Snapshot-at-open proof: hold this fd across a remote
+            // replace; it must keep serving the CURRENT (second) version.
+            let mut held = std::fs::File::open(&file_path).unwrap();
+            // Touch it so the open definitely reached the daemon.
+            let mut first = [0u8; 1];
+            held.read_exact(&mut first).unwrap();
+            assert_eq!(first[0], expected[0]);
+            (whole, slice, held)
+        }
+    })
+    .await
+    .map(|(w, s, h)| (w, s, h))
+    .unwrap();
+    assert_eq!(whole, new_content);
+    assert_eq!(slice, &new_content[6..11]);
+
+    // Remote replace with a third version.
+    let third = b"THIRD VERSION".to_vec();
+    let part = reqwest::multipart::Part::bytes(third.clone()).file_name("hello.txt");
+    let form = reqwest::multipart::Form::new()
+        .text("inode_id", inode_uuid.to_string())
+        .part(format!("file_{}", third.len()), part);
+    assert!(
+        reqwest::Client::new()
+            .patch(format!("{}/api/files", node.base()))
+            .bearer_auth(&jwt)
+            .multipart(form)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+
+    let expected_second = new_content.clone();
+    let third_clone = third.clone();
+    let snapshot_ok = tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut held = held_content;
+        // Wait for the fresh-open path to see the third version.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let fresh = std::fs::read(&file_path).unwrap();
+            if fresh == third_clone {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                return Err(format!("fresh open never saw third version, got {fresh:?}"));
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        // The held fd must read a CONSISTENT version — either its
+        // daemon-layer snapshot (second) or, via the shared per-inode
+        // page cache, the third; never a torn mix. (Per-fd isolation is
+        // deliberately not promised — see OpenFile's scope note.)
+        held.seek(SeekFrom::Start(0)).unwrap();
+        let mut observed = Vec::new();
+        held.read_to_end(&mut observed).unwrap();
+        if observed != expected_second && observed != third_clone {
+            return Err(format!("held fd tore across versions: {observed:?}"));
+        }
+        Ok(())
+    })
+    .await
+    .unwrap();
+    snapshot_ok.expect("held fd version consistency");
 
     watcher.abort();
     drop(session);

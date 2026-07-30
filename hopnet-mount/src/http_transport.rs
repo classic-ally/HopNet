@@ -8,6 +8,7 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use hopnet_common::CustomUUID;
 use hopnet_common::db::InodeType;
 use hopnet_common::fileprovider::{HealthResponse, HealthStatus};
 use hopnet_common::mount::{MountChangesResponse, MountEnumerateResponse, MountItem};
@@ -259,6 +260,58 @@ impl NodeTransport for HttpTransport {
                 }
             };
             Ok(Box::pin(stream) as WatchStream)
+        })
+    }
+
+    fn read_blob(
+        &self,
+        blob: CustomUUID,
+        offset: u64,
+        len: u64,
+    ) -> BoxFuture<'_, Result<Vec<u8>, TransportError>> {
+        Box::pin(async move {
+            if len == 0 {
+                return Ok(Vec::new());
+            }
+            let query = vec![("blob_id", blob.to_string())];
+            let range = format!("bytes={}-{}", offset, offset + len - 1);
+            for attempt in 0..2 {
+                let result = self
+                    .client
+                    .get(self.url("download"))
+                    .bearer_auth(&self.token)
+                    .header(reqwest::header::RANGE, &range)
+                    .query(&query)
+                    .send()
+                    .await;
+                let response = match result {
+                    Ok(response) => response,
+                    Err(e) if is_transport_level(&e) && attempt == 0 => continue,
+                    Err(e) => return Err(map_reqwest_err(e)),
+                };
+                let response = check_status(response)?;
+                let status = response.status();
+                // 416 past EOF = empty (callers clamp, but a raced
+                // shrink shouldn't error a read).
+                if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+                    return Ok(Vec::new());
+                }
+                if status == reqwest::StatusCode::NOT_FOUND {
+                    // Blob collected under an open handle (issue #26).
+                    return Err(TransportError::Protocol("blob gone".to_string()));
+                }
+                if !status.is_success() {
+                    return Err(TransportError::Protocol(format!(
+                        "unexpected status {status}"
+                    )));
+                }
+                let body = response
+                    .bytes()
+                    .await
+                    .map_err(map_reqwest_err)?;
+                return Ok(body.to_vec());
+            }
+            unreachable!("loop returns on second attempt")
         })
     }
 

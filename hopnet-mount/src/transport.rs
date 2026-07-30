@@ -140,6 +140,16 @@ pub trait NodeTransport: Send + Sync {
     /// connection drops; callers reconnect and resync from their anchor.
     fn watch(&self) -> BoxFuture<'_, Result<WatchStream, TransportError>>;
 
+    /// One ranged read of a blob's plaintext (RFC-018 S5). Blob-addressed
+    /// so open handles keep snapshot-at-open semantics. Callers keep
+    /// ranges within one cache segment.
+    fn read_blob(
+        &self,
+        blob: CustomUUID,
+        offset: u64,
+        len: u64,
+    ) -> BoxFuture<'_, Result<Vec<u8>, TransportError>>;
+
     /// Node readiness — distinguishes "not running" from "not set up".
     fn health(&self) -> BoxFuture<'_, Result<Health, TransportError>>;
 }

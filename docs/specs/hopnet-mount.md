@@ -147,6 +147,12 @@ New mount `/api/integrations/mount`, `AuthClass::DeviceToken`, declared in
       keeps reading the blob current at open() even if a (possibly
       remote) modify swaps the inode's data_id mid-read;
       inode-addressed download would tear content under the handle
+    - scope (learned in S5): the snapshot pins what the DAEMON serves per
+      handle; the kernel page cache is per-inode, so after inval_inode a
+      fresh read can populate pages an older fd then sees — local
+      overwrite-in-place visibility, consistent but not per-fd isolated.
+      True isolation would need direct_io (page-cache and mmap costs) —
+      deliberately not taken
     - consequence: a displaced blob under an open handle races RFC-007
       orphan cleanup — same keep-set family as pins/version retention
       (issues #23/#26)
@@ -326,8 +332,8 @@ implements that contract. Each slice is PR-sized and lands green.
 - [x] S4 — /watch SSE + subscribe seam + kernel invalidation + poke
       test suite (2026-07-30; includes the modification-height stamping
       fix — deciding block height, not lagging last_decided)
-- [ ] S5 — content reads: sparse cache, whole-file fast path,
-      snapshot-at-open, disk-pressure eviction
+- [x] S5 — content reads: sparse cache, whole-file fast path,
+      snapshot-at-open, disk-pressure eviction (2026-07-30)
 - [ ] S6 — submit-and-wait-decided + strict mutation routes (node-side)
 - [ ] S7 — writes: staging, copy-up, release/fsync tiers, conflict
       logging, startup recovery

@@ -48,6 +48,18 @@ mod linux {
         /// HOPNET_MOUNT_TOKEN env var takes precedence
         #[arg(long)]
         token_file: Option<PathBuf>,
+
+        /// Content cache directory (default: $XDG_CACHE_HOME/hopnet/content)
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
+    }
+
+    fn default_cache_dir() -> PathBuf {
+        let base = std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        base.join("hopnet").join("content")
     }
 
     fn resolve_token(args: &Args) -> String {
@@ -103,7 +115,22 @@ mod linux {
             transport
         };
 
-        let core = Arc::new(MountCore::new(transport.clone(), DEFAULT_TTL));
+        let cache_config = hopnet_mount::cache::CacheConfig {
+            root: args.cache_dir.clone().unwrap_or_else(default_cache_dir),
+            segment_size: hopnet_mount::cache::DEFAULT_SEGMENT_SIZE,
+            policy: hopnet_mount::cache::EvictionPolicy::default_min_free(
+                hopnet_mount::cache::DEFAULT_SEGMENT_SIZE,
+            ),
+        };
+        let cache = match hopnet_mount::cache::CacheManager::new(cache_config, transport.clone()) {
+            Ok(cache) => Arc::new(cache),
+            Err(e) => {
+                eprintln!("cache setup failed: {e}");
+                std::process::exit(1);
+            }
+        };
+
+        let core = Arc::new(MountCore::new(transport.clone(), DEFAULT_TTL).with_cache(cache));
         let fs = HopFs::new(core.clone(), rt.handle().clone());
 
         let mut config = fuser::Config::default();
