@@ -170,6 +170,27 @@ impl AssetDescriptorBuilder {
         self
     }
 
+    /// Append the two synthetic thumbnail sentinels exactly as
+    /// `DescriptorExtraction.swift` does: uti public.jpeg, no filename,
+    /// constant admission estimates (64 KiB / 512 KiB), locally available.
+    /// Opt-in — the plain builders model spike-verified PhotoKit shapes.
+    pub fn with_thumbnails(mut self) -> Self {
+        use crate::model::{PH_SENTINEL_THUMBNAIL_MEDIUM, PH_SENTINEL_THUMBNAIL_SMALL};
+        for (ph, size) in [
+            (PH_SENTINEL_THUMBNAIL_SMALL, 65_536),
+            (PH_SENTINEL_THUMBNAIL_MEDIUM, 524_288),
+        ] {
+            self.desc.resources.push(ResourceDescriptor {
+                ph_resource_type: ph,
+                uti: "public.jpeg".to_string(),
+                original_filename: None,
+                expected_size: Some(size),
+                locally_available: Some(true),
+            });
+        }
+        self
+    }
+
     pub fn build(self) -> AssetDescriptor {
         self.desc
     }

@@ -166,6 +166,23 @@ pub fn plan_changes(
         }
     }
 
+    // Thumbnails render the *current* primary display. Any edit-mutable
+    // membership change (first edit, re-edit, revert) changes what they
+    // show, so written thumbnail rows reopen alongside. Deliberately NOT in
+    // EDIT_MUTABLE's size-compare — their descriptor expectedSize is a
+    // constant admission estimate, and comparing it against real stored
+    // bytes would reopen them on every delivery forever.
+    let edit_state_changed = !plan.reopen_resources.is_empty()
+        || plan.add_resources.iter().any(|rt| EDIT_MUTABLE.contains(rt))
+        || plan.remove_resources.iter().any(|rt| EDIT_MUTABLE.contains(rt));
+    if edit_state_changed {
+        for row in existing {
+            if row.resource_type.is_thumbnail() && row.written_at.is_some() {
+                plan.reopen_resources.push(row.resource_type);
+            }
+        }
+    }
+
     plan
 }
 

@@ -161,6 +161,16 @@ impl IngressSession {
                 ),
             }
         })?;
+        if resource_type.is_thumbnail() {
+            // Renditions have no backing PHAssetResource — they stream via
+            // the scheduler fetcher (PHImageManager), never this legacy path.
+            return Err(FfiError::InvalidDescriptor {
+                msg: format!(
+                    "thumbnail sentinel {ph_resource_type} streams via the scheduler fetcher, \
+                     not begin_resource"
+                ),
+            });
+        }
 
         let photo_id = PhotoId::from_string(photo_id);
         let (photo, library_id) = self.runtime.block_on(async {

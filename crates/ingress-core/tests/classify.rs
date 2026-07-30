@@ -466,3 +466,177 @@ async fn scope_flip_plans_transition() {
         other => panic!("expected Known(plan), got {other:?}"),
     }
 }
+
+// Impact: every new photo's thumbnails exist only because seed/classify mint
+// rows from the synthetic sentinel descriptors — and the constant admission
+// estimate must NEVER act as a re-edit signal, or every delivery would
+// reopen the renditions forever.
+// Should: seed of a sentinel-bearing descriptor mints pending 5 and 6 rows.
+// Should: re-delivering the identical descriptor to the materialized photo
+// classifies NoOp even though stored thumbnail sizes differ from the
+// constant expectedSize estimates.
+#[tokio::test]
+async fn sentinel_descriptor_mints_thumbnails_and_stays_noop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, ..) = store_with_roots(tmp.path()).await;
+    let data_dir = DataDir::new(tmp.path().join("data"));
+    let desc = AssetDescriptorBuilder::simple_image()
+        .with_thumbnails()
+        .modified_at(Utc::now())
+        .build();
+    let id = seed_one(&store, &desc).await;
+
+    let rows = store.resources_for_photo(&id).await.unwrap();
+    for rt in [ResourceType::ThumbnailSmall, ResourceType::ThumbnailMedium] {
+        assert!(
+            rows.iter()
+                .any(|r| r.resource_type == rt && r.written_at.is_none()),
+            "pending {rt:?} row minted at seed"
+        );
+    }
+
+    // materialize_all stamps every row with the ORIGINAL's expected size —
+    // deliberately different from the thumbnail estimates (64/512 KiB).
+    materialize_all(&store, &data_dir, &desc, &id).await;
+    let (classification, outcome) = apply_change(&store, &data_dir, &desc).await.unwrap();
+    assert_eq!(classification, Classification::NoOp { photo_id: id });
+    assert_eq!(outcome, Default::default());
+}
+
+// Impact: the observer/scan healing path for archives whose photos predate
+// renditions — a sentinel-bearing re-delivery must mint the missing rows.
+// Should: a known materialized photo without 5/6 gains pending rows and
+// re-enters the work queue.
+#[tokio::test]
+async fn sentinel_descriptor_heals_missing_thumbnails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, ..) = store_with_roots(tmp.path()).await;
+    let data_dir = DataDir::new(tmp.path().join("data"));
+    let t1 = Utc::now();
+    let bare = AssetDescriptorBuilder::simple_image().modified_at(t1).build();
+    let id = seed_one(&store, &bare).await;
+    materialize_all(&store, &data_dir, &bare, &id).await;
+
+    let mut with_thumbs = bare.clone();
+    with_thumbs.resources = AssetDescriptorBuilder::simple_image()
+        .with_thumbnails()
+        .build()
+        .resources;
+
+    let (_, outcome) = apply_change(&store, &data_dir, &with_thumbs).await.unwrap();
+    assert_eq!(outcome.resources_added, 2, "thumbnail_small + thumbnail_medium");
+    let photo = store.photo(&id).await.unwrap().unwrap();
+    assert!(photo.materialized_at.is_none(), "re-entered the work queue");
+}
+
+// Impact: thumbnails render the primary display, so any edit-mutable set
+// change (first edit, re-edit, revert) must refresh them — but ONLY those;
+// a metadata-only bump refetching renditions would churn on every favorite.
+// Should: a size-changed edited row reopens written 5/6 alongside it.
+// Should: a first edit (Edited appearing) reopens written thumbnails.
+// Should: a revert (Edited disappearing) reopens written thumbnails.
+// Should not: reopen thumbnails on a metadata-only refresh.
+#[tokio::test]
+async fn edit_set_changes_reopen_written_thumbnails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, ..) = store_with_roots(tmp.path()).await;
+    let data_dir = DataDir::new(tmp.path().join("data"));
+    let t1 = Utc::now();
+
+    // -- re-edit: size change on the written Edited row
+    let desc = AssetDescriptorBuilder::edited_live_photo()
+        .with_thumbnails()
+        .modified_at(t1)
+        .build();
+    let id = seed_one(&store, &desc).await;
+    materialize_all(&store, &data_dir, &desc, &id).await;
+
+    let mut reedit = desc.clone();
+    reedit.asset_modified_at = Some(t1 + Duration::seconds(5));
+    for r in &mut reedit.resources {
+        if r.ph_resource_type == 5 {
+            r.expected_size = Some(r.expected_size.unwrap() + 1);
+        }
+    }
+    let (_, outcome) = apply_change(&store, &data_dir, &reedit).await.unwrap();
+    assert_eq!(
+        outcome.resources_reopened, 3,
+        "edited + thumbnail_small + thumbnail_medium"
+    );
+    let rows = store.resources_for_photo(&id).await.unwrap();
+    for rt in [ResourceType::ThumbnailSmall, ResourceType::ThumbnailMedium] {
+        assert!(
+            rows.iter()
+                .any(|r| r.resource_type == rt && r.written_at.is_none()),
+            "{rt:?} reopened"
+        );
+    }
+
+    // -- metadata-only on a fresh photo: no thumbnail churn
+    let desc2 = AssetDescriptorBuilder::simple_image()
+        .with_thumbnails()
+        .modified_at(t1)
+        .build();
+    let id2 = seed_one(&store, &desc2).await;
+    materialize_all(&store, &data_dir, &desc2, &id2).await;
+    let mut meta_only = desc2.clone();
+    meta_only.asset_modified_at = Some(t1 + Duration::seconds(5));
+    meta_only.favorite = true;
+    let (_, outcome) = apply_change(&store, &data_dir, &meta_only).await.unwrap();
+    assert_eq!(outcome.resources_reopened, 0, "metadata-only never reopens");
+
+    // -- first edit: Edited appears in add_resources
+    let mut first_edit = AssetDescriptorBuilder::edited_live_photo()
+        .with_thumbnails()
+        .modified_at(t1 + Duration::seconds(10))
+        .build();
+    let base = AssetDescriptorBuilder::live_photo()
+        .with_thumbnails()
+        .modified_at(t1)
+        .build();
+    let id3 = seed_one(&store, &base).await;
+    materialize_all(&store, &data_dir, &base, &id3).await;
+    first_edit.cloud_id = base.cloud_id.clone();
+    first_edit.local_id = base.local_id.clone();
+    let (_, outcome) = apply_change(&store, &data_dir, &first_edit).await.unwrap();
+    assert_eq!(outcome.resources_added, 3, "edited set added");
+    assert_eq!(outcome.resources_reopened, 2, "thumbnails refresh on first edit");
+
+    // -- revert: Edited disappears
+    let mut revert = base.clone();
+    revert.asset_modified_at = Some(t1 + Duration::seconds(20));
+    // Re-materialize the first-edit state so revert acts on written rows.
+    materialize_all(&store, &data_dir, &first_edit, &id3).await;
+    let (_, outcome) = apply_change(&store, &data_dir, &revert).await.unwrap();
+    assert!(outcome.resources_removed >= 1, "edited rows removed");
+    assert_eq!(outcome.resources_reopened, 2, "thumbnails refresh on revert");
+}
+
+// Impact: the backfill migration deliberately skips tombstoned photos — the
+// restore delivery is what re-arms their thumbnails.
+// Should: a tombstone → restore delivery of a sentinel-bearing descriptor
+// mints 5/6 and clears materialized_at.
+#[tokio::test]
+async fn restored_photo_regains_thumbnails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, ..) = store_with_roots(tmp.path()).await;
+    let data_dir = DataDir::new(tmp.path().join("data"));
+    let t1 = Utc::now();
+    // Pre-thumbnail archive shape: no sentinel resources.
+    let bare = AssetDescriptorBuilder::simple_image().modified_at(t1).build();
+    let id = seed_one(&store, &bare).await;
+    materialize_all(&store, &data_dir, &bare, &id).await;
+    apply_removal(&store, &data_dir, &bare.local_id).await.unwrap();
+
+    let mut restored = bare.clone();
+    restored.resources = AssetDescriptorBuilder::simple_image()
+        .with_thumbnails()
+        .build()
+        .resources;
+    let (_, outcome) = apply_change(&store, &data_dir, &restored).await.unwrap();
+    assert!(outcome.restored);
+    assert_eq!(outcome.resources_added, 2);
+    let photo = store.photo(&id).await.unwrap().unwrap();
+    assert!(photo.deleted_at.is_none());
+    assert!(photo.materialized_at.is_none(), "drains its new thumbnails");
+}

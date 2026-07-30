@@ -97,7 +97,10 @@ impl ResourceFetcher for MemoryFetcher {
             .strip_prefix("e2e-")
             .and_then(|s| s.parse().ok())
             .ok_or_else(|| FetchFailure::AssetUnavailable("bad local id".into()))?;
-        sink.write(&photo_bytes(index))?;
+        // Mix the resource type in so original/thumbnail_small/medium hash
+        // distinctly (otherwise all three would dedup to one blob).
+        let salt = (request.ph_resource_type as u32).wrapping_mul(0x9E37);
+        sink.write(&photo_bytes(index ^ salt))?;
         Ok(())
     }
 }
@@ -178,6 +181,7 @@ async fn main() {
                 let desc = AssetDescriptorBuilder::simple_image()
                     .with_cloud_id(&format!("e2e-cloud-{index}"))
                     .with_local_id(&format!("e2e-{index}"))
+                    .with_thumbnails()
                     .build();
                 match seed_descriptor(&store, &desc).await.expect("seed") {
                     SeedOutcome::MintedPending { .. } => {}

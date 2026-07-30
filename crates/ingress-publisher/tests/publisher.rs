@@ -34,15 +34,8 @@ fn make_item(dir: &std::path::Path, resources: Vec<(&str, &str, Vec<u8>)>) -> Pu
         let hash = hex_hash(index as u8 + 1);
         let blob_path = dir.join(format!("{hash}.{ext}"));
         std::fs::write(&blob_path, bytes).unwrap();
-        let resource_type = match *type_name {
-            "original" => ingress_core::ResourceType::Original,
-            "edited" => ingress_core::ResourceType::Edited,
-            "paired_video" => ingress_core::ResourceType::PairedVideo,
-            "adjustment_data" => ingress_core::ResourceType::AdjustmentData,
-            "raw_alternate" => ingress_core::ResourceType::RawAlternate,
-            "edited_paired_video" => ingress_core::ResourceType::EditedPairedVideo,
-            other => panic!("unknown type {other}"),
-        };
+        let resource_type = ingress_core::ResourceType::from_name(type_name)
+            .unwrap_or_else(|| panic!("unknown type {type_name}"));
         publish_resources.push(PublishResource {
             resource_type,
             content_hash: ingress_core::ContentHash::from_hex(hash.clone()),
@@ -142,6 +135,8 @@ fn maps_all_daemon_resource_types() {
             ("paired_video", "mov", vec![3u8; 300]),
             ("adjustment_data", "plist", vec![4u8; 50]),
             ("raw_alternate", "dng", vec![5u8; 400]),
+            ("thumbnail_small", "jpg", vec![7u8; 60]),
+            ("thumbnail_medium", "jpg", vec![8u8; 120]),
             ("edited_paired_video", "mov", vec![6u8; 500]),
         ],
     );
@@ -156,8 +151,14 @@ fn maps_all_daemon_resource_types() {
             "paired_video",
             "adjustment_data",
             "raw_alternate",
+            "thumbnail_small",
+            "thumbnail_medium",
             "edited_paired_video"
         ]
+    );
+    assert_eq!(
+        asset.resources[5].content.format_hint.as_deref(),
+        Some("image/jpeg")
     );
     assert_eq!(asset.resources[0].content.byte_len, 100);
     assert_eq!(

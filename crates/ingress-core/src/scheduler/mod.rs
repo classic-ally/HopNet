@@ -427,7 +427,9 @@ async fn photo_task<F: ResourceFetcher>(
         .filter(|r| r.next_retry_at.map(|t| t <= Utc::now()).unwrap_or(true))
         .map(|r| r.resource_type)
         .collect();
-    pending.sort(); // ResourceType::Original == 0 sorts first
+    // Original first (identity merge depends on it), thumbnails last —
+    // renditions are the cheapest and least critical rows.
+    pending.sort_by_key(|rt| (rt.is_thumbnail(), *rt));
 
     let mut current_photo_id = photo.photo_id.clone();
     for resource_type in pending {

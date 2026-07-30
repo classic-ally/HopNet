@@ -33,6 +33,8 @@ struct FakeFetcher {
     barrier: Option<Arc<Barrier>>,
     cancel_on_fetch: Option<CancelToken>,
     fetch_calls: AtomicU64,
+    /// ph_resource_type of every fetch, in call order (ordering assertions).
+    fetch_order: Mutex<Vec<i32>>,
 }
 
 impl FakeFetcher {
@@ -74,6 +76,10 @@ impl ResourceFetcher for FakeFetcher {
         sink: Arc<StreamSink>,
     ) -> Result<(), FetchFailure> {
         self.fetch_calls.fetch_add(1, Ordering::Relaxed);
+        self.fetch_order
+            .lock()
+            .unwrap()
+            .push(request.ph_resource_type);
         if let Some(b) = &self.barrier {
             b.wait();
         }
@@ -986,4 +992,116 @@ async fn seed_is_idempotent() {
         SeedOutcome::AlreadyKnown { .. }
     ));
     assert_eq!(rig.store.count_photos().await.unwrap(), 2);
+}
+
+// Impact: original-first ordering is what the late-binding identity merge
+// depends on — renditions must never preempt it; and the thumbnail rows must
+// flow the full write path (blob, ext derivation, sidecar) like any resource.
+// Should: fetch thumbnails LAST (after every real resource), commit them
+// with ext jpg, and list them in the completed photo's sidecar.
+#[tokio::test(flavor = "multi_thread")]
+async fn thumbnails_drain_last_and_flow_the_write_path() {
+    let rig = rig().await;
+    let desc = AssetDescriptorBuilder::live_photo()
+        .with_thumbnails()
+        .build();
+    rig.fetcher.add_asset(&desc, b"original-bytes", Some(b"paired-bytes"));
+    {
+        let mut bytes = rig.fetcher.bytes.lock().unwrap();
+        bytes.insert((desc.local_id.clone(), 1005), b"small-jpeg".to_vec());
+        bytes.insert((desc.local_id.clone(), 1006), b"medium-jpeg".to_vec());
+    }
+    match seed_descriptor(&rig.store, &desc).await.unwrap() {
+        SeedOutcome::MintedPending { .. } => {}
+        other => panic!("expected MintedPending, got {other:?}"),
+    }
+
+    let report = scheduler(&rig).drain().await.unwrap();
+    assert_eq!(report.photos_completed, 1);
+    assert_eq!(report.resources_written, 4);
+
+    let order = rig.fetcher.fetch_order.lock().unwrap().clone();
+    assert_eq!(order, vec![1, 9, 1005, 1006], "original first, thumbnails last");
+
+    let photo_id = rig
+        .store
+        .photo_by_cloud_id(desc.cloud_id.as_ref().unwrap())
+        .await
+        .unwrap()
+        .unwrap()
+        .photo_id;
+    let rows = rig.store.resources_for_photo(&photo_id).await.unwrap();
+    for rt in [
+        ingress_core::ResourceType::ThumbnailSmall,
+        ingress_core::ResourceType::ThumbnailMedium,
+    ] {
+        let row = rows
+            .iter()
+            .find(|r| r.resource_type == rt)
+            .unwrap_or_else(|| panic!("{rt:?} row"));
+        assert!(row.written_at.is_some());
+        assert_eq!(row.ext.as_deref(), Some("jpg"));
+    }
+
+    let sidecar_path = ingress_core::sidecar_io::find_sidecar(
+        &rig.data_dir.sidecar_root(&ingress_core::LibraryId::new("personal")),
+        &photo_id,
+    )
+    .unwrap()
+    .expect("sidecar written at completion");
+    let doc = ingress_core::Sidecar::from_json(&std::fs::read_to_string(sidecar_path).unwrap())
+        .unwrap();
+    let names: Vec<&str> = doc.resources.iter().map(|r| r.resource_type.as_str()).collect();
+    assert!(names.contains(&"thumbnail_small") && names.contains(&"thumbnail_medium"));
+}
+
+// Impact: a stale Swift binary (Rust knows the sentinels, descriptors lack
+// them) must degrade to thumbnail-only retry burn — never block the photo's
+// real resources.
+// Should: write the enumerated resources and burn retries only on the
+// thumbnail rows ("resource no longer enumerated").
+// Should not: materialize the photo while thumbnail rows stay pending.
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_sentinels_burn_only_thumbnail_retries() {
+    let rig = rig().await;
+    // Seeded WITH thumbnails (rows exist), but the fetcher's descriptor —
+    // what drain re-enumerates — lacks the sentinels.
+    let seeded = AssetDescriptorBuilder::simple_image().with_thumbnails().build();
+    let mut stale = seeded.clone();
+    stale.resources.retain(|r| r.ph_resource_type < 1000);
+    rig.fetcher.add_asset(&stale, b"original-bytes", None);
+    match seed_descriptor(&rig.store, &seeded).await.unwrap() {
+        SeedOutcome::MintedPending { .. } => {}
+        other => panic!("expected MintedPending, got {other:?}"),
+    }
+
+    let report = scheduler(&rig).drain().await.unwrap();
+    assert_eq!(report.photos_completed, 0, "thumbnails gate materialization");
+
+    let photo_id = rig
+        .store
+        .photo_by_cloud_id(seeded.cloud_id.as_ref().unwrap())
+        .await
+        .unwrap()
+        .unwrap()
+        .photo_id;
+    let rows = rig.store.resources_for_photo(&photo_id).await.unwrap();
+    let original = rows
+        .iter()
+        .find(|r| r.resource_type == ingress_core::ResourceType::Original)
+        .unwrap();
+    assert!(original.written_at.is_some(), "real resource unaffected");
+    for rt in [
+        ingress_core::ResourceType::ThumbnailSmall,
+        ingress_core::ResourceType::ThumbnailMedium,
+    ] {
+        let row = rows.iter().find(|r| r.resource_type == rt).unwrap();
+        assert!(row.written_at.is_none());
+        assert_eq!(row.retry_count, rig.config.retry_cap, "burned to the cap");
+        assert!(
+            row.last_error.as_deref().unwrap_or_default().contains("no longer enumerated"),
+            "error: {:?}",
+            row.last_error
+        );
+    }
 }
