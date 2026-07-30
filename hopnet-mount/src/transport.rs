@@ -44,6 +44,9 @@ pub struct Item {
     pub created: SystemTime,
     pub modified: SystemTime,
     pub height: Height,
+    /// Backing blob for files (None for folders and empty files — nothing
+    /// to download when absent). Load-bearing for S5 snapshot-at-open.
+    pub blob: Option<CustomUUID>,
 }
 
 /// Opaque enumeration cursor, defined by the node (last-seen-id per

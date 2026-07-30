@@ -89,6 +89,9 @@ boundaries but is not a deliverable.
     kernel invalidations (fuser notify) for touched inodes and parent dirs
 - cache policy: generous, cache-until-poked
   - long kernel entry/attr TTLs; proactive invalidation on the changes feed
+  - interim (S3, pre-S4): no /watch yet — remote-change staleness is
+    TTL-bounded (60 s attr + kernel TTLs); S4 replaces this with
+    poke-driven invalidation
   - poke correctness is therefore load-bearing
   - test suite MUST cover poke-driven invalidation end-to-end: mutation on
     node → poke → kernel cache invalidated → fresh stat/readdir observes
@@ -309,7 +312,8 @@ implements that contract. Each slice is PR-sized and lands green.
       async bridge decided (2026-07-30)
 - [x] S2 — node read surface: enumerate/lookup/item/blob download/
       changes/health (2026-07-30)
-- [ ] S3 — HTTP transport joins the halves; real tree browses read-only
+- [x] S3 — HTTP transport joins the halves; real tree browses read-only
+      (2026-07-30)
 - [ ] S4 — /watch SSE + subscribe seam + kernel invalidation + poke
       test suite
 - [ ] S5 — content reads: sparse cache, whole-file fast path,

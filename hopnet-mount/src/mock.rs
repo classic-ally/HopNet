@@ -42,6 +42,7 @@ impl MockState {
             created: SystemTime::UNIX_EPOCH,
             modified: SystemTime::UNIX_EPOCH,
             height: self.height,
+            blob: None,
         }
     }
 }
@@ -92,6 +93,12 @@ impl MockHandle {
         let mut state = self.state.lock().expect("mock poisoned");
         let id = ItemId::Inode(CustomUUID::new(None));
         state.height += 1;
+        let blob = match kind {
+            // Non-empty mock files get a fake backing blob id, mirroring
+            // the node (empty files and folders have none).
+            ItemKind::File { size } if size > 0 => Some(CustomUUID::new(None)),
+            _ => None,
+        };
         let item = Item {
             id: id.clone(),
             parent: parent.clone(),
@@ -100,6 +107,7 @@ impl MockHandle {
             created: SystemTime::now(),
             modified: SystemTime::now(),
             height: state.height,
+            blob,
         };
         state.items.insert(id.clone(), item);
         state.children.entry(parent).or_default().push(id.clone());
