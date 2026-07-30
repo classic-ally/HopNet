@@ -200,6 +200,49 @@ pub fn read_photo_committed(
     Ok(uploaded_by.filter(|&owner| owner == user_id))
 }
 
+/// By-fingerprint committed lookup for the thin-client resolve route
+/// (cross-device dedupe / remote adoption). Same contract shape as
+/// [`read_photo_committed`]: ownership filtered Rust-side, and deliberately
+/// NO deleted_at filter — a tombstoned row still holds its fingerprint in
+/// the partial UNIQUE index until hard-delete, so a re-publish would fail
+/// deterministically anyway; resolving it lets the daemon adopt instead of
+/// burning retries. Personal scope only in v1 (`library_id IS NULL`,
+/// matching the fp_personal partial index).
+pub fn read_photo_by_fingerprint(
+    pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    user_id: i32,
+    fingerprint_hex: &str,
+) -> Result<Option<hopnet_common::CustomUUID>, String> {
+    use rusqlite::OptionalExtension;
+    let conn = pool.get().map_err(|e| format!("pool: {e}"))?;
+    let row: Option<(hopnet_common::CustomUUID, i32)> = conn
+        .query_row(
+            "SELECT id, uploaded_by FROM photos
+             WHERE cloud_fingerprint = ? AND library_id IS NULL",
+            rusqlite::params![fingerprint_hex],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| format!("fingerprint lookup: {e:?}"))?;
+    Ok(row.and_then(|(id, owner)| (owner == user_id).then_some(id)))
+}
+
+/// Current ingress responsibility holder for a user's personal scope.
+pub fn read_ingress_responsibility(
+    pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    user_id: i32,
+) -> Result<Option<hopnet_common::CustomUUID>, String> {
+    use rusqlite::OptionalExtension;
+    let conn = pool.get().map_err(|e| format!("pool: {e}"))?;
+    conn.query_row(
+        "SELECT device_id FROM photo_ingress_responsibility WHERE user_id = ?",
+        rusqlite::params![user_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|e| format!("responsibility lookup: {e:?}"))
+}
+
 fn pubkey_from_blob(blob: Vec<u8>) -> Result<hopnet_storage::x25519_dalek::PublicKey, String> {
     let arr: [u8; 32] = blob
         .try_into()
@@ -370,6 +413,7 @@ mod tests {
                 encrypted_metadata_key: vec![0xFF; 48],
             }],
             operation_id: hopnet_common::CustomUUID::new(None),
+            cloud_fingerprint: None,
         };
         {
             let conn = pool.get().unwrap();
@@ -483,5 +527,105 @@ mod tests {
             read_photo_committed(&pool, 7, &hopnet_common::CustomUUID::new(None)),
             Ok(None)
         );
+    }
+
+    fn insert_photo_row_with_fp(
+        pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+        photo_id: &hopnet_common::CustomUUID,
+        uploaded_by: i32,
+        fingerprint_hex: &str,
+    ) {
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO photos (id, library_id, uploaded_by, encrypted_metadata, \
+                 metadata_nonce, cloud_fingerprint) VALUES (?, NULL, ?, ?, ?, ?)",
+                rusqlite::params![
+                    photo_id,
+                    uploaded_by,
+                    vec![0u8; 4],
+                    vec![0u8; 12],
+                    fingerprint_hex
+                ],
+            )
+            .unwrap();
+    }
+
+    // Should: resolve a fingerprint to the caller's committed photo_id.
+    // Should not: report a photo whose fingerprint was committed by a
+    // different user, or a fingerprint that never committed.
+    #[test]
+    fn fingerprint_probe_matches_and_filters_owner() {
+        let pool = test_pool();
+        let pubkey = hopnet_storage::x25519_dalek::PublicKey::from(
+            &hopnet_storage::x25519_dalek::StaticSecret::from([0x33; 32]),
+        );
+        insert_user(&pool, 7, &pubkey);
+        insert_user(&pool, 8, &pubkey);
+        let mine = hopnet_common::CustomUUID::new(None);
+        let theirs = hopnet_common::CustomUUID::new(None);
+        insert_photo_row_with_fp(&pool, &mine, 7, "aa11");
+        insert_photo_row_with_fp(&pool, &theirs, 8, "bb22");
+
+        assert_eq!(read_photo_by_fingerprint(&pool, 7, "aa11"), Ok(Some(mine)));
+        assert_eq!(read_photo_by_fingerprint(&pool, 7, "bb22"), Ok(None));
+        assert_eq!(read_photo_by_fingerprint(&pool, 7, "cc33"), Ok(None));
+    }
+
+    // Impact: the tombstoned row still owns its fingerprint in the partial
+    // UNIQUE index, so a re-publish would fail deterministically — resolving
+    // it lets the daemon adopt instead of burning its retry budget.
+    // Should: keep resolving a soft-deleted photo by fingerprint.
+    #[test]
+    fn fingerprint_probe_resolves_tombstoned_photo() {
+        let pool = test_pool();
+        let pubkey = hopnet_storage::x25519_dalek::PublicKey::from(
+            &hopnet_storage::x25519_dalek::StaticSecret::from([0x44; 32]),
+        );
+        insert_user(&pool, 7, &pubkey);
+        let photo_id = hopnet_common::CustomUUID::new(None);
+        insert_photo_row_with_fp(&pool, &photo_id, 7, "dd44");
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE photos SET deleted_at = '2026-01-01T00:00:00Z', deleted_by = 7 WHERE id = ?",
+                rusqlite::params![photo_id],
+            )
+            .unwrap();
+
+        assert_eq!(
+            read_photo_by_fingerprint(&pool, 7, "dd44"),
+            Ok(Some(photo_id))
+        );
+    }
+
+    // Should: report the responsibility holder once claimed, and None for a
+    // user with no claim.
+    #[test]
+    fn responsibility_read_reports_holder() {
+        let pool = test_pool();
+        let pubkey = hopnet_storage::x25519_dalek::PublicKey::from(
+            &hopnet_storage::x25519_dalek::StaticSecret::from([0x55; 32]),
+        );
+        insert_user(&pool, 7, &pubkey);
+        let device_id = hopnet_common::CustomUUID::new(None);
+        {
+            let conn = pool.get().unwrap();
+            conn.execute(
+                "INSERT INTO device_tokens (id, user_id, api_key_hash, encrypted_device_name, \
+                 wrapped_user_key) VALUES (?, 7, ?, 'enc', ?)",
+                rusqlite::params![device_id, vec![0u8; 32], vec![0u8; 32]],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO photo_ingress_responsibility (user_id, device_id, operation_id) \
+                 VALUES (7, ?, ?)",
+                rusqlite::params![device_id, hopnet_common::CustomUUID::new(None)],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(read_ingress_responsibility(&pool, 7), Ok(Some(device_id)));
+        assert_eq!(read_ingress_responsibility(&pool, 8), Ok(None));
     }
 }

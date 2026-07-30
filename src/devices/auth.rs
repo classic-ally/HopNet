@@ -9,6 +9,13 @@ use axum::{
 };
 use std::str::FromStr;
 
+/// The authenticated device's id, inserted into request extensions by
+/// [`device_token_auth_middleware`] alongside the bare-`i32` user id.
+/// A newtype because a second bare `i32`/`CustomUUID` extension would
+/// collide with existing insertions by type.
+#[derive(Clone)]
+pub struct AuthedDevice(pub CustomUUID);
+
 pub struct DeviceTokenAuthError {
     message: String,
     status_code: StatusCode,
@@ -146,8 +153,10 @@ pub async fn device_token_auth_middleware(
         }
     }
 
-    // Insert user_id into request extensions for downstream handlers
+    // Insert user_id + device identity into request extensions for
+    // downstream handlers (the responsibility gate keys on the device).
     req.extensions_mut().insert(device.user_id);
+    req.extensions_mut().insert(AuthedDevice(device_id));
 
     Ok(next.run(req).await)
 }

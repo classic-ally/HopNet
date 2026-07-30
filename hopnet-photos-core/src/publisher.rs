@@ -54,6 +54,9 @@ pub struct PublishRequest<'a> {
     pub photo_id: CustomUUID,
     pub library_id: Option<CustomUUID>,
     pub byte_sources: Vec<(ResourceKind, ByteSource)>,
+    /// Keyed HMAC of the asset's stable cross-device id, obtained from the
+    /// node's resolve route pre-publish. None = local-only asset (no dedupe).
+    pub cloud_fingerprint: Option<[u8; 32]>,
 }
 
 pub struct IngestOutcome {
@@ -395,6 +398,7 @@ pub async fn publish_photo_add(
         resources: resource_ops,
         metadata_access,
         operation_id: operation_id.clone(),
+        cloud_fingerprint: req.cloud_fingerprint,
     };
     let payload = match build_photo_add_and_encode(draft) {
         Ok(p) => p,
@@ -602,6 +606,7 @@ mod tests {
             photo_id: CustomUUID::new(None),
             library_id: None,
             byte_sources,
+            cloud_fingerprint: None,
         }
     }
 
@@ -784,6 +789,7 @@ mod tests {
             photo_id: photo_id.clone(),
             library_id: None,
             byte_sources: vec![(ResourceKind::Original, test_stream(data))],
+            cloud_fingerprint: None,
         };
         let outcome = publish_photo_add(&dispatch, req).await.unwrap();
         assert_eq!(outcome.photo_id, photo_id);
@@ -816,6 +822,7 @@ mod tests {
             photo_id: CustomUUID::new(None),
             library_id: None,
             byte_sources: vec![(ResourceKind::Original, test_stream(data))],
+            cloud_fingerprint: None,
         };
         publish_photo_add(&dispatch, req).await.unwrap();
 
@@ -911,6 +918,7 @@ mod tests {
             photo_id: photo_id.clone(),
             library_id: None,
             byte_sources: vec![(ResourceKind::Original, test_stream(data))],
+            cloud_fingerprint: None,
         };
         let err = publish_photo_add(&dispatch, req).await.unwrap_err();
         match err {
@@ -938,6 +946,7 @@ mod tests {
             photo_id: photo_id.clone(),
             library_id: None,
             byte_sources: vec![(ResourceKind::Original, test_stream(data))],
+            cloud_fingerprint: None,
         };
         let outcome = publish_photo_add(&dispatch, req).await.unwrap();
         assert_eq!(outcome.photo_id, photo_id);

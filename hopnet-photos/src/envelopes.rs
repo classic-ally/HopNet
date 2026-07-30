@@ -48,6 +48,14 @@ pub struct PhotoAddEntry {
     pub metadata_access: Vec<MetadataAccessEntry>,
     /// UUIDv7 for the `photo_operations` row.
     pub operation_id: CustomUUID,
+    /// Cross-device asset identity: keyed HMAC (blake3 keyed_hash under a
+    /// per-user derived key) of the source library's stable asset id
+    /// (PHCloudIdentifier). None = local-only asset, no dedupe. Opaque to
+    /// validators (no user key material node-side at validation) —
+    /// enforcement is solely the partial UNIQUE indexes on
+    /// photos.cloud_fingerprint. Appended pre-release (amend-in-place;
+    /// dev meshes wiped) — the freeze convention applies from first release.
+    pub cloud_fingerprint: Option<[u8; 32]>,
 }
 
 /// A resource-type tag paired with its blob registration.
@@ -200,6 +208,22 @@ pub struct PhotoUnfavoriteEntry {
     pub operation_id: CustomUUID,
 }
 
+// --- photo_ingress_claim ---
+
+/// Claim (or transfer — same operation, upsert) ingress responsibility
+/// for the submitting user's personal scope. The handler validates the
+/// device exists and belongs to the submitting user against the
+/// consensus-replicated `device_tokens` table, then upserts
+/// `photo_ingress_responsibility`. JWT-route only in v1: the thin-client
+/// device route rejects this tx kind, so a daemon can never claim for
+/// itself.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PhotoIngressClaimPayload {
+    pub device_id: CustomUUID,
+    /// UUIDv7 — audit/ordering stamp for the responsibility row.
+    pub operation_id: CustomUUID,
+}
+
 /// System-maintenance batch hard-delete of expired tombstones. Submitted
 /// by the periodic cleanup cron (TxSigner::Node, no user auth). The
 /// handler deterministically checks `datetime(deleted_at, '+30 days') <
@@ -306,6 +330,7 @@ mod tests {
                     encrypted_metadata_key: vec![0xFF; 48],
                 }],
                 operation_id: CustomUUID::retention_cutoff(2),
+                cloud_fingerprint: Some([0x5A; 32]),
             }],
         };
 
@@ -404,6 +429,69 @@ mod tests {
         expected.push(0xfe);
         let encoded = bincode::serde::encode_to_vec(&entry, bincode::config::standard()).unwrap();
         assert_eq!(encoded, expected, "PhotoFavoriteEntry wire format changed");
+    }
+
+    /// Should: encode cloud_fingerprint as the FINAL field of
+    /// PhotoAddEntry — None as a single 0x00 tail byte, Some as 0x01
+    /// followed by 32 raw bytes, with every preceding byte identical
+    /// between the two encodings.
+    /// Impact: pins the amended (pre-release) wire position of the dedupe
+    /// fingerprint; a positional shift silently corrupts every field
+    /// behind it on decode.
+    #[test]
+    fn photo_add_entry_fingerprint_tail_bytes() {
+        let base = PhotoAddEntry {
+            photo_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+            library_id: None,
+            uploaded_by: 1,
+            encrypted_metadata: vec![0xEE; 4],
+            metadata_nonce: [0u8; 12],
+            resources: vec![],
+            metadata_access: vec![],
+            operation_id: "00000000-0000-0000-0000-000000000002".parse().unwrap(),
+            cloud_fingerprint: None,
+        };
+        let mut with_fp = base.clone();
+        with_fp.cloud_fingerprint = Some([0xD4; 32]);
+
+        let none_bytes =
+            bincode::serde::encode_to_vec(&base, bincode::config::standard()).unwrap();
+        let some_bytes =
+            bincode::serde::encode_to_vec(&with_fp, bincode::config::standard()).unwrap();
+
+        assert_eq!(none_bytes.last(), Some(&0x00), "None must encode as a 0x00 tail");
+        assert_eq!(
+            some_bytes.len(),
+            none_bytes.len() + 32,
+            "Some must add exactly the 32 fingerprint bytes"
+        );
+        let split = none_bytes.len() - 1;
+        assert_eq!(
+            some_bytes[..split],
+            none_bytes[..split],
+            "all fields before the fingerprint must be byte-identical"
+        );
+        assert_eq!(some_bytes[split], 0x01, "Some tag byte");
+        assert_eq!(some_bytes[split + 1..], [0xD4; 32], "raw fingerprint bytes, no length prefix");
+    }
+
+    /// Should: encode PhotoIngressClaimPayload as two length-prefixed
+    /// UUIDs (device_id, operation_id) in that order.
+    #[test]
+    fn photo_ingress_claim_payload_golden_bytes() {
+        let payload = PhotoIngressClaimPayload {
+            device_id: "00000000-0000-0000-0000-0000000000aa".parse().unwrap(),
+            operation_id: "00000000-0000-0000-0000-0000000000ab".parse().unwrap(),
+        };
+        let mut expected = vec![0x10u8]; // varint(16) — device_id
+        expected.extend_from_slice(&[0u8; 15]);
+        expected.push(0xaa);
+        expected.push(0x10); // varint(16) — operation_id
+        expected.extend_from_slice(&[0u8; 15]);
+        expected.push(0xab);
+        let encoded =
+            bincode::serde::encode_to_vec(&payload, bincode::config::standard()).unwrap();
+        assert_eq!(encoded, expected, "PhotoIngressClaimPayload wire format changed");
     }
 
     /// Golden round-trip for photo_edit_metadata (batch of one).

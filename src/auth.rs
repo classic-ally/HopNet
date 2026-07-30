@@ -356,6 +356,22 @@ pub fn derive_x25519_privkey_from_user(user_privkey: &PrivKey) -> x25519_dalek::
     x25519_dalek::StaticSecret::from(x25519_secret_bytes)
 }
 
+/// Derives the per-user photo fingerprint key from the user's Ed25519
+/// private key. Fingerprints are `blake3::keyed_hash(&key, cloud_id)` over
+/// the asset's stable cross-device identifier (PHCloudIdentifier), computed
+/// node-side in the resolve route — keyed so replicated state carries no
+/// unkeyed function of the identifier (RFC-014 confirmation-oracle rule).
+///
+/// The context string is FROZEN: changing it orphans every committed
+/// cloud_fingerprint (dedupe silently stops matching existing rows).
+pub fn derive_photo_fingerprint_key(user_privkey: &PrivKey) -> [u8; 32] {
+    let mut key = [0u8; 32];
+    let mut hasher = blake3::Hasher::new_derive_key("hopnet photos cloud fingerprint v1");
+    hasher.update(&user_privkey.to_bytes());
+    hasher.finalize_xof().fill(&mut key);
+    key
+}
+
 /// Wrap a user private key with a password using Argon2id + ChaCha20-Poly1305.
 /// Returns (nonce || ciphertext, salt).
 pub fn wrap_user_privkey(

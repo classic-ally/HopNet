@@ -6,14 +6,14 @@
 //! execute passes; side effects (notifier, work) fire only under execute.
 
 use crate::db::photos::{
-    delete_favorite, edit_photo_content, edit_photo_metadata, hard_delete_expired_photo,
-    insert_favorite, insert_photo_entry, lookup_photo_owner, restore_photo, soft_delete_photo,
-    undo_content_edit,
+    delete_favorite, device_belongs_to_user, edit_photo_content, edit_photo_metadata,
+    hard_delete_expired_photo, insert_favorite, insert_photo_entry, lookup_photo_owner,
+    restore_photo, soft_delete_photo, undo_content_edit, upsert_ingress_responsibility,
 };
 use crate::envelopes::{
     PhotoAddPayload, PhotoCleanupExpiredPayload, PhotoDeletePayload, PhotoEditContentPayload,
-    PhotoEditMetadataPayload, PhotoFavoritePayload, PhotoRestorePayload, PhotoUndoPayload,
-    PhotoUnfavoritePayload,
+    PhotoEditMetadataPayload, PhotoFavoritePayload, PhotoIngressClaimPayload, PhotoRestorePayload,
+    PhotoUndoPayload, PhotoUnfavoritePayload,
 };
 use hopnet_projection::{DatabaseError, HandlerCtx, HandlerResult, TransactionHandler, TxMeta};
 
@@ -30,6 +30,7 @@ pub const TX_FUNCTIONS: &[&str] = &[
     "photo_undo",
     "photo_favorite",
     "photo_unfavorite",
+    "photo_ingress_claim",
 ];
 
 /// Subset of [`TX_FUNCTIONS`] that users may submit directly (excludes
@@ -43,11 +44,33 @@ pub const USER_TX_FUNCTIONS: &[&str] = &[
     "photo_undo",
     "photo_favorite",
     "photo_unfavorite",
+    "photo_ingress_claim",
 ];
 
 const _USER_TX_COUNT: () = assert!(
     USER_TX_FUNCTIONS.len() + 1 == TX_FUNCTIONS.len(),
     "USER_TX_FUNCTIONS out of sync with TX_FUNCTIONS — did you add a node-signed handler?"
+);
+
+/// Subset of [`USER_TX_FUNCTIONS`] that thin-client DEVICES may submit
+/// (`POST /api/photos/client/transaction`). Excludes `photo_ingress_claim`:
+/// responsibility claims are JWT-route only in v1, so a daemon can never
+/// designate itself — the enablement UI (or any logged-in session) issues
+/// the claim deliberately.
+pub const DEVICE_TX_FUNCTIONS: &[&str] = &[
+    "photo_add",
+    "photo_delete",
+    "photo_restore",
+    "photo_edit_content",
+    "photo_edit_metadata",
+    "photo_undo",
+    "photo_favorite",
+    "photo_unfavorite",
+];
+
+const _DEVICE_TX_COUNT: () = assert!(
+    DEVICE_TX_FUNCTIONS.len() + 1 == USER_TX_FUNCTIONS.len(),
+    "DEVICE_TX_FUNCTIONS out of sync with USER_TX_FUNCTIONS — decide whether the new user tx is device-submittable"
 );
 
 // --- photo_add ---
@@ -562,6 +585,50 @@ impl TransactionHandler for PhotoUnfavoriteHandler {
 
 inventory::submit! { &PhotoUnfavoriteHandler as &dyn TransactionHandler }
 
+// --- photo_ingress_claim ---
+
+pub struct PhotoIngressClaimHandler;
+
+impl TransactionHandler for PhotoIngressClaimHandler {
+    fn name(&self) -> &'static str {
+        "photo_ingress_claim"
+    }
+
+    fn process(
+        &self,
+        tx: &TxMeta<'_>,
+        _execute: bool,
+        _ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
+    ) -> HandlerResult {
+        let (payload, _) = bincode::serde::decode_from_slice::<PhotoIngressClaimPayload, _>(
+            tx.payload,
+            bincode::config::standard(),
+        )
+        .map_err(|_| DatabaseError::InvalidPayload)?;
+
+        let user_id = tx.user_id.ok_or_else(|| {
+            tracing::warn!("photo_ingress_claim: requires user authentication");
+            DatabaseError::AuthorizationError
+        })?;
+
+        // Deterministic: device_tokens is consensus-replicated, so every
+        // validator sees the same ownership state at this height.
+        if !device_belongs_to_user(db_tx, &payload.device_id, user_id)? {
+            tracing::warn!(
+                "photo_ingress_claim: device {} does not belong to user {}",
+                payload.device_id,
+                user_id,
+            );
+            return Err(DatabaseError::AuthorizationError);
+        }
+
+        upsert_ingress_responsibility(db_tx, user_id, &payload.device_id, &payload.operation_id)
+    }
+}
+
+inventory::submit! { &PhotoIngressClaimHandler as &dyn TransactionHandler }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,6 +659,22 @@ mod tests {
         conn.execute(
             "INSERT INTO users (user_id, x25519_pubkey) VALUES (2, x'01')",
             [],
+        )
+        .unwrap();
+        // Host-owned device_tokens mirror (src/db/shared.rs DDL) — the
+        // responsibility table FKs it and the claim handler reads it.
+        conn.execute_batch(
+            "CREATE TABLE device_tokens (
+                 id TEXT PRIMARY KEY,
+                 user_id INTEGER NOT NULL,
+                 api_key_hash BLOB NOT NULL,
+                 encrypted_device_name TEXT NOT NULL,
+                 wrapped_user_key BLOB NOT NULL,
+                 FOREIGN KEY (user_id) REFERENCES users(user_id)
+             );
+             INSERT INTO device_tokens VALUES ('00000000-0000-0000-0000-0000000000d1', 1, x'00', 'enc', x'00');
+             INSERT INTO device_tokens VALUES ('00000000-0000-0000-0000-0000000000d2', 1, x'00', 'enc', x'00');
+             INSERT INTO device_tokens VALUES ('00000000-0000-0000-0000-0000000000d9', 2, x'00', 'enc', x'00');",
         )
         .unwrap();
         conn
@@ -653,6 +736,7 @@ mod tests {
                     encrypted_metadata_key: vec![0xFF; 48],
                 }],
                 operation_id: op_id,
+                cloud_fingerprint: None,
             }],
         };
         bincode::serde::encode_to_vec(&payload, bincode::config::standard()).unwrap()
@@ -972,6 +1056,7 @@ mod tests {
                     }],
                     metadata_access: vec![],
                     operation_id: "00000000-0000-0000-0000-000000000002".parse().unwrap(),
+                    cloud_fingerprint: None,
                 },
                 PhotoAddEntry {
                     photo_id: "00000000-0000-0000-0000-000000000003".parse().unwrap(),
@@ -995,6 +1080,7 @@ mod tests {
                     ],
                     metadata_access: vec![],
                     operation_id: "00000000-0000-0000-0000-000000000004".parse().unwrap(),
+                    cloud_fingerprint: None,
                 },
             ],
         };
@@ -1474,5 +1560,168 @@ mod tests {
             &unfav_bytes,
             Some(1),
         );
+    }
+
+    // --- cloud_fingerprint + photo_ingress_claim ---
+
+    fn add_payload_with_fp(
+        photo_id: CustomUUID,
+        blob_id: CustomUUID,
+        op_id: CustomUUID,
+        fingerprint: Option<[u8; 32]>,
+    ) -> Vec<u8> {
+        let payload = PhotoAddPayload {
+            entries: vec![PhotoAddEntry {
+                photo_id,
+                library_id: None,
+                uploaded_by: 1,
+                encrypted_metadata: b"enc_meta".to_vec(),
+                metadata_nonce: [0u8; 12],
+                resources: vec![PhotoResourceOp {
+                    resource_type: 0,
+                    op: make_blob_op(blob_id),
+                }],
+                metadata_access: vec![MetadataAccessEntry {
+                    user_id: 1,
+                    ephemeral_pubkey: [0x42; 32],
+                    encrypted_metadata_key: vec![0xFF; 48],
+                }],
+                operation_id: op_id,
+                cloud_fingerprint: fingerprint,
+            }],
+        };
+        bincode::serde::encode_to_vec(&payload, bincode::config::standard()).unwrap()
+    }
+
+    fn claim_bytes(device_id: &str) -> Vec<u8> {
+        let payload = crate::envelopes::PhotoIngressClaimPayload {
+            device_id: device_id.parse().unwrap(),
+            operation_id: CustomUUID::new(None),
+        };
+        bincode::serde::encode_to_vec(&payload, bincode::config::standard()).unwrap()
+    }
+
+    fn read_holder(conn: &Connection, user_id: i32) -> Option<String> {
+        conn.query_row(
+            "SELECT device_id FROM photo_ingress_responsibility WHERE user_id = ?1",
+            rusqlite::params![user_id],
+            |r| r.get(0),
+        )
+        .ok()
+    }
+
+    // Should: persist the wire fingerprint as lowercase hex on the photos row.
+    #[test]
+    fn photo_add_persists_fingerprint_hex() {
+        let conn = fixture();
+        let bytes = add_payload_with_fp(
+            CustomUUID::retention_cutoff(0),
+            CustomUUID::retention_cutoff(1),
+            CustomUUID::retention_cutoff(2),
+            Some([0xAB; 32]),
+        );
+        apply(&conn, &PhotoAddHandler, "photo_add", &bytes, Some(1));
+
+        let stored: String = conn
+            .query_row("SELECT cloud_fingerprint FROM photos", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, "ab".repeat(32));
+    }
+
+    // Impact: the UNIQUE backstop is what makes admission races harmless —
+    // the losing device's tx must fail deterministically on every validator
+    // so it re-resolves and adopts instead of committing a duplicate.
+    // Should: reject a second photo_add carrying an already-committed
+    // fingerprint under a different photo_id.
+    #[test]
+    fn photo_add_duplicate_fingerprint_rejected() {
+        let conn = fixture();
+        let first = add_payload_with_fp(
+            CustomUUID::retention_cutoff(0),
+            CustomUUID::retention_cutoff(1),
+            CustomUUID::retention_cutoff(2),
+            Some([0xAB; 32]),
+        );
+        apply(&conn, &PhotoAddHandler, "photo_add", &first, Some(1));
+
+        let loser = add_payload_with_fp(
+            CustomUUID::retention_cutoff(10),
+            CustomUUID::retention_cutoff(11),
+            CustomUUID::retention_cutoff(12),
+            Some([0xAB; 32]),
+        );
+        let result = validate(&conn, &PhotoAddHandler, "photo_add", &loser, Some(1));
+        assert!(
+            matches!(result, Err(DatabaseError::InsertError)),
+            "duplicate fingerprint must fail the insert, got {result:?}"
+        );
+    }
+
+    // Should: admit any number of NULL-fingerprint photos (local-only
+    // assets are exempt from dedupe).
+    #[test]
+    fn photo_add_null_fingerprints_coexist() {
+        let conn = fixture();
+        for i in 0..2u32 {
+            let bytes = add_payload_with_fp(
+                CustomUUID::retention_cutoff(i as i64 * 10),
+                CustomUUID::retention_cutoff(i as i64 * 10 + 1),
+                CustomUUID::retention_cutoff(i as i64 * 10 + 2),
+                None,
+            );
+            apply(&conn, &PhotoAddHandler, "photo_add", &bytes, Some(1));
+        }
+        let count: i32 = conn
+            .query_row("SELECT COUNT(*) FROM photos", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    // Should: claim responsibility for an owned device, and transfer it by
+    // re-claiming a different owned device (upsert — last claim wins).
+    #[test]
+    fn ingress_claim_upserts_and_transfers() {
+        let conn = fixture();
+        let dev_a = "00000000-0000-0000-0000-0000000000d1";
+        let dev_b = "00000000-0000-0000-0000-0000000000d2";
+
+        let bytes = claim_bytes(dev_a);
+        validate(&conn, &PhotoIngressClaimHandler, "photo_ingress_claim", &bytes, Some(1)).unwrap();
+        apply(&conn, &PhotoIngressClaimHandler, "photo_ingress_claim", &bytes, Some(1));
+        assert_eq!(read_holder(&conn, 1).as_deref(), Some(dev_a));
+
+        let bytes = claim_bytes(dev_b);
+        apply(&conn, &PhotoIngressClaimHandler, "photo_ingress_claim", &bytes, Some(1));
+        assert_eq!(read_holder(&conn, 1).as_deref(), Some(dev_b), "transfer = re-claim");
+    }
+
+    // Impact: the ownership check is the only thing stopping one user from
+    // hijacking another user's publish pipeline onto their own device.
+    // Should not: allow claiming a device that belongs to another user, an
+    // unknown device, or claiming without user auth.
+    #[test]
+    fn ingress_claim_rejects_foreign_missing_and_unauthed() {
+        let conn = fixture();
+
+        // Device d9 belongs to user 2; user 1 must not claim it.
+        let foreign = claim_bytes("00000000-0000-0000-0000-0000000000d9");
+        assert!(matches!(
+            validate(&conn, &PhotoIngressClaimHandler, "photo_ingress_claim", &foreign, Some(1)),
+            Err(DatabaseError::AuthorizationError)
+        ));
+
+        let missing = claim_bytes("00000000-0000-0000-0000-0000000000ee");
+        assert!(matches!(
+            validate(&conn, &PhotoIngressClaimHandler, "photo_ingress_claim", &missing, Some(1)),
+            Err(DatabaseError::AuthorizationError)
+        ));
+
+        let owned = claim_bytes("00000000-0000-0000-0000-0000000000d1");
+        assert!(matches!(
+            validate(&conn, &PhotoIngressClaimHandler, "photo_ingress_claim", &owned, None),
+            Err(DatabaseError::AuthorizationError)
+        ));
+
+        assert_eq!(read_holder(&conn, 1), None, "no claim may have landed");
     }
 }

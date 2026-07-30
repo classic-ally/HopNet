@@ -30,7 +30,14 @@ pub fn router<S: Clone + Send + Sync + 'static>(app_state: AppState) -> Router<S
         .route("/photos/{id}/resource/{type}", get(get_photo_resource))
         .route("/photos/recently-deleted", get(get_recently_deleted))
         .route("/photos/transaction", post(post_transaction))
-        .route("/photos/sync", get(get_sync_feed));
+        .route("/photos/sync", get(get_sync_feed))
+        // Ingress responsibility management (JWT only, deliberately: a
+        // daemon can never claim for itself — see DEVICE_TX_FUNCTIONS).
+        .route("/photos/ingress/claim", post(post_ingress_claim))
+        .route(
+            "/photos/ingress/responsibility",
+            get(get_ingress_responsibility),
+        );
     // Separate sub-router so the raised body limit applies only to ingest
     // (the rest of the surface keeps axum's 2 MB default).
     let ingest = Router::new()
@@ -53,7 +60,8 @@ pub fn device_router<S: Clone + Send + Sync + 'static>(app_state: AppState) -> R
     let small = Router::new()
         .route("/membership", get(get_client_membership))
         .route("/transaction", post(post_client_transaction))
-        .route("/committed/{photo_id}", get(get_client_committed));
+        .route("/committed/{photo_id}", get(get_client_committed))
+        .route("/resolve", post(post_client_resolve));
     let upload = Router::new()
         .route("/data-block/{blob_id}", post(post_client_data_block))
         .layer(axum::extract::DefaultBodyLimit::max(DATA_BLOCK_BODY_LIMIT));
@@ -320,6 +328,9 @@ async fn post_photo_ingest(
             photo_id,
             library_id: None, // personal library only until Phase 3
             byte_sources,
+            // Browser/desktop uploads carry no PhotoKit identity; import-time
+            // fingerprints for non-PhotoKit paths are a recorded deferral.
+            cloud_fingerprint: None,
         },
     )
     .await
@@ -366,6 +377,75 @@ async fn post_transaction(
     Json(body): Json<TransactionBody>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     submit_photos_transaction(state, uid, body).await
+}
+
+#[derive(Deserialize)]
+struct IngressClaimBody {
+    device_id: hopnet_common::CustomUUID,
+}
+
+/// Claim (or transfer) ingress responsibility to one of the caller's
+/// devices. JWT-authenticated and JSON-bodied on purpose: the GUI enable
+/// flow and a plain curl both need it without bincode-encoding a payload
+/// client-side — the route builds and submits the consensus tx itself.
+/// The handler re-validates device ownership deterministically; the check
+/// here just gives the caller a friendly 4xx instead of a rejected tx.
+async fn post_ingress_claim(
+    State(state): State<AppState>,
+    Extension(uid): Extension<i32>,
+    Json(body): Json<IngressClaimBody>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let owned = {
+        let db = state
+            .db_pool
+            .get()
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        crate::db::devices::get_device_by_id(&db, &body.device_id)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:?}")))?
+            .is_some_and(|d| d.user_id == uid)
+    };
+    if !owned {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "device not found for this user".into(),
+        ));
+    }
+
+    let payload = hopnet_photos::envelopes::PhotoIngressClaimPayload {
+        device_id: body.device_id,
+        operation_id: hopnet_common::CustomUUID::new(None),
+    };
+    let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    submit_photos_transaction(
+        state,
+        uid,
+        TransactionBody {
+            tx_type: "photo_ingress_claim".into(),
+            payload: encoded,
+        },
+    )
+    .await
+}
+
+#[derive(Serialize)]
+struct IngressResponsibilityResponse {
+    device_id: Option<String>,
+}
+
+async fn get_ingress_responsibility(
+    State(state): State<AppState>,
+    Extension(uid): Extension<i32>,
+) -> Result<Json<IngressResponsibilityResponse>, (StatusCode, String)> {
+    let pool = state.db_pool.clone();
+    let holder =
+        tokio::task::spawn_blocking(move || super::query::read_ingress_responsibility(&pool, uid))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(IngressResponsibilityResponse {
+        device_id: holder.map(|d| d.to_string()),
+    }))
 }
 
 #[derive(Deserialize)]
@@ -589,12 +669,128 @@ async fn post_client_data_block(
     Ok((StatusCode::CREATED, Json(uploaded)))
 }
 
+/// Device-route mutations are double-gated beyond the shared contract:
+/// (a) tx_type must be device-submittable (no self-claims), (b) the authed
+/// device must hold ingress responsibility. The 403 body is machine-
+/// parseable (`ingress_not_responsible:{other|unclaimed}`) — a well-behaved
+/// daemon parks on the resolve pre-pass and never hits this; it exists as
+/// the admission backstop, with the fingerprint UNIQUE pair behind it.
 async fn post_client_transaction(
     State(state): State<AppState>,
     Extension(uid): Extension<i32>,
+    Extension(device): Extension<crate::devices::auth::AuthedDevice>,
     Json(body): Json<TransactionBody>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    if !hopnet_photos::handlers::DEVICE_TX_FUNCTIONS.contains(&body.tx_type.as_str()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("tx_type not device-submittable: {}", body.tx_type),
+        ));
+    }
+
+    let pool = state.db_pool.clone();
+    let holder =
+        tokio::task::spawn_blocking(move || super::query::read_ingress_responsibility(&pool, uid))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    match holder {
+        Some(h) if h == device.0 => {}
+        Some(_) => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "ingress_not_responsible:other".into(),
+            ));
+        }
+        None => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "ingress_not_responsible:unclaimed".into(),
+            ));
+        }
+    }
+
     submit_photos_transaction(state, uid, body).await
+}
+
+/// Resolve batch size ceiling. Must stay >= the ingress publisher's claim
+/// batch (PublishConfig::default().batch — a couple dozen) so one publish
+/// pass never needs a chunked resolve.
+const RESOLVE_MAX_IDS: usize = 500;
+
+#[derive(Deserialize)]
+struct ResolveBody {
+    cloud_ids: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ResolveEntryResponse {
+    cloud_id: String,
+    fingerprint: String,
+    photo_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ResolveResponse {
+    /// The caller's standing: "holder" | "other" | "unclaimed".
+    responsibility: &'static str,
+    entries: Vec<ResolveEntryResponse>,
+}
+
+/// Pre-publish identity resolution for the thin client. The daemon holds
+/// no user key material, so the fingerprint HMAC is computed here from the
+/// device-auth session's user key; the response pairs each fingerprint
+/// with any already-committed photo_id (→ the daemon adopts instead of
+/// re-uploading) plus the caller's responsibility standing. Read-only —
+/// deliberately NOT gated on responsibility, so non-holder devices can
+/// still adopt (that's what makes handoff a cheap sweep).
+async fn post_client_resolve(
+    State(state): State<AppState>,
+    Extension(uid): Extension<i32>,
+    Extension(device): Extension<crate::devices::auth::AuthedDevice>,
+    Json(body): Json<ResolveBody>,
+) -> Result<Json<ResolveResponse>, (StatusCode, String)> {
+    if body.cloud_ids.len() > RESOLVE_MAX_IDS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("too many cloud_ids (max {RESOLVE_MAX_IDS})"),
+        ));
+    }
+
+    let session = state
+        .get_session(uid)
+        .await
+        .map_err(|s| (s, "no session".into()))?;
+    let fp_key = crate::auth::derive_photo_fingerprint_key(&session.user_keys.private_key);
+
+    let pool = state.db_pool.clone();
+    tokio::task::spawn_blocking(move || {
+        let holder = super::query::read_ingress_responsibility(&pool, uid)?;
+        let responsibility = match &holder {
+            Some(h) if *h == device.0 => "holder",
+            Some(_) => "other",
+            None => "unclaimed",
+        };
+
+        let mut entries = Vec::with_capacity(body.cloud_ids.len());
+        for cloud_id in body.cloud_ids {
+            let fingerprint = hex::encode(blake3::keyed_hash(&fp_key, cloud_id.as_bytes()).as_bytes());
+            let photo_id = super::query::read_photo_by_fingerprint(&pool, uid, &fingerprint)?;
+            entries.push(ResolveEntryResponse {
+                cloud_id,
+                fingerprint,
+                photo_id: photo_id.map(|id| id.to_string()),
+            });
+        }
+        Ok(ResolveResponse {
+            responsibility,
+            entries,
+        })
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map(Json)
+    .map_err(|e: String| (StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
 #[derive(Serialize)]

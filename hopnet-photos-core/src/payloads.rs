@@ -16,6 +16,9 @@ pub struct PhotoAddDraft {
     pub resources: Vec<PhotoResourceOp>,
     pub metadata_access: Vec<MetadataAccessEntry>,
     pub operation_id: CustomUUID,
+    /// Keyed HMAC of the asset's stable cross-device id (computed
+    /// node-side via the resolve route). None = local-only asset.
+    pub cloud_fingerprint: Option<[u8; 32]>,
 }
 
 pub fn build_photo_add(drafts: Vec<PhotoAddDraft>) -> PhotoAddPayload {
@@ -31,6 +34,7 @@ pub fn build_photo_add(drafts: Vec<PhotoAddDraft>) -> PhotoAddPayload {
                 resources: d.resources,
                 metadata_access: d.metadata_access,
                 operation_id: d.operation_id,
+                cloud_fingerprint: d.cloud_fingerprint,
             })
             .collect(),
     }
@@ -106,7 +110,21 @@ mod tests {
                 encrypted_metadata_key: vec![0xFF; 48],
             }],
             operation_id: CustomUUID::retention_cutoff(2),
+            cloud_fingerprint: Some([0x5A; 32]),
         }
+    }
+
+    // Should: carry the draft's cloud_fingerprint into the wire entry
+    // unchanged, and preserve None for local-only assets.
+    #[test]
+    fn build_photo_add_threads_cloud_fingerprint() {
+        let payload = build_photo_add(vec![make_draft()]);
+        assert_eq!(payload.entries[0].cloud_fingerprint, Some([0x5A; 32]));
+
+        let mut draft = make_draft();
+        draft.cloud_fingerprint = None;
+        let payload = build_photo_add(vec![draft]);
+        assert_eq!(payload.entries[0].cloud_fingerprint, None);
     }
 
     #[test]

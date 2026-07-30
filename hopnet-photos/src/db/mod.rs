@@ -26,6 +26,7 @@ pub const TABLES: &[&str] = &[
     "photo_album_entries",
     "photo_favorites",
     "photo_changes",
+    "photo_ingress_responsibility",
 ];
 
 pub mod photos;
@@ -96,6 +97,13 @@ pub fn install_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error
             deleted_at               TEXT,                 -- ISO 8601, NULL when active
             deleted_by               INTEGER,
 
+            -- Cross-device asset identity: lowercase-hex keyed HMAC of the
+            -- source library's stable asset id (PHCloudIdentifier), keyed
+            -- per-user (RFC-014: no unkeyed function of plaintext in
+            -- replicated state). NULL = local-only asset, no dedupe.
+            -- Opaque to validators; enforced by the partial UNIQUE pair.
+            cloud_fingerprint        TEXT,
+
             FOREIGN KEY (uploaded_by) REFERENCES users(user_id),
             FOREIGN KEY (deleted_by) REFERENCES users(user_id),
             FOREIGN KEY (library_id) REFERENCES shared_libraries(id)
@@ -103,6 +111,16 @@ pub fn install_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error
 
         CREATE INDEX idx_photos_library ON photos(library_id);
         CREATE INDEX idx_photos_deleted ON photos(deleted_at) WHERE deleted_at IS NOT NULL;
+
+        -- Dedupe uniqueness must be split: SQLite treats NULLs as distinct
+        -- in UNIQUE indexes, so a composite UNIQUE(library_id,
+        -- cloud_fingerprint) would never constrain personal (NULL-library)
+        -- rows. Fingerprints are per-user-keyed HMACs, so a global index
+        -- over personal rows is collision-safe across users.
+        CREATE UNIQUE INDEX idx_photos_fp_personal ON photos(cloud_fingerprint)
+            WHERE library_id IS NULL AND cloud_fingerprint IS NOT NULL;
+        CREATE UNIQUE INDEX idx_photos_fp_shared ON photos(library_id, cloud_fingerprint)
+            WHERE library_id IS NOT NULL AND cloud_fingerprint IS NOT NULL;
 
         -- Per-user metadata decryption keys (photos.md:100-116). Mirrors
         -- the storage substrate's `blob_access` pattern: each photo's
@@ -207,6 +225,23 @@ pub fn install_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error
             FOREIGN KEY (photo_id) REFERENCES photos(id),
             FOREIGN KEY (user_id) REFERENCES users(user_id)
         );
+
+        -- Ingress responsibility (v1, personal scope): the single device
+        -- allowed to publish ingress mutations for a user. Claimed and
+        -- transferred ONLY via the JWT claim route (photo_ingress_claim) —
+        -- daemons never auto-claim. Enforced at thin-client route
+        -- admission, not in handlers: the UNIQUE fingerprint pair above is
+        -- the correctness backstop for any admission race. device_tokens
+        -- is consensus-replicated, so the FK and the handler's ownership
+        -- check are deterministic on every validator.
+        CREATE TABLE photo_ingress_responsibility (
+            user_id                  INTEGER PRIMARY KEY,
+            device_id                TEXT NOT NULL,
+            operation_id             TEXT NOT NULL,        -- UUIDv7, audit/ordering
+
+            FOREIGN KEY (user_id) REFERENCES users(user_id),
+            FOREIGN KEY (device_id) REFERENCES device_tokens(id)
+        );
         ",
     )
 }
@@ -218,6 +253,7 @@ pub fn install_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error
 pub fn uninstall_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(
         "
+        DROP TABLE IF EXISTS photo_ingress_responsibility;
         DROP TABLE IF EXISTS photo_favorites;
         DROP TABLE IF EXISTS photo_changes;
         DROP TABLE IF EXISTS photo_album_entries;
@@ -249,7 +285,15 @@ mod tests {
             "PRAGMA foreign_keys = ON;
              CREATE TABLE users (user_id INTEGER PRIMARY KEY, username TEXT);
              CREATE TABLE consensus_meta (key TEXT PRIMARY KEY, value BLOB);
-             CREATE TABLE nodes (node_id INTEGER PRIMARY KEY);",
+             CREATE TABLE nodes (node_id INTEGER PRIMARY KEY);
+             CREATE TABLE device_tokens (
+                 id TEXT PRIMARY KEY,
+                 user_id INTEGER NOT NULL,
+                 api_key_hash BLOB NOT NULL,
+                 encrypted_device_name TEXT NOT NULL,
+                 wrapped_user_key BLOB NOT NULL,
+                 FOREIGN KEY (user_id) REFERENCES users(user_id)
+             );",
         )
         .unwrap();
         hopnet_storage::store::install_schema(&conn).unwrap();
@@ -336,8 +380,33 @@ mod tests {
         )
         .unwrap();
 
+        // Responsibility FK surface: valid claim for an existing owned
+        // device passes; a dangling device_id is rejected.
+        conn.execute(
+            "INSERT INTO device_tokens VALUES ('dev1', 1, x'00', 'enc', x'00')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO photo_ingress_responsibility (user_id, device_id, operation_id)
+             VALUES (1, 'dev1', 'op1')",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO photo_ingress_responsibility (user_id, device_id, operation_id)
+                 VALUES (99, 'nope', 'op2')",
+                [],
+            )
+            .is_err(),
+            "dangling device_id must be rejected"
+        );
+
         // Uninstall drops exactly the photos unit. Must clear children first
         // (foreign_keys = ON).
+        conn.execute("DELETE FROM photo_ingress_responsibility", [])
+            .unwrap();
         conn.execute("DELETE FROM photo_operations", []).unwrap();
         conn.execute("DELETE FROM photo_resources", []).unwrap();
         conn.execute("DELETE FROM photo_metadata_access", []).unwrap();
@@ -369,5 +438,47 @@ mod tests {
                 .unwrap();
             assert!(exists, "{table} must survive photos uninstall");
         }
+    }
+
+    // Impact: SQLite treats NULLs as distinct in UNIQUE indexes, so dedupe
+    // correctness rests entirely on the partial-index pair having exactly
+    // the right predicates — this pins them at the SQL level.
+    // Should: reject a duplicate fingerprint within the personal scope and
+    // within one shared library.
+    // Should not: constrain NULL fingerprints, or collide a personal-scope
+    // fingerprint with the same value in a shared library.
+    #[test]
+    fn fingerprint_partial_unique_index_semantics() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;", // isolate index semantics from FK setup
+        )
+        .unwrap();
+        install_schema(&conn).unwrap();
+
+        let insert = |id: &str, lib: Option<&str>, fp: Option<&str>| {
+            conn.execute(
+                "INSERT INTO photos (id, library_id, uploaded_by, encrypted_metadata, metadata_nonce, cloud_fingerprint)
+                 VALUES (?1, ?2, 1, x'00', x'00', ?3)",
+                rusqlite::params![id, lib, fp],
+            )
+        };
+
+        insert("p1", None, Some("fp_a")).unwrap();
+        assert!(
+            insert("p2", None, Some("fp_a")).is_err(),
+            "duplicate personal-scope fingerprint must be rejected"
+        );
+        insert("p3", Some("lib1"), Some("fp_a"))
+            .expect("same fingerprint under a shared library is a different scope");
+        assert!(
+            insert("p4", Some("lib1"), Some("fp_a")).is_err(),
+            "duplicate fingerprint within one shared library must be rejected"
+        );
+        insert("p5", Some("lib2"), Some("fp_a"))
+            .expect("same fingerprint under a different shared library is fine");
+        insert("p6", None, None).unwrap();
+        insert("p7", None, None)
+            .expect("NULL fingerprints are unconstrained (local-only assets)");
     }
 }

@@ -41,17 +41,31 @@ pub fn insert_photo_entry(
     // --- Projection half: photos row (identity + encrypted metadata).
     db_tx
         .execute(
-            "INSERT INTO photos (id, library_id, uploaded_by, encrypted_metadata, metadata_nonce)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO photos
+               (id, library_id, uploaded_by, encrypted_metadata, metadata_nonce, cloud_fingerprint)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 entry.photo_id,
                 entry.library_id,
                 entry.uploaded_by,
                 entry.encrypted_metadata,
                 entry.metadata_nonce,
+                entry.cloud_fingerprint.map(hex::encode),
             ],
         )
         .map_err(|e| {
+            if let rusqlite::Error::SqliteFailure(err, _) = &e {
+                if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE {
+                    // Deterministic on every validator: the fingerprint's
+                    // partial UNIQUE index is the dedupe backstop for
+                    // admission races (the loser re-resolves and adopts).
+                    tracing::warn!(
+                        "photo_add: photos row {} rejected — cloud_fingerprint already committed",
+                        entry.photo_id
+                    );
+                    return DatabaseError::InsertError;
+                }
+            }
             tracing::error!(
                 "photo_add: insert photos row {} failed: {e}",
                 entry.photo_id
@@ -345,6 +359,52 @@ pub fn hard_delete_expired_photo(
         })?;
 
     Ok(())
+}
+
+/// Upsert the ingress responsibility holder for a user's personal scope.
+/// Claim and transfer are the same operation — last committed claim wins.
+pub fn upsert_ingress_responsibility(
+    db_tx: &rusqlite::Transaction,
+    user_id: i32,
+    device_id: &CustomUUID,
+    operation_id: &CustomUUID,
+) -> Result<(), DatabaseError> {
+    db_tx
+        .execute(
+            "INSERT INTO photo_ingress_responsibility (user_id, device_id, operation_id)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(user_id) DO UPDATE SET device_id = ?2, operation_id = ?3",
+            params![user_id, device_id, operation_id],
+        )
+        .map_err(|e| {
+            tracing::error!(
+                "photo_ingress_claim: upsert responsibility (user {}, device {}) failed: {e}",
+                user_id,
+                device_id,
+            );
+            DatabaseError::InsertError
+        })?;
+    Ok(())
+}
+
+/// Deterministic ownership check against the consensus-replicated
+/// `device_tokens` table (host-owned; photos SQL may READ it — the
+/// ownership boundary is code, not schema).
+pub fn device_belongs_to_user(
+    db_tx: &rusqlite::Transaction,
+    device_id: &CustomUUID,
+    user_id: i32,
+) -> Result<bool, DatabaseError> {
+    db_tx
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM device_tokens WHERE id = ?1 AND user_id = ?2",
+            params![device_id, user_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| {
+            tracing::error!("device_belongs_to_user ({}, {}) failed: {e}", device_id, user_id);
+            DatabaseError::RecallError
+        })
 }
 
 // --- Private helpers ---
@@ -1038,6 +1098,7 @@ mod tests {
                 encrypted_metadata_key: vec![0xFF; 48],
             }],
             operation_id: CustomUUID::retention_cutoff(2),
+            cloud_fingerprint: None,
         };
         let tx = conn.unchecked_transaction().unwrap();
         insert_photo_entry(&tx, &entry, "/tmp/fragments").unwrap();
@@ -1081,6 +1142,7 @@ mod tests {
                 encrypted_metadata_key: vec![0xFF; 48],
             }],
             operation_id: CustomUUID::retention_cutoff(2),
+            cloud_fingerprint: None,
         };
         let tx = conn.unchecked_transaction().unwrap();
         insert_photo_entry(&tx, &entry, "/tmp/fragments").unwrap();
@@ -1147,6 +1209,7 @@ mod tests {
                 encrypted_metadata_key: vec![0xFF; 48],
             }],
             operation_id: CustomUUID::retention_cutoff(2),
+            cloud_fingerprint: None,
         };
         let tx = conn.unchecked_transaction().unwrap();
         insert_photo_entry(&tx, &entry, "/tmp/fragments").unwrap();
@@ -1207,6 +1270,7 @@ mod tests {
                 encrypted_metadata_key: vec![0xFF; 48],
             }],
             operation_id: CustomUUID::retention_cutoff(2),
+            cloud_fingerprint: None,
         };
         let tx = conn.unchecked_transaction().unwrap();
         insert_photo_entry(&tx, &entry, "/tmp/fragments").unwrap();
@@ -1282,6 +1346,7 @@ mod tests {
                 encrypted_metadata_key: vec![0xFF; 48],
             }],
             operation_id: CustomUUID::retention_cutoff(2),
+            cloud_fingerprint: None,
         };
         let tx = conn.unchecked_transaction().unwrap();
         insert_photo_entry(&tx, &entry, "/tmp/fragments").unwrap();
@@ -1322,6 +1387,7 @@ mod tests {
                 encrypted_metadata_key: vec![0xFF; 48],
             }],
             operation_id: CustomUUID::retention_cutoff(2),
+            cloud_fingerprint: None,
         };
         let tx = conn.unchecked_transaction().unwrap();
         insert_photo_entry(&tx, &entry, "/tmp/fragments").unwrap();
@@ -1408,6 +1474,7 @@ mod tests {
                 encrypted_metadata_key: vec![0xFF; 48],
             }],
             operation_id: CustomUUID::retention_cutoff(2),
+            cloud_fingerprint: None,
         };
         let tx = conn.unchecked_transaction().unwrap();
         insert_photo_entry(&tx, &entry, "/tmp/fragments").unwrap();
@@ -1516,6 +1583,7 @@ mod tests {
                 encrypted_metadata_key: vec![0xFF; 48],
             }],
             operation_id: CustomUUID::new(None),
+            cloud_fingerprint: None,
         };
         let tx = conn.unchecked_transaction().unwrap();
         insert_photo_entry(&tx, &entry, "/tmp/fragments").unwrap();
