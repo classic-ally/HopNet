@@ -1,0 +1,47 @@
+//! Wire types for the Linux mount surface (`/api/integrations/mount`,
+//! RFC-018 S2).
+//!
+//! Deliberately NOT `#[typeshare]`: the only consumer is the Rust
+//! hopnet-mount daemon, and typeshare sweeps this directory into the
+//! Swift/TS/Kotlin generated files — untagged types stay out of those
+//! artifacts. Dates are epoch milliseconds (documentprovider precedent).
+
+use serde::{Deserialize, Serialize};
+
+use crate::db::{CustomUUID, InodeType};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MountItem {
+    /// None = the root folder itself.
+    pub id: Option<CustomUUID>,
+    /// None = the parent is the root.
+    pub parent_id: Option<CustomUUID>,
+    /// Decrypted name; "" for the root.
+    pub name: String,
+    pub item_type: InodeType,
+    /// Files only (0 for empty files); None for folders.
+    pub size: Option<u64>,
+    /// The blob backing this file (data_id). None for folders AND for
+    /// empty files — there is nothing to download when absent. Load-bearing
+    /// for the daemon: downloads are blob-addressed (snapshot-at-open).
+    pub blob_id: Option<CustomUUID>,
+    pub created_ms: i64,
+    pub modified_ms: Option<i64>,
+    /// Consensus height of the last modification, when known.
+    pub height: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MountEnumerateResponse {
+    pub items: Vec<MountItem>,
+    /// Present when another page exists; opaque, thread it back verbatim.
+    pub next_cursor: Option<String>,
+    pub height: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MountChangesResponse {
+    pub items: Vec<MountItem>,
+    pub deleted_ids: Vec<CustomUUID>,
+    pub height: i32,
+}

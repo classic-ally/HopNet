@@ -599,10 +599,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             let api_routes = Router::new()
                 .merge(protected_routes)
                 .merge(jwt_or_rpc_routes)
-                .route(
-                    "/integrations/fileprovider/health",
-                    get(fileprovider::routes::get_health),
-                )
+                .nest("/integrations", fileprovider::routes::health_router())
                 .nest("/devices", devices::routes::router(app_state.clone()))
                 .merge(test_routes)
                 .route("/setup", get(setup::get_setup))
@@ -756,7 +753,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(not(feature = "gui"))]
     {
-        run_server(&format!("0.0.0.0:{}", HEADLESS_BACKEND_PORT)).await
+        // HOPNET_HTTP_PORT lets a dev copy run alongside a real node on the
+        // same machine (pair with XDG_DATA_HOME for storage isolation).
+        let port = std::env::var("HOPNET_HTTP_PORT")
+            .ok()
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(HEADLESS_BACKEND_PORT);
+        run_server(&format!("0.0.0.0:{}", port)).await
     }
 }
 

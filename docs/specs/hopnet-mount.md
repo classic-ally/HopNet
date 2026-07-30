@@ -307,8 +307,8 @@ implements that contract. Each slice is PR-sized and lands green.
 
 - [x] S1 — crate + transport trait + mock + fuser namespace skeleton;
       async bridge decided (2026-07-30)
-- [ ] S2 — node read surface: enumerate/lookup/item/blob download/
-      changes/health
+- [x] S2 — node read surface: enumerate/lookup/item/blob download/
+      changes/health (2026-07-30)
 - [ ] S3 — HTTP transport joins the halves; real tree browses read-only
 - [ ] S4 — /watch SSE + subscribe seam + kernel invalidation + poke
       test suite

@@ -15,6 +15,19 @@ use crate::AppState;
 use crate::db;
 use hopnet_common::fileprovider::TestResponse;
 
+/// Unauthenticated readiness endpoints for OS-integration clients, one
+/// subrouter so main.rs carries a single nest line. Unauthenticated by
+/// design: clients probe readiness before any token exists, and these
+/// cannot live inside a DeviceToken projection mount (auth wraps the
+/// whole router). Same handler for every integration — readiness is a
+/// node property, not a per-surface one.
+pub fn health_router() -> axum::Router<AppState> {
+    use axum::routing::get;
+    axum::Router::new()
+        .route("/fileprovider/health", get(get_health))
+        .route("/mount/health", get(get_health))
+}
+
 /// Health check endpoint for FileProvider extension
 /// Returns ready if database setup is completed, not_ready otherwise
 pub async fn get_health(State(app_state): State<AppState>) -> impl axum::response::IntoResponse {

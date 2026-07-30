@@ -177,6 +177,109 @@ pub async fn reconstruct_file_stream(
     }
 }
 
+/// Blob-addressed preparation (RFC-018 S2): authorization is the
+/// blob_access wrap row — the same gate the path-addressed flow uses,
+/// minus the inode lookup. Unknown blob → NotFound; no wrap for this
+/// user → Forbidden.
+async fn prepare_blob_data(
+    state: &DriveState,
+    blob_id: &hopnet_common::CustomUUID,
+    user_id: i32,
+) -> Result<PreparedFile, FileReconstructionError> {
+    let (manifest, file_access_entry) = {
+        let db_lock = state
+            .db_pool
+            .get()
+            .map_err(|_| FileReconstructionError::InternalError)?;
+
+        let manifest = hopnet_storage::store::blob_manifest(&db_lock, blob_id)
+            .map_err(|_| FileReconstructionError::InternalError)?
+            .ok_or(FileReconstructionError::NotFound)?;
+
+        let access = files::get_file_access(&db_lock, blob_id, user_id)?;
+        (manifest, access)
+    };
+
+    let Some(file_access_entry) = file_access_entry else {
+        tracing::warn!("User {} has no access wrap for blob {}", user_id, blob_id);
+        return Err(FileReconstructionError::Forbidden);
+    };
+
+    let session = state
+        .sessions
+        .user_session(user_id)
+        .await
+        .map_err(|_| FileReconstructionError::InternalError)?;
+
+    let per_blob_key = hopnet_storage::crypto::unwrap_blob_key(
+        &file_access_entry,
+        &hopnet_storage::crypto::StaticRecipient(session.x25519_privkey),
+    )
+    .map_err(|e| {
+        tracing::error!("Failed to decrypt blob key for {}: {:?}", blob_id, e);
+        FileReconstructionError::KeyDecryptionError
+    })?;
+
+    let file_size = manifest.file_size;
+    Ok(PreparedFile::Ready {
+        manifest,
+        per_blob_key,
+        file_size,
+    })
+}
+
+/// Clamp a requested (start, optional-end) against the file size.
+fn resolve_range(
+    file_size: u64,
+    requested_range: Option<(u64, Option<u64>)>,
+) -> Result<Option<ByteRange>, FileReconstructionError> {
+    match requested_range {
+        Some((start, end_opt)) => {
+            if start >= file_size {
+                return Err(FileReconstructionError::RangeNotSatisfiable(file_size));
+            }
+            let end = end_opt.unwrap_or(file_size - 1).min(file_size - 1);
+            Ok(Some(ByteRange { start, end }))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Range-aware blob-addressed reconstruction (RFC-018 S2). Mirrors
+/// [`reconstruct_file_range`] with blob-id addressing so an open FUSE
+/// handle keeps reading the blob that was current at open().
+pub async fn reconstruct_blob_range(
+    state: &DriveState,
+    blob_id: &hopnet_common::CustomUUID,
+    user_id: i32,
+    requested_range: Option<(u64, Option<u64>)>,
+) -> Result<FileDownloadInfo, FileReconstructionError> {
+    match prepare_blob_data(state, blob_id, user_id).await? {
+        PreparedFile::Empty => Ok(FileDownloadInfo {
+            stream: empty_stream(),
+            file_size: 0,
+            is_partial: false,
+            range: None,
+        }),
+        PreparedFile::Ready {
+            manifest,
+            per_blob_key,
+            file_size,
+        } => {
+            let resolved_range = resolve_range(file_size, requested_range)?;
+            let range_tuple = resolved_range.as_ref().map(|r| (r.start, r.end));
+            let is_partial = resolved_range.is_some();
+            let stream = reconstruct_stream(state, manifest, per_blob_key, range_tuple);
+            Ok(FileDownloadInfo {
+                stream: Box::pin(stream),
+                file_size,
+                is_partial,
+                range: resolved_range,
+            })
+        }
+    }
+}
+
 /// Range-aware file reconstruction for the download route
 /// Returns FileDownloadInfo with stream, file_size, and range metadata for building HTTP responses
 pub async fn reconstruct_file_range(
@@ -197,16 +300,7 @@ pub async fn reconstruct_file_range(
             per_blob_key,
             file_size,
         } => {
-            let resolved_range = match requested_range {
-                Some((start, end_opt)) => {
-                    if start >= file_size {
-                        return Err(FileReconstructionError::RangeNotSatisfiable(file_size));
-                    }
-                    let end = end_opt.unwrap_or(file_size - 1).min(file_size - 1);
-                    Some(ByteRange { start, end })
-                }
-                None => None,
-            };
+            let resolved_range = resolve_range(file_size, requested_range)?;
 
             let range_tuple = resolved_range.as_ref().map(|r| (r.start, r.end));
             let is_partial = resolved_range.is_some();

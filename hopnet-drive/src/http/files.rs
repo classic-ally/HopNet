@@ -311,21 +311,7 @@ pub async fn get_file_fragments(
 
     let filename = path.split('/').next_back().unwrap_or("download");
 
-    // Parse Range header: supports "bytes=START-END" and "bytes=START-" (single range only)
-    let requested_range = headers.get(header::RANGE).and_then(|val| {
-        let s = val.to_str().ok()?;
-        let s = s.strip_prefix("bytes=")?;
-        // Ignore multi-range (contains comma)
-        if s.contains(',') {
-            return None;
-        }
-        let mut parts = s.splitn(2, '-');
-        let start: u64 = parts.next()?.parse().ok()?;
-        let end: Option<u64> = parts
-            .next()
-            .and_then(|e| if e.is_empty() { None } else { e.parse().ok() });
-        Some((start, end))
-    });
+    let requested_range = super::parse_range(&headers);
 
     let enc_path = encrypt_path(file_path, &session.siv_key, &session.siv_nonce)
         .await

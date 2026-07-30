@@ -119,6 +119,11 @@ impl hopnet_projection::Projection for DriveProjection {
                 auth: AuthClass::DeviceToken,
                 router: http::documentprovider::router(caps.clone()),
             },
+            Mount {
+                prefix: "/integrations/mount",
+                auth: AuthClass::DeviceToken,
+                router: http::mount::router(caps.clone()),
+            },
         ]
     }
 }
