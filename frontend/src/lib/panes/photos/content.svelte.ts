@@ -41,9 +41,16 @@ const MIME_HINTS: Record<ContentClass, string> = {
     original: 'video/mp4', // only requested for video playback
 };
 
-/** Thumbs/displays are small; originals (videos) are full-buffer blobs. */
-const MAX_IMAGE_ENTRIES = 300;
-const MAX_ORIGINAL_ENTRIES = 4;
+/** Per-class caps. The thumb cap MUST exceed the grid's sliding-window CAP
+ *  (600): every windowed cell stays rendered, and evicting a rendered cell's
+ *  entry makes its reactive urlFor refetch it — evicting another rendered
+ *  entry in turn, a perpetual flash/refetch churn. Displays are ~10x bigger
+ *  (small cap); originals (videos) are full-buffer blobs (tiny cap). */
+const CLASS_CAPS: Record<ContentClass, number> = {
+    thumb: 800,
+    display: 48,
+    original: 4,
+};
 
 interface Entry {
     blobId: string;
@@ -73,11 +80,8 @@ function resolve(photoId: string, cls: ContentClass): [number, string] | null {
 }
 
 function evict(cls: ContentClass) {
-    const isOriginal = cls === 'original';
-    const cap = isOriginal ? MAX_ORIGINAL_ENTRIES : MAX_IMAGE_ENTRIES;
-    const keys = [...entries.keys()].filter(
-        (k) => k.endsWith('/original') === isOriginal,
-    );
+    const cap = CLASS_CAPS[cls];
+    const keys = [...entries.keys()].filter((k) => k.endsWith(`/${cls}`));
     for (const key of keys.slice(0, Math.max(0, keys.length - cap))) {
         const entry = entries.get(key);
         if (entry) URL.revokeObjectURL(entry.url);
