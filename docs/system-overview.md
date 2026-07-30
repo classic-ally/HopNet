@@ -113,8 +113,19 @@ apply functions inside consensus handlers.
       contract; `PhotoDispatch` gains the upload pipe
       (`upload_data_block`, `fetch_library_members`), implemented on the
       node-local `Submitter` with `uploaded_by` derived from
-      authenticated dispatch state. Byte-transport HTTP routes and the
-      macOS ingress adapter remain deferred.
+      authenticated dispatch state.
+- [x] Thin-client dispatch routes + ingress publisher adapter, Rust
+      slice (2026-07-30): device-token-authenticated
+      `/api/photos/client/*` surface (membership, streaming data-block
+      upload with inline declared-length enforcement, transaction relay,
+      committed-state confirm probe); ingress-core publish queue
+      (`published_at` ledger, park-on-unreachable daemon tick, inflight
+      deferral); `crates/ingress-publisher` (sidecar→PhotoAsset mapping,
+      `HttpDispatch`, confirm-then-retry `NodePublisher`, e2e driver
+      bin); `photos-ingress-publish` orchestrator scenario. Swift/FFI
+      wiring + SMAppService packaging remain for the Mac phase; buffer-
+      mode retention (delete local blobs after confirmed publish) is the
+      follow-up phase.
 - [x] hopnet-drive + hopnet-projection + hopnet-takeout extraction
       ([RFC-015](specs/hopnet-drive.md)) COMPLETE (stages D0–D5,
       2026-07-08): narrowed handler seam, per-projection schema units,
@@ -393,9 +404,9 @@ S3-compatible API layer enabling standard S3 clients and SDKs to interact with H
 - [ ] Integration with AWS CLI and standard S3 SDKs
 
 ### 11. Apple Photos Ingress ([spec](specs/apple-photos-ingress.md))
-**Status**: Phases 0–6 complete; Phase 7 (hardening) in progress; Phase 8 (interim viewer) started
+**Status**: Phases 0–6 complete; Phase 7 (hardening) in progress; Phase 8 (interim viewer) started; RFC-011 integration begun (publish queue, Rust slice)
 
-Interim daemon archiving an Apple Photos library (personal + iCloud Shared Photo Library) to content-addressed BLAKE3 blobs + JSON sidecars on user-controlled storage, designed to migrate into the RFC-011 photos module. Standalone Rust workspace at `crates/` (sqlx 0.9 pilot) + Swift PhotoKit shim at `apple/PhotoIngress/`. A freestanding read-only web viewer (`crates/ingress-server`, Phase 8) serves the archive off the storage host — folds into HopNet's own UI later.
+Interim daemon archiving an Apple Photos library (personal + iCloud Shared Photo Library) to content-addressed BLAKE3 blobs + JSON sidecars on user-controlled storage, designed to migrate into the RFC-011 photos module. Standalone Rust workspace at `crates/` (sqlx 0.9 pilot) + Swift PhotoKit shim at `apple/PhotoIngress/`. Integration into HopNet proper has begun: the daemon loop now carries a publish queue (lazy-coupled, park-on-unreachable) that pushes completed photos into a node over the device-token thin-client routes via `crates/ingress-publisher` — the daemon-minted photo_id becomes the consensus id with no remapping. The freestanding viewer (`crates/ingress-server`, Phase 8) has been superseded by the ported gallery in HopNet's own frontend.
 
 - [x] Phase 0: PhotoKit spike (identity, scope detection, streaming)
 - [x] Phase 1: ingress-core skeleton (schema, match precedence, sidecars)

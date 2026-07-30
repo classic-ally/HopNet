@@ -118,6 +118,7 @@ Roughly:
 - One in-process tokio runtime hosting: PhotoKit observer callback, resource fetch workers, hash workers, blob writers, sidecar writers, and the SQLite executor.
 - Bounded concurrency: a configurable number of parallel resource fetches and a separate configurable number of parallel blob writes. Defaults are conservative (e.g. 4 fetches, 4 writes) and tuned per network.
 - All long-running operations are interruptible via cooperative cancellation; the daemon is expected to be SIGTERM-clean on user logout or system shutdown.
+- **Lazy coupling to the HopNet node**: the daemon's lifecycle is its own — a periodic publish tick pushes completed photos into a node over HTTP (see §HopNet publish queue), and when the node is unreachable the tick PARKS (no retry budget consumed, observation and ingest continue untouched) rather than tearing anything down. Reachability edges are logged once (`node_unreachable` / `node_regained`), not per tick.
 
 ### Why this shape
 
@@ -372,6 +373,12 @@ CREATE TABLE photos (
     materialized_at   TEXT,                -- NULL = not all resources written yet
     sidecar_replicated_at TEXT,            -- NULL = local sidecar newer than remote copy (replication pending)
 
+    -- HopNet publish queue (see §HopNet publish queue)
+    published_at          TEXT,            -- NULL = not yet published into HopNet; set once, never reset
+    publish_attempts      INTEGER NOT NULL DEFAULT 0,
+    publish_next_retry_at TEXT,
+    publish_last_error    TEXT,
+
     -- Tombstone (RFC-011-compatible; deleted_by deliberately absent, see notes)
     deleted_at        TEXT,                -- ISO 8601, NULL when active
 
@@ -382,6 +389,8 @@ CREATE INDEX idx_photos_library ON photos(library_id);
 CREATE INDEX idx_photos_pending ON photos(materialized_at) WHERE materialized_at IS NULL;
 CREATE INDEX idx_photos_deleted ON photos(deleted_at) WHERE deleted_at IS NOT NULL;
 CREATE INDEX idx_photos_group ON photos(group_id) WHERE group_id IS NOT NULL;
+CREATE INDEX idx_photos_unpublished ON photos(photo_id)
+    WHERE published_at IS NULL AND materialized_at IS NOT NULL;
 ```
 
 Notes:
@@ -393,6 +402,7 @@ Notes:
 - `asset_modified_at` powers the fast path's "unless metadata changed" check: if the incoming descriptor's `PHAsset.modificationDate` equals the stored value, the observer event is a no-op; if newer, sidecar metadata is refreshed and resource-level changes are re-enumerated.
 - **There is no `deleted_by` column.** The daemon has a single implicit local user and no consensus `user_id` to record — storing a sentinel would be fabricating data. The migrator sets RFC-011's `photos.deleted_by` to the importing user's `user_id` for any tombstone that flows through migration.
 - `sidecar_replicated_at` is the remote-sidecar dirty flag: every local sidecar rewrite sets it to `NULL` (in the same transaction as the state change that triggered the rewrite); successful replication to `sidecar_root_remote` stamps it. The daemon drains the dirty set (`WHERE sidecar_replicated_at IS NULL`) whenever the mount is available. This matters because metadata-only rewrites (tombstone, restore, favorite) do not require the mount and can accumulate while it is down — without a durable marker, a Mac dying with an unreplicated tombstone would resurrect the deleted photo in disaster recovery.
+- `published_at` is the HopNet publish terminal state and the retry ledger's clear signal (see §HopNet publish queue). It is set once and **never reset** — deliberately NOT the `sidecar_replicated_at` re-enqueue pattern, because a re-publish of the same `photo_id` is hard-rejected by consensus (re-edit propagation is a future content-update transaction). `published_at` is also the GC predicate for a future buffer-mode retention phase (delete local blobs after confirmed publish); today blobs and sidecars are untouched by publishing.
 
 ### `photo_resources`
 
@@ -627,6 +637,19 @@ Before a fetch is admitted, the scheduler checks that the write can complete:
 - At most one inflight materialization per `(library_id, content_hash)` (see `blobs` notes) and per `(photo_id, resource_type)` (structural, via temp naming).
 - SIGTERM triggers cooperative cancellation: inflight streams are abandoned (their temps swept at next startup), SQLite transactions are never interrupted mid-flight (they are fast and atomic anyway).
 - Every step is re-runnable. Idempotency falls out of content addressing plus match precedence — re-fetching a written resource is a dedup hit; re-processing a discovery event is a no-op.
+
+### HopNet publish queue
+
+The daemon-loop tick (`ingress-core/src/publish.rs`; concrete publisher in `crates/ingress-publisher`) that pushes completed photos into a HopNet node over the thin-client routes, replacing the interim "NAS blob dump is the archive" model with consensus-committed, RS-encoded storage.
+
+- **Claim predicate**: `published_at IS NULL AND materialized_at IS NOT NULL AND deleted_at IS NULL AND publish_attempts < cap AND (publish_next_retry_at IS NULL OR due)`, joined to libraries with `scope_binding IS NULL` — the **personal partition only** (publishing the iCloud-shared partition as personal-consensus photos would create Phase-3 dedup debt). Small batches (default 4), claimed photos registered **inflight** for the pass so PhotoKit events for them defer — the same machinery that protects photo_tasks also excludes supersede/hard-move races on the streaming blob reads.
+- **One spawned pass task** (unlike the inline replication tick): publishing streams multi-GB originals; inline it would stall event routing for the duration.
+- **Metadata source is the sidecar JSON** — it exists exactly when a photo is publishable, reflects committed state only, and avoids duplicating descriptor fields into a second source of truth. A missing sidecar (crash window) skips that photo and the batch continues.
+- **The daemon-minted `photo_id` IS the consensus `photos.id`** (the spec's no-remapping commitment, realized): `PublishRequest.photo_id` carries it verbatim, so state.db needs no mapping table and the `SourceIdentity → photo_id` persistence half of the publisher idempotency contract is satisfied by construction.
+- **Confirm-then-retry**: consensus hard-rejects duplicate photo ids (proposer preflight), so every publish attempt probes `GET /api/photos/client/committed/{photo_id}` first — 200 resolves an earlier ambiguous failure as already-published (stamp, never re-submit); 404 makes the same-id submit safe. Ambiguous outcomes (opaque 500s, submit timeouts) classify as transient; the next tick's probe disambiguates.
+- **Retry ledger**: transient failures back off exponentially (base 60s, max 6h) up to `publish_attempts = cap` (terminal until operator reset); permanent rejections (mapping/validation) jump straight to the cap. Node unreachability (connect/timeout/HTTP 503 shedding) consumes **no** attempts — the pass parks.
+- **Auth**: an RFC-012 device token (`{device_id}.{secret}`), so the daemon can target any node holding the consensus state, and revoking the device row kills its access mesh-wide.
+- **Out of scope (this phase)**: re-edit propagation (a re-materialized published photo is NOT re-enqueued; content updates need their own transaction type), tombstone propagation, favorites (Phase 4), shared libraries (Phase 3), and buffer-mode retention (`published_at` is its future GC predicate).
 
 The daemon mirrors PhotoKit deletions into its own state, but does not delete bytes from the storage root immediately. A retention window allows recovery from accidental deletes — both at the user's "oh wait" level and at the level of unexpected PhotoKit observer churn during library reorganizations.
 
