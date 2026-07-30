@@ -136,6 +136,20 @@ apply functions inside consensus handlers.
       placeholders on img decode errors. Soak-verified end-to-end with a
       real library (HEIC + video cells render). Deferred: non-PhotoKit
       import paths must generate their own thumbnails when import lands.
+- [x] Consensus photo identity (2026-07-31): `photos.cloud_fingerprint`
+      (per-user keyed HMAC of the PHCloudIdentifier, computed node-side
+      at `POST /api/photos/client/resolve`, enforced by a partial UNIQUE
+      pair) + `photo_ingress_responsibility` (explicit JWT-only
+      claim/transfer via `/api/photos/ingress/claim`, device tx route
+      gates on holder) + ingress remote adoption (resolve pre-pass stamps
+      mesh-held photos as adopted with `consensus_photo_id`, zero
+      uploads; non-holders adopt but park mutations without burning
+      retries). Wire break: `PhotoAddEntry` amended in place
+      (pre-release), dev meshes reseeded. `photos-ingress-identity`
+      orchestrator scenario covers the dual-device shape end to end.
+      Deferred: library-scoped fingerprint keys (Phase 3) +
+      cross-participant PHCloudIdentifier spike; import-time fingerprints
+      for non-PhotoKit paths.
 - [x] hopnet-drive + hopnet-projection + hopnet-takeout extraction
       ([RFC-015](specs/hopnet-drive.md)) COMPLETE (stages D0–D5,
       2026-07-08): narrowed handler seam, per-projection schema units,

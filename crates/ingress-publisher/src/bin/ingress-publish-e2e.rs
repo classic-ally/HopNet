@@ -44,6 +44,11 @@ enum Cmd {
     Seed {
         #[arg(long, default_value_t = 6)]
         count: u32,
+        /// First asset index (cloud/local ids derive from the absolute
+        /// index) — lets a scenario add NEW assets to an existing dir, or
+        /// seed a second dir with the same identities as another.
+        #[arg(long, default_value_t = 0)]
+        start: u32,
     },
     /// Publish everything claimable into the node; loops until the queue is
     /// drained or the pass parks.
@@ -115,7 +120,11 @@ struct ResourceReport {
 #[derive(serde::Serialize)]
 struct PhotoReport {
     photo_id: String,
+    cloud_id: Option<String>,
     published_at: Option<String>,
+    /// Set when the photo was ADOPTED (mesh already held it) — the remote
+    /// consensus identity; NULL = self-published or unpublished.
+    consensus_photo_id: Option<String>,
     resources: Vec<ResourceReport>,
 }
 
@@ -140,7 +149,9 @@ async fn photo_reports(store: &StateStore) -> Vec<PhotoReport> {
             .collect();
         reports.push(PhotoReport {
             photo_id: photo.photo_id.as_str().to_string(),
+            cloud_id: photo.cloud_id.clone(),
             published_at: photo.published_at.map(|t| t.to_rfc3339()),
+            consensus_photo_id: photo.consensus_photo_id.clone(),
             resources,
         });
     }
@@ -157,7 +168,7 @@ async fn main() {
     let data_dir = DataDir::new(&args.data_dir);
 
     match args.cmd {
-        Cmd::Seed { count } => {
+        Cmd::Seed { count, start } => {
             let library_id = ingress_core::LibraryId::new("personal");
             if store.library(&library_id).await.expect("library").is_none() {
                 let blob_root = args.data_dir.join("blob-root");
@@ -177,7 +188,7 @@ async fn main() {
             }
 
             let mut descriptors = std::collections::HashMap::new();
-            for index in 0..count {
+            for index in start..start + count {
                 let desc = AssetDescriptorBuilder::simple_image()
                     .with_cloud_id(&format!("e2e-cloud-{index}"))
                     .with_local_id(&format!("e2e-{index}"))

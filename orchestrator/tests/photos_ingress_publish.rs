@@ -224,6 +224,21 @@ impl TestScenario for PhotosIngressPublish {
         }
         .await);
 
+        // Step 2b: claim ingress responsibility for the device (explicit-claim
+        // contract — an unclaimed scope parks every publish).
+        check_or_bail!("Claim ingress responsibility", async {
+            let device_id = api_key.split('.').next().context("token shape")?;
+            let response = client
+                .post(format!("{}/api/photos/ingress/claim", base_url(&nodes[0])))
+                .header("Authorization", format!("Bearer {}", nodes[0].jwt_token))
+                .json(&serde_json::json!({ "device_id": device_id }))
+                .send()
+                .await?;
+            anyhow::ensure!(response.status().is_success(), "claim: {}", response.status());
+            Ok(())
+        }
+        .await);
+
         // Step 3: fabricate daemon state (seed → drain, real pipeline).
         let seed_report = check_or_bail!(
             format!("Fabricate {COUNT} ingress photos"),

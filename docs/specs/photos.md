@@ -65,6 +65,11 @@ CREATE TABLE photos (
     deleted_at       TEXT,                 -- ISO 8601, NULL when active
     deleted_by       INTEGER,              -- user who deleted (FK users)
 
+    -- Cross-device asset identity: lowercase-hex keyed HMAC of the source
+    -- library's stable asset id (PHCloudIdentifier for the macOS ingress).
+    -- NULL = local-only or non-PhotoKit asset (no dedupe).
+    cloud_fingerprint TEXT,
+
     FOREIGN KEY (uploaded_by) REFERENCES users(user_id),
     FOREIGN KEY (deleted_by) REFERENCES users(user_id),
     FOREIGN KEY (library_id) REFERENCES shared_libraries(id)
@@ -72,7 +77,77 @@ CREATE TABLE photos (
 
 CREATE INDEX idx_photos_library ON photos(library_id);
 CREATE INDEX idx_photos_deleted ON photos(deleted_at) WHERE deleted_at IS NOT NULL;
+
+-- Dedupe uniqueness is a partial-index PAIR because SQLite treats NULLs as
+-- distinct in UNIQUE indexes: a composite UNIQUE(library_id, cloud_fingerprint)
+-- would never constrain personal (NULL-library) rows.
+CREATE UNIQUE INDEX idx_photos_fp_personal ON photos(cloud_fingerprint)
+    WHERE library_id IS NULL AND cloud_fingerprint IS NOT NULL;
+CREATE UNIQUE INDEX idx_photos_fp_shared ON photos(library_id, cloud_fingerprint)
+    WHERE library_id IS NOT NULL AND cloud_fingerprint IS NOT NULL;
 ```
+
+##### Cloud Fingerprint (cross-device identity)
+
+Two devices ingesting the same source library (e.g. two Macs on one iCloud
+account) each mint their own photo ids, so without a shared identity key
+every asset would duplicate mesh-side. The fingerprint is that key:
+
+- **Computed node-side, keyed per-user**: `blake3::keyed_hash(k, cloud_id)`
+  where `k = blake3 derive_key("hopnet photos cloud fingerprint v1", user
+  Ed25519 privkey)` (context string frozen — changing it orphans every
+  committed fingerprint). The thin client obtains fingerprints from
+  `POST /api/photos/client/resolve`; it holds no user key material itself.
+  Keyed per RFC-014's confirmation-oracle rule: replicated state carries no
+  unkeyed function of the identifier, so validators (who hold no user keys)
+  cannot test whether a given cloud id is present.
+- **Opaque to validators**: handlers cannot re-derive it; enforcement is
+  solely the partial UNIQUE pair. A device can submit garbage fingerprints —
+  the blast radius is the user's own dedupe scope.
+- **Claim-on-conflict**: the resolve probe is the cooperative path (a hit
+  returns the committed photo id and the client adopts instead of
+  publishing); the UNIQUE index is the race backstop — the losing insert
+  fails deterministically at the proposer preflight, and the loser adopts on
+  its next resolve.
+- **Tombstones hold their fingerprint** until the 30-day hard delete frees
+  the index entry — a resolve on a mesh-deleted photo still returns its id
+  (the client adopts a tombstoned photo rather than colliding with it).
+  "Undelete by republish" is deliberately not a thing.
+- **Shared-library scoping (Phase 3)**: the `(library_id, cloud_fingerprint)`
+  index already accommodates it, but cross-member dedupe requires the HMAC
+  key to be library-scoped (a shared secret distributed with the library
+  keys) — and a spike on whether PHCloudIdentifiers agree across iCloud
+  Shared Photo Library participants. Until then shared-library adds carry
+  whatever the publishing path computes for the personal scope: nothing,
+  since shared publishes are still rejected.
+
+##### Ingress Responsibility (explicit publish designation)
+
+```sql
+CREATE TABLE photo_ingress_responsibility (
+    user_id       INTEGER PRIMARY KEY,   -- personal scope, v1
+    device_id     TEXT NOT NULL,
+    operation_id  TEXT NOT NULL,         -- UUIDv7, audit/ordering
+
+    FOREIGN KEY (user_id) REFERENCES users(user_id),
+    FOREIGN KEY (device_id) REFERENCES device_tokens(id)
+);
+```
+
+One device per user (personal scope) may publish ingress mutations. Claims
+are **explicit and JWT-only**: `POST /api/photos/ingress/claim
+{"device_id"}` builds and submits the `photo_ingress_claim` tx server-side
+(curl/GUI friendly); `GET /api/photos/ingress/responsibility` reads the
+holder. The thin-client transaction route enforces `DEVICE_TX_FUNCTIONS`
+(which excludes the claim tx — a daemon can never designate itself) and
+403s non-holders with `ingress_not_responsible:{other|unclaimed}`. Claim
+and transfer are one upsert — the dead-Mac case is any logged-in session
+re-claiming to a new device, after which the new daemon's first pass adopts
+the whole published archive by fingerprint instead of re-uploading it.
+Enforcement is admission-time (device identity is an HTTP-layer concept);
+the fingerprint UNIQUE pair is the correctness backstop for any admission
+race. Adoption and the resolve/committed probes are reads and deliberately
+ungated.
 
 The `encrypted_metadata` blob contains all photo metadata: date taken, dimensions, orientation, media type, duration, camera make/model, GPS coordinates, EXIF data, **and cross-asset grouping** (`group_id`, `group_type`, `group_index`, `is_group_pick`). None of this is queryable at the consensus level. The photo ID (UUIDv7) encodes upload timestamp, which is the only temporal signal visible to nodes.
 
@@ -493,6 +568,7 @@ The photos module registers its own transaction handlers via the existing `inven
 | `photo_edit_content` | `PhotoEditContentHandler` | Log content edit for a specific `resource_type`, update `photo_resources.data_block_id` for that row, distribute new file_access to library members |
 | `photo_edit_metadata` | `PhotoEditMetadataHandler` | Log metadata diff, update encrypted_metadata blob on photos row |
 | `photo_restore` | `PhotoRestoreHandler` | Restore soft-deleted photo within retention window (clear `deleted_at` / `deleted_by`) |
+| `photo_ingress_claim` | `PhotoIngressClaimHandler` | Claim/transfer ingress responsibility (upsert; device ownership validated against consensus-replicated `device_tokens`). JWT route only — excluded from `DEVICE_TX_FUNCTIONS`. |
 | `photo_undo` | `PhotoUndoHandler` | Revert most recent operation on a photo (content edit on a specific resource, or metadata edit) |
 | `create_shared_library` | `CreateSharedLibraryHandler` | Create library + initial membership |
 | `join_shared_library` | `JoinSharedLibraryHandler` | Add member, create file_access + photo_metadata_access for all existing library photos |
