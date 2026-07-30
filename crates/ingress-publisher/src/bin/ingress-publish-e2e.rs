@@ -229,7 +229,7 @@ async fn main() {
                 let report = run_publish_pass(&store, &data_dir, &publisher, &cfg, claimed, &mut state)
                     .await
                     .expect("publish pass");
-                let parked = report.parked;
+                let parked = report.parked || report.parked_responsibility;
                 totals.absorb(&report);
                 if parked {
                     break;
@@ -239,15 +239,22 @@ async fn main() {
             let out = serde_json::json!({
                 "published": totals.published,
                 "already_published": totals.already_published,
+                "adopted": totals.adopted,
                 "failed": totals.failed,
                 "gave_up": totals.gave_up,
                 "missing_sidecar": totals.missing_sidecar,
                 "parked": totals.parked,
+                "parked_responsibility": totals.parked_responsibility,
                 "photos": photo_reports(&store).await,
             });
             println!("{}", serde_json::to_string_pretty(&out).unwrap());
             if totals.parked {
                 std::process::exit(2);
+            }
+            if totals.parked_responsibility {
+                // Distinct from unreachable-park so the orchestrator can
+                // assert the explicit-claim contract cheaply.
+                std::process::exit(3);
             }
         }
 

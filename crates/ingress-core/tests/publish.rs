@@ -14,7 +14,7 @@ use ingress_core::fixtures::AssetDescriptorBuilder;
 use ingress_core::paths::DataDir;
 use ingress_core::publish::{
     PublishConfig, PublishError, PublishItem, PublishOutcome, PublishState, Publisher,
-    claim_publishable, run_publish_pass,
+    ResolveEntry, ResolveOutcome, Responsibility, claim_publishable, run_publish_pass,
 };
 use ingress_core::scheduler::{
     BackoffConfig, CancelToken, FetchFailure, FetchRequest, FreeSpaceProbe, ResourceFetcher,
@@ -72,6 +72,12 @@ struct FakePublisher {
     fallback: fn() -> Result<PublishOutcome, PublishError>,
     calls: AtomicU64,
     seen: Mutex<Vec<PhotoId>>,
+    /// The `cloud_fingerprint` each publish item carried, in call order.
+    seen_fingerprints: Mutex<Vec<Option<String>>>,
+    /// None = use the trait's legacy default (Holder, no entries).
+    resolve_result: Mutex<Option<Result<ResolveOutcome, PublishError>>>,
+    /// The cloud_id batches the pass sent to resolve.
+    resolve_seen: Mutex<Vec<Vec<String>>>,
     gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 
@@ -86,8 +92,30 @@ impl FakePublisher {
             fallback,
             calls: AtomicU64::new(0),
             seen: Mutex::new(Vec::new()),
+            seen_fingerprints: Mutex::new(Vec::new()),
+            resolve_result: Mutex::new(None),
+            resolve_seen: Mutex::new(Vec::new()),
             gate: None,
         }
+    }
+
+    fn set_resolve(&self, result: Result<ResolveOutcome, PublishError>) {
+        *self.resolve_result.lock().unwrap() = Some(result);
+    }
+}
+
+fn entry(cloud_id: &str, fingerprint: &str, committed: Option<&str>) -> ResolveEntry {
+    ResolveEntry {
+        cloud_id: cloud_id.into(),
+        fingerprint: fingerprint.into(),
+        committed_photo_id: committed.map(Into::into),
+    }
+}
+
+fn outcome(responsibility: Responsibility, entries: Vec<ResolveEntry>) -> ResolveOutcome {
+    ResolveOutcome {
+        responsibility,
+        entries,
     }
 }
 
@@ -96,11 +124,23 @@ impl Publisher for FakePublisher {
     async fn publish(&self, item: PublishItem) -> Result<PublishOutcome, PublishError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         self.seen.lock().unwrap().push(item.photo.photo_id.clone());
+        self.seen_fingerprints
+            .lock()
+            .unwrap()
+            .push(item.cloud_fingerprint.clone());
         if let Some(gate) = &self.gate {
             let _permit = gate.acquire().await.unwrap();
         }
         let scripted = self.scripted.lock().unwrap().pop();
         scripted.unwrap_or_else(|| (self.fallback)())
+    }
+
+    async fn resolve(&self, cloud_ids: &[String]) -> Result<ResolveOutcome, PublishError> {
+        self.resolve_seen.lock().unwrap().push(cloud_ids.to_vec());
+        match &*self.resolve_result.lock().unwrap() {
+            Some(result) => result.clone(),
+            None => Ok(outcome(Responsibility::Holder, Vec::new())),
+        }
     }
 }
 
@@ -533,4 +573,212 @@ async fn daemon_tick_publishes_and_defers_events() {
     let report = daemon.await.unwrap().unwrap();
     assert_eq!(report.publish.published, 1);
     assert!(report.events_deferred >= 1);
+}
+
+// ---------------------------------------------- resolve / adoption / gate
+
+// Impact: adoption is what makes a second device (or a fresh state.db after
+// handoff) converge on the mesh's existing photos instead of duplicating
+// the whole archive upload.
+// Should: stamp a resolve-hit photo as adopted with the remote consensus id
+// recorded, and drain it from the claimable queue.
+// Should not: call publish (no bytes move) or consume retry attempts for an
+// adopted photo.
+#[tokio::test(flavor = "multi_thread")]
+async fn resolve_hit_adopts_without_publishing() {
+    let rig = rig().await;
+    let id = materialize(&rig, "a", b"a-bytes").await;
+
+    let publisher = FakePublisher::ok();
+    let remote = "01890a5d-ac96-774b-0000-000000000042";
+    publisher.set_resolve(Ok(outcome(
+        Responsibility::Holder,
+        vec![entry("cloud-a", &"ab".repeat(32), Some(remote))],
+    )));
+    let mut state = PublishState::default();
+    let report = pass(&rig, &publisher, &mut state).await;
+
+    assert_eq!(report.adopted, 1);
+    assert_eq!(report.published, 0);
+    assert_eq!(publisher.calls.load(Ordering::Relaxed), 0, "nothing uploads");
+    let row = photo(&rig, &id).await;
+    assert!(row.published_at.is_some());
+    assert_eq!(row.consensus_photo_id.as_deref(), Some(remote));
+    assert_eq!(row.publish_attempts, 0);
+    assert!(claim(&rig).await.is_empty());
+    assert_eq!(rig.store.log_events("publish_adopted").await.unwrap().len(), 1);
+}
+
+// Should: count a resolve hit on the photo's OWN id as already-published
+// (an earlier ambiguous submit landed) rather than adopted, leaving
+// consensus_photo_id NULL (self-published identity).
+#[tokio::test(flavor = "multi_thread")]
+async fn self_resolution_counts_already_published() {
+    let rig = rig().await;
+    let id = materialize(&rig, "a", b"a-bytes").await;
+
+    let publisher = FakePublisher::ok();
+    publisher.set_resolve(Ok(outcome(
+        Responsibility::Holder,
+        vec![entry("cloud-a", &"ab".repeat(32), Some(id.as_str()))],
+    )));
+    let mut state = PublishState::default();
+    let report = pass(&rig, &publisher, &mut state).await;
+
+    assert_eq!(report.already_published, 1);
+    assert_eq!(report.adopted, 0);
+    let row = photo(&rig, &id).await;
+    assert!(row.published_at.is_some());
+    assert!(row.consensus_photo_id.is_none());
+}
+
+// Impact: explicit-claim contract — a daemon must never publish before a
+// human designates it, and a stale designation must not burn retry budget
+// while it waits for a transfer.
+// Should: hold remaining photos with a distinct parked state when not the
+// holder, log the edge once, and log recovery once after a claim/transfer.
+// Should not: call publish or consume attempts while parked.
+#[tokio::test(flavor = "multi_thread")]
+async fn non_holder_parks_remaining_without_attempts() {
+    let rig = rig().await;
+    let a = materialize(&rig, "a", b"a-bytes").await;
+
+    let publisher = FakePublisher::ok();
+    publisher.set_resolve(Ok(outcome(Responsibility::Unclaimed, Vec::new())));
+    let mut state = PublishState::default();
+
+    let report = pass(&rig, &publisher, &mut state).await;
+    assert!(report.parked_responsibility);
+    assert!(!report.parked, "responsibility park is distinct from unreachable park");
+    assert_eq!(publisher.calls.load(Ordering::Relaxed), 0);
+    let row = photo(&rig, &a).await;
+    assert_eq!(row.publish_attempts, 0);
+    assert!(row.published_at.is_none());
+
+    // Second parked pass: edge already logged.
+    let report = pass(&rig, &publisher, &mut state).await;
+    assert!(report.parked_responsibility);
+    assert_eq!(
+        rig.store.log_events("publish_not_responsible").await.unwrap().len(),
+        1
+    );
+
+    // Claim lands (holder now): photo publishes, recovery edge logs once.
+    publisher.set_resolve(Ok(outcome(Responsibility::Holder, Vec::new())));
+    let report = pass(&rig, &publisher, &mut state).await;
+    assert_eq!(report.published, 1);
+    assert!(!report.parked_responsibility);
+    assert_eq!(
+        rig.store.log_events("responsibility_regained").await.unwrap().len(),
+        1
+    );
+}
+
+// Impact: adoption during non-holder standing is what makes a
+// responsibility handoff a cheap sweep — the incoming Mac converges on the
+// mesh's photos before it is ever allowed to publish.
+// Should: adopt resolve hits even when another device holds responsibility,
+// while holding (not failing) the genuinely-new photos.
+#[tokio::test(flavor = "multi_thread")]
+async fn non_holder_still_adopts() {
+    let rig = rig().await;
+    let known = materialize(&rig, "a", b"a-bytes").await;
+    let fresh = materialize(&rig, "b", b"b-bytes").await;
+
+    let publisher = FakePublisher::ok();
+    let remote = "01890a5d-ac96-774b-0000-000000000099";
+    publisher.set_resolve(Ok(outcome(
+        Responsibility::Other,
+        vec![entry("cloud-a", &"cd".repeat(32), Some(remote))],
+    )));
+    let mut state = PublishState::default();
+    let report = pass(&rig, &publisher, &mut state).await;
+
+    assert_eq!(report.adopted, 1);
+    assert!(report.parked_responsibility);
+    assert_eq!(publisher.calls.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        photo(&rig, &known).await.consensus_photo_id.as_deref(),
+        Some(remote)
+    );
+    let held = photo(&rig, &fresh).await;
+    assert!(held.published_at.is_none());
+    assert_eq!(held.publish_attempts, 0);
+}
+
+// Should: stamp the resolve entry's fingerprint into the publish item, and
+// publish a NULL-cloud_id photo with no fingerprint (exempt from dedupe,
+// absent from the resolve batch).
+#[tokio::test(flavor = "multi_thread")]
+async fn fingerprints_thread_into_publish_items() {
+    let rig = rig().await;
+    let _with_cloud = materialize(&rig, "a", b"a-bytes").await;
+    let local_only = materialize(&rig, "b", b"b-bytes").await;
+    sqlx::query("UPDATE photos SET cloud_id = NULL WHERE photo_id = ?")
+        .bind(&local_only)
+        .execute(rig.store.raw_pool())
+        .await
+        .unwrap();
+
+    let publisher = FakePublisher::ok();
+    let fp = "ef".repeat(32);
+    publisher.set_resolve(Ok(outcome(
+        Responsibility::Holder,
+        vec![entry("cloud-a", &fp, None)],
+    )));
+    let mut state = PublishState::default();
+    let report = pass(&rig, &publisher, &mut state).await;
+
+    assert_eq!(report.published, 2);
+    assert_eq!(
+        *publisher.resolve_seen.lock().unwrap(),
+        vec![vec!["cloud-a".to_string()]],
+        "only cloud-bearing photos enter the resolve batch"
+    );
+    let mut fingerprints = publisher.seen_fingerprints.lock().unwrap().clone();
+    fingerprints.sort();
+    assert_eq!(fingerprints, vec![None, Some(fp)]);
+}
+
+// Should: park on an unreachable resolve exactly like an unreachable
+// publish — batch aborted, edge logged once, no attempts consumed.
+#[tokio::test(flavor = "multi_thread")]
+async fn resolve_unreachable_parks_the_pass() {
+    let rig = rig().await;
+    let id = materialize(&rig, "a", b"a-bytes").await;
+
+    let publisher = FakePublisher::ok();
+    publisher.set_resolve(Err(PublishError::NodeUnreachable("refused".into())));
+    let mut state = PublishState::default();
+
+    let report = pass(&rig, &publisher, &mut state).await;
+    assert!(report.parked);
+    assert_eq!(publisher.calls.load(Ordering::Relaxed), 0);
+    assert_eq!(photo(&rig, &id).await.publish_attempts, 0);
+    let report = pass(&rig, &publisher, &mut state).await;
+    assert!(report.parked);
+    assert_eq!(rig.store.log_events("node_unreachable").await.unwrap().len(), 1);
+}
+
+// Should: burn one attempt per claimed photo when resolve fails
+// non-transport (a persistently broken resolve must back off toward
+// gave_up, not spin silently forever).
+#[tokio::test(flavor = "multi_thread")]
+async fn resolve_failure_burns_one_attempt_per_photo() {
+    let rig = rig().await;
+    let a = materialize(&rig, "a", b"a-bytes").await;
+    let b = materialize(&rig, "b", b"b-bytes").await;
+
+    let publisher = FakePublisher::ok();
+    publisher.set_resolve(Err(PublishError::Transient("resolve 500".into())));
+    let mut state = PublishState::default();
+    let report = pass(&rig, &publisher, &mut state).await;
+
+    assert_eq!(report.failed, 2);
+    assert_eq!(publisher.calls.load(Ordering::Relaxed), 0);
+    for id in [&a, &b] {
+        let row = photo(&rig, id).await;
+        assert_eq!(row.publish_attempts, 1);
+        assert!(row.publish_last_error.as_deref().unwrap().contains("resolve"));
+    }
 }

@@ -49,3 +49,7 @@ required-features = ["e2e-bin"]
 axum = "0.8"
 tokio = { version = "1.45", features = ["macros", "rt-multi-thread", "net"] }
 tempfile = "3"
+# Wire assertions: the stub node decodes photo_add payloads to verify the
+# fingerprint travels. Envelopes only — no projection feature.
+hopnet-photos = { path = "../../hopnet-photos", default-features = false }
+bincode = { version = "2.0.1", features = ["serde"] }

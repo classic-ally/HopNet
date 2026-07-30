@@ -212,11 +212,17 @@ pub struct FfiCleanupReport {
 pub struct FfiPublishReport {
     pub published: u64,
     pub already_published: u64,
+    /// Photos the mesh already held (cloud-fingerprint match) — stamped
+    /// published locally, nothing uploaded.
+    pub adopted: u64,
     pub failed: u64,
     pub gave_up: u64,
     pub missing_sidecar: u64,
     /// The last pass aborted because the node was unreachable.
     pub parked: bool,
+    /// The last pass held its photos because this device does not hold
+    /// ingress responsibility (claim via the node's JWT route to unpark).
+    pub parked_responsibility: bool,
 }
 
 /// Daemon outcome (mirrors `daemon::DaemonReport`): drain counters plus the

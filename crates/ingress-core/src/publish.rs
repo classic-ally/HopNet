@@ -93,6 +93,9 @@ pub struct PublishItem {
     pub library: LibraryConfig,
     pub sidecar: Sidecar,
     pub resources: Vec<PublishResource>,
+    /// Hex fingerprint from the resolve pre-pass (None = no cloud_id).
+    /// Hex keeps ingress-core free of HopNet crypto types.
+    pub cloud_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,12 +128,54 @@ impl std::fmt::Display for PublishError {
     }
 }
 
+/// The caller's publish standing per the node's responsibility record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Responsibility {
+    /// This device holds ingress responsibility — publish freely.
+    Holder,
+    /// Another device holds it — adopt only, park mutations.
+    Other,
+    /// No claim exists — adopt only, park mutations (claims are explicit
+    /// and JWT-issued; a daemon never claims for itself).
+    Unclaimed,
+}
+
+/// One cloud_id resolved by the node: its fingerprint (travels into the
+/// publish payload) and any already-committed consensus photo id (→ adopt).
+#[derive(Debug, Clone)]
+pub struct ResolveEntry {
+    pub cloud_id: String,
+    pub fingerprint: String,
+    pub committed_photo_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolveOutcome {
+    pub responsibility: Responsibility,
+    pub entries: Vec<ResolveEntry>,
+}
+
 /// The publish seam. Core stays free of HTTP/HopNet types the same way
 /// `ResourceFetcher` keeps PhotoKit out — the concrete impl (HTTP dispatch +
 /// RFC-011 mapping) lives out-of-crate.
 #[async_trait::async_trait]
 pub trait Publisher: Send + Sync + 'static {
     async fn publish(&self, item: PublishItem) -> std::result::Result<PublishOutcome, PublishError>;
+
+    /// Pre-pass identity resolution: cloud_ids → fingerprints + committed
+    /// ids + the caller's responsibility standing. The default is the
+    /// legacy/no-dedupe publisher — proceeds as holder with no
+    /// fingerprints, preserving pre-identity behavior for mocks.
+    async fn resolve(
+        &self,
+        cloud_ids: &[String],
+    ) -> std::result::Result<ResolveOutcome, PublishError> {
+        let _ = cloud_ids;
+        Ok(ResolveOutcome {
+            responsibility: Responsibility::Holder,
+            entries: Vec::new(),
+        })
+    }
 }
 
 /// One pass's counters (absorbed into daemon totals).
@@ -138,6 +183,9 @@ pub trait Publisher: Send + Sync + 'static {
 pub struct PublishReport {
     pub published: u64,
     pub already_published: u64,
+    /// Photos the mesh already held under another device's publish —
+    /// stamped with the remote consensus id, nothing uploaded.
+    pub adopted: u64,
     /// Transient failures still under the retry cap.
     pub failed: u64,
     /// Photos whose attempts reached the cap this pass.
@@ -146,16 +194,22 @@ pub struct PublishReport {
     pub missing_sidecar: u64,
     /// The pass aborted early because the node was unreachable.
     pub parked: bool,
+    /// The pass held its remaining photos because this device does not
+    /// hold ingress responsibility (adoption still ran). No attempts
+    /// consumed — a claim/transfer unparks the next pass.
+    pub parked_responsibility: bool,
 }
 
 impl PublishReport {
     pub fn absorb(&mut self, other: &PublishReport) {
         self.published += other.published;
         self.already_published += other.already_published;
+        self.adopted += other.adopted;
         self.failed += other.failed;
         self.gave_up += other.gave_up;
         self.missing_sidecar += other.missing_sidecar;
         self.parked = other.parked;
+        self.parked_responsibility = other.parked_responsibility;
     }
 }
 
@@ -163,6 +217,7 @@ impl PublishReport {
 #[derive(Debug, Default, Clone)]
 pub struct PublishState {
     unreachable: bool,
+    not_responsible: bool,
 }
 
 /// Claim helper for the daemon tick: publishable photos minus `skip`.
@@ -193,8 +248,116 @@ pub async fn run_publish_pass(
 ) -> Result<PublishReport> {
     let mut report = PublishReport::default();
 
+    // --- Resolve pre-pass: fingerprints + remote adoption + standing. ---
+    // One batch call; NULL-cloud_id photos simply get no entry (they publish
+    // with no fingerprint and are exempt from dedupe).
+    let cloud_ids: Vec<String> = claimed.iter().filter_map(|p| p.cloud_id.clone()).collect();
+    let resolved = match publisher.resolve(&cloud_ids).await {
+        Ok(outcome) => outcome,
+        Err(PublishError::NodeUnreachable(msg)) => {
+            if !state.unreachable {
+                state.unreachable = true;
+                let _ = store
+                    .append_log(
+                        "node_unreachable",
+                        None,
+                        Some(serde_json::json!({ "error": msg })),
+                    )
+                    .await;
+            }
+            report.parked = true;
+            return Ok(report);
+        }
+        Err(e) => {
+            // A failing resolve blocks the whole batch: burn one attempt per
+            // claimed photo so a persistently broken resolve backs off and
+            // eventually surfaces as gave_up instead of spinning silently.
+            let msg = format!("resolve failed: {e}");
+            for photo in &claimed {
+                record_failure(store, cfg, photo, &msg, &mut report).await?;
+            }
+            return Ok(report);
+        }
+    };
+    // Deliberately NOT the reachability recovery edge: `node_regained` stays
+    // pinned to a publish success (its pre-identity meaning), so a resolve
+    // that succeeds while uploads still fail cannot flap the edge logs.
+
+    let by_cloud_id: std::collections::HashMap<&str, &ResolveEntry> = resolved
+        .entries
+        .iter()
+        .map(|e| (e.cloud_id.as_str(), e))
+        .collect();
+
+    // Adoption runs regardless of responsibility standing — it is read-only
+    // node-side and purely local otherwise, and it is exactly what makes a
+    // responsibility handoff a cheap sweep instead of a full re-upload.
+    let mut remaining: Vec<(PhotoRecord, Option<String>)> = Vec::with_capacity(claimed.len());
     for photo in claimed {
-        let item = match assemble_item(store, data_dir, &photo).await? {
+        let entry = photo
+            .cloud_id
+            .as_deref()
+            .and_then(|cid| by_cloud_id.get(cid).copied());
+        match entry.and_then(|e| e.committed_photo_id.as_deref()) {
+            Some(remote) if remote == photo.photo_id.as_str() => {
+                // Our own earlier (ambiguous) submit actually landed —
+                // self-resolution subsumes the confirm probe.
+                crate::store::photos::mark_published(store.pool(), &photo.photo_id, Utc::now())
+                    .await?;
+                report.already_published += 1;
+            }
+            Some(remote) => {
+                crate::store::photos::mark_adopted(
+                    store.pool(),
+                    &photo.photo_id,
+                    remote,
+                    Utc::now(),
+                )
+                .await?;
+                report.adopted += 1;
+                let _ = store
+                    .append_log(
+                        "publish_adopted",
+                        Some(&photo.photo_id),
+                        Some(serde_json::json!({ "consensus_photo_id": remote })),
+                    )
+                    .await;
+            }
+            None => {
+                let fingerprint = entry.map(|e| e.fingerprint.clone());
+                remaining.push((photo, fingerprint));
+            }
+        }
+    }
+
+    // --- Responsibility gate: mutations are holder-only. ---
+    if resolved.responsibility != Responsibility::Holder {
+        if !remaining.is_empty() {
+            if !state.not_responsible {
+                state.not_responsible = true;
+                let status = match resolved.responsibility {
+                    Responsibility::Other => "other",
+                    _ => "unclaimed",
+                };
+                let _ = store
+                    .append_log(
+                        "publish_not_responsible",
+                        None,
+                        Some(serde_json::json!({ "holder": status })),
+                    )
+                    .await;
+            }
+            report.parked_responsibility = true;
+        }
+        return Ok(report);
+    }
+    if state.not_responsible {
+        state.not_responsible = false;
+        let _ = store.append_log("responsibility_regained", None, None).await;
+    }
+
+    for (photo, fingerprint) in remaining {
+        let mut item = match assemble_item(store, data_dir, &photo).await? {
             Ok(item) => item,
             Err(skip) => {
                 match skip {
@@ -215,6 +378,7 @@ pub async fn run_publish_pass(
                 continue;
             }
         };
+        item.cloud_fingerprint = fingerprint;
 
         match publisher.publish(item).await {
             Ok(outcome) => {
@@ -354,6 +518,7 @@ async fn assemble_item(
         library,
         sidecar,
         resources,
+        cloud_fingerprint: None, // stamped by the pass from the resolve entry
     }))
 }
 

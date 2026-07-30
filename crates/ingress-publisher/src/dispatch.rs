@@ -34,6 +34,20 @@ pub enum CommitProbe {
     Failed(String),
 }
 
+/// Wire shape of the node's `POST /api/photos/client/resolve` response.
+#[derive(Debug, serde::Deserialize)]
+pub struct ResolveResponseWire {
+    pub responsibility: String,
+    pub entries: Vec<ResolveEntryWire>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ResolveEntryWire {
+    pub cloud_id: String,
+    pub fingerprint: String,
+    pub photo_id: Option<String>,
+}
+
 pub struct HttpDispatch {
     client: reqwest::Client,
     /// Node base URL WITHOUT `/api` (seeder convention), no trailing slash.
@@ -81,6 +95,31 @@ impl HttpDispatch {
         } else {
             PhotosCoreError::Dispatch(format!("http {status}: {body}"))
         }
+    }
+
+    /// Resolve pre-pass (`POST /resolve`): cloud_ids → fingerprints +
+    /// committed ids + responsibility standing. Not part of the
+    /// `PhotoDispatch` trait — publish-flow only.
+    pub async fn resolve_cloud_ids(
+        &self,
+        cloud_ids: &[String],
+    ) -> Result<ResolveResponseWire, PhotosCoreError> {
+        let response = self
+            .client
+            .post(self.url("/resolve"))
+            .bearer_auth(&self.device_token)
+            .timeout(SMALL_TIMEOUT)
+            .json(&serde_json::json!({ "cloud_ids": cloud_ids }))
+            .send()
+            .await
+            .map_err(Self::transport_err)?;
+        if !response.status().is_success() {
+            return Err(Self::status_err(response).await);
+        }
+        response
+            .json::<ResolveResponseWire>()
+            .await
+            .map_err(|e| PhotosCoreError::Dispatch(format!("resolve response: {e}")))
     }
 
     /// Confirm probe (`GET /committed/{photo_id}`) for the idempotency

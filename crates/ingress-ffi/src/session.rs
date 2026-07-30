@@ -515,10 +515,12 @@ impl IngressSession {
             publish: crate::types::FfiPublishReport {
                 published: report.publish.published,
                 already_published: report.publish.already_published,
+                adopted: report.publish.adopted,
                 failed: report.publish.failed,
                 gave_up: report.publish.gave_up,
                 missing_sidecar: report.publish.missing_sidecar,
                 parked: report.publish.parked,
+                parked_responsibility: report.publish.parked_responsibility,
             },
         })
     }

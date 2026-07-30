@@ -351,6 +351,33 @@ where
         > 0)
 }
 
+/// Remote adoption: the mesh already holds this asset (cloud-fingerprint
+/// match), published by another device or a previous state.db. Stamp
+/// published_at WITHOUT uploading and record the remote consensus id.
+/// Same still-NULL guard as [`mark_published`].
+pub(crate) async fn mark_adopted<'e, E>(
+    exec: E,
+    id: &PhotoId,
+    consensus_photo_id: &str,
+    at: DateTime<Utc>,
+) -> Result<bool>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    Ok(sqlx::query(
+        "UPDATE photos SET published_at = ?, consensus_photo_id = ?, publish_attempts = 0, \
+         publish_next_retry_at = NULL, publish_last_error = NULL \
+         WHERE photo_id = ? AND published_at IS NULL",
+    )
+    .bind(at)
+    .bind(consensus_photo_id)
+    .bind(id)
+    .execute(exec)
+    .await?
+    .rows_affected()
+        > 0)
+}
+
 /// Record one failed publish attempt. `attempts` is the caller-computed new
 /// total (set to the cap for permanent rejections); `next_retry_at = None`
 /// leaves the photo immediately claimable once attempts allow.

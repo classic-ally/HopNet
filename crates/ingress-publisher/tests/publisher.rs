@@ -70,6 +70,7 @@ fn make_item(dir: &std::path::Path, resources: Vec<(&str, &str, Vec<u8>)>) -> Pu
             publish_attempts: 0,
             publish_next_retry_at: None,
             publish_last_error: None,
+            consensus_photo_id: None,
             deleted_at: None,
         },
         library: ingress_core::LibraryConfig {
@@ -110,6 +111,7 @@ fn make_item(dir: &std::path::Path, resources: Vec<(&str, &str, Vec<u8>)>) -> Pu
             resources: sidecar_resources,
         },
         resources: publish_resources,
+        cloud_fingerprint: None,
     }
 }
 
@@ -267,6 +269,12 @@ struct Stub {
     /// Scripted status for the next data-block posts (default 201 + JSON).
     upload_statuses: Mutex<VecDeque<u16>>,
     uploads: Mutex<Vec<UploadRecord>>,
+    /// Raw transaction bodies as received (tx_type + payload bytes).
+    tx_bodies: Mutex<Vec<serde_json::Value>>,
+    /// Scripted `/resolve` JSON response (default: holder, no entries).
+    resolve_response: Mutex<Option<serde_json::Value>>,
+    /// cloud_id batches received by `/resolve`.
+    resolve_seen: Mutex<Vec<Vec<String>>>,
 }
 
 struct UploadRecord {
@@ -344,11 +352,16 @@ async fn start_stub() -> (Arc<Stub>, String) {
             .into_response()
     }
 
-    async fn transaction(State(stub): State<Arc<Stub>>, headers: HeaderMap) -> axum::response::Response {
+    async fn transaction(
+        State(stub): State<Arc<Stub>>,
+        headers: HeaderMap,
+        axum::Json(body): axum::Json<serde_json::Value>,
+    ) -> axum::response::Response {
         stub.calls
             .lock()
             .unwrap()
             .push(("transaction".into(), bearer(&headers)));
+        stub.tx_bodies.lock().unwrap().push(body);
         let status = stub
             .tx_statuses
             .lock()
@@ -356,6 +369,29 @@ async fn start_stub() -> (Arc<Stub>, String) {
             .pop_front()
             .unwrap_or(200);
         (StatusCode::from_u16(status).unwrap(), "scripted").into_response()
+    }
+
+    async fn resolve(
+        State(stub): State<Arc<Stub>>,
+        headers: HeaderMap,
+        axum::Json(body): axum::Json<serde_json::Value>,
+    ) -> axum::response::Response {
+        stub.calls
+            .lock()
+            .unwrap()
+            .push(("resolve".into(), bearer(&headers)));
+        let cloud_ids: Vec<String> = body["cloud_ids"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        stub.resolve_seen.lock().unwrap().push(cloud_ids);
+        let response = stub
+            .resolve_response
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({ "responsibility": "holder", "entries": [] }));
+        axum::Json(response).into_response()
     }
 
     async fn committed(
@@ -383,6 +419,7 @@ async fn start_stub() -> (Arc<Stub>, String) {
         .route("/api/photos/client/data-block/{blob_id}", post(data_block))
         .route("/api/photos/client/transaction", post(transaction))
         .route("/api/photos/client/committed/{photo_id}", get(committed))
+        .route("/api/photos/client/resolve", post(resolve))
         .with_state(stub.clone());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -523,4 +560,126 @@ async fn mapping_failure_rejects_without_uploading() {
 
     assert!(matches!(err, PublishError::Rejected(_)), "got {err:?}");
     assert_eq!(call_names(&stub), vec!["committed"]);
+}
+
+// ------------------------------------------------------- resolve/identity
+
+// Should: map the resolve wire response onto the core's outcome — each
+// standing string, and entries with and without a committed photo id.
+#[tokio::test(flavor = "multi_thread")]
+async fn resolve_maps_wire_to_outcome() {
+    let (stub, base_url) = start_stub().await;
+    let publisher = NodePublisher::new(&base_url, "dev.secret").unwrap();
+
+    *stub.resolve_response.lock().unwrap() = Some(serde_json::json!({
+        "responsibility": "other",
+        "entries": [
+            { "cloud_id": "c1", "fingerprint": "ab12", "photo_id": PHOTO_ID },
+            { "cloud_id": "c2", "fingerprint": "cd34", "photo_id": null },
+        ],
+    }));
+    let outcome = publisher
+        .resolve(&["c1".into(), "c2".into()])
+        .await
+        .unwrap();
+    assert_eq!(outcome.responsibility, ingress_core::publish::Responsibility::Other);
+    assert_eq!(outcome.entries.len(), 2);
+    assert_eq!(outcome.entries[0].committed_photo_id.as_deref(), Some(PHOTO_ID));
+    assert_eq!(outcome.entries[1].committed_photo_id, None);
+    assert_eq!(outcome.entries[1].fingerprint, "cd34");
+    assert_eq!(
+        *stub.resolve_seen.lock().unwrap(),
+        vec![vec!["c1".to_string(), "c2".to_string()]]
+    );
+
+    // Unknown standing string is Transient, not a silent Holder.
+    *stub.resolve_response.lock().unwrap() = Some(serde_json::json!({
+        "responsibility": "supreme-leader",
+        "entries": [],
+    }));
+    let err = publisher.resolve(&[]).await.unwrap_err();
+    assert!(matches!(err, PublishError::Transient(_)), "got {err:?}");
+}
+
+// Should: classify a refused connection on resolve as NodeUnreachable so
+// the pass parks instead of burning attempts.
+#[tokio::test(flavor = "multi_thread")]
+async fn resolve_connection_refused_is_unreachable() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+
+    let publisher = NodePublisher::new(&base_url, "dev.secret").unwrap();
+    let err = publisher.resolve(&["c1".into()]).await.unwrap_err();
+    assert!(matches!(err, PublishError::NodeUnreachable(_)), "got {err:?}");
+}
+
+// Impact: the fingerprint is the mesh's only cross-device dedupe key — if
+// it silently drops between the resolve entry and the committed
+// PhotoAddEntry, every second device duplicates the archive.
+// Should: carry the item's hex fingerprint into the submitted photo_add
+// payload as raw bytes; a fingerprint-less item submits None.
+#[tokio::test(flavor = "multi_thread")]
+async fn fingerprint_travels_into_photo_add_payload() {
+    let dir = tempfile::tempdir().unwrap();
+    let (stub, base_url) = start_stub().await;
+    let publisher = NodePublisher::new(&base_url, "dev.secret").unwrap();
+
+    let mut item = simple_item(dir.path());
+    item.cloud_fingerprint = Some("5a".repeat(32));
+    publisher.publish(item).await.unwrap();
+
+    let decode = |body: &serde_json::Value| -> hopnet_photos::envelopes::PhotoAddPayload {
+        let bytes: Vec<u8> = body["payload"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u8)
+            .collect();
+        bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+            .unwrap()
+            .0
+    };
+    {
+        let bodies = stub.tx_bodies.lock().unwrap();
+        assert_eq!(bodies[0]["tx_type"], "photo_add");
+        let payload = decode(&bodies[0]);
+        assert_eq!(payload.entries[0].cloud_fingerprint, Some([0x5A; 32]));
+    }
+
+    let item = simple_item(dir.path()); // fingerprint None
+    publisher.publish(item).await.unwrap();
+    let bodies = stub.tx_bodies.lock().unwrap();
+    let payload = decode(&bodies[1]);
+    assert_eq!(payload.entries[0].cloud_fingerprint, None);
+}
+
+// Should: reject a malformed fingerprint locally (Rejected, nothing
+// uploaded) rather than submitting a corrupt payload.
+#[tokio::test(flavor = "multi_thread")]
+async fn malformed_fingerprint_rejects_before_upload() {
+    let dir = tempfile::tempdir().unwrap();
+    let (stub, base_url) = start_stub().await;
+    let publisher = NodePublisher::new(&base_url, "dev.secret").unwrap();
+
+    let mut item = simple_item(dir.path());
+    item.cloud_fingerprint = Some("not-hex".into());
+    let err = publisher.publish(item).await.unwrap_err();
+    assert!(matches!(err, PublishError::Rejected(_)), "got {err:?}");
+    assert_eq!(call_names(&stub), vec!["committed"], "no bytes moved");
+}
+
+// Impact: the 403 gate is the admission backstop — a daemon that somehow
+// publishes without resolving must land in the retry class that a
+// responsibility transfer can heal, not park or give up permanently.
+// Should: classify the node's ingress_not_responsible 403 as Transient.
+#[tokio::test(flavor = "multi_thread")]
+async fn not_responsible_403_classifies_transient() {
+    let dir = tempfile::tempdir().unwrap();
+    let (stub, base_url) = start_stub().await;
+    stub.tx_statuses.lock().unwrap().push_back(403);
+
+    let publisher = NodePublisher::new(&base_url, "dev.secret").unwrap();
+    let err = publisher.publish(simple_item(dir.path())).await.unwrap_err();
+    assert!(matches!(err, PublishError::Transient(_)), "got {err:?}");
 }

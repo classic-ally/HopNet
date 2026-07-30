@@ -14,7 +14,10 @@ use std::str::FromStr;
 use hopnet_common::CustomUUID;
 use hopnet_photos_core::PhotosCoreError;
 use hopnet_photos_core::publisher::{ByteSource, PublishRequest, publish_photo_add};
-use ingress_core::publish::{PublishError, PublishItem, PublishOutcome, Publisher};
+use ingress_core::publish::{
+    PublishError, PublishItem, PublishOutcome, Publisher, ResolveEntry, ResolveOutcome,
+    Responsibility,
+};
 
 use crate::dispatch::{CommitProbe, HttpDispatch, UNREACHABLE_PREFIX};
 
@@ -47,6 +50,12 @@ impl Publisher for NodePublisher {
         let asset = crate::map::to_photo_asset(&item).map_err(PublishError::Rejected)?;
         let photo_id = CustomUUID::from_str(item.photo.photo_id.as_str())
             .map_err(|e| PublishError::Rejected(format!("photo id not a uuid: {e}")))?;
+        let cloud_fingerprint = item
+            .cloud_fingerprint
+            .as_deref()
+            .map(parse_fingerprint)
+            .transpose()
+            .map_err(PublishError::Rejected)?;
 
         // 3. Open blob files as streaming byte sources. The unix fd survives
         //    a concurrent unlink; state races are excluded anyway — the
@@ -76,6 +85,7 @@ impl Publisher for NodePublisher {
                 photo_id,
                 library_id: None, // personal partition only this phase
                 byte_sources,
+                cloud_fingerprint,
             },
         )
         .await
@@ -84,6 +94,44 @@ impl Publisher for NodePublisher {
             Err(e) => Err(classify(e)),
         }
     }
+
+    async fn resolve(&self, cloud_ids: &[String]) -> Result<ResolveOutcome, PublishError> {
+        let wire = self
+            .dispatch
+            .resolve_cloud_ids(cloud_ids)
+            .await
+            .map_err(classify)?;
+        let responsibility = match wire.responsibility.as_str() {
+            "holder" => Responsibility::Holder,
+            "other" => Responsibility::Other,
+            "unclaimed" => Responsibility::Unclaimed,
+            other => {
+                return Err(PublishError::Transient(format!(
+                    "resolve: unknown responsibility `{other}`"
+                )));
+            }
+        };
+        Ok(ResolveOutcome {
+            responsibility,
+            entries: wire
+                .entries
+                .into_iter()
+                .map(|e| ResolveEntry {
+                    cloud_id: e.cloud_id,
+                    fingerprint: e.fingerprint,
+                    committed_photo_id: e.photo_id,
+                })
+                .collect(),
+        })
+    }
+}
+
+/// 64 hex chars → the 32-byte fingerprint the payload carries.
+fn parse_fingerprint(hex_str: &str) -> Result<[u8; 32], String> {
+    let bytes = hex::decode(hex_str).map_err(|e| format!("fingerprint not hex: {e}"))?;
+    bytes
+        .try_into()
+        .map_err(|_| format!("fingerprint must be 32 bytes, got {} hex chars", hex_str.len()))
 }
 
 /// Map publish failures onto the queue's retry classes. Ambiguous outcomes

@@ -49,6 +49,26 @@ async fn fresh_migrate_creates_schema() {
     );
 }
 
+// Should: carry the consensus_photo_id adoption column on a migrated photos
+// table, NULL by default (self-published identity).
+#[tokio::test]
+async fn consensus_adoption_column_exists_and_defaults_null() {
+    let (store, _) = store_with_personal().await;
+    sqlx::query(
+        "INSERT INTO photos (photo_id, library_id, discovered_at) VALUES ('p1', 'personal', ?)",
+    )
+    .bind(chrono::Utc::now())
+    .execute(store.raw_pool())
+    .await
+    .unwrap();
+    let (adopted,): (Option<String>,) =
+        sqlx::query_as("SELECT consensus_photo_id FROM photos WHERE photo_id = 'p1'")
+            .fetch_one(store.raw_pool())
+            .await
+            .unwrap();
+    assert!(adopted.is_none());
+}
+
 // Should: re-run the migrator on an already-migrated database as a no-op.
 #[tokio::test]
 async fn migrate_is_idempotent() {
@@ -65,7 +85,7 @@ async fn migrate_is_idempotent() {
         .fetch_one(second.raw_pool())
         .await
         .unwrap();
-    assert_eq!(n, 3);
+    assert_eq!(n, 4);
 
     std::fs::remove_dir_all(&dir).ok();
 }

@@ -160,6 +160,10 @@ pub struct PhotoRecord {
     pub publish_attempts: i64,
     pub publish_next_retry_at: Option<DateTime<Utc>>,
     pub publish_last_error: Option<String>,
+    /// Set when the publish pass ADOPTED a photo the mesh already held
+    /// (matched by cloud fingerprint) instead of uploading. The photo's
+    /// consensus identity is `COALESCE(consensus_photo_id, photo_id)`.
+    pub consensus_photo_id: Option<String>,
 
     pub deleted_at: Option<DateTime<Utc>>,
 }
