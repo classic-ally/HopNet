@@ -50,6 +50,9 @@ pub struct SchedulerConfig {
     /// so one tick never stalls the loop.
     pub replication_interval: Duration,
     pub cleanup: crate::cleanup::CleanupConfig,
+    /// HopNet publish tick (active only when a publisher is attached via
+    /// `Scheduler::with_publisher`).
+    pub publish: crate::publish::PublishConfig,
 }
 
 impl Default for SchedulerConfig {
@@ -65,6 +68,7 @@ impl Default for SchedulerConfig {
             cleanup_interval: Duration::from_secs(3600),
             replication_interval: Duration::from_secs(60),
             cleanup: crate::cleanup::CleanupConfig::default(),
+            publish: crate::publish::PublishConfig::default(),
         }
     }
 }
@@ -121,6 +125,9 @@ struct Shared {
 pub struct Scheduler<F: ResourceFetcher> {
     fetcher: Arc<F>,
     shared: Arc<Shared>,
+    /// Attached via `with_publisher`; None = the daemon loop skips the
+    /// publish tick entirely (drain-only tools, tests, pre-integration).
+    publisher: Option<Arc<dyn crate::publish::Publisher>>,
 }
 
 impl<F: ResourceFetcher> Scheduler<F> {
@@ -146,7 +153,15 @@ impl<F: ResourceFetcher> Scheduler<F> {
                 pause: Mutex::new(PauseState::default()),
                 inflight: Mutex::new(HashSet::new()),
             }),
+            publisher: None,
         }
+    }
+
+    /// Attach a HopNet publisher; the daemon loop then runs the publish tick
+    /// (`config.publish`). Drain runs never publish.
+    pub fn with_publisher(mut self, publisher: Arc<dyn crate::publish::Publisher>) -> Self {
+        self.publisher = Some(publisher);
+        self
     }
 
     /// Drain until the queue is empty/terminal or cancellation. Blocking

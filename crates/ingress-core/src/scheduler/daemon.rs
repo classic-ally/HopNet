@@ -100,6 +100,7 @@ pub struct DaemonReport {
     pub resources_reopened: u64,
     pub cleanup: crate::cleanup::CleanupReport,
     pub replication: crate::cleanup::ReplicationReport,
+    pub publish: crate::publish::PublishReport,
 }
 
 #[derive(Default)]
@@ -131,9 +132,15 @@ impl<F: ResourceFetcher> Scheduler<F> {
         // startup cleanup and begins draining the replication backlog.
         let mut last_cleanup: Option<std::time::Instant> = None;
         let mut last_replication: Option<std::time::Instant> = None;
+        let mut last_publish: Option<std::time::Instant> = None;
         let mut repl_state = crate::cleanup::ReplicationState::default();
         let mut cleanup_totals = crate::cleanup::CleanupReport::default();
         let mut replication_totals = crate::cleanup::ReplicationReport::default();
+        // Publish pass state, shared with the spawned pass task (one alive at
+        // a time — the tick is gated on the previous task having finished).
+        let publish_totals = Arc::new(Mutex::new(crate::publish::PublishReport::default()));
+        let publish_state = Arc::new(Mutex::new(crate::publish::PublishState::default()));
+        let mut publish_task: Option<tokio::task::JoinHandle<()>> = None;
 
         fn due(last: Option<std::time::Instant>, interval: std::time::Duration) -> bool {
             last.map(|t| t.elapsed() >= interval).unwrap_or(true)
@@ -205,6 +212,91 @@ impl<F: ResourceFetcher> Scheduler<F> {
                 }
                 last_replication = Some(std::time::Instant::now());
             }
+            // Publish tick: claim in-loop (fast indexed query), register the
+            // claimed photos INFLIGHT (their PhotoKit events defer, which
+            // also excludes supersede/hard-move races on the blob reads),
+            // then run the pass in ONE spawned task — unlike replication,
+            // publishing streams multi-GB originals, and inline it would
+            // stall event routing for the duration.
+            if let Some(publisher) = &self.publisher {
+                let alive = publish_task.as_ref().is_some_and(|t| !t.is_finished());
+                if !alive && due(last_publish, self.shared.config.publish.interval) {
+                    let skip = self.shared.inflight.lock().expect("inflight mutex").clone();
+                    match crate::publish::claim_publishable(
+                        &self.shared.store,
+                        &self.shared.config.publish,
+                        &skip,
+                    )
+                    .await
+                    {
+                        Ok(claimed) if !claimed.is_empty() => {
+                            let ids: Vec<PhotoId> =
+                                claimed.iter().map(|p| p.photo_id.clone()).collect();
+                            self.shared
+                                .inflight
+                                .lock()
+                                .expect("inflight mutex")
+                                .extend(ids.iter().cloned());
+                            let shared = self.shared.clone();
+                            let publisher = publisher.clone();
+                            let totals = publish_totals.clone();
+                            let state_slot = publish_state.clone();
+                            publish_task = Some(tokio::spawn(async move {
+                                let mut state =
+                                    state_slot.lock().expect("publish state").clone();
+                                let result = crate::publish::run_publish_pass(
+                                    &shared.store,
+                                    &shared.data_dir,
+                                    publisher.as_ref(),
+                                    &shared.config.publish,
+                                    claimed,
+                                    &mut state,
+                                )
+                                .await;
+                                *state_slot.lock().expect("publish state") = state;
+                                match result {
+                                    Ok(r) => {
+                                        totals.lock().expect("publish totals").absorb(&r)
+                                    }
+                                    Err(e) => {
+                                        let _ = shared
+                                            .store
+                                            .append_log(
+                                                "publish_error",
+                                                None,
+                                                Some(serde_json::json!({
+                                                    "error": e.to_string()
+                                                })),
+                                            )
+                                            .await;
+                                    }
+                                }
+                                let mut inflight =
+                                    shared.inflight.lock().expect("inflight mutex");
+                                for id in &ids {
+                                    inflight.remove(id);
+                                }
+                            }));
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            let _ = self
+                                .shared
+                                .store
+                                .append_log(
+                                    "publish_error",
+                                    None,
+                                    Some(serde_json::json!({
+                                        "op": "claim",
+                                        "error": e.to_string()
+                                    })),
+                                )
+                                .await;
+                        }
+                    }
+                    last_publish = Some(std::time::Instant::now());
+                }
+            }
 
             // 1. Route everything currently queued.
             while let Ok(event) = rx.try_recv() {
@@ -262,12 +354,16 @@ impl<F: ResourceFetcher> Scheduler<F> {
                 last.map(|t| interval.saturating_sub(t.elapsed()))
                     .unwrap_or_default()
             };
-            let next_retry = next_retry
+            let mut next_retry = next_retry
                 .min(time_to(last_cleanup, self.shared.config.cleanup_interval))
                 .min(time_to(
                     last_replication,
                     self.shared.config.replication_interval,
                 ));
+            if self.publisher.is_some() {
+                next_retry =
+                    next_retry.min(time_to(last_publish, self.shared.config.publish.interval));
+            }
             tokio::select! {
                 event = rx.recv() => {
                     match event {
@@ -278,6 +374,14 @@ impl<F: ResourceFetcher> Scheduler<F> {
                     }
                 }
                 Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
+                // A finished publish pass frees its inflight photos — wake so
+                // their deferred events flush promptly. The handler clears
+                // the slot: this await consumed the handle's output, and the
+                // shutdown join would panic re-polling it.
+                _ = async { let _ = publish_task.as_mut().expect("guarded").await; },
+                    if publish_task.as_ref().is_some_and(|t| !t.is_finished()) => {
+                    publish_task = None;
+                }
                 _ = handle.wake.notified() => {}
                 _ = self.shared.cancel.cancelled() => {}
                 _ = tokio::time::sleep(next_retry) => {}
@@ -285,6 +389,9 @@ impl<F: ResourceFetcher> Scheduler<F> {
         }
 
         while tasks.join_next().await.is_some() {}
+        if let Some(task) = publish_task.take() {
+            let _ = task.await;
+        }
         // Deferred events still queued at shutdown are dropped — the next
         // startup scan re-derives them from PhotoKit state (events are
         // hints, not authoritative deltas).
@@ -299,6 +406,7 @@ impl<F: ResourceFetcher> Scheduler<F> {
             resources_reopened: counters.reopened,
             cleanup: cleanup_totals,
             replication: replication_totals,
+            publish: publish_totals.lock().expect("publish totals").clone(),
         })
     }
 

@@ -298,6 +298,85 @@ where
     .await?)
 }
 
+/// The publish work queue: materialized, active, unpublished photos of the
+/// PERSONAL partition (`scope_binding IS NULL` — publishing the iCloud-shared
+/// partition as personal-consensus photos would create Phase-3 dedup debt).
+/// Tombstones are excluded: tombstone propagation is out of scope, and a
+/// deleted-then-published photo would be unreachable in HopNet anyway.
+/// Attempts at the cap are terminal until an operator resets them.
+pub(crate) async fn publishable_photos<'e, E>(
+    exec: E,
+    now: DateTime<Utc>,
+    retry_cap: i64,
+    limit: i64,
+) -> Result<Vec<PhotoRecord>>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    Ok(sqlx::query_as(
+        "SELECT p.* FROM photos p \
+         JOIN libraries l ON l.library_id = p.library_id \
+         WHERE l.scope_binding IS NULL \
+           AND p.published_at IS NULL \
+           AND p.materialized_at IS NOT NULL \
+           AND p.deleted_at IS NULL \
+           AND p.publish_attempts < ? \
+           AND (p.publish_next_retry_at IS NULL OR p.publish_next_retry_at <= ?) \
+         ORDER BY p.photo_id \
+         LIMIT ?",
+    )
+    .bind(retry_cap)
+    .bind(now)
+    .bind(limit)
+    .fetch_all(exec)
+    .await?)
+}
+
+/// Terminal publish success: stamp once and clear the retry ledger. Guarded
+/// on still-NULL so a duplicate mark (confirm race) is a no-op.
+pub(crate) async fn mark_published<'e, E>(exec: E, id: &PhotoId, at: DateTime<Utc>) -> Result<bool>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    Ok(sqlx::query(
+        "UPDATE photos SET published_at = ?, publish_attempts = 0, \
+         publish_next_retry_at = NULL, publish_last_error = NULL \
+         WHERE photo_id = ? AND published_at IS NULL",
+    )
+    .bind(at)
+    .bind(id)
+    .execute(exec)
+    .await?
+    .rows_affected()
+        > 0)
+}
+
+/// Record one failed publish attempt. `attempts` is the caller-computed new
+/// total (set to the cap for permanent rejections); `next_retry_at = None`
+/// leaves the photo immediately claimable once attempts allow.
+pub(crate) async fn record_publish_failure<'e, E>(
+    exec: E,
+    id: &PhotoId,
+    attempts: i64,
+    next_retry_at: Option<DateTime<Utc>>,
+    error: &str,
+) -> Result<()>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    sqlx::query(
+        "UPDATE photos SET publish_attempts = ?, publish_next_retry_at = ?, \
+         publish_last_error = ? WHERE photo_id = ?",
+    )
+    .bind(attempts)
+    .bind(next_retry_at)
+    .bind(error)
+    .bind(id)
+    .execute(exec)
+    .await?;
+    Ok(())
+}
+
 /// Every materialized photo of one library, tombstoned included — fsck's
 /// sidecar-consistency population (a materialized photo must have a local
 /// sidecar; tombstoned ones carry their `deleted_at` in it).

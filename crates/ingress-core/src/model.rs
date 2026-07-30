@@ -129,6 +129,13 @@ pub struct PhotoRecord {
     pub materialized_at: Option<DateTime<Utc>>,
     pub sidecar_replicated_at: Option<DateTime<Utc>>,
 
+    /// NULL = not yet published into HopNet; set once, never reset (a
+    /// re-edit must NOT re-enqueue — consensus rejects duplicate photo ids).
+    pub published_at: Option<DateTime<Utc>>,
+    pub publish_attempts: i64,
+    pub publish_next_retry_at: Option<DateTime<Utc>>,
+    pub publish_last_error: Option<String>,
+
     pub deleted_at: Option<DateTime<Utc>>,
 }
 

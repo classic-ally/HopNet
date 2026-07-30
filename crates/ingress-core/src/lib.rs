@@ -16,6 +16,7 @@ pub mod ids;
 pub mod libconfig;
 pub mod model;
 pub mod paths;
+pub mod publish;
 pub mod recover;
 pub mod recovery;
 pub mod resolve;

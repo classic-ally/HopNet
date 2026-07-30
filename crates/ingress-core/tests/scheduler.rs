@@ -157,6 +157,7 @@ async fn rig() -> Rig {
             cleanup_interval: Duration::from_secs(3600),
             replication_interval: Duration::from_secs(3600),
             cleanup: ingress_core::cleanup::CleanupConfig::default(),
+            publish: ingress_core::publish::PublishConfig::default(),
         },
         _dirs: (blob_dir, data_tmp),
     }
