@@ -762,7 +762,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(not(feature = "gui"))]
     {
-        run_server(&format!("0.0.0.0:{}", HEADLESS_BACKEND_PORT)).await
+        // HOPNET_HTTP_PORT lets a dev copy run alongside a real node on the
+        // same machine (pair with XDG_DATA_HOME for storage isolation).
+        let port = std::env::var("HOPNET_HTTP_PORT")
+            .ok()
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(HEADLESS_BACKEND_PORT);
+        run_server(&format!("0.0.0.0:{}", port)).await
     }
 }
 

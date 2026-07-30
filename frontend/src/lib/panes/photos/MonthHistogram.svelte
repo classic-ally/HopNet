@@ -116,7 +116,9 @@
     z-index: 20;
     display: flex;
     flex-direction: column;
-    justify-content: stretch;
+    /* Pin rows to the top: sparse libraries hug the top-right corner
+       instead of stretching a handful of months over the full height. */
+    justify-content: flex-start;
     overflow: hidden;
     transition: width 0.18s ease;
   }
@@ -126,7 +128,9 @@
 
   .month-row {
     position: relative;
-    flex: 1 1 0;
+    /* Fixed basis that can shrink (dense libraries compress to fit, as
+       before) but never grow (sparse libraries stay compact at the top). */
+    flex: 0 1 22px;
     min-height: 2px;
     display: flex;
     align-items: center;

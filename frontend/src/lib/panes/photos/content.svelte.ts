@@ -50,8 +50,9 @@ interface Entry {
     url: string;
 }
 
-// SvelteMap so cells re-render when their entry lands. Insertion order doubles
-// as LRU order (delete+set on touch).
+// SvelteMap so cells re-render when their entry lands. Eviction is
+// insertion-order FIFO — reads happen during render, where touching the
+// reactive map is forbidden (state_unsafe_mutation).
 const entries = new SvelteMap<string, Entry>();
 const registered = new Map<string, [number, string][]>();
 const inFlight = new Set<string>();
@@ -120,10 +121,10 @@ export function urlFor(photoId: string, cls: ContentClass): string {
 
     const cached = entries.get(key);
     if (cached && cached.blobId === blobId) {
-        // LRU touch. delete+set inside a getter is safe with SvelteMap (no
-        // infinite loop: value identity is unchanged for subscribers).
-        entries.delete(key);
-        entries.set(key, cached);
+        // No LRU touch here: urlFor runs inside template expressions, and
+        // mutating the reactive map during render is a Svelte 5
+        // state_unsafe_mutation error. Eviction is insertion-order FIFO
+        // instead — fine at this cache size.
         return cached.url;
     }
     if (!inFlight.has(key)) {
