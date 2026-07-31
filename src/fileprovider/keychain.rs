@@ -25,6 +25,10 @@ const API_KEY_ACCOUNT: &str = "api_key";
 const BASE_URL_ACCOUNT: &str = "base_url";
 const SESSION_PRIVKEY_ACCOUNT: &str = "owner_privkey";
 const SESSION_USERID_ACCOUNT: &str = "owner_user_id";
+/// Photo-ingress library provisioning (enablement flow): the daemon's
+/// startup auto-bind reads these alongside the credentials.
+const BLOB_ROOT_ACCOUNT: &str = "blob_root";
+const SIDECAR_ROOT_REMOTE_ACCOUNT: &str = "sidecar_root_remote";
 
 /// Keychain environment configuration
 #[derive(Debug, Clone, Copy)]
@@ -219,6 +223,50 @@ pub fn load_photo_ingress_config() -> Result<(String, String), KeychainError> {
 #[cfg(target_os = "macos")]
 pub fn update_photo_ingress_base_url(base_url: &str) -> Result<(), KeychainError> {
     store_keychain_item_with_service(PHOTO_INGRESS_SERVICE, BASE_URL_ACCOUNT, base_url.as_bytes())
+}
+
+/// Store the library provisioning values the daemon's startup auto-bind
+/// reads. A None sidecar root removes any previous value so a re-enable
+/// without one doesn't resurrect a stale path.
+#[cfg(target_os = "macos")]
+pub fn store_photo_ingress_provisioning(
+    blob_root: &str,
+    sidecar_root_remote: Option<&str>,
+) -> Result<(), KeychainError> {
+    store_keychain_item_with_service(PHOTO_INGRESS_SERVICE, BLOB_ROOT_ACCOUNT, blob_root.as_bytes())?;
+    match sidecar_root_remote {
+        Some(remote) => store_keychain_item_with_service(
+            PHOTO_INGRESS_SERVICE,
+            SIDECAR_ROOT_REMOTE_ACCOUNT,
+            remote.as_bytes(),
+        ),
+        None => {
+            let _ = remove_keychain_item_with_service(
+                PHOTO_INGRESS_SERVICE,
+                SIDECAR_ROOT_REMOTE_ACCOUNT,
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Load the provisioned blob root (status display; the BOUND value lives in
+/// the daemon's state.db and wins on divergence).
+#[cfg(target_os = "macos")]
+pub fn load_photo_ingress_blob_root() -> Result<String, KeychainError> {
+    let bytes = load_keychain_item_bytes_with_service(PHOTO_INGRESS_SERVICE, BLOB_ROOT_ACCOUNT)?;
+    String::from_utf8(bytes).map_err(|_| KeychainError::InvalidData)
+}
+
+/// Remove the full photo-ingress provisioning (disable flow). Tolerates
+/// absent items — disable is best-effort/idempotent per step.
+#[cfg(target_os = "macos")]
+pub fn remove_photo_ingress_config() {
+    info!("Removing photo-ingress configuration from keychain");
+    let _ = remove_keychain_item_with_service(PHOTO_INGRESS_SERVICE, API_KEY_ACCOUNT);
+    let _ = remove_keychain_item_with_service(PHOTO_INGRESS_SERVICE, BASE_URL_ACCOUNT);
+    let _ = remove_keychain_item_with_service(PHOTO_INGRESS_SERVICE, BLOB_ROOT_ACCOUNT);
+    let _ = remove_keychain_item_with_service(PHOTO_INGRESS_SERVICE, SIDECAR_ROOT_REMOTE_ACCOUNT);
 }
 
 /// Remove FileProvider configuration from keychain

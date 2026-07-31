@@ -239,13 +239,18 @@ pub async fn sign_in(
                     tracing::warn!("Failed to ensure FileProvider device token: {:?}", e);
                 }
 
-                if let Err(e) = crate::devices::routes::ensure_photo_ingress_device_token(
-                    &app_state,
-                    db_user.user_id,
-                )
-                .await
-                {
-                    tracing::warn!("Failed to ensure photo-ingress device token: {:?}", e);
+                // Photo ingress is enablement-gated (the /photo-ingress/enable
+                // route is the sole minting entry): login only self-heals an
+                // EXISTING provision (revoked-token re-mint), never creates one.
+                if crate::fileprovider::keychain::load_photo_ingress_config().is_ok() {
+                    if let Err(e) = crate::devices::routes::ensure_photo_ingress_device_token(
+                        &app_state,
+                        db_user.user_id,
+                    )
+                    .await
+                    {
+                        tracing::warn!("Failed to ensure photo-ingress device token: {:?}", e);
+                    }
                 }
             }
         }

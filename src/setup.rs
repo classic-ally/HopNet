@@ -253,17 +253,10 @@ pub async fn post_setup(
                                 e
                             );
                         }
-                        if let Err(e) = crate::devices::routes::ensure_photo_ingress_device_token(
-                            &app_state_clone,
-                            user_id,
-                        )
-                        .await
-                        {
-                            tracing::warn!(
-                                "Failed to register photo-ingress device token at setup: {:?}",
-                                e
-                            );
-                        }
+                        // Photo ingress deliberately NOT provisioned here:
+                        // minting is enablement-gated behind the
+                        // /photo-ingress/enable route (a fresh node cannot
+                        // already be enabled).
                     });
                 }
             }

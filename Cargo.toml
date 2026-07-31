@@ -109,6 +109,8 @@ objc2-file-provider = "0.3.1"
 objc2-foundation = "0.3.1"
 objc2 = "0.6.2"
 block2 = "0.6.1"
+# SMAppService for the bundled photo-ingress LaunchAgent
+objc2-service-management = "0.3.2"
 # Security framework for keychain access
 security-framework = "3.3.0"
 

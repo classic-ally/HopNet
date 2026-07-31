@@ -634,6 +634,16 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 .route("/setup", post(setup::post_setup))
                 .route("/login", post(auth::sign_in));
 
+            // Photo-ingress enablement plumbing (owner-only, JWT): the
+            // future settings pane's backing routes. macOS GUI process only —
+            // SMAppService and the keychain are per-user-session concerns of
+            // the machine the daemon runs on.
+            #[cfg(all(target_os = "macos", feature = "gui"))]
+            let api_routes = api_routes.nest(
+                "/photo-ingress",
+                photo_ingress::routes::router(app_state.clone()),
+            );
+
             // Projection mounts (RFC-016 Stage 4). Host routes close over
             // AppState first; each projection's routers are Router<()> and
             // get nested under their declared auth class. Everything —
