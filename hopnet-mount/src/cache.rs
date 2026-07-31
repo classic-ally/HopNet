@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use hopnet_common::CustomUUID;
@@ -84,6 +84,30 @@ struct BlobState {
     file: File,
     size: u64,
     segs: Mutex<SegState>,
+    /// Passthrough pins (S9): while > 0 the kernel may read ANY offset
+    /// of this blob's file without the daemon observing it, so eviction
+    /// must not punch holes — a punched page would fault in as zeros.
+    /// Whole-blob by necessity, not per-segment.
+    pins: AtomicUsize,
+}
+
+/// A complete blob's cache file plus its eviction pin (S9 passthrough).
+/// The fd is registered with the kernel as a backing file; the pin
+/// keeps every byte on disk until the guard drops at release.
+pub struct Backing {
+    pub file: File,
+    pub pin: PinGuard,
+}
+
+/// RAII eviction pin; dropping re-exposes the blob to eviction.
+pub struct PinGuard {
+    state: Arc<BlobState>,
+}
+
+impl Drop for PinGuard {
+    fn drop(&mut self) {
+        self.state.pins.fetch_sub(1, Ordering::Release);
+    }
 }
 
 pub struct CacheManager {
@@ -120,6 +144,39 @@ impl CacheManager {
         self.cached_bytes.load(Ordering::Relaxed)
     }
 
+    /// Hand out the blob's cache file for kernel passthrough (S9), if —
+    /// and only if — every segment is present and none is mid-fetch.
+    /// The fd is a `try_clone` of the live handle (no reopen race, same
+    /// pattern as read), and the pin is taken under the `segs` lock so
+    /// eviction cannot slip between the completeness check and the pin.
+    pub fn backing(&self, blob: &CustomUUID) -> Option<Backing> {
+        let state = self
+            .blobs
+            .lock()
+            .expect("cache blobs poisoned")
+            .get(blob)
+            .cloned()?;
+        let segs = state.segs.lock().expect("segstate poisoned");
+        if !segs.inflight.is_empty() || !segs.present.iter().all(|p| *p) {
+            return None;
+        }
+        let file = match state.file.try_clone() {
+            Ok(file) => file,
+            Err(e) => {
+                tracing::debug!("backing fd clone failed: {e}");
+                return None;
+            }
+        };
+        state.pins.fetch_add(1, Ordering::AcqRel);
+        drop(segs);
+        Some(Backing {
+            file,
+            pin: PinGuard {
+                state: state.clone(),
+            },
+        })
+    }
+
     fn seg_len(&self, size: u64, seg: u32) -> u64 {
         let start = seg as u64 * self.config.segment_size;
         (size - start).min(self.config.segment_size)
@@ -148,6 +205,7 @@ impl CacheManager {
                 present: vec![false; seg_count],
                 inflight: HashMap::new(),
             }),
+            pins: AtomicUsize::new(0),
         });
         blobs.insert(blob.clone(), state.clone());
         Ok(state)
@@ -349,7 +407,8 @@ impl CacheManager {
             }
             if !self.evict_coldest() {
                 // Nothing evictable: for MaxBytes that's a cap smaller
-                // than one segment; for MinFree the disk is genuinely
+                // than one segment (or everything left is pinned by
+                // passthrough opens); for MinFree the disk is genuinely
                 // full of other people's data. Proceed and let the write
                 // fail loudly if it must.
                 return Ok(());
@@ -357,12 +416,27 @@ impl CacheManager {
         }
     }
 
-    /// Punch the least-recently-used cached segment. False if none.
+    /// Punch the least-recently-used cached segment of an UNPINNED
+    /// blob. False if nothing is evictable (empty, or all pinned).
     fn evict_coldest(&self) -> bool {
+        // Pinned blobs stay in the index untouched — they become
+        // evictable again the instant their last pin drops, with their
+        // stamps intact. Snapshot first, then scan: taking `blobs`
+        // inside the `cached` lock would create a lock cycle with the
+        // segs→cached order used below.
+        let pinned: std::collections::HashSet<CustomUUID> = {
+            let blobs = self.blobs.lock().expect("cache blobs poisoned");
+            blobs
+                .iter()
+                .filter(|(_, s)| s.pins.load(Ordering::Acquire) > 0)
+                .map(|(b, _)| b.clone())
+                .collect()
+        };
         let coldest = {
             let cached = self.cached.lock().expect("cache index poisoned");
             cached
                 .iter()
+                .filter(|((blob, _), _)| !pinned.contains(blob))
                 .min_by_key(|(_, stamp)| **stamp)
                 .map(|(key, _)| key.clone())
         };
@@ -384,6 +458,12 @@ impl CacheManager {
         };
 
         let mut segs = state.segs.lock().expect("segstate poisoned");
+        // A pin may have landed after the snapshot; the pin was taken
+        // under this same segs lock, so this re-check is authoritative.
+        // Keep the index entry — the next snapshot filters it out.
+        if state.pins.load(Ordering::Acquire) > 0 {
+            return true;
+        }
         // Never punch a segment mid-fetch.
         if segs.inflight.contains_key(&seg) {
             // Drop it from the index so the scan doesn't spin on it; the

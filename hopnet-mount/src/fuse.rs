@@ -28,15 +28,34 @@ pub struct HopFs {
     rt: tokio::runtime::Handle,
     uid: u32,
     gid: u32,
+    /// Passthrough armed (S9): requires the CLI not disabling it, the
+    /// kernel negotiating FUSE_PASSTHROUGH at init, AND no EPERM yet —
+    /// the backing ioctl needs CAP_SYS_ADMIN, so the first refusal
+    /// disarms for the session (probe ladder, never an error).
+    passthrough_allowed: bool,
+    passthrough: Arc<std::sync::atomic::AtomicBool>,
+    /// Live backing registrations by file handle. The BackingId must
+    /// outlive the kernel's use of the fh (drop => backing-close ioctl;
+    /// dropping early makes reads EIO), and the Backing's pin keeps
+    /// eviction away from the file the kernel is reading.
+    #[allow(clippy::type_complexity)]
+    backings: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<u64, (Arc<fuser::BackingId>, crate::cache::Backing)>,
+        >,
+    >,
 }
 
 impl HopFs {
-    pub fn new(core: Arc<MountCore>, rt: tokio::runtime::Handle) -> Self {
+    pub fn new(core: Arc<MountCore>, rt: tokio::runtime::Handle, allow_passthrough: bool) -> Self {
         HopFs {
             core,
             rt,
             uid: rustix::process::getuid().as_raw(),
             gid: rustix::process::getgid().as_raw(),
+            passthrough_allowed: allow_passthrough,
+            passthrough: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            backings: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -104,6 +123,38 @@ fn errno(e: &CoreError) -> Errno {
 }
 
 impl Filesystem for HopFs {
+    fn init(
+        &mut self,
+        _req: &Request,
+        config: &mut fuser::KernelConfig,
+    ) -> std::io::Result<()> {
+        if !self.passthrough_allowed {
+            return Ok(());
+        }
+        // The negotiation doubles as the kernel probe: pre-6.9 kernels
+        // (or CONFIG_FUSE_PASSTHROUGH=n) don't advertise the flag and
+        // add_capabilities errs — fall back, never fail the mount.
+        match config.add_capabilities(fuser::InitFlags::FUSE_PASSTHROUGH) {
+            Ok(()) => {
+                // 1 = our backing files live on a normal filesystem;
+                // depth only matters for stacking FUSE on FUSE.
+                if let Err(e) = config.set_max_stack_depth(1) {
+                    tracing::info!("passthrough disabled: max_stack_depth rejected ({e})");
+                } else {
+                    self.passthrough
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    tracing::info!("FUSE passthrough negotiated");
+                }
+            }
+            Err(_) => {
+                tracing::info!(
+                    "kernel lacks FUSE_PASSTHROUGH (needs 6.9+); daemon-mediated reads"
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let Some(name) = name.to_str().map(String::from) else {
             // Drive names are UTF-8 by construction; nothing non-UTF-8 exists.
@@ -195,6 +246,8 @@ impl Filesystem for HopFs {
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let core = self.core.clone();
         let write_intent = !matches!(flags.acc_mode(), fuser::OpenAccMode::O_RDONLY);
+        let passthrough = self.passthrough.clone();
+        let backings = self.backings.clone();
         self.rt.spawn(async move {
             // O_TRUNC never reaches open (kernel sends setattr(size=0)).
             let result = if write_intent {
@@ -202,10 +255,46 @@ impl Filesystem for HopFs {
             } else {
                 core.open(ino.0).await
             };
-            match result {
-                Ok(fh) => reply.opened(FileHandle(fh), fuser::FopenFlags::empty()),
-                Err(e) => reply.error(errno(&e)),
+            let fh = match result {
+                Ok(fh) => fh,
+                Err(e) => return reply.error(errno(&e)),
+            };
+
+            // Passthrough (S9): read-only opens of fully-cached blobs
+            // hand the kernel a backing fd — reads then bypass the
+            // daemon entirely. Every failure falls through to the
+            // daemon-mediated reply; correctness never depends on this.
+            if !write_intent && passthrough.load(std::sync::atomic::Ordering::Acquire) {
+                if let Some(backing) = core.backing_for(fh) {
+                    match reply.open_backing(&backing.file) {
+                        Ok(id) => {
+                            let id = Arc::new(id);
+                            // Insert BEFORE replying so even an
+                            // instant release finds the entry.
+                            backings
+                                .lock()
+                                .expect("backings poisoned")
+                                .insert(fh, (id.clone(), backing));
+                            return reply.opened_passthrough(
+                                FileHandle(fh),
+                                fuser::FopenFlags::empty(),
+                                &id,
+                            );
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                            // No CAP_SYS_ADMIN: disarm for the session,
+                            // one info line, permanent fallback.
+                            passthrough.store(false, std::sync::atomic::Ordering::Release);
+                            tracing::info!(
+                                "passthrough needs CAP_SYS_ADMIN (see the NixOS module's \
+                                 allowPassthrough); daemon-mediated reads"
+                            );
+                        }
+                        Err(e) => tracing::debug!("open_backing failed: {e}"),
+                    }
+                }
             }
+            reply.opened(FileHandle(fh), fuser::FopenFlags::empty())
         });
     }
 
@@ -459,7 +548,15 @@ impl Filesystem for HopFs {
     ) {
         // Must run on the runtime: release spawns the background upload.
         let core = self.core.clone();
+        let backings = self.backings.clone();
         self.rt.spawn(async move {
+            // Passthrough teardown first: dropping the BackingId issues
+            // the kernel backing-close ioctl, and dropping the Backing
+            // releases the eviction pin. Unlike the S4/S7 notify case
+            // (which waits on inode locks whose holders may need OUR
+            // reply), the backing ioctls are bounded kernel work with
+            // no request-completion dependency — safe inline.
+            drop(backings.lock().expect("backings poisoned").remove(&fh.0));
             core.release(fh.0);
             reply.ok();
         });

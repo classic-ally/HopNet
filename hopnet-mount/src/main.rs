@@ -74,6 +74,12 @@ mod linux {
         /// (default: $XDG_DATA_HOME/hopnet/staging)
         #[arg(long)]
         staging_dir: Option<PathBuf>,
+
+        /// Disable FUSE passthrough even where the kernel and
+        /// privileges would allow it (measurement baseline / escape
+        /// hatch); passthrough otherwise arms itself when possible
+        #[arg(long)]
+        no_passthrough: bool,
     }
 
     #[derive(clap::Args)]
@@ -337,7 +343,7 @@ mod linux {
         cleanup_stale_mount(&args.mountpoint);
         provision::abort_recorded_conn(&data_dir);
 
-        let fs = HopFs::new(core.clone(), rt.handle().clone());
+        let fs = HopFs::new(core.clone(), rt.handle().clone(), !args.no_passthrough);
 
         let mut config = fuser::Config::default();
         config.mount_options = vec![fuser::MountOption::FSName("hopnet".to_string())];

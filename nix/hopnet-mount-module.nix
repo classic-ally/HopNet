@@ -15,8 +15,15 @@ let
     then cfg.mountpoint
     else "%h/${cfg.mountpoint}";
 
+  # Passthrough needs CAP_SYS_ADMIN; when granted via the wrapper, the
+  # unit must exec the wrapped binary, not the store path.
+  daemonBin =
+    if flavor == "nixos" && cfg.allowPassthrough
+    then "/run/wrappers/bin/hopnet-mount"
+    else "${cfg.package}/bin/hopnet-mount";
+
   execStart = lib.concatStringsSep " " (
-    [ "${cfg.package}/bin/hopnet-mount" "mount" mountArg ]
+    [ daemonBin "mount" mountArg ]
     ++ lib.optionals (cfg.url != null) [ "--url" cfg.url ]
     ++ cfg.extraArgs
   );
@@ -59,10 +66,34 @@ in
       default = [ ];
       description = "Extra arguments appended to `hopnet-mount mount`.";
     };
+
+    allowPassthrough = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Grant the daemon CAP_SYS_ADMIN via a security.wrappers file
+        capability so FUSE passthrough (kernel-direct reads of fully
+        cached files, RFC-018 S9) can activate. SECURITY TRADEOFF:
+        cap_sys_admin is effectively root for anyone able to execute
+        the wrapper — leave this off unless the host's users are
+        trusted. NixOS module only; home-manager cannot grant file
+        capabilities.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable (
     if flavor == "hm" then {
+      assertions = [
+        {
+          assertion = !cfg.allowPassthrough;
+          message = ''
+            services.hopnet-mount.allowPassthrough needs the NixOS
+            module (file capabilities come from security.wrappers,
+            which home-manager cannot manage).
+          '';
+        }
+      ];
       home.packages = [ cfg.package ];
       systemd.user.services.hopnet-mount = {
         Unit.Description = description;
@@ -76,6 +107,14 @@ in
       };
     } else {
       environment.systemPackages = [ cfg.package ];
+      security.wrappers = lib.mkIf cfg.allowPassthrough {
+        hopnet-mount = {
+          source = "${cfg.package}/bin/hopnet-mount";
+          capabilities = "cap_sys_admin+ep";
+          owner = "root";
+          group = "root";
+        };
+      };
       systemd.user.services.hopnet-mount = {
         inherit description;
         serviceConfig = {

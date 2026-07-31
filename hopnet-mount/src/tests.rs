@@ -1101,3 +1101,185 @@ async fn statfs_refetches_after_ttl() {
         "expired cache must refetch"
     );
 }
+
+// ---------------------------------------------------------------- S9 —
+// passthrough eligibility + eviction pinning (kernel-free layer; the
+// privileged stack smoke proves the kernel half).
+
+// Impact: handing the kernel a backing fd for an incomplete blob would
+// serve hole zeros to page faults with no daemon in the loop.
+// Should: refuse a backing until every segment is present.
+// Should: hand out a backing once the whole blob has been read.
+#[tokio::test]
+async fn backing_appears_only_when_blob_complete() {
+    let (core, handle, _dir) = setup_cached(16, EvictionPolicy::MaxBytes { bytes: 1 << 20 });
+    let content: Vec<u8> = (0..48u8).collect(); // 3 segments
+    handle.add_file_with_content(ItemId::Root, "part.bin", &content);
+    let node = core.lookup(ROOT_INO, "part.bin").await.unwrap();
+    let fh = core.open(node.ino).await.unwrap();
+
+    core.read(fh, 0, 16).await.unwrap();
+    assert!(
+        core.backing_for(fh).is_none(),
+        "one of three segments must not qualify"
+    );
+
+    core.read(fh, 16, 32).await.unwrap();
+    assert!(
+        core.backing_for(fh).is_some(),
+        "fully-read blob must hand out a backing"
+    );
+}
+
+// Should: refuse a backing while any segment fetch is in flight.
+#[tokio::test(flavor = "multi_thread")]
+async fn backing_refused_mid_fetch() {
+    let (core, handle, _dir) = setup_cached(64, EvictionPolicy::MaxBytes { bytes: 1 << 20 });
+    let content = vec![3u8; 64];
+    handle.add_file_with_content(ItemId::Root, "slow.bin", &content);
+    let node = core.lookup(ROOT_INO, "slow.bin").await.unwrap();
+    let fh = core.open(node.ino).await.unwrap();
+
+    handle.hold_fetches();
+    let reader = {
+        let core = core.clone();
+        tokio::spawn(async move { core.read(fh, 0, 64).await })
+    };
+    assert!(
+        wait_until(2000, || !read_blob_calls(&handle).is_empty()).await,
+        "fetch should have started"
+    );
+    assert!(
+        core.backing_for(fh).is_none(),
+        "in-flight fetch must block the backing"
+    );
+    handle.release_fetches();
+    reader.await.unwrap().unwrap();
+    assert!(core.backing_for(fh).is_some());
+}
+
+// Should: serve the blob's exact bytes through the cloned backing fd —
+// what the kernel will read is what the daemon would have served.
+#[tokio::test]
+async fn backing_fd_reads_exact_bytes() {
+    let (core, handle, _dir) = setup_cached(16, EvictionPolicy::MaxBytes { bytes: 1 << 20 });
+    let content: Vec<u8> = (0..=99u8).collect();
+    handle.add_file_with_content(ItemId::Root, "data.bin", &content);
+    let node = core.lookup(ROOT_INO, "data.bin").await.unwrap();
+    let fh = core.open(node.ino).await.unwrap();
+    core.read(fh, 0, 100).await.unwrap();
+
+    let backing = core.backing_for(fh).expect("complete blob");
+    let mut bytes = vec![0u8; 100];
+    use std::os::unix::fs::FileExt;
+    backing.file.read_exact_at(&mut bytes, 0).expect("pread");
+    assert_eq!(bytes, content);
+}
+
+// Impact: the kernel reads a backing file at offsets the daemon never
+// sees; a hole punched under it silently yields zeros. The pin is the
+// only thing standing between eviction and that corruption.
+// Should: keep every pinned segment on disk under eviction pressure.
+// Should: evict the blob again once the pin is dropped.
+#[tokio::test]
+async fn pin_blocks_eviction_until_dropped() {
+    // Cap = A(2 segs) + B(4 segs) exactly; C then forces eviction.
+    let (core, handle, _dir) = setup_cached(16, EvictionPolicy::MaxBytes { bytes: 96 });
+    let a: Vec<u8> = (0..32u8).collect();
+    let b = vec![9u8; 64];
+    let c = vec![5u8; 32];
+    handle.add_file_with_content(ItemId::Root, "a.bin", &a);
+    handle.add_file_with_content(ItemId::Root, "b.bin", &b);
+    handle.add_file_with_content(ItemId::Root, "c.bin", &c);
+
+    let a_node = core.lookup(ROOT_INO, "a.bin").await.unwrap();
+    let a_fh = core.open(a_node.ino).await.unwrap();
+    core.read(a_fh, 0, 32).await.unwrap();
+    let backing = core.backing_for(a_fh).expect("A complete");
+
+    let b_node = core.lookup(ROOT_INO, "b.bin").await.unwrap();
+    let b_fh = core.open(b_node.ino).await.unwrap();
+    core.read(b_fh, 0, 64).await.unwrap();
+
+    // A survived B's fill: re-reading A needs no refetch.
+    handle.clear_calls();
+    assert_eq!(core.read(a_fh, 0, 32).await.unwrap(), a);
+    assert!(
+        read_blob_calls(&handle).is_empty(),
+        "pinned A must still be fully cached"
+    );
+
+    // Pin dropped: C's pressure may now punch A. Re-warm B first so A
+    // is unambiguously the coldest (the earlier A re-read bumped it).
+    drop(backing);
+    core.read(b_fh, 0, 64).await.unwrap();
+    let c_node = core.lookup(ROOT_INO, "c.bin").await.unwrap();
+    let c_fh = core.open(c_node.ino).await.unwrap();
+    core.read(c_fh, 0, 32).await.unwrap();
+    assert!(
+        core.backing_for(a_fh).is_none(),
+        "unpinned A should have lost segments to C's fill"
+    );
+}
+
+// Impact: a regression here is not wrong bytes but a hung daemon —
+// ensure_room looping forever over unevictable blobs.
+// Should: complete fetches past the byte cap when every cached blob is
+// pinned, rather than livelocking in eviction.
+#[tokio::test]
+async fn all_pinned_cache_overflows_loudly_instead_of_livelocking() {
+    let (core, handle, _dir) = setup_cached(16, EvictionPolicy::MaxBytes { bytes: 16 });
+    let a = vec![1u8; 16];
+    let b = vec![2u8; 16];
+    handle.add_file_with_content(ItemId::Root, "a.bin", &a);
+    handle.add_file_with_content(ItemId::Root, "b.bin", &b);
+
+    let a_node = core.lookup(ROOT_INO, "a.bin").await.unwrap();
+    let a_fh = core.open(a_node.ino).await.unwrap();
+    core.read(a_fh, 0, 16).await.unwrap();
+    let _pin = core.backing_for(a_fh).expect("A complete");
+
+    let b_node = core.lookup(ROOT_INO, "b.bin").await.unwrap();
+    let b_fh = core.open(b_node.ino).await.unwrap();
+    assert_eq!(
+        core.read(b_fh, 0, 16).await.unwrap(),
+        b,
+        "fetch must proceed past the cap when nothing is evictable"
+    );
+}
+
+// Should not: offer a backing for a dirty handle (staged bytes must
+// stay daemon-served) or for an empty file (no blob to back).
+#[tokio::test]
+async fn backing_refused_for_dirty_and_empty_handles() {
+    let (core, handle, _dir) = setup_writable();
+    handle.add_file_with_content(ItemId::Root, "doc.txt", b"0123456789");
+    handle.add_file(ItemId::Root, "empty.txt", 0);
+
+    let doc = core.lookup(ROOT_INO, "doc.txt").await.unwrap();
+    let doc_fh = core.open_rw(doc.ino, false).await.unwrap();
+    core.read(doc_fh, 0, 10).await.unwrap(); // hydrate via copy-up path? no — clean until write
+    core.write(doc_fh, 0, b"XX").await.unwrap();
+    assert!(
+        core.backing_for(doc_fh).is_none(),
+        "dirty handle must never expose a backing"
+    );
+
+    let empty = core.lookup(ROOT_INO, "empty.txt").await.unwrap();
+    let empty_fh = core.open(empty.ino).await.unwrap();
+    assert!(core.backing_for(empty_fh).is_none());
+}
+
+// Should: count daemon-mediated reads (the passthrough proof signal).
+#[tokio::test]
+async fn read_calls_counter_tracks_daemon_reads() {
+    let (core, handle, _dir) = setup_cached(16, EvictionPolicy::MaxBytes { bytes: 1 << 20 });
+    handle.add_file_with_content(ItemId::Root, "n.bin", b"abcdef");
+    let node = core.lookup(ROOT_INO, "n.bin").await.unwrap();
+    let fh = core.open(node.ino).await.unwrap();
+
+    let before = core.read_calls();
+    core.read(fh, 0, 6).await.unwrap();
+    core.read(fh, 0, 6).await.unwrap();
+    assert_eq!(core.read_calls(), before + 2);
+}

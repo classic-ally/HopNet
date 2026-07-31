@@ -558,7 +558,9 @@ async fn fuse_mount_smoke_against_live_node() {
             .with_cache(cache)
             .with_staging(staging),
     );
-    let fs = HopFs::new(core.clone(), tokio::runtime::Handle::current());
+    // Passthrough allowed: unprivileged runs exercise the EPERM-disarm
+    // fallback implicitly; the privileged smoke proves the fast path.
+    let fs = HopFs::new(core.clone(), tokio::runtime::Handle::current(), true);
     let mountpoint = tempfile::tempdir().unwrap();
     let mut config = fuser::Config::default();
     config.mount_options = vec![fuser::MountOption::FSName("hopnet-test".to_string())];
@@ -866,4 +868,138 @@ async fn statfs_route_is_authed_and_shaped() {
         reqwest::StatusCode::UNAUTHORIZED,
         "statfs must sit behind device-token auth"
     );
+}
+
+// Impact: the only proof the S9 fast path is real — kernel-served reads
+// with the daemon silent. Everything below the kernel boundary is
+// covered by the unit layer; this is the boundary.
+// Should: serve identical bytes through a passthrough reopen with ZERO
+// daemon read calls (privileged runs).
+// Should: fall back to daemon-mediated reads with correct bytes when
+// unprivileged (EPERM disarm), rather than erroring.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires /dev/fuse and a built hopnet binary; passthrough proof additionally needs CAP_SYS_ADMIN (sudo -E)"]
+async fn passthrough_smoke_against_live_node() {
+    use hopnet_mount::attrs::DEFAULT_TTL;
+    use hopnet_mount::fuse::HopFs;
+    use hopnet_mount::vfs::MountCore;
+    use std::io::Read;
+    use std::sync::Arc;
+
+    let privileged = std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
+        .unwrap_or(false);
+
+    let node = boot_node().await;
+    let (api_key, jwt) = provision(&node).await;
+    let transport = Arc::new(HttpTransport::new(&node.base(), &api_key).unwrap());
+
+    // 12 MB across three 4 MB cache segments — multi-segment
+    // completeness without a 40 MB+ upload. (Cache segment size is a
+    // daemon-side choice, independent of the node's chunking.)
+    const SEGMENT: u64 = 4 * 1024 * 1024;
+    let content: Vec<u8> = (0..3 * SEGMENT).map(|i| (i % 251) as u8).collect();
+    let item = seed_file(&node, &jwt, &transport, "/Big", "movie.bin", &content).await;
+    assert!(matches!(item.kind, ItemKind::File { size } if size == content.len() as u64));
+
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache = Arc::new(
+        hopnet_mount::cache::CacheManager::new(
+            hopnet_mount::cache::CacheConfig {
+                root: cache_dir.path().join("content"),
+                segment_size: SEGMENT,
+                policy: hopnet_mount::cache::EvictionPolicy::MaxBytes { bytes: 1 << 30 },
+            },
+            transport.clone() as Arc<dyn NodeTransport>,
+        )
+        .unwrap(),
+    );
+    let staging = Arc::new(
+        hopnet_mount::staging::Staging::new(cache_dir.path().join("staging")).unwrap(),
+    );
+    let core = Arc::new(
+        MountCore::new(transport.clone(), DEFAULT_TTL)
+            .with_cache(cache)
+            .with_staging(staging),
+    );
+    let fs = HopFs::new(core.clone(), tokio::runtime::Handle::current(), true);
+    let mountpoint = tempfile::tempdir().unwrap();
+    let mut config = fuser::Config::default();
+    config.mount_options = vec![fuser::MountOption::FSName("hopnet-test".to_string())];
+    let session = fuser::spawn_mount(fs, mountpoint.path(), &config).unwrap();
+
+    let file_path = mountpoint.path().join("Big").join("movie.bin");
+
+    // Pass A — cold: daemon-mediated hydration (fills all segments).
+    let expected = content.clone();
+    let path = file_path.clone();
+    tokio::task::spawn_blocking(move || {
+        let bytes = std::fs::read(&path).expect("cold read");
+        assert_eq!(bytes, expected, "cold pass must serve exact bytes");
+    })
+    .await
+    .unwrap();
+    let daemon_reads_after_hydrate = core.read_calls();
+    assert!(daemon_reads_after_hydrate > 0, "cold pass is daemon-served");
+
+    // Pass B — reopen read-only: passthrough if privileged.
+    let expected = content.clone();
+    let path = file_path.clone();
+    let (bytes_ok, secs) = tokio::task::spawn_blocking(move || {
+        let start = std::time::Instant::now();
+        let mut file = std::fs::File::open(&path).expect("reopen");
+        let mut bytes = Vec::with_capacity(expected.len());
+        file.read_to_end(&mut bytes).expect("reread");
+        (bytes == expected, start.elapsed().as_secs_f64())
+    })
+    .await
+    .unwrap();
+    assert!(bytes_ok, "warm pass must serve exact bytes");
+    let mb = content.len() as f64 / (1024.0 * 1024.0);
+    eprintln!("PASS B (reopen, passthrough if privileged): {:.0} MB/s", mb / secs);
+
+    // Pass C — reopen read-write: never passthrough, daemon path on a
+    // warm cache. The fair baseline for the pass-B number.
+    let before_c = core.read_calls();
+    let expected = content.clone();
+    let path = file_path.clone();
+    let (bytes_ok, secs) = tokio::task::spawn_blocking(move || {
+        let start = std::time::Instant::now();
+        let mut file = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("rw reopen");
+        let mut bytes = Vec::with_capacity(expected.len());
+        file.read_to_end(&mut bytes).expect("rw read");
+        (bytes == expected, start.elapsed().as_secs_f64())
+    })
+    .await
+    .unwrap();
+    assert!(bytes_ok, "rw pass must serve exact bytes");
+    assert!(
+        core.read_calls() > before_c,
+        "rw open must stay daemon-mediated"
+    );
+    eprintln!("PASS C (daemon-mediated, warm cache): {:.0} MB/s", mb / secs);
+
+    if privileged {
+        // The proof: pass B never woke the daemon.
+        assert_eq!(
+            daemon_reads_after_hydrate,
+            before_c,
+            "privileged reopen must be kernel-served (zero daemon reads)"
+        );
+        eprintln!("PASSTHROUGH PROVEN: 0 daemon reads on the read-only reopen");
+    } else {
+        assert!(
+            before_c > daemon_reads_after_hydrate,
+            "unprivileged fallback should read via the daemon"
+        );
+        eprintln!("SKIP passthrough proof: not root (run with sudo -E for CAP_SYS_ADMIN)");
+    }
+
+    drop(session);
 }

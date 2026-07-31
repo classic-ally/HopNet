@@ -224,13 +224,31 @@ Per-blob sparse files in `$XDG_CACHE_HOME/hopnet/content/{blob_id}`.
     like /health since the drive crate cannot see resilience code, but
     device-token-authed). Daemon TTL-caches (15 s) and serves
     last-known on transport blips — `df` never errors
-- passthrough acceleration (optional, later phase):
-  - only when a file's content is provably complete, and only on a
-    subsequent open — passthrough is all-or-nothing per open
-  - raw-ioctl registration quarantined in one feature-gated module — the
-    crate's only `unsafe`; kernel probe + graceful fallback to
-    daemon-mediated reads
-  - v1 ships without it; added as a measured optimization
+- passthrough acceleration (S9, shipped):
+  - only when a file's content is provably complete (every cache
+    segment present, none in flight — a pure bitmap query, no
+    hydrate-on-open), only on read-only opens (write opens must stay
+    daemon-served for staging), and in practice on a subsequent open —
+    the cold first open hydrates as it reads
+  - via fuser 0.18's native safe API (`BackingId`,
+    `opened_passthrough`), which superseded the original plan of a
+    quarantined raw-ioctl unsafe module — the crate still has zero
+    `unsafe` and no feature gate; `--no-passthrough` is the escape
+    hatch
+  - probe ladder, never an error: FUSE_PASSTHROUGH negotiation at INIT
+    (fails on pre-6.9 kernels → disabled), then the first backing
+    registration EPERM (no CAP_SYS_ADMIN) disarms for the session
+  - lifetime: BackingId + whole-blob eviction pin live from open to
+    release; pinned blobs are skipped by eviction (the kernel reads
+    offsets the daemon never sees — a punched hole would fault in as
+    zeros), and become evictable the instant the pin drops
+  - privilege: the backing ioctl requires CAP_SYS_ADMIN; the NixOS
+    module's `allowPassthrough` (default off, root-equivalence
+    tradeoff documented) grants it via a security.wrappers file
+    capability
+  - measured (laptop, 12 MB file, warm cache): ~1460 MB/s passthrough
+    vs ~918 MB/s daemon-mediated, with zero daemon wakeups on the
+    passthrough path
 
 ## Writes & Consistency
 
@@ -389,7 +407,15 @@ implements that contract. Each slice is PR-sized and lands green.
       packaging: packages.hopnet-mount + homeManagerModules/
       nixosModules sharing one unit definition. Zero-touch node arm
       deferred to S10 (no same-session Linux node deployment exists)
-- [ ] S9 — passthrough quarantine module + measurement
+- [x] S9 — passthrough + measurement (2026-07-31): fuser 0.18 turned
+      out to ship a native safe passthrough API, so the planned unsafe
+      quarantine module evaporated — negotiation probe at INIT,
+      EPERM-disarm on unprivileged sessions, whole-blob eviction pins,
+      BackingId lifetime open→release. Proven by a privileged kernel
+      smoke: zero daemon reads on a read-only reopen, ~1460 vs
+      ~918 MB/s against the warm daemon path. NixOS module gained
+      `allowPassthrough` (security.wrappers CAP_SYS_ADMIN, default
+      off)
 - [ ] S10 — desktop badges, context menus, packaging
 
 Testing mirrors RFC-010: `HOPNET_EPHEMERAL_DB=1`, a test-mode route

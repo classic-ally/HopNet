@@ -121,6 +121,8 @@ pub struct MountCore {
     /// node-side number is a full-table scan. Also the last-known store
     /// — a transport blip must not turn `df` into an error.
     statfs: Mutex<StatfsState>,
+    /// Daemon-mediated read count (S9 signal: passthrough bypasses it).
+    reads: AtomicU64,
 }
 
 #[derive(Default)]
@@ -145,6 +147,7 @@ impl MountCore {
             upload_locks: Mutex::new(HashMap::new()),
             conflicts: AtomicU64::new(0),
             statfs: Mutex::new(StatfsState::default()),
+            reads: AtomicU64::new(0),
         }
     }
 
@@ -345,9 +348,31 @@ impl MountCore {
             .ok_or(CoreError::StaleHandle)
     }
 
+    /// Daemon-mediated reads served so far — the passthrough proof
+    /// signal (S9): with a backing fd registered, this must not move.
+    pub fn read_calls(&self) -> u64 {
+        self.reads.load(Ordering::Relaxed)
+    }
+
+    /// Passthrough eligibility (S9): the handle's snapshot blob, IF the
+    /// cache holds it complete right now. `None` for empty files (no
+    /// blob), dirty handles (staged bytes must stay daemon-served), or
+    /// any missing/in-flight segment. No hydration here — the RFC's
+    /// "subsequent open" semantics: a cold first open stays
+    /// daemon-mediated and completes the bitmap as it reads.
+    pub fn backing_for(&self, fh: u64) -> Option<crate::cache::Backing> {
+        let state = self.handle(fh).ok()?;
+        if state.dirty.load(Ordering::Acquire) {
+            return None;
+        }
+        let blob = state.blob.as_ref()?;
+        self.cache.as_ref()?.backing(blob)
+    }
+
     /// Read from an open handle. Dirty handles serve staged bytes
     /// (read-your-writes); otherwise the snapshot blob via the cache.
     pub async fn read(&self, fh: u64, offset: u64, len: u64) -> Result<Vec<u8>, CoreError> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
         let state = self.handle(fh)?;
         {
             let write = state.write.lock().await;
