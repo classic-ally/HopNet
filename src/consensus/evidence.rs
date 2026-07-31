@@ -41,7 +41,7 @@ pub struct PeerEvidence {
     pub last_probe_at: Option<Instant>,
     pub probes_since_contact: u32,
     pub bright_since: Option<Instant>,
-    pub last_known_height: Option<i64>,
+    pub last_known_height: Option<u64>,
 }
 
 /// Copy-out view — snapshots never alias the live map.
@@ -53,7 +53,7 @@ pub struct EvidenceMap {
     origin: Instant,
     /// Decided height when the evidence began (first scheduler pass wins);
     /// the proven-quorum ceiling's pre-boot arm.
-    boot_height: once_cell::sync::OnceCell<i64>,
+    boot_height: once_cell::sync::OnceCell<u64>,
     /// bright_since reset gap in millis: the band-independent upper bound
     /// t_unresponsive(Lazy). Initialized from the default policy; the
     /// probe scheduler refreshes it from the replicated policy each scan.
@@ -83,11 +83,11 @@ impl EvidenceMap {
     }
 
     /// Set once by the probe scheduler's first pass (idempotent).
-    pub fn set_boot_height(&self, h: i64) {
+    pub fn set_boot_height(&self, h: u64) {
         let _ = self.boot_height.set(h);
     }
 
-    pub fn boot_height(&self) -> Option<i64> {
+    pub fn boot_height(&self) -> Option<u64> {
         self.boot_height.get().copied()
     }
 
@@ -106,7 +106,7 @@ impl EvidenceMap {
 
     /// Contact that also proved a decided height (status-probe response,
     /// certificate signature at its height).
-    pub fn record_contact_with_height(&self, node_id: i32, height: i64) {
+    pub fn record_contact_with_height(&self, node_id: i32, height: u64) {
         self.record_at(node_id, Some(height), Instant::now());
     }
 
@@ -124,7 +124,7 @@ impl EvidenceMap {
         out
     }
 
-    pub(crate) fn record_at(&self, node_id: i32, height: Option<i64>, now: Instant) {
+    pub(crate) fn record_at(&self, node_id: i32, height: Option<u64>, now: Instant) {
         let reset_gap = Duration::from_millis(self.reset_gap_ms.load(Ordering::Relaxed));
         let mut map = self.inner.lock();
         let entry = map.entry(node_id).or_insert(PeerEvidence {
@@ -300,7 +300,7 @@ impl hopnet_comms::RpcHandler for StatusScope {
                 Ok((StatusRequest::Ping { decided_height }, _)) => {
                     app_state
                         .evidence
-                        .record_contact_with_height(peer.node_id, decided_height as i64);
+                        .record_contact_with_height(peer.node_id, decided_height);
                 }
                 Err(_) => app_state.evidence.record_contact(peer.node_id),
             }
@@ -377,7 +377,7 @@ pub fn spawn_probe_scheduler(app_state: crate::AppState) {
                 continue;
             };
             let decided = *engine.decided.borrow();
-            app_state.evidence.set_boot_height(decided as i64);
+            app_state.evidence.set_boot_height(decided);
 
             let (policy, profile, seated, seat_starts, pool) = {
                 let Ok(conn) = app_state.db_pool.get() else {
@@ -397,14 +397,14 @@ pub fn spawn_probe_scheduler(app_state: crate::AppState) {
                 .and_then(|b| String::from_utf8(b).ok())
                 .and_then(|s| QuorumProfile::parse(&s))
                 .unwrap_or(QuorumProfile::Auto);
-                let pending = i32::try_from(decided.saturating_add(1)).unwrap_or(i32::MAX);
+                let pending = decided.saturating_add(1);
                 let seated: Vec<i32> =
                     crate::db::consensus::get_validators_with_conn(&conn, pending)
                         .map(|v| v.into_iter().map(|n| n.node_id).collect())
                         .unwrap_or_default();
                 // Seat starts (proven pre-boot arm) + the candidate pool
                 // (registered minus seated, with each one's last departure).
-                let mut seat_starts: Vec<(i32, i32)> = Vec::with_capacity(seated.len());
+                let mut seat_starts: Vec<(i32, u64)> = Vec::with_capacity(seated.len());
                 for id in &seated {
                     if let Ok(Some(h)) =
                         hopnet_consensus::validators::activation_height(&conn, *id, pending)
@@ -481,7 +481,7 @@ pub fn spawn_probe_scheduler(app_state: crate::AppState) {
                 let g = policy.grace;
                 tokio::spawn(async move {
                     if let Ok(h) = status_probe(&comms, &peer, decided, g).await {
-                        evidence.record_contact_with_height(peer.node_id, h as i64);
+                        evidence.record_contact_with_height(peer.node_id, h);
                     }
                     // Failure: the silence is already recorded as the
                     // unanswered probe.
@@ -570,7 +570,7 @@ pub fn spawn_probe_scheduler(app_state: crate::AppState) {
                         my_id,
                         boot_height: app_state.evidence.boot_height(),
                         seat_starts: &seat_starts,
-                        pending_height: decided.saturating_add(1) as i64,
+                        pending_height: decided.saturating_add(1),
                     };
                     if let Some(batch) =
                         crate::consensus::membership_guards::plan_seating_batch(&inp, &pool)
@@ -643,7 +643,7 @@ pub fn evidence_inputs(
             .and_then(|b| String::from_utf8(b).ok())
             .and_then(|s| QuorumProfile::parse(&s))
             .unwrap_or(QuorumProfile::Auto);
-    let pending = i32::try_from(decided.saturating_add(1)).unwrap_or(i32::MAX);
+    let pending = decided.saturating_add(1);
     let seated: Vec<i32> = crate::db::consensus::get_validators_with_conn(conn, pending)
         .map(|v| v.into_iter().map(|n| n.node_id).collect())
         .unwrap_or_default();

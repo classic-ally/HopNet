@@ -33,7 +33,7 @@ pub(crate) async fn view_state(client: &Client, node: &NodeInfo, height: i64) ->
     let resp = client
         .post(&url)
         .header("Authorization", format!("Bearer {}", node.jwt_token))
-        .json(&(height as i32))
+        .json(&height)
         .timeout(Duration::from_secs(10))
         .send()
         .await?;

@@ -466,7 +466,7 @@ pub struct FileFragmentDistribution {
     pub inode_id: String,
     pub data_block_id: String,
     pub file_size: u64,
-    pub placement_height: Option<i64>,
+    pub placement_height: Option<u64>,
     pub fragment_count: u32,
     pub original_count: u32,
     pub recovery_count: u32,

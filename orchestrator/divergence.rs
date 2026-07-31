@@ -7,7 +7,7 @@ use std::collections::HashMap;
 #[derive(Debug)]
 pub struct TableCluster {
     pub nodes: Vec<u32>,
-    pub view: i32,
+    pub view: u64,
     pub hash: String,
     pub row_count: usize,
     pub excluded_columns: Vec<String>,
@@ -59,8 +59,8 @@ impl TableDivergenceReport {
 pub struct DivergenceReport {
     pub mesh_id: u32,
     pub total_nodes: usize,
-    pub view_range: (i32, i32),   // (min, max)
-    pub height_range: (i32, i32), // (min, max)
+    pub view_range: (u64, u64),   // (min, max)
+    pub height_range: (u64, u64), // (min, max)
     pub table_reports: Vec<TableDivergenceReport>,
 }
 
@@ -90,7 +90,7 @@ fn analyze_table(
     node_snapshots: &[(u32, StateSnapshot)],
 ) -> TableDivergenceReport {
     // Group nodes by (view, hash) for this table
-    let mut view_hash_to_nodes: HashMap<(i32, String), Vec<u32>> = HashMap::new();
+    let mut view_hash_to_nodes: HashMap<(u64, String), Vec<u32>> = HashMap::new();
     let mut hash_to_info: HashMap<String, &TableHashInfo> = HashMap::new();
 
     for (node_id, snapshot) in node_snapshots {
@@ -140,11 +140,11 @@ pub fn build_divergence_report(
     }
 
     // Calculate view and height ranges
-    let views: Vec<i32> = node_snapshots
+    let views: Vec<u64> = node_snapshots
         .iter()
         .map(|(_, s)| s.committed_view)
         .collect();
-    let heights: Vec<i32> = node_snapshots
+    let heights: Vec<u64> = node_snapshots
         .iter()
         .map(|(_, s)| s.consensus_height)
         .collect();

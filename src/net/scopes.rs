@@ -82,7 +82,7 @@ pub fn build_registry(app_state: &AppState) -> ScopeRegistry {
 // ============================================================================
 
 /// Largest decided-range chunk the fetch server returns per request.
-const DECIDED_FETCH_MAX: i64 = 100;
+const DECIDED_FETCH_MAX: u64 = 100;
 
 pub struct ConsensusScope {
     app_state: AppState,
@@ -154,8 +154,8 @@ impl ConsensusScope {
 
 async fn serve_decided_fetch(
     app_state: &AppState,
-    from_height: i64,
-    to_height: i64,
+    from_height: u64,
+    to_height: u64,
 ) -> ConsensusNetResponse {
     // Barrier tap for sync serving, test_mode only.
     if app_state.test_mode {
@@ -165,7 +165,7 @@ async fn serve_decided_fetch(
             .await;
     }
     let to = to_height.min(from_height.saturating_add(DECIDED_FETCH_MAX - 1));
-    if from_height < 0 || to < from_height {
+    if to < from_height {
         return ConsensusNetResponse::Error {
             message: "bad height range".into(),
         };
@@ -178,7 +178,7 @@ async fn serve_decided_fetch(
             };
         }
     };
-    match store::decided_range(&conn, Height::from_db(from_height), Height::from_db(to)) {
+    match store::decided_range(&conn, Height(from_height), Height(to)) {
         Ok(pairs) => {
             let mut items = Vec::with_capacity(pairs.len());
             for (block, cert) in &pairs {
@@ -268,17 +268,14 @@ async fn serve_tx_forward(
             // The forwarder targeting a height above ours proves peers
             // decided past us — kick a sync instead of waiting seconds
             // for timeout-driven republish to drag us forward.
-            if req.height > height as i64 {
+            if req.height > height {
                 crate::consensus::malachite::engine::kick_sync_if_behind(
                     &app_state,
-                    (req.height - 1) as u64,
+                    req.height - 1,
                     peer.node_id,
                 );
             }
-            let reject = encode_payload(&ForwardReply::NotProposer {
-                height: height as i64,
-                round,
-            });
+            let reject = encode_payload(&ForwardReply::NotProposer { height, round });
             if let Err(e) = out.send(reject).await {
                 tracing::debug!("txforward reject to node {} failed: {}", peer.node_id, e);
                 return;

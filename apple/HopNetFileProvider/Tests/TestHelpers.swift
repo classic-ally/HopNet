@@ -422,7 +422,7 @@ public struct TestHelpers {
     /// Determine the type of version data (consensus height vs timestamp)
     public static func getVersionType(from versionData: Data) -> VersionType {
         // Try to decode as Int32 (consensus height)
-        if versionData.count == MemoryLayout<Int32>.size {
+        if versionData.count == MemoryLayout<UInt64>.size {
             let height = versionData.withUnsafeBytes { $0.load(as: Int32.self) }
             return .consensusHeight(height)
         }

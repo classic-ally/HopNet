@@ -371,7 +371,7 @@ impl TestScenario for RestartPersistence {
             &docker,
             mesh_id,
             nodes[1].node_id,
-            crate::sys::ContainerRuntime::Docker,
+            crate::sys::detect_runtime(&docker).await?,
         )
         .await
         {

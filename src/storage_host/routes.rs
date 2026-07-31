@@ -36,7 +36,7 @@ pub struct CleanupQueryParams {
 #[derive(Deserialize)]
 pub struct RebalanceQueryParams {
     max_data_blocks: i32,
-    min_age_heights: i32,
+    min_age_heights: u64,
 }
 
 #[derive(Serialize)]
@@ -102,7 +102,7 @@ pub async fn get_storage_view(State(app_state): State<AppState>) -> impl IntoRes
         Ok(Ok(view)) => {
             #[derive(Serialize)]
             struct StorageViewResponse {
-                height: i32,
+                height: u64,
                 watermark: usize,
                 members: Vec<i32>,
                 tiers: std::collections::HashMap<i32, i64>,
@@ -234,17 +234,6 @@ pub async fn post_rebalance_network(
             Json(serde_json::json!({
                 "status": "error",
                 "error": "max_data_blocks must be positive"
-            })),
-        )
-            .into_response();
-    }
-
-    if params.min_age_heights < 0 {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "status": "error",
-                "error": "min_age_heights cannot be negative"
             })),
         )
             .into_response();

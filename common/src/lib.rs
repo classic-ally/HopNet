@@ -5,6 +5,7 @@ pub mod devices;
 pub mod documentprovider;
 pub mod fileprovider;
 pub mod hash;
+pub mod height;
 pub mod quorum;
 pub mod setup;
 pub mod shares;

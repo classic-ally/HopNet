@@ -25,7 +25,7 @@ struct MetricEntry {
     rtt_variance: Option<f64>,
     rtt_jitter: Option<f64>,
     throughput: Option<i64>,
-    height: i32,
+    height: u64,
     available: bool,
     storage_total_gb: Option<u32>,
     storage_used_gb: Option<u32>,
@@ -244,7 +244,7 @@ impl TestScenario for MetricsCollection {
 
         // 9-10. Query GET /metrics on all nodes and verify consistency
         let mut all_counts: Vec<usize> = Vec::new();
-        let mut all_heights: Vec<Vec<i32>> = Vec::new();
+        let mut all_heights: Vec<Vec<u64>> = Vec::new();
         let mut fetch_ok = true;
 
         for node in nodes {
@@ -259,7 +259,7 @@ impl TestScenario for MetricsCollection {
                 Ok(resp) if resp.status().is_success() => {
                     match resp.json::<Vec<MetricEntry>>().await {
                         Ok(metrics) => {
-                            let heights: Vec<i32> = metrics.iter().map(|m| m.height).collect();
+                            let heights: Vec<u64> = metrics.iter().map(|m| m.height).collect();
                             all_counts.push(metrics.len());
                             all_heights.push(heights);
                         }

@@ -48,8 +48,8 @@ const CONSENSUS_TABLES: &[&str] = &[
 /// Internal state snapshot with rich types (Blake3Hash)
 #[derive(Debug)]
 pub struct StateSnapshot {
-    pub consensus_height: i32,
-    pub committed_view: i32,
+    pub consensus_height: u64,
+    pub committed_view: u64,
     pub table_hashes: HashMap<String, TableHashInfo>,
 }
 
@@ -280,7 +280,7 @@ pub struct FileFragmentDistribution {
     pub inode_id: CustomUUID,
     pub data_block_id: CustomUUID,
     pub file_size: u64,
-    pub placement_height: Option<i64>,
+    pub placement_height: Option<u64>,
     pub fragment_count: u32,
     pub original_count: u32,
     pub recovery_count: u32,
@@ -446,7 +446,7 @@ pub fn get_file_fragment_distribution(
     match db_connection {
         Ok(db_lock) => {
             // First, get the file's inode_id, data_block_id, and basic metadata
-            let file_metadata: Option<(CustomUUID, CustomUUID, u64, Option<i32>, i32)> = db_lock
+            let file_metadata: Option<(CustomUUID, CustomUUID, u64, Option<u64>, i32)> = db_lock
                 .query_row(
                     "SELECT i.id, db.id, db.file_size, db.placement_height, db.fragment_count
                  FROM inodes i
@@ -458,7 +458,7 @@ pub fn get_file_fragment_distribution(
                             row.get(0)?,                  // inode_id
                             row.get(1)?,                  // data_block_id
                             row.get::<_, i64>(2)? as u64, // file_size
-                            row.get(3)?,                  // placement_height
+                            row.get::<_, Option<i64>>(3)?.map(hopnet_common::height::height_from_db), // placement_height
                             row.get(4)?,                  // fragment_count
                         ))
                     },
@@ -536,7 +536,7 @@ pub fn get_file_fragment_distribution(
                 inode_id,
                 data_block_id,
                 file_size,
-                placement_height: placement_height.map(|h| h as i64),
+                placement_height,
                 fragment_count: fragment_count as u32,
                 original_count,
                 recovery_count,

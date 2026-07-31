@@ -532,7 +532,7 @@ async fn wait_for_formation(
         if let Ok(resp) = client
             .post(&url)
             .header("Authorization", format!("Bearer {}", token))
-            .json(&i32::MAX) // any height >= tip resolves to the latest set
+            .json(&u64::MAX) // any height >= tip resolves to the latest set
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await

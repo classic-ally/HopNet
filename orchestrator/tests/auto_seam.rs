@@ -130,7 +130,7 @@ impl TestScenario for AutoSeam {
         );
 
         // 3. Add the 7th container.
-        crate::add_nodes_to_mesh(&docker, mesh_id, 1, crate::sys::ContainerRuntime::Docker).await?;
+        crate::add_nodes_to_mesh(&docker, mesh_id, 1, crate::sys::detect_runtime(&docker).await?).await?;
         let all7 = rebuild_nodes(&docker, mesh_id).await?;
 
         // 4. Crossing observer: poll the live quorum @1s until v=7,quorum=5.

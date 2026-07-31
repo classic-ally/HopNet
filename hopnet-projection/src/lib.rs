@@ -393,8 +393,8 @@ pub trait Projection: Send + Sync {
 /// read-your-writes and the sync context. Pre-genesis (missing row) reads
 /// as 0; errors map to `RecallError` — the previous copies' semantics, with
 /// hopnet-consensus's SQL as the single source of truth.
-pub fn current_height(conn: &rusqlite::Connection) -> Result<i32, DatabaseError> {
+pub fn current_height(conn: &rusqlite::Connection) -> Result<u64, DatabaseError> {
     hopnet_consensus::store::last_decided_height(conn)
-        .map(|h| h.map_or(0, |h| h.as_db() as i32))
+        .map(|h| h.map_or(0, |h| h.0))
         .map_err(|_| DatabaseError::RecallError)
 }

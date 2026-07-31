@@ -228,7 +228,7 @@ public class HopNetApiClient {
     
     // MARK: - Changes
     
-    public func getChanges(parentPath: String? = nil, sinceHeight: Int32? = nil) async throws -> ChangesResponse {
+    public func getChanges(parentPath: String? = nil, sinceHeight: UInt64? = nil) async throws -> ChangesResponse {
         let urlString = "\(config.baseUrl)/api/integrations/fileprovider/changes"
         
         guard var urlComponents = URLComponents(string: urlString) else {

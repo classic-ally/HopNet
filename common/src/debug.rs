@@ -4,8 +4,8 @@ use std::collections::HashMap;
 /// Snapshot of consensus-tracked database state for divergence detection
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateSnapshot {
-    pub consensus_height: i32,
-    pub committed_view: i32,
+    pub consensus_height: u64,
+    pub committed_view: u64,
     pub table_hashes: HashMap<String, TableHashInfo>,
 }
 

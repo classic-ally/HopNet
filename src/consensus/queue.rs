@@ -642,7 +642,7 @@ async fn handle_as_forwarder(
         &app_state.comms,
         &proposer_ref,
         transactions,
-        height as i64,
+        height,
         &mut decided_rx,
     )
     .await;
@@ -718,10 +718,10 @@ async fn handle_as_forwarder(
             // raced its own activation block) retargets the same stale height
             // every 250ms until malachite's slow internal sync timer fires
             // (~minutes), stranding the forwarded batch.
-            if their_height > height as i64 {
+            if their_height > height {
                 crate::consensus::malachite::engine::kick_sync_if_behind(
                     app_state,
-                    their_height as u64,
+                    their_height,
                     proposer,
                 );
             }

@@ -26,7 +26,7 @@ pub const B_MAX: usize = 5;
 
 /// The activation catch-up gate (spec Constants), unchanged value —
 /// now checked evidence-side (last_known_height vs the pending height).
-pub const CATCH_UP_TOLERANCE: i64 = 10;
+pub const CATCH_UP_TOLERANCE: u64 = 10;
 
 // --- Policy keys (hopnet_consensus_policy rows; setup docs reference) ---
 pub const KEY_PROBE_BASE: &str = "probe_base";

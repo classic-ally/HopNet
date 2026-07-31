@@ -393,7 +393,7 @@ impl<C: DerefMut<Target = Connection> + 'static> Storage for SqliteStorage<C> {
         block: &Block,
         cert: &WireCommitCertificate,
     ) -> Result<(), StoreError> {
-        let height = i64::try_from(block.data.height).expect("height exceeds i64");
+        let height = hopnet_common::height::height_to_db(block.data.height);
         let block_bytes = codec::encode(block).map_err(StoreError::Codec)?;
         let cert_bytes = codec::encode(cert).map_err(StoreError::Codec)?;
         tx.prepare_cached(

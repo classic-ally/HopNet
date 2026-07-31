@@ -445,7 +445,7 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
                 None,                                  // old_parent_id (new file)
                 None,                                  // old_path
                 Some(&format!("/root/file{}.txt", i)), // new_path
-                i as i32 + 1,                          // modification_height
+                i as u64 + 1,                          // modification_height
             )
             .expect("Failed to log modification");
         }

@@ -23,7 +23,7 @@ pub struct TierMembership;
 
 #[derive(Debug, Deserialize, PartialEq, Clone)]
 struct StorageViewResponse {
-    height: i32,
+    height: u64,
     watermark: usize,
     members: Vec<i32>,
     tiers: HashMap<i32, i64>,

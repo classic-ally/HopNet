@@ -13,7 +13,7 @@ use serde::Deserialize;
 
 #[derive(Deserialize)]
 pub struct PlacementScoresQuery {
-    pub height: i32,
+    pub height: u64,
     pub fragment_type: Option<String>, // "original" or "recovery"
 }
 

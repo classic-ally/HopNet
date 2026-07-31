@@ -550,7 +550,7 @@ async fn distribute_blob_fragments<T, S, X, L>(
     seams: &Seams<T, S, X, L>,
     config: &EngineConfig,
     blob: &DistributableBlob,
-) -> Result<i32, EngineError>
+) -> Result<u64, EngineError>
 where
     T: Transport + 'static,
     S: StateReader,
@@ -953,7 +953,7 @@ mod tests {
                 metrics: vec![],
             })
         }
-        fn placement_inputs_at(&self, height: i32) -> Result<PlacementInputs, StorageError> {
+        fn placement_inputs_at(&self, height: u64) -> Result<PlacementInputs, StorageError> {
             // Historical placement: the remote peer (node 2) only.
             Ok(PlacementInputs {
                 height,

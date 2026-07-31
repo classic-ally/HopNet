@@ -107,11 +107,7 @@ pub fn proposal_target(app_state: &AppState) -> Option<(u64, u32, i32)> {
     }
     let pending = decided + 1;
     let conn = app_state.db_pool.get().ok()?;
-    let validators = crate::db::consensus::get_validators_with_conn(
-        &conn,
-        i32::try_from(pending).unwrap_or(i32::MAX),
-    )
-    .ok()?;
+    let validators = crate::db::consensus::get_validators_with_conn(&conn, pending).ok()?;
     if validators.is_empty() {
         return None;
     }
@@ -367,12 +363,8 @@ fn spawn_tip_poll(app_state: AppState) {
                 // Fail closed: on a query error assume seated and skip —
                 // gossip is then feeding us anyway or the node is broken
                 // in ways a poll won't fix.
-                hopnet_consensus::validators::is_node_active(
-                    &conn,
-                    node_id,
-                    i32::try_from(pending).unwrap_or(i32::MAX),
-                )
-                .unwrap_or(true)
+                hopnet_consensus::validators::is_node_active(&conn, node_id, pending)
+                    .unwrap_or(true)
             };
             if am_active {
                 continue;

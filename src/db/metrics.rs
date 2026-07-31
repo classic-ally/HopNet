@@ -33,7 +33,7 @@ pub fn get_metric(
                     rtt_variance: row.get(4)?,
                     rtt_jitter: row.get(5)?,
                     throughput: row.get(6)?,
-                    height: row.get(7)?,           // New: consensus height
+                    height: row.get::<_, i64>(7).map(hopnet_common::height::height_from_db)?, // New: consensus height
                     available: row.get(8)?,        // New: node availability
                     storage_total_gb: row.get(9)?, // New: storage capacity
                     storage_used_gb: row.get(10)?, // New: storage utilization
@@ -77,7 +77,7 @@ pub fn insert_metric(
                     metric.rtt_variance,
                     metric.rtt_jitter,
                     metric.throughput,
-                    metric.height,
+                    hopnet_common::height::height_to_db(metric.height),
                     metric.available,
                     metric.storage_total_gb,
                     metric.storage_used_gb,
@@ -116,7 +116,7 @@ pub fn insert_metrics_batch(
                 metric.rtt_variance,
                 metric.rtt_jitter,
                 metric.throughput,
-                metric.height,
+                hopnet_common::height::height_to_db(metric.height),
                 metric.available,
                 metric.storage_total_gb,
                 metric.storage_used_gb,
@@ -191,7 +191,7 @@ pub struct NodeMetrics {
 /// Includes all registered nodes (validators + storage-only nodes) for fragment placement
 pub fn get_all_node_metrics(
     db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
-    consensus_height: i32,
+    consensus_height: u64,
 ) -> Result<Vec<NodeMetrics>, DatabaseError> {
     match db_connection {
         Ok(db_lock) => get_all_node_metrics_with_conn(&db_lock, consensus_height),
@@ -203,7 +203,7 @@ pub fn get_all_node_metrics(
 /// transaction, via deref) can read metrics without a second pool hit.
 pub fn get_all_node_metrics_with_conn(
     db_lock: &rusqlite::Connection,
-    consensus_height: i32,
+    consensus_height: u64,
 ) -> Result<Vec<NodeMetrics>, DatabaseError> {
     {
         {
@@ -328,7 +328,8 @@ pub fn get_all_node_metrics_with_conn(
                 ORDER BY n.node_id";
 
             // Only consensus height parameter needed now
-            let params = [&consensus_height as &dyn rusqlite::ToSql];
+            let height_db = hopnet_common::height::height_to_db(consensus_height);
+            let params = [&height_db as &dyn rusqlite::ToSql];
 
             let mut stmt = db_lock.prepare(query).map_err(|e| {
                 tracing::error!("Failed to prepare metrics query: {:?}", e);
@@ -398,7 +399,7 @@ pub struct AvailabilityGrid {
 /// is bounded by the window but the table grows unbounded (deferred).
 pub fn get_availability_history_with_conn(
     conn: &rusqlite::Connection,
-    height: i32,
+    height: u64,
     lookback_buckets: i64,
     step_secs: i64,
 ) -> Result<AvailabilityGrid, DatabaseError> {
@@ -406,7 +407,7 @@ pub fn get_availability_history_with_conn(
         .query_row(
             "SELECT CAST(strftime('%s', MAX(start_time)) AS INTEGER)
              FROM metrics WHERE height <= ?1",
-            rusqlite::params![height],
+            rusqlite::params![hopnet_common::height::height_to_db(height)],
             |row| row.get(0),
         )
         .map_err(|e| {
@@ -443,7 +444,7 @@ pub fn get_availability_history_with_conn(
         })?;
     let sparse: Vec<(i32, i64, bool)> = stmt
         .query_map(
-            rusqlite::params![height, step_secs, window_start],
+            rusqlite::params![hopnet_common::height::height_to_db(height), step_secs, window_start],
             |row| {
                 Ok((
                     row.get::<_, i32>(0)?,

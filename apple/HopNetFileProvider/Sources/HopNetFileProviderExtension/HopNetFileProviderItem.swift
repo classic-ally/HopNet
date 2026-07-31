@@ -75,7 +75,7 @@ public class HopNetFileProviderItem: NSObject, NSFileProviderItem {
         if let modHeight = apiItem.modification_height {
             // Convert the consensus height to Data safely
             var height = modHeight
-            versionData = Data(bytes: &height, count: MemoryLayout<Int32>.size)
+            versionData = Data(bytes: &height, count: MemoryLayout<UInt64>.size)
         } else {
             // Generate timestamp-based version when modification height unavailable
             let timestamp = Date().timeIntervalSince1970

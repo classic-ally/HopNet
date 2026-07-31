@@ -5,8 +5,10 @@
 //!
 //! All functions take `&rusqlite::Connection`; both `r2d2::PooledConnection`
 //! and `rusqlite::Transaction` deref-coerce to it (the `store::meta_get`
-//! pattern). Heights are `i32` to match the host's height plumbing.
+//! pattern). Heights are `u64`, mapped to SQLite INTEGER via the lossless
+//! bit cast in `hopnet_common::height`.
 
+use hopnet_common::height::{height_from_db, height_to_db};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::store::StoreError;
@@ -73,7 +75,7 @@ const LATEST_ACTIVE_CTE: &str = "
 /// wins), joined to the host's `nodes` table for keys and identity.
 pub fn get_validators(
     conn: &Connection,
-    height: i32,
+    height: u64,
 ) -> Result<Vec<ValidatorEntry>, StoreError> {
     let sql = format!(
         "{LATEST_ACTIVE_CTE}
@@ -82,7 +84,7 @@ pub fn get_validators(
         JOIN nodes n ON av.node_id = n.node_id"
     );
     let mut stmt = conn.prepare_cached(&sql)?;
-    let rows = stmt.query_map([height], |row| {
+    let rows = stmt.query_map([height_to_db(height)], |row| {
         Ok(ValidatorEntry {
             node_id: row.get(0)?,
             name: row.get(1)?,
@@ -99,23 +101,23 @@ pub fn get_validators(
 
 /// |active validator set| at `height`. Deliberately no `nodes` JOIN —
 /// guard math must not depend on the interface table.
-pub fn count_active_validators(conn: &Connection, height: i32) -> Result<u64, StoreError> {
+pub fn count_active_validators(conn: &Connection, height: u64) -> Result<u64, StoreError> {
     let sql = format!("{LATEST_ACTIVE_CTE} SELECT COUNT(*) FROM active_validators");
     let mut stmt = conn.prepare_cached(&sql)?;
-    let count: i64 = stmt.query_row([height], |row| row.get(0))?;
+    let count: i64 = stmt.query_row([height_to_db(height)], |row| row.get(0))?;
     Ok(count as u64)
 }
 
 /// Whether `node_id` is active at `height` (most recent row at or before
 /// the height; absent = never activated = inactive).
-pub fn is_node_active(conn: &Connection, node_id: i32, height: i32) -> Result<bool, StoreError> {
+pub fn is_node_active(conn: &Connection, node_id: i32, height: u64) -> Result<bool, StoreError> {
     let is_active: Option<bool> = conn
         .query_row(
             "SELECT is_active FROM validators
              WHERE node_id = ? AND effective_height <= ?
              ORDER BY effective_height DESC
              LIMIT 1",
-            params![node_id, height],
+            params![node_id, height_to_db(height)],
             |row| row.get(0),
         )
         .optional()?;
@@ -129,19 +131,18 @@ pub fn is_node_active(conn: &Connection, node_id: i32, height: i32) -> Result<bo
 pub fn activate_validator(
     conn: &Connection,
     node_id: i32,
-    effective_height: i32,
+    effective_height: u64,
 ) -> Result<(), StoreError> {
-    let current_height = crate::store::last_decided_height(conn)?
-        .map_or(0i32, |h| i32::try_from(h.as_db()).unwrap_or(i32::MAX));
+    let current_height = crate::store::last_decided_height(conn)?.map_or(0u64, |h| h.0);
 
-    let existing_future_activation: Option<i32> = conn
+    let existing_future_activation: Option<u64> = conn
         .query_row(
             "SELECT effective_height FROM validators
              WHERE node_id = ? AND effective_height > ? AND is_active = true
              ORDER BY effective_height ASC
              LIMIT 1",
-            params![node_id, current_height],
-            |row| row.get(0),
+            params![node_id, height_to_db(current_height)],
+            |row| row.get(0).map(height_from_db),
         )
         .optional()?;
 
@@ -149,7 +150,7 @@ pub fn activate_validator(
         conn.execute(
             "UPDATE validators SET effective_height = ?
              WHERE node_id = ? AND effective_height = ?",
-            params![effective_height, node_id, old_height],
+            params![height_to_db(effective_height), node_id, height_to_db(old_height)],
         )?;
         tracing::info!(
             "Updated activation for node {node_id} from height {old_height} to height {effective_height}"
@@ -157,7 +158,7 @@ pub fn activate_validator(
     } else {
         conn.execute(
             "INSERT INTO validators (effective_height, node_id, is_active) VALUES (?, ?, true)",
-            params![effective_height, node_id],
+            params![height_to_db(effective_height), node_id],
         )?;
         tracing::info!("Scheduled activation for node {node_id} at height {effective_height}");
     }
@@ -173,13 +174,13 @@ pub fn activate_validator(
 pub fn deactivate_validator(
     conn: &Connection,
     node_id: i32,
-    effective_height: i32,
+    effective_height: u64,
     kind: DepartureKind,
 ) -> Result<(), StoreError> {
     conn.execute(
         "INSERT INTO validators (effective_height, node_id, is_active, departure_kind)
          VALUES (?, ?, false, ?)",
-        params![effective_height, node_id, kind.as_str()],
+        params![height_to_db(effective_height), node_id, kind.as_str()],
     )?;
     tracing::info!(
         "Deactivated validator {node_id} at height {effective_height} ({})",
@@ -194,16 +195,16 @@ pub fn deactivate_validator(
 pub fn activation_height(
     conn: &Connection,
     node_id: i32,
-    height: i32,
-) -> Result<Option<i32>, StoreError> {
-    let h: Option<i32> = conn
+    height: u64,
+) -> Result<Option<u64>, StoreError> {
+    let h: Option<u64> = conn
         .query_row(
             "SELECT effective_height FROM validators
              WHERE node_id = ? AND effective_height <= ? AND is_active = true
              ORDER BY effective_height DESC
              LIMIT 1",
-            params![node_id, height],
-            |row| row.get(0),
+            params![node_id, height_to_db(height)],
+            |row| row.get(0).map(height_from_db),
         )
         .optional()?;
     Ok(h)
@@ -215,7 +216,7 @@ pub fn activation_height(
 pub fn last_departure(
     conn: &Connection,
     node_id: i32,
-    height: i32,
+    height: u64,
 ) -> Result<Option<DepartureKind>, StoreError> {
     let kind: Option<String> = conn
         .query_row(
@@ -223,7 +224,7 @@ pub fn last_departure(
              WHERE node_id = ? AND effective_height <= ? AND is_active = false
              ORDER BY effective_height DESC
              LIMIT 1",
-            params![node_id, height],
+            params![node_id, height_to_db(height)],
             |row| row.get(0),
         )
         .optional()?;
@@ -313,11 +314,11 @@ mod tests {
     #[test]
     fn check_constraint_rejections() {
         let conn = test_conn();
-        let insert = |h: i32, active: i32, kind: Option<&str>| {
+        let insert = |h: u64, active: i32, kind: Option<&str>| {
             conn.execute(
                 "INSERT INTO validators (effective_height, node_id, is_active, departure_kind)
                  VALUES (?, 1, ?, ?)",
-                params![h, active, kind],
+                params![height_to_db(h), active, kind],
             )
         };
         assert!(insert(10, 1, Some("voluntary")).is_err());

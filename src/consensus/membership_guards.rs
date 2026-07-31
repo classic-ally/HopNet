@@ -31,11 +31,11 @@ pub struct GuardInputs<'a> {
     pub my_id: i32,
     /// Decided height when my evidence began (proven pre-boot arm);
     /// None before the first scheduler pass.
-    pub boot_height: Option<i64>,
+    pub boot_height: Option<u64>,
     /// (node_id, activation effective_height) for every seated member.
-    pub seat_starts: &'a [(i32, i32)],
+    pub seat_starts: &'a [(i32, u64)],
     /// committed + 1 — the catch-up anchor.
-    pub pending_height: i64,
+    pub pending_height: u64,
 }
 
 fn lookup<'a>(snap: &'a [(i32, PeerEvidenceView)], id: i32) -> Option<&'a PeerEvidenceView> {
@@ -131,7 +131,7 @@ pub fn proven_live(inp: &GuardInputs<'_>, current_band: hopnet_consensus::member
                 inp.boot_height,
                 inp.seat_starts.iter().find(|(n, _)| n == *id),
             ) {
-                (Some(boot), Some((_, start))) => i64::from(*start) <= boot,
+                (Some(boot), Some((_, start))) => *start <= boot,
                 _ => false,
             };
             if pre_boot {
@@ -322,7 +322,7 @@ pub fn subjective_membership_check(
         .into_iter()
         .map(|v| v.node_id)
         .collect();
-    let mut seat_starts: Vec<(i32, i32)> = Vec::with_capacity(seated.len());
+    let mut seat_starts: Vec<(i32, u64)> = Vec::with_capacity(seated.len());
     for id in &seated {
         if let Ok(Some(h)) = hopnet_consensus::validators::activation_height(db_tx, *id, pending)
         {
@@ -340,7 +340,7 @@ pub fn subjective_membership_check(
         my_id,
         boot_height: app_state.evidence.boot_height(),
         seat_starts: &seat_starts,
-        pending_height: i64::from(pending),
+        pending_height: pending,
     };
     let cfg = bincode::config::standard();
     match function {

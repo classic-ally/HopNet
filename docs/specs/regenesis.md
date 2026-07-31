@@ -488,7 +488,7 @@ Each PR-sized, landing green; detail deferred to each slice's own
 planning — these fix ORDER, not content. The model precedes the
 protocol it checks.
 
-- [ ] S0 — app-layer height widening to u64
+- [x] S0 — app-layer height widening to u64
   - lossless u64 ⇄ i64 mapping at every SQLite boundary, full-range
     tests; consensus-affecting, so ships while meshes are disposable
 - [ ] S1 — canonical snapshot serializer (pure function, no protocol)

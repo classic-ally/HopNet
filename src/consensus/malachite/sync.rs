@@ -22,7 +22,7 @@ use hopnet_consensus::types::Block;
 use super::gossip::{ConsensusNetRequest, ConsensusNetResponse};
 
 /// Heights fetched per request (server caps at 100).
-const CHUNK: i64 = 50;
+const CHUNK: u64 = 50;
 /// Stream-level timeout per fetch.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long we wait for the shell to apply a fed chunk before suspecting a
@@ -115,9 +115,9 @@ async fn sync_loop(
         let peer = peers[cursor % peers.len()];
         cursor += 1;
 
-        let from = (*decided.borrow() as i64) + 1;
+        let from = *decided.borrow() + 1;
         let to = match target {
-            Some(t) => (from + CHUNK - 1).min(t as i64),
+            Some(t) => (from + CHUNK - 1).min(t),
             None => from + CHUNK - 1,
         };
         match fetch_chunk(comms, &peer, from, to).await {
@@ -128,7 +128,7 @@ async fn sync_loop(
                     ev.record_contact(peer.node_id);
                 }
                 let mut last_fed = *decided.borrow();
-                let mut expected = from as u64;
+                let mut expected = from;
                 for (block, cert) in pairs {
                     // Structural checks; certificate verification is the
                     // engine's job.
@@ -260,8 +260,8 @@ pub(crate) fn peer_list(
 async fn fetch_chunk(
     comms: &IrohComms,
     peer: &PeerRef,
-    from: i64,
-    to: i64,
+    from: u64,
+    to: u64,
 ) -> Result<Vec<(Block, WireCommitCertificate)>, String> {
     let payload = crate::net::encode_payload(&ConsensusNetRequest::DecidedFetch {
         from_height: from,

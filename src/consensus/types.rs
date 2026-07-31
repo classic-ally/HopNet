@@ -25,57 +25,6 @@ pub enum BlockError {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct Block {
-    // hash of this block: db key
-    pub block_hash: Blake3Hash,
-
-    // computed based on these: db value
-    pub data: BlockData,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct BlockData {
-    pub height: i32,
-    pub view_number: i32,
-    pub parent_hash: Option<Blake3Hash>,
-    pub transactions: Option<Transactions>,
-}
-
-impl BlockData {
-    pub fn encode(&self) -> Result<Vec<u8>, BlockError> {
-        encode_to_vec(self, config::standard()).map_err(|_| BlockError::EncodingError)
-    }
-
-    pub fn compute_hash(&self) -> Result<Blake3Hash, BlockError> {
-        let mut hasher = Hasher::new();
-        let encoded_data = &self.encode()?;
-        hasher.update(encoded_data.as_slice());
-        let digest = Blake3Hash::new(hasher.finalize());
-        Ok(digest)
-    }
-}
-
-impl Block {
-    pub fn new(data: BlockData) -> Result<Block, BlockError> {
-        // compute hash over blockdata
-        let digest = data.compute_hash()?;
-
-        Ok(Block {
-            block_hash: digest,
-            data,
-        })
-    }
-
-    pub fn verify(&self) -> Result<(), BlockError> {
-        // compute hash and compare to self
-        let digest = self.data.compute_hash()?;
-        if digest != self.block_hash {
-            return Err(BlockError::EncodingError);
-        }
-        Ok(())
-    }
-}
-#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RpcCall {
     pub function: String,
     pub payload: Vec<u8>,

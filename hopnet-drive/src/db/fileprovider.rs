@@ -6,6 +6,7 @@
 use crate::model::CustomDateTime;
 use crate::paths::decrypt_path;
 use aes_siv::{Key, Nonce, siv::Aes256Siv};
+use hopnet_common::height::{height_from_db, height_to_db};
 use hopnet_common::{CustomUUID, InodeType};
 use hopnet_projection::DatabaseError;
 use r2d2_sqlite::SqliteConnectionManager;
@@ -22,14 +23,14 @@ pub struct FileProviderItemData {
     pub file_size: Option<u64>,                            // File size in bytes (None for folders)
     pub creation_date: Option<CustomDateTime>, // Timestamp extracted from UUIDv7 or folder creation
     pub content_modification_date: Option<CustomDateTime>, // Timestamp from modified_at column
-    pub modification_height: Option<i32>,      // Consensus height when item was last modified
+    pub modification_height: Option<u64>,      // Consensus height when item was last modified
 }
 
 /// FileProvider enumeration result with consensus height for sync anchoring
 #[derive(Debug)]
 pub struct FileProviderEnumerateResult {
     pub items: Vec<FileProviderItemData>,
-    pub current_consensus_height: i32,
+    pub current_consensus_height: u64,
     pub deleted_identifiers: Option<Vec<String>>, // Optional list of deleted item identifiers
 }
 
@@ -116,7 +117,7 @@ pub fn get_folder_contents(
                         let file_size = row.get::<_, Option<i64>>(4)?.map(|v| v as u64); // File size from data_blocks (NULL for folders)
                         let creation_date: Option<CustomDateTime> = row.get(5)?; // UUIDv7 timestamp or NULL for folders
                         let content_modification_date: Option<CustomDateTime> = row.get(6)?; // modified_at from data_blocks
-                        let modification_height: Option<i32> = row.get(7)?; // Consensus height when item was last modified
+                        let modification_height: Option<u64> = row.get::<_, Option<i64>>(7)?.map(height_from_db); // Consensus height when item was last modified
 
                         // Decrypt the full path using the same pattern as get_files
                         let decrypted_path = decrypt_path(encrypted_path, siv_key, siv_nonce)
@@ -176,7 +177,7 @@ pub fn get_folder_changes_since_height(
     db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
     user_id: i32,
     encrypted_parent_path: &str,
-    since_height: i32,
+    since_height: u64,
     siv_key: &Key<Aes256Siv>,
     siv_nonce: &Nonce,
 ) -> Result<FileProviderEnumerateResult, DatabaseError> {
@@ -278,7 +279,7 @@ pub fn get_folder_changes_since_height(
                 Option<u64>,
                 Option<CustomDateTime>,
                 Option<CustomDateTime>,
-                Option<i32>,
+                Option<u64>,
             );
 
             // Define the closure once to avoid type mismatch
@@ -292,7 +293,7 @@ pub fn get_folder_changes_since_height(
                 let file_size = row.get::<_, Option<i64>>(6)?.map(|v| v as u64);
                 let creation_date: Option<CustomDateTime> = row.get(7)?;
                 let content_modification_date: Option<CustomDateTime> = row.get(8)?;
-                let modification_height: Option<i32> = row.get(9)?;
+                let modification_height: Option<u64> = row.get::<_, Option<i64>>(9)?.map(height_from_db);
 
                 Ok((
                     status,
@@ -316,7 +317,7 @@ pub fn get_folder_changes_since_height(
             );
 
             let rows = if is_root {
-                stmt.query_map(params![user_id, since_height], row_mapper)
+                stmt.query_map(params![user_id, height_to_db(since_height)], row_mapper)
                     .map_err(|_| DatabaseError::RecallError)?
             } else {
                 stmt.query_map(
@@ -324,9 +325,9 @@ pub fn get_folder_changes_since_height(
                         user_id,
                         encrypted_parent_path,
                         user_id,
-                        since_height,
+                        height_to_db(since_height),
                         user_id,
-                        since_height
+                        height_to_db(since_height)
                     ],
                     row_mapper,
                 )
@@ -411,7 +412,7 @@ pub type InodeMetadata = (
     Option<u64>,
     CustomDateTime,
     Option<CustomDateTime>,
-    Option<i32>,
+    Option<u64>,
 );
 
 pub fn get_item_metadata_by_inode_id(
@@ -463,7 +464,7 @@ pub fn get_item_metadata_by_inode_id(
                     let file_size = row.get::<_, Option<i64>>(2)?.map(|v| v as u64); // NULL for folders
                     let creation_date: CustomDateTime = row.get(3)?; // UUIDv7 from inode.id (always exists)
                     let content_modification_date: Option<CustomDateTime> = row.get(4)?; // UUIDv7 from data_id (files only)
-                    let modification_height: Option<i32> = row.get(5)?; // Consensus height when item was last modified
+                    let modification_height: Option<u64> = row.get::<_, Option<i64>>(5)?.map(height_from_db); // Consensus height when item was last modified
                     Ok((
                         path,
                         item_type,

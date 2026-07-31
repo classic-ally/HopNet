@@ -306,7 +306,7 @@ pub struct ViewNode {
 /// derived input and it touches only the watermark's fault budget, never the
 /// member set or placement.
 pub fn derive_view(
-    height: i32,
+    height: u64,
     nodes: Vec<ViewNode>,
     grid_per_node: &HashMap<i32, Vec<(i64, bool)>>,
     grid_step_secs: i64,

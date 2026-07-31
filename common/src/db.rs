@@ -36,7 +36,8 @@ pub struct TakeoutRecord {
     pub created_at: DateTime<Utc>,
     #[typeshare(serialized_as = "String")]
     pub expires_at: DateTime<Utc>,
-    pub consensus_height: i32,
+    #[typeshare(serialized_as = "U64Height")]
+    pub consensus_height: u64,
 }
 
 /// Import status — tracks progress of user data ingest

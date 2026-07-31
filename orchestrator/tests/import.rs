@@ -1929,7 +1929,7 @@ impl TestScenario for ImportResumeAfterRestart {
             &docker,
             mesh_id,
             nodes[0].node_id,
-            crate::sys::ContainerRuntime::Docker,
+            crate::sys::detect_runtime(&docker).await?,
         )
         .await
         {

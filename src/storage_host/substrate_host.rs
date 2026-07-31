@@ -105,7 +105,7 @@ impl StateReader for SubstrateHost {
         })
     }
 
-    fn placement_inputs_at(&self, height: i32) -> Result<PlacementInputs, StorageError> {
+    fn placement_inputs_at(&self, height: u64) -> Result<PlacementInputs, StorageError> {
         let conn = self
             .app_state
             .db_pool

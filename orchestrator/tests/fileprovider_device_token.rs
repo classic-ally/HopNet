@@ -29,14 +29,14 @@ struct FileProviderItem {
 struct FPEnumerateResponse {
     items: Vec<FileProviderItem>,
     next_page: Option<String>,
-    current_consensus_height: i32,
+    current_consensus_height: u64,
 }
 
 #[derive(Debug, Deserialize)]
 struct FPChangesResponse {
     items: Vec<FileProviderItem>,
     deleted_identifiers: Vec<String>,
-    current_consensus_height: i32,
+    current_consensus_height: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -956,7 +956,7 @@ async fn fp_changes(
     client: &Client,
     node: &NodeInfo,
     api_key: &str,
-    since_height: i32,
+    since_height: u64,
 ) -> Result<FPChangesResponse> {
     let url = format!(
         "http://{}:{}/api/integrations/fileprovider/changes?since_height={}",

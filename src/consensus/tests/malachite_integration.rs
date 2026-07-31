@@ -542,7 +542,7 @@ fn fresh_node_syncs_vote_out_chain_without_wedging() {
         loop {
             {
                 let conn = network.nodes[0].app_state.db_pool.get().unwrap();
-                let pending = (*n0.decided.borrow() as i32) + 1;
+                let pending = *n0.decided.borrow() + 1;
                 if !hopnet_consensus::validators::is_node_active(&conn, 2, pending).unwrap() {
                     break;
                 }
@@ -618,7 +618,7 @@ fn fresh_node_syncs_vote_out_chain_without_wedging() {
 
         // The replayed chain told node 2 about its own removal.
         let conn = network.nodes[2].app_state.db_pool.get().unwrap();
-        let pending = (mesh_tip as i32) + 1;
+        let pending = mesh_tip + 1;
         assert!(!hopnet_consensus::validators::is_node_active(&conn, 2, pending).unwrap());
         assert_eq!(
             hopnet_consensus::validators::last_departure(&conn, 2, pending).unwrap(),

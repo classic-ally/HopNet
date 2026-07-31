@@ -76,7 +76,7 @@ fn node_row(app_state: &AppState, node_id: i32) -> Option<crate::types::Node> {
 // route to get acceptable validators for a given height
 pub async fn get_validators(
     State(app_state): State<AppState>,
-    Json(height): Json<i32>,
+    Json(height): Json<u64>,
 ) -> impl IntoResponse {
     match db::get_validators(app_state.db_pool.get(), height) {
         Ok(nodes) => (StatusCode::OK, Json(nodes)).into_response(),
@@ -94,8 +94,8 @@ pub async fn get_validators(
 #[derive(Serialize, Debug)]
 pub struct DebugViewState {
     pub node_id: i32,
-    pub queried_view: i32,
-    pub height_at_view: i32,
+    pub queried_view: u64,
+    pub height_at_view: u64,
     pub is_active_at_height: bool,
     /// This node's own latest departure kind at the queried height
     /// (height-scoped: stays "voted_out" at pre-readmission heights even
@@ -107,7 +107,7 @@ pub struct DebugViewState {
 
 pub async fn debug_view_state(
     State(app_state): State<AppState>,
-    Json(view): Json<i32>,
+    Json(view): Json<u64>,
 ) -> impl IntoResponse {
     let (node_id, is_active, last_departure_kind) = {
         let mut conn = match app_state.db_pool.get() {
@@ -167,7 +167,7 @@ pub async fn debug_view_state(
     } else {
         let mut ids: Vec<i32> = validators.iter().map(|n| n.node_id).collect();
         ids.sort_unstable();
-        let idx = (view.max(0) as usize) % ids.len();
+        let idx = (view as usize) % ids.len();
         node_row(&app_state, ids[idx])
     };
 
@@ -187,8 +187,8 @@ pub async fn debug_view_state(
 // View history entry for debugging/monitoring
 #[derive(Serialize, Debug)]
 pub struct ViewHistoryEntry {
-    pub view: i32,
-    pub height: i32,
+    pub view: u64,
+    pub height: u64,
     pub has_propose_qc: bool,
     pub has_lock_qc: bool,
     pub has_tc: bool,
@@ -229,8 +229,8 @@ pub async fn get_consensus_history(State(app_state): State<AppState>) -> impl In
         let hash: Vec<u8> = row.get(1)?;
         let has_cert: bool = row.get(2)?;
         Ok(ViewHistoryEntry {
-            view: height as i32,
-            height: height as i32,
+            view: hopnet_common::height::height_from_db(height),
+            height: hopnet_common::height::height_from_db(height),
             has_propose_qc: has_cert,
             has_lock_qc: has_cert,
             has_tc: false,

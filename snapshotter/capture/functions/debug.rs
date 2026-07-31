@@ -24,8 +24,8 @@ pub fn capture(
                 }
                 #[derive(Serialize)]
                 struct StateSnapshotProxy {
-                    consensus_height: i32,
-                    committed_view: i32,
+                    consensus_height: u64,
+                    committed_view: u64,
                     tables: Vec<TableHashProxy>,
                 }
                 let mut tables: Vec<TableHashProxy> = snapshot

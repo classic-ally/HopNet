@@ -23,7 +23,7 @@ pub enum ConsensusNetRequest {
     Gossip(Vec<u8>),
     /// Fetch decided (block, certificate) pairs for `[from_height, to_height]`
     /// — the decided-value sync protocol.
-    DecidedFetch { from_height: i64, to_height: i64 },
+    DecidedFetch { from_height: u64, to_height: u64 },
 }
 
 /// Wire response for the "consensus" scope.
@@ -55,12 +55,9 @@ fn peers(
     let conn = db_pool.get().map_err(|e| format!("db pool: {e}"))?;
     let pending = hopnet_consensus::store::last_decided_height(&conn)
         .map_err(|e| e.to_string())?
-        .map_or(0i64, |h| h.as_db().saturating_add(1));
-    let validators = crate::db::consensus::get_validators_with_conn(
-        &conn,
-        i32::try_from(pending).unwrap_or(i32::MAX),
-    )
-    .map_err(|e| format!("validators: {e:?}"))?;
+        .map_or(0u64, |h| h.0.saturating_add(1));
+    let validators = crate::db::consensus::get_validators_with_conn(&conn, pending)
+        .map_err(|e| format!("validators: {e:?}"))?;
     Ok(validators
         .into_iter()
         .filter(|n| n.node_id != my_node_id)

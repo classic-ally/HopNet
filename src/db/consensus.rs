@@ -9,7 +9,7 @@ pub use hopnet_consensus::validators::DepartureKind;
 
 pub fn get_validators_with_conn(
     db_lock: &r2d2::PooledConnection<SqliteConnectionManager>,
-    height: i32,
+    height: u64,
 ) -> Result<Vec<Node>, DatabaseError> {
     let rows = hopnet_consensus::validators::get_validators(db_lock, height).map_err(|e| {
         tracing::error!("validators query: {e}");
@@ -28,7 +28,7 @@ pub fn get_validators_with_conn(
 
 pub fn get_validators(
     db_connection: Result<r2d2::PooledConnection<SqliteConnectionManager>, r2d2::Error>,
-    height: i32,
+    height: u64,
 ) -> Result<Vec<Node>, DatabaseError> {
     match db_connection {
         Ok(db_lock) => get_validators_with_conn(&db_lock, height),
@@ -221,7 +221,7 @@ pub fn get_startup_state(
 }
 
 
-pub fn get_current_consensus_height(conn: &rusqlite::Connection) -> Result<i32, DatabaseError> {
+pub fn get_current_consensus_height(conn: &rusqlite::Connection) -> Result<u64, DatabaseError> {
     // RFC-017 Stage 3: delegates to the projection layer's canonical reader
     // (hopnet-consensus's SQL underneath). Host entry point kept — the
     // snapshotter captures this function by label.
@@ -232,7 +232,7 @@ pub fn get_current_consensus_height(conn: &rusqlite::Connection) -> Result<i32, 
 pub fn is_node_active(
     tx: &rusqlite::Transaction,
     node_id: i32,
-    height: i32,
+    height: u64,
 ) -> Result<bool, DatabaseError> {
     hopnet_consensus::validators::is_node_active(tx, node_id, height)
         .map_err(|_| DatabaseError::RecallError)
@@ -243,7 +243,7 @@ pub fn is_node_active(
 pub fn activate_validator(
     tx: &rusqlite::Transaction,
     node_id: i32,
-    effective_height: i32,
+    effective_height: u64,
 ) -> Result<(), DatabaseError> {
     hopnet_consensus::validators::activate_validator(tx, node_id, effective_height)
         .map_err(|_| DatabaseError::InsertError)
@@ -254,7 +254,7 @@ pub fn activate_validator(
 pub fn deactivate_validator(
     tx: &rusqlite::Transaction,
     node_id: i32,
-    effective_height: i32,
+    effective_height: u64,
     kind: DepartureKind,
 ) -> Result<(), DatabaseError> {
     hopnet_consensus::validators::deactivate_validator(tx, node_id, effective_height, kind)
@@ -265,7 +265,7 @@ pub fn deactivate_validator(
 pub fn last_departure(
     conn: &rusqlite::Connection,
     node_id: i32,
-    height: i32,
+    height: u64,
 ) -> Result<Option<DepartureKind>, DatabaseError> {
     hopnet_consensus::validators::last_departure(conn, node_id, height)
         .map_err(|_| DatabaseError::RecallError)
@@ -365,6 +365,44 @@ mod tests {
         // Results should be ordered by node_id
         assert_eq!(validators[0].node_id, 1);
         assert_eq!(validators[1].node_id, 2);
+    }
+
+    // Should: resolve the validator set at heights near the top of the
+    // ordered range (activation rows and query heights just below 2^63 —
+    // the bit-cast mapping keeps SQL ordering valid only below i64::MAX,
+    // which RFC-019's ceiling analysis shows is unreachable in practice).
+    #[test]
+    fn test_get_validators_near_max_ordered_height() {
+        let pool = setup_test_db();
+        let conn = pool.get().unwrap();
+
+        let user_pubkey = generate_test_pubkey();
+        let node1_pubkey = generate_test_pubkey();
+        conn.execute(
+            "INSERT INTO users (user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            params![1, "test", &user_pubkey, &vec![0u8; 32], &vec![0u8; 44], &vec![0u8; 16]]
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO nodes (node_id, name, owner, pubkey) VALUES (?, ?, ?, ?)",
+            params![1, "node1", 1, &node1_pubkey],
+        )
+        .unwrap();
+
+        let activation = i64::MAX as u64 - 10;
+        conn.execute(
+            "INSERT INTO validators (effective_height, node_id, is_active) VALUES (?, 1, true)",
+            params![hopnet_common::height::height_to_db(activation)],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert_eq!(get_validators(pool.get(), activation - 1).unwrap().len(), 0);
+        assert_eq!(get_validators(pool.get(), activation).unwrap().len(), 1);
+        assert_eq!(
+            get_validators(pool.get(), i64::MAX as u64).unwrap().len(),
+            1
+        );
     }
 
     // Should: the crate's install (via shared::initialize) produce the

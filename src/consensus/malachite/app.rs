@@ -223,8 +223,7 @@ impl<C: DerefMut<Target = Connection> + 'static> Application<SqliteStorage<C>>
     }
 
     fn validator_set(&mut self, height: Height) -> HopNetValidatorSet {
-        let h = i32::try_from(height.as_db()).unwrap_or(i32::MAX);
-        let nodes = db::get_validators_with_conn(&self.conn, h).expect("validator query");
+        let nodes = db::get_validators_with_conn(&self.conn, height.0).expect("validator query");
         HopNetValidatorSet::new(
             nodes
                 .into_iter()
@@ -244,7 +243,7 @@ impl<C: DerefMut<Target = Connection> + 'static> Application<SqliteStorage<C>>
         for (node_id, _sig) in cert.signatures.iter() {
             self.app_state
                 .evidence
-                .record_contact_with_height(*node_id, cert.height as i64);
+                .record_contact_with_height(*node_id, cert.height);
         }
 
         // Distribution kick (RFC-014/017): every registered projection

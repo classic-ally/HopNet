@@ -140,7 +140,7 @@ impl TestScenario for VoteOutAfterKill {
             &docker,
             mesh_id,
             victim.node_id,
-            crate::sys::ContainerRuntime::Docker,
+            crate::sys::detect_runtime(&docker).await?,
         )
         .await
         {
