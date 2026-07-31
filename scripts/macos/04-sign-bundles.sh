@@ -43,6 +43,32 @@ if [ ! -d "$EXTENSION_DIR" ]; then
     exit 1
 fi
 
+# Step 0: Sign the photo-ingress daemon (inner-first: daemon → appex →
+# outer app). Hardened runtime + timestamp for notarization; deliberately
+# NO entitlements file and NO provisioning profile — the daemon is
+# unsandboxed (arbitrary blob roots, incl. SMB mounts) and carries no
+# restricted entitlements, so there is nothing for AMFI to match against a
+# profile. Its signing identifier comes from the __TEXT,__info_plist
+# CFBundleIdentifier (com.hopnet.desktop.photo-ingress), which is what TCC
+# keys the Photos grant on — keep the cert stable or grants reset.
+DAEMON_BINARY="$APP_BUNDLE/Contents/MacOS/photo-ingress"
+if [ -f "$DAEMON_BINARY" ]; then
+    echo "🔐 Signing photo-ingress daemon..."
+    codesign --force --sign "$SIGNING_IDENTITY" \
+        --options runtime \
+        --timestamp \
+        "$DAEMON_BINARY"
+    if codesign --verify --verbose "$DAEMON_BINARY" 2>/dev/null; then
+        echo "✅ Daemon signature verified"
+    else
+        echo "❌ Daemon signature verification failed"
+        exit 1
+    fi
+else
+    echo "❌ photo-ingress daemon not found. Did stage 3b complete successfully?"
+    exit 1
+fi
+
 # Step 1: Sign the extension
 echo "🔐 Signing extension with identity: $SIGNING_IDENTITY"
 

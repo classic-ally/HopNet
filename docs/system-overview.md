@@ -125,8 +125,9 @@ apply functions inside consensus handlers.
       bin); `photos-ingress-publish` orchestrator scenario. Swift/FFI
       wiring landed 2026-07-30 (publish credentials via FfiDaemonOptions,
       keychain provisioning from the app, soak-verified on a real
-      library); SMAppService packaging remains; buffer-mode retention
-      (delete local blobs after confirmed publish) is the follow-up phase.
+      library); SMAppService packaging landed 2026-07-31 (below);
+      buffer-mode retention (delete local blobs after confirmed publish)
+      is the follow-up phase.
 - [x] Thumbnail renditions (2026-07-30): the ingress daemon generates
       ~256px/~1024px JPEG renditions per photo (PHImageManager,
       synchronous delivery + ImageIO fallback; video poster frames) as
@@ -150,6 +151,22 @@ apply functions inside consensus handlers.
       Deferred: library-scoped fingerprint keys (Phase 3) +
       cross-participant PHCloudIdentifier spike; import-time fingerprints
       for non-PhotoKit paths.
+- [x] Photo-ingress packaging + provisioning plumbing (2026-07-31): the
+      daemon ships inside HopNet.app (build stages 1b/3b embed
+      `Contents/MacOS/photo-ingress` + the SMAppService agent plist,
+      signed individually, hardened runtime, no entitlements; bundle id
+      now `com.hopnet.desktop.photo-ingress`). Owner-only
+      `/api/photo-ingress/{enable,disable,status}` routes provision the
+      keychain (device token + blob_root) and drive
+      registration/unregistration — the future settings pane's backing
+      API, enablement-gated minting (setup/login no longer mint
+      unconditionally). Daemon self-provisions at startup: canonical
+      `--data-dir` default, `ensure_personal_library` auto-bind from
+      keychain blob_root (closes the fresh-state `scope_unmapped` trap),
+      `--log-to-data-dir` log ownership, and `RefreshingPublisher`
+      credential re-read after unreachable passes (GUI ephemeral-port
+      relaunch heals without a daemon restart). Settings pane UI is the
+      next slice.
 - [x] hopnet-drive + hopnet-projection + hopnet-takeout extraction
       ([RFC-015](specs/hopnet-drive.md)) COMPLETE (stages D0–D5,
       2026-07-08): narrowed handler seam, per-projection schema units,
