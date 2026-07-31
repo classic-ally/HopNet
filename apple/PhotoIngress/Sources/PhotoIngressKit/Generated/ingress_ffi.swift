@@ -802,6 +802,20 @@ public protocol IngressSessionProtocol: AnyObject, Sendable {
     func drain(fetcher: PhotoResourceFetcher, options: FfiDrainOptions) throws  -> FfiDrainReport
     
     /**
+     * Ensure a personal (NULL-scope) library exists, creating one with the
+     * CLI-equivalent defaults when absent.
+     *
+     * Deliberate partial reversal of the Phase-6 "libconfig is CLI-only"
+     * rule: the sandboxed GUI app cannot write `~/.local/share/...` and the
+     * root workspace cannot link ingress-core (sha2 workspace split), so
+     * the daemon is the only process that can bind the library the
+     * enablement flow provisions. Ensure-only — bind/rename/set-retention
+     * stay CLI-only. Called at daemon startup BEFORE `run_daemon` acquires
+     * the run lock (`add_library` takes it exclusively itself).
+     */
+    func ensurePersonalLibrary(blobRoot: String, sidecarRootRemote: String?) throws  -> FfiEnsureLibraryOutcome
+    
+    /**
      * Close the active scan: offline-deletion synthesis (guarded against
      * zero-enumeration), gave-up retry reset, `scan_completed` log. Wakes
      * the daemon loop so revived work is picked up promptly.
@@ -830,7 +844,7 @@ public protocol IngressSessionProtocol: AnyObject, Sendable {
      * call from a background thread AFTER registering the observer (missed
      * window closes via idempotent duplicate delivery). One run per session.
      */
-    func runDaemon(fetcher: PhotoResourceFetcher, options: FfiDaemonOptions) throws  -> FfiDaemonReport
+    func runDaemon(fetcher: PhotoResourceFetcher, options: FfiDaemonOptions, credentialsProvider: PublishCredentialsProvider?) throws  -> FfiDaemonReport
     
     /**
      * Probe one enumerated asset (light — no resource enumeration).
@@ -1004,6 +1018,28 @@ open func drain(fetcher: PhotoResourceFetcher, options: FfiDrainOptions)throws  
 }
     
     /**
+     * Ensure a personal (NULL-scope) library exists, creating one with the
+     * CLI-equivalent defaults when absent.
+     *
+     * Deliberate partial reversal of the Phase-6 "libconfig is CLI-only"
+     * rule: the sandboxed GUI app cannot write `~/.local/share/...` and the
+     * root workspace cannot link ingress-core (sha2 workspace split), so
+     * the daemon is the only process that can bind the library the
+     * enablement flow provisions. Ensure-only — bind/rename/set-retention
+     * stay CLI-only. Called at daemon startup BEFORE `run_daemon` acquires
+     * the run lock (`add_library` takes it exclusively itself).
+     */
+open func ensurePersonalLibrary(blobRoot: String, sidecarRootRemote: String?)throws  -> FfiEnsureLibraryOutcome  {
+    return try  FfiConverterTypeFfiEnsureLibraryOutcome_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_ingress_ffi_fn_method_ingresssession_ensure_personal_library(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(blobRoot),
+        FfiConverterOptionString.lower(sidecarRootRemote),$0
+    )
+})
+}
+    
+    /**
      * Close the active scan: offline-deletion synthesis (guarded against
      * zero-enumeration), gave-up retry reset, `scan_completed` log. Wakes
      * the daemon loop so revived work is picked up promptly.
@@ -1059,12 +1095,13 @@ open func observeRemoved(localIds: [String])  {try! rustCall() {
      * call from a background thread AFTER registering the observer (missed
      * window closes via idempotent duplicate delivery). One run per session.
      */
-open func runDaemon(fetcher: PhotoResourceFetcher, options: FfiDaemonOptions)throws  -> FfiDaemonReport  {
+open func runDaemon(fetcher: PhotoResourceFetcher, options: FfiDaemonOptions, credentialsProvider: PublishCredentialsProvider?)throws  -> FfiDaemonReport  {
     return try  FfiConverterTypeFfiDaemonReport_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_ingress_ffi_fn_method_ingresssession_run_daemon(
             self.uniffiCloneHandle(),
         FfiConverterTypePhotoResourceFetcher_lower(fetcher),
-        FfiConverterTypeFfiDaemonOptions_lower(options),$0
+        FfiConverterTypeFfiDaemonOptions_lower(options),
+        FfiConverterOptionTypePublishCredentialsProvider.lower(credentialsProvider),$0
     )
 })
 }
@@ -1400,6 +1437,213 @@ public func FfiConverterTypePhotoResourceFetcher_lift(_ handle: UInt64) throws -
 #endif
 public func FfiConverterTypePhotoResourceFetcher_lower(_ value: PhotoResourceFetcher) -> UInt64 {
     return FfiConverterTypePhotoResourceFetcher.lower(value)
+}
+
+
+
+
+
+
+/**
+ * Implemented in Swift (keychain read). Called at most once per publish
+ * tick, and only after a tick observed the node unreachable. `None` =
+ * credentials missing (deprovisioned) — the current client is kept and the
+ * pass keeps parking.
+ */
+public protocol PublishCredentialsProvider: AnyObject, Sendable {
+    
+    func current()  -> FfiPublishCredentials?
+    
+}
+/**
+ * Implemented in Swift (keychain read). Called at most once per publish
+ * tick, and only after a tick observed the node unreachable. `None` =
+ * credentials missing (deprovisioned) — the current client is kept and the
+ * pass keeps parking.
+ */
+open class PublishCredentialsProviderImpl: PublishCredentialsProvider, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_ingress_ffi_fn_clone_publishcredentialsprovider(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_ingress_ffi_fn_free_publishcredentialsprovider(handle, $0) }
+    }
+
+    
+
+    
+open func current() -> FfiPublishCredentials?  {
+    return try!  FfiConverterOptionTypeFfiPublishCredentials.lift(try! rustCall() {
+    uniffi_ingress_ffi_fn_method_publishcredentialsprovider_current(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+
+    
+}
+
+
+
+// Put the implementation in a struct so we don't pollute the top-level namespace
+fileprivate struct UniffiCallbackInterfacePublishCredentialsProvider {
+
+    // Create the VTable using a series of closures.
+    // Swift automatically converts these into C callback functions.
+    //
+    // Store the vtable directly.
+    static let vtable: UniffiVTableCallbackInterfacePublishCredentialsProvider = UniffiVTableCallbackInterfacePublishCredentialsProvider(
+        uniffiFree: { (uniffiHandle: UInt64) -> () in
+            do {
+                try FfiConverterTypePublishCredentialsProvider.handleMap.remove(handle: uniffiHandle)
+            } catch {
+                print("Uniffi callback interface PublishCredentialsProvider: handle missing in uniffiFree")
+            }
+        },
+        uniffiClone: { (uniffiHandle: UInt64) -> UInt64 in
+            do {
+                return try FfiConverterTypePublishCredentialsProvider.handleMap.clone(handle: uniffiHandle)
+            } catch {
+                fatalError("Uniffi callback interface PublishCredentialsProvider: handle missing in uniffiClone")
+            }
+        },
+        current: { (
+            uniffiHandle: UInt64,
+            uniffiOutReturn: UnsafeMutablePointer<RustBuffer>,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> FfiPublishCredentials? in
+                guard let uniffiObj = try? FfiConverterTypePublishCredentialsProvider.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.current(
+                )
+            }
+
+            
+            let writeReturn = { uniffiOutReturn.pointee = FfiConverterOptionTypeFfiPublishCredentials.lower($0) }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        }
+    )
+
+    // Rust stores this pointer for future callback invocations, so it must live
+    // for the process lifetime (not just for the init function call).
+    //
+    // `nonisolated(unsafe)` is needed under Swift 6 strict concurrency.
+    // This is safe because the pointee is initialized once during static init
+    // and never mutated by either side of the FFI.  Its fields are C function pointers.
+    nonisolated(unsafe) static let vtablePtr: UnsafePointer<UniffiVTableCallbackInterfacePublishCredentialsProvider> = {
+        let ptr = UnsafeMutablePointer<UniffiVTableCallbackInterfacePublishCredentialsProvider>.allocate(capacity: 1)
+        ptr.initialize(to: vtable)
+        return UnsafePointer(ptr)
+    }()
+}
+
+private func uniffiCallbackInitPublishCredentialsProvider() {
+    uniffi_ingress_ffi_fn_init_callback_vtable_publishcredentialsprovider(UniffiCallbackInterfacePublishCredentialsProvider.vtablePtr)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePublishCredentialsProvider: FfiConverter {
+    fileprivate static let handleMap = UniffiHandleMap<PublishCredentialsProvider>()
+
+    typealias FfiType = UInt64
+    typealias SwiftType = PublishCredentialsProvider
+
+    public static func lift(_ handle: UInt64) throws -> PublishCredentialsProvider {
+        if ((handle & 1) == 0) {
+            // Rust-generated handle, construct a new class that uses the handle to implement the
+            // interface
+            return PublishCredentialsProviderImpl(unsafeFromHandle: handle)
+        } else {
+            // Swift-generated handle, get the object from the handle map
+            return try handleMap.remove(handle: handle)
+        }
+    }
+
+    public static func lower(_ value: PublishCredentialsProvider) -> UInt64 {
+         if let rustImpl = value as? PublishCredentialsProviderImpl {
+             // Rust-implemented object.  Clone the handle and return it
+            return rustImpl.uniffiCloneHandle()
+         } else {
+            // Swift object, generate a new vtable handle and return that.
+            return handleMap.insert(obj: value)
+         }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PublishCredentialsProvider {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: PublishCredentialsProvider, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePublishCredentialsProvider_lift(_ handle: UInt64) throws -> PublishCredentialsProvider {
+    return try FfiConverterTypePublishCredentialsProvider.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePublishCredentialsProvider_lower(_ value: PublishCredentialsProvider) -> UInt64 {
+    return FfiConverterTypePublishCredentialsProvider.lower(value)
 }
 
 
@@ -1848,6 +2092,19 @@ public struct FfiDaemonOptions: Equatable, Hashable {
      * Dirty-sidecar replication cadence (faster, batch-capped).
      */
     public var replicationIntervalSecs: UInt64
+    /**
+     * HopNet publish tick: node base URL (WITHOUT `/api`) + RFC-012 device
+     * token (`{device_id}.{secret}`). Both set = publishing on; either
+     * absent = ingest-only daemon (the pre-integration behavior). The
+     * platform side owns credential storage (keychain) — the core never
+     * reads secrets itself.
+     */
+    public var publishNodeUrl: String?
+    public var publishDeviceToken: String?
+    /**
+     * Publish tick cadence (seconds); same class as replication.
+     */
+    public var publishIntervalSecs: UInt64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -1857,7 +2114,17 @@ public struct FfiDaemonOptions: Equatable, Hashable {
          */cleanupIntervalSecs: UInt64, 
         /**
          * Dirty-sidecar replication cadence (faster, batch-capped).
-         */replicationIntervalSecs: UInt64) {
+         */replicationIntervalSecs: UInt64, 
+        /**
+         * HopNet publish tick: node base URL (WITHOUT `/api`) + RFC-012 device
+         * token (`{device_id}.{secret}`). Both set = publishing on; either
+         * absent = ingest-only daemon (the pre-integration behavior). The
+         * platform side owns credential storage (keychain) — the core never
+         * reads secrets itself.
+         */publishNodeUrl: String?, publishDeviceToken: String?, 
+        /**
+         * Publish tick cadence (seconds); same class as replication.
+         */publishIntervalSecs: UInt64) {
         self.fetchConcurrency = fetchConcurrency
         self.retryCap = retryCap
         self.retryBaseSecs = retryBaseSecs
@@ -1867,6 +2134,9 @@ public struct FfiDaemonOptions: Equatable, Hashable {
         self.storagePollSecs = storagePollSecs
         self.cleanupIntervalSecs = cleanupIntervalSecs
         self.replicationIntervalSecs = replicationIntervalSecs
+        self.publishNodeUrl = publishNodeUrl
+        self.publishDeviceToken = publishDeviceToken
+        self.publishIntervalSecs = publishIntervalSecs
     }
 
     
@@ -1893,7 +2163,10 @@ public struct FfiConverterTypeFfiDaemonOptions: FfiConverterRustBuffer {
                 pressurePauseSecs: FfiConverterUInt64.read(from: &buf), 
                 storagePollSecs: FfiConverterUInt64.read(from: &buf), 
                 cleanupIntervalSecs: FfiConverterUInt64.read(from: &buf), 
-                replicationIntervalSecs: FfiConverterUInt64.read(from: &buf)
+                replicationIntervalSecs: FfiConverterUInt64.read(from: &buf), 
+                publishNodeUrl: FfiConverterOptionString.read(from: &buf), 
+                publishDeviceToken: FfiConverterOptionString.read(from: &buf), 
+                publishIntervalSecs: FfiConverterUInt64.read(from: &buf)
         )
     }
 
@@ -1907,6 +2180,9 @@ public struct FfiConverterTypeFfiDaemonOptions: FfiConverterRustBuffer {
         FfiConverterUInt64.write(value.storagePollSecs, into: &buf)
         FfiConverterUInt64.write(value.cleanupIntervalSecs, into: &buf)
         FfiConverterUInt64.write(value.replicationIntervalSecs, into: &buf)
+        FfiConverterOptionString.write(value.publishNodeUrl, into: &buf)
+        FfiConverterOptionString.write(value.publishDeviceToken, into: &buf)
+        FfiConverterUInt64.write(value.publishIntervalSecs, into: &buf)
     }
 }
 
@@ -1939,10 +2215,11 @@ public struct FfiDaemonReport: Equatable, Hashable {
     public var transitions: UInt64
     public var resourcesReopened: UInt64
     public var cleanup: FfiCleanupReport
+    public var publish: FfiPublishReport
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(drain: FfiDrainReport, eventsApplied: UInt64, eventsDeferred: UInt64, deletions: UInt64, restores: UInt64, transitions: UInt64, resourcesReopened: UInt64, cleanup: FfiCleanupReport) {
+    public init(drain: FfiDrainReport, eventsApplied: UInt64, eventsDeferred: UInt64, deletions: UInt64, restores: UInt64, transitions: UInt64, resourcesReopened: UInt64, cleanup: FfiCleanupReport, publish: FfiPublishReport) {
         self.drain = drain
         self.eventsApplied = eventsApplied
         self.eventsDeferred = eventsDeferred
@@ -1951,6 +2228,7 @@ public struct FfiDaemonReport: Equatable, Hashable {
         self.transitions = transitions
         self.resourcesReopened = resourcesReopened
         self.cleanup = cleanup
+        self.publish = publish
     }
 
     
@@ -1976,7 +2254,8 @@ public struct FfiConverterTypeFfiDaemonReport: FfiConverterRustBuffer {
                 restores: FfiConverterUInt64.read(from: &buf), 
                 transitions: FfiConverterUInt64.read(from: &buf), 
                 resourcesReopened: FfiConverterUInt64.read(from: &buf), 
-                cleanup: FfiConverterTypeFfiCleanupReport.read(from: &buf)
+                cleanup: FfiConverterTypeFfiCleanupReport.read(from: &buf), 
+                publish: FfiConverterTypeFfiPublishReport.read(from: &buf)
         )
     }
 
@@ -1989,6 +2268,7 @@ public struct FfiConverterTypeFfiDaemonReport: FfiConverterRustBuffer {
         FfiConverterUInt64.write(value.transitions, into: &buf)
         FfiConverterUInt64.write(value.resourcesReopened, into: &buf)
         FfiConverterTypeFfiCleanupReport.write(value.cleanup, into: &buf)
+        FfiConverterTypeFfiPublishReport.write(value.publish, into: &buf)
     }
 }
 
@@ -2307,6 +2587,178 @@ public func FfiConverterTypeFfiLocation_lower(_ value: FfiLocation) -> RustBuffe
 }
 
 
+/**
+ * Current publish credentials as the platform sees them.
+ */
+public struct FfiPublishCredentials: Equatable, Hashable {
+    /**
+     * Node base URL WITHOUT `/api` (same contract as `FfiDaemonOptions`).
+     */
+    public var nodeUrl: String
+    /**
+     * RFC-012 device token (`{device_id}.{secret}`).
+     */
+    public var deviceToken: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Node base URL WITHOUT `/api` (same contract as `FfiDaemonOptions`).
+         */nodeUrl: String, 
+        /**
+         * RFC-012 device token (`{device_id}.{secret}`).
+         */deviceToken: String) {
+        self.nodeUrl = nodeUrl
+        self.deviceToken = deviceToken
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiPublishCredentials: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiPublishCredentials: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiPublishCredentials {
+        return
+            try FfiPublishCredentials(
+                nodeUrl: FfiConverterString.read(from: &buf), 
+                deviceToken: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiPublishCredentials, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.nodeUrl, into: &buf)
+        FfiConverterString.write(value.deviceToken, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiPublishCredentials_lift(_ buf: RustBuffer) throws -> FfiPublishCredentials {
+    return try FfiConverterTypeFfiPublishCredentials.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiPublishCredentials_lower(_ value: FfiPublishCredentials) -> RustBuffer {
+    return FfiConverterTypeFfiPublishCredentials.lower(value)
+}
+
+
+/**
+ * Publish-tick aggregates (mirrors `publish::PublishReport`).
+ */
+public struct FfiPublishReport: Equatable, Hashable {
+    public var published: UInt64
+    public var alreadyPublished: UInt64
+    /**
+     * Photos the mesh already held (cloud-fingerprint match) — stamped
+     * published locally, nothing uploaded.
+     */
+    public var adopted: UInt64
+    public var failed: UInt64
+    public var gaveUp: UInt64
+    public var missingSidecar: UInt64
+    /**
+     * The last pass aborted because the node was unreachable.
+     */
+    public var parked: Bool
+    /**
+     * The last pass held its photos because this device does not hold
+     * ingress responsibility (claim via the node's JWT route to unpark).
+     */
+    public var parkedResponsibility: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(published: UInt64, alreadyPublished: UInt64, 
+        /**
+         * Photos the mesh already held (cloud-fingerprint match) — stamped
+         * published locally, nothing uploaded.
+         */adopted: UInt64, failed: UInt64, gaveUp: UInt64, missingSidecar: UInt64, 
+        /**
+         * The last pass aborted because the node was unreachable.
+         */parked: Bool, 
+        /**
+         * The last pass held its photos because this device does not hold
+         * ingress responsibility (claim via the node's JWT route to unpark).
+         */parkedResponsibility: Bool) {
+        self.published = published
+        self.alreadyPublished = alreadyPublished
+        self.adopted = adopted
+        self.failed = failed
+        self.gaveUp = gaveUp
+        self.missingSidecar = missingSidecar
+        self.parked = parked
+        self.parkedResponsibility = parkedResponsibility
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiPublishReport: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiPublishReport: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiPublishReport {
+        return
+            try FfiPublishReport(
+                published: FfiConverterUInt64.read(from: &buf), 
+                alreadyPublished: FfiConverterUInt64.read(from: &buf), 
+                adopted: FfiConverterUInt64.read(from: &buf), 
+                failed: FfiConverterUInt64.read(from: &buf), 
+                gaveUp: FfiConverterUInt64.read(from: &buf), 
+                missingSidecar: FfiConverterUInt64.read(from: &buf), 
+                parked: FfiConverterBool.read(from: &buf), 
+                parkedResponsibility: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiPublishReport, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.published, into: &buf)
+        FfiConverterUInt64.write(value.alreadyPublished, into: &buf)
+        FfiConverterUInt64.write(value.adopted, into: &buf)
+        FfiConverterUInt64.write(value.failed, into: &buf)
+        FfiConverterUInt64.write(value.gaveUp, into: &buf)
+        FfiConverterUInt64.write(value.missingSidecar, into: &buf)
+        FfiConverterBool.write(value.parked, into: &buf)
+        FfiConverterBool.write(value.parkedResponsibility, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiPublishReport_lift(_ buf: RustBuffer) throws -> FfiPublishReport {
+    return try FfiConverterTypeFfiPublishReport.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiPublishReport_lower(_ value: FfiPublishReport) -> RustBuffer {
+    return FfiConverterTypeFfiPublishReport.lower(value)
+}
+
+
 public struct FfiResourceDescriptor: Equatable, Hashable {
     /**
      * Raw `PHAssetResourceType` value; mapping happens Rust-side.
@@ -2609,6 +3061,96 @@ public func FfiConverterTypeFfiWriteOutcome_lift(_ buf: RustBuffer) throws -> Ff
 public func FfiConverterTypeFfiWriteOutcome_lower(_ value: FfiWriteOutcome) -> RustBuffer {
     return FfiConverterTypeFfiWriteOutcome.lower(value)
 }
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Outcome of the daemon's startup library auto-bind (see
+ * `IngressSession::ensure_personal_library`).
+ */
+
+public enum FfiEnsureLibraryOutcome: Equatable, Hashable {
+    
+    /**
+     * No personal library existed; one was created (CLI-equivalent
+     * defaults). `warn_no_remote` mirrors the CLI's loud warning: without
+     * a remote sidecar root, recovery from a dead Mac degrades to
+     * blob-only.
+     */
+    case created(libraryId: String, warnNoRemote: Bool
+    )
+    /**
+     * A personal library already existed — nothing written. `blob_root` is
+     * the BOUND root (state.db wins); the platform side warns when its
+     * provisioned value diverges.
+     */
+    case alreadyExists(libraryId: String, blobRoot: String
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FfiEnsureLibraryOutcome: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiEnsureLibraryOutcome: FfiConverterRustBuffer {
+    typealias SwiftType = FfiEnsureLibraryOutcome
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiEnsureLibraryOutcome {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .created(libraryId: try FfiConverterString.read(from: &buf), warnNoRemote: try FfiConverterBool.read(from: &buf)
+        )
+        
+        case 2: return .alreadyExists(libraryId: try FfiConverterString.read(from: &buf), blobRoot: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiEnsureLibraryOutcome, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .created(libraryId,warnNoRemote):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(libraryId, into: &buf)
+            FfiConverterBool.write(warnNoRemote, into: &buf)
+            
+        
+        case let .alreadyExists(libraryId,blobRoot):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(libraryId, into: &buf)
+            FfiConverterString.write(blobRoot, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiEnsureLibraryOutcome_lift(_ buf: RustBuffer) throws -> FfiEnsureLibraryOutcome {
+    return try FfiConverterTypeFfiEnsureLibraryOutcome.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiEnsureLibraryOutcome_lower(_ value: FfiEnsureLibraryOutcome) -> RustBuffer {
+    return FfiConverterTypeFfiEnsureLibraryOutcome.lower(value)
+}
+
 
 
 public enum FfiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
@@ -3411,6 +3953,30 @@ fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypePublishCredentialsProvider: FfiConverterRustBuffer {
+    typealias SwiftType = PublishCredentialsProvider?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypePublishCredentialsProvider.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypePublishCredentialsProvider.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeFfiBurstInfo: FfiConverterRustBuffer {
     typealias SwiftType = FfiBurstInfo?
 
@@ -3475,6 +4041,30 @@ fileprivate struct FfiConverterOptionTypeFfiLocation: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeFfiLocation.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeFfiPublishCredentials: FfiConverterRustBuffer {
+    typealias SwiftType = FfiPublishCredentials?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiPublishCredentials.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiPublishCredentials.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -3576,6 +4166,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_ingress_ffi_checksum_method_photoresourcefetcher_fetch_resource() != 55469) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_ingress_ffi_checksum_method_publishcredentialsprovider_current() != 56892) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_ingress_ffi_checksum_method_chunksink_abort() != 44232) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3606,6 +4199,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_ingress_ffi_checksum_method_ingresssession_drain() != 12569) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_ingress_ffi_checksum_method_ingresssession_ensure_personal_library() != 64532) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_ingress_ffi_checksum_method_ingresssession_finish_scan() != 31670) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3618,7 +4214,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_ingress_ffi_checksum_method_ingresssession_observe_removed() != 38301) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ingress_ffi_checksum_method_ingresssession_run_daemon() != 30255) {
+    if (uniffi_ingress_ffi_checksum_method_ingresssession_run_daemon() != 40423) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ingress_ffi_checksum_method_ingresssession_scan_asset() != 65296) {
@@ -3632,6 +4228,7 @@ private let initializationResult: InitializationResult = {
     }
 
     uniffiCallbackInitPhotoResourceFetcher()
+    uniffiCallbackInitPublishCredentialsProvider()
     return InitializationResult.ok
 }()
 

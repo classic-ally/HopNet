@@ -18,6 +18,7 @@ ingress-core = { path = "../ingress-core" }
 ingress-publisher = { path = "../ingress-publisher" }
 uniffi = { version = "0.31.2", features = ["cli", "tokio"] }
 tokio = { version = "1.45", features = ["rt-multi-thread"] }
+async-trait = "0.1"
 chrono = "0.4.41"
 serde_json = "1.0"
 thiserror = "2.0.18"
@@ -25,3 +26,4 @@ thiserror = "2.0.18"
 [dev-dependencies]
 ingress-core = { path = "../ingress-core", features = ["fixtures"] }
 tempfile = "3"
+tokio = { version = "1.45", features = ["macros", "rt-multi-thread"] }

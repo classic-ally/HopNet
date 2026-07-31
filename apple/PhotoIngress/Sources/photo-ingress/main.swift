@@ -21,13 +21,25 @@ func flagValue(_ args: [String], _ name: String) -> String? {
 }
 
 let args = Array(CommandLine.arguments.dropFirst())
-guard let command = args.first else {
-    print("usage: photo-ingress setup --data-dir D    (libraries: see `ingress-cli library add`)")
-    print("       photo-ingress ingest --data-dir D <local_id>")
-    exit(2)
-}
-guard let dataDir = flagValue(args, "--data-dir") else {
-    fail("--data-dir is required (deliberately no default — keeps slice state away from production paths)")
+// Zero arguments = the bundled LaunchAgent invocation (belt-and-braces for
+// BundleProgram argv semantics) — run the daemon.
+let command = args.first ?? "daemon"
+
+// Default mirrors ingress-cli's canonical data dir. The bundled LaunchAgent
+// plist cannot expand `~`, so the daemon must self-default; the explicit
+// flag remains for dev/soak isolation.
+let dataDir = flagValue(args, "--data-dir")
+    ?? FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".local/share/hopnet-photo-ingress").path
+
+// The bundled plist passes --log-to-data-dir: launchd's StandardOutPath
+// cannot be user-relative, so the daemon owns its log file instead.
+if args.contains("--log-to-data-dir") {
+    try? FileManager.default.createDirectory(atPath: dataDir, withIntermediateDirectories: true)
+    let logPath = dataDir + "/daemon.log"
+    freopen(logPath, "a", stdout)
+    freopen(logPath, "a", stderr)
+    setvbuf(stdout, nil, _IOLBF, 0)
 }
 
 // The PH resource types the daemon archives (spec mapping table), original first.
@@ -229,6 +241,31 @@ func runCleanup() throws {
 func runDaemon() throws {
     try ensureAuthorized()
     let session = try IngressSession(dataDir: dataDir)
+
+    // Startup auto-bind (enablement flow): the HopNet app provisions
+    // blob_root via the keychain; binding must precede the startup scan so
+    // seeded assets route into the library instead of minting unmapped
+    // rows. A failure (e.g. ingress-cli holds the run lock) aborts startup —
+    // the run lock would block the daemon loop anyway; launchd retries.
+    if let blobRoot = PublishCredentials.loadBlobRoot() {
+        switch try session.ensurePersonalLibrary(
+            blobRoot: blobRoot,
+            sidecarRootRemote: PublishCredentials.loadSidecarRootRemote())
+        {
+        case .created(let libraryId, let warnNoRemote):
+            print("library auto-bind: created \(libraryId) blob_root=\(blobRoot)")
+            if warnNoRemote {
+                print("WARNING: no remote sidecar root configured — recovery " +
+                      "from a dead Mac degrades to blob-only")
+            }
+        case .alreadyExists(let libraryId, let boundRoot):
+            if boundRoot != blobRoot {
+                print("WARNING: provisioned blob_root \(blobRoot) differs from " +
+                      "bound \(boundRoot) (\(libraryId)) — state.db wins")
+            }
+        }
+    }
+
     let fetcher = PhotoKitFetcher()
     let retryCap = Int64(intFlag("--retry-cap", default: 5))
     let scanQueue = DispatchQueue(label: "photo-ingress.scan")
@@ -307,13 +344,19 @@ func runDaemon() throws {
         publishIntervalSecs: intFlag("--publish-interval-secs", default: 60)
     )
     if publishing {
-        print("publishing to \(nodeUrl!) (device token \(deviceToken!.prefix(8))…)")
+        // Device id only — the secret half of the token stays out of logs.
+        print("publishing to \(nodeUrl!) (device \(deviceToken!.prefix(while: { $0 != "." })))")
     } else {
         print("publishing OFF — no --node-url/--device-token and no keychain " +
               "credentials (\(PublishCredentials.service))")
     }
+    // Flags pin credentials (dev/soak); only a fully keychain-sourced daemon
+    // re-reads them after unreachable passes (ephemeral-port healing).
+    let credentialsProvider: PublishCredentialsProvider? =
+        (flagUrl == nil && flagToken == nil) ? KeychainCredentialsProvider() : nil
     print("daemon running (scan interval \(scanInterval)s) — SIGTERM/SIGINT to stop")
-    let report = try session.runDaemon(fetcher: fetcher, options: options)
+    let report = try session.runDaemon(
+        fetcher: fetcher, options: options, credentialsProvider: credentialsProvider)
     print("daemon report:")
     print("  events applied:       \(report.eventsApplied) (deferred \(report.eventsDeferred))")
     print("  deletions:            \(report.deletions)")
@@ -333,11 +376,14 @@ func runDaemon() throws {
     if publishing {
         print("  publish:")
         print("    published:          \(report.publish.published) " +
-              "(already \(report.publish.alreadyPublished))")
+              "(already \(report.publish.alreadyPublished), adopted \(report.publish.adopted))")
         print("    failed:             \(report.publish.failed) " +
               "(gave up \(report.publish.gaveUp), missing sidecar \(report.publish.missingSidecar))")
         if report.publish.parked {
             print("    PARKED — node unreachable at last pass")
+        }
+        if report.publish.parkedResponsibility {
+            print("    PARKED — not the responsible ingress device")
         }
     }
 }

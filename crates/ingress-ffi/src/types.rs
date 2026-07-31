@@ -159,6 +159,27 @@ pub struct FfiScanSummary {
     pub synthesis_skipped: bool,
 }
 
+/// Outcome of the daemon's startup library auto-bind (see
+/// `IngressSession::ensure_personal_library`).
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum FfiEnsureLibraryOutcome {
+    /// No personal library existed; one was created (CLI-equivalent
+    /// defaults). `warn_no_remote` mirrors the CLI's loud warning: without
+    /// a remote sidecar root, recovery from a dead Mac degrades to
+    /// blob-only.
+    Created {
+        library_id: String,
+        warn_no_remote: bool,
+    },
+    /// A personal library already existed — nothing written. `blob_root` is
+    /// the BOUND root (state.db wins); the platform side warns when its
+    /// provisioned value diverges.
+    AlreadyExists {
+        library_id: String,
+        blob_root: String,
+    },
+}
+
 /// Daemon knobs — the drain knobs plus the lifecycle-tick cadences (the
 /// rescan timer is owned by the platform side, which also owns enumeration).
 #[derive(Debug, Clone, uniffi::Record)]

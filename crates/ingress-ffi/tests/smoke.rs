@@ -3,8 +3,9 @@
 //! verifies that).
 
 use ingress_ffi::{
-    FfiAssetDescriptor, FfiCaptureMetadata, FfiError, FfiHashResolutionKind, FfiLibraryScope,
-    FfiMediaType, FfiResolution, FfiResourceDescriptor, IngressSession,
+    FfiAssetDescriptor, FfiCaptureMetadata, FfiEnsureLibraryOutcome, FfiError,
+    FfiHashResolutionKind, FfiLibraryScope, FfiMediaType, FfiResolution, FfiResourceDescriptor,
+    IngressSession,
 };
 
 fn slice_descriptor(cloud_id: &str, live_photo: bool) -> FfiAssetDescriptor {
@@ -59,9 +60,10 @@ struct Rig {
 fn rig() -> Rig {
     let data_dir = tempfile::tempdir().unwrap();
     let blob_dir = tempfile::tempdir().unwrap();
-    // Library config has no FFI surface (it lives in ingress-cli, Phase 6);
-    // seed via ingress-core BEFORE the session opens its pool, and drop the
-    // seeding store so exactly one writer pool is live at a time.
+    // Seed via ingress-core BEFORE the session opens its pool (the FFI's
+    // ensure_personal_library generates ids; the rig wants the fixed
+    // "personal" id), and drop the seeding store so exactly one writer pool
+    // is live at a time.
     {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -360,5 +362,116 @@ fn bad_timestamp_rejected() {
     assert!(matches!(
         rig.session.ingest_descriptor(desc).unwrap_err(),
         FfiError::InvalidDescriptor { .. }
+    ));
+}
+
+// ============================================================================
+// ensure_personal_library — the daemon-startup auto-bind surface
+// ============================================================================
+
+/// Read one scalar back out of state.db (same sqlite3-shell approach as
+/// `rusqlite_free_update` — no sqlx dev-dep in this crate).
+fn sqlite_scalar(data_dir: &std::path::Path, sql: &str) -> String {
+    let out = std::process::Command::new("sqlite3")
+        .arg(data_dir.join("state.db"))
+        .arg(sql)
+        .output()
+        .unwrap();
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+// Impact: the enablement flow depends on this being the ONLY provisioning
+// step a fresh install needs — without it every ingest silently parks as
+// scope_unmapped.
+// Should: create a personal library with a generated id when none exists.
+// Should: record the creation in the ingest log.
+// Should: warn when no remote sidecar root is configured.
+#[test]
+fn ensure_personal_library_creates_when_absent() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let blob_dir = tempfile::tempdir().unwrap();
+    let session = IngressSession::new(data_dir.path().to_string_lossy().into_owned()).unwrap();
+    let outcome = session
+        .ensure_personal_library(blob_dir.path().to_string_lossy().into_owned(), None)
+        .unwrap();
+    match outcome {
+        FfiEnsureLibraryOutcome::Created {
+            library_id,
+            warn_no_remote,
+        } => {
+            assert!(library_id.contains('_'), "generated two-word id: {library_id}");
+            assert!(warn_no_remote);
+        }
+        other => panic!("expected Created, got {other:?}"),
+    }
+    assert_eq!(
+        sqlite_scalar(
+            data_dir.path(),
+            "SELECT COUNT(*) FROM ingest_log WHERE event_type = 'library_added'",
+        ),
+        "1"
+    );
+}
+
+// Should: report the already-bound library (state.db wins) instead of
+// creating a second personal-routing candidate.
+// Should not: compare the provisioned blob_root against the bound one —
+// divergence is the platform side's warning to raise.
+#[test]
+fn ensure_personal_library_is_idempotent() {
+    let rig = rig();
+    let outcome = rig
+        .session
+        .ensure_personal_library("/somewhere/else/entirely".into(), None)
+        .unwrap();
+    match outcome {
+        FfiEnsureLibraryOutcome::AlreadyExists {
+            library_id,
+            blob_root,
+        } => {
+            assert_eq!(library_id, "personal");
+            assert_eq!(blob_root, rig.blob_dir.path().to_string_lossy());
+        }
+        other => panic!("expected AlreadyExists, got {other:?}"),
+    }
+}
+
+// Should: reject a relative blob root before any state is written.
+#[test]
+fn ensure_personal_library_rejects_relative_blob_root() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let session = IngressSession::new(data_dir.path().to_string_lossy().into_owned()).unwrap();
+    assert!(matches!(
+        session
+            .ensure_personal_library("relative/blobs".into(), None)
+            .unwrap_err(),
+        FfiError::Invariant { .. }
+    ));
+    assert_eq!(
+        sqlite_scalar(data_dir.path(), "SELECT COUNT(*) FROM libraries"),
+        "0"
+    );
+}
+
+// Impact: library writes and daemon/CLI runs share one exclusive run lock;
+// the auto-bind must respect a live holder rather than corrupting refcounts.
+// Should: refuse to bind while another live process holds the run lock.
+#[test]
+fn ensure_personal_library_refuses_live_run_lock() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let blob_dir = tempfile::tempdir().unwrap();
+    let session = IngressSession::new(data_dir.path().to_string_lossy().into_owned()).unwrap();
+    // A lock file stamped with THIS (live) pid reads as another running
+    // process to the acquire path.
+    std::fs::write(
+        data_dir.path().join("drain.lock"),
+        format!("{}", std::process::id()),
+    )
+    .unwrap();
+    assert!(matches!(
+        session
+            .ensure_personal_library(blob_dir.path().to_string_lossy().into_owned(), None)
+            .unwrap_err(),
+        FfiError::Invariant { .. }
     ));
 }

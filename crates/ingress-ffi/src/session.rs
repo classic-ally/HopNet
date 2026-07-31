@@ -78,9 +78,48 @@ impl IngressSession {
         }))
     }
 
-    // Library configuration deliberately has NO FFI surface: it moved
-    // wholesale to the Rust `ingress-cli` (Phase 6) — `library add/bind/
-    // rename/set-retention` — which generates the immutable library_id.
+    /// Ensure a personal (NULL-scope) library exists, creating one with the
+    /// CLI-equivalent defaults when absent.
+    ///
+    /// Deliberate partial reversal of the Phase-6 "libconfig is CLI-only"
+    /// rule: the sandboxed GUI app cannot write `~/.local/share/...` and the
+    /// root workspace cannot link ingress-core (sha2 workspace split), so
+    /// the daemon is the only process that can bind the library the
+    /// enablement flow provisions. Ensure-only — bind/rename/set-retention
+    /// stay CLI-only. Called at daemon startup BEFORE `run_daemon` acquires
+    /// the run lock (`add_library` takes it exclusively itself).
+    pub fn ensure_personal_library(
+        &self,
+        blob_root: String,
+        sidecar_root_remote: Option<String>,
+    ) -> Result<FfiEnsureLibraryOutcome, FfiError> {
+        use ingress_core::descriptor::LibraryScope;
+        use ingress_core::libconfig::{AddLibraryOptions, add_library};
+
+        let existing = self.runtime.block_on(self.inner.store.libraries())?;
+        if let Some(l) = existing.iter().find(|l| l.scope_binding.is_none()) {
+            return Ok(FfiEnsureLibraryOutcome::AlreadyExists {
+                library_id: l.library_id.to_string(),
+                blob_root: l.blob_root.clone(),
+            });
+        }
+        let opts = AddLibraryOptions {
+            id: None,
+            display_name: None,
+            blob_root,
+            sidecar_root_remote,
+            scope: LibraryScope::Personal,
+            // Mirrors the ingress-cli `library add` default.
+            retention_days: 30,
+        };
+        let added = self
+            .runtime
+            .block_on(add_library(&self.inner.store, &self.inner.data_dir, &opts))?;
+        Ok(FfiEnsureLibraryOutcome::Created {
+            library_id: added.config.library_id.to_string(),
+            warn_no_remote: added.warn_no_remote,
+        })
+    }
 
     /// Match-precedence rule 1. `NeedsOriginal` → stream the original via
     /// [`Self::begin_original`]; `AlreadyKnown` → done for the slice.
@@ -437,6 +476,7 @@ impl IngressSession {
         &self,
         fetcher: Arc<dyn crate::fetcher::PhotoResourceFetcher>,
         options: FfiDaemonOptions,
+        credentials_provider: Option<Arc<dyn crate::refreshing::PublishCredentialsProvider>>,
     ) -> Result<FfiDaemonReport, FfiError> {
         use ingress_core::scheduler::{BackoffConfig, Scheduler, SchedulerConfig, StatvfsProbe};
         let rx = self
@@ -479,15 +519,30 @@ impl IngressSession {
         // Publishing is opt-in: both credentials present. The NodePublisher
         // constructor only builds the HTTP client — reachability is probed
         // lazily by the tick (park semantics), so a down node at daemon
-        // start is not an error.
+        // start is not an error. A provider without startup credentials
+        // does NOT enable publishing later — the enablement flow registers
+        // the agent fresh, so launchd start ordering covers the real flow.
         if let (Some(node_url), Some(device_token)) =
             (&options.publish_node_url, &options.publish_device_token)
         {
-            let publisher = ingress_publisher::NodePublisher::new(node_url, device_token)
-                .map_err(|msg| FfiError::Invariant {
-                    msg: format!("publisher init: {msg}"),
-                })?;
-            scheduler = scheduler.with_publisher(Arc::new(publisher));
+            let init = |creds: &crate::refreshing::FfiPublishCredentials| {
+                ingress_publisher::NodePublisher::new(&creds.node_url, &creds.device_token)
+            };
+            let built_from = crate::refreshing::FfiPublishCredentials {
+                node_url: node_url.clone(),
+                device_token: device_token.clone(),
+            };
+            let publisher = init(&built_from).map_err(|msg| FfiError::Invariant {
+                msg: format!("publisher init: {msg}"),
+            })?;
+            scheduler = match credentials_provider {
+                Some(provider) => scheduler.with_publisher(Arc::new(
+                    crate::refreshing::RefreshingPublisher::new(
+                        publisher, built_from, provider, init,
+                    ),
+                )),
+                None => scheduler.with_publisher(Arc::new(publisher)),
+            };
         }
         let report = self
             .runtime

@@ -1,11 +1,22 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
+<!-- Embedded via the __TEXT,__info_plist linker section (Package.swift).
+     The bundle identifier is the daemon's TCC + codesign identity and the
+     LaunchAgent label. It appears in exactly three places, which must stay
+     in sync:
+       1. this file (CFBundleIdentifier)
+       2. scripts/macos/03b-embed-photo-ingress.sh (AGENT_ID)
+       3. src/photo_ingress/service.rs (AGENT_PLIST_NAME) -->
 <dict>
     <key>CFBundleIdentifier</key>
-    <string>app.hopnet.photo-ingress</string>
+    <string>com.hopnet.desktop.photo-ingress</string>
     <key>CFBundleName</key>
     <string>photo-ingress</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
     <key>NSPhotoLibraryUsageDescription</key>
     <string>HopNet photo ingress: archives your Photos library to storage you control.</string>
 </dict>
