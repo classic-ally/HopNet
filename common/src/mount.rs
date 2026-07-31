@@ -76,3 +76,12 @@ pub struct MountDeleteRequest {
     #[serde(default)]
     pub recursive: bool,
 }
+
+/// Node-side statfs numbers (RFC-018 S8): mesh capacity constrained to
+/// >= 2-failure tolerance, and raw user bytes consumed at tolerance >= 0
+/// — the resilience pane's definitions, not local-disk state.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct MountStatfsResponse {
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+}

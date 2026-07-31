@@ -405,6 +405,21 @@ pub fn generate_fault_tolerance_curve(
     curve
 }
 
+/// User-data capacity while the mesh still tolerates `min_tolerance` node
+/// failures: the curve's x-value where `nodes_can_fail` first drops below
+/// the floor, or the final point if it never does. This is the resilience
+/// pane's headline capacity (StoragePanel.svelte) lifted into Rust so the
+/// mount statfs surface (RFC-018 S8) and the pane share one definition;
+/// issue #24's shared abstraction can absorb it from here.
+pub fn capacity_at_tolerance(curve: &[FaultToleranceCurvePoint], min_tolerance: i32) -> f64 {
+    curve
+        .iter()
+        .find(|p| p.nodes_can_fail < min_tolerance)
+        .or(curve.last())
+        .map(|p| p.user_data_gb)
+        .unwrap_or(0.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -572,5 +587,42 @@ mod tests {
         let curve = generate_fault_tolerance_curve(fifty_nodes, 0.9);
         assert_eq!(curve[0].active_nodes, 50);
         assert_eq!(curve[0].nodes_can_fail, 20); // 50-17=33, but capped at 20
+    }
+
+    fn point(user_data_gb: f64, nodes_can_fail: i32) -> FaultToleranceCurvePoint {
+        FaultToleranceCurvePoint {
+            user_data_gb,
+            active_nodes: 0,
+            nodes_can_fail,
+            participating_nodes: vec![],
+        }
+    }
+
+    // Impact: this is the statfs total the mount reports; disagreeing with
+    // the resilience pane's headline number would show users two different
+    // capacities for the same mesh.
+    // Should: report the x-value of the first curve point that drops below
+    // the tolerance floor.
+    #[test]
+    fn capacity_stops_at_first_point_below_tolerance_floor() {
+        let curve = vec![point(0.0, 4), point(50.0, 3), point(80.0, 1), point(90.0, 0)];
+        assert_eq!(capacity_at_tolerance(&curve, 2), 80.0);
+    }
+
+    // Should: report the final point's capacity when tolerance never drops
+    // below the floor.
+    #[test]
+    fn capacity_uses_last_point_when_floor_never_crossed() {
+        let curve = vec![point(0.0, 5), point(120.0, 3), point(200.0, 2)];
+        assert_eq!(capacity_at_tolerance(&curve, 2), 200.0);
+    }
+
+    // Should: report zero capacity for a mesh already below the floor at
+    // x=0, and for an empty curve.
+    #[test]
+    fn capacity_is_zero_when_already_below_floor_or_empty() {
+        let curve = vec![point(0.0, 1), point(30.0, 0)];
+        assert_eq!(capacity_at_tolerance(&curve, 2), 0.0);
+        assert_eq!(capacity_at_tolerance(&[], 2), 0.0);
     }
 }

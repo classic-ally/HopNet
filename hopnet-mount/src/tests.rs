@@ -1020,3 +1020,84 @@ async fn ls_shaped_sequence_emits_expected_calls() {
          the node, and a single-page listing is one enumerate"
     );
 }
+
+// ---------------------------------------------------------------- S8 —
+// statfs: TTL-cached mesh numbers that never turn df into an error.
+
+// Should: serve repeated statfs reads within the TTL from cache with a
+// single transport call.
+#[tokio::test]
+async fn statfs_within_ttl_is_cache_served() {
+    let (core, handle) = setup();
+    handle.set_statfs(Some(crate::transport::StatfsInfo {
+        total_bytes: 1000,
+        used_bytes: 250,
+    }));
+
+    let first = core.statfs().await;
+    let second = core.statfs().await;
+    assert_eq!(first.total_bytes, 1000);
+    assert_eq!(second, first);
+    assert_eq!(
+        handle
+            .calls()
+            .iter()
+            .filter(|c| **c == CallRecord::Statfs)
+            .count(),
+        1,
+        "second read within the TTL must not hit the node"
+    );
+}
+
+// Impact: file managers poll statfs continuously; a node blip must
+// degrade to stale numbers, not to an erroring drive.
+// Should: keep serving the last-known numbers when the node becomes
+// unreachable.
+// Should not: report zeros once real numbers have been seen.
+#[tokio::test(start_paused = true)]
+async fn statfs_serves_last_known_on_transport_failure() {
+    let (core, handle) = setup();
+    handle.set_statfs(Some(crate::transport::StatfsInfo {
+        total_bytes: 4096,
+        used_bytes: 1024,
+    }));
+    let first = core.statfs().await;
+    assert_eq!(first.used_bytes, 1024);
+
+    handle.set_statfs(None);
+    tokio::time::advance(std::time::Duration::from_secs(20)).await;
+    let stale = core.statfs().await;
+    assert_eq!(stale, first, "transport failure must serve last-known");
+}
+
+// Should: report zeros before the first successful fetch rather than
+// erroring the mount.
+#[tokio::test]
+async fn statfs_before_first_success_is_zeros() {
+    let (core, handle) = setup();
+    handle.set_statfs(None);
+    let info = core.statfs().await;
+    assert_eq!((info.total_bytes, info.used_bytes), (0, 0));
+}
+
+// Should: refetch once the TTL lapses and pick up fresh numbers.
+#[tokio::test(start_paused = true)]
+async fn statfs_refetches_after_ttl() {
+    let (core, handle) = setup();
+    handle.set_statfs(Some(crate::transport::StatfsInfo {
+        total_bytes: 1000,
+        used_bytes: 100,
+    }));
+    assert_eq!(core.statfs().await.used_bytes, 100);
+
+    handle.set_statfs(Some(crate::transport::StatfsInfo {
+        total_bytes: 1000,
+        used_bytes: 900,
+    }));
+    tokio::time::advance(std::time::Duration::from_secs(20)).await;
+    assert_eq!(
+        core.statfs().await.used_bytes,
+        900,
+        "expired cache must refetch"
+    );
+}

@@ -466,8 +466,17 @@ impl Filesystem for HopFs {
     }
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
-        // Placeholder numbers; node-side tolerance-constrained capacity
-        // lands in S8 (issue #24).
-        reply.statfs(0, 0, 0, 0, 0, 4096, 255, 4096);
+        // Node-side numbers (RFC-018 S8): total = capacity while the mesh
+        // tolerates >= 2 failures, used = observed bytes — never local
+        // cache state. The core TTL-caches and serves last-known on
+        // transport blips, so this arm cannot error.
+        let core = self.core.clone();
+        self.rt.spawn(async move {
+            let info = core.statfs().await;
+            const BLOCK: u64 = 4096;
+            let blocks = info.total_bytes / BLOCK;
+            let free = info.total_bytes.saturating_sub(info.used_bytes) / BLOCK;
+            reply.statfs(blocks, free, free, 0, 0, BLOCK as u32, 255, BLOCK as u32);
+        });
     }
 }

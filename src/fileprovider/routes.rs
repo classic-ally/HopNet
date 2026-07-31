@@ -28,6 +28,27 @@ pub fn health_router() -> axum::Router<AppState> {
         .route("/mount/health", get(get_health))
 }
 
+/// Mount statfs (RFC-018 S8) — host-owned like health, but AUTHED: the
+/// capacity reduction lives in `views::resilience`, which the drive crate
+/// cannot see, so main.rs nests this one route under the same
+/// device-token middleware that wraps the mount projection. The scan is
+/// the resilience pane's full-table pass — spawn_blocking, as the view
+/// route does.
+pub async fn get_mount_statfs(
+    State(app_state): State<AppState>,
+) -> Result<Json<hopnet_common::mount::MountStatfsResponse>, StatusCode> {
+    let pool = app_state.db_pool.clone();
+    let (total_bytes, used_bytes) =
+        tokio::task::spawn_blocking(move || crate::views::resilience::mount_statfs_bytes(&pool))
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(hopnet_common::mount::MountStatfsResponse {
+        total_bytes,
+        used_bytes,
+    }))
+}
+
 /// Health check endpoint for FileProvider extension
 /// Returns ready if database setup is completed, not_ready otherwise
 pub async fn get_health(State(app_state): State<AppState>) -> impl axum::response::IntoResponse {

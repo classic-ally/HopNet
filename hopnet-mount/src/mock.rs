@@ -12,7 +12,8 @@ use std::time::SystemTime;
 use hopnet_common::CustomUUID;
 
 use crate::transport::{
-    BoxFuture, Cursor, Health, Item, ItemId, ItemKind, NodeTransport, Page, TransportError,
+    BoxFuture, Cursor, Health, Item, ItemId, ItemKind, NodeTransport, Page, StatfsInfo,
+    TransportError,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +30,7 @@ pub enum CallRecord {
     Rename { id: CustomUUID, new_parent: Option<ItemId>, new_name: Option<String> },
     Delete { id: CustomUUID, recursive: bool },
     Health,
+    Statfs,
 }
 
 struct MockState {
@@ -55,6 +57,9 @@ struct MockState {
     upload_hold: tokio::sync::watch::Sender<bool>,
     /// When true, content uploads fail with Unavailable.
     upload_fail: bool,
+    /// Scripted statfs numbers; None = statfs fails Unavailable (the
+    /// node-unreachable arm of the daemon's last-known-value cache).
+    statfs: Option<StatfsInfo>,
 }
 
 impl MockState {
@@ -96,6 +101,10 @@ impl MockTransport {
             fetch_hold: tokio::sync::watch::channel(false).0,
             upload_hold: tokio::sync::watch::channel(false).0,
             upload_fail: false,
+            statfs: Some(StatfsInfo {
+                total_bytes: 100 * 1024 * 1024 * 1024,
+                used_bytes: 25 * 1024 * 1024 * 1024,
+            }),
         }));
         (
             Arc::new(MockTransport {
@@ -311,6 +320,11 @@ impl MockHandle {
     /// Make content uploads fail (retry/recovery tests).
     pub fn set_upload_fail(&self, fail: bool) {
         self.state.lock().expect("mock poisoned").upload_fail = fail;
+    }
+
+    /// Script the statfs numbers; None makes statfs fail Unavailable.
+    pub fn set_statfs(&self, info: Option<StatfsInfo>) {
+        self.state.lock().expect("mock poisoned").statfs = info;
     }
 
     /// Page size for enumerate — small values force multi-page listings.
@@ -685,6 +699,18 @@ impl NodeTransport for MockTransport {
                 .calls
                 .push(CallRecord::Health);
             Ok(Health::Ready)
+        })
+    }
+
+    fn statfs(&self) -> BoxFuture<'_, Result<StatfsInfo, TransportError>> {
+        let state = self.state.clone();
+        Box::pin(async move {
+            let mut locked = state.lock().expect("mock poisoned");
+            locked.calls.push(CallRecord::Statfs);
+            match locked.statfs {
+                Some(info) => Ok(info),
+                None => Err(TransportError::Unavailable("statfs scripted away".into())),
+            }
         })
     }
 }

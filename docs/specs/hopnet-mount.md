@@ -218,6 +218,12 @@ Per-blob sparse files in `$XDG_CACHE_HOME/hopnet/content/{blob_id}`.
     total − consumed
   - v1 may read the existing view; migrates to the shared
     available-capacity abstraction (issue #24)
+  - S8 shape: the pane's headline number existed only in the frontend;
+    the reduction now lives in `db::resilience::capacity_at_tolerance`
+    and is served by `GET /api/integrations/mount/statfs` (host-owned
+    like /health since the drive crate cannot see resilience code, but
+    device-token-authed). Daemon TTL-caches (15 s) and serves
+    last-known on transport blips — `df` never errors
 - passthrough acceleration (optional, later phase):
   - only when a file's content is provably complete, and only on a
     subsequent open — passthrough is all-or-nothing per open
@@ -273,10 +279,16 @@ Per-blob sparse files in `$XDG_CACHE_HOME/hopnet/content/{blob_id}`.
   - zero-touch (GUI mode, node in the same user session): node
     auto-registers a "Mount" device on login and writes credentials into
     the user's Secret Service — Linux arm of macOS
-    `ensure_fileprovider_device_token`
+    `ensure_fileprovider_device_token`. DEFERRED to S10 (decided at S8):
+    the node runs as a system user on every current Linux deployment, so
+    there is no session D-Bus for it to write into — the arm lands with
+    the Linux desktop packaging that creates a same-session node
   - manual (`hopnet-mount login`): paste `device_id.secret` from the
     DevicesPane UI — the Android model; required because headless nodes
-    commonly run as a different user than the interactive session
+    commonly run as a different user than the interactive session.
+    Validates (health + one authed read) before storing; token to
+    Secret Service or the 0600 fallback, URL to
+    `$XDG_CONFIG_HOME/hopnet/mount.json`
 - endpoint discovery:
   - headless: fixed :34632, nothing to do
   - GUI: ephemeral port → node writes `$XDG_RUNTIME_DIR/hopnet/endpoint`
@@ -287,9 +299,18 @@ Per-blob sparse files in `$XDG_CACHE_HOME/hopnet/content/{blob_id}`.
   surfaces the difference rather than generic EIO
 - lifecycle:
   - systemd user unit `hopnet-mount.service`; mountpoint `~/HopDrive`
-    by default
+    by default. Shipped as flake outputs: `packages.hopnet-mount` plus
+    `homeManagerModules.hopnet-mount` / `nixosModules.hopnet-mount`
+    (one shared unit definition, `nix/hopnet-mount-module.nix`)
   - on start: clean up stale mounts from a previous crash
-    (`fusermount3 -uz`); on stop: unmount
+    (`fusermount3 -uz`), then abort the recorded orphaned fuse
+    connection via fusectl — lazy unmount alone detaches the namespace
+    but leaves wedged /dev/fuse ops alive, and those D-state tasks
+    block system suspend (observed in the field during S7). The daemon
+    records `minor(st_dev)` of its live mount (= the fusectl
+    connection id) and the next start aborts exactly that orphan
+  - on stop (SIGTERM from systemd, SIGINT interactively): unmount,
+    remove the connection record
   - node-unreachable: cached attrs keep answering; ops requiring the
     node fail with EIO after a short bounded retry — never indefinite
     hangs
@@ -358,8 +379,16 @@ implements that contract. Each slice is PR-sized and lands green.
       traffic exposed: kernel notify (inval_*) is a synchronous
       /dev/fuse write that can wait on an in-flight FUSE request — it
       now runs via spawn_blocking, never on async workers.
-- [ ] S8 — provisioning & lifecycle: secrets, login, endpoint file,
-      systemd unit, statfs
+- [x] S8 — provisioning & lifecycle (2026-07-31): `login` subcommand
+      (validate-then-store; Secret Service via pure-Rust zbus, 0600
+      file fallback), URL discovery chain (flag > login config >
+      node-written $XDG_RUNTIME_DIR/hopnet/endpoint > :34632), real
+      statfs (capacity math lifted from the frontend into
+      db::resilience, host-owned device-token route), SIGTERM
+      lifecycle + stale-mount/orphaned-connection cleanup, and Nix
+      packaging: packages.hopnet-mount + homeManagerModules/
+      nixosModules sharing one unit definition. Zero-touch node arm
+      deferred to S10 (no same-session Linux node deployment exists)
 - [ ] S9 — passthrough quarantine module + measurement
 - [ ] S10 — desktop badges, context menus, packaging
 

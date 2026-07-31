@@ -130,6 +130,14 @@ pub struct Mutated {
     pub height: Height,
 }
 
+/// Node-side statfs numbers (RFC-018 S8): total = user-data capacity
+/// while the mesh tolerates >= 2 node failures, used = observed bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatfsInfo {
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+}
+
 pub trait NodeTransport: Send + Sync {
     /// Resolve one child of `parent` by name. `Ok(None)` = no such child.
     fn lookup(
@@ -212,4 +220,8 @@ pub trait NodeTransport: Send + Sync {
 
     /// Node readiness — distinguishes "not running" from "not set up".
     fn health(&self) -> BoxFuture<'_, Result<Health, TransportError>>;
+
+    /// Mesh-level capacity numbers for statfs — node-side definitions
+    /// (tolerance-constrained total, observed used), never local disk.
+    fn statfs(&self) -> BoxFuture<'_, Result<StatfsInfo, TransportError>>;
 }

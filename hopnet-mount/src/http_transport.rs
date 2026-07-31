@@ -11,11 +11,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use hopnet_common::CustomUUID;
 use hopnet_common::db::InodeType;
 use hopnet_common::fileprovider::{HealthResponse, HealthStatus};
-use hopnet_common::mount::{MountChangesResponse, MountEnumerateResponse, MountItem};
+use hopnet_common::mount::{
+    MountChangesResponse, MountEnumerateResponse, MountItem, MountStatfsResponse,
+};
 
 use crate::transport::{
     BoxFuture, Changes, Cursor, Health, Height, Item, ItemId, ItemKind, Mutated, NodeTransport,
-    Page, TransportError, WatchEvent, WatchStream,
+    Page, StatfsInfo, TransportError, WatchEvent, WatchStream,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -498,6 +500,23 @@ impl NodeTransport for HttpTransport {
             Ok(match wire.status {
                 HealthStatus::Ready => Health::Ready,
                 HealthStatus::NotReady => Health::NotReady,
+            })
+        })
+    }
+
+    fn statfs(&self) -> BoxFuture<'_, Result<StatfsInfo, TransportError>> {
+        Box::pin(async move {
+            let response = self
+                .client
+                .get(self.url("statfs"))
+                .bearer_auth(&self.token)
+                .send()
+                .await
+                .map_err(map_reqwest_err)?;
+            let wire = parse_json::<MountStatfsResponse>(response).await?;
+            Ok(StatfsInfo {
+                total_bytes: wire.total_bytes,
+                used_bytes: wire.used_bytes,
             })
         })
     }

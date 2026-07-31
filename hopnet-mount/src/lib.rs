@@ -20,5 +20,8 @@ pub mod watch;
 #[cfg(target_os = "linux")]
 pub mod fuse;
 
+#[cfg(target_os = "linux")]
+pub mod provision;
+
 #[cfg(test)]
 mod tests;

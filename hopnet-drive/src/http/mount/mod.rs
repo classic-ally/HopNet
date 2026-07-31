@@ -690,7 +690,8 @@ pub async fn delete_item(
     Extension(user_id): Extension<i32>,
     Json(request): Json<MountDeleteRequest>,
 ) -> Result<Json<MountMutationResponse>, StatusCode> {
-    let session = session_or_status(&state, user_id).await?;
+    // Deletes need no key material; the call is the liveness gate only.
+    let _session = session_or_status(&state, user_id).await?;
 
     let encrypted_path = {
         let db_lock = state

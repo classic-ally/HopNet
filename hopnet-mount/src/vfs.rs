@@ -14,6 +14,9 @@ use crate::attrs::AttrCache;
 use crate::idmap::{IdMap, ROOT_INO};
 use crate::transport::{Item, ItemId, ItemKind, NodeTransport, TransportError};
 
+/// statfs numbers refresh at most this often (node-side full-table scan).
+const STATFS_TTL: Duration = Duration::from_secs(15);
+
 #[derive(Debug)]
 pub enum CoreError {
     /// Unknown inode number, unknown name, or item gone. (ENOENT)
@@ -114,6 +117,17 @@ pub struct MountCore {
     upload_locks: Mutex<HashMap<hopnet_common::CustomUUID, Arc<tokio::sync::Mutex<()>>>>,
     /// LWW conflicts observed at upload (issue #26 owns resolution).
     conflicts: AtomicU64,
+    /// statfs TTL cache (S8): file managers hammer statfs, and the
+    /// node-side number is a full-table scan. Also the last-known store
+    /// — a transport blip must not turn `df` into an error.
+    statfs: Mutex<StatfsState>,
+}
+
+#[derive(Default)]
+struct StatfsState {
+    info: Option<crate::transport::StatfsInfo>,
+    /// tokio Instant, not std: the paused-clock tests advance it.
+    fetched_at: Option<tokio::time::Instant>,
 }
 
 impl MountCore {
@@ -130,6 +144,7 @@ impl MountCore {
             next_file_handle: AtomicU64::new(1),
             upload_locks: Mutex::new(HashMap::new()),
             conflicts: AtomicU64::new(0),
+            statfs: Mutex::new(StatfsState::default()),
         }
     }
 
@@ -148,6 +163,36 @@ impl MountCore {
     /// LWW conflicts observed at upload time (test/metrics gauge).
     pub fn conflicts(&self) -> u64 {
         self.conflicts.load(Ordering::Relaxed)
+    }
+
+    /// Mesh capacity for the statfs arm, TTL-cached and never failing:
+    /// within the TTL the cached numbers answer directly; past it we
+    /// refetch, and a transport error falls back to the last-known
+    /// numbers (zeros before the first success). Concurrent expiry may
+    /// double-fetch — harmless, the route is a read.
+    pub async fn statfs(&self) -> crate::transport::StatfsInfo {
+        let cached = {
+            let state = self.statfs.lock().expect("statfs poisoned");
+            match (state.info, state.fetched_at) {
+                (Some(info), Some(at)) if at.elapsed() < STATFS_TTL => return info,
+                (info, _) => info,
+            }
+        };
+        match self.transport.statfs().await {
+            Ok(info) => {
+                let mut state = self.statfs.lock().expect("statfs poisoned");
+                state.info = Some(info);
+                state.fetched_at = Some(tokio::time::Instant::now());
+                info
+            }
+            Err(e) => {
+                tracing::debug!("statfs fetch failed, serving last-known: {e}");
+                cached.unwrap_or(crate::transport::StatfsInfo {
+                    total_bytes: 0,
+                    used_bytes: 0,
+                })
+            }
+        }
     }
 
     pub async fn lookup(&self, parent_ino: u64, name: &str) -> Result<NodeAttr, CoreError> {

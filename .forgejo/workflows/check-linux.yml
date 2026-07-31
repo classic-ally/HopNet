@@ -50,3 +50,9 @@ jobs:
 
       - name: Verify headless binary
         run: test -x result/bin/hopnet
+
+      - name: nix build .#hopnet-mount
+        run: nix build .#hopnet-mount --print-build-logs
+
+      - name: Verify mount binary
+        run: test -x result/bin/hopnet-mount

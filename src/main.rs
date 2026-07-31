@@ -112,6 +112,24 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Linux arm of the same discovery problem (RFC-018 S8): hopnet-mount
+    // finds a same-user node through $XDG_RUNTIME_DIR/hopnet/endpoint.
+    // Written for fixed and ephemeral ports alike (harmless when fixed);
+    // skipped in test mode — stack tests boot nodes as the real user and
+    // must not clobber the session's live endpoint file.
+    #[cfg(target_os = "linux")]
+    if std::env::var("HOPNET_TEST_MODE").is_err() {
+        if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+            let dir = std::path::Path::new(&runtime_dir).join("hopnet");
+            let write = std::fs::create_dir_all(&dir).and_then(|_| {
+                std::fs::write(dir.join("endpoint"), format!("http://127.0.0.1:{port}\n"))
+            });
+            if let Err(e) = write {
+                tracing::warn!("mount endpoint file write failed: {e}");
+            }
+        }
+    }
+
     let (encodingkey, decodingkey) = auth::generate_jwt_key();
 
     // Check if ephemeral database mode is requested (for testing)
@@ -601,6 +619,21 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 .merge(protected_routes)
                 .merge(jwt_or_rpc_routes)
                 .nest("/integrations", fileprovider::routes::health_router())
+                // Host-owned mount statfs (RFC-018 S8): the capacity math
+                // lives host-side (views::resilience), so this one route
+                // can't ride the drive-owned projection mount — but it
+                // wears the same device-token auth. A literal route, not a
+                // second nest at the projection's prefix: two nests at one
+                // path conflict, a static route beside a nest does not.
+                .route(
+                    "/integrations/mount/statfs",
+                    get(fileprovider::routes::get_mount_statfs).layer(
+                        middleware::from_fn_with_state(
+                            app_state.clone(),
+                            devices::auth::device_token_auth_middleware,
+                        ),
+                    ),
+                )
                 .nest("/devices", devices::routes::router(app_state.clone()))
                 .merge(test_routes)
                 .route("/setup", get(setup::get_setup))

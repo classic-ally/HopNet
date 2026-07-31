@@ -674,7 +674,6 @@ async fn fuse_mount_smoke_against_live_node() {
         }
     })
     .await
-    .map(|(w, s, h)| (w, s, h))
     .unwrap();
     assert_eq!(whole, new_content);
     assert_eq!(slice, &new_content[6..11]);
@@ -837,4 +836,34 @@ async fn fuse_mount_smoke_against_live_node() {
 
     watcher.abort();
     drop(session);
+}
+
+// Impact: statfs is the surface `df` and every file manager reads; the
+// numbers must come from the mesh capacity definitions and the route
+// must be closed to the unauthenticated.
+// Should: return capacity numbers through the transport with a valid
+// device token.
+// Should not: answer statfs without a device token.
+#[tokio::test]
+async fn statfs_route_is_authed_and_shaped() {
+    let node = boot_node().await;
+    let (api_key, _jwt) = provision(&node).await;
+
+    let transport = HttpTransport::new(&node.base(), &api_key).unwrap();
+    let info = transport.statfs().await.expect("statfs over transport");
+    // A fresh single-node mesh has no metrics rows yet, so both numbers
+    // are legitimately zero — the contract here is shape + auth, the
+    // capacity math itself is unit-tested in src/db/resilience.rs.
+    assert_eq!(info.used_bytes, 0, "fresh node has no placed user data");
+
+    let bare = reqwest::Client::new()
+        .get(format!("{}/api/integrations/mount/statfs", node.base()))
+        .send()
+        .await
+        .expect("unauthenticated statfs request");
+    assert_eq!(
+        bare.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "statfs must sit behind device-token auth"
+    );
 }
