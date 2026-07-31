@@ -500,10 +500,15 @@ protocol it checks.
   - `node_staged_version` tx; v1 git-release provider; advisory
     surface
 - [ ] S4 — qnt: epoch-transition extension of
-      `validator_membership.qnt`
-  - invariants verified BEFORE the protocol is coded: boundary
-    preserves the seated set; dark-seat vote-out from a carried
-    configuration is quorum-safe; no cross-epoch evidence flow
+      `validator_membership.qnt` + the SEAL CONTRACT
+  - invariants verified BEFORE the protocol is coded: seal safety
+    (nothing decides past the boundary in epoch N), abort enabled
+    strictly inside (start, commit), boundary preserves the seated
+    set; dark-seat vote-out from a carried configuration is
+    quorum-safe; no cross-epoch evidence flow
+  - the engine's seal contract lands here as a short
+    `hopnet-consensus/spec/` note in engine vocabulary (terminal
+    height, restart from H+1), prose deferring to the model
 - [ ] S5 — boundary protocol: `regenesis_start`/`commit`/`abort`,
       admission gate, drain, vote-iff-match, seal
   - deterministic-sim + fault-fuzzing coverage
