@@ -81,10 +81,7 @@ pub trait TxGateway: Send + Sync {
 }
 
 pub type ByteStream = Pin<
-    Box<
-        dyn tokio_stream::Stream<Item = Result<bytes::Bytes, hopnet_storage::StorageError>>
-            + Send,
-    >,
+    Box<dyn tokio_stream::Stream<Item = Result<bytes::Bytes, hopnet_storage::StorageError>> + Send>,
 >;
 
 /// Type-erases hopnet_storage::api::get + the host's seam bundle (the

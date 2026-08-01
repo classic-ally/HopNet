@@ -58,13 +58,14 @@ pub fn setup_genesis(pool: &Pool<SqliteConnectionManager>) {
 
         // Engine-shape genesis block (empty transactions — fixture doesn't
         // exercise the dispatch table) with the synthetic trusted certificate.
-        let engine_block = hopnet_consensus::types::Block::new(hopnet_consensus::types::BlockData {
-            height: 0,
-            round: 0,
-            parent_hash: None,
-            transactions: hopnet_consensus::types::Transactions(Vec::new()),
-        })
-        .expect("Failed to build engine genesis block");
+        let engine_block =
+            hopnet_consensus::types::Block::new(hopnet_consensus::types::BlockData {
+                height: 0,
+                round: 0,
+                parent_hash: None,
+                transactions: hopnet_consensus::types::Transactions(Vec::new()),
+            })
+            .expect("Failed to build engine genesis block");
         let cert = hopnet_consensus::codec::WireCommitCertificate {
             height: 0,
             round: 0,

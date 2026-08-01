@@ -1,7 +1,7 @@
 //! Export (materialization) pipeline (RFC-015 Stage D5b).
 //!
 //! Reshaped from the host's `takeout::routes::execute_takeout_materialization`
-//! + `takeout::materialization`: enumeration moved OUT of consensus apply
+//! plus `takeout::materialization`: enumeration moved OUT of consensus apply
 //! (decision 3) — this task asks each registered exporter to `enumerate()`
 //! the user's state, populates the core work table, streams each entry's
 //! content through `open()` into staging while CORE computes the manifest
@@ -16,12 +16,12 @@ use hopnet_projection::host::{TxSigner, TxSpec};
 use hopnet_projection::{DatabaseError, ExportEntry};
 use tokio_stream::StreamExt;
 
-use crate::TakeoutState;
 use crate::db::entries::{self, EntryRow, MaterializationStatus};
 use crate::db::takeout::TakeoutStatusPayload;
 use crate::manifest::{
-    EntryKind, MANIFEST_VERSION, ManifestEntry, ProjectionSection, TakeoutManifest,
+    EntryKind, ManifestEntry, ProjectionSection, TakeoutManifest, MANIFEST_VERSION,
 };
+use crate::TakeoutState;
 
 #[derive(Debug)]
 pub enum TakeoutMaterializationError {
@@ -265,11 +265,7 @@ pub async fn execute_takeout_materialization(
     );
 
     // Clean up the entire takeout directory (staging + uuid folder)
-    let takeout_root = format!(
-        "{}/takeouts/{}",
-        state.fragments_dir,
-        takeout_id.simple()
-    );
+    let takeout_root = format!("{}/takeouts/{}", state.fragments_dir, takeout_id.simple());
     if let Err(e) = std::fs::remove_dir_all(&takeout_root) {
         tracing::warn!(
             "Failed to remove takeout directory {}: {:?}",

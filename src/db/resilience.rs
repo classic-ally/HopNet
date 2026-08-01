@@ -29,7 +29,11 @@ pub fn resilience_level_rows(
     let placeholders = if member_ids.is_empty() {
         "NULL".to_string()
     } else {
-        member_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ")
+        member_ids
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(", ")
     };
 
     // Anchored on data_blocks, not fragment_hashes, so a block with no fragment
@@ -205,7 +209,6 @@ pub fn unplaced_age_buckets(
         (">1d", sums[4]),
     ])
 }
-
 
 /// Get node storage baselines for fault tolerance curve generation
 /// Returns each node's total capacity and baseline usage for simulation

@@ -19,9 +19,8 @@
 /// projection-agnostic services and future projections can consume them;
 /// re-exported here so drive call sites are unchanged.
 pub use hopnet_projection::host::{
-    BlobStreamer, BoxFuture, ByteStream, HostCapabilities, SessionAccess, SessionError,
-    TxGateway, TxSigner, TxSpec, TxSubmitError, UserSession, WriteAdmission, WriteCheckError,
-    WriteDenied,
+    BlobStreamer, BoxFuture, ByteStream, HostCapabilities, SessionAccess, SessionError, TxGateway,
+    TxSigner, TxSpec, TxSubmitError, UserSession, WriteAdmission, WriteCheckError, WriteDenied,
 };
 
 /// The drive's axum state IS the host capability bundle (RFC-016 Stage 2)

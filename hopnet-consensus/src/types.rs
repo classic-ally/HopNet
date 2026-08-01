@@ -9,6 +9,7 @@
 //! - `Blake3Hash` gains `Ord` (Malachite's `Value::Id` requires it).
 //! - `PubKey`/`PrivKey` carry no iroh/axum impls (transport-agnostic crate);
 //!   the main crate adds those via extension traits at the Stage-5 swap.
+//!
 //! SQL/bincode/serde encodings are byte-identical with the main crate's
 //! (raw 32-byte blobs for hashes, bincode-serde blobs for keys/transactions)
 //! so persisted app data needs no migration.

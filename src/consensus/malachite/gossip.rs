@@ -12,8 +12,8 @@ use tokio::sync::mpsc;
 use hopnet_comms::{Broadcast, PeerRef};
 use hopnet_consensus::codec::{self, WireConsensusMsg, WireVoteType};
 
-use crate::consensus::barriers::names as barrier_names;
 use crate::AppState;
+use crate::consensus::barriers::names as barrier_names;
 
 /// Wire request for the "consensus" scope.
 #[derive(Serialize, Deserialize, Debug)]
@@ -33,8 +33,12 @@ pub enum ConsensusNetResponse {
     Ack,
     /// Decided (block bytes, certificate bytes) pairs, ascending and
     /// contiguous from `from_height` (bincode-encoded engine types)
-    Decided { items: Vec<(Vec<u8>, Vec<u8>)> },
-    Error { message: String },
+    Decided {
+        items: Vec<(Vec<u8>, Vec<u8>)>,
+    },
+    Error {
+        message: String,
+    },
 }
 
 /// Per-publish send timeout (matches the old broadcast paths' 3s).
@@ -44,10 +48,7 @@ const PUBLISH_TIMEOUT: Duration = Duration::from_secs(3);
 /// (RFC-CONSENSUS-002 S1: consensus gossip goes to the valset, not all
 /// registered nodes — departed/pool nodes follow the chain via the
 /// tip-poll instead; decided-value sync serving stays open to everyone).
-fn peers(
-    db_pool: &Pool<SqliteConnectionManager>,
-    my_node_id: i32,
-) -> Result<Vec<PeerRef>, String> {
+fn peers(db_pool: &Pool<SqliteConnectionManager>, my_node_id: i32) -> Result<Vec<PeerRef>, String> {
     // NB: a pool checkout failure here used to be masked as
     // rusqlite::Error::InvalidQuery ("Query is not read-only") — keep the
     // real error visible; pool starvation under API load is a live failure

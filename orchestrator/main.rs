@@ -536,18 +536,17 @@ async fn wait_for_formation(
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
+            && let Ok(doc) = resp.json::<serde_json::Value>().await
         {
-            if let Ok(doc) = resp.json::<serde_json::Value>().await {
-                let count = doc["validators_at_height"]
-                    .as_array()
-                    .map(|a| a.len() as u32)
-                    .unwrap_or(0);
-                if count >= 2 && prev == Some(count) {
-                    println!("Mesh {} seated to {} validators", mesh_id, count);
-                    return Ok(count);
-                }
-                prev = Some(count);
+            let count = doc["validators_at_height"]
+                .as_array()
+                .map(|a| a.len() as u32)
+                .unwrap_or(0);
+            if count >= 2 && prev == Some(count) {
+                println!("Mesh {} seated to {} validators", mesh_id, count);
+                return Ok(count);
             }
+            prev = Some(count);
         }
         tokio::time::sleep(std::time::Duration::from_secs(4)).await;
     }

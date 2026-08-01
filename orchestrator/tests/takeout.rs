@@ -16,7 +16,10 @@ use crate::tests::{Check, TestResult, TestScenario, print_and_add_check};
 /// POST /takeout/initiate — start a new takeout for the authenticated user.
 pub async fn initiate_takeout(node: &NodeInfo) -> Result<()> {
     let client = Client::new();
-    let url = format!("http://{}:{}/api/takeout/initiate", node.ip_address, node.port);
+    let url = format!(
+        "http://{}:{}/api/takeout/initiate",
+        node.ip_address, node.port
+    );
 
     let response = client
         .post(&url)
@@ -175,9 +178,8 @@ pub fn extract_tar_gz(archive_bytes: &[u8]) -> Result<ExtractedArchive> {
 
     let manifest_raw =
         manifest_raw.ok_or_else(|| anyhow::anyhow!("Archive missing manifest.json"))?;
-    let manifest: hopnet_takeout::manifest::TakeoutManifest =
-        serde_json::from_slice(&manifest_raw)
-            .map_err(|e| anyhow::anyhow!("Failed to parse manifest.json: {}", e))?;
+    let manifest: hopnet_takeout::manifest::TakeoutManifest = serde_json::from_slice(&manifest_raw)
+        .map_err(|e| anyhow::anyhow!("Failed to parse manifest.json: {}", e))?;
 
     Ok(ExtractedArchive {
         entry_order,
@@ -531,7 +533,10 @@ impl TestScenario for TakeoutHappyPath {
             print_and_add_check(
                 &mut result,
                 Check {
-                    name: format!("Manifest content_hash matches reconstructed for {}", filename),
+                    name: format!(
+                        "Manifest content_hash matches reconstructed for {}",
+                        filename
+                    ),
                     passed: hash_matches,
                     detail: Some(format!(
                         "entry blob_id={:?} content_hash={:?}",

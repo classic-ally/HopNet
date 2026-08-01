@@ -1,5 +1,8 @@
 use crate::{
-    db::{DatabaseError, nodes::{insert_node_tx, pubkey_exists}},
+    db::{
+        DatabaseError,
+        nodes::{insert_node_tx, pubkey_exists},
+    },
     handlers::{HandlerCtx, HandlerResult, TransactionHandler, TxMeta},
     types::Node,
 };
@@ -105,8 +108,7 @@ mod tests {
         user_id: i32,
         execute: bool,
     ) -> HandlerResult {
-        let payload =
-            bincode::serde::encode_to_vec(node, bincode::config::standard()).unwrap();
+        let payload = bincode::serde::encode_to_vec(node, bincode::config::standard()).unwrap();
         let meta = TxMeta {
             function: "insert_node",
             payload: &payload,
@@ -192,8 +194,7 @@ mod tests {
     fn insert_no_user_rejected() {
         let pool = setup_pool();
         let node = make_node(99, "anon", 1, new_pubkey());
-        let payload =
-            bincode::serde::encode_to_vec(&node, bincode::config::standard()).unwrap();
+        let payload = bincode::serde::encode_to_vec(&node, bincode::config::standard()).unwrap();
         let meta = TxMeta {
             function: "insert_node",
             payload: &payload,

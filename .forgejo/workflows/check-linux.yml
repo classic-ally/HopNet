@@ -39,7 +39,10 @@ jobs:
   nix-build:
     if: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: x86_64-linux
-    timeout-minutes: 45
+    # A workspace-wide change (toolchain bump, reformat) forces a full
+    # release rebuild (~30m alone) while the cargo job competes for the
+    # same runner's cores — 45m was calibrated for incremental pushes.
+    timeout-minutes: 75
 
     steps:
       - name: Checkout

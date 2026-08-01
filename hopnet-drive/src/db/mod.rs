@@ -11,7 +11,6 @@ pub mod files;
 pub mod shares;
 pub mod users;
 
-
 /// The tables this projection owns, in dependency order (parents first).
 /// Exposed for divergence tooling and the host's boot tripwire.
 pub const TABLES: &[&str] = &["inodes", "modification_log", "incoming_shares", "shares"];

@@ -43,8 +43,8 @@ pub fn pins_for_blob(
     conn: &rusqlite::Connection,
     blob_id: &BlobId,
 ) -> rusqlite::Result<Vec<String>> {
-    let mut stmt = conn
-        .prepare("SELECT owner FROM hopnet_storage_pins WHERE blob_id = ?1 ORDER BY owner")?;
+    let mut stmt =
+        conn.prepare("SELECT owner FROM hopnet_storage_pins WHERE blob_id = ?1 ORDER BY owner")?;
     let owners = stmt
         .query_map([blob_id.to_string()], |row| row.get(0))?
         .collect::<Result<_, _>>()?;
@@ -81,7 +81,10 @@ mod tests {
         pin(&conn, &blob, "drive").unwrap();
         pin(&conn, &blob, "photos").unwrap();
         pin(&conn, &blob, "drive").unwrap(); // idempotent
-        assert_eq!(pins_for_blob(&conn, &blob).unwrap(), vec!["drive", "photos"]);
+        assert_eq!(
+            pins_for_blob(&conn, &blob).unwrap(),
+            vec!["drive", "photos"]
+        );
 
         unpin(&conn, &blob, "drive").unwrap();
         assert!(pinned_blob_ids(&conn).unwrap().contains(&blob.to_string()));

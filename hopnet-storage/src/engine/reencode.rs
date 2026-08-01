@@ -7,11 +7,11 @@
 //! touches disk. No key custody, no plaintext, no consensus transaction —
 //! the inventory settles through the next self-check.
 
-use crate::StorageError;
 use crate::fragstore;
 use crate::rs::{ORIGINAL_FRAGMENTS_PER_CHUNK, RECOVERY_FRAGMENTS_PER_CHUNK};
 use crate::traits::{LocalStateSink, StateReader, Transport};
 use crate::types::BlobId;
+use crate::StorageError;
 use hopnet_common::Blake3Hash;
 use std::collections::HashMap;
 
@@ -55,7 +55,11 @@ pub(crate) fn regenerate_missing(
         );
         return Err(StorageError::Rs);
     }
-    let shard_size = shards.values().next().map(|d| d.len()).ok_or(StorageError::Rs)?;
+    let shard_size = shards
+        .values()
+        .next()
+        .map(|d| d.len())
+        .ok_or(StorageError::Rs)?;
 
     // Decode: restore every missing ORIGINAL from any K shards.
     let mut decoder = reed_solomon_simd::ReedSolomonDecoder::new(
@@ -274,7 +278,11 @@ mod tests {
     /// 10 original shards → 20 recovery shards, hashes over all 30.
     fn synthetic_chunk(shard_size: usize) -> (Vec<Vec<u8>>, Vec<Blake3Hash>) {
         let originals: Vec<Vec<u8>> = (0..ORIGINAL_FRAGMENTS_PER_CHUNK)
-            .map(|i| (0..shard_size).map(|b| ((i * 31 + b * 7) % 251) as u8).collect())
+            .map(|i| {
+                (0..shard_size)
+                    .map(|b| ((i * 31 + b * 7) % 251) as u8)
+                    .collect()
+            })
             .collect();
         let mut encoder = reed_solomon_simd::ReedSolomonEncoder::new(
             ORIGINAL_FRAGMENTS_PER_CHUNK,
@@ -288,7 +296,10 @@ mod tests {
         let encoded = encoder.encode().unwrap();
         let mut all: Vec<Vec<u8>> = originals;
         all.extend(encoded.recovery_iter().map(|d| d.to_vec()));
-        let hashes = all.iter().map(|d| Blake3Hash::new(blake3::hash(d))).collect();
+        let hashes = all
+            .iter()
+            .map(|d| Blake3Hash::new(blake3::hash(d)))
+            .collect();
         (all, hashes)
     }
 
@@ -317,13 +328,15 @@ mod tests {
 
         // Recovery-only survivors: exactly K recovery shards regenerate
         // every original.
-        let shards: HashMap<u32, Vec<u8>> = (10..20u32)
-            .map(|c| (c, all[c as usize].clone()))
-            .collect();
+        let shards: HashMap<u32, Vec<u8>> =
+            (10..20u32).map(|c| (c, all[c as usize].clone())).collect();
         let all_originals: Vec<u32> = (0..10).collect();
         let out = regenerate_missing(&shards, &all_originals).unwrap();
         for c in 0..10u32 {
-            assert_eq!(out[&c], all[c as usize], "original {c} from recovery-only set");
+            assert_eq!(
+                out[&c], all[c as usize],
+                "original {c} from recovery-only set"
+            );
         }
     }
 
@@ -334,9 +347,8 @@ mod tests {
     #[test]
     fn refuses_below_k() {
         let (all, _) = synthetic_chunk(64);
-        let shards: HashMap<u32, Vec<u8>> = (0..9u32)
-            .map(|c| (c, all[c as usize].clone()))
-            .collect();
+        let shards: HashMap<u32, Vec<u8>> =
+            (0..9u32).map(|c| (c, all[c as usize].clone())).collect();
         assert!(regenerate_missing(&shards, &[15]).is_err());
     }
 

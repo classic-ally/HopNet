@@ -94,7 +94,10 @@ impl Timers for ShellTimers {
 #[derive(Debug)]
 pub enum HostInput {
     /// A consensus message received from `from` (node_id) over the network.
-    Wire { from: i32, msg: WireConsensusMsg },
+    Wire {
+        from: i32,
+        msg: WireConsensusMsg,
+    },
     /// The value built in response to [`HostEvent::NeedValue`].
     Propose {
         height: Height,
@@ -253,7 +256,13 @@ async fn run_shell<A, S, F>(
         }
     }
     drain(
-        &mut core, &timers, &mut dq, &timeouts, &event_tx, &decided_tx, &round_tx,
+        &mut core,
+        &timers,
+        &mut dq,
+        &timeouts,
+        &event_tx,
+        &decided_tx,
+        &round_tx,
     );
 
     loop {
@@ -337,7 +346,13 @@ async fn run_shell<A, S, F>(
         }
 
         drain(
-            &mut core, &timers, &mut dq, &timeouts, &event_tx, &decided_tx, &round_tx,
+            &mut core,
+            &timers,
+            &mut dq,
+            &timeouts,
+            &event_tx,
+            &decided_tx,
+            &round_tx,
         );
     }
     tracing::info!("consensus shell stopped");

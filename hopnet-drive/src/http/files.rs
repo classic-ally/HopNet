@@ -4,12 +4,12 @@
 
 use axum::http::StatusCode;
 use axum::{
-    Json, Router,
     body::Body,
     extract::{DefaultBodyLimit, Extension, Multipart, Path, Query, State},
     http::header,
     response::Response,
     routing::{get, post},
+    Json, Router,
 };
 use std::str::FromStr;
 
@@ -66,14 +66,19 @@ pub async fn process_uploaded_file<R: AsyncRead + Unpin>(
     per_file_key: &chacha20poly1305::Key,
     fragments_dir: &str,
 ) -> Result<hopnet_storage::store::BlobInsertOp, StatusCode> {
-    let outcome =
-        hopnet_storage::api::put(source, file_size, dataid.clone(), per_file_key, fragments_dir)
-            .await
-            .map_err(|e| match e {
-                hopnet_storage::StorageError::Read(_) => StatusCode::UNPROCESSABLE_ENTITY,
-                hopnet_storage::StorageError::Io(_) => StatusCode::INSUFFICIENT_STORAGE,
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
-            })?;
+    let outcome = hopnet_storage::api::put(
+        source,
+        file_size,
+        dataid.clone(),
+        per_file_key,
+        fragments_dir,
+    )
+    .await
+    .map_err(|e| match e {
+        hopnet_storage::StorageError::Read(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        hopnet_storage::StorageError::Io(_) => StatusCode::INSUFFICIENT_STORAGE,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    })?;
 
     let fragments = outcome
         .fragments
@@ -195,7 +200,7 @@ pub async fn prepare_content_update(
     ),
     StatusCode,
 > {
-    use chacha20poly1305::{ChaCha20Poly1305, aead::KeyInit, aead::OsRng as CryptoOsRng};
+    use chacha20poly1305::{aead::KeyInit, aead::OsRng as CryptoOsRng, ChaCha20Poly1305};
 
     let dataid = CustomUUID::new(None);
 
@@ -321,9 +326,10 @@ pub async fn get_file_fragments(
         }
         let mut parts = s.splitn(2, '-');
         let start: u64 = parts.next()?.parse().ok()?;
-        let end: Option<u64> = parts
-            .next()
-            .and_then(|e| if e.is_empty() { None } else { e.parse().ok() });
+        let end: Option<u64> =
+            parts
+                .next()
+                .and_then(|e| if e.is_empty() { None } else { e.parse().ok() });
         Some((start, end))
     });
 
@@ -331,28 +337,24 @@ pub async fn get_file_fragments(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let download_info = match crate::download::reconstruct_file_range(
-        &state,
-        enc_path,
-        user_id,
-        requested_range,
-    )
-    .await
-    {
-        Ok(info) => info,
-        Err(crate::download::FileReconstructionError::RangeNotSatisfiable(file_size)) => {
-            let response = Response::builder()
-                .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                .header(header::CONTENT_RANGE, format!("bytes */{}", file_size))
-                .body(Body::empty())
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            return Ok(response);
-        }
-        Err(e) => {
-            tracing::error!("Error reconstructing file: {:?}", e);
-            return Err(StatusCode::from(e));
-        }
-    };
+    let download_info =
+        match crate::download::reconstruct_file_range(&state, enc_path, user_id, requested_range)
+            .await
+        {
+            Ok(info) => info,
+            Err(crate::download::FileReconstructionError::RangeNotSatisfiable(file_size)) => {
+                let response = Response::builder()
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .header(header::CONTENT_RANGE, format!("bytes */{}", file_size))
+                    .body(Body::empty())
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                return Ok(response);
+            }
+            Err(e) => {
+                tracing::error!("Error reconstructing file: {:?}", e);
+                return Err(StatusCode::from(e));
+            }
+        };
 
     // Detect MIME type from filename
     let content_type = mime_guess::from_path(filename)

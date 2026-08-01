@@ -5,8 +5,8 @@
 //! layers its own auth middleware (JWT / device token) around them.
 
 pub mod documentprovider;
-pub mod files;
 pub mod fileprovider;
+pub mod files;
 pub mod shares;
 
 /// Per-user write gate (moved to hopnet-projection at RFC-016 Stage 2 —

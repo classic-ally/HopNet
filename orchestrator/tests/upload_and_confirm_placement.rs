@@ -44,11 +44,14 @@ impl TestScenario for UploadAndConfirmPlacement {
         let content_hash = blake3::hash(&contents);
 
         // 1. Upload the file to node 0
-        print_and_add_check(&mut result, Check {
-            name: "Upload 80 MB file to node 0".to_string(),
-            passed: true,
-            detail: None,
-        });
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Upload 80 MB file to node 0".to_string(),
+                passed: true,
+                detail: None,
+            },
+        );
 
         upload_file(&nodes[0], path, filename, contents.clone()).await?;
 
@@ -68,21 +71,25 @@ impl TestScenario for UploadAndConfirmPlacement {
         };
 
         let still_null = early.placement_height.is_none();
-        print_and_add_check(&mut result, Check {
-            name: "Placement height is NULL after commit (distribution in progress)".to_string(),
-            passed: still_null,
-            detail: if still_null {
-                Some(format!(
-                    "NULL for {:.1}s before distribution completed",
-                    appear_start.elapsed().as_secs_f64()
-                ))
-            } else {
-                Some(format!(
-                    "Already placed at height {} — try larger file or measure distribution speed",
-                    early.placement_height.unwrap()
-                ))
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Placement height is NULL after commit (distribution in progress)"
+                    .to_string(),
+                passed: still_null,
+                detail: if still_null {
+                    Some(format!(
+                        "NULL for {:.1}s before distribution completed",
+                        appear_start.elapsed().as_secs_f64()
+                    ))
+                } else {
+                    Some(format!(
+                        "Already placed at height {} — try larger file or measure distribution speed",
+                        early.placement_height.unwrap()
+                    ))
+                },
             },
-        });
+        );
 
         // 3. Wait for node 0 to finish distribution (placement_height set).
         //    Poll in tight loop so we can record latency.
@@ -92,20 +99,25 @@ impl TestScenario for UploadAndConfirmPlacement {
                 anyhow::bail!("Timeout waiting for fragment distribution");
             }
             match get_fragment_distribution(&nodes[0], full_path).await {
-                Ok(dist) if dist.placement_height.is_some() => break dist.placement_height.unwrap(),
+                Ok(dist) if dist.placement_height.is_some() => {
+                    break dist.placement_height.unwrap();
+                }
                 _ => tokio::time::sleep(Duration::from_millis(200)).await,
             }
         };
         let dist_secs = dist_start.elapsed().as_secs_f64();
 
-        print_and_add_check(&mut result, Check {
-            name: format!(
-                "Node 0 placed at height {} (distribution took {:.1}s)",
-                ph0, dist_secs
-            ),
-            passed: true,
-            detail: None,
-        });
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: format!(
+                    "Node 0 placed at height {} (distribution took {:.1}s)",
+                    ph0, dist_secs
+                ),
+                passed: true,
+                detail: None,
+            },
+        );
 
         // 4. Poll remaining nodes until they converge on the same placement
         //    height. Since the placement commit is consensus-driven, every
@@ -121,41 +133,44 @@ impl TestScenario for UploadAndConfirmPlacement {
                     all_converged = false;
                     break;
                 }
-                match get_fragment_distribution(node, full_path).await {
-                    Ok(dist) => {
-                        if let Some(ph) = dist.placement_height {
-                            heights.push(ph);
-                            break;
-                        }
-                    }
-                    Err(_) => {}
+                if let Ok(dist) = get_fragment_distribution(node, full_path).await
+                    && let Some(ph) = dist.placement_height
+                {
+                    heights.push(ph);
+                    break;
                 }
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
         }
 
-        print_and_add_check(&mut result, Check {
-            name: "All nodes converge on a non-NULL placement height".to_string(),
-            passed: all_converged,
-            detail: if all_converged {
-                None
-            } else {
-                Some("One or more nodes did not see a placement height within 30s".to_string())
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "All nodes converge on a non-NULL placement height".to_string(),
+                passed: all_converged,
+                detail: if all_converged {
+                    None
+                } else {
+                    Some("One or more nodes did not see a placement height within 30s".to_string())
+                },
             },
-        });
+        );
 
         // 5. Verify all nodes agree on the same placement height
         let first = heights[0];
         let all_agree = heights.iter().all(|ph| *ph == first);
-        print_and_add_check(&mut result, Check {
-            name: format!("All nodes agree on placement height {}", first),
-            passed: all_agree,
-            detail: if all_agree {
-                None
-            } else {
-                Some(format!("Heights: {:?}", heights))
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: format!("All nodes agree on placement height {}", first),
+                passed: all_agree,
+                detail: if all_agree {
+                    None
+                } else {
+                    Some(format!("Heights: {:?}", heights))
+                },
             },
-        });
+        );
 
         if !all_converged || !all_agree {
             result.duration = start.elapsed();
@@ -163,32 +178,35 @@ impl TestScenario for UploadAndConfirmPlacement {
         }
 
         // 6. Verify the file is retrievable and matches the uploaded content
-        let dl = download_file_from_all_nodes_with_timeout(
-            nodes,
-            full_path,
-            Duration::from_secs(60),
-        )
-        .await;
+        let dl =
+            download_file_from_all_nodes_with_timeout(nodes, full_path, Duration::from_secs(60))
+                .await;
         let retrievable = dl.is_ok();
         let dl_err = dl.as_ref().err().map(|e| format!("{e:?}"));
-        print_and_add_check(&mut result, Check {
-            name: "File is retrievable from all nodes after placement".to_string(),
-            passed: retrievable,
-            detail: dl_err,
-        });
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "File is retrievable from all nodes after placement".to_string(),
+                passed: retrievable,
+                detail: dl_err,
+            },
+        );
 
         if retrievable {
             let data = dl.unwrap();
             let all_match = data.iter().all(|d| blake3::hash(d) == content_hash);
-            print_and_add_check(&mut result, Check {
-                name: "Retrieved content matches uploaded content (BLAKE3 hash)".to_string(),
-                passed: all_match,
-                detail: if all_match {
-                    None
-                } else {
-                    Some("Hash mismatch across nodes".to_string())
+            print_and_add_check(
+                &mut result,
+                Check {
+                    name: "Retrieved content matches uploaded content (BLAKE3 hash)".to_string(),
+                    passed: all_match,
+                    detail: if all_match {
+                        None
+                    } else {
+                        Some("Hash mismatch across nodes".to_string())
+                    },
                 },
-            });
+            );
         }
 
         result.duration = start.elapsed();

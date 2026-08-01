@@ -162,14 +162,11 @@ pub fn verify_round_certificate(
             return Err(CertificateError::InvalidVoteType(rs.address));
         }
         let vote = match rs.vote_type {
-            VoteType::Precommit => HopNetContext.new_precommit(
-                cert.height,
-                cert.round,
-                rs.value_id.clone(),
-                rs.address,
-            ),
+            VoteType::Precommit => {
+                HopNetContext.new_precommit(cert.height, cert.round, rs.value_id, rs.address)
+            }
             VoteType::Prevote => {
-                HopNetContext.new_prevote(cert.height, cert.round, rs.value_id.clone(), rs.address)
+                HopNetContext.new_prevote(cert.height, cert.round, rs.value_id, rs.address)
             }
         };
         if !verify_vote(chain_id, &validator.public_key, &vote, &rs.signature) {

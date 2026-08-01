@@ -11,7 +11,6 @@ pub mod import_paths;
 pub mod imports;
 pub mod takeout;
 
-
 /// The static tables this service owns. Work tables are per-id and excluded.
 pub const TABLES: &[&str] = &["takeouts", "imports"];
 

@@ -6,9 +6,9 @@
 use hopnet_common::{CustomUUID, ImportStatus, TakeoutStatus};
 use hopnet_projection::host::{TxSigner, TxSpec};
 
-use crate::TakeoutState;
 use crate::db::import_paths;
 use crate::db::takeout::TakeoutStatusPayload;
+use crate::TakeoutState;
 
 /// Takeout maintenance (runs every 4-6 hours with randomization, plus the
 /// manual `/maintenance/takeout` trigger). Handles expiration checking and
@@ -140,10 +140,7 @@ pub async fn scan_at_startup(
     // otherwise the async generator captures them and the future fails to
     // satisfy `Send` for tokio::spawn.
     let to_register: Vec<(i32, CustomUUID)> = {
-        let conn = state
-            .db_pool
-            .get()
-            .map_err(|_| DatabaseError::LockError)?;
+        let conn = state.db_pool.get().map_err(|_| DatabaseError::LockError)?;
 
         let mut stmt = conn
             .prepare(

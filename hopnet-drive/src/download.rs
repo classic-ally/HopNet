@@ -18,9 +18,8 @@ pub struct ByteRange {
 
 /// Result of file download preparation (range-aware)
 pub struct FileDownloadInfo {
-    pub stream: std::pin::Pin<
-        Box<dyn tokio_stream::Stream<Item = Result<bytes::Bytes, FileError>> + Send>,
-    >,
+    pub stream:
+        std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<bytes::Bytes, FileError>> + Send>>,
     pub file_size: u64,
     pub is_partial: bool,
     pub range: Option<ByteRange>,
@@ -143,8 +142,8 @@ fn reconstruct_stream(
         .map(|item| item.map_err(FileError::from))
 }
 
-fn empty_stream()
--> std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<bytes::Bytes, FileError>> + Send>> {
+fn empty_stream(
+) -> std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<bytes::Bytes, FileError>> + Send>> {
     Box::pin(async_stream::try_stream! {
         if false { yield bytes::Bytes::new(); }
     })

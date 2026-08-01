@@ -22,10 +22,7 @@ pub fn serve_fragment_health(fragments_dir: &str, fragment_hash: &Blake3Hash) ->
 }
 
 /// Fetch: return the fragment bytes if present AND content-verified.
-pub fn serve_fragment_fetch(
-    fragments_dir: &str,
-    fragment_hash: &Blake3Hash,
-) -> Option<Vec<u8>> {
+pub fn serve_fragment_fetch(fragments_dir: &str, fragment_hash: &Blake3Hash) -> Option<Vec<u8>> {
     fragstore::fetch_and_verify_fragment(fragment_hash, fragments_dir).ok()
 }
 

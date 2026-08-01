@@ -33,7 +33,7 @@ pub(crate) async fn fetch_evidence(client: &Client, node: &NodeInfo) -> Result<s
     Ok(resp.json().await?)
 }
 
-pub(crate) fn node_entry<'a>(doc: &'a serde_json::Value, node_id: i64) -> Option<&'a serde_json::Value> {
+pub(crate) fn node_entry(doc: &serde_json::Value, node_id: i64) -> Option<&serde_json::Value> {
     doc["nodes"]
         .as_array()?
         .iter()
@@ -49,12 +49,7 @@ impl TestScenario for EvidenceObserve {
         "Per-peer evidence goes bright, then a killed node ages out and the band compresses"
     }
 
-    async fn run(
-        &self,
-        mesh_id: u32,
-        nodes: &[NodeInfo],
-        _flags: &[String],
-    ) -> Result<TestResult> {
+    async fn run(&self, mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
         let mut result = TestResult::new();
         let client = Client::new();
         anyhow::ensure!(nodes.len() == 3, "evidence-observe expects a 3-node mesh");
@@ -87,8 +82,8 @@ impl TestScenario for EvidenceObserve {
                         break;
                     };
                     let age_ok = entry["age_ms"].as_u64().unwrap_or(u64::MAX) < t_unresp;
-                    let height_known = entry["last_known_height"].is_i64()
-                        || entry["last_known_height"].is_u64();
+                    let height_known =
+                        entry["last_known_height"].is_i64() || entry["last_known_height"].is_u64();
                     if !age_ok || !height_known {
                         fresh = false;
                         break;

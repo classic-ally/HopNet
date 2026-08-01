@@ -46,15 +46,13 @@ impl TestScenario for EvidenceDrivesVoteout {
         "Evidence compression is observed to precede and cause the vote-out, in one run"
     }
 
-    async fn run(
-        &self,
-        mesh_id: u32,
-        nodes: &[NodeInfo],
-        _flags: &[String],
-    ) -> Result<TestResult> {
+    async fn run(&self, mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
         let mut result = TestResult::new();
         let client = Client::new();
-        anyhow::ensure!(nodes.len() == 3, "evidence-drives-voteout expects a 3-node mesh");
+        anyhow::ensure!(
+            nodes.len() == 3,
+            "evidence-drives-voteout expects a 3-node mesh"
+        );
 
         println!("\nRunning evidence-drives-voteout checks:");
 
@@ -165,10 +163,15 @@ impl TestScenario for EvidenceDrivesVoteout {
         }
 
         // 4. Confirm removal on committed state too.
-        let committed_removed =
-            wait_validator_count(&client, &survivors, 2, Some(victim_id), Duration::from_secs(30))
-                .await
-                .unwrap_or(false);
+        let committed_removed = wait_validator_count(
+            &client,
+            &survivors,
+            2,
+            Some(victim_id),
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap_or(false);
 
         // 5. Assertions from the sample logs. The compression observation is
         // the timing-sensitive one; require it on at least one survivor (fall
@@ -177,8 +180,9 @@ impl TestScenario for EvidenceDrivesVoteout {
         print_and_add_check(
             &mut result,
             Check {
-                name: "Compression observed while victim still seated (v=3, band Cliff, H=0, live=2)"
-                    .to_string(),
+                name:
+                    "Compression observed while victim still seated (v=3, band Cliff, H=0, live=2)"
+                        .to_string(),
                 passed: compress_seen,
                 detail: Some(format!(
                     "first at {}",

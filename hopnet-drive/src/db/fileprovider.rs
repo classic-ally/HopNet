@@ -5,7 +5,7 @@
 
 use crate::model::CustomDateTime;
 use crate::paths::decrypt_path;
-use aes_siv::{Key, Nonce, siv::Aes256Siv};
+use aes_siv::{siv::Aes256Siv, Key, Nonce};
 use hopnet_common::{CustomUUID, InodeType};
 use hopnet_projection::DatabaseError;
 use r2d2_sqlite::SqliteConnectionManager;
@@ -157,8 +157,7 @@ pub fn get_folder_contents(
 
             // Current decided height (malachite schema — the legacy blocks
             // table died with the bespoke engine at Stage 5b)
-            let current_consensus_height =
-                crate::db::current_height(&db_lock)?;
+            let current_consensus_height = crate::db::current_height(&db_lock)?;
 
             Ok(FileProviderEnumerateResult {
                 items,
@@ -381,8 +380,7 @@ pub fn get_folder_changes_since_height(
 
             // Current decided height (malachite schema — same as
             // get_folder_contents)
-            let current_consensus_height =
-                crate::db::current_height(&db_lock)?;
+            let current_consensus_height = crate::db::current_height(&db_lock)?;
 
             tracing::debug!(
                 "Found {} changed items and {} deleted items since height {}",

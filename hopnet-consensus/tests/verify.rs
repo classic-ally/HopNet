@@ -101,7 +101,13 @@ fn majority_quorum_boundaries() {
 fn commit_certificate_valid_quorum_passes() {
     let vs = valset(4);
     let cert = commit_cert(&[0, 1, 2]);
-    verify_commit_certificate(&chain_id(), &cert, &vs, QuorumProfile::Bft.thresholds_for(1)).unwrap();
+    verify_commit_certificate(
+        &chain_id(),
+        &cert,
+        &vs,
+        QuorumProfile::Bft.thresholds_for(1),
+    )
+    .unwrap();
 }
 
 // Should: reject a certificate below quorum with NotEnoughVotingPower.
@@ -112,8 +118,13 @@ fn commit_certificate_valid_quorum_passes() {
 fn commit_certificate_sub_quorum_fails() {
     let vs = valset(4);
     let cert = commit_cert(&[0, 1]);
-    let err = verify_commit_certificate(&chain_id(), &cert, &vs, QuorumProfile::Bft.thresholds_for(1))
-        .unwrap_err();
+    let err = verify_commit_certificate(
+        &chain_id(),
+        &cert,
+        &vs,
+        QuorumProfile::Bft.thresholds_for(1),
+    )
+    .unwrap_err();
     assert!(matches!(
         err,
         CertificateError::NotEnoughVotingPower {
@@ -136,8 +147,13 @@ fn commit_certificate_duplicate_signer_rejected() {
     cert.commit_signatures.push(dup.clone());
     cert.commit_signatures.push(dup);
 
-    let err = verify_commit_certificate(&chain_id(), &cert, &vs, QuorumProfile::Bft.thresholds_for(1))
-        .unwrap_err();
+    let err = verify_commit_certificate(
+        &chain_id(),
+        &cert,
+        &vs,
+        QuorumProfile::Bft.thresholds_for(1),
+    )
+    .unwrap_err();
     assert!(matches!(err, CertificateError::DuplicateVote(a) if a.0 == 0));
 }
 
@@ -150,8 +166,13 @@ fn commit_certificate_duplicate_signer_rejected() {
 fn commit_certificate_unknown_validator_rejected() {
     let vs = valset(3);
     let cert = commit_cert(&[0, 1, 7]); // node 7 not in the set
-    let err = verify_commit_certificate(&chain_id(), &cert, &vs, QuorumProfile::Bft.thresholds_for(1))
-        .unwrap_err();
+    let err = verify_commit_certificate(
+        &chain_id(),
+        &cert,
+        &vs,
+        QuorumProfile::Bft.thresholds_for(1),
+    )
+    .unwrap_err();
     assert!(matches!(err, CertificateError::UnknownValidator(a) if a.0 == 7));
 }
 
@@ -173,8 +194,13 @@ fn commit_certificate_forged_signature_rejected() {
     );
     cert.commit_signatures[2].signature = sign_vote(&chain_id(), &key(3), &vote);
 
-    let err = verify_commit_certificate(&chain_id(), &cert, &vs, QuorumProfile::Bft.thresholds_for(1))
-        .unwrap_err();
+    let err = verify_commit_certificate(
+        &chain_id(),
+        &cert,
+        &vs,
+        QuorumProfile::Bft.thresholds_for(1),
+    )
+    .unwrap_err();
     assert!(matches!(err, CertificateError::InvalidCommitSignature(_)));
 }
 
@@ -213,8 +239,11 @@ fn profile_boundary_two_of_three() {
         QuorumProfile::Majority.thresholds_for(1),
     )
     .unwrap();
-    assert!(
-        verify_commit_certificate(&chain_id(), &cert, &vs, QuorumProfile::Bft.thresholds_for(1))
-            .is_err()
-    );
+    assert!(verify_commit_certificate(
+        &chain_id(),
+        &cert,
+        &vs,
+        QuorumProfile::Bft.thresholds_for(1)
+    )
+    .is_err());
 }

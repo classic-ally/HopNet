@@ -141,7 +141,6 @@ impl StateReader for SubstrateHost {
         storage_view_with_conn(&conn)
     }
 
-
     fn fragment_sources(
         &self,
         fragment_hashes: &[Blake3Hash],
@@ -267,9 +266,7 @@ impl LocalStateSink for SubstrateHost {
 /// pool but no `AppState` — the snapshotter, and the read-only diagnostics
 /// views — can reach the same derivation. This feeds `select_nodes_for_blob`,
 /// so it is a behaviour-preserving move and nothing more.
-pub fn storage_view_with_conn(
-    conn: &rusqlite::Connection,
-) -> Result<StorageView, StorageError> {
+pub fn storage_view_with_conn(conn: &rusqlite::Connection) -> Result<StorageView, StorageError> {
     use hopnet_storage::membership;
 
     let height = crate::db::consensus::get_current_consensus_height(conn)

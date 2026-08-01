@@ -70,8 +70,7 @@ pub fn post_initial_setup(
     // Mesh-wide keypair (RFC-014): generated once at genesis; privkey wrapped
     // to user 0's X25519 pubkey. Wrap bytes go INTO the payload so replay is
     // deterministic.
-    let mesh_secret =
-        x25519_dalek::StaticSecret::random_from_rng(chacha20poly1305::aead::OsRng);
+    let mesh_secret = x25519_dalek::StaticSecret::random_from_rng(chacha20poly1305::aead::OsRng);
     let mesh_pubkey = x25519_dalek::PublicKey::from(&mesh_secret);
     let (mesh_eph, mesh_wrapped) = hopnet_storage::crypto::wrap_mesh_privkey(
         &mesh_pubkey,
@@ -93,14 +92,12 @@ pub fn post_initial_setup(
     // resolves the same policy regardless of its own environment. Format:
     // "key=value;key=value" (e.g. "decay_tiers=60,120,180,240" for
     // orchestrator tests). Empty/absent = code defaults.
-    let storage_policy: Vec<(String, String)> =
-        std::env::var("HOPNET_GENESIS_STORAGE_POLICY")
-            .map(|s| parse_policy_spec(&s))
-            .unwrap_or_default();
-    let consensus_policy: Vec<(String, String)> =
-        std::env::var("HOPNET_GENESIS_CONSENSUS_POLICY")
-            .map(|s| parse_policy_spec(&s))
-            .unwrap_or_default();
+    let storage_policy: Vec<(String, String)> = std::env::var("HOPNET_GENESIS_STORAGE_POLICY")
+        .map(|s| parse_policy_spec(&s))
+        .unwrap_or_default();
+    let consensus_policy: Vec<(String, String)> = std::env::var("HOPNET_GENESIS_CONSENSUS_POLICY")
+        .map(|s| parse_policy_spec(&s))
+        .unwrap_or_default();
 
     // Create genesis payload with user, node, and mesh key material
     let genesis_payload = GenesisPayload {
@@ -160,12 +157,12 @@ pub fn post_initial_setup(
 
         crate::consensus::dispatch::process_transaction(&genesis_tx, state, true, &genesis_tx_db)
             .map_err(|e| {
-                tracing::error!(
-                    "post_initial_setup: Handler failed to process genesis transaction: {:?}",
-                    e
-                );
+            tracing::error!(
+                "post_initial_setup: Handler failed to process genesis transaction: {:?}",
                 e
-            })?;
+            );
+            e
+        })?;
 
         crate::db::shared::commit_timed(genesis_tx_db).map_err(|e| {
             tracing::error!(
@@ -220,29 +217,31 @@ pub fn post_initial_setup(
             Err(_) => hopnet_consensus::config::QuorumProfile::Auto,
         };
 
-        let engine_txs = crate::consensus::malachite::app::to_engine_transactions(
-            &Transactions(vec![genesis_tx.clone()]),
-        )
-        .map_err(|e| {
-            tracing::error!(
-                "post_initial_setup: Failed to bridge genesis transactions: {}",
-                e
-            );
-            DatabaseError::ProcessingError
-        })?;
-        let engine_block = hopnet_consensus::types::Block::new(hopnet_consensus::types::BlockData {
-            height: 0,
-            round: 0,
-            parent_hash: None,
-            transactions: engine_txs,
-        })
-        .map_err(|e| {
-            tracing::error!(
-                "post_initial_setup: Failed to build engine genesis block: {:?}",
-                e
-            );
-            DatabaseError::ProcessingError
-        })?;
+        let engine_txs =
+            crate::consensus::malachite::app::to_engine_transactions(&Transactions(vec![
+                genesis_tx.clone(),
+            ]))
+            .map_err(|e| {
+                tracing::error!(
+                    "post_initial_setup: Failed to bridge genesis transactions: {}",
+                    e
+                );
+                DatabaseError::ProcessingError
+            })?;
+        let engine_block =
+            hopnet_consensus::types::Block::new(hopnet_consensus::types::BlockData {
+                height: 0,
+                round: 0,
+                parent_hash: None,
+                transactions: engine_txs,
+            })
+            .map_err(|e| {
+                tracing::error!(
+                    "post_initial_setup: Failed to build engine genesis block: {:?}",
+                    e
+                );
+                DatabaseError::ProcessingError
+            })?;
         let synthetic_cert = hopnet_consensus::codec::WireCommitCertificate {
             height: 0,
             round: 0,
@@ -266,7 +265,10 @@ pub fn post_initial_setup(
         })?;
         hopnet_consensus::store::install_genesis(&tx_db, &engine_block, &synthetic_cert).map_err(
             |e| {
-                tracing::error!("post_initial_setup: Failed to install engine genesis: {}", e);
+                tracing::error!(
+                    "post_initial_setup: Failed to install engine genesis: {}",
+                    e
+                );
                 DatabaseError::InsertError
             },
         )?;
@@ -369,10 +371,10 @@ mod policy_spec_tests {
                 ("c".to_string(), "3".to_string()),
             ]
         );
-        assert_eq!(parse_policy_spec("noequals;x=9"), vec![(
-            "x".to_string(),
-            "9".to_string()
-        )]);
+        assert_eq!(
+            parse_policy_spec("noequals;x=9"),
+            vec![("x".to_string(), "9".to_string())]
+        );
         assert!(parse_policy_spec("").is_empty());
     }
 }

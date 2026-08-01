@@ -68,7 +68,11 @@ fn auto_tracks_the_seam() {
 // while the mesh is one member from unreconstructable.
 #[test]
 fn watermark_above_floor_where_active_profile_is_fault_tolerant() {
-    for profile in [QuorumProfile::Auto, QuorumProfile::Bft, QuorumProfile::Majority] {
+    for profile in [
+        QuorumProfile::Auto,
+        QuorumProfile::Bft,
+        QuorumProfile::Majority,
+    ] {
         for v in 1..=30usize {
             let fault_tolerant = v.saturating_sub(profile.quorum(v as u64) as usize) >= 1;
             if !fault_tolerant {
@@ -126,9 +130,11 @@ fn metrics(node_id: i32) -> MetricsRow {
     }
 }
 
+type AvailabilityFixture = HashMap<i32, Vec<(i64, bool)>>;
+
 /// `n` fully-online nodes (absence 0 → all are storage members) with a dense
 /// all-available grid, plus a matching profile-agnostic node universe.
-fn scenario(n: i32) -> (Vec<ViewNode>, HashMap<i32, Vec<(i64, bool)>>, i64) {
+fn scenario(n: i32) -> (Vec<ViewNode>, AvailabilityFixture, i64) {
     let step = 600i64;
     let mut nodes = Vec::new();
     let mut grid = HashMap::new();
@@ -157,8 +163,22 @@ fn profile_moves_watermark_only_not_membership() {
     let policy = StoragePolicy::default();
 
     let bft = derive_view(100, nodes.clone(), &grid, step, &policy, QuorumProfile::Bft);
-    let maj = derive_view(100, nodes.clone(), &grid, step, &policy, QuorumProfile::Majority);
-    let auto = derive_view(100, nodes.clone(), &grid, step, &policy, QuorumProfile::Auto);
+    let maj = derive_view(
+        100,
+        nodes.clone(),
+        &grid,
+        step,
+        &policy,
+        QuorumProfile::Majority,
+    );
+    let auto = derive_view(
+        100,
+        nodes.clone(),
+        &grid,
+        step,
+        &policy,
+        QuorumProfile::Auto,
+    );
 
     let ids = |v: &hopnet_storage::traits::StorageView| {
         let mut m: Vec<i32> = v.members.iter().map(|p| p.node_id).collect();
@@ -212,7 +232,15 @@ fn placement_is_profile_invariant() {
     };
 
     let bft = place(QuorumProfile::Bft);
-    assert_eq!(bft, place(QuorumProfile::Majority), "placement moved under majority");
-    assert_eq!(bft, place(QuorumProfile::Auto), "placement moved under auto");
+    assert_eq!(
+        bft,
+        place(QuorumProfile::Majority),
+        "placement moved under majority"
+    );
+    assert_eq!(
+        bft,
+        place(QuorumProfile::Auto),
+        "placement moved under auto"
+    );
     assert!(!bft.is_empty(), "sanity: some nodes were selected");
 }

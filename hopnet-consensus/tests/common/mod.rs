@@ -48,10 +48,8 @@ pub fn params(node_id: i32, profile: QuorumProfile) -> Params<HopNetContext> {
 
 /// Unique temp DB path per test (SQLite needs a real file to survive reopen).
 pub fn temp_db(name: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!(
-        "hopnet-consensus-{name}-{}.db",
-        std::process::id()
-    ));
+    let path =
+        std::env::temp_dir().join(format!("hopnet-consensus-{name}-{}.db", std::process::id()));
     let _ = std::fs::remove_file(&path);
     path
 }

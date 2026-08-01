@@ -220,7 +220,6 @@ pub fn get_startup_state(
     }
 }
 
-
 pub fn get_current_consensus_height(conn: &rusqlite::Connection) -> Result<i32, DatabaseError> {
     // RFC-017 Stage 3: delegates to the projection layer's canonical reader
     // (hopnet-consensus's SQL underneath). Host entry point kept — the

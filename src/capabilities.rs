@@ -29,14 +29,14 @@ impl SessionAccess for CapabilityHost {
         Box::pin(async move {
             // AppState::get_session maps expired → 401, missing → 428; the
             // seam preserves exactly that split.
-            let entry = self
-                .app_state
-                .get_session(user_id)
-                .await
-                .map_err(|status| match status {
-                    StatusCode::UNAUTHORIZED => SessionError::Unauthorized,
-                    _ => SessionError::PreconditionRequired,
-                })?;
+            let entry =
+                self.app_state
+                    .get_session(user_id)
+                    .await
+                    .map_err(|status| match status {
+                        StatusCode::UNAUTHORIZED => SessionError::Unauthorized,
+                        _ => SessionError::PreconditionRequired,
+                    })?;
 
             // Derive the drive-facing key material host-side — the ed25519
             // identity key never crosses the seam.
@@ -111,7 +111,9 @@ impl BlobStreamer for CapabilityHost {
         range: Option<(u64, u64)>,
     ) -> ByteStream {
         Box::pin(hopnet_storage::api::get(
-            Some(crate::storage_host::substrate_host::get_net(&self.app_state)),
+            Some(crate::storage_host::substrate_host::get_net(
+                &self.app_state,
+            )),
             self.app_state.fragments_dir.clone(),
             manifest,
             per_blob_key,

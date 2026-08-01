@@ -383,8 +383,7 @@ pub fn spawn_probe_scheduler(app_state: crate::AppState) {
                 let Ok(conn) = app_state.db_pool.get() else {
                     continue;
                 };
-                let policy = hopnet_consensus::store::read_policy(&conn)
-                    .unwrap_or_default();
+                let policy = hopnet_consensus::store::read_policy(&conn).unwrap_or_default();
                 app_state
                     .evidence
                     .set_reset_gap(policy.t_unresponsive(Band::Lazy));
@@ -424,10 +423,9 @@ pub fn spawn_probe_scheduler(app_state: crate::AppState) {
                         .iter()
                         .filter(|id| !seated.contains(id) && **id != my_id)
                         .map(|id| {
-                            let dep = hopnet_consensus::validators::last_departure(
-                                &conn, *id, pending,
-                            )
-                            .unwrap_or(None);
+                            let dep =
+                                hopnet_consensus::validators::last_departure(&conn, *id, pending)
+                                    .unwrap_or(None);
                             (*id, dep)
                         })
                         .collect();
@@ -496,8 +494,8 @@ pub fn spawn_probe_scheduler(app_state: crate::AppState) {
             // eventually proposes — with no coordination protocol.
             if seated.contains(&my_id) {
                 let t_out = policy.t_out(est.band);
-                let cooled = last_voteout_at
-                    .is_none_or(|t| now.saturating_duration_since(t) >= t_out / 2);
+                let cooled =
+                    last_voteout_at.is_none_or(|t| now.saturating_duration_since(t) >= t_out / 2);
                 if cooled {
                     let target = seated
                         .iter()
@@ -507,13 +505,10 @@ pub fn spawn_probe_scheduler(app_state: crate::AppState) {
                                 .binary_search_by_key(id, |(k, _)| *k)
                                 .ok()
                                 .map(|i| snap[i].1);
-                            let age =
-                                contact_age(view.as_ref(), app_state.evidence.origin(), now);
-                            let probes =
-                                view.map(|v| v.probes_since_contact).unwrap_or(0);
+                            let age = contact_age(view.as_ref(), app_state.evidence.origin(), now);
+                            let probes = view.map(|v| v.probes_since_contact).unwrap_or(0);
                             (age >= t_out
-                                && probes
-                                    >= hopnet_consensus::membership::ATTESTATION_PROBE_FLOOR)
+                                && probes >= hopnet_consensus::membership::ATTESTATION_PROBE_FLOOR)
                                 .then_some((*id, age))
                         })
                         .max_by_key(|(_, age)| *age);
@@ -557,8 +552,8 @@ pub fn spawn_probe_scheduler(app_state: crate::AppState) {
             // pool. Nodes never request seats — this is the only initiator.
             if seated.contains(&my_id) && !pool.is_empty() {
                 let seat_cooldown = policy.t_probe(est.band);
-                let cooled = last_seat_at
-                    .is_none_or(|t| now.saturating_duration_since(t) >= seat_cooldown);
+                let cooled =
+                    last_seat_at.is_none_or(|t| now.saturating_duration_since(t) >= seat_cooldown);
                 if cooled {
                     let inp = crate::consensus::membership_guards::GuardInputs {
                         snapshot: &snap,
@@ -592,9 +587,7 @@ pub fn spawn_probe_scheduler(app_state: crate::AppState) {
                                 let queue = app_state.consensus_queue.clone();
                                 tokio::spawn(async move {
                                     match queue.submit(tx).await {
-                                        Ok(()) => tracing::info!(
-                                            "seated batch {batch:?}"
-                                        ),
+                                        Ok(()) => tracing::info!("seated batch {batch:?}"),
                                         Err(e) => tracing::debug!(
                                             "seat batch {batch:?} not committed: {e}"
                                         ),
@@ -667,7 +660,10 @@ pub async fn get_evidence(State(app_state): State<crate::AppState>) -> impl Into
     use axum::http::StatusCode;
 
     let Ok(my_id) = app_state.get_node_id() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "node identity not initialized")
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "node identity not initialized",
+        )
             .into_response();
     };
     let decided = app_state
@@ -1008,6 +1004,9 @@ mod tests {
             bright_span(Some(&dark), origin, &p, Band::Lazy, now),
             Duration::ZERO
         );
-        assert_eq!(bright_span(None, origin, &p, Band::Lazy, now), Duration::ZERO);
+        assert_eq!(
+            bright_span(None, origin, &p, Band::Lazy, now),
+            Duration::ZERO
+        );
     }
 }
