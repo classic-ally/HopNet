@@ -193,8 +193,6 @@ pub struct FfiDaemonOptions {
     pub storage_poll_secs: u64,
     /// Hourly lifecycle job cadence (hard deletes, log pruning, snapshots).
     pub cleanup_interval_secs: u64,
-    /// Dirty-sidecar replication cadence (faster, batch-capped).
-    pub replication_interval_secs: u64,
     /// HopNet publish tick: node base URL (WITHOUT `/api`) + RFC-012 device
     /// token (`{device_id}.{secret}`). Both set = publishing on; either
     /// absent = ingest-only daemon (the pre-integration behavior). The
@@ -202,7 +200,7 @@ pub struct FfiDaemonOptions {
     /// reads secrets itself.
     pub publish_node_url: Option<String>,
     pub publish_device_token: Option<String>,
-    /// Publish tick cadence (seconds); same class as replication.
+    /// Publish tick cadence (seconds).
     pub publish_interval_secs: u64,
 }
 
@@ -212,20 +210,15 @@ pub struct FfiCleanupOptions {
     pub log_retention_days: i64,
     pub snapshot_keep: u32,
     pub hard_delete_batch: u32,
-    pub replication_batch: u32,
 }
 
-/// Lifecycle outcome (mirrors `cleanup::CleanupReport` + the replication
-/// side).
+/// Lifecycle outcome (mirrors `cleanup::CleanupReport`).
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiCleanupReport {
     pub photos_hard_deleted: u64,
     pub blob_files_deleted: u64,
     pub log_rows_pruned: u64,
     pub snapshots_written: u64,
-    pub sidecars_replicated: u64,
-    pub sidecars_missing: u64,
-    pub replication_stalled: bool,
 }
 
 /// Publish-tick aggregates (mirrors `publish::PublishReport`).
@@ -238,7 +231,8 @@ pub struct FfiPublishReport {
     pub adopted: u64,
     pub failed: u64,
     pub gave_up: u64,
-    pub missing_sidecar: u64,
+    /// Skipped: publish-metadata capsule absent (awaiting heal backfill).
+    pub missing_descriptor: u64,
     /// The last pass aborted because the node was unreachable.
     pub parked: bool,
     /// The last pass held its photos because this device does not hold
@@ -282,6 +276,7 @@ pub struct FfiWriteOutcome {
     pub deduped: bool,
     pub blob_path: String,
     pub photo_completed: bool,
-    /// Set when `photo_completed` and the local sidecar was written.
-    pub sidecar_path: Option<String>,
+    /// Set when `photo_completed` and the publish-metadata capsule was
+    /// persisted to state.db.
+    pub descriptor_persisted: bool,
 }

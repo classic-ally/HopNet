@@ -2,7 +2,6 @@
 //! Printing is the product here — everything else lives in ingress-core.
 
 use ingress_core::fsck::FsckReport;
-use ingress_core::recover::RecoverReport;
 use ingress_core::status::{PhotoStatus, StatusReport};
 
 pub fn print_json(value: &impl serde::Serialize) {
@@ -102,7 +101,6 @@ pub fn print_photo(view: &PhotoStatus) {
     println!("local_id:     {}", opt(&photo.local_id));
     println!("discovered:   {}", photo.discovered_at);
     println!("materialized: {}", opt(&photo.materialized_at));
-    println!("replicated:   {}", opt(&photo.sidecar_replicated_at));
     println!("deleted:      {}", opt(&photo.deleted_at));
     if let Some(group) = &photo.group_id {
         println!(
@@ -112,11 +110,12 @@ pub fn print_photo(view: &PhotoStatus) {
         );
     }
     println!(
-        "sidecar:      {}",
-        view.sidecar_local
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "MISSING".into())
+        "descriptor:   {}",
+        if photo.descriptor_json.is_some() {
+            "present"
+        } else {
+            "MISSING"
+        }
     );
 
     println!("\nRESOURCES");
@@ -211,22 +210,6 @@ pub fn print_fsck(report: &FsckReport) {
     for f in &report.foreign_files {
         println!("  {}", f.display());
     }
-    section(
-        "local sidecar findings",
-        report.sidecar_findings.len(),
-        None,
-    );
-    for s in &report.sidecar_findings {
-        println!("  {}  {:?}", s.photo_id, s.kind);
-    }
-    section(
-        "remote sidecar findings",
-        report.remote_findings.len(),
-        None,
-    );
-    for r in &report.remote_findings {
-        println!("  {}  {:?}", r.photo_id, r.kind);
-    }
     for skipped in &report.skipped_roots {
         println!("note: skipped {skipped} — rerun with the mount up for full coverage");
     }
@@ -242,55 +225,4 @@ fn section(label: &str, count: usize, note: Option<&str>) {
             None => println!("{label}: {count}"),
         }
     }
-}
-
-pub fn print_recover(report: &RecoverReport) {
-    match &report.source {
-        ingress_core::recover::RecoverSource::Snapshot { path, ts } => {
-            println!("recovered from snapshot {} (ts {ts})", path.display());
-        }
-        ingress_core::recover::RecoverSource::Sidecars => {
-            println!("recovered from sidecar trees");
-        }
-    }
-    println!(
-        "  photos {}  resources {}  blobs {}  sidecars hydrated {}",
-        report.photos, report.resources, report.blobs, report.sidecars_hydrated
-    );
-    if report.missing_blob_files > 0 {
-        println!(
-            "!!! {} referenced blob file(s) missing — check the blob= paths in your specs",
-            report.missing_blob_files
-        );
-    }
-    for w in &report.warnings {
-        println!("warning: {w}");
-    }
-    println!("\nrecovered library configuration (review paths before starting the daemon):");
-    let rows: Vec<Vec<String>> = report
-        .libraries
-        .iter()
-        .map(|l| {
-            vec![
-                l.library_id.to_string(),
-                l.display_name.clone(),
-                l.blob_root.clone(),
-                l.sidecar_root_remote.clone().unwrap_or_else(|| "-".into()),
-                l.retention_days.to_string(),
-            ]
-        })
-        .collect();
-    table(
-        &["ID", "NAME", "BLOB ROOT", "REMOTE SIDECARS", "RETENTION"],
-        &rows,
-    );
-}
-
-/// The spec's loud warning for a library without a remote sidecar backup.
-pub fn print_no_remote_warning(library_id: &str) {
-    eprintln!("WARNING: library {library_id} has no remote sidecar backup root.");
-    eprintln!("  Without remote sidecars, recovery from a lost Mac degrades to blob-only");
-    eprintln!("  rebuild: all PhotoKit-derived metadata (capture grouping, library scope,");
-    eprintln!("  favorites, edit relationships) is lost and fresh photo_ids are minted.");
-    eprintln!("  Configure one later with: ingress-cli library ... (or re-add).");
 }

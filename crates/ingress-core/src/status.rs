@@ -9,8 +9,7 @@ use std::path::PathBuf;
 use crate::error::Result;
 use crate::ids::PhotoId;
 use crate::model::{LibraryConfig, PhotoRecord, ResourceRecord};
-use crate::paths::{BlobPaths, DataDir};
-use crate::sidecar_io::find_sidecar;
+use crate::paths::BlobPaths;
 use crate::store::{LibraryStats, LogEvent, RetrySummary, StateStore};
 
 /// How many log events the per-photo view tails by default.
@@ -66,8 +65,6 @@ pub async fn status(store: &StateStore, retry_cap: i64) -> Result<StatusReport> 
 pub struct PhotoStatus {
     pub photo: PhotoRecord,
     pub resources: Vec<ResourceStatus>,
-    /// The local sidecar document, if present in the YYYY/MM tree.
-    pub sidecar_local: Option<PathBuf>,
     /// Newest-first ingest-log tail for this photo.
     pub events: Vec<LogEvent>,
 }
@@ -86,11 +83,7 @@ pub struct ResourceStatus {
 
 /// Per-photo view. `key` is tried as a `photo_id` first, then a `cloud_id`.
 /// Returns None when neither matches.
-pub async fn photo_status(
-    store: &StateStore,
-    data_dir: &DataDir,
-    key: &str,
-) -> Result<Option<PhotoStatus>> {
+pub async fn photo_status(store: &StateStore, key: &str) -> Result<Option<PhotoStatus>> {
     let by_id = store.photo(&PhotoId::from_string(key)).await?;
     let photo = match by_id {
         Some(p) => p,
@@ -120,10 +113,6 @@ pub async fn photo_status(
         });
     }
 
-    let sidecar_local = match &photo.library_id {
-        Some(lib) => find_sidecar(&data_dir.sidecar_root(lib), &photo.photo_id)?,
-        None => None,
-    };
     let events = store
         .log_tail_for_photo(&photo.photo_id, PHOTO_LOG_TAIL)
         .await?;
@@ -131,7 +120,6 @@ pub async fn photo_status(
     Ok(Some(PhotoStatus {
         photo,
         resources,
-        sidecar_local,
         events,
     }))
 }

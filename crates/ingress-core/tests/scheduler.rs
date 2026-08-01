@@ -161,7 +161,6 @@ async fn rig() -> Rig {
             // Long intervals: lifecycle ticks stay out of the way unless a
             // test opts in by zeroing them.
             cleanup_interval: Duration::from_secs(3600),
-            replication_interval: Duration::from_secs(3600),
             cleanup: ingress_core::cleanup::CleanupConfig::default(),
             publish: ingress_core::publish::PublishConfig::default(),
         },
@@ -852,27 +851,14 @@ async fn cancel_exits_daemon_with_report() {
 
 // Impact: the lifecycle job must run INSIDE the daemon without an operator —
 // hard deletes, log pruning, and replication all ride the loop's timers.
-// Should: with zero intervals, an expired tombstone hard-deletes and a dirty
-// sidecar replicates during run_daemon; the report carries both.
+// Should: with a zero interval, an expired tombstone hard-deletes during
+// run_daemon; the report carries the cleanup counters.
 #[tokio::test(flavor = "multi_thread")]
-async fn daemon_tick_runs_cleanup_and_replication() {
+async fn daemon_tick_runs_cleanup() {
     let mut r = rig().await;
     r.config.cleanup_interval = Duration::ZERO;
-    r.config.replication_interval = Duration::ZERO;
     let rig = r;
 
-    // Remote sidecar root for the personal library.
-    let remote = rig._dirs.0.path().join("remote");
-    sqlx::query("UPDATE libraries SET sidecar_root_remote = ? WHERE library_id = 'personal'")
-        .bind(remote.to_string_lossy().into_owned())
-        .execute(rig.store.raw_pool())
-        .await
-        .unwrap();
-
-    // One photo to materialize (dirty sidecar → replication) and one
-    // pre-materialized tombstone past retention (hard delete).
-    let live = AssetDescriptorBuilder::simple_image().build();
-    seed_asset(&rig, &live, b"live-bytes", None).await;
     let dead = AssetDescriptorBuilder::simple_image().build();
     seed_asset(&rig, &dead, b"dead-bytes", None).await;
     scheduler(&rig).drain().await.unwrap();
@@ -883,7 +869,7 @@ async fn daemon_tick_runs_cleanup_and_replication() {
         .unwrap()
         .unwrap()
         .photo_id;
-    ingress_core::classify::apply_removal(&rig.store, &rig.data_dir, &dead.local_id)
+    ingress_core::classify::apply_removal(&rig.store, &dead.local_id)
         .await
         .unwrap();
     sqlx::query("UPDATE photos SET deleted_at = ? WHERE photo_id = ?")
@@ -908,27 +894,11 @@ async fn daemon_tick_runs_cleanup_and_replication() {
         async move { store.photo(&id).await.unwrap().is_none() }
     })
     .await;
-    let store = rig.store.clone();
-    wait_until("dirty sidecar replicated", || {
-        let store = store.clone();
-        async move {
-            sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM photos WHERE sidecar_replicated_at IS NOT NULL",
-            )
-            .fetch_one(store.raw_pool())
-            .await
-            .unwrap()
-                > 0
-        }
-    })
-    .await;
 
     rig.cancel.cancel();
     handle.wake();
     let report = daemon.await.unwrap().unwrap();
     assert!(report.cleanup.photos_hard_deleted >= 1);
-    assert!(report.replication.replicated >= 1);
-    assert!(remote.join("sidecars").parent().is_some()); // remote tree exists
     let events = rig.store.log_events("hard_delete").await.unwrap();
     assert_eq!(events.len(), 1);
 }
@@ -1043,14 +1013,27 @@ async fn thumbnails_drain_last_and_flow_the_write_path() {
         assert_eq!(row.ext.as_deref(), Some("jpg"));
     }
 
-    let sidecar_path = ingress_core::sidecar_io::find_sidecar(
-        &rig.data_dir.sidecar_root(&ingress_core::LibraryId::new("personal")),
-        &photo_id,
-    )
-    .unwrap()
-    .expect("sidecar written at completion");
-    let doc = ingress_core::Sidecar::from_json(&std::fs::read_to_string(sidecar_path).unwrap())
+    let photo = rig.store.photo(&photo_id).await.unwrap().unwrap();
+    let capsule_json = photo.descriptor_json.expect("capsule persisted at completion");
+    let capsule: ingress_core::descriptor::DescriptorCapsule =
+        serde_json::from_str(&capsule_json).unwrap();
+    let library = rig
+        .store
+        .library(&ingress_core::LibraryId::new("personal"))
+        .await
+        .unwrap()
         .unwrap();
+    let photo = rig.store.photo(&photo_id).await.unwrap().unwrap();
+    let doc = ingress_core::Sidecar::compose(
+        &photo,
+        &library,
+        capsule.media_type,
+        &capsule.media_subtypes,
+        capsule.favorite,
+        &capsule.capture,
+        &rows,
+    )
+    .unwrap();
     let names: Vec<&str> = doc.resources.iter().map(|r| r.resource_type.as_str()).collect();
     assert!(names.contains(&"thumbnail_small") && names.contains(&"thumbnail_medium"));
 }

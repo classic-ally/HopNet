@@ -99,7 +99,6 @@ pub struct DaemonReport {
     pub transitions: u64,
     pub resources_reopened: u64,
     pub cleanup: crate::cleanup::CleanupReport,
-    pub replication: crate::cleanup::ReplicationReport,
     pub publish: crate::publish::PublishReport,
 }
 
@@ -129,13 +128,10 @@ impl<F: ResourceFetcher> Scheduler<F> {
         let mut deferred: HashMap<PhotoId, VecDeque<ChangeEvent>> = HashMap::new();
         let mut counters = EventCounters::default();
         // Lifecycle timers: None = due immediately, so a boot runs the
-        // startup cleanup and begins draining the replication backlog.
+        // startup cleanup.
         let mut last_cleanup: Option<std::time::Instant> = None;
-        let mut last_replication: Option<std::time::Instant> = None;
         let mut last_publish: Option<std::time::Instant> = None;
-        let mut repl_state = crate::cleanup::ReplicationState::default();
         let mut cleanup_totals = crate::cleanup::CleanupReport::default();
-        let mut replication_totals = crate::cleanup::ReplicationReport::default();
         // Publish pass state, shared with the spawned pass task (one alive at
         // a time — the tick is gated on the previous task having finished).
         let publish_totals = Arc::new(Mutex::new(crate::publish::PublishReport::default()));
@@ -182,35 +178,6 @@ impl<F: ResourceFetcher> Scheduler<F> {
                     }
                 }
                 last_cleanup = Some(std::time::Instant::now());
-            }
-            if due(last_replication, self.shared.config.replication_interval) {
-                // Skip inflight photos: their sidecars may be rewritten
-                // concurrently by photo_tasks (post-tx), and stamping a
-                // stale copy would record it as current.
-                let skip = self.shared.inflight.lock().expect("inflight mutex").clone();
-                match crate::cleanup::replicate_dirty_sidecars(
-                    &self.shared.store,
-                    &self.shared.data_dir,
-                    self.shared.config.cleanup.replication_batch,
-                    &skip,
-                    &mut repl_state,
-                )
-                .await
-                {
-                    Ok(r) => replication_totals.absorb(&r),
-                    Err(e) => {
-                        let _ = self
-                            .shared
-                            .store
-                            .append_log(
-                                "cleanup_error",
-                                None,
-                                Some(serde_json::json!({ "op": "replication", "error": e.to_string() })),
-                            )
-                            .await;
-                    }
-                }
-                last_replication = Some(std::time::Instant::now());
             }
             // Publish tick: claim in-loop (fast indexed query), register the
             // claimed photos INFLIGHT (their PhotoKit events defer, which
@@ -338,8 +305,8 @@ impl<F: ResourceFetcher> Scheduler<F> {
             // 4. Idle: wake on a new event, a task exit (may unblock
             //    deferrals or free capacity), an external nudge, the
             //    earliest retry deadline, or the next lifecycle tick (an
-            //    idle daemon must not skew the 60s replication cadence to
-            //    the retry default).
+            //    idle daemon must not skew lifecycle cadence to the retry
+            //    default).
             let summary = self
                 .shared
                 .store
@@ -353,12 +320,8 @@ impl<F: ResourceFetcher> Scheduler<F> {
                 last.map(|t| interval.saturating_sub(t.elapsed()))
                     .unwrap_or_default()
             };
-            let mut next_retry = next_retry
-                .min(time_to(last_cleanup, self.shared.config.cleanup_interval))
-                .min(time_to(
-                    last_replication,
-                    self.shared.config.replication_interval,
-                ));
+            let mut next_retry =
+                next_retry.min(time_to(last_cleanup, self.shared.config.cleanup_interval));
             if self.publisher.is_some() {
                 next_retry =
                     next_retry.min(time_to(last_publish, self.shared.config.publish.interval));
@@ -404,7 +367,6 @@ impl<F: ResourceFetcher> Scheduler<F> {
             transitions: counters.transitions,
             resources_reopened: counters.reopened,
             cleanup: cleanup_totals,
-            replication: replication_totals,
             publish: publish_totals.lock().expect("publish totals").clone(),
         })
     }
@@ -471,7 +433,7 @@ impl<F: ResourceFetcher> Scheduler<F> {
         let scan = handle.scan.lock().expect("scan mutex").clone();
         match &event {
             ChangeEvent::Descriptor(desc) => {
-                match apply_change(&self.shared.store, &self.shared.data_dir, desc).await {
+                match apply_change(&self.shared.store, desc).await {
                     Ok((classification, outcome)) => {
                         counters.applied += 1;
                         counters.restores += outcome.restored as u64;
@@ -490,7 +452,7 @@ impl<F: ResourceFetcher> Scheduler<F> {
                 }
             }
             ChangeEvent::Removed { local_id } => {
-                match apply_removal(&self.shared.store, &self.shared.data_dir, local_id).await {
+                match apply_removal(&self.shared.store, local_id).await {
                     Ok(outcome) => {
                         counters.applied += 1;
                         if matches!(outcome, RemovalOutcome::Tombstoned { .. }) {

@@ -33,8 +33,8 @@ impl StateStore {
 
     /// Persist the publish-metadata capsule (serialized
     /// [`crate::descriptor::DescriptorCapsule`]). Rides the same trigger
-    /// points as the sidecar rewrite — materialization, metadata refresh,
-    /// heal — so the column tracks the live descriptor.
+    /// points as materialization, metadata refresh, and heal — so the
+    /// column tracks the live descriptor.
     pub async fn update_descriptor_capsule(&self, id: &PhotoId, json: &str) -> Result<()> {
         sqlx::query("UPDATE photos SET descriptor_json = ? WHERE photo_id = ?")
             .bind(json)
@@ -42,6 +42,18 @@ impl StateStore {
             .execute(self.pool())
             .await?;
         Ok(())
+    }
+
+    /// Persist the capsule straight from a live descriptor — the single
+    /// metadata write every materialization/refresh/heal path funnels
+    /// through (the successor of the sidecar-file write).
+    pub async fn persist_descriptor(
+        &self,
+        id: &PhotoId,
+        desc: &crate::descriptor::AssetDescriptor,
+    ) -> Result<()> {
+        let json = serde_json::to_string(&crate::descriptor::DescriptorCapsule::from(desc))?;
+        self.update_descriptor_capsule(id, &json).await
     }
 }
 
@@ -204,52 +216,12 @@ pub(crate) async fn set_asset_modified_at<'e, E>(
 where
     E: Executor<'e, Database = Sqlite>,
 {
-    // The metadata refresh rewrote the sidecar just before this stamp — the
-    // remote copy is stale, so the dirty flag rides the same statement (T6).
-    sqlx::query(
-        "UPDATE photos SET asset_modified_at = ?, sidecar_replicated_at = NULL WHERE photo_id = ?",
-    )
-    .bind(at)
-    .bind(id)
-    .execute(exec)
-    .await?;
-    Ok(())
-}
-
-/// Every local sidecar rewrite dirties the remote copy (spec §photos notes:
-/// the NULL commits in the same transaction as the triggering state change).
-pub(crate) async fn mark_sidecar_dirty<'e, E>(exec: E, id: &PhotoId) -> Result<()>
-where
-    E: Executor<'e, Database = Sqlite>,
-{
-    sqlx::query("UPDATE photos SET sidecar_replicated_at = NULL WHERE photo_id = ?")
+    sqlx::query("UPDATE photos SET asset_modified_at = ? WHERE photo_id = ?")
+        .bind(at)
         .bind(id)
         .execute(exec)
         .await?;
     Ok(())
-}
-
-/// Stamp a successful remote replication. Guarded on still-NULL: a rewrite
-/// that landed after the copy was taken must win (the stamp would otherwise
-/// record a stale remote as current).
-pub(crate) async fn stamp_sidecar_replicated<'e, E>(
-    exec: E,
-    id: &PhotoId,
-    at: DateTime<Utc>,
-) -> Result<bool>
-where
-    E: Executor<'e, Database = Sqlite>,
-{
-    Ok(sqlx::query(
-        "UPDATE photos SET sidecar_replicated_at = ? \
-         WHERE photo_id = ? AND sidecar_replicated_at IS NULL",
-    )
-    .bind(at)
-    .bind(id)
-    .execute(exec)
-    .await?
-    .rows_affected()
-        > 0)
 }
 
 /// Hard-delete candidates: tombstones past their retention cutoff. The
@@ -286,29 +258,6 @@ where
         .fetch_all(exec)
         .await?),
     }
-}
-
-/// The replication work queue: dirty photos in libraries with a remote root.
-/// `materialized_at IS NOT NULL` keeps never-materialized photos (no sidecar
-/// exists) out of every pass; tombstoned materialized photos keep the stamp,
-/// so their deleted_at sidecar replicates — the resurrection case the column
-/// exists to prevent. Mid-re-edit photos defer to completion.
-pub(crate) async fn dirty_sidecar_photos<'e, E>(exec: E, limit: i64) -> Result<Vec<PhotoRecord>>
-where
-    E: Executor<'e, Database = Sqlite>,
-{
-    Ok(sqlx::query_as(
-        "SELECT p.* FROM photos p \
-         JOIN libraries l ON l.library_id = p.library_id \
-         WHERE p.sidecar_replicated_at IS NULL \
-           AND l.sidecar_root_remote IS NOT NULL \
-           AND p.materialized_at IS NOT NULL \
-         ORDER BY p.photo_id \
-         LIMIT ?",
-    )
-    .bind(limit)
-    .fetch_all(exec)
-    .await?)
 }
 
 /// The publish work queue: materialized, active, unpublished photos of the

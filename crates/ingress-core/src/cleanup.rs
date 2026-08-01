@@ -1,14 +1,10 @@
-//! The lifecycle job (spec §Hard-delete cleanup, §State snapshots, §photos
-//! notes on `sidecar_replicated_at`): hard-delete tombstones past retention,
-//! prune the ingest log, write daily state snapshots to the storage roots,
-//! and drain the dirty-sidecar set to each library's remote backup root.
+//! The lifecycle job (spec §Hard-delete cleanup, §State snapshots):
+//! hard-delete tombstones past retention, prune the ingest log, and write
+//! daily state snapshots to the storage roots.
 //!
-//! Hourly work (`run_cleanup`) and the faster replication drain
-//! (`replicate_dirty_sidecars`) are separate entry points: the daemon loop
-//! runs them on independent timers, and the one-shot CLI subcommand
-//! (`run_standalone`) runs both once under the exclusive run lock.
+//! The daemon loop runs `run_cleanup` on a timer; the one-shot CLI
+//! subcommand (`run_standalone`) runs it once under the exclusive run lock.
 
-use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -18,7 +14,6 @@ use crate::error::{IngressError, Result};
 use crate::ids::{ContentHash, PhotoId};
 use crate::model::LibraryConfig;
 use crate::paths::{BlobPaths, DataDir};
-use crate::sidecar_io::find_sidecar;
 use crate::store::StateStore;
 
 /// Retention for unmapped tombstones (NULL library — no per-library config
@@ -34,8 +29,6 @@ pub struct CleanupConfig {
     /// Hard-delete cap per run — a whole-library expiry must not stall the
     /// daemon loop; the remainder processes on subsequent ticks.
     pub hard_delete_batch: usize,
-    /// Sidecar replication cap per pass (same rationale).
-    pub replication_batch: usize,
 }
 
 impl Default for CleanupConfig {
@@ -44,7 +37,6 @@ impl Default for CleanupConfig {
             log_retention_days: 180,
             snapshot_keep: 7,
             hard_delete_batch: 500,
-            replication_batch: 500,
         }
     }
 }
@@ -66,38 +58,6 @@ impl CleanupReport {
     }
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct ReplicationReport {
-    pub replicated: u64,
-    /// Dirty photos whose local sidecar is missing (crash between the
-    /// completion tx and the first sidecar write) — skipped unstamped;
-    /// fsck tier-2's class.
-    pub missing: u64,
-    /// Dirty photos the mount accepted the root of but refused the copy for
-    /// (e.g. a destination clash, or a per-file fs error) — skipped unstamped
-    /// and retried next pass, but NOT allowed to stall the whole drain. The
-    /// poison-pill guard: one un-copyable photo at the head of the `photo_id`
-    /// order must not freeze replication for every following photo/library.
-    pub failed: u64,
-    pub stalled: bool,
-}
-
-impl ReplicationReport {
-    pub fn absorb(&mut self, other: &ReplicationReport) {
-        self.replicated += other.replicated;
-        self.missing += other.missing;
-        self.failed += other.failed;
-        self.stalled = other.stalled;
-    }
-}
-
-/// Edge-trigger state for `mount_lost`/`mount_regained`, held by the caller
-/// across ticks so a down mount logs once, not per pass.
-#[derive(Debug, Default)]
-pub struct ReplicationState {
-    stalled: bool,
-}
-
 /// The hourly job. `now` is injected (tests; also keeps one consistent
 /// instant across the sub-steps).
 pub async fn run_cleanup(
@@ -107,7 +67,7 @@ pub async fn run_cleanup(
     now: DateTime<Utc>,
 ) -> Result<CleanupReport> {
     let mut report = CleanupReport::default();
-    hard_delete_expired(store, data_dir, cfg, now, &mut report).await?;
+    hard_delete_expired(store, cfg, now, &mut report).await?;
     report.log_rows_pruned =
         crate::store::log::prune_before(store.pool(), now - Duration::days(cfg.log_retention_days))
             .await?;
@@ -117,29 +77,20 @@ pub async fn run_cleanup(
 
 /// One-shot entry for the CLI subcommand: exclusive lock (errors while the
 /// daemon holds it), Tier-1 repair on an unclean reclaim, then one cleanup
-/// run + one replication pass (no daemon → empty skip set).
+/// run.
 pub async fn run_standalone(
     store: &StateStore,
     data_dir: &DataDir,
     cfg: &CleanupConfig,
     now: DateTime<Utc>,
-) -> Result<(CleanupReport, ReplicationReport)> {
+) -> Result<CleanupReport> {
     let acquired = crate::runlock::DrainLock::acquire(data_dir)?;
     if acquired.unclean {
         crate::recovery::repair_refcounts(store).await?;
     }
     let cleanup = run_cleanup(store, data_dir, cfg, now).await?;
-    let mut state = ReplicationState::default();
-    let replication = replicate_dirty_sidecars(
-        store,
-        data_dir,
-        cfg.replication_batch,
-        &HashSet::new(),
-        &mut state,
-    )
-    .await?;
     drop(acquired.lock);
-    Ok((cleanup, replication))
+    Ok(cleanup)
 }
 
 // ---------------------------------------------------------------- hard delete
@@ -149,7 +100,6 @@ pub async fn run_standalone(
 /// tx and fs cleanup must never leave a vanished photo with a silent log.
 async fn hard_delete_expired(
     store: &StateStore,
-    data_dir: &DataDir,
     cfg: &CleanupConfig,
     now: DateTime<Utc>,
     report: &mut CleanupReport,
@@ -179,7 +129,7 @@ async fn hard_delete_expired(
         )
         .await?;
         for photo in candidates {
-            hard_delete_one(store, data_dir, library.as_ref(), &photo.photo_id, report).await?;
+            hard_delete_one(store, library.as_ref(), &photo.photo_id, report).await?;
             budget -= 1;
         }
     }
@@ -188,7 +138,6 @@ async fn hard_delete_expired(
 
 async fn hard_delete_one(
     store: &StateStore,
-    data_dir: &DataDir,
     library: Option<&LibraryConfig>,
     photo_id: &PhotoId,
     report: &mut CleanupReport,
@@ -255,16 +204,6 @@ async fn hard_delete_one(
         for (hash, ext) in &reap {
             if fs::remove_file(paths.blob_path(hash, ext)).is_ok() {
                 report.blob_files_deleted += 1;
-            }
-        }
-        // Local sidecar (rel-path derived from the local hit), then the
-        // remote copy best-effort.
-        let local_root = data_dir.sidecar_root(&library.library_id);
-        if let Some(local) = find_sidecar(&local_root, photo_id)? {
-            let rel = local.strip_prefix(&local_root).ok().map(Path::to_path_buf);
-            let _ = fs::remove_file(&local);
-            if let (Some(rel), Some(remote)) = (rel, &library.sidecar_root_remote) {
-                let _ = fs::remove_file(Path::new(remote).join(rel));
             }
         }
     }
@@ -374,157 +313,3 @@ pub(crate) fn parse_snapshot_ts(name: &str) -> Option<i64> {
         .ok()
 }
 
-// ---------------------------------------------------------------- replication
-
-/// Drain one batch of the dirty-sidecar set to the remote backup roots.
-/// `skip` = photos with a live `photo_task` (their sidecar may be rewritten
-/// concurrently; stamping after copying a stale version would record the
-/// stale remote as current). First fs failure stops the pass and edge-logs
-/// `mount_lost`; the first subsequent success logs `mount_regained`.
-pub async fn replicate_dirty_sidecars(
-    store: &StateStore,
-    data_dir: &DataDir,
-    batch: usize,
-    skip: &HashSet<PhotoId>,
-    state: &mut ReplicationState,
-) -> Result<ReplicationReport> {
-    let mut report = ReplicationReport::default();
-    let candidates = crate::store::photos::dirty_sidecar_photos(store.pool(), batch as i64).await?;
-    let libraries: std::collections::HashMap<_, _> = store
-        .libraries()
-        .await?
-        .into_iter()
-        .map(|l| (l.library_id.clone(), l))
-        .collect();
-
-    let mut copied_any = false;
-    // First per-file copy failure of this pass, logged once at the end so a
-    // recurring poison photo does not write one row per tick.
-    let mut first_failure: Option<(PhotoId, String)> = None;
-    for photo in candidates {
-        if skip.contains(&photo.photo_id) {
-            continue;
-        }
-        let Some(library) = photo.library_id.as_ref().and_then(|id| libraries.get(id)) else {
-            continue; // unmapped rows are filtered by the query; races tolerated
-        };
-        let Some(remote_root) = &library.sidecar_root_remote else {
-            continue;
-        };
-
-        let local_root = data_dir.sidecar_root(&library.library_id);
-        let Some(local) = find_sidecar(&local_root, &photo.photo_id)? else {
-            report.missing += 1;
-            continue;
-        };
-        let rel = local
-            .strip_prefix(&local_root)
-            .map_err(|_| IngressError::Invariant("sidecar outside its root".into()))?
-            .to_path_buf();
-
-        match copy_atomic(&local, &Path::new(remote_root).join(&rel)) {
-            Ok(()) => {
-                crate::store::photos::stamp_sidecar_replicated(
-                    store.pool(),
-                    &photo.photo_id,
-                    Utc::now(),
-                )
-                .await?;
-                report.replicated += 1;
-                copied_any = true;
-            }
-            Err(e) => {
-                // Two distinct failure modes, told apart by probing the root:
-                //   - root not a reachable directory  => the mount is gone.
-                //     Stop the pass (hammering a dead mount is wasted work)
-                //     and edge-log `mount_lost` once.
-                //   - root still a live directory      => this one file failed
-                //     (destination clash, per-file fs error). Skip it and keep
-                //     draining — a single un-copyable photo at the head of the
-                //     `photo_id` order must not freeze the whole backlog.
-                if !Path::new(remote_root).is_dir() {
-                    report.stalled = true;
-                    if !state.stalled {
-                        state.stalled = true;
-                        store
-                            .append_log(
-                                "mount_lost",
-                                None,
-                                Some(serde_json::json!({
-                                    "op": "sidecar_replication",
-                                    "library": library.library_id.to_string(),
-                                    "error": e.to_string(),
-                                })),
-                            )
-                            .await?;
-                    }
-                    return Ok(report);
-                }
-                report.failed += 1;
-                if first_failure.is_none() {
-                    first_failure = Some((photo.photo_id.clone(), e.to_string()));
-                }
-            }
-        }
-    }
-
-    if let Some((photo_id, error)) = first_failure {
-        store
-            .append_log(
-                "sidecar_copy_failed",
-                Some(&photo_id),
-                Some(serde_json::json!({
-                    "op": "sidecar_replication",
-                    "error": error,
-                    "failed_in_pass": report.failed,
-                })),
-            )
-            .await?;
-    }
-
-    if state.stalled && copied_any {
-        state.stalled = false;
-        store
-            .append_log(
-                "mount_regained",
-                None,
-                Some(serde_json::json!({ "op": "sidecar_replication" })),
-            )
-            .await?;
-    }
-    Ok(report)
-}
-
-/// Copy sidecar *data* via `.tmp` + rename on the destination filesystem.
-///
-/// Deliberately NOT `fs::copy`: on macOS that lowers to `copyfile(…,
-/// COPYFILE_ALL)`, which also replicates the source's xattrs (Photos-derived
-/// sidecars carry `com.apple.provenance`). Network/FUSE backups (macfuse over
-/// SMB/NFS) reject that `setxattr` with EPERM *after* creating the
-/// destination, aborting the copy and leaving a 0-byte `.tmp`. A plain data
-/// copy sidesteps the metadata replication entirely — the sidecar is
-/// self-describing JSON; its xattrs are not part of the backup.
-///
-/// The `.tmp` is removed on any failure so an aborted pass leaves no litter
-/// (and no partial file for a later pass to mistake for a real sidecar).
-fn copy_atomic(src: &Path, dst: &Path) -> std::io::Result<()> {
-    let parent = dst.parent().expect("sidecar dst has YYYY/MM parents");
-    fs::create_dir_all(parent)?;
-    let tmp = dst.with_extension("json.tmp");
-    match copy_data(src, &tmp).and_then(|()| fs::rename(&tmp, dst)) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
-}
-
-/// Byte-for-byte data copy, flushed to disk before the caller renames it into
-/// place. No metadata (mode/xattrs/times) is carried over.
-fn copy_data(src: &Path, tmp: &Path) -> std::io::Result<()> {
-    let mut reader = fs::File::open(src)?;
-    let mut writer = fs::File::create(tmp)?;
-    std::io::copy(&mut reader, &mut writer)?;
-    writer.sync_all()
-}

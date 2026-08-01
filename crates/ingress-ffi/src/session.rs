@@ -15,7 +15,6 @@ use ingress_core::ext::{ExtDerivation, ext_for_uti};
 use ingress_core::model::ResourceType;
 use ingress_core::paths::{BlobPaths, DataDir, TempKey};
 use ingress_core::resolve::{HashResolution, Resolution, resolve_descriptor, resolve_with_hash};
-use ingress_core::sidecar_io::write_photo_sidecar;
 use ingress_core::writer::{ResourceWrite, finalize_resource};
 use ingress_core::{LibraryId, PhotoId, StateStore};
 
@@ -406,14 +405,9 @@ impl IngressSession {
                 })
                 .transpose()?,
         };
-        let verdict =
-            self.runtime
-                .block_on(ingress_core::scan::probe(
-                    &self.inner.store,
-                    &self.inner.data_dir,
-                    &scan,
-                    &p,
-                ))?;
+        let verdict = self
+            .runtime
+            .block_on(ingress_core::scan::probe(&self.inner.store, &scan, &p))?;
         Ok(match verdict {
             ingress_core::scan::ScanVerdict::Done => FfiScanVerdict::Done,
             ingress_core::scan::ScanVerdict::NeedsFull => FfiScanVerdict::NeedsFull,
@@ -436,7 +430,6 @@ impl IngressSession {
             })?;
         let summary = self.runtime.block_on(ingress_core::scan::finish(
             &self.inner.store,
-            &self.inner.data_dir,
             &scan,
             enumerated,
             retry_cap,
@@ -499,9 +492,6 @@ impl IngressSession {
             pressure_pause: std::time::Duration::from_secs(options.pressure_pause_secs),
             storage_poll: std::time::Duration::from_secs(options.storage_poll_secs),
             cleanup_interval: std::time::Duration::from_secs(options.cleanup_interval_secs.max(1)),
-            replication_interval: std::time::Duration::from_secs(
-                options.replication_interval_secs.max(1),
-            ),
             publish: ingress_core::publish::PublishConfig {
                 interval: std::time::Duration::from_secs(options.publish_interval_secs.max(1)),
                 ..ingress_core::publish::PublishConfig::default()
@@ -566,14 +556,14 @@ impl IngressSession {
             restores: report.restores,
             transitions: report.transitions,
             resources_reopened: report.resources_reopened,
-            cleanup: cleanup_report_to_ffi(&report.cleanup, &report.replication),
+            cleanup: cleanup_report_to_ffi(&report.cleanup),
             publish: crate::types::FfiPublishReport {
                 published: report.publish.published,
                 already_published: report.publish.already_published,
                 adopted: report.publish.adopted,
                 failed: report.publish.failed,
                 gave_up: report.publish.gave_up,
-                missing_sidecar: report.publish.missing_sidecar,
+                missing_descriptor: report.publish.missing_sidecar,
                 parked: report.publish.parked,
                 parked_responsibility: report.publish.parked_responsibility,
             },
@@ -582,39 +572,32 @@ impl IngressSession {
 
     /// One-shot lifecycle run (the `cleanup` subcommand): exclusive lock
     /// (errors while the daemon holds it), Tier-1 repair on an unclean
-    /// reclaim, one cleanup pass + one replication pass. No PhotoKit
-    /// involvement — safe without authorization.
+    /// reclaim, one cleanup pass. No PhotoKit involvement — safe without
+    /// authorization.
     pub fn cleanup(&self, options: FfiCleanupOptions) -> Result<FfiCleanupReport, FfiError> {
         let cfg = ingress_core::cleanup::CleanupConfig {
             log_retention_days: options.log_retention_days.max(0),
             snapshot_keep: options.snapshot_keep.max(1) as usize,
             hard_delete_batch: options.hard_delete_batch.max(1) as usize,
-            replication_batch: options.replication_batch.max(1) as usize,
         };
-        let (cleanup, replication) =
-            self.runtime
-                .block_on(ingress_core::cleanup::run_standalone(
-                    &self.inner.store,
-                    &self.inner.data_dir,
-                    &cfg,
-                    Utc::now(),
-                ))?;
-        Ok(cleanup_report_to_ffi(&cleanup, &replication))
+        let cleanup = self
+            .runtime
+            .block_on(ingress_core::cleanup::run_standalone(
+                &self.inner.store,
+                &self.inner.data_dir,
+                &cfg,
+                Utc::now(),
+            ))?;
+        Ok(cleanup_report_to_ffi(&cleanup))
     }
 }
 
-fn cleanup_report_to_ffi(
-    cleanup: &ingress_core::cleanup::CleanupReport,
-    replication: &ingress_core::cleanup::ReplicationReport,
-) -> FfiCleanupReport {
+fn cleanup_report_to_ffi(cleanup: &ingress_core::cleanup::CleanupReport) -> FfiCleanupReport {
     FfiCleanupReport {
         photos_hard_deleted: cleanup.photos_hard_deleted,
         blob_files_deleted: cleanup.blob_files_deleted,
         log_rows_pruned: cleanup.log_rows_pruned,
         snapshots_written: cleanup.snapshots_written,
-        sidecars_replicated: replication.replicated,
-        sidecars_missing: replication.missing,
-        replication_stalled: replication.stalled,
     }
 }
 
@@ -810,26 +793,24 @@ impl ChunkSink {
             )
             .await?;
 
-            let sidecar_path = if outcome.photo_completed() {
+            let descriptor_persisted = if outcome.photo_completed() {
                 let desc = inner
                     .inflight
                     .lock()
                     .expect("inflight mutex")
                     .remove(&photo_id.to_string());
                 match desc {
-                    Some(desc) => Some(
-                        write_photo_sidecar(&inner.store, &inner.data_dir, &desc, &photo_id)
-                            .await?
-                            .to_string_lossy()
-                            .into_owned(),
-                    ),
+                    Some(desc) => {
+                        inner.store.persist_descriptor(&photo_id, &desc).await?;
+                        true
+                    }
                     // Descriptor not retained (e.g. process restarted between
-                    // resources): completion stands, sidecar comes with the
-                    // next metadata pass. Phase 2 slice never hits this.
-                    None => None,
+                    // resources): completion stands, the capsule comes with
+                    // the next metadata pass. Phase 2 slice never hits this.
+                    None => false,
                 }
             } else {
-                None
+                false
             };
 
             Ok(FfiWriteOutcome {
@@ -841,7 +822,7 @@ impl ChunkSink {
                 deduped: outcome.deduped(),
                 blob_path: outcome.blob_path().to_string_lossy().into_owned(),
                 photo_completed: outcome.photo_completed(),
-                sidecar_path,
+                descriptor_persisted,
             })
         })
     }

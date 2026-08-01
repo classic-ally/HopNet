@@ -37,9 +37,7 @@ async fn run(cli: Cli) -> Result<ExitCode, IngressError> {
             let store = open_read_only(&data_dir).await?;
             match args.photo {
                 Some(key) => {
-                    let Some(view) =
-                        ingress_core::status::photo_status(&store, &data_dir, &key).await?
-                    else {
+                    let Some(view) = ingress_core::status::photo_status(&store, &key).await? else {
                         eprintln!("no photo matches {key:?} (tried photo_id, then cloud_id)");
                         return Ok(ExitCode::from(2));
                     };
@@ -70,7 +68,6 @@ async fn run(cli: Cli) -> Result<ExitCode, IngressError> {
             };
             let opts = ingress_core::fsck::FsckOptions {
                 repair: args.repair,
-                deep: args.deep,
             };
             let report = ingress_core::fsck::run_fsck(&store, &data_dir, &opts).await?;
             if args.json {
@@ -83,18 +80,6 @@ async fn run(cli: Cli) -> Result<ExitCode, IngressError> {
             } else {
                 ExitCode::from(1)
             })
-        }
-
-        Command::Recover(args) => {
-            let opts = ingress_core::recover::RecoverOptions {
-                roots: args.root,
-                libraries: args.library,
-                from_sidecars: args.from_sidecars,
-                force: args.force,
-            };
-            let report = ingress_core::recover::recover(&data_dir, &opts).await?;
-            render::print_recover(&report);
-            Ok(ExitCode::SUCCESS)
         }
 
         Command::Library(cmd) => run_library(&data_dir, cmd).await,
@@ -128,9 +113,6 @@ async fn run_library(data_dir: &DataDir, cmd: LibraryCommand) -> Result<ExitCode
                 "added library {} ({:?})",
                 added.config.library_id, added.config.display_name
             );
-            if added.warn_no_remote {
-                render::print_no_remote_warning(added.config.library_id.as_str());
-            }
             Ok(ExitCode::SUCCESS)
         }
         LibraryCommand::List { json } => {

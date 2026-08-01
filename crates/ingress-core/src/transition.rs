@@ -13,8 +13,7 @@ use std::io::{Read, Write as _};
 
 use crate::error::{IngressError, Result};
 use crate::ids::{ContentHash, LibraryId, PhotoId};
-use crate::paths::{BlobPaths, DataDir};
-use crate::sidecar_io::move_sidecar;
+use crate::paths::BlobPaths;
 use crate::store::StateStore;
 
 fn io_err(e: std::io::Error) -> IngressError {
@@ -39,12 +38,11 @@ pub struct TransitionReport {
 /// 2. One transaction: per written resource, increment the dst refcount and
 ///    decrement the src (reaping the src row at 0); repoint
 ///    `photos.library_id`; append `library_transition {src, dst}`.
-/// 3. Post-tx: delete reaped src files; relocate the sidecar (skipped when
-///    the photo never materialized — its pending rows fetch into the dst
-///    root automatically, since paths derive from `photos.library_id`).
+/// 3. Post-tx: delete reaped src files. Metadata needs no relocation — the
+///    publish capsule lives on the photo row and `library_id` is repointed
+///    in step 2.
 pub async fn execute_transition(
     store: &StateStore,
-    data_dir: &DataDir,
     photo_id: &PhotoId,
     src: &LibraryId,
     dst: &LibraryId,
@@ -104,9 +102,6 @@ pub async fn execute_transition(
         Some(serde_json::json!({ "src": src.to_string(), "dst": dst.to_string() })),
     )
     .await?;
-    // T5: the sidecar relocates below (new library_id inside it) — the
-    // remote copy under the DESTINATION root doesn't exist yet.
-    crate::store::photos::mark_sidecar_dirty(&mut *tx, photo_id).await?;
     tx.commit().await?;
 
     // Step 3 — post-transaction cleanup. Failures here leave benign orphans.
@@ -114,21 +109,6 @@ pub async fn execute_transition(
         if fs::remove_file(src_paths.blob_path(hash, ext)).is_ok() {
             report.src_files_deleted += 1;
         }
-    }
-    // Capture the rel-path BEFORE the move — the remote copy under the
-    // SOURCE library's backup root must go too, or a sidecar-tree recovery
-    // resurrects the photo in the wrong library (spec §Asset migrating
-    // step 6 note). Best-effort: a mount-down failure leaves a stale
-    // document for fsck.
-    let src_rel =
-        crate::sidecar_io::find_sidecar(&data_dir.sidecar_root(src), photo_id)?.and_then(|p| {
-            p.strip_prefix(data_dir.sidecar_root(src))
-                .ok()
-                .map(|r| r.to_path_buf())
-        });
-    move_sidecar(data_dir, photo_id, src, dst)?;
-    if let (Some(rel), Some(remote)) = (src_rel, &src_config.sidecar_root_remote) {
-        let _ = fs::remove_file(std::path::Path::new(remote).join(rel));
     }
 
     Ok(report)

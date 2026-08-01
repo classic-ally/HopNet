@@ -1,11 +1,10 @@
 //! Blob write path (spec §Write path): streaming, dedup, crash windows,
-//! photo completion, sidecar composition on disk.
+//! photo completion, capsule persistence.
 
 use ingress_core::fixtures::{AssetDescriptorBuilder, store_with_personal};
 use ingress_core::model::ResourceType;
-use ingress_core::paths::{BlobPaths, DataDir, TempKey};
+use ingress_core::paths::{BlobPaths, TempKey};
 use ingress_core::resolve::{resolve_descriptor, resolve_with_hash};
-use ingress_core::sidecar_io::write_photo_sidecar;
 use ingress_core::writer::{FinalizeOutcome, ResourceWrite, finalize_resource, place_blob};
 use ingress_core::{ContentHash, HashResolution, LibraryId, PhotoId, Resolution, StateStore};
 
@@ -294,15 +293,14 @@ async fn abort_and_reentry_semantics() {
     assert_eq!(finished.hash, ContentHash::of_bytes(b"fresh"));
 }
 
-// Impact: photo-level completion gates sidecar writes and (later) the CLI's
-// notion of "done" — stamping early would advertise unarchived photos.
+// Impact: photo-level completion gates the capsule write and (later) the
+// CLI's notion of "done" — stamping early would advertise unarchived photos.
 // Should: stamp materialized_at only with the photo's final resource, and
-// write a sidecar listing exactly the written resources.
+// persist a capsule whose recomposed document lists exactly the written
+// resources.
 #[tokio::test]
-async fn completion_and_sidecar_for_multi_resource_photo() {
+async fn completion_and_capsule_for_multi_resource_photo() {
     let rig = rig().await;
-    let data_dir_tmp = tempfile::tempdir().unwrap();
-    let data_dir = DataDir::new(data_dir_tmp.path());
 
     let desc = AssetDescriptorBuilder::live_photo().build();
     assert!(matches!(
@@ -357,18 +355,26 @@ async fn completion_and_sidecar_for_multi_resource_photo() {
     .unwrap();
     assert!(o2.photo_completed());
 
-    let sidecar_path = write_photo_sidecar(&rig.store, &data_dir, &desc, &photo_id)
+    rig.store
+        .persist_descriptor(&photo_id, &desc)
         .await
         .unwrap();
-    assert!(sidecar_path.exists());
-    let doc: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&sidecar_path).unwrap()).unwrap();
-    let types: Vec<&str> = doc["resources"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|r| r["type"].as_str().unwrap())
-        .collect();
+    let photo = rig.store.photo(&photo_id).await.unwrap().unwrap();
+    assert!(photo.descriptor_json.is_some(), "capsule persisted");
+    let library = rig.store.library(&rig.library).await.unwrap().unwrap();
+    let resources = rig.store.resources_for_photo(&photo_id).await.unwrap();
+    let capsule: ingress_core::descriptor::DescriptorCapsule =
+        serde_json::from_str(photo.descriptor_json.as_ref().unwrap()).unwrap();
+    let doc = ingress_core::sidecar::Sidecar::compose(
+        &photo,
+        &library,
+        capsule.media_type,
+        &capsule.media_subtypes,
+        capsule.favorite,
+        &capsule.capture,
+        &resources,
+    )
+    .unwrap();
+    let types: Vec<&str> = doc.resources.iter().map(|r| r.resource_type.as_str()).collect();
     assert_eq!(types, vec!["original", "paired_video"]);
-    assert!(sidecar_path.starts_with(data_dir.sidecar_root(&rig.library)));
 }

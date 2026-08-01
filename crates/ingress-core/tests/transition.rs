@@ -6,12 +6,11 @@ use chrono::Utc;
 use ingress_core::classify::apply_change;
 use ingress_core::fixtures::AssetDescriptorBuilder;
 use ingress_core::model::{ICLOUD_SHARED_LIBRARY_BINDING, LibraryConfig, ResourceType};
-use ingress_core::paths::{BlobPaths, DataDir};
+use ingress_core::paths::BlobPaths;
 use ingress_core::resolve::{SeedOutcome, seed_descriptor};
-use ingress_core::sidecar_io::find_sidecar;
 use ingress_core::transition::execute_transition;
 use ingress_core::{
-    AssetDescriptor, ContentHash, LibraryId, LibraryScope, PhotoId, Sidecar, StateStore,
+    AssetDescriptor, ContentHash, LibraryId, LibraryScope, PhotoId, StateStore,
 };
 
 async fn store_with_roots(tmp: &std::path::Path) -> (StateStore, LibraryId, LibraryId) {
@@ -84,28 +83,26 @@ async fn write_resource(
 
 // Impact: "a photo's bytes are always under its current library_id's subtree"
 // is the feature — a half-moved photo has an incoherent ACL state.
-// Should: relocate bytes, swap refcounts, repoint the photo, move the
-// sidecar, and log library_transition — end-to-end through apply_change.
+// Should: relocate bytes, swap refcounts, repoint the photo, and log
+// library_transition — end-to-end through apply_change. Metadata needs no
+// relocation: the capsule rides the photo row.
 #[tokio::test]
 async fn hard_move_relocates_bytes_and_refcounts() {
     let tmp = tempfile::tempdir().unwrap();
     let (store, personal, shared) = store_with_roots(tmp.path()).await;
-    let data_dir = DataDir::new(tmp.path().join("data"));
     let desc = AssetDescriptorBuilder::simple_image()
         .modified_at(Utc::now())
         .build();
     let id = seed_one(&store, &desc).await;
     let hash = write_resource(&store, &id, ResourceType::Original, b"original-bytes").await;
-    ingress_core::sidecar_io::write_photo_sidecar(&store, &data_dir, &desc, &id)
-        .await
-        .unwrap();
+    store.persist_descriptor(&id, &desc).await.unwrap();
 
     let src_paths = blob_paths(&store, &personal).await;
     let dst_paths = blob_paths(&store, &shared).await;
 
     let mut moved = desc.clone();
     moved.scope = LibraryScope::Shared;
-    let (_, outcome) = apply_change(&store, &data_dir, &moved).await.unwrap();
+    let (_, outcome) = apply_change(&store, &moved).await.unwrap();
     assert!(outcome.transitioned);
 
     assert_eq!(
@@ -132,17 +129,16 @@ async fn hard_move_relocates_bytes_and_refcounts() {
         store.log_events("library_transition").await.unwrap().len(),
         1
     );
-
     assert!(
-        find_sidecar(&data_dir.sidecar_root(&personal), &id)
+        store
+            .photo(&id)
+            .await
             .unwrap()
-            .is_none()
+            .unwrap()
+            .descriptor_json
+            .is_some(),
+        "capsule untouched by the move"
     );
-    let path = find_sidecar(&data_dir.sidecar_root(&shared), &id)
-        .unwrap()
-        .unwrap();
-    let doc = Sidecar::from_json(&std::fs::read_to_string(path).unwrap()).unwrap();
-    assert_eq!(doc.library_id, shared);
 }
 
 // Impact: spec step-3 refcount check — the destination already holding the
@@ -152,7 +148,6 @@ async fn hard_move_relocates_bytes_and_refcounts() {
 async fn hard_move_shared_dst_blob_skips_copy() {
     let tmp = tempfile::tempdir().unwrap();
     let (store, personal, shared) = store_with_roots(tmp.path()).await;
-    let data_dir = DataDir::new(tmp.path().join("data"));
 
     // A shared-library photo already holds the same bytes.
     let bytes = b"identical-content";
@@ -169,7 +164,7 @@ async fn hard_move_shared_dst_blob_skips_copy() {
     let id = seed_one(&store, &desc).await;
     let hash = write_resource(&store, &id, ResourceType::Original, bytes).await;
 
-    let report = execute_transition(&store, &data_dir, &id, &personal, &shared)
+    let report = execute_transition(&store, &id, &personal, &shared)
         .await
         .unwrap();
     assert_eq!(report.blobs_shared, 1);
@@ -188,7 +183,6 @@ async fn hard_move_shared_dst_blob_skips_copy() {
 async fn hard_move_shared_src_blob_keeps_file() {
     let tmp = tempfile::tempdir().unwrap();
     let (store, personal, shared) = store_with_roots(tmp.path()).await;
-    let data_dir = DataDir::new(tmp.path().join("data"));
 
     let bytes = b"shared-within-src";
     let stay_desc = AssetDescriptorBuilder::simple_image()
@@ -213,7 +207,7 @@ async fn hard_move_shared_src_blob_keeps_file() {
     );
 
     let src_paths = blob_paths(&store, &personal).await;
-    let report = execute_transition(&store, &data_dir, &id, &personal, &shared)
+    let report = execute_transition(&store, &id, &personal, &shared)
         .await
         .unwrap();
     assert_eq!(report.blobs_copied, 1);
@@ -246,7 +240,6 @@ async fn hard_move_shared_src_blob_keeps_file() {
 async fn hard_move_with_pending_resources_moves_written_only() {
     let tmp = tempfile::tempdir().unwrap();
     let (store, personal, shared) = store_with_roots(tmp.path()).await;
-    let data_dir = DataDir::new(tmp.path().join("data"));
     let desc = AssetDescriptorBuilder::live_photo()
         .modified_at(Utc::now())
         .build();
@@ -254,7 +247,7 @@ async fn hard_move_with_pending_resources_moves_written_only() {
     let still = write_resource(&store, &id, ResourceType::Original, b"still-bytes").await;
     // PairedVideo stays pending.
 
-    let report = execute_transition(&store, &data_dir, &id, &personal, &shared)
+    let report = execute_transition(&store, &id, &personal, &shared)
         .await
         .unwrap();
     assert_eq!(report.blobs_copied, 1);

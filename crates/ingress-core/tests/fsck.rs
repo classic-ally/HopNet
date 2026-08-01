@@ -1,16 +1,15 @@
 //! Tier-2 fsck audit (spec §Recovery Tier 2): refcount drift, blob
-//! existence, orphan scan, sidecar consistency local + remote.
+//! existence, orphan scan.
 
 use chrono::Utc;
 use ingress_core::fixtures::AssetDescriptorBuilder;
-use ingress_core::fsck::{FsckOptions, RemoteProblem, SidecarProblem, run_fsck};
+use ingress_core::fsck::{FsckOptions, run_fsck};
 use ingress_core::model::LibraryConfig;
 use ingress_core::paths::{BlobPaths, DataDir};
 use ingress_core::resolve::{SeedOutcome, seed_descriptor};
 use ingress_core::{AssetDescriptor, ContentHash, LibraryId, PhotoId, StateStore};
 
-/// File-backed store: personal library with tempdir blob root and remote
-/// sidecar root.
+/// File-backed store: personal library with a tempdir blob root.
 async fn rig(tmp: &std::path::Path) -> (StateStore, LibraryId, DataDir) {
     let store = StateStore::open(&tmp.join("state.db")).await.unwrap();
     let personal = LibraryId::new("personal");
@@ -19,7 +18,7 @@ async fn rig(tmp: &std::path::Path) -> (StateStore, LibraryId, DataDir) {
             library_id: personal.clone(),
             display_name: "Personal".into(),
             blob_root: tmp.join("blobs-personal").to_string_lossy().into_owned(),
-            sidecar_root_remote: Some(tmp.join("remote-personal").to_string_lossy().into_owned()),
+            sidecar_root_remote: None,
             scope_binding: None,
             retention_days: 30,
             created_at: Utc::now(),
@@ -40,7 +39,6 @@ async fn seed_one(store: &StateStore, desc: &AssetDescriptor) -> PhotoId {
 
 async fn materialize_all(
     store: &StateStore,
-    data_dir: &DataDir,
     desc: &AssetDescriptor,
     photo_id: &PhotoId,
 ) {
@@ -73,32 +71,15 @@ async fn materialize_all(
             .await
             .unwrap();
     }
-    ingress_core::sidecar_io::write_photo_sidecar(store, data_dir, desc, photo_id)
-        .await
-        .unwrap();
-}
-
-/// Materialize + replicate the sidecar to the remote root (stamped).
-async fn replicate(store: &StateStore, data_dir: &DataDir) {
-    let mut state = ingress_core::cleanup::ReplicationState::default();
-    ingress_core::cleanup::replicate_dirty_sidecars(
-        store,
-        data_dir,
-        100,
-        &std::collections::HashSet::new(),
-        &mut state,
-    )
-    .await
-    .unwrap();
+    store.persist_descriptor(photo_id, desc).await.unwrap();
 }
 
 async fn fsck(
     store: &StateStore,
     data_dir: &DataDir,
     repair: bool,
-    deep: bool,
 ) -> ingress_core::fsck::FsckReport {
-    run_fsck(store, data_dir, &FsckOptions { repair, deep })
+    run_fsck(store, data_dir, &FsckOptions { repair })
         .await
         .unwrap()
 }
@@ -123,10 +104,10 @@ async fn clean_tree_is_clean_and_logs_nothing() {
         .with_cloud_id("c1")
         .build();
     let id = seed_one(&store, &desc).await;
-    materialize_all(&store, &data_dir, &desc, &id).await;
-    replicate(&store, &data_dir).await;
+    materialize_all(&store, &desc, &id).await;
 
-    let report = fsck(&store, &data_dir, false, true).await;
+
+    let report = fsck(&store, &data_dir, false).await;
     assert!(report.is_clean(), "{report:?}");
     assert!(report.skipped_roots.is_empty());
     assert!(
@@ -158,7 +139,7 @@ async fn refcount_drift_reported_then_repaired() {
         .with_cloud_id("c1")
         .build();
     let id = seed_one(&store, &desc).await;
-    materialize_all(&store, &data_dir, &desc, &id).await;
+    materialize_all(&store, &desc, &id).await;
 
     // Corrupt the stored count.
     sqlx::query("UPDATE blobs SET ref_count = 7 WHERE library_id = ?")
@@ -167,7 +148,7 @@ async fn refcount_drift_reported_then_repaired() {
         .await
         .unwrap();
 
-    let report = fsck(&store, &data_dir, false, false).await;
+    let report = fsck(&store, &data_dir, false).await;
     assert_eq!(report.refcount_drift.len(), 1);
     assert!(!report.refcount_repaired);
     assert!(!report.is_clean());
@@ -177,7 +158,7 @@ async fn refcount_drift_reported_then_repaired() {
         .unwrap();
     assert_eq!(still, 7, "default run must not repair");
 
-    let report = fsck(&store, &data_dir, true, false).await;
+    let report = fsck(&store, &data_dir, true).await;
     assert_eq!(
         report.refcount_drift.len(),
         1,
@@ -207,7 +188,7 @@ async fn missing_blob_is_loud_and_survives_repair() {
         .with_cloud_id("c1")
         .build();
     let id = seed_one(&store, &desc).await;
-    materialize_all(&store, &data_dir, &desc, &id).await;
+    materialize_all(&store, &desc, &id).await;
 
     // Destroy the blob file behind the row's back.
     let row = &store.resources_for_photo(&id).await.unwrap()[0];
@@ -221,7 +202,7 @@ async fn missing_blob_is_loud_and_survives_repair() {
     std::fs::remove_file(&path).unwrap();
 
     for repair in [false, true] {
-        let report = fsck(&store, &data_dir, repair, false).await;
+        let report = fsck(&store, &data_dir, repair).await;
         assert_eq!(report.missing_blobs.len(), 1, "repair={repair}");
         assert_eq!(report.missing_blobs[0].expected_path, path);
         assert!(!report.is_clean());
@@ -246,7 +227,7 @@ async fn orphans_deleted_only_under_repair() {
         .with_cloud_id("c1")
         .build();
     let id = seed_one(&store, &desc).await;
-    materialize_all(&store, &data_dir, &desc, &id).await;
+    materialize_all(&store, &desc, &id).await;
 
     let config = store.library(&lib).await.unwrap().unwrap();
     let orphan = plant_orphan(&config.blob_root);
@@ -257,14 +238,14 @@ async fn orphans_deleted_only_under_repair() {
     std::fs::create_dir_all(partial.parent().unwrap()).unwrap();
     std::fs::write(&partial, b"inflight").unwrap();
 
-    let report = fsck(&store, &data_dir, false, false).await;
+    let report = fsck(&store, &data_dir, false).await;
     assert_eq!(report.orphan_blobs.len(), 1);
     assert_eq!(report.orphans_deleted, 0);
     assert!(!report.is_clean());
     assert!(orphan.is_file(), "default run leaves the file");
     assert!(report.foreign_files.is_empty());
 
-    let report = fsck(&store, &data_dir, true, false).await;
+    let report = fsck(&store, &data_dir, true).await;
     assert_eq!(report.orphan_blobs.len(), 1);
     assert_eq!(report.orphans_deleted, 1);
     assert!(report.is_clean());
@@ -292,7 +273,7 @@ async fn ext_mismatch_and_foreign_files_never_deleted() {
         .with_cloud_id("c1")
         .build();
     let id = seed_one(&store, &desc).await;
-    materialize_all(&store, &data_dir, &desc, &id).await;
+    materialize_all(&store, &desc, &id).await;
 
     let config = store.library(&lib).await.unwrap().unwrap();
     let paths = BlobPaths::new(&config.blob_root);
@@ -311,7 +292,7 @@ async fn ext_mismatch_and_foreign_files_never_deleted() {
     let ds_leaf = mismatched.parent().unwrap().join(".DS_Store");
     std::fs::write(&ds_leaf, b"finder").unwrap();
 
-    let report = fsck(&store, &data_dir, true, false).await;
+    let report = fsck(&store, &data_dir, true).await;
     assert_eq!(report.ext_mismatches.len(), 1);
     assert_eq!(report.ext_mismatches[0].file_ext, "heic");
     assert_eq!(report.foreign_files, vec![junk.clone()]);
@@ -333,135 +314,16 @@ async fn absent_blob_root_is_skipped_not_byte_loss() {
         .with_cloud_id("c1")
         .build();
     let id = seed_one(&store, &desc).await;
-    materialize_all(&store, &data_dir, &desc, &id).await;
+    materialize_all(&store, &desc, &id).await;
 
     // "Unmount": the whole root vanishes.
     let config = store.library(&lib).await.unwrap().unwrap();
     std::fs::remove_dir_all(&config.blob_root).unwrap();
 
-    let report = fsck(&store, &data_dir, false, false).await;
+    let report = fsck(&store, &data_dir, false).await;
     assert!(report.missing_blobs.is_empty());
     assert_eq!(report.skipped_roots.len(), 1);
     assert!(report.skipped_roots[0].contains("blob root unavailable"));
-}
-
-// Impact: sidecars are the only off-device record of the photo-to-blob
-// mapping; silent local drift becomes permanent damage the day the Mac dies.
-// Should: flag a missing document, a corrupt document, and db-vs-doc field
-// drift (including the resources array).
-#[tokio::test]
-async fn sidecar_findings_cover_missing_corrupt_and_drift() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (store, lib, data_dir) = rig(tmp.path()).await;
-
-    let missing_desc = AssetDescriptorBuilder::simple_image()
-        .with_cloud_id("c-missing")
-        .build();
-    let corrupt_desc = AssetDescriptorBuilder::simple_image()
-        .with_cloud_id("c-corrupt")
-        .build();
-    let drifted_desc = AssetDescriptorBuilder::simple_image()
-        .with_cloud_id("c-drift")
-        .build();
-    let missing_id = seed_one(&store, &missing_desc).await;
-    let corrupt_id = seed_one(&store, &corrupt_desc).await;
-    let drifted_id = seed_one(&store, &drifted_desc).await;
-    for (desc, id) in [
-        (&missing_desc, &missing_id),
-        (&corrupt_desc, &corrupt_id),
-        (&drifted_desc, &drifted_id),
-    ] {
-        materialize_all(&store, &data_dir, desc, id).await;
-    }
-
-    let root = data_dir.sidecar_root(&lib);
-    let find = |id: &PhotoId| {
-        ingress_core::sidecar_io::find_sidecar(&root, id)
-            .unwrap()
-            .unwrap()
-    };
-    std::fs::remove_file(find(&missing_id)).unwrap();
-    std::fs::write(find(&corrupt_id), b"{ not json").unwrap();
-    // Drift: flip deleted_at in the doc only.
-    let path = find(&drifted_id);
-    let doc = std::fs::read_to_string(&path).unwrap();
-    let mut v: serde_json::Value = serde_json::from_str(&doc).unwrap();
-    v["deleted_at"] = serde_json::json!("2020-01-01T00:00:00Z");
-    std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
-
-    let report = fsck(&store, &data_dir, false, false).await;
-    assert_eq!(report.sidecar_findings.len(), 3, "{report:?}");
-    let kind_for = |id: &PhotoId| {
-        &report
-            .sidecar_findings
-            .iter()
-            .find(|f| &f.photo_id == id)
-            .unwrap()
-            .kind
-    };
-    assert!(matches!(kind_for(&missing_id), SidecarProblem::Missing));
-    assert!(matches!(
-        kind_for(&corrupt_id),
-        SidecarProblem::ParseError { .. }
-    ));
-    match kind_for(&drifted_id) {
-        SidecarProblem::Mismatch { fields } => {
-            assert_eq!(fields, &vec!["deleted_at".to_string()])
-        }
-        other => panic!("expected Mismatch, got {other:?}"),
-    }
-}
-
-// Impact: "stamped ⇒ remote ≥ local" is the disaster-recovery invariant;
-// a stamp with no (or stale) remote bytes means the backup lies.
-// Should: existence miss by default; --deep catches byte-different remote
-// content that passes the existence check.
-#[tokio::test]
-async fn remote_findings_existence_and_deep() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (store, lib, data_dir) = rig(tmp.path()).await;
-
-    let gone_desc = AssetDescriptorBuilder::simple_image()
-        .with_cloud_id("c-gone")
-        .build();
-    let stale_desc = AssetDescriptorBuilder::simple_image()
-        .with_cloud_id("c-stale")
-        .build();
-    let gone_id = seed_one(&store, &gone_desc).await;
-    let stale_id = seed_one(&store, &stale_desc).await;
-    materialize_all(&store, &data_dir, &gone_desc, &gone_id).await;
-    materialize_all(&store, &data_dir, &stale_desc, &stale_id).await;
-    replicate(&store, &data_dir).await;
-
-    let remote_root = store
-        .library(&lib)
-        .await
-        .unwrap()
-        .unwrap()
-        .sidecar_root_remote
-        .unwrap();
-    let remote_of = |id: &PhotoId| {
-        ingress_core::sidecar_io::find_sidecar(std::path::Path::new(&remote_root), id)
-            .unwrap()
-            .unwrap()
-    };
-    std::fs::remove_file(remote_of(&gone_id)).unwrap();
-    std::fs::write(remote_of(&stale_id), b"{\"stale\": true}").unwrap();
-
-    let shallow = fsck(&store, &data_dir, false, false).await;
-    assert_eq!(shallow.remote_findings.len(), 1, "existence only");
-    assert!(matches!(
-        shallow.remote_findings[0].kind,
-        RemoteProblem::Missing { .. }
-    ));
-
-    let deep = fsck(&store, &data_dir, false, true).await;
-    assert_eq!(deep.remote_findings.len(), 2, "{deep:?}");
-    assert!(
-        deep.remote_findings
-            .iter()
-            .any(|f| { f.photo_id == stale_id && matches!(f.kind, RemoteProblem::Differs { .. }) })
-    );
 }
 
 // Impact: a dead-pid lock reclaim is THE unclean-shutdown signal; if fsck
@@ -476,7 +338,7 @@ async fn repair_on_unclean_reclaim_runs_tier1() {
         .with_cloud_id("c1")
         .build();
     let id = seed_one(&store, &desc).await;
-    materialize_all(&store, &data_dir, &desc, &id).await;
+    materialize_all(&store, &desc, &id).await;
 
     // Simulate the crash: stale empty lock + drifted refcount.
     std::fs::write(data_dir.root().join("drain.lock"), "").unwrap();
@@ -486,7 +348,7 @@ async fn repair_on_unclean_reclaim_runs_tier1() {
         .await
         .unwrap();
 
-    let report = fsck(&store, &data_dir, true, false).await;
+    let report = fsck(&store, &data_dir, true).await;
     assert!(report.refcount_repaired);
     assert!(report.is_clean());
     let fixed: i64 = sqlx::query_scalar("SELECT ref_count FROM blobs")

@@ -5,7 +5,7 @@ use chrono::{Duration, Utc};
 use ingress_core::classify::apply_removal;
 use ingress_core::fixtures::AssetDescriptorBuilder;
 use ingress_core::model::{ICLOUD_SHARED_LIBRARY_BINDING, LibraryConfig, ResourceType};
-use ingress_core::paths::{BlobPaths, DataDir};
+use ingress_core::paths::BlobPaths;
 use ingress_core::resolve::{SeedOutcome, seed_descriptor};
 use ingress_core::status::{photo_status, status};
 use ingress_core::{AssetDescriptor, ContentHash, LibraryId, LibraryScope, PhotoId, StateStore};
@@ -54,10 +54,9 @@ async fn seed_one(store: &StateStore, desc: &AssetDescriptor) -> PhotoId {
     }
 }
 
-/// Materialize every pending resource with real blob bytes + write the sidecar.
+/// Materialize every pending resource with real blob bytes + persist the capsule.
 async fn materialize_all(
     store: &StateStore,
-    data_dir: &DataDir,
     desc: &AssetDescriptor,
     photo_id: &PhotoId,
 ) {
@@ -90,7 +89,7 @@ async fn materialize_all(
             .await
             .unwrap();
     }
-    ingress_core::sidecar_io::write_photo_sidecar(store, data_dir, desc, photo_id)
+    store.persist_descriptor(photo_id, desc)
         .await
         .unwrap();
 }
@@ -105,22 +104,21 @@ async fn library_stats_reflect_mixed_population() {
     let tmp = tempfile::tempdir().unwrap();
     let (store, personal) = store_personal_only(tmp.path()).await;
     let shared = add_shared_library(&store, tmp.path()).await;
-    let data_dir = DataDir::new(tmp.path().join("data"));
 
     // Personal: one materialized-active, one materialized-tombstoned, one pending.
     let done = AssetDescriptorBuilder::simple_image()
         .with_cloud_id("cloud-done")
         .build();
     let done_id = seed_one(&store, &done).await;
-    materialize_all(&store, &data_dir, &done, &done_id).await;
+    materialize_all(&store, &done, &done_id).await;
 
     let doomed = AssetDescriptorBuilder::simple_image()
         .with_cloud_id("cloud-doomed")
         .with_local_id("local-doomed")
         .build();
     let doomed_id = seed_one(&store, &doomed).await;
-    materialize_all(&store, &data_dir, &doomed, &doomed_id).await;
-    apply_removal(&store, &data_dir, "local-doomed")
+    materialize_all(&store, &doomed, &doomed_id).await;
+    apply_removal(&store, "local-doomed")
         .await
         .unwrap();
 
@@ -135,7 +133,7 @@ async fn library_stats_reflect_mixed_population() {
         .scope(LibraryScope::Shared)
         .build();
     let shared_id = seed_one(&store, &shared_desc).await;
-    materialize_all(&store, &data_dir, &shared_desc, &shared_id).await;
+    materialize_all(&store, &shared_desc, &shared_id).await;
 
     let report = status(&store, 5).await.unwrap();
     assert_eq!(report.libraries.len(), 2);
@@ -218,27 +216,26 @@ async fn pipeline_view_splits_work_states() {
 // Impact: the per-photo view is the operator's drill-down when one photo
 // misbehaves; a broken lookup or wrong blob path turns triage into guesswork.
 // Should: resolve by photo_id AND cloud_id, reconstruct existing blob paths,
-// find the local sidecar, and tail this photo's log newest-first.
+// report the capsule as present, and tail this photo's log newest-first.
 // Should not: match garbage keys.
 #[tokio::test]
 async fn photo_view_resolves_both_keys_with_paths() {
     let tmp = tempfile::tempdir().unwrap();
     let (store, _personal) = store_personal_only(tmp.path()).await;
-    let data_dir = DataDir::new(tmp.path().join("data"));
 
     let desc = AssetDescriptorBuilder::live_photo()
         .with_cloud_id("cloud-live")
         .with_local_id("local-live")
         .build();
     let id = seed_one(&store, &desc).await;
-    materialize_all(&store, &data_dir, &desc, &id).await;
+    materialize_all(&store, &desc, &id).await;
     // Tombstone to generate a photo-scoped log event.
-    apply_removal(&store, &data_dir, "local-live")
+    apply_removal(&store, "local-live")
         .await
         .unwrap();
 
     for key in [id.as_str(), "cloud-live"] {
-        let view = photo_status(&store, &data_dir, key)
+        let view = photo_status(&store, key)
             .await
             .unwrap()
             .unwrap_or_else(|| panic!("lookup by {key:?} missed"));
@@ -250,8 +247,7 @@ async fn photo_view_resolves_both_keys_with_paths() {
             assert!(path.to_string_lossy().contains("blobs-personal"));
             assert_eq!(res.blob_exists, Some(true));
         }
-        let sidecar = view.sidecar_local.expect("sidecar present");
-        assert!(sidecar.is_file());
+        assert!(view.photo.descriptor_json.is_some(), "capsule present");
         assert!(
             view.events
                 .iter()
@@ -261,7 +257,7 @@ async fn photo_view_resolves_both_keys_with_paths() {
     }
 
     assert!(
-        photo_status(&store, &data_dir, "no-such-key")
+        photo_status(&store, "no-such-key")
             .await
             .unwrap()
             .is_none()

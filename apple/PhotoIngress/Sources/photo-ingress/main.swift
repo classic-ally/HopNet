@@ -50,8 +50,8 @@ func describe(_ outcome: FfiWriteOutcome, label: String) {
     print("  [\(label)] hash=\(outcome.contentHash.prefix(16))… size=\(outcome.sizeBytes) " +
           "ext=\(outcome.ext) deduped=\(outcome.deduped)")
     print("           blob=\(outcome.blobPath)")
-    if let sidecar = outcome.sidecarPath {
-        print("           photo COMPLETE — sidecar=\(sidecar)")
+    if outcome.photoCompleted {
+        print("           photo COMPLETE — descriptor persisted=\(outcome.descriptorPersisted)")
     }
 }
 
@@ -64,8 +64,8 @@ func runSetup() throws {
     try ensureAuthorized()
     print("Photos authorization: granted")
     print("next: configure libraries with")
-    print("  ingress-cli --data-dir \(dataDir) library add --blob-root <path> --scope personal [--sidecar-remote <path>]")
-    print("  ingress-cli --data-dir \(dataDir) library add --blob-root <path> --scope shared   [--sidecar-remote <path>]")
+    print("  ingress-cli --data-dir \(dataDir) library add --blob-root <path> --scope personal")
+    print("  ingress-cli --data-dir \(dataDir) library add --blob-root <path> --scope shared")
 }
 
 func runIngest() throws {
@@ -218,8 +218,6 @@ func printCleanup(_ c: FfiCleanupReport, indent: String = "  ") {
     print("\(indent)blob files deleted:   \(c.blobFilesDeleted)")
     print("\(indent)log rows pruned:      \(c.logRowsPruned)")
     print("\(indent)snapshots written:    \(c.snapshotsWritten)")
-    print("\(indent)sidecars replicated:  \(c.sidecarsReplicated) (missing \(c.sidecarsMissing))" +
-          (c.replicationStalled ? " REPLICATION STALLED (mount down?)" : ""))
 }
 
 /// One-shot lifecycle run. No PhotoKit involvement — needs no authorization;
@@ -229,8 +227,7 @@ func runCleanup() throws {
     let report = try session.cleanup(options: FfiCleanupOptions(
         logRetentionDays: Int64(intFlag("--log-retention-days", default: 180)),
         snapshotKeep: UInt32(intFlag("--snapshot-keep", default: 7)),
-        hardDeleteBatch: UInt32(intFlag("--hard-delete-batch", default: 500)),
-        replicationBatch: UInt32(intFlag("--replication-batch", default: 500))
+        hardDeleteBatch: UInt32(intFlag("--hard-delete-batch", default: 500))
     ))
     print("cleanup report:")
     printCleanup(report)
@@ -252,12 +249,8 @@ func runDaemon() throws {
             blobRoot: blobRoot,
             sidecarRootRemote: PublishCredentials.loadSidecarRootRemote())
         {
-        case .created(let libraryId, let warnNoRemote):
+        case .created(let libraryId, _):
             print("library auto-bind: created \(libraryId) blob_root=\(blobRoot)")
-            if warnNoRemote {
-                print("WARNING: no remote sidecar root configured — recovery " +
-                      "from a dead Mac degrades to blob-only")
-            }
         case .alreadyExists(let libraryId, let boundRoot):
             if boundRoot != blobRoot {
                 print("WARNING: provisioned blob_root \(blobRoot) differs from " +
@@ -338,7 +331,6 @@ func runDaemon() throws {
         pressurePauseSecs: intFlag("--pressure-pause-secs", default: 60),
         storagePollSecs: intFlag("--storage-poll-secs", default: 15),
         cleanupIntervalSecs: intFlag("--cleanup-interval-secs", default: 3600),
-        replicationIntervalSecs: intFlag("--replication-interval-secs", default: 60),
         publishNodeUrl: publishing ? nodeUrl : nil,
         publishDeviceToken: publishing ? deviceToken : nil,
         publishIntervalSecs: intFlag("--publish-interval-secs", default: 60)
@@ -378,7 +370,7 @@ func runDaemon() throws {
         print("    published:          \(report.publish.published) " +
               "(already \(report.publish.alreadyPublished), adopted \(report.publish.adopted))")
         print("    failed:             \(report.publish.failed) " +
-              "(gave up \(report.publish.gaveUp), missing sidecar \(report.publish.missingSidecar))")
+              "(gave up \(report.publish.gaveUp), missing descriptor \(report.publish.missingDescriptor))")
         if report.publish.parked {
             print("    PARKED — node unreachable at last pass")
         }

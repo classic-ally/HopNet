@@ -153,16 +153,18 @@ fn end_to_end_live_photo() {
     ));
     assert!(outcome2.photo_completed);
     assert_eq!(outcome2.ext, "mov");
-    let sidecar_path = outcome2
-        .sidecar_path
-        .expect("sidecar written on completion");
-    assert!(std::path::Path::new(&sidecar_path).exists());
+    assert!(
+        outcome2.descriptor_persisted,
+        "capsule persisted on completion"
+    );
 
-    // Sidecar content sanity: both resources, capture offset preserved.
-    let doc: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&sidecar_path).unwrap()).unwrap();
-    assert_eq!(doc["resources"].as_array().unwrap().len(), 2);
-    assert_eq!(doc["captured_at"], "2019-08-14T16:22:03+02:00");
+    // Capsule content sanity: capture offset preserved, media type carried.
+    let json = sqlite_scalar(
+        rig.data_dir.path(),
+        "SELECT descriptor_json FROM photos LIMIT 1",
+    );
+    let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(doc["capture"]["captured_at"], "2019-08-14T16:22:03+02:00");
     assert_eq!(doc["media_type"], "live_photo");
 
     // Blobs live under the configured root; .partial is empty.
@@ -292,16 +294,16 @@ fn seed_and_drain_through_fetcher_trait() {
 }
 
 // Impact: this is the exact call sequence the Swift `cleanup` subcommand
-// performs — lock, hard-delete with retention 0, replicate, report.
-// Should: hard-delete an expired tombstone and replicate the other photo's
-// sidecar to the configured remote root, reporting both.
+// performs — lock, hard-delete past retention, snapshot, report.
+// Should: hard-delete an expired tombstone (rows + blob file) and write a
+// state snapshot, reporting both.
 #[test]
 fn cleanup_round_trip() {
     use ingress_ffi::FfiCleanupOptions;
 
     let rig = rig();
 
-    // One completed photo (sidecar becomes replication work)…
+    // One completed photo that survives the run…
     let keep = slice_descriptor("CLOUD-CLEAN-KEEP:001", false);
     rig.session.ingest_descriptor(keep.clone()).unwrap();
     let sink = rig.session.begin_original(keep.clone()).unwrap();
@@ -330,15 +332,11 @@ fn cleanup_round_trip() {
             log_retention_days: 180,
             snapshot_keep: 7,
             hard_delete_batch: 500,
-            replication_batch: 500,
         })
         .unwrap();
     assert_eq!(report.photos_hard_deleted, 1);
     assert_eq!(report.blob_files_deleted, 1);
-    assert!(report.sidecars_replicated >= 1);
-    assert!(!report.replication_stalled);
     assert!(report.snapshots_written >= 1);
-    assert!(rig.blob_dir.path().join("sidecar-backup").is_dir());
     assert!(rig.blob_dir.path().join("state-snapshots").is_dir());
 }
 
@@ -385,7 +383,6 @@ fn sqlite_scalar(data_dir: &std::path::Path, sql: &str) -> String {
 // scope_unmapped.
 // Should: create a personal library with a generated id when none exists.
 // Should: record the creation in the ingest log.
-// Should: warn when no remote sidecar root is configured.
 #[test]
 fn ensure_personal_library_creates_when_absent() {
     let data_dir = tempfile::tempdir().unwrap();
@@ -395,12 +392,8 @@ fn ensure_personal_library_creates_when_absent() {
         .ensure_personal_library(blob_dir.path().to_string_lossy().into_owned(), None)
         .unwrap();
     match outcome {
-        FfiEnsureLibraryOutcome::Created {
-            library_id,
-            warn_no_remote,
-        } => {
+        FfiEnsureLibraryOutcome::Created { library_id, .. } => {
             assert!(library_id.contains('_'), "generated two-word id: {library_id}");
-            assert!(warn_no_remote);
         }
         other => panic!("expected Created, got {other:?}"),
     }

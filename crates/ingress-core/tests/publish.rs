@@ -192,7 +192,6 @@ async fn rig() -> Rig {
             storage_poll: Duration::from_millis(10),
             default_size_estimate: 1024,
             cleanup_interval: Duration::from_secs(3600),
-            replication_interval: Duration::from_secs(3600),
             cleanup: ingress_core::cleanup::CleanupConfig::default(),
             publish: PublishConfig {
                 interval: Duration::from_secs(3600),
@@ -474,22 +473,13 @@ async fn missing_descriptor_skips_photo_but_batch_continues() {
     );
 }
 
-// Impact: state.db is the sole publish-metadata source — publish must not
-// depend on archive files the spool transplant deletes out from under it.
-// Should: publish a photo whose sidecar file is gone, recomposing metadata
-// from the persisted descriptor capsule and live DB rows.
+// Impact: state.db is the sole publish-metadata source — publish must
+// recompose its metadata document from the persisted capsule + live DB
+// rows, with no filesystem dependency at all.
 #[tokio::test(flavor = "multi_thread")]
-async fn publishes_from_capsule_without_sidecar_file() {
+async fn publishes_from_capsule_and_db_rows() {
     let rig = rig().await;
     let id = materialize(&rig, "a", b"a-bytes").await;
-
-    let sidecar_root = rig
-        .data_dir
-        .sidecar_root(&ingress_core::LibraryId::new("personal"));
-    let path = ingress_core::sidecar_io::find_sidecar(&sidecar_root, &id)
-        .unwrap()
-        .expect("sidecar written at materialization");
-    std::fs::remove_file(path).unwrap();
 
     let publisher = FakePublisher::ok();
     let mut state = PublishState::default();

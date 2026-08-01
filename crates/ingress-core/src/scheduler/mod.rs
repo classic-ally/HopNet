@@ -23,7 +23,6 @@ use crate::ids::PhotoId;
 use crate::model::{LibraryConfig, PhotoRecord, ResourceType};
 use crate::paths::{BlobPaths, DataDir, TempKey};
 use crate::resolve::late_binding_merge;
-use crate::sidecar_io::write_photo_sidecar;
 use crate::store::{StateStore, photos};
 use crate::writer::{ResourceWrite, finalize_resource, sweep_partials};
 
@@ -45,10 +44,6 @@ pub struct SchedulerConfig {
     /// Daemon-loop cadence of the hourly lifecycle job (hard deletes, log
     /// pruning, snapshots).
     pub cleanup_interval: Duration,
-    /// Daemon-loop cadence of the dirty-sidecar replication drain — faster
-    /// than cleanup so the remote backup tracks changes closely, batch-capped
-    /// so one tick never stalls the loop.
-    pub replication_interval: Duration,
     pub cleanup: crate::cleanup::CleanupConfig,
     /// HopNet publish tick (active only when a publisher is attached via
     /// `Scheduler::with_publisher`).
@@ -66,7 +61,6 @@ impl Default for SchedulerConfig {
             storage_poll: Duration::from_secs(15),
             default_size_estimate: 64 * 1024 * 1024,
             cleanup_interval: Duration::from_secs(3600),
-            replication_interval: Duration::from_secs(60),
             cleanup: crate::cleanup::CleanupConfig::default(),
             publish: crate::publish::PublishConfig::default(),
         }
@@ -667,7 +661,7 @@ async fn stream_one_resource<F: ResourceFetcher>(
     }
 
     if outcome.photo_completed() {
-        write_photo_sidecar(&shared.store, &shared.data_dir, desc, current_photo_id).await?;
+        shared.store.persist_descriptor(current_photo_id, desc).await?;
     }
     Ok(TaskFlow::Continue)
 }

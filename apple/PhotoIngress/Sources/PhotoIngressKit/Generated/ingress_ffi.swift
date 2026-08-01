@@ -788,8 +788,8 @@ public protocol IngressSessionProtocol: AnyObject, Sendable {
     /**
      * One-shot lifecycle run (the `cleanup` subcommand): exclusive lock
      * (errors while the daemon holds it), Tier-1 repair on an unclean
-     * reclaim, one cleanup pass + one replication pass. No PhotoKit
-     * involvement — safe without authorization.
+     * reclaim, one cleanup pass. No PhotoKit involvement — safe without
+     * authorization.
      */
     func cleanup(options: FfiCleanupOptions) throws  -> FfiCleanupReport
     
@@ -989,8 +989,8 @@ open func cancelDrain()  {try! rustCall() {
     /**
      * One-shot lifecycle run (the `cleanup` subcommand): exclusive lock
      * (errors while the daemon holds it), Tier-1 repair on an unclean
-     * reclaim, one cleanup pass + one replication pass. No PhotoKit
-     * involvement — safe without authorization.
+     * reclaim, one cleanup pass. No PhotoKit involvement — safe without
+     * authorization.
      */
 open func cleanup(options: FfiCleanupOptions)throws  -> FfiCleanupReport  {
     return try  FfiConverterTypeFfiCleanupReport_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
@@ -1936,15 +1936,13 @@ public struct FfiCleanupOptions: Equatable, Hashable {
     public var logRetentionDays: Int64
     public var snapshotKeep: UInt32
     public var hardDeleteBatch: UInt32
-    public var replicationBatch: UInt32
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(logRetentionDays: Int64, snapshotKeep: UInt32, hardDeleteBatch: UInt32, replicationBatch: UInt32) {
+    public init(logRetentionDays: Int64, snapshotKeep: UInt32, hardDeleteBatch: UInt32) {
         self.logRetentionDays = logRetentionDays
         self.snapshotKeep = snapshotKeep
         self.hardDeleteBatch = hardDeleteBatch
-        self.replicationBatch = replicationBatch
     }
 
     
@@ -1965,8 +1963,7 @@ public struct FfiConverterTypeFfiCleanupOptions: FfiConverterRustBuffer {
             try FfiCleanupOptions(
                 logRetentionDays: FfiConverterInt64.read(from: &buf), 
                 snapshotKeep: FfiConverterUInt32.read(from: &buf), 
-                hardDeleteBatch: FfiConverterUInt32.read(from: &buf), 
-                replicationBatch: FfiConverterUInt32.read(from: &buf)
+                hardDeleteBatch: FfiConverterUInt32.read(from: &buf)
         )
     }
 
@@ -1974,7 +1971,6 @@ public struct FfiConverterTypeFfiCleanupOptions: FfiConverterRustBuffer {
         FfiConverterInt64.write(value.logRetentionDays, into: &buf)
         FfiConverterUInt32.write(value.snapshotKeep, into: &buf)
         FfiConverterUInt32.write(value.hardDeleteBatch, into: &buf)
-        FfiConverterUInt32.write(value.replicationBatch, into: &buf)
     }
 }
 
@@ -1995,28 +1991,21 @@ public func FfiConverterTypeFfiCleanupOptions_lower(_ value: FfiCleanupOptions) 
 
 
 /**
- * Lifecycle outcome (mirrors `cleanup::CleanupReport` + the replication
- * side).
+ * Lifecycle outcome (mirrors `cleanup::CleanupReport`).
  */
 public struct FfiCleanupReport: Equatable, Hashable {
     public var photosHardDeleted: UInt64
     public var blobFilesDeleted: UInt64
     public var logRowsPruned: UInt64
     public var snapshotsWritten: UInt64
-    public var sidecarsReplicated: UInt64
-    public var sidecarsMissing: UInt64
-    public var replicationStalled: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(photosHardDeleted: UInt64, blobFilesDeleted: UInt64, logRowsPruned: UInt64, snapshotsWritten: UInt64, sidecarsReplicated: UInt64, sidecarsMissing: UInt64, replicationStalled: Bool) {
+    public init(photosHardDeleted: UInt64, blobFilesDeleted: UInt64, logRowsPruned: UInt64, snapshotsWritten: UInt64) {
         self.photosHardDeleted = photosHardDeleted
         self.blobFilesDeleted = blobFilesDeleted
         self.logRowsPruned = logRowsPruned
         self.snapshotsWritten = snapshotsWritten
-        self.sidecarsReplicated = sidecarsReplicated
-        self.sidecarsMissing = sidecarsMissing
-        self.replicationStalled = replicationStalled
     }
 
     
@@ -2038,10 +2027,7 @@ public struct FfiConverterTypeFfiCleanupReport: FfiConverterRustBuffer {
                 photosHardDeleted: FfiConverterUInt64.read(from: &buf), 
                 blobFilesDeleted: FfiConverterUInt64.read(from: &buf), 
                 logRowsPruned: FfiConverterUInt64.read(from: &buf), 
-                snapshotsWritten: FfiConverterUInt64.read(from: &buf), 
-                sidecarsReplicated: FfiConverterUInt64.read(from: &buf), 
-                sidecarsMissing: FfiConverterUInt64.read(from: &buf), 
-                replicationStalled: FfiConverterBool.read(from: &buf)
+                snapshotsWritten: FfiConverterUInt64.read(from: &buf)
         )
     }
 
@@ -2050,9 +2036,6 @@ public struct FfiConverterTypeFfiCleanupReport: FfiConverterRustBuffer {
         FfiConverterUInt64.write(value.blobFilesDeleted, into: &buf)
         FfiConverterUInt64.write(value.logRowsPruned, into: &buf)
         FfiConverterUInt64.write(value.snapshotsWritten, into: &buf)
-        FfiConverterUInt64.write(value.sidecarsReplicated, into: &buf)
-        FfiConverterUInt64.write(value.sidecarsMissing, into: &buf)
-        FfiConverterBool.write(value.replicationStalled, into: &buf)
     }
 }
 
@@ -2089,10 +2072,6 @@ public struct FfiDaemonOptions: Equatable, Hashable {
      */
     public var cleanupIntervalSecs: UInt64
     /**
-     * Dirty-sidecar replication cadence (faster, batch-capped).
-     */
-    public var replicationIntervalSecs: UInt64
-    /**
      * HopNet publish tick: node base URL (WITHOUT `/api`) + RFC-012 device
      * token (`{device_id}.{secret}`). Both set = publishing on; either
      * absent = ingest-only daemon (the pre-integration behavior). The
@@ -2102,7 +2081,7 @@ public struct FfiDaemonOptions: Equatable, Hashable {
     public var publishNodeUrl: String?
     public var publishDeviceToken: String?
     /**
-     * Publish tick cadence (seconds); same class as replication.
+     * Publish tick cadence (seconds).
      */
     public var publishIntervalSecs: UInt64
 
@@ -2113,9 +2092,6 @@ public struct FfiDaemonOptions: Equatable, Hashable {
          * Hourly lifecycle job cadence (hard deletes, log pruning, snapshots).
          */cleanupIntervalSecs: UInt64, 
         /**
-         * Dirty-sidecar replication cadence (faster, batch-capped).
-         */replicationIntervalSecs: UInt64, 
-        /**
          * HopNet publish tick: node base URL (WITHOUT `/api`) + RFC-012 device
          * token (`{device_id}.{secret}`). Both set = publishing on; either
          * absent = ingest-only daemon (the pre-integration behavior). The
@@ -2123,7 +2099,7 @@ public struct FfiDaemonOptions: Equatable, Hashable {
          * reads secrets itself.
          */publishNodeUrl: String?, publishDeviceToken: String?, 
         /**
-         * Publish tick cadence (seconds); same class as replication.
+         * Publish tick cadence (seconds).
          */publishIntervalSecs: UInt64) {
         self.fetchConcurrency = fetchConcurrency
         self.retryCap = retryCap
@@ -2133,7 +2109,6 @@ public struct FfiDaemonOptions: Equatable, Hashable {
         self.pressurePauseSecs = pressurePauseSecs
         self.storagePollSecs = storagePollSecs
         self.cleanupIntervalSecs = cleanupIntervalSecs
-        self.replicationIntervalSecs = replicationIntervalSecs
         self.publishNodeUrl = publishNodeUrl
         self.publishDeviceToken = publishDeviceToken
         self.publishIntervalSecs = publishIntervalSecs
@@ -2163,7 +2138,6 @@ public struct FfiConverterTypeFfiDaemonOptions: FfiConverterRustBuffer {
                 pressurePauseSecs: FfiConverterUInt64.read(from: &buf), 
                 storagePollSecs: FfiConverterUInt64.read(from: &buf), 
                 cleanupIntervalSecs: FfiConverterUInt64.read(from: &buf), 
-                replicationIntervalSecs: FfiConverterUInt64.read(from: &buf), 
                 publishNodeUrl: FfiConverterOptionString.read(from: &buf), 
                 publishDeviceToken: FfiConverterOptionString.read(from: &buf), 
                 publishIntervalSecs: FfiConverterUInt64.read(from: &buf)
@@ -2179,7 +2153,6 @@ public struct FfiConverterTypeFfiDaemonOptions: FfiConverterRustBuffer {
         FfiConverterUInt64.write(value.pressurePauseSecs, into: &buf)
         FfiConverterUInt64.write(value.storagePollSecs, into: &buf)
         FfiConverterUInt64.write(value.cleanupIntervalSecs, into: &buf)
-        FfiConverterUInt64.write(value.replicationIntervalSecs, into: &buf)
         FfiConverterOptionString.write(value.publishNodeUrl, into: &buf)
         FfiConverterOptionString.write(value.publishDeviceToken, into: &buf)
         FfiConverterUInt64.write(value.publishIntervalSecs, into: &buf)
@@ -2669,7 +2642,10 @@ public struct FfiPublishReport: Equatable, Hashable {
     public var adopted: UInt64
     public var failed: UInt64
     public var gaveUp: UInt64
-    public var missingSidecar: UInt64
+    /**
+     * Skipped: publish-metadata capsule absent (awaiting heal backfill).
+     */
+    public var missingDescriptor: UInt64
     /**
      * The last pass aborted because the node was unreachable.
      */
@@ -2686,7 +2662,10 @@ public struct FfiPublishReport: Equatable, Hashable {
         /**
          * Photos the mesh already held (cloud-fingerprint match) — stamped
          * published locally, nothing uploaded.
-         */adopted: UInt64, failed: UInt64, gaveUp: UInt64, missingSidecar: UInt64, 
+         */adopted: UInt64, failed: UInt64, gaveUp: UInt64, 
+        /**
+         * Skipped: publish-metadata capsule absent (awaiting heal backfill).
+         */missingDescriptor: UInt64, 
         /**
          * The last pass aborted because the node was unreachable.
          */parked: Bool, 
@@ -2699,7 +2678,7 @@ public struct FfiPublishReport: Equatable, Hashable {
         self.adopted = adopted
         self.failed = failed
         self.gaveUp = gaveUp
-        self.missingSidecar = missingSidecar
+        self.missingDescriptor = missingDescriptor
         self.parked = parked
         self.parkedResponsibility = parkedResponsibility
     }
@@ -2725,7 +2704,7 @@ public struct FfiConverterTypeFfiPublishReport: FfiConverterRustBuffer {
                 adopted: FfiConverterUInt64.read(from: &buf), 
                 failed: FfiConverterUInt64.read(from: &buf), 
                 gaveUp: FfiConverterUInt64.read(from: &buf), 
-                missingSidecar: FfiConverterUInt64.read(from: &buf), 
+                missingDescriptor: FfiConverterUInt64.read(from: &buf), 
                 parked: FfiConverterBool.read(from: &buf), 
                 parkedResponsibility: FfiConverterBool.read(from: &buf)
         )
@@ -2737,7 +2716,7 @@ public struct FfiConverterTypeFfiPublishReport: FfiConverterRustBuffer {
         FfiConverterUInt64.write(value.adopted, into: &buf)
         FfiConverterUInt64.write(value.failed, into: &buf)
         FfiConverterUInt64.write(value.gaveUp, into: &buf)
-        FfiConverterUInt64.write(value.missingSidecar, into: &buf)
+        FfiConverterUInt64.write(value.missingDescriptor, into: &buf)
         FfiConverterBool.write(value.parked, into: &buf)
         FfiConverterBool.write(value.parkedResponsibility, into: &buf)
     }
@@ -2985,16 +2964,18 @@ public struct FfiWriteOutcome: Equatable, Hashable {
     public var blobPath: String
     public var photoCompleted: Bool
     /**
-     * Set when `photo_completed` and the local sidecar was written.
+     * Set when `photo_completed` and the publish-metadata capsule was
+     * persisted to state.db.
      */
-    public var sidecarPath: String?
+    public var descriptorPersisted: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
     public init(photoId: String, resolutionKind: FfiHashResolutionKind, contentHash: String, sizeBytes: UInt64, ext: String, deduped: Bool, blobPath: String, photoCompleted: Bool, 
         /**
-         * Set when `photo_completed` and the local sidecar was written.
-         */sidecarPath: String?) {
+         * Set when `photo_completed` and the publish-metadata capsule was
+         * persisted to state.db.
+         */descriptorPersisted: Bool) {
         self.photoId = photoId
         self.resolutionKind = resolutionKind
         self.contentHash = contentHash
@@ -3003,7 +2984,7 @@ public struct FfiWriteOutcome: Equatable, Hashable {
         self.deduped = deduped
         self.blobPath = blobPath
         self.photoCompleted = photoCompleted
-        self.sidecarPath = sidecarPath
+        self.descriptorPersisted = descriptorPersisted
     }
 
     
@@ -3030,7 +3011,7 @@ public struct FfiConverterTypeFfiWriteOutcome: FfiConverterRustBuffer {
                 deduped: FfiConverterBool.read(from: &buf), 
                 blobPath: FfiConverterString.read(from: &buf), 
                 photoCompleted: FfiConverterBool.read(from: &buf), 
-                sidecarPath: FfiConverterOptionString.read(from: &buf)
+                descriptorPersisted: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -3043,7 +3024,7 @@ public struct FfiConverterTypeFfiWriteOutcome: FfiConverterRustBuffer {
         FfiConverterBool.write(value.deduped, into: &buf)
         FfiConverterString.write(value.blobPath, into: &buf)
         FfiConverterBool.write(value.photoCompleted, into: &buf)
-        FfiConverterOptionString.write(value.sidecarPath, into: &buf)
+        FfiConverterBool.write(value.descriptorPersisted, into: &buf)
     }
 }
 
@@ -4193,7 +4174,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_ingress_ffi_checksum_method_ingresssession_cancel_drain() != 12111) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ingress_ffi_checksum_method_ingresssession_cleanup() != 13048) {
+    if (uniffi_ingress_ffi_checksum_method_ingresssession_cleanup() != 61311) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ingress_ffi_checksum_method_ingresssession_drain() != 12569) {

@@ -15,11 +15,10 @@ use crate::descriptor::AssetDescriptor;
 use crate::error::Result;
 use crate::ids::{LibraryId, PhotoId};
 use crate::model::{PhotoRecord, ResourceRecord, ResourceType};
-use crate::paths::{BlobPaths, DataDir};
+use crate::paths::BlobPaths;
 use crate::resolve::{
     Resolution, SeedOutcome, diff_resources, resolve_descriptor, seed_descriptor,
 };
-use crate::sidecar_io::{edit_sidecar_deleted_at, write_photo_sidecar};
 use crate::store::StateStore;
 
 /// What one descriptor event means for a known photo. Built by the pure
@@ -255,16 +254,16 @@ pub async fn classify(store: &StateStore, desc: &AssetDescriptor) -> Result<Clas
 /// refresh rather than losing it.
 pub async fn apply_change(
     store: &StateStore,
-    data_dir: &DataDir,
     desc: &AssetDescriptor,
 ) -> Result<(Classification, ChangeOutcome)> {
     let classification = classify(store, desc).await?;
-    // A NoOp delivery still heals a missing local sidecar: the scan re-probes a
-    // materialized photo whose sidecar vanished (crash window) as NeedsFull, but
-    // `classify` — pure and fs-blind — sees no work and returns NoOp. Recompose
-    // it here from the live descriptor before the early return.
+    // A NoOp delivery still heals a missing capsule: the scan re-probes a
+    // materialized photo whose capsule is NULL (crash window / pre-migration
+    // row) as NeedsFull, but `classify` — pure — sees no work and returns
+    // NoOp. Backfill it here from the live descriptor before the early
+    // return.
     if let Classification::NoOp { photo_id } = &classification {
-        heal_missing_sidecar(store, data_dir, desc, photo_id).await?;
+        heal_missing_descriptor(store, desc, photo_id).await?;
         return Ok((classification, ChangeOutcome::default()));
     }
     let Classification::Known(plan) = &classification else {
@@ -278,7 +277,7 @@ pub async fn apply_change(
     }
 
     if let Some((src, dst)) = &plan.transition {
-        crate::transition::execute_transition(store, data_dir, &plan.photo_id, src, dst).await?;
+        crate::transition::execute_transition(store, &plan.photo_id, src, dst).await?;
         outcome.transitioned = true;
     }
 
@@ -358,12 +357,6 @@ pub async fn apply_change(
             .execute(&mut *tx)
             .await?;
         }
-        // T2: this tx precedes a sidecar rewrite (revert path) or a later
-        // completion rewrite (add/reopen) — dirty the remote copy either way.
-        // The restamp UPDATE above can't carry it: its materialized-IS-NULL
-        // guard doesn't fire on adjustment-only reverts, yet the sidecar is
-        // still rewritten.
-        crate::store::photos::mark_sidecar_dirty(&mut *tx, &plan.photo_id).await?;
         tx.commit().await?;
 
         // Post-commit: reaped blob files. A crash here leaves benign orphans.
@@ -378,10 +371,10 @@ pub async fn apply_change(
         }
     }
 
-    // Sidecar rewrite: only when the photo is materialized — a sidecar
+    // Capsule rewrite: only when the photo is materialized — the capsule
     // reflects committed state; drain (re)writes it at completion otherwise.
-    // On a committed change, always rewrite; with no change, still recompose a
-    // missing sidecar (crash-window self-heal, same as the NoOp branch above).
+    // On a committed change, always rewrite; with no change, still backfill a
+    // missing capsule (crash-window self-heal, same as the NoOp branch above).
     let state_changed = outcome.restored
         || outcome.transitioned
         || outcome.resources_removed > 0
@@ -390,10 +383,10 @@ pub async fn apply_change(
         if let Some(photo) = store.photo(&plan.photo_id).await?
             && photo.materialized_at.is_some()
         {
-            write_photo_sidecar(store, data_dir, desc, &plan.photo_id).await?;
+            store.persist_descriptor(&plan.photo_id, desc).await?;
         }
     } else {
-        heal_missing_sidecar(store, data_dir, desc, &plan.photo_id).await?;
+        heal_missing_descriptor(store, desc, &plan.photo_id).await?;
     }
     if plan.metadata_refresh {
         if let Some(at) = desc.asset_modified_at {
@@ -405,32 +398,25 @@ pub async fn apply_change(
     Ok((classification, outcome))
 }
 
-/// Recompose a materialized photo's local sidecar iff it is absent on disk,
-/// or its publish-metadata capsule iff the column is NULL — the crash-window
-/// class (completion tx committed, `write_photo_sidecar` never landed) and
-/// the pre-capsule-migration backfill respectively. No-op for an
-/// unmaterialized/unmapped photo with both present. Needs the live
+/// Backfill a materialized photo's publish-metadata capsule iff the column
+/// is NULL — the crash-window class (completion tx committed, capsule write
+/// never landed) and the pre-capsule-migration backfill. No-op for an
+/// unmaterialized/unmapped photo or a present capsule. Needs the live
 /// descriptor: capsule fields are persisted nowhere else, so nothing else
 /// can regenerate them.
-async fn heal_missing_sidecar(
+async fn heal_missing_descriptor(
     store: &StateStore,
-    data_dir: &DataDir,
     desc: &AssetDescriptor,
     photo_id: &PhotoId,
 ) -> Result<()> {
     let Some(photo) = store.photo(photo_id).await? else {
         return Ok(());
     };
-    if photo.materialized_at.is_none() {
+    if photo.materialized_at.is_none() || photo.library_id.is_none() {
         return Ok(());
     }
-    let Some(library_id) = &photo.library_id else {
-        return Ok(());
-    };
-    if photo.descriptor_json.is_none()
-        || crate::sidecar_io::find_sidecar(&data_dir.sidecar_root(library_id), photo_id)?.is_none()
-    {
-        write_photo_sidecar(store, data_dir, desc, photo_id).await?;
+    if photo.descriptor_json.is_none() {
+        store.persist_descriptor(photo_id, desc).await?;
     }
     Ok(())
 }
@@ -449,17 +435,13 @@ pub enum RemovalOutcome {
 /// Apply an observer `removed` event. Resolution is by live `local_id` —
 /// the asset is gone from PhotoKit, so its cloud mapping is unavailable and
 /// `local_id` is the only handle `removedObjects` still exposes.
-pub async fn apply_removal(
-    store: &StateStore,
-    data_dir: &DataDir,
-    local_id: &str,
-) -> Result<RemovalOutcome> {
+pub async fn apply_removal(store: &StateStore, local_id: &str) -> Result<RemovalOutcome> {
     let Some(photo) =
         crate::store::photos::photo_by_local_id_active(store.pool(), local_id).await?
     else {
         return Ok(RemovalOutcome::Unknown);
     };
-    if tombstone_photo(store, data_dir, &photo).await? {
+    if tombstone_photo(store, &photo).await? {
         Ok(RemovalOutcome::Tombstoned {
             photo_id: photo.photo_id,
         })
@@ -475,11 +457,7 @@ pub async fn apply_removal(
 /// Resource rows and blob refcounts are deliberately untouched — bytes stay
 /// through the retention window. Shared by removal events and the scan's
 /// offline-deletion synthesis. Returns false (no-op) when already tombstoned.
-pub(crate) async fn tombstone_photo(
-    store: &StateStore,
-    data_dir: &DataDir,
-    photo: &PhotoRecord,
-) -> Result<bool> {
+pub(crate) async fn tombstone_photo(store: &StateStore, photo: &PhotoRecord) -> Result<bool> {
     let now = Utc::now();
     let mut tx = store.pool().begin().await?;
     let tombstoned = crate::store::photos::tombstone_photo(&mut *tx, &photo.photo_id, now).await?;
@@ -487,14 +465,7 @@ pub(crate) async fn tombstone_photo(
         return Ok(false);
     }
     crate::store::log::append(&mut *tx, "deletion_observed", Some(&photo.photo_id), None).await?;
-    // T3: the sidecar's deleted_at is rewritten below — an unreplicated
-    // tombstone dying with this Mac would resurrect the photo in recovery.
-    crate::store::photos::mark_sidecar_dirty(&mut *tx, &photo.photo_id).await?;
     tx.commit().await?;
-
-    if let Some(library) = &photo.library_id {
-        edit_sidecar_deleted_at(data_dir, library, &photo.photo_id, Some(now))?;
-    }
     Ok(true)
 }
 
@@ -510,8 +481,6 @@ pub(crate) async fn restore_photo(store: &StateStore, photo_id: &PhotoId) -> Res
         return Ok(false);
     }
     crate::store::log::append(&mut *tx, "restore_observed", Some(photo_id), None).await?;
-    // T4: the caller rewrites the sidecar (recompose or deleted_at clear).
-    crate::store::photos::mark_sidecar_dirty(&mut *tx, photo_id).await?;
     tx.commit().await?;
     Ok(true)
 }
