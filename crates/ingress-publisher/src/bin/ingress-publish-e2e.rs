@@ -224,6 +224,7 @@ async fn main() {
         } => {
             let publisher = NodePublisher::new(&node_url, &device_token).expect("publisher");
             let cfg = ingress_core::publish::PublishConfig::default();
+            let spool = data_dir.spool();
             let mut state = PublishState::default();
             let mut totals = ingress_core::publish::PublishReport::default();
             loop {
@@ -233,7 +234,7 @@ async fn main() {
                 if claimed.is_empty() {
                     break;
                 }
-                let report = run_publish_pass(&store, &data_dir, &publisher, &cfg, claimed, &mut state)
+                let report = run_publish_pass(&store, &spool, &publisher, &cfg, claimed, &mut state)
                     .await
                     .expect("publish pass");
                 let parked = report.parked || report.parked_responsibility;
@@ -249,7 +250,7 @@ async fn main() {
                 "adopted": totals.adopted,
                 "failed": totals.failed,
                 "gave_up": totals.gave_up,
-                "missing_sidecar": totals.missing_sidecar,
+                "missing_descriptor": totals.missing_descriptor,
                 "parked": totals.parked,
                 "parked_responsibility": totals.parked_responsibility,
                 "photos": photo_reports(&store).await,

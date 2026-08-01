@@ -462,7 +462,7 @@ async fn missing_descriptor_skips_photo_but_batch_continues() {
     let mut state = PublishState::default();
     let report = pass(&rig, &publisher, &mut state).await;
 
-    assert_eq!(report.missing_sidecar, 1);
+    assert_eq!(report.missing_descriptor, 1);
     assert_eq!(report.published, 1);
     assert!(photo(&rig, &healthy).await.published_at.is_some());
     let broken_row = photo(&rig, &broken).await;
@@ -491,7 +491,7 @@ async fn publishes_from_capsule_and_db_rows() {
     let report = pass(&rig, &publisher, &mut state).await;
 
     assert_eq!(report.published, 1);
-    assert_eq!(report.missing_sidecar, 0);
+    assert_eq!(report.missing_descriptor, 0);
     let sidecars = publisher.seen_sidecars.lock().unwrap();
     assert_eq!(sidecars.len(), 1);
     assert_eq!(sidecars[0].photo_id, id);

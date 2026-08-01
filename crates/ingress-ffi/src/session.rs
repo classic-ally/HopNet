@@ -557,7 +557,7 @@ impl IngressSession {
                 adopted: report.publish.adopted,
                 failed: report.publish.failed,
                 gave_up: report.publish.gave_up,
-                missing_descriptor: report.publish.missing_sidecar,
+                missing_descriptor: report.publish.missing_descriptor,
                 evicted_blobs: report.publish.evicted_blobs,
                 parked: report.publish.parked,
                 parked_responsibility: report.publish.parked_responsibility,

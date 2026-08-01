@@ -192,8 +192,9 @@ pub struct PublishReport {
     pub failed: u64,
     /// Photos whose attempts reached the cap this pass.
     pub gave_up: u64,
-    /// Claimed photos whose sidecar was missing (crash window) — skipped.
-    pub missing_sidecar: u64,
+    /// Claimed photos with a NULL descriptor capsule (pre-column rows
+    /// awaiting scan backfill) — skipped, no attempt burned.
+    pub missing_descriptor: u64,
     /// Blobs spool-evicted at the end of the pass (every referent decided).
     pub evicted_blobs: u64,
     /// The pass aborted early because the node was unreachable.
@@ -211,7 +212,7 @@ impl PublishReport {
         self.adopted += other.adopted;
         self.failed += other.failed;
         self.gave_up += other.gave_up;
-        self.missing_sidecar += other.missing_sidecar;
+        self.missing_descriptor += other.missing_descriptor;
         self.evicted_blobs += other.evicted_blobs;
         self.parked = other.parked;
         self.parked_responsibility = other.parked_responsibility;
@@ -367,7 +368,7 @@ pub async fn run_publish_pass(
             Err(skip) => {
                 match skip {
                     AssembleSkip::MissingDescriptor => {
-                        report.missing_sidecar += 1;
+                        report.missing_descriptor += 1;
                         let _ = store
                             .append_log(
                                 "publish_descriptor_missing",
