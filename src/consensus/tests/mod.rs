@@ -7,6 +7,7 @@ mod authorization;
 mod byzantine;
 mod malachite_integration;
 mod signatures;
+mod upgrade;
 
 #[derive(Clone)]
 pub struct MockNode {

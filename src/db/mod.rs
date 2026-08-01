@@ -29,6 +29,7 @@ pub mod snapshot;
 pub mod takeout;
 pub mod types;
 pub mod users;
+pub mod versions;
 pub mod write_gate;
 
 /// Maximum r2d2 connections checked out simultaneously across the process.

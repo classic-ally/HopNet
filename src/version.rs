@@ -108,6 +108,6 @@ mod tests {
         assert_eq!(parse_code("2026.8.0.1"), None);
         assert!(!code_is_valid(20260000)); // month 0
         assert!(!code_is_valid(20261300)); // month 13
-        assert!(!code_is_valid(100));      // year 0
+        assert!(!code_is_valid(100)); // year 0
     }
 }

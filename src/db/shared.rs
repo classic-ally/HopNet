@@ -304,6 +304,18 @@ pub fn initialize(db: PooledConnection<SqliteConnectionManager>) -> Result<(), D
                 name            TEXT NOT NULL,
                 owner           INTEGER NOT NULL,
                 pubkey          BLOB NOT NULL UNIQUE,
+                -- Version attestation (RFC-019 S3): the node's objective
+                -- self-claim, overwritten wholesale by each
+                -- node_staged_version tx — a staged version upstream moved
+                -- past vanishes at the next attestation. Codes are CalVer
+                -- integers (src/version.rs); NULL until first attestation.
+                -- staged stays NULL until a staging-capable upgrade
+                -- provider exists (v1 git-release only reports). Read by
+                -- the upgrade advisory now, the regenesis_start
+                -- precondition later (S5).
+                running_version_code    INTEGER,
+                staged_version_code     INTEGER,
+                version_attested_height INTEGER,
 
                 FOREIGN KEY (owner) REFERENCES users(user_id)
             );

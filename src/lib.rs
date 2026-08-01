@@ -31,6 +31,7 @@ pub mod setup;
 pub mod shares;
 pub mod takeout_host;
 pub mod types;
+pub mod upgrade;
 pub mod users;
 pub mod version;
 pub mod views;

@@ -17,7 +17,8 @@ use crate::db::DatabaseError;
 /// by consensus transactions, so honest nodes agree on it.
 pub const HOST_SECTION: SectionSpec = SectionSpec {
     name: "host",
-    format_version: 1,
+    // v2: nodes gained the version-attestation columns (RFC-019 S3).
+    format_version: 2,
     tables: &[
         TableSpec::exported("sequences"),
         TableSpec::exported("users"),
@@ -123,8 +124,8 @@ mod tests {
             "INSERT INTO sequences VALUES ('users', 2);
              INSERT INTO users (user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt)
              VALUES (1, 'alice', X'AA01', X'BB02', X'CC03', X'DD04');
-             INSERT INTO nodes VALUES (1, 'n1', 1, X'0A');
-             INSERT INTO nodes VALUES (2, 'n2', 1, X'0B');
+             INSERT INTO nodes VALUES (1, 'n1', 1, X'0A', 20260800, NULL, 3);
+             INSERT INTO nodes VALUES (2, 'n2', 1, X'0B', NULL, NULL, NULL);
              INSERT INTO metrics VALUES (1, 2, '2026-01-01T00:00:00Z', 10.5, 0.25, 0.125, 1000, 5, 1, 100, 50);
              INSERT INTO fragment_request_metrics VALUES (1, 1, 2, 5, 10, 9);
              INSERT INTO device_tokens VALUES ('dt1', 1, X'EE05', 'abcd', X'FF06');
@@ -224,11 +225,11 @@ mod tests {
         assert_eq!(report.manifest.top_hash.to_hex(), EMPTY_TOP_HASH);
     }
 
-    const EMPTY_TOP_HASH: &str = "ffc969f7421de05e30a5dd947c037b3c96a0538f73cc50717dd4a3ce63929464";
+    const EMPTY_TOP_HASH: &str = "dc21e8215ff112db5d01e50f9ec24cfed81fa6f236b5216a022158a89a635ef0";
     const EMPTY_SECTION_HASHES: &[(&str, &str)] = &[
         (
             "host",
-            "bfba9b1b1461f7a5bfe058f4d5d030248888943c8adafd324c64eccb3c506971",
+            "72fdfe80d94d2154aba4ad5b0862515a7c543aaa503d9d55bc7e784ed67eb081",
         ),
         (
             "consensus",
@@ -268,10 +269,10 @@ mod tests {
     }
 
     const SEEDED_TOP_HASH: &str =
-        "cc54486124b1474e2767ecdc54accd4f8e91b647fe3e7a536d44e7de1f4853b9";
+        "d95f46e5581c6a1bda6906799c609821c884e2552f1d6affc393c0569e113abf";
     const SEEDED_ARTIFACT_HASH: &str =
-        "0c8221cb78f4e84257912ec27e02efb4c16ec07e5f1ac1bb7feafa90e33bb4fe";
-    const SEEDED_ARTIFACT_LEN: usize = 3111;
+        "00bac305681c823116e79f0b73bf175484fc2817f8b644f4b6b72c8adf115bad";
+    const SEEDED_ARTIFACT_LEN: usize = 3207;
 
     // Should: report identical manifests from the hash-only walk and the
     // full export, and byte-identical artifacts from two independently
