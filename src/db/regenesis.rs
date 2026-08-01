@@ -78,6 +78,30 @@ pub fn set_moratorium_tx(
     Ok(())
 }
 
+/// `regenesis_commit` applies: seal the epoch at terminal height H. The
+/// WHERE clause enforces the window — sealing requires an open
+/// moratorium row, so 0 updated rows is a phase violation, not a shrug.
+pub fn set_sealed_tx(
+    db_tx: &rusqlite::Transaction,
+    snapshot_hash: &[u8],
+    seal_height: u64,
+) -> Result<(), DatabaseError> {
+    let n = db_tx
+        .execute(
+            "UPDATE regenesis_state SET phase = 2, snapshot_hash = ?, seal_height = ?
+             WHERE internal_id = 1 AND phase = 1",
+            rusqlite::params![
+                snapshot_hash,
+                hopnet_common::height::height_to_db(seal_height)
+            ],
+        )
+        .map_err(|_| DatabaseError::ProcessingError)?;
+    if n == 0 {
+        return Err(DatabaseError::ProcessingError);
+    }
+    Ok(())
+}
+
 /// `regenesis_abort` applies: back to normal — the row disappears (the
 /// single canonical Normal encoding).
 pub fn clear_to_normal_tx(db_tx: &rusqlite::Transaction) -> Result<(), DatabaseError> {

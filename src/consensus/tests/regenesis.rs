@@ -292,3 +292,151 @@ fn queue_refuses_new_submissions_during_moratorium() {
         "got {err:?}"
     );
 }
+
+fn commit_payload(snapshot_hash: [u8; 32], seal_height: u64) -> Vec<u8> {
+    bincode::serde::encode_to_vec(
+        crate::regenesis::RegenesisCommit {
+            snapshot_hash,
+            seal_height,
+        },
+        bincode::config::standard(),
+    )
+    .unwrap()
+}
+
+// Should not: seal outside the moratorium — the commit's one
+// deterministic phase rule at the handler layer.
+#[test]
+fn commit_refused_in_normal() {
+    let node = MockNode::new(3);
+    register_node(&node);
+    seat_with_version(&node, 3, 20260800);
+
+    let err = apply(&node, "regenesis_commit", commit_payload([7u8; 32], 5)).unwrap_err();
+    assert!(matches!(err, DatabaseError::ProcessingError));
+    assert_eq!(committed_state(&node).phase, RegenesisPhase::Normal);
+}
+
+// Should: seal from the moratorium, recording the certified hash and the
+// terminal height; afterwards the window is closed forward-only — no
+// second commit, no abort, no new start.
+#[test]
+fn commit_seals_and_closes_the_window() {
+    let node = MockNode::new(3);
+    register_node(&node);
+    seat_with_version(&node, 3, 20260800);
+
+    apply(&node, "regenesis_start", start_payload(20260800)).unwrap();
+    apply(&node, "regenesis_commit", commit_payload([7u8; 32], 9)).unwrap();
+
+    let state = committed_state(&node);
+    assert_eq!(state.phase, RegenesisPhase::Sealed);
+    assert_eq!(state.snapshot_hash, Some(vec![7u8; 32]));
+    assert_eq!(state.seal_height, Some(9));
+    assert_eq!(state.target_version_code, Some(20260800));
+
+    for (function, payload) in [
+        ("regenesis_commit", commit_payload([7u8; 32], 10)),
+        ("regenesis_abort", abort_payload()),
+        ("regenesis_start", start_payload(20260800)),
+    ] {
+        let err = apply(&node, function, payload).unwrap_err();
+        assert!(matches!(err, DatabaseError::ProcessingError), "{function}");
+    }
+}
+
+// Should: vote for an honest regenesis commit (matching hash, bound
+// height, riding alone) and refuse every malformed shape — wrong local
+// hash, wrong terminal height, shared block — and refuse ANY block once
+// the epoch is sealed.
+// Impact: this is the byzantine-tolerant layer — a proposer cannot seal
+// a mesh onto a snapshot its validators cannot reproduce, cannot bind
+// the seal to the wrong height, cannot smuggle work into the final
+// block, and cannot decide anything past the seal.
+#[test]
+fn commit_block_vote_iff_match_and_shape() {
+    use super::byzantine::validate_at_height_1;
+    use hopnet_consensus::Validity;
+
+    let network = MockNetwork::setup_with_validators(1);
+    let node = &network.nodes[0];
+
+    // Enter the moratorium (committed state).
+    {
+        let mut conn = node.app_state.db_pool.get().unwrap();
+        let db_tx = conn.transaction().unwrap();
+        set_moratorium_tx(&db_tx, 20260800).unwrap();
+        db_tx.commit().unwrap();
+    }
+
+    // The honest hash: what every validator recomputes locally.
+    let report = crate::db::snapshot::compute_node_state(node.app_state.db_pool.get()).unwrap();
+    let mut honest = [0u8; 32];
+    honest.copy_from_slice(report.manifest.top_hash.as_bytes());
+
+    let commit_tx = |hash: [u8; 32], seal_height: u64| {
+        Transaction::new(
+            "regenesis_commit".to_string(),
+            commit_payload(hash, seal_height),
+            node.node_id,
+            &node.signing_key,
+        )
+        .unwrap()
+    };
+
+    // Honest commit at the actual block height, alone: votable.
+    assert_eq!(
+        validate_at_height_1(&node.app_state, vec![commit_tx(honest, 1)]),
+        Validity::Valid,
+        "honest seal must be votable"
+    );
+
+    // Wrong hash: vote-iff-match refuses.
+    assert_eq!(
+        validate_at_height_1(&node.app_state, vec![commit_tx([0xAB; 32], 1)]),
+        Validity::Invalid,
+        "hash mismatch must refuse the vote"
+    );
+
+    // seal_height not bound to the block height: refused.
+    assert_eq!(
+        validate_at_height_1(&node.app_state, vec![commit_tx(honest, 7)]),
+        Validity::Invalid,
+        "unbound seal_height must be refused"
+    );
+
+    // The commit must ride alone.
+    let bystander = Transaction::new(
+        "node_staged_version".to_string(),
+        vec![],
+        node.node_id,
+        &node.signing_key,
+    )
+    .unwrap();
+    assert_eq!(
+        validate_at_height_1(&node.app_state, vec![commit_tx(honest, 1), bystander]),
+        Validity::Invalid,
+        "commit sharing a block must be refused"
+    );
+
+    // Seal the epoch; nothing further is votable — not even an otherwise
+    // well-formed ordinary transaction.
+    {
+        let mut conn = node.app_state.db_pool.get().unwrap();
+        let db_tx = conn.transaction().unwrap();
+        crate::db::regenesis::set_sealed_tx(&db_tx, &honest, 1).unwrap();
+        db_tx.commit().unwrap();
+    }
+    let ordinary = Transaction::new(
+        "node_staged_version".to_string(),
+        vec![],
+        node.node_id,
+        &node.signing_key,
+    )
+    .unwrap();
+    assert_eq!(
+        validate_at_height_1(&node.app_state, vec![ordinary]),
+        Validity::Invalid,
+        "no block may decide past the seal"
+    );
+}

@@ -19,8 +19,9 @@ type PoolStorage = SqliteStorage<r2d2::PooledConnection<r2d2_sqlite::SqliteConne
 
 /// Build the engine-shape block at height 1 (parent = the installed genesis)
 /// containing `txs`, then run the receiver-side Rule-8 validation the way the
-/// host does: inside a rolled-back DB transaction.
-fn validate_at_height_1(
+/// host does: inside a rolled-back DB transaction. Shared with the regenesis
+/// boundary tests (RFC-019 S5).
+pub(super) fn validate_at_height_1(
     app_state: &crate::AppState,
     txs: Vec<crate::consensus::types::Transaction>,
 ) -> Validity {

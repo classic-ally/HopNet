@@ -12,9 +12,9 @@ use hopnet_projection::{HandlerCtx, HandlerResult, TransactionHandler, TxMeta};
 
 use crate::db::DatabaseError;
 use crate::db::regenesis::{
-    RegenesisPhase, clear_to_normal_tx, read_regenesis_state, set_moratorium_tx,
+    RegenesisPhase, clear_to_normal_tx, read_regenesis_state, set_moratorium_tx, set_sealed_tx,
 };
-use crate::regenesis::{RegenesisAbort, RegenesisStart};
+use crate::regenesis::{RegenesisAbort, RegenesisCommit, RegenesisStart};
 
 /// Seated-validator check shared by the boundary handlers.
 fn require_seated(
@@ -138,3 +138,44 @@ impl TransactionHandler for RegenesisAbortHandler {
 }
 
 inventory::submit! { &RegenesisAbortHandler as &dyn TransactionHandler }
+
+pub struct RegenesisCommitHandler;
+
+impl TransactionHandler for RegenesisCommitHandler {
+    fn name(&self) -> &'static str {
+        "regenesis_commit"
+    }
+
+    fn process(
+        &self,
+        tx: &TxMeta<'_>,
+        execute: bool,
+        _ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
+    ) -> HandlerResult {
+        let Ok((req, _)) = bincode::serde::decode_from_slice::<RegenesisCommit, _>(
+            tx.payload,
+            bincode::config::standard(),
+        ) else {
+            return Err(DatabaseError::InvalidPayload);
+        };
+
+        require_seated(db_tx, tx.submitter_node)?;
+
+        // Deterministic phase rule only. Everything subjective about the
+        // commit — the vote-iff-match hash recompute, the own-pool drain
+        // check, the seal_height ↔ block height binding, the solo-block
+        // shape — is the vote-time layer's job (validate_inner): apply
+        // must NEVER fail on it, because decided is decided.
+        if read_regenesis_state(db_tx)?.phase != RegenesisPhase::Moratorium {
+            return Err(DatabaseError::ProcessingError);
+        }
+
+        if !execute {
+            return Ok(());
+        }
+        set_sealed_tx(db_tx, &req.snapshot_hash, req.seal_height)
+    }
+}
+
+inventory::submit! { &RegenesisCommitHandler as &dyn TransactionHandler }

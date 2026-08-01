@@ -117,6 +117,15 @@ pub fn is_membership_tx(function: &str) -> bool {
     MEMBERSHIP_TX_FUNCTIONS.contains(&function)
 }
 
+/// Block-shape registry: functions that must ride ALONE in a block —
+/// membership transitions (joint constraints are invisible to per-tx
+/// validation) and the regenesis commit (RFC-019 S5: the decide
+/// certificate of the final block IS the snapshot certificate; nothing
+/// else may share it).
+pub fn requires_solo_block(function: &str) -> bool {
+    is_membership_tx(function) || function == "regenesis_commit"
+}
+
 // ============================================================================
 // Voluntary leave (RFC-CONSENSUS-002 S1) — the departure twin of activation
 // ============================================================================

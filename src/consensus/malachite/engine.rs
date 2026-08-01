@@ -303,6 +303,15 @@ pub fn spawn_engine(app_state: &AppState) -> Result<(), String> {
     // plane on the caller's (main) runtime; placement batcher on queue_rt.
     crate::storage_host::substrate_host::spawn_storage_engine(app_state);
 
+    // Regenesis drain watcher (RFC-019 S5): wakes the on-demand engine to
+    // propose the commit once a moratorium drains — including after a
+    // crash mid-moratorium, since this spawns on every engine start.
+    spawn_drain_watcher(
+        app_state.clone(),
+        input_tx.clone(),
+        app_state.consensus_queue.pending_pool(),
+    );
+
     let engine = EngineHandle {
         input_tx,
         decided,
@@ -554,6 +563,85 @@ fn spawn_driver(
     });
 }
 
+/// Committed regenesis phase, or None on any read failure (treated as
+/// "don't act" by every caller — hygiene skips, seal proposal skips).
+fn committed_regenesis_phase(
+    app_state: &AppState,
+) -> Option<crate::db::regenesis::RegenesisPhase> {
+    let conn = app_state.db_pool.get().ok()?;
+    crate::db::regenesis::read_regenesis_state(&conn)
+        .ok()
+        .map(|s| s.phase)
+}
+
+/// Build the proposer-injected `regenesis_commit` (RFC-019 S5): recompute
+/// the canonical snapshot over ONE transaction snapshot of the build
+/// connection, bind it to the pending height, node-sign. Solo by
+/// construction — only called when no other candidate exists.
+fn seal_candidate(
+    app_state: &AppState,
+    conn: &mut r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>,
+    seal_height: u64,
+) -> Result<crate::consensus::types::Transaction, String> {
+    let started = std::time::Instant::now();
+    let tx_snapshot = conn
+        .transaction()
+        .map_err(|e| format!("snapshot tx: {e}"))?;
+    let report = crate::db::snapshot::compute_node_state_tx(&tx_snapshot)
+        .map_err(|e| format!("snapshot compute: {e:?}"))?;
+    drop(tx_snapshot);
+    let mut snapshot_hash = [0u8; 32];
+    snapshot_hash.copy_from_slice(report.manifest.top_hash.as_bytes());
+    tracing::info!(
+        seal_height,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        top_hash = %report.manifest.top_hash.to_hex(),
+        "regenesis commit candidate: snapshot recomputed (OQ1 timing)"
+    );
+    let payload = bincode::serde::encode_to_vec(
+        &crate::regenesis::RegenesisCommit {
+            snapshot_hash,
+            seal_height,
+        },
+        bincode::config::standard(),
+    )
+    .map_err(|e| format!("encode: {e}"))?;
+    crate::consensus::dispatch::create_signed_transaction(
+        app_state,
+        "regenesis_commit".to_string(),
+        payload,
+    )
+    .map_err(|e| format!("sign: {e:?}"))
+}
+
+/// RFC-019 S5 (OQ4): an empty pool never fires the work signal, so a
+/// drained moratorium would leave the on-demand engine paused with nobody
+/// to propose the regenesis commit. This watcher nudges the engine while
+/// (and only while) the committed phase is MORATORIUM and this node's
+/// pool is drained — `Resume` is idempotent, and the nudge stops on its
+/// own once the commit decides (phase leaves MORATORIUM). Lives for the
+/// engine's lifetime; outside a moratorium it is one cheap singleton
+/// read per second.
+fn spawn_drain_watcher(
+    app_state: AppState,
+    input_tx: mpsc::Sender<HostInput>,
+    pool: Arc<crate::consensus::queue::PendingPool>,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            if committed_regenesis_phase(&app_state)
+                == Some(crate::db::regenesis::RegenesisPhase::Moratorium)
+                && pool.staged_len() == 0
+                && pool.inflight_len() == 0
+                && input_tx.send(HostInput::Resume).await.is_err()
+            {
+                return; // engine gone
+            }
+        }
+    });
+}
+
 /// NeedValue: linger for forwarded transactions, drain the pool, build the
 /// block off the async workers (write gate + Immediate-tx preflight), then
 /// hand the proposal to the shell. Preflight rejections resolve their
@@ -591,21 +679,17 @@ async fn handle_need_value(
     let mut candidates: Vec<crate::consensus::types::Transaction> =
         entries.iter().map(|e| e.transaction().clone()).collect();
 
+    let regenesis_phase = committed_regenesis_phase(app_state);
+
     // Periodic nonce-table hygiene, appended AFTER the queue entries so
     // candidate indices still line up with `entries`. Suppressed outside
     // the normal phase (RFC-019 S5): this injection bypasses the queue's
     // admission gate, and hygiene must neither dilute the drain nor break
     // the regenesis commit's solo block. On a read error we skip — a
     // missed cleanup is harmless; the next interval retries.
-    let hygiene_admissible = || {
-        app_state
-            .db_pool
-            .get()
-            .ok()
-            .and_then(|c| crate::db::regenesis::read_regenesis_state(&c).ok())
-            .is_some_and(|s| s.phase == crate::db::regenesis::RegenesisPhase::Normal)
-    };
-    if height.0.is_multiple_of(NONCE_CLEANUP_INTERVAL) && hygiene_admissible() {
+    if height.0.is_multiple_of(NONCE_CLEANUP_INTERVAL)
+        && regenesis_phase == Some(crate::db::regenesis::RegenesisPhase::Normal)
+    {
         let cutoff_ts = (chrono::Utc::now() - chrono::Duration::hours(1)).timestamp() as u64;
         let cutoff = hopnet_common::CustomUUID::new(Some(&uuid::Timestamp::from_unix(
             uuid::NoContext,
@@ -623,6 +707,17 @@ async fn handle_need_value(
         }
     }
 
+    // RFC-019 S5: once the moratorium holds and this node's pool has fully
+    // drained (nothing staged, nothing inflight, no candidate this round),
+    // the proposer's next block is the regenesis commit — the SOLE
+    // transaction of the final block, carrying the snapshot hash it
+    // recomputes over the build connection (proposer-injected, queue-
+    // bypassing: the cleanup_nonces precedent).
+    let propose_seal = regenesis_phase
+        == Some(crate::db::regenesis::RegenesisPhase::Moratorium)
+        && candidates.is_empty()
+        && pool.inflight_len() == 0;
+
     // Dedicated build connection: proposal building must never lose a pool
     // checkout race under load (a failed build wastes the whole round — the
     // image-14 finding: "build conn: timed out" → empty heights). The conn is
@@ -638,6 +733,15 @@ async fn handle_need_value(
                 .get()
                 .map_err(|e| format!("build conn: {e}"))?,
         };
+        let mut candidates = candidates;
+        if propose_seal {
+            match seal_candidate(&build_state, &mut conn, height.0) {
+                Ok(tx) => candidates.push(tx),
+                // A failed recompute wastes this round only — the drain
+                // watcher keeps nudging and the next NeedValue retries.
+                Err(e) => tracing::warn!("regenesis commit candidate failed: {e}"),
+            }
+        }
         let result = build_value(&build_state, &mut conn, height, round, candidates);
         Ok::<_, String>((conn, result))
     })

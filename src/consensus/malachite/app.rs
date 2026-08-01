@@ -92,11 +92,77 @@ impl HopNetApplication {
             ));
         }
 
-        // Solo-block rule (RFC-CONSENSUS-002): structural, both origins.
+        // Solo-block rule (RFC-CONSENSUS-002 membership transitions;
+        // RFC-019 S5 regenesis commit): structural, both origins.
         check_solo_membership(
             block.data.transactions.iter().map(|t| t.rpc.function.as_str()),
             block.data.transactions.len(),
         )?;
+
+        // Regenesis boundary checks (RFC-019 S5).
+        let regenesis = crate::db::regenesis::read_regenesis_state(db_tx)
+            .map_err(|e| format!("regenesis state: {e:?}"))?;
+        // Nothing decides past the seal — the vote-time belt to the
+        // engine-halt suspenders (seal contract item 1).
+        if regenesis.phase == crate::db::regenesis::RegenesisPhase::Sealed {
+            return Err("epoch is sealed: no further block may decide".into());
+        }
+        for tx in block.data.transactions.iter() {
+            if tx.rpc.function != "regenesis_commit" {
+                continue;
+            }
+            let Ok((commit, _)) =
+                bincode::serde::decode_from_slice::<crate::regenesis::RegenesisCommit, _>(
+                    &tx.rpc.payload,
+                    bincode::config::standard(),
+                )
+            else {
+                return Err("undecodable regenesis_commit payload".into());
+            };
+            // The payload's terminal height binds to the actual block
+            // height — deterministic, both origins (no in-apply height
+            // read anywhere).
+            if commit.seal_height != block.data.height {
+                return Err(format!(
+                    "regenesis commit seal_height {} != block height {}",
+                    commit.seal_height, block.data.height
+                ));
+            }
+            if origin == ValidationOrigin::Live {
+                // Vote-iff-match (Rule-8, RFC-013 precedent): recompute
+                // the canonical snapshot over OWN state at this height and
+                // vote only on a hash match. A quorum deciding despite our
+                // mismatch means our replica is the anomaly (divergence
+                // surfacing, not being caused). Never at Sync — decided is
+                // decided, and the certificate carries the quorum's word.
+                let started = std::time::Instant::now();
+                let report = crate::db::snapshot::compute_node_state_tx(db_tx)
+                    .map_err(|e| format!("vote-iff-match snapshot: {e:?}"))?;
+                tracing::info!(
+                    height = height.0,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "vote-iff-match: snapshot recomputed inside the round (OQ1 timing)"
+                );
+                if report.manifest.top_hash.as_bytes() != commit.snapshot_hash.as_slice() {
+                    return Err(format!(
+                        "vote-iff-match: local snapshot {} != proposed {}",
+                        report.manifest.top_hash.to_hex(),
+                        hopnet_common::Blake3Hash::from_bytes(commit.snapshot_hash).to_hex()
+                    ));
+                }
+                // Own-drain check: refuse to seal past work this node has
+                // accepted but not yet seen decided (one dissenting vote,
+                // not a veto — protects the drain promise).
+                let pool = self.app_state.consensus_queue.pending_pool();
+                if pool.staged_len() > 0 || pool.inflight_len() > 0 {
+                    return Err(format!(
+                        "own pool not drained (staged {}, inflight {}): refusing to seal",
+                        pool.staged_len(),
+                        pool.inflight_len()
+                    ));
+                }
+            }
+        }
 
         // Parent linkage: must extend the last decided block exactly.
         let last: Option<Vec<u8>> = db_tx
@@ -271,15 +337,17 @@ impl<C: DerefMut<Target = Connection> + 'static> Application<SqliteStorage<C>>
 // Value builder (proposer path)
 
 /// Result of building a proposal value.
-/// Solo-block selection (proposer side): if any membership transition is
-/// among the candidates, keep the FIRST one alone; every other candidate
-/// (membership or not) is deferred to a later height — restaged, not
-/// rejected (RFC-CONSENSUS-002: joint constraints are invisible to per-tx
-/// validation, so the block shape carries them).
+/// Solo-block selection (proposer side): if any solo-riding transaction
+/// (membership transition, regenesis commit) is among the candidates,
+/// keep the FIRST one alone; every other candidate is deferred to a
+/// later height — restaged, not rejected (RFC-CONSENSUS-002: joint
+/// constraints are invisible to per-tx validation, so the block shape
+/// carries them; RFC-019 S5: the final block's certificate IS the
+/// snapshot certificate).
 pub fn solo_block_deferrals(functions: &[&str]) -> Vec<usize> {
     match functions
         .iter()
-        .position(|f| crate::consensus::handlers::is_membership_tx(f))
+        .position(|f| crate::consensus::handlers::requires_solo_block(f))
     {
         Some(keep) => (0..functions.len()).filter(|&i| i != keep).collect(),
         None => Vec::new(),
@@ -287,20 +355,20 @@ pub fn solo_block_deferrals(functions: &[&str]) -> Vec<usize> {
 }
 
 /// Solo-block shape check (validation side): structural and deterministic —
-/// BOTH origins. A proposer that packs a membership transition with anything
-/// else (or two of them) is rejected outright.
+/// BOTH origins. A proposer that packs a solo-riding transaction with
+/// anything else (or two of them) is rejected outright.
 pub fn check_solo_membership<'a>(
     functions: impl Iterator<Item = &'a str>,
     total: usize,
 ) -> Result<(), String> {
     let n = functions
-        .filter(|f| crate::consensus::handlers::is_membership_tx(f))
+        .filter(|f| crate::consensus::handlers::requires_solo_block(f))
         .count();
     if n > 1 {
-        return Err("more than one membership transition in block".into());
+        return Err("more than one solo-riding transaction in block".into());
     }
     if n == 1 && total > 1 {
-        return Err("membership transition must ride alone".into());
+        return Err("solo-riding transaction must ride alone".into());
     }
     Ok(())
 }
