@@ -33,9 +33,25 @@ fn splitmix(state: &mut u64) -> u64 {
 // denies liveness to any consensus protocol (the safety sweep's
 // regime).
 #[test]
-fn drain_reaches_quiescence_under_faults() {
+fn drain_reaches_quiescence_under_faults_a() {
+    drain_sweep(0..4);
+}
+#[test]
+fn drain_reaches_quiescence_under_faults_b() {
+    drain_sweep(4..8);
+}
+#[test]
+fn drain_reaches_quiescence_under_faults_c() {
+    drain_sweep(8..12);
+}
+#[test]
+fn drain_reaches_quiescence_under_faults_d() {
+    drain_sweep(12..16);
+}
+
+fn drain_sweep(seeds: std::ops::Range<u64>) {
     const CAP: u64 = 400_000;
-    for seed in 0..16u64 {
+    for seed in seeds {
         let n = 3 + (seed % 3) as i32; // 3..=5
         let mut fr = seed ^ 0xFA17_5EED;
         let faults = FaultConfig {
@@ -91,9 +107,25 @@ fn drain_reaches_quiescence_under_faults() {
 // Impact: seal contract items 1–2 at the engine layer, fuzzed: crashes,
 // partitions, and replays cannot push a sealed mesh past H.
 #[test]
-fn seal_is_terminal_under_faults() {
+fn seal_is_terminal_under_faults_a() {
+    terminal_sweep(0..3);
+}
+#[test]
+fn seal_is_terminal_under_faults_b() {
+    terminal_sweep(3..6);
+}
+#[test]
+fn seal_is_terminal_under_faults_c() {
+    terminal_sweep(6..9);
+}
+#[test]
+fn seal_is_terminal_under_faults_d() {
+    terminal_sweep(9..12);
+}
+
+fn terminal_sweep(seeds: std::ops::Range<u64>) {
     const TERMINAL: u64 = 4;
-    for seed in 0..12u64 {
+    for seed in seeds {
         let faults = FaultConfig::from_seed(seed, 3);
         let mut sim = Sim::with_faults_on_demand(3, QuorumProfile::Auto, faults);
         sim.start().unwrap();
