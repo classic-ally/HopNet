@@ -5,9 +5,9 @@
 //! POST /photo-ingress/disable  — unregister agent, clear keychain, revoke device
 //! GET  /photo-ingress/status   — assemble provisioning + registration state
 //!
-//! Enable orders keychain-before-register so credentials and blob_root are
-//! in place before launchd first spawns the daemon. Disable is best-effort
-//! per step (a half-disabled state can simply be disabled again).
+//! The orchestration (and its ordering invariants) lives in `flow`, tested
+//! on every platform; this module is the axum glue plus [`LiveDeps`], the
+//! real SMAppService / keychain / consensus implementation.
 
 use std::str::FromStr;
 
@@ -18,9 +18,8 @@ use axum::{
     middleware,
     routing::{get, post},
 };
-use tracing::warn;
 
-use super::helpers::{build_status, device_id_from_token, validate_blob_root};
+use super::flow::{self, Failure, ProvisioningDeps};
 use super::service;
 use super::{AgentRegistration, DisableRequest, DisableResponse, EnableRequest, PhotoIngressStatus};
 use crate::db::CustomUUID;
@@ -35,63 +34,83 @@ pub fn router(app_state: AppState) -> Router<AppState> {
         .layer(middleware::from_fn_with_state(app_state, auth_middleware))
 }
 
-type Failure = (StatusCode, String);
+struct LiveDeps {
+    app_state: AppState,
+}
 
-/// Every route is owner-only: provisioning writes THIS Mac's keychain and
-/// login items — meaningless (and confusing) for any other user of the node.
-fn ensure_owner(app_state: &AppState, user_id: i32) -> Result<(), Failure> {
-    match app_state.get_user_id() {
-        Ok(owner) if owner == user_id => Ok(()),
-        _ => Err((
-            StatusCode::FORBIDDEN,
-            "photo ingress provisioning is owner-only".into(),
-        )),
+impl ProvisioningDeps for LiveDeps {
+    fn owner_user_id(&self) -> Option<i32> {
+        self.app_state.get_user_id().ok()
     }
-}
 
-fn internal(msg: impl std::fmt::Display) -> Failure {
-    (StatusCode::INTERNAL_SERVER_ERROR, msg.to_string())
-}
+    async fn ensure_device_token(&self, user_id: i32) -> Result<(), StatusCode> {
+        crate::devices::routes::ensure_photo_ingress_device_token(&self.app_state, user_id).await
+    }
 
-/// SMAppService calls are XPC-backed and may block.
-async fn blocking_service<T: Send + 'static>(
-    f: impl FnOnce() -> T + Send + 'static,
-) -> Result<T, Failure> {
-    tokio::task::spawn_blocking(f).await.map_err(internal)
-}
+    async fn revoke_device(&self, user_id: i32, device_id: CustomUUID) -> Result<(), StatusCode> {
+        crate::devices::routes::revoke_device_internal(&self.app_state, user_id, device_id).await
+    }
 
-fn device_row_present(app_state: &AppState, device_id: Option<&str>) -> bool {
-    let Some(id) = device_id.and_then(|s| CustomUUID::from_str(s).ok()) else {
-        return false;
-    };
-    let Ok(db_lock) = app_state.db_pool.get() else {
-        return false;
-    };
-    matches!(
-        crate::db::devices::get_device_by_id(&db_lock, &id),
-        Ok(Some(_))
-    )
-}
+    fn device_row_present(&self, device_id: Option<&str>) -> bool {
+        let Some(id) = device_id.and_then(|s| CustomUUID::from_str(s).ok()) else {
+            return false;
+        };
+        let Ok(db_lock) = self.app_state.db_pool.get() else {
+            return false;
+        };
+        matches!(
+            crate::db::devices::get_device_by_id(&db_lock, &id),
+            Ok(Some(_))
+        )
+    }
 
-fn current_status(app_state: &AppState, registration: AgentRegistration) -> PhotoIngressStatus {
-    let keychain_pair = keychain::load_photo_ingress_config().ok();
-    let blob_root = keychain::load_photo_ingress_blob_root().ok();
-    let present = device_row_present(
-        app_state,
-        keychain_pair
-            .as_ref()
-            .and_then(|(api_key, _)| device_id_from_token(api_key)),
-    );
-    build_status(registration, keychain_pair, blob_root, present)
+    // SMAppService calls are XPC-backed and may block — off the async
+    // threads with them.
+    async fn agent_status(&self) -> Result<AgentRegistration, String> {
+        tokio::task::spawn_blocking(service::agent_status)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn register_agent(&self) -> Result<AgentRegistration, String> {
+        tokio::task::spawn_blocking(service::register_agent)
+            .await
+            .map_err(|e| e.to_string())?
+    }
+
+    async fn unregister_agent(&self) -> Result<(), String> {
+        tokio::task::spawn_blocking(service::unregister_agent)
+            .await
+            .map_err(|e| e.to_string())?
+    }
+
+    fn load_config(&self) -> Option<(String, String)> {
+        keychain::load_photo_ingress_config().ok()
+    }
+
+    fn load_blob_root(&self) -> Option<String> {
+        keychain::load_photo_ingress_blob_root().ok()
+    }
+
+    fn store_provisioning(
+        &self,
+        blob_root: &str,
+        sidecar_root_remote: Option<&str>,
+    ) -> Result<(), String> {
+        keychain::store_photo_ingress_provisioning(blob_root, sidecar_root_remote)
+            .map_err(|e| e.to_string())
+    }
+
+    fn remove_config(&self) {
+        keychain::remove_photo_ingress_config();
+    }
 }
 
 async fn get_status(
     State(app_state): State<AppState>,
     Extension(user_id): Extension<i32>,
 ) -> Result<Json<PhotoIngressStatus>, Failure> {
-    ensure_owner(&app_state, user_id)?;
-    let registration = blocking_service(service::agent_status).await?;
-    Ok(Json(current_status(&app_state, registration)))
+    flow::status(&LiveDeps { app_state }, user_id).await.map(Json)
 }
 
 async fn post_enable(
@@ -99,24 +118,9 @@ async fn post_enable(
     Extension(user_id): Extension<i32>,
     Json(req): Json<EnableRequest>,
 ) -> Result<Json<PhotoIngressStatus>, Failure> {
-    ensure_owner(&app_state, user_id)?;
-    validate_blob_root(&req.blob_root).map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
-
-    // 1. Token (mint, or heal a revoked one; no-op while valid).
-    crate::devices::routes::ensure_photo_ingress_device_token(&app_state, user_id)
+    flow::enable(&LiveDeps { app_state }, user_id, req)
         .await
-        .map_err(|status| (status, "device token provisioning failed".into()))?;
-    // 2. Library provisioning — in the keychain BEFORE launchd can spawn
-    //    the daemon, so its startup auto-bind sees it.
-    keychain::store_photo_ingress_provisioning(&req.blob_root, req.sidecar_root_remote.as_deref())
-        .map_err(internal)?;
-    // 3. Lifecycle handoff to launchd. RequiresApproval is a success —
-    //    surfaced in the status for the caller to act on.
-    let registration = blocking_service(service::register_agent)
-        .await?
-        .map_err(internal)?;
-
-    Ok(Json(current_status(&app_state, registration)))
+        .map(Json)
 }
 
 async fn post_disable(
@@ -124,32 +128,8 @@ async fn post_disable(
     Extension(user_id): Extension<i32>,
     body: Option<Json<DisableRequest>>,
 ) -> Result<Json<DisableResponse>, Failure> {
-    ensure_owner(&app_state, user_id)?;
     let req = body.map(|Json(r)| r).unwrap_or_default();
-
-    // Capture the device id BEFORE the keychain wipe destroys the token.
-    let device_id = keychain::load_photo_ingress_config()
-        .ok()
-        .and_then(|(api_key, _)| device_id_from_token(&api_key).map(str::to_string));
-
-    if let Err(e) = blocking_service(service::unregister_agent).await? {
-        warn!("photo-ingress disable: unregister failed (continuing): {e}");
-    }
-    keychain::remove_photo_ingress_config();
-
-    let mut device_revoked = false;
-    if req.revoke_device.unwrap_or(true)
-        && let Some(id) = device_id.as_deref().and_then(|s| CustomUUID::from_str(s).ok())
-    {
-        match crate::devices::routes::revoke_device_internal(&app_state, user_id, id).await {
-            Ok(()) => device_revoked = true,
-            Err(e) => warn!("photo-ingress disable: device revoke failed: {e:?}"),
-        }
-    }
-
-    let registration = blocking_service(service::agent_status).await?;
-    Ok(Json(DisableResponse {
-        device_revoked,
-        status: current_status(&app_state, registration),
-    }))
+    flow::disable(&LiveDeps { app_state }, user_id, req)
+        .await
+        .map(Json)
 }

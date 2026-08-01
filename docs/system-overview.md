@@ -173,7 +173,11 @@ apply functions inside consensus handlers.
       bundled daemon to its containing bundle; hardened runtime denies
       without prompt otherwise), and a GUI auto-login startup panic
       (tokio `blocking_write` inside the runtime) that killed the HTTP
-      server on every release launch with a stored session key.
+      server on every release launch with a stored session key. The route
+      orchestration has since been extracted into `photo_ingress::flow`
+      behind a `ProvisioningDeps` seam, so its ordering/owner invariants
+      (creds-before-register, capture-before-wipe, owner-only 403) are
+      pinned by mock tests in Linux CI.
 - [x] hopnet-drive + hopnet-projection + hopnet-takeout extraction
       ([RFC-015](specs/hopnet-drive.md)) COMPLETE (stages D0–D5,
       2026-07-08): narrowed handler seam, per-projection schema units,
