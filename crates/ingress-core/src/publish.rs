@@ -1,9 +1,9 @@
-//! The HopNet publish queue: pushes completed photos into a HopNet node.
+//! The HopNet publish queue: pushes completed photos into a HopNet node,
+//! then evicts their spool bytes once the publish is consensus-decided.
 //!
-//! Mirrors the sidecar-replication tick's shape (claim a batch, act, stamp)
-//! with one structural difference: publishing streams multi-GB originals
-//! over HTTP, so the daemon runs the pass in ONE spawned background task
-//! instead of inline, keeping the event loop responsive.
+//! Claim a batch, act, stamp — run in ONE spawned background task instead
+//! of inline, because publishing streams multi-GB originals over HTTP and
+//! the event loop must stay responsive.
 //!
 //! ## Lazy coupling
 //!
@@ -21,15 +21,17 @@
 //!   transaction (future phase). Deliberately NO `published_at = NULL` reset
 //!   on `mark_resource_written`.
 //! - Tombstone propagation, favorites, and shared libraries are out of scope.
-//! - `published_at` doubles as the GC predicate for a future buffer-mode
-//!   retention phase; blobs and sidecars are untouched here.
+//! - `published_at` is the eviction predicate: each pass ends by stamping
+//!   `evicted_at` on blobs whose every referencing photo is decided and
+//!   unlinking their spool files (hash-liveness gated; see `cleanup.rs`).
 //!
 //! ## Metadata source
 //!
-//! The sidecar JSON is the publish metadata source: it exists exactly when a
-//! photo is publishable (written at photo-complete), reflects committed state
-//! only, and persisting descriptor fields into state.db would duplicate it
-//! into a second source of truth.
+//! The descriptor capsule (`photos.descriptor_json`) plus the live DB rows:
+//! `Sidecar::compose` builds the publish document per pass, so it always
+//! reflects committed state with no stored copy to drift. A NULL capsule
+//! (pre-column photo awaiting scan backfill) skips without burning an
+//! attempt.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
