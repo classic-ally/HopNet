@@ -63,8 +63,14 @@ an audit found a view-change safety hole. See RFC-013 for the full design
       running/staged attestation columns via the node_staged_version
       tx) + v1 git-release upgrade provider (reports
       available-but-unstaged from the Forgejo releases API) +
-      /api/views/upgrade-readiness advisory. Next: S4 qnt
-      epoch-transition extension + seal contract.
+      /api/views/upgrade-readiness advisory; S4 epoch-boundary model
+      (`epoch_policy` in validator_membership.qnt: the restart lands
+      inside the membership machine's inductive invariant, so the
+      whole safety matrix transfers across the boundary depth-free;
+      seal safety via inductively-checked ghost) + the seal contract
+      note (hopnet-consensus/spec/regenesis-seal-contract.md). Next:
+      S5 boundary protocol (regenesis_start/commit/abort, drain,
+      vote-iff-match, seal).
 
 ### 2. Storage Substrate ([RFC-014](specs/hopnet-storage.md)) + File Storage ([RFC-002](specs/file-storage.md))
 **Status**: Substrate extraction COMPLETE (stages A–F, 2026-07-07) — the `hopnet-storage`

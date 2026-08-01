@@ -526,7 +526,7 @@ protocol it checks.
     self-cleans. The v1 provider reports available-but-unstaged only,
     so attestations are running-only until a staging-capable provider
     exists; the propose-time precondition remains S5's
-- [ ] S4 — qnt: epoch-transition extension of
+- [x] S4 — qnt: epoch-transition extension of
       `validator_membership.qnt` + the SEAL CONTRACT
   - invariants verified BEFORE the protocol is coded: seal safety
     (nothing decides past the boundary in epoch N), abort enabled
@@ -536,6 +536,23 @@ protocol it checks.
   - the engine's seal contract lands here as a short
     `hopnet-consensus/spec/` note in engine vocabulary (terminal
     height, restart from H+1), prose deferring to the model
+  - landed as `epoch_policy`: a phase machine (normal / moratorium /
+    sealed / restart) over a `membership_policy` instance. The load-
+    bearing move is the bridge: restart carries committed state
+    (seated set, activation-height proven-ness) verbatim and wipes
+    in-memory evidence, and that state satisfies the membership
+    machine's existing inductive invariant — so the whole safety
+    matrix (no-harm, ceiling, floor, no-exile) transfers across the
+    boundary depth-free (Apalache, `epochIndInv`), including the
+    dark-seat property; the quiet period falls out structurally
+    (vote-out/seating windows re-accrue from zero). Seal safety is
+    the `decidedPastSeal` ghost, checked inductively. Modeling notes:
+    no epoch counter (properties are per-crossing); the staged pool
+    is abstract and admission closes structurally at start, so drain
+    termination is a bounded witness rather than a temporal proof;
+    membership commits during the moratorium consume the pool (staged
+    vote-outs legitimately decide in the drain). Seal contract:
+    `hopnet-consensus/spec/regenesis-seal-contract.md`
 - [ ] S5 — boundary protocol: `regenesis_start`/`commit`/`abort`,
       admission gate, drain, vote-iff-match, seal
   - deterministic-sim + fault-fuzzing coverage
