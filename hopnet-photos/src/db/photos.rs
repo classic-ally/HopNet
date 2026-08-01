@@ -870,7 +870,7 @@ pub struct ChangeRow {
     pub enc_meta_key: Option<Vec<u8>>,
 }
 
-fn map_change_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChangeRow> {
+pub(crate) fn map_change_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChangeRow> {
     let nonce_blob: Option<Vec<u8>> = row.get(6)?;
     let eph_blob: Option<Vec<u8>> = row.get(9)?;
     Ok(ChangeRow {

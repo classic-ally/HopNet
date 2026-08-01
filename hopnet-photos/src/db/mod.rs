@@ -33,6 +33,7 @@ pub const TABLES: &[&str] = &[
     "photo_ingress_responsibility",
 ];
 
+pub mod libraries;
 pub mod photos;
 
 /// Edit-history retention window (days). Operation-log rows older than
