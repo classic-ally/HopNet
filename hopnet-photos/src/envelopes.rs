@@ -237,6 +237,128 @@ pub struct PhotoCleanupExpiredPayload {
     pub scan_cutoff: String,
 }
 
+// --- shared-library membership lifecycle ---
+
+/// One user's X25519 ECDH wrap of a library key (LIBRARY_KEY_WRAP_DOMAIN,
+/// wrap id = library id bytes). Rides create (creator) and invite
+/// (invitee) payloads; lands in `shared_library_keys` /
+/// `shared_library_invites`.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct LibraryKeyWrap {
+    pub user_id: i32,
+    /// Fresh per-wrap ephemeral X25519 pubkey (32 bytes).
+    pub ephemeral_pubkey: [u8; 32],
+    /// ChaCha20-Poly1305(wrap_key, nonce, library_key) — 48 bytes.
+    pub wrapped_key: Vec<u8>,
+}
+
+/// Mint a shared library: row + creator membership + creator's key wrap.
+/// The library key is client-minted; the name is encrypted under it so
+/// every current and future member can render it (via their own wrap).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CreateSharedLibraryPayload {
+    /// Client-minted UUIDv7.
+    pub library_id: CustomUUID,
+    /// ChaCha20-Poly1305(library_key, name_nonce, name).
+    pub encrypted_name: Vec<u8>,
+    pub name_nonce: [u8; 12],
+    /// Creator's wrap — `user_id` must equal the submitting user.
+    pub creator_key: LibraryKeyWrap,
+    /// UUIDv7, audit/ordering.
+    pub operation_id: CustomUUID,
+}
+
+/// Invite a mesh user into a library (consent pattern: membership only
+/// materializes at the invitee's accept). Carries the invitee's library-
+/// key wrap, minted AT invite time by the inviter, so accept needs no
+/// inviter online and the library name renders in the invite listing.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct LibraryInvitePayload {
+    pub library_id: CustomUUID,
+    /// The invitee's wrap — `user_id` is the invited user.
+    pub invitee: LibraryKeyWrap,
+    pub operation_id: CustomUUID,
+}
+
+/// Invitee-signed consent: insert membership, promote the invite-row key
+/// wrap into `shared_library_keys`, delete the invite, and signal the
+/// invitee's view change (the sidecar backfills the library client-side —
+/// no photo_changes writes; the photos did not change).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct LibraryInviteAcceptPayload {
+    pub library_id: CustomUUID,
+    pub operation_id: CustomUUID,
+}
+
+/// Withdraw a pending invite. Submitter may be the invitee (refusal) or
+/// any library member (retraction) — the drive decline pattern
+/// generalized to equal-standing membership.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct LibraryInviteDeclinePayload {
+    pub library_id: CustomUUID,
+    pub invitee_user_id: i32,
+    pub operation_id: CustomUUID,
+}
+
+/// Remove a member or pending invitee. Self-removal is leave; removing
+/// another is kick (all members have equal standing — RFC-011). Deletes
+/// membership + key wrap + pending invite + the target's view-signal
+/// row; the convergence worker lazily revokes the target's access rows
+/// afterwards (row-deletion revocation; key rotation is a future lane).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct LibraryRemoveMemberPayload {
+    pub library_id: CustomUUID,
+    pub user_id: i32,
+    pub operation_id: CustomUUID,
+}
+
+/// One photo's metadata-key wrap for a grant target.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct LibraryMetadataGrant {
+    pub photo_id: CustomUUID,
+    pub ephemeral_pubkey: [u8; 32],
+    /// ChaCha20-Poly1305 wrap of the per-photo metadata key — 48 bytes.
+    pub encrypted_metadata_key: Vec<u8>,
+}
+
+/// One data block's blob-key wrap for a grant target. Deliberately NO
+/// recipient pubkey on the wire: the handler resolves the target user's
+/// `users.x25519_pubkey` itself, so a malicious grantor cannot plant
+/// wraps for arbitrary keys.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct LibraryBlobGrant {
+    pub data_block_id: CustomUUID,
+    pub ephemeral_pubkey: [u8; 32],
+    /// ChaCha20-Poly1305 wrap of the per-blob file key — 48 bytes.
+    pub wrapped_key: Vec<u8>,
+}
+
+/// Convergence-worker grant batch: access rows for ONE target user
+/// (member or pending invitee) of ONE library. Inserts are OR IGNORE —
+/// first committed wrap wins, so racing workers are harmless. Ends by
+/// signalling the target's view change.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct LibraryAccessGrantPayload {
+    pub library_id: CustomUUID,
+    pub user_id: i32,
+    pub entries: Vec<LibraryMetadataGrant>,
+    pub blob_wraps: Vec<LibraryBlobGrant>,
+    pub operation_id: CustomUUID,
+}
+
+/// Convergence-worker revoke batch: delete access rows of a user who is
+/// neither member nor invitee (the handler enforces that inversion — a
+/// live member cannot be stealth-revoked; kicks go through
+/// `library_remove_member`).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct LibraryAccessRevokePayload {
+    pub library_id: CustomUUID,
+    pub user_id: i32,
+    pub photo_ids: Vec<CustomUUID>,
+    pub data_block_ids: Vec<CustomUUID>,
+    pub operation_id: CustomUUID,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,6 +614,123 @@ mod tests {
         let encoded =
             bincode::serde::encode_to_vec(&payload, bincode::config::standard()).unwrap();
         assert_eq!(encoded, expected, "PhotoIngressClaimPayload wire format changed");
+    }
+
+    // Should: encode LibraryKeyWrap as signed-varint user_id, raw 32-byte
+    // ephemeral pubkey (no length prefix), then length-prefixed wrapped key.
+    // Impact: this struct nests inside create and invite payloads — a
+    // positional shift here corrupts both wire formats at once.
+    #[test]
+    fn library_key_wrap_golden_bytes() {
+        let wrap = LibraryKeyWrap {
+            user_id: 1,
+            ephemeral_pubkey: [0xAB; 32],
+            wrapped_key: vec![0xCC; 48],
+        };
+        let encoded = bincode::serde::encode_to_vec(&wrap, bincode::config::standard()).unwrap();
+        let mut expected = vec![0x02u8]; // user_id = 1 (signed varint zigzag)
+        expected.extend_from_slice(&[0xAB; 32]); // ephemeral_pubkey — no length prefix
+        expected.push(0x30); // vec len 48 (varint)
+        expected.extend_from_slice(&[0xCC; 48]);
+        assert_eq!(encoded, expected, "LibraryKeyWrap wire format changed");
+    }
+
+    // Should: encode CreateSharedLibraryPayload as library_id UUID,
+    // length-prefixed name ciphertext, raw 12-byte nonce, nested
+    // LibraryKeyWrap, then operation_id UUID — in that order.
+    #[test]
+    fn create_shared_library_payload_golden_bytes() {
+        let payload = CreateSharedLibraryPayload {
+            library_id: "00000000-0000-0000-0000-0000000000c1".parse().unwrap(),
+            encrypted_name: vec![0xEE; 4],
+            name_nonce: [0xA1; 12],
+            creator_key: LibraryKeyWrap {
+                user_id: 1,
+                ephemeral_pubkey: [0xAB; 32],
+                wrapped_key: vec![0xCC; 48],
+            },
+            operation_id: "00000000-0000-0000-0000-0000000000c2".parse().unwrap(),
+        };
+        let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard()).unwrap();
+        let mut expected = vec![0x10u8]; // varint(16) — library_id
+        expected.extend_from_slice(&[0u8; 15]);
+        expected.push(0xc1);
+        expected.push(0x04); // encrypted_name len 4
+        expected.extend_from_slice(&[0xEE; 4]);
+        expected.extend_from_slice(&[0xA1; 12]); // name_nonce — no length prefix
+        expected.push(0x02); // creator_key.user_id = 1
+        expected.extend_from_slice(&[0xAB; 32]);
+        expected.push(0x30); // wrapped_key len 48
+        expected.extend_from_slice(&[0xCC; 48]);
+        expected.push(0x10); // varint(16) — operation_id
+        expected.extend_from_slice(&[0u8; 15]);
+        expected.push(0xc2);
+        assert_eq!(encoded, expected, "CreateSharedLibraryPayload wire format changed");
+    }
+
+    // Should: round-trip every membership-lifecycle payload byte-identically.
+    #[test]
+    fn library_lifecycle_payloads_bincode_round_trip() {
+        fn round_trip<T>(payload: &T)
+        where
+            T: Serialize + for<'de> Deserialize<'de>,
+        {
+            let encoded =
+                bincode::serde::encode_to_vec(payload, bincode::config::standard()).unwrap();
+            let (decoded, _): (T, _) =
+                bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+            let encoded2 =
+                bincode::serde::encode_to_vec(&decoded, bincode::config::standard()).unwrap();
+            assert_eq!(encoded, encoded2, "bincode round-trip must be byte-identical");
+        }
+
+        let lib: CustomUUID = "00000000-0000-0000-0000-0000000000d1".parse().unwrap();
+        let op: CustomUUID = "00000000-0000-0000-0000-0000000000d2".parse().unwrap();
+        round_trip(&LibraryInvitePayload {
+            library_id: lib.clone(),
+            invitee: LibraryKeyWrap {
+                user_id: 2,
+                ephemeral_pubkey: [0x11; 32],
+                wrapped_key: vec![0x22; 48],
+            },
+            operation_id: op.clone(),
+        });
+        round_trip(&LibraryInviteAcceptPayload {
+            library_id: lib.clone(),
+            operation_id: op.clone(),
+        });
+        round_trip(&LibraryInviteDeclinePayload {
+            library_id: lib.clone(),
+            invitee_user_id: 2,
+            operation_id: op.clone(),
+        });
+        round_trip(&LibraryRemoveMemberPayload {
+            library_id: lib.clone(),
+            user_id: 2,
+            operation_id: op.clone(),
+        });
+        round_trip(&LibraryAccessGrantPayload {
+            library_id: lib.clone(),
+            user_id: 2,
+            entries: vec![LibraryMetadataGrant {
+                photo_id: "00000000-0000-0000-0000-0000000000d3".parse().unwrap(),
+                ephemeral_pubkey: [0x33; 32],
+                encrypted_metadata_key: vec![0x44; 48],
+            }],
+            blob_wraps: vec![LibraryBlobGrant {
+                data_block_id: "00000000-0000-0000-0000-0000000000d4".parse().unwrap(),
+                ephemeral_pubkey: [0x55; 32],
+                wrapped_key: vec![0x66; 48],
+            }],
+            operation_id: op.clone(),
+        });
+        round_trip(&LibraryAccessRevokePayload {
+            library_id: lib,
+            user_id: 2,
+            photo_ids: vec!["00000000-0000-0000-0000-0000000000d5".parse().unwrap()],
+            data_block_ids: vec!["00000000-0000-0000-0000-0000000000d6".parse().unwrap()],
+            operation_id: op,
+        });
     }
 
     /// Golden round-trip for photo_edit_metadata (batch of one).
