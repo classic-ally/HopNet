@@ -5,17 +5,39 @@
 //! nothing was dropped at link time. DB mutations run in BOTH validate and
 //! execute passes; side effects (notifier, work) fire only under execute.
 
+use crate::db::libraries;
 use crate::db::photos::{
     delete_favorite, device_belongs_to_user, edit_photo_content, edit_photo_metadata,
-    hard_delete_expired_photo, insert_favorite, insert_photo_entry, lookup_photo_owner,
+    hard_delete_expired_photo, insert_favorite, insert_photo_entry, lookup_photo_authz,
     restore_photo, soft_delete_photo, undo_content_edit, upsert_ingress_responsibility,
 };
 use crate::envelopes::{
-    PhotoAddPayload, PhotoCleanupExpiredPayload, PhotoDeletePayload, PhotoEditContentPayload,
-    PhotoEditMetadataPayload, PhotoFavoritePayload, PhotoIngressClaimPayload, PhotoRestorePayload,
-    PhotoUndoPayload, PhotoUnfavoritePayload,
+    CreateSharedLibraryPayload, LibraryAccessGrantPayload, LibraryAccessRevokePayload,
+    LibraryInviteAcceptPayload, LibraryInviteDeclinePayload, LibraryInvitePayload,
+    LibraryRemoveMemberPayload, PhotoAddPayload, PhotoCleanupExpiredPayload, PhotoDeletePayload,
+    PhotoEditContentPayload, PhotoEditMetadataPayload, PhotoFavoritePayload,
+    PhotoIngressClaimPayload, PhotoRestorePayload, PhotoUndoPayload, PhotoUnfavoritePayload,
 };
+use hopnet_common::CustomUUID;
 use hopnet_projection::{DatabaseError, HandlerCtx, HandlerResult, TransactionHandler, TxMeta};
+
+/// Write authorization for an existing photo: the uploader always may;
+/// for shared photos any library member may (RFC-011 equal standing).
+/// Deterministic — membership is consensus state.
+fn photo_write_allowed(
+    db_tx: &rusqlite::Transaction,
+    user_id: i32,
+    uploaded_by: i32,
+    library_id: Option<&CustomUUID>,
+) -> Result<bool, DatabaseError> {
+    if uploaded_by == user_id {
+        return Ok(true);
+    }
+    match library_id {
+        Some(lib) => libraries::is_member(db_tx, lib, user_id),
+        None => Ok(false),
+    }
+}
 
 /// Every consensus function this projection registers — the host boot
 /// tripwire asserts these are present in its dispatch table (guards
@@ -31,6 +53,13 @@ pub const TX_FUNCTIONS: &[&str] = &[
     "photo_favorite",
     "photo_unfavorite",
     "photo_ingress_claim",
+    "create_shared_library",
+    "library_invite",
+    "library_invite_accept",
+    "library_invite_decline",
+    "library_remove_member",
+    "library_access_grant",
+    "library_access_revoke",
 ];
 
 /// Subset of [`TX_FUNCTIONS`] that users may submit directly (excludes
@@ -45,6 +74,13 @@ pub const USER_TX_FUNCTIONS: &[&str] = &[
     "photo_favorite",
     "photo_unfavorite",
     "photo_ingress_claim",
+    "create_shared_library",
+    "library_invite",
+    "library_invite_accept",
+    "library_invite_decline",
+    "library_remove_member",
+    "library_access_grant",
+    "library_access_revoke",
 ];
 
 const _USER_TX_COUNT: () = assert!(
@@ -69,8 +105,8 @@ pub const DEVICE_TX_FUNCTIONS: &[&str] = &[
 ];
 
 const _DEVICE_TX_COUNT: () = assert!(
-    DEVICE_TX_FUNCTIONS.len() + 1 == USER_TX_FUNCTIONS.len(),
-    "DEVICE_TX_FUNCTIONS out of sync with USER_TX_FUNCTIONS — decide whether the new user tx is device-submittable"
+    DEVICE_TX_FUNCTIONS.len() + 8 == USER_TX_FUNCTIONS.len(),
+    "DEVICE_TX_FUNCTIONS out of sync with USER_TX_FUNCTIONS — decide whether the new user tx is device-submittable. JWT-only today: photo_ingress_claim + the 7 shared-library membership txs (a daemon must never mint, invite into, or grant access on a library)"
 );
 
 // --- photo_add ---
@@ -109,15 +145,16 @@ impl TransactionHandler for PhotoAddHandler {
                 );
                 return Err(DatabaseError::AuthorizationError);
             }
-            // Phase 3: when create_shared_library lands, replace this
-            // guard with a shared_library_members membership check.
-            // Without it, any user could add into any library.
-            if entry.library_id.is_some() {
-                tracing::warn!(
-                    "photo_add: shared libraries not yet supported (library_id={})",
-                    entry.library_id.as_ref().unwrap(),
-                );
-                return Err(DatabaseError::InvalidPayload);
+            // Shared-library adds require membership — deterministic
+            // against consensus state; the device route cannot check this
+            // (the payload is opaque bincode at the route layer).
+            if let Some(lib) = &entry.library_id {
+                if !libraries::is_member(db_tx, lib, user_id)? {
+                    tracing::warn!(
+                        "photo_add: user {user_id} is not a member of library {lib}",
+                    );
+                    return Err(DatabaseError::AuthorizationError);
+                }
             }
             insert_photo_entry(db_tx, entry, ctx.fragments_dir)?;
         }
@@ -174,9 +211,9 @@ impl TransactionHandler for PhotoDeleteHandler {
                 }
             };
 
-            // Authorization: the actor must be the uploader (personal
-            // library). Phase 3 extends this to shared_library_members.
-            if uploaded_by != user_id {
+            // Authorization: the uploader, or any member of the photo's
+            // shared library (equal standing — RFC-011).
+            if !photo_write_allowed(db_tx, user_id, uploaded_by, library_id.as_ref())? {
                 tracing::warn!(
                     "photo_delete: user {} not authorized for photo {} (owned by {})",
                     user_id,
@@ -265,7 +302,7 @@ impl TransactionHandler for PhotoRestoreHandler {
                 }
             };
 
-            if uploaded_by != user_id {
+            if !photo_write_allowed(db_tx, user_id, uploaded_by, library_id.as_ref())? {
                 tracing::warn!(
                     "photo_restore: user {} not authorized for photo {} (owned by {})",
                     user_id,
@@ -375,12 +412,12 @@ impl TransactionHandler for PhotoEditContentHandler {
             if entry.resources.is_empty() {
                 return Err(DatabaseError::InvalidPayload);
             }
-            let owner =
-                lookup_photo_owner(db_tx, &entry.photo_id)?.ok_or(DatabaseError::NotFound)?;
-            if owner.0 != user_id {
+            let (uploaded_by, deleted_at, library_id) =
+                lookup_photo_authz(db_tx, &entry.photo_id)?.ok_or(DatabaseError::NotFound)?;
+            if !photo_write_allowed(db_tx, user_id, uploaded_by, library_id.as_ref())? {
                 return Err(DatabaseError::AuthorizationError);
             }
-            if owner.1.is_some() {
+            if deleted_at.is_some() {
                 // Tombstoned — reject edits.
                 return Err(DatabaseError::ConflictError);
             }
@@ -416,12 +453,12 @@ impl TransactionHandler for PhotoEditMetadataHandler {
         let user_id = tx.user_id.ok_or(DatabaseError::AuthorizationError)?;
 
         for entry in &payload.entries {
-            let owner =
-                lookup_photo_owner(db_tx, &entry.photo_id)?.ok_or(DatabaseError::NotFound)?;
-            if owner.0 != user_id {
+            let (uploaded_by, deleted_at, library_id) =
+                lookup_photo_authz(db_tx, &entry.photo_id)?.ok_or(DatabaseError::NotFound)?;
+            if !photo_write_allowed(db_tx, user_id, uploaded_by, library_id.as_ref())? {
                 return Err(DatabaseError::AuthorizationError);
             }
-            if owner.1.is_some() {
+            if deleted_at.is_some() {
                 return Err(DatabaseError::ConflictError);
             }
             edit_photo_metadata(db_tx, entry, user_id)?;
@@ -456,12 +493,12 @@ impl TransactionHandler for PhotoUndoHandler {
         let user_id = tx.user_id.ok_or(DatabaseError::AuthorizationError)?;
 
         for entry in &payload.entries {
-            let owner =
-                lookup_photo_owner(db_tx, &entry.photo_id)?.ok_or(DatabaseError::NotFound)?;
-            if owner.0 != user_id {
+            let (uploaded_by, deleted_at, library_id) =
+                lookup_photo_authz(db_tx, &entry.photo_id)?.ok_or(DatabaseError::NotFound)?;
+            if !photo_write_allowed(db_tx, user_id, uploaded_by, library_id.as_ref())? {
                 return Err(DatabaseError::AuthorizationError);
             }
-            if owner.1.is_some() {
+            if deleted_at.is_some() {
                 return Err(DatabaseError::ConflictError);
             }
             undo_content_edit(
@@ -502,14 +539,21 @@ impl TransactionHandler for PhotoFavoriteHandler {
         let user_id = tx.user_id.ok_or(DatabaseError::AuthorizationError)?;
 
         for entry in &payload.entries {
-            let Some(owner) = lookup_photo_owner(db_tx, &entry.photo_id)? else {
+            let Some((uploaded_by, deleted_at, library_id)) =
+                lookup_photo_authz(db_tx, &entry.photo_id)?
+            else {
                 continue; // hard-deleted — idempotent skip
             };
-            if owner.1.is_some() {
+            if deleted_at.is_some() {
                 return Err(DatabaseError::ConflictError);
             }
-            // Any user can favorite any photo — no ownership check needed
-            // (photos.md:218 — favorites are per-user, user_id is the actor).
+            // Favorites are per-user state, but the photo must be YOURS to
+            // see: uploader or library member. (Previously unchecked — a
+            // non-member could favorite any guessed photo_id and mint an
+            // operation row against it.)
+            if !photo_write_allowed(db_tx, user_id, uploaded_by, library_id.as_ref())? {
+                return Err(DatabaseError::AuthorizationError);
+            }
             insert_favorite(db_tx, &entry.photo_id, user_id)?;
             crate::db::photos::upsert_photo_changes(db_tx, &entry.photo_id)?;
             crate::db::photos::insert_operation_row(
@@ -558,11 +602,16 @@ impl TransactionHandler for PhotoUnfavoriteHandler {
             // Skip missing or tombstoned photos. soft_delete_photo already
             // clears favorites, so the delete is a no-op, but rejecting
             // tombstoned avoids logging a spurious operation.
-            let Some(owner) = lookup_photo_owner(db_tx, &entry.photo_id)? else {
+            let Some((uploaded_by, deleted_at, library_id)) =
+                lookup_photo_authz(db_tx, &entry.photo_id)?
+            else {
                 continue;
             };
-            if owner.1.is_some() {
+            if deleted_at.is_some() {
                 continue;
+            }
+            if !photo_write_allowed(db_tx, user_id, uploaded_by, library_id.as_ref())? {
+                return Err(DatabaseError::AuthorizationError);
             }
             delete_favorite(db_tx, &entry.photo_id, user_id)?;
             crate::db::photos::upsert_photo_changes(db_tx, &entry.photo_id)?;
@@ -629,6 +678,350 @@ impl TransactionHandler for PhotoIngressClaimHandler {
 
 inventory::submit! { &PhotoIngressClaimHandler as &dyn TransactionHandler }
 
+// --- create_shared_library ---
+
+pub struct CreateSharedLibraryHandler;
+
+impl TransactionHandler for CreateSharedLibraryHandler {
+    fn name(&self) -> &'static str {
+        "create_shared_library"
+    }
+
+    fn process(
+        &self,
+        tx: &TxMeta<'_>,
+        _execute: bool,
+        _ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
+    ) -> HandlerResult {
+        let (payload, _) = bincode::serde::decode_from_slice::<CreateSharedLibraryPayload, _>(
+            tx.payload,
+            bincode::config::standard(),
+        )
+        .map_err(|_| DatabaseError::InvalidPayload)?;
+        let user_id = tx.user_id.ok_or(DatabaseError::AuthorizationError)?;
+
+        // The creator can only wrap the library key for themself here;
+        // everyone else arrives via invite.
+        if payload.creator_key.user_id != user_id {
+            tracing::warn!(
+                "create_shared_library: creator wrap targets user {} but submitter is {}",
+                payload.creator_key.user_id,
+                user_id,
+            );
+            return Err(DatabaseError::AuthorizationError);
+        }
+
+        libraries::insert_library(
+            db_tx,
+            &payload.library_id,
+            &payload.encrypted_name,
+            &payload.name_nonce,
+        )?;
+        libraries::insert_member(db_tx, &payload.library_id, user_id)?;
+        libraries::insert_library_key(
+            db_tx,
+            &payload.library_id,
+            user_id,
+            &payload.creator_key.ephemeral_pubkey,
+            &payload.creator_key.wrapped_key,
+        )?;
+        Ok(())
+    }
+}
+
+inventory::submit! { &CreateSharedLibraryHandler as &dyn TransactionHandler }
+
+// --- library_invite ---
+
+pub struct LibraryInviteHandler;
+
+impl TransactionHandler for LibraryInviteHandler {
+    fn name(&self) -> &'static str {
+        "library_invite"
+    }
+
+    fn process(
+        &self,
+        tx: &TxMeta<'_>,
+        _execute: bool,
+        _ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
+    ) -> HandlerResult {
+        let (payload, _) = bincode::serde::decode_from_slice::<LibraryInvitePayload, _>(
+            tx.payload,
+            bincode::config::standard(),
+        )
+        .map_err(|_| DatabaseError::InvalidPayload)?;
+        let user_id = tx.user_id.ok_or(DatabaseError::AuthorizationError)?;
+        let invitee = payload.invitee.user_id;
+
+        if !libraries::is_member(db_tx, &payload.library_id, user_id)? {
+            return Err(DatabaseError::AuthorizationError);
+        }
+        if invitee == user_id || libraries::is_member(db_tx, &payload.library_id, invitee)? {
+            return Err(DatabaseError::ConflictError);
+        }
+        // Invitee must be a known mesh user with a wrappable pubkey.
+        if libraries::user_x25519_pubkey(db_tx, invitee)?.is_none() {
+            return Err(DatabaseError::InvalidPayload);
+        }
+
+        libraries::insert_invite(
+            db_tx,
+            &payload.library_id,
+            invitee,
+            user_id,
+            &payload.operation_id,
+            &payload.invitee.ephemeral_pubkey,
+            &payload.invitee.wrapped_key,
+        )
+    }
+}
+
+inventory::submit! { &LibraryInviteHandler as &dyn TransactionHandler }
+
+// --- library_invite_accept ---
+
+pub struct LibraryInviteAcceptHandler;
+
+impl TransactionHandler for LibraryInviteAcceptHandler {
+    fn name(&self) -> &'static str {
+        "library_invite_accept"
+    }
+
+    fn process(
+        &self,
+        tx: &TxMeta<'_>,
+        _execute: bool,
+        _ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
+    ) -> HandlerResult {
+        let (payload, _) = bincode::serde::decode_from_slice::<LibraryInviteAcceptPayload, _>(
+            tx.payload,
+            bincode::config::standard(),
+        )
+        .map_err(|_| DatabaseError::InvalidPayload)?;
+        let user_id = tx.user_id.ok_or(DatabaseError::AuthorizationError)?;
+
+        // Consent: only the invitee's own signature accepts. Re-delivery
+        // is deterministic — the invite row is gone, so NotFound.
+        let (eph, wrapped) = libraries::get_invite_wrap(db_tx, &payload.library_id, user_id)?
+            .ok_or(DatabaseError::NotFound)?;
+
+        libraries::insert_member(db_tx, &payload.library_id, user_id)?;
+        // Promote the invite-parked wrap; OR IGNORE tolerates a re-grant.
+        libraries::insert_library_key(db_tx, &payload.library_id, user_id, &eph, &wrapped)?;
+        libraries::delete_invite(db_tx, &payload.library_id, user_id)?;
+        // Signal the new member's sidecar to backfill the library. No
+        // photo_changes writes — the photos did not change; the view did.
+        libraries::upsert_view_change(db_tx, user_id, &payload.library_id)
+    }
+}
+
+inventory::submit! { &LibraryInviteAcceptHandler as &dyn TransactionHandler }
+
+// --- library_invite_decline ---
+
+pub struct LibraryInviteDeclineHandler;
+
+impl TransactionHandler for LibraryInviteDeclineHandler {
+    fn name(&self) -> &'static str {
+        "library_invite_decline"
+    }
+
+    fn process(
+        &self,
+        tx: &TxMeta<'_>,
+        _execute: bool,
+        _ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
+    ) -> HandlerResult {
+        let (payload, _) = bincode::serde::decode_from_slice::<LibraryInviteDeclinePayload, _>(
+            tx.payload,
+            bincode::config::standard(),
+        )
+        .map_err(|_| DatabaseError::InvalidPayload)?;
+        let user_id = tx.user_id.ok_or(DatabaseError::AuthorizationError)?;
+
+        // The invitee may refuse; any member may retract (equal standing).
+        if payload.invitee_user_id != user_id
+            && !libraries::is_member(db_tx, &payload.library_id, user_id)?
+        {
+            return Err(DatabaseError::AuthorizationError);
+        }
+        if !libraries::delete_invite(db_tx, &payload.library_id, payload.invitee_user_id)? {
+            return Err(DatabaseError::NotFound);
+        }
+        Ok(())
+    }
+}
+
+inventory::submit! { &LibraryInviteDeclineHandler as &dyn TransactionHandler }
+
+// --- library_remove_member ---
+
+pub struct LibraryRemoveMemberHandler;
+
+impl TransactionHandler for LibraryRemoveMemberHandler {
+    fn name(&self) -> &'static str {
+        "library_remove_member"
+    }
+
+    fn process(
+        &self,
+        tx: &TxMeta<'_>,
+        _execute: bool,
+        _ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
+    ) -> HandlerResult {
+        let (payload, _) = bincode::serde::decode_from_slice::<LibraryRemoveMemberPayload, _>(
+            tx.payload,
+            bincode::config::standard(),
+        )
+        .map_err(|_| DatabaseError::InvalidPayload)?;
+        let user_id = tx.user_id.ok_or(DatabaseError::AuthorizationError)?;
+
+        // Self-removal is leave; removing another member is kick. Both
+        // require the SUBMITTER to be a member (equal standing).
+        if !libraries::is_member(db_tx, &payload.library_id, user_id)? {
+            return Err(DatabaseError::AuthorizationError);
+        }
+
+        let was_member = libraries::delete_member(db_tx, &payload.library_id, payload.user_id)?;
+        let was_invitee = libraries::delete_invite(db_tx, &payload.library_id, payload.user_id)?;
+        if !was_member && !was_invitee {
+            return Err(DatabaseError::NotFound);
+        }
+        libraries::delete_library_key(db_tx, &payload.library_id, payload.user_id)?;
+        // The target's client detects membership loss by diff and purges;
+        // a dangling view signal would just point at a library they can no
+        // longer read. The convergence worker revokes their access rows
+        // lazily (row-deletion revocation; key rotation is a future lane).
+        libraries::delete_view_change(db_tx, payload.user_id, &payload.library_id)
+    }
+}
+
+inventory::submit! { &LibraryRemoveMemberHandler as &dyn TransactionHandler }
+
+// --- library_access_grant ---
+
+pub struct LibraryAccessGrantHandler;
+
+impl TransactionHandler for LibraryAccessGrantHandler {
+    fn name(&self) -> &'static str {
+        "library_access_grant"
+    }
+
+    fn process(
+        &self,
+        tx: &TxMeta<'_>,
+        _execute: bool,
+        _ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
+    ) -> HandlerResult {
+        let (payload, _) = bincode::serde::decode_from_slice::<LibraryAccessGrantPayload, _>(
+            tx.payload,
+            bincode::config::standard(),
+        )
+        .map_err(|_| DatabaseError::InvalidPayload)?;
+        let user_id = tx.user_id.ok_or(DatabaseError::AuthorizationError)?;
+
+        if payload.entries.is_empty() && payload.blob_wraps.is_empty() {
+            return Err(DatabaseError::InvalidPayload);
+        }
+        if !libraries::is_member(db_tx, &payload.library_id, user_id)? {
+            return Err(DatabaseError::AuthorizationError);
+        }
+        // Target must be asserted: member or pending invitee. A grant to
+        // anyone else would be an access leak no read gate could catch
+        // for personal-library semantics.
+        let target = payload.user_id;
+        if !libraries::is_member(db_tx, &payload.library_id, target)?
+            && !libraries::is_invitee(db_tx, &payload.library_id, target)?
+        {
+            return Err(DatabaseError::AuthorizationError);
+        }
+        // The recipient pubkey comes from consensus state, never the wire.
+        let target_pubkey = libraries::user_x25519_pubkey(db_tx, target)?
+            .ok_or(DatabaseError::InvalidPayload)?;
+
+        for grant in &payload.entries {
+            // Live photos of THIS library only — tombstoned photos are
+            // never granted (invitees don't inherit the recovery window),
+            // and a foreign photo id must not smuggle access.
+            if !libraries::photo_in_library_live(db_tx, &grant.photo_id, &payload.library_id)? {
+                return Err(DatabaseError::ValidationError);
+            }
+            libraries::insert_metadata_access_grant(db_tx, grant, target)?;
+        }
+        for grant in &payload.blob_wraps {
+            if !libraries::block_in_library(db_tx, &grant.data_block_id, &payload.library_id)? {
+                return Err(DatabaseError::ValidationError);
+            }
+            libraries::insert_blob_access_grant(db_tx, grant, &target_pubkey)?;
+        }
+        // Late-grant signal: an already-accepted member re-backfills the
+        // library on this height bump. NO photo_changes writes — a grant
+        // changes the target's view, not the photo.
+        libraries::upsert_view_change(db_tx, target, &payload.library_id)
+    }
+}
+
+inventory::submit! { &LibraryAccessGrantHandler as &dyn TransactionHandler }
+
+// --- library_access_revoke ---
+
+pub struct LibraryAccessRevokeHandler;
+
+impl TransactionHandler for LibraryAccessRevokeHandler {
+    fn name(&self) -> &'static str {
+        "library_access_revoke"
+    }
+
+    fn process(
+        &self,
+        tx: &TxMeta<'_>,
+        _execute: bool,
+        _ctx: &HandlerCtx<'_>,
+        db_tx: &rusqlite::Transaction<'_>,
+    ) -> HandlerResult {
+        let (payload, _) = bincode::serde::decode_from_slice::<LibraryAccessRevokePayload, _>(
+            tx.payload,
+            bincode::config::standard(),
+        )
+        .map_err(|_| DatabaseError::InvalidPayload)?;
+        let user_id = tx.user_id.ok_or(DatabaseError::AuthorizationError)?;
+
+        if !libraries::is_member(db_tx, &payload.library_id, user_id)? {
+            return Err(DatabaseError::AuthorizationError);
+        }
+        // Revoke only converges toward the assertion: the target must be
+        // NEITHER member nor invitee. Without this inversion a member
+        // could stealth-kick a peer by stripping wraps while the
+        // membership row (and the read gate it opens) still stands —
+        // removals go through library_remove_member.
+        let target = payload.user_id;
+        if libraries::is_member(db_tx, &payload.library_id, target)?
+            || libraries::is_invitee(db_tx, &payload.library_id, target)?
+        {
+            return Err(DatabaseError::AuthorizationError);
+        }
+        let target_pubkey = libraries::user_x25519_pubkey(db_tx, target)?
+            .ok_or(DatabaseError::InvalidPayload)?;
+
+        for photo_id in &payload.photo_ids {
+            libraries::delete_metadata_access(db_tx, photo_id, target)?;
+        }
+        for block_id in &payload.data_block_ids {
+            libraries::delete_blob_access(db_tx, block_id, &target_pubkey)?;
+        }
+        Ok(())
+    }
+}
+
+inventory::submit! { &LibraryAccessRevokeHandler as &dyn TransactionHandler }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -651,16 +1044,15 @@ mod tests {
         .unwrap();
         hopnet_storage::store::install_schema(&conn).unwrap();
         crate::db::install_schema(&conn).unwrap();
-        conn.execute(
-            "INSERT INTO users (user_id, x25519_pubkey) VALUES (1, x'00')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO users (user_id, x25519_pubkey) VALUES (2, x'01')",
-            [],
-        )
-        .unwrap();
+        // Real-shaped 32-byte pubkeys: the membership handlers resolve and
+        // validate them (a short blob is a RecallError by design).
+        for uid in [1, 2, 3] {
+            conn.execute(
+                "INSERT INTO users (user_id, x25519_pubkey) VALUES (?1, ?2)",
+                rusqlite::params![uid, vec![uid as u8; 32]],
+            )
+            .unwrap();
+        }
         // Host-owned device_tokens mirror (src/db/shared.rs DDL) — the
         // responsibility table FKs it and the claim handler reads it.
         conn.execute_batch(
@@ -819,8 +1211,8 @@ mod tests {
         assert!(matches!(result, Err(DatabaseError::AuthorizationError)));
     }
 
-    /// photo_add: non-NULL library_id with no shared_library row must fail.
-    /// create_shared_library doesn't exist yet (Phase 3) — the FK catches it.
+    // Should: reject a photo_add into a nonexistent library (no
+    // membership can exist for it) with an authorization error.
     #[test]
     fn photo_add_rejects_nonexistent_library() {
         let conn = fixture();
@@ -833,8 +1225,8 @@ mod tests {
         );
         let result = validate(&conn, &PhotoAddHandler, "photo_add", &bytes, Some(1));
         assert!(
-            result.is_err(),
-            "non-NULL library_id without library row must fail"
+            matches!(result, Err(DatabaseError::AuthorizationError)),
+            "non-member add into an unknown library must be rejected"
         );
     }
 
@@ -1723,5 +2115,460 @@ mod tests {
         ));
 
         assert_eq!(read_holder(&conn, 1), None, "no claim may have landed");
+    }
+
+    // --- Shared-library membership lifecycle ---
+
+    use crate::envelopes::{
+        CreateSharedLibraryPayload, LibraryAccessGrantPayload, LibraryAccessRevokePayload,
+        LibraryBlobGrant, LibraryInviteAcceptPayload, LibraryInviteDeclinePayload,
+        LibraryInvitePayload, LibraryKeyWrap, LibraryMetadataGrant, LibraryRemoveMemberPayload,
+    };
+
+    fn enc<T: serde::Serialize>(payload: &T) -> Vec<u8> {
+        bincode::serde::encode_to_vec(payload, bincode::config::standard()).unwrap()
+    }
+
+    fn key_wrap(user_id: i32) -> LibraryKeyWrap {
+        LibraryKeyWrap {
+            user_id,
+            ephemeral_pubkey: [0x11; 32],
+            wrapped_key: vec![0x22; 48],
+        }
+    }
+
+    /// Apply create_shared_library for `creator`; returns the library id.
+    fn create_library(conn: &Connection, creator: i32, seq: i64) -> CustomUUID {
+        let lib = CustomUUID::retention_cutoff(seq);
+        let bytes = enc(&CreateSharedLibraryPayload {
+            library_id: lib.clone(),
+            encrypted_name: vec![0xEE; 8],
+            name_nonce: [0u8; 12],
+            creator_key: key_wrap(creator),
+            operation_id: CustomUUID::retention_cutoff(seq + 1),
+        });
+        apply(
+            conn,
+            &CreateSharedLibraryHandler,
+            "create_shared_library",
+            &bytes,
+            Some(creator),
+        );
+        lib
+    }
+
+    fn invite(conn: &Connection, lib: &CustomUUID, inviter: i32, invitee: i32) {
+        let bytes = enc(&LibraryInvitePayload {
+            library_id: lib.clone(),
+            invitee: key_wrap(invitee),
+            operation_id: CustomUUID::retention_cutoff(900),
+        });
+        apply(conn, &LibraryInviteHandler, "library_invite", &bytes, Some(inviter));
+    }
+
+    fn accept(conn: &Connection, lib: &CustomUUID, invitee: i32) {
+        let bytes = enc(&LibraryInviteAcceptPayload {
+            library_id: lib.clone(),
+            operation_id: CustomUUID::retention_cutoff(901),
+        });
+        apply(
+            conn,
+            &LibraryInviteAcceptHandler,
+            "library_invite_accept",
+            &bytes,
+            Some(invitee),
+        );
+    }
+
+    fn count(conn: &Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    // Should: create the library row, the creator's membership, and the
+    // creator's key wrap in one op.
+    // Should not: accept a creator wrap targeting another user.
+    // Impact: creation is the only path that mints a library — a foreign
+    // creator wrap would hand the library key namespace to a non-member.
+    #[test]
+    fn create_shared_library_mints_row_member_and_key() {
+        let conn = fixture();
+        let lib = create_library(&conn, 1, 0x100);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM shared_libraries"), 1);
+        assert!(crate::db::libraries::is_member(&conn, &lib, 1).unwrap());
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM shared_library_keys"), 1);
+
+        let foreign = enc(&CreateSharedLibraryPayload {
+            library_id: CustomUUID::retention_cutoff(0x200),
+            encrypted_name: vec![0xEE; 8],
+            name_nonce: [0u8; 12],
+            creator_key: key_wrap(2), // wrap for someone else
+            operation_id: CustomUUID::retention_cutoff(0x201),
+        });
+        assert!(matches!(
+            validate(&conn, &CreateSharedLibraryHandler, "create_shared_library", &foreign, Some(1)),
+            Err(DatabaseError::AuthorizationError)
+        ));
+    }
+
+    // Should: let only members invite, refuse duplicate/self/member/unknown
+    // invitees, and park the invitee's key wrap on the invite row.
+    #[test]
+    fn library_invite_authz_matrix() {
+        let conn = fixture();
+        let lib = create_library(&conn, 1, 0x100);
+
+        // Non-member cannot invite.
+        let by_stranger = enc(&LibraryInvitePayload {
+            library_id: lib.clone(),
+            invitee: key_wrap(2),
+            operation_id: CustomUUID::retention_cutoff(0x300),
+        });
+        assert!(matches!(
+            validate(&conn, &LibraryInviteHandler, "library_invite", &by_stranger, Some(2)),
+            Err(DatabaseError::AuthorizationError)
+        ));
+        // Self-invite and member-invite are conflicts.
+        let self_invite = enc(&LibraryInvitePayload {
+            library_id: lib.clone(),
+            invitee: key_wrap(1),
+            operation_id: CustomUUID::retention_cutoff(0x301),
+        });
+        assert!(matches!(
+            validate(&conn, &LibraryInviteHandler, "library_invite", &self_invite, Some(1)),
+            Err(DatabaseError::ConflictError)
+        ));
+        // Unknown mesh user is rejected.
+        let unknown = enc(&LibraryInvitePayload {
+            library_id: lib.clone(),
+            invitee: key_wrap(99),
+            operation_id: CustomUUID::retention_cutoff(0x302),
+        });
+        assert!(matches!(
+            validate(&conn, &LibraryInviteHandler, "library_invite", &unknown, Some(1)),
+            Err(DatabaseError::InvalidPayload)
+        ));
+
+        invite(&conn, &lib, 1, 2);
+        assert!(crate::db::libraries::is_invitee(&conn, &lib, 2).unwrap());
+        // Duplicate invite conflicts.
+        let dup = enc(&LibraryInvitePayload {
+            library_id: lib.clone(),
+            invitee: key_wrap(2),
+            operation_id: CustomUUID::retention_cutoff(0x303),
+        });
+        assert!(matches!(
+            validate(&conn, &LibraryInviteHandler, "library_invite", &dup, Some(1)),
+            Err(DatabaseError::ConflictError)
+        ));
+    }
+
+    // Should: on accept, insert membership, promote the invite wrap into
+    // shared_library_keys, delete the invite, and write the invitee's
+    // view-change signal.
+    // Should not: honor a second delivery (invite gone → NotFound) or an
+    // accept from a user who was never invited.
+    // Impact: accept is the consent boundary — membership (and therefore
+    // the read gate) must open only on the invitee's own signature.
+    #[test]
+    fn invite_accept_promotes_membership_and_signals() {
+        let conn = fixture();
+        let lib = create_library(&conn, 1, 0x100);
+        invite(&conn, &lib, 1, 2);
+
+        // A never-invited user cannot accept.
+        let bytes = enc(&LibraryInviteAcceptPayload {
+            library_id: lib.clone(),
+            operation_id: CustomUUID::retention_cutoff(0x400),
+        });
+        assert!(matches!(
+            validate(&conn, &LibraryInviteAcceptHandler, "library_invite_accept", &bytes, Some(3)),
+            Err(DatabaseError::NotFound)
+        ));
+
+        accept(&conn, &lib, 2);
+        assert!(crate::db::libraries::is_member(&conn, &lib, 2).unwrap());
+        assert!(!crate::db::libraries::is_invitee(&conn, &lib, 2).unwrap());
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM shared_library_keys WHERE user_id = 2"),
+            1,
+            "invite wrap promoted"
+        );
+        assert_eq!(
+            crate::db::libraries::read_view_changes(&conn, 2).unwrap().len(),
+            1,
+            "backfill signal written"
+        );
+        // Re-delivery: invite row is gone.
+        assert!(matches!(
+            validate(&conn, &LibraryInviteAcceptHandler, "library_invite_accept", &bytes, Some(2)),
+            Err(DatabaseError::NotFound)
+        ));
+    }
+
+    // Should: allow the invitee to refuse and any member to retract;
+    // refuse strangers.
+    #[test]
+    fn invite_decline_authz() {
+        let conn = fixture();
+        let lib = create_library(&conn, 1, 0x100);
+        invite(&conn, &lib, 1, 2);
+
+        let bytes = enc(&LibraryInviteDeclinePayload {
+            library_id: lib.clone(),
+            invitee_user_id: 2,
+            operation_id: CustomUUID::retention_cutoff(0x500),
+        });
+        assert!(matches!(
+            validate(&conn, &LibraryInviteDeclineHandler, "library_invite_decline", &bytes, Some(3)),
+            Err(DatabaseError::AuthorizationError)
+        ));
+        apply(&conn, &LibraryInviteDeclineHandler, "library_invite_decline", &bytes, Some(2));
+        assert!(!crate::db::libraries::is_invitee(&conn, &lib, 2).unwrap());
+    }
+
+    // Should: let any member remove any member (kick) or themself (leave),
+    // clearing membership, key wrap, pending invite, and view signal.
+    // Should not: let a non-member remove anyone.
+    #[test]
+    fn remove_member_kick_and_leave() {
+        let conn = fixture();
+        let lib = create_library(&conn, 1, 0x100);
+        invite(&conn, &lib, 1, 2);
+        accept(&conn, &lib, 2);
+
+        // Non-member cannot kick.
+        let by_stranger = enc(&LibraryRemoveMemberPayload {
+            library_id: lib.clone(),
+            user_id: 2,
+            operation_id: CustomUUID::retention_cutoff(0x600),
+        });
+        assert!(matches!(
+            validate(&conn, &LibraryRemoveMemberHandler, "library_remove_member", &by_stranger, Some(3)),
+            Err(DatabaseError::AuthorizationError)
+        ));
+
+        // Member 2 kicks member 1 (equal standing).
+        let kick = enc(&LibraryRemoveMemberPayload {
+            library_id: lib.clone(),
+            user_id: 1,
+            operation_id: CustomUUID::retention_cutoff(0x601),
+        });
+        apply(&conn, &LibraryRemoveMemberHandler, "library_remove_member", &kick, Some(2));
+        assert!(!crate::db::libraries::is_member(&conn, &lib, 1).unwrap());
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM shared_library_keys WHERE user_id = 1"),
+            0,
+            "kicked member's key wrap cleared"
+        );
+
+        // Removing someone who is neither member nor invitee → NotFound.
+        assert!(matches!(
+            validate(&conn, &LibraryRemoveMemberHandler, "library_remove_member", &kick, Some(2)),
+            Err(DatabaseError::NotFound)
+        ));
+    }
+
+    // Should: grant metadata + blob wraps to a member or invitee, resolve
+    // the recipient pubkey from consensus state, and signal the target's
+    // view change.
+    // Should not: grant to a stranger, grant a tombstoned photo, grant a
+    // photo or block from another library, or accept an empty batch.
+    // Impact: the grant handler is the write gate for pre-staged invitee
+    // access — these rejections are what keeps 'access rows exist early'
+    // from ever meaning 'access leaked early'.
+    #[test]
+    fn access_grant_validation_matrix() {
+        let conn = fixture();
+        let lib = create_library(&conn, 1, 0x100);
+        invite(&conn, &lib, 1, 2);
+
+        // Member 1 adds a photo into the library (membership path).
+        let photo_id = CustomUUID::retention_cutoff(0x700);
+        let blob_id = CustomUUID::retention_cutoff(0x701);
+        let add = add_payload_bytes(
+            photo_id.clone(),
+            1,
+            blob_id.clone(),
+            CustomUUID::retention_cutoff(0x702),
+            Some(lib.clone()),
+        );
+        apply(&conn, &PhotoAddHandler, "photo_add", &add, Some(1));
+
+        let grant = |target: i32, photo: &CustomUUID, block: &CustomUUID| {
+            enc(&LibraryAccessGrantPayload {
+                library_id: lib.clone(),
+                user_id: target,
+                entries: vec![LibraryMetadataGrant {
+                    photo_id: photo.clone(),
+                    ephemeral_pubkey: [0x77; 32],
+                    encrypted_metadata_key: vec![0x88; 48],
+                }],
+                blob_wraps: vec![LibraryBlobGrant {
+                    data_block_id: block.clone(),
+                    ephemeral_pubkey: [0x99; 32],
+                    wrapped_key: vec![0xAA; 48],
+                }],
+                operation_id: CustomUUID::retention_cutoff(0x703),
+            })
+        };
+
+        // Stranger target rejected.
+        assert!(matches!(
+            validate(&conn, &LibraryAccessGrantHandler, "library_access_grant", &grant(3, &photo_id, &blob_id), Some(1)),
+            Err(DatabaseError::AuthorizationError)
+        ));
+        // Foreign photo rejected.
+        assert!(matches!(
+            validate(&conn, &LibraryAccessGrantHandler, "library_access_grant", &grant(2, &CustomUUID::retention_cutoff(0x7FF), &blob_id), Some(1)),
+            Err(DatabaseError::ValidationError)
+        ));
+        // Empty batch rejected.
+        let empty = enc(&LibraryAccessGrantPayload {
+            library_id: lib.clone(),
+            user_id: 2,
+            entries: vec![],
+            blob_wraps: vec![],
+            operation_id: CustomUUID::retention_cutoff(0x704),
+        });
+        assert!(matches!(
+            validate(&conn, &LibraryAccessGrantHandler, "library_access_grant", &empty, Some(1)),
+            Err(DatabaseError::InvalidPayload)
+        ));
+
+        // Grant to the pending invitee succeeds and signals.
+        apply(&conn, &LibraryAccessGrantHandler, "library_access_grant", &grant(2, &photo_id, &blob_id), Some(1));
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM photo_metadata_access WHERE user_id = 2"),
+            1
+        );
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM blob_access"), 1);
+        assert_eq!(
+            crate::db::libraries::read_view_changes(&conn, 2).unwrap().len(),
+            1
+        );
+
+        // Tombstone the photo; a fresh grant of it must be rejected.
+        let del = enc(&PhotoDeletePayload {
+            entries: vec![PhotoDeleteEntry {
+                photo_id: photo_id.clone(),
+                operation_id: CustomUUID::new(None),
+            }],
+        });
+        apply(&conn, &PhotoDeleteHandler, "photo_delete", &del, Some(1));
+        assert!(matches!(
+            validate(&conn, &LibraryAccessGrantHandler, "library_access_grant", &grant(2, &photo_id, &blob_id), Some(1)),
+            Err(DatabaseError::ValidationError)
+        ));
+    }
+
+    // Should: revoke access rows only for a user who is neither member nor
+    // invitee.
+    // Should not: strip a live member's or invitee's wraps — that would be
+    // a stealth kick bypassing library_remove_member.
+    // Impact: the inversion IS the anti-abuse property of the revoke tx.
+    #[test]
+    fn access_revoke_requires_departed_target() {
+        let conn = fixture();
+        let lib = create_library(&conn, 1, 0x100);
+        invite(&conn, &lib, 1, 2);
+        accept(&conn, &lib, 2);
+
+        let photo_id = CustomUUID::retention_cutoff(0x800);
+        let blob_id = CustomUUID::retention_cutoff(0x801);
+        let add = add_payload_bytes(
+            photo_id.clone(),
+            1,
+            blob_id.clone(),
+            CustomUUID::retention_cutoff(0x802),
+            Some(lib.clone()),
+        );
+        apply(&conn, &PhotoAddHandler, "photo_add", &add, Some(1));
+        let grant = enc(&LibraryAccessGrantPayload {
+            library_id: lib.clone(),
+            user_id: 2,
+            entries: vec![LibraryMetadataGrant {
+                photo_id: photo_id.clone(),
+                ephemeral_pubkey: [0x77; 32],
+                encrypted_metadata_key: vec![0x88; 48],
+            }],
+            blob_wraps: vec![],
+            operation_id: CustomUUID::retention_cutoff(0x803),
+        });
+        apply(&conn, &LibraryAccessGrantHandler, "library_access_grant", &grant, Some(1));
+
+        let revoke = enc(&LibraryAccessRevokePayload {
+            library_id: lib.clone(),
+            user_id: 2,
+            photo_ids: vec![photo_id.clone()],
+            data_block_ids: vec![],
+            operation_id: CustomUUID::retention_cutoff(0x804),
+        });
+        // Live member → rejected.
+        assert!(matches!(
+            validate(&conn, &LibraryAccessRevokeHandler, "library_access_revoke", &revoke, Some(1)),
+            Err(DatabaseError::AuthorizationError)
+        ));
+
+        // Kick, then revoke converges.
+        let kick = enc(&LibraryRemoveMemberPayload {
+            library_id: lib.clone(),
+            user_id: 2,
+            operation_id: CustomUUID::retention_cutoff(0x805),
+        });
+        apply(&conn, &LibraryRemoveMemberHandler, "library_remove_member", &kick, Some(1));
+        apply(&conn, &LibraryAccessRevokeHandler, "library_access_revoke", &revoke, Some(1));
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM photo_metadata_access WHERE user_id = 2"),
+            0,
+            "departed user's wraps removed"
+        );
+    }
+
+    // Should: allow a co-member to soft-delete a shared photo they did not
+    // upload (equal standing), and reject a favorite from a non-member.
+    // Impact: pins the authz widening — shared photos answer to the
+    // member set, not just the uploader; personal photos answer only to
+    // their owner.
+    #[test]
+    fn widened_authz_member_delete_and_nonmember_favorite() {
+        let conn = fixture();
+        let lib = create_library(&conn, 1, 0x100);
+        invite(&conn, &lib, 1, 2);
+        accept(&conn, &lib, 2);
+
+        let photo_id = CustomUUID::retention_cutoff(0x900);
+        let add = add_payload_bytes(
+            photo_id.clone(),
+            1,
+            CustomUUID::retention_cutoff(0x901),
+            CustomUUID::retention_cutoff(0x902),
+            Some(lib.clone()),
+        );
+        apply(&conn, &PhotoAddHandler, "photo_add", &add, Some(1));
+
+        // Non-member favorite rejected (previously unchecked).
+        let fav = enc(&crate::envelopes::PhotoFavoritePayload {
+            entries: vec![PhotoFavoriteEntry {
+                photo_id: photo_id.clone(),
+                operation_id: CustomUUID::retention_cutoff(0x903),
+            }],
+        });
+        assert!(matches!(
+            validate(&conn, &PhotoFavoriteHandler, "photo_favorite", &fav, Some(3)),
+            Err(DatabaseError::AuthorizationError)
+        ));
+
+        // Co-member (not uploader) soft-deletes.
+        let del = enc(&PhotoDeletePayload {
+            entries: vec![PhotoDeleteEntry {
+                photo_id: photo_id.clone(),
+                operation_id: CustomUUID::new(None),
+            }],
+        });
+        apply(&conn, &PhotoDeleteHandler, "photo_delete", &del, Some(2));
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM photos WHERE deleted_at IS NOT NULL"),
+            1
+        );
     }
 }

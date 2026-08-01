@@ -493,21 +493,22 @@ pub fn upsert_photo_changes(
     Ok(())
 }
 
-/// Look up a photo's owner + tombstone state. Returns None if the photo
-/// doesn't exist. Used by edit handlers for authz + tombstone gating.
-pub fn lookup_photo_owner(
+/// Look up a photo's owner, tombstone state, and library scope. Returns
+/// None if the photo doesn't exist. Used by mutation handlers for authz
+/// (owner-or-library-member) + tombstone gating.
+pub fn lookup_photo_authz(
     db_tx: &rusqlite::Transaction,
     photo_id: &CustomUUID,
-) -> Result<Option<(i32, Option<String>)>, DatabaseError> {
+) -> Result<Option<(i32, Option<String>, Option<CustomUUID>)>, DatabaseError> {
     match db_tx.query_row(
-        "SELECT uploaded_by, deleted_at FROM photos WHERE id = ?1",
+        "SELECT uploaded_by, deleted_at, library_id FROM photos WHERE id = ?1",
         rusqlite::params![photo_id],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     ) {
         Ok(row) => Ok(Some(row)),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => {
-            tracing::error!("lookup_photo_owner {} failed: {e}", photo_id);
+            tracing::error!("lookup_photo_authz {} failed: {e}", photo_id);
             Err(DatabaseError::RecallError)
         }
     }
