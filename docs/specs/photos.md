@@ -184,6 +184,8 @@ CREATE TABLE photo_metadata_access (
 
 This mirrors the `file_access` table pattern. When a photo is shared to a new context (shared library, shared album, individual share), the per-photo metadata key is wrapped with each new recipient's pubkey and a row is inserted. The metadata blob itself does not change.
 
+**Access-row existence is the read grant only for PERSONAL photos.** For shared-library photos, reads additionally require a `shared_library_members` row (Phase 3, "Design B"): the convergence worker pre-stages wraps for pending invitees *before* they accept, and a kicked member's wraps are deleted lazily — in both cases the wrap row alone must not read. The gate lives in `query_changes` (both statements, boundary batch included) and the resource byte path (`lookup_resource_block_authz`, wrap ∧ membership, 403 on non-membership).
+
 #### Photo Resources
 
 A single photo can have multiple byte streams associated with it: the original capture, an edited variant, the paired Live Photo video, RAW sensor data, thumbnails, and so on. PhotoKit exposes these as `PHAssetResource` entries on a single `PHAsset`. The `photo_resources` table maps a photo to its constituent data blocks:
@@ -224,14 +226,16 @@ All resources are supplied by the ingesting client at upload time when they exis
 #### Shared Libraries
 
 ```sql
--- Shared library definition
+-- Shared library definition. The name is encrypted under the LIBRARY
+-- key (below), not a single-recipient seal — every member can render it.
 CREATE TABLE shared_libraries (
     id               TEXT PRIMARY KEY,     -- UUIDv7
-    encrypted_name   BLOB NOT NULL,        -- ChaCha20-Poly1305 encrypted library name
-    name_ephemeral_pubkey BLOB NOT NULL    -- X25519 ephemeral pubkey for name decryption
+    encrypted_name   BLOB NOT NULL,        -- ChaCha20-Poly1305 under the library key
+    name_nonce       BLOB NOT NULL         -- 12-byte nonce
 );
 
--- Library membership (N-way, no owner)
+-- Library membership (N-way, no owner). Membership is also the READ
+-- GATE for shared photos (see Photo Metadata Access).
 CREATE TABLE shared_library_members (
     library_id       TEXT NOT NULL,
     user_id          INTEGER NOT NULL,
@@ -240,9 +244,53 @@ CREATE TABLE shared_library_members (
     FOREIGN KEY (library_id) REFERENCES shared_libraries(id),
     FOREIGN KEY (user_id) REFERENCES users(user_id)
 );
+
+-- Per-member wrapped LIBRARY key (X25519 ECDH, LIBRARY_KEY_WRAP_DOMAIN,
+-- wrap id = library id). Decrypts the library name today; the designed
+-- seam for the future library-scoped cloud-fingerprint key.
+CREATE TABLE shared_library_keys (
+    library_id       TEXT NOT NULL,
+    user_id          INTEGER NOT NULL,
+    ephemeral_pubkey BLOB NOT NULL,
+    wrapped_key      BLOB NOT NULL,
+    PRIMARY KEY (library_id, user_id),
+    FOREIGN KEY (library_id) REFERENCES shared_libraries(id),
+    FOREIGN KEY (user_id) REFERENCES users(user_id)
+);
+
+-- Pending membership (consent pattern, mirroring drive's incoming_shares).
+-- Carries the invitee's library-key wrap, minted AT invite time, so
+-- accept needs no inviter online and the invite listing shows the name.
+CREATE TABLE shared_library_invites (
+    library_id       TEXT NOT NULL,
+    user_id          INTEGER NOT NULL,     -- invitee
+    invited_by       INTEGER NOT NULL,
+    operation_id     TEXT NOT NULL,
+    ephemeral_pubkey BLOB NOT NULL,
+    wrapped_key      BLOB NOT NULL,
+    PRIMARY KEY (library_id, user_id),
+    FOREIGN KEY (library_id) REFERENCES shared_libraries(id),
+    FOREIGN KEY (user_id) REFERENCES users(user_id),
+    FOREIGN KEY (invited_by) REFERENCES users(user_id)
+);
+
+-- Per-user VIEW-change signal: "your visibility into this library
+-- changed at height h". Written by accept/grant handlers, consumed by
+-- the sidecar sync worker to trigger a targeted library backfill.
+-- Deliberately NOT photo_changes: a membership or grant change alters
+-- the user's view, not the photo — bumping the global feed would make
+-- every member re-sync the whole library on each join.
+CREATE TABLE photo_view_changes (
+    user_id           INTEGER NOT NULL,
+    library_id        TEXT NOT NULL,
+    changed_at_height INTEGER NOT NULL,
+    PRIMARY KEY (user_id, library_id),
+    FOREIGN KEY (user_id) REFERENCES users(user_id),
+    FOREIGN KEY (library_id) REFERENCES shared_libraries(id)
+);
 ```
 
-There is no owner column. All members have equal standing — any member can add photos, remove photos, or invite new members. The `uploaded_by` field on `photos` records provenance for activity feeds but confers no special permissions.
+There is no owner column. All members have equal standing — any member can add photos, remove photos, invite new members, or remove members (self-removal is leave; removing another is kick). The `uploaded_by` field on `photos` records provenance for activity feeds but confers no special permissions. A library whose last member leaves is stranded (rows unreadable by anyone) — allowed, documented; GC is future work.
 
 #### Albums
 
@@ -570,9 +618,13 @@ The photos module registers its own transaction handlers via the existing `inven
 | `photo_restore` | `PhotoRestoreHandler` | Restore soft-deleted photo within retention window (clear `deleted_at` / `deleted_by`) |
 | `photo_ingress_claim` | `PhotoIngressClaimHandler` | Claim/transfer ingress responsibility (upsert; device ownership validated against consensus-replicated `device_tokens`). JWT route only — excluded from `DEVICE_TX_FUNCTIONS`. |
 | `photo_undo` | `PhotoUndoHandler` | Revert most recent operation on a photo (content edit on a specific resource, or metadata edit) |
-| `create_shared_library` | `CreateSharedLibraryHandler` | Create library + initial membership |
-| `join_shared_library` | `JoinSharedLibraryHandler` | Add member, create file_access + photo_metadata_access for all existing library photos |
-| `leave_shared_library` | `LeaveSharedLibraryHandler` | Remove member, clean up their file_access and photo_metadata_access entries |
+| `create_shared_library` | `CreateSharedLibraryHandler` | Create library + creator membership + creator's library-key wrap |
+| `library_invite` | `LibraryInviteHandler` | Member-only; parks the invitee's library-key wrap on the invite row (accept works with the inviter offline) |
+| `library_invite_accept` | `LibraryInviteAcceptHandler` | Invitee-signed consent: membership + wrap promotion + view-change signal. Re-delivery is a deterministic NotFound |
+| `library_invite_decline` | `LibraryInviteDeclineHandler` | Invitee refuses, or any member retracts |
+| `library_remove_member` | `LibraryRemoveMemberHandler` | Leave/kick (one equal-standing op): deletes membership, key wrap, pending invite, view signal. Access rows revoked lazily by convergence |
+| `library_access_grant` | `LibraryAccessGrantHandler` | Convergence batch: OR-IGNORE metadata + blob wraps for ONE member-or-invitee target; validates every photo is live and in-library, every block backs one; recipient pubkey resolved from consensus state, never the wire; signals the target's view change |
+| `library_access_revoke` | `LibraryAccessRevokeHandler` | Convergence batch: delete a departed user's wraps. Target must be NEITHER member nor invitee — the inversion prevents a stealth kick bypassing `library_remove_member` |
 | `album_create` | `AlbumCreateHandler` | Create album |
 | `album_add_photo` | `AlbumAddPhotoHandler` | Add photo to album, log operation |
 | `album_remove_photo` | `AlbumRemovePhotoHandler` | Remove photo from album, log operation |
@@ -635,25 +687,69 @@ photo_edit_content handler (all nodes):
 
 The old data block is retained because the operation log entry references its `prior_data_block_id`. Any member can undo by submitting `photo_undo`, which swaps the `photo_resources` row back.
 
-### Shared Library: Join Flow
+### Shared Library: Invite, Join, and the Convergence Worker
 
-When a new member joins an existing library:
+Membership changes are consent-based (mirroring the drive share accept
+pattern) and access distribution is a **background convergence loop**, not
+a one-shot bulk transaction. The original design — one
+`join_shared_library` tx carrying every wrap — could not scale past a few
+thousand photos and made the join race (photos added between wrap
+computation and commit) unfixable handler-side, since validators hold no
+member key and cannot wrap.
+
+**The convergence worker** runs per signed-in user beside the sidecar sync
+worker (same session-key lifetime — no session, no unwrapping). Each 30 s
+tick (or an immediate poke from the invite route), per library the user
+belongs to:
 
 ```
-Client-side (initiated by existing member):
-  1. For each photo in library:
-     a. For each resource of the photo: wrap file key for new member
-     b. Wrap metadata key for new member
-  2. Submit join_shared_library transaction with all wrapped keys
-
-join_shared_library handler (all nodes):
-  1. Insert into shared_library_members
-  2. For each photo in library:
-     a. Insert file_access entries for every photo_resources row
-     b. Insert photo_metadata_access entry
+assertion set  = members ∪ pending invitees
+For each target in the assertion set (≠ self):
+  delta = live library photos/blocks the target has no wrap for
+  unwrap own wraps → rewrap for target → library_access_grant (≤500/batch)
+For each user holding wraps who is NEITHER member nor invitee:
+  library_access_revoke for their rows
+Loop until a pass emits nothing (cap 200 rounds/tick).
 ```
 
-This may be a large transaction for libraries with many photos. A batched approach (process N photos per consensus round) may be necessary for libraries exceeding a few thousand photos. This is a detail for implementation phase.
+Grant handlers are OR IGNORE (first committed wrap wins), so any member's
+worker can cover any delta and racing workers are harmless. A rejected tx
+means state moved (kick/leave race) — the next tick re-derives; nothing
+retries a stale batch. The worker's loop iterates a `ConvergeLane` enum
+with a single `Access` variant: the future **`Keys` rotation lane**
+(re-encrypt blocks under fresh keys after a kick, so remembered keys stop
+decrypting new fetches) slots in without changing the tick or tx surface —
+designed, deliberately not built.
+
+**Invite → accept flow:**
+
+```
+Invite (any member): rewrap the LIBRARY key for the invitee, submit
+  library_invite (wrap parked on the invite row), poke convergence —
+  access pre-staging begins immediately. Pre-staged rows are inert:
+  reads gate on membership.
+Accept (invitee-signed): insert membership + promote the library-key
+  wrap + delete invite + write the invitee's photo_view_changes signal.
+  The invitee instantly sees everything pre-staged — even if the
+  inviter has been offline since the invite.
+```
+
+**Client-side rematerialization**: the sidecar sync worker's
+membership-diff pre-phase reconciles against memberships +
+`photo_view_changes` (never the photo_changes cursor — the photos didn't
+change): a new library or moved view signal triggers a paged,
+cursor-independent backfill of photos-with-my-wraps; a departed library
+purges its local rows (the client half of kick — the mesh read gate
+closed the instant the membership row died). Publish-time fan-out
+(`fetch_library_members`) returns members ∪ invitees, so new adds/edits
+cover pending invitees directly; the worker is backfill, not race repair.
+
+**Revocation semantics (v1)**: kick = instant API revocation (membership
+row deletion closes the read gate) + lazy wrap deletion by convergence.
+This is deliberately NOT cryptographic revocation — a departed member who
+dumped DB state beforehand retains keys for the bytes they already had
+access to; the accepted trade until the `Keys` rotation lane lands.
+Plaintext already downloaded is theirs forever under any scheme.
 
 ## Retention Policy
 
@@ -835,12 +931,15 @@ If the module is not compiled, no photos tables are created, no handlers are reg
 - [x] Deletion with 30-day retention and restore
 - [x] Periodic cleanup job for expired deletions
 
-### Phase 3: Shared Libraries [ ]
-- Library creation and membership management
-- Auto-share on add (file_access + photo_metadata_access distribution to all members)
-- Member join flow with bulk key wrapping
-- Member leave with cleanup
-- Library member pubkey endpoint (for thin client key wrapping)
+### Phase 3: Shared Libraries [~]
+- [x] Library creation and membership lifecycle (2026-08-01): `create_shared_library` + invite/accept/decline/remove consensus txs (JWT-only — excluded from `DEVICE_TX_FUNCTIONS`), per-member wrapped library key (`shared_library_keys`; name encrypted under it), consent-pattern invites with invite-parked wraps, JWT routes `/api/photos/libraries{,/{id}/invite,accept,decline,leave}`
+- [x] Auto-share on add: `photo_add`/`photo_edit_content` fan out to members ∪ pending invitees (`read_library_membership` union); handler authz widened from uploader-only to member (equal standing) across delete/restore/edit/undo/favorite
+- [x] Access convergence worker (replaces the one-shot bulk join): per-user session-lifetime loop deriving grant/revoke deltas, `library_access_grant`/`_revoke` batches, rotation-lane seam (`ConvergeLane`)
+- [x] Membership-gated reads (Design B): shared photos require membership at `query_changes` (both statements) and the resource byte path; pre-staged invitee wraps inert until accept; kick = instant API revocation
+- [x] Sidecar rematerialization: membership-diff pre-phase, `photo_view_changes`-triggered paged backfill, purge on leave/kick (`sidecar_libraries` state)
+- [ ] Ingress daemon shared publish (next cycle — opens the iCloud shared-library cutover): mesh library binding on the ingress `libraries` table, claim predicate extension, per-library ingress responsibility, library-scoped fingerprint key on `POST /api/photos/client/resolve` (derive from the library key — the seam exists)
+- [ ] `Keys` rotation lane (cryptographic revocation after kick) — designed into the convergence contract, not built
+- [ ] Empty-library GC (last leaver strands the library row)
 
 ### Phase 4: Albums and Organization [ ]
 - Album CRUD with consensus

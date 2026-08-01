@@ -177,6 +177,24 @@ apply functions inside consensus handlers.
       behind a `ProvisioningDeps` seam, so its ordering/owner invariants
       (creds-before-register, capture-before-wipe, owner-only 403) are
       pinned by mock tests in Linux CI.
+- [~] Shared-library membership lifecycle, mesh side (RFC-011 Phase 3,
+      2026-08-01): create_shared_library + invite/accept/decline/
+      remove_member consensus txs (JWT-only; DEVICE list unchanged) with
+      per-member wrapped library key (name encrypted under it; seam for
+      the library-scoped fingerprint key); consent-pattern invites carry
+      the invitee's wrap so accept works inviter-offline. Access
+      distribution is a per-user CONVERGENCE worker (session-lifetime,
+      beside the sidecar sync worker): grant/revoke deltas toward
+      members ∪ invitees, OR-IGNORE handlers make racing workers
+      harmless, ConvergeLane seam reserves the future key-rotation lane.
+      Reads are membership-gated for shared photos (Design B — pre-staged
+      invitee wraps inert until accept; kick = instant API revocation);
+      sidecar rematerializes on membership diff + photo_view_changes
+      signals (join backfill / leave purge) instead of photo_changes
+      bumps. JWT routes /api/photos/libraries*, ingest route gains a
+      library_id target. Remaining for cutover: ingress-side shared
+      publish (mesh binding, claim predicate, per-library responsibility,
+      library-scoped fingerprint resolve) — next cycle.
 - [x] Ingress transplant: archive → transient spool (2026-08-01): the
       daemon's independent archive on user-owned storage (blob roots,
       sidecar JSON files, remote replication, snapshots, Tier-3 recover,
