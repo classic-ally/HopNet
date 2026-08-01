@@ -418,14 +418,13 @@ pub async fn rpc_auth_middleware(
     }
 }
 
-/// GET /debug/state-snapshot — full-table content hashes for divergence checks
+/// GET /debug/state — the canonical snapshot manifest (per-table,
+/// per-section, and top hashes) plus the height it was computed at. The
+/// top hash is the one-line cross-node equality check; the same walk
+/// produces the epoch snapshot artifact (RFC-019).
 pub async fn get_state_snapshot(State(app_state): State<AppState>) -> impl IntoResponse {
-    match crate::db::debug::compute_state_snapshot(app_state.db_pool.get()) {
-        Ok(internal_snapshot) => {
-            // Convert internal (Blake3Hash) to wire format (String)
-            let wire_snapshot: hopnet_common::StateSnapshot = internal_snapshot.into();
-            (axum::http::StatusCode::OK, Json(wire_snapshot)).into_response()
-        }
+    match crate::db::snapshot::compute_node_state(app_state.db_pool.get()) {
+        Ok(report) => (axum::http::StatusCode::OK, Json(report)).into_response(),
         Err(e) => {
             tracing::error!("Failed to compute state snapshot: {:?}", e);
             (

@@ -556,8 +556,6 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                     auth::auth_middleware,
                 ));
 
-            // State snapshot endpoint requires DuckDB JSON extension (not codesigned for macOS release)
-            #[cfg(any(not(target_os = "macos"), debug_assertions))]
             let protected_routes =
                 protected_routes.route("/debug/state", get(consensus::routes::get_state_snapshot));
 

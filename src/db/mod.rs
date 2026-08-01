@@ -25,6 +25,7 @@ pub mod resilience;
 pub mod setup;
 pub mod shared;
 pub mod shares;
+pub mod snapshot;
 pub mod takeout;
 pub mod types;
 pub mod users;

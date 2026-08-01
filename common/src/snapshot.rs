@@ -323,7 +323,7 @@ mod engine {
     ) -> Result<TableManifest, SnapshotError> {
         let mut hasher = blake3::Hasher::new();
         hasher.update(DOMAIN_TABLE);
-        let mut write =
+        let write =
             |hasher: &mut blake3::Hasher, artifact: &mut Option<&mut Vec<u8>>, bytes: &[u8]| {
                 hasher.update(bytes);
                 if let Some(buf) = artifact.as_deref_mut() {
