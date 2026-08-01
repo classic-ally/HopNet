@@ -162,6 +162,16 @@ pub fn extract_tar_gz(archive_bytes: &[u8]) -> Result<ExtractedArchive> {
             } else {
                 files.insert(path, buf);
             }
+        } else if !entry_type.is_dir() {
+            // The takeout wire format contains only Regular files and
+            // directories. Anything else (GNU sparse, links, …) breaks
+            // naive tar readers — fail loudly instead of silently
+            // omitting the entry from `files` (issue #28).
+            anyhow::bail!(
+                "Archive entry {} has unexpected type {:?} — takeout must emit only regular entries",
+                path,
+                entry_type
+            );
         }
         // Directory entries are tracked in entry_order but contribute no bytes.
     }
