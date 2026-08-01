@@ -553,9 +553,51 @@ protocol it checks.
     membership commits during the moratorium consume the pool (staged
     vote-outs legitimately decide in the drain). Seal contract:
     `hopnet-consensus/spec/regenesis-seal-contract.md`
-- [ ] S5 — boundary protocol: `regenesis_start`/`commit`/`abort`,
+- [x] S5 — boundary protocol: `regenesis_start`/`commit`/`abort`,
       admission gate, drain, vote-iff-match, seal
   - deterministic-sim + fault-fuzzing coverage
+  - landed as `src/regenesis/` (handlers, gate, seal, routes) plus the
+    engine hooks. Resolutions recorded:
+    - OQ2 (authorization): the membership-ops class — a SEATED
+      validator's node signature; no admin role exists and none was
+      invented (the human gate is the authenticated
+      `/consensus/regenesis/*` route). Roles stay deferred with
+      issue #21.
+    - OQ4 (drain-complete): staged 0 AND inflight 0 AND tip applied,
+      observed by the proposer's own NeedValue path; a drain watcher
+      nudges the on-demand engine with idempotent Resumes while the
+      committed phase is moratorium (an empty pool never fires the
+      work signal), re-armed on every engine start for crash recovery
+    - `snapshot_hash` is blake3 over the ARTIFACT bytes (Exported
+      tables only), NOT the manifest top hash: the top hash covers
+      divergence-only state (`regenesis_state`, `decided_blocks`),
+      which moves when the commit applies and with every height — no
+      post-seal recompute could match it. The artifact identity is
+      stable across the seal by construction and is exactly what an
+      S7 joiner verifies against the certificate
+    - freeze enforcement is LAYERED: HTTP 503 (+ structured
+      `RegenesisRefusalView`, Retry-After) → queue-chokepoint gate
+      covering every client route AND internal cron → vote-time
+      checks (solo block, seal-height binding, vote-iff-match Live-
+      only, own-drain, sealed-refusal) → engine halt. The
+      admissibility predicate (`regenesis::gate`) is ONE seam,
+      deliberately generic: future dynamic module enable/disable adds
+      committed-state inputs to it, no new chokepoints
+    - drain semantics kept per spec (staged work completes; the
+      forwarded path stays ungated BY DESIGN). Byzantine drain-padding
+      degrades to the wedged-drain failure mode, answered by abort; a
+      consensus-visible drain deadline is noted as future hardening
+    - the sealed mesh parks: `spawn_engine` refuses over the durable
+      `regenesis_sealed_at` marker and recomputes a missing artifact
+      idempotently — the S6 restart consumes both
+    - observed while building the e2e: a seated node that misses the
+      FINAL block (lagging at the instant the commit decides) is left
+      in the moratorium with a halted mesh around it — nothing pushes
+      the seal to it. This is the existing straggler case ("offline
+      through the regenesis") and lands with S7's rejoin (peers answer
+      epoch-mismatch + lineage); with on-demand heights the window is
+      tiny (a drained moratorium is height-stable), but S7 should keep
+      it explicitly in scope
 - [ ] S6 — genesis construction + restart: lineage, boot gates,
       awaiting-upgrade parking, `(epoch, version)` handshake
 - [ ] S7 — stragglers + rejoin: overlap verification, snapshot

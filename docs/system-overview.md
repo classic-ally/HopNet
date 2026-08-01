@@ -68,9 +68,20 @@ an audit found a view-change safety hole. See RFC-013 for the full design
       inside the membership machine's inductive invariant, so the
       whole safety matrix transfers across the boundary depth-free;
       seal safety via inductively-checked ghost) + the seal contract
-      note (hopnet-consensus/spec/regenesis-seal-contract.md). Next:
-      S5 boundary protocol (regenesis_start/commit/abort, drain,
-      vote-iff-match, seal).
+      note (hopnet-consensus/spec/regenesis-seal-contract.md); S5
+      boundary protocol — regenesis_start/commit/abort txs over the
+      regenesis_state singleton (seated-validator authz, staged-target
+      precondition), the layered freeze (503 + structured refusal →
+      queue-chokepoint admissibility seam → vote-time solo/binding/
+      vote-iff-match/sealed checks → engine halt at terminal H),
+      drain watcher + proposer commit injection (snapshot_hash =
+      blake3 of the artifact bytes), durable seal marker + byte-
+      certified artifact next to the database; evidence at four
+      layers (handler/vote-time units, seeded sim drain+seal
+      scenarios, real-engine loopback e2e, orchestrator
+      regenesis-seal ending deliberately sealed). Next: S6 genesis
+      construction + restart (boot gates, awaiting-upgrade parking,
+      epoch/version handshake).
 
 ### 2. Storage Substrate ([RFC-014](specs/hopnet-storage.md)) + File Storage ([RFC-002](specs/file-storage.md))
 **Status**: Substrate extraction COMPLETE (stages A–F, 2026-07-07) — the `hopnet-storage`

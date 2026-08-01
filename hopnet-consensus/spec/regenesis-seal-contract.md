@@ -53,6 +53,11 @@ seal would violate an inductively checked invariant.
 
 ## What the engine must implement (S5/S6)
 
+Items 1–3 and the halt/recompute obligations below landed in S5
+(`Application::sealed_after` + the terminal branch of `Effect::Decide`;
+`regenesis_sealed_at` marker; idempotent artifact recompute); the boot
+path at H+1 is S6's.
+
 - Halt after applying the `regenesis_commit` block; refuse to
   propose, vote, or apply anything in this epoch above H.
 - Treat sealed artifacts (snapshot, certificate, genesis) as derived,
