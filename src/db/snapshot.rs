@@ -88,6 +88,24 @@ pub fn compute_node_state_tx(tx: &rusqlite::Transaction) -> Result<NodeStateRepo
     })
 }
 
+/// Canonical artifact identity (RFC-019 S5): blake3 over the artifact
+/// bytes — the EXPORTED subset only, so it is stable across the seal
+/// transition (the boundary machinery mutates only DivergenceOnly
+/// state: regenesis_state, decided_blocks). Identically computable by
+/// the proposer, every validator at vote time, the artifact writer
+/// after the seal, and a joiner verifying its download (S7). The
+/// manifest's top hash is deliberately NOT used here: it covers
+/// divergence-only tables and changes with every decided height.
+pub fn compute_artifact_hash_tx(
+    tx: &rusqlite::Transaction,
+) -> Result<hopnet_common::Blake3Hash, DatabaseError> {
+    let (artifact, _manifest) = snapshot::serialize_snapshot(tx, &sections()).map_err(|e| {
+        tracing::error!("artifact serialization failed: {e}");
+        DatabaseError::ProcessingError
+    })?;
+    Ok(hopnet_common::Blake3Hash::new(blake3::hash(&artifact)))
+}
+
 /// Import an epoch snapshot artifact into this (fresh) database — the
 /// S6 boot-gate entry point, fixed here beside the manifest reader.
 /// Caller commits (via crate::db::shared::commit_timed on real paths).

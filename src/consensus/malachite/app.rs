@@ -130,23 +130,24 @@ impl HopNetApplication {
             }
             if origin == ValidationOrigin::Live {
                 // Vote-iff-match (Rule-8, RFC-013 precedent): recompute
-                // the canonical snapshot over OWN state at this height and
-                // vote only on a hash match. A quorum deciding despite our
-                // mismatch means our replica is the anomaly (divergence
-                // surfacing, not being caused). Never at Sync — decided is
-                // decided, and the certificate carries the quorum's word.
+                // the canonical snapshot ARTIFACT over OWN state at this
+                // height and vote only on a byte-identity match. A quorum
+                // deciding despite our mismatch means our replica is the
+                // anomaly (divergence surfacing, not being caused). Never
+                // at Sync — decided is decided, and the certificate
+                // carries the quorum's word.
                 let started = std::time::Instant::now();
-                let report = crate::db::snapshot::compute_node_state_tx(db_tx)
+                let local = crate::db::snapshot::compute_artifact_hash_tx(db_tx)
                     .map_err(|e| format!("vote-iff-match snapshot: {e:?}"))?;
                 tracing::info!(
                     height = height.0,
                     elapsed_ms = started.elapsed().as_millis() as u64,
-                    "vote-iff-match: snapshot recomputed inside the round (OQ1 timing)"
+                    "vote-iff-match: artifact recomputed inside the round (OQ1 timing)"
                 );
-                if report.manifest.top_hash.as_bytes() != commit.snapshot_hash.as_slice() {
+                if local.as_bytes() != commit.snapshot_hash.as_slice() {
                     return Err(format!(
-                        "vote-iff-match: local snapshot {} != proposed {}",
-                        report.manifest.top_hash.to_hex(),
+                        "vote-iff-match: local artifact {} != proposed {}",
+                        local.to_hex(),
                         hopnet_common::Blake3Hash::from_bytes(commit.snapshot_hash).to_hex()
                     ));
                 }
@@ -298,6 +299,16 @@ impl<C: DerefMut<Target = Connection> + 'static> Application<SqliteStorage<C>>
         )
     }
 
+    fn sealed_after(&mut self, _height: Height, block: &engine::Block) -> bool {
+        // A decided commit block applied successfully, so the epoch IS
+        // sealed — the engine parks at the terminal height (RFC-019).
+        block
+            .data
+            .transactions
+            .iter()
+            .any(|t| t.rpc.function == "regenesis_commit")
+    }
+
     fn on_decided(&mut self, height: Height, block: &engine::Block, cert: &WireCommitCertificate) {
         tracing::debug!(height = height.0, "block decided (malachite engine)");
 
@@ -310,6 +321,24 @@ impl<C: DerefMut<Target = Connection> + 'static> Application<SqliteStorage<C>>
             self.app_state
                 .evidence
                 .record_contact_with_height(*node_id, cert.height);
+        }
+
+        // RFC-019 S5: the commit block seals the epoch — run the
+        // node-local seal work (durable marker + snapshot artifact) OFF
+        // the shell thread (this hook is non-blocking only). Idempotent
+        // by construction: a crash before completion recomputes from
+        // sealed local state on the next boot.
+        if block
+            .data
+            .transactions
+            .iter()
+            .any(|t| t.rpc.function == "regenesis_commit")
+        {
+            let app_state = self.app_state.clone();
+            let seal_height = height.0;
+            std::thread::spawn(move || {
+                crate::regenesis::seal::run_seal_work(&app_state, seal_height);
+            });
         }
 
         // Distribution kick (RFC-014/017): every registered projection

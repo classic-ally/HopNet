@@ -369,10 +369,16 @@ fn commit_block_vote_iff_match_and_shape() {
         db_tx.commit().unwrap();
     }
 
-    // The honest hash: what every validator recomputes locally.
-    let report = crate::db::snapshot::compute_node_state(node.app_state.db_pool.get()).unwrap();
-    let mut honest = [0u8; 32];
-    honest.copy_from_slice(report.manifest.top_hash.as_bytes());
+    // The honest identity: blake3 over the canonical artifact bytes —
+    // what every validator recomputes locally at vote time.
+    let honest = {
+        let mut conn = node.app_state.db_pool.get().unwrap();
+        let db_tx = conn.transaction().unwrap();
+        let hash = crate::db::snapshot::compute_artifact_hash_tx(&db_tx).unwrap();
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(hash.as_bytes());
+        bytes
+    };
 
     let commit_tx = |hash: [u8; 32], seal_height: u64| {
         Transaction::new(
@@ -439,4 +445,50 @@ fn commit_block_vote_iff_match_and_shape() {
         Validity::Invalid,
         "no block may decide past the seal"
     );
+}
+
+// Should: write the snapshot artifact from sealed local state when the
+// recomputed artifact hash matches the committed one — the certified
+// bytes themselves — and refuse loudly when this replica's recompute
+// diverges from what the mesh certified.
+// Impact: the seal's hash identity covers the EXPORTED subset only, so
+// it survives the seal transition (only divergence-only state changes
+// when the commit applies) and a diverged replica can never publish a
+// wrong artifact for joiners.
+#[test]
+fn seal_artifact_written_only_on_hash_match() {
+    let node = MockNode::new(3);
+    register_node(&node);
+    seat_with_version(&node, 3, 20260800);
+
+    apply(&node, "regenesis_start", start_payload(20260800)).unwrap();
+    let honest = {
+        let mut conn = node.app_state.db_pool.get().unwrap();
+        let db_tx = conn.transaction().unwrap();
+        let hash = crate::db::snapshot::compute_artifact_hash_tx(&db_tx).unwrap();
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(hash.as_bytes());
+        bytes
+    };
+    apply(&node, "regenesis_commit", commit_payload(honest, 9)).unwrap();
+
+    let dir = std::env::temp_dir().join(format!("hopnet-seal-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("regenesis-snapshot.bin");
+    let written =
+        crate::regenesis::seal::write_seal_artifact_to(&node.app_state, &path).unwrap();
+    let bytes = std::fs::read(&written).unwrap();
+    assert!(bytes.starts_with(b"HOPSNAP\0"), "artifact magic");
+    assert_eq!(blake3::hash(&bytes).as_bytes(), &honest, "bytes are the certified bytes");
+
+    // Tamper the committed hash: the writer must refuse (this replica
+    // would be the diverged one).
+    {
+        let conn = node.app_state.db_pool.get().unwrap();
+        conn.execute("UPDATE regenesis_state SET snapshot_hash = X'AB'", [])
+            .unwrap();
+    }
+    let err = crate::regenesis::seal::write_seal_artifact_to(&node.app_state, &path).unwrap_err();
+    assert!(err.contains("diverged"), "{err}");
+    std::fs::remove_dir_all(&dir).ok();
 }

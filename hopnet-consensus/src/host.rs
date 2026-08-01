@@ -810,16 +810,23 @@ where
             ctx.app.on_decided(height, &block, &wire_cert);
             ctx.outputs.push(HostOutput::Decided { height });
 
-            // Advance to the next height (queued, not re-entrant). In
-            // on-demand mode the start is deferred until a wake signal —
-            // an idle mesh arms no timers and produces no empty blocks.
-            let next = malachitebft_core_types::Height::increment(&height);
-            if ctx.on_demand {
-                *ctx.deferred_start = Some(next);
+            if ctx.app.sealed_after(height, &block) {
+                // RFC-019 seal contract, item 1: H is TERMINAL. Neither
+                // defer nor start H+1 — later wake signals find no
+                // deferred height to resume, and the park is the halt.
+                *ctx.deferred_start = None;
             } else {
-                let valset = ctx.app.validator_set(next);
-                ctx.pending_inputs
-                    .push_back(Input::StartHeight(next, valset, false, None));
+                // Advance to the next height (queued, not re-entrant). In
+                // on-demand mode the start is deferred until a wake signal —
+                // an idle mesh arms no timers and produces no empty blocks.
+                let next = malachitebft_core_types::Height::increment(&height);
+                if ctx.on_demand {
+                    *ctx.deferred_start = Some(next);
+                } else {
+                    let valset = ctx.app.validator_set(next);
+                    ctx.pending_inputs
+                        .push_back(Input::StartHeight(next, valset, false, None));
+                }
             }
             *ctx.wal_seq = 0;
 

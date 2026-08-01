@@ -12,6 +12,7 @@
 pub mod gate;
 pub mod handlers;
 pub mod routes;
+pub mod seal;
 
 use serde::{Deserialize, Serialize};
 
@@ -25,10 +26,14 @@ pub struct RegenesisStart {
     pub target_version_code: u32,
 }
 
-/// `regenesis_commit` payload: the snapshot hash every validator must
-/// reproduce over its own state (vote-iff-match), and the terminal
-/// height. `seal_height` is bound to the actual block height at vote
-/// time — deterministic with no in-apply height read.
+/// `regenesis_commit` payload: the snapshot identity every validator
+/// must reproduce over its own state (vote-iff-match), and the terminal
+/// height. `snapshot_hash` is blake3 over the canonical ARTIFACT bytes
+/// (Exported tables only — stable across the seal transition, and
+/// exactly what a joiner verifies against the certificate; never the
+/// manifest top hash, which covers divergence-only tables and moves
+/// with every height). `seal_height` is bound to the actual block
+/// height at vote time — deterministic with no in-apply height read.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegenesisCommit {
     pub snapshot_hash: [u8; 32],

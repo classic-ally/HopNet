@@ -137,6 +137,28 @@ pub fn spawn_engine(app_state: &AppState) -> Result<(), String> {
         let last_decided = store::last_decided_height(&conn)
             .map_err(|e| format!("spawn_engine: {e}"))?
             .ok_or("spawn_engine: no consensus genesis installed")?;
+        // RFC-019 seal contract: a sealed epoch never restarts its engine —
+        // the node parks awaiting the S6 restart path. The artifact is
+        // recomputed on wake if a crash interrupted the seal work
+        // (idempotent from sealed local state).
+        if let Some(sealed_at) = crate::regenesis::seal::sealed_marker(&conn) {
+            tracing::warn!(
+                sealed_at,
+                "epoch is sealed: consensus engine will not start (awaiting restart)"
+            );
+            let recompute_state = app_state.clone();
+            std::thread::spawn(move || {
+                if !crate::regenesis::seal::artifact_path().exists()
+                    && let Err(e) = crate::regenesis::seal::write_seal_artifact_to(
+                        &recompute_state,
+                        &crate::regenesis::seal::artifact_path(),
+                    )
+                {
+                    tracing::error!("seal artifact recompute failed: {e}");
+                }
+            });
+            return Ok(());
+        }
         let chain_bytes = store::meta_get(&conn, store::META_CHAIN_ID)
             .map_err(|e| format!("spawn_engine: {e}"))?
             .ok_or("spawn_engine: no chain id in consensus_meta")?;
@@ -587,16 +609,16 @@ fn seal_candidate(
     let tx_snapshot = conn
         .transaction()
         .map_err(|e| format!("snapshot tx: {e}"))?;
-    let report = crate::db::snapshot::compute_node_state_tx(&tx_snapshot)
+    let artifact_hash = crate::db::snapshot::compute_artifact_hash_tx(&tx_snapshot)
         .map_err(|e| format!("snapshot compute: {e:?}"))?;
     drop(tx_snapshot);
     let mut snapshot_hash = [0u8; 32];
-    snapshot_hash.copy_from_slice(report.manifest.top_hash.as_bytes());
+    snapshot_hash.copy_from_slice(artifact_hash.as_bytes());
     tracing::info!(
         seal_height,
         elapsed_ms = started.elapsed().as_millis() as u64,
-        top_hash = %report.manifest.top_hash.to_hex(),
-        "regenesis commit candidate: snapshot recomputed (OQ1 timing)"
+        artifact_hash = %artifact_hash.to_hex(),
+        "regenesis commit candidate: artifact recomputed (OQ1 timing)"
     );
     let payload = bincode::serde::encode_to_vec(
         &crate::regenesis::RegenesisCommit {
