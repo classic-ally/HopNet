@@ -301,4 +301,135 @@ mod tests {
         assert_eq!(manifest_a, manifest_b);
         assert_eq!(artifact_a, artifact_b);
     }
+
+    /// Exported-role table manifests — the subset the post-import parity
+    /// check compares (DivergenceOnly tables legitimately differ on a
+    /// fresh database).
+    fn exported_tables(
+        manifest: &hopnet_common::SnapshotManifest,
+    ) -> Vec<&hopnet_common::TableManifest> {
+        manifest
+            .sections
+            .iter()
+            .flat_map(|s| {
+                s.tables
+                    .iter()
+                    .filter(|t| t.role == hopnet_common::TableRole::Exported)
+            })
+            .collect()
+    }
+
+    // Should: serialize the seeded five-section fixture, import it into
+    // a second freshly initialized database, and get an equal top hash,
+    // equal per-section hashes, equal exported table manifests, and a
+    // byte-identical re-serialized artifact; the excluded node-local
+    // columns land as fresh-node values.
+    // Should not: compare DivergenceOnly manifests — decided_blocks
+    // differs on a fresh node by design.
+    // Impact: this is RFC-019 S2's acceptance gate over the real schema,
+    // foreign-key chains included — the epoch boundary's state-transfer
+    // contract.
+    #[test]
+    fn fresh_db_import_roundtrip_gate() {
+        let source_pool = fresh_pool();
+        seed(&source_pool.get().unwrap());
+        let mut source = source_pool.get().unwrap();
+        let tx = source.transaction().unwrap();
+        let (artifact, manifest_src) =
+            hopnet_common::snapshot::serialize_snapshot(&tx, &sections()).unwrap();
+        drop(tx);
+
+        let target_pool = fresh_pool();
+        let mut target = target_pool.get().unwrap();
+        {
+            let tx = target.transaction().unwrap();
+            let report = import_snapshot_tx(&tx, &artifact).unwrap();
+            assert!(report.skipped.is_empty());
+            assert_eq!(report.imported.len(), 5);
+            tx.commit().unwrap();
+        }
+
+        let tx = target.transaction().unwrap();
+        let (artifact_again, manifest_re) =
+            hopnet_common::snapshot::serialize_snapshot(&tx, &sections()).unwrap();
+        assert_eq!(artifact_again, artifact);
+        assert_eq!(manifest_re.top_hash, manifest_src.top_hash);
+        for (re, src) in manifest_re.sections.iter().zip(&manifest_src.sections) {
+            assert_eq!(re.section_hash, src.section_hash, "section {}", re.name);
+        }
+        assert_eq!(
+            exported_tables(&manifest_re),
+            exported_tables(&manifest_src)
+        );
+
+        let (stored_locally, self_verified): (i64, Option<i64>) = tx
+            .query_row(
+                "SELECT stored_locally, self_verified_height
+                 FROM fragment_hashes fh JOIN fragment_inventory fi
+                 ON fh.fragment_hash = fi.fragment_hash",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored_locally, 0);
+        assert_eq!(self_verified, None);
+    }
+
+    // Should not: import into a database that already has covered rows;
+    // the error names the first non-empty table.
+    #[test]
+    fn import_into_nonempty_db_fails_loudly() {
+        let source_pool = fresh_pool();
+        seed(&source_pool.get().unwrap());
+        let mut source = source_pool.get().unwrap();
+        let tx = source.transaction().unwrap();
+        let (artifact, _) = hopnet_common::snapshot::serialize_snapshot(&tx, &sections()).unwrap();
+        drop(tx);
+
+        let target_pool = fresh_pool();
+        seed(&target_pool.get().unwrap());
+        let mut target = target_pool.get().unwrap();
+        let tx = target.transaction().unwrap();
+        let err = import_snapshot_tx(&tx, &artifact).unwrap_err();
+        assert!(matches!(
+            err,
+            hopnet_common::snapshot::SnapshotError::TargetNotEmpty { ref table }
+                if table == "sequences"
+        ));
+    }
+
+    // Should: skip a section missing from the import registry with an
+    // UnknownSection report, import the rest, and recompute a top hash
+    // that DIFFERS from the source's.
+    // Impact: a skipped section surfaces as certificate mismatch — the
+    // property the S6 boot gate turns into fatal-or-informed.
+    #[test]
+    fn import_with_missing_registry_section_skips_and_diverges() {
+        let source_pool = fresh_pool();
+        seed(&source_pool.get().unwrap());
+        let mut source = source_pool.get().unwrap();
+        let tx = source.transaction().unwrap();
+        let (artifact, manifest_src) =
+            hopnet_common::snapshot::serialize_snapshot(&tx, &sections()).unwrap();
+        drop(tx);
+
+        let all = sections();
+        let without_takeout = &all[..4];
+        let target_pool = fresh_pool();
+        let mut target = target_pool.get().unwrap();
+        let tx = target.transaction().unwrap();
+        let report =
+            hopnet_common::snapshot::import_snapshot(&tx, without_takeout, &artifact).unwrap();
+        assert_eq!(report.imported.len(), 4);
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].name, "takeout");
+        assert_eq!(
+            report.skipped[0].reason,
+            hopnet_common::snapshot::SkipReason::UnknownSection
+        );
+
+        let manifest_partial =
+            hopnet_common::snapshot::compute_manifest(&tx, without_takeout).unwrap();
+        assert_ne!(manifest_partial.top_hash, manifest_src.top_hash);
+    }
 }
