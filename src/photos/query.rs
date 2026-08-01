@@ -126,6 +126,152 @@ fn rows_to_changes(
     Ok(changes)
 }
 
+/// One shared library the user belongs to (or is invited to), with the
+/// user's own library-key wrap so the route can decrypt the name.
+pub struct UserLibraryRow {
+    pub library_id: hopnet_common::CustomUUID,
+    pub encrypted_name: Vec<u8>,
+    pub name_nonce: [u8; 12],
+    pub ephemeral_pubkey: [u8; 32],
+    pub wrapped_key: Vec<u8>,
+    /// Some(inviter) for a pending invite, None for a membership.
+    pub invited_by: Option<i32>,
+}
+
+fn map_library_row(
+    r: &rusqlite::Row<'_>,
+    invited_by_col: Option<usize>,
+) -> rusqlite::Result<(hopnet_common::CustomUUID, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Option<i32>)> {
+    Ok((
+        r.get(0)?,
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        r.get(4)?,
+        invited_by_col.map(|c| r.get(c)).transpose()?,
+    ))
+}
+
+fn finish_library_row(
+    (library_id, encrypted_name, nonce, eph, wrapped_key, invited_by): (
+        hopnet_common::CustomUUID,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Option<i32>,
+    ),
+) -> Result<UserLibraryRow, String> {
+    Ok(UserLibraryRow {
+        library_id,
+        encrypted_name,
+        name_nonce: nonce
+            .try_into()
+            .map_err(|_| "malformed name nonce".to_string())?,
+        ephemeral_pubkey: eph
+            .try_into()
+            .map_err(|_| "malformed ephemeral pubkey".to_string())?,
+        wrapped_key,
+        invited_by,
+    })
+}
+
+/// The user's shared-library memberships (with key wraps) and pending
+/// invites (with the invite-parked wraps).
+pub fn read_user_libraries(
+    pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    user_id: i32,
+) -> Result<Vec<UserLibraryRow>, String> {
+    let conn = pool.get().map_err(|e| format!("pool: {e}"))?;
+    let mut out = Vec::new();
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT l.id, l.encrypted_name, l.name_nonce, k.ephemeral_pubkey, k.wrapped_key
+             FROM shared_library_members m
+             JOIN shared_libraries l ON l.id = m.library_id
+             JOIN shared_library_keys k
+               ON k.library_id = m.library_id AND k.user_id = m.user_id
+             WHERE m.user_id = ?1 ORDER BY l.id",
+        )
+        .map_err(|e| format!("prepare memberships: {e:?}"))?;
+    let rows = stmt
+        .query_map(rusqlite::params![user_id], |r| map_library_row(r, None))
+        .map_err(|e| format!("memberships: {e:?}"))?;
+    for row in rows {
+        out.push(finish_library_row(
+            row.map_err(|e| format!("membership row: {e:?}"))?,
+        )?);
+    }
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT l.id, l.encrypted_name, l.name_nonce, i.ephemeral_pubkey, i.wrapped_key,
+                    i.invited_by
+             FROM shared_library_invites i
+             JOIN shared_libraries l ON l.id = i.library_id
+             WHERE i.user_id = ?1 ORDER BY l.id",
+        )
+        .map_err(|e| format!("prepare invites: {e:?}"))?;
+    let rows = stmt
+        .query_map(rusqlite::params![user_id], |r| map_library_row(r, Some(5)))
+        .map_err(|e| format!("invites: {e:?}"))?;
+    for row in rows {
+        out.push(finish_library_row(
+            row.map_err(|e| format!("invite row: {e:?}"))?,
+        )?);
+    }
+    Ok(out)
+}
+
+/// The caller's own library-key wrap for one library (membership only).
+pub fn read_own_library_key(
+    pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    user_id: i32,
+    library_id: &hopnet_common::CustomUUID,
+) -> Result<Option<([u8; 32], Vec<u8>)>, String> {
+    use rusqlite::OptionalExtension;
+    let conn = pool.get().map_err(|e| format!("pool: {e}"))?;
+    conn.query_row(
+        "SELECT ephemeral_pubkey, wrapped_key FROM shared_library_keys
+         WHERE library_id = ?1 AND user_id = ?2",
+        rusqlite::params![library_id, user_id],
+        |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?)),
+    )
+    .optional()
+    .map_err(|e| format!("own key: {e:?}"))?
+    .map(|(eph, wrapped)| {
+        Ok((
+            eph.try_into()
+                .map_err(|_| "malformed ephemeral pubkey".to_string())?,
+            wrapped,
+        ))
+    })
+    .transpose()
+}
+
+/// A mesh user's X25519 pubkey (for invite wrapping). None = unknown user.
+pub fn read_user_pubkey(
+    pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    user_id: i32,
+) -> Result<Option<[u8; 32]>, String> {
+    let conn = pool.get().map_err(|e| format!("pool: {e}"))?;
+    hopnet_photos::db::libraries::user_x25519_pubkey(&conn, user_id)
+        .map_err(|e| format!("pubkey: {e:?}"))
+}
+
+/// Membership pre-check for the ingest route (the handler is the
+/// deterministic backstop; this avoids uploading blobs for a doomed tx).
+pub fn is_library_member(
+    pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    user_id: i32,
+    library_id: &hopnet_common::CustomUUID,
+) -> Result<bool, String> {
+    let conn = pool.get().map_err(|e| format!("pool: {e}"))?;
+    hopnet_photos::db::libraries::is_member(&conn, library_id, user_id)
+        .map_err(|e| format!("membership: {e:?}"))
+}
+
 /// The sync worker's membership-diff inputs: the user's current library
 /// memberships and their per-library view-change signals.
 pub fn read_membership_state(

@@ -37,7 +37,17 @@ pub fn router<S: Clone + Send + Sync + 'static>(app_state: AppState) -> Router<S
         .route(
             "/photos/ingress/responsibility",
             get(get_ingress_responsibility),
-        );
+        )
+        // Shared-library membership lifecycle (JWT only — see the
+        // DEVICE_TX_FUNCTIONS const assert; daemons submit none of these).
+        .route(
+            "/photos/libraries",
+            get(get_libraries).post(post_create_library),
+        )
+        .route("/photos/libraries/{id}/invite", post(post_library_invite))
+        .route("/photos/libraries/{id}/accept", post(post_library_accept))
+        .route("/photos/libraries/{id}/decline", post(post_library_decline))
+        .route("/photos/libraries/{id}/leave", post(post_library_leave));
     // Separate sub-router so the raised body limit applies only to ingest
     // (the rest of the surface keeps axum's 2 MB default).
     let ingest = Router::new()
@@ -268,10 +278,13 @@ fn map_publish_error(e: hopnet_photos_core::PhotosCoreError) -> (StatusCode, Str
 async fn post_photo_ingest(
     State(state): State<AppState>,
     Extension(uid): Extension<i32>,
+    axum::extract::Query(ingest_query): axum::extract::Query<IngestQuery>,
     mut multipart: axum::extract::Multipart,
 ) -> Result<(StatusCode, Json<IngestResponse>), (StatusCode, String)> {
     use hopnet_photos_core::asset::{PhotoAsset, ResourceKind};
     use hopnet_photos_core::publisher::{ByteSource, PublishRequest, publish_photo_add};
+
+    let library_id = ingest_query.library_id;
 
     let first = multipart
         .next_field()
@@ -319,6 +332,21 @@ async fn post_photo_ingest(
         ));
     }
 
+    // Shared-library target: route-level membership pre-check (the
+    // consensus handler is the deterministic backstop — this just avoids
+    // uploading blobs for a tx that will be rejected, which would leave
+    // orphan fragments for the sweep).
+    if let Some(lib) = &library_id {
+        let member = super::query::is_library_member(&state.db_pool, uid, lib)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        if !member {
+            return Err((
+                StatusCode::FORBIDDEN,
+                format!("not a member of library {lib}"),
+            ));
+        }
+    }
+
     let photo_id = hopnet_common::CustomUUID::new(None);
     let sub = Submitter::new(std::sync::Arc::new(state), uid);
     let outcome = publish_photo_add(
@@ -326,7 +354,7 @@ async fn post_photo_ingest(
         PublishRequest {
             asset: &asset,
             photo_id,
-            library_id: None, // personal library only until Phase 3
+            library_id,
             byte_sources,
             // Browser/desktop uploads carry no PhotoKit identity; import-time
             // fingerprints for non-PhotoKit paths are a recorded deferral.
@@ -446,6 +474,301 @@ async fn get_ingress_responsibility(
     Ok(Json(IngressResponsibilityResponse {
         device_id: holder.map(|d| d.to_string()),
     }))
+}
+
+// --- Shared-library membership lifecycle (JWT) ---
+
+#[derive(Deserialize)]
+struct IngestQuery {
+    library_id: Option<hopnet_common::CustomUUID>,
+}
+
+#[derive(Deserialize)]
+struct CreateLibraryBody {
+    name: String,
+}
+
+#[derive(Serialize)]
+struct CreateLibraryResponse {
+    library_id: String,
+}
+
+#[derive(Serialize)]
+struct LibraryEntry {
+    library_id: String,
+    /// Decrypted server-side via the caller's session key.
+    name: Option<String>,
+    /// "member" or "invited".
+    status: &'static str,
+    invited_by: Option<i32>,
+}
+
+#[derive(Deserialize)]
+struct InviteBody {
+    user_id: i32,
+}
+
+#[derive(Deserialize, Default)]
+struct MemberBody {
+    /// Defaults to the caller (decline own invite / leave). Another user =
+    /// retract their invite / kick them.
+    user_id: Option<i32>,
+}
+
+/// Sign + submit a user tx built by a library route. Mirrors the
+/// ingress-claim submission path.
+async fn submit_library_tx(
+    state: &AppState,
+    uid: i32,
+    tx_type: &str,
+    payload_bytes: Vec<u8>,
+) -> Result<(), (StatusCode, String)> {
+    let sub = Submitter::new(std::sync::Arc::new(state.clone()), uid);
+    sub.submit_transaction(tx_type, payload_bytes)
+        .await
+        .map_err(|e| {
+            // Handler rejections surface as submit errors; the common
+            // cases are authz/conflict shapes worth a 4xx.
+            let msg = format!("{e}");
+            let status = if msg.contains("Authorization") {
+                StatusCode::FORBIDDEN
+            } else if msg.contains("Conflict") {
+                StatusCode::CONFLICT
+            } else if msg.contains("NotFound") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, msg)
+        })
+}
+
+fn session_recipient(
+    session: &crate::auth::SessionEntry,
+) -> hopnet_storage::crypto::StaticRecipient {
+    StaticRecipient(derive_x25519_privkey_from_user(
+        &session.user_keys.private_key,
+    ))
+}
+
+async fn post_create_library(
+    State(state): State<AppState>,
+    Extension(uid): Extension<i32>,
+    Json(body): Json<CreateLibraryBody>,
+) -> Result<(StatusCode, Json<CreateLibraryResponse>), (StatusCode, String)> {
+    let session = state
+        .get_session(uid)
+        .await
+        .map_err(|s| (s, "no session".into()))?;
+    let recipient = session_recipient(&session);
+
+    let library_id = hopnet_common::CustomUUID::new(None);
+    let library_key = hopnet_photos_core::crypto::generate_library_key();
+    let (encrypted_name, name_nonce) =
+        hopnet_photos_core::crypto::encrypt_metadata(&library_key, body.name.as_bytes())
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("encrypt: {e}")))?;
+    let (ephemeral_pubkey, wrapped_key) = hopnet_photos_core::crypto::wrap_library_key(
+        &library_id,
+        &hopnet_storage::RecipientKey::pubkey(&recipient),
+        &library_key,
+    )
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("wrap: {e}")))?;
+
+    let payload = hopnet_photos::envelopes::CreateSharedLibraryPayload {
+        library_id: library_id.clone(),
+        encrypted_name,
+        name_nonce,
+        creator_key: hopnet_photos::envelopes::LibraryKeyWrap {
+            user_id: uid,
+            ephemeral_pubkey,
+            wrapped_key,
+        },
+        operation_id: hopnet_common::CustomUUID::new(None),
+    };
+    let bytes = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("encode: {e}")))?;
+    submit_library_tx(&state, uid, "create_shared_library", bytes).await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateLibraryResponse {
+            library_id: library_id.to_string(),
+        }),
+    ))
+}
+
+async fn get_libraries(
+    State(state): State<AppState>,
+    Extension(uid): Extension<i32>,
+) -> Result<Json<Vec<LibraryEntry>>, (StatusCode, String)> {
+    let session = state
+        .get_session(uid)
+        .await
+        .map_err(|s| (s, "no session".into()))?;
+    let recipient = session_recipient(&session);
+
+    let pool = state.db_pool.clone();
+    let rows = tokio::task::spawn_blocking(move || super::query::read_user_libraries(&pool, uid))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let entries = rows
+        .into_iter()
+        .map(|row| {
+            // A name that fails to unwrap renders as None rather than
+            // failing the listing — one bad wrap must not hide the rest.
+            let name = hopnet_photos_core::crypto::unwrap_library_key(
+                &row.library_id,
+                &row.ephemeral_pubkey,
+                &row.wrapped_key,
+                &recipient,
+            )
+            .ok()
+            .and_then(|key| {
+                hopnet_photos_core::crypto::decrypt_metadata(
+                    &key,
+                    &row.name_nonce,
+                    &row.encrypted_name,
+                )
+                .ok()
+            })
+            .and_then(|bytes| String::from_utf8(bytes).ok());
+            LibraryEntry {
+                library_id: row.library_id.to_string(),
+                name,
+                status: if row.invited_by.is_some() {
+                    "invited"
+                } else {
+                    "member"
+                },
+                invited_by: row.invited_by,
+            }
+        })
+        .collect();
+    Ok(Json(entries))
+}
+
+async fn post_library_invite(
+    State(state): State<AppState>,
+    Extension(uid): Extension<i32>,
+    axum::extract::Path(library_id): axum::extract::Path<hopnet_common::CustomUUID>,
+    Json(body): Json<InviteBody>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let session = state
+        .get_session(uid)
+        .await
+        .map_err(|s| (s, "no session".into()))?;
+    let recipient = session_recipient(&session);
+
+    // Friendly pre-checks; the handler re-validates deterministically.
+    let pool = state.db_pool.clone();
+    let lib = library_id.clone();
+    let own_wrap =
+        tokio::task::spawn_blocking(move || super::query::read_own_library_key(&pool, uid, &lib))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+            .ok_or((
+                StatusCode::FORBIDDEN,
+                "not a member of this library".to_string(),
+            ))?;
+    let pool = state.db_pool.clone();
+    let invitee = body.user_id;
+    let invitee_pubkey =
+        tokio::task::spawn_blocking(move || super::query::read_user_pubkey(&pool, invitee))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+            .ok_or((StatusCode::NOT_FOUND, "unknown user".to_string()))?;
+
+    // Rewrap the library key for the invitee AT INVITE TIME — accept must
+    // work with the inviter offline, and the invite listing must render
+    // the library name.
+    let library_key = hopnet_photos_core::crypto::unwrap_library_key(
+        &library_id,
+        &own_wrap.0,
+        &own_wrap.1,
+        &recipient,
+    )
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("unwrap: {e}")))?;
+    let (ephemeral_pubkey, wrapped_key) = hopnet_photos_core::crypto::wrap_library_key(
+        &library_id,
+        &hopnet_storage::x25519_dalek::PublicKey::from(invitee_pubkey),
+        &library_key,
+    )
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("wrap: {e}")))?;
+
+    let payload = hopnet_photos::envelopes::LibraryInvitePayload {
+        library_id,
+        invitee: hopnet_photos::envelopes::LibraryKeyWrap {
+            user_id: invitee,
+            ephemeral_pubkey,
+            wrapped_key,
+        },
+        operation_id: hopnet_common::CustomUUID::new(None),
+    };
+    let bytes = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("encode: {e}")))?;
+    submit_library_tx(&state, uid, "library_invite", bytes).await?;
+
+    // Fire pre-staging now rather than on the next 30 s tick.
+    state.photos_host.poke_converge(uid).await;
+    Ok(StatusCode::OK)
+}
+
+async fn post_library_accept(
+    State(state): State<AppState>,
+    Extension(uid): Extension<i32>,
+    axum::extract::Path(library_id): axum::extract::Path<hopnet_common::CustomUUID>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let payload = hopnet_photos::envelopes::LibraryInviteAcceptPayload {
+        library_id,
+        operation_id: hopnet_common::CustomUUID::new(None),
+    };
+    let bytes = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("encode: {e}")))?;
+    submit_library_tx(&state, uid, "library_invite_accept", bytes).await?;
+    Ok(StatusCode::OK)
+}
+
+async fn post_library_decline(
+    State(state): State<AppState>,
+    Extension(uid): Extension<i32>,
+    axum::extract::Path(library_id): axum::extract::Path<hopnet_common::CustomUUID>,
+    body: Option<Json<MemberBody>>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let target = body.and_then(|Json(b)| b.user_id).unwrap_or(uid);
+    let payload = hopnet_photos::envelopes::LibraryInviteDeclinePayload {
+        library_id,
+        invitee_user_id: target,
+        operation_id: hopnet_common::CustomUUID::new(None),
+    };
+    let bytes = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("encode: {e}")))?;
+    submit_library_tx(&state, uid, "library_invite_decline", bytes).await?;
+    Ok(StatusCode::OK)
+}
+
+async fn post_library_leave(
+    State(state): State<AppState>,
+    Extension(uid): Extension<i32>,
+    axum::extract::Path(library_id): axum::extract::Path<hopnet_common::CustomUUID>,
+    body: Option<Json<MemberBody>>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    // Self = leave; another member = kick (equal standing).
+    let target = body.and_then(|Json(b)| b.user_id).unwrap_or(uid);
+    let payload = hopnet_photos::envelopes::LibraryRemoveMemberPayload {
+        library_id,
+        user_id: target,
+        operation_id: hopnet_common::CustomUUID::new(None),
+    };
+    let bytes = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("encode: {e}")))?;
+    submit_library_tx(&state, uid, "library_remove_member", bytes).await?;
+    // The convergence worker revokes the departed user's wraps lazily.
+    state.photos_host.poke_converge(uid).await;
+    Ok(StatusCode::OK)
 }
 
 #[derive(Deserialize)]
