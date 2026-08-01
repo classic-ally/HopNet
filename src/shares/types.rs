@@ -30,10 +30,7 @@ pub fn encrypt_display_name(
     plaintext: &str,
     recipient_x25519_pubkey: &XPubKey,
 ) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
-    hopnet_drive::http::shares::encrypt_display_name(
-        plaintext,
-        recipient_x25519_pubkey.as_x25519(),
-    )
+    hopnet_drive::http::shares::encrypt_display_name(plaintext, recipient_x25519_pubkey.as_x25519())
 }
 
 /// Decrypt a display name using the recipient's X25519 private key.

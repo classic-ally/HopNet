@@ -165,7 +165,9 @@ impl TestScenario for TierMembership {
             &mut result,
             Check {
                 name: "Genesis-seeded cold-start tiers resolved".to_string(),
-                passed: seeded || (default_cold && !views[0].tiers.is_empty()) || views[0].tiers.is_empty(),
+                passed: seeded
+                    || (default_cold && !views[0].tiers.is_empty())
+                    || views[0].tiers.is_empty(),
                 detail: Some(format!(
                     "tiers={:?} ({})",
                     views[0].tiers,

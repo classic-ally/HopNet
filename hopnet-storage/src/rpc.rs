@@ -193,9 +193,7 @@ impl<R: hopnet_comms::Rpc> Transport for RpcTransport<R> {
             FragmentResponse::Fetch { found, data } => {
                 if found {
                     data.ok_or_else(|| {
-                        TransportError::Transport(
-                            "fragment marked found but data is None".into(),
-                        )
+                        TransportError::Transport("fragment marked found but data is None".into())
                     })
                 } else {
                     Err(TransportError::Peer("fragment not found".into()))

@@ -207,9 +207,9 @@ mod tests {
 
         let rows = vec![
             ("probe_base".to_string(), "2".to_string()),
-            ("grace".to_string(), "abc".to_string()),   // malformed
-            ("s_full".to_string(), "0".to_string()),    // zero
-            ("mystery".to_string(), "9".to_string()),   // unknown
+            ("grace".to_string(), "abc".to_string()), // malformed
+            ("s_full".to_string(), "0".to_string()),  // zero
+            ("mystery".to_string(), "9".to_string()), // unknown
         ];
         let p = ConsensusPolicy::from_rows(&rows);
         assert_eq!(p.probe_base, Duration::from_secs(2));
@@ -228,7 +228,11 @@ mod tests {
             let bft_gain = u64::from((v + 1) % 3 == 1);
             let maj_gain = u64::from((v + 1) % 2 == 1);
             assert_eq!(delta_h(QuorumProfile::Bft, v, 1), bft_gain, "bft v={v}");
-            assert_eq!(delta_h(QuorumProfile::Majority, v, 1), maj_gain, "maj v={v}");
+            assert_eq!(
+                delta_h(QuorumProfile::Majority, v, 1),
+                maj_gain,
+                "maj v={v}"
+            );
             for p in PROFILES {
                 assert!(delta_h(p, v, 1) <= 1);
             }
@@ -388,9 +392,8 @@ mod tests {
             }
         }
         // Sanity: the waiver set is {1,2} (majority) and {1,2,3} (BFT).
-        let waived = |p: QuorumProfile| -> Vec<u64> {
-            (1..=6).filter(|v| v - p.quorum(*v) == 0).collect()
-        };
+        let waived =
+            |p: QuorumProfile| -> Vec<u64> { (1..=6).filter(|v| v - p.quorum(*v) == 0).collect() };
         assert_eq!(waived(QuorumProfile::Majority), vec![1, 2]);
         assert_eq!(waived(QuorumProfile::Bft), vec![1, 2, 3]);
     }

@@ -9,8 +9,8 @@ use std::io;
 /// don't churn.
 pub use hopnet_drive::error::FileError;
 pub use hopnet_drive::paths::{
-    build_encrypted_path, decrypt_part, decrypt_path, encrypt_part, encrypt_path,
-    generate_siv_key, generate_siv_nonce,
+    build_encrypted_path, decrypt_part, decrypt_path, encrypt_part, encrypt_path, generate_siv_key,
+    generate_siv_nonce,
 };
 
 // Chunk/padding math and format constants live in the substrate crate
@@ -105,8 +105,7 @@ pub fn encrypt_chunk(
     per_file_key: &chacha20poly1305::Key,
     fragment_id: &crate::db::CustomUUID,
 ) -> Result<Vec<u8>, FileError> {
-    hopnet_storage::crypto::encrypt_chunk(chunk, per_file_key, fragment_id)
-        .map_err(FileError::from)
+    hopnet_storage::crypto::encrypt_chunk(chunk, per_file_key, fragment_id).map_err(FileError::from)
 }
 
 pub fn decrypt_chunk(
@@ -117,6 +116,3 @@ pub fn decrypt_chunk(
     hopnet_storage::crypto::decrypt_chunk(encrypted_chunk, per_file_key, fragment_id)
         .map_err(FileError::from)
 }
-
-
-

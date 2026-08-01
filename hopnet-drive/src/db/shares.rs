@@ -9,7 +9,7 @@ use hopnet_common::CustomUUID;
 use hopnet_projection::DatabaseError;
 use r2d2::PooledConnection;
 use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{params, OptionalExtension};
 
 /// Raw incoming share row from the database.
 pub struct IncomingShareRow {

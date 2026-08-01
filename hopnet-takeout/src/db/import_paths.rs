@@ -15,7 +15,7 @@
 
 use chrono::Utc;
 use hopnet_common::{CustomUUID, ImportPathCounts, ImportPathRow, ImportPathStatus, InodeType};
-use rusqlite::{Connection, Transaction, params};
+use rusqlite::{params, Connection, Transaction};
 
 use hopnet_projection::DatabaseError;
 

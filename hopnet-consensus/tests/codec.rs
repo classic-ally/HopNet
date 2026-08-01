@@ -6,7 +6,6 @@
 mod common;
 
 use common::{chain_id, key, valset};
-use hopnet_consensus::MalachiteThresholds;
 use hopnet_consensus::codec::{
     decode, encode, SignedProposal, SignedVote, WireCommitCertificate, WireConsensusMsg,
     WireProposal, WireProposedValue, WireVote, WireWalEntry,
@@ -14,6 +13,7 @@ use hopnet_consensus::codec::{
 use hopnet_consensus::context::ConsensusProposal;
 use hopnet_consensus::signing::{sign_proposal, sign_vote};
 use hopnet_consensus::types::{Blake3Hash, Block, BlockData, Transaction, Transactions};
+use hopnet_consensus::MalachiteThresholds;
 use hopnet_consensus::{Address, Height, HopNetContext};
 use malachitebft_core_consensus::{ProposedValue, SignedConsensusMsg, WalEntry};
 use malachitebft_core_types::{

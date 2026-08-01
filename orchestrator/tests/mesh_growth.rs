@@ -17,16 +17,19 @@ use crate::tests::{Check, NodeInfo, TestResult, TestScenario, get_max_view, prin
 /// the seating policy.
 pub struct MeshGrowth;
 
-pub(crate) async fn rebuild_nodes(
-    docker: &Docker,
-    mesh_id: u32,
-) -> Result<Vec<NodeInfo>> {
-    let addresses = crate::get_external_addresses(docker, mesh_id, crate::sys::ContainerRuntime::Docker).await?;
+pub(crate) async fn rebuild_nodes(docker: &Docker, mesh_id: u32) -> Result<Vec<NodeInfo>> {
+    let addresses =
+        crate::get_external_addresses(docker, mesh_id, crate::sys::ContainerRuntime::Docker)
+            .await?;
     let mut nodes = Vec::new();
     for (node_id, ip_address, port) in addresses {
-        let jwt_token =
-            crate::get_jwt_token(docker, mesh_id, node_id, crate::sys::ContainerRuntime::Docker)
-                .await?;
+        let jwt_token = crate::get_jwt_token(
+            docker,
+            mesh_id,
+            node_id,
+            crate::sys::ContainerRuntime::Docker,
+        )
+        .await?;
         nodes.push(NodeInfo {
             node_id,
             ip_address,
@@ -39,7 +42,10 @@ pub(crate) async fn rebuild_nodes(
 }
 
 async fn seated_count(client: &Client, node: &NodeInfo, height: i64) -> usize {
-    let url = format!("http://{}:{}/api/consensus/view", node.ip_address, node.port);
+    let url = format!(
+        "http://{}:{}/api/consensus/view",
+        node.ip_address, node.port
+    );
     let Ok(resp) = client
         .post(&url)
         .header("Authorization", format!("Bearer {}", node.jwt_token))
@@ -66,12 +72,7 @@ impl TestScenario for MeshGrowth {
         "Single lateral join stays pooled; a second join batch-seats both (majority parity)"
     }
 
-    async fn run(
-        &self,
-        mesh_id: u32,
-        nodes: &[NodeInfo],
-        _flags: &[String],
-    ) -> Result<TestResult> {
+    async fn run(&self, mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
         let mut result = TestResult::new();
         let client = Client::new();
         anyhow::ensure!(nodes.len() == 3, "mesh-growth expects a 3-node mesh");

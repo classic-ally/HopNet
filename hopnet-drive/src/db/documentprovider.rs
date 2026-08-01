@@ -3,15 +3,15 @@
 //! Moved verbatim from the host's `db::documentprovider`; the host
 //! re-exports this module at its old path.
 
-use aes_siv::{Key, Nonce, siv::Aes256Siv};
+use aes_siv::{siv::Aes256Siv, Key, Nonce};
 use r2d2::PooledConnection;
 use rusqlite::params;
 
 use crate::model::CustomDateTime;
 use crate::paths::decrypt_path;
-use hopnet_common::CustomUUID;
 use hopnet_common::db::InodeType;
 use hopnet_common::documentprovider::DocumentProviderItem;
+use hopnet_common::CustomUUID;
 use r2d2_sqlite::SqliteConnectionManager;
 
 use hopnet_projection::DatabaseError;

@@ -268,7 +268,6 @@ pub fn apply_placement_commit(
     Ok(applied)
 }
 
-
 /// Batched inventory attestation (self_check_fragments): verify the reported
 /// previous count against current state, then remove / re-height / add.
 /// Addition-only reports tolerate concurrent growth; removal reports require
@@ -450,8 +449,10 @@ pub fn apply_delete_orphaned(
     }
 
     let placeholders = vec!["?"; blob_ids.len()].join(", ");
-    let id_params: Vec<&dyn rusqlite::ToSql> =
-        blob_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    let id_params: Vec<&dyn rusqlite::ToSql> = blob_ids
+        .iter()
+        .map(|id| id as &dyn rusqlite::ToSql)
+        .collect();
 
     // Collect locally-stored fragment hashes for post-commit file cleanup
     let mut stmt = db_tx
@@ -490,7 +491,6 @@ pub fn apply_delete_orphaned(
     );
     Ok(local_hashes)
 }
-
 
 /// Batch-update the node-local stored_locally flags (write-gate drain path:
 /// fragment receipt / local deletion outside consensus). The OTHER writer is
@@ -797,7 +797,10 @@ pub fn get_data_blocks_for_rebalancing(
         }
     }
 
-    tracing::info!("Found {} complete data blocks for rebalancing", result.len());
+    tracing::info!(
+        "Found {} complete data blocks for rebalancing",
+        result.len()
+    );
     Ok(result)
 }
 
@@ -911,7 +914,14 @@ mod tests {
 
         let mut conn = test_conn();
         let tx = conn.transaction().unwrap();
-        apply_blob_insert(&tx, &op, &ApplyCtx { fragments_dir: &dir_s }).unwrap();
+        apply_blob_insert(
+            &tx,
+            &op,
+            &ApplyCtx {
+                fragments_dir: &dir_s,
+            },
+        )
+        .unwrap();
 
         let (count, placement): (i32, Option<i32>) = tx
             .query_row(
@@ -939,8 +949,7 @@ mod tests {
             .unwrap();
         assert_eq!(wraps, 1);
 
-        let applied =
-            apply_placement_commit(&tx, &[(blob_id.clone(), 7)]).unwrap();
+        let applied = apply_placement_commit(&tx, &[(blob_id.clone(), 7)]).unwrap();
         assert_eq!(applied, 1);
         let placement: Option<i32> = tx
             .query_row(
@@ -1023,6 +1032,8 @@ mod tests {
 
         let wrap = get_blob_access(&tx, &blob_id, &[2u8; 32]).unwrap().unwrap();
         assert_eq!(wrap.ephemeral_pubkey, [3u8; 32]);
-        assert!(get_blob_access(&tx, &blob_id, &[7u8; 32]).unwrap().is_none());
+        assert!(get_blob_access(&tx, &blob_id, &[7u8; 32])
+            .unwrap()
+            .is_none());
     }
 }

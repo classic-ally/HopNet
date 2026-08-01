@@ -27,12 +27,12 @@ use hopnet_consensus::shell::HostInput;
 use hopnet_consensus::store;
 
 use super::{decode_payload, encode_payload};
+use crate::AppState;
 use crate::consensus::barriers::names as barrier_names;
 use crate::consensus::malachite::gossip::{ConsensusNetRequest, ConsensusNetResponse};
 use crate::consensus::rpc::{ForwardReply, TransactionForwardRequest};
 use crate::metrics::rpc::{MetricsRequest, MetricsResponse};
 use crate::setup::{SetupRequest, SetupResponse};
-use crate::AppState;
 
 /// The host's full scope map — one construction shared by `main.rs` and the
 /// integration tests so the registries cannot drift.
@@ -112,29 +112,27 @@ impl ConsensusScope {
         };
         match request {
             // Mesh plane: pure channel work — INLINE on the net runtime.
-            ConsensusNetRequest::Gossip(bytes) => {
-                match codec::decode::<WireConsensusMsg>(&bytes) {
-                    Ok(msg) => {
-                        if engine
-                            .input_tx
-                            .send(HostInput::Wire {
-                                from: peer.node_id,
-                                msg,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            return ConsensusNetResponse::Error {
-                                message: "consensus shell stopped".into(),
-                            };
-                        }
-                        ConsensusNetResponse::Ack
+            ConsensusNetRequest::Gossip(bytes) => match codec::decode::<WireConsensusMsg>(&bytes) {
+                Ok(msg) => {
+                    if engine
+                        .input_tx
+                        .send(HostInput::Wire {
+                            from: peer.node_id,
+                            msg,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return ConsensusNetResponse::Error {
+                            message: "consensus shell stopped".into(),
+                        };
                     }
-                    Err(e) => ConsensusNetResponse::Error {
-                        message: format!("bad consensus msg: {e}"),
-                    },
+                    ConsensusNetResponse::Ack
                 }
-            }
+                Err(e) => ConsensusNetResponse::Error {
+                    message: format!("bad consensus msg: {e}"),
+                },
+            },
             // Consensus-support plane: blocking DB read — the QUEUE runtime.
             ConsensusNetRequest::DecidedFetch {
                 from_height,
@@ -296,7 +294,10 @@ async fn serve_tx_forward(
 
     // Phase 2: Process and send final result
     let response = crate::consensus::rpc::handle_transaction_forward(req, &app_state).await;
-    if let Err(e) = out.send(encode_payload(&ForwardReply::Result(response))).await {
+    if let Err(e) = out
+        .send(encode_payload(&ForwardReply::Result(response)))
+        .await
+    {
         tracing::debug!("txforward result to node {} failed: {}", peer.node_id, e);
         return;
     }
@@ -374,9 +375,9 @@ impl RpcHandler for MetricsScope {
                     let app_state = self.app_state.clone();
                     self.app_state
                         .runtime
-                        .spawn(
-                            async move { crate::metrics::rpc::handle_storage_query(&app_state).await },
-                        )
+                        .spawn(async move {
+                            crate::metrics::rpc::handle_storage_query(&app_state).await
+                        })
                         .await
                         .expect("storage-query task panicked")
                 }

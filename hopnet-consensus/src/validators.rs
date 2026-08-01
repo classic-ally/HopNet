@@ -7,7 +7,7 @@
 //! and `rusqlite::Transaction` deref-coerce to it (the `store::meta_get`
 //! pattern). Heights are `i32` to match the host's height plumbing.
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::store::StoreError;
 use crate::types::PubKey;
@@ -71,10 +71,7 @@ const LATEST_ACTIVE_CTE: &str = "
 
 /// The active validator set at `height` (latest effective row per node
 /// wins), joined to the host's `nodes` table for keys and identity.
-pub fn get_validators(
-    conn: &Connection,
-    height: i32,
-) -> Result<Vec<ValidatorEntry>, StoreError> {
+pub fn get_validators(conn: &Connection, height: i32) -> Result<Vec<ValidatorEntry>, StoreError> {
     let sql = format!(
         "{LATEST_ACTIVE_CTE}
         SELECT n.node_id, n.name, n.owner, n.pubkey

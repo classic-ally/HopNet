@@ -11,26 +11,24 @@ pub use crate::NodeInfo;
 pub mod files;
 
 // Test implementations
+mod auto_seam;
 mod consensus_queue;
 mod db_pragma_bench;
 mod device_tokens;
-mod eviction;
 mod documentprovider_write;
+mod eviction;
+pub(crate) mod evidence_observe;
 mod evidence_voteout;
 mod file_upload;
 mod fileprovider_device_token;
 mod fragment_distribution;
-pub(crate) mod evidence_observe;
-mod auto_seam;
-pub(crate) mod mesh_growth;
-pub(crate) mod graceful_leave;
-mod three_timescales;
-mod vote_out;
 mod fragment_health_check;
+pub(crate) mod graceful_leave;
 mod import;
 mod iroh_ping;
 mod iroh_reject_unknown;
 mod malachite;
+pub(crate) mod mesh_growth;
 mod metrics;
 mod multi_size_files;
 pub(crate) mod multi_user;
@@ -44,8 +42,10 @@ mod recents;
 pub(crate) mod reencode;
 mod sharing;
 mod takeout;
+mod three_timescales;
 mod tier_membership;
 mod upload_and_confirm_placement;
+mod vote_out;
 
 /// Represents the result of a test scenario execution
 #[derive(Debug)]
@@ -111,11 +111,15 @@ pub fn mesh_creation_env(test_name: &str) -> Vec<(&'static str, &'static str)> {
             // 4-node BFT mesh forms.
             ("HOPNET_GENESIS_CONSENSUS_POLICY", "s_full=6;p_prove=6"),
         ],
-        "auto-seam" => vec![
-            ("HOPNET_GENESIS_CONSENSUS_POLICY", "probe_base=2;grace=1;s_full=6;p_prove=6"),
-        ],
+        "auto-seam" => vec![(
+            "HOPNET_GENESIS_CONSENSUS_POLICY",
+            "probe_base=2;grace=1;s_full=6;p_prove=6",
+        )],
         "mesh-growth" => vec![
-            ("HOPNET_GENESIS_CONSENSUS_POLICY", "probe_base=2;grace=1;s_full=6;p_prove=6"),
+            (
+                "HOPNET_GENESIS_CONSENSUS_POLICY",
+                "probe_base=2;grace=1;s_full=6;p_prove=6",
+            ),
             // AUTO (default): majority below v=7 — the growth stays in the
             // majority region, no forcing.
         ],
@@ -289,12 +293,8 @@ pub async fn run_test_by_name(
                 .run(mesh_id, nodes, flags)
                 .await
         }
-        "auto-seam" => {
-            auto_seam::AutoSeam.run(mesh_id, nodes, flags).await
-        }
-        "mesh-growth" => {
-            mesh_growth::MeshGrowth.run(mesh_id, nodes, flags).await
-        }
+        "auto-seam" => auto_seam::AutoSeam.run(mesh_id, nodes, flags).await,
+        "mesh-growth" => mesh_growth::MeshGrowth.run(mesh_id, nodes, flags).await,
         "three-timescales" => {
             three_timescales::ThreeTimescales
                 .run(mesh_id, nodes, flags)
@@ -305,11 +305,7 @@ pub async fn run_test_by_name(
                 .run(mesh_id, nodes, flags)
                 .await
         }
-        "vote-out-after-kill" => {
-            vote_out::VoteOutAfterKill
-                .run(mesh_id, nodes, flags)
-                .await
-        }
+        "vote-out-after-kill" => vote_out::VoteOutAfterKill.run(mesh_id, nodes, flags).await,
         "evidence-observe" => {
             evidence_observe::EvidenceObserve
                 .run(mesh_id, nodes, flags)

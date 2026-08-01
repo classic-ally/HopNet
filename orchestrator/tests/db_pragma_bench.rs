@@ -50,7 +50,10 @@ async fn fetch_db_stats(node: &NodeInfo) -> Result<DbStatsClient> {
     // Retry transport-level failures: macOS ephemeral port exhaustion
     // (EADDRNOTAVAIL) after sustained HTTP load takes ~15s of TIME_WAIT to drain.
     // HTTP-level errors (4xx/5xx) are not retried.
-    let url = format!("http://{}:{}/api/debug/db-stats", node.ip_address, node.port);
+    let url = format!(
+        "http://{}:{}/api/debug/db-stats",
+        node.ip_address, node.port
+    );
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..6 {
         if attempt > 0 {

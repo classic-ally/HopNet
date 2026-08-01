@@ -47,7 +47,11 @@ pub fn insert_mesh_grant_tx(
 
 pub fn get_mesh_pubkey(conn: &rusqlite::Connection) -> Result<Option<[u8; 32]>, DatabaseError> {
     let blob: Option<Vec<u8>> = conn
-        .query_row("SELECT pubkey FROM mesh_key WHERE internal_id = 1", [], |r| r.get(0))
+        .query_row(
+            "SELECT pubkey FROM mesh_key WHERE internal_id = 1",
+            [],
+            |r| r.get(0),
+        )
         .optional()
         .map_err(|_| DatabaseError::RecallError)?;
     match blob {

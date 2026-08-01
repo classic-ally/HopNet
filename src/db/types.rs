@@ -141,5 +141,3 @@ pub fn blob_access_for_user(
         Err(_) => Err(DatabaseError::LockError),
     }
 }
-
-

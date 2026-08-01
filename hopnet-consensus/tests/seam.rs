@@ -5,8 +5,8 @@
 //! threshold for the committed set size, so a 7-node AUTO mesh runs BFT
 //! (quorum 5) and a 6-or-fewer AUTO mesh runs majority.
 
-use hopnet_consensus::QuorumProfile;
 use hopnet_consensus::sim::{FaultConfig, Sim};
+use hopnet_consensus::QuorumProfile;
 
 // Should: a full mesh decide under AUTO on BOTH sides of the seam — a
 // 6-node mesh at majority thresholds, a 7-node mesh at BFT thresholds.

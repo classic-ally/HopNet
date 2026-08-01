@@ -14,8 +14,9 @@
 use hopnet_common::{Blake3Hash, CustomUUID};
 use hopnet_projection::{DatabaseError, ExportEntry};
 use rusqlite::{
-    Connection, ToSql, Transaction, params,
+    params,
     types::{FromSql, FromSqlResult, ToSqlOutput, ValueRef},
+    Connection, ToSql, Transaction,
 };
 
 use crate::manifest::EntryKind;
@@ -146,8 +147,7 @@ pub fn insert_entry(
     kind: EntryKind,
 ) -> Result<(), DatabaseError> {
     let table = table_name(takeout_id);
-    let metadata =
-        serde_json::to_string(&entry.metadata).unwrap_or_else(|_| "null".to_string());
+    let metadata = serde_json::to_string(&entry.metadata).unwrap_or_else(|_| "null".to_string());
     tx.execute(
         &format!(
             "INSERT OR IGNORE INTO {} (projection, path, kind, blob_id, size, metadata, export_handle, status)
@@ -185,7 +185,8 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> Result<EntryRow, rusqlite::Error> {
     })
 }
 
-const ENTRY_COLUMNS: &str = "projection, path, kind, blob_id, size, metadata, export_handle, manifest_hash";
+const ENTRY_COLUMNS: &str =
+    "projection, path, kind, blob_id, size, metadata, export_handle, manifest_hash";
 
 /// All Pending folder entries, ordered depth-ascending then path (parents
 /// before children within and across projections).
@@ -307,11 +308,6 @@ pub fn update_entry_status(
         DatabaseError::ProcessingError
     })?;
 
-    tracing::debug!(
-        "Updated entry {}/{} status to {}",
-        projection,
-        path,
-        status
-    );
+    tracing::debug!("Updated entry {}/{} status to {}", projection, path, status);
     Ok(())
 }

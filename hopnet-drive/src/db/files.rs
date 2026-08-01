@@ -6,12 +6,12 @@
 
 use crate::model::{CustomDateTime, FileAccessData, Inode};
 use crate::paths::decrypt_path;
-use aes_siv::{Key, Nonce, siv::Aes256Siv};
+use aes_siv::{siv::Aes256Siv, Key, Nonce};
 use hopnet_common::{CustomUUID, FileItem};
 use hopnet_projection::DatabaseError;
 use r2d2_sqlite::SqliteConnectionManager;
 
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{params, OptionalExtension, Transaction};
 use std::str::FromStr;
 
 /// Helper function to log ancestor folder modifications (extracted from log_modification)
@@ -941,9 +941,7 @@ pub fn get_file_access(
         )
         .optional()
         .map_err(|_| DatabaseError::RecallError)?
-        .map(|blob| {
-            <[u8; 32]>::try_from(blob).map_err(|_| DatabaseError::RecallError)
-        })
+        .map(|blob| <[u8; 32]>::try_from(blob).map_err(|_| DatabaseError::RecallError))
         .transpose()?;
     let pubkey = match pubkey {
         Some(pubkey) => pubkey,

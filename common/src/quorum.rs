@@ -124,8 +124,10 @@ mod tests {
         assert_eq!(a.profile_at(6), QuorumProfile::Majority);
         assert_eq!(a.profile_at(7), QuorumProfile::Bft);
         // f_eq: 0 below the seam, ⌊(v-1)/3⌋ at/above; f_eq(7)=2.
-        assert_eq!((1..=10).map(|v| a.f_eq(v)).collect::<Vec<_>>(),
-                   vec![0, 0, 0, 0, 0, 0, 2, 2, 2, 3]);
+        assert_eq!(
+            (1..=10).map(|v| a.f_eq(v)).collect::<Vec<_>>(),
+            vec![0, 0, 0, 0, 0, 0, 2, 2, 2, 3]
+        );
         // Crash tolerance monotone non-decreasing.
         let tol: Vec<u64> = (2..=10).map(|v| v - a.quorum(v)).collect();
         assert_eq!(tol, vec![0, 1, 1, 2, 2, 2, 2, 2, 3]);
@@ -134,7 +136,11 @@ mod tests {
     // Should: round-trip through the stable string form.
     #[test]
     fn parse_roundtrip() {
-        for p in [QuorumProfile::Bft, QuorumProfile::Majority, QuorumProfile::Auto] {
+        for p in [
+            QuorumProfile::Bft,
+            QuorumProfile::Majority,
+            QuorumProfile::Auto,
+        ] {
             assert_eq!(QuorumProfile::parse(p.as_str()), Some(p));
         }
         assert_eq!(QuorumProfile::parse("nonsense"), None);

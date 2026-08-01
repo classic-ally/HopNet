@@ -236,7 +236,9 @@ pub fn lookup_disk_fragments(
             "SELECT fragment_hash, data_block_id, local_index
              FROM fragment_hashes WHERE fragment_hash IN ({placeholders})"
         );
-        let mut stmt = conn.prepare(&query).map_err(|_| DatabaseError::RecallError)?;
+        let mut stmt = conn
+            .prepare(&query)
+            .map_err(|_| DatabaseError::RecallError)?;
         let params: Vec<&dyn rusqlite::ToSql> =
             chunk.iter().map(|h| h as &dyn rusqlite::ToSql).collect();
         let mut rows = stmt
@@ -273,7 +275,9 @@ pub fn member_holder_counts(
             "SELECT fragment_hash, node_id FROM fragment_inventory
              WHERE fragment_hash IN ({placeholders})"
         );
-        let mut stmt = conn.prepare(&query).map_err(|_| DatabaseError::RecallError)?;
+        let mut stmt = conn
+            .prepare(&query)
+            .map_err(|_| DatabaseError::RecallError)?;
         let params: Vec<&dyn rusqlite::ToSql> =
             chunk.iter().map(|h| h as &dyn rusqlite::ToSql).collect();
         let mut rows = stmt

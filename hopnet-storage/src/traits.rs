@@ -15,8 +15,8 @@ use crate::error::StorageError;
 use crate::placement::{MetricsRow, PlacementNode};
 use crate::store::DistributableBlob;
 use crate::types::BlobId;
-use hopnet_common::Blake3Hash;
 use hopnet_common::quorum::QuorumProfile;
+use hopnet_common::Blake3Hash;
 use std::future::Future;
 
 /// A peer as the substrate sees it — the comms vocabulary type (RFC-017
@@ -168,8 +168,10 @@ pub trait StateReader: Send + Sync {
     /// The blob's local fragment set IF this node should distribute it:
     /// unplaced and every fragment stored locally (origin filter). `None`
     /// is the common no-op on non-origin nodes.
-    fn distributable_blob(&self, blob_id: &BlobId)
-    -> Result<Option<DistributableBlob>, StorageError>;
+    fn distributable_blob(
+        &self,
+        blob_id: &BlobId,
+    ) -> Result<Option<DistributableBlob>, StorageError>;
 
     /// The blob's full reassembly manifest (tier-1 repair reads the
     /// fragment layout + this node's local availability). `None` for an

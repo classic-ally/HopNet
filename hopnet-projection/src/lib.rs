@@ -17,8 +17,7 @@ pub mod dbstats;
 pub mod host;
 
 pub use host::{
-    BoxFuture, SessionAccess, SessionError, TxGateway, TxSigner, TxSpec, TxSubmitError,
-    UserSession,
+    BoxFuture, SessionAccess, SessionError, TxGateway, TxSigner, TxSpec, TxSubmitError, UserSession,
 };
 
 use serde::{Deserialize, Serialize};
@@ -52,9 +51,7 @@ impl rusqlite::types::ToSql for CustomDateTime {
 }
 
 impl rusqlite::types::FromSql for CustomDateTime {
-    fn column_result(
-        value: rusqlite::types::ValueRef<'_>,
-    ) -> rusqlite::types::FromSqlResult<Self> {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
         use chrono::DateTime;
         use rusqlite::types::{FromSqlError, ValueRef};
         match value {
@@ -363,11 +360,7 @@ pub trait Projection: Send + Sync {
     /// decode: runs on the consensus shell thread post-decide — no DB, no
     /// IO, no awaits. Decode failures must yield an empty vec, never
     /// panic. Default: no blobs.
-    fn committed_blob_ids(
-        &self,
-        _function: &str,
-        _payload: &[u8],
-    ) -> Vec<hopnet_storage::BlobId> {
+    fn committed_blob_ids(&self, _function: &str, _payload: &[u8]) -> Vec<hopnet_storage::BlobId> {
         Vec::new()
     }
 
