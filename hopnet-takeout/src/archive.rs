@@ -4,7 +4,7 @@
 //! pass the fully projection-prefixed archive path) instead of a global
 //! `files/` prefix, and the version gate accepts exactly v2.
 
-use flate2::{Compression, read::GzDecoder, write::GzEncoder};
+use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tar::{Archive, Builder};
 use tracing;
 
-use crate::manifest::{MANIFEST_FILENAME, MANIFEST_VERSION, TakeoutManifest};
+use crate::manifest::{TakeoutManifest, MANIFEST_FILENAME, MANIFEST_VERSION};
 
 /// Errors raised while reading an import-side archive (read counterpart to
 /// `create_archive`'s write side). Each variant maps cleanly to a route-level
@@ -167,7 +167,7 @@ pub fn create_archive(
             }
         }
 
-        if files_archived % 100 == 0 && files_archived > 0 {
+        if files_archived > 0 && files_archived.is_multiple_of(100) {
             tracing::debug!("Archived {} files so far...", files_archived);
         }
     }

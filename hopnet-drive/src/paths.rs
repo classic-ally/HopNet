@@ -5,9 +5,9 @@
 
 use crate::error::FileError;
 use aes_siv::{
-    Aes256SivAead, Key, KeyInit, Nonce,
     aead::{Aead, OsRng},
     siv::Aes256Siv,
+    Aes256SivAead, Key, KeyInit, Nonce,
 };
 use rand::RngExt;
 

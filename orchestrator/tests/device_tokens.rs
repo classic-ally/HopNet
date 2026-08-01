@@ -242,7 +242,10 @@ async fn register_device(
     node: &NodeInfo,
     device_name: &str,
 ) -> Result<RegisterDeviceResponse> {
-    let url = format!("http://{}:{}/api/devices/register", node.ip_address, node.port);
+    let url = format!(
+        "http://{}:{}/api/devices/register",
+        node.ip_address, node.port
+    );
 
     let response = client
         .post(&url)

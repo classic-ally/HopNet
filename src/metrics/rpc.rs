@@ -44,8 +44,13 @@ pub enum MetricsResponse {
     /// Ack for a throughput upload chunk
     ThroughputAck,
     /// Storage query result
-    Storage { total_gb: u32, used_gb: u32 },
-    Error { message: String },
+    Storage {
+        total_gb: u32,
+        used_gb: u32,
+    },
+    Error {
+        message: String,
+    },
 }
 
 // ============================================================================
@@ -174,9 +179,10 @@ pub async fn measure_throughput(comms: &IrohComms, peer: &PeerRef) -> Result<i64
     let mut total_bytes: usize = 0;
 
     while start.elapsed() < THROUGHPUT_TEST_DURATION {
-        let payload = crate::net::encode_payload(&MetricsRequest::Throughput(
-            ThroughputUploadRequest { data: data.clone() },
-        ));
+        let payload =
+            crate::net::encode_payload(&MetricsRequest::Throughput(ThroughputUploadRequest {
+                data: data.clone(),
+            }));
         let reply = comms
             .rpc(peer, "metrics", payload, THROUGHPUT_TIMEOUT)
             .await?;

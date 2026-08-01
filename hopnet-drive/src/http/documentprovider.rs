@@ -3,12 +3,12 @@
 //! host layers the device-token auth middleware around this router.
 
 use axum::{
-    Extension, Json, Router,
     body::Body,
     extract::{Multipart, Query, State},
-    http::{StatusCode, header},
+    http::{header, StatusCode},
     response::Response,
     routing::{delete, get, post},
+    Extension, Json, Router,
 };
 use serde::Deserialize;
 use std::str::FromStr;
@@ -17,12 +17,12 @@ use crate::db;
 use crate::host::{DriveState, TxSigner, TxSpec};
 use crate::paths::{build_encrypted_path, decrypt_part, encrypt_part, encrypt_path};
 use crate::upload::session_or_status;
-use hopnet_common::CustomUUID;
 use hopnet_common::db::InodeType;
 use hopnet_common::documentprovider::{
     DocumentProviderEnumerateResponse, DocumentProviderItem, ModifyDocumentProviderRequest,
     ModifyDocumentProviderResponse,
 };
+use hopnet_common::CustomUUID;
 use hopnet_projection::DatabaseError;
 
 /// Build the DocumentProvider router. Reads bypass the import gate; writes
@@ -231,9 +231,9 @@ pub async fn delete_item(
     // Look up encrypted_path by inode_id
     let encrypted_path = db::documentprovider::get_path_by_inode_id(&db_lock, &inode_id, user_id)
         .map_err(|e| match e {
-            DatabaseError::NotFound => StatusCode::NOT_FOUND,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
-        })?;
+        DatabaseError::NotFound => StatusCode::NOT_FOUND,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    })?;
 
     // Drop db_lock before consensus (which may need the connection)
     drop(db_lock);

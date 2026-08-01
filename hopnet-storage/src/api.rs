@@ -13,8 +13,8 @@ use crate::crypto;
 use crate::error::StorageError;
 use crate::fragstore;
 use crate::rs::{
-    CHUNK_SIZE, ORIGINAL_FRAGMENTS_PER_CHUNK, RECOVERY_FRAGMENTS_PER_CHUNK,
-    calculate_chunk_padding, calculate_chunked_fragments, calculate_padding_and_chunks,
+    calculate_chunk_padding, calculate_chunked_fragments, calculate_padding_and_chunks, CHUNK_SIZE,
+    ORIGINAL_FRAGMENTS_PER_CHUNK, RECOVERY_FRAGMENTS_PER_CHUNK,
 };
 use crate::types::BlobId;
 use hopnet_common::{Blake3Hash, CustomUUID};
@@ -221,8 +221,7 @@ fn process_logical_chunk(
     let recovery_generator = encoder.encode().map_err(|_| StorageError::Rs)?;
     let recovery_iter = recovery_generator.recovery_iter();
 
-    let mut recovery_index = ORIGINAL_FRAGMENTS_PER_CHUNK;
-    for recovery_fragment in recovery_iter {
+    for (i, recovery_fragment) in recovery_iter.enumerate() {
         let fragment_id = CustomUUID::new(None);
         let fragment_hash = Blake3Hash::new(blake3::hash(recovery_fragment));
 
@@ -230,12 +229,11 @@ fn process_logical_chunk(
 
         fragments.push(PutFragment {
             chunk_number,
-            local_index: recovery_index as u32,
+            local_index: (ORIGINAL_FRAGMENTS_PER_CHUNK + i) as u32,
             fragment_id,
             fragment_hash,
             recovery: true,
         });
-        recovery_index += 1;
     }
 
     Ok(padding)
@@ -434,7 +432,10 @@ impl StateReader for NullNet {
     fn placement_inputs(&self) -> Result<crate::traits::PlacementInputs, StorageError> {
         Err(StorageError::Host("null state reader".into()))
     }
-    fn placement_inputs_at(&self, _height: i32) -> Result<crate::traits::PlacementInputs, StorageError> {
+    fn placement_inputs_at(
+        &self,
+        _height: i32,
+    ) -> Result<crate::traits::PlacementInputs, StorageError> {
         Err(StorageError::Host("null state reader".into()))
     }
     fn fragment_sources(
@@ -452,10 +453,7 @@ impl StateReader for NullNet {
     ) -> Result<Option<crate::store::DistributableBlob>, StorageError> {
         Ok(None)
     }
-    fn blob_manifest(
-        &self,
-        _blob_id: &BlobId,
-    ) -> Result<Option<BlobManifest>, StorageError> {
+    fn blob_manifest(&self, _blob_id: &BlobId) -> Result<Option<BlobManifest>, StorageError> {
         Ok(None)
     }
     fn local_node_id(&self) -> Option<i32> {
@@ -501,10 +499,7 @@ where
     S: StateReader,
     L: LocalStateSink,
 {
-    let (originals, recovery) = manifest
-        .chunks
-        .get(&chunk_number)
-        .ok_or(StorageError::Rs)?;
+    let (originals, recovery) = manifest.chunks.get(&chunk_number).ok_or(StorageError::Rs)?;
 
     // Count how many fragments we already have locally for this chunk
     let local_count = originals
@@ -564,14 +559,13 @@ where
     let mut source_map = net.state.fragment_sources(&missing_hashes)?;
 
     // Pre-distribute inventory hints into the work items
-    let missing_fragments: Vec<(usize, Blake3Hash, bool, Option<Vec<PeerRef>>)> =
-        missing_fragments
-            .into_iter()
-            .map(|(index, hash, recovery)| {
-                let hint = source_map.remove(&hash);
-                (index, hash, recovery, hint)
-            })
-            .collect();
+    let missing_fragments: Vec<(usize, Blake3Hash, bool, Option<Vec<PeerRef>>)> = missing_fragments
+        .into_iter()
+        .map(|(index, hash, recovery)| {
+            let hint = source_map.remove(&hash);
+            (index, hash, recovery, hint)
+        })
+        .collect();
 
     // Worker count: at least 2 for redundancy (even if only need 1), capped
     // at the missing count.
@@ -607,7 +601,10 @@ where
             loop {
                 // Stop once enough successful downloads landed
                 if successes.load(std::sync::atomic::Ordering::Relaxed) >= fragments_needed {
-                    tracing::debug!("Worker {} stopping - enough fragments downloaded", worker_id);
+                    tracing::debug!(
+                        "Worker {} stopping - enough fragments downloaded",
+                        worker_id
+                    );
                     break;
                 }
 
@@ -622,7 +619,9 @@ where
 
                 match find_fragment_via(&transport, &fragment_hash, &candidates, hint).await {
                     Some(data) => {
-                        if let Err(e) = fragstore::store_fragment(&fragments_dir, &fragment_hash, data) {
+                        if let Err(e) =
+                            fragstore::store_fragment(&fragments_dir, &fragment_hash, data)
+                        {
                             tracing::error!(
                                 "Worker {} failed to store fragment {}: {}",
                                 worker_id,
@@ -946,10 +945,16 @@ fn reconstruct_single_chunk(
     })?;
 
     for (index, chunk_data) in &available_original {
-        decoder.add_original_shard(*index, chunk_data).map_err(|e| {
-            tracing::error!("RS reconstruction: failed to add original shard {}: {:?}", index, e);
-            StorageError::Rs
-        })?;
+        decoder
+            .add_original_shard(*index, chunk_data)
+            .map_err(|e| {
+                tracing::error!(
+                    "RS reconstruction: failed to add original shard {}: {:?}",
+                    index,
+                    e
+                );
+                StorageError::Rs
+            })?;
     }
 
     // Recovery fragments are stored with local_index 10-29; the RS decoder
@@ -1046,11 +1051,7 @@ mod tests {
 
         // Reassemble from originals
         let mut reassembled = Vec::new();
-        let mut originals: Vec<_> = outcome
-            .fragments
-            .iter()
-            .filter(|f| !f.recovery)
-            .collect();
+        let mut originals: Vec<_> = outcome.fragments.iter().filter(|f| !f.recovery).collect();
         originals.sort_by_key(|f| f.local_index);
         for f in originals {
             let ct = fragstore::fetch_and_verify_fragment(&f.fragment_hash, &dir).unwrap();
@@ -1157,10 +1158,7 @@ mod tests {
         ) -> Result<Option<crate::store::DistributableBlob>, StorageError> {
             Ok(None)
         }
-        fn blob_manifest(
-            &self,
-            _blob_id: &BlobId,
-        ) -> Result<Option<BlobManifest>, StorageError> {
+        fn blob_manifest(&self, _blob_id: &BlobId) -> Result<Option<BlobManifest>, StorageError> {
             Ok(None)
         }
         fn local_node_id(&self) -> Option<i32> {
@@ -1184,7 +1182,11 @@ mod tests {
         let mut chunks: HashMap<u32, crate::store::ChunkFragmentMaps> = HashMap::new();
         for f in &outcome.fragments {
             let entry = chunks.entry(f.chunk_number).or_default();
-            let bucket = if f.recovery { &mut entry.1 } else { &mut entry.0 };
+            let bucket = if f.recovery {
+                &mut entry.1
+            } else {
+                &mut entry.0
+            };
             bucket.insert(
                 f.local_index as usize,
                 (f.fragment_hash, f.fragment_id.clone(), stored(f)),
@@ -1290,16 +1292,13 @@ mod tests {
             state: net_peer.clone(),
             local_state: net_peer.clone(),
         };
-        let got = collect_stream(get(
-            Some(net),
-            dir_c.clone(),
-            manifest,
-            Some(key),
-            None,
-        ))
-        .await
-        .unwrap();
-        assert_eq!(got, plaintext, "discovery + RS must reproduce the plaintext");
+        let got = collect_stream(get(Some(net), dir_c.clone(), manifest, Some(key), None))
+            .await
+            .unwrap();
+        assert_eq!(
+            got, plaintext,
+            "discovery + RS must reproduce the plaintext"
+        );
         assert!(
             net_peer.marked_local.lock().unwrap().len() >= ORIGINAL_FRAGMENTS_PER_CHUNK,
             "downloaded fragments must settle through the sink"
@@ -1312,8 +1311,7 @@ mod tests {
         }
         let dir_d = base.join("d").to_str().unwrap().to_string();
         std::fs::create_dir_all(&dir_d).unwrap();
-        let manifest =
-            manifest_from_outcome(&blob_id, &outcome, plaintext.len() as u64, |_| false);
+        let manifest = manifest_from_outcome(&blob_id, &outcome, plaintext.len() as u64, |_| false);
         let net = GetNet {
             transport: bad_peer.clone(),
             state: bad_peer.clone(),

@@ -3,14 +3,14 @@ use chrono::Utc;
 use flate2::{Compression, write::GzEncoder};
 use hopnet::db::CustomUUID;
 use hopnet::types::Blake3Hash;
-use hopnet_takeout::manifest::{
-    EntryKind, MANIFEST_FILENAME, ManifestEntry, ProjectionSection, TakeoutManifest,
-};
-use std::collections::BTreeMap;
 use hopnet_common::{
     ImportPathCounts, ImportPathRow, ImportPathStatus, ImportRecord, ImportStatus, InodeType,
 };
+use hopnet_takeout::manifest::{
+    EntryKind, MANIFEST_FILENAME, ManifestEntry, ProjectionSection, TakeoutManifest,
+};
 use reqwest::{Client, StatusCode};
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::time::{Duration, Instant};
 use tar::{Builder, Header};
@@ -98,7 +98,10 @@ pub fn build_archive_with_wrong_first_entry() -> Result<Vec<u8>> {
 /// bytes. Caller inspects the returned `Response` for status + body.
 pub async fn upload_import_archive(node: &NodeInfo, bytes: Vec<u8>) -> Result<reqwest::Response> {
     let client = Client::new();
-    let url = format!("http://{}:{}/api/takeout/import", node.ip_address, node.port);
+    let url = format!(
+        "http://{}:{}/api/takeout/import",
+        node.ip_address, node.port
+    );
     let part = reqwest::multipart::Part::bytes(bytes).file_name("archive.tar.gz");
     let form = reqwest::multipart::Form::new().part("archive", part);
     let resp = client
@@ -118,7 +121,10 @@ async fn initiate_import_status(node: &NodeInfo, bytes: Vec<u8>) -> Result<Statu
 /// GET /takeout/import — fetch the user's current import (singleton).
 async fn get_current_import(node: &NodeInfo) -> Result<Option<ImportRecord>> {
     let client = Client::new();
-    let url = format!("http://{}:{}/api/takeout/import", node.ip_address, node.port);
+    let url = format!(
+        "http://{}:{}/api/takeout/import",
+        node.ip_address, node.port
+    );
     let resp = client
         .get(&url)
         .header("Authorization", format!("Bearer {}", node.jwt_token))
@@ -269,8 +275,8 @@ pub fn build_projection_section(
 }
 
 /// Build a fully-formed v2 import archive: the manifest declares a "drive"
-/// section with the supplied folders + files (each file with size + blob_id
-/// + correctly computed `content_hash`); tar payload writes file bytes under
+/// section with the supplied folders + files (each file with size, blob_id,
+/// and correctly computed `content_hash`); tar payload writes file bytes under
 /// the canonical `drive/` projection prefix.
 pub fn build_import_archive_with_files(
     folders: Vec<String>,
@@ -889,11 +895,9 @@ impl TestScenario for ImportExtractionHappyPath {
         // The creation walk starts as soon as extraction seeds rows, and
         // consensus is now fast enough that it can finish entries before this
         // poll observes them — Imported is a legal state here; Failed is not.
-        let all_seeded = rows
-            .iter()
-            .all(|r| {
-                r.status == ImportPathStatus::Pending || r.status == ImportPathStatus::Imported
-            });
+        let all_seeded = rows.iter().all(|r| {
+            r.status == ImportPathStatus::Pending || r.status == ImportPathStatus::Imported
+        });
         let any_failed = rows.iter().any(|r| r.error_code.is_some());
 
         print_and_add_check(

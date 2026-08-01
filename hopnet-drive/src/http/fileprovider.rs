@@ -5,11 +5,11 @@
 //! device-token auth middleware + body limit around this router.
 
 use axum::{
-    Extension, Json, Router,
     extract::{Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{delete, get, patch, post},
+    Extension, Json, Router,
 };
 use serde::Deserialize;
 use std::str::FromStr;
@@ -18,11 +18,11 @@ use crate::db;
 use crate::host::{DriveState, TxSigner, TxSpec};
 use crate::paths::{build_encrypted_path, decrypt_path, encrypt_part, encrypt_path};
 use crate::upload::session_or_status;
-use hopnet_common::CustomUUID;
 use hopnet_common::fileprovider::{
     ChangesQuery, ChangesResponse, DeleteItemRequest, DownloadQuery, EnumerateResponse,
     FileProviderItem, ItemQuery, ModifyItemResponse,
 };
+use hopnet_common::CustomUUID;
 use hopnet_projection::DatabaseError;
 
 pub fn router<S: Clone + Send + Sync + 'static>(state: DriveState) -> Router<S> {
@@ -507,8 +507,11 @@ pub async fn get_item(
         creation_date,
         content_modification_date,
         modification_height,
-    ) = match db::fileprovider::get_item_metadata_by_inode_id(state.db_pool.get(), inode_id, user_id)
-    {
+    ) = match db::fileprovider::get_item_metadata_by_inode_id(
+        state.db_pool.get(),
+        inode_id,
+        user_id,
+    ) {
         Ok(metadata) => metadata,
         Err(DatabaseError::NotFound) => return Err(StatusCode::NOT_FOUND),
         Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
@@ -577,12 +580,7 @@ pub async fn create_item(
     multipart: axum::extract::Multipart,
 ) -> impl IntoResponse {
     // Forward to post_files implementation which now handles parent_item_identifier + filename
-    match super::files::post_files(
-        State(state),
-        axum::extract::Extension(user_id),
-        multipart,
-    )
-    .await
+    match super::files::post_files(State(state), axum::extract::Extension(user_id), multipart).await
     {
         Ok(()) => StatusCode::CREATED.into_response(),
         Err(status_code) => status_code.into_response(),

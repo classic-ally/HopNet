@@ -556,8 +556,7 @@ pub async fn batch_processor(mut rx: mpsc::Receiver<QueuedTransaction>, app_stat
             continue;
         };
 
-        let Some((height, round, proposer)) =
-            super::malachite::engine::proposal_target(&app_state)
+        let Some((height, round, proposer)) = super::malachite::engine::proposal_target(&app_state)
         else {
             retry_holdback = batch;
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -574,13 +573,7 @@ pub async fn batch_processor(mut rx: mpsc::Receiver<QueuedTransaction>, app_stat
             (Vec::new(), DispatchOutcome::Resolved)
         } else {
             handle_as_forwarder(
-                &app_state,
-                &engine,
-                batch,
-                height,
-                round,
-                proposer,
-                &mut conn,
+                &app_state, &engine, batch, height, round, proposer, &mut conn,
             )
             .await
         };
@@ -635,7 +628,7 @@ async fn handle_as_forwarder(
             Err(_) => return (batch, DispatchOutcome::RetryAfterDelay),
         };
         match pubkeys.get(&proposer) {
-            Some(pubkey) => pubkey.clone(),
+            Some(pubkey) => *pubkey,
             None => {
                 tracing::error!("proposer node {} not in nodes table", proposer);
                 return (batch, DispatchOutcome::RetryAfterDelay);
@@ -818,7 +811,7 @@ fn process_forward_results(
     let mut retries = Vec::new();
     let mut settle_locally = Vec::new();
 
-    for (queued, result) in batch.into_iter().zip(results.into_iter()) {
+    for (queued, result) in batch.into_iter().zip(results) {
         match result {
             super::rpc::TransactionForwardResult::Committed => {
                 // The PROPOSER's word — its local commit, not necessarily

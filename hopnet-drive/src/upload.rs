@@ -6,7 +6,7 @@
 //! via `TxGateway` (signing stays host-side).
 
 use axum::http::StatusCode;
-use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::OsRng};
+use chacha20poly1305::{aead::OsRng, ChaCha20Poly1305, KeyInit};
 use rusqlite::Transaction as RusqliteTransaction;
 use tokio::io::AsyncRead;
 
@@ -96,7 +96,14 @@ pub async fn assemble_file_inode<R: AsyncRead + Unpin>(
     filename: &str,
     source: R,
     file_size: usize,
-) -> Result<(Inode, CustomUUID, Option<hopnet_storage::store::BlobInsertOp>), StatusCode> {
+) -> Result<
+    (
+        Inode,
+        CustomUUID,
+        Option<hopnet_storage::store::BlobInsertOp>,
+    ),
+    StatusCode,
+> {
     let encrypted_filename = encrypt_part(filename, &session.siv_key, &session.siv_nonce)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;

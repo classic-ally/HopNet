@@ -41,12 +41,7 @@ impl TestScenario for ThreeTimescales {
         "One kill: fast validator vote-out, storage placement unmoved, then slow decay + re-encode"
     }
 
-    async fn run(
-        &self,
-        mesh_id: u32,
-        nodes: &[NodeInfo],
-        _flags: &[String],
-    ) -> Result<TestResult> {
+    async fn run(&self, mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
         let start = Instant::now();
         let mut result = TestResult::new();
         let client = Client::new();
@@ -140,16 +135,21 @@ impl TestScenario for ThreeTimescales {
                 detail: Some(format!("classes: {victim_classes:?}")),
             },
         );
-        if !(stop_ok && !victim_classes.is_empty()) {
+        if !stop_ok || victim_classes.is_empty() {
             result.duration = start.elapsed();
             return Ok(result);
         }
 
         // 4. FAST CLOCK: the mesh votes the dead validator out (v=2).
-        let voted_out =
-            wait_validator_count(&client, survivors, 2, Some(victim_consensus_id), Duration::from_secs(60))
-                .await
-                .unwrap_or(false);
+        let voted_out = wait_validator_count(
+            &client,
+            survivors,
+            2,
+            Some(victim_consensus_id),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap_or(false);
         let t_voteout = t_kill.elapsed();
         print_and_add_check(
             &mut result,
@@ -196,8 +196,9 @@ impl TestScenario for ThreeTimescales {
         print_and_add_check(
             &mut result,
             Check {
-                name: "Zero bytes moved on vote-out: victim still holds its classes (not regenerated)"
-                    .to_string(),
+                name:
+                    "Zero bytes moved on vote-out: victim still holds its classes (not regenerated)"
+                        .to_string(),
                 passed: still_holder,
                 detail: None,
             },
@@ -289,7 +290,10 @@ impl TestScenario for ThreeTimescales {
             Check {
                 name: "Every victim class regenerated on survivors".to_string(),
                 passed: regenerated,
-                detail: Some(format!("after {:.0}s", repair_start.elapsed().as_secs_f64())),
+                detail: Some(format!(
+                    "after {:.0}s",
+                    repair_start.elapsed().as_secs_f64()
+                )),
             },
         );
 

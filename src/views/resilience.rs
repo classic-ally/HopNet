@@ -10,8 +10,7 @@ use r2d2::PooledConnection;
 use r2d2_sqlite::SqliteConnectionManager;
 
 use hopnet_common::views::{
-    ConsensusPanelView, ResilienceLevelBytes, StoragePanelView, UnplacedBucket,
-    UnplacedSeverity,
+    ConsensusPanelView, ResilienceLevelBytes, StoragePanelView, UnplacedBucket, UnplacedSeverity,
 };
 
 const BYTES_PER_GB: f64 = 1024.0 * 1024.0 * 1024.0;

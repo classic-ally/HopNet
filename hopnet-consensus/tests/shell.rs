@@ -128,7 +128,7 @@ async fn three_shells_decide_over_channels() {
     let mut nodes = Vec::new();
     let mut outs = Vec::new();
     for i in 0..n {
-        let (node, out) = spawn_node(i, n as i32, QuorumProfile::Bft);
+        let (node, out) = spawn_node(i, n, QuorumProfile::Bft);
         nodes.push(node);
         outs.push(out);
     }
@@ -153,7 +153,7 @@ async fn two_shell_cft_mesh_decides() {
     let mut nodes = Vec::new();
     let mut outs = Vec::new();
     for i in 0..n {
-        let (node, out) = spawn_node(i, n as i32, QuorumProfile::Majority);
+        let (node, out) = spawn_node(i, n, QuorumProfile::Majority);
         nodes.push(node);
         outs.push(out);
     }

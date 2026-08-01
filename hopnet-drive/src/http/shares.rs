@@ -4,30 +4,28 @@
 //! path for its unit tests).
 
 use axum::{
-    Router,
     extract::{Extension, Json, Path, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{delete, get, post},
+    Router,
 };
 use chacha20poly1305::{
-    ChaCha20Poly1305,
     aead::{Aead, KeyInit, OsRng},
+    ChaCha20Poly1305,
 };
 use std::str::FromStr;
 use x25519_dalek::PublicKey as X25519PublicKey;
 
 use crate::db;
-use crate::envelopes::{
-    AcceptSharePayload, DeclineSharePayload, ShareFilePayload, UnsharePayload,
-};
+use crate::envelopes::{AcceptSharePayload, DeclineSharePayload, ShareFilePayload, UnsharePayload};
 use crate::host::{DriveState, TxSigner, TxSpec, TxSubmitError};
 use crate::paths::{decrypt_part, encrypt_path};
-use hopnet_common::CustomUUID;
 use hopnet_common::shares::{
     AcceptShareRequest, IncomingShareResponse, ShareCountResponse, ShareDetailResponse,
     ShareParticipant, ShareRequest,
 };
+use hopnet_common::CustomUUID;
 
 pub fn router<S: Clone + Send + Sync + 'static>(state: DriveState) -> Router<S> {
     let reads = Router::new()
@@ -143,12 +141,11 @@ pub async fn post_share(
     };
 
     // Look up recipient by username
-    let recipient =
-        match db::users::get_recipient_by_username(&conn, &payload.recipient_username) {
-            Ok(Some(u)) => u,
-            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        };
+    let recipient = match db::users::get_recipient_by_username(&conn, &payload.recipient_username) {
+        Ok(Some(u)) => u,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
 
     // Self-share check
     if recipient.user_id == user_id {
@@ -320,16 +317,11 @@ pub async fn post_accept_share(
     };
 
     // Encrypt placement path with recipient's SIV key
-    let encrypted_path = match encrypt_path(
-        payload.placement_path,
-        &session.siv_key,
-        &session.siv_nonce,
-    )
-    .await
-    {
-        Ok(p) => p,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
+    let encrypted_path =
+        match encrypt_path(payload.placement_path, &session.siv_key, &session.siv_nonce).await {
+            Ok(p) => p,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
 
     let parent_folder_inodes: Vec<(CustomUUID, String)> = {
         let conn = match state.db_pool.get() {

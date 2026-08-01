@@ -42,12 +42,17 @@ pub struct TransactionForwardResponse {
 pub enum ForwardReply {
     /// Rejection: this node is not the proposer for its current (height,
     /// round). Includes the handler's position so the forwarder can retarget.
-    NotProposer { height: i64, round: u32 },
+    NotProposer {
+        height: i64,
+        round: u32,
+    },
     /// Immediate ACK before processing (phase 1).
     Ack,
     /// Final result after processing (phase 2).
     Result(TransactionForwardResponse),
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 /// Server: process forwarded transactions by pushing them into the local consensus queue.
@@ -86,7 +91,7 @@ pub async fn handle_transaction_forward(
             .consensus_queue
             .enqueue_forwarded(pending_txs)
             .await;
-        for (idx, result) in pending_indices.into_iter().zip(submit_results.into_iter()) {
+        for (idx, result) in pending_indices.into_iter().zip(submit_results) {
             results_map[idx] = Some(match result {
                 Ok(()) => TransactionForwardResult::Committed,
                 Err(super::queue::ConsensusSubmitError::Rejected(reason)) => {

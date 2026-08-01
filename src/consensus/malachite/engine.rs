@@ -100,10 +100,10 @@ fn consensus_timeouts() -> LinearTimeouts {
 pub fn proposal_target(app_state: &AppState) -> Option<(u64, u32, i32)> {
     let engine = app_state.malachite.get()?;
     let decided = *engine.decided.borrow();
-    if let Some(ri) = *engine.round.borrow() {
-        if ri.height > decided {
-            return Some((ri.height, ri.round, ri.proposer));
-        }
+    if let Some(ri) = *engine.round.borrow()
+        && ri.height > decided
+    {
+        return Some((ri.height, ri.round, ri.proposer));
     }
     let pending = decided + 1;
     let conn = app_state.db_pool.get().ok()?;
@@ -339,7 +339,6 @@ pub fn spawn_engine(app_state: &AppState) -> Result<(), String> {
     // that keeps every registered peer's evidence bounded-stale.
     crate::consensus::evidence::spawn_probe_scheduler(app_state.clone());
 
-
     tracing::info!(
         start_height = start_height.0,
         profile = profile.as_str(),
@@ -393,15 +392,14 @@ fn spawn_tip_poll(app_state: AppState) {
             }
             let peers = sync::peer_list(&app_state.db_pool, node_id, None);
             let mut decided = engine.decided.clone();
-            if let Err(e) =
-                sync::sync_to_tip(
-                    &app_state.comms,
-                    &engine.input_tx,
-                    &mut decided,
-                    &peers,
-                    Some(app_state.evidence.clone()),
-                )
-                .await
+            if let Err(e) = sync::sync_to_tip(
+                &app_state.comms,
+                &engine.input_tx,
+                &mut decided,
+                &peers,
+                Some(app_state.evidence.clone()),
+            )
+            .await
             {
                 tracing::debug!("tip-poll sync: {e:?}");
             }
@@ -463,8 +461,12 @@ pub async fn bootstrap_join(
                 .map_err(|e| format!("genesis apply: {e:?}"))?;
         }
         store::install_genesis(&tx_db, &block, &cert).map_err(|e| e.to_string())?;
-        store::meta_put(&tx_db, store::META_CHAIN_ID, block.block_hash.as_bytes().as_slice())
-            .map_err(|e| e.to_string())?;
+        store::meta_put(
+            &tx_db,
+            store::META_CHAIN_ID,
+            block.block_hash.as_bytes().as_slice(),
+        )
+        .map_err(|e| e.to_string())?;
         store::meta_put(
             &tx_db,
             store::META_QUORUM_PROFILE,
@@ -492,8 +494,8 @@ pub async fn bootstrap_join(
         &peers,
         None, // bootstrap: nodes table still filling; evidence starts post-join
     )
-        .await
-        .map_err(|e| format!("sync to tip: {e:?}"))?;
+    .await
+    .map_err(|e| format!("sync to tip: {e:?}"))?;
 
     tracing::info!("join bootstrap: synced to height {reached}");
     Ok(reached)

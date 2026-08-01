@@ -3,9 +3,7 @@
 //! (typetag pattern); the host's boot tripwire asserts `TX_FUNCTIONS` all
 //! made it into the dispatch table (linker-drop guard).
 
-use hopnet_projection::{
-    DatabaseError, HandlerCtx, HandlerResult, TransactionHandler, TxMeta,
-};
+use hopnet_projection::{DatabaseError, HandlerCtx, HandlerResult, TransactionHandler, TxMeta};
 
 use crate::db::{
     imports::{self, ImportPayload, ImportStatusPayload},
@@ -137,10 +135,8 @@ impl TransactionHandler for UpdateTakeoutStatusHandler {
                                 status_payload.takeout_id,
                                 status_payload.new_status
                             );
-                            ctx.work.schedule(
-                                "takeout.cleanup",
-                                status_payload.takeout_id.to_string(),
-                            );
+                            ctx.work
+                                .schedule("takeout.cleanup", status_payload.takeout_id.to_string());
                         }
                         Some(_) => {
                             tracing::debug!(

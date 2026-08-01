@@ -32,8 +32,12 @@ pub enum SetupRequest {
 #[derive(Serialize, Deserialize, Debug)]
 pub enum SetupResponse {
     /// Ack for JoinDeliver
-    JoinAck { success: bool },
-    Error { message: String },
+    JoinAck {
+        success: bool,
+    },
+    Error {
+        message: String,
+    },
 }
 
 pub async fn get_setup(State(app_state): State<AppState>) -> impl IntoResponse {

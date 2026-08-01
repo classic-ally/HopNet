@@ -291,7 +291,13 @@ pub fn unwrap_mesh_privkey(
     reader: &dyn RecipientKey,
 ) -> Result<x25519_dalek::StaticSecret, StorageError> {
     let id = mesh_key_wrap_id(mesh_pubkey);
-    let key = unwrap_v1(&id, recipient_pubkey, ephemeral_pubkey, wrapped_privkey, reader)?;
+    let key = unwrap_v1(
+        &id,
+        recipient_pubkey,
+        ephemeral_pubkey,
+        wrapped_privkey,
+        reader,
+    )?;
     let mut bytes = [0u8; 32];
     bytes.copy_from_slice(key.as_slice());
     Ok(x25519_dalek::StaticSecret::from(bytes))
@@ -501,8 +507,7 @@ mod tests {
         let mesh_pub = X25519PublicKey::from(&mesh_secret);
         let member = StaticRecipient(x25519_dalek::StaticSecret::random_from_rng(OsRng));
 
-        let (eph, wrapped) =
-            wrap_mesh_privkey(&mesh_pub, &mesh_secret, &member.pubkey()).unwrap();
+        let (eph, wrapped) = wrap_mesh_privkey(&mesh_pub, &mesh_secret, &member.pubkey()).unwrap();
         let recovered = unwrap_mesh_privkey(
             &mesh_pub,
             member.pubkey().as_bytes(),

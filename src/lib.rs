@@ -19,7 +19,6 @@ pub mod devices;
 // hopnet_drive::http::documentprovider; the host mounts them in main.rs.
 pub mod capabilities;
 pub mod fileprovider;
-pub mod storage_host;
 pub mod handlers;
 pub mod metrics;
 pub mod net;
@@ -29,6 +28,7 @@ pub mod projections;
 pub mod reference_providers;
 pub mod setup;
 pub mod shares;
+pub mod storage_host;
 pub mod takeout_host;
 pub mod types;
 pub mod users;

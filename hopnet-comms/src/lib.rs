@@ -17,14 +17,16 @@ use std::time::Duration;
 
 #[cfg(feature = "iroh")]
 mod iroh_impl;
-#[cfg(feature = "iroh")]
-pub use iroh_impl::{net_rt, Call, CallOptions, EndpointAddr, IrohComms, ScopeRegistry, HOPNET_ALPN};
 /// The raw iroh crate, for test harnesses that must impersonate a foreign
 /// endpoint (e.g. the orchestrator's reject-unknown probe). Production code
 /// goes through [`IrohComms`]; containment means no other workspace manifest
 /// names iroh.
 #[cfg(feature = "iroh")]
 pub use iroh;
+#[cfg(feature = "iroh")]
+pub use iroh_impl::{
+    net_rt, Call, CallOptions, EndpointAddr, IrohComms, ScopeRegistry, HOPNET_ALPN,
+};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -180,12 +182,8 @@ pub trait RpcHandler: Send + Sync {
 /// forwarding: ack frame, then result frame). NO transport-level dedup —
 /// the protocol owns its idempotency (e.g. the consensus nonce table).
 pub trait StreamHandler: Send + Sync {
-    fn handle(
-        &self,
-        peer: PeerRef,
-        payload: Vec<u8>,
-        out: Box<dyn FrameSink>,
-    ) -> BoxFuture<'_, ()>;
+    fn handle(&self, peer: PeerRef, payload: Vec<u8>, out: Box<dyn FrameSink>)
+        -> BoxFuture<'_, ()>;
 }
 
 /// Server-side response writer for [`StreamHandler`]. The handler sends
