@@ -192,14 +192,33 @@ impl Storage for MemStorage {
 
 pub struct MemApp {
     valset: HopNetValidatorSet,
-    reject_height: Option<Height>,
+    /// Vote-iff-match dissent model (RFC-019 S5): refuse any block at this
+    /// height — the sim analog of a validator whose local recompute
+    /// mismatches the proposed snapshot hash.
+    reject_height: Rc<RefCell<Option<Height>>>,
+    /// Seal model (RFC-019 S5): blocks at/past this height seal the epoch —
+    /// `sealed_after` reports true (the engine parks at the terminal) and
+    /// anything beyond it is refused at vote time, mirroring production.
+    terminal: Rc<RefCell<Option<u64>>>,
 }
 
 impl MemApp {
     pub fn new(valset: HopNetValidatorSet) -> Self {
+        Self::with_handles(valset, Rc::default(), Rc::default())
+    }
+
+    /// Shared handles let the sim steer a node's app after the core takes
+    /// ownership (dissent injection, sealing), and let `restart` carry the
+    /// state across a rebuild.
+    pub fn with_handles(
+        valset: HopNetValidatorSet,
+        reject_height: Rc<RefCell<Option<Height>>>,
+        terminal: Rc<RefCell<Option<u64>>>,
+    ) -> Self {
         Self {
             valset,
-            reject_height: None,
+            reject_height,
+            terminal,
         }
     }
 }
@@ -212,11 +231,15 @@ impl Application<MemStorage> for MemApp {
         _tx: &mut MemTx,
         _origin: ValidationOrigin,
     ) -> Validity {
-        if self.reject_height == Some(height) {
-            Validity::Invalid
-        } else {
-            Validity::Valid
+        if *self.reject_height.borrow() == Some(height) {
+            return Validity::Invalid;
         }
+        // Sealed-epoch refusal (RFC-019 seal contract): nothing past the
+        // terminal height is votable.
+        if self.terminal.borrow().is_some_and(|t| height.0 > t) {
+            return Validity::Invalid;
+        }
+        Validity::Valid
     }
     fn apply_block(
         &mut self,
@@ -231,6 +254,9 @@ impl Application<MemStorage> for MemApp {
         self.valset.clone()
     }
     fn on_decided(&mut self, _height: Height, _block: &Block, _cert: &WireCommitCertificate) {}
+    fn sealed_after(&mut self, height: Height, _block: &Block) -> bool {
+        self.terminal.borrow().is_some_and(|t| height.0 >= t)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -459,6 +485,10 @@ struct SimNode {
     down: bool,
     /// Highest decided height observed, for contiguity checks.
     last_decided_seen: u64,
+    /// Steering handles shared with the core-owned MemApp (RFC-019
+    /// scenarios); carried across `restart`.
+    reject: Rc<RefCell<Option<Height>>>,
+    terminal: Rc<RefCell<Option<u64>>>,
 }
 
 pub struct Sim {
@@ -583,6 +613,30 @@ impl Sim {
     /// Whether `node` is paused before `height` (on-demand assertions).
     pub fn paused_at(&self, node: usize) -> Option<u64> {
         self.nodes[node].core.paused_at().map(|h| h.0)
+    }
+
+    /// RFC-019 seal model: mark `height` terminal on EVERY node — the sim
+    /// analog of the regenesis commit deciding (committed state is
+    /// mesh-wide, so all honest nodes learn the terminal together).
+    pub fn seal_all_at(&mut self, height: u64) {
+        for node in &self.nodes {
+            *node.terminal.borrow_mut() = Some(height);
+        }
+    }
+
+    /// Vote-iff-match dissent model: `node` refuses any block at `height`.
+    pub fn set_reject_height(&mut self, node: usize, height: u64) {
+        *self.nodes[node].reject.borrow_mut() = Some(Height(height));
+    }
+
+    /// Highest height ANY node has decided (agreement-oracle keyed).
+    pub fn max_agreed_height(&self) -> u64 {
+        self.agreed.keys().max().copied().unwrap_or(0)
+    }
+
+    /// Whether `node` is currently crashed.
+    pub fn is_down(&self, node: usize) -> bool {
+        self.nodes[node].down
     }
 
     /// After any interaction with node `i`, fulfil its value requests, then
@@ -808,13 +862,15 @@ impl Sim {
     /// liveness target — for scenarios where some nodes legitimately lag
     /// (message loss drifts heights; catch-up needs Stage-4 sync). The
     /// agreement / contiguity / equivocation oracles still run continuously,
-    /// so this asserts SAFETY under the fault, not liveness.
-    pub fn run_safety_only(&mut self, max_events: u64) -> Result<(), HostError<MemError>> {
+    /// so this asserts SAFETY under the fault, not liveness. Returns the
+    /// number of events processed: a value below `max_events` means the
+    /// queue genuinely drained (quiescence); equal means the budget hit.
+    pub fn run_safety_only(&mut self, max_events: u64) -> Result<u64, HostError<MemError>> {
         let mut events = 0u64;
         while let Some(item) = self.queue.pop() {
             events += 1;
             if events > max_events {
-                break;
+                return Ok(max_events);
             }
             self.vtime = item.vtime;
             match item.event {
@@ -855,7 +911,7 @@ impl Sim {
                 }
             }
         }
-        Ok(())
+        Ok(events)
     }
 
     fn decided_count(&self, target: u64) -> usize {
@@ -887,7 +943,11 @@ impl Sim {
             params,
             resume,
             self.valset.clone(),
-            MemApp::new(self.valset.clone()),
+            MemApp::with_handles(
+                self.valset.clone(),
+                self.nodes[node].reject.clone(),
+                self.nodes[node].terminal.clone(),
+            ),
             self.nodes[node].storage.clone(),
             gossip,
             timers,
@@ -985,6 +1045,8 @@ fn build_node(
     let storage = MemStorage::default();
     let gossip = MemGossip::default();
     let timers = MemTimers::default();
+    let reject: Rc<RefCell<Option<Height>>> = Rc::default();
+    let terminal: Rc<RefCell<Option<u64>>> = Rc::default();
     let mut core = HostCore::new(
         chain_id,
         signer.clone(),
@@ -993,7 +1055,7 @@ fn build_node(
         params_for(Address(node_id), profile),
         Height::INITIAL,
         valset.clone(),
-        MemApp::new(valset.clone()),
+        MemApp::with_handles(valset.clone(), reject.clone(), terminal.clone()),
         storage.clone(),
         gossip.clone(),
         timers.clone(),
@@ -1009,6 +1071,8 @@ fn build_node(
         node_id,
         down: false,
         last_decided_seen: 0,
+        reject,
+        terminal,
     }
 }
 

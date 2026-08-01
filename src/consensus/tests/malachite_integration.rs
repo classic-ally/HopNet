@@ -626,3 +626,272 @@ fn fresh_node_syncs_vote_out_chain_without_wedging() {
         );
     });
 }
+
+/// The PRODUCTION driver stack over a test shell — spawn_driver + settler
+/// + drain watcher, spawn_engine parity minus its config reads. The
+/// regenesis boundary must be exercised through the code the real node
+/// runs (proposer commit injection, drain watcher, terminal halt), not a
+/// test-local approximation.
+async fn start_engine_production(app_state: &AppState, node_id: i32) -> EngineNode {
+    let db_pool = app_state.db_pool.clone();
+    let (out_tx, out_rx) = mpsc::unbounded_channel();
+    tokio::spawn(gossip::run_publisher(app_state.clone(), node_id, out_rx));
+
+    let start_height = {
+        let conn = db_pool.get().unwrap();
+        let last = hopnet_consensus::store::last_decided_height(&conn)
+            .unwrap()
+            .map(|h| h.0)
+            .unwrap_or(0);
+        Height(last + 1)
+    };
+
+    let storage_conn = db_pool.get().unwrap();
+    let signer = hopnet_consensus::types::PrivKey(app_state.private_key.0.clone());
+    let app_state_for_core = app_state.clone();
+    let app_conn = app_state.db_pool.get().expect("app conn");
+    let handle: ConsensusHandle = shell::spawn(
+        move |gossip_seam, timers| {
+            let storage = PoolStorage::from_handle(storage_conn, crate::db::shared::commit_timed)
+                .expect("consensus storage");
+            let mut app = HopNetApplication::new(app_state_for_core, app_conn);
+            let valset = <HopNetApplication as Application<PoolStorage>>::validator_set(
+                &mut app,
+                start_height,
+            );
+            // ON-DEMAND, like spawn_engine: a drained moratorium is
+            // height-stable until the commit proposal — no free-running
+            // empty blocks racing a node past the seal (a straggler that
+            // misses the final block is S7's rejoin case, not this
+            // test's).
+            HostCore::new(
+                chain_id(),
+                signer,
+                Address(node_id),
+                hopnet_consensus::config::QuorumProfile::Majority,
+                engine_params(node_id),
+                start_height,
+                valset,
+                app,
+                storage,
+                gossip_seam,
+                timers,
+            )
+            .on_demand()
+        },
+        start_height,
+        LinearTimeouts::default(),
+        out_tx,
+    );
+    let ConsensusHandle {
+        input_tx,
+        decided,
+        round,
+        events,
+    } = handle;
+    let sync_inflight = Arc::new(AtomicBool::new(false));
+    let _ = app_state.malachite.set(EngineHandle {
+        input_tx: input_tx.clone(),
+        decided: decided.clone(),
+        round,
+        sync_inflight: sync_inflight.clone(),
+    });
+
+    // Settler (spawn_engine parity): resolve pool notifiers on decide —
+    // without it, inflight entries never clear and drain never completes.
+    {
+        let pool = app_state.consensus_queue.pending_pool();
+        let db_pool = app_state.db_pool.clone();
+        let mut decided_watch = decided.clone();
+        tokio::spawn(async move {
+            while decided_watch.changed().await.is_ok() {
+                let h = *decided_watch.borrow_and_update();
+                if let Ok(conn) = db_pool.get() {
+                    pool.settle(&conn, h);
+                }
+            }
+        });
+    }
+
+    let build_conn = app_state.db_pool.get().expect("build conn");
+    crate::consensus::malachite::engine::spawn_driver(
+        app_state.clone(),
+        node_id,
+        input_tx.clone(),
+        decided.clone(),
+        events,
+        build_conn,
+        sync_inflight,
+    );
+    crate::consensus::malachite::engine::spawn_drain_watcher(
+        app_state.clone(),
+        input_tx.clone(),
+        app_state.consensus_queue.pending_pool(),
+    );
+    // Tip-poll (spawn_engine parity): during a boundary it also covers
+    // SEATED stragglers — a node that misses the final block pulls the
+    // seal via decided-value sync from the halted-but-serving peers.
+    crate::consensus::malachite::engine::spawn_tip_poll(app_state.clone());
+
+    EngineNode { input_tx, decided }
+}
+
+// Should: drive a real 3-node loopback mesh through the whole boundary
+// over the PRODUCTION driver stack — regenesis_start decides and the
+// moratorium commits mesh-wide; once every pool drains, the proposer
+// injects the commit bound to its exact height; vote-iff-match passes on
+// identical replicas; every engine halts at the same terminal H; the
+// seal work leaves the durable marker and the byte-certified artifact.
+// Should not: decide anything past the terminal height, on any node.
+// Impact: OQ4's drain rule, the drain watcher, the proposer injection,
+// the halt, and the artifact writer are the shipping code paths — S5's
+// real-engine end-to-end.
+#[test]
+fn regenesis_seal_halts_mesh_and_writes_artifact() {
+    // The artifact path derives from XDG_DATA_HOME; isolate it for this
+    // process. set_var is process-global, but nothing else in the lib
+    // tests resolves the data dir.
+    let data_dir = std::env::temp_dir().join(format!("hopnet-seal-e2e-{}", std::process::id()));
+    std::fs::create_dir_all(data_dir.join("hopnet")).unwrap();
+    unsafe { std::env::set_var("XDG_DATA_HOME", &data_dir) };
+
+    let network = MockNetwork::setup_with_validators(3);
+    let rt = crate::consensus::tests::test_iroh_rt();
+    let data_dir_in = data_dir.clone();
+    rt.block_on(async move {
+        for node in &network.nodes {
+            install_consensus_schema(&node.app_state);
+            // The start precondition: every seated validator runs the
+            // target. Identical direct writes on every replica keep the
+            // fixtures consistent (the S3 attestation path needs the very
+            // engine we are about to start).
+            node.app_state
+                .db_pool
+                .get()
+                .unwrap()
+                .execute("UPDATE nodes SET running_version_code = 20260800", [])
+                .unwrap();
+        }
+        connect_mesh(&network).await;
+
+        let mut engines = Vec::new();
+        for (i, node) in network.nodes.iter().enumerate() {
+            engines.push(start_engine_production(&node.app_state, i as i32).await);
+        }
+
+        // Freeze: a seated validator's node-signed start, routed into the
+        // PENDING PROPOSER's pool exactly as production forwarding would
+        // (the pool push wakes that node's on-demand engine — wake rule
+        // 1; the settler resolves the notifier on decide).
+        let start_tx = crate::consensus::types::Transaction::new(
+            "regenesis_start".to_string(),
+            bincode::serde::encode_to_vec(
+                &crate::regenesis::RegenesisStart {
+                    target_version_code: 20260800,
+                },
+                bincode::config::standard(),
+            )
+            .unwrap(),
+            network.nodes[0].node_id,
+            &network.nodes[0].signing_key,
+        )
+        .unwrap();
+        let (_pending, _round, proposer) =
+            crate::consensus::malachite::engine::proposal_target(&network.nodes[0].app_state)
+                .expect("proposal target");
+        let queue = network.nodes[proposer as usize]
+            .app_state
+            .consensus_queue
+            .clone();
+        tokio::spawn(async move { queue.enqueue_forwarded(vec![start_tx]).await });
+
+        let state_of = |st: &AppState| {
+            let conn = st.db_pool.get().unwrap();
+            crate::db::regenesis::read_regenesis_state(&conn).unwrap()
+        };
+
+        // Moratorium mesh-wide, then the drain watcher + proposer carry it
+        // to the seal with no further help from the test.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
+        loop {
+            let states: Vec<_> = network
+                .nodes
+                .iter()
+                .map(|n| state_of(&n.app_state))
+                .collect();
+            if states
+                .iter()
+                .all(|s| s.phase == crate::db::regenesis::RegenesisPhase::Sealed)
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "mesh never sealed: {states:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        let sealed: Vec<_> = network
+            .nodes
+            .iter()
+            .map(|n| state_of(&n.app_state))
+            .collect();
+        let seal_height = sealed[0].seal_height.unwrap();
+        let committed_hash = sealed[0].snapshot_hash.clone().unwrap();
+        for s in &sealed {
+            assert_eq!(s.seal_height, Some(seal_height), "terminal height differs");
+            assert_eq!(
+                s.snapshot_hash.as_deref(),
+                Some(committed_hash.as_slice()),
+                "certified hash differs"
+            );
+        }
+
+        // Halt: every engine converges on the terminal height and stops.
+        for e in engines.iter_mut() {
+            wait_decided(e, seal_height, 120).await;
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        for e in &engines {
+            assert_eq!(*e.decided.borrow(), seal_height, "decided past the seal");
+        }
+
+        // Durable marker on every node.
+        for node in &network.nodes {
+            let conn = node.app_state.db_pool.get().unwrap();
+            assert_eq!(
+                crate::regenesis::seal::sealed_marker(&conn),
+                Some(seal_height),
+                "seal marker missing"
+            );
+        }
+
+        // The artifact next to the (XDG-derived) database: byte-certified
+        // against the committed hash. All three in-process nodes write the
+        // same path with identical bytes (unique tmp names, last rename
+        // wins).
+        let artifact = data_dir_in
+            .join("hopnet")
+            .join(crate::regenesis::seal::SEAL_ARTIFACT_FILENAME);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while !artifact.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "artifact never written"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let bytes = std::fs::read(&artifact).unwrap();
+        assert_eq!(
+            blake3::hash(&bytes).as_bytes(),
+            committed_hash.as_slice(),
+            "artifact bytes are not the certified bytes"
+        );
+
+        for e in &engines {
+            let _ = e.input_tx.send(HostInput::Shutdown).await;
+        }
+    });
+    std::fs::remove_dir_all(&data_dir).ok();
+}

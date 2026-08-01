@@ -90,7 +90,16 @@ pub fn write_seal_artifact_to(
         ));
     }
 
-    let tmp = path.with_extension("tmp");
+    // Unique tmp per writer: concurrent recomputes (multiple in-process
+    // nodes in tests; a crashed-then-woken node racing on_decided) each
+    // rename their own COMPLETE bytes — last rename wins, and every
+    // writer's bytes are identical (certified above).
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = path.with_extension(format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     std::fs::write(&tmp, &artifact).map_err(|e| format!("write {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, path).map_err(|e| format!("rename to {}: {e}", path.display()))?;
     Ok(path.to_path_buf())
