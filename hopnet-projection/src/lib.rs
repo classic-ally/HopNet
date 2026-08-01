@@ -383,6 +383,28 @@ pub trait Projection: Send + Sync {
     ) -> host::BoxFuture<'static, Result<u64, String>> {
         Box::pin(std::future::ready(Ok(0)))
     }
+
+    // RFC-019 additions:
+
+    /// This projection's section of the canonical state snapshot: the
+    /// covered tables the divergence manifest hashes and the epoch
+    /// artifact exports (the mesh-scoped sibling of [`ProjectionExporter`],
+    /// which is per-user). The host assembles sections after the
+    /// substrate's, in registration order. The `'static` return is
+    /// deliberate — the host builds a `'static` section list from unit
+    /// structs. Default: no covered tables.
+    fn snapshot_section(&self) -> Option<&'static hopnet_common::SectionSpec> {
+        None
+    }
+
+    /// This projection's node-local tables — outside the snapshot
+    /// universe entirely; the host's registry test pins
+    /// covered ∪ node-local == sqlite_master, so every table this
+    /// projection installs must appear in exactly one of the two.
+    /// Default: none.
+    fn node_local_tables(&self) -> &'static [&'static str] {
+        &[]
+    }
 }
 
 /// Current decided consensus height off any connection to the shared DB

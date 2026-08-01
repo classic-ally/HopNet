@@ -50,6 +50,14 @@ impl hopnet_projection::Projection for TakeoutProjection {
     fn install_schema(&self, conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
         db::install_schema(conn)
     }
+
+    fn snapshot_section(&self) -> Option<&'static hopnet_common::SectionSpec> {
+        Some(&db::SNAPSHOT_SECTION)
+    }
+
+    fn node_local_tables(&self) -> &'static [&'static str] {
+        db::NODE_LOCAL_TABLES
+    }
 }
 
 /// Takeout/import test barriers. The name registry lives here with the

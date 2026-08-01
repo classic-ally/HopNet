@@ -33,16 +33,24 @@ pub const HOST_SECTION: SectionSpec = SectionSpec {
 pub const HOST_NODE_LOCAL_TABLES: &[&str] = &["this_node", "pending_fragment_requests"];
 
 /// All sections, in the install_schema walk order (= FK direction; the
-/// section order is therefore also a valid import insert order). Adding a
-/// module = one SNAPSHOT_SECTION const in its crate + one line here.
-pub fn sections() -> [&'static SectionSpec; 5] {
-    [
+/// section order is therefore also a valid import insert order). The
+/// named units sit below the projection seam — same split the schema
+/// chain makes in `initialize` — then every registered projection
+/// contributes via `Projection::snapshot_section` (RFC-016 amendment,
+/// RFC-019 S2). Adding a projection touches zero host lines; adding a
+/// named unit = one SNAPSHOT_SECTION const + one line here.
+pub fn sections() -> Vec<&'static SectionSpec> {
+    let mut sections: Vec<&'static SectionSpec> = vec![
         &HOST_SECTION,
         &hopnet_consensus::store::SNAPSHOT_SECTION,
         &hopnet_storage::store::SNAPSHOT_SECTION,
-        &hopnet_drive::db::SNAPSHOT_SECTION,
-        &hopnet_takeout::db::SNAPSHOT_SECTION,
-    ]
+    ];
+    sections.extend(
+        crate::projections::manifests()
+            .iter()
+            .filter_map(|p| p.snapshot_section()),
+    );
+    sections
 }
 
 /// Union of every unit's node-local tables.
@@ -51,8 +59,9 @@ pub fn node_local_tables() -> Vec<&'static str> {
     tables.extend_from_slice(HOST_NODE_LOCAL_TABLES);
     tables.extend_from_slice(hopnet_consensus::store::NODE_LOCAL_TABLES);
     tables.extend_from_slice(hopnet_storage::store::NODE_LOCAL_TABLES);
-    tables.extend_from_slice(hopnet_drive::db::NODE_LOCAL_TABLES);
-    tables.extend_from_slice(hopnet_takeout::db::NODE_LOCAL_TABLES);
+    for projection in crate::projections::manifests() {
+        tables.extend_from_slice(projection.node_local_tables());
+    }
     tables
 }
 
