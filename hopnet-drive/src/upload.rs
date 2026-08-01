@@ -182,6 +182,14 @@ pub async fn submit_inodes(
     }
 
     let results = state.txs.submit_batch(transactions).await;
+    // Admission closed (regenesis moratorium) is retryable — surface 503
+    // so clients back off instead of treating the freeze as a failure.
+    if results
+        .iter()
+        .any(|r| matches!(r, Err(crate::host::TxSubmitError::Unavailable(_))))
+    {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
     if results.iter().any(|r| r.is_err()) {
         tracing::error!("Failed to submit inodes to consensus");
         return Err(StatusCode::INTERNAL_SERVER_ERROR);

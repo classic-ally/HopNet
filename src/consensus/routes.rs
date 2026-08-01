@@ -302,6 +302,18 @@ pub async fn post_leave(State(app_state): State<AppState>) -> impl IntoResponse 
         Ok(Err(ConsensusSubmitError::Rejected(r))) => {
             (StatusCode::CONFLICT, format!("leave refused: {r}")).into_response()
         }
+        Ok(Err(ConsensusSubmitError::Moratorium {
+            phase,
+            target_version_code,
+        })) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(axum::http::header::RETRY_AFTER, "5")],
+            Json(crate::regenesis::routes::refusal_view(
+                phase,
+                target_version_code,
+            )),
+        )
+            .into_response(),
         Ok(Err(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("leave failed: {e:?}"),

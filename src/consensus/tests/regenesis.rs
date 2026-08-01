@@ -247,3 +247,48 @@ fn start_rejects_malformed_payloads() {
 
     assert_eq!(committed_state(&node).phase, RegenesisPhase::Normal);
 }
+
+// Should: refuse NEW submissions at the queue chokepoint once the
+// moratorium holds — the same gate every client route and internal cron
+// funnels through — with the retryable Moratorium error, not Rejected.
+// Impact: the freeze must be real at the submission layer, or our own
+// crons keep refilling the pool and the drain never terminates.
+#[test]
+fn queue_refuses_new_submissions_during_moratorium() {
+    use crate::consensus::queue::ConsensusSubmitError;
+
+    let node = MockNode::new(3);
+    register_node(&node);
+    {
+        let mut conn = node.app_state.db_pool.get().unwrap();
+        let db_tx = conn.transaction().unwrap();
+        set_moratorium_tx(&db_tx, 20260800).unwrap();
+        db_tx.commit().unwrap();
+    }
+
+    let tx = Transaction::new(
+        "node_staged_version".to_string(),
+        vec![],
+        node.node_id,
+        &node.signing_key,
+    )
+    .unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let err = rt
+        .block_on(node.app_state.consensus_queue.submit(tx))
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ConsensusSubmitError::Moratorium {
+                phase: "moratorium",
+                target_version_code: Some(20260800),
+            }
+        ),
+        "got {err:?}"
+    );
+}

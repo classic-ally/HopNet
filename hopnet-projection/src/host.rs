@@ -60,6 +60,10 @@ pub enum TxSubmitError {
     Rejected(String),
     /// Consensus failed the transaction (timeout / queue full / internal).
     Submit,
+    /// Mesh-global admission is closed (regenesis moratorium, RFC-019
+    /// S5) — retryable, unlike Rejected. Routes map it to 503; the
+    /// string is a serialized host-side refusal body.
+    Unavailable(String),
 }
 
 pub trait TxGateway: Send + Sync {

@@ -595,6 +595,14 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .route("/consensus/view", post(consensus::routes::debug_view_state))
                 .route("/consensus/leave", post(consensus::routes::post_leave))
+                .route(
+                    "/consensus/regenesis/start",
+                    post(regenesis::routes::post_regenesis_start),
+                )
+                .route(
+                    "/consensus/regenesis/abort",
+                    post(regenesis::routes::post_regenesis_abort),
+                )
                 .route("/consensus/evidence", get(consensus::evidence::get_evidence))
                 .layer(middleware::from_fn_with_state(
                     app_state.clone(),

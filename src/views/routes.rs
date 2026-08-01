@@ -8,6 +8,10 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/network-resilience", get(get_network_resilience))
         .route("/upgrade-readiness", get(get_upgrade_readiness))
+        .route(
+            "/regenesis-status",
+            get(crate::regenesis::routes::get_regenesis_status),
+        )
 }
 
 /// GET /views/upgrade-readiness (RFC-019 S3)

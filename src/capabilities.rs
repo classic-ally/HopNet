@@ -95,6 +95,16 @@ impl TxGateway for CapabilityHost {
                         crate::consensus::queue::ConsensusSubmitError::Rejected(reason) => {
                             TxSubmitError::Rejected(reason)
                         }
+                        crate::consensus::queue::ConsensusSubmitError::Moratorium {
+                            phase,
+                            target_version_code,
+                        } => TxSubmitError::Unavailable(
+                            serde_json::to_string(&crate::regenesis::routes::refusal_view(
+                                phase,
+                                target_version_code,
+                            ))
+                            .unwrap_or_else(|_| "regenesis in progress".to_string()),
+                        ),
                         _ => TxSubmitError::Submit,
                     })
                 })

@@ -9,7 +9,9 @@
 //! the engine obligations are hopnet-consensus/spec/
 //! regenesis-seal-contract.md.
 
+pub mod gate;
 pub mod handlers;
+pub mod routes;
 
 use serde::{Deserialize, Serialize};
 

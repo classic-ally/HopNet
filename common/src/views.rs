@@ -171,3 +171,30 @@ pub struct ProviderStatusView {
     pub fetched_at: Option<String>,
     pub error: Option<String>,
 }
+
+/// 503 body when the regenesis moratorium refuses a new submission
+/// (RFC-019 S5) — the structured "regenesis in progress" contract, so
+/// callers know to retry rather than treat the refusal as an error.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[typeshare]
+pub struct RegenesisRefusalView {
+    /// "moratorium" | "sealed".
+    pub phase: String,
+    /// The version the next epoch requires, formatted CalVer.
+    pub target_version: Option<String>,
+    pub message: String,
+}
+
+/// GET /views/regenesis-status (RFC-019 S5): the committed boundary
+/// phase plus this node's drain observation. Facts only.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[typeshare]
+pub struct RegenesisStatusView {
+    /// "normal" | "moratorium" | "sealed".
+    pub phase: String,
+    pub target_version: Option<String>,
+    /// Terminal height H once sealed (stringified u64).
+    pub seal_height: Option<String>,
+    /// This node's pool observation: nothing staged, nothing inflight.
+    pub drained: bool,
+}

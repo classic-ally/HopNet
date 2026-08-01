@@ -592,8 +592,20 @@ async fn handle_need_value(
         entries.iter().map(|e| e.transaction().clone()).collect();
 
     // Periodic nonce-table hygiene, appended AFTER the queue entries so
-    // candidate indices still line up with `entries`.
-    if height.0.is_multiple_of(NONCE_CLEANUP_INTERVAL) {
+    // candidate indices still line up with `entries`. Suppressed outside
+    // the normal phase (RFC-019 S5): this injection bypasses the queue's
+    // admission gate, and hygiene must neither dilute the drain nor break
+    // the regenesis commit's solo block. On a read error we skip — a
+    // missed cleanup is harmless; the next interval retries.
+    let hygiene_admissible = || {
+        app_state
+            .db_pool
+            .get()
+            .ok()
+            .and_then(|c| crate::db::regenesis::read_regenesis_state(&c).ok())
+            .is_some_and(|s| s.phase == crate::db::regenesis::RegenesisPhase::Normal)
+    };
+    if height.0.is_multiple_of(NONCE_CLEANUP_INTERVAL) && hygiene_admissible() {
         let cutoff_ts = (chrono::Utc::now() - chrono::Duration::hours(1)).timestamp() as u64;
         let cutoff = hopnet_common::CustomUUID::new(Some(&uuid::Timestamp::from_unix(
             uuid::NoContext,

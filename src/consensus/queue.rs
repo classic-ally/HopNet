@@ -23,6 +23,12 @@ pub enum ConsensusSubmitError {
     Timeout,
     /// Queue is at capacity — caller should retry later
     QueueFull,
+    /// Mesh-global admission is closed (RFC-019 S5): a regenesis boundary
+    /// is in progress. Retryable — routes map it to 503 + Retry-After.
+    Moratorium {
+        phase: &'static str,
+        target_version_code: Option<u32>,
+    },
     /// Unexpected internal failure
     InternalError(String),
 }
@@ -33,6 +39,9 @@ impl fmt::Display for ConsensusSubmitError {
             Self::Rejected(reason) => write!(f, "rejected: {}", reason),
             Self::Timeout => write!(f, "consensus timeout"),
             Self::QueueFull => write!(f, "queue full"),
+            Self::Moratorium { phase, .. } => {
+                write!(f, "regenesis in progress ({phase}): admission closed")
+            }
             Self::InternalError(msg) => write!(f, "internal error: {}", msg),
         }
     }
@@ -98,6 +107,12 @@ impl PendingPool {
     /// Number of staged (not yet proposed) transactions.
     pub fn staged_len(&self) -> usize {
         self.queued.lock().unwrap().len()
+    }
+
+    /// Number of proposed-but-undecided transactions. Drain-complete
+    /// (RFC-019 S5, OQ4) = staged 0 AND inflight 0 AND tip applied.
+    pub fn inflight_len(&self) -> usize {
+        self.inflight.lock().unwrap().len()
     }
 
     /// Take up to `max` staged transactions for a proposal at `height`.
@@ -272,11 +287,7 @@ impl ConsensusQueue {
     /// Submit a single transaction. Pre-validates against committed state first.
     /// Returns when the transaction is committed, rejected, or times out.
     pub async fn submit(&self, transaction: Transaction) -> Result<(), ConsensusSubmitError> {
-        // Pre-validate: check the handler exists
-        if let Err(reason) = self.pre_validate(&transaction) {
-            return Err(ConsensusSubmitError::Rejected(reason));
-        }
-
+        self.pre_validate(&transaction)?;
         self.enqueue_one(transaction).await
     }
 
@@ -290,8 +301,8 @@ impl ConsensusQueue {
 
         for transaction in transactions {
             // Pre-validate each transaction
-            if let Err(reason) = self.pre_validate(&transaction) {
-                results.push(Err(ConsensusSubmitError::Rejected(reason)));
+            if let Err(e) = self.pre_validate(&transaction) {
+                results.push(Err(e));
                 continue;
             }
 
@@ -344,20 +355,36 @@ impl ConsensusQueue {
         results
     }
 
-    /// Pre-validate a transaction against current committed state.
-    /// Currently checks that the handler exists in the dispatch table.
-    /// Full preflight validation (with execute=true dry-run) happens on the leader.
-    fn pre_validate(&self, transaction: &Transaction) -> Result<(), String> {
+    /// Pre-validate a transaction against current committed state: the
+    /// handler must exist, and mesh-global admission must be open (the
+    /// RFC-019 S5 moratorium gate — this chokepoint covers every client
+    /// route AND every internal cron; the forwarded path deliberately
+    /// bypasses it, because already-accepted work drains through the
+    /// moratorium). Full preflight (execute=false dry-run) happens on
+    /// the leader.
+    fn pre_validate(&self, transaction: &Transaction) -> Result<(), ConsensusSubmitError> {
         if DISPATCH_TABLE
             .get(transaction.rpc.function.as_str())
-            .is_some()
+            .is_none()
         {
-            Ok(())
-        } else {
-            Err(format!(
+            return Err(ConsensusSubmitError::Rejected(format!(
                 "no handler for function: {}",
                 transaction.rpc.function
-            ))
+            )));
+        }
+
+        let conn = self.db_pool.get().map_err(|e| {
+            ConsensusSubmitError::InternalError(format!("admission gate conn: {e}"))
+        })?;
+        match crate::regenesis::gate::admission_refusal(&conn, &transaction.rpc.function) {
+            Ok(None) => Ok(()),
+            Ok(Some(state)) => Err(ConsensusSubmitError::Moratorium {
+                phase: crate::regenesis::gate::phase_str(state.phase),
+                target_version_code: state.target_version_code,
+            }),
+            Err(e) => Err(ConsensusSubmitError::InternalError(format!(
+                "admission gate read: {e:?}"
+            ))),
         }
     }
 
