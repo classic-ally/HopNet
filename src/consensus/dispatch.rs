@@ -135,7 +135,16 @@ pub fn process_transactions(
                         if execute { "processed" } else { "validated" },
                         &tx.rpc.function
                     );
-                    if execute {
+                    // The regenesis commit is nonce-EXEMPT (RFC-019 S5):
+                    // committed_tx_nonces is an EXPORTED table, and the
+                    // commit's certified snapshot hash covers the state
+                    // BEFORE its own block — inserting its nonce would make
+                    // the post-seal artifact recompute never match the
+                    // certificate. Replay protection is not weakened: it is
+                    // the final block of the epoch (nothing decides after
+                    // it), the sealed gate refuses everything, and a replay
+                    // in a later moratorium dies on the phase rules.
+                    if execute && tx.rpc.function != "regenesis_commit" {
                         nonces.push(tx.nonce.clone());
                     }
                 }

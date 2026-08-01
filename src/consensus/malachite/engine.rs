@@ -368,7 +368,7 @@ pub fn spawn_engine(app_state: &AppState) -> Result<(), String> {
 /// cohort doesn't poll in lockstep.
 const TIP_POLL_BASE: Duration = Duration::from_secs(5);
 
-fn spawn_tip_poll(app_state: AppState) {
+pub(crate) fn spawn_tip_poll(app_state: AppState) {
     crate::consensus::queue::queue_rt().spawn(async move {
         loop {
             let jitter_ns = (std::time::SystemTime::now()
@@ -398,7 +398,25 @@ fn spawn_tip_poll(app_state: AppState) {
                     .unwrap_or(true)
             };
             if am_active {
-                continue;
+                // Seated nodes normally skip: live gossip feeds them. ONE
+                // exception (RFC-019 S5): during a regenesis boundary the
+                // mesh may have already sealed and gone SILENT — a seated
+                // straggler that missed the final block would otherwise
+                // churn rounds at the boundary height forever, with nothing
+                // pushing the seal to it. Poll while the committed phase is
+                // not normal; the pulled commit block seals this node too
+                // (Sync-origin validation skips vote-iff-match by design).
+                let boundary_in_flight = app_state
+                    .db_pool
+                    .get()
+                    .ok()
+                    .and_then(|c| crate::db::regenesis::read_regenesis_state(&c).ok())
+                    .is_some_and(|s| {
+                        s.phase != crate::db::regenesis::RegenesisPhase::Normal
+                    });
+                if !boundary_in_flight {
+                    continue;
+                }
             }
             if engine.sync_inflight.swap(true, Ordering::SeqCst) {
                 continue; // one sync at a time
@@ -514,7 +532,7 @@ pub async fn bootstrap_join(
 /// The app-side event loop: answers NeedValue with built proposals, kicks the
 /// sync client on SyncNeeded, and forwards the PendingPool's work signal as
 /// a Resume (on-demand wake rule 1).
-fn spawn_driver(
+pub(crate) fn spawn_driver(
     app_state: AppState,
     node_id: i32,
     input_tx: mpsc::Sender<HostInput>,
@@ -644,7 +662,7 @@ fn seal_candidate(
 /// own once the commit decides (phase leaves MORATORIUM). Lives for the
 /// engine's lifetime; outside a moratorium it is one cheap singleton
 /// read per second.
-fn spawn_drain_watcher(
+pub(crate) fn spawn_drain_watcher(
     app_state: AppState,
     input_tx: mpsc::Sender<HostInput>,
     pool: Arc<crate::consensus::queue::PendingPool>,
