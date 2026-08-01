@@ -119,7 +119,10 @@
           hopnet = craneLib.buildPackage (commonArgs // {
             inherit cargoArtifacts;
             pname = "hopnet";
-            version = "0.1.0";
+            # Version inherited from Cargo.toml — the single version
+            # authority (RFC-019 S3). Other derivations' hardcoded
+            # versions are store-path cosmetic only.
+            inherit (craneLib.crateNameFromCargoToml { src = ./.; }) version;
 
             preBuild = ''
               mkdir -p frontend/dist
