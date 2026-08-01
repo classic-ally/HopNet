@@ -10,14 +10,17 @@
 //!
 //! Install order matters: photos FKs point at the host's `users` and the
 //! substrate's `data_blocks`. Within this unit, `shared_libraries` is the
-//! sole parent table — `photos`, `shared_library_members`, `photo_albums`
-//! FK it; everything else FKs `photos` or `users`.
+//! sole parent table — `photos`, `shared_library_members`,
+//! `shared_library_keys`, `shared_library_invites`, `photo_view_changes`,
+//! and `photo_albums` FK it; everything else FKs `photos` or `users`.
 
 /// The tables this projection owns, in dependency order (parents first).
 /// Exposed for divergence tooling and the host's boot tripwire.
 pub const TABLES: &[&str] = &[
     "shared_libraries",
     "shared_library_members",
+    "shared_library_keys",
+    "shared_library_invites",
     "photos",
     "photo_metadata_access",
     "photo_resources",
@@ -26,6 +29,7 @@ pub const TABLES: &[&str] = &[
     "photo_album_entries",
     "photo_favorites",
     "photo_changes",
+    "photo_view_changes",
     "photo_ingress_responsibility",
 ];
 
@@ -58,14 +62,19 @@ pub fn install_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error
         -- Shared libraries: multi-user key-distribution membership
         -- (photos.md:155-176). There is no owner column — all members
         -- have equal standing. The personal library is NULL on `photos`
-        -- (photos.md:57), not a sentinel row here.
+        -- (photos.md:57), not a sentinel row here. The name is encrypted
+        -- under the LIBRARY key (per-member wraps in shared_library_keys),
+        -- not a single-recipient ECDH seal — every member can render it.
         CREATE TABLE shared_libraries (
             id                       TEXT PRIMARY KEY,    -- UUIDv7
-            encrypted_name           BLOB NOT NULL,        -- ChaCha20-Poly1305
-            name_ephemeral_pubkey    BLOB NOT NULL         -- 32-byte X25519
+            encrypted_name           BLOB NOT NULL,        -- ChaCha20-Poly1305 under library key
+            name_nonce               BLOB NOT NULL         -- 12-byte nonce
         );
 
-        -- Library membership (N-way, no owner).
+        -- Library membership (N-way, no owner). Membership is the READ
+        -- GATE for shared photos: access-row existence alone is not
+        -- sufficient (pre-staged invitee wraps are inert without a row
+        -- here).
         CREATE TABLE shared_library_members (
             library_id               TEXT NOT NULL,
             user_id                  INTEGER NOT NULL,
@@ -73,6 +82,41 @@ pub fn install_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error
             PRIMARY KEY (library_id, user_id),
             FOREIGN KEY (library_id) REFERENCES shared_libraries(id),
             FOREIGN KEY (user_id) REFERENCES users(user_id)
+        );
+
+        -- Per-member wrapped library key (X25519 ECDH wrap, LIBRARY_KEY_
+        -- WRAP_DOMAIN, wrap id = library id bytes). Decrypts the library
+        -- name; the designed seam for the future library-scoped cloud
+        -- fingerprint key.
+        CREATE TABLE shared_library_keys (
+            library_id               TEXT NOT NULL,
+            user_id                  INTEGER NOT NULL,
+            ephemeral_pubkey         BLOB NOT NULL,        -- 32-byte X25519
+            wrapped_key              BLOB NOT NULL,        -- 48 bytes (32 key + 16 tag)
+
+            PRIMARY KEY (library_id, user_id),
+            FOREIGN KEY (library_id) REFERENCES shared_libraries(id),
+            FOREIGN KEY (user_id) REFERENCES users(user_id)
+        );
+
+        -- Pending membership: consent pattern mirroring drive's
+        -- incoming_shares. The row carries the invitee's library-key wrap,
+        -- minted AT invite time, so accept needs no inviter online and the
+        -- library name renders in the invite listing. Access-row
+        -- pre-staging (the convergence worker) targets invitees too;
+        -- membership-gated reads keep everything invisible until accept.
+        CREATE TABLE shared_library_invites (
+            library_id               TEXT NOT NULL,
+            user_id                  INTEGER NOT NULL,     -- invitee
+            invited_by               INTEGER NOT NULL,
+            operation_id             TEXT NOT NULL,        -- UUIDv7, audit/ordering
+            ephemeral_pubkey         BLOB NOT NULL,        -- invitee's library-key wrap
+            wrapped_key              BLOB NOT NULL,
+
+            PRIMARY KEY (library_id, user_id),
+            FOREIGN KEY (library_id) REFERENCES shared_libraries(id),
+            FOREIGN KEY (user_id) REFERENCES users(user_id),
+            FOREIGN KEY (invited_by) REFERENCES users(user_id)
         );
 
         -- Photos: identity, tombstone. The encrypted_metadata blob carries
@@ -193,6 +237,22 @@ pub fn install_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error
         );
         CREATE INDEX idx_photo_changes_height ON photo_changes(changed_at_height);
 
+        -- Per-user VIEW-change signal: 'your visibility into this library
+        -- changed at height h' — written by membership/grant/revoke
+        -- handlers, consumed by the sidecar sync worker to trigger a
+        -- targeted library backfill or purge. Deliberately separate from
+        -- photo_changes, which records only changes to the photo itself;
+        -- a grant does not edit the photo. Upserted to the latest height.
+        CREATE TABLE photo_view_changes (
+            user_id              INTEGER NOT NULL,
+            library_id           TEXT NOT NULL,
+            changed_at_height    INTEGER NOT NULL,
+
+            PRIMARY KEY (user_id, library_id),
+            FOREIGN KEY (user_id) REFERENCES users(user_id),
+            FOREIGN KEY (library_id) REFERENCES shared_libraries(id)
+        );
+
         -- Albums: lightweight groupings (photos.md:178-205). A photo can
         -- belong to multiple albums. Personal or shared.
         CREATE TABLE photo_albums (
@@ -254,6 +314,7 @@ pub fn uninstall_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Err
     conn.execute_batch(
         "
         DROP TABLE IF EXISTS photo_ingress_responsibility;
+        DROP TABLE IF EXISTS photo_view_changes;
         DROP TABLE IF EXISTS photo_favorites;
         DROP TABLE IF EXISTS photo_changes;
         DROP TABLE IF EXISTS photo_album_entries;
@@ -262,6 +323,8 @@ pub fn uninstall_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Err
         DROP TABLE IF EXISTS photo_resources;
         DROP TABLE IF EXISTS photo_metadata_access;
         DROP TABLE IF EXISTS photos;
+        DROP TABLE IF EXISTS shared_library_invites;
+        DROP TABLE IF EXISTS shared_library_keys;
         DROP TABLE IF EXISTS shared_library_members;
         DROP TABLE IF EXISTS shared_libraries;
         ",
@@ -308,7 +371,7 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO shared_libraries (id, encrypted_name, name_ephemeral_pubkey)
+            "INSERT INTO shared_libraries (id, encrypted_name, name_nonce)
              VALUES ('lib1', x'00', x'00')",
             [],
         )
@@ -380,6 +443,57 @@ mod tests {
         )
         .unwrap();
 
+        // Membership-lifecycle FK surface: key wraps, invites, and view
+        // signals all hang off shared_libraries + users; dangling parents
+        // are rejected.
+        conn.execute(
+            "INSERT INTO shared_library_keys (library_id, user_id, ephemeral_pubkey, wrapped_key)
+             VALUES ('lib1', 1, x'00', x'00')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO shared_library_invites
+               (library_id, user_id, invited_by, operation_id, ephemeral_pubkey, wrapped_key)
+             VALUES ('lib1', 1, 1, 'op-inv', x'00', x'00')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO photo_view_changes (user_id, library_id, changed_at_height)
+             VALUES (1, 'lib1', 7)",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO shared_library_keys (library_id, user_id, ephemeral_pubkey, wrapped_key)
+                 VALUES ('nope', 1, x'00', x'00')",
+                [],
+            )
+            .is_err(),
+            "key wrap for an unknown library must be rejected"
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO shared_library_invites
+                   (library_id, user_id, invited_by, operation_id, ephemeral_pubkey, wrapped_key)
+                 VALUES ('lib1', 99, 1, 'op-x', x'00', x'00')",
+                [],
+            )
+            .is_err(),
+            "invite for an unknown user must be rejected"
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO photo_view_changes (user_id, library_id, changed_at_height)
+                 VALUES (1, 'nope', 7)",
+                [],
+            )
+            .is_err(),
+            "view signal for an unknown library must be rejected"
+        );
+
         // Responsibility FK surface: valid claim for an existing owned
         // device passes; a dangling device_id is rejected.
         conn.execute(
@@ -407,12 +521,15 @@ mod tests {
         // (foreign_keys = ON).
         conn.execute("DELETE FROM photo_ingress_responsibility", [])
             .unwrap();
+        conn.execute("DELETE FROM photo_view_changes", []).unwrap();
         conn.execute("DELETE FROM photo_operations", []).unwrap();
         conn.execute("DELETE FROM photo_resources", []).unwrap();
         conn.execute("DELETE FROM photo_metadata_access", []).unwrap();
         conn.execute("DELETE FROM photo_favorites", []).unwrap();
         conn.execute("DELETE FROM photo_album_entries", []).unwrap();
         conn.execute("DELETE FROM photos", []).unwrap();
+        conn.execute("DELETE FROM shared_library_invites", []).unwrap();
+        conn.execute("DELETE FROM shared_library_keys", []).unwrap();
         conn.execute("DELETE FROM shared_library_members", []).unwrap();
         conn.execute("DELETE FROM shared_libraries", []).unwrap();
         uninstall_schema(&conn).unwrap();

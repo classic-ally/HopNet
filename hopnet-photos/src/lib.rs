@@ -26,6 +26,17 @@ pub const METADATA_KEY_WRAP_DOMAIN: hopnet_storage::WrapDomain = hopnet_storage:
     nonce_context: "hopnet-photos metadata_nonce v1",
 };
 
+/// Domain-separation constant for shared-library key wrapping (the
+/// per-member wrap in `shared_library_keys` / `shared_library_invites`).
+/// The wrap id is the library id's bytes, so a wrap cannot be
+/// transplanted between libraries. The library key encrypts the library
+/// name today and is the seam for the future library-scoped cloud
+/// fingerprint key.
+pub const LIBRARY_KEY_WRAP_DOMAIN: hopnet_storage::WrapDomain = hopnet_storage::WrapDomain {
+    key_context: "hopnet-photos library_key v1",
+    nonce_context: "hopnet-photos library_nonce v1",
+};
+
 #[cfg(feature = "projection")]
 pub mod db;
 #[cfg(feature = "projection")]
