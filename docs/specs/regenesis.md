@@ -514,9 +514,18 @@ protocol it checks.
     sections assembled through the registry); bounds-checked artifact
     import into a fresh schema with parse-to-skip for unknown sections;
     byte-identical roundtrip gate green on the full host schema
-- [ ] S3 — staged versions + upgrade provider
+- [x] S3 — staged versions + upgrade provider
   - `node_staged_version` tx; v1 git-release provider; advisory
-    surface
+    surface (route only — pressure bands await OQ5)
+  - landed with two recorded deviations: versions are CalVer YYYY.M.N
+    integer codes (Cargo.toml authoritative; equality AND ordering are
+    integer math), and the staged claim is a SINGLE slot on `nodes`
+    (running/staged/attested-height columns) rather than a set — any
+    real deployment has at most one pending version, and each
+    attestation overwrites wholesale, so a claim upstream moved past
+    self-cleans. The v1 provider reports available-but-unstaged only,
+    so attestations are running-only until a staging-capable provider
+    exists; the propose-time precondition remains S5's
 - [ ] S4 — qnt: epoch-transition extension of
       `validator_membership.qnt` + the SEAL CONTRACT
   - invariants verified BEFORE the protocol is coded: seal safety

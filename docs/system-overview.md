@@ -58,8 +58,13 @@ an audit found a view-change safety hole. See RFC-013 for the full design
       manifest's top hash — and now a real gate that fails the run on
       divergence; S2 Projection snapshot seam (RFC-016 amendment:
       projections declare their own sections) + fresh-DB artifact
-      import, byte-identical roundtrip gate green. Next: S3 staged
-      versions + upgrade provider.
+      import, byte-identical roundtrip gate green; S3 staged versions
+      (CalVer integer codes, Cargo.toml authoritative; per-node
+      running/staged attestation columns via the node_staged_version
+      tx) + v1 git-release upgrade provider (reports
+      available-but-unstaged from the Forgejo releases API) +
+      /api/views/upgrade-readiness advisory. Next: S4 qnt
+      epoch-transition extension + seal contract.
 
 ### 2. Storage Substrate ([RFC-014](specs/hopnet-storage.md)) + File Storage ([RFC-002](specs/file-storage.md))
 **Status**: Substrate extraction COMPLETE (stages A–F, 2026-07-07) — the `hopnet-storage`
