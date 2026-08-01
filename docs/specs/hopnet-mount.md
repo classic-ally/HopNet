@@ -441,6 +441,16 @@ together as a stack:
   are the same cut
 - **full stack** — real node + real mountpoint, POSIX ops observed
   end-to-end (the RFC-010-style harness above)
+- **cross-node mesh** — orchestrator test `mount-cross-node-consistency`
+  (2026-08-01): node containers get `/dev/fuse` + CAP_SYS_ADMIN and the
+  image carries `hopnet-mount`; the daemon mounts inside node 0's
+  container, then the test proves kernel writes appear byte-identical
+  via the other nodes' APIs, remote API writes surface through the
+  mount (the poke path), and remote deletes vanish from it — with the
+  auto-managed divergence check on top. This is the automated successor
+  to the manual `#[ignore]` kernel smokes, and the only harness that
+  exercises the mount against real multi-node consensus (S4 height
+  determinism, S6 forwarder path)
 
 ## Open Questions
 

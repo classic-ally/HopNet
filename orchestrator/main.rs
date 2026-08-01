@@ -1013,6 +1013,17 @@ async fn create_hopnet_container(
         host_config: Some(HostConfig {
             port_bindings,
             binds: Some(binds),
+            // FUSE support for the mount-cross-node-consistency test: the
+            // hopnet-mount daemon mounts /hopdrive inside the container.
+            // SYS_ADMIN covers mount(2) as container root and the kernel's
+            // backing-fd capability check, so passthrough (RFC-018 S9) can
+            // arm in-container. Purely additive for every other test.
+            devices: Some(vec![bollard::models::DeviceMapping {
+                path_on_host: Some("/dev/fuse".to_string()),
+                path_in_container: Some("/dev/fuse".to_string()),
+                cgroup_permissions: Some("rwm".to_string()),
+            }]),
+            cap_add: Some(vec!["SYS_ADMIN".to_string()]),
             ..Default::default()
         }),
         ..Default::default()

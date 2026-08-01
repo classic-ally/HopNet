@@ -209,8 +209,10 @@ Cross-platform desktop application providing file management and network adminis
       fallback, mesh-capacity statfs, systemd user unit via flake
       home-manager/NixOS modules), and kernel passthrough reads of fully
       cached files (~1.6× the daemon path, zero daemon wakeups; opt-in
-      CAP_SYS_ADMIN wrapper in the NixOS module). Remaining: S10 desktop
-      polish/packaging)
+      CAP_SYS_ADMIN wrapper in the NixOS module). Cross-node regression
+      guard: orchestrator test `mount-cross-node-consistency` mounts via
+      FUSE inside a node container and proves kernel IO converges across
+      the mesh (2026-08-01). Remaining: S10 desktop polish/packaging)
 - [ ] Advanced file operations (multi-select, context menus, drag-drop)
 - [x] Network health dashboard — invariant-derived resilience pane (2026-07-25): the
       Network Resilience pane reports margins to the model-checked invariants rather than

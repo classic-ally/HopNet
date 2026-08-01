@@ -293,7 +293,10 @@
             tag = "latest";
             # iroh-relay rides along so the orchestrator can run a relay
             # container from this same image (entrypoint override).
-            contents = [ hopnet iroh-relay ];
+            # hopnet-mount + fuse3 serve the mount-cross-node-consistency
+            # test (fusermount3 for the daemon's stale-mount cleanup);
+            # busybox gives docker exec a shell for debugging and test IO.
+            contents = [ hopnet hopnet-mount pkgs.fuse3 pkgs.busybox iroh-relay ];
             config = {
               Entrypoint = [ "${hopnet}/bin/hopnet" ];
               ExposedPorts."34632/tcp" = {};

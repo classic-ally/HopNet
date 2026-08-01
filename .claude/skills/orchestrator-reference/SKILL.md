@@ -105,6 +105,7 @@ Pass means **test passed AND no divergence**. The mesh is only deleted when the 
 | `import-resume-after-restart` | Stop owner mid-import, restart, re-login: status stays Importing pre-login; login hook fires resume; creation walk completes; all files queryable cross-node |
 | `post-files-consensus-shape` | Upload N files in a single POST `/files` request; assert one consensus view advance and all N files visible on every node (tripwire for batching regressions in `post_files`) |
 | `mixed-files-and-folders-one-request` | Upload N files into a deep nested path with no pre-existing parents; assert single view advance and all parents + files visible on every node |
+| `mount-cross-node-consistency` | Run the hopnet-mount FUSE daemon inside node 0's container (containers have `/dev/fuse` + CAP_SYS_ADMIN; image carries `hopnet-mount`, `fusermount3`, busybox); kernel writes through the mount verify byte-identical via other nodes' APIs, remote API writes/deletes surface through the mount |
 
 ## Common Workflows
 
