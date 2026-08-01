@@ -8,6 +8,7 @@ name: Check (Linux)
 # CI to code we already control. To run CI against a fork's branch, push it
 # into this repo manually (e.g. `git push origin pr/123-review`).
 on:
+  workflow_dispatch:
   push:
     branches: [master]
   pull_request:
