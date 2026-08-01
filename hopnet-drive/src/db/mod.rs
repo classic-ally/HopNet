@@ -11,10 +11,23 @@ pub mod files;
 pub mod shares;
 pub mod users;
 
-
 /// The tables this projection owns, in dependency order (parents first).
 /// Exposed for divergence tooling and the host's boot tripwire.
 pub const TABLES: &[&str] = &["inodes", "modification_log", "incoming_shares", "shares"];
+
+/// This projection's section of the canonical state snapshot (RFC-019 S1).
+pub const SNAPSHOT_SECTION: hopnet_common::SectionSpec = hopnet_common::SectionSpec {
+    name: "drive",
+    format_version: 1,
+    tables: &[
+        hopnet_common::TableSpec::exported("inodes"),
+        hopnet_common::TableSpec::exported("incoming_shares"),
+        hopnet_common::TableSpec::exported("shares"),
+    ],
+};
+
+/// Node-local tables — outside the snapshot universe entirely.
+pub const NODE_LOCAL_TABLES: &[&str] = &["modification_log"];
 
 /// Current decided consensus height — the projection layer's canonical
 /// reader (RFC-017 Stage 3; this crate's verbatim SQL copy died with it,

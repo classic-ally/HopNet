@@ -136,7 +136,7 @@ const SCHEMA: &str = "
     -- membership::ConsensusPolicy::from_rows resolves it with code defaults
     -- for absent keys. Values parameterize SUBJECTIVE votes only, so
     -- per-node disagreement degrades latency, never safety; replicated for
-    -- band alignment. Host lists it in CONSENSUS_TABLES.
+    -- band alignment. Covered by this crate's SNAPSHOT_SECTION.
     CREATE TABLE IF NOT EXISTS hopnet_consensus_policy (
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -157,6 +157,34 @@ pub fn install_schema(conn: &Connection) -> Result<(), StoreError> {
     conn.execute_batch(SCHEMA)?;
     Ok(())
 }
+
+/// This crate's section of the canonical state snapshot (RFC-019 S1).
+///
+/// decided_blocks IS the agreement invariant, so the live-mesh divergence
+/// check covers it — but epoch history dies with the retained epoch-N
+/// database (RFC-019 Archival & Retention), and the next epoch's chain
+/// tables are born from the genesis installer, so it is never exported
+/// across a boundary (DivergenceOnly).
+pub const SNAPSHOT_SECTION: hopnet_common::SectionSpec = hopnet_common::SectionSpec {
+    name: "consensus",
+    format_version: 1,
+    tables: &[
+        hopnet_common::TableSpec::exported("validators"),
+        hopnet_common::TableSpec::exported("hopnet_consensus_policy"),
+        hopnet_common::TableSpec {
+            name: "decided_blocks",
+            role: hopnet_common::TableRole::DivergenceOnly,
+            excluded_columns: &[],
+        },
+    ],
+};
+
+/// Node-local tables — outside the snapshot universe entirely:
+/// consensus_wal is per-node ephemeral (and empty at a seal by
+/// construction), consensus_meta is a per-node cursor plus per-epoch
+/// derived values, and decided_certificates is a node-local quorum proof —
+/// different vote subsets are legitimate.
+pub const NODE_LOCAL_TABLES: &[&str] = &["consensus_wal", "consensus_meta", "decided_certificates"];
 
 /// Read `consensus_meta.last_decided_height` on any connection. `None` until
 /// genesis has been installed. Free function so hosts can read it outside the
@@ -380,7 +408,10 @@ impl<C: DerefMut<Target = Connection> + 'static> Storage for SqliteStorage<C> {
         Ok(r)
     }
 
-    fn with_rollback<R>(&mut self, f: impl FnOnce(&mut Self::Tx<'_>) -> R) -> Result<R, StoreError> {
+    fn with_rollback<R>(
+        &mut self,
+        f: impl FnOnce(&mut Self::Tx<'_>) -> R,
+    ) -> Result<R, StoreError> {
         let mut tx = self.conn.transaction()?;
         let r = f(&mut tx);
         // Dropped without commit — rolls back.

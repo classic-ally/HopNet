@@ -9,6 +9,7 @@ pub mod height;
 pub mod quorum;
 pub mod setup;
 pub mod shares;
+pub mod snapshot;
 pub mod users;
 pub mod views;
 
@@ -31,5 +32,9 @@ pub use hash::Blake3Hash;
 pub use shares::{
     AcceptShareRequest, IncomingShareResponse, ShareCountResponse, ShareDetailResponse,
     ShareParticipant, ShareRequest,
+};
+pub use snapshot::{
+    NodeStateReport, SectionManifest, SectionSpec, SnapshotManifest, TableManifest, TableRole,
+    TableSpec,
 };
 pub use users::{OnboardingFlag, OnboardingFlags, PublicUserInfo, SelfUserInfo};

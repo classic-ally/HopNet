@@ -2730,6 +2730,7 @@ dependencies = [
  "hex",
  "rusqlite",
  "serde",
+ "serde_json",
  "typeshare",
  "uuid",
 ]

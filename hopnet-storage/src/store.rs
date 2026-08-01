@@ -16,8 +16,8 @@
 use crate::error::StorageError;
 use crate::fragstore;
 use crate::types::{BlobAccess, BlobId, SelfCheckFragments};
-use hopnet_common::Blake3Hash;
 use hopnet_common::height::{height_from_db, height_to_db};
+use hopnet_common::Blake3Hash;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -139,8 +139,8 @@ pub fn install_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error
         -- Mesh policy config (RFC-STORAGE-002 Configuration):
         -- consensus-replicated key/value, seeded through the genesis
         -- payload; membership::StoragePolicy::from_rows resolves it with
-        -- code defaults for absent keys. Consensus-tracked (host lists it
-        -- in CONSENSUS_TABLES).
+        -- code defaults for absent keys. Consensus-tracked (covered by
+        -- this crate's SNAPSHOT_SECTION).
         CREATE TABLE hopnet_storage_policy (
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
@@ -148,7 +148,7 @@ pub fn install_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error
 
         -- Pins (RFC-STORAGE-001 Copy classes): substrate state, projection
         -- meaning — owner is an opaque projection tag. NODE-LOCAL, never
-        -- replicated (host lists it in LOCAL_ONLY_TABLES). Deliberately no
+        -- replicated (this crate's NODE_LOCAL_TABLES). Deliberately no
         -- FK to data_blocks: a pin may outlive a raced delete; eviction
         -- ignores pins on deleted blobs.
         CREATE TABLE hopnet_storage_pins (
@@ -161,6 +161,37 @@ pub fn install_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error
         ",
     )
 }
+
+/// This substrate's section of the canonical state snapshot (RFC-019 S1).
+///
+/// mesh_key/mesh_key_access are public replicated state — losing them
+/// across an epoch boundary would strand every all-users blob, so they
+/// are covered. stored_locally and self_verified_height are node-local
+/// columns of otherwise-replicated tables, excluded from canonical bytes.
+pub const SNAPSHOT_SECTION: hopnet_common::SectionSpec = hopnet_common::SectionSpec {
+    name: "storage",
+    format_version: 1,
+    tables: &[
+        hopnet_common::TableSpec::exported("data_blocks"),
+        hopnet_common::TableSpec::exported("blob_access"),
+        hopnet_common::TableSpec::exported("mesh_key"),
+        hopnet_common::TableSpec::exported("mesh_key_access"),
+        hopnet_common::TableSpec {
+            name: "fragment_hashes",
+            role: hopnet_common::TableRole::Exported,
+            excluded_columns: &["stored_locally"],
+        },
+        hopnet_common::TableSpec {
+            name: "fragment_inventory",
+            role: hopnet_common::TableRole::Exported,
+            excluded_columns: &["self_verified_height"],
+        },
+        hopnet_common::TableSpec::exported("hopnet_storage_policy"),
+    ],
+};
+
+/// Node-local tables — outside the snapshot universe entirely.
+pub const NODE_LOCAL_TABLES: &[&str] = &["hopnet_storage_pins"];
 
 /// Seed/overwrite mesh policy rows (genesis apply; later a settings tx).
 pub fn apply_policy_rows(
@@ -268,7 +299,6 @@ pub fn apply_placement_commit(
     }
     Ok(applied)
 }
-
 
 /// Batched inventory attestation (self_check_fragments): verify the reported
 /// previous count against current state, then remove / re-height / add.
@@ -451,8 +481,10 @@ pub fn apply_delete_orphaned(
     }
 
     let placeholders = vec!["?"; blob_ids.len()].join(", ");
-    let id_params: Vec<&dyn rusqlite::ToSql> =
-        blob_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    let id_params: Vec<&dyn rusqlite::ToSql> = blob_ids
+        .iter()
+        .map(|id| id as &dyn rusqlite::ToSql)
+        .collect();
 
     // Collect locally-stored fragment hashes for post-commit file cleanup
     let mut stmt = db_tx
@@ -491,7 +523,6 @@ pub fn apply_delete_orphaned(
     );
     Ok(local_hashes)
 }
-
 
 /// Batch-update the node-local stored_locally flags (write-gate drain path:
 /// fragment receipt / local deletion outside consensus). The OTHER writer is
@@ -798,7 +829,10 @@ pub fn get_data_blocks_for_rebalancing(
         }
     }
 
-    tracing::info!("Found {} complete data blocks for rebalancing", result.len());
+    tracing::info!(
+        "Found {} complete data blocks for rebalancing",
+        result.len()
+    );
     Ok(result)
 }
 
@@ -912,7 +946,14 @@ mod tests {
 
         let mut conn = test_conn();
         let tx = conn.transaction().unwrap();
-        apply_blob_insert(&tx, &op, &ApplyCtx { fragments_dir: &dir_s }).unwrap();
+        apply_blob_insert(
+            &tx,
+            &op,
+            &ApplyCtx {
+                fragments_dir: &dir_s,
+            },
+        )
+        .unwrap();
 
         let (count, placement): (i32, Option<i32>) = tx
             .query_row(
@@ -940,8 +981,7 @@ mod tests {
             .unwrap();
         assert_eq!(wraps, 1);
 
-        let applied =
-            apply_placement_commit(&tx, &[(blob_id.clone(), 7)]).unwrap();
+        let applied = apply_placement_commit(&tx, &[(blob_id.clone(), 7)]).unwrap();
         assert_eq!(applied, 1);
         let placement: Option<i32> = tx
             .query_row(
@@ -1024,6 +1064,8 @@ mod tests {
 
         let wrap = get_blob_access(&tx, &blob_id, &[2u8; 32]).unwrap().unwrap();
         assert_eq!(wrap.ephemeral_pubkey, [3u8; 32]);
-        assert!(get_blob_access(&tx, &blob_id, &[7u8; 32]).unwrap().is_none());
+        assert!(get_blob_access(&tx, &blob_id, &[7u8; 32])
+            .unwrap()
+            .is_none());
     }
 }
