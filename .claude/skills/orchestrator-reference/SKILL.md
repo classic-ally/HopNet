@@ -126,11 +126,12 @@ Most CI-style usage: auto-managed mode handles mesh creation, divergence check, 
 nix build .#packages.aarch64-linux.dockerImage   # macOS / Apple Silicon
 # nix build .#packages.x86_64-linux.dockerImage  # Linux x86_64
 
-# 2. Load the image into Docker
-docker load < result
-
-# 3. Build orchestrator
+# 2. Build orchestrator
 cargo build --release --bin orchestrator --features skip-frontend
+
+# 3. Load the image, retagged for THIS checkout (never `docker load < result`,
+#    which would clobber the machine-wide hopnet:latest under other agents)
+./target/release/orchestrator load-image
 
 # 4. Run a test (auto-creates mesh, runs divergence check, deletes on full pass)
 ./target/release/orchestrator test --test file-upload-consistency
@@ -187,12 +188,15 @@ When `--no-cleanup` is used on create, containers remain for inspection:
 # Create mesh that won't auto-cleanup on failure
 ./target/release/orchestrator create --nodes 3 --no-cleanup
 
-# If test fails, containers remain running
+# If test fails, containers remain running.
+# Container names are hopnet-<hash>-{mesh_id}-{node_id}; get <hash> from
+# `orchestrator prefix` (full names also appear in `orchestrator list`).
+
 # Check container logs
-docker logs hopnet-orchestrator-0-0
+docker logs hopnet-<hash>-0-0
 
 # Inspect container state
-docker exec -it hopnet-orchestrator-0-0 /bin/sh
+docker exec -it hopnet-<hash>-0-0 /bin/sh
 
 # Manual cleanup when done
 ./target/release/orchestrator delete --mesh-id 0 -y
@@ -208,14 +212,15 @@ HopNet uses two tracing span types for end-to-end request correlation:
 When an HTTP request triggers inter-node communication (e.g., file upload → transaction forward), `rpc_req` spans nest inside the `api_req` span on the sender. On the receiving node, the same `rpc_req` ID appears at the top level. This enables cross-node tracing:
 
 ```bash
+# (<hash> is this checkout's namespace hash — see `orchestrator prefix`)
 # 1. Find the HTTP request on the originating node
-docker logs hopnet-orchestrator-0-0 --timestamps 2>&1 | grep "api_req.*POST.*files"
+docker logs hopnet-<hash>-0-0 --timestamps 2>&1 | grep "api_req.*POST.*files"
 
 # 2. Find rpc_req IDs spawned by that HTTP request (nested spans)
-docker logs hopnet-orchestrator-0-0 --timestamps 2>&1 | grep "rpc_req.*<id-from-step-1>"
+docker logs hopnet-<hash>-0-0 --timestamps 2>&1 | grep "rpc_req.*<id-from-step-1>"
 
 # 3. Trace the same rpc_req ID on the receiving node
-docker logs hopnet-orchestrator-0-1 --timestamps 2>&1 | grep "rpc_req{id=<hex-id>}"
+docker logs hopnet-<hash>-0-1 --timestamps 2>&1 | grep "rpc_req{id=<hex-id>}"
 ```
 
 The `rpc_req` ID is also used for request-level deduplication — retried requests reuse the same ID, so the receiver can coalesce duplicates.
@@ -242,18 +247,46 @@ The `rpc_req` ID is also used for request-level deduplication — retried reques
 - **FAILED**: One or more checks failed
 - Check details show exactly what passed/failed
 
-## Container Naming Convention
+## Per-Checkout Namespace
 
-- **Networks**: `hopnet-orchestrator-{mesh_id}-0`
-- **Containers**: `hopnet-orchestrator-{mesh_id}-{node_id}`
-- **Relay**: `hopnet-orchestrator-{mesh_id}-relay` (one per mesh — see below)
-- **Volumes**: `hopnet-orchestrator-{mesh_id}-{node_id}-data`
+Every checkout (git worktree) of this repo gets an isolated namespace on the
+shared container daemon, keyed by `{hash}` = first 8 hex chars of blake3 of
+the canonicalized checkout root. Concurrent agents in different worktrees
+cannot see or delete each other's images, meshes, or volumes; `list`,
+`delete`, and `cleanup` only ever operate on the current checkout's
+resources. Discover the hash with `./target/release/orchestrator prefix`
+(it is also printed in the `list` header).
+
+- **Image**: `hopnet:{hash}` (loaded by `orchestrator load-image`, which
+  retags the nix-built archive on the fly — no shared `hopnet:latest`)
+- **Networks**: `hopnet-{hash}-{mesh_id}-0`
+- **Containers**: `hopnet-{hash}-{mesh_id}-{node_id}`
+- **Relay**: `hopnet-{hash}-{mesh_id}-relay` (one per mesh — see below)
+- **Volumes**: `hopnet-{hash}-{mesh_id}-{node_id}-data`
+
+Overrides (rarely needed): `HOPNET_ORCH_HASH` replaces the derived hash;
+`HOPNET_ORCH_IMAGE` replaces the image ref only.
+
+### Migrating from the shared-namespace scheme
+
+Resources named `hopnet-orchestrator-*` (pre-namespace) are invisible to the
+current binary — list/delete/cleanup can never touch them. Clean them up
+manually when convenient:
+
+```bash
+podman ps -a --format '{{.Names}}' | grep '^hopnet-orchestrator-' | xargs -r podman rm -f
+podman network ls --format '{{.Name}}' | grep '^hopnet-orchestrator-' | xargs -r podman network rm
+podman volume ls -q | grep '^hopnet-orchestrator-' | xargs -r podman volume rm
+```
+
+Do NOT remove the `hopnet:latest` image while any worktree still predates
+the namespace change — its orchestrator still runs from that tag.
 
 ## Self-Hosted Iroh Relay
 
 Every mesh gets its own `iroh-relay --dev` container (same hopnet image,
 entrypoint override, plain HTTP on `:3340`). Node containers receive
-`HOPNET_RELAY_URL=http://hopnet-orchestrator-{mesh_id}-relay:3340`, which
+`HOPNET_RELAY_URL=http://hopnet-{hash}-{mesh_id}-relay:3340`, which
 switches their endpoints to that single relay with NO public discovery —
 mesh tests have zero dependency on n0's public relay/DNS infrastructure
 (which rate-limits under mesh churn and used to flake mesh creation).
@@ -280,6 +313,9 @@ HOPNET_QUORUM_PROFILE=majority HOPNET_CONSENSUS_TIMEOUT_MS=2000 \
 ## Port Mapping
 
 - Internal port: `34632`
-- Host port (macOS/Podman): `40000 + (mesh_id * 500) + node_id`
-  - Mesh 0: ports 40000-40499
-  - Mesh 1: ports 40500-40999
+- Host port (macOS/Podman): `40000 + (slot * 500) + node_id`, where
+  `slot = (checkout_slot + mesh_id) % 51` — the starting slot rotates per
+  checkout so concurrent worktrees' meshes prefer different port ranges. If
+  the preferred port is taken, the orchestrator scans forward for a free
+  one. Never derive a node's port from the formula — read it from the
+  `hopnet.host_port` container label or `orchestrator creds`.

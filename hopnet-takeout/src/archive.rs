@@ -66,6 +66,13 @@ pub fn create_archive(
     let archive_file = File::create(archive_path)?;
     let gz_encoder = GzEncoder::new(archive_file, Compression::default());
     let mut tar_builder = Builder::new(gz_encoder);
+    // Portability: never emit GNU sparse entries. The builder's default
+    // hole detection turns an all-zero staged file (stored sparse by the
+    // filesystem) into a typeflag-'S' entry, which naive tar readers
+    // (busybox; anything filtering on EntryType::is_file) drop or choke
+    // on. Takeout archives are the user-facing backup wire format — plain
+    // Regular entries only.
+    tar_builder.sparse(false);
 
     // Write manifest as the first tar entry. Must be first so import can
     // parse it from a streaming reader without buffering the full archive.
@@ -310,6 +317,62 @@ mod tests {
             .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(paths, vec!["manifest.json", "drive/test.txt"]);
+    }
+
+    /// Should: write an all-zero, filesystem-sparse staged file as a plain
+    /// Regular tar entry with its full content.
+    /// Should not: emit a GNU sparse (typeflag 'S') entry.
+    /// Impact: regression guard — the builder's default hole detection made
+    /// the first all-zero file a sparse entry, which busybox tar rejects
+    /// and EntryType::is_file() filters silently drop, so the file vanished
+    /// from downloaded takeout archives (issue #28).
+    #[test]
+    fn all_zero_sparse_file_archives_as_regular_entry() {
+        let temp_dir = TempDir::new().unwrap();
+        let staging_dir = temp_dir.path().join("staging");
+        fs::create_dir_all(&staging_dir).unwrap();
+
+        // set_len without writing guarantees a hole on any fs that
+        // supports sparse files — the strongest form of the trigger.
+        let zero_file = staging_dir.join("zeros.bin");
+        let file = File::create(&zero_file).unwrap();
+        file.set_len(4096).unwrap();
+        drop(file);
+
+        let entries = vec![ArchiveEntry {
+            staging_path: zero_file.to_string_lossy().to_string(),
+            archive_path: "drive/zeros.bin".to_string(),
+            is_directory: false,
+        }];
+
+        let archive_path = temp_dir.path().join("zeros.tar.gz");
+        create_archive(
+            br#"{"version":2}"#,
+            entries,
+            archive_path.to_str().unwrap(),
+            false,
+        )
+        .unwrap();
+
+        let gz = GzDecoder::new(File::open(&archive_path).unwrap());
+        let mut ar = Archive::new(gz);
+        let mut saw_zero_file = false;
+        for entry in ar.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            assert!(
+                entry.header().entry_type().is_file(),
+                "non-Regular entry {:?} ({:?}) in takeout archive",
+                entry.path().unwrap(),
+                entry.header().entry_type()
+            );
+            if entry.path().unwrap().to_string_lossy() == "drive/zeros.bin" {
+                let mut buf = Vec::new();
+                entry.read_to_end(&mut buf).unwrap();
+                assert_eq!(buf, vec![0u8; 4096]);
+                saw_zero_file = true;
+            }
+        }
+        assert!(saw_zero_file);
     }
 
     /// Should: reject a manifest whose version differs from v2 (both the

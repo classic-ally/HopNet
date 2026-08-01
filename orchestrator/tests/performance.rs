@@ -244,7 +244,7 @@ impl TestScenario for ChunkedStreamingPerformance {
         // Start memory monitoring for upload node (node 0)
         let upload_peak_memory = Arc::new(AtomicU64::new(0));
         let upload_stop_signal = Arc::new(AtomicU64::new(0));
-        let upload_container_name = format!("hopnet-orchestrator-{}-0", mesh_id);
+        let upload_container_name = crate::naming::container_name(mesh_id, 0);
 
         let monitor_handle = {
             let docker_clone = docker.clone();
@@ -479,7 +479,7 @@ impl TestScenario for ChunkedStreamingPerformance {
         // Start memory monitoring for download node (last node)
         let download_peak_memory = Arc::new(AtomicU64::new(0));
         let download_stop_signal = Arc::new(AtomicU64::new(0));
-        let download_container_name = format!("hopnet-orchestrator-{}-{}", mesh_id, last_node_id);
+        let download_container_name = crate::naming::container_name(mesh_id, last_node_id as u32);
 
         let download_monitor_handle = {
             let docker_clone = docker.clone();

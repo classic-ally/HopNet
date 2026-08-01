@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use tokio_stream::StreamExt;
 
 mod divergence;
+mod naming;
 mod sys;
 mod tests;
 
@@ -93,6 +94,19 @@ enum Commands {
         #[arg(short, long)]
         mesh_id: u32,
     },
+    /// Load the nix-built docker archive, retagged for this checkout.
+    ///
+    /// Rewrites the archive's embedded repo tag (hopnet:latest) to this
+    /// checkout's hopnet:<hash> while streaming it into the container
+    /// runtime — no shared intermediate tag exists at any point, so
+    /// concurrent loads from other checkouts cannot collide.
+    LoadImage {
+        /// Path to the docker-archive (nix build output symlink)
+        #[arg(long, default_value = "./result")]
+        archive: std::path::PathBuf,
+    },
+    /// Print this checkout's resource prefix and image ref
+    Prefix,
     /// Run integration test on a mesh.
     ///
     /// If `--mesh-id` is omitted, a fresh mesh is auto-created for this run,
@@ -151,6 +165,14 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Cleanup { yes }) => {
             cleanup_orphaned_networks(&docker, *yes).await?;
+        }
+        Some(Commands::LoadImage { archive }) => {
+            load_image(&docker, archive).await?;
+        }
+        Some(Commands::Prefix) => {
+            println!("checkout hash: {}", naming::checkout_hash());
+            println!("resource prefix: {}", naming::prefix());
+            println!("image ref: {}", naming::image_ref());
         }
         Some(Commands::Status { mesh_id }) => {
             show_mesh_status(&docker, *mesh_id, runtime).await?;
@@ -306,17 +328,12 @@ async fn get_next_mesh_id(docker: &Docker) -> Result<u32> {
 
     let mut mesh_ids: Vec<u32> = Vec::new();
 
-    // Find all hopnet-orchestrator networks and extract mesh IDs
+    // Find this checkout's networks and extract mesh IDs
     for network in &networks {
         if let Some(ref name) = network.name
-            && name.starts_with("hopnet-orchestrator-")
+            && let Some(mesh_id) = naming::mesh_id_of(name)
         {
-            let parts: Vec<&str> = name.split('-').collect();
-            if parts.len() >= 4
-                && let Ok(mesh_id) = parts[2].parse::<u32>()
-            {
-                mesh_ids.push(mesh_id);
-            }
+            mesh_ids.push(mesh_id);
         }
     }
 
@@ -337,26 +354,25 @@ async fn get_next_mesh_id(docker: &Docker) -> Result<u32> {
 
 async fn list_meshes(docker: &Docker) -> Result<()> {
     println!("HopNet Orchestrator - Listing Meshes");
+    println!(
+        "Namespace: {}*  (image {})",
+        naming::prefix(),
+        naming::image_ref()
+    );
 
-    // List all networks that match hopnet-orchestrator-* pattern
+    // List this checkout's networks
     let networks = docker
         .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
         .await?;
 
     let mut meshes: HashMap<u32, Vec<String>> = HashMap::new();
 
-    // Find hopnet-orchestrator networks and extract mesh IDs
+    // Find this checkout's networks and extract mesh IDs
     for network in &networks {
         if let Some(ref name) = network.name
-            && name.starts_with("hopnet-orchestrator-")
+            && let Some(mesh_id) = naming::mesh_id_of(name)
         {
-            // Parse mesh ID from network name: hopnet-orchestrator-{mesh_id}-{network_space}
-            let parts: Vec<&str> = name.split('-').collect();
-            if parts.len() >= 4
-                && let Ok(mesh_id) = parts[2].parse::<u32>()
-            {
-                meshes.entry(mesh_id).or_default();
-            }
+            meshes.entry(mesh_id).or_default();
         }
     }
 
@@ -371,15 +387,8 @@ async fn list_meshes(docker: &Docker) -> Result<()> {
     for container in containers {
         if let Some(names) = &container.names {
             for name in names {
-                if name.starts_with("/hopnet-orchestrator-") {
-                    // Parse mesh ID from container name: /hopnet-orchestrator-{mesh_id}-{node_id}
-                    let clean_name = &name[1..]; // Remove leading '/'
-                    let parts: Vec<&str> = clean_name.split('-').collect();
-                    if parts.len() >= 4
-                        && let Ok(mesh_id) = parts[2].parse::<u32>()
-                    {
-                        meshes.entry(mesh_id).or_default().push(name.clone());
-                    }
+                if let Some(mesh_id) = naming::mesh_id_of(name) {
+                    meshes.entry(mesh_id).or_default().push(name.clone());
                 }
             }
         }
@@ -425,7 +434,7 @@ async fn cleanup_mesh_resources(
 ) {
     // The relay container isn't in the caller's list — remove it by name.
     {
-        let relay = relay_container_name(mesh_id);
+        let relay = naming::relay_container_name(mesh_id);
         let _ = docker
             .stop_container(
                 &relay,
@@ -473,11 +482,19 @@ async fn cleanup_mesh_resources(
     {
         let mut tasks = Vec::new();
         for volume in volume_list {
+            // Both labels must match: mesh id AND this checkout's hash —
+            // another checkout's mesh 0 volumes carry a different hash (and
+            // pre-namespace volumes carry none), so they are untouchable.
             let is_mesh_volume = volume
                 .labels
                 .get("hopnet.mesh_id")
                 .map(|id| id == &mesh_id.to_string())
-                .unwrap_or(false);
+                .unwrap_or(false)
+                && volume
+                    .labels
+                    .get(naming::CHECKOUT_LABEL)
+                    .map(String::as_str)
+                    == Some(naming::checkout_hash());
             if is_mesh_volume {
                 let volume_name = volume.name.clone();
                 let docker_clone = docker.clone();
@@ -564,7 +581,7 @@ async fn create_mesh(
     println!("Creating mesh {} with {} nodes", mesh_id, node_count);
 
     // Create network for the mesh
-    let network_name = format!("hopnet-orchestrator-{}-0", mesh_id);
+    let network_name = naming::network_name(mesh_id);
 
     match create_hopnet_network(docker, &network_name).await {
         Ok(network_id) => {
@@ -584,10 +601,18 @@ async fn create_mesh(
 
             // Create containers for each node
             for node_id in 0..node_count {
-                let container_name = format!("hopnet-orchestrator-{}-{}", mesh_id, node_id);
+                let container_name = naming::container_name(mesh_id, node_id);
                 println!("Creating HopNet container: {}", container_name);
 
-                match create_hopnet_container(docker, &container_name, &network_name, runtime).await
+                match create_hopnet_container(
+                    docker,
+                    mesh_id,
+                    node_id,
+                    &container_name,
+                    &network_name,
+                    runtime,
+                )
+                .await
                 {
                     Ok((container_id, ip_address)) => {
                         println!(
@@ -608,11 +633,10 @@ async fn create_mesh(
 
             // Setup node 0 if it exists
             if let Some((container_name, _container_id, ip_address)) = containers.first() {
-                println!(
-                    "Setting up node 0 at IP: {} (host port: {})",
-                    ip_address,
-                    40000 + (mesh_id * 500)
-                );
+                // Host port is not derivable here — the bind-scan fallback
+                // may have shifted it; the actual value lives in the
+                // hopnet.host_port container label.
+                println!("Setting up node 0 at IP: {}", ip_address);
                 match setup_node_0(docker, mesh_id, container_name, runtime).await {
                     Ok(passphrase) => {
                         store_mesh_passphrase(docker, mesh_id, &passphrase).await?;
@@ -731,14 +755,8 @@ pub(crate) async fn add_nodes_to_mesh(
     for container in &existing_containers {
         if let Some(names) = &container.names {
             for name in names {
-                if name.starts_with("/hopnet-orchestrator-") {
-                    let clean_name = &name[1..];
-                    let parts: Vec<&str> = clean_name.split('-').collect();
-                    if parts.len() >= 4
-                        && let Ok(node_id) = parts[3].parse::<u32>()
-                    {
-                        max_node_id = max_node_id.max(node_id);
-                    }
+                if let Some(node_id) = naming::node_id_of(name) {
+                    max_node_id = max_node_id.max(node_id);
                 }
             }
         }
@@ -748,7 +766,7 @@ pub(crate) async fn add_nodes_to_mesh(
     println!("Next available node_id: {}", starting_node_id);
 
     // Get the network name for this mesh
-    let network_name = format!("hopnet-orchestrator-{}-0", mesh_id);
+    let network_name = naming::network_name(mesh_id);
 
     // Verify network exists
     let networks = get_mesh_networks(docker, mesh_id).await?;
@@ -761,10 +779,19 @@ pub(crate) async fn add_nodes_to_mesh(
 
     for i in 0..node_count {
         let node_id = starting_node_id + i;
-        let container_name = format!("hopnet-orchestrator-{}-{}", mesh_id, node_id);
+        let container_name = naming::container_name(mesh_id, node_id);
         println!("Creating container: {}", container_name);
 
-        match create_hopnet_container(docker, &container_name, &network_name, runtime).await {
+        match create_hopnet_container(
+            docker,
+            mesh_id,
+            node_id,
+            &container_name,
+            &network_name,
+            runtime,
+        )
+        .await
+        {
             Ok((container_id, ip_address)) => {
                 println!(
                     "Successfully created container: {} with IP: {}",
@@ -785,9 +812,8 @@ pub(crate) async fn add_nodes_to_mesh(
 
     // Register new nodes with node 0 (triggers catch-up based bootstrap)
     for (container_name, _container_id, _node_ip) in &new_containers {
-        // Extract node_id from container name
-        let parts: Vec<&str> = container_name.split('-').collect();
-        let node_id: u32 = parts[3].parse().unwrap();
+        let node_id: u32 = naming::node_id_of(container_name)
+            .expect("container_name was built by naming::container_name");
 
         println!(
             "Registering node {} ({}) with node 0...",
@@ -828,13 +854,76 @@ async fn create_hopnet_network(docker: &Docker, network_name: &str) -> Result<St
     Ok(response.id)
 }
 
-/// The in-network DNS name + port of a mesh's self-hosted iroh relay.
-fn relay_container_name(mesh_id: u32) -> String {
-    format!("hopnet-orchestrator-{}-relay", mesh_id)
-}
+/// Load the nix-built gzipped docker-archive, rewriting its embedded
+/// `RepoTags` (always `hopnet:latest` from the flake) to this checkout's
+/// [`naming::image_ref`] on the fly. The rewritten tar streams straight
+/// into the runtime's /images/load, so no shared intermediate tag ever
+/// exists and concurrent loads from other checkouts cannot clobber each
+/// other. Peak memory: the ~1 KB manifest plus the channel buffer.
+async fn load_image(docker: &Docker, archive: &std::path::Path) -> Result<()> {
+    let image_ref = naming::image_ref();
+    println!("Loading {} as {}", archive.display(), image_ref);
 
-fn relay_url(mesh_id: u32) -> String {
-    format!("http://{}:3340", relay_container_name(mesh_id))
+    let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
+
+    let archive = archive.to_path_buf();
+    let new_tag = image_ref.clone();
+    let rewriter = tokio::task::spawn_blocking(move || -> Result<()> {
+        struct ChanWriter(tokio::sync::mpsc::Sender<bytes::Bytes>);
+        impl std::io::Write for ChanWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .blocking_send(bytes::Bytes::copy_from_slice(buf))
+                    .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let file = std::fs::File::open(&archive)?;
+        let mut input = tar::Archive::new(flate2::read::GzDecoder::new(file));
+        // Emit an UNCOMPRESSED tar — /images/load auto-detects the format,
+        // and skipping re-gzip keeps the rewrite CPU-cheap.
+        let mut out = tar::Builder::new(ChanWriter(tx));
+        for entry in input.entries()? {
+            let mut entry = entry?;
+            let path = entry.path()?.into_owned();
+            let mut header = entry.header().clone();
+            if path == std::path::Path::new("manifest.json") {
+                let mut buf = Vec::new();
+                std::io::Read::read_to_end(&mut entry, &mut buf)?;
+                let mut manifest: serde_json::Value = serde_json::from_slice(&buf)?;
+                for item in manifest.as_array_mut().into_iter().flatten() {
+                    item["RepoTags"] = json!([new_tag]);
+                }
+                let buf = serde_json::to_vec(&manifest)?;
+                header.set_size(buf.len() as u64);
+                header.set_cksum();
+                out.append_data(&mut header, &path, buf.as_slice())?;
+            } else {
+                out.append_data(&mut header, &path, &mut entry)?;
+            }
+        }
+        out.finish()?;
+        Ok(())
+    });
+
+    let body = bollard::body_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
+    let options = bollard::query_parameters::ImportImageOptionsBuilder::default()
+        .quiet(false)
+        .build();
+    let mut responses = docker.import_image(options, body, None);
+    while let Some(msg) = responses.next().await {
+        if let Some(s) = msg?.stream {
+            print!("{}", s);
+        }
+    }
+    rewriter.await??;
+
+    println!("Image ready: {}  (prefix {})", image_ref, naming::prefix());
+    Ok(())
 }
 
 /// Start the mesh's self-hosted iroh relay: the hopnet image with an
@@ -847,7 +936,7 @@ async fn create_relay_container(
     mesh_id: u32,
     network_name: &str,
 ) -> Result<String> {
-    let container_name = relay_container_name(mesh_id);
+    let container_name = naming::relay_container_name(mesh_id);
 
     let mut endpoints_config = HashMap::new();
     endpoints_config.insert(
@@ -861,9 +950,13 @@ async fn create_relay_container(
     let mut labels = HashMap::new();
     labels.insert("hopnet.mesh_id".to_string(), mesh_id.to_string());
     labels.insert("hopnet.role".to_string(), "relay".to_string());
+    labels.insert(
+        naming::CHECKOUT_LABEL.to_string(),
+        naming::checkout_hash().to_string(),
+    );
 
     let config = ContainerCreateBody {
-        image: Some("hopnet:latest".to_string()),
+        image: Some(naming::image_ref()),
         entrypoint: Some(vec!["iroh-relay".to_string(), "--dev".to_string()]),
         labels: Some(labels),
         networking_config: Some(NetworkingConfig {
@@ -887,28 +980,19 @@ async fn create_relay_container(
         "Started iroh relay {} on network {} ({})",
         container_name,
         network_name,
-        relay_url(mesh_id)
+        naming::relay_url(mesh_id)
     );
     Ok(response.id)
 }
 
 async fn create_hopnet_container(
     docker: &Docker,
+    mesh_id: u32,
+    node_id: u32,
     container_name: &str,
     network_name: &str,
     runtime: sys::ContainerRuntime,
 ) -> Result<(String, String)> {
-    // Extract mesh_id and node_id from container name
-    // container_name format: hopnet-orchestrator-{mesh_id}-{node_id}
-    let parts: Vec<&str> = container_name.split('-').collect();
-    let (mesh_id, node_id) = if parts.len() >= 4 {
-        let mesh: u32 = parts[2].parse().unwrap_or(0);
-        let node: u32 = parts[3].parse().unwrap_or(0);
-        (mesh, node)
-    } else {
-        (0, 0)
-    };
-
     // Port bindings needed for Podman and Docker on macOS (can't access container IPs directly)
     let needs_port_binding = runtime == sys::ContainerRuntime::Podman || cfg!(target_os = "macos");
     let (port_bindings, host_port) = if needs_port_binding {
@@ -943,14 +1027,22 @@ async fn create_hopnet_container(
     labels.insert("hopnet.mesh_id".to_string(), mesh_id.to_string());
     labels.insert("hopnet.node_id".to_string(), node_id.to_string());
     labels.insert("hopnet.host_port".to_string(), host_port.to_string());
+    labels.insert(
+        naming::CHECKOUT_LABEL.to_string(),
+        naming::checkout_hash().to_string(),
+    );
 
     // Create a named volume for persistent storage (matches container naming pattern)
-    let volume_name = format!("hopnet-orchestrator-{}-{}-data", mesh_id, node_id);
+    let volume_name = naming::volume_name(mesh_id, node_id);
 
     // Create volume if it doesn't exist (idempotent operation)
     let mut vol_labels = HashMap::new();
     vol_labels.insert("hopnet.mesh_id".to_string(), mesh_id.to_string());
     vol_labels.insert("hopnet.node_id".to_string(), node_id.to_string());
+    vol_labels.insert(
+        naming::CHECKOUT_LABEL.to_string(),
+        naming::checkout_hash().to_string(),
+    );
 
     let volume_config = bollard::models::VolumeCreateOptions {
         name: Some(volume_name.clone()),
@@ -974,13 +1066,13 @@ async fn create_hopnet_container(
 
     // Container configuration
     let config = ContainerCreateBody {
-        image: Some("hopnet:latest".to_string()),
+        image: Some(naming::image_ref()),
         labels: Some(labels),
         env: Some({
             let mut e = vec![
                 "HOPNET_TEST_MODE=1".to_string(),
                 // Self-hosted relay: no n0 public relay/discovery dependency.
-                format!("HOPNET_RELAY_URL={}", relay_url(mesh_id)),
+                format!("HOPNET_RELAY_URL={}", naming::relay_url(mesh_id)),
             ];
             // Forward HOPNET_DB_* (pragma tuning), HOPNET_CONSENSUS_*/
             // HOPNET_QUORUM_* (timeouts, quorum profile), and
@@ -1495,6 +1587,8 @@ async fn delete_mesh(docker: &Docker, mesh_id: u32, skip_confirmation: bool) -> 
         .list_volumes(None::<bollard::query_parameters::ListVolumesOptions>)
         .await?;
     if let Some(volume_list) = volumes.volumes {
+        // Mesh-id label alone is ambiguous across checkouts (every checkout
+        // has a mesh 0) — the checkout label must match too.
         let mesh_volumes: Vec<_> = volume_list
             .into_iter()
             .filter(|v| {
@@ -1502,6 +1596,8 @@ async fn delete_mesh(docker: &Docker, mesh_id: u32, skip_confirmation: bool) -> 
                     .get("hopnet.mesh_id")
                     .map(|id| id == &mesh_id.to_string())
                     .unwrap_or(false)
+                    && v.labels.get(naming::CHECKOUT_LABEL).map(String::as_str)
+                        == Some(naming::checkout_hash())
             })
             .collect();
 
@@ -1583,18 +1679,9 @@ async fn get_mesh_containers(
         .into_iter()
         .filter(|container| {
             if let Some(names) = &container.names {
-                names.iter().any(|name| {
-                    if name.starts_with("/hopnet-orchestrator-") {
-                        let clean_name = &name[1..];
-                        let parts: Vec<&str> = clean_name.split('-').collect();
-                        if parts.len() >= 4
-                            && let Ok(id) = parts[2].parse::<u32>()
-                        {
-                            return id == mesh_id;
-                        }
-                    }
-                    false
-                })
+                names
+                    .iter()
+                    .any(|name| naming::mesh_id_of(name) == Some(mesh_id))
             } else {
                 false
             }
@@ -1612,17 +1699,11 @@ async fn get_mesh_networks(docker: &Docker, mesh_id: u32) -> Result<Vec<bollard:
     let mesh_networks: Vec<_> = networks
         .into_iter()
         .filter(|network| {
-            if let Some(ref name) = network.name
-                && name.starts_with("hopnet-orchestrator-")
-            {
-                let parts: Vec<&str> = name.split('-').collect();
-                if parts.len() >= 4
-                    && let Ok(id) = parts[2].parse::<u32>()
-                {
-                    return id == mesh_id;
-                }
-            }
-            false
+            network
+                .name
+                .as_deref()
+                .and_then(naming::mesh_id_of)
+                .is_some_and(|id| id == mesh_id)
         })
         .collect();
 
@@ -1632,19 +1713,13 @@ async fn get_mesh_networks(docker: &Docker, mesh_id: u32) -> Result<Vec<bollard:
 async fn cleanup_orphaned_networks(docker: &Docker, skip_confirmation: bool) -> Result<()> {
     println!("Scanning for orphaned mesh networks...");
 
-    // Get all hopnet-orchestrator networks
+    // Get this checkout's networks
     let networks = docker
         .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
         .await?;
     let hopnet_networks: Vec<_> = networks
         .into_iter()
-        .filter(|network| {
-            if let Some(ref name) = network.name {
-                name.starts_with("hopnet-orchestrator-")
-            } else {
-                false
-            }
-        })
+        .filter(|network| network.name.as_deref().is_some_and(naming::is_ours))
         .collect();
 
     if hopnet_networks.is_empty() {
@@ -1652,7 +1727,7 @@ async fn cleanup_orphaned_networks(docker: &Docker, skip_confirmation: bool) -> 
         return Ok(());
     }
 
-    // Get all hopnet-orchestrator containers
+    // Get this checkout's containers
     let options = ListContainersOptionsBuilder::default()
         .all(true) // Include stopped containers
         .build();
@@ -1661,9 +1736,7 @@ async fn cleanup_orphaned_networks(docker: &Docker, skip_confirmation: bool) -> 
         .into_iter()
         .filter(|container| {
             if let Some(names) = &container.names {
-                names
-                    .iter()
-                    .any(|name| name.starts_with("/hopnet-orchestrator-"))
+                names.iter().any(|name| naming::is_ours(name))
             } else {
                 false
             }
@@ -1676,14 +1749,8 @@ async fn cleanup_orphaned_networks(docker: &Docker, skip_confirmation: bool) -> 
     for container in &hopnet_containers {
         if let Some(names) = &container.names {
             for name in names {
-                if name.starts_with("/hopnet-orchestrator-") {
-                    let clean_name = &name[1..]; // Remove leading '/'
-                    let parts: Vec<&str> = clean_name.split('-').collect();
-                    if parts.len() >= 4
-                        && let Ok(mesh_id) = parts[2].parse::<u32>()
-                    {
-                        *mesh_container_counts.entry(mesh_id).or_insert(0) += 1;
-                    }
+                if let Some(mesh_id) = naming::mesh_id_of(name) {
+                    *mesh_container_counts.entry(mesh_id).or_insert(0) += 1;
                 }
             }
         }
@@ -1692,15 +1759,12 @@ async fn cleanup_orphaned_networks(docker: &Docker, skip_confirmation: bool) -> 
     // Find orphaned networks (networks for meshes with 0 containers)
     let mut orphaned_networks = Vec::new();
     for network in &hopnet_networks {
-        if let Some(ref name) = network.name {
-            let parts: Vec<&str> = name.split('-').collect();
-            if parts.len() >= 4
-                && let Ok(mesh_id) = parts[2].parse::<u32>()
-            {
-                let container_count = mesh_container_counts.get(&mesh_id).unwrap_or(&0);
-                if *container_count == 0 {
-                    orphaned_networks.push((mesh_id, network));
-                }
+        if let Some(ref name) = network.name
+            && let Some(mesh_id) = naming::mesh_id_of(name)
+        {
+            let container_count = mesh_container_counts.get(&mesh_id).unwrap_or(&0);
+            if *container_count == 0 {
+                orphaned_networks.push((mesh_id, network));
             }
         }
     }
@@ -1806,15 +1870,9 @@ async fn show_mesh_status(
     for container in &containers {
         if let Some(names) = &container.names {
             for name in names {
-                if name.starts_with("/hopnet-orchestrator-") {
-                    let clean_name = &name[1..]; // Remove leading '/'
-                    let parts: Vec<&str> = clean_name.split('-').collect();
-                    if parts.len() >= 4
-                        && let Ok(node_id) = parts[3].parse::<u32>()
-                    {
-                        node_data.push((node_id, container));
-                        break;
-                    }
+                if let Some(node_id) = naming::node_id_of(name) {
+                    node_data.push((node_id, container));
+                    break;
                 }
             }
         }
@@ -2102,52 +2160,46 @@ async fn get_node_metadata(docker: &Docker, mesh_id: u32) -> Result<Vec<NodeMeta
     for container in &containers {
         if let Some(names) = &container.names {
             for name in names {
-                if name.starts_with("/hopnet-orchestrator-") {
-                    let clean_name = &name[1..];
-                    let parts: Vec<&str> = clean_name.split('-').collect();
-                    if parts.len() >= 4
-                        && let Ok(node_id) = parts[3].parse::<u32>()
-                    {
-                        let container_id = container.id.as_ref().unwrap();
-                        let container_info = docker
-                            .inspect_container(
-                                container_id,
-                                None::<bollard::query_parameters::InspectContainerOptions>,
-                            )
-                            .await?;
+                if let Some(node_id) = naming::node_id_of(name) {
+                    let container_id = container.id.as_ref().unwrap();
+                    let container_info = docker
+                        .inspect_container(
+                            container_id,
+                            None::<bollard::query_parameters::InspectContainerOptions>,
+                        )
+                        .await?;
 
-                        // Extract container IP from networks
-                        let networks = container_info
-                            .network_settings
-                            .and_then(|ns| ns.networks)
-                            .unwrap_or_default();
-                        let container_ip = networks
-                            .values()
-                            .find_map(|endpoint| endpoint.ip_address.as_ref())
-                            .ok_or_else(|| {
-                                anyhow::anyhow!("Container IP not found for node {}", node_id)
-                            })?
-                            .clone();
+                    // Extract container IP from networks
+                    let networks = container_info
+                        .network_settings
+                        .and_then(|ns| ns.networks)
+                        .unwrap_or_default();
+                    let container_ip = networks
+                        .values()
+                        .find_map(|endpoint| endpoint.ip_address.as_ref())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Container IP not found for node {}", node_id)
+                        })?
+                        .clone();
 
-                        // Extract host port from labels
-                        let labels = container_info
-                            .config
-                            .and_then(|c| c.labels)
-                            .unwrap_or_default();
-                        let host_port = labels
-                            .get("hopnet.host_port")
-                            .and_then(|p| p.parse::<u16>().ok())
-                            .ok_or_else(|| {
-                                anyhow::anyhow!("Host port label not found for node {}", node_id)
-                            })?;
+                    // Extract host port from labels
+                    let labels = container_info
+                        .config
+                        .and_then(|c| c.labels)
+                        .unwrap_or_default();
+                    let host_port = labels
+                        .get("hopnet.host_port")
+                        .and_then(|p| p.parse::<u16>().ok())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Host port label not found for node {}", node_id)
+                        })?;
 
-                        metadata.push(NodeMetadata {
-                            node_id,
-                            container_ip,
-                            host_port,
-                        });
-                        break;
-                    }
+                    metadata.push(NodeMetadata {
+                        node_id,
+                        container_ip,
+                        host_port,
+                    });
+                    break;
                 }
             }
         }
@@ -2197,7 +2249,7 @@ const PASSPHRASE_PATH: &str = "/root/.local/share/hopnet/.passphrase";
 /// Store a mesh passphrase inside node 0's container volume.
 /// Uses Docker's tar upload API so the container image doesn't need a shell.
 async fn store_mesh_passphrase(docker: &Docker, mesh_id: u32, passphrase: &str) -> Result<()> {
-    let container_name = format!("hopnet-orchestrator-{}-0", mesh_id);
+    let container_name = naming::container_name(mesh_id, 0);
 
     // Build an in-memory tar archive containing the passphrase file
     let mut tar_builder = tar::Builder::new(Vec::new());
@@ -2234,7 +2286,7 @@ async fn store_mesh_passphrase(docker: &Docker, mesh_id: u32, passphrase: &str) 
 /// Load the mesh passphrase from node 0's container volume.
 /// Uses Docker's tar download API so the container image doesn't need a shell.
 async fn load_mesh_passphrase(docker: &Docker, mesh_id: u32) -> Result<String> {
-    let container_name = format!("hopnet-orchestrator-{}-0", mesh_id);
+    let container_name = naming::container_name(mesh_id, 0);
 
     let stream = docker.download_from_container(
         &container_name,
