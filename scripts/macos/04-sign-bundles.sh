@@ -44,19 +44,22 @@ if [ ! -d "$EXTENSION_DIR" ]; then
 fi
 
 # Step 0: Sign the photo-ingress daemon (inner-first: daemon → appex →
-# outer app). Hardened runtime + timestamp for notarization; deliberately
-# NO entitlements file and NO provisioning profile — the daemon is
-# unsandboxed (arbitrary blob roots, incl. SMB mounts) and carries no
-# restricted entitlements, so there is nothing for AMFI to match against a
-# profile. Its signing identifier comes from the __TEXT,__info_plist
-# CFBundleIdentifier (com.hopnet.desktop.photo-ingress), which is what TCC
-# keys the Photos grant on — keep the cert stable or grants reset.
+# outer app). Hardened runtime + timestamp for notarization. Entitlements:
+# ONLY the photos-library resource-access key — under the hardened runtime
+# tccd auto-denies Photos access (no consent prompt at all) unless it is
+# declared. It is not provisioning-profile-gated, so Developer ID + AMFI
+# are fine with it. The daemon stays unsandboxed (arbitrary blob roots,
+# incl. SMB mounts) and carries no restricted entitlements. Its signing
+# identifier comes from the __TEXT,__info_plist CFBundleIdentifier
+# (com.hopnet.desktop.photo-ingress), which is what TCC keys the Photos
+# grant on — keep the cert stable or grants reset.
 DAEMON_BINARY="$APP_BUNDLE/Contents/MacOS/photo-ingress"
 if [ -f "$DAEMON_BINARY" ]; then
     echo "🔐 Signing photo-ingress daemon..."
     codesign --force --sign "$SIGNING_IDENTITY" \
         --options runtime \
         --timestamp \
+        --entitlements "$PROJECT_ROOT/apple/entitlements-photo-ingress.plist" \
         "$DAEMON_BINARY"
     if codesign --verify --verbose "$DAEMON_BINARY" 2>/dev/null; then
         echo "✅ Daemon signature verified"

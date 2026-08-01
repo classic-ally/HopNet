@@ -154,8 +154,8 @@ apply functions inside consensus handlers.
 - [x] Photo-ingress packaging + provisioning plumbing (2026-07-31): the
       daemon ships inside HopNet.app (build stages 1b/3b embed
       `Contents/MacOS/photo-ingress` + the SMAppService agent plist,
-      signed individually, hardened runtime, no entitlements; bundle id
-      now `com.hopnet.desktop.photo-ingress`). Owner-only
+      signed individually, hardened runtime + photos-library entitlement;
+      bundle id now `com.hopnet.desktop.photo-ingress`). Owner-only
       `/api/photo-ingress/{enable,disable,status}` routes provision the
       keychain (device token + blob_root) and drive
       registration/unregistration — the future settings pane's backing
@@ -166,7 +166,14 @@ apply functions inside consensus handlers.
       `--log-to-data-dir` log ownership, and `RefreshingPublisher`
       credential re-read after unreachable passes (GUI ephemeral-port
       relaunch heals without a daemon restart). Settings pane UI is the
-      next slice.
+      next slice. Live smoke on the macbook (2026-08-01) passed the full
+      enable/disable/re-enable cycle on the production state.db; fixes it
+      forced: app unsandboxed (SMAppService EPERM), photos-library
+      entitlement + usage string on the MAIN app (TCC attributes the
+      bundled daemon to its containing bundle; hardened runtime denies
+      without prompt otherwise), and a GUI auto-login startup panic
+      (tokio `blocking_write` inside the runtime) that killed the HTTP
+      server on every release launch with a stored session key.
 - [x] hopnet-drive + hopnet-projection + hopnet-takeout extraction
       ([RFC-015](specs/hopnet-drive.md)) COMPLETE (stages D0–D5,
       2026-07-08): narrowed handler seam, per-projection schema units,

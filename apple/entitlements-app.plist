@@ -15,9 +15,15 @@
         The FileProvider extension carries its own entitlements file
         (apple/entitlements.plist) which keeps the fileprovider keys and
         is matched by apple/HopNet_Dev.provisionprofile.
+
+        Deliberately NOT sandboxed: SMAppService.agent registration of the
+        bundled photo-ingress LaunchAgent is refused (EPERM "Operation not
+        permitted") from a sandboxed process — only the loginItem variant
+        is sandbox-compatible — and the node keeps its data at the XDG
+        path (~/.local/share/hopnet) rather than a container. Sandboxing
+        would only become mandatory for App Store distribution, which the
+        unsandboxed agent architecture precludes anyway.
     -->
-    <key>com.apple.security.app-sandbox</key>
-    <true/>
     <key>com.apple.security.network.client</key>
     <true/>
     <key>com.apple.security.network.server</key>
@@ -25,6 +31,18 @@
     <key>com.apple.security.files.user-selected.read-write</key>
     <true/>
     <key>com.apple.security.files.downloads.read-write</key>
+    <true/>
+    <!--
+        Photos library access: TCC attributes the bundled photo-ingress
+        daemon (Contents/MacOS/photo-ingress) to this bundle, and under the
+        hardened runtime tccd requires the attributed identity — the main
+        app — to carry this entitlement or it denies WITHOUT prompting
+        ("Prompting policy for hardened runtime ... entitlement missing").
+        The daemon's own copy lives in entitlements-photo-ingress.plist;
+        the matching NSPhotoLibraryUsageDescription is stamped onto the
+        app's Info.plist by scripts/macos/03b-embed-photo-ingress.sh.
+    -->
+    <key>com.apple.security.personal-information.photos-library</key>
     <true/>
 </dict>
 </plist>

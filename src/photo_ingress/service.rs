@@ -50,8 +50,14 @@ pub fn register_agent() -> Result<AgentRegistration, String> {
     if before == AgentRegistration::Enabled {
         return Ok(before);
     }
-    unsafe { service.registerAndReturnError() }
-        .map_err(|e| format!("SMAppService register: {e}"))?;
+    unsafe { service.registerAndReturnError() }.map_err(|e| {
+        format!(
+            "SMAppService register: {} (domain={} code={})",
+            e.localizedDescription(),
+            e.domain(),
+            e.code()
+        )
+    })?;
     let after = map_status(unsafe { service.status() });
     info!("photo-ingress agent registered (status {after:?})");
     Ok(after)
@@ -64,8 +70,14 @@ pub fn unregister_agent() -> Result<(), String> {
     if map_status(unsafe { service.status() }) == AgentRegistration::NotRegistered {
         return Ok(());
     }
-    unsafe { service.unregisterAndReturnError() }
-        .map_err(|e| format!("SMAppService unregister: {e}"))?;
+    unsafe { service.unregisterAndReturnError() }.map_err(|e| {
+        format!(
+            "SMAppService unregister: {} (domain={} code={})",
+            e.localizedDescription(),
+            e.domain(),
+            e.code()
+        )
+    })?;
     info!("photo-ingress agent unregistered");
     Ok(())
 }

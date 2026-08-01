@@ -75,4 +75,20 @@ cat > "$AGENTS_DIR/$AGENT_ID.plist" << EOF
 EOF
 echo "✅ Agent plist → Contents/Library/LaunchAgents/$AGENT_ID.plist"
 
+# Photos usage description on the MAIN app's Info.plist. TCC attributes the
+# daemon to its containing bundle (com.hopnet.desktop) — the consent prompt
+# renders as "HopNet would like to access Photos" and needs this string on
+# the attributed bundle, not (only) the daemon's embedded plist. Pairs with
+# the photos-library entitlement in apple/entitlements-app.plist.
+USAGE_DESC="HopNet archives your Photos library to storage you control."
+if /usr/libexec/PlistBuddy -c "Print :NSPhotoLibraryUsageDescription" \
+    "$APP_BUNDLE/Contents/Info.plist" >/dev/null 2>&1; then
+    /usr/libexec/PlistBuddy -c "Set :NSPhotoLibraryUsageDescription $USAGE_DESC" \
+        "$APP_BUNDLE/Contents/Info.plist"
+else
+    /usr/libexec/PlistBuddy -c "Add :NSPhotoLibraryUsageDescription string $USAGE_DESC" \
+        "$APP_BUNDLE/Contents/Info.plist"
+fi
+echo "✅ NSPhotoLibraryUsageDescription → Contents/Info.plist"
+
 echo "✅ Stage 3b completed: photo-ingress embedded"

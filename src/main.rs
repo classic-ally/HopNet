@@ -327,7 +327,8 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                             };
                             app_state
                                 .session_store
-                                .blocking_write()
+                                .write()
+                                .await
                                 .insert(kc_user_id, session);
                             tracing::info!("Loaded owner session from keychain (auto-login ready)");
                             tokio::spawn(hopnet_takeout::jobs::maybe_resume_for_user(
