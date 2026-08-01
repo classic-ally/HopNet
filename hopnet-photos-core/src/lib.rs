@@ -26,6 +26,15 @@ pub const METADATA_KEY_WRAP_DOMAIN: WrapDomain = WrapDomain {
     nonce_context: "hopnet-photos metadata_nonce v1",
 };
 
+/// Domain-separation constant for shared-library key wrapping. Must
+/// byte-match the copy in hopnet-photos/src/lib.rs (same duplication
+/// convention as METADATA_KEY_WRAP_DOMAIN — the two crates share no dep).
+/// Wrap id = library id bytes, so a wrap cannot move between libraries.
+pub const LIBRARY_KEY_WRAP_DOMAIN: WrapDomain = WrapDomain {
+    key_context: "hopnet-photos library_key v1",
+    nonce_context: "hopnet-photos library_nonce v1",
+};
+
 pub use asset::{
     AssetValidationError, PhotoAsset, PhotoResource, ResourceContent, ResourceKind, SourceIdentity,
 };

@@ -54,6 +54,28 @@ pub fn read_photo_changes(
         chain_height,
     );
 
+    let changes = rows_to_changes(&conn, rows)?;
+
+    Ok(SyncBatch {
+        changes,
+        high_water_mark,
+    })
+}
+
+/// Map DB change rows into wire `PhotoChange`s, batch-fetching resources.
+/// Shared by the cursor sync and the library-backfill path.
+fn rows_to_changes(
+    conn: &rusqlite::Connection,
+    rows: Vec<hopnet_photos::db::photos::ChangeRow>,
+) -> Result<Vec<PhotoChange>, String> {
+    let existing_ids: Vec<&hopnet_common::CustomUUID> = rows
+        .iter()
+        .filter(|r| r.row_exists)
+        .map(|r| &r.photo_id)
+        .collect();
+    let resources = photos::query_resources(conn, &existing_ids)
+        .map_err(|e| format!("query_resources: {e:?}"))?;
+
     let changes: Vec<PhotoChange> = rows
         .into_iter()
         .map(|r| {
@@ -101,10 +123,51 @@ pub fn read_photo_changes(
         })
         .collect();
 
-    Ok(SyncBatch {
-        changes,
-        high_water_mark,
-    })
+    Ok(changes)
+}
+
+/// The sync worker's membership-diff inputs: the user's current library
+/// memberships and their per-library view-change signals.
+pub fn read_membership_state(
+    pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    user_id: i32,
+) -> Result<
+    (
+        Vec<hopnet_common::CustomUUID>,
+        Vec<(hopnet_common::CustomUUID, i64)>,
+    ),
+    String,
+> {
+    let conn = pool.get().map_err(|e| format!("pool: {e}"))?;
+    let memberships = hopnet_photos::db::libraries::libraries_for_member(&conn, user_id)
+        .map_err(|e| format!("memberships: {e:?}"))?;
+    let signals = hopnet_photos::db::libraries::read_view_changes(&conn, user_id)
+        .map_err(|e| format!("view changes: {e:?}"))?;
+    Ok((memberships, signals))
+}
+
+/// One page of the join-time library backfill: photos of `library_id` the
+/// user holds a metadata wrap for, in `PhotoChange` shape (heights carry
+/// 0 — the backfill lives outside the cursor). Returns the page plus the
+/// last photo id for keyset continuation; a short page ends the loop.
+pub fn read_library_backfill(
+    pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    user_id: i32,
+    library_id: &hopnet_common::CustomUUID,
+    after: Option<&hopnet_common::CustomUUID>,
+) -> Result<(Vec<PhotoChange>, Option<hopnet_common::CustomUUID>), String> {
+    let conn = pool.get().map_err(|e| format!("pool: {e}"))?;
+    let rows = hopnet_photos::db::libraries::library_photos_for_member(
+        &conn,
+        library_id,
+        user_id,
+        after,
+        SYNC_BATCH_LIMIT as u32,
+    )
+    .map_err(|e| format!("library backfill: {e:?}"))?;
+    let last = rows.last().map(|r| r.photo_id.clone());
+    let changes = rows_to_changes(&conn, rows)?;
+    Ok((changes, last))
 }
 
 /// Everything the content route needs to serve one resource: the blob id

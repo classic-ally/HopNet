@@ -116,7 +116,7 @@ async fn post_sidecar_enable(
     let recipient = StaticRecipient(x25519);
     state
         .photos_host
-        .enable(uid, recipient, state.db_pool.clone())
+        .enable(uid, recipient, state.clone())
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(StatusCode::OK)
@@ -142,7 +142,7 @@ async fn post_sidecar_reinit(
     let recipient = StaticRecipient(x25519);
     state
         .photos_host
-        .reinit(uid, recipient, state.db_pool.clone())
+        .reinit(uid, recipient, state.clone())
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(StatusCode::OK)

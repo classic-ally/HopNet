@@ -90,6 +90,67 @@ pub fn wrap_blob_key_for_recipients(
         .collect()
 }
 
+pub fn generate_library_key() -> Key {
+    ChaCha20Poly1305::generate_key(OsRng)
+}
+
+pub fn wrap_library_key(
+    library_id: &CustomUUID,
+    recipient: &hopnet_storage::x25519_dalek::PublicKey,
+    key: &Key,
+) -> Result<([u8; 32], Vec<u8>), PhotosCoreError> {
+    hopnet_storage::wrap_key_v1_in_domain(
+        &crate::LIBRARY_KEY_WRAP_DOMAIN,
+        library_id.as_bytes(),
+        recipient,
+        key,
+    )
+    .map_err(Into::into)
+}
+
+pub fn unwrap_library_key(
+    library_id: &CustomUUID,
+    ephemeral_pubkey: &[u8; 32],
+    wrapped: &[u8],
+    reader: &dyn RecipientKey,
+) -> Result<Key, PhotosCoreError> {
+    hopnet_storage::unwrap_key_v1_in_domain(
+        &crate::LIBRARY_KEY_WRAP_DOMAIN,
+        library_id.as_bytes(),
+        reader.pubkey().as_bytes(),
+        ephemeral_pubkey,
+        wrapped,
+        reader,
+    )
+    .map_err(Into::into)
+}
+
+/// Convergence composite: unwrap the caller's own metadata-key wrap and
+/// re-wrap for a grant target. Returns the target's (ephemeral, wrapped)
+/// pair.
+pub fn rewrap_metadata_key(
+    photo_id: &CustomUUID,
+    own_ephemeral: &[u8; 32],
+    own_wrapped: &[u8],
+    reader: &dyn RecipientKey,
+    recipient: &hopnet_storage::x25519_dalek::PublicKey,
+) -> Result<([u8; 32], Vec<u8>), PhotosCoreError> {
+    let key = unwrap_metadata_key(photo_id, own_ephemeral, own_wrapped, reader)?;
+    wrap_metadata_key(photo_id, recipient, &key)
+}
+
+/// Convergence composite: unwrap the caller's own blob-key wrap and
+/// re-wrap for a grant target.
+pub fn rewrap_blob_key(
+    own_access: &BlobAccess,
+    reader: &dyn RecipientKey,
+    recipient: &hopnet_storage::x25519_dalek::PublicKey,
+) -> Result<BlobAccess, PhotosCoreError> {
+    let key = hopnet_storage::crypto::unwrap_blob_key(own_access, reader)
+        .map_err(PhotosCoreError::from)?;
+    hopnet_storage::crypto::wrap_blob_key(&own_access.blob_id, recipient, &key).map_err(Into::into)
+}
+
 pub fn compute_integrity_hash(
     per_blob_key: &Key,
     plaintext: &[u8],

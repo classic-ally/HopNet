@@ -115,6 +115,17 @@ pub fn install_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             key   TEXT PRIMARY KEY,
             value BLOB NOT NULL
         );
+
+        -- Hydrated shared libraries: which libraries this sidecar has
+        -- backfilled, and the last consensus photo_view_changes height
+        -- consumed for each. Joining/late-grant rematerialization keys on
+        -- this instead of the photo_changes cursor — a membership change
+        -- alters the VIEW, not the photos, so the global cursor never
+        -- moves for it. IF NOT EXISTS keeps existing sidecars compatible.
+        CREATE TABLE IF NOT EXISTS sidecar_libraries (
+            library_id       TEXT PRIMARY KEY,
+            last_view_height INTEGER NOT NULL
+        );
         ",
     )
 }
@@ -501,6 +512,66 @@ impl<R: RecipientKey> SidecarDb<R> {
             self.apply_change(&tx, change)?;
         }
         Self::set_cursor(&tx, new_cursor)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Apply a library-backfill page WITHOUT touching the height cursor.
+    /// Backfill rows sit outside the photo_changes feed (joining a library
+    /// changes the view, not the photos); concurrent genuine changes still
+    /// arrive via the ordinary cursor path, and upserts are idempotent
+    /// either way.
+    pub fn apply_backfill(&self, changes: &[PhotoChange]) -> Result<(), PhotosCoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        for change in changes {
+            self.apply_change(&tx, change)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Hydrated shared libraries with the last consumed view height.
+    pub fn library_states(&self) -> Result<Vec<(CustomUUID, i64)>, PhotosCoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT library_id, last_view_height FROM sidecar_libraries")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn set_library_state(
+        &self,
+        library_id: &CustomUUID,
+        last_view_height: i64,
+    ) -> Result<(), PhotosCoreError> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO sidecar_libraries (library_id, last_view_height)
+             VALUES (?1, ?2)",
+            rusqlite::params![library_id, last_view_height],
+        )?;
+        Ok(())
+    }
+
+    /// Drop every local row belonging to a library the user left or was
+    /// removed from — the client-side half of membership revocation (the
+    /// mesh-side read gate closed the moment the membership row died).
+    pub fn purge_library(&self, library_id: &CustomUUID) -> Result<(), PhotosCoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM photo_resources_cache WHERE photo_id IN
+               (SELECT photo_id FROM photo_index WHERE library_id = ?1)",
+            rusqlite::params![library_id],
+        )?;
+        tx.execute(
+            "DELETE FROM photo_index WHERE library_id = ?1",
+            rusqlite::params![library_id],
+        )?;
+        tx.execute(
+            "DELETE FROM sidecar_libraries WHERE library_id = ?1",
+            rusqlite::params![library_id],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -1315,5 +1386,81 @@ mod tests {
         .unwrap();
         let flat: Vec<_> = no_video.iter().map(|b| (b.month.as_str(), b.count)).collect();
         assert_eq!(flat, vec![("2025-06", 2), ("2025-05", 2)]);
+    }
+
+    // Impact: the backfill is the join-time rematerialization path — if it
+    // moved the photo_changes cursor, a joiner would skip genuine changes
+    // that landed between the backfill snapshot and their next sync.
+    // Should: apply backfill rows into the index without touching the
+    // cursor, and be idempotent on re-apply.
+    #[test]
+    fn backfill_applies_without_moving_cursor() {
+        let reader = new_reader();
+        let db = SidecarDb::open_in_memory(new_reader()).unwrap();
+        db.sync_from_batch(SyncBatch {
+            changes: vec![],
+            high_water_mark: 41,
+        })
+        .unwrap();
+
+        let photo_id = CustomUUID::retention_cutoff(1);
+        let lib = CustomUUID::retention_cutoff(2);
+        let mut state = make_encrypted_state(&photo_id, &reader, None);
+        state.library_id = Some(lib.clone());
+        let changes = vec![PhotoChange {
+            photo_id: photo_id.clone(),
+            changed_at_height: 0, // backfill rows live outside the cursor
+            state: Some(state),
+        }];
+        db.apply_backfill(&changes).unwrap();
+        db.apply_backfill(&changes).unwrap(); // idempotent
+
+        assert_eq!(db.cursor().unwrap(), 41, "cursor untouched by backfill");
+        assert!(db.get_photo(&photo_id).unwrap().is_some());
+    }
+
+    // Should: track hydrated libraries with their last view height, purge
+    // a departed library's rows (index + resource cache + state), and
+    // leave other libraries' rows alone.
+    // Impact: purge is the client half of kick/leave — the mesh read gate
+    // closes instantly, and this is what stops the local sidecar from
+    // showing a library the user no longer belongs to.
+    #[test]
+    fn library_state_and_purge_round_trip() {
+        let reader = new_reader();
+        let db = SidecarDb::open_in_memory(new_reader()).unwrap();
+        let lib_a = CustomUUID::retention_cutoff(10);
+        let lib_b = CustomUUID::retention_cutoff(11);
+
+        for (i, lib) in [(20, &lib_a), (21, &lib_b)] {
+            let photo_id = CustomUUID::retention_cutoff(i);
+            let mut state = make_encrypted_state(&photo_id, &reader, None);
+            state.library_id = Some((*lib).clone());
+            db.apply_backfill(&[PhotoChange {
+                photo_id,
+                changed_at_height: 0,
+                state: Some(state),
+            }])
+            .unwrap();
+        }
+        db.set_library_state(&lib_a, 7).unwrap();
+        db.set_library_state(&lib_b, 9).unwrap();
+        assert_eq!(
+            db.library_states().unwrap().len(),
+            2,
+            "both libraries tracked"
+        );
+
+        db.purge_library(&lib_a).unwrap();
+        let states = db.library_states().unwrap();
+        assert_eq!(states, vec![(lib_b, 9)]);
+        assert!(
+            db.get_photo(&CustomUUID::retention_cutoff(20)).unwrap().is_none(),
+            "purged library's photo gone"
+        );
+        assert!(
+            db.get_photo(&CustomUUID::retention_cutoff(21)).unwrap().is_some(),
+            "other library's photo untouched"
+        );
     }
 }
