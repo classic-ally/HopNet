@@ -112,7 +112,7 @@ pub(crate) async fn try_download_file(
 /// Fetch /debug/state from all nodes in parallel. Returns (node_id, snapshot) pairs.
 pub(crate) async fn fetch_state_snapshots(
     nodes: &[NodeInfo],
-) -> Result<Vec<(u32, hopnet_common::StateSnapshot)>> {
+) -> Result<Vec<(u32, hopnet_common::NodeStateReport)>> {
     let mut handles = Vec::new();
 
     for node in nodes {
@@ -122,7 +122,7 @@ pub(crate) async fn fetch_state_snapshots(
             if !response.status().is_success() {
                 anyhow::bail!("HTTP {}", response.status());
             }
-            let snapshot: hopnet_common::StateSnapshot = response.json().await?;
+            let snapshot: hopnet_common::NodeStateReport = response.json().await?;
             Ok::<_, anyhow::Error>((node.node_id, snapshot))
         }));
     }
@@ -780,10 +780,10 @@ impl TestScenario for MultiUserIsolation {
                                 name: "Zero divergence".to_string(),
                                 passed: true,
                                 detail: Some(format!(
-                                    "{} tables, views {}-{}",
+                                    "{} tables, heights {}-{}",
                                     report.table_reports.len(),
-                                    report.view_range.0,
-                                    report.view_range.1,
+                                    report.height_range.0,
+                                    report.height_range.1,
                                 )),
                             },
                         );

@@ -1,6 +1,5 @@
 // HopNet Common Types Library
 pub mod db;
-pub mod debug;
 pub mod devices;
 pub mod documentprovider;
 pub mod fileprovider;
@@ -22,7 +21,6 @@ pub use db::{
     CustomUUID, FileItem, ImportPathCounts, ImportPathRow, ImportPathStatus, ImportRecord,
     ImportStatus, InodeType, TakeoutRecord, TakeoutStatus,
 };
-pub use debug::{StateSnapshot, TableHashInfo};
 pub use devices::{DeviceInfo, RegisterDeviceRequest, RegisterDeviceResponse};
 pub use fileprovider::{
     ChangesQuery, ChangesResponse, DeleteItemRequest, EnumerateResponse, FileProviderItem,
