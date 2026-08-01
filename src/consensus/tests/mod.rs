@@ -6,6 +6,7 @@ use rand::rngs::SysRng;
 mod authorization;
 mod byzantine;
 mod malachite_integration;
+mod regenesis;
 mod signatures;
 mod upgrade;
 

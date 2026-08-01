@@ -27,6 +27,7 @@ pub mod nodes;
 pub mod passphrase;
 pub mod projections;
 pub mod reference_providers;
+pub mod regenesis;
 pub mod setup;
 pub mod shares;
 pub mod takeout_host;

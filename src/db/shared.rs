@@ -433,6 +433,21 @@ pub fn initialize(db: PooledConnection<SqliteConnectionManager>) -> Result<(), D
                 nonce TEXT PRIMARY KEY
             );
 
+            -- Regenesis boundary state (RFC-019 S5): the committed phase of
+            -- the epoch boundary. Singleton row (mesh_key precedent) with
+            -- ONE canonical Normal encoding: the row is ABSENT in the normal
+            -- phase (fresh meshes converge on absence; abort deletes). Only
+            -- consensus handlers write here. Divergence-checked but never
+            -- exported: epoch N+1 is born normal from the genesis installer,
+            -- like the chain tables (see src/db/snapshot.rs).
+            CREATE TABLE regenesis_state (
+                internal_id         INTEGER PRIMARY KEY CHECK (internal_id = 1),
+                phase               INTEGER NOT NULL,  -- 1 moratorium | 2 sealed
+                target_version_code INTEGER NOT NULL,  -- CalVer code the next epoch requires
+                snapshot_hash       BLOB,              -- set by regenesis_commit
+                seal_height         INTEGER            -- terminal H (bit-cast u64), set by regenesis_commit
+            );
+
         "
     )?;
 

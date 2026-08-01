@@ -18,7 +18,10 @@ use crate::db::DatabaseError;
 pub const HOST_SECTION: SectionSpec = SectionSpec {
     name: "host",
     // v2: nodes gained the version-attestation columns (RFC-019 S3).
-    format_version: 2,
+    // v3: regenesis_state joined (RFC-019 S5) — divergence-checked,
+    //     never exported (epoch N+1 is born normal from the genesis
+    //     installer, the decided_blocks precedent).
+    format_version: 3,
     tables: &[
         TableSpec::exported("sequences"),
         TableSpec::exported("users"),
@@ -27,6 +30,11 @@ pub const HOST_SECTION: SectionSpec = SectionSpec {
         TableSpec::exported("fragment_request_metrics"),
         TableSpec::exported("device_tokens"),
         TableSpec::exported("committed_tx_nonces"),
+        TableSpec {
+            name: "regenesis_state",
+            role: snapshot::TableRole::DivergenceOnly,
+            excluded_columns: &[],
+        },
     ],
 };
 
@@ -130,6 +138,7 @@ mod tests {
              INSERT INTO fragment_request_metrics VALUES (1, 1, 2, 5, 10, 9);
              INSERT INTO device_tokens VALUES ('dt1', 1, X'EE05', 'abcd', X'FF06');
              INSERT INTO committed_tx_nonces VALUES ('nonce-1');
+             INSERT INTO regenesis_state VALUES (1, 2, 20260801, X'5EA1', 7);
              INSERT INTO validators VALUES (1, 1, 1, NULL);
              INSERT INTO validators VALUES (1, 2, 1, NULL);
              INSERT INTO hopnet_consensus_policy VALUES ('ck', 'cv');
@@ -225,11 +234,11 @@ mod tests {
         assert_eq!(report.manifest.top_hash.to_hex(), EMPTY_TOP_HASH);
     }
 
-    const EMPTY_TOP_HASH: &str = "dc21e8215ff112db5d01e50f9ec24cfed81fa6f236b5216a022158a89a635ef0";
+    const EMPTY_TOP_HASH: &str = "98a6b6eb298ae078036e9a91b1ce9bbc13600f48f7d6db33fbac17738a5c53dc";
     const EMPTY_SECTION_HASHES: &[(&str, &str)] = &[
         (
             "host",
-            "72fdfe80d94d2154aba4ad5b0862515a7c543aaa503d9d55bc7e784ed67eb081",
+            "bd6624fc32983b3ae8f4ce149f34e291c281eefde17dde82b40ef0bb6cd2cc0c",
         ),
         (
             "consensus",
@@ -269,9 +278,9 @@ mod tests {
     }
 
     const SEEDED_TOP_HASH: &str =
-        "d95f46e5581c6a1bda6906799c609821c884e2552f1d6affc393c0569e113abf";
+        "731999ef6d44ae6797b7f2735db193ff2cb6ceae9064deb3164f65b8b330937e";
     const SEEDED_ARTIFACT_HASH: &str =
-        "00bac305681c823116e79f0b73bf175484fc2817f8b644f4b6b72c8adf115bad";
+        "1ce11ba7a4a57dfbf9b0032eda5391715a606994a0e4a00cfa43ce96bfe3fae1";
     const SEEDED_ARTIFACT_LEN: usize = 3207;
 
     // Should: report identical manifests from the hash-only walk and the

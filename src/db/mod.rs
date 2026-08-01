@@ -21,6 +21,7 @@ pub mod inventory;
 pub mod mesh;
 pub mod metrics;
 pub mod nodes;
+pub mod regenesis;
 pub mod resilience;
 pub mod setup;
 pub mod shared;
