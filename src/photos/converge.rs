@@ -94,7 +94,7 @@ async fn run_passes(user_id: i32, recipient: &StaticRecipient, app_state: &crate
 }
 
 /// The per-target grant work one pass derived, ready to rewrap.
-struct GrantWork {
+pub(crate) struct GrantWork {
     library_id: CustomUUID,
     target: i32,
     target_pubkey: [u8; 32],
@@ -104,7 +104,7 @@ struct GrantWork {
     blobs: Vec<hopnet_storage::BlobAccess>,
 }
 
-struct RevokeWork {
+pub(crate) struct RevokeWork {
     library_id: CustomUUID,
     target: i32,
     photo_ids: Vec<CustomUUID>,

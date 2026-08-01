@@ -40,6 +40,7 @@ pub(crate) mod persistence;
 mod photos;
 mod photos_ingress_identity;
 mod photos_ingress_publish;
+mod photos_shared_library;
 mod post_files_mixed;
 mod post_files_shape;
 mod range_download;
@@ -384,6 +385,11 @@ pub async fn run_test_by_name(
                 .run(mesh_id, nodes, flags)
                 .await
         }
+        "photos-shared-library" => {
+            photos_shared_library::PhotosSharedLibrary
+                .run(mesh_id, nodes, flags)
+                .await
+        }
         "recents-ordering" => recents::RecentsOrdering.run(mesh_id, nodes, flags).await,
         "range-download" => {
             range_download::RangeDownload
@@ -513,6 +519,7 @@ pub fn list_test_names() -> Vec<&'static str> {
         "photos-upload-consistency",
         "photos-ingress-publish",
         "photos-ingress-identity",
+        "photos-shared-library",
         "recents-ordering",
         "range-download",
         "takeout-happy-path",
