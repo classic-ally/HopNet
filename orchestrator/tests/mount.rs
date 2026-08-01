@@ -18,6 +18,8 @@ use crate::NodeInfo;
 use crate::tests::files::upload_file;
 use crate::tests::{Check, TestResult, TestScenario, print_and_add_check};
 
+use crate::naming::container_name;
+
 pub struct MountCrossNodeConsistency;
 
 const MOUNTPOINT: &str = "/hopdrive";
@@ -28,10 +30,6 @@ fn deterministic_bytes(len: usize, salt: u8) -> Vec<u8> {
     (0..len)
         .map(|i| ((i as u64 + salt as u64) % 251) as u8)
         .collect()
-}
-
-fn container_name(mesh_id: u32, node_id: u32) -> String {
-    format!("hopnet-orchestrator-{}-{}", mesh_id, node_id)
 }
 
 /// Run a command in the container via busybox sh, returning (exit_code, output).

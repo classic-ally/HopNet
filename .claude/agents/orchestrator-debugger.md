@@ -22,28 +22,32 @@ Investigate failures reported by orchestrator-runner. Analyze logs, diagnose iss
 
 ## Key Commands
 
+Container names are namespaced per checkout: `hopnet-{hash}-{mesh_id}-{node_id}`.
+Get `{hash}` from `./target/release/orchestrator prefix` (also shown in the
+`orchestrator list` header).
+
 ### Container Logs
 ```bash
 # Recent logs from a specific container
-docker logs hopnet-orchestrator-{mesh_id}-{node_id} --tail 100
+docker logs hopnet-{hash}-{mesh_id}-{node_id} --tail 100
 
 # Logs with timestamps
-docker logs hopnet-orchestrator-{mesh_id}-{node_id} --timestamps
+docker logs hopnet-{hash}-{mesh_id}-{node_id} --timestamps
 
 # Follow logs (use timeout)
-timeout 10 docker logs -f hopnet-orchestrator-{mesh_id}-{node_id}
+timeout 10 docker logs -f hopnet-{hash}-{mesh_id}-{node_id}
 ```
 
 ### Container State
 ```bash
 # Check if container is running
-docker ps -a --filter "name=hopnet-orchestrator-{mesh_id}"
+docker ps -a --filter "name=hopnet-{hash}-{mesh_id}"
 
 # Inspect container details
-docker inspect hopnet-orchestrator-{mesh_id}-{node_id}
+docker inspect hopnet-{hash}-{mesh_id}-{node_id}
 
 # Check container resource usage
-docker stats --no-stream hopnet-orchestrator-{mesh_id}-{node_id}
+docker stats --no-stream hopnet-{hash}-{mesh_id}-{node_id}
 ```
 
 ### Consensus Analysis

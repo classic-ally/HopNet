@@ -60,9 +60,13 @@ async fn is_port_available(port: u32) -> bool {
     std::net::TcpListener::bind(format!("0.0.0.0:{}", port)).is_ok()
 }
 
-/// Find an available port for Podman port mapping (with collision detection)
+/// Find an available port for Podman port mapping (with collision detection).
+/// The preferred slot rotates by checkout hash so concurrent checkouts'
+/// mesh 0 start in different 500-port slots; the bind-check scan below
+/// remains the collision backstop either way.
 pub async fn find_available_port(mesh_id: u32, node_id: u32) -> Result<u16> {
-    let preferred = 40000 + (mesh_id * 500) + node_id;
+    let slot = (crate::naming::checkout_slot() + mesh_id) % 51;
+    let preferred = 40000 + (slot * 500) + node_id;
 
     // Try preferred port first
     if is_port_available(preferred).await {

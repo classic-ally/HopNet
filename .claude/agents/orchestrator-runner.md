@@ -14,7 +14,7 @@ Execute orchestrator commands and return concise, actionable summaries. Keep ver
 
 ## Guidelines
 
-1. **Build first** - Build the orchestrator with `cargo build --release --bin orchestrator --features skip-frontend`, then build and load the Docker image via the nix flake. Use `nix build .#packages.aarch64-linux.dockerImage && docker load < result` on macOS (Apple Silicon), or `nix build .#packages.x86_64-linux.dockerImage && docker load < result` on Linux x86_64. On macOS, the Linux build is delegated to a remote nix builder — do not attempt to cross-compile locally.
+1. **Build first** - Build the orchestrator with `cargo build --release --bin orchestrator --features skip-frontend`, then build the Docker image via the nix flake: `nix build .#packages.aarch64-linux.dockerImage` on macOS (Apple Silicon; the Linux build is delegated to a remote nix builder — do not attempt to cross-compile locally) or `nix build .#packages.x86_64-linux.dockerImage` on Linux x86_64. Load it with `./target/release/orchestrator load-image` — NEVER `docker load < result`, which clobbers the machine-wide `hopnet:latest` under other agents; `load-image` retags the archive to this checkout's `hopnet:<hash>` image.
 2. **Mesh lifecycle modes** - `orchestrator test` supports two modes:
    - **Auto-managed (default; `--mesh-id` omitted)**: orchestrator creates a fresh mesh, runs the test, runs a divergence check on pass, and only deletes the mesh when **both** the test passed and no divergence was detected. Either failure leaves the mesh up so it can be inspected. The fail path prints the mesh id and the inspection/cleanup commands. This is the default for one-shot runs.
      - Example: `./target/release/orchestrator test --test takeout-happy-path` (3 nodes default)
@@ -117,5 +117,5 @@ Test `file-upload-consistency` failed on mesh 0. Node 2 not responding.
 
 ### Recommendation
 Use orchestrator-debugger to analyze node 2 container logs and determine crash cause.
-Container: hopnet-orchestrator-0-2
+Container: hopnet-<hash>-0-2 (get <hash> from `orchestrator prefix`)
 ```
