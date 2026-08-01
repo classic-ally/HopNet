@@ -44,6 +44,19 @@ an audit found a view-change safety hole. See RFC-013 for the full design
       (graceful-leave, evidence-observe, vote-out-after-kill,
       mesh-growth, auto-seam, consensus-bft-quorum-loss), divergence
       clean.
+- [~] Regenesis: epoch compression + coordinated upgrades — SPECIFIED
+      ([RFC-019](specs/regenesis.md), 2026-07-30): operator-initiated
+      epoch boundaries (drain → seal → certified snapshot → fresh
+      genesis at a CONTINUOUS height) discharging catchup cost and
+      history storage; the decide certificate of the final block IS
+      the snapshot certificate. Landed: S0 app-layer u64 heights
+      (lossless SQLite bit-cast mapping); S1 canonical snapshot
+      serializer (domain-tagged binary encoding, per-module
+      SNAPSHOT_SECTION registry pinned against sqlite_master,
+      decided_blocks divergence-checked but never exported, golden
+      tests) with the orchestrator divergence check rebuilt on the
+      manifest's top hash — and now a real gate that fails the run on
+      divergence. Next: S2 Projection snapshot seam + fresh-DB import.
 
 ### 2. Storage Substrate ([RFC-014](specs/hopnet-storage.md)) + File Storage ([RFC-002](specs/file-storage.md))
 **Status**: Substrate extraction COMPLETE (stages A–F, 2026-07-07) — the `hopnet-storage`

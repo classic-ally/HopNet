@@ -178,11 +178,20 @@ The snapshot is a CANONICAL LOGICAL export — never a database file
 copy (SQLite page layout, freelists, and vacuum state differ across
 nodes; the bytes must not).
 
-- covered set: exactly the divergence checker's table universe — the
-  replicated tables whose content hashes `compute_state_snapshot`
-  (`src/consensus/routes.rs:421`) already compares across nodes. One
-  source of truth for "what is consensus state"; node-local tables
-  (`this_node`, pins, inventory, queues) are excluded by the same line
+- covered set: the divergence checker's table universe — one registry
+  (per-module `SNAPSHOT_SECTION` specs assembled by the host,
+  `src/db/snapshot.rs`) is the single source of truth for "what is
+  consensus state", pinned against `sqlite_master` by test so a new
+  table must be classified at birth. Node-local tables (`this_node`,
+  pins, queues, the engine WAL/cursor/certificates, drive's
+  modification log) sit outside the universe entirely. One carve-out
+  INSIDE the universe: `decided_blocks` (epoch history) is CHECKED for
+  divergence — it is the live mesh's agreement invariant — but
+  EXCLUDED from the snapshot export set: history dies with the
+  retained epoch-N database (Archival & Retention), and epoch-N+1's
+  chain tables are born from the genesis installer, not the import.
+  The registry carries this as a per-table role (`Exported` vs
+  `DivergenceOnly`)
 - determinism rules:
   - sections ordered by module (manifest order = FK direction, same
     ordering `install_schema` already walks)
@@ -271,9 +280,9 @@ Boot gates, in order — all mechanical, all mandatory:
 3. IMPORT: import into a FRESH database (current binary's full schema
    via `initialize` — which this design redeems as the permanent
    fresh-schema installer), then recompute per-section hashes against
-   the manifest. `compute_state_snapshot` is the existing machinery
-   for exactly this comparison. Crash mid-import is safe: fresh file +
-   atomic swap, retry idempotent
+   the manifest. `compute_manifest` (`common/src/snapshot.rs`, the S1
+   serializer) is the machinery for exactly this comparison. Crash
+   mid-import is safe: fresh file + atomic swap, retry idempotent
 4. NODE-LOCAL CARRY: node-local tables (`this_node`, pins, inventory)
    are carried into the new database; their schema evolution is
    ordinary linear migrations (RFC-020 owns the policy; the hook point
@@ -491,9 +500,12 @@ protocol it checks.
 - [x] S0 — app-layer height widening to u64
   - lossless u64 ⇄ i64 mapping at every SQLite boundary, full-range
     tests; consensus-affecting, so ships while meshes are disposable
-- [ ] S1 — canonical snapshot serializer (pure function, no protocol)
-  - covered set = divergence-checker universe; golden tests +
-    orchestrator cross-node hash equality
+- [x] S1 — canonical snapshot serializer (pure function, no protocol)
+  - covered set = divergence-checker universe (with the
+    `decided_blocks` export carve-out and six previously-untracked
+    replicated tables brought in); domain-tagged binary encoding,
+    golden tests, orchestrator divergence gate rebuilt on the manifest
+    (and made to actually fail on divergence)
 - [ ] S2 — Projection snapshot seam + fresh-DB import
   - the RFC-016 amendment; byte-identical roundtrip gate
 - [ ] S3 — staged versions + upgrade provider
@@ -528,7 +540,7 @@ No new verification machinery — new scenarios for existing tools:
 | property | tool |
 | --- | --- |
 | snapshot canonicality/determinism | golden tests + orchestrator cross-node hash compare |
-| import correctness | post-import `compute_state_snapshot` parity + byte-identical roundtrip |
+| import correctness | post-import `compute_manifest` parity + byte-identical roundtrip |
 | drain reaches quiescence under faults | deterministic sim + seeded fuzzing corpus |
 | membership safety across the boundary | `validator_membership.qnt` extension |
 | end-to-end epoch upgrade | orchestrator gates (S7/S8 scenarios) |
