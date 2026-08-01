@@ -206,7 +206,10 @@ nodes; the bytes must not).
   (`hopnet-projection/src/lib.rs:254`, per-user takeout). The host
   orchestrates sections in manifest order; each module owns its own
   section's shape — schema evolution at import time is each module's
-  translator (RFC-020's business)
+  translator (RFC-020's business). Landed (S2) as
+  `Projection::snapshot_section`/`node_local_tables` plus
+  `hopnet_common::snapshot::import_snapshot` (fresh-DB import with
+  skip-reporting)
 - artifact + serving: written next to the database; joiners and
   rebuilding nodes fetch it from any peer and verify against the
   certificate before import — the epoch analog of decided-value sync.
@@ -506,8 +509,11 @@ protocol it checks.
     replicated tables brought in); domain-tagged binary encoding,
     golden tests, orchestrator divergence gate rebuilt on the manifest
     (and made to actually fail on divergence)
-- [ ] S2 — Projection snapshot seam + fresh-DB import
-  - the RFC-016 amendment; byte-identical roundtrip gate
+- [x] S2 — Projection snapshot seam + fresh-DB import
+  - the RFC-016 amendment (`snapshot_section`/`node_local_tables`,
+    sections assembled through the registry); bounds-checked artifact
+    import into a fresh schema with parse-to-skip for unknown sections;
+    byte-identical roundtrip gate green on the full host schema
 - [ ] S3 — staged versions + upgrade provider
   - `node_staged_version` tx; v1 git-release provider; advisory
     surface

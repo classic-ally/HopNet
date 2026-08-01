@@ -56,7 +56,10 @@ an audit found a view-change safety hole. See RFC-013 for the full design
       decided_blocks divergence-checked but never exported, golden
       tests) with the orchestrator divergence check rebuilt on the
       manifest's top hash — and now a real gate that fails the run on
-      divergence. Next: S2 Projection snapshot seam + fresh-DB import.
+      divergence; S2 Projection snapshot seam (RFC-016 amendment:
+      projections declare their own sections) + fresh-DB artifact
+      import, byte-identical roundtrip gate green. Next: S3 staged
+      versions + upgrade provider.
 
 ### 2. Storage Substrate ([RFC-014](specs/hopnet-storage.md)) + File Storage ([RFC-002](specs/file-storage.md))
 **Status**: Substrate extraction COMPLETE (stages A–F, 2026-07-07) — the `hopnet-storage`

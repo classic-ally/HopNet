@@ -2,6 +2,8 @@
 
 **Status**: Implemented (stages 1–6 complete, 2026-07-08)
 **Depends on**: RFC-014 (storage substrate), RFC-015 (projection modularity)
+**Amended by**: RFC-019 (snapshot seam — `snapshot_section` /
+`node_local_tables`, 2026-08-01)
 
 ## Motivation
 
@@ -72,6 +74,13 @@ pub trait Projection: Send + Sync {
     fn user_data_size_bytes(&self, caps: &HostCapabilities, user_id: i32)
         -> BoxFuture<'static, Result<u64, String>>;
         // takeout/import quota sizing, summed across manifests
+    // RFC-019 additions:
+    fn snapshot_section(&self) -> Option<&'static SectionSpec>;
+        // this projection's slice of the canonical state snapshot —
+        // covered tables for divergence hashing + epoch export
+    fn node_local_tables(&self) -> &'static [&'static str];
+        // tables outside the snapshot universe; the host's registry test
+        // pins covered ∪ node-local == sqlite_master
 }
 ```
 
@@ -109,6 +118,11 @@ The registry drives:
    subsystems are offered to each manifest; the first `Some(future)` is
    spawned on the MAIN runtime (consensus apply runs on the malachite
    shell's time-only runtime — IO work must not land there).
+6. **Snapshot sections** (`src/db/snapshot.rs`, RFC-019 S2): the named
+   substrate trio (host, consensus, storage) first, then
+   `manifests().filter_map(snapshot_section)`; `node_local_tables()`
+   unions likewise. Adding a projection's state to the divergence
+   universe and the epoch snapshot is zero host lines.
 
 ## HostCapabilities
 
