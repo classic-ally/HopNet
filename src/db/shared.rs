@@ -342,7 +342,12 @@ pub fn initialize(db: PooledConnection<SqliteConnectionManager>) -> Result<(), D
                 hopnet_storage_gc_high_pct       INTEGER NOT NULL DEFAULT 90,
                 hopnet_storage_gc_low_pct        INTEGER NOT NULL DEFAULT 80,
                 hopnet_storage_reencode_enabled  INTEGER NOT NULL DEFAULT 1,
-                hopnet_storage_repair_budget_pct INTEGER NOT NULL DEFAULT 10
+                hopnet_storage_repair_budget_pct INTEGER NOT NULL DEFAULT 10,
+                -- Upgrade-provider settings (RFC-019 S3): node-local, no
+                -- determinism impact. NULL release_url = derive the default
+                -- from the crate's repository field.
+                hopnet_upgrade_check_enabled     INTEGER NOT NULL DEFAULT 1,
+                hopnet_upgrade_release_url       TEXT
             );
 
             CREATE TABLE metrics (
@@ -486,6 +491,35 @@ pub fn read_storage_node_settings(
     )
     .map_err(|e| {
         tracing::error!("read storage node settings: {e:?}");
+        DatabaseError::RecallError
+    })
+}
+
+/// Node-local upgrade-provider settings from the this_node singleton
+/// (RFC-019 S3).
+#[derive(Debug, Clone)]
+pub struct UpgradeNodeSettings {
+    pub check_enabled: bool,
+    /// None = derive the default from the crate's repository field.
+    pub release_url: Option<String>,
+}
+
+pub fn read_upgrade_node_settings(
+    conn: &rusqlite::Connection,
+) -> Result<UpgradeNodeSettings, DatabaseError> {
+    conn.query_row(
+        "SELECT hopnet_upgrade_check_enabled, hopnet_upgrade_release_url
+         FROM this_node WHERE internal_id = 1",
+        [],
+        |row| {
+            Ok(UpgradeNodeSettings {
+                check_enabled: row.get::<_, i64>(0)? != 0,
+                release_url: row.get(1)?,
+            })
+        },
+    )
+    .map_err(|e| {
+        tracing::error!("read upgrade node settings: {e:?}");
         DatabaseError::RecallError
     })
 }

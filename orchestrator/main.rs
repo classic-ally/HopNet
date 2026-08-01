@@ -984,15 +984,17 @@ async fn create_hopnet_container(
                 format!("HOPNET_RELAY_URL={}", relay_url(mesh_id)),
             ];
             // Forward HOPNET_DB_* (pragma tuning), HOPNET_CONSENSUS_*/
-            // HOPNET_QUORUM_* (timeouts, quorum profile), and
+            // HOPNET_QUORUM_* (timeouts, quorum profile),
             // HOPNET_GENESIS_* (mesh-creation inputs, e.g. the storage
-            // policy seed) from the orchestrator process so tests can
+            // policy seed), and HOPNET_UPGRADE_* (upgrade-provider
+            // overrides) from the orchestrator process so tests can
             // configure meshes without rebuilding the image.
             for (k, v) in std::env::vars() {
                 if k.starts_with("HOPNET_DB_")
                     || k.starts_with("HOPNET_CONSENSUS_")
                     || k.starts_with("HOPNET_QUORUM_")
                     || k.starts_with("HOPNET_GENESIS_")
+                    || k.starts_with("HOPNET_UPGRADE_")
                 {
                     e.push(format!("{}={}", k, v));
                 }

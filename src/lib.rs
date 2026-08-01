@@ -68,6 +68,9 @@ pub struct AppState {
     /// every on-the-fly `takeout_host::takeout_state` construction.
     pub takeout_runtime: Arc<hopnet_takeout::TakeoutRuntime>,
     pub consensus_queue: consensus::queue::ConsensusQueue,
+    /// Upgrade-provider runtime state (RFC-019 S3): last poll result,
+    /// feeding the upgrade-readiness advisory.
+    pub upgrade: Arc<upgrade::UpgradeState>,
     pub write_gate: Arc<db::write_gate::WriteGate>,
     pub local_state_tx: tokio::sync::mpsc::Sender<db::write_gate::LocalStateUpdate>,
     /// Malachite engine handle — set by `spawn_engine` (startup restart path,

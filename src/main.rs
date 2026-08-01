@@ -259,6 +259,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 session_store: Arc::new(auth::SessionStore::default()),
                 takeout_runtime: Arc::new(hopnet_takeout::TakeoutRuntime::default()),
                 consensus_queue,
+                upgrade: Arc::new(upgrade::UpgradeState::default()),
                 write_gate: write_gate.clone(),
                 local_state_tx,
                 malachite: Arc::new(OnceCell::new()),
@@ -443,6 +444,28 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 policy_tick_worker.run().await;
             });
 
+            // Upgrade tick (RFC-019 S3): provider poll + version
+            // attestation reconcile, ~6-hourly with randomization. The
+            // boot task below covers the first attestation.
+            let random_second = rand::rng().random_range(5..55);
+            let random_minute = rand::rng().random_range(0..60);
+            let upgrade_cron_expression = format!("{} {} */6 * * *", random_second, random_minute);
+            let upgrade_schedule = apalis_cron::Schedule::from_str(&upgrade_cron_expression).unwrap();
+            let upgrade_cron_stream = apalis_cron::CronStream::new(upgrade_schedule);
+
+            let upgrade_worker = WorkerBuilder::new("upgrade-tick")
+                .data(app_state.clone())
+                .backend(upgrade_cron_stream)
+                .build_fn(upgrade::jobs::handle_upgrade_tick);
+
+            tokio::spawn(async move {
+                upgrade_worker.run().await;
+            });
+
+            // Boot attestation: converge the committed version claim as
+            // soon as the node is set up and the engine is live.
+            tokio::spawn(upgrade::jobs::attest_until_converged(app_state.clone()));
+
             // Spawn consensus queue batch processor — on the dedicated queue
             // runtime (see consensus::queue::queue_rt) so consensus keeps
             // draining when API load starves the main runtime.
@@ -525,6 +548,10 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 .route(
                     "/maintenance/policy-tick",
                     post(storage_host::routes::post_policy_tick),
+                )
+                .route(
+                    "/maintenance/upgrade-tick",
+                    post(upgrade::routes::post_upgrade_tick),
                 )
                 .route(
                     "/diagnostics/fragment-inventory-differential",

@@ -9,3 +9,4 @@
 
 pub mod resilience;
 pub mod routes;
+pub mod upgrade;
