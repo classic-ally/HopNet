@@ -153,7 +153,10 @@ pub struct NodeStateReport {
 }
 
 #[cfg(feature = "database")]
-pub use engine::{compute_manifest, serialize_snapshot, SnapshotError};
+pub use engine::{
+    compute_manifest, import_snapshot, serialize_snapshot, ImportReport, ImportedSection,
+    SkipReason, SkippedSection, SnapshotError,
+};
 
 #[cfg(feature = "database")]
 mod engine {
@@ -180,6 +183,30 @@ mod engine {
         UnknownExcludedColumn {
             table: String,
             column: String,
+        },
+        /// Artifact does not begin with MAGIC — not a snapshot at all.
+        BadMagic,
+        /// Container version this build cannot read (parse-far-enough:
+        /// magic, then version, then nothing else is trusted).
+        UnsupportedArtifactVersion {
+            found: u32,
+        },
+        /// Structural decode failure: truncation, a length prefix past
+        /// the buffer, an unknown value tag, trailing bytes.
+        Malformed {
+            offset: usize,
+            what: &'static str,
+        },
+        /// Artifact section/table/column shape disagrees with the fresh
+        /// schema's canonical shape.
+        SchemaMismatch {
+            section: String,
+            table: String,
+            detail: String,
+        },
+        /// Import target is not fresh: a covered table already has rows.
+        TargetNotEmpty {
+            table: String,
         },
     }
 
@@ -208,6 +235,29 @@ mod engine {
                         "snapshot: excluded column {table}.{column} does not exist"
                     )
                 }
+                Self::BadMagic => write!(f, "snapshot: artifact does not begin with HOPSNAP magic"),
+                Self::UnsupportedArtifactVersion { found } => {
+                    write!(
+                        f,
+                        "snapshot: artifact version {found} unreadable (this build reads {ARTIFACT_VERSION})"
+                    )
+                }
+                Self::Malformed { offset, what } => {
+                    write!(f, "snapshot: malformed artifact at byte {offset}: {what}")
+                }
+                Self::SchemaMismatch {
+                    section,
+                    table,
+                    detail,
+                } => {
+                    write!(
+                        f,
+                        "snapshot: artifact disagrees with schema at {section}/{table}: {detail}"
+                    )
+                }
+                Self::TargetNotEmpty { table } => {
+                    write!(f, "snapshot: import target is not fresh — {table} has rows")
+                }
             }
         }
     }
@@ -234,6 +284,367 @@ mod engine {
         let mut artifact = Vec::new();
         let manifest = walk(tx, sections, Some(&mut artifact))?;
         Ok((artifact, manifest))
+    }
+
+    /// What happened during an import: which sections landed (with row
+    /// counts) and which were skipped. A skipped section means the
+    /// recomputed top hash will NOT match the certified one — the caller
+    /// decides fatal-or-informed; import only surfaces it.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct ImportReport {
+        pub imported: Vec<ImportedSection>,
+        pub skipped: Vec<SkippedSection>,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct ImportedSection {
+        pub name: String,
+        /// (table, rows inserted) in artifact order.
+        pub tables: Vec<(String, u64)>,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct SkippedSection {
+        pub name: String,
+        pub reason: SkipReason,
+    }
+
+    /// Why a section was skipped rather than imported. Skip-with-report
+    /// is what adjacent-version readability rides on: an importer without
+    /// a matching registry entry parses past the section structurally
+    /// (values are self-delimiting) instead of failing the whole import.
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum SkipReason {
+        UnknownSection,
+        FormatVersionMismatch { artifact: u32, registry: u32 },
+    }
+
+    /// Import a snapshot artifact into a FRESH database — schema already
+    /// installed, zero rows in every covered table. Plain INSERTs in
+    /// artifact order: the section order is the FK direction (verified
+    /// backward-only across the whole schema), so no constraint deferral
+    /// is needed, and a hostile reordering fails loudly on FK inside the
+    /// transaction. The CALLER commits (matches serialize_snapshot's
+    /// shape).
+    pub fn import_snapshot(
+        tx: &Transaction,
+        sections: &[&SectionSpec],
+        artifact: &[u8],
+    ) -> Result<ImportReport, SnapshotError> {
+        let mut cur = Cursor {
+            buf: artifact,
+            pos: 0,
+        };
+        if artifact.len() < MAGIC.len() || &artifact[..MAGIC.len()] != MAGIC {
+            return Err(SnapshotError::BadMagic);
+        }
+        cur.pos = MAGIC.len();
+        let version = cur.read_u32()?;
+        if version != ARTIFACT_VERSION {
+            return Err(SnapshotError::UnsupportedArtifactVersion { found: version });
+        }
+
+        let section_count = cur.read_u32()?;
+        let mut report = ImportReport {
+            imported: Vec::new(),
+            skipped: Vec::new(),
+        };
+        for _ in 0..section_count {
+            let name = cur.read_name()?;
+            let format_version = cur.read_u32()?;
+            let table_count = cur.read_u32()?;
+
+            let spec = sections.iter().copied().find(|s| s.name == name);
+            let skip = match spec {
+                None => Some(SkipReason::UnknownSection),
+                Some(s) if s.format_version != format_version => {
+                    Some(SkipReason::FormatVersionMismatch {
+                        artifact: format_version,
+                        registry: s.format_version,
+                    })
+                }
+                Some(_) => None,
+            };
+
+            match skip {
+                Some(reason) => {
+                    // Parse-to-skip: the format has no section length
+                    // prefix, so skipping IS a full structural decode.
+                    for _ in 0..table_count {
+                        let unit = read_table_header(&mut cur)?;
+                        walk_table_rows(&mut cur, &unit, |_| Ok(()))?;
+                    }
+                    report.skipped.push(SkippedSection {
+                        name: name.to_string(),
+                        reason,
+                    });
+                }
+                None => {
+                    let spec = spec.expect("skip is None only when spec matched");
+                    report
+                        .imported
+                        .push(import_section(tx, spec, &mut cur, table_count)?);
+                }
+            }
+        }
+
+        if !cur.done() {
+            return Err(cur.malformed("trailing bytes after the last section"));
+        }
+        Ok(report)
+    }
+
+    fn import_section(
+        tx: &Transaction,
+        spec: &SectionSpec,
+        cur: &mut Cursor<'_>,
+        table_count: u32,
+    ) -> Result<ImportedSection, SnapshotError> {
+        let mismatch = |table: &str, detail: String| SnapshotError::SchemaMismatch {
+            section: spec.name.to_string(),
+            table: table.to_string(),
+            detail,
+        };
+
+        let mut imported = ImportedSection {
+            name: spec.name.to_string(),
+            tables: Vec::new(),
+        };
+        for _ in 0..table_count {
+            let unit = read_table_header(cur)?;
+            let table_spec = spec
+                .tables
+                .iter()
+                .find(|t| t.role == TableRole::Exported && t.name == unit.name)
+                .ok_or_else(|| {
+                    mismatch(unit.name, "not an exported table of this section".into())
+                })?;
+            // A duplicate table unit in a hostile artifact needs no
+            // special case: the second pass fails the emptiness check
+            // (or a PK violation) below.
+            if imported.tables.iter().any(|(name, _)| name == unit.name) {
+                return Err(mismatch(unit.name, "duplicate table unit".into()));
+            }
+
+            let (canonical, _pk) = canonical_columns(tx, table_spec)?;
+            if !canonical
+                .iter()
+                .map(String::as_str)
+                .eq(unit.columns.iter().copied())
+            {
+                return Err(mismatch(
+                    unit.name,
+                    format!(
+                        "artifact columns {:?} != schema canonical columns {:?}",
+                        unit.columns, canonical
+                    ),
+                ));
+            }
+
+            let existing = tx.query_row(
+                &format!("SELECT COUNT(*) FROM \"{}\"", unit.name),
+                [],
+                |row| row.get::<_, i64>(0),
+            )?;
+            if existing != 0 {
+                return Err(SnapshotError::TargetNotEmpty {
+                    table: unit.name.to_string(),
+                });
+            }
+
+            // Column-named INSERT: the excluded node-local columns take
+            // their DDL defaults — right for a fresh node.
+            let column_list = unit
+                .columns
+                .iter()
+                .map(|c| format!("\"{c}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let placeholders = vec!["?"; unit.columns.len()].join(", ");
+            let mut stmt = tx.prepare(&format!(
+                "INSERT INTO \"{}\" ({column_list}) VALUES ({placeholders})",
+                unit.name
+            ))?;
+            let mut rows = 0u64;
+            walk_table_rows(cur, &unit, |values| {
+                stmt.execute(rusqlite::params_from_iter(values.iter()))?;
+                rows += 1;
+                Ok(())
+            })?;
+            imported.tables.push((unit.name.to_string(), rows));
+        }
+
+        // A short artifact must not import partial state and leave the
+        // hash gate to notice later.
+        for table in spec.tables {
+            if table.role == TableRole::Exported
+                && !imported.tables.iter().any(|(name, _)| name == table.name)
+            {
+                return Err(mismatch(table.name, "missing from artifact".into()));
+            }
+        }
+        Ok(imported)
+    }
+
+    /// Bounds-checked reader over the artifact. Every length is checked
+    /// against the remaining buffer BEFORE any slice or allocation, so a
+    /// bogus 2^60 length prefix fails cleanly instead of allocating.
+    struct Cursor<'a> {
+        buf: &'a [u8],
+        pos: usize,
+    }
+
+    impl<'a> Cursor<'a> {
+        fn malformed(&self, what: &'static str) -> SnapshotError {
+            SnapshotError::Malformed {
+                offset: self.pos,
+                what,
+            }
+        }
+
+        fn read_bytes(&mut self, n: usize) -> Result<&'a [u8], SnapshotError> {
+            let end = self
+                .pos
+                .checked_add(n)
+                .filter(|&end| end <= self.buf.len())
+                .ok_or_else(|| self.malformed("runs past the end of the artifact"))?;
+            let out = &self.buf[self.pos..end];
+            self.pos = end;
+            Ok(out)
+        }
+
+        fn read_u32(&mut self) -> Result<u32, SnapshotError> {
+            Ok(u32::from_le_bytes(self.read_bytes(4)?.try_into().unwrap()))
+        }
+
+        fn read_u64(&mut self) -> Result<u64, SnapshotError> {
+            Ok(u64::from_le_bytes(self.read_bytes(8)?.try_into().unwrap()))
+        }
+
+        fn read_len_u64(&mut self) -> Result<usize, SnapshotError> {
+            let len = self.read_u64()?;
+            usize::try_from(len).map_err(|_| self.malformed("length prefix overflows usize"))
+        }
+
+        /// Section/table/column names are &'static str on the write side;
+        /// non-UTF-8 here means a corrupt artifact.
+        fn read_name(&mut self) -> Result<&'a str, SnapshotError> {
+            let len = self.read_u32()? as usize;
+            let start = self.pos;
+            let bytes = self.read_bytes(len)?;
+            std::str::from_utf8(bytes).map_err(|_| SnapshotError::Malformed {
+                offset: start,
+                what: "name is not UTF-8",
+            })
+        }
+
+        fn done(&self) -> bool {
+            self.pos == self.buf.len()
+        }
+    }
+
+    struct TableUnit<'a> {
+        name: &'a str,
+        columns: Vec<&'a str>,
+        row_count: u64,
+    }
+
+    fn read_table_header<'a>(cur: &mut Cursor<'a>) -> Result<TableUnit<'a>, SnapshotError> {
+        let name = cur.read_name()?;
+        let col_count = cur.read_u32()?;
+        let mut columns = Vec::with_capacity(col_count.min(1024) as usize);
+        for _ in 0..col_count {
+            columns.push(cur.read_name()?);
+        }
+        let row_count = cur.read_u64()?;
+        Ok(TableUnit {
+            name,
+            columns,
+            row_count,
+        })
+    }
+
+    /// Decode a table unit's rows through `row_sink` — the one shared
+    /// walk for both the import path and the parse-to-skip path, so the
+    /// two cannot drift (mirror of the serializer's single-walk sink).
+    fn walk_table_rows<'a>(
+        cur: &mut Cursor<'a>,
+        unit: &TableUnit<'a>,
+        mut row_sink: impl FnMut(&[RawValue<'a>]) -> Result<(), SnapshotError>,
+    ) -> Result<(), SnapshotError> {
+        let mut values: Vec<RawValue<'a>> = Vec::with_capacity(unit.columns.len());
+        for _ in 0..unit.row_count {
+            values.clear();
+            for column in &unit.columns {
+                values.push(decode_value(cur, unit.name, column)?);
+            }
+            row_sink(&values)?;
+        }
+        Ok(())
+    }
+
+    /// A decoded SQLite value borrowing from the artifact. TEXT stays raw
+    /// bytes end to end — SQLite permits non-UTF-8 text, and routing it
+    /// through String would corrupt or reject bytes that are certificate
+    /// preimage.
+    enum RawValue<'a> {
+        Null,
+        Integer(i64),
+        Real(f64),
+        Text(&'a [u8]),
+        Blob(&'a [u8]),
+    }
+
+    impl rusqlite::ToSql for RawValue<'_> {
+        fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+            use rusqlite::types::ToSqlOutput;
+            Ok(ToSqlOutput::Borrowed(match self {
+                RawValue::Null => ValueRef::Null,
+                RawValue::Integer(i) => ValueRef::Integer(*i),
+                RawValue::Real(f) => ValueRef::Real(*f),
+                RawValue::Text(bytes) => ValueRef::Text(bytes),
+                RawValue::Blob(bytes) => ValueRef::Blob(bytes),
+            }))
+        }
+    }
+
+    /// Tag-for-tag mirror of `encode_value_into`. NaN and -0.0 bits are
+    /// rejected: the serializer never emits either, so their presence
+    /// means corruption — rejecting keeps re-serialize ≡ input an
+    /// invariant rather than a hope.
+    fn decode_value<'a>(
+        cur: &mut Cursor<'a>,
+        table: &str,
+        column: &str,
+    ) -> Result<RawValue<'a>, SnapshotError> {
+        match cur.read_bytes(1)?[0] {
+            0x00 => Ok(RawValue::Null),
+            0x01 => Ok(RawValue::Integer(i64::from_le_bytes(
+                cur.read_bytes(8)?.try_into().unwrap(),
+            ))),
+            0x02 => {
+                let f = f64::from_le_bytes(cur.read_bytes(8)?.try_into().unwrap());
+                if f.is_nan() || (f == 0.0 && f.is_sign_negative()) {
+                    return Err(SnapshotError::NonCanonicalFloat {
+                        table: table.to_string(),
+                        column: column.to_string(),
+                    });
+                }
+                Ok(RawValue::Real(f))
+            }
+            0x03 => {
+                let len = cur.read_len_u64()?;
+                Ok(RawValue::Text(cur.read_bytes(len)?))
+            }
+            0x04 => {
+                let len = cur.read_len_u64()?;
+                Ok(RawValue::Blob(cur.read_bytes(len)?))
+            }
+            _ => Err(SnapshotError::Malformed {
+                offset: cur.pos - 1,
+                what: "unknown value tag",
+            }),
+        }
     }
 
     fn walk(
@@ -811,6 +1222,362 @@ mod tests {
         let mut tampered = manifest.clone();
         tampered.sections[0].format_version = 2;
         assert_ne!(tampered.compute_top_hash(), manifest.top_hash);
+    }
+
+    /// Exported-role table manifests across all sections — the subset a
+    /// post-import parity check may compare (DivergenceOnly tables
+    /// legitimately differ on a fresh database).
+    fn exported_tables(manifest: &SnapshotManifest) -> Vec<&TableManifest> {
+        manifest
+            .sections
+            .iter()
+            .flat_map(|s| s.tables.iter().filter(|t| t.role == TableRole::Exported))
+            .collect()
+    }
+
+    /// Patch helper for corruption tests: replace the single occurrence
+    /// of `find` in the artifact (asserts exactly one, so a fixture
+    /// change that makes the pattern ambiguous fails loudly).
+    fn patch(artifact: &[u8], find: &[u8], replace: &[u8]) -> Vec<u8> {
+        let positions: Vec<usize> = artifact
+            .windows(find.len())
+            .enumerate()
+            .filter(|(_, w)| *w == find)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(positions.len(), 1, "pattern must occur exactly once");
+        let mut out = artifact.to_vec();
+        out[positions[0]..positions[0] + replace.len()].copy_from_slice(replace);
+        out
+    }
+
+    /// Import with the real caller contract: commit on Ok, drop (roll
+    /// back) on Err — an errored import must leave the fresh target
+    /// untouched.
+    fn import_into_fresh(
+        artifact: &[u8],
+        sections: &[&SectionSpec],
+    ) -> (Connection, Result<ImportReport, SnapshotError>) {
+        let mut conn = fixture_conn();
+        let result = {
+            let tx = conn.transaction().unwrap();
+            let result = import_snapshot(&tx, sections, artifact);
+            if result.is_ok() {
+                tx.commit().unwrap();
+            }
+            result
+        };
+        (conn, result)
+    }
+
+    // Should: import the seeded fixture's artifact into a fresh fixture
+    // schema, re-serialize byte-identically, and report the imported
+    // tables with row counts and no skips.
+    // Should not: compare the DivergenceOnly history table's manifest —
+    // a fresh database legitimately lacks its rows.
+    // Impact: byte-identity across export→import→export is the epoch
+    // boundary contract regenesis_commit certifies.
+    #[test]
+    fn import_roundtrip_synthetic_schema() {
+        let mut source = fixture_conn();
+        seed_items(&source);
+        let (artifact, manifest_src) = snapshot(&mut source, &[&MAIN_SECTION, &EMPTY_SECTION]);
+
+        let (mut imported, result) = import_into_fresh(&artifact, &[&MAIN_SECTION, &EMPTY_SECTION]);
+        let report = result.unwrap();
+        assert!(report.skipped.is_empty());
+        assert_eq!(
+            report.imported,
+            vec![
+                ImportedSection {
+                    name: "main".to_string(),
+                    tables: vec![("items".to_string(), 3)],
+                },
+                ImportedSection {
+                    name: "empty".to_string(),
+                    tables: vec![("empty_a".to_string(), 0), ("empty_b".to_string(), 0)],
+                },
+            ]
+        );
+
+        let (artifact_again, manifest_re) =
+            snapshot(&mut imported, &[&MAIN_SECTION, &EMPTY_SECTION]);
+        assert_eq!(artifact_again, artifact);
+        assert_eq!(manifest_re.top_hash, manifest_src.top_hash);
+        for (re, src) in manifest_re.sections.iter().zip(&manifest_src.sections) {
+            assert_eq!(re.section_hash, src.section_hash);
+        }
+        assert_eq!(
+            exported_tables(&manifest_re),
+            exported_tables(&manifest_src)
+        );
+    }
+
+    // Should: decode the pinned golden artifact directly into a fresh
+    // fixture and match a freshly seeded source's exported manifests.
+    // Impact: pins the parser against known bytes, not just against
+    // whatever serialize currently produces.
+    #[test]
+    fn import_golden_artifact_parses() {
+        let artifact = hex::decode(GOLDEN_ARTIFACT_HEX).unwrap();
+        let (mut imported, result) = import_into_fresh(&artifact, &[&MAIN_SECTION, &EMPTY_SECTION]);
+        result.unwrap();
+
+        let mut source = fixture_conn();
+        seed_items(&source);
+        let (_, manifest_src) = snapshot(&mut source, &[&MAIN_SECTION, &EMPTY_SECTION]);
+        let (_, manifest_imp) = snapshot(&mut imported, &[&MAIN_SECTION, &EMPTY_SECTION]);
+        assert_eq!(
+            exported_tables(&manifest_imp),
+            exported_tables(&manifest_src)
+        );
+    }
+
+    // Should not: read past the first bytes of a non-snapshot; BadMagic
+    // is a hard error.
+    #[test]
+    fn import_rejects_bad_magic() {
+        let (_, result) = import_into_fresh(b"NOTSNAP\0rest", &[&MAIN_SECTION]);
+        assert!(matches!(result.unwrap_err(), SnapshotError::BadMagic));
+    }
+
+    // Should: hard-error on an unreadable container version — magic,
+    // then version, then nothing else is trusted.
+    #[test]
+    fn import_rejects_wrong_artifact_version() {
+        let mut source = fixture_conn();
+        seed_items(&source);
+        let (artifact, _) = snapshot(&mut source, &[&MAIN_SECTION]);
+        let mut patched = artifact.clone();
+        patched[8..12].copy_from_slice(&999u32.to_le_bytes());
+        let (_, result) = import_into_fresh(&patched, &[&MAIN_SECTION]);
+        assert!(matches!(
+            result.unwrap_err(),
+            SnapshotError::UnsupportedArtifactVersion { found: 999 }
+        ));
+    }
+
+    // Should: return Err — never panic, never partially succeed — for
+    // every strict prefix of a valid artifact.
+    #[test]
+    fn import_rejects_every_truncation() {
+        let artifact = hex::decode(GOLDEN_ARTIFACT_HEX).unwrap();
+        for n in 0..artifact.len() {
+            let (conn, result) =
+                import_into_fresh(&artifact[..n], &[&MAIN_SECTION, &EMPTY_SECTION]);
+            assert!(result.is_err(), "prefix of {n} bytes must not import");
+            let rows: i64 = conn
+                .query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(rows, 0, "prefix of {n} bytes must not leave rows behind");
+        }
+    }
+
+    // Should not: accept bytes after the last declared section.
+    #[test]
+    fn import_rejects_trailing_bytes() {
+        let mut artifact = hex::decode(GOLDEN_ARTIFACT_HEX).unwrap();
+        artifact.push(0x00);
+        let (_, result) = import_into_fresh(&artifact, &[&MAIN_SECTION, &EMPTY_SECTION]);
+        assert!(matches!(
+            result.unwrap_err(),
+            SnapshotError::Malformed {
+                what: "trailing bytes after the last section",
+                ..
+            }
+        ));
+    }
+
+    // Should: bounds-check a patched huge length prefix rather than
+    // allocate or slice past the buffer.
+    #[test]
+    fn import_rejects_bogus_length_prefix() {
+        let artifact = hex::decode(GOLDEN_ARTIFACT_HEX).unwrap();
+        // The TEXT value 'héllo': tag 0x03 + u64 len 6.
+        let find: &[u8] = &[0x03, 6, 0, 0, 0, 0, 0, 0, 0];
+        let replace: &[u8] = &[0x03, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        let patched = patch(&artifact, find, replace);
+        let (_, result) = import_into_fresh(&patched, &[&MAIN_SECTION, &EMPTY_SECTION]);
+        assert!(matches!(
+            result.unwrap_err(),
+            SnapshotError::Malformed { .. }
+        ));
+    }
+
+    // Should: fail Malformed with the offset on an unknown value tag.
+    #[test]
+    fn import_rejects_unknown_value_tag() {
+        let artifact = hex::decode(GOLDEN_ARTIFACT_HEX).unwrap();
+        // First row's height value: tag 0x01, i64 42.
+        let find: &[u8] = &[0x01, 42, 0, 0, 0, 0, 0, 0, 0];
+        let replace: &[u8] = &[0x05, 42, 0, 0, 0, 0, 0, 0, 0];
+        let patched = patch(&artifact, find, replace);
+        let (_, result) = import_into_fresh(&patched, &[&MAIN_SECTION, &EMPTY_SECTION]);
+        assert!(matches!(
+            result.unwrap_err(),
+            SnapshotError::Malformed {
+                what: "unknown value tag",
+                ..
+            }
+        ));
+    }
+
+    // Should not: accept NaN or -0.0 REAL bits — the serializer never
+    // emits either, so their presence means corruption; rejecting keeps
+    // re-serialize ≡ input an invariant rather than a hope.
+    #[test]
+    fn import_rejects_non_canonical_real() {
+        let artifact = hex::decode(GOLDEN_ARTIFACT_HEX).unwrap();
+        // The REAL value 1.5: tag 0x02 + IEEE-754 LE bits.
+        let mut find = vec![0x02];
+        find.extend_from_slice(&1.5f64.to_le_bytes());
+        for bad in [f64::NAN.to_le_bytes(), (-0.0f64).to_le_bytes()] {
+            let mut replace = vec![0x02];
+            replace.extend_from_slice(&bad);
+            let patched = patch(&artifact, &find, &replace);
+            let (_, result) = import_into_fresh(&patched, &[&MAIN_SECTION, &EMPTY_SECTION]);
+            assert!(matches!(
+                result.unwrap_err(),
+                SnapshotError::NonCanonicalFloat { .. }
+            ));
+        }
+    }
+
+    // Should: parse-to-skip a section absent from the registry and one
+    // whose registry format_version differs, import the rest, and report
+    // both reasons.
+    // Impact: adjacent-version readability rides on skip-with-report; a
+    // skipped section surfaces as a top-hash mismatch for the caller.
+    #[test]
+    fn import_skips_unknown_and_mismatched_sections_with_report() {
+        let mut source = fixture_conn();
+        seed_items(&source);
+        let (artifact, _) = snapshot(&mut source, &[&MAIN_SECTION, &EMPTY_SECTION]);
+
+        // Registry knows only "main": "empty" is unknown.
+        let (_, result) = import_into_fresh(&artifact, &[&MAIN_SECTION]);
+        let report = result.unwrap();
+        assert_eq!(report.imported.len(), 1);
+        assert_eq!(
+            report.skipped,
+            vec![SkippedSection {
+                name: "empty".to_string(),
+                reason: SkipReason::UnknownSection,
+            }]
+        );
+
+        // Registry knows "empty" at a different format version.
+        const EMPTY_V2: SectionSpec = SectionSpec {
+            name: "empty",
+            format_version: 2,
+            tables: &[EMPTY_A, EMPTY_B],
+        };
+        let (_, result) = import_into_fresh(&artifact, &[&MAIN_SECTION, &EMPTY_V2]);
+        let report = result.unwrap();
+        assert_eq!(
+            report.skipped,
+            vec![SkippedSection {
+                name: "empty".to_string(),
+                reason: SkipReason::FormatVersionMismatch {
+                    artifact: 1,
+                    registry: 2,
+                },
+            }]
+        );
+    }
+
+    // Should not: insert over existing rows; the error names the table.
+    // Impact: standing guard against a future initialize() that
+    // pre-seeds covered tables — import targets are FRESH by contract.
+    #[test]
+    fn import_rejects_nonempty_target() {
+        let mut source = fixture_conn();
+        seed_items(&source);
+        let (artifact, _) = snapshot(&mut source, &[&MAIN_SECTION]);
+
+        let mut target = fixture_conn();
+        target
+            .execute("INSERT INTO items (id) VALUES (99)", [])
+            .unwrap();
+        let tx = target.transaction().unwrap();
+        let err = import_snapshot(&tx, &[&MAIN_SECTION], &artifact).unwrap_err();
+        assert!(matches!(err, SnapshotError::TargetNotEmpty { ref table } if table == "items"));
+    }
+
+    // Should: hard-error when the artifact's column list differs from
+    // the fresh schema's canonical columns, and when the artifact's
+    // table set falls short of the spec's exported set.
+    #[test]
+    fn import_rejects_schema_mismatch() {
+        let mut source = fixture_conn();
+        seed_items(&source);
+        let (artifact, _) = snapshot(&mut source, &[&MAIN_SECTION]);
+
+        // Target whose items table lacks a column.
+        let mut narrow = Connection::open_in_memory().unwrap();
+        narrow
+            .execute_batch(
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, local_flag INTEGER);
+                 CREATE TABLE history (height INTEGER PRIMARY KEY, block BLOB);",
+            )
+            .unwrap();
+        let tx = narrow.transaction().unwrap();
+        let err = import_snapshot(&tx, &[&MAIN_SECTION], &artifact).unwrap_err();
+        assert!(matches!(err, SnapshotError::SchemaMismatch { .. }));
+        drop(tx);
+
+        // Registry spec expecting an exported table the artifact lacks.
+        const MAIN_PLUS: SectionSpec = SectionSpec {
+            name: "main",
+            format_version: 1,
+            tables: &[ITEMS, HISTORY, EMPTY_A],
+        };
+        let (_, result) = import_into_fresh(&artifact, &[&MAIN_PLUS]);
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, SnapshotError::SchemaMismatch { ref table, .. } if table == "empty_a")
+        );
+    }
+
+    // Should: roundtrip non-UTF-8 TEXT byte-identically and preserve
+    // every column's storage class across import.
+    // Should not: route TEXT through String.
+    // Impact: TEXT bytes are certificate preimage; a UTF-8 laundering
+    // step would corrupt or reject them.
+    #[test]
+    fn import_preserves_non_utf8_text_and_storage_classes() {
+        let mut source = fixture_conn();
+        source
+            .execute_batch(
+                "INSERT INTO items (id, name, payload, score, height, local_flag)
+                 VALUES (1, CAST(X'80FF' AS TEXT), X'01', 2.5, 7, 0);
+                 INSERT INTO history VALUES (1, X'AA');",
+            )
+            .unwrap();
+        let (artifact, _) = snapshot(&mut source, &[&MAIN_SECTION]);
+
+        let (imported, result) = import_into_fresh(&artifact, &[&MAIN_SECTION]);
+        result.unwrap();
+        let (artifact_again, _) = {
+            let mut conn = imported;
+            snapshot(&mut conn, &[&MAIN_SECTION])
+        };
+        assert_eq!(artifact_again, artifact);
+
+        let mut check = fixture_conn();
+        {
+            let tx = check.transaction().unwrap();
+            import_snapshot(&tx, &[&MAIN_SECTION], &artifact).unwrap();
+            tx.commit().unwrap();
+        }
+        let classes: (String, String, String) = check
+            .query_row(
+                "SELECT typeof(name), typeof(payload), typeof(score) FROM items WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(classes, ("text".into(), "blob".into(), "real".into()));
     }
 
     // Should: roundtrip the manifest through JSON with hashes as hex

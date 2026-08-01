@@ -79,6 +79,16 @@ pub fn compute_node_state_tx(tx: &rusqlite::Transaction) -> Result<NodeStateRepo
     })
 }
 
+/// Import an epoch snapshot artifact into this (fresh) database — the
+/// S6 boot-gate entry point, fixed here beside the manifest reader.
+/// Caller commits (via crate::db::shared::commit_timed on real paths).
+pub fn import_snapshot_tx(
+    tx: &rusqlite::Transaction,
+    artifact: &[u8],
+) -> Result<snapshot::ImportReport, snapshot::SnapshotError> {
+    snapshot::import_snapshot(tx, &sections(), artifact)
+}
+
 /// Convenience wrapper that manages transaction creation.
 pub fn compute_node_state(
     db_connection: Result<r2d2::PooledConnection<crate::db::SqliteConnectionManager>, r2d2::Error>,
