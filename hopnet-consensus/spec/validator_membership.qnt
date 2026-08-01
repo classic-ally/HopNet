@@ -21,6 +21,10 @@
 //                       POS, asymmetric-refresh RECOVERY block.
 //   partition_policy  — two-block dynamic partition machine: quorum
 //                       commits measured against the committing block.
+//   epoch_policy      — RFC-019 regenesis boundary: a phase machine
+//                       (normal / moratorium / sealed / restart) over
+//                       a membership_policy instance; restart wipes
+//                       evidence and lands inside indInv (the bridge).
 //   configs           — small / seam / pinned / neg_* instances plus
 //                       scripted witness and NEG runs.
 //
@@ -1259,4 +1263,343 @@ module cfg_sched {
       .then(envReviveN(5)).then(7.reps(_ => policyTick))
       // span re-proved (5 ticks) then mandatory seating fired
       .expect(seated.contains(5) and vSize == 5 and invNoHarm and invCeiling)
+}
+
+// ============================================================
+// RFC-019 regenesis: the epoch-boundary machine. A phase machine
+// (NORMAL -> MORATORIUM -> SEALED -> restart) layered over a
+// membership_policy instance at cfg_seam scale, so a boundary can
+// cross the quorum seam. Versions and the S5 staged-version
+// precondition are deliberately NOT modeled: they never affect
+// membership safety — a node parked "awaiting upgrade" is simply dark
+// at restart, which is already the environment's choice.
+//
+// The bridge: restartEpoch carries seated / seatedFor / lastDeparture
+// verbatim (proven-ness reads committed activation heights, not
+// evidence), wipes darkFor / brightFor to zero (EvidenceMap is
+// in-memory and dies with the process), and resets calm. Every indInv
+// conjunct is satisfied by that state, so the whole membership safety
+// matrix (no-harm, ceiling, floor, no-exile) transfers to the new
+// epoch depth-free — proven by extending the inductive invariant
+// (epochIndInv) over the enlarged machine, never by re-proving the
+// membership layer. The post-restart quiet period is structural, not
+// added: vote-out needs darkFor >= T_CLIFF and seating needs a fresh
+// bright span, both zeroed at the boundary.
+//
+// The staged pool is abstract: admitOne models admission (NORMAL
+// only — closing admission IS the moratorium, so the pool can only
+// fall once regenesis starts and drain termination is structural);
+// membership commits during MORATORIUM consume pool (they are staged
+// txs draining); commitSeal requires pool == 0 (drain complete).
+// decidedPastSeal is the seal-safety ghost: every decide records
+// whether it fired past the seal — the guards make that unreachable,
+// and the inductive check keeps it unreachable against future edits.
+// ============================================================
+module epoch_policy {
+  import q_tables.*
+  import membership_policy(
+    REGISTERED = 1.to(9), INIT_SEATED = 1.to(7),
+    Q_TABLE = Q_AUTO_TABLE, FEQ_TABLE = FEQ_AUTO_TABLE,
+    T_CLIFF = 2, T_FAST = 3, T_LAZY = 4, S_FLOOR = 1, S_FULL = 5,
+    P_PROVE = 5, B_MAX = 5, CEILING_MODE = 0, ENFORCE_SMIN = true
+  ).*
+
+  pure val POOL_MAX = 3
+
+  // Phases.
+  pure val P_NORMAL = 0
+  pure val P_MORATORIUM = 1     // regenesis_start decided, draining
+  pure val P_SEALED = 2         // regenesis_commit decided, awaiting restart
+
+  var phase: int
+  var pool: int                 // staged-but-undecided txs, abstracted
+  var carriedSeated: Set[int]   // ghost: seated as of the seal
+  var decidedPastSeal: bool     // ghost: some decide fired after the seal
+
+  // === Guard vocabulary (shared by actions, invariants, witnesses) ===
+  // A membership commit decides freely in NORMAL, or in MORATORIUM as
+  // a staged tx while the pool lasts. Never in SEALED.
+  val commitPhaseOk = or {
+    phase == P_NORMAL,
+    and { phase == P_MORATORIUM, pool > 0 },
+  }
+  val drainEnabled = and { phase != P_SEALED, pool > 0 }
+  val abortEnabled = (phase == P_MORATORIUM)  // strictly inside (start, commit)
+  val sealEnabled = and { phase == P_MORATORIUM, pool == 0 }
+  val poolAfterCommit = if (phase == P_MORATORIUM) pool - 1 else pool
+
+  // === Frame helpers ===
+  action keepEpoch = all {
+    phase' = phase, pool' = pool, carriedSeated' = carriedSeated,
+    decidedPastSeal' = decidedPastSeal,
+  }
+  action keepMembership = all {
+    seated' = seated, alive' = alive, darkFor' = darkFor,
+    brightFor' = brightFor, seatedFor' = seatedFor,
+    lastDeparture' = lastDeparture, harmedByPolicy' = harmedByPolicy,
+    ceilingHarm' = ceilingHarm, calm' = calm,
+  }
+
+  action epochInit = all {
+    init,
+    phase' = P_NORMAL, pool' = 0, carriedSeated' = Set(),
+    decidedPastSeal' = false,
+  }
+
+  // === Environment ===
+  // Kills/revives in every phase — nodes crash and come back between
+  // seal and restart too (the dark-seat setup). Ticks only while the
+  // engine runs probe cycles, i.e. never in SEALED.
+  action eEnvKillN(n: int): bool = all { envKillN(n), keepEpoch }
+  action eEnvKill = all { envKill, keepEpoch }
+  action eEnvReviveN(n: int): bool = all { envReviveN(n), keepEpoch }
+  action eEnvRevive = all { envRevive, keepEpoch }
+  action eEnvTick = all { phase != P_SEALED, envTick, keepEpoch }
+
+  // === Decides (each = one consensus height; each records the ghost) ===
+  action eCommitVoteOutN(x: int): bool = all {
+    commitPhaseOk, commitVoteOutN(x),
+    phase' = phase, pool' = poolAfterCommit, carriedSeated' = carriedSeated,
+    decidedPastSeal' = (decidedPastSeal or phase == P_SEALED),
+  }
+  action eCommitVoteOut = all {
+    commitPhaseOk, commitVoteOut,
+    phase' = phase, pool' = poolAfterCommit, carriedSeated' = carriedSeated,
+    decidedPastSeal' = (decidedPastSeal or phase == P_SEALED),
+  }
+  action eCommitLeaveN(x: int): bool = all {
+    commitPhaseOk, commitLeaveN(x),
+    phase' = phase, pool' = poolAfterCommit, carriedSeated' = carriedSeated,
+    decidedPastSeal' = (decidedPastSeal or phase == P_SEALED),
+  }
+  action eCommitLeave = all {
+    commitPhaseOk, commitLeave,
+    phase' = phase, pool' = poolAfterCommit, carriedSeated' = carriedSeated,
+    decidedPastSeal' = (decidedPastSeal or phase == P_SEALED),
+  }
+  action eCommitSeatBatchB(bs: Set[int]): bool = all {
+    commitPhaseOk, commitSeatBatchB(bs),
+    phase' = phase, pool' = poolAfterCommit, carriedSeated' = carriedSeated,
+    decidedPastSeal' = (decidedPastSeal or phase == P_SEALED),
+  }
+  action eCommitSeatBatch = all {
+    commitPhaseOk, commitSeatBatch,
+    phase' = phase, pool' = poolAfterCommit, carriedSeated' = carriedSeated,
+    decidedPastSeal' = (decidedPastSeal or phase == P_SEALED),
+  }
+
+  // Admission is a client submitting, not a decide — NORMAL only:
+  // closing this action IS the moratorium.
+  action admitOne = all {
+    phase == P_NORMAL,
+    pool' = (if (pool < POOL_MAX) pool + 1 else POOL_MAX),
+    phase' = phase, carriedSeated' = carriedSeated,
+    decidedPastSeal' = decidedPastSeal,
+    keepMembership,
+  }
+  // A staged non-membership tx decides.
+  action drainOne = all {
+    drainEnabled,
+    pool' = pool - 1,
+    phase' = phase, carriedSeated' = carriedSeated,
+    decidedPastSeal' = (decidedPastSeal or phase == P_SEALED),
+    keepMembership,
+  }
+
+  // regenesis_start decides: moratorium opens, admission closes.
+  action commitStart = all {
+    phase == P_NORMAL,
+    phase' = P_MORATORIUM,
+    pool' = pool, carriedSeated' = carriedSeated,
+    decidedPastSeal' = (decidedPastSeal or phase == P_SEALED),
+    keepMembership,
+  }
+  // regenesis_abort decides (admin-signed, bypasses the closed
+  // admission gate): back to NORMAL, nothing else changes.
+  action commitAbort = all {
+    abortEnabled,
+    phase' = P_NORMAL,
+    pool' = pool, carriedSeated' = carriedSeated,
+    decidedPastSeal' = (decidedPastSeal or phase == P_SEALED),
+    keepMembership,
+  }
+  // regenesis_commit decides as the sole tx of the final block (drain
+  // complete by its guard): the epoch is sealed.
+  action commitSeal = all {
+    sealEnabled,
+    phase' = P_SEALED,
+    pool' = pool,
+    carriedSeated' = seated,
+    decidedPastSeal' = (decidedPastSeal or phase == P_SEALED),
+    keepMembership,
+  }
+
+  // Restart is NOT a decide: each node derives it locally from the
+  // sealed artifacts. Committed state (seated set, activation-height
+  // proven-ness, departure kinds) carries verbatim; in-memory evidence
+  // dies with the process; calm restarts. The target state satisfies
+  // every indInv conjunct — the bridge into the next epoch.
+  action restartEpoch = all {
+    phase == P_SEALED,
+    phase' = P_NORMAL,
+    pool' = 0,
+    carriedSeated' = carriedSeated,
+    decidedPastSeal' = decidedPastSeal,
+    seated' = seated,
+    seatedFor' = seatedFor,
+    lastDeparture' = lastDeparture,
+    alive' = alive,
+    darkFor' = REGISTERED.mapBy(n => 0),
+    brightFor' = REGISTERED.mapBy(n => 0),
+    harmedByPolicy' = harmedByPolicy,
+    ceilingHarm' = ceilingHarm,
+    calm' = 0,
+  }
+
+  action epochStep = any {
+    eEnvKill, eEnvRevive, eEnvTick,
+    eCommitVoteOut, eCommitLeave, eCommitSeatBatch,
+    admitOne, drainOne,
+    commitStart, commitAbort, commitSeal, restartEpoch,
+  }
+
+  // === Invariants ===
+  val invSealSafety = not(decidedPastSeal)
+  val invCarry = (phase == P_SEALED) implies (seated == carriedSeated)
+  val epochSafetyInv = and { safetyInv, invSealSafety, invCarry }
+
+  // Inductive form (indInv's conjuncts inlined — Apalache needs every
+  // variable constrained at the TOP level of the conjunction). One
+  // epochStep from ANY state satisfying this preserves it, and it
+  // implies epochSafetyInv — the membership proofs transfer across the
+  // boundary with no depth bound.
+  val epochIndInv = and {
+    seated.in(REGISTERED.powerset()),
+    alive.in(REGISTERED.powerset()),
+    darkFor.in(REGISTERED.setOfMaps(0.to(T_LAZY))),
+    brightFor.in(REGISTERED.setOfMaps(0.to(S_FULL))),
+    seatedFor.in(REGISTERED.setOfMaps(0.to(P_PROVE))),
+    lastDeparture.in(REGISTERED.setOfMaps(Set(D_NONE, D_VOLUNTARY, D_VOTEDOUT))),
+    harmedByPolicy == false,
+    ceilingHarm == false,
+    calm == 0,
+    phase.in(Set(P_NORMAL, P_MORATORIUM, P_SEALED)),
+    pool.in(0.to(POOL_MAX)),
+    carriedSeated.in(REGISTERED.powerset()),
+    decidedPastSeal == false,
+    vSize >= 1,
+    (phase == P_SEALED) implies (seated == carriedSeated and pool == 0),
+    REGISTERED.forall(n => and {
+      alive.contains(n) implies darkFor.get(n) == 0,
+      not(alive.contains(n)) implies brightFor.get(n) == 0,
+      not(seated.contains(n)) implies seatedFor.get(n) == 0,
+    }),
+  }
+
+  // WITNESS (the full boundary, dark seats voted out from a carried
+  // configuration): a staged vote-out decides in the drain, the seal
+  // carries the set verbatim, two nodes die between seal and restart,
+  // and the ordinary machinery removes them from the carried set —
+  // safely — once fresh evidence accrues.
+  run fullBoundaryTest =
+    epochInit
+      .then(eEnvKillN(7)).then(2.reps(_ => eEnvTick))   // 7 dark past window
+      .then(admitOne).then(admitOne)                    // staged backlog of 2
+      .then(commitStart)
+      .expect(phase == P_MORATORIUM and pool == 2)
+      .then(eCommitVoteOutN(7))                         // staged membership tx drains
+      .expect(vSize == 6 and pool == 1)
+      .then(drainOne)
+      .then(commitSeal)
+      .expect(phase == P_SEALED and seated == carriedSeated and pool == 0)
+      .then(eEnvKillN(5)).then(eEnvKillN(6))            // die between seal and restart
+      .then(restartEpoch)
+      // carried verbatim; fresh evidence: nothing removable or seatable
+      .expect(and {
+        phase == P_NORMAL,
+        seated == carriedSeated,
+        vSize == 6,
+        REGISTERED.forall(n => darkFor.get(n) == 0 and brightFor.get(n) == 0),
+        REGISTERED.forall(n => not(voteOutEnabled(n))),
+      })
+      .then(2.reps(_ => eEnvTick))                      // fresh spans accrue
+      .then(eCommitVoteOutN(5)).then(eCommitVoteOutN(6))
+      .expect(vSize == 4 and headroom == 1
+        and invNoHarm and invCeiling and not(decidedPastSeal))
+
+  // WITNESS (abort round-trip): abort mid-drain restores NORMAL with
+  // membership state and evidence untouched, admission reopens, and a
+  // second start can still reach the seal — abort wedges nothing.
+  run abortRoundTripTest =
+    epochInit
+      .then(3.reps(_ => admitOne))
+      .then(commitStart)
+      .expect(phase == P_MORATORIUM and not(sealEnabled))
+      .then(drainOne)                                   // partial drain
+      .then(commitAbort)
+      .expect(and {
+        phase == P_NORMAL, pool == 2,
+        seated == 1.to(7), alive == 1.to(9),
+        REGISTERED.forall(n =>
+          brightFor.get(n) == S_FULL and darkFor.get(n) == 0),
+      })
+      .then(admitOne)                                   // admission reopened
+      .expect(pool == 3)
+      .then(commitStart)
+      .then(3.reps(_ => drainOne))
+      .then(commitSeal)
+      .expect(phase == P_SEALED and seated == carriedSeated
+        and not(decidedPastSeal))
+
+  // WITNESS (quiet period is structural): a candidate provably
+  // seatable before the boundary is NOT seatable after it until a
+  // fresh bright span accrues, and a seat gone dark across the
+  // boundary is NOT removable until fresh darkness accrues — then
+  // both proceed safely (T_CLIFF < S_FULL ordering visible midway).
+  run quietPeriodTest =
+    epochInit
+      .then(eEnvKillN(7)).then(2.reps(_ => eEnvTick))
+      .then(eCommitVoteOutN(7))                         // v=6, majority region
+      .then(eEnvReviveN(7)).then(5.reps(_ => eEnvTick))
+      .expect(seatEnabled(Set(7)))                      // re-proven pre-boundary
+      .then(commitStart).then(commitSeal)               // housekeeping boundary
+      .then(eEnvKillN(6))                               // goes dark across it
+      .then(restartEpoch)
+      .expect(and {
+        not(seatEnabled(Set(7))),                       // span must re-accrue
+        not(voteOutEnabled(6)),                         // evidence must re-accrue
+      })
+      .then(2.reps(_ => eEnvTick))
+      .expect(voteOutEnabled(6) and not(seatEnabled(Set(7))))
+      .then(3.reps(_ => eEnvTick))
+      .then(eCommitSeatBatchB(Set(7)))                  // crossing seat, span re-proven
+      .then(eCommitVoteOutN(6))                         // dark carried seat out
+      .expect(vSize == 6 and invNoHarm and invCeiling and not(decidedPastSeal))
+
+  // WITNESS (recovery is forward-only): after the seal, no decide of
+  // any kind is enabled — no membership commit, no drain, no abort.
+  run sealForwardOnlyTest =
+    epochInit.then(commitStart).then(commitSeal)        // empty pool: instant seal
+      .expect(and {
+        phase == P_SEALED,
+        not(commitPhaseOk), not(drainEnabled),
+        not(abortEnabled), not(sealEnabled),
+        seated == carriedSeated,
+      })
+
+  // WITNESS (drain terminates): admission closed at start, so the
+  // pool only falls; the seal is enabled exactly when it empties.
+  run drainTerminationTest =
+    epochInit.then(3.reps(_ => admitOne))
+      .expect(pool == POOL_MAX)
+      .then(admitOne)                                   // saturates at the cap
+      .expect(pool == POOL_MAX)
+      .then(commitStart)
+      .expect(not(sealEnabled) and drainEnabled)
+      .then(drainOne).then(drainOne)
+      .expect(not(sealEnabled) and pool == 1)
+      .then(drainOne)
+      .expect(sealEnabled and not(drainEnabled))        // drain terminated
+      .then(commitSeal)
+      .expect(phase == P_SEALED and not(decidedPastSeal))
 }
