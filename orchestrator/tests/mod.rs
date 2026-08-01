@@ -42,6 +42,7 @@ mod post_files_shape;
 mod range_download;
 mod recents;
 pub(crate) mod reencode;
+pub(crate) mod regenesis;
 mod sharing;
 mod takeout;
 mod tier_membership;
@@ -127,6 +128,12 @@ pub fn mesh_creation_env(test_name: &str) -> Vec<(&'static str, &'static str)> {
             // AUTO (default): majority at v=3, so the kill leaves a live
             // quorum — no forcing needed.
         ],
+        // Same seeding as vote-out: the 3-seat formation batch needs the
+        // shortened spans; the boundary logic itself needs no knobs.
+        "regenesis-seal" => vec![(
+            "HOPNET_GENESIS_CONSENSUS_POLICY",
+            "probe_base=2;grace=1;s_full=6;p_prove=6",
+        )],
         // REGRESSION FIX (S4): the S_min gate makes the BFT rejoin seat
         // EXPOSED (quorum(3)-quorum(2)=1) => req_span = s_full; the
         // default 30 min would refuse the rejoin inside the test window.
@@ -310,6 +317,11 @@ pub async fn run_test_by_name(
                 .run(mesh_id, nodes, flags)
                 .await
         }
+        "regenesis-seal" => {
+            regenesis::RegenesisSeal
+                .run(mesh_id, nodes, flags)
+                .await
+        }
         "evidence-observe" => {
             evidence_observe::EvidenceObserve
                 .run(mesh_id, nodes, flags)
@@ -466,6 +478,7 @@ pub fn list_test_names() -> Vec<&'static str> {
         "graceful-leave",
         "evidence-observe",
         "vote-out-after-kill",
+        "regenesis-seal",
         "mesh-growth",
         "auto-seam",
         "three-timescales",
