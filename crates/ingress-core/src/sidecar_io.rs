@@ -34,18 +34,24 @@ pub fn write_sidecar_local(root: &Path, sidecar: &Sidecar) -> Result<PathBuf> {
     Ok(final_path)
 }
 
-/// Compose and locally write the sidecar for a photo from current state.
+/// Compose and locally write the sidecar for a photo from current state,
+/// and persist the publish-metadata capsule (`photos.descriptor_json`) in
+/// the same pass — publish reads the capsule, not the file.
 ///
-/// Takes the `AssetDescriptor` because sidecar-only fields (media type,
-/// subtypes, favorite, capture metadata) are deliberately not persisted in
-/// `state.db` — the caller must still have the descriptor in hand. The FFI
-/// session retains descriptors per inflight photo for exactly this.
+/// Takes the `AssetDescriptor` because the capsule fields (media type,
+/// subtypes, favorite, capture metadata) exist nowhere else — the caller
+/// must still have the descriptor in hand. The FFI session retains
+/// descriptors per inflight photo for exactly this.
 pub async fn write_photo_sidecar(
     store: &StateStore,
     data_dir: &DataDir,
     desc: &AssetDescriptor,
     photo_id: &PhotoId,
 ) -> Result<PathBuf> {
+    let capsule = crate::descriptor::DescriptorCapsule::from(desc);
+    store
+        .update_descriptor_capsule(photo_id, &serde_json::to_string(&capsule)?)
+        .await?;
     let photo = store
         .photo(photo_id)
         .await?

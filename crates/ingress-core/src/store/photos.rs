@@ -30,6 +30,19 @@ impl StateStore {
             .await?;
         Ok(n)
     }
+
+    /// Persist the publish-metadata capsule (serialized
+    /// [`crate::descriptor::DescriptorCapsule`]). Rides the same trigger
+    /// points as the sidecar rewrite — materialization, metadata refresh,
+    /// heal — so the column tracks the live descriptor.
+    pub async fn update_descriptor_capsule(&self, id: &PhotoId, json: &str) -> Result<()> {
+        sqlx::query("UPDATE photos SET descriptor_json = ? WHERE photo_id = ?")
+            .bind(json)
+            .bind(id)
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
 }
 
 pub(crate) async fn photo_by_cloud_id<'e, E>(exec: E, cloud_id: &str) -> Result<Option<PhotoRecord>>

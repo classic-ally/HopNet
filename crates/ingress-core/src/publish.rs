@@ -39,10 +39,10 @@ use chrono::Utc;
 use crate::error::Result;
 use crate::ids::{ContentHash, PhotoId};
 use crate::model::{LibraryConfig, PhotoRecord, ResourceType};
-use crate::paths::{BlobPaths, DataDir};
+use crate::paths::BlobPaths;
 use crate::scheduler::BackoffConfig;
+use crate::descriptor::DescriptorCapsule;
 use crate::sidecar::Sidecar;
-use crate::sidecar_io::find_sidecar;
 use crate::store::StateStore;
 
 /// Publish-tick configuration (daemon loop cadence + retry policy).
@@ -240,7 +240,6 @@ pub async fn claim_publishable(
 /// ends, which also excludes supersede/hard-move races on the blob reads).
 pub async fn run_publish_pass(
     store: &StateStore,
-    data_dir: &DataDir,
     publisher: &dyn Publisher,
     cfg: &PublishConfig,
     claimed: Vec<PhotoRecord>,
@@ -357,15 +356,15 @@ pub async fn run_publish_pass(
     }
 
     for (photo, fingerprint) in remaining {
-        let mut item = match assemble_item(store, data_dir, &photo).await? {
+        let mut item = match assemble_item(store, &photo).await? {
             Ok(item) => item,
             Err(skip) => {
                 match skip {
-                    AssembleSkip::MissingSidecar => {
+                    AssembleSkip::MissingDescriptor => {
                         report.missing_sidecar += 1;
                         let _ = store
                             .append_log(
-                                "publish_sidecar_missing",
+                                "publish_descriptor_missing",
                                 Some(&photo.photo_id),
                                 None,
                             )
@@ -435,16 +434,20 @@ pub async fn run_publish_pass(
 }
 
 enum AssembleSkip {
-    MissingSidecar,
+    MissingDescriptor,
     Transient(String),
 }
 
 /// Resolve one claimed photo to a `PublishItem`, re-reading library and
 /// resource state fresh (hard-move safety). Recoverable problems return
 /// `Err(AssembleSkip)` inside `Ok` — the outer `Result` is store I/O only.
+///
+/// Metadata comes from the photo row's publish-metadata capsule
+/// (`descriptor_json`), re-composed against the authoritative DB rows —
+/// identity, group, tombstone, and resource state are read live, so
+/// tombstone/move flows never have to edit the stored capsule.
 async fn assemble_item(
     store: &StateStore,
-    data_dir: &DataDir,
     photo: &PhotoRecord,
 ) -> Result<std::result::Result<PublishItem, AssembleSkip>> {
     let Some(library_id) = &photo.library_id else {
@@ -462,25 +465,22 @@ async fn assemble_item(
         )));
     }
 
-    let sidecar_root = data_dir.sidecar_root(library_id);
-    let Some(sidecar_path) = find_sidecar(&sidecar_root, &photo.photo_id)? else {
-        return Ok(Err(AssembleSkip::MissingSidecar));
+    let Some(capsule_json) = &photo.descriptor_json else {
+        return Ok(Err(AssembleSkip::MissingDescriptor));
     };
-    let sidecar: Sidecar = match std::fs::read(&sidecar_path)
-        .map_err(|e| e.to_string())
-        .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|e| e.to_string()))
-    {
-        Ok(sidecar) => sidecar,
+    let capsule: DescriptorCapsule = match serde_json::from_str(capsule_json) {
+        Ok(capsule) => capsule,
         Err(e) => {
             return Ok(Err(AssembleSkip::Transient(format!(
-                "sidecar unreadable: {e}"
+                "descriptor capsule unreadable: {e}"
             ))));
         }
     };
 
     let blob_paths = BlobPaths::new(&library.blob_root);
+    let records = store.resources_for_photo(&photo.photo_id).await?;
     let mut resources = Vec::new();
-    for record in store.resources_for_photo(&photo.photo_id).await? {
+    for record in &records {
         if record.written_at.is_none() {
             continue;
         }
@@ -512,6 +512,23 @@ async fn assemble_item(
             "materialized photo has no written resources".into(),
         )));
     }
+
+    let sidecar = match Sidecar::compose(
+        photo,
+        &library,
+        capsule.media_type,
+        &capsule.media_subtypes,
+        capsule.favorite,
+        &capsule.capture,
+        &records,
+    ) {
+        Ok(sidecar) => sidecar,
+        Err(e) => {
+            return Ok(Err(AssembleSkip::Transient(format!(
+                "metadata recompose failed: {e}"
+            ))));
+        }
+    };
 
     Ok(Ok(PublishItem {
         photo: photo.clone(),

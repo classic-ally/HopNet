@@ -85,7 +85,7 @@ async fn migrate_is_idempotent() {
         .fetch_one(second.raw_pool())
         .await
         .unwrap();
-    assert_eq!(n, 4);
+    assert_eq!(n, 5);
 
     std::fs::remove_dir_all(&dir).ok();
 }

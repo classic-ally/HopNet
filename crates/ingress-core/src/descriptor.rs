@@ -47,9 +47,10 @@ pub struct Location {
     pub lon: f64,
 }
 
-/// PhotoKit-derived capture metadata. Feeds sidecars only — none of this
-/// lands in `state.db`.
-#[derive(Debug, Clone, Default, PartialEq)]
+/// PhotoKit-derived capture metadata. Persisted per photo as part of the
+/// [`DescriptorCapsule`] (`photos.descriptor_json`) — publish's metadata
+/// source.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CaptureMetadata {
     /// Capture time as PhotoKit resolves it, preserving the local UTC offset.
     pub captured_at: Option<DateTime<FixedOffset>>,
@@ -61,6 +62,33 @@ pub struct CaptureMetadata {
     pub duration_ms: Option<u64>,
     pub camera: Option<Camera>,
     pub location: Option<Location>,
+}
+
+/// The publish-metadata capsule persisted at `photos.descriptor_json`: the
+/// descriptor-derived fields that exist nowhere else in `state.db` (every
+/// other publish input — identity, group, tombstone, resources — lives in
+/// its own column). Written at materialization alongside the photo's
+/// completion; publish re-composes the full metadata document from this
+/// capsule plus the authoritative DB rows, so tombstone/move flows never
+/// need to edit it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DescriptorCapsule {
+    pub media_type: MediaType,
+    #[serde(default)]
+    pub media_subtypes: Vec<String>,
+    pub favorite: bool,
+    pub capture: CaptureMetadata,
+}
+
+impl From<&AssetDescriptor> for DescriptorCapsule {
+    fn from(desc: &AssetDescriptor) -> Self {
+        Self {
+            media_type: desc.media_type,
+            media_subtypes: desc.media_subtypes.clone(),
+            favorite: desc.favorite,
+            capture: desc.capture.clone(),
+        }
+    }
 }
 
 /// One `PHAssetResource` as enumerated on the asset.

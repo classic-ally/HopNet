@@ -66,6 +66,7 @@ fn make_item(dir: &std::path::Path, resources: Vec<(&str, &str, Vec<u8>)>) -> Pu
             asset_modified_at: None,
             materialized_at: Some(now),
             sidecar_replicated_at: None,
+            descriptor_json: None,
             published_at: None,
             publish_attempts: 0,
             publish_next_retry_at: None,

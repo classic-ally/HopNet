@@ -153,6 +153,9 @@ pub struct PhotoRecord {
     pub asset_modified_at: Option<DateTime<Utc>>,
     pub materialized_at: Option<DateTime<Utc>>,
     pub sidecar_replicated_at: Option<DateTime<Utc>>,
+    /// The serialized [`crate::descriptor::DescriptorCapsule`] — publish's
+    /// metadata source. NULL until materialization first writes it.
+    pub descriptor_json: Option<String>,
 
     /// NULL = not yet published into HopNet; set once, never reset (a
     /// re-edit must NOT re-enqueue — consensus rejects duplicate photo ids).

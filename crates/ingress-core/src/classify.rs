@@ -405,12 +405,13 @@ pub async fn apply_change(
     Ok((classification, outcome))
 }
 
-/// Recompose a materialized photo's local sidecar iff it is absent on disk —
-/// the crash-window class (completion tx committed, `write_photo_sidecar` never
-/// landed). No-op for an unmaterialized/unmapped photo or an existing sidecar.
-/// Needs the live descriptor: sidecar-only fields are not persisted in the DB,
-/// so nothing else can regenerate it. The replication drain then backs up the
-/// recomposed file on its next pass (the photo is already sidecar-dirty).
+/// Recompose a materialized photo's local sidecar iff it is absent on disk,
+/// or its publish-metadata capsule iff the column is NULL — the crash-window
+/// class (completion tx committed, `write_photo_sidecar` never landed) and
+/// the pre-capsule-migration backfill respectively. No-op for an
+/// unmaterialized/unmapped photo with both present. Needs the live
+/// descriptor: capsule fields are persisted nowhere else, so nothing else
+/// can regenerate them.
 async fn heal_missing_sidecar(
     store: &StateStore,
     data_dir: &DataDir,
@@ -426,7 +427,9 @@ async fn heal_missing_sidecar(
     let Some(library_id) = &photo.library_id else {
         return Ok(());
     };
-    if crate::sidecar_io::find_sidecar(&data_dir.sidecar_root(library_id), photo_id)?.is_none() {
+    if photo.descriptor_json.is_none()
+        || crate::sidecar_io::find_sidecar(&data_dir.sidecar_root(library_id), photo_id)?.is_none()
+    {
         write_photo_sidecar(store, data_dir, desc, photo_id).await?;
     }
     Ok(())

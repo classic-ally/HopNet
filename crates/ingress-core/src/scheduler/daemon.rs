@@ -246,7 +246,6 @@ impl<F: ResourceFetcher> Scheduler<F> {
                                     state_slot.lock().expect("publish state").clone();
                                 let result = crate::publish::run_publish_pass(
                                     &shared.store,
-                                    &shared.data_dir,
                                     publisher.as_ref(),
                                     &shared.config.publish,
                                     claimed,

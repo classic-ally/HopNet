@@ -74,6 +74,8 @@ struct FakePublisher {
     seen: Mutex<Vec<PhotoId>>,
     /// The `cloud_fingerprint` each publish item carried, in call order.
     seen_fingerprints: Mutex<Vec<Option<String>>>,
+    /// The recomposed metadata document each publish item carried.
+    seen_sidecars: Mutex<Vec<ingress_core::sidecar::Sidecar>>,
     /// None = use the trait's legacy default (Holder, no entries).
     resolve_result: Mutex<Option<Result<ResolveOutcome, PublishError>>>,
     /// The cloud_id batches the pass sent to resolve.
@@ -93,6 +95,7 @@ impl FakePublisher {
             calls: AtomicU64::new(0),
             seen: Mutex::new(Vec::new()),
             seen_fingerprints: Mutex::new(Vec::new()),
+            seen_sidecars: Mutex::new(Vec::new()),
             resolve_result: Mutex::new(None),
             resolve_seen: Mutex::new(Vec::new()),
             gate: None,
@@ -128,6 +131,7 @@ impl Publisher for FakePublisher {
             .lock()
             .unwrap()
             .push(item.cloud_fingerprint.clone());
+        self.seen_sidecars.lock().unwrap().push(item.sidecar.clone());
         if let Some(gate) = &self.gate {
             let _permit = gate.acquire().await.unwrap();
         }
@@ -254,16 +258,9 @@ async fn photo(rig: &Rig, id: &PhotoId) -> ingress_core::PhotoRecord {
 
 async fn pass(rig: &Rig, publisher: &FakePublisher, state: &mut PublishState) -> ingress_core::publish::PublishReport {
     let claimed = claim(rig).await;
-    run_publish_pass(
-        &rig.store,
-        &rig.data_dir,
-        publisher,
-        &rig.config.publish,
-        claimed,
-        state,
-    )
-    .await
-    .unwrap()
+    run_publish_pass(&rig.store, publisher, &rig.config.publish, claimed, state)
+        .await
+        .unwrap()
 }
 
 // ------------------------------------------------------------------- tests
@@ -442,21 +439,20 @@ async fn rejection_gives_up_immediately() {
     assert_eq!(rig.store.log_events("publish_rejected").await.unwrap().len(), 1);
 }
 
-// Should: skip a claimed photo whose sidecar is missing (crash window) and
-// keep publishing the rest of the batch.
+// Should: skip a claimed photo whose publish-metadata capsule is absent
+// (pre-capsule row awaiting heal) and keep publishing the rest of the batch.
+// Should not: burn a publish attempt on the skipped photo.
 #[tokio::test(flavor = "multi_thread")]
-async fn missing_sidecar_skips_photo_but_batch_continues() {
+async fn missing_descriptor_skips_photo_but_batch_continues() {
     let rig = rig().await;
     let broken = materialize(&rig, "broken", b"broken-bytes").await;
     let healthy = materialize(&rig, "healthy", b"healthy-bytes").await;
 
-    let sidecar_root = rig
-        .data_dir
-        .sidecar_root(&ingress_core::LibraryId::new("personal"));
-    let path = ingress_core::sidecar_io::find_sidecar(&sidecar_root, &broken)
-        .unwrap()
-        .expect("sidecar written at materialization");
-    std::fs::remove_file(path).unwrap();
+    sqlx::query("UPDATE photos SET descriptor_json = NULL WHERE photo_id = ?")
+        .bind(&broken)
+        .execute(rig.store.raw_pool())
+        .await
+        .unwrap();
 
     let publisher = FakePublisher::ok();
     let mut state = PublishState::default();
@@ -465,15 +461,50 @@ async fn missing_sidecar_skips_photo_but_batch_continues() {
     assert_eq!(report.missing_sidecar, 1);
     assert_eq!(report.published, 1);
     assert!(photo(&rig, &healthy).await.published_at.is_some());
-    assert!(photo(&rig, &broken).await.published_at.is_none());
+    let broken_row = photo(&rig, &broken).await;
+    assert!(broken_row.published_at.is_none());
+    assert_eq!(broken_row.publish_attempts, 0);
     assert_eq!(
         rig.store
-            .log_events("publish_sidecar_missing")
+            .log_events("publish_descriptor_missing")
             .await
             .unwrap()
             .len(),
         1
     );
+}
+
+// Impact: state.db is the sole publish-metadata source — publish must not
+// depend on archive files the spool transplant deletes out from under it.
+// Should: publish a photo whose sidecar file is gone, recomposing metadata
+// from the persisted descriptor capsule and live DB rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn publishes_from_capsule_without_sidecar_file() {
+    let rig = rig().await;
+    let id = materialize(&rig, "a", b"a-bytes").await;
+
+    let sidecar_root = rig
+        .data_dir
+        .sidecar_root(&ingress_core::LibraryId::new("personal"));
+    let path = ingress_core::sidecar_io::find_sidecar(&sidecar_root, &id)
+        .unwrap()
+        .expect("sidecar written at materialization");
+    std::fs::remove_file(path).unwrap();
+
+    let publisher = FakePublisher::ok();
+    let mut state = PublishState::default();
+    let report = pass(&rig, &publisher, &mut state).await;
+
+    assert_eq!(report.published, 1);
+    assert_eq!(report.missing_sidecar, 0);
+    let sidecars = publisher.seen_sidecars.lock().unwrap();
+    assert_eq!(sidecars.len(), 1);
+    assert_eq!(sidecars[0].photo_id, id);
+    assert_eq!(
+        sidecars[0].library_id,
+        ingress_core::LibraryId::new("personal")
+    );
+    assert!(!sidecars[0].resources.is_empty());
 }
 
 // Impact: consensus hard-rejects duplicate photo ids (proposer preflight),
