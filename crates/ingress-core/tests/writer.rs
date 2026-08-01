@@ -3,7 +3,7 @@
 
 use ingress_core::fixtures::{AssetDescriptorBuilder, store_with_personal};
 use ingress_core::model::ResourceType;
-use ingress_core::paths::{BlobPaths, TempKey};
+use ingress_core::paths::{SpoolPaths, TempKey};
 use ingress_core::resolve::{resolve_descriptor, resolve_with_hash};
 use ingress_core::writer::{FinalizeOutcome, ResourceWrite, finalize_resource, place_blob};
 use ingress_core::{ContentHash, HashResolution, LibraryId, PhotoId, Resolution, StateStore};
@@ -11,14 +11,14 @@ use ingress_core::{ContentHash, HashResolution, LibraryId, PhotoId, Resolution, 
 struct Rig {
     store: StateStore,
     library: LibraryId,
-    paths: BlobPaths,
+    paths: SpoolPaths,
     _blob_dir: tempfile::TempDir,
 }
 
 async fn rig() -> Rig {
     let (store, library) = store_with_personal().await;
     let blob_dir = tempfile::tempdir().expect("temp blob root");
-    let paths = BlobPaths::new(blob_dir.path());
+    let paths = SpoolPaths::new(blob_dir.path());
     Rig {
         store,
         library,
@@ -28,7 +28,7 @@ async fn rig() -> Rig {
 }
 
 fn stream_chunks(
-    paths: &BlobPaths,
+    paths: &SpoolPaths,
     key: &TempKey,
     chunks: &[&[u8]],
 ) -> ingress_core::writer::FinishedStream {

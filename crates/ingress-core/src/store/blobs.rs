@@ -104,6 +104,20 @@ impl StateStore {
         .await?;
         Ok(())
     }
+
+    /// Whether ANY library's ledger row still expects this hash's bytes on
+    /// disk (unevicted). The spool is process-global — one file can back
+    /// rows in several libraries — so every unlink site must gate on this,
+    /// not on its own row alone.
+    pub async fn hash_is_live(&self, hash: &ContentHash) -> Result<bool> {
+        let (n,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM blobs WHERE content_hash = ? AND evicted_at IS NULL",
+        )
+        .bind(hash)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(n > 0)
+    }
 }
 
 /// Increment the refcount, creating the row at 1 if absent. On conflict the

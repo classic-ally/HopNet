@@ -213,6 +213,7 @@ impl<F: ResourceFetcher> Scheduler<F> {
                                     state_slot.lock().expect("publish state").clone();
                                 let result = crate::publish::run_publish_pass(
                                     &shared.store,
+                                    &shared.data_dir.spool(),
                                     publisher.as_ref(),
                                     &shared.config.publish,
                                     claimed,
@@ -433,7 +434,7 @@ impl<F: ResourceFetcher> Scheduler<F> {
         let scan = handle.scan.lock().expect("scan mutex").clone();
         match &event {
             ChangeEvent::Descriptor(desc) => {
-                match apply_change(&self.shared.store, desc).await {
+                match apply_change(&self.shared.store, &self.shared.data_dir.spool(), desc).await {
                     Ok((classification, outcome)) => {
                         counters.applied += 1;
                         counters.restores += outcome.restored as u64;

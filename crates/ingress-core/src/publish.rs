@@ -39,7 +39,7 @@ use chrono::Utc;
 use crate::error::Result;
 use crate::ids::{ContentHash, PhotoId};
 use crate::model::{LibraryConfig, PhotoRecord, ResourceType};
-use crate::paths::BlobPaths;
+use crate::paths::SpoolPaths;
 use crate::scheduler::BackoffConfig;
 use crate::descriptor::DescriptorCapsule;
 use crate::sidecar::Sidecar;
@@ -243,6 +243,7 @@ pub async fn claim_publishable(
 /// ends, which also excludes supersede/hard-move races on the blob reads).
 pub async fn run_publish_pass(
     store: &StateStore,
+    spool: &SpoolPaths,
     publisher: &dyn Publisher,
     cfg: &PublishConfig,
     claimed: Vec<PhotoRecord>,
@@ -359,7 +360,7 @@ pub async fn run_publish_pass(
     }
 
     for (photo, fingerprint) in remaining {
-        let mut item = match assemble_item(store, &photo).await? {
+        let mut item = match assemble_item(store, spool, &photo).await? {
             Ok(item) => item,
             Err(skip) => {
                 match skip {
@@ -437,7 +438,7 @@ pub async fn run_publish_pass(
     // local disk with minimal residence; the cleanup tick sweeps whatever a
     // crash window strands.
     report.evicted_blobs =
-        crate::cleanup::evict_published_blobs(store, EVICT_BATCH).await?;
+        crate::cleanup::evict_published_blobs(store, spool, EVICT_BATCH).await?;
 
     Ok(report)
 }
@@ -460,6 +461,7 @@ enum AssembleSkip {
 /// tombstone/move flows never have to edit the stored capsule.
 async fn assemble_item(
     store: &StateStore,
+    spool: &SpoolPaths,
     photo: &PhotoRecord,
 ) -> Result<std::result::Result<PublishItem, AssembleSkip>> {
     let Some(library_id) = &photo.library_id else {
@@ -489,7 +491,7 @@ async fn assemble_item(
         }
     };
 
-    let blob_paths = BlobPaths::new(&library.blob_root);
+    let blob_paths = spool;
     let records = store.resources_for_photo(&photo.photo_id).await?;
     let mut resources = Vec::new();
     for record in &records {

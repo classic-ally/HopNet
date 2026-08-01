@@ -21,7 +21,7 @@ use axum::{
 
 use super::flow::{self, Failure, ProvisioningDeps};
 use super::service;
-use super::{AgentRegistration, DisableRequest, DisableResponse, EnableRequest, PhotoIngressStatus};
+use super::{AgentRegistration, DisableRequest, DisableResponse, PhotoIngressStatus};
 use crate::db::CustomUUID;
 use crate::fileprovider::keychain;
 use crate::{AppState, auth::auth_middleware};
@@ -88,19 +88,6 @@ impl ProvisioningDeps for LiveDeps {
         keychain::load_photo_ingress_config().ok()
     }
 
-    fn load_blob_root(&self) -> Option<String> {
-        keychain::load_photo_ingress_blob_root().ok()
-    }
-
-    fn store_provisioning(
-        &self,
-        blob_root: &str,
-        sidecar_root_remote: Option<&str>,
-    ) -> Result<(), String> {
-        keychain::store_photo_ingress_provisioning(blob_root, sidecar_root_remote)
-            .map_err(|e| e.to_string())
-    }
-
     fn remove_config(&self) {
         keychain::remove_photo_ingress_config();
     }
@@ -116,11 +103,8 @@ async fn get_status(
 async fn post_enable(
     State(app_state): State<AppState>,
     Extension(user_id): Extension<i32>,
-    Json(req): Json<EnableRequest>,
 ) -> Result<Json<PhotoIngressStatus>, Failure> {
-    flow::enable(&LiveDeps { app_state }, user_id, req)
-        .await
-        .map(Json)
+    flow::enable(&LiveDeps { app_state }, user_id).await.map(Json)
 }
 
 async fn post_disable(

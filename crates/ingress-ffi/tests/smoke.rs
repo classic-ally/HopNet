@@ -54,12 +54,10 @@ fn slice_descriptor(cloud_id: &str, live_photo: bool) -> FfiAssetDescriptor {
 struct Rig {
     session: std::sync::Arc<IngressSession>,
     data_dir: tempfile::TempDir,
-    blob_dir: tempfile::TempDir,
 }
 
 fn rig() -> Rig {
     let data_dir = tempfile::tempdir().unwrap();
-    let blob_dir = tempfile::tempdir().unwrap();
     // Seed via ingress-core BEFORE the session opens its pool (the FFI's
     // ensure_personal_library generates ids; the rig wants the fixed
     // "personal" id), and drop the seeding store so exactly one writer pool
@@ -77,14 +75,6 @@ fn rig() -> Rig {
                 .insert_library(&ingress_core::LibraryConfig {
                     library_id: ingress_core::LibraryId::new("personal"),
                     display_name: "Personal".into(),
-                    blob_root: blob_dir.path().to_string_lossy().into_owned(),
-                    sidecar_root_remote: Some(
-                        blob_dir
-                            .path()
-                            .join("sidecar-backup")
-                            .to_string_lossy()
-                            .into_owned(),
-                    ),
                     scope_binding: None,
                     retention_days: 30,
                     created_at: chrono::Utc::now(),
@@ -97,7 +87,7 @@ fn rig() -> Rig {
     Rig {
         session,
         data_dir,
-        blob_dir,
+
     }
 }
 
@@ -167,11 +157,11 @@ fn end_to_end_live_photo() {
     assert_eq!(doc["capture"]["captured_at"], "2019-08-14T16:22:03+02:00");
     assert_eq!(doc["media_type"], "live_photo");
 
-    // Blobs live under the configured root; .partial is empty.
-    assert!(std::path::Path::new(&outcome.blob_path).starts_with(rig.blob_dir.path()));
-    let partial = rig.blob_dir.path().join("blobs").join(".partial");
+    // Blobs live under the data dir's spool; .partial is empty.
+    let spool = rig.data_dir.path().join("spool");
+    assert!(std::path::Path::new(&outcome.blob_path).starts_with(&spool));
+    let partial = spool.join("blobs").join(".partial");
     assert_eq!(std::fs::read_dir(&partial).unwrap().count(), 0);
-    let _ = &rig.data_dir;
 }
 
 // Should: resolve a re-delivered descriptor to AlreadyKnown without streaming.
@@ -330,14 +320,12 @@ fn cleanup_round_trip() {
         .session
         .cleanup(FfiCleanupOptions {
             log_retention_days: 180,
-            snapshot_keep: 7,
+
             hard_delete_batch: 500,
         })
         .unwrap();
     assert_eq!(report.photos_hard_deleted, 1);
     assert_eq!(report.blob_files_deleted, 1);
-    assert!(report.snapshots_written >= 1);
-    assert!(rig.blob_dir.path().join("state-snapshots").is_dir());
 }
 
 /// The FFI crate has no direct sqlx dev-dep; shell out to sqlite3 for the
@@ -386,10 +374,9 @@ fn sqlite_scalar(data_dir: &std::path::Path, sql: &str) -> String {
 #[test]
 fn ensure_personal_library_creates_when_absent() {
     let data_dir = tempfile::tempdir().unwrap();
-    let blob_dir = tempfile::tempdir().unwrap();
     let session = IngressSession::new(data_dir.path().to_string_lossy().into_owned()).unwrap();
     let outcome = session
-        .ensure_personal_library(blob_dir.path().to_string_lossy().into_owned(), None)
+        .ensure_personal_library()
         .unwrap();
     match outcome {
         FfiEnsureLibraryOutcome::Created { library_id, .. } => {
@@ -406,44 +393,18 @@ fn ensure_personal_library_creates_when_absent() {
     );
 }
 
-// Should: report the already-bound library (state.db wins) instead of
-// creating a second personal-routing candidate.
-// Should not: compare the provisioned blob_root against the bound one —
-// divergence is the platform side's warning to raise.
+// Should: report the already-existing library instead of creating a second
+// personal-routing candidate.
 #[test]
 fn ensure_personal_library_is_idempotent() {
     let rig = rig();
-    let outcome = rig
-        .session
-        .ensure_personal_library("/somewhere/else/entirely".into(), None)
-        .unwrap();
+    let outcome = rig.session.ensure_personal_library().unwrap();
     match outcome {
-        FfiEnsureLibraryOutcome::AlreadyExists {
-            library_id,
-            blob_root,
-        } => {
+        FfiEnsureLibraryOutcome::AlreadyExists { library_id } => {
             assert_eq!(library_id, "personal");
-            assert_eq!(blob_root, rig.blob_dir.path().to_string_lossy());
         }
         other => panic!("expected AlreadyExists, got {other:?}"),
     }
-}
-
-// Should: reject a relative blob root before any state is written.
-#[test]
-fn ensure_personal_library_rejects_relative_blob_root() {
-    let data_dir = tempfile::tempdir().unwrap();
-    let session = IngressSession::new(data_dir.path().to_string_lossy().into_owned()).unwrap();
-    assert!(matches!(
-        session
-            .ensure_personal_library("relative/blobs".into(), None)
-            .unwrap_err(),
-        FfiError::Invariant { .. }
-    ));
-    assert_eq!(
-        sqlite_scalar(data_dir.path(), "SELECT COUNT(*) FROM libraries"),
-        "0"
-    );
 }
 
 // Impact: library writes and daemon/CLI runs share one exclusive run lock;
@@ -452,7 +413,6 @@ fn ensure_personal_library_rejects_relative_blob_root() {
 #[test]
 fn ensure_personal_library_refuses_live_run_lock() {
     let data_dir = tempfile::tempdir().unwrap();
-    let blob_dir = tempfile::tempdir().unwrap();
     let session = IngressSession::new(data_dir.path().to_string_lossy().into_owned()).unwrap();
     // A lock file stamped with THIS (live) pid reads as another running
     // process to the acquire path.
@@ -463,7 +423,7 @@ fn ensure_personal_library_refuses_live_run_lock() {
     .unwrap();
     assert!(matches!(
         session
-            .ensure_personal_library(blob_dir.path().to_string_lossy().into_owned(), None)
+            .ensure_personal_library()
             .unwrap_err(),
         FfiError::Invariant { .. }
     ));

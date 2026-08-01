@@ -37,7 +37,9 @@ async fn run(cli: Cli) -> Result<ExitCode, IngressError> {
             let store = open_read_only(&data_dir).await?;
             match args.photo {
                 Some(key) => {
-                    let Some(view) = ingress_core::status::photo_status(&store, &key).await? else {
+                    let Some(view) =
+                        ingress_core::status::photo_status(&store, &data_dir.spool(), &key).await?
+                    else {
                         eprintln!("no photo matches {key:?} (tried photo_id, then cloud_id)");
                         return Ok(ExitCode::from(2));
                     };
@@ -98,10 +100,6 @@ async fn run_library(data_dir: &DataDir, cmd: LibraryCommand) -> Result<ExitCode
             let opts = ingress_core::libconfig::AddLibraryOptions {
                 id,
                 display_name: args.display_name,
-                blob_root: args.blob_root.to_string_lossy().into_owned(),
-                sidecar_root_remote: args
-                    .sidecar_remote
-                    .map(|p| p.to_string_lossy().into_owned()),
                 scope: match args.scope {
                     AddScope::Personal => LibraryScope::Personal,
                     AddScope::Shared => LibraryScope::Shared,
@@ -128,25 +126,11 @@ async fn run_library(data_dir: &DataDir, cmd: LibraryCommand) -> Result<ExitCode
                             l.library_id.to_string(),
                             l.display_name.clone(),
                             l.scope_binding.clone().unwrap_or_else(|| "personal".into()),
-                            l.blob_root.clone(),
-                            l.sidecar_root_remote
-                                .clone()
-                                .unwrap_or_else(|| "NO BACKUP".into()),
                             l.retention_days.to_string(),
                         ]
                     })
                     .collect();
-                render::table(
-                    &[
-                        "ID",
-                        "NAME",
-                        "SCOPE",
-                        "BLOB ROOT",
-                        "REMOTE SIDECARS",
-                        "RETENTION",
-                    ],
-                    &rows,
-                );
+                render::table(&["ID", "NAME", "SCOPE", "RETENTION"], &rows);
             }
             Ok(ExitCode::SUCCESS)
         }

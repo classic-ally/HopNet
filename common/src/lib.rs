@@ -29,7 +29,7 @@ pub use fileprovider::{
 };
 pub use hash::Blake3Hash;
 pub use photo_ingress::{
-    AgentRegistration, DisableRequest, DisableResponse, EnableRequest, PhotoIngressStatus,
+    AgentRegistration, DisableRequest, DisableResponse, PhotoIngressStatus,
 };
 pub use shares::{
     AcceptShareRequest, IncomingShareResponse, ShareCountResponse, ShareDetailResponse,

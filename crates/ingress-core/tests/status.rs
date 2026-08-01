@@ -5,7 +5,7 @@ use chrono::{Duration, Utc};
 use ingress_core::classify::apply_removal;
 use ingress_core::fixtures::AssetDescriptorBuilder;
 use ingress_core::model::{ICLOUD_SHARED_LIBRARY_BINDING, LibraryConfig, ResourceType};
-use ingress_core::paths::BlobPaths;
+use ingress_core::paths::DataDir;
 use ingress_core::resolve::{SeedOutcome, seed_descriptor};
 use ingress_core::status::{photo_status, status};
 use ingress_core::{AssetDescriptor, ContentHash, LibraryId, LibraryScope, PhotoId, StateStore};
@@ -19,8 +19,6 @@ async fn store_personal_only(tmp: &std::path::Path) -> (StateStore, LibraryId) {
         .insert_library(&LibraryConfig {
             library_id: personal.clone(),
             display_name: "Personal".into(),
-            blob_root: tmp.join("blobs-personal").to_string_lossy().into_owned(),
-            sidecar_root_remote: None,
             scope_binding: None,
             retention_days: 30,
             created_at: Utc::now(),
@@ -30,14 +28,12 @@ async fn store_personal_only(tmp: &std::path::Path) -> (StateStore, LibraryId) {
     (store, personal)
 }
 
-async fn add_shared_library(store: &StateStore, tmp: &std::path::Path) -> LibraryId {
+async fn add_shared_library(store: &StateStore, _tmp: &std::path::Path) -> LibraryId {
     let shared = LibraryId::new("shared_household");
     store
         .insert_library(&LibraryConfig {
             library_id: shared.clone(),
             display_name: "Shared".into(),
-            blob_root: tmp.join("blobs-shared").to_string_lossy().into_owned(),
-            sidecar_root_remote: None,
             scope_binding: Some(ICLOUD_SHARED_LIBRARY_BINDING.to_string()),
             retention_days: 30,
             created_at: Utc::now(),
@@ -54,21 +50,15 @@ async fn seed_one(store: &StateStore, desc: &AssetDescriptor) -> PhotoId {
     }
 }
 
-/// Materialize every pending resource with real blob bytes + persist the capsule.
+/// Materialize every pending resource with real spool bytes + persist the
+/// capsule.
 async fn materialize_all(
     store: &StateStore,
+    data_dir: &DataDir,
     desc: &AssetDescriptor,
     photo_id: &PhotoId,
 ) {
-    let library = store
-        .photo(photo_id)
-        .await
-        .unwrap()
-        .unwrap()
-        .library_id
-        .unwrap();
-    let config = store.library(&library).await.unwrap().unwrap();
-    let paths = BlobPaths::new(&config.blob_root);
+    let paths = data_dir.spool();
     for row in store.resources_for_photo(photo_id).await.unwrap() {
         if row.written_at.is_some() {
             continue;
@@ -103,6 +93,7 @@ async fn materialize_all(
 async fn library_stats_reflect_mixed_population() {
     let tmp = tempfile::tempdir().unwrap();
     let (store, personal) = store_personal_only(tmp.path()).await;
+    let data_dir = DataDir::new(tmp.path().join("data"));
     let shared = add_shared_library(&store, tmp.path()).await;
 
     // Personal: one materialized-active, one materialized-tombstoned, one pending.
@@ -110,14 +101,14 @@ async fn library_stats_reflect_mixed_population() {
         .with_cloud_id("cloud-done")
         .build();
     let done_id = seed_one(&store, &done).await;
-    materialize_all(&store, &done, &done_id).await;
+    materialize_all(&store, &data_dir, &done, &done_id).await;
 
     let doomed = AssetDescriptorBuilder::simple_image()
         .with_cloud_id("cloud-doomed")
         .with_local_id("local-doomed")
         .build();
     let doomed_id = seed_one(&store, &doomed).await;
-    materialize_all(&store, &doomed, &doomed_id).await;
+    materialize_all(&store, &data_dir, &doomed, &doomed_id).await;
     apply_removal(&store, "local-doomed")
         .await
         .unwrap();
@@ -133,7 +124,7 @@ async fn library_stats_reflect_mixed_population() {
         .scope(LibraryScope::Shared)
         .build();
     let shared_id = seed_one(&store, &shared_desc).await;
-    materialize_all(&store, &shared_desc, &shared_id).await;
+    materialize_all(&store, &data_dir, &shared_desc, &shared_id).await;
 
     let report = status(&store, 5).await.unwrap();
     assert_eq!(report.libraries.len(), 2);
@@ -165,6 +156,7 @@ async fn library_stats_reflect_mixed_population() {
 async fn pipeline_view_splits_work_states() {
     let tmp = tempfile::tempdir().unwrap();
     let (store, _personal) = store_personal_only(tmp.path()).await;
+    let _data_dir = DataDir::new(tmp.path().join("data"));
 
     // Fresh pending resource.
     let fresh = AssetDescriptorBuilder::simple_image()
@@ -222,20 +214,21 @@ async fn pipeline_view_splits_work_states() {
 async fn photo_view_resolves_both_keys_with_paths() {
     let tmp = tempfile::tempdir().unwrap();
     let (store, _personal) = store_personal_only(tmp.path()).await;
+    let data_dir = DataDir::new(tmp.path().join("data"));
 
     let desc = AssetDescriptorBuilder::live_photo()
         .with_cloud_id("cloud-live")
         .with_local_id("local-live")
         .build();
     let id = seed_one(&store, &desc).await;
-    materialize_all(&store, &desc, &id).await;
+    materialize_all(&store, &data_dir, &desc, &id).await;
     // Tombstone to generate a photo-scoped log event.
     apply_removal(&store, "local-live")
         .await
         .unwrap();
 
     for key in [id.as_str(), "cloud-live"] {
-        let view = photo_status(&store, key)
+        let view = photo_status(&store, &data_dir.spool(), key)
             .await
             .unwrap()
             .unwrap_or_else(|| panic!("lookup by {key:?} missed"));
@@ -244,7 +237,7 @@ async fn photo_view_resolves_both_keys_with_paths() {
         assert_eq!(view.resources.len(), 2); // original + paired video
         for res in &view.resources {
             let path = res.blob_path.as_ref().expect("written resource has path");
-            assert!(path.to_string_lossy().contains("blobs-personal"));
+            assert!(path.to_string_lossy().contains("spool"));
             assert_eq!(res.blob_exists, Some(true));
         }
         assert!(view.photo.descriptor_json.is_some(), "capsule present");
@@ -257,7 +250,7 @@ async fn photo_view_resolves_both_keys_with_paths() {
     }
 
     assert!(
-        photo_status(&store, "no-such-key")
+        photo_status(&store, &data_dir.spool(), "no-such-key")
             .await
             .unwrap()
             .is_none()

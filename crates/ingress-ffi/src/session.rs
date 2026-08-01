@@ -13,7 +13,7 @@ use chrono::Utc;
 use ingress_core::descriptor::AssetDescriptor;
 use ingress_core::ext::{ExtDerivation, ext_for_uti};
 use ingress_core::model::ResourceType;
-use ingress_core::paths::{BlobPaths, DataDir, TempKey};
+use ingress_core::paths::{DataDir, SpoolPaths, TempKey};
 use ingress_core::resolve::{HashResolution, Resolution, resolve_descriptor, resolve_with_hash};
 use ingress_core::writer::{ResourceWrite, finalize_resource};
 use ingress_core::{LibraryId, PhotoId, StateStore};
@@ -78,20 +78,18 @@ impl IngressSession {
     }
 
     /// Ensure a personal (NULL-scope) library exists, creating one with the
-    /// CLI-equivalent defaults when absent.
+    /// CLI-equivalent defaults when absent. Takes no configuration — the
+    /// spool is data-dir-derived, so a personal library needs no user
+    /// input at all.
     ///
     /// Deliberate partial reversal of the Phase-6 "libconfig is CLI-only"
-    /// rule: the sandboxed GUI app cannot write `~/.local/share/...` and the
-    /// root workspace cannot link ingress-core (sha2 workspace split), so
-    /// the daemon is the only process that can bind the library the
-    /// enablement flow provisions. Ensure-only — bind/rename/set-retention
-    /// stay CLI-only. Called at daemon startup BEFORE `run_daemon` acquires
-    /// the run lock (`add_library` takes it exclusively itself).
-    pub fn ensure_personal_library(
-        &self,
-        blob_root: String,
-        sidecar_root_remote: Option<String>,
-    ) -> Result<FfiEnsureLibraryOutcome, FfiError> {
+    /// rule: the root workspace cannot link ingress-core (sha2 workspace
+    /// split), so the daemon is the only process that can create the
+    /// library the enablement flow needs. Ensure-only — bind/rename/
+    /// set-retention stay CLI-only. Called at daemon startup BEFORE
+    /// `run_daemon` acquires the run lock (`add_library` takes it
+    /// exclusively itself).
+    pub fn ensure_personal_library(&self) -> Result<FfiEnsureLibraryOutcome, FfiError> {
         use ingress_core::descriptor::LibraryScope;
         use ingress_core::libconfig::{AddLibraryOptions, add_library};
 
@@ -99,14 +97,11 @@ impl IngressSession {
         if let Some(l) = existing.iter().find(|l| l.scope_binding.is_none()) {
             return Ok(FfiEnsureLibraryOutcome::AlreadyExists {
                 library_id: l.library_id.to_string(),
-                blob_root: l.blob_root.clone(),
             });
         }
         let opts = AddLibraryOptions {
             id: None,
             display_name: None,
-            blob_root,
-            sidecar_root_remote,
             scope: LibraryScope::Personal,
             // Mirrors the ingress-cli `library add` default.
             retention_days: 30,
@@ -116,7 +111,6 @@ impl IngressSession {
             .block_on(add_library(&self.inner.store, &self.inner.data_dir, &opts))?;
         Ok(FfiEnsureLibraryOutcome::Created {
             library_id: added.config.library_id.to_string(),
-            warn_no_remote: added.warn_no_remote,
         })
     }
 
@@ -228,7 +222,7 @@ impl IngressSession {
             })?;
 
         let ext = self.derive_ext(&uti, original_filename.as_deref(), Some(&photo.photo_id))?;
-        let paths = BlobPaths::new(&library.blob_root);
+        let paths = self.inner.data_dir.spool();
         let key = TempKey::Resource {
             photo_id: photo.photo_id.clone(),
             resource_type,
@@ -578,7 +572,7 @@ impl IngressSession {
     pub fn cleanup(&self, options: FfiCleanupOptions) -> Result<FfiCleanupReport, FfiError> {
         let cfg = ingress_core::cleanup::CleanupConfig {
             log_retention_days: options.log_retention_days.max(0),
-            snapshot_keep: options.snapshot_keep.max(1) as usize,
+
             hard_delete_batch: options.hard_delete_batch.max(1) as usize,
         };
         let cleanup = self
@@ -598,20 +592,20 @@ fn cleanup_report_to_ffi(cleanup: &ingress_core::cleanup::CleanupReport) -> FfiC
         photos_hard_deleted: cleanup.photos_hard_deleted,
         blob_files_deleted: cleanup.blob_files_deleted,
         log_rows_pruned: cleanup.log_rows_pruned,
-        snapshots_written: cleanup.snapshots_written,
+
         spool_evicted: cleanup.spool_evicted,
     }
 }
 
 impl IngressSession {
-    fn library_for(&self, desc: &AssetDescriptor) -> Result<(LibraryId, BlobPaths), FfiError> {
+    fn library_for(&self, desc: &AssetDescriptor) -> Result<(LibraryId, SpoolPaths), FfiError> {
         let config = self
             .runtime
             .block_on(self.inner.store.library_for_scope(desc.scope))?
             .ok_or(FfiError::UnmappedScope {
                 msg: format!("{:?}", desc.scope),
             })?;
-        let paths = BlobPaths::new(&config.blob_root);
+        let paths = self.inner.data_dir.spool();
         Ok((config.library_id, paths))
     }
 
@@ -650,7 +644,7 @@ enum SinkKind {
 
 struct SinkState {
     write: ResourceWrite,
-    paths: BlobPaths,
+    paths: SpoolPaths,
     library: LibraryId,
     ext: String,
     kind: SinkKind,

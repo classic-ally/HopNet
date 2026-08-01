@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use crate::error::{IngressError, Result};
 use crate::ids::{ContentHash, LibraryId, PhotoId};
 use crate::model::ResourceType;
-use crate::paths::{BlobPaths, TempKey};
+use crate::paths::{SpoolPaths, TempKey};
 use crate::store::StateStore;
 
 /// Facts about a completed stream, produced by [`ResourceWrite::finish`].
@@ -42,7 +42,7 @@ impl ResourceWrite {
     /// Open the temp for writing. Creates `.partial/` on demand; truncates
     /// any stale temp with the same key — re-entry after an abandoned
     /// stream is a fresh start.
-    pub fn begin(paths: &BlobPaths, key: &TempKey) -> Result<Self> {
+    pub fn begin(paths: &SpoolPaths, key: &TempKey) -> Result<Self> {
         let dir = paths.partial_dir();
         fs::create_dir_all(&dir).map_err(io_err)?;
         let temp_path = paths.temp_path(key);
@@ -88,7 +88,7 @@ fn io_err(e: std::io::Error) -> IngressError {
 /// Startup sweep (spec §Write path crash windows): delete every file under
 /// `.partial/` — nothing ever references temps, so this is always safe.
 /// Returns the number of files removed.
-pub fn sweep_partials(paths: &BlobPaths) -> Result<u64> {
+pub fn sweep_partials(paths: &SpoolPaths) -> Result<u64> {
     let dir = paths.partial_dir();
     let mut removed = 0u64;
     match fs::read_dir(&dir) {
@@ -135,7 +135,7 @@ pub(crate) fn sync_file(file: &fs::File) -> std::io::Result<()> {
 /// temp, create the fan-out dirs, atomically rename into place, best-effort
 /// fsync the parent dir. Separately callable so crash-window tests can
 /// exercise "renamed but not committed" without fault injection.
-pub fn place_blob(paths: &BlobPaths, finished: &FinishedStream, ext: &str) -> Result<PathBuf> {
+pub fn place_blob(paths: &SpoolPaths, finished: &FinishedStream, ext: &str) -> Result<PathBuf> {
     let file = fs::File::open(&finished.temp_path).map_err(io_err)?;
     sync_file(&file).map_err(io_err)?;
     drop(file);
@@ -194,7 +194,7 @@ impl FinalizeOutcome {
 /// committed row never references bytes that might not exist.
 pub async fn finalize_resource(
     store: &StateStore,
-    paths: &BlobPaths,
+    paths: &SpoolPaths,
     library: &LibraryId,
     photo_id: &PhotoId,
     resource_type: ResourceType,
@@ -241,7 +241,11 @@ pub async fn finalize_resource(
 
     // Reap a superseded blob whose refcount hit 0 — after the commit, so a
     // crash here leaves only a benign orphan file (recovery's orphan scan).
-    if let Some((old_hash, old_ext)) = commit.reap_superseded {
+    // Guarded on liveness: the spool is process-global, so another
+    // library's row may still back the same file.
+    if let Some((old_hash, old_ext)) = commit.reap_superseded
+        && !store.hash_is_live(&old_hash).await?
+    {
         let _ = fs::remove_file(paths.blob_path(&old_hash, &old_ext));
     }
 

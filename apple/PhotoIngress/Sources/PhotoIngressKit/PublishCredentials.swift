@@ -25,17 +25,6 @@ public enum PublishCredentials {
         return Credentials(baseUrl: url, deviceToken: token)
     }
 
-    /// Library provisioning values the app stores alongside the token
-    /// (enablement flow): the personal library's blob root and the optional
-    /// remote sidecar root. Absent until the user enables photo ingress.
-    public static func loadBlobRoot() -> String? {
-        loadItem(account: "blob_root")
-    }
-
-    public static func loadSidecarRootRemote() -> String? {
-        loadItem(account: "sidecar_root_remote")
-    }
-
     private static func loadItem(account: String) -> String? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,

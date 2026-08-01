@@ -15,5 +15,5 @@ pub mod routes;
 pub mod service;
 
 pub use hopnet_common::photo_ingress::{
-    AgentRegistration, DisableRequest, DisableResponse, EnableRequest, PhotoIngressStatus,
+    AgentRegistration, DisableRequest, DisableResponse, PhotoIngressStatus,
 };

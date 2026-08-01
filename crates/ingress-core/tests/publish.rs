@@ -167,8 +167,6 @@ async fn rig() -> Rig {
         .insert_library(&ingress_core::LibraryConfig {
             library_id: ingress_core::LibraryId::new("personal"),
             display_name: "Personal".into(),
-            blob_root: blob_dir.path().to_string_lossy().into_owned(),
-            sidecar_root_remote: None,
             scope_binding: None,
             retention_days: 30,
             created_at: Utc::now(),
@@ -257,7 +255,14 @@ async fn photo(rig: &Rig, id: &PhotoId) -> ingress_core::PhotoRecord {
 
 async fn pass(rig: &Rig, publisher: &FakePublisher, state: &mut PublishState) -> ingress_core::publish::PublishReport {
     let claimed = claim(rig).await;
-    run_publish_pass(&rig.store, publisher, &rig.config.publish, claimed, state)
+    run_publish_pass(
+        &rig.store,
+        &rig.data_dir.spool(),
+        publisher,
+        &rig.config.publish,
+        claimed,
+        state,
+    )
         .await
         .unwrap()
 }
@@ -510,9 +515,9 @@ async fn republished_reedit_is_not_reclaimed() {
     let mut state = PublishState::default();
     assert_eq!(pass(&rig, &publisher, &mut state).await.published, 1);
 
-    // Simulate a re-edit completing: re-materialized, sidecar re-dirtied.
+    // Simulate a re-edit completing: re-materialized.
     sqlx::query(
-        "UPDATE photos SET materialized_at = ?, sidecar_replicated_at = NULL WHERE photo_id = ?",
+        "UPDATE photos SET materialized_at = ? WHERE photo_id = ?",
     )
     .bind(Utc::now())
     .bind(&id)
@@ -809,13 +814,7 @@ async fn resolve_failure_burns_one_attempt_per_photo() {
 /// The on-disk blob file for a written resource of `id`.
 async fn blob_file(rig: &Rig, id: &PhotoId) -> std::path::PathBuf {
     let row = &rig.store.resources_for_photo(id).await.unwrap()[0];
-    let config = rig
-        .store
-        .library(&ingress_core::LibraryId::new("personal"))
-        .await
-        .unwrap()
-        .unwrap();
-    ingress_core::paths::BlobPaths::new(&config.blob_root).blob_path(
+    rig.data_dir.spool().blob_path(
         row.content_hash.as_ref().unwrap(),
         row.ext.as_deref().unwrap(),
     )

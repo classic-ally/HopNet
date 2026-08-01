@@ -32,20 +32,7 @@ pub struct PhotoIngressStatus {
     /// by a few seconds right after enable (registration is a consensus
     /// submit); stays false after a revoke until re-enable.
     pub device_row_present: bool,
-    pub blob_root: Option<String>,
     pub node_base_url: Option<String>,
-}
-
-/// POST /photo-ingress/enable request.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[typeshare]
-pub struct EnableRequest {
-    /// Absolute path to the personal library's blob root. Applied by the
-    /// daemon's startup auto-bind; once a library is bound, state.db wins
-    /// and a changed value here only produces a daemon-side warning.
-    pub blob_root: String,
-    #[serde(default)]
-    pub sidecar_root_remote: Option<String>,
 }
 
 /// POST /photo-ingress/disable request.

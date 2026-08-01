@@ -64,9 +64,6 @@ pub struct AddLibraryOptions {
     pub id: Option<LibraryId>,
     /// None = default by scope ("Personal Library" / "Shared Library").
     pub display_name: Option<String>,
-    /// Absolute path to the per-library subtree on the storage root.
-    pub blob_root: String,
-    pub sidecar_root_remote: Option<String>,
     pub scope: LibraryScope,
     pub retention_days: i64,
 }
@@ -74,9 +71,6 @@ pub struct AddLibraryOptions {
 #[derive(Debug)]
 pub struct AddedLibrary {
     pub config: LibraryConfig,
-    /// No remote sidecar root configured — recovery from a dead Mac
-    /// degrades to blob-only. The CLI prints the loud warning.
-    pub warn_no_remote: bool,
 }
 
 pub async fn add_library(
@@ -86,12 +80,6 @@ pub async fn add_library(
 ) -> Result<AddedLibrary> {
     let _lock = acquire_repairing(store, data_dir).await?;
 
-    if !std::path::Path::new(&opts.blob_root).is_absolute() {
-        return Err(IngressError::Invariant(format!(
-            "blob root must be an absolute path (got {:?})",
-            opts.blob_root
-        )));
-    }
     if opts.retention_days < 0 {
         return Err(IngressError::Invariant(
             "retention days must be >= 0".into(),
@@ -150,8 +138,6 @@ pub async fn add_library(
             }
             .to_string()
         }),
-        blob_root: opts.blob_root.clone(),
-        sidecar_root_remote: opts.sidecar_root_remote.clone(),
         scope_binding,
         retention_days: opts.retention_days,
         created_at: Utc::now(),
@@ -169,17 +155,12 @@ pub async fn add_library(
                 LibraryScope::Personal => "personal",
                 LibraryScope::Shared => "shared",
             },
-            "blob_root": config.blob_root,
         })),
     )
     .await?;
     tx.commit().await?;
 
-    let warn_no_remote = config.sidecar_root_remote.is_none();
-    Ok(AddedLibrary {
-        config,
-        warn_no_remote,
-    })
+    Ok(AddedLibrary { config })
 }
 
 /// Attach the shared-scope marker to a library, or detach it (`scope` =

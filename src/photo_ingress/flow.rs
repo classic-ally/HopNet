@@ -12,8 +12,8 @@ use std::str::FromStr;
 use axum::http::StatusCode;
 use tracing::warn;
 
-use super::helpers::{build_status, device_id_from_token, validate_blob_root};
-use super::{AgentRegistration, DisableRequest, DisableResponse, EnableRequest, PhotoIngressStatus};
+use super::helpers::{build_status, device_id_from_token};
+use super::{AgentRegistration, DisableRequest, DisableResponse, PhotoIngressStatus};
 use crate::db::CustomUUID;
 
 pub(crate) type Failure = (StatusCode, String);
@@ -35,12 +35,6 @@ pub(crate) trait ProvisioningDeps {
 
     // Keychain. `load_config` is the stored `(api_key, base_url)` pair.
     fn load_config(&self) -> Option<(String, String)>;
-    fn load_blob_root(&self) -> Option<String>;
-    fn store_provisioning(
-        &self,
-        blob_root: &str,
-        sidecar_root_remote: Option<&str>,
-    ) -> Result<(), String>;
     fn remove_config(&self);
 }
 
@@ -65,13 +59,12 @@ fn current_status(
     registration: AgentRegistration,
 ) -> PhotoIngressStatus {
     let keychain_pair = deps.load_config();
-    let blob_root = deps.load_blob_root();
     let present = deps.device_row_present(
         keychain_pair
             .as_ref()
             .and_then(|(api_key, _)| device_id_from_token(api_key)),
     );
-    build_status(registration, keychain_pair, blob_root, present)
+    build_status(registration, keychain_pair, present)
 }
 
 pub(crate) async fn status(
@@ -86,20 +79,17 @@ pub(crate) async fn status(
 pub(crate) async fn enable(
     deps: &impl ProvisioningDeps,
     user_id: i32,
-    req: EnableRequest,
 ) -> Result<PhotoIngressStatus, Failure> {
     ensure_owner(deps, user_id)?;
-    validate_blob_root(&req.blob_root).map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
 
-    // 1. Token (mint, or heal a revoked one; no-op while valid).
+    // 1. Token (mint, or heal a revoked one; no-op while valid) — in the
+    //    keychain BEFORE launchd can spawn the daemon. The daemon needs no
+    //    other configuration: the spool is data-dir-derived and the
+    //    personal library self-creates at startup.
     deps.ensure_device_token(user_id)
         .await
         .map_err(|status| (status, "device token provisioning failed".into()))?;
-    // 2. Library provisioning — in the keychain BEFORE launchd can spawn
-    //    the daemon, so its startup auto-bind sees it.
-    deps.store_provisioning(&req.blob_root, req.sidecar_root_remote.as_deref())
-        .map_err(internal)?;
-    // 3. Lifecycle handoff to launchd. RequiresApproval is a success —
+    // 2. Lifecycle handoff to launchd. RequiresApproval is a success —
     //    surfaced in the status for the caller to act on.
     let registration = deps.register_agent().await.map_err(internal)?;
 
@@ -154,10 +144,8 @@ mod tests {
     struct MockDeps {
         calls: Mutex<Vec<&'static str>>,
         token: Mutex<Option<String>>,
-        blob_root: Mutex<Option<String>>,
         revoked: Mutex<Vec<CustomUUID>>,
         mint_fails: bool,
-        store_fails: bool,
         unregister_fails: bool,
         revoke_fails: bool,
         register_requires_approval: bool,
@@ -167,7 +155,6 @@ mod tests {
         fn provisioned() -> Self {
             let deps = Self::default();
             *deps.token.lock().unwrap() = Some(TOKEN.into());
-            *deps.blob_root.lock().unwrap() = Some("/blobs".into());
             deps
         }
 
@@ -240,34 +227,9 @@ mod tests {
                 .map(|t| (t, "http://127.0.0.1:1".into()))
         }
 
-        fn load_blob_root(&self) -> Option<String> {
-            self.blob_root.lock().unwrap().clone()
-        }
-
-        fn store_provisioning(
-            &self,
-            blob_root: &str,
-            _sidecar_root_remote: Option<&str>,
-        ) -> Result<(), String> {
-            self.log("store");
-            if self.store_fails {
-                return Err("keychain write refused".into());
-            }
-            *self.blob_root.lock().unwrap() = Some(blob_root.into());
-            Ok(())
-        }
-
         fn remove_config(&self) {
             self.log("remove");
             *self.token.lock().unwrap() = None;
-            *self.blob_root.lock().unwrap() = None;
-        }
-    }
-
-    fn enable_req() -> EnableRequest {
-        EnableRequest {
-            blob_root: "/blobs".into(),
-            sidecar_root_remote: None,
         }
     }
 
@@ -287,7 +249,7 @@ mod tests {
         let intruder = OWNER + 1;
 
         let s = status(&deps, intruder).await;
-        let e = enable(&deps, intruder, enable_req()).await;
+        let e = enable(&deps, intruder).await;
         let d = disable(&deps, intruder, disable_req()).await;
 
         assert_eq!(s.unwrap_err().0, StatusCode::FORBIDDEN);
@@ -298,47 +260,32 @@ mod tests {
     }
 
     // Impact: launchd may spawn the daemon the instant registration lands;
-    // credentials and blob root must already be readable or its startup
-    // auto-bind races an empty keychain.
-    // Should: mint the token, then store provisioning, then register — in
-    // that order.
+    // the credentials must already be readable or its first publish tick
+    // runs ingest-only until a restart.
+    // Should: mint the token, then register — in that order.
     #[tokio::test]
     async fn enable_provisions_keychain_before_registering() {
         let deps = MockDeps::default();
-        let status = enable(&deps, OWNER, enable_req()).await.unwrap();
+        let status = enable(&deps, OWNER).await.unwrap();
 
-        assert_eq!(deps.calls(), vec!["mint", "store", "register"]);
+        assert_eq!(deps.calls(), vec!["mint", "register"]);
         assert_eq!(status.registration, AgentRegistration::Enabled);
         assert!(status.keychain_provisioned);
         assert_eq!(status.device_id.as_deref(), Some(DEVICE_ID));
     }
 
-    // Should not: write the keychain or register the agent when token
-    // minting fails; the mint failure status propagates to the caller.
+    // Should not: register the agent when token minting fails; the mint
+    // failure status propagates to the caller.
     #[tokio::test]
-    async fn enable_stops_before_keychain_when_mint_fails() {
+    async fn enable_stops_when_mint_fails() {
         let deps = MockDeps {
             mint_fails: true,
             ..Default::default()
         };
-        let err = enable(&deps, OWNER, enable_req()).await.unwrap_err();
+        let err = enable(&deps, OWNER).await.unwrap_err();
 
         assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(deps.calls(), vec!["mint"]);
-        assert!(deps.blob_root.lock().unwrap().is_none());
-    }
-
-    // Should not: register the agent when the keychain write fails.
-    #[tokio::test]
-    async fn enable_stops_before_register_when_store_fails() {
-        let deps = MockDeps {
-            store_fails: true,
-            ..Default::default()
-        };
-        let err = enable(&deps, OWNER, enable_req()).await.unwrap_err();
-
-        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(deps.calls(), vec!["mint", "store"]);
     }
 
     // Should: treat registration landing in RequiresApproval as success and
@@ -350,7 +297,7 @@ mod tests {
             register_requires_approval: true,
             ..Default::default()
         };
-        let status = enable(&deps, OWNER, enable_req()).await.unwrap();
+        let status = enable(&deps, OWNER).await.unwrap();
 
         assert_eq!(status.registration, AgentRegistration::RequiresApproval);
     }

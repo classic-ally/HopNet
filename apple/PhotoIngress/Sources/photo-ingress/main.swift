@@ -64,8 +64,8 @@ func runSetup() throws {
     try ensureAuthorized()
     print("Photos authorization: granted")
     print("next: configure libraries with")
-    print("  ingress-cli --data-dir \(dataDir) library add --blob-root <path> --scope personal")
-    print("  ingress-cli --data-dir \(dataDir) library add --blob-root <path> --scope shared")
+    print("  ingress-cli --data-dir \(dataDir) library add --scope personal")
+    print("  ingress-cli --data-dir \(dataDir) library add --scope shared")
 }
 
 func runIngest() throws {
@@ -88,7 +88,7 @@ func runIngest() throws {
         return
     case .unmappedScope(let photoId):
         print("resolution: UNMAPPED SCOPE photo_id=\(photoId)")
-        print("run setup with the appropriate blob root to bind this scope")
+        print("bind this scope with: ingress-cli library add --scope shared")
         return
     case .adopted(let photoId):
         print("resolution: ADOPTED photo_id=\(photoId) — pending rows now drain-eligible")
@@ -217,7 +217,6 @@ func printCleanup(_ c: FfiCleanupReport, indent: String = "  ") {
     print("\(indent)photos hard-deleted:  \(c.photosHardDeleted)")
     print("\(indent)blob files deleted:   \(c.blobFilesDeleted)")
     print("\(indent)log rows pruned:      \(c.logRowsPruned)")
-    print("\(indent)snapshots written:    \(c.snapshotsWritten)")
     print("\(indent)spool evicted:        \(c.spoolEvicted)")
 }
 
@@ -227,7 +226,6 @@ func runCleanup() throws {
     let session = try IngressSession(dataDir: dataDir)
     let report = try session.cleanup(options: FfiCleanupOptions(
         logRetentionDays: Int64(intFlag("--log-retention-days", default: 180)),
-        snapshotKeep: UInt32(intFlag("--snapshot-keep", default: 7)),
         hardDeleteBatch: UInt32(intFlag("--hard-delete-batch", default: 500))
     ))
     print("cleanup report:")
@@ -240,24 +238,17 @@ func runDaemon() throws {
     try ensureAuthorized()
     let session = try IngressSession(dataDir: dataDir)
 
-    // Startup auto-bind (enablement flow): the HopNet app provisions
-    // blob_root via the keychain; binding must precede the startup scan so
-    // seeded assets route into the library instead of minting unmapped
-    // rows. A failure (e.g. ingress-cli holds the run lock) aborts startup —
-    // the run lock would block the daemon loop anyway; launchd retries.
-    if let blobRoot = PublishCredentials.loadBlobRoot() {
-        switch try session.ensurePersonalLibrary(
-            blobRoot: blobRoot,
-            sidecarRootRemote: PublishCredentials.loadSidecarRootRemote())
-        {
-        case .created(let libraryId, _):
-            print("library auto-bind: created \(libraryId) blob_root=\(blobRoot)")
-        case .alreadyExists(let libraryId, let boundRoot):
-            if boundRoot != blobRoot {
-                print("WARNING: provisioned blob_root \(blobRoot) differs from " +
-                      "bound \(boundRoot) (\(libraryId)) — state.db wins")
-            }
-        }
+    // Startup library ensure: the personal library needs no configuration
+    // (the spool is data-dir-derived), so it is created unconditionally
+    // when absent — this must precede the startup scan so seeded assets
+    // route into the library instead of minting unmapped rows. A failure
+    // (e.g. ingress-cli holds the run lock) aborts startup — the run lock
+    // would block the daemon loop anyway; launchd retries.
+    switch try session.ensurePersonalLibrary() {
+    case .created(let libraryId):
+        print("personal library created: \(libraryId)")
+    case .alreadyExists:
+        break
     }
 
     let fetcher = PhotoKitFetcher()

@@ -803,17 +803,19 @@ public protocol IngressSessionProtocol: AnyObject, Sendable {
     
     /**
      * Ensure a personal (NULL-scope) library exists, creating one with the
-     * CLI-equivalent defaults when absent.
+     * CLI-equivalent defaults when absent. Takes no configuration — the
+     * spool is data-dir-derived, so a personal library needs no user
+     * input at all.
      *
      * Deliberate partial reversal of the Phase-6 "libconfig is CLI-only"
-     * rule: the sandboxed GUI app cannot write `~/.local/share/...` and the
-     * root workspace cannot link ingress-core (sha2 workspace split), so
-     * the daemon is the only process that can bind the library the
-     * enablement flow provisions. Ensure-only — bind/rename/set-retention
-     * stay CLI-only. Called at daemon startup BEFORE `run_daemon` acquires
-     * the run lock (`add_library` takes it exclusively itself).
+     * rule: the root workspace cannot link ingress-core (sha2 workspace
+     * split), so the daemon is the only process that can create the
+     * library the enablement flow needs. Ensure-only — bind/rename/
+     * set-retention stay CLI-only. Called at daemon startup BEFORE
+     * `run_daemon` acquires the run lock (`add_library` takes it
+     * exclusively itself).
      */
-    func ensurePersonalLibrary(blobRoot: String, sidecarRootRemote: String?) throws  -> FfiEnsureLibraryOutcome
+    func ensurePersonalLibrary() throws  -> FfiEnsureLibraryOutcome
     
     /**
      * Close the active scan: offline-deletion synthesis (guarded against
@@ -1019,22 +1021,22 @@ open func drain(fetcher: PhotoResourceFetcher, options: FfiDrainOptions)throws  
     
     /**
      * Ensure a personal (NULL-scope) library exists, creating one with the
-     * CLI-equivalent defaults when absent.
+     * CLI-equivalent defaults when absent. Takes no configuration — the
+     * spool is data-dir-derived, so a personal library needs no user
+     * input at all.
      *
      * Deliberate partial reversal of the Phase-6 "libconfig is CLI-only"
-     * rule: the sandboxed GUI app cannot write `~/.local/share/...` and the
-     * root workspace cannot link ingress-core (sha2 workspace split), so
-     * the daemon is the only process that can bind the library the
-     * enablement flow provisions. Ensure-only — bind/rename/set-retention
-     * stay CLI-only. Called at daemon startup BEFORE `run_daemon` acquires
-     * the run lock (`add_library` takes it exclusively itself).
+     * rule: the root workspace cannot link ingress-core (sha2 workspace
+     * split), so the daemon is the only process that can create the
+     * library the enablement flow needs. Ensure-only — bind/rename/
+     * set-retention stay CLI-only. Called at daemon startup BEFORE
+     * `run_daemon` acquires the run lock (`add_library` takes it
+     * exclusively itself).
      */
-open func ensurePersonalLibrary(blobRoot: String, sidecarRootRemote: String?)throws  -> FfiEnsureLibraryOutcome  {
+open func ensurePersonalLibrary()throws  -> FfiEnsureLibraryOutcome  {
     return try  FfiConverterTypeFfiEnsureLibraryOutcome_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_ingress_ffi_fn_method_ingresssession_ensure_personal_library(
-            self.uniffiCloneHandle(),
-        FfiConverterString.lower(blobRoot),
-        FfiConverterOptionString.lower(sidecarRootRemote),$0
+            self.uniffiCloneHandle(),$0
     )
 })
 }
@@ -1934,14 +1936,12 @@ public func FfiConverterTypeFfiCaptureMetadata_lower(_ value: FfiCaptureMetadata
  */
 public struct FfiCleanupOptions: Equatable, Hashable {
     public var logRetentionDays: Int64
-    public var snapshotKeep: UInt32
     public var hardDeleteBatch: UInt32
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(logRetentionDays: Int64, snapshotKeep: UInt32, hardDeleteBatch: UInt32) {
+    public init(logRetentionDays: Int64, hardDeleteBatch: UInt32) {
         self.logRetentionDays = logRetentionDays
-        self.snapshotKeep = snapshotKeep
         self.hardDeleteBatch = hardDeleteBatch
     }
 
@@ -1962,14 +1962,12 @@ public struct FfiConverterTypeFfiCleanupOptions: FfiConverterRustBuffer {
         return
             try FfiCleanupOptions(
                 logRetentionDays: FfiConverterInt64.read(from: &buf), 
-                snapshotKeep: FfiConverterUInt32.read(from: &buf), 
                 hardDeleteBatch: FfiConverterUInt32.read(from: &buf)
         )
     }
 
     public static func write(_ value: FfiCleanupOptions, into buf: inout [UInt8]) {
         FfiConverterInt64.write(value.logRetentionDays, into: &buf)
-        FfiConverterUInt32.write(value.snapshotKeep, into: &buf)
         FfiConverterUInt32.write(value.hardDeleteBatch, into: &buf)
     }
 }
@@ -1997,16 +1995,14 @@ public struct FfiCleanupReport: Equatable, Hashable {
     public var photosHardDeleted: UInt64
     public var blobFilesDeleted: UInt64
     public var logRowsPruned: UInt64
-    public var snapshotsWritten: UInt64
     public var spoolEvicted: UInt64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(photosHardDeleted: UInt64, blobFilesDeleted: UInt64, logRowsPruned: UInt64, snapshotsWritten: UInt64, spoolEvicted: UInt64) {
+    public init(photosHardDeleted: UInt64, blobFilesDeleted: UInt64, logRowsPruned: UInt64, spoolEvicted: UInt64) {
         self.photosHardDeleted = photosHardDeleted
         self.blobFilesDeleted = blobFilesDeleted
         self.logRowsPruned = logRowsPruned
-        self.snapshotsWritten = snapshotsWritten
         self.spoolEvicted = spoolEvicted
     }
 
@@ -2029,7 +2025,6 @@ public struct FfiConverterTypeFfiCleanupReport: FfiConverterRustBuffer {
                 photosHardDeleted: FfiConverterUInt64.read(from: &buf), 
                 blobFilesDeleted: FfiConverterUInt64.read(from: &buf), 
                 logRowsPruned: FfiConverterUInt64.read(from: &buf), 
-                snapshotsWritten: FfiConverterUInt64.read(from: &buf), 
                 spoolEvicted: FfiConverterUInt64.read(from: &buf)
         )
     }
@@ -2038,7 +2033,6 @@ public struct FfiConverterTypeFfiCleanupReport: FfiConverterRustBuffer {
         FfiConverterUInt64.write(value.photosHardDeleted, into: &buf)
         FfiConverterUInt64.write(value.blobFilesDeleted, into: &buf)
         FfiConverterUInt64.write(value.logRowsPruned, into: &buf)
-        FfiConverterUInt64.write(value.snapshotsWritten, into: &buf)
         FfiConverterUInt64.write(value.spoolEvicted, into: &buf)
     }
 }
@@ -2072,7 +2066,8 @@ public struct FfiDaemonOptions: Equatable, Hashable {
     public var pressurePauseSecs: UInt64
     public var storagePollSecs: UInt64
     /**
-     * Hourly lifecycle job cadence (hard deletes, log pruning, snapshots).
+     * Hourly lifecycle job cadence (hard deletes, log pruning, spool
+     * eviction sweep).
      */
     public var cleanupIntervalSecs: UInt64
     /**
@@ -2093,7 +2088,8 @@ public struct FfiDaemonOptions: Equatable, Hashable {
     // declare one manually.
     public init(fetchConcurrency: UInt32, retryCap: Int64, retryBaseSecs: UInt64, retryMaxSecs: UInt64, reserveFloorGib: UInt64, pressurePauseSecs: UInt64, storagePollSecs: UInt64, 
         /**
-         * Hourly lifecycle job cadence (hard deletes, log pruning, snapshots).
+         * Hourly lifecycle job cadence (hard deletes, log pruning, spool
+         * eviction sweep).
          */cleanupIntervalSecs: UInt64, 
         /**
          * HopNet publish tick: node base URL (WITHOUT `/api`) + RFC-012 device
@@ -3062,7 +3058,7 @@ public func FfiConverterTypeFfiWriteOutcome_lower(_ value: FfiWriteOutcome) -> R
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
- * Outcome of the daemon's startup library auto-bind (see
+ * Outcome of the daemon's startup library ensure (see
  * `IngressSession::ensure_personal_library`).
  */
 
@@ -3070,18 +3066,14 @@ public enum FfiEnsureLibraryOutcome: Equatable, Hashable {
     
     /**
      * No personal library existed; one was created (CLI-equivalent
-     * defaults). `warn_no_remote` mirrors the CLI's loud warning: without
-     * a remote sidecar root, recovery from a dead Mac degrades to
-     * blob-only.
+     * defaults).
      */
-    case created(libraryId: String, warnNoRemote: Bool
+    case created(libraryId: String
     )
     /**
-     * A personal library already existed — nothing written. `blob_root` is
-     * the BOUND root (state.db wins); the platform side warns when its
-     * provisioned value diverges.
+     * A personal library already existed — nothing written.
      */
-    case alreadyExists(libraryId: String, blobRoot: String
+    case alreadyExists(libraryId: String
     )
 
 
@@ -3104,10 +3096,10 @@ public struct FfiConverterTypeFfiEnsureLibraryOutcome: FfiConverterRustBuffer {
         let variant: Int32 = try readInt(&buf)
         switch variant {
         
-        case 1: return .created(libraryId: try FfiConverterString.read(from: &buf), warnNoRemote: try FfiConverterBool.read(from: &buf)
+        case 1: return .created(libraryId: try FfiConverterString.read(from: &buf)
         )
         
-        case 2: return .alreadyExists(libraryId: try FfiConverterString.read(from: &buf), blobRoot: try FfiConverterString.read(from: &buf)
+        case 2: return .alreadyExists(libraryId: try FfiConverterString.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -3118,16 +3110,14 @@ public struct FfiConverterTypeFfiEnsureLibraryOutcome: FfiConverterRustBuffer {
         switch value {
         
         
-        case let .created(libraryId,warnNoRemote):
+        case let .created(libraryId):
             writeInt(&buf, Int32(1))
             FfiConverterString.write(libraryId, into: &buf)
-            FfiConverterBool.write(warnNoRemote, into: &buf)
             
         
-        case let .alreadyExists(libraryId,blobRoot):
+        case let .alreadyExists(libraryId):
             writeInt(&buf, Int32(2))
             FfiConverterString.write(libraryId, into: &buf)
-            FfiConverterString.write(blobRoot, into: &buf)
             
         }
     }
@@ -4196,7 +4186,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_ingress_ffi_checksum_method_ingresssession_drain() != 12569) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ingress_ffi_checksum_method_ingresssession_ensure_personal_library() != 64532) {
+    if (uniffi_ingress_ffi_checksum_method_ingresssession_ensure_personal_library() != 59593) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ingress_ffi_checksum_method_ingresssession_finish_scan() != 31670) {

@@ -65,7 +65,6 @@ fn make_item(dir: &std::path::Path, resources: Vec<(&str, &str, Vec<u8>)>) -> Pu
             discovered_at: now,
             asset_modified_at: None,
             materialized_at: Some(now),
-            sidecar_replicated_at: None,
             descriptor_json: None,
             published_at: None,
             publish_attempts: 0,
@@ -77,8 +76,6 @@ fn make_item(dir: &std::path::Path, resources: Vec<(&str, &str, Vec<u8>)>) -> Pu
         library: ingress_core::LibraryConfig {
             library_id: library_id.clone(),
             display_name: "Personal".into(),
-            blob_root: dir.to_string_lossy().into_owned(),
-            sidecar_root_remote: None,
             scope_binding: None,
             retention_days: 30,
             created_at: now,

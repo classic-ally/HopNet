@@ -159,25 +159,15 @@ pub struct FfiScanSummary {
     pub synthesis_skipped: bool,
 }
 
-/// Outcome of the daemon's startup library auto-bind (see
+/// Outcome of the daemon's startup library ensure (see
 /// `IngressSession::ensure_personal_library`).
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum FfiEnsureLibraryOutcome {
     /// No personal library existed; one was created (CLI-equivalent
-    /// defaults). `warn_no_remote` mirrors the CLI's loud warning: without
-    /// a remote sidecar root, recovery from a dead Mac degrades to
-    /// blob-only.
-    Created {
-        library_id: String,
-        warn_no_remote: bool,
-    },
-    /// A personal library already existed — nothing written. `blob_root` is
-    /// the BOUND root (state.db wins); the platform side warns when its
-    /// provisioned value diverges.
-    AlreadyExists {
-        library_id: String,
-        blob_root: String,
-    },
+    /// defaults).
+    Created { library_id: String },
+    /// A personal library already existed — nothing written.
+    AlreadyExists { library_id: String },
 }
 
 /// Daemon knobs — the drain knobs plus the lifecycle-tick cadences (the
@@ -191,7 +181,8 @@ pub struct FfiDaemonOptions {
     pub reserve_floor_gib: u64,
     pub pressure_pause_secs: u64,
     pub storage_poll_secs: u64,
-    /// Hourly lifecycle job cadence (hard deletes, log pruning, snapshots).
+    /// Hourly lifecycle job cadence (hard deletes, log pruning, spool
+    /// eviction sweep).
     pub cleanup_interval_secs: u64,
     /// HopNet publish tick: node base URL (WITHOUT `/api`) + RFC-012 device
     /// token (`{device_id}.{secret}`). Both set = publishing on; either
@@ -208,7 +199,6 @@ pub struct FfiDaemonOptions {
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiCleanupOptions {
     pub log_retention_days: i64,
-    pub snapshot_keep: u32,
     pub hard_delete_batch: u32,
 }
 
@@ -218,7 +208,6 @@ pub struct FfiCleanupReport {
     pub photos_hard_deleted: u64,
     pub blob_files_deleted: u64,
     pub log_rows_pruned: u64,
-    pub snapshots_written: u64,
     pub spool_evicted: u64,
 }
 

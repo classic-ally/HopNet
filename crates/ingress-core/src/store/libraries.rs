@@ -51,13 +51,11 @@ where
 {
     sqlx::query(
         "INSERT INTO libraries \
-         (library_id, display_name, blob_root, sidecar_root_remote, scope_binding, retention_days, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+         (library_id, display_name, scope_binding, retention_days, created_at) \
+         VALUES (?, ?, ?, ?, ?)",
     )
     .bind(&lib.library_id)
     .bind(&lib.display_name)
-    .bind(&lib.blob_root)
-    .bind(&lib.sidecar_root_remote)
     .bind(&lib.scope_binding)
     .bind(lib.retention_days)
     .bind(lib.created_at)

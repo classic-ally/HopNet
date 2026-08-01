@@ -63,20 +63,14 @@ pub fn print_status(report: &StatusReport) {
                 l.stats.photos_active.to_string(),
                 l.stats.photos_pending.to_string(),
                 l.stats.tombstones.to_string(),
-                l.stats.dirty_sidecars.to_string(),
                 l.stats.blob_count.to_string(),
                 human_bytes(l.stats.blob_bytes),
-                if l.config.sidecar_root_remote.is_some() {
-                    "yes".into()
-                } else {
-                    "NO BACKUP".into()
-                },
             ]
         })
         .collect();
     table(
         &[
-            "ID", "NAME", "ACTIVE", "PENDING", "TOMB", "DIRTY", "BLOBS", "SIZE", "REMOTE",
+            "ID", "NAME", "ACTIVE", "PENDING", "TOMB", "BLOBS", "SIZE",
         ],
         &rows,
     );
@@ -210,9 +204,6 @@ pub fn print_fsck(report: &FsckReport) {
     );
     for f in &report.foreign_files {
         println!("  {}", f.display());
-    }
-    for skipped in &report.skipped_roots {
-        println!("note: skipped {skipped} — rerun with the mount up for full coverage");
     }
     if report.is_clean() {
         println!("clean");

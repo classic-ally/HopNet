@@ -1,62 +1,38 @@
 //! Library transitions — the hard move (spec §Asset migrating between
-//! libraries): a photo's bytes are physically relocated so its full state
-//! lives under the destination library's subtree. The `photo_id` is retained.
-//!
-//! Ordering deviates from the spec's step numbering deliberately: files are
-//! copied BEFORE the refcount transaction (spec errata — a dst refcount
-//! committed ahead of the copy could reference bytes that never arrived,
-//! which fsck classifies as byte loss). Copy-first leaves only benign
-//! orphans, matching the write path's durability-precedes-commit invariant.
-
-use std::fs;
-use std::io::{Read, Write as _};
+//! libraries). With the process-global spool there are no per-library byte
+//! trees: a hard move is a pure ledger operation — transfer the refcounts
+//! between the libraries' `blobs` rows and repoint `photos.library_id`.
+//! The file never moves; the `photo_id` is retained.
 
 use crate::error::{IngressError, Result};
 use crate::ids::{ContentHash, LibraryId, PhotoId};
-use crate::paths::BlobPaths;
 use crate::store::StateStore;
-
-fn io_err(e: std::io::Error) -> IngressError {
-    IngressError::Invariant(format!("transition io: {e}"))
-}
 
 /// Counters from one transition, for logging and daemon reporting.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct TransitionReport {
-    /// Blobs physically copied to the destination root.
-    pub blobs_copied: u64,
-    /// Blobs already present at the destination (refcount-only increment).
-    pub blobs_shared: u64,
-    /// Source files deleted (refcount reached 0 at the source).
-    pub src_files_deleted: u64,
+    /// Written resources whose refcounts transferred src → dst.
+    pub blobs_transferred: u64,
 }
 
-/// Execute a hard move (spec's seven steps, copy-first):
-///
-/// 1. Pre-tx: copy every written blob absent at the destination
-///    (`.partial` temp + fsync + rename — idempotent, skip when present).
-/// 2. One transaction: per written resource, increment the dst refcount and
-///    decrement the src (reaping the src row at 0); repoint
-///    `photos.library_id`; append `library_transition {src, dst}`.
-/// 3. Post-tx: delete reaped src files. Metadata needs no relocation — the
-///    publish capsule lives on the photo row and `library_id` is repointed
-///    in step 2.
+/// Execute a hard move, in one transaction: per written resource, increment
+/// the dst refcount and decrement the src (reaping the src row at 0 —
+/// never the file: the dst row references it); repoint `photos.library_id`;
+/// append `library_transition {src, dst}`. Metadata needs no relocation —
+/// the publish capsule lives on the photo row. A spool-evicted src blob
+/// passes its eviction stamp to the dst row post-tx (the bytes are
+/// deliberately gone; HopNet holds them).
 pub async fn execute_transition(
     store: &StateStore,
     photo_id: &PhotoId,
     src: &LibraryId,
     dst: &LibraryId,
 ) -> Result<TransitionReport> {
-    let src_config = store
-        .library(src)
-        .await?
-        .ok_or_else(|| IngressError::Invariant(format!("no library row {src}")))?;
-    let dst_config = store
-        .library(dst)
-        .await?
-        .ok_or_else(|| IngressError::Invariant(format!("no library row {dst}")))?;
-    let src_paths = BlobPaths::new(&src_config.blob_root);
-    let dst_paths = BlobPaths::new(&dst_config.blob_root);
+    for lib in [src, dst] {
+        if store.library(lib).await?.is_none() {
+            return Err(IngressError::Invariant(format!("no library row {lib}")));
+        }
+    }
 
     let written: Vec<(ContentHash, String, i64)> = store
         .resources_for_photo(photo_id)
@@ -67,43 +43,24 @@ pub async fn execute_transition(
         .collect();
 
     let mut report = TransitionReport::default();
-
-    // Step 1 — pre-transaction filesystem copies. The dst `blobs` row is the
-    // authority for "already there" (spec step 3's refcount check); the file
-    // check on top makes re-runs after a partial crash idempotent. A
-    // spool-evicted src blob has no bytes to move — the dst row inherits
-    // the eviction stamp post-tx instead (the referent is decided; HopNet
-    // holds the bytes).
     let mut inherit_eviction: Vec<ContentHash> = Vec::new();
-    for (hash, ext, _) in &written {
-        // First-writer-wins carries the SOURCE library's ext to the dst.
-        let dst_present =
-            store.blob(dst, hash).await?.is_some() || dst_paths.blob_path(hash, ext).is_file();
-        let src_evicted = store
+    for (hash, _, _) in &written {
+        if store
             .blob(src, hash)
             .await?
-            .is_some_and(|b| b.evicted_at.is_some());
-        if dst_present {
-            report.blobs_shared += 1;
-        } else if src_evicted {
-            report.blobs_shared += 1;
+            .is_some_and(|b| b.evicted_at.is_some())
+            && store.blob(dst, hash).await?.is_none()
+        {
             inherit_eviction.push(hash.clone());
-        } else {
-            copy_blob(&src_paths, &dst_paths, hash, ext)?;
-            report.blobs_copied += 1;
         }
     }
 
-    // Step 2 — single transaction over all refcounts + the photo row.
-    let mut reap: Vec<(ContentHash, String)> = Vec::new();
     let mut tx = store.pool().begin().await?;
     for (hash, ext, size_bytes) in &written {
+        // First-writer-wins carries the SOURCE library's ext to the dst.
         crate::store::blobs::upsert_increment(&mut *tx, dst, hash, ext, *size_bytes).await?;
-        if let Some(reaped_ext) =
-            crate::store::blobs::decrement_and_reap(&mut tx, src, hash).await?
-        {
-            reap.push((hash.clone(), reaped_ext));
-        }
+        crate::store::blobs::decrement_and_reap(&mut tx, src, hash).await?;
+        report.blobs_transferred += 1;
     }
     crate::store::photos::set_library(&mut *tx, photo_id, dst).await?;
     crate::store::log::append(
@@ -115,47 +72,9 @@ pub async fn execute_transition(
     .await?;
     tx.commit().await?;
 
-    // Step 3 — post-transaction cleanup. Failures here leave benign orphans.
-    for (hash, ext) in &reap {
-        if fs::remove_file(src_paths.blob_path(hash, ext)).is_ok() {
-            report.src_files_deleted += 1;
-        }
-    }
     for hash in &inherit_eviction {
         store.stamp_blob_evicted(dst, hash).await?;
     }
 
     Ok(report)
-}
-
-/// Copy one blob between library roots via the destination's `.partial/`
-/// directory + fsync + atomic rename (same crash discipline as the write
-/// path; renames cannot cross filesystems, so the temp lives on the dst).
-fn copy_blob(src: &BlobPaths, dst: &BlobPaths, hash: &ContentHash, ext: &str) -> Result<()> {
-    let src_path = src.blob_path(hash, ext);
-    let dst_path = dst.blob_path(hash, ext);
-
-    fs::create_dir_all(dst.partial_dir()).map_err(io_err)?;
-    let tmp = dst.partial_dir().join(format!("move-{hash}.{ext}"));
-
-    let mut reader = fs::File::open(&src_path).map_err(io_err)?;
-    let mut writer = fs::File::create(&tmp).map_err(io_err)?;
-    let mut buf = vec![0u8; 1 << 20];
-    loop {
-        let n = reader.read(&mut buf).map_err(io_err)?;
-        if n == 0 {
-            break;
-        }
-        writer.write_all(&buf[..n]).map_err(io_err)?;
-    }
-    crate::writer::sync_file(&writer).map_err(io_err)?;
-    drop(writer);
-
-    let parent = dst_path.parent().expect("blob path has fan-out parents");
-    fs::create_dir_all(parent).map_err(io_err)?;
-    fs::rename(&tmp, &dst_path).map_err(io_err)?;
-    if let Ok(dir) = fs::File::open(parent) {
-        let _ = dir.sync_all();
-    }
-    Ok(())
 }

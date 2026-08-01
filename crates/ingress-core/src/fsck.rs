@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 
 use crate::error::Result;
 use crate::ids::{ContentHash, LibraryId};
-use crate::model::LibraryConfig;
-use crate::paths::{BlobPaths, DataDir};
+
+use crate::paths::DataDir;
 use crate::recovery::{RefcountDrift, recount_diff, repair_refcounts};
 use crate::store::StateStore;
 
@@ -41,7 +41,6 @@ pub struct MissingBlob {
 /// rename and commit, or a crashed hard-delete's leftovers).
 #[derive(Debug, serde::Serialize)]
 pub struct OrphanBlob {
-    pub library_id: LibraryId,
     pub path: PathBuf,
 }
 
@@ -69,9 +68,6 @@ pub struct FsckReport {
     /// Unparseable names or wrong-depth entries in the blob tree — never
     /// deleted, listed for the operator.
     pub foreign_files: Vec<PathBuf>,
-    /// Roots that could not be checked (mount down). Advisory: an absent
-    /// mount must never read as byte loss.
-    pub skipped_roots: Vec<String>,
 }
 
 impl FsckReport {
@@ -119,10 +115,7 @@ pub async fn run_fsck(
         report.refcount_repaired = true;
     }
 
-    let libraries = store.libraries().await?;
-    for library in &libraries {
-        check_blob_tree(store, library, opts, &mut report).await?;
-    }
+    check_blob_tree(store, &data_dir.spool(), opts, &mut report).await?;
 
     if report.orphans_deleted > 0 {
         let samples: Vec<String> = report
@@ -145,52 +138,46 @@ pub async fn run_fsck(
     Ok(report)
 }
 
-/// Blob-existence (b) and orphan-scan (c) checks for one library.
+/// Blob-existence (b) and orphan-scan (c) checks over the process-global
+/// spool. The spool is hash-addressed: one file can back rows in several
+/// libraries, so a hash is "live" (bytes expected on disk) iff ANY
+/// library's row for it is unevicted.
 async fn check_blob_tree(
     store: &StateStore,
-    library: &LibraryConfig,
+    spool: &crate::paths::SpoolPaths,
     opts: &FsckOptions,
     report: &mut FsckReport,
 ) -> Result<()> {
-    let paths = BlobPaths::new(&library.blob_root);
-    let rows = store.blobs_for_library(&library.library_id).await?;
-
-    // Mount-down guard: an entirely-absent root is advisory, not thousands
-    // of byte-loss findings.
-    if !Path::new(&library.blob_root).is_dir() {
-        report.skipped_roots.push(format!(
-            "{}: blob root unavailable ({})",
-            library.library_id, library.blob_root
-        ));
-        return Ok(());
+    // Live hashes across every library. Spool-evicted rows are excluded —
+    // their bytes are SUPPOSED to be gone (HopNet holds them) — so a
+    // lingering file for an all-evicted hash classifies as a benign orphan
+    // in the walk below.
+    let mut row_exts: HashMap<ContentHash, (String, LibraryId)> = HashMap::new();
+    for library in store.libraries().await? {
+        for row in store.blobs_for_library(&library.library_id).await? {
+            if row.evicted_at.is_none() {
+                row_exts.insert(row.content_hash, (row.ext, library.library_id.clone()));
+            }
+        }
     }
 
-    // (b) every UNEVICTED row's file must exist. The root is reachable
-    // here, so a miss is genuine. Spool-evicted rows are the opposite:
-    // their bytes are SUPPOSED to be gone (HopNet holds them), so they are
-    // excluded here AND from `row_exts` — a lingering file for an evicted
-    // row then classifies as a benign orphan in the walk below.
-    let mut row_exts: HashMap<ContentHash, String> = HashMap::new();
-    for row in rows {
-        if row.evicted_at.is_some() {
-            continue;
-        }
-        let expected = paths.blob_path(&row.content_hash, &row.ext);
+    // (b) every live hash's file must exist. The spool is a local
+    // directory — no mount-down class.
+    for (hash, (ext, library_id)) in &row_exts {
+        let expected = spool.blob_path(hash, ext);
         if !expected.is_file() {
             report.missing_blobs.push(MissingBlob {
-                library_id: library.library_id.clone(),
-                content_hash: row.content_hash.clone(),
-                ext: row.ext.clone(),
+                library_id: library_id.clone(),
+                content_hash: hash.clone(),
+                ext: ext.clone(),
                 expected_path: expected,
             });
         }
-        row_exts.insert(row.content_hash, row.ext);
     }
 
-    // (c) walk <blob_root>/blobs/ two fan-out levels, skipping .partial
-    // and Finder's .DS_Store droppings (browsing the share plants them at
-    // every level; flagging them would pin fsck at exit 1 forever).
-    let blobs_dir = paths.blobs_dir();
+    // (c) walk <spool>/blobs/ two fan-out levels, skipping .partial and
+    // Finder's .DS_Store droppings.
+    let blobs_dir = spool.blobs_dir();
     if !blobs_dir.is_dir() {
         return Ok(()); // nothing written yet; (b) already covered the rows
     }
@@ -213,14 +200,7 @@ async fn check_blob_tree(
                 continue;
             }
             for entry in fs::read_dir(bb.path()).map_err(io_invariant)?.flatten() {
-                classify_blob_file(
-                    &entry.path(),
-                    (&name, &bb_name),
-                    library,
-                    &row_exts,
-                    opts,
-                    report,
-                );
+                classify_blob_file(&entry.path(), (&name, &bb_name), &row_exts, opts, report);
             }
         }
     }
@@ -231,8 +211,7 @@ async fn check_blob_tree(
 fn classify_blob_file(
     path: &Path,
     fanout: (&str, &str),
-    library: &LibraryConfig,
-    row_exts: &HashMap<ContentHash, String>,
+    row_exts: &HashMap<ContentHash, (String, LibraryId)>,
     opts: &FsckOptions,
     report: &mut FsckReport,
 ) {
@@ -263,9 +242,9 @@ fn classify_blob_file(
     };
 
     match row_exts.get(&hash) {
-        Some(row_ext) if *row_ext == file_ext => {} // expected
-        Some(row_ext) => report.ext_mismatches.push(ExtMismatch {
-            library_id: library.library_id.clone(),
+        Some((row_ext, _)) if *row_ext == file_ext => {} // expected
+        Some((row_ext, library_id)) => report.ext_mismatches.push(ExtMismatch {
+            library_id: library_id.clone(),
             content_hash: hash,
             row_ext: row_ext.clone(),
             file_ext,
@@ -276,7 +255,6 @@ fn classify_blob_file(
                 report.orphans_deleted += 1;
             }
             report.orphan_blobs.push(OrphanBlob {
-                library_id: library.library_id.clone(),
                 path: path.to_path_buf(),
             });
         }

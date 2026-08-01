@@ -1,20 +1,18 @@
-//! Lifecycle scenarios (spec §Hard-delete cleanup, §State snapshots) —
-//! Phase 5, minus the archive-era sidecar replication (removed with the
-//! sidecar file layer).
+//! Lifecycle scenarios (spec §Hard-delete cleanup): retention hard-deletes,
+//! log pruning, and the spool-eviction sweep.
 
 use chrono::{Duration, Utc};
 use ingress_core::classify::{apply_change, apply_removal};
 use ingress_core::cleanup::{CleanupConfig, run_cleanup};
 use ingress_core::fixtures::AssetDescriptorBuilder;
 use ingress_core::model::{ICLOUD_SHARED_LIBRARY_BINDING, LibraryConfig};
-use ingress_core::paths::{BlobPaths, DataDir};
+use ingress_core::paths::DataDir;
 use ingress_core::resolve::{SeedOutcome, seed_descriptor};
 use ingress_core::{AssetDescriptor, ContentHash, LibraryId, LibraryScope, PhotoId, StateStore};
 
-/// Personal + shared libraries with tempdir blob roots. File-backed (not
-/// in-memory): snapshots go through `VACUUM INTO`, which silently no-ops on
-/// an in-memory store.
-async fn store_with_libs(tmp: &std::path::Path) -> (StateStore, LibraryId, LibraryId) {
+/// Personal + shared libraries over a file-backed store, plus the data dir
+/// whose spool holds every blob.
+async fn rig(tmp: &std::path::Path) -> (StateStore, DataDir, LibraryId, LibraryId) {
     let store = StateStore::open(&tmp.join("state.db")).await.unwrap();
     let personal = LibraryId::new("personal");
     let shared = LibraryId::new("shared_household");
@@ -30,11 +28,6 @@ async fn store_with_libs(tmp: &std::path::Path) -> (StateStore, LibraryId, Libra
             .insert_library(&LibraryConfig {
                 library_id: id.clone(),
                 display_name: name.into(),
-                blob_root: tmp
-                    .join(format!("blobs-{id}"))
-                    .to_string_lossy()
-                    .into_owned(),
-                sidecar_root_remote: None,
                 scope_binding: binding,
                 retention_days: 30,
                 created_at: Utc::now(),
@@ -42,7 +35,9 @@ async fn store_with_libs(tmp: &std::path::Path) -> (StateStore, LibraryId, Libra
             .await
             .unwrap();
     }
-    (store, personal, shared)
+    let data_dir = DataDir::new(tmp.join("data"));
+    std::fs::create_dir_all(data_dir.root()).unwrap();
+    (store, data_dir, personal, shared)
 }
 
 async fn seed_one(store: &StateStore, desc: &AssetDescriptor) -> PhotoId {
@@ -52,18 +47,15 @@ async fn seed_one(store: &StateStore, desc: &AssetDescriptor) -> PhotoId {
     }
 }
 
-/// Materialize every pending resource with real blob bytes + persist the
+/// Materialize every pending resource with real spool bytes + persist the
 /// publish-metadata capsule.
-async fn materialize_all(store: &StateStore, desc: &AssetDescriptor, photo_id: &PhotoId) {
-    let library = store
-        .photo(photo_id)
-        .await
-        .unwrap()
-        .unwrap()
-        .library_id
-        .unwrap();
-    let config = store.library(&library).await.unwrap().unwrap();
-    let paths = BlobPaths::new(&config.blob_root);
+async fn materialize_all(
+    store: &StateStore,
+    data_dir: &DataDir,
+    desc: &AssetDescriptor,
+    photo_id: &PhotoId,
+) {
+    let spool = data_dir.spool();
     let size = desc.resources[0].expected_size.unwrap() as i64;
     for row in store.resources_for_photo(photo_id).await.unwrap() {
         if row.written_at.is_some() {
@@ -71,7 +63,7 @@ async fn materialize_all(store: &StateStore, desc: &AssetDescriptor, photo_id: &
         }
         let bytes = format!("{photo_id}-{:?}", row.resource_type);
         let hash = ContentHash::of_bytes(bytes.as_bytes());
-        let path = paths.blob_path(&hash, "bin");
+        let path = spool.blob_path(&hash, "bin");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, &bytes).unwrap();
         store
@@ -91,19 +83,18 @@ async fn materialize_all(store: &StateStore, desc: &AssetDescriptor, photo_id: &
 #[tokio::test]
 async fn refcount_repair_covers_all_three_drift_classes() {
     let tmp = tempfile::tempdir().unwrap();
-    let (store, lib, _) = store_with_libs(tmp.path()).await;
+    let (store, data_dir, lib, _) = rig(tmp.path()).await;
     let desc = AssetDescriptorBuilder::live_photo()
         .modified_at(Utc::now())
         .build();
     let id = seed_one(&store, &desc).await;
-    materialize_all(&store, &desc, &id).await;
+    materialize_all(&store, &data_dir, &desc, &id).await;
     let rows = store.resources_for_photo(&id).await.unwrap();
     let (h1, h2) = (
         rows[0].content_hash.clone().unwrap(),
         rows[1].content_hash.clone().unwrap(),
     );
-    let blob_file = BlobPaths::new(&store.library(&lib).await.unwrap().unwrap().blob_root)
-        .blob_path(&h1, "bin");
+    let blob_file = data_dir.spool().blob_path(&h1, "bin");
     assert!(blob_file.is_file());
 
     // Drift class 1: count mismatch. Class 2: orphan row. Class 3: missing row.
@@ -176,19 +167,18 @@ fn cfg() -> CleanupConfig {
 }
 
 // Impact: this is the daemon's only irreversible byte destruction — every
-// artifact (rows, blob files) must go, and the black-box hard_delete row
+// artifact (rows, spool files) must go, and the black-box hard_delete row
 // must commit atomically with the row deletions.
 // Should: remove everything and log hard_delete with the reaped hashes.
 #[tokio::test]
 async fn hard_delete_past_retention_removes_everything() {
     let tmp = tempfile::tempdir().unwrap();
-    let (store, lib, _) = store_with_libs(tmp.path()).await;
-    let data_dir = DataDir::new(tmp.path().join("data"));
+    let (store, data_dir, lib, _) = rig(tmp.path()).await;
     let desc = AssetDescriptorBuilder::live_photo()
         .modified_at(Utc::now())
         .build();
     let id = seed_one(&store, &desc).await;
-    materialize_all(&store, &desc, &id).await;
+    materialize_all(&store, &data_dir, &desc, &id).await;
 
     apply_removal(&store, &desc.local_id).await.unwrap();
     backdate_tombstone(&store, &id, 31).await;
@@ -200,7 +190,6 @@ async fn hard_delete_past_retention_removes_everything() {
         .into_iter()
         .filter_map(|r| r.content_hash)
         .collect();
-    let paths = BlobPaths::new(&store.library(&lib).await.unwrap().unwrap().blob_root);
 
     let report = run_cleanup(&store, &data_dir, &cfg(), Utc::now())
         .await
@@ -215,7 +204,10 @@ async fn hard_delete_past_retention_removes_everything() {
             store.blob(&lib, h).await.unwrap().is_none(),
             "blob row reaped"
         );
-        assert!(!paths.blob_path(h, "bin").is_file(), "blob file deleted");
+        assert!(
+            !data_dir.spool().blob_path(h, "bin").is_file(),
+            "spool file deleted"
+        );
     }
 
     let events = store.log_events("hard_delete").await.unwrap();
@@ -230,20 +222,19 @@ async fn hard_delete_past_retention_removes_everything() {
 #[tokio::test]
 async fn hard_delete_respects_per_library_retention() {
     let tmp = tempfile::tempdir().unwrap();
-    let (store, personal, shared) = store_with_libs(tmp.path()).await;
-    let data_dir = DataDir::new(tmp.path().join("data"));
+    let (store, data_dir, personal, shared) = rig(tmp.path()).await;
 
     let p_desc = AssetDescriptorBuilder::simple_image()
         .modified_at(Utc::now())
         .build();
     let p_id = seed_one(&store, &p_desc).await;
-    materialize_all(&store, &p_desc, &p_id).await;
+    materialize_all(&store, &data_dir, &p_desc, &p_id).await;
     let s_desc = AssetDescriptorBuilder::simple_image()
         .scope(LibraryScope::Shared)
         .modified_at(Utc::now())
         .build();
     let s_id = seed_one(&store, &s_desc).await;
-    materialize_all(&store, &s_desc, &s_id).await;
+    materialize_all(&store, &data_dir, &s_desc, &s_id).await;
 
     apply_removal(&store, &p_desc.local_id).await.unwrap();
     apply_removal(&store, &s_desc.local_id).await.unwrap();
@@ -272,8 +263,7 @@ async fn hard_delete_respects_per_library_retention() {
 #[tokio::test]
 async fn hard_delete_preserves_shared_blobs() {
     let tmp = tempfile::tempdir().unwrap();
-    let (store, lib, _) = store_with_libs(tmp.path()).await;
-    let data_dir = DataDir::new(tmp.path().join("data"));
+    let (store, data_dir, lib, _) = rig(tmp.path()).await;
 
     // Two photos sharing identical original bytes (dedup at write time).
     let keep_desc = AssetDescriptorBuilder::simple_image()
@@ -286,8 +276,7 @@ async fn hard_delete_preserves_shared_blobs() {
     let gone = seed_one(&store, &gone_desc).await;
     let bytes = b"shared-bytes";
     let hash = ContentHash::of_bytes(bytes);
-    let paths = BlobPaths::new(&store.library(&lib).await.unwrap().unwrap().blob_root);
-    let path = paths.blob_path(&hash, "bin");
+    let path = data_dir.spool().blob_path(&hash, "bin");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, bytes).unwrap();
     for id in [&keep, &gone] {
@@ -314,8 +303,7 @@ async fn hard_delete_preserves_shared_blobs() {
 #[tokio::test]
 async fn hard_delete_pending_and_superseded_rows() {
     let tmp = tempfile::tempdir().unwrap();
-    let (store, lib, _) = store_with_libs(tmp.path()).await;
-    let data_dir = DataDir::new(tmp.path().join("data"));
+    let (store, data_dir, lib, _) = rig(tmp.path()).await;
 
     // Pending-only photo (seeded, never fetched).
     let pending_desc = AssetDescriptorBuilder::simple_image()
@@ -330,7 +318,7 @@ async fn hard_delete_pending_and_superseded_rows() {
         .modified_at(Utc::now())
         .build();
     let sp = seed_one(&store, &sp_desc).await;
-    materialize_all(&store, &sp_desc, &sp).await;
+    materialize_all(&store, &data_dir, &sp_desc, &sp).await;
     let hash = store.resources_for_photo(&sp).await.unwrap()[0]
         .content_hash
         .clone()
@@ -358,14 +346,13 @@ async fn hard_delete_pending_and_superseded_rows() {
 #[tokio::test]
 async fn hard_delete_is_idempotent_and_batch_capped() {
     let tmp = tempfile::tempdir().unwrap();
-    let (store, ..) = store_with_libs(tmp.path()).await;
-    let data_dir = DataDir::new(tmp.path().join("data"));
+    let (store, data_dir, ..) = rig(tmp.path()).await;
     for _ in 0..2 {
         let desc = AssetDescriptorBuilder::simple_image()
             .modified_at(Utc::now())
             .build();
         let id = seed_one(&store, &desc).await;
-        materialize_all(&store, &desc, &id).await;
+        materialize_all(&store, &data_dir, &desc, &id).await;
         apply_removal(&store, &desc.local_id).await.unwrap();
         backdate_tombstone(&store, &id, 31).await;
     }
@@ -393,8 +380,7 @@ async fn hard_delete_is_idempotent_and_batch_capped() {
 #[tokio::test]
 async fn unmapped_tombstone_hard_deletes_after_default_window() {
     let tmp = tempfile::tempdir().unwrap();
-    let (store, ..) = store_with_libs(tmp.path()).await;
-    let data_dir = DataDir::new(tmp.path().join("data"));
+    let (store, data_dir, ..) = rig(tmp.path()).await;
 
     let id = PhotoId::mint();
     sqlx::query(
@@ -421,8 +407,7 @@ async fn unmapped_tombstone_hard_deletes_after_default_window() {
 #[tokio::test]
 async fn log_prune_removes_only_expired_rows() {
     let tmp = tempfile::tempdir().unwrap();
-    let (store, ..) = store_with_libs(tmp.path()).await;
-    let data_dir = DataDir::new(tmp.path().join("data"));
+    let (store, data_dir, ..) = rig(tmp.path()).await;
 
     store.append_log("scan_started", None, None).await.unwrap();
     sqlx::query("INSERT INTO ingest_log (at, event_type) VALUES (?, 'ancient_event')")
@@ -439,70 +424,52 @@ async fn log_prune_removes_only_expired_rows() {
     assert_eq!(store.log_events("scan_started").await.unwrap().len(), 1);
 }
 
-// Impact: snapshots remain the fast-restart convenience for a lost state.db
-// — they must be written daily, be openable, and prune to the newest 7.
-// Should: one per UTC day per root; same-day rerun no-op; consistent copy;
-// keep-7 pruning ignoring unparseable names.
+// Impact: the publish pass's own eviction can crash between mark_published
+// and the eviction step — the cleanup tick is the sweep that guarantees
+// decided bytes still leave local disk.
+// Should: evict a published photo's blob on the cleanup tick (file gone,
+// eviction stamped, refcount intact).
+// Should not: touch an unpublished photo's blob.
 #[tokio::test]
-async fn snapshots_daily_consistent_and_pruned() {
+async fn cleanup_sweep_evicts_decided_blobs() {
     let tmp = tempfile::tempdir().unwrap();
-    let (store, lib, _) = store_with_libs(tmp.path()).await;
-    let data_dir = DataDir::new(tmp.path().join("data"));
-    let desc = AssetDescriptorBuilder::simple_image()
+    let (store, data_dir, lib, _) = rig(tmp.path()).await;
+
+    let published_desc = AssetDescriptorBuilder::simple_image()
         .modified_at(Utc::now())
         .build();
-    let id = seed_one(&store, &desc).await;
-    materialize_all(&store, &desc, &id).await;
+    let published = seed_one(&store, &published_desc).await;
+    materialize_all(&store, &data_dir, &published_desc, &published).await;
+    let pending_desc = AssetDescriptorBuilder::simple_image()
+        .modified_at(Utc::now())
+        .build();
+    let pending = seed_one(&store, &pending_desc).await;
+    materialize_all(&store, &data_dir, &pending_desc, &pending).await;
 
-    let now = Utc::now();
-    let r1 = run_cleanup(&store, &data_dir, &cfg(), now).await.unwrap();
-    assert_eq!(r1.snapshots_written, 2, "one per library root");
-    let snap_dir =
-        BlobPaths::new(&store.library(&lib).await.unwrap().unwrap().blob_root).snapshot_dir();
-    let first: Vec<_> = std::fs::read_dir(&snap_dir).unwrap().flatten().collect();
-    assert_eq!(first.len(), 1);
-
-    // Same day: no-op.
-    let r2 = run_cleanup(&store, &data_dir, &cfg(), now + Duration::hours(1))
+    sqlx::query("UPDATE photos SET published_at = ? WHERE photo_id = ?")
+        .bind(Utc::now())
+        .bind(published.to_string())
+        .execute(store.raw_pool())
         .await
         .unwrap();
-    assert_eq!(r2.snapshots_written, 0);
 
-    // The snapshot is a consistent, openable database.
-    let snap_path = first[0].path();
-    let snap_store = StateStore::open(&snap_path).await.unwrap();
-    assert_eq!(snap_store.count_photos().await.unwrap(), 1);
-
-    // Next days: new snapshots; keep only the newest N (unparseable ignored).
-    std::fs::write(snap_dir.join("not-a-snapshot.txt"), "x").unwrap();
-    let keep2 = CleanupConfig {
-        snapshot_keep: 2,
-        ..cfg()
+    let hash_of = |rows: &[ingress_core::model::ResourceRecord]| {
+        rows[0].content_hash.clone().unwrap()
     };
-    for d in 1..=3 {
-        let r = run_cleanup(&store, &data_dir, &keep2, now + Duration::days(d))
-            .await
-            .unwrap();
-        assert_eq!(r.snapshots_written, 2);
-    }
-    let names: Vec<String> = std::fs::read_dir(&snap_dir)
-        .unwrap()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
-    // Note: opening the snapshot above leaves `-wal`/`-shm` companions in
-    // the dir — count only real snapshot names.
-    assert_eq!(
-        names
-            .iter()
-            .filter(|n| n.starts_with("state.db.") && n.ends_with(".sqlite3"))
-            .count(),
-        2
-    );
-    assert!(
-        names.iter().any(|n| n == "not-a-snapshot.txt"),
-        "unparseable untouched"
-    );
+    let published_hash = hash_of(&store.resources_for_photo(&published).await.unwrap());
+    let pending_hash = hash_of(&store.resources_for_photo(&pending).await.unwrap());
+    let published_file = data_dir.spool().blob_path(&published_hash, "bin");
+    let pending_file = data_dir.spool().blob_path(&pending_hash, "bin");
+
+    let report = run_cleanup(&store, &data_dir, &cfg(), Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(report.spool_evicted, 1);
+    assert!(!published_file.exists(), "decided bytes swept");
+    assert!(pending_file.is_file(), "undecided bytes retained");
+    let blob = store.blob(&lib, &published_hash).await.unwrap().unwrap();
+    assert!(blob.evicted_at.is_some());
+    assert_eq!(blob.ref_count, 1);
 }
 
 // Impact: the crash-window class (materialized, capsule never persisted)
@@ -516,12 +483,12 @@ async fn snapshots_daily_consistent_and_pruned() {
 #[tokio::test]
 async fn scan_self_heals_missing_descriptor_capsule() {
     let tmp = tempfile::tempdir().unwrap();
-    let (store, ..) = store_with_libs(tmp.path()).await;
+    let (store, data_dir, ..) = rig(tmp.path()).await;
     let desc = AssetDescriptorBuilder::simple_image()
         .modified_at(Utc::now())
         .build();
     let id = seed_one(&store, &desc).await;
-    materialize_all(&store, &desc, &id).await;
+    materialize_all(&store, &data_dir, &desc, &id).await;
 
     let probe_of = ingress_core::scan::ScanProbe {
         local_id: desc.local_id.clone(),
@@ -560,7 +527,7 @@ async fn scan_self_heals_missing_descriptor_capsule() {
 
     // The re-delivered descriptor classifies NoOp (nothing else changed),
     // yet apply_change backfills the capsule.
-    apply_change(&store, &desc).await.unwrap();
+    apply_change(&store, &data_dir.spool(), &desc).await.unwrap();
     let capsule: Option<String> =
         sqlx::query_scalar("SELECT descriptor_json FROM photos WHERE photo_id = ?")
             .bind(id.to_string())
@@ -576,9 +543,7 @@ async fn scan_self_heals_missing_descriptor_capsule() {
 #[tokio::test]
 async fn standalone_cleanup_respects_drain_lock() {
     let tmp = tempfile::tempdir().unwrap();
-    let (store, ..) = store_with_libs(tmp.path()).await;
-    let data_dir = DataDir::new(tmp.path().join("data"));
-    std::fs::create_dir_all(data_dir.root()).unwrap();
+    let (store, data_dir, ..) = rig(tmp.path()).await;
 
     // A live holder (our own pid).
     let lock_path = data_dir.root().join("drain.lock");
@@ -592,62 +557,4 @@ async fn standalone_cleanup_respects_drain_lock() {
         .unwrap();
     assert_eq!(cleanup.photos_hard_deleted, 0);
     assert!(!lock_path.exists(), "lock released after the run");
-}
-
-// Impact: the publish pass's own eviction can crash between mark_published
-// and the eviction step — the cleanup tick is the sweep that guarantees
-// decided bytes still leave local disk.
-// Should: evict a published photo's blob on the cleanup tick (file gone,
-// eviction stamped, refcount intact).
-// Should not: touch an unpublished photo's blob.
-#[tokio::test]
-async fn cleanup_sweep_evicts_decided_blobs() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (store, lib, _) = store_with_libs(tmp.path()).await;
-    let data_dir = DataDir::new(tmp.path().join("data"));
-
-    let published_desc = AssetDescriptorBuilder::simple_image()
-        .modified_at(Utc::now())
-        .build();
-    let published = seed_one(&store, &published_desc).await;
-    materialize_all(&store, &published_desc, &published).await;
-    let pending_desc = AssetDescriptorBuilder::simple_image()
-        .modified_at(Utc::now())
-        .build();
-    let pending = seed_one(&store, &pending_desc).await;
-    materialize_all(&store, &pending_desc, &pending).await;
-
-    sqlx::query("UPDATE photos SET published_at = ? WHERE photo_id = ?")
-        .bind(Utc::now())
-        .bind(published.to_string())
-        .execute(store.raw_pool())
-        .await
-        .unwrap();
-
-    let paths = BlobPaths::new(&store.library(&lib).await.unwrap().unwrap().blob_root);
-    let file_of = |id: &PhotoId, store: &StateStore| {
-        let id = id.clone();
-        let store = store.clone();
-        let paths = paths.clone();
-        async move {
-            let row = &store.resources_for_photo(&id).await.unwrap()[0];
-            paths.blob_path(row.content_hash.as_ref().unwrap(), "bin")
-        }
-    };
-    let published_file = file_of(&published, &store).await;
-    let pending_file = file_of(&pending, &store).await;
-
-    let report = run_cleanup(&store, &data_dir, &cfg(), Utc::now())
-        .await
-        .unwrap();
-    assert_eq!(report.spool_evicted, 1);
-    assert!(!published_file.exists(), "decided bytes swept");
-    assert!(pending_file.is_file(), "undecided bytes retained");
-    let hash = store.resources_for_photo(&published).await.unwrap()[0]
-        .content_hash
-        .clone()
-        .unwrap();
-    let blob = store.blob(&lib, &hash).await.unwrap().unwrap();
-    assert!(blob.evicted_at.is_some());
-    assert_eq!(blob.ref_count, 1);
 }

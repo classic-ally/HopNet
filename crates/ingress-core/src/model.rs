@@ -152,7 +152,6 @@ pub struct PhotoRecord {
     pub discovered_at: DateTime<Utc>,
     pub asset_modified_at: Option<DateTime<Utc>>,
     pub materialized_at: Option<DateTime<Utc>>,
-    pub sidecar_replicated_at: Option<DateTime<Utc>>,
     /// The serialized [`crate::descriptor::DescriptorCapsule`] — publish's
     /// metadata source. NULL until materialization first writes it.
     pub descriptor_json: Option<String>,
@@ -193,8 +192,6 @@ pub struct ResourceRecord {
 pub struct LibraryConfig {
     pub library_id: LibraryId,
     pub display_name: String,
-    pub blob_root: String,
-    pub sidecar_root_remote: Option<String>,
     /// PhotoKit scope binding; the shared library uses the fixed marker
     /// `icloud-shared-library` (binary scope signal, one SPL per account).
     pub scope_binding: Option<String>,

@@ -16,12 +16,10 @@ async fn rig(tmp: &std::path::Path) -> (StateStore, DataDir) {
     (store, data_dir)
 }
 
-fn opts(tmp: &std::path::Path, scope: LibraryScope) -> AddLibraryOptions {
+fn opts(scope: LibraryScope) -> AddLibraryOptions {
     AddLibraryOptions {
         id: None,
         display_name: None,
-        blob_root: tmp.join("blobs").to_string_lossy().into_owned(),
-        sidecar_root_remote: None,
         scope,
         retention_days: 30,
     }
@@ -31,38 +29,31 @@ fn opts(tmp: &std::path::Path, scope: LibraryScope) -> AddLibraryOptions {
 // defaults or accepted-but-invalid input become permanent (ids are
 // immutable by design).
 // Should: generate a parseable two-word id, default the display name by
-// scope, set the shared marker, and surface the no-remote warning.
-// Should not: accept a relative blob root or negative retention.
+// scope, and set the shared marker.
+// Should not: accept negative retention.
 #[tokio::test]
 async fn add_generates_id_and_validates() {
     let tmp = tempfile::tempdir().unwrap();
     let (store, data_dir) = rig(tmp.path()).await;
 
-    let added = add_library(&store, &data_dir, &opts(tmp.path(), LibraryScope::Personal))
+    let added = add_library(&store, &data_dir, &opts(LibraryScope::Personal))
         .await
         .unwrap();
     assert!(LibraryId::parse(added.config.library_id.as_str()).is_ok());
     assert!(added.config.library_id.as_str().contains('_'));
     assert_eq!(added.config.display_name, "Personal Library");
     assert!(added.config.scope_binding.is_none());
-    assert!(added.warn_no_remote, "no remote root => loud warning flag");
 
-    let mut shared_opts = opts(tmp.path(), LibraryScope::Shared);
-    shared_opts.sidecar_root_remote =
-        Some(tmp.path().join("remote").to_string_lossy().into_owned());
-    let shared = add_library(&store, &data_dir, &shared_opts).await.unwrap();
+    let shared = add_library(&store, &data_dir, &opts(LibraryScope::Shared))
+        .await
+        .unwrap();
     assert_eq!(
         shared.config.scope_binding.as_deref(),
         Some(ICLOUD_SHARED_LIBRARY_BINDING)
     );
-    assert!(!shared.warn_no_remote);
     assert_eq!(store.log_events("library_added").await.unwrap().len(), 2);
 
-    let mut relative = opts(tmp.path(), LibraryScope::Personal);
-    relative.blob_root = "relative/path".into();
-    assert!(add_library(&store, &data_dir, &relative).await.is_err());
-
-    let mut negative = opts(tmp.path(), LibraryScope::Personal);
+    let mut negative = opts(LibraryScope::Personal);
     negative.retention_days = -1;
     assert!(add_library(&store, &data_dir, &negative).await.is_err());
 }
@@ -76,24 +67,24 @@ async fn add_enforces_singleton_invariants() {
     let tmp = tempfile::tempdir().unwrap();
     let (store, data_dir) = rig(tmp.path()).await;
 
-    add_library(&store, &data_dir, &opts(tmp.path(), LibraryScope::Personal))
+    add_library(&store, &data_dir, &opts(LibraryScope::Personal))
         .await
         .unwrap();
-    let err = add_library(&store, &data_dir, &opts(tmp.path(), LibraryScope::Personal))
+    let err = add_library(&store, &data_dir, &opts(LibraryScope::Personal))
         .await
         .unwrap_err();
     assert!(err.to_string().contains("personal library already exists"));
 
-    add_library(&store, &data_dir, &opts(tmp.path(), LibraryScope::Shared))
+    add_library(&store, &data_dir, &opts(LibraryScope::Shared))
         .await
         .unwrap();
-    let err = add_library(&store, &data_dir, &opts(tmp.path(), LibraryScope::Shared))
+    let err = add_library(&store, &data_dir, &opts(LibraryScope::Shared))
         .await
         .unwrap_err();
     assert!(err.to_string().contains("already bound"));
 
     // Duplicate explicit id.
-    let mut with_id = opts(tmp.path(), LibraryScope::Shared);
+    let mut with_id = opts(LibraryScope::Shared);
     with_id.id = Some(store.libraries().await.unwrap()[0].library_id.clone());
     let err = add_library(&store, &data_dir, &with_id).await.unwrap_err();
     assert!(err.to_string().contains("already exists"));
@@ -107,12 +98,12 @@ async fn add_enforces_singleton_invariants() {
 async fn bind_moves_marker_and_guards_ambiguity() {
     let tmp = tempfile::tempdir().unwrap();
     let (store, data_dir) = rig(tmp.path()).await;
-    let personal = add_library(&store, &data_dir, &opts(tmp.path(), LibraryScope::Personal))
+    let personal = add_library(&store, &data_dir, &opts(LibraryScope::Personal))
         .await
         .unwrap()
         .config
         .library_id;
-    let shared = add_library(&store, &data_dir, &opts(tmp.path(), LibraryScope::Shared))
+    let shared = add_library(&store, &data_dir, &opts(LibraryScope::Shared))
         .await
         .unwrap()
         .config
@@ -152,14 +143,14 @@ async fn bind_moves_marker_and_guards_ambiguity() {
 }
 
 // Impact: rename must touch ONLY the mutable label — the id is embedded in
-// every sidecar document and path; retention gates irreversible deletes.
+// retention gates irreversible deletes.
 // Should: update display_name / retention_days and log old→new.
 // Should not: change the library_id.
 #[tokio::test]
 async fn rename_and_retention_update_and_log() {
     let tmp = tempfile::tempdir().unwrap();
     let (store, data_dir) = rig(tmp.path()).await;
-    let id = add_library(&store, &data_dir, &opts(tmp.path(), LibraryScope::Personal))
+    let id = add_library(&store, &data_dir, &opts(LibraryScope::Personal))
         .await
         .unwrap()
         .config
@@ -202,7 +193,7 @@ async fn rename_and_retention_update_and_log() {
 async fn writes_refused_while_daemon_lock_held() {
     let tmp = tempfile::tempdir().unwrap();
     let (store, data_dir) = rig(tmp.path()).await;
-    let id = add_library(&store, &data_dir, &opts(tmp.path(), LibraryScope::Personal))
+    let id = add_library(&store, &data_dir, &opts(LibraryScope::Personal))
         .await
         .unwrap()
         .config
@@ -212,7 +203,7 @@ async fn writes_refused_while_daemon_lock_held() {
     std::fs::write(&lock_path, std::process::id().to_string()).unwrap();
 
     assert!(
-        add_library(&store, &data_dir, &opts(tmp.path(), LibraryScope::Shared))
+        add_library(&store, &data_dir, &opts(LibraryScope::Shared))
             .await
             .is_err()
     );

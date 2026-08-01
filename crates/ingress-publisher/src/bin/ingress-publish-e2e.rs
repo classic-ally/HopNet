@@ -171,14 +171,10 @@ async fn main() {
         Cmd::Seed { count, start } => {
             let library_id = ingress_core::LibraryId::new("personal");
             if store.library(&library_id).await.expect("library").is_none() {
-                let blob_root = args.data_dir.join("blob-root");
-                std::fs::create_dir_all(&blob_root).expect("create blob root");
                 store
                     .insert_library(&ingress_core::LibraryConfig {
                         library_id: library_id.clone(),
                         display_name: "Personal".into(),
-                        blob_root: blob_root.to_string_lossy().into_owned(),
-                        sidecar_root_remote: None,
                         scope_binding: None,
                         retention_days: 30,
                         created_at: chrono::Utc::now(),

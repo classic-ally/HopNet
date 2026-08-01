@@ -91,17 +91,10 @@ pub enum BindScope {
 
 #[derive(Debug, Args)]
 pub struct LibraryAddArgs {
-    /// Absolute path to the per-library subtree on the storage root.
-    #[arg(long)]
-    pub blob_root: PathBuf,
     #[arg(long, value_enum)]
     pub scope: AddScope,
     #[arg(long)]
     pub display_name: Option<String>,
-    /// Remote sidecar backup root. Omitting it degrades disaster recovery
-    /// to blob-only — the command warns loudly.
-    #[arg(long)]
-    pub sidecar_remote: Option<PathBuf>,
     #[arg(long, default_value_t = 30)]
     pub retention_days: i64,
     /// Explicit id override (scripts/tests); lowercase [a-z0-9_].

@@ -15,7 +15,7 @@ use crate::descriptor::AssetDescriptor;
 use crate::error::Result;
 use crate::ids::{LibraryId, PhotoId};
 use crate::model::{PhotoRecord, ResourceRecord, ResourceType};
-use crate::paths::BlobPaths;
+use crate::paths::SpoolPaths;
 use crate::resolve::{
     Resolution, SeedOutcome, diff_resources, resolve_descriptor, seed_descriptor,
 };
@@ -254,6 +254,7 @@ pub async fn classify(store: &StateStore, desc: &AssetDescriptor) -> Result<Clas
 /// refresh rather than losing it.
 pub async fn apply_change(
     store: &StateStore,
+    spool: &SpoolPaths,
     desc: &AssetDescriptor,
 ) -> Result<(Classification, ChangeOutcome)> {
     let classification = classify(store, desc).await?;
@@ -359,14 +360,12 @@ pub async fn apply_change(
         }
         tx.commit().await?;
 
-        // Post-commit: reaped blob files. A crash here leaves benign orphans.
-        if let Some(library) = &library
-            && !reap.is_empty()
-            && let Some(config) = store.library(library).await?
-        {
-            let paths = BlobPaths::new(&config.blob_root);
-            for (hash, ext) in &reap {
-                let _ = std::fs::remove_file(paths.blob_path(hash, ext));
+        // Post-commit: reaped blob files. A crash here leaves benign
+        // orphans. Liveness-guarded: the spool is process-global, so
+        // another library's row may still back the same file.
+        for (hash, ext) in &reap {
+            if !store.hash_is_live(hash).await? {
+                let _ = std::fs::remove_file(spool.blob_path(hash, ext));
             }
         }
     }

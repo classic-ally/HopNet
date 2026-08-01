@@ -133,8 +133,6 @@ async fn rig() -> Rig {
         .insert_library(&ingress_core::LibraryConfig {
             library_id: library.clone(),
             display_name: "Personal".into(),
-            blob_root: blob_dir.path().to_string_lossy().into_owned(),
-            sidecar_root_remote: None,
             scope_binding: None,
             retention_days: 30,
             created_at: chrono::Utc::now(),
@@ -496,20 +494,7 @@ async fn unmapped_then_adopted_then_drained() {
     // Drain does nothing — NULL-library rows are not eligible.
     assert_eq!(scheduler(&rig).drain().await.unwrap().photos_completed, 0);
 
-    let shared_lib = add_shared(&rig.store).await;
-    sqlx::query("UPDATE libraries SET blob_root = ? WHERE library_id = ?")
-        .bind(
-            rig._dirs
-                .0
-                .path()
-                .join("shared")
-                .to_string_lossy()
-                .into_owned(),
-        )
-        .bind(shared_lib.as_str())
-        .execute(rig.store.raw_pool())
-        .await
-        .unwrap();
+    let _shared_lib = add_shared(&rig.store).await;
 
     match seed_descriptor(&rig.store, &desc).await.unwrap() {
         SeedOutcome::Adopted { .. } => {}
@@ -589,15 +574,7 @@ async fn events_for_inflight_photo_are_deferred() {
     });
     let rig = r;
 
-    // Bind the shared library with its own temp root.
     let shared_lib = add_shared(&rig.store).await;
-    let shared_root = rig._dirs.0.path().join("shared");
-    sqlx::query("UPDATE libraries SET blob_root = ? WHERE library_id = ?")
-        .bind(shared_root.to_string_lossy().into_owned())
-        .bind(shared_lib.as_str())
-        .execute(rig.store.raw_pool())
-        .await
-        .unwrap();
 
     let desc = AssetDescriptorBuilder::simple_image().build();
     seed_asset(&rig, &desc, b"moving-bytes", None).await;
@@ -656,12 +633,9 @@ async fn events_for_inflight_photo_are_deferred() {
         1
     );
 
-    // Bytes live under the destination — and only there.
+    // The spool file stays put — the move is ledger-only.
     let hash = ingress_core::ContentHash::of_bytes(b"moving-bytes");
-    let src_paths = ingress_core::paths::BlobPaths::new(rig._dirs.0.path());
-    let dst_paths = ingress_core::paths::BlobPaths::new(&shared_root);
-    assert!(dst_paths.blob_path(&hash, "heic").is_file());
-    assert!(!src_paths.blob_path(&hash, "heic").is_file());
+    assert!(rig.data_dir.spool().blob_path(&hash, "heic").is_file());
 }
 
 // Impact: reordering deferred events resurrects deleted renders — an edit

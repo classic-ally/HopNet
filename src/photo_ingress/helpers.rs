@@ -4,18 +4,6 @@
 
 use super::{AgentRegistration, PhotoIngressStatus};
 
-/// The blob root must be absolute — same invariant `add_library` enforces —
-/// so the daemon never binds a library relative to launchd's working dir.
-pub fn validate_blob_root(blob_root: &str) -> Result<(), String> {
-    if blob_root.is_empty() {
-        return Err("blob_root must not be empty".into());
-    }
-    if !std::path::Path::new(blob_root).is_absolute() {
-        return Err(format!("blob_root must be an absolute path (got {blob_root:?})"));
-    }
-    Ok(())
-}
-
 /// The device-id half of an RFC-012 token (`{device_id}.{secret}`), without
 /// validating the UUID shape (the caller's DB lookup does that).
 pub fn device_id_from_token(api_key: &str) -> Option<&str> {
@@ -28,7 +16,6 @@ pub fn device_id_from_token(api_key: &str) -> Option<&str> {
 pub fn build_status(
     registration: AgentRegistration,
     keychain: Option<(String, String)>,
-    blob_root: Option<String>,
     device_row_present: bool,
 ) -> PhotoIngressStatus {
     let (device_id, node_base_url) = match &keychain {
@@ -43,7 +30,6 @@ pub fn build_status(
         keychain_provisioned: keychain.is_some(),
         device_id,
         device_row_present,
-        blob_root,
         node_base_url,
     }
 }
@@ -51,16 +37,6 @@ pub fn build_status(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // Should: accept absolute paths and reject relative or empty ones —
-    // the 400 gate ahead of any keychain write.
-    #[test]
-    fn blob_root_validation() {
-        assert!(validate_blob_root("/Users/a/blobs").is_ok());
-        assert!(validate_blob_root("relative/blobs").is_err());
-        assert!(validate_blob_root("").is_err());
-        assert!(validate_blob_root("~/blobs").is_err());
-    }
 
     // Should: extract the device id from a well-formed token.
     // Should not: produce an id from a token missing either half.
@@ -79,21 +55,19 @@ mod tests {
         let status = build_status(
             AgentRegistration::Enabled,
             Some(("dev-1.secret".into(), "http://127.0.0.1:4242".into())),
-            Some("/blobs".into()),
             true,
         );
         assert_eq!(status.registration, AgentRegistration::Enabled);
         assert!(status.keychain_provisioned);
         assert_eq!(status.device_id.as_deref(), Some("dev-1"));
         assert!(status.device_row_present);
-        assert_eq!(status.blob_root.as_deref(), Some("/blobs"));
         assert_eq!(status.node_base_url.as_deref(), Some("http://127.0.0.1:4242"));
     }
 
     // Should not: invent device/url fields on an unprovisioned status.
     #[test]
     fn status_assembly_unprovisioned() {
-        let status = build_status(AgentRegistration::NotRegistered, None, None, false);
+        let status = build_status(AgentRegistration::NotRegistered, None, false);
         assert!(!status.keychain_provisioned);
         assert_eq!(status.device_id, None);
         assert_eq!(status.node_base_url, None);

@@ -5,7 +5,7 @@ use chrono::Utc;
 use ingress_core::fixtures::AssetDescriptorBuilder;
 use ingress_core::fsck::{FsckOptions, run_fsck};
 use ingress_core::model::LibraryConfig;
-use ingress_core::paths::{BlobPaths, DataDir};
+use ingress_core::paths::{DataDir, SpoolPaths};
 use ingress_core::resolve::{SeedOutcome, seed_descriptor};
 use ingress_core::{AssetDescriptor, ContentHash, LibraryId, PhotoId, StateStore};
 
@@ -17,8 +17,6 @@ async fn rig(tmp: &std::path::Path) -> (StateStore, LibraryId, DataDir) {
         .insert_library(&LibraryConfig {
             library_id: personal.clone(),
             display_name: "Personal".into(),
-            blob_root: tmp.join("blobs-personal").to_string_lossy().into_owned(),
-            sidecar_root_remote: None,
             scope_binding: None,
             retention_days: 30,
             created_at: Utc::now(),
@@ -38,19 +36,12 @@ async fn seed_one(store: &StateStore, desc: &AssetDescriptor) -> PhotoId {
 }
 
 async fn materialize_all(
+    data_dir: &DataDir,
     store: &StateStore,
     desc: &AssetDescriptor,
     photo_id: &PhotoId,
 ) {
-    let library = store
-        .photo(photo_id)
-        .await
-        .unwrap()
-        .unwrap()
-        .library_id
-        .unwrap();
-    let config = store.library(&library).await.unwrap().unwrap();
-    let paths = BlobPaths::new(&config.blob_root);
+    let paths = data_dir.spool();
     for row in store.resources_for_photo(photo_id).await.unwrap() {
         if row.written_at.is_some() {
             continue;
@@ -84,9 +75,9 @@ async fn fsck(
         .unwrap()
 }
 
-fn plant_orphan(blob_root: &str) -> std::path::PathBuf {
+fn plant_orphan(spool: &SpoolPaths) -> std::path::PathBuf {
     let hash = ContentHash::of_bytes(b"orphan-bytes");
-    let path = BlobPaths::new(blob_root).blob_path(&hash, "bin");
+    let path = spool.blob_path(&hash, "bin");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, b"orphan-bytes").unwrap();
     path
@@ -104,12 +95,12 @@ async fn clean_tree_is_clean_and_logs_nothing() {
         .with_cloud_id("c1")
         .build();
     let id = seed_one(&store, &desc).await;
-    materialize_all(&store, &desc, &id).await;
+    materialize_all(&data_dir, &store, &desc, &id).await;
 
 
     let report = fsck(&store, &data_dir, false).await;
     assert!(report.is_clean(), "{report:?}");
-    assert!(report.skipped_roots.is_empty());
+
     assert!(
         store
             .log_events("fsck_orphans_deleted")
@@ -139,7 +130,7 @@ async fn refcount_drift_reported_then_repaired() {
         .with_cloud_id("c1")
         .build();
     let id = seed_one(&store, &desc).await;
-    materialize_all(&store, &desc, &id).await;
+    materialize_all(&data_dir, &store, &desc, &id).await;
 
     // Corrupt the stored count.
     sqlx::query("UPDATE blobs SET ref_count = 7 WHERE library_id = ?")
@@ -188,17 +179,17 @@ async fn missing_blob_is_loud_and_survives_repair() {
         .with_cloud_id("c1")
         .build();
     let id = seed_one(&store, &desc).await;
-    materialize_all(&store, &desc, &id).await;
+    materialize_all(&data_dir, &store, &desc, &id).await;
 
     // Destroy the blob file behind the row's back.
     let row = &store.resources_for_photo(&id).await.unwrap()[0];
-    let config = store
+    let _config = store
         .library(&LibraryId::new("personal"))
         .await
         .unwrap()
         .unwrap();
     let path =
-        BlobPaths::new(&config.blob_root).blob_path(row.content_hash.as_ref().unwrap(), "bin");
+        data_dir.spool().blob_path(row.content_hash.as_ref().unwrap(), "bin");
     std::fs::remove_file(&path).unwrap();
 
     for repair in [false, true] {
@@ -227,12 +218,12 @@ async fn orphans_deleted_only_under_repair() {
         .with_cloud_id("c1")
         .build();
     let id = seed_one(&store, &desc).await;
-    materialize_all(&store, &desc, &id).await;
+    materialize_all(&data_dir, &store, &desc, &id).await;
 
-    let config = store.library(&lib).await.unwrap().unwrap();
-    let orphan = plant_orphan(&config.blob_root);
+    let _config = store.library(&lib).await.unwrap().unwrap();
+    let orphan = plant_orphan(&data_dir.spool());
     // An in-flight temp that must never be flagged or deleted.
-    let partial = BlobPaths::new(&config.blob_root)
+    let partial = data_dir.spool()
         .partial_dir()
         .join("probe-test");
     std::fs::create_dir_all(partial.parent().unwrap()).unwrap();
@@ -273,10 +264,10 @@ async fn ext_mismatch_and_foreign_files_never_deleted() {
         .with_cloud_id("c1")
         .build();
     let id = seed_one(&store, &desc).await;
-    materialize_all(&store, &desc, &id).await;
+    materialize_all(&data_dir, &store, &desc, &id).await;
 
-    let config = store.library(&lib).await.unwrap().unwrap();
-    let paths = BlobPaths::new(&config.blob_root);
+    let _config = store.library(&lib).await.unwrap().unwrap();
+    let paths = data_dir.spool();
     // Same hash as the real row, different extension on disk.
     let row = &store.resources_for_photo(&id).await.unwrap()[0];
     let hash = row.content_hash.as_ref().unwrap();
@@ -302,30 +293,6 @@ async fn ext_mismatch_and_foreign_files_never_deleted() {
     assert!(ds_top.is_file() && ds_leaf.is_file(), ".DS_Store untouched");
 }
 
-// Impact: a down mount looks exactly like mass byte loss to a naive check;
-// fsck screaming BYTE LOSS during SMB flaps would train the operator to
-// ignore the one banner that matters.
-// Should: record the root as skipped, zero missing-blob findings.
-#[tokio::test]
-async fn absent_blob_root_is_skipped_not_byte_loss() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (store, lib, data_dir) = rig(tmp.path()).await;
-    let desc = AssetDescriptorBuilder::simple_image()
-        .with_cloud_id("c1")
-        .build();
-    let id = seed_one(&store, &desc).await;
-    materialize_all(&store, &desc, &id).await;
-
-    // "Unmount": the whole root vanishes.
-    let config = store.library(&lib).await.unwrap().unwrap();
-    std::fs::remove_dir_all(&config.blob_root).unwrap();
-
-    let report = fsck(&store, &data_dir, false).await;
-    assert!(report.missing_blobs.is_empty());
-    assert_eq!(report.skipped_roots.len(), 1);
-    assert!(report.skipped_roots[0].contains("blob root unavailable"));
-}
-
 // Impact: a dead-pid lock reclaim is THE unclean-shutdown signal; if fsck
 // --repair consumes it without running Tier-1, the next daemon start looks
 // clean and skips the recount that gates irreversible deletes.
@@ -338,7 +305,7 @@ async fn repair_on_unclean_reclaim_runs_tier1() {
         .with_cloud_id("c1")
         .build();
     let id = seed_one(&store, &desc).await;
-    materialize_all(&store, &desc, &id).await;
+    materialize_all(&data_dir, &store, &desc, &id).await;
 
     // Simulate the crash: stale empty lock + drifted refcount.
     std::fs::write(data_dir.root().join("drain.lock"), "").unwrap();
@@ -379,12 +346,11 @@ async fn evicted_blob_is_not_byte_loss() {
         .with_cloud_id("c1")
         .build();
     let id = seed_one(&store, &desc).await;
-    materialize_all(&store, &desc, &id).await;
+    materialize_all(&data_dir, &store, &desc, &id).await;
 
     let row = &store.resources_for_photo(&id).await.unwrap()[0];
     let hash = row.content_hash.clone().unwrap();
-    let config = store.library(&lib).await.unwrap().unwrap();
-    let path = BlobPaths::new(&config.blob_root).blob_path(&hash, "bin");
+    let path = data_dir.spool().blob_path(&hash, "bin");
 
     // Completed eviction: stamp + unlink.
     store.stamp_blob_evicted(&lib, &hash).await.unwrap();

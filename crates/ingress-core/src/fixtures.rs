@@ -21,8 +21,6 @@ pub async fn store_with_personal() -> (StateStore, LibraryId) {
         .insert_library(&LibraryConfig {
             library_id: id.clone(),
             display_name: "Personal".into(),
-            blob_root: "/tmp/blobs/personal".into(),
-            sidecar_root_remote: None,
             scope_binding: None,
             retention_days: 30,
             created_at: Utc::now(),
@@ -39,8 +37,6 @@ pub async fn add_shared(store: &StateStore) -> LibraryId {
         .insert_library(&LibraryConfig {
             library_id: id.clone(),
             display_name: "Shared".into(),
-            blob_root: "/tmp/blobs/shared".into(),
-            sidecar_root_remote: None,
             scope_binding: Some(ICLOUD_SHARED_LIBRARY_BINDING.into()),
             retention_days: 30,
             created_at: Utc::now(),
