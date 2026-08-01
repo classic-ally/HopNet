@@ -9,5 +9,4 @@ members = [
     "ingress-core",
     "ingress-ffi",
     "ingress-publisher",
-    "ingress-server",
 ]
