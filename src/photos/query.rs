@@ -150,9 +150,21 @@ pub fn read_resource_grant(
         .get()
         .map_err(|e| ResourceGrantError::Internal(format!("pool: {e}")))?;
 
-    let data_block_id = photos::lookup_resource_block(&conn, photo_id, kind.as_wire())
-        .map_err(|e| ResourceGrantError::Internal(format!("resource lookup: {e:?}")))?
-        .ok_or(ResourceGrantError::NotFound)?;
+    let data_block_id = match photos::lookup_resource_block_authz(
+        &conn,
+        photo_id,
+        kind.as_wire(),
+        user_id,
+    )
+    .map_err(|e| ResourceGrantError::Internal(format!("resource lookup: {e:?}")))?
+    {
+        photos::ResourceBlockLookup::Found(id) => id,
+        photos::ResourceBlockLookup::NotFound => return Err(ResourceGrantError::NotFound),
+        // Shared photo, no membership: the wrap row alone (pre-staged
+        // invitee grant, or a kicked member's not-yet-revoked row) must
+        // not serve bytes.
+        photos::ResourceBlockLookup::NotMember => return Err(ResourceGrantError::Forbidden),
+    };
 
     let access = photos::get_blob_access_for_user(&conn, &data_block_id, user_id)
         .map_err(|e| ResourceGrantError::Internal(format!("access lookup: {e:?}")))?
@@ -252,8 +264,12 @@ fn pubkey_from_blob(blob: Vec<u8>) -> Result<hopnet_storage::x25519_dalek::Publi
 
 /// Recipients for a publish by `user_id`. `library_id == None` is the
 /// personal library: exactly the acting user. For shared libraries the
-/// member set comes from `shared_library_members`; an unknown library yields
-/// an empty set, which the publisher rejects as NoRecipients.
+/// recipient set is members UNION pending invitees — publish-time fan-out
+/// covers invitees so the convergence worker only backfills, never races
+/// new adds (the live-link lesson from drive). The caller must belong to
+/// the library (member or invitee); membership lists are real data now.
+/// An unknown library yields an empty set, which the publisher rejects as
+/// NoRecipients.
 pub fn read_library_membership(
     pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
     user_id: i32,
@@ -276,13 +292,27 @@ pub fn read_library_membership(
             }]
         }
         Some(lib) => {
+            let caller_belongs: bool = conn
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM shared_library_members
+                                    WHERE library_id = ?1 AND user_id = ?2)
+                         OR EXISTS (SELECT 1 FROM shared_library_invites
+                                    WHERE library_id = ?1 AND user_id = ?2)",
+                    rusqlite::params![lib, user_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("caller membership: {e:?}"))?;
+            if !caller_belongs {
+                return Err(format!("user {user_id} is not a member of library {lib}"));
+            }
             let mut stmt = conn
                 .prepare(
-                    "SELECT m.user_id, u.x25519_pubkey
-                     FROM shared_library_members m
-                     JOIN users u ON u.user_id = m.user_id
-                     WHERE m.library_id = ?
-                     ORDER BY m.user_id",
+                    "SELECT t.user_id, u.x25519_pubkey FROM (
+                         SELECT user_id FROM shared_library_members WHERE library_id = ?1
+                         UNION
+                         SELECT user_id FROM shared_library_invites WHERE library_id = ?1
+                     ) t JOIN users u ON u.user_id = t.user_id
+                     ORDER BY t.user_id",
                 )
                 .map_err(|e| format!("prepare members: {e:?}"))?;
             let rows = stmt

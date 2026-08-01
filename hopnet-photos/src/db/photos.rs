@@ -520,19 +520,41 @@ pub fn lookup_photo_authz(
 /// Tombstone-agnostic by design: soft-deleted photos still serve content
 /// (the recently-deleted UI needs thumbnails and the blobs stay pinned for
 /// the 30-day window); hard-deleted rows are gone, so None -> 404 upstream.
-pub fn lookup_resource_block(
+///
+/// `NotMember` is returned for a shared photo the reading user has no
+/// membership for — the byte gate is wrap AND membership (the wrap alone
+/// may be a pre-staged invitee grant or a kicked member's stale row).
+#[derive(Debug, PartialEq, Eq)]
+pub enum ResourceBlockLookup {
+    Found(CustomUUID),
+    NotFound,
+    NotMember,
+}
+
+pub fn lookup_resource_block_authz(
     conn: &rusqlite::Connection,
     photo_id: &CustomUUID,
     resource_type: i32,
-) -> Result<Option<CustomUUID>, DatabaseError> {
+    user_id: i32,
+) -> Result<ResourceBlockLookup, DatabaseError> {
     match conn.query_row(
-        "SELECT data_block_id FROM photo_resources
-         WHERE photo_id = ?1 AND resource_type = ?2",
-        params![photo_id, resource_type],
-        |r| r.get(0),
+        "SELECT r.data_block_id,
+                (p.library_id IS NULL
+                 OR EXISTS (SELECT 1 FROM shared_library_members m
+                            WHERE m.library_id = p.library_id
+                              AND m.user_id = ?3))
+         FROM photo_resources r
+         JOIN photos p ON p.id = r.photo_id
+         WHERE r.photo_id = ?1 AND r.resource_type = ?2",
+        params![photo_id, resource_type, user_id],
+        |r| Ok((r.get::<_, CustomUUID>(0)?, r.get::<_, bool>(1)?)),
     ) {
-        Ok(id) => Ok(Some(id)),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Ok((id, member)) => Ok(if member {
+            ResourceBlockLookup::Found(id)
+        } else {
+            ResourceBlockLookup::NotMember
+        }),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(ResourceBlockLookup::NotFound),
         Err(e) => {
             tracing::error!("lookup_resource_block {photo_id}/{resource_type} failed: {e}");
             Err(DatabaseError::RecallError)
@@ -908,8 +930,8 @@ pub fn query_changes(
              FROM photo_changes pc
              LEFT JOIN photos p ON p.id = pc.photo_id
              LEFT JOIN photo_metadata_access pma
-                 ON pma.photo_id = pc.photo_id AND pma.user_id = ?
-             WHERE pc.changed_at_height > ?
+                 ON pma.photo_id = pc.photo_id AND pma.user_id = ?1
+             WHERE pc.changed_at_height > ?2
                -- Active photos: scoped to users with a metadata_access row.
                -- Hard-deleted photos (p.id IS NULL): the photo + access rows
                -- are gone (FK cascade in hard_delete_expired_photo), but the
@@ -918,6 +940,16 @@ pub fn query_changes(
                -- no content — the encrypted metadata and resources were
                -- deleted.
                AND (pma.photo_id IS NOT NULL OR p.id IS NULL)
+               -- Shared photos additionally require MEMBERSHIP: access-row
+               -- existence alone is not the read grant for library photos
+               -- (pre-staged invitee wraps must stay inert until accept,
+               -- and a kicked member loses reads the instant the
+               -- membership row dies). Personal photos (NULL library) keep
+               -- existence-as-grant.
+               AND (p.id IS NULL OR p.library_id IS NULL
+                    OR EXISTS (SELECT 1 FROM shared_library_members m
+                               WHERE m.library_id = p.library_id
+                                 AND m.user_id = ?1))
              ORDER BY pc.changed_at_height ASC, pc.photo_id ASC
              LIMIT ?3",
         )
@@ -963,6 +995,12 @@ pub fn query_changes(
                  WHERE pc.changed_at_height = ?2
                    AND pc.photo_id > ?3
                    AND (pma.photo_id IS NOT NULL OR p.id IS NULL)
+                   -- Same membership gate as the main statement — a capped
+                   -- batch must not leak shared rows at the boundary.
+                   AND (p.id IS NULL OR p.library_id IS NULL
+                        OR EXISTS (SELECT 1 FROM shared_library_members m
+                                   WHERE m.library_id = p.library_id
+                                     AND m.user_id = ?1))
                  ORDER BY pc.photo_id ASC",
             )
             .map_err(|e| {
@@ -1495,6 +1533,92 @@ mod tests {
         assert!(exists, "active photo must survive cleanup attempt");
     }
 
+    // Impact: this is Design B's metadata read gate — access-row existence
+    // alone must NOT surface shared photos. Pre-staged invitee wraps stay
+    // inert until the accept commits a membership row, and a kicked
+    // member's stale wraps go dark the instant the row dies.
+    // Should: surface a shared photo to a member with a wrap.
+    // Should not: surface it to a wrap-holding non-member (invitee
+    // pre-accept, kicked member), in the main batch OR the boundary
+    // extension.
+    #[test]
+    fn query_changes_gates_shared_photos_on_membership() {
+        let conn = fixture();
+        conn.execute("INSERT INTO users (user_id, x25519_pubkey) VALUES (2, x'02')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO shared_libraries (id, encrypted_name, name_nonce)
+             VALUES ('00000000-0000-0000-0000-0000000000f1', x'00', x'00')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO shared_library_members (library_id, user_id) VALUES ('00000000-0000-0000-0000-0000000000f1', 1)",
+            [],
+        )
+        .unwrap();
+        let photo_id = CustomUUID::retention_cutoff(40);
+        conn.execute(
+            "INSERT INTO photos (id, library_id, uploaded_by, encrypted_metadata, metadata_nonce)
+             VALUES (?1, '00000000-0000-0000-0000-0000000000f1', 1, x'00', x'00')",
+            rusqlite::params![photo_id],
+        )
+        .unwrap();
+        // BOTH users hold metadata wraps — user 2 is a pre-staged invitee
+        // (or a kicked member): wrap present, membership absent.
+        for uid in [1, 2] {
+            conn.execute(
+                "INSERT INTO photo_metadata_access
+                   (photo_id, user_id, ephemeral_pubkey, encrypted_metadata_key)
+                 VALUES (?1, ?2, x'00', x'00')",
+                rusqlite::params![photo_id, uid],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO photo_changes (photo_id, changed_at_height) VALUES (?1, 5)",
+            rusqlite::params![photo_id],
+        )
+        .unwrap();
+
+        let member_rows = query_changes(&conn, 1, 0, 500).unwrap();
+        assert_eq!(member_rows.len(), 1, "member sees the shared photo");
+        let outsider_rows = query_changes(&conn, 2, 0, 500).unwrap();
+        assert!(
+            outsider_rows.is_empty(),
+            "wrap without membership must surface nothing"
+        );
+
+        // Boundary-extension path: cap the batch exactly at the boundary
+        // height so the second statement runs, and pin the same gate there.
+        let filler = CustomUUID::retention_cutoff(39); // sorts before photo_id
+        conn.execute(
+            "INSERT INTO photos (id, library_id, uploaded_by, encrypted_metadata, metadata_nonce)
+             VALUES (?1, NULL, 2, x'00', x'00')",
+            rusqlite::params![filler],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO photo_metadata_access
+               (photo_id, user_id, ephemeral_pubkey, encrypted_metadata_key)
+             VALUES (?1, 2, x'00', x'00')",
+            rusqlite::params![filler],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO photo_changes (photo_id, changed_at_height) VALUES (?1, 5)",
+            rusqlite::params![filler],
+        )
+        .unwrap();
+        let capped = query_changes(&conn, 2, 0, 1).unwrap();
+        assert_eq!(
+            capped.len(),
+            1,
+            "boundary extension must not leak the shared photo to a non-member"
+        );
+        assert_eq!(capped[0].photo_id, filler);
+    }
+
     #[test]
     fn query_changes_extends_through_boundary_height() {
         let conn = fixture();
@@ -1591,7 +1715,8 @@ mod tests {
         tx.commit().unwrap();
     }
 
-    // Should: resolve a declared (photo, resource type) pair to its data block.
+    // Should: resolve a declared (photo, resource type) pair to its data
+    // block — any authenticated user for a personal photo.
     // Should not: report a data block for an undeclared type or unknown photo.
     #[test]
     fn lookup_resource_block_resolves_and_misses() {
@@ -1601,13 +1726,67 @@ mod tests {
         insert_photo_with_access(&conn, &photo_id, &blob_id, vec![]);
 
         assert_eq!(
-            lookup_resource_block(&conn, &photo_id, 0).unwrap(),
-            Some(blob_id)
+            lookup_resource_block_authz(&conn, &photo_id, 0, 1).unwrap(),
+            ResourceBlockLookup::Found(blob_id)
         );
-        assert_eq!(lookup_resource_block(&conn, &photo_id, 5).unwrap(), None);
         assert_eq!(
-            lookup_resource_block(&conn, &CustomUUID::retention_cutoff(99), 0).unwrap(),
-            None
+            lookup_resource_block_authz(&conn, &photo_id, 5, 1).unwrap(),
+            ResourceBlockLookup::NotFound
+        );
+        assert_eq!(
+            lookup_resource_block_authz(&conn, &CustomUUID::retention_cutoff(99), 0, 1).unwrap(),
+            ResourceBlockLookup::NotFound
+        );
+    }
+
+    // Impact: the byte gate for shared photos is wrap AND membership — a
+    // pre-staged invitee wrap or a kicked member's stale row must never
+    // serve bytes on its own.
+    // Should: serve a member; refuse a non-member with NotMember (403
+    // upstream, distinct from a 404).
+    #[test]
+    fn lookup_resource_block_gates_shared_on_membership() {
+        let conn = fixture();
+        conn.execute(
+            "INSERT INTO shared_libraries (id, encrypted_name, name_nonce)
+             VALUES ('lib1', x'00', x'00')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO shared_library_members (library_id, user_id) VALUES ('lib1', 1)",
+            [],
+        )
+        .unwrap();
+        let photo_id = CustomUUID::retention_cutoff(30);
+        let blob_id = CustomUUID::retention_cutoff(31);
+        conn.execute(
+            "INSERT INTO data_blocks (id, file_hash, fragment_count, added_bytes, file_size)
+             VALUES (?1, x'00', 1, 0, 10)",
+            params![blob_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO photos (id, library_id, uploaded_by, encrypted_metadata, metadata_nonce)
+             VALUES (?1, 'lib1', 1, x'00', x'00')",
+            params![photo_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO photo_resources (photo_id, resource_type, data_block_id)
+             VALUES (?1, 0, ?2)",
+            params![photo_id, blob_id],
+        )
+        .unwrap();
+
+        assert_eq!(
+            lookup_resource_block_authz(&conn, &photo_id, 0, 1).unwrap(),
+            ResourceBlockLookup::Found(blob_id)
+        );
+        assert_eq!(
+            lookup_resource_block_authz(&conn, &photo_id, 0, 2).unwrap(),
+            ResourceBlockLookup::NotMember,
+            "non-member must be refused even though the resource exists"
         );
     }
 
@@ -1634,8 +1813,8 @@ mod tests {
         tx.commit().unwrap();
 
         assert_eq!(
-            lookup_resource_block(&conn, &photo_id, 0).unwrap(),
-            Some(blob_id)
+            lookup_resource_block_authz(&conn, &photo_id, 0, 1).unwrap(),
+            ResourceBlockLookup::Found(blob_id)
         );
     }
 
