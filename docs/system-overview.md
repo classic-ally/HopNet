@@ -201,6 +201,18 @@ Cross-platform desktop application providing file management and network adminis
 - [x] User authentication and session management
 - [ ] File preview system with secure thumbnail generation
 - [ ] Native OS integration (Apple FileProvider, Windows Cloud Files API)
+- [~] Linux filesystem integration — hopnet-mount FUSE daemon
+      ([RFC-018](specs/hopnet-mount.md), spec 2026-07-30; S1–S9 of 10 shipped
+      2026-07-31: read-write mount with strict namespace ops, poke-driven
+      freshness, sparse content cache, durable write-back staging,
+      provisioning/lifecycle (`hopnet-mount login`, Secret Service + file
+      fallback, mesh-capacity statfs, systemd user unit via flake
+      home-manager/NixOS modules), and kernel passthrough reads of fully
+      cached files (~1.6× the daemon path, zero daemon wakeups; opt-in
+      CAP_SYS_ADMIN wrapper in the NixOS module). Cross-node regression
+      guard: orchestrator test `mount-cross-node-consistency` mounts via
+      FUSE inside a node container and proves kernel IO converges across
+      the mesh (2026-08-01). Remaining: S10 desktop polish/packaging)
 - [ ] Advanced file operations (multi-select, context menus, drag-drop)
 - [x] Network health dashboard — invariant-derived resilience pane (2026-07-25): the
       Network Resilience pane reports margins to the model-checked invariants rather than

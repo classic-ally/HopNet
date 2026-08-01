@@ -179,6 +179,44 @@ pub fn storage_view(
     }
 }
 
+/// The mount's statfs numbers (RFC-018 S8): total = user-data capacity
+/// while the placement curve still tolerates this many node failures,
+/// used = raw bytes observed at tolerance >= 0. Composes the same pieces
+/// as `storage_view` (same member predicate, same 0.9 threshold, same
+/// level rows) so `df` on a mounted drive and the resilience pane cannot
+/// disagree; unrecoverable/unknown bytes are excluded from `used` exactly
+/// as the pane excludes them from its consumed figure.
+const STATFS_MIN_TOLERANCE: i32 = 2;
+
+pub fn mount_statfs_bytes(
+    pool: &r2d2::Pool<SqliteConnectionManager>,
+) -> Result<(u64, u64), crate::db::DatabaseError> {
+    use crate::db::resilience;
+
+    let conn = pool
+        .get()
+        .map_err(|_| crate::db::DatabaseError::LockError)?;
+
+    let view = crate::storage_host::substrate_host::storage_view_with_conn(&conn).ok();
+    let member_ids: Vec<i32> = view
+        .as_ref()
+        .map(|v| v.members.iter().map(|p| p.node_id).collect())
+        .unwrap_or_default();
+
+    let used: f64 = resilience::resilience_level_rows(&conn, &member_ids)?
+        .into_iter()
+        .filter(|(level, _)| *level >= 0)
+        .map(|(_, bytes)| bytes)
+        .sum();
+
+    let curve = resilience::get_node_storage_baselines(pool.get())
+        .map(|baselines| resilience::generate_fault_tolerance_curve(baselines, 0.9))
+        .unwrap_or_default();
+    let total_gb = resilience::capacity_at_tolerance(&curve, STATFS_MIN_TOLERANCE);
+
+    Ok(((total_gb * BYTES_PER_GB) as u64, used as u64))
+}
+
 /// Count members the evidence layer cannot currently reach.
 fn unreachable_member_count(
     app_state: &crate::AppState,

@@ -112,6 +112,24 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Linux arm of the same discovery problem (RFC-018 S8): hopnet-mount
+    // finds a same-user node through $XDG_RUNTIME_DIR/hopnet/endpoint.
+    // Written for fixed and ephemeral ports alike (harmless when fixed);
+    // skipped in test mode — stack tests boot nodes as the real user and
+    // must not clobber the session's live endpoint file.
+    #[cfg(target_os = "linux")]
+    if std::env::var("HOPNET_TEST_MODE").is_err()
+        && let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR")
+    {
+        let dir = std::path::Path::new(&runtime_dir).join("hopnet");
+        let write = std::fs::create_dir_all(&dir).and_then(|_| {
+            std::fs::write(dir.join("endpoint"), format!("http://127.0.0.1:{port}\n"))
+        });
+        if let Err(e) = write {
+            tracing::warn!("mount endpoint file write failed: {e}");
+        }
+    }
+
     let (encodingkey, decodingkey) = auth::generate_jwt_key();
 
     // Check if ephemeral database mode is requested (for testing)
@@ -265,6 +283,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 evidence: std::sync::Arc::new(consensus::evidence::EvidenceMap::new()),
                 storage: Arc::new(OnceCell::new()),
                 runtime: tokio::runtime::Handle::current(),
+                change_tx: tokio::sync::broadcast::channel(16).0,
             };
 
             // If we loaded state from database, populate the OnceCell fields
@@ -607,9 +626,21 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             let api_routes = Router::new()
                 .merge(protected_routes)
                 .merge(jwt_or_rpc_routes)
+                .nest("/integrations", fileprovider::routes::health_router())
+                // Host-owned mount statfs (RFC-018 S8): the capacity math
+                // lives host-side (views::resilience), so this one route
+                // can't ride the drive-owned projection mount — but it
+                // wears the same device-token auth. A literal route, not a
+                // second nest at the projection's prefix: two nests at one
+                // path conflict, a static route beside a nest does not.
                 .route(
-                    "/integrations/fileprovider/health",
-                    get(fileprovider::routes::get_health),
+                    "/integrations/mount/statfs",
+                    get(fileprovider::routes::get_mount_statfs).layer(
+                        middleware::from_fn_with_state(
+                            app_state.clone(),
+                            devices::auth::device_token_auth_middleware,
+                        ),
+                    ),
                 )
                 .nest("/devices", devices::routes::router(app_state.clone()))
                 .merge(test_routes)
@@ -762,7 +793,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(not(feature = "gui"))]
     {
-        run_server(&format!("0.0.0.0:{}", HEADLESS_BACKEND_PORT)).await
+        // HOPNET_HTTP_PORT lets a dev copy run alongside a real node on the
+        // same machine (pair with XDG_DATA_HOME for storage isolation).
+        let port = std::env::var("HOPNET_HTTP_PORT")
+            .ok()
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(HEADLESS_BACKEND_PORT);
+        run_server(&format!("0.0.0.0:{}", port)).await
     }
 }
 

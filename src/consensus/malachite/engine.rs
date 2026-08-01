@@ -260,7 +260,18 @@ pub fn spawn_engine(app_state: &AppState) -> Result<(), String> {
         let db_pool = app_state.db_pool.clone();
         let mut decided_watch = decided.clone();
         crate::consensus::queue::queue_rt().spawn(async move {
-            while decided_watch.changed().await.is_ok() {
+            loop {
+                // Wake on a new decide OR a settle kick (remote-committed
+                // entries staged after the decide that applied their block
+                // — RFC-018 S6).
+                tokio::select! {
+                    changed = decided_watch.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                    }
+                    _ = pool.settle_kicked() => {}
+                }
                 let h = *decided_watch.borrow_and_update();
                 // Retry on pool contention: a skipped settle would orphan the
                 // notifiers of committed txs (clients hang to timeout). The
@@ -446,7 +457,7 @@ pub async fn bootstrap_join(
         // nonce insert — the genesis node has no nonce row either, keeping
         // committed_tx_nonces byte-identical across the mesh).
         for t in old_txs.iter() {
-            crate::consensus::dispatch::process_transaction(t, app_state, true, &tx_db)
+            crate::consensus::dispatch::process_transaction(t, app_state, true, 1, &tx_db)
                 .map_err(|e| format!("genesis apply: {e:?}"))?;
         }
         store::install_genesis(&tx_db, &block, &cert).map_err(|e| e.to_string())?;
@@ -678,7 +689,9 @@ async fn handle_need_value(
                 }
                 match rejected_by_idx.remove(&i) {
                     Some(reason) if reason == "already committed" => {
-                        pool.resolve_committed(entry);
+                        // Nonce is in local committed_tx_nonces — applied
+                        // here at some height below the one we're proposing.
+                        pool.resolve_committed(entry, height.0.saturating_sub(1));
                     }
                     Some(reason) => pool.reject(entry, reason),
                     None => inflight.push(entry),

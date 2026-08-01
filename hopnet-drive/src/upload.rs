@@ -166,7 +166,7 @@ pub async fn submit_inodes(
     blob_ops: Vec<hopnet_storage::store::BlobInsertOp>,
     inodes: Vec<Inode>,
     attestation: Option<Vec<u8>>,
-) -> Result<(), StatusCode> {
+) -> Result<i32, StatusCode> {
     let payload = crate::envelopes::DriveInsertPayload { blob_ops, inodes };
     let encoded_inodes = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
         .map_err(|e| {
@@ -188,8 +188,18 @@ pub async fn submit_inodes(
         });
     }
 
-    let results = state.txs.submit_batch(transactions).await;
+    // Strict wait: success means decided AND applied locally (RFC-018
+    // S6); the returned height is the insert entry's read anchor.
+    let mut results = state.txs.submit_batch_decided(transactions).await;
     if results.iter().any(|r| r.is_err()) {
+        for result in &results {
+            if let Err(e) = result {
+                if matches!(e, hopnet_projection::host::TxSubmitError::Timeout) {
+                    tracing::error!("Inode submission timed out (outcome unknown)");
+                    return Err(StatusCode::GATEWAY_TIMEOUT);
+                }
+            }
+        }
         tracing::error!("Failed to submit inodes to consensus");
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
@@ -197,7 +207,10 @@ pub async fn submit_inodes(
     // Distribution is kicked by our own apply (on_decided → global worker
     // queue) — no per-file spawns, no polling, and modify updates are
     // covered by the same path.
-    Ok(())
+    match results.remove(0) {
+        Ok(height) => Ok(height),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
 }
 
 /// Collect the fragment hashes across `blob_ops`. Pure — no DB.
@@ -384,5 +397,7 @@ pub async fn create_folder(
         prepend_missing_parents(&tx, &mut inodes, user_id)?;
     }
 
-    submit_inodes(state, user_id, Vec::new(), inodes, None).await
+    submit_inodes(state, user_id, Vec::new(), inodes, None)
+        .await
+        .map(|_| ())
 }

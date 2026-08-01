@@ -54,6 +54,24 @@ impl SessionAccess for CapabilityHost {
 
 impl TxGateway for CapabilityHost {
     fn submit_batch(&self, txs: Vec<TxSpec>) -> BoxFuture<'_, Vec<Result<(), TxSubmitError>>> {
+        // One implementation: the decided-height variant, heights discarded.
+        let fut = self.submit_batch_decided_inner(txs);
+        Box::pin(async move { fut.await.into_iter().map(|r| r.map(|_| ())).collect() })
+    }
+
+    fn submit_batch_decided(
+        &self,
+        txs: Vec<TxSpec>,
+    ) -> BoxFuture<'_, Vec<Result<i32, TxSubmitError>>> {
+        self.submit_batch_decided_inner(txs)
+    }
+}
+
+impl CapabilityHost {
+    fn submit_batch_decided_inner(
+        &self,
+        txs: Vec<TxSpec>,
+    ) -> BoxFuture<'_, Vec<Result<i32, TxSubmitError>>> {
         Box::pin(async move {
             let n = txs.len();
 
@@ -85,18 +103,21 @@ impl TxGateway for CapabilityHost {
             }
 
             // ONE consensus submission for the whole batch, per-entry results.
+            // Success = decided AND applied locally, height attached.
             self.app_state
                 .consensus_queue
                 .submit_batch(signed)
                 .await
                 .into_iter()
-                .map(|r| {
-                    r.map_err(|e| match e {
-                        crate::consensus::queue::ConsensusSubmitError::Rejected(reason) => {
-                            TxSubmitError::Rejected(reason)
-                        }
-                        _ => TxSubmitError::Submit,
-                    })
+                .map(|r| match r {
+                    Ok(height) => Ok(i32::try_from(height).unwrap_or(i32::MAX)),
+                    Err(crate::consensus::queue::ConsensusSubmitError::Rejected(reason)) => {
+                        Err(TxSubmitError::Rejected(reason))
+                    }
+                    Err(crate::consensus::queue::ConsensusSubmitError::Timeout) => {
+                        Err(TxSubmitError::Timeout)
+                    }
+                    Err(_) => Err(TxSubmitError::Submit),
                 })
                 .collect()
         })
@@ -165,6 +186,7 @@ pub fn build_capabilities(app_state: &AppState) -> HostCapabilities {
         blobs: host.clone(),
         notify: Arc::new(crate::handlers::HostNotifier {
             test_mode: app_state.test_mode,
+            change_tx: app_state.change_tx.clone(),
         }),
         write_admission: host,
     }

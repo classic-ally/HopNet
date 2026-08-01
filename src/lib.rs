@@ -88,6 +88,11 @@ pub struct AppState {
     /// blocking work there stalls consensus), so `tokio::spawn` from apply
     /// must not land on the ambient runtime.
     pub runtime: tokio::runtime::Handle,
+    /// Change-poke broadcast (RFC-018 S4). HostNotifier is constructed
+    /// per-transaction, so the one channel every notifier sends into and
+    /// every /watch subscriber listens on must live here. Content-free;
+    /// send() is sync and never blocks (lagged subscribers coalesce).
+    pub change_tx: tokio::sync::broadcast::Sender<()>,
 }
 
 impl AppState {

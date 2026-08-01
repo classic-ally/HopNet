@@ -30,6 +30,7 @@ mod iroh_reject_unknown;
 mod malachite;
 pub(crate) mod mesh_growth;
 mod metrics;
+mod mount;
 mod multi_size_files;
 pub(crate) mod multi_user;
 mod orphan_cleanup;
@@ -283,6 +284,11 @@ pub async fn run_test_by_name(
                 .await
         }
         "metrics-collection" => metrics::MetricsCollection.run(mesh_id, nodes, flags).await,
+        "mount-cross-node-consistency" => {
+            mount::MountCrossNodeConsistency
+                .run(mesh_id, nodes, flags)
+                .await
+        }
         "eviction-under-pressure" => {
             eviction::EvictionUnderPressure
                 .run(mesh_id, nodes, flags)
@@ -476,6 +482,7 @@ pub fn list_test_names() -> Vec<&'static str> {
         "consensus-barrier-decide-window",
         "consensus-barrier-proposal-hold",
         "metrics-collection",
+        "mount-cross-node-consistency",
         "tier-membership",
         "eviction-under-pressure",
         "re-encode-after-departure",

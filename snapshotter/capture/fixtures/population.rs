@@ -284,11 +284,18 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
             &[],
             vec![folder_inodes.remove(0)],
             "/tmp/hopnet-snapshotter-fragments",
+            1,
         )
         .expect("Failed to insert root folder");
         // Then insert subfolder (its parent /root now exists)
-        db::files::insert_files(&tx, &[], folder_inodes, "/tmp/hopnet-snapshotter-fragments")
-            .expect("Failed to insert subfolder");
+        db::files::insert_files(
+            &tx,
+            &[],
+            folder_inodes,
+            "/tmp/hopnet-snapshotter-fragments",
+            1,
+        )
+        .expect("Failed to insert subfolder");
 
         // Insert files referencing the blobs by id (blob ops apply first)
         let file_inodes = vec![
@@ -319,6 +326,7 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
             &blob_ops,
             file_inodes,
             "/tmp/hopnet-snapshotter-fragments",
+            1,
         )
         .expect("Failed to insert files");
 
@@ -336,6 +344,7 @@ pub fn populate(pool: &Pool<SqliteConnectionManager>, ctx: &mut FixtureContext) 
             &[],
             user1_file_inodes,
             "/tmp/hopnet-snapshotter-fragments",
+            1,
         )
         .expect("Failed to insert user 1 folder");
 

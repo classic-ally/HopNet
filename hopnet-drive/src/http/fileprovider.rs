@@ -315,7 +315,7 @@ pub async fn delete_item(
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
         };
 
-        match db::files::delete_files(&db_tx, encrypted_path.clone(), user_id) {
+        match db::files::delete_files(&db_tx, encrypted_path.clone(), user_id, 0) {
             Ok(_) => {
                 // Item exists and user has access, roll back validation transaction
                 if db_tx.rollback().is_err() {
@@ -876,6 +876,7 @@ pub async fn modify_item(
             content_update.clone().map(|u| u.blob_op),
             None, // incoming_share_updates not needed for validation
             &state.fragments_dir,
+            0, // validation only — rolled back, height never persisted
         ) {
             Ok(_) => {
                 // Validation passed, roll back transaction

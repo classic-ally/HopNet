@@ -8,6 +8,7 @@
 pub mod documentprovider;
 pub mod fileprovider;
 pub mod files;
+pub mod mount;
 pub mod shares;
 pub mod users;
 

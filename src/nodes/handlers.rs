@@ -120,6 +120,7 @@ mod tests {
         let ctx = HandlerCtx {
             fragments_dir: "",
             node_id: Some(0),
+            height: 1,
             notifier: &notifier,
             work: &scheduler,
         };
@@ -206,6 +207,7 @@ mod tests {
         let ctx = HandlerCtx {
             fragments_dir: "",
             node_id: Some(0),
+            height: 1,
             notifier: &notifier,
             work: &scheduler,
         };
