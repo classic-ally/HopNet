@@ -3,7 +3,7 @@ use axum::{
     Router,
     body::Body,
     extract::{DefaultBodyLimit, Request},
-    http::{header, HeaderValue, Method, StatusCode},
+    http::{HeaderValue, Method, StatusCode, header},
     middleware,
     response::Response,
     routing::{get, post},
@@ -21,6 +21,9 @@ const API_CONCURRENCY_LIMIT: usize = 128;
 /// this many idle connections, keeping a trickle available for background
 /// tasks that aren't behind the gate (settler retries, metrics, peer refresh).
 const DB_GATE_IDLE_HEADROOM: u32 = 2;
+use bytes::Bytes;
+use hopnet::db::{PrivKey, PubKey};
+use hopnet::*;
 use once_cell::sync::{Lazy, OnceCell};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
@@ -28,9 +31,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use bytes::Bytes;
-use hopnet::db::{PrivKey, PubKey};
-use hopnet::*;
 
 static ASSETS_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/frontend/dist");
 
@@ -471,16 +471,18 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             // comms spawns it on its dedicated net runtime (see
             // hopnet_comms::net_rt); each scope handler hops DB-touching work
             // to its own runtime. Mesh liveness must not depend on API load.
-            app_state.comms.start(net::scopes::build_registry(&app_state));
+            app_state
+                .comms
+                .start(net::scopes::build_registry(&app_state));
 
             // Restart path: an initialized node starts the consensus engine
             // now — AFTER the accept loop (QUIC handshakes only complete under
             // a polled accept; consensus participation must not precede it).
             // Fresh nodes spawn the engine from the setup/join flows instead.
-            if app_state.node_id.get().is_some() {
-                if let Err(e) = consensus::malachite::engine::spawn_engine(&app_state) {
-                    tracing::error!("failed to start consensus engine: {e}");
-                }
+            if app_state.node_id.get().is_some()
+                && let Err(e) = consensus::malachite::engine::spawn_engine(&app_state)
+            {
+                tracing::error!("failed to start consensus engine: {e}");
             }
 
             // Host capabilities (RFC-016): one seam bundle handed to every
@@ -547,7 +549,10 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                     "/metrics/scores",
                     get(metrics::routes::get_placement_scores),
                 )
-                .nest("/takeout", hopnet_takeout::routes::router(takeout_state.clone()))
+                .nest(
+                    "/takeout",
+                    hopnet_takeout::routes::router(takeout_state.clone()),
+                )
                 .nest("/admin", admin::routes::admin_routes())
                 .nest("/views", views::routes::router())
                 .route("/logout", post(auth::sign_out))
@@ -570,7 +575,10 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .route("/consensus/view", post(consensus::routes::debug_view_state))
                 .route("/consensus/leave", post(consensus::routes::post_leave))
-                .route("/consensus/evidence", get(consensus::evidence::get_evidence))
+                .route(
+                    "/consensus/evidence",
+                    get(consensus::evidence::get_evidence),
+                )
                 .layer(middleware::from_fn_with_state(
                     app_state.clone(),
                     consensus::routes::jwt_or_rpc_auth_middleware,
@@ -620,12 +628,9 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 .flat_map(|m| m.mounts(&host_caps))
             {
                 let routed = match mount.auth {
-                    hopnet_projection::AuthClass::UserJwt => {
-                        mount.router.layer(middleware::from_fn_with_state(
-                            app_state.clone(),
-                            auth::auth_middleware,
-                        ))
-                    }
+                    hopnet_projection::AuthClass::UserJwt => mount.router.layer(
+                        middleware::from_fn_with_state(app_state.clone(), auth::auth_middleware),
+                    ),
                     hopnet_projection::AuthClass::DeviceToken => {
                         mount.router.layer(middleware::from_fn_with_state(
                             app_state.clone(),
@@ -703,7 +708,10 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                         use tower_http::classify::ServerErrorsFailureClass as C;
                         match class {
                             C::StatusCode(StatusCode::SERVICE_UNAVAILABLE) => {
-                                tracing::debug!(latency_ms = latency.as_millis() as u64, "request shed (503)");
+                                tracing::debug!(
+                                    latency_ms = latency.as_millis() as u64,
+                                    "request shed (503)"
+                                );
                             }
                             other => {
                                 tracing::error!(
@@ -718,9 +726,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
 
             // Root router: /api for all endpoints, SPA fallback serves
             // index.html for any remaining path so client-side routing works.
-            let app = Router::new()
-                .nest("/api", api_routes)
-                .fallback(serve_spa);
+            let app = Router::new().nest("/api", api_routes).fallback(serve_spa);
 
             let app = if cfg!(debug_assertions) {
                 let cors = CorsLayer::new()

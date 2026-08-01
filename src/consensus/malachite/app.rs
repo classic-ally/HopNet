@@ -19,13 +19,11 @@ use hopnet_consensus::traits::{Application, ApplyError, ValidationOrigin};
 use hopnet_consensus::types as engine;
 use hopnet_consensus::{Round, Validity};
 
-use crate::consensus::dispatch::{
-    MAX_TRANSACTION_AGE, process_transaction, process_transactions,
-};
-use crate::consensus::types::Transactions as OldTransactions;
-use crate::db::consensus as db;
 use crate::AppState;
 use crate::DISPATCH_TABLE;
+use crate::consensus::dispatch::{MAX_TRANSACTION_AGE, process_transaction, process_transactions};
+use crate::consensus::types::Transactions as OldTransactions;
+use crate::db::consensus as db;
 
 // ---------------------------------------------------------------------------
 // Type bridging
@@ -94,7 +92,11 @@ impl HopNetApplication {
 
         // Solo-block rule (RFC-CONSENSUS-002): structural, both origins.
         check_solo_membership(
-            block.data.transactions.iter().map(|t| t.rpc.function.as_str()),
+            block
+                .data
+                .transactions
+                .iter()
+                .map(|t| t.rpc.function.as_str()),
             block.data.transactions.len(),
         )?;
 
@@ -258,9 +260,7 @@ impl<C: DerefMut<Target = Connection> + 'static> Application<SqliteStorage<C>>
         };
         for tx in block.data.transactions.iter() {
             for projection in crate::projections::manifests() {
-                for blob_id in
-                    projection.committed_blob_ids(&tx.rpc.function, &tx.rpc.payload)
-                {
+                for blob_id in projection.committed_blob_ids(&tx.rpc.function, &tx.rpc.payload) {
                     storage.notify_blob_committed(blob_id);
                 }
             }
@@ -379,8 +379,8 @@ pub fn build_value(
             // S4): the proposer never re-validates its own block through
             // validate_inner, so this is its Live attestation — and it
             // keeps us from proposing blocks the mesh would nil-vote.
-            if crate::consensus::handlers::is_membership_tx(&tx.rpc.function) {
-                if let Err(reason) =
+            if crate::consensus::handlers::is_membership_tx(&tx.rpc.function)
+                && let Err(reason) =
                     crate::consensus::membership_guards::subjective_membership_check(
                         app_state,
                         &db_tx,
@@ -388,10 +388,9 @@ pub fn build_value(
                         &tx.rpc.payload,
                         tx.submitter.id,
                     )
-                {
-                    failed.push((*i, format!("membership guard: {reason}")));
-                    continue;
-                }
+            {
+                failed.push((*i, format!("membership guard: {reason}")));
+                continue;
             }
             let sp = format!("preflight_{slot}");
             if db_tx.execute_batch(&format!("SAVEPOINT {sp}")).is_err() {
@@ -474,7 +473,11 @@ pub fn build_value(
     })
     .map_err(|e| format!("block build: {e:?}"))?;
 
-    Ok(BuiltValue { block, rejected, deferred })
+    Ok(BuiltValue {
+        block,
+        rejected,
+        deferred,
+    })
 }
 
 #[cfg(test)]

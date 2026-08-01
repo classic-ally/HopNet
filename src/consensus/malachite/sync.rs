@@ -40,6 +40,9 @@ pub enum SyncError {
 /// Sync until `decided` reaches `target`. Tries `hint_peer` first, then
 /// rotates through all known peers; a peer whose data fails structural checks
 /// or does not apply is skipped for the remainder of this sync.
+// A sync driver threading every seam it touches; a params struct would just
+// relocate the same eight names.
+#[allow(clippy::too_many_arguments)]
 pub async fn sync_to_target(
     comms: &IrohComms,
     db_pool: &Pool<SqliteConnectionManager>,
@@ -88,10 +91,10 @@ async fn sync_loop(
     let mut empty_answers = 0usize;
 
     loop {
-        if let Some(t) = target {
-            if *decided.borrow() >= t {
-                return Ok(*decided.borrow());
-            }
+        if let Some(t) = target
+            && *decided.borrow() >= t
+        {
+            return Ok(*decided.borrow());
         }
         let reached = *decided.borrow();
         if target.is_none() && !peers.is_empty() && empty_answers >= peers.len() {
@@ -128,18 +131,16 @@ async fn sync_loop(
                     ev.record_contact(peer.node_id);
                 }
                 let mut last_fed = *decided.borrow();
-                let mut expected = from as u64;
-                for (block, cert) in pairs {
+                for (i, (block, cert)) in pairs.into_iter().enumerate() {
                     // Structural checks; certificate verification is the
                     // engine's job.
-                    if block.data.height != expected
+                    if block.data.height != from as u64 + i as u64
                         || block.verify().is_err()
                         || block.block_hash != cert.value_id
                     {
                         tracing::warn!("sync: node {} served malformed chunk", peer.node_id);
                         break;
                     }
-                    expected += 1;
                     last_fed = block.data.height;
                     if input_tx
                         .send(HostInput::SyncValue {
