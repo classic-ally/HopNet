@@ -204,11 +204,22 @@ pub async fn finalize_resource(
     let existing = store.blob(library, &finished.hash).await?;
 
     let (blob_path, deduped) = match existing {
-        Some(blob) => {
+        Some(blob) if blob.evicted_at.is_none() => {
             // Dedup hit: the bytes are already durably on disk. Discard the
             // temp; keep the first writer's extension for the path.
             fs::remove_file(&finished.temp_path).map_err(io_err)?;
             (paths.blob_path(&finished.hash, &blob.ext), true)
+        }
+        Some(blob) => {
+            // Evicted hit: the ledger row lives on (its referents are all
+            // consensus-decided) but the spool bytes are gone. Re-place them
+            // under the row's ext and clear the stamp — this new referent is
+            // undecided and publish needs the bytes.
+            let path = place_blob(paths, &finished, &blob.ext)?;
+            store
+                .clear_blob_eviction(library, &finished.hash)
+                .await?;
+            (path, false)
         }
         None => (place_blob(paths, &finished, ext)?, false),
     };

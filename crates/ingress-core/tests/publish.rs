@@ -803,3 +803,135 @@ async fn resolve_failure_burns_one_attempt_per_photo() {
         assert!(row.publish_last_error.as_deref().unwrap().contains("resolve"));
     }
 }
+
+// ------------------------------------------------------------ spool eviction
+
+/// The on-disk blob file for a written resource of `id`.
+async fn blob_file(rig: &Rig, id: &PhotoId) -> std::path::PathBuf {
+    let row = &rig.store.resources_for_photo(id).await.unwrap()[0];
+    let config = rig
+        .store
+        .library(&ingress_core::LibraryId::new("personal"))
+        .await
+        .unwrap()
+        .unwrap();
+    ingress_core::paths::BlobPaths::new(&config.blob_root).blob_path(
+        row.content_hash.as_ref().unwrap(),
+        row.ext.as_deref().unwrap(),
+    )
+}
+
+async fn blob_row(rig: &Rig, id: &PhotoId) -> ingress_core::model::BlobRecord {
+    let hash = rig.store.resources_for_photo(id).await.unwrap()[0]
+        .content_hash
+        .clone()
+        .unwrap();
+    rig.store
+        .blob(&ingress_core::LibraryId::new("personal"), &hash)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+// Impact: eviction is the transplant's point — after HopNet takes custody
+// the local copy is spool pollution — but deleting bytes for an UNDECIDED
+// photo is data loss, since nothing else holds them yet.
+// Should: evict a published photo's blob at the end of the pass — file
+// deleted, ledger row retained with its refcount and an eviction stamp,
+// photo and resource rows untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn pass_evicts_blobs_of_published_photos() {
+    let rig = rig().await;
+    let id = materialize(&rig, "a", b"a-bytes").await;
+    let file = blob_file(&rig, &id).await;
+    assert!(file.is_file());
+
+    let publisher = FakePublisher::ok();
+    let mut state = PublishState::default();
+    let report = pass(&rig, &publisher, &mut state).await;
+
+    assert_eq!(report.published, 1);
+    assert_eq!(report.evicted_blobs, 1);
+    assert!(!file.exists(), "spool bytes deleted after decided publish");
+    let blob = blob_row(&rig, &id).await;
+    assert!(blob.evicted_at.is_some());
+    assert_eq!(blob.ref_count, 1, "refcount untouched by eviction");
+    let row = &rig.store.resources_for_photo(&id).await.unwrap()[0];
+    assert!(row.written_at.is_some(), "resource row untouched");
+    assert!(photo(&rig, &id).await.published_at.is_some());
+    assert_eq!(
+        rig.store.log_events("spool_evicted").await.unwrap().len(),
+        1
+    );
+}
+
+// Impact: the never-delete-undecided invariant under dedup — one blob, two
+// photos, only one decided: the bytes are still the sole copy for the other.
+// Should: retain a shared blob until EVERY referencing photo is decided,
+// then evict it.
+#[tokio::test(flavor = "multi_thread")]
+async fn shared_blob_evicts_only_when_all_referents_decided() {
+    let rig = rig().await;
+    let a = materialize(&rig, "a", b"same-bytes").await;
+    let b = materialize(&rig, "b", b"same-bytes").await;
+    let file = blob_file(&rig, &a).await;
+    assert_eq!(blob_row(&rig, &a).await.ref_count, 2, "deduped share");
+
+    // Keep b out of the first pass via a future retry deadline.
+    sqlx::query(
+        "UPDATE photos SET publish_attempts = 1, publish_next_retry_at = ? WHERE photo_id = ?",
+    )
+    .bind(Utc::now() + chrono::Duration::hours(1))
+    .bind(&b)
+    .execute(rig.store.raw_pool())
+    .await
+    .unwrap();
+
+    let publisher = FakePublisher::ok();
+    let mut state = PublishState::default();
+    let report = pass(&rig, &publisher, &mut state).await;
+    assert_eq!(report.published, 1);
+    assert_eq!(report.evicted_blobs, 0, "undecided referent keeps the blob");
+    assert!(file.is_file());
+    assert!(blob_row(&rig, &a).await.evicted_at.is_none());
+
+    // b becomes claimable and publishes: now every referent is decided.
+    sqlx::query(
+        "UPDATE photos SET publish_attempts = 0, publish_next_retry_at = NULL WHERE photo_id = ?",
+    )
+    .bind(&b)
+    .execute(rig.store.raw_pool())
+    .await
+    .unwrap();
+    let report = pass(&rig, &publisher, &mut state).await;
+    assert_eq!(report.published, 1);
+    assert_eq!(report.evicted_blobs, 1);
+    assert!(!file.exists());
+    assert!(blob_row(&rig, &a).await.evicted_at.is_some());
+}
+
+// Should: treat adoption (mesh already held the photo; zero uploads) as
+// decided and evict its spool bytes the same pass.
+#[tokio::test(flavor = "multi_thread")]
+async fn adoption_evicts_spool_bytes() {
+    let rig = rig().await;
+    let id = materialize(&rig, "a", b"a-bytes").await;
+    let file = blob_file(&rig, &id).await;
+
+    let publisher = FakePublisher::ok();
+    publisher.set_resolve(Ok(outcome(
+        Responsibility::Holder,
+        vec![entry(
+            "cloud-a",
+            "aa".repeat(32).as_str(),
+            Some("01912e5a-7b3c-7f21-a4d8-3e9f12ab34cd"),
+        )],
+    )));
+    let mut state = PublishState::default();
+    let report = pass(&rig, &publisher, &mut state).await;
+
+    assert_eq!(report.adopted, 1);
+    assert_eq!(publisher.calls.load(Ordering::Relaxed), 0, "zero uploads");
+    assert_eq!(report.evicted_blobs, 1);
+    assert!(!file.exists());
+}

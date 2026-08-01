@@ -46,6 +46,64 @@ impl StateStore {
                 .await?,
         )
     }
+
+    /// Blobs whose every referencing photo is consensus-decided
+    /// (`published_at` set — adoption sets it too) — the spool-eviction
+    /// work queue. A single undecided referent keeps the blob.
+    pub async fn evictable_blobs(&self, limit: i64) -> Result<Vec<BlobRecord>> {
+        Ok(sqlx::query_as(
+            "SELECT b.* FROM blobs b \
+             WHERE b.evicted_at IS NULL \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM photo_resources r \
+                 JOIN photos p ON p.photo_id = r.photo_id \
+                 WHERE p.library_id = b.library_id \
+                   AND r.content_hash = b.content_hash \
+                   AND p.published_at IS NULL) \
+             ORDER BY b.written_at \
+             LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?)
+    }
+
+    /// Stamp a blob evicted. Stamped BEFORE the unlink: a crash between
+    /// leaves an evicted row with a lingering file, which fsck classifies
+    /// as a benign orphan (the reverse order would read as byte loss).
+    pub async fn stamp_blob_evicted(
+        &self,
+        library_id: &LibraryId,
+        hash: &ContentHash,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE blobs SET evicted_at = ? \
+             WHERE library_id = ? AND content_hash = ? AND evicted_at IS NULL",
+        )
+        .bind(Utc::now())
+        .bind(library_id)
+        .bind(hash)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// Clear the eviction stamp — a new (undecided) photo re-referenced the
+    /// hash and the write path re-placed the bytes.
+    pub async fn clear_blob_eviction(
+        &self,
+        library_id: &LibraryId,
+        hash: &ContentHash,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE blobs SET evicted_at = NULL WHERE library_id = ? AND content_hash = ?",
+        )
+        .bind(library_id)
+        .bind(hash)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
 }
 
 /// Increment the refcount, creating the row at 1 if absent. On conflict the

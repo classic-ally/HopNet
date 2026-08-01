@@ -365,3 +365,38 @@ async fn repair_on_unclean_reclaim_runs_tier1() {
         "lock released after the run"
     );
 }
+
+// Impact: after spool eviction, missing bytes are the CORRECT state — fsck
+// reading them as byte loss would page the operator on every archive photo.
+// Should: report clean when an evicted blob's file is absent.
+// Should: classify a lingering file for an evicted row as a benign orphan
+// (the stamp-then-unlink crash window), never byte loss.
+#[tokio::test]
+async fn evicted_blob_is_not_byte_loss() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, lib, data_dir) = rig(tmp.path()).await;
+    let desc = AssetDescriptorBuilder::simple_image()
+        .with_cloud_id("c1")
+        .build();
+    let id = seed_one(&store, &desc).await;
+    materialize_all(&store, &desc, &id).await;
+
+    let row = &store.resources_for_photo(&id).await.unwrap()[0];
+    let hash = row.content_hash.clone().unwrap();
+    let config = store.library(&lib).await.unwrap().unwrap();
+    let path = BlobPaths::new(&config.blob_root).blob_path(&hash, "bin");
+
+    // Completed eviction: stamp + unlink.
+    store.stamp_blob_evicted(&lib, &hash).await.unwrap();
+    std::fs::remove_file(&path).unwrap();
+
+    let report = fsck(&store, &data_dir, false).await;
+    assert!(report.missing_blobs.is_empty(), "{report:?}");
+    assert!(report.is_clean());
+
+    // Crash window: stamped but the unlink never ran.
+    std::fs::write(&path, b"lingering").unwrap();
+    let report = fsck(&store, &data_dir, false).await;
+    assert!(report.missing_blobs.is_empty());
+    assert_eq!(report.orphan_blobs.len(), 1, "lingering file is orphan-class");
+}

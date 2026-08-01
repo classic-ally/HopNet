@@ -165,10 +165,16 @@ async fn check_blob_tree(
         return Ok(());
     }
 
-    // (b) every row's file must exist. The root is reachable here, so a
-    // miss is genuine.
+    // (b) every UNEVICTED row's file must exist. The root is reachable
+    // here, so a miss is genuine. Spool-evicted rows are the opposite:
+    // their bytes are SUPPOSED to be gone (HopNet holds them), so they are
+    // excluded here AND from `row_exts` — a lingering file for an evicted
+    // row then classifies as a benign orphan in the walk below.
     let mut row_exts: HashMap<ContentHash, String> = HashMap::new();
     for row in rows {
+        if row.evicted_at.is_some() {
+            continue;
+        }
         let expected = paths.blob_path(&row.content_hash, &row.ext);
         if !expected.is_file() {
             report.missing_blobs.push(MissingBlob {

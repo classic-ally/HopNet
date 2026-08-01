@@ -219,6 +219,7 @@ pub struct FfiCleanupReport {
     pub blob_files_deleted: u64,
     pub log_rows_pruned: u64,
     pub snapshots_written: u64,
+    pub spool_evicted: u64,
 }
 
 /// Publish-tick aggregates (mirrors `publish::PublishReport`).
@@ -233,6 +234,9 @@ pub struct FfiPublishReport {
     pub gave_up: u64,
     /// Skipped: publish-metadata capsule absent (awaiting heal backfill).
     pub missing_descriptor: u64,
+    /// Blobs spool-evicted at the end of the pass (every referent decided
+    /// in HopNet; local bytes deleted).
+    pub evicted_blobs: u64,
     /// The last pass aborted because the node was unreachable.
     pub parked: bool,
     /// The last pass held its photos because this device does not hold

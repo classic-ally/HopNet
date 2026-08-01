@@ -214,6 +214,9 @@ pub struct BlobRecord {
     pub size_bytes: i64,
     pub ref_count: i64,
     pub written_at: DateTime<Utc>,
+    /// Set when the local bytes were spool-evicted (every referencing photo
+    /// consensus-decided). NULL = bytes expected on disk.
+    pub evicted_at: Option<DateTime<Utc>>,
 }
 
 #[cfg(test)]

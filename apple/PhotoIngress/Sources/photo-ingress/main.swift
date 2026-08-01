@@ -218,6 +218,7 @@ func printCleanup(_ c: FfiCleanupReport, indent: String = "  ") {
     print("\(indent)blob files deleted:   \(c.blobFilesDeleted)")
     print("\(indent)log rows pruned:      \(c.logRowsPruned)")
     print("\(indent)snapshots written:    \(c.snapshotsWritten)")
+    print("\(indent)spool evicted:        \(c.spoolEvicted)")
 }
 
 /// One-shot lifecycle run. No PhotoKit involvement — needs no authorization;
@@ -370,7 +371,8 @@ func runDaemon() throws {
         print("    published:          \(report.publish.published) " +
               "(already \(report.publish.alreadyPublished), adopted \(report.publish.adopted))")
         print("    failed:             \(report.publish.failed) " +
-              "(gave up \(report.publish.gaveUp), missing descriptor \(report.publish.missingDescriptor))")
+              "(gave up \(report.publish.gaveUp), missing descriptor \(report.publish.missingDescriptor), " +
+              "spool evicted \(report.publish.evictedBlobs))")
         if report.publish.parked {
             print("    PARKED — node unreachable at last pass")
         }

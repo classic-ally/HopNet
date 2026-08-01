@@ -564,6 +564,7 @@ impl IngressSession {
                 failed: report.publish.failed,
                 gave_up: report.publish.gave_up,
                 missing_descriptor: report.publish.missing_sidecar,
+                evicted_blobs: report.publish.evicted_blobs,
                 parked: report.publish.parked,
                 parked_responsibility: report.publish.parked_responsibility,
             },
@@ -598,6 +599,7 @@ fn cleanup_report_to_ffi(cleanup: &ingress_core::cleanup::CleanupReport) -> FfiC
         blob_files_deleted: cleanup.blob_files_deleted,
         log_rows_pruned: cleanup.log_rows_pruned,
         snapshots_written: cleanup.snapshots_written,
+        spool_evicted: cleanup.spool_evicted,
     }
 }
 

@@ -70,13 +70,24 @@ pub async fn execute_transition(
 
     // Step 1 — pre-transaction filesystem copies. The dst `blobs` row is the
     // authority for "already there" (spec step 3's refcount check); the file
-    // check on top makes re-runs after a partial crash idempotent.
+    // check on top makes re-runs after a partial crash idempotent. A
+    // spool-evicted src blob has no bytes to move — the dst row inherits
+    // the eviction stamp post-tx instead (the referent is decided; HopNet
+    // holds the bytes).
+    let mut inherit_eviction: Vec<ContentHash> = Vec::new();
     for (hash, ext, _) in &written {
         // First-writer-wins carries the SOURCE library's ext to the dst.
         let dst_present =
             store.blob(dst, hash).await?.is_some() || dst_paths.blob_path(hash, ext).is_file();
+        let src_evicted = store
+            .blob(src, hash)
+            .await?
+            .is_some_and(|b| b.evicted_at.is_some());
         if dst_present {
             report.blobs_shared += 1;
+        } else if src_evicted {
+            report.blobs_shared += 1;
+            inherit_eviction.push(hash.clone());
         } else {
             copy_blob(&src_paths, &dst_paths, hash, ext)?;
             report.blobs_copied += 1;
@@ -109,6 +120,9 @@ pub async fn execute_transition(
         if fs::remove_file(src_paths.blob_path(hash, ext)).is_ok() {
             report.src_files_deleted += 1;
         }
+    }
+    for hash in &inherit_eviction {
+        store.stamp_blob_evicted(dst, hash).await?;
     }
 
     Ok(report)

@@ -192,6 +192,8 @@ pub struct PublishReport {
     pub gave_up: u64,
     /// Claimed photos whose sidecar was missing (crash window) — skipped.
     pub missing_sidecar: u64,
+    /// Blobs spool-evicted at the end of the pass (every referent decided).
+    pub evicted_blobs: u64,
     /// The pass aborted early because the node was unreachable.
     pub parked: bool,
     /// The pass held its remaining photos because this device does not
@@ -208,6 +210,7 @@ impl PublishReport {
         self.failed += other.failed;
         self.gave_up += other.gave_up;
         self.missing_sidecar += other.missing_sidecar;
+        self.evicted_blobs += other.evicted_blobs;
         self.parked = other.parked;
         self.parked_responsibility = other.parked_responsibility;
     }
@@ -430,8 +433,17 @@ pub async fn run_publish_pass(
         }
     }
 
+    // Spool eviction rides the end of every pass so decided bytes leave
+    // local disk with minimal residence; the cleanup tick sweeps whatever a
+    // crash window strands.
+    report.evicted_blobs =
+        crate::cleanup::evict_published_blobs(store, EVICT_BATCH).await?;
+
     Ok(report)
 }
+
+/// Eviction cap per pass (same stall rationale as the hard-delete batch).
+const EVICT_BATCH: i64 = 500;
 
 enum AssembleSkip {
     MissingDescriptor,

@@ -1998,14 +1998,16 @@ public struct FfiCleanupReport: Equatable, Hashable {
     public var blobFilesDeleted: UInt64
     public var logRowsPruned: UInt64
     public var snapshotsWritten: UInt64
+    public var spoolEvicted: UInt64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(photosHardDeleted: UInt64, blobFilesDeleted: UInt64, logRowsPruned: UInt64, snapshotsWritten: UInt64) {
+    public init(photosHardDeleted: UInt64, blobFilesDeleted: UInt64, logRowsPruned: UInt64, snapshotsWritten: UInt64, spoolEvicted: UInt64) {
         self.photosHardDeleted = photosHardDeleted
         self.blobFilesDeleted = blobFilesDeleted
         self.logRowsPruned = logRowsPruned
         self.snapshotsWritten = snapshotsWritten
+        self.spoolEvicted = spoolEvicted
     }
 
     
@@ -2027,7 +2029,8 @@ public struct FfiConverterTypeFfiCleanupReport: FfiConverterRustBuffer {
                 photosHardDeleted: FfiConverterUInt64.read(from: &buf), 
                 blobFilesDeleted: FfiConverterUInt64.read(from: &buf), 
                 logRowsPruned: FfiConverterUInt64.read(from: &buf), 
-                snapshotsWritten: FfiConverterUInt64.read(from: &buf)
+                snapshotsWritten: FfiConverterUInt64.read(from: &buf), 
+                spoolEvicted: FfiConverterUInt64.read(from: &buf)
         )
     }
 
@@ -2036,6 +2039,7 @@ public struct FfiConverterTypeFfiCleanupReport: FfiConverterRustBuffer {
         FfiConverterUInt64.write(value.blobFilesDeleted, into: &buf)
         FfiConverterUInt64.write(value.logRowsPruned, into: &buf)
         FfiConverterUInt64.write(value.snapshotsWritten, into: &buf)
+        FfiConverterUInt64.write(value.spoolEvicted, into: &buf)
     }
 }
 
@@ -2647,6 +2651,11 @@ public struct FfiPublishReport: Equatable, Hashable {
      */
     public var missingDescriptor: UInt64
     /**
+     * Blobs spool-evicted at the end of the pass (every referent decided
+     * in HopNet; local bytes deleted).
+     */
+    public var evictedBlobs: UInt64
+    /**
      * The last pass aborted because the node was unreachable.
      */
     public var parked: Bool
@@ -2667,6 +2676,10 @@ public struct FfiPublishReport: Equatable, Hashable {
          * Skipped: publish-metadata capsule absent (awaiting heal backfill).
          */missingDescriptor: UInt64, 
         /**
+         * Blobs spool-evicted at the end of the pass (every referent decided
+         * in HopNet; local bytes deleted).
+         */evictedBlobs: UInt64, 
+        /**
          * The last pass aborted because the node was unreachable.
          */parked: Bool, 
         /**
@@ -2679,6 +2692,7 @@ public struct FfiPublishReport: Equatable, Hashable {
         self.failed = failed
         self.gaveUp = gaveUp
         self.missingDescriptor = missingDescriptor
+        self.evictedBlobs = evictedBlobs
         self.parked = parked
         self.parkedResponsibility = parkedResponsibility
     }
@@ -2705,6 +2719,7 @@ public struct FfiConverterTypeFfiPublishReport: FfiConverterRustBuffer {
                 failed: FfiConverterUInt64.read(from: &buf), 
                 gaveUp: FfiConverterUInt64.read(from: &buf), 
                 missingDescriptor: FfiConverterUInt64.read(from: &buf), 
+                evictedBlobs: FfiConverterUInt64.read(from: &buf), 
                 parked: FfiConverterBool.read(from: &buf), 
                 parkedResponsibility: FfiConverterBool.read(from: &buf)
         )
@@ -2717,6 +2732,7 @@ public struct FfiConverterTypeFfiPublishReport: FfiConverterRustBuffer {
         FfiConverterUInt64.write(value.failed, into: &buf)
         FfiConverterUInt64.write(value.gaveUp, into: &buf)
         FfiConverterUInt64.write(value.missingDescriptor, into: &buf)
+        FfiConverterUInt64.write(value.evictedBlobs, into: &buf)
         FfiConverterBool.write(value.parked, into: &buf)
         FfiConverterBool.write(value.parkedResponsibility, into: &buf)
     }

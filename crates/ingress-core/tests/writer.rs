@@ -378,3 +378,72 @@ async fn completion_and_capsule_for_multi_resource_photo() {
     let types: Vec<&str> = doc.resources.iter().map(|r| r.resource_type.as_str()).collect();
     assert_eq!(types, vec!["original", "paired_video"]);
 }
+
+// Impact: a spool-evicted hash re-referenced by a NEW (undecided) photo has
+// no local bytes — treating it as a plain dedup hit would commit a written
+// row whose file doesn't exist, stranding the new photo out of HopNet.
+// Should: re-place the bytes under the row's ext, clear the eviction stamp,
+// and increment the refcount.
+#[tokio::test]
+async fn evicted_dedup_rehit_replaces_bytes() {
+    let rig = rig().await;
+    let bytes = b"evict-rehit-bytes";
+    let hash = ContentHash::of_bytes(bytes);
+
+    let first = minted_photo(&rig, bytes).await;
+    let k1 = TempKey::Resource {
+        photo_id: first.clone(),
+        resource_type: ResourceType::Original,
+    };
+    let f1 = stream_chunks(&rig.paths, &k1, &[bytes]);
+    finalize_resource(
+        &rig.store,
+        &rig.paths,
+        &rig.library,
+        &first,
+        ResourceType::Original,
+        f1,
+        "heic",
+    )
+    .await
+    .unwrap();
+
+    // Simulate a completed eviction: stamp + delete the file.
+    rig.store
+        .stamp_blob_evicted(&rig.library, &hash)
+        .await
+        .unwrap();
+    std::fs::remove_file(rig.paths.blob_path(&hash, "heic")).unwrap();
+
+    // Second photo, byte-identical original.
+    let desc2 = AssetDescriptorBuilder::simple_image()
+        .with_cloud_id("CLOUD-EVICT-REHIT:001")
+        .build();
+    resolve_descriptor(&rig.store, &desc2).await.unwrap();
+    let second = match resolve_with_hash(&rig.store, &desc2, &hash).await.unwrap() {
+        HashResolution::NewPhotoSharedBlob { photo_id, .. } => photo_id,
+        other => panic!("expected NewPhotoSharedBlob, got {other:?}"),
+    };
+    let k2 = TempKey::Resource {
+        photo_id: second.clone(),
+        resource_type: ResourceType::Original,
+    };
+    let f2 = stream_chunks(&rig.paths, &k2, &[bytes]);
+    let outcome = finalize_resource(
+        &rig.store,
+        &rig.paths,
+        &rig.library,
+        &second,
+        ResourceType::Original,
+        f2,
+        "heic",
+    )
+    .await
+    .unwrap();
+
+    assert!(!outcome.deduped(), "bytes were re-placed, not reused");
+    assert!(rig.paths.blob_path(&hash, "heic").is_file());
+    let blob = rig.store.blob(&rig.library, &hash).await.unwrap().unwrap();
+    assert!(blob.evicted_at.is_none(), "eviction stamp cleared");
+    assert_eq!(blob.ref_count, 2);
+}

@@ -132,10 +132,11 @@ pub fn print_photo(view: &PhotoStatus) {
             } else {
                 "pending".to_string()
             };
-            let blob = match (&r.blob_path, r.blob_exists) {
-                (Some(p), Some(true)) => p.display().to_string(),
-                (Some(p), _) => format!("{} (MISSING)", p.display()),
-                (None, _) => "-".into(),
+            let blob = match (&r.blob_path, r.blob_exists, r.evicted) {
+                (Some(_), _, true) => "(evicted — in HopNet)".into(),
+                (Some(p), Some(true), _) => p.display().to_string(),
+                (Some(p), _, _) => format!("{} (MISSING)", p.display()),
+                (None, ..) => "-".into(),
             };
             vec![
                 r.record.resource_type.as_str().to_string(),

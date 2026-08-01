@@ -79,6 +79,8 @@ pub struct ResourceStatus {
     /// (never conflate "unknown" with "missing" — an absent mount must not
     /// read as byte loss).
     pub blob_exists: Option<bool>,
+    /// Spool-evicted: the bytes are deliberately gone (HopNet holds them).
+    pub evicted: bool,
 }
 
 /// Per-photo view. `key` is tried as a `photo_id` first, then a `cloud_id`.
@@ -106,10 +108,18 @@ pub async fn photo_status(store: &StateStore, key: &str) -> Result<Option<PhotoS
             _ => None,
         };
         let blob_exists = blob_path.as_ref().map(|p| p.is_file());
+        let evicted = match (&photo.library_id, &record.content_hash) {
+            (Some(lib), Some(hash)) => store
+                .blob(lib, hash)
+                .await?
+                .is_some_and(|b| b.evicted_at.is_some()),
+            _ => false,
+        };
         resources.push(ResourceStatus {
             record,
             blob_path,
             blob_exists,
+            evicted,
         });
     }
 

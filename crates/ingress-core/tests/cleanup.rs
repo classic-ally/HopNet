@@ -593,3 +593,61 @@ async fn standalone_cleanup_respects_drain_lock() {
     assert_eq!(cleanup.photos_hard_deleted, 0);
     assert!(!lock_path.exists(), "lock released after the run");
 }
+
+// Impact: the publish pass's own eviction can crash between mark_published
+// and the eviction step — the cleanup tick is the sweep that guarantees
+// decided bytes still leave local disk.
+// Should: evict a published photo's blob on the cleanup tick (file gone,
+// eviction stamped, refcount intact).
+// Should not: touch an unpublished photo's blob.
+#[tokio::test]
+async fn cleanup_sweep_evicts_decided_blobs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, lib, _) = store_with_libs(tmp.path()).await;
+    let data_dir = DataDir::new(tmp.path().join("data"));
+
+    let published_desc = AssetDescriptorBuilder::simple_image()
+        .modified_at(Utc::now())
+        .build();
+    let published = seed_one(&store, &published_desc).await;
+    materialize_all(&store, &published_desc, &published).await;
+    let pending_desc = AssetDescriptorBuilder::simple_image()
+        .modified_at(Utc::now())
+        .build();
+    let pending = seed_one(&store, &pending_desc).await;
+    materialize_all(&store, &pending_desc, &pending).await;
+
+    sqlx::query("UPDATE photos SET published_at = ? WHERE photo_id = ?")
+        .bind(Utc::now())
+        .bind(published.to_string())
+        .execute(store.raw_pool())
+        .await
+        .unwrap();
+
+    let paths = BlobPaths::new(&store.library(&lib).await.unwrap().unwrap().blob_root);
+    let file_of = |id: &PhotoId, store: &StateStore| {
+        let id = id.clone();
+        let store = store.clone();
+        let paths = paths.clone();
+        async move {
+            let row = &store.resources_for_photo(&id).await.unwrap()[0];
+            paths.blob_path(row.content_hash.as_ref().unwrap(), "bin")
+        }
+    };
+    let published_file = file_of(&published, &store).await;
+    let pending_file = file_of(&pending, &store).await;
+
+    let report = run_cleanup(&store, &data_dir, &cfg(), Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(report.spool_evicted, 1);
+    assert!(!published_file.exists(), "decided bytes swept");
+    assert!(pending_file.is_file(), "undecided bytes retained");
+    let hash = store.resources_for_photo(&published).await.unwrap()[0]
+        .content_hash
+        .clone()
+        .unwrap();
+    let blob = store.blob(&lib, &hash).await.unwrap().unwrap();
+    assert!(blob.evicted_at.is_some());
+    assert_eq!(blob.ref_count, 1);
+}

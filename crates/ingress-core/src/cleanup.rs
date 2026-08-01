@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Datelike, Duration, Utc};
 
 use crate::error::{IngressError, Result};
-use crate::ids::{ContentHash, PhotoId};
+use crate::ids::{ContentHash, LibraryId, PhotoId};
 use crate::model::LibraryConfig;
 use crate::paths::{BlobPaths, DataDir};
 use crate::store::StateStore;
@@ -47,6 +47,10 @@ pub struct CleanupReport {
     pub blob_files_deleted: u64,
     pub log_rows_pruned: u64,
     pub snapshots_written: u64,
+    /// Spool-evicted blobs: local bytes deleted because every referencing
+    /// photo is consensus-decided in HopNet (the crash-window sweep behind
+    /// the publish pass's own eviction).
+    pub spool_evicted: u64,
 }
 
 impl CleanupReport {
@@ -55,6 +59,7 @@ impl CleanupReport {
         self.blob_files_deleted += other.blob_files_deleted;
         self.log_rows_pruned += other.log_rows_pruned;
         self.snapshots_written += other.snapshots_written;
+        self.spool_evicted += other.spool_evicted;
     }
 }
 
@@ -72,7 +77,53 @@ pub async fn run_cleanup(
         crate::store::log::prune_before(store.pool(), now - Duration::days(cfg.log_retention_days))
             .await?;
     report.snapshots_written = snapshot_if_due(store, data_dir, cfg, now).await?;
+    report.spool_evicted = evict_published_blobs(store, cfg.hard_delete_batch as i64).await?;
     Ok(report)
+}
+
+// ---------------------------------------------------------------- spool eviction
+
+/// Delete the local bytes of every blob whose referencing photos are all
+/// consensus-decided (published or adopted): HopNet holds the archive copy,
+/// so the spool entry's job is done. Stamp-then-unlink — a crash between
+/// the two leaves an evicted row with a lingering file, which fsck
+/// classifies as a benign orphan rather than byte loss. Runs at the end of
+/// every publish pass (minimal residence) and on the cleanup tick (crash
+/// windows).
+pub async fn evict_published_blobs(store: &StateStore, limit: i64) -> Result<u64> {
+    let candidates = store.evictable_blobs(limit).await?;
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+    let libraries: std::collections::HashMap<LibraryId, LibraryConfig> = store
+        .libraries()
+        .await?
+        .into_iter()
+        .map(|l| (l.library_id.clone(), l))
+        .collect();
+
+    let mut evicted = 0u64;
+    for blob in candidates {
+        let Some(config) = libraries.get(&blob.library_id) else {
+            continue;
+        };
+        store
+            .stamp_blob_evicted(&blob.library_id, &blob.content_hash)
+            .await?;
+        let path = BlobPaths::new(&config.blob_root).blob_path(&blob.content_hash, &blob.ext);
+        let _ = fs::remove_file(path);
+        evicted += 1;
+    }
+    if evicted > 0 {
+        store
+            .append_log(
+                "spool_evicted",
+                None,
+                Some(serde_json::json!({ "blobs": evicted })),
+            )
+            .await?;
+    }
+    Ok(evicted)
 }
 
 /// One-shot entry for the CLI subcommand: exclusive lock (errors while the
