@@ -457,6 +457,9 @@ pub fn delete_files(
     Ok(())
 }
 
+// One argument per orthogonal aspect of a modify (rename, content, shares,
+// height stamp); a params struct would just relocate the same names.
+#[allow(clippy::too_many_arguments)]
 pub fn modify_item(
     db_tx: &rusqlite::Transaction,
     user_id: i32,

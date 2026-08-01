@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fuser::{
-    Errno, FileAttr, FileHandle, FileType, Filesystem, Generation, INodeNo, OpenFlags,
-    ReplyAttr, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, Request,
+    Errno, FileAttr, FileHandle, FileType, Filesystem, Generation, INodeNo, OpenFlags, ReplyAttr,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, Request,
 };
 
 use crate::transport::ItemKind;
@@ -96,7 +96,10 @@ pub struct FuserInvalidator(pub fuser::Notifier);
 
 impl crate::watch::KernelInvalidator for FuserInvalidator {
     fn inval_entry(&self, parent_ino: u64, name: &str) {
-        if let Err(e) = self.0.inval_entry(INodeNo(parent_ino), std::ffi::OsStr::new(name)) {
+        if let Err(e) = self
+            .0
+            .inval_entry(INodeNo(parent_ino), std::ffi::OsStr::new(name))
+        {
             tracing::debug!("inval_entry({parent_ino}, {name}): {e}");
         }
     }
@@ -123,11 +126,7 @@ fn errno(e: &CoreError) -> Errno {
 }
 
 impl Filesystem for HopFs {
-    fn init(
-        &mut self,
-        _req: &Request,
-        config: &mut fuser::KernelConfig,
-    ) -> std::io::Result<()> {
+    fn init(&mut self, _req: &Request, config: &mut fuser::KernelConfig) -> std::io::Result<()> {
         if !self.passthrough_allowed {
             return Ok(());
         }
@@ -147,9 +146,7 @@ impl Filesystem for HopFs {
                 }
             }
             Err(_) => {
-                tracing::info!(
-                    "kernel lacks FUSE_PASSTHROUGH (needs 6.9+); daemon-mediated reads"
-                );
+                tracing::info!("kernel lacks FUSE_PASSTHROUGH (needs 6.9+); daemon-mediated reads");
             }
         }
         Ok(())

@@ -200,11 +200,7 @@ impl MountCore {
 
     pub async fn lookup(&self, parent_ino: u64, name: &str) -> Result<NodeAttr, CoreError> {
         let parent = self.ids.get(parent_ino).ok_or(CoreError::NotFound)?;
-        match self
-            .transport
-            .lookup(parent, name.to_string())
-            .await?
-        {
+        match self.transport.lookup(parent, name.to_string()).await? {
             None => Err(CoreError::NotFound),
             Some(item) => {
                 self.attrs.insert(item.clone());
@@ -387,7 +383,9 @@ impl MountCore {
             return Ok(Vec::new());
         };
         let cache = self.cache.as_ref().ok_or_else(|| {
-            CoreError::Cache(crate::cache::CacheError::Io("no cache attached".to_string()))
+            CoreError::Cache(crate::cache::CacheError::Io(
+                "no cache attached".to_string(),
+            ))
         })?;
         cache
             .read(&blob, state.size, offset, len)
@@ -464,7 +462,9 @@ impl MountCore {
             .write_at(offset, data.to_vec())
             .await
             .map_err(|e| CoreError::Staging(e.to_string()))?;
-        state.dirty.store(true, std::sync::atomic::Ordering::Release);
+        state
+            .dirty
+            .store(true, std::sync::atomic::Ordering::Release);
         Ok(data.len() as u32)
     }
 
@@ -480,7 +480,9 @@ impl MountCore {
             .set_len(size)
             .await
             .map_err(|e| CoreError::Staging(e.to_string()))?;
-        state.dirty.store(true, std::sync::atomic::Ordering::Release);
+        state
+            .dirty
+            .store(true, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -519,19 +521,16 @@ impl MountCore {
         };
         drop(write);
         self.upload_staged(&staged).await?;
-        state.dirty.store(false, std::sync::atomic::Ordering::Release);
+        state
+            .dirty
+            .store(false, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
     /// Release: drop the handle; dirty content uploads in the background
     /// (durable staging means a crash before upload loses nothing).
     pub fn release(self: &Arc<Self>, fh: u64) {
-        let Some(state) = self
-            .files
-            .lock()
-            .expect("file table poisoned")
-            .remove(&fh)
-        else {
+        let Some(state) = self.files.lock().expect("file table poisoned").remove(&fh) else {
             return;
         };
         if !state.dirty.load(std::sync::atomic::Ordering::Acquire) {
@@ -685,13 +684,7 @@ impl MountCore {
         self.attrs.insert(item.clone());
         let ino = self.ids.ino(&item.id);
         let fh = self.open_rw(ino, true).await?;
-        Ok((
-            NodeAttr {
-                ino,
-                item,
-            },
-            fh,
-        ))
+        Ok((NodeAttr { ino, item }, fh))
     }
 
     /// rename/move: strict.

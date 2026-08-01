@@ -8,12 +8,12 @@
 //! whole router.
 
 use axum::{
-    Extension, Json, Router,
     body::Body,
     extract::{DefaultBodyLimit, Multipart, Query, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{header, HeaderMap, StatusCode},
     response::Response,
     routing::get,
+    Extension, Json, Router,
 };
 use serde::Deserialize;
 use std::str::FromStr;
@@ -25,12 +25,12 @@ use crate::host::{DriveState, TxSigner, TxSpec, TxSubmitError};
 use crate::model::{Inode, InodeOwner};
 use crate::paths::{build_encrypted_path, encrypt_part};
 use crate::upload::session_or_status;
-use hopnet_common::CustomUUID;
 use hopnet_common::db::InodeType;
 use hopnet_common::mount::{
     MountChangesResponse, MountDeleteRequest, MountEnumerateResponse, MountItem,
     MountModifyRequest, MountMutationResponse,
 };
+use hopnet_common::CustomUUID;
 use hopnet_projection::DatabaseError;
 
 #[cfg(test)]
@@ -111,13 +111,11 @@ pub async fn get_watch(
 
     let mut rx = state.notify.subscribe();
     let stream = async_stream::stream! {
-        loop {
-            match rx.recv().await {
-                Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    yield Ok(Event::default().data(""));
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            }
+        // Closed ends the stream; Lagged still means "something changed".
+        while let Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) =
+            rx.recv().await
+        {
+            yield Ok(Event::default().data(""));
         }
     };
     Sse::new(stream).keep_alive(KeepAlive::new().interval(WATCH_KEEPALIVE))
@@ -375,12 +373,11 @@ pub async fn post_create(
                 if folder_name.is_empty() || folder_name.contains('/') {
                     return Err(StatusCode::BAD_REQUEST);
                 }
-                let parent = ensure_parent_path(&state, user_id, &parent_id, &mut parent_path)
-                    .await?;
-                let segment =
-                    encrypt_part(&folder_name, &session.siv_key, &session.siv_nonce)
-                        .await
-                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                let parent =
+                    ensure_parent_path(&state, user_id, &parent_id, &mut parent_path).await?;
+                let segment = encrypt_part(&folder_name, &session.siv_key, &session.siv_nonce)
+                    .await
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
                 let path = build_encrypted_path(&parent, &segment);
                 ensure_vacant(&state, user_id, &path, &session)?;
                 created = Some((
@@ -406,8 +403,8 @@ pub async fn post_create(
                 if filename.is_empty() || filename.contains('/') {
                     return Err(StatusCode::BAD_REQUEST);
                 }
-                let parent = ensure_parent_path(&state, user_id, &parent_id, &mut parent_path)
-                    .await?;
+                let parent =
+                    ensure_parent_path(&state, user_id, &parent_id, &mut parent_path).await?;
                 let segment = encrypt_part(&filename, &session.siv_key, &session.siv_nonce)
                     .await
                     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -417,8 +414,7 @@ pub async fn post_create(
                     &build_encrypted_path(&parent, &segment),
                     &session,
                 )?;
-                let reader =
-                    StreamReader::new(field.map(|r| r.map_err(std::io::Error::other)));
+                let reader = StreamReader::new(field.map(|r| r.map_err(std::io::Error::other)));
                 let (inode, _data_id, blob_op) = crate::upload::assemble_file_inode(
                     &state, &session, user_id, &parent, &filename, reader, file_size,
                 )
@@ -450,7 +446,13 @@ pub async fn post_create(
     let height =
         crate::upload::submit_inodes(&state, user_id, blob_ops, vec![inode], attestation).await?;
 
-    let item = read_back_item(&state, user_id, &inode_id, &session.siv_key, &session.siv_nonce)?;
+    let item = read_back_item(
+        &state,
+        user_id,
+        &inode_id,
+        &session.siv_key,
+        &session.siv_nonce,
+    )?;
     Ok((
         StatusCode::CREATED,
         Json(MountMutationResponse {
@@ -613,7 +615,13 @@ pub async fn patch_modify(
         .await
         .map_err(|e| tx_error_status(&e))?;
 
-    let item = read_back_item(&state, user_id, &request.id, &session.siv_key, &session.siv_nonce)?;
+    let item = read_back_item(
+        &state,
+        user_id,
+        &request.id,
+        &session.siv_key,
+        &session.siv_nonce,
+    )?;
     Ok(Json(MountMutationResponse {
         item: Some(item),
         height,
@@ -677,7 +685,13 @@ pub async fn put_content(
         .await
         .map_err(|e| tx_error_status(&e))?;
 
-    let item = read_back_item(&state, user_id, &inode_id, &session.siv_key, &session.siv_nonce)?;
+    let item = read_back_item(
+        &state,
+        user_id,
+        &inode_id,
+        &session.siv_key,
+        &session.siv_nonce,
+    )?;
     Ok(Json(MountMutationResponse {
         item: Some(item),
         height,
@@ -712,16 +726,19 @@ pub async fn delete_item(
             .transaction()
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         if !request.recursive {
-            let is_empty = db::fileprovider::is_folder_empty(state.db_pool.get(), &encrypted_path, user_id)
-                .unwrap_or(true);
+            let is_empty =
+                db::fileprovider::is_folder_empty(state.db_pool.get(), &encrypted_path, user_id)
+                    .unwrap_or(true);
             if !is_empty {
                 return Err(StatusCode::CONFLICT);
             }
         }
-        db::files::delete_files(&db_tx, encrypted_path.clone(), user_id, 0).map_err(|e| match e {
-            DatabaseError::NotFound => StatusCode::NOT_FOUND,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
-        })?;
+        db::files::delete_files(&db_tx, encrypted_path.clone(), user_id, 0).map_err(
+            |e| match e {
+                DatabaseError::NotFound => StatusCode::NOT_FOUND,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            },
+        )?;
         db_tx
             .rollback()
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -744,10 +761,7 @@ pub async fn delete_item(
         .await
         .map_err(|e| tx_error_status(&e))?;
 
-    Ok(Json(MountMutationResponse {
-        item: None,
-        height,
-    }))
+    Ok(Json(MountMutationResponse { item: None, height }))
 }
 
 #[derive(Debug, Deserialize)]

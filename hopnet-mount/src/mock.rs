@@ -18,17 +18,48 @@ use crate::transport::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallRecord {
-    Lookup { parent: ItemId, name: String },
-    Item { id: ItemId },
-    Enumerate { parent: ItemId, cursor: Option<String> },
-    Changes { since: i64 },
+    Lookup {
+        parent: ItemId,
+        name: String,
+    },
+    Item {
+        id: ItemId,
+    },
+    Enumerate {
+        parent: ItemId,
+        cursor: Option<String>,
+    },
+    Changes {
+        since: i64,
+    },
     Watch,
-    ReadBlob { blob: CustomUUID, offset: u64, len: u64 },
-    CreateFolder { parent: ItemId, name: String },
-    CreateFile { parent: ItemId, name: String, bytes: Vec<u8> },
-    UpdateContent { id: CustomUUID, bytes: Vec<u8> },
-    Rename { id: CustomUUID, new_parent: Option<ItemId>, new_name: Option<String> },
-    Delete { id: CustomUUID, recursive: bool },
+    ReadBlob {
+        blob: CustomUUID,
+        offset: u64,
+        len: u64,
+    },
+    CreateFolder {
+        parent: ItemId,
+        name: String,
+    },
+    CreateFile {
+        parent: ItemId,
+        name: String,
+        bytes: Vec<u8>,
+    },
+    UpdateContent {
+        id: CustomUUID,
+        bytes: Vec<u8>,
+    },
+    Rename {
+        id: CustomUUID,
+        new_parent: Option<ItemId>,
+        new_name: Option<String>,
+    },
+    Delete {
+        id: CustomUUID,
+        recursive: bool,
+    },
     Health,
     Statfs,
 }
@@ -208,7 +239,11 @@ impl MockHandle {
         item.name = new_name.to_string();
         item.height = height;
         state.items.insert(id.clone(), item.clone());
-        state.children.entry(new_parent).or_default().push(id.clone());
+        state
+            .children
+            .entry(new_parent)
+            .or_default()
+            .push(id.clone());
         state.journal.push((height, id.clone(), Some(item)));
     }
 
@@ -238,7 +273,13 @@ impl MockHandle {
         name: &str,
         content: &[u8],
     ) -> (ItemId, CustomUUID) {
-        let id = self.insert(parent, name, ItemKind::File { size: content.len() as u64 });
+        let id = self.insert(
+            parent,
+            name,
+            ItemKind::File {
+                size: content.len() as u64,
+            },
+        );
         let mut state = self.state.lock().expect("mock poisoned");
         let blob = match state.items.get(&id).and_then(|i| i.blob.clone()) {
             Some(blob) => blob,
@@ -265,7 +306,9 @@ impl MockHandle {
         let new_blob = CustomUUID::new(None);
         state.blobs.insert(new_blob.clone(), content.to_vec());
         if let Some(item) = state.items.get_mut(id) {
-            item.kind = ItemKind::File { size: content.len() as u64 };
+            item.kind = ItemKind::File {
+                size: content.len() as u64,
+            };
             item.blob = Some(new_blob.clone());
             item.height = height;
             let snapshot = item.clone();
@@ -467,17 +510,17 @@ impl NodeTransport for MockTransport {
         })
     }
 
-    fn watch(
-        &self,
-    ) -> BoxFuture<'_, Result<crate::transport::WatchStream, TransportError>> {
+    fn watch(&self) -> BoxFuture<'_, Result<crate::transport::WatchStream, TransportError>> {
         let state = self.state.clone();
         Box::pin(async move {
             let mut state = state.lock().expect("mock poisoned");
             state.calls.push(CallRecord::Watch);
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             state.watch_tx = Some(tx);
-            Ok(Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx))
-                as crate::transport::WatchStream)
+            Ok(
+                Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx))
+                    as crate::transport::WatchStream,
+            )
         })
     }
 
@@ -674,10 +717,7 @@ impl NodeTransport for MockTransport {
                 if !locked.items.contains_key(&item_id) {
                     return Err(TransportError::Protocol("item gone".to_string()));
                 }
-                let has_children = locked
-                    .children
-                    .get(&item_id)
-                    .is_some_and(|c| !c.is_empty());
+                let has_children = locked.children.get(&item_id).is_some_and(|c| !c.is_empty());
                 if has_children && !recursive {
                     return Err(TransportError::Conflict);
                 }

@@ -99,9 +99,7 @@ mod linux {
     fn default_data_dir() -> PathBuf {
         let base = std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share"))
-            })
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
             .unwrap_or_else(|| PathBuf::from("/tmp"));
         base.join("hopnet")
     }
@@ -176,11 +174,9 @@ mod linux {
         }
         // Shape check before any network call: a mangled paste gets a
         // clear message here rather than the node's 400 on every request.
-        let wellformed = token
-            .split_once('.')
-            .is_some_and(|(id, secret)| {
-                id.parse::<hopnet_common::CustomUUID>().is_ok() && !secret.is_empty()
-            });
+        let wellformed = token.split_once('.').is_some_and(|(id, secret)| {
+            id.parse::<hopnet_common::CustomUUID>().is_ok() && !secret.is_empty()
+        });
         if !wellformed {
             eprintln!("malformed token; expected `device_id.secret` from the Devices pane");
             std::process::exit(2);
@@ -257,8 +253,7 @@ mod linux {
         let target = mountpoint.to_string_lossy();
         let stale = mounts.lines().any(|line| {
             let mut fields = line.split_whitespace();
-            let (Some(_), Some(mp), Some(fstype)) =
-                (fields.next(), fields.next(), fields.next())
+            let (Some(_), Some(mp), Some(fstype)) = (fields.next(), fields.next(), fields.next())
             else {
                 return false;
             };

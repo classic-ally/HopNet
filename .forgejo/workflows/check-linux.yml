@@ -36,6 +36,13 @@ jobs:
       - name: cargo test (unit only — skips orchestrator)
         run: nix develop --command cargo test --workspace --lib --bins
 
+      # The mount stack suite boots the real node binary over localhost HTTP
+      # (no /dev/fuse needed — the two kernel smokes stay #[ignore]d).
+      - name: hopnet-mount stack suite
+        run: |
+          nix develop --command cargo build --bin hopnet
+          nix develop --command cargo test -p hopnet-mount --test stack
+
   nix-build:
     if: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: x86_64-linux

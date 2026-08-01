@@ -15,10 +15,7 @@ use crate::watch::{KernelInvalidator, Watcher};
 
 fn setup() -> (Arc<MountCore>, MockHandle) {
     let (transport, handle) = MockTransport::new();
-    (
-        Arc::new(MountCore::new(transport, DEFAULT_TTL)),
-        handle,
-    )
+    (Arc::new(MountCore::new(transport, DEFAULT_TTL)), handle)
 }
 
 // Should: resolve a child of the root by name and hand back a stable
@@ -113,7 +110,10 @@ async fn open_dir_snapshot_is_immutable_under_mutation() {
     let snapshot = core.dir_entries(fh).unwrap();
     let names: Vec<&str> = snapshot.iter().map(|e| e.name.as_str()).collect();
     assert!(names.contains(&"b.txt"), "snapshot keeps removed entry");
-    assert!(!names.contains(&"c.txt"), "snapshot excludes later addition");
+    assert!(
+        !names.contains(&"c.txt"),
+        "snapshot excludes later addition"
+    );
 
     let fh2 = core.opendir(ROOT_INO).await.unwrap();
     let fresh = core.dir_entries(fh2).unwrap();
@@ -213,10 +213,7 @@ impl KernelInvalidator for RecordingInvalidator {
         });
     }
     fn inval_inode(&self, ino: u64) {
-        self.seen
-            .lock()
-            .unwrap()
-            .push(Invalidation::Inode { ino });
+        self.seen.lock().unwrap().push(Invalidation::Inode { ino });
     }
 }
 impl RecordingInvalidator {
@@ -255,10 +252,17 @@ async fn spawn_watcher(
 ) -> Arc<RecordingInvalidator> {
     let invalidator = Arc::new(RecordingInvalidator::default());
     tokio::spawn(
-        Watcher::new(core, transport as Arc<dyn NodeTransport>, invalidator.clone()).run(),
+        Watcher::new(
+            core,
+            transport as Arc<dyn NodeTransport>,
+            invalidator.clone(),
+        )
+        .run(),
     );
     assert!(
-        wait_until(2000, || handle.watch_connected() && !changes_calls(handle).is_empty()).await,
+        wait_until(2000, || handle.watch_connected()
+            && !changes_calls(handle).is_empty())
+        .await,
         "watcher never connected + synced"
     );
     invalidator
@@ -568,9 +572,9 @@ async fn concurrent_reads_single_flight_one_fetch() {
     let mut tasks = Vec::new();
     for i in 0..8u64 {
         let core = core.clone();
-        tasks.push(tokio::spawn(async move {
-            core.read(fh, (i * 8) % 64, 8).await
-        }));
+        tasks.push(tokio::spawn(
+            async move { core.read(fh, (i * 8) % 64, 8).await },
+        ));
     }
     // Give every reader time to reach the segment gate.
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -609,7 +613,10 @@ async fn snapshot_at_open_survives_remote_replace() {
     );
 
     let new_fh = core.open(node.ino).await.unwrap();
-    assert_eq!(core.read(new_fh, 0, 64).await.unwrap(), b"VERSION TWO IS LONGER");
+    assert_eq!(
+        core.read(new_fh, 0, 64).await.unwrap(),
+        b"VERSION TWO IS LONGER"
+    );
 }
 
 // Should: hold cached bytes at or under the cap while walking a file
@@ -763,15 +770,25 @@ async fn mkdir_is_strict_and_visible() {
 async fn create_write_release_uploads_exact_bytes() {
     let (core, handle, dir) = setup_writable();
     let (node, fh) = core.create(ROOT_INO, "out.txt").await.unwrap();
-    assert_eq!(node.item.kind, ItemKind::File { size: 0 }, "created empty on node");
+    assert_eq!(
+        node.item.kind,
+        ItemKind::File { size: 0 },
+        "created empty on node"
+    );
 
     core.write(fh, 0, b"hello ").await.unwrap();
     core.write(fh, 6, b"staged world").await.unwrap();
-    assert_eq!(staging_pairs(dir.path()), 1, "dirty session has a staging pair");
+    assert_eq!(
+        staging_pairs(dir.path()),
+        1,
+        "dirty session has a staging pair"
+    );
 
     core.release(fh);
     assert!(
-        wait_until(3000, || upload_records(&handle) == vec![b"hello staged world".to_vec()]).await,
+        wait_until(3000, || upload_records(&handle)
+            == vec![b"hello staged world".to_vec()])
+        .await,
         "release must upload the exact staged bytes, got {:?}",
         upload_records(&handle)
     );
@@ -795,7 +812,9 @@ async fn copy_up_preserves_untouched_bytes() {
     core.release(fh);
 
     assert!(
-        wait_until(3000, || upload_records(&handle) == vec![b"01abcd6789".to_vec()]).await,
+        wait_until(3000, || upload_records(&handle)
+            == vec![b"01abcd6789".to_vec()])
+        .await,
         "copy-up must preserve untouched bytes, got {:?}",
         upload_records(&handle)
     );
@@ -834,7 +853,10 @@ async fn fsync_blocks_release_does_not() {
     let fsync_core = core.clone();
     let fsync_task = tokio::spawn(async move { fsync_core.fsync(fh).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(!fsync_task.is_finished(), "fsync must block while upload is parked");
+    assert!(
+        !fsync_task.is_finished(),
+        "fsync must block while upload is parked"
+    );
 
     handle.release_uploads();
     tokio::time::timeout(Duration::from_secs(5), fsync_task)
@@ -847,7 +869,11 @@ async fn fsync_blocks_release_does_not() {
     // A clean release after fsync uploads nothing further.
     core.release(fh);
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(upload_records(&handle).len(), 1, "clean close re-uploads nothing");
+    assert_eq!(
+        upload_records(&handle).len(),
+        1,
+        "clean close re-uploads nothing"
+    );
 }
 
 // Should: stage a truncate and upload the shortened content.
@@ -877,7 +903,9 @@ async fn rename_and_rmdir_semantics() {
     handle.add_file_with_content(ItemId::Root, "a.txt", b"x");
     core.lookup(ROOT_INO, "a.txt").await.unwrap();
 
-    core.rename(ROOT_INO, "a.txt", folder.ino, "b.txt").await.unwrap();
+    core.rename(ROOT_INO, "a.txt", folder.ino, "b.txt")
+        .await
+        .unwrap();
     match core.lookup(ROOT_INO, "a.txt").await {
         Err(CoreError::NotFound) => {}
         other => panic!("old name must be gone, got {other:?}"),
@@ -940,7 +968,10 @@ async fn recovery_uploads_leftover_staging() {
             base_height: 1,
         })
         .unwrap();
-    staged.write_at(0, b"recovered content".to_vec()).await.unwrap();
+    staged
+        .write_at(0, b"recovered content".to_vec())
+        .await
+        .unwrap();
 
     // A second pair whose inode is gone.
     let ghost = staging
@@ -974,7 +1005,11 @@ async fn upload_failure_retains_staging_then_retries() {
     handle.set_upload_fail(true);
     core.release(fh);
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(staging_pairs(dir.path()), 1, "failed upload must retain staging");
+    assert_eq!(
+        staging_pairs(dir.path()),
+        1,
+        "failed upload must retain staging"
+    );
 
     handle.set_upload_fail(false);
     // The background retry loop (1s backoff) picks it up.

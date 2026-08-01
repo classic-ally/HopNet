@@ -89,13 +89,19 @@ async fn provision(node: &NodeGuard) -> (String, String) {
         .json()
         .await
         .expect("setup json");
-    let passphrase = setup["passphrase"].as_str().expect("passphrase").to_string();
+    let passphrase = setup["passphrase"]
+        .as_str()
+        .expect("passphrase")
+        .to_string();
 
     // The test route registers a device via consensus; retry until decided.
     let mut api_key = None;
     for _ in 0..50 {
         let response = client
-            .get(format!("{}/api/integrations/fileprovider/test", node.base()))
+            .get(format!(
+                "{}/api/integrations/fileprovider/test",
+                node.base()
+            ))
             .send()
             .await
             .expect("test route");
@@ -136,8 +142,7 @@ async fn seed_file(
     name: &str,
     contents: &[u8],
 ) -> Item {
-    let part = reqwest::multipart::Part::bytes(contents.to_vec())
-        .file_name(name.to_string());
+    let part = reqwest::multipart::Part::bytes(contents.to_vec()).file_name(name.to_string());
     let form = reqwest::multipart::Form::new()
         .text("path", parent_plain.to_string())
         .part(format!("file_{}", contents.len()), part);
@@ -357,7 +362,10 @@ async fn mutations_are_strict_read_your_writes() {
         .json()
         .await
         .expect("create response json");
-    let folder_id = response["item"]["id"].as_str().expect("folder id").to_string();
+    let folder_id = response["item"]["id"]
+        .as_str()
+        .expect("folder id")
+        .to_string();
     let create_height = response["height"].as_i64().expect("height");
     assert!(create_height > 0);
 
@@ -468,14 +476,22 @@ async fn transport_write_methods_roundtrip() {
     let source: hopnet_mount::transport::ByteSource =
         Box::pin(tokio_stream::once(Ok(bytes::Bytes::from(content.clone()))));
     let created = transport
-        .create_file(folder.id.clone(), "s7.txt".to_string(), content.len() as u64, source)
+        .create_file(
+            folder.id.clone(),
+            "s7.txt".to_string(),
+            content.len() as u64,
+            source,
+        )
         .await
         .expect("create file")
         .item
         .unwrap();
     let blob_v1 = created.blob.clone().expect("blob");
     assert_eq!(
-        transport.read_blob(blob_v1.clone(), 0, content.len() as u64).await.unwrap(),
+        transport
+            .read_blob(blob_v1.clone(), 0, content.len() as u64)
+            .await
+            .unwrap(),
         content
     );
 
@@ -494,7 +510,10 @@ async fn transport_write_methods_roundtrip() {
     let blob_v2 = updated.blob.clone().unwrap();
     assert_ne!(blob_v2, blob_v1, "content update mints a new blob");
     assert_eq!(
-        transport.read_blob(blob_v2, 0, v2.len() as u64).await.unwrap(),
+        transport
+            .read_blob(blob_v2, 0, v2.len() as u64)
+            .await
+            .unwrap(),
         v2
     );
 
@@ -550,9 +569,8 @@ async fn fuse_mount_smoke_against_live_node() {
         )
         .unwrap(),
     );
-    let staging = Arc::new(
-        hopnet_mount::staging::Staging::new(cache_dir.path().join("staging")).unwrap(),
-    );
+    let staging =
+        Arc::new(hopnet_mount::staging::Staging::new(cache_dir.path().join("staging")).unwrap());
     let core = Arc::new(
         MountCore::new(transport.clone(), DEFAULT_TTL)
             .with_cache(cache)
@@ -686,17 +704,15 @@ async fn fuse_mount_smoke_against_live_node() {
     let form = reqwest::multipart::Form::new()
         .text("inode_id", inode_uuid.to_string())
         .part(format!("file_{}", third.len()), part);
-    assert!(
-        reqwest::Client::new()
-            .patch(format!("{}/api/files", node.base()))
-            .bearer_auth(&jwt)
-            .multipart(form)
-            .send()
-            .await
-            .unwrap()
-            .status()
-            .is_success()
-    );
+    assert!(reqwest::Client::new()
+        .patch(format!("{}/api/files", node.base()))
+        .bearer_auth(&jwt)
+        .multipart(form)
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
 
     let expected_second = new_content.clone();
     let third_clone = third.clone();
@@ -813,8 +829,11 @@ async fn fuse_mount_smoke_against_live_node() {
         let root = root.clone();
         move || {
             eprintln!("SMOKE: renaming");
-            std::fs::rename(root.join("Kernel/note.txt"), root.join("Kernel/renamed.txt"))
-                .unwrap();
+            std::fs::rename(
+                root.join("Kernel/note.txt"),
+                root.join("Kernel/renamed.txt"),
+            )
+            .unwrap();
             eprintln!("SMOKE: rename done");
             assert!(root.join("Kernel/renamed.txt").exists());
             assert!(!root.join("Kernel/note.txt").exists());
@@ -916,9 +935,8 @@ async fn passthrough_smoke_against_live_node() {
         )
         .unwrap(),
     );
-    let staging = Arc::new(
-        hopnet_mount::staging::Staging::new(cache_dir.path().join("staging")).unwrap(),
-    );
+    let staging =
+        Arc::new(hopnet_mount::staging::Staging::new(cache_dir.path().join("staging")).unwrap());
     let core = Arc::new(
         MountCore::new(transport.clone(), DEFAULT_TTL)
             .with_cache(cache)
@@ -958,7 +976,10 @@ async fn passthrough_smoke_against_live_node() {
     .unwrap();
     assert!(bytes_ok, "warm pass must serve exact bytes");
     let mb = content.len() as f64 / (1024.0 * 1024.0);
-    eprintln!("PASS B (reopen, passthrough if privileged): {:.0} MB/s", mb / secs);
+    eprintln!(
+        "PASS B (reopen, passthrough if privileged): {:.0} MB/s",
+        mb / secs
+    );
 
     // Pass C — reopen read-write: never passthrough, daemon path on a
     // warm cache. The fair baseline for the pass-B number.
@@ -983,13 +1004,15 @@ async fn passthrough_smoke_against_live_node() {
         core.read_calls() > before_c,
         "rw open must stay daemon-mediated"
     );
-    eprintln!("PASS C (daemon-mediated, warm cache): {:.0} MB/s", mb / secs);
+    eprintln!(
+        "PASS C (daemon-mediated, warm cache): {:.0} MB/s",
+        mb / secs
+    );
 
     if privileged {
         // The proof: pass B never woke the daemon.
         assert_eq!(
-            daemon_reads_after_hydrate,
-            before_c,
+            daemon_reads_after_hydrate, before_c,
             "privileged reopen must be kernel-served (zero daemon reads)"
         );
         eprintln!("PASSTHROUGH PROVEN: 0 daemon reads on the read-only reopen");

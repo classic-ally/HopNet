@@ -155,8 +155,14 @@ pub fn post_initial_setup(
             DatabaseError::InsertError
         })?;
 
-        crate::consensus::dispatch::process_transaction(&genesis_tx, state, true, 1, &genesis_tx_db)
-            .map_err(|e| {
+        crate::consensus::dispatch::process_transaction(
+            &genesis_tx,
+            state,
+            true,
+            1,
+            &genesis_tx_db,
+        )
+        .map_err(|e| {
             tracing::error!(
                 "post_initial_setup: Handler failed to process genesis transaction: {:?}",
                 e

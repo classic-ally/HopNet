@@ -8,16 +8,16 @@
 //! is a stable walk; readdir snapshots need stability, not any particular
 //! ordering.
 
-use aes_siv::{Key, Nonce, siv::Aes256Siv};
+use aes_siv::{siv::Aes256Siv, Key, Nonce};
 use r2d2::PooledConnection;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::params;
 
 use crate::model::CustomDateTime;
 use crate::paths::decrypt_path;
-use hopnet_common::CustomUUID;
 use hopnet_common::db::InodeType;
 use hopnet_common::mount::MountItem;
+use hopnet_common::CustomUUID;
 use hopnet_projection::DatabaseError;
 
 /// Shared SELECT list for item rows. Parent id comes from a self-join on
@@ -66,7 +66,11 @@ fn row_to_item(
     let parent_id: Option<CustomUUID> = row.get(8)?;
 
     let decrypted_path = decrypt_path(encrypted_path, siv_key, siv_nonce).map_err(|_| {
-        rusqlite::Error::InvalidColumnType(2, "path_decryption".to_string(), rusqlite::types::Type::Text)
+        rusqlite::Error::InvalidColumnType(
+            2,
+            "path_decryption".to_string(),
+            rusqlite::types::Type::Text,
+        )
     })?;
     let name = decrypted_path
         .split('/')

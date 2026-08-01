@@ -10,16 +10,16 @@
 
 use std::sync::Arc;
 
-use aes_siv::{Key, Nonce, siv::Aes256Siv};
+use aes_siv::{siv::Aes256Siv, Key, Nonce};
 use axum::body::Body;
-use axum::http::{Request, StatusCode, header};
+use axum::http::{header, Request, StatusCode};
 use axum::{Extension, Router};
 use tower::ServiceExt;
 
 use crate::host::DriveState;
 use crate::paths::encrypt_path;
-use hopnet_common::CustomUUID;
 use hopnet_common::mount::{MountChangesResponse, MountEnumerateResponse, MountItem};
+use hopnet_common::CustomUUID;
 use hopnet_projection::host::{
     BlobStreamer, BoxFuture, ByteStream, SessionAccess, SessionError, TxGateway, TxSpec,
     TxSubmitError, UserSession, WriteAdmission, WriteCheckError,
@@ -39,10 +39,7 @@ fn siv_fixture() -> (Key<Aes256Siv>, Nonce) {
     let mut hasher = blake3::Hasher::new_derive_key("hopnet-drive mount tests nonce");
     hasher.update(&[7u8; 32]);
     hasher.finalize_xof().fill(&mut nonce_bytes);
-    (
-        Key::<Aes256Siv>::from(key_bytes),
-        Nonce::from(nonce_bytes),
-    )
+    (Key::<Aes256Siv>::from(key_bytes), Nonce::from(nonce_bytes))
 }
 
 fn x25519_fixture() -> x25519_dalek::StaticSecret {
@@ -177,8 +174,9 @@ impl BlobStreamer for CannedBlob {
         range: Option<(u64, u64)>,
     ) -> ByteStream {
         let bytes = match range {
-            Some((start, end)) => self.0[start as usize..=(end as usize).min(self.0.len() - 1)]
-                .to_vec(),
+            Some((start, end)) => {
+                self.0[start as usize..=(end as usize).min(self.0.len() - 1)].to_vec()
+            }
             None => self.0.clone(),
         };
         Box::pin(tokio_stream::once(Ok(bytes::Bytes::from(bytes))))
@@ -331,7 +329,11 @@ impl TestEnv {
     /// A file inode; when `size` is Some a backing blob row, one fragment
     /// row (blob_manifest requires it), and an access wrap for USER_ID are
     /// created. None = empty file (data_id NULL).
-    async fn add_file(&self, plain_path: &str, size: Option<u64>) -> (CustomUUID, Option<CustomUUID>) {
+    async fn add_file(
+        &self,
+        plain_path: &str,
+        size: Option<u64>,
+    ) -> (CustomUUID, Option<CustomUUID>) {
         let inode_id = CustomUUID::new(None);
         let path = self.enc(plain_path).await;
         let conn = self.state.db_pool.get().unwrap();
@@ -394,14 +396,19 @@ impl TestEnv {
     }
 }
 
-async fn get_json<T: serde::de::DeserializeOwned>(app: &Router, uri: &str) -> (StatusCode, Option<T>) {
+async fn get_json<T: serde::de::DeserializeOwned>(
+    app: &Router,
+    uri: &str,
+) -> (StatusCode, Option<T>) {
     let response = app
         .clone()
         .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
         .await
         .unwrap();
     let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
     let parsed = serde_json::from_slice::<T>(&bytes).ok();
     (status, parsed)
 }
@@ -418,7 +425,9 @@ async fn get_raw(app: &Router, uri: &str, range: Option<&str>) -> axum::http::Re
 }
 
 async fn body_bytes(response: axum::http::Response<Body>) -> bytes::Bytes {
-    axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap()
+    axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap()
 }
 
 /// Broadcast-backed notifier standing in for the host's (S4): the test
@@ -477,10 +486,7 @@ fn multipart_body(parts: &[(&str, Option<&str>, &[u8])]) -> (String, Vec<u8>) {
         body.extend_from_slice(b"\r\n");
     }
     body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
-    (
-        format!("multipart/form-data; boundary={BOUNDARY}"),
-        body,
-    )
+    (format!("multipart/form-data; boundary={BOUNDARY}"), body)
 }
 
 async fn send_json<T: serde::de::DeserializeOwned>(
@@ -502,7 +508,9 @@ async fn send_json<T: serde::de::DeserializeOwned>(
         .await
         .unwrap();
     let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
     (status, serde_json::from_slice(&bytes).ok())
 }
 
@@ -525,7 +533,9 @@ async fn send_multipart<T: serde::de::DeserializeOwned>(
         .await
         .unwrap();
     let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
     (status, serde_json::from_slice(&bytes).ok())
 }
 
@@ -553,7 +563,11 @@ async fn create_folder_is_immediately_visible() {
     let item = response.item.expect("created item read back");
     assert_eq!(item.name, "Projets");
     assert!(response.height >= 10);
-    assert_eq!(item.height, Some(response.height), "modification stamped at decided height");
+    assert_eq!(
+        item.height,
+        Some(response.height),
+        "modification stamped at decided height"
+    );
 
     let (status, found) = get_json::<MountItem>(&app, "/lookup?name=Projets").await;
     assert_eq!(status, StatusCode::OK);
@@ -582,7 +596,10 @@ async fn create_file_registers_blob() {
     let item = response.unwrap().item.unwrap();
     assert_eq!(item.name, "notes.txt");
     assert_eq!(item.size, Some(content.len() as u64));
-    assert!(item.blob_id.is_some(), "non-empty file must register a blob");
+    assert!(
+        item.blob_id.is_some(),
+        "non-empty file must register a blob"
+    );
 }
 
 // Should: reject a create whose name already exists under the parent.
@@ -590,19 +607,13 @@ async fn create_file_registers_blob() {
 async fn create_collision_is_409() {
     let env = setup_env_apply(vec![]);
     let app = env.app();
-    let (status, _) = send_multipart::<MountMutationResponse>(
-        &app,
-        "/create",
-        &[("folder_name", None, b"Dup")],
-    )
-    .await;
+    let (status, _) =
+        send_multipart::<MountMutationResponse>(&app, "/create", &[("folder_name", None, b"Dup")])
+            .await;
     assert_eq!(status, StatusCode::CREATED);
-    let (status, _) = send_multipart::<MountMutationResponse>(
-        &app,
-        "/create",
-        &[("folder_name", None, b"Dup")],
-    )
-    .await;
+    let (status, _) =
+        send_multipart::<MountMutationResponse>(&app, "/create", &[("folder_name", None, b"Dup")])
+            .await;
     assert_eq!(status, StatusCode::CONFLICT);
 }
 
@@ -627,7 +638,11 @@ async fn modify_renames_and_moves() {
         "/create",
         &[
             ("parent_id", None, folder_id.to_string().as_bytes()),
-            (&format!("file_{}", content.len()), Some("old.txt"), content.as_slice()),
+            (
+                &format!("file_{}", content.len()),
+                Some("old.txt"),
+                content.as_slice(),
+            ),
         ],
     )
     .await;
@@ -684,7 +699,11 @@ async fn delete_respects_recursive_and_feeds_changes() {
         "/create",
         &[
             ("parent_id", None, folder_id.to_string().as_bytes()),
-            (&format!("file_{}", content.len()), Some("child.txt"), content.as_slice()),
+            (
+                &format!("file_{}", content.len()),
+                Some("child.txt"),
+                content.as_slice(),
+            ),
         ],
     )
     .await;
@@ -709,7 +728,11 @@ async fn delete_respects_recursive_and_feeds_changes() {
     let height = deleted.unwrap().height;
 
     let (status, _) = get_json::<MountItem>(&app, &format!("/item?id={folder_id}")).await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "deleted immediately invisible");
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "deleted immediately invisible"
+    );
 
     let (_, changes) = get_json::<hopnet_common::mount::MountChangesResponse>(
         &app,
@@ -733,7 +756,11 @@ async fn content_put_replaces_blob_strictly() {
     let (_, created) = send_multipart::<MountMutationResponse>(
         &app,
         "/create",
-        &[(&format!("file_{}", v1.len()), Some("doc.txt"), v1.as_slice())],
+        &[(
+            &format!("file_{}", v1.len()),
+            Some("doc.txt"),
+            v1.as_slice(),
+        )],
     )
     .await;
     let created = created.unwrap().item.unwrap();
@@ -744,7 +771,11 @@ async fn content_put_replaces_blob_strictly() {
     let (status, updated) = {
         let (content_type, body) = multipart_body(&[
             ("inode_id", None, file_id.to_string().as_bytes()),
-            (&format!("file_{}", v2.len()), Some("doc.txt"), v2.as_slice()),
+            (
+                &format!("file_{}", v2.len()),
+                Some("doc.txt"),
+                v2.as_slice(),
+            ),
         ]);
         let response = app
             .clone()
@@ -759,16 +790,29 @@ async fn content_put_replaces_blob_strictly() {
             .await
             .unwrap();
         let status = response.status();
-        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
-        (status, serde_json::from_slice::<MountMutationResponse>(&bytes).ok())
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice::<MountMutationResponse>(&bytes).ok(),
+        )
     };
     assert_eq!(status, StatusCode::OK);
     let updated = updated.unwrap().item.unwrap();
     assert_eq!(updated.size, Some(v2.len() as u64));
-    assert_ne!(updated.blob_id.as_ref().unwrap(), &old_blob, "modify mints a new blob");
+    assert_ne!(
+        updated.blob_id.as_ref().unwrap(),
+        &old_blob,
+        "modify mints a new blob"
+    );
 
     let (_, fresh) = get_json::<MountItem>(&app, &format!("/item?id={file_id}")).await;
-    assert_eq!(fresh.unwrap().size, Some(v2.len() as u64), "immediately visible");
+    assert_eq!(
+        fresh.unwrap().size,
+        Some(v2.len() as u64),
+        "immediately visible"
+    );
 }
 
 // Should: map a consensus wait timeout to 504 — outcome unknown, never
@@ -801,19 +845,22 @@ async fn watch_streams_pokes_as_sse_events() {
 
     let response = app
         .clone()
-        .oneshot(Request::builder().uri("/watch").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/watch")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(
-        response
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .starts_with("text/event-stream")
-    );
+    assert!(response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("text/event-stream"));
 
     let mut body = response.into_body().into_data_stream();
     use tokio_stream::StreamExt;
@@ -825,7 +872,10 @@ async fn watch_streams_pokes_as_sse_events() {
         .expect("stream open")
         .expect("frame ok");
     let text = String::from_utf8_lossy(&frame).into_owned();
-    assert!(text.contains("data:"), "expected SSE data frame, got {text:?}");
+    assert!(
+        text.contains("data:"),
+        "expected SSE data frame, got {text:?}"
+    );
 
     tx.send(()).unwrap();
     let frame = tokio::time::timeout(std::time::Duration::from_secs(5), body.next())
@@ -846,7 +896,12 @@ async fn watch_ends_on_closed_channel() {
 
     let response = app
         .clone()
-        .oneshot(Request::builder().uri("/watch").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/watch")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     let mut body = response.into_body().into_data_stream();
@@ -855,7 +910,10 @@ async fn watch_ends_on_closed_channel() {
     let end = tokio::time::timeout(std::time::Duration::from_secs(5), body.next())
         .await
         .expect("stream should end promptly");
-    assert!(end.is_none(), "expected immediate end-of-stream on dead channel");
+    assert!(
+        end.is_none(),
+        "expected immediate end-of-stream on dead channel"
+    );
 }
 
 // ---------- enumerate ----------
@@ -877,11 +935,8 @@ async fn enumerate_lists_children_with_metadata() {
     assert!(root.items[0].size.is_none());
 
     let docs_id = root.items[0].id.clone().unwrap();
-    let (status, docs) = get_json::<MountEnumerateResponse>(
-        &app,
-        &format!("/enumerate?parent_id={docs_id}"),
-    )
-    .await;
+    let (status, docs) =
+        get_json::<MountEnumerateResponse>(&app, &format!("/enumerate?parent_id={docs_id}")).await;
     assert_eq!(status, StatusCode::OK);
     let docs = docs.unwrap();
     assert_eq!(docs.items.len(), 1);
@@ -1094,8 +1149,7 @@ async fn changes_reports_live_and_deleted_since_anchor() {
     env.log_modification(&ghost, 6);
 
     let app = env.app();
-    let (status, changes) =
-        get_json::<MountChangesResponse>(&app, "/changes?since_height=3").await;
+    let (status, changes) = get_json::<MountChangesResponse>(&app, "/changes?since_height=3").await;
     assert_eq!(status, StatusCode::OK);
     let changes = changes.unwrap();
 
@@ -1134,7 +1188,9 @@ async fn download_full_body() {
 async fn download_range_is_partial_content() {
     let content = b"0123456789".to_vec();
     let env = setup_env(content.clone());
-    let (_, blob) = env.add_file("/digits.txt", Some(content.len() as u64)).await;
+    let (_, blob) = env
+        .add_file("/digits.txt", Some(content.len() as u64))
+        .await;
     let app = env.app();
 
     let response = get_raw(
@@ -1181,7 +1237,9 @@ async fn download_range_past_eof_is_416() {
 async fn download_without_access_wrap_is_403() {
     let content = b"secret".to_vec();
     let env = setup_env(content.clone());
-    let (_, blob) = env.add_file("/secret.txt", Some(content.len() as u64)).await;
+    let (_, blob) = env
+        .add_file("/secret.txt", Some(content.len() as u64))
+        .await;
     let blob = blob.unwrap();
     let conn = env.state.db_pool.get().unwrap();
     conn.execute(

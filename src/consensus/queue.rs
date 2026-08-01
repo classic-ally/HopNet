@@ -44,7 +44,9 @@ enum ConsensusResult {
     /// the applying block: the nonce row's presence proves local
     /// application at some height ≤ this one, so any read anchored at
     /// `height` observes the transaction's effects (read-your-writes).
-    Committed { height: u64 },
+    Committed {
+        height: u64,
+    },
     Rejected(String),
     Failed(String),
 }
@@ -697,15 +699,13 @@ async fn handle_as_forwarder(
             resume_own_engine();
             (batch, DispatchOutcome::RetryAfterDelay)
         }
-        Ok(super::rpc::ForwardAckResult::AckedWithResult(results)) => {
-            process_forward_results(
-                batch,
-                results,
-                proposer,
-                conn,
-                &app_state.consensus_queue.pending_pool(),
-            )
-        }
+        Ok(super::rpc::ForwardAckResult::AckedWithResult(results)) => process_forward_results(
+            batch,
+            results,
+            proposer,
+            conn,
+            &app_state.consensus_queue.pending_pool(),
+        ),
         Ok(super::rpc::ForwardAckResult::AckedDecided) => {
             // A height decided before the proposer's result — the nonce table
             // already knows which of ours landed. Anything still pending

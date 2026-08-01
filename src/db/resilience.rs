@@ -608,7 +608,12 @@ mod tests {
     // the tolerance floor.
     #[test]
     fn capacity_stops_at_first_point_below_tolerance_floor() {
-        let curve = vec![point(0.0, 4), point(50.0, 3), point(80.0, 1), point(90.0, 0)];
+        let curve = vec![
+            point(0.0, 4),
+            point(50.0, 3),
+            point(80.0, 1),
+            point(90.0, 0),
+        ];
         assert_eq!(capacity_at_tolerance(&curve, 2), 80.0);
     }
 

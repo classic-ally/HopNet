@@ -123,10 +123,7 @@ pub struct CacheManager {
 
 impl CacheManager {
     /// Wipes and recreates the cache root (ephemeral by design).
-    pub fn new(
-        config: CacheConfig,
-        transport: Arc<dyn NodeTransport>,
-    ) -> Result<Self, CacheError> {
+    pub fn new(config: CacheConfig, transport: Arc<dyn NodeTransport>) -> Result<Self, CacheError> {
         let _ = std::fs::remove_dir_all(&config.root);
         std::fs::create_dir_all(&config.root)
             .map_err(|e| CacheError::Io(format!("create cache root: {e}")))?;
@@ -262,7 +259,9 @@ impl CacheManager {
                 return Ok(buf);
             }
         }
-        Err(CacheError::Io("segment evicted repeatedly under read".to_string()))
+        Err(CacheError::Io(
+            "segment evicted repeatedly under read".to_string(),
+        ))
     }
 
     fn touch(&self, blob: &CustomUUID, first_seg: u32, last_seg: u32) {
@@ -319,7 +318,9 @@ impl CacheManager {
                 }
             }
         }
-        Err(CacheError::Io("segment fetch failed after retry".to_string()))
+        Err(CacheError::Io(
+            "segment fetch failed after retry".to_string(),
+        ))
     }
 
     async fn fetch_segment(
@@ -332,7 +333,9 @@ impl CacheManager {
         let seg_start = seg as u64 * self.config.segment_size;
         let seg_len = self.seg_len(state.size, seg);
 
-        let result = self.fetch_segment_inner(blob, state, seg_start, seg_len).await;
+        let result = self
+            .fetch_segment_inner(blob, state, seg_start, seg_len)
+            .await;
 
         let mut segs = state.segs.lock().expect("segstate poisoned");
         segs.inflight.remove(&seg);

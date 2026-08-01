@@ -8,12 +8,12 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use hopnet_common::CustomUUID;
 use hopnet_common::db::InodeType;
 use hopnet_common::fileprovider::{HealthResponse, HealthStatus};
 use hopnet_common::mount::{
     MountChangesResponse, MountEnumerateResponse, MountItem, MountStatfsResponse,
 };
+use hopnet_common::CustomUUID;
 
 use crate::transport::{
     BoxFuture, Changes, Cursor, Health, Height, Item, ItemId, ItemKind, Mutated, NodeTransport,
@@ -202,7 +202,9 @@ impl NodeTransport for HttpTransport {
             if response.status() == reqwest::StatusCode::NOT_FOUND {
                 return Ok(None);
             }
-            Ok(Some(item_from_wire(parse_json::<MountItem>(response).await?)))
+            Ok(Some(item_from_wire(
+                parse_json::<MountItem>(response).await?,
+            )))
         })
     }
 
@@ -216,7 +218,9 @@ impl NodeTransport for HttpTransport {
             if response.status() == reqwest::StatusCode::NOT_FOUND {
                 return Ok(None);
             }
-            Ok(Some(item_from_wire(parse_json::<MountItem>(response).await?)))
+            Ok(Some(item_from_wire(
+                parse_json::<MountItem>(response).await?,
+            )))
         })
     }
 
@@ -348,10 +352,7 @@ impl NodeTransport for HttpTransport {
                         "unexpected status {status}"
                     )));
                 }
-                let body = response
-                    .bytes()
-                    .await
-                    .map_err(map_reqwest_err)?;
+                let body = response.bytes().await.map_err(map_reqwest_err)?;
                 return Ok(body.to_vec());
             }
             unreachable!("loop returns on second attempt")

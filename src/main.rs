@@ -118,15 +118,15 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
     // skipped in test mode — stack tests boot nodes as the real user and
     // must not clobber the session's live endpoint file.
     #[cfg(target_os = "linux")]
-    if std::env::var("HOPNET_TEST_MODE").is_err() {
-        if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-            let dir = std::path::Path::new(&runtime_dir).join("hopnet");
-            let write = std::fs::create_dir_all(&dir).and_then(|_| {
-                std::fs::write(dir.join("endpoint"), format!("http://127.0.0.1:{port}\n"))
-            });
-            if let Err(e) = write {
-                tracing::warn!("mount endpoint file write failed: {e}");
-            }
+    if std::env::var("HOPNET_TEST_MODE").is_err()
+        && let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR")
+    {
+        let dir = std::path::Path::new(&runtime_dir).join("hopnet");
+        let write = std::fs::create_dir_all(&dir).and_then(|_| {
+            std::fs::write(dir.join("endpoint"), format!("http://127.0.0.1:{port}\n"))
+        });
+        if let Err(e) = write {
+            tracing::warn!("mount endpoint file write failed: {e}");
         }
     }
 

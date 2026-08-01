@@ -397,5 +397,7 @@ pub async fn create_folder(
         prepend_missing_parents(&tx, &mut inodes, user_id)?;
     }
 
-    submit_inodes(state, user_id, Vec::new(), inodes, None).await.map(|_| ())
+    submit_inodes(state, user_id, Vec::new(), inodes, None)
+        .await
+        .map(|_| ())
 }
