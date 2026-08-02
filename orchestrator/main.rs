@@ -893,7 +893,7 @@ async fn create_relay_container(
     Ok(response.id)
 }
 
-async fn create_hopnet_container(
+pub(crate) async fn create_hopnet_container(
     docker: &Docker,
     container_name: &str,
     network_name: &str,
@@ -980,6 +980,13 @@ async fn create_hopnet_container(
         env: Some({
             let mut e = vec![
                 "HOPNET_TEST_MODE=1".to_string(),
+                // The image leaves HOME unset, so the node would derive its
+                // data dir as /.local/share/hopnet — OUTSIDE the named
+                // volume mounted at /root/.local/share/hopnet. Container
+                // stop/start masked this (writable-layer persistence); a
+                // remove+recreate (the S6 "binary swap") must find the data
+                // in the volume.
+                "HOME=/root".to_string(),
                 // Self-hosted relay: no n0 public relay/discovery dependency.
                 format!("HOPNET_RELAY_URL={}", relay_url(mesh_id)),
             ];
@@ -995,6 +1002,7 @@ async fn create_hopnet_container(
                     || k.starts_with("HOPNET_QUORUM_")
                     || k.starts_with("HOPNET_GENESIS_")
                     || k.starts_with("HOPNET_UPGRADE_")
+                    || k.starts_with("HOPNET_RESTART_")
                 {
                     e.push(format!("{}={}", k, v));
                 }

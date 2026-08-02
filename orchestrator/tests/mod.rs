@@ -129,11 +129,23 @@ pub fn mesh_creation_env(test_name: &str) -> Vec<(&'static str, &'static str)> {
             // quorum — no forcing needed.
         ],
         // Same seeding as vote-out: the 3-seat formation batch needs the
-        // shortened spans; the boundary logic itself needs no knobs.
-        "regenesis-seal" => vec![(
+        // shortened spans. No grace override: the scenario detects the
+        // seal by the exit code, never by racing HTTP against the exit.
+        "regenesis-restart" => vec![(
             "HOPNET_GENESIS_CONSENSUS_POLICY",
             "probe_base=2;grace=1;s_full=6;p_prove=6",
         )],
+        // Upgrade-target boundary: the staged override lets the mesh claim
+        // 2026.8.1 staged (the start precondition) without a second image;
+        // nodes then park awaiting-upgrade and are recreated one by one
+        // with the running-version override — the "binary swap".
+        "regenesis-awaiting-upgrade" => vec![
+            (
+                "HOPNET_GENESIS_CONSENSUS_POLICY",
+                "probe_base=2;grace=1;s_full=6;p_prove=6",
+            ),
+            ("HOPNET_UPGRADE_STAGED_OVERRIDE", "2026.8.1"),
+        ],
         // REGRESSION FIX (S4): the S_min gate makes the BFT rejoin seat
         // EXPOSED (quorum(3)-quorum(2)=1) => req_span = s_full; the
         // default 30 min would refuse the rejoin inside the test window.
@@ -199,6 +211,8 @@ pub fn preferred_auto_nodes(test_name: &str) -> Option<u32> {
         // 6 nodes: forms in the majority region (seats 5 + pooled spare, or
         // 6); the test adds the 7th itself to watch the seam get crossed.
         "auto-seam" => Some(6),
+        // Boundary scenarios are written against a 3-node mesh.
+        "regenesis-restart" | "regenesis-awaiting-upgrade" => Some(3),
         _ => None,
     }
 }
@@ -317,8 +331,13 @@ pub async fn run_test_by_name(
                 .run(mesh_id, nodes, flags)
                 .await
         }
-        "regenesis-seal" => {
-            regenesis::RegenesisSeal
+        "regenesis-restart" => {
+            regenesis::RegenesisRestart
+                .run(mesh_id, nodes, flags)
+                .await
+        }
+        "regenesis-awaiting-upgrade" => {
+            regenesis::RegenesisAwaitingUpgrade
                 .run(mesh_id, nodes, flags)
                 .await
         }
@@ -478,7 +497,8 @@ pub fn list_test_names() -> Vec<&'static str> {
         "graceful-leave",
         "evidence-observe",
         "vote-out-after-kill",
-        "regenesis-seal",
+        "regenesis-restart",
+        "regenesis-awaiting-upgrade",
         "mesh-growth",
         "auto-seam",
         "three-timescales",

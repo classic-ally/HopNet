@@ -1,27 +1,28 @@
 use anyhow::Result;
+use bollard::Docker;
 use reqwest::Client;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::tests::files::upload_file;
 use crate::tests::multi_user::fetch_state_snapshots;
+use crate::tests::persistence::{start_node, wait_for_node_ready};
 use crate::tests::{Check, NodeInfo, TestResult, TestScenario, get_max_view, print_and_add_check};
 
-/// Regenesis boundary, S5 scope (RFC-019): freeze → abort round-trip →
-/// freeze again → drain → seal → halt, over real containers.
-///
-/// The scenario asserts every layer of the freeze: client writes 503
-/// during the moratorium (retryable, structured refusal), the abort
-/// reopens the mesh losslessly, the drain watcher + proposer injection
-/// carry a drained moratorium to the commit with no outside help, every
-/// node freezes at the same terminal height, and the replicas are
-/// hash-identical at the seal.
-///
-/// DELIBERATELY ENDS SEALED: there is no restart path until S6, so the
-/// mesh finishes halted by design. The auto-managed divergence gate still
-/// passes — it only needs the HTTP plane, and a sealed mesh reports one
-/// top-hash cluster at the terminal height (arguably the strongest
-/// coherence assertion this suite has).
-pub struct RegenesisSeal;
+/// Regenesis full cycle, S6 scope (RFC-019): freeze → abort round-trip →
+/// freeze again → drain → seal → every node EXITS with the restart code →
+/// containers restarted against their surviving volumes → boot gates +
+/// import + genesis at H → the mesh resumes in epoch 2, decides new
+/// writes at H+1 onward, and closes the rollback window.
+pub struct RegenesisRestart;
+
+/// Upgrade-target boundary (RFC-019 S6 awaiting-upgrade): the mesh claims
+/// a staged 2026.8.1 (test-gated override), seals for it, and — running
+/// 2026.8.0 — every node PARKS alive instead of exiting. Nodes are then
+/// recreated one by one with the running-version override (the "binary
+/// swap"): the first reaches epoch 2 but decides nothing (no quorum of
+/// the carried set yet — the liveness gate), the rest complete it and the
+/// mesh progresses.
+pub struct RegenesisAwaitingUpgrade;
 
 async fn post_json(
     node: &NodeInfo,
@@ -49,9 +50,15 @@ async fn get_json(node: &NodeInfo, path: &str) -> Result<serde_json::Value> {
     Ok(resp.json().await?)
 }
 
+async fn regenesis_status(node: &NodeInfo) -> Result<serde_json::Value> {
+    get_json(node, "/api/views/regenesis-status").await
+}
+
 async fn regenesis_phase(node: &NodeInfo) -> Result<String> {
-    let v = get_json(node, "/api/views/regenesis-status").await?;
-    Ok(v["phase"].as_str().unwrap_or("?").to_string())
+    Ok(regenesis_status(node).await?["phase"]
+        .as_str()
+        .unwrap_or("?")
+        .to_string())
 }
 
 async fn decided_height(node: &NodeInfo) -> Result<u64> {
@@ -59,74 +66,257 @@ async fn decided_height(node: &NodeInfo) -> Result<u64> {
     Ok(v["last_decided_height"].as_u64().unwrap_or(0))
 }
 
-impl TestScenario for RegenesisSeal {
+/// List/inspect calls can transiently FAIL TO PARSE under podman: a
+/// container mid-shutdown reports state "stopping", which bollard's
+/// typed enums do not know. Retry through those windows.
+async fn find_container_id(docker: &Docker, mesh_id: u32, node_id: u32) -> Result<String> {
+    let mut last: Option<anyhow::Error> = None;
+    for _ in 0..20 {
+        match docker
+            .list_containers(Some(
+                bollard::query_parameters::ListContainersOptionsBuilder::new()
+                    .all(true)
+                    .build(),
+            ))
+            .await
+        {
+            Ok(containers) => {
+                for container in containers {
+                    if let Some(labels) = &container.labels
+                        && labels.get("hopnet.mesh_id") == Some(&mesh_id.to_string())
+                        && labels.get("hopnet.node_id") == Some(&node_id.to_string())
+                        && let Some(id) = &container.id
+                    {
+                        return Ok(id.clone());
+                    }
+                }
+                anyhow::bail!("container for mesh {mesh_id} node {node_id} not found");
+            }
+            Err(e) => last = Some(e.into()),
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("container lookup kept failing")))
+}
+
+/// Wait until the node's container has EXITED and return its code — the
+/// restart request's observable half (RFC-019 S6: exit 75 asks the
+/// service manager for a fresh boot; the orchestrator IS the service
+/// manager here). None = still running at the deadline.
+pub async fn wait_for_exit_code(
+    docker: &Docker,
+    mesh_id: u32,
+    node_id: u32,
+    timeout: Duration,
+) -> Result<Option<i64>> {
+    let id = find_container_id(docker, mesh_id, node_id).await?;
+    let start = Instant::now();
+    loop {
+        // Inspect errors are tolerated inside the deadline: podman
+        // reports a transient "stopping" state bollard cannot parse —
+        // exactly while the process is exiting, i.e. exactly when this
+        // waits.
+        if let Ok(info) = docker
+            .inspect_container(
+                &id,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            && let Some(state) = info.state
+            && state.status == Some(bollard::models::ContainerStateStatusEnum::EXITED)
+        {
+            return Ok(Some(state.exit_code.unwrap_or(-1)));
+        }
+        if start.elapsed() > timeout {
+            return Ok(None); // still running
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+fn is_running(state: &Option<bollard::models::ContainerState>) -> bool {
+    state
+        .as_ref()
+        .map(|s| s.status == Some(bollard::models::ContainerStateStatusEnum::RUNNING))
+        .unwrap_or(false)
+}
+
+/// Stop + REMOVE the node's container and recreate it (same name, same
+/// labels, same surviving data volume) with `extra_env` added to the
+/// environment — the per-node "binary swap" primitive. Env is injected
+/// through the orchestrator's process environment around the sequential
+/// create, exactly how mesh_creation_env seeds mesh-wide values.
+pub async fn recreate_node_with_env(
+    docker: &Docker,
+    mesh_id: u32,
+    node_id: u32,
+    extra_env: &[(&str, &str)],
+) -> Result<()> {
+    let runtime = crate::sys::detect_runtime(docker).await?;
+    let id = find_container_id(docker, mesh_id, node_id).await?;
+    let _ = docker
+        .stop_container(&id, None::<bollard::query_parameters::StopContainerOptions>)
+        .await; // may already be exited
+    let mut removed = Ok(());
+    for _ in 0..10 {
+        removed = docker
+            .remove_container(
+                &id,
+                None::<bollard::query_parameters::RemoveContainerOptions>,
+            )
+            .await;
+        if removed.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    removed?;
+
+    for (k, v) in extra_env {
+        unsafe { std::env::set_var(k, v) };
+    }
+    let container_name = format!("hopnet-orchestrator-{mesh_id}-{node_id}");
+    let network_name = format!("hopnet-orchestrator-{mesh_id}-0");
+    let created =
+        crate::create_hopnet_container(docker, &container_name, &network_name, runtime).await;
+    for (k, _) in extra_env {
+        unsafe { std::env::remove_var(k) };
+    }
+    created?;
+    Ok(())
+}
+
+/// Re-resolve one node's address (containers change IP/port on recreate)
+/// and mint a fresh JWT (the signing key rolls every boot).
+async fn reauth_node(docker: &Docker, mesh_id: u32, node: &NodeInfo) -> Result<NodeInfo> {
+    let runtime = crate::sys::detect_runtime(docker).await?;
+    let addrs = crate::get_external_addresses(docker, mesh_id, runtime).await?;
+    let (_, ip, port) = addrs
+        .into_iter()
+        .find(|(id, _, _)| *id == node.node_id)
+        .ok_or_else(|| anyhow::anyhow!("node {} address not found", node.node_id))?;
+    let mut fresh = NodeInfo {
+        node_id: node.node_id,
+        ip_address: ip,
+        port: port as u32,
+        jwt_token: String::new(),
+    };
+    if !wait_for_node_ready(&fresh, Duration::from_secs(90)).await? {
+        anyhow::bail!("node {} never became ready", node.node_id);
+    }
+    fresh.jwt_token = crate::get_jwt_token(docker, mesh_id, node.node_id, runtime).await?;
+    Ok(fresh)
+}
+
+/// Boot attestation gate + a start decided at the given target. Returns
+/// the RUNNING version string the mesh attested.
+async fn attest_and_freeze(
+    result: &mut TestResult,
+    nodes: &[NodeInfo],
+    target_override: Option<&str>,
+) -> Result<Option<String>> {
+    // Every seated validator must show a committed running version — the
+    // start precondition's input (S3 attestations).
+    let mut running = None;
+    for _ in 0..40 {
+        let v = get_json(&nodes[0], "/api/views/upgrade-readiness").await?;
+        let all_attested = v["mesh"]
+            .as_array()
+            .map(|m| !m.is_empty() && m.iter().all(|n| n["running"].is_string()))
+            .unwrap_or(false);
+        let staged_ok = match target_override {
+            // Upgrade target: every node must also have STAGED it.
+            Some(t) => v["mesh"]
+                .as_array()
+                .map(|m| m.iter().all(|n| n["staged"].as_str() == Some(t)))
+                .unwrap_or(false),
+            None => true,
+        };
+        if all_attested && staged_ok {
+            running = v["running"].as_str().map(str::to_string);
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+    print_and_add_check(
+        result,
+        Check {
+            name: "Every validator attested its versions (start precondition input)".to_string(),
+            passed: running.is_some(),
+            detail: running.clone(),
+        },
+    );
+    let Some(running) = running else {
+        return Ok(None);
+    };
+
+    let target = target_override.unwrap_or(&running).to_string();
+    let (status, body) = post_json(
+        &nodes[0],
+        "/api/consensus/regenesis/start",
+        Some(serde_json::json!({ "target_version": target })),
+    )
+    .await?;
+    print_and_add_check(
+        result,
+        Check {
+            name: format!("regenesis_start decided (target {target})"),
+            passed: status == 200,
+            detail: Some(format!("{status}: {body}")),
+        },
+    );
+    if status != 200 {
+        return Ok(None);
+    }
+    Ok(Some(running))
+}
+
+/// Poll until every node reports the sealed phase; returns the terminal
+/// height from the status view.
+async fn wait_sealed_everywhere(nodes: &[NodeInfo]) -> Result<Option<u64>> {
+    for _ in 0..120 {
+        let mut all = true;
+        for node in nodes {
+            if regenesis_phase(node).await.unwrap_or_default() != "sealed" {
+                all = false;
+                break;
+            }
+        }
+        if all {
+            let v = regenesis_status(&nodes[0]).await?;
+            return Ok(v["seal_height"].as_str().and_then(|s| s.parse().ok()));
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    Ok(None)
+}
+
+impl TestScenario for RegenesisRestart {
     fn name(&self) -> &'static str {
-        "regenesis-seal"
+        "regenesis-restart"
     }
 
     fn description(&self) -> &'static str {
-        "Freeze/abort round-trip, then drain, seal, and halt the mesh (RFC-019 S5; ends sealed)"
+        "Freeze/abort, seal, exit 75, restart into epoch 2, decide new heights (RFC-019 S6)"
     }
 
     async fn run(
         &self,
-        _mesh_id: u32,
+        mesh_id: u32,
         nodes: &[NodeInfo],
         _flags: &[String],
     ) -> Result<TestResult> {
         let mut result = TestResult::new();
-        anyhow::ensure!(nodes.len() == 3, "regenesis-seal expects a 3-node mesh");
+        anyhow::ensure!(nodes.len() == 3, "regenesis-restart expects a 3-node mesh");
+        let docker = Docker::connect_with_local_defaults()?;
 
-        println!("\nRunning regenesis-seal checks:");
+        println!("\nRunning regenesis-restart checks:");
 
-        // 1. Baseline traffic + the boot version attestations (S3) that
-        //    the start precondition reads. Every seated validator must
-        //    show a committed running version.
+        // 1-2. Baseline traffic, attestations, same-version freeze.
         upload_file(&nodes[0], "/", "pre-freeze.txt", b"before the boundary".to_vec()).await?;
-        let running = {
-            let mut running = None;
-            for _ in 0..40 {
-                let v = get_json(&nodes[0], "/api/views/upgrade-readiness").await?;
-                let all_attested = v["mesh"]
-                    .as_array()
-                    .map(|m| !m.is_empty() && m.iter().all(|n| n["running"].is_string()))
-                    .unwrap_or(false);
-                if all_attested {
-                    running = v["running"].as_str().map(str::to_string);
-                    break;
-                }
-                tokio::time::sleep(Duration::from_secs(3)).await;
-            }
-            running
-        };
-        print_and_add_check(
-            &mut result,
-            Check {
-                name: "Every validator attested its running version (S3 precondition input)"
-                    .to_string(),
-                passed: running.is_some(),
-                detail: running.clone(),
-            },
-        );
-        let Some(running) = running else {
+        let Some(running) = attest_and_freeze(&mut result, nodes, None).await? else {
             return Ok(result);
         };
-
-        // 2. Freeze: a same-version (housekeeping) regenesis_start.
-        let (status, body) = post_json(
-            &nodes[0],
-            "/api/consensus/regenesis/start",
-            Some(serde_json::json!({ "target_version": running })),
-        )
-        .await?;
-        print_and_add_check(
-            &mut result,
-            Check {
-                name: "regenesis_start decided (moratorium opens)".to_string(),
-                passed: status == 200,
-                detail: Some(format!("{status}: {body}")),
-            },
-        );
 
         let phase = regenesis_phase(&nodes[1]).await.unwrap_or_default();
         print_and_add_check(
@@ -183,8 +373,12 @@ impl TestScenario for RegenesisSeal {
             },
         );
 
-        // 5. Freeze again — this time all the way: the drain watcher and
-        //    the proposer's commit injection need NO help from the test.
+        // 5+6. Freeze again, all the way through: drain → autonomous
+        //    commit → seal → restart derivation → EXIT 75. The exit code
+        //    IS the observable seal (an HTTP poll would race the grace
+        //    window — the derivation only runs at the tail of the seal
+        //    work, so 75 implies sealed).
+        let tip_at_freeze = decided_height(&nodes[0]).await.unwrap_or(0);
         let (status, body) = post_json(
             &nodes[0],
             "/api/consensus/regenesis/start",
@@ -192,93 +386,132 @@ impl TestScenario for RegenesisSeal {
         )
         .await?;
         anyhow::ensure!(status == 200, "second start failed: {status} {body}");
+        let mut exit_codes = Vec::new();
+        for node in nodes {
+            exit_codes.push(
+                wait_for_exit_code(&docker, mesh_id, node.node_id, Duration::from_secs(300))
+                    .await?,
+            );
+        }
+        let all_exited_75 = exit_codes.iter().all(|c| *c == Some(75));
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Drained moratorium seals on its own; every node exits with the restart code (75)"
+                    .to_string(),
+                passed: all_exited_75,
+                detail: Some(format!("exit codes: {exit_codes:?}")),
+            },
+        );
+        if !all_exited_75 {
+            return Ok(result);
+        }
 
-        let mut sealed_everywhere = false;
-        for _ in 0..120 {
+        // 7. The service manager's half: start the containers against
+        //    their surviving volumes; the boot transition crosses the
+        //    boundary on the way up. The terminal height H is what every
+        //    node resumes at (nothing new decides until we write).
+        let mut fresh_nodes = Vec::new();
+        for node in nodes {
+            start_node(&docker, mesh_id, node.node_id).await?;
+            fresh_nodes.push(reauth_node(&docker, mesh_id, node).await?);
+        }
+        let mut resumed_heights = Vec::new();
+        for node in &fresh_nodes {
+            resumed_heights.push(decided_height(node).await.unwrap_or(0));
+        }
+        let seal_height = resumed_heights[0];
+        anyhow::ensure!(
+            resumed_heights.iter().all(|h| *h == seal_height) && seal_height > tip_at_freeze,
+            "nodes resumed at inconsistent heights: {resumed_heights:?} (tip at freeze {tip_at_freeze})"
+        );
+        let mut statuses = Vec::new();
+        for node in &fresh_nodes {
+            let v = regenesis_status(node).await?;
+            statuses.push((
+                v["phase"].as_str().unwrap_or("?").to_string(),
+                v["epoch"].as_str().unwrap_or("?").to_string(),
+                v["rollback_retained"].as_bool().unwrap_or(false),
+            ));
+        }
+        let crossed = statuses
+            .iter()
+            .all(|(phase, epoch, retained)| phase == "normal" && epoch == "2" && *retained);
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Every node booted into epoch 2 (normal phase, rollback retained)"
+                    .to_string(),
+                passed: crossed,
+                detail: Some(format!("{statuses:?}")),
+            },
+        );
+
+        // 8. Progression: a new write decides past H (heights continuous),
+        //    and the rollback window closes at that first decide.
+        upload_file(
+            &fresh_nodes[0],
+            "/",
+            "epoch-2.txt",
+            b"decided in the new epoch".to_vec(),
+        )
+        .await?;
+        let mut progressed = false;
+        for _ in 0..60 {
             let mut all = true;
-            for node in nodes {
-                if regenesis_phase(node).await.unwrap_or_default() != "sealed" {
+            for node in &fresh_nodes {
+                if decided_height(node).await.unwrap_or(0) <= seal_height {
                     all = false;
                     break;
                 }
             }
             if all {
-                sealed_everywhere = true;
+                progressed = true;
                 break;
             }
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        let mut rollback_closed = false;
+        for _ in 0..30 {
+            let mut all = true;
+            for node in &fresh_nodes {
+                let v = regenesis_status(node).await?;
+                if v["rollback_retained"].as_bool().unwrap_or(true) {
+                    all = false;
+                    break;
+                }
+            }
+            if all {
+                rollback_closed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
         print_and_add_check(
             &mut result,
             Check {
-                name: "Drained moratorium seals on its own (watcher + proposer injection)"
-                    .to_string(),
-                passed: sealed_everywhere,
-                detail: None,
-            },
-        );
-        if !sealed_everywhere {
-            return Ok(result);
-        }
-
-        // 6. The halt: every node frozen at the same terminal height.
-        let status_view = get_json(&nodes[0], "/api/views/regenesis-status").await?;
-        let seal_height: u64 = status_view["seal_height"]
-            .as_str()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let mut before = Vec::new();
-        for node in nodes {
-            before.push(decided_height(node).await.unwrap_or(0));
-        }
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        let mut after = Vec::new();
-        for node in nodes {
-            after.push(decided_height(node).await.unwrap_or(0));
-        }
-        let frozen = before == after
-            && after.iter().all(|h| *h == seal_height)
-            && seal_height > 0;
-        print_and_add_check(
-            &mut result,
-            Check {
-                name: "Every engine halted at the terminal height".to_string(),
-                passed: frozen,
-                detail: Some(format!("seal_height {seal_height}, decided {after:?}")),
+                name: "Epoch 2 decides new writes past H; rollback window closes".to_string(),
+                passed: progressed && rollback_closed,
+                detail: Some(format!(
+                    "progressed: {progressed}, rollback closed: {rollback_closed}"
+                )),
             },
         );
 
-        // 7. Sealed admits nothing (forward-only).
-        let sealed_refused = matches!(
-            upload_file(&nodes[0], "/", "post-seal.txt", b"never".to_vec()).await,
-            Err(e) if e.to_string().contains("503")
-        );
+        // 9. Coherence in the NEW epoch: hash-identical replicas at one
+        //    height above H — strictly stronger than S5's sealed cluster.
+        let snapshots = fetch_state_snapshots(&fresh_nodes).await?;
+        let coherent = snapshots.windows(2).all(|w| {
+            w[0].1.consensus_height == w[1].1.consensus_height
+                && w[0].1.manifest.top_hash == w[1].1.manifest.top_hash
+        }) && snapshots
+            .first()
+            .map(|(_, s)| s.consensus_height > seal_height)
+            .unwrap_or(false);
         print_and_add_check(
             &mut result,
             Check {
-                name: "Writes refused with 503 after the seal".to_string(),
-                passed: sealed_refused,
-                detail: None,
-            },
-        );
-
-        // 8. Coherence at the seal: one top-hash cluster at one height —
-        //    the mesh crossed nothing and diverged nowhere.
-        let snapshots = fetch_state_snapshots(nodes).await?;
-        let coherent = snapshots
-            .windows(2)
-            .all(|w| {
-                w[0].1.consensus_height == w[1].1.consensus_height
-                    && w[0].1.manifest.top_hash == w[1].1.manifest.top_hash
-            })
-            && snapshots
-                .first()
-                .map(|(_, s)| s.consensus_height == seal_height)
-                .unwrap_or(false);
-        print_and_add_check(
-            &mut result,
-            Check {
-                name: "Replicas hash-identical at the terminal height".to_string(),
+                name: "Replicas hash-identical in epoch 2, above the boundary".to_string(),
                 passed: coherent,
                 detail: Some(format!(
                     "heights: {:?}",
@@ -290,7 +523,179 @@ impl TestScenario for RegenesisSeal {
             },
         );
 
-        // The mesh ends SEALED on purpose (see the struct doc).
+        Ok(result)
+    }
+}
+
+impl TestScenario for RegenesisAwaitingUpgrade {
+    fn name(&self) -> &'static str {
+        "regenesis-awaiting-upgrade"
+    }
+
+    fn description(&self) -> &'static str {
+        "Upgrade-target seal parks nodes alive; per-node 'binary swap' completes epoch 2 (RFC-019 S6)"
+    }
+
+    async fn run(
+        &self,
+        mesh_id: u32,
+        nodes: &[NodeInfo],
+        _flags: &[String],
+    ) -> Result<TestResult> {
+        let mut result = TestResult::new();
+        anyhow::ensure!(
+            nodes.len() == 3,
+            "regenesis-awaiting-upgrade expects a 3-node mesh"
+        );
+        let docker = Docker::connect_with_local_defaults()?;
+        const TARGET: &str = "2026.8.1";
+
+        println!("\nRunning regenesis-awaiting-upgrade checks:");
+
+        // 1-2. Attestations INCLUDING the staged claim, then an
+        //      upgrade-target freeze; the drained mesh seals on its own.
+        upload_file(&nodes[0], "/", "pre-upgrade.txt", b"epoch 1 data".to_vec()).await?;
+        if attest_and_freeze(&mut result, nodes, Some(TARGET))
+            .await?
+            .is_none()
+        {
+            return Ok(result);
+        }
+        let seal_height = wait_sealed_everywhere(nodes).await?.unwrap_or(0);
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Upgrade-target moratorium seals on its own".to_string(),
+                passed: seal_height > 0,
+                detail: Some(format!("seal_height {seal_height}")),
+            },
+        );
+        if seal_height == 0 {
+            return Ok(result);
+        }
+
+        // 3. PARKED ALIVE: running != target, so nobody exits — the
+        //    process keeps serving status (and refusing writes) while it
+        //    waits for its operator.
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        let mut parked = Vec::new();
+        for node in nodes {
+            let id = find_container_id(&docker, mesh_id, node.node_id).await?;
+            let info = docker
+                .inspect_container(
+                    &id,
+                    None::<bollard::query_parameters::InspectContainerOptions>,
+                )
+                .await?;
+            let v = regenesis_status(node).await?;
+            parked.push((
+                is_running(&info.state),
+                v["awaiting_upgrade"].as_bool().unwrap_or(false),
+                v["target_version"].as_str().unwrap_or("?").to_string(),
+            ));
+        }
+        let all_parked = parked
+            .iter()
+            .all(|(alive, awaiting, target)| *alive && *awaiting && target == TARGET);
+        let write_refused = matches!(
+            upload_file(&nodes[0], "/", "while-parked.txt", b"never".to_vec()).await,
+            Err(e) if e.to_string().contains("503")
+        );
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Sealed-for-upgrade nodes park ALIVE (status up, writes 503)".to_string(),
+                passed: all_parked && write_refused,
+                detail: Some(format!("{parked:?}, write refused: {write_refused}")),
+            },
+        );
+
+        // 4. The first "binary swap": node 0 recreated with the running-
+        //    version override crosses into epoch 2 — and decides NOTHING
+        //    (the liveness gate: no quorum of the carried set has booted).
+        recreate_node_with_env(
+            &docker,
+            mesh_id,
+            nodes[0].node_id,
+            &[("HOPNET_UPGRADE_VERSION_OVERRIDE", TARGET)],
+        )
+        .await?;
+        let node0 = reauth_node(&docker, mesh_id, &nodes[0]).await?;
+        let v = regenesis_status(&node0).await?;
+        let crossed = v["phase"].as_str() == Some("normal")
+            && v["epoch"].as_str() == Some("2")
+            && v["running_version"].as_str() == Some(TARGET);
+        let h_before = decided_height(&node0).await.unwrap_or(0);
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        let h_after = decided_height(&node0).await.unwrap_or(0);
+        let alone_and_stalled = h_before == seal_height && h_after == seal_height;
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "First upgraded node reaches epoch 2 but decides nothing alone".to_string(),
+                passed: crossed && alone_and_stalled,
+                detail: Some(format!(
+                    "status crossed: {crossed}, decided {h_before}->{h_after} (H={seal_height})"
+                )),
+            },
+        );
+
+        // 5. Swap the rest; the carried set reaches quorum and the mesh
+        //    progresses past H.
+        let mut fresh_nodes = vec![node0];
+        for node in &nodes[1..] {
+            recreate_node_with_env(
+                &docker,
+                mesh_id,
+                node.node_id,
+                &[("HOPNET_UPGRADE_VERSION_OVERRIDE", TARGET)],
+            )
+            .await?;
+            fresh_nodes.push(reauth_node(&docker, mesh_id, node).await?);
+        }
+        upload_file(
+            &fresh_nodes[1],
+            "/",
+            "epoch-2-upgrade.txt",
+            b"decided by the upgraded mesh".to_vec(),
+        )
+        .await?;
+        let mut progressed = false;
+        for _ in 0..60 {
+            let mut all = true;
+            for node in &fresh_nodes {
+                if decided_height(node).await.unwrap_or(0) <= seal_height {
+                    all = false;
+                    break;
+                }
+            }
+            if all {
+                progressed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        let epochs: Vec<String> = {
+            let mut e = Vec::new();
+            for node in &fresh_nodes {
+                e.push(
+                    regenesis_status(node).await?["epoch"]
+                        .as_str()
+                        .unwrap_or("?")
+                        .to_string(),
+                );
+            }
+            e
+        };
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Upgraded quorum completes epoch 2 and decides past H".to_string(),
+                passed: progressed && epochs.iter().all(|e| e == "2"),
+                detail: Some(format!("progressed: {progressed}, epochs: {epochs:?}")),
+            },
+        );
+
         Ok(result)
     }
 }
