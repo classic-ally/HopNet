@@ -78,6 +78,10 @@ fn make_item(dir: &std::path::Path, resources: Vec<(&str, &str, Vec<u8>)>) -> Pu
             tombstone_publish_attempts: 0,
             tombstone_publish_next_retry_at: None,
             tombstone_publish_last_error: None,
+            published_asset_modified_at: None,
+            edit_publish_attempts: 0,
+            edit_publish_next_retry_at: None,
+            edit_publish_last_error: None,
         },
         library: ingress_core::LibraryConfig {
             library_id: library_id.clone(),

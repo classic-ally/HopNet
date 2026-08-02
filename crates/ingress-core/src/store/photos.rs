@@ -312,48 +312,88 @@ where
 
 /// Terminal publish success: stamp once and clear the retry ledger. Guarded
 /// on still-NULL so a duplicate mark (confirm race) is a no-op.
-pub(crate) async fn mark_published<'e, E>(exec: E, id: &PhotoId, at: DateTime<Utc>) -> Result<bool>
-where
-    E: Executor<'e, Database = Sqlite>,
-{
-    Ok(sqlx::query(
-        "UPDATE photos SET published_at = ?, publish_attempts = 0, \
+/// Stamp a first publish AND the edit-propagation baseline: the mesh now
+/// holds exactly this metadata and these resource bytes.
+///
+/// The baseline is not bookkeeping — it is what stops the edit queue from
+/// firing on every freshly published photo. With the markers left NULL,
+/// "the mesh has never been told" and "the mesh is current" would be the
+/// same state, and the next pass would re-upload the entire archive.
+pub(crate) async fn mark_published(
+    pool: &sqlx::SqlitePool,
+    id: &PhotoId,
+    at: DateTime<Utc>,
+) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+    let stamped = sqlx::query(
+        "UPDATE photos SET published_at = ?, \
+         published_asset_modified_at = asset_modified_at, publish_attempts = 0, \
          publish_next_retry_at = NULL, publish_last_error = NULL \
          WHERE photo_id = ? AND published_at IS NULL",
     )
     .bind(at)
     .bind(id)
-    .execute(exec)
+    .execute(&mut *tx)
     .await?
     .rows_affected()
-        > 0)
+        > 0;
+    if stamped {
+        stamp_resource_baseline(&mut tx, id).await?;
+    }
+    tx.commit().await?;
+    Ok(stamped)
+}
+
+/// Every written resource's bytes are now the mesh's. Runs inside the
+/// publish/adopt stamp so there is no committed state where a photo reads
+/// as published but its resources read as never told.
+async fn stamp_resource_baseline(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    id: &PhotoId,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE photo_resources SET published_content_hash = content_hash \
+         WHERE photo_id = ? AND removed_at IS NULL AND written_at IS NOT NULL",
+    )
+    .bind(id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 /// Remote adoption: the mesh already holds this asset (cloud-fingerprint
 /// match), published by another device or a previous state.db. Stamp
 /// published_at WITHOUT uploading and record the remote consensus id.
 /// Same still-NULL guard as [`mark_published`].
-pub(crate) async fn mark_adopted<'e, E>(
-    exec: E,
+pub(crate) async fn mark_adopted(
+    pool: &sqlx::SqlitePool,
     id: &PhotoId,
     consensus_photo_id: &str,
     at: DateTime<Utc>,
-) -> Result<bool>
-where
-    E: Executor<'e, Database = Sqlite>,
-{
-    Ok(sqlx::query(
-        "UPDATE photos SET published_at = ?, consensus_photo_id = ?, publish_attempts = 0, \
+) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+    let stamped = sqlx::query(
+        "UPDATE photos SET published_at = ?, consensus_photo_id = ?, \
+         published_asset_modified_at = asset_modified_at, publish_attempts = 0, \
          publish_next_retry_at = NULL, publish_last_error = NULL \
          WHERE photo_id = ? AND published_at IS NULL",
     )
     .bind(at)
     .bind(consensus_photo_id)
     .bind(id)
-    .execute(exec)
+    .execute(&mut *tx)
     .await?
     .rows_affected()
-        > 0)
+        > 0;
+    if stamped {
+        // Adoption uploads nothing, which is exactly why the baseline
+        // matters most here: the mesh's copy came from another device, and
+        // without the stamp this daemon would immediately "correct" it by
+        // re-uploading every resource it holds.
+        stamp_resource_baseline(&mut tx, id).await?;
+    }
+    tx.commit().await?;
+    Ok(stamped)
 }
 
 /// Record one failed publish attempt. `attempts` is the caller-computed new
@@ -471,6 +511,109 @@ where
     sqlx::query(
         "UPDATE photos SET tombstone_publish_attempts = ?, tombstone_publish_next_retry_at = ?, \
          tombstone_publish_last_error = ? WHERE photo_id = ?",
+    )
+    .bind(attempts)
+    .bind(next_retry_at)
+    .bind(error)
+    .bind(id)
+    .execute(exec)
+    .await?;
+    Ok(())
+}
+
+/// Photos whose bytes or metadata have moved on from what the mesh holds
+/// (spec §Propagation of edits). Three kinds of divergence, one queue:
+///
+/// - a written resource whose hash no longer matches its marker (a re-edit)
+/// - a resource minted after publish and never told (a first edit)
+/// - a resource removed locally that the mesh still serves (a revert)
+/// - `asset_modified_at` past the value the mesh's metadata was composed from
+///
+/// `materialized_at IS NOT NULL` gates the whole thing: a reopened resource
+/// clears it, so a photo mid-refetch cannot submit half an edit and stamp it
+/// converged. `deleted_at IS NULL` because the handler rejects an edit to a
+/// tombstoned photo outright — those belong to the tombstone queue.
+pub(crate) async fn editable_photos<'e, E>(
+    exec: E,
+    now: DateTime<Utc>,
+    retry_cap: i64,
+    limit: i64,
+) -> Result<Vec<PhotoRecord>>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    Ok(sqlx::query_as(
+        "SELECT p.* FROM photos p \
+         JOIN libraries l ON l.library_id = p.library_id \
+         WHERE (l.scope_binding IS NULL OR l.mesh_library_id IS NOT NULL) \
+           AND p.published_at IS NOT NULL \
+           AND p.materialized_at IS NOT NULL \
+           AND p.deleted_at IS NULL \
+           AND p.edit_publish_attempts < ? \
+           AND (p.edit_publish_next_retry_at IS NULL \
+                OR p.edit_publish_next_retry_at <= ?) \
+           AND (p.published_asset_modified_at IS NOT p.asset_modified_at \
+             OR EXISTS (SELECT 1 FROM photo_resources r \
+                        WHERE r.photo_id = p.photo_id \
+                          AND ((r.removed_at IS NOT NULL \
+                                AND r.published_content_hash IS NOT NULL) \
+                            OR (r.removed_at IS NULL AND r.written_at IS NOT NULL \
+                                AND r.published_content_hash IS NOT r.content_hash)))) \
+         ORDER BY p.photo_id \
+         LIMIT ?",
+    )
+    .bind(retry_cap)
+    .bind(now)
+    .bind(limit)
+    .fetch_all(exec)
+    .await?)
+}
+
+/// The mesh now holds this photo's metadata. Clears the edit ledger.
+pub(crate) async fn mark_metadata_published<'e, E>(exec: E, id: &PhotoId) -> Result<()>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    sqlx::query(
+        "UPDATE photos SET published_asset_modified_at = asset_modified_at \
+         WHERE photo_id = ?",
+    )
+    .bind(id)
+    .execute(exec)
+    .await?;
+    Ok(())
+}
+
+/// Clear the edit retry ledger after a successful propagation.
+pub(crate) async fn clear_edit_failure<'e, E>(exec: E, id: &PhotoId) -> Result<()>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    sqlx::query(
+        "UPDATE photos SET edit_publish_attempts = 0, edit_publish_next_retry_at = NULL, \
+         edit_publish_last_error = NULL WHERE photo_id = ?",
+    )
+    .bind(id)
+    .execute(exec)
+    .await?;
+    Ok(())
+}
+
+/// Record one failed edit propagation. Same contract as
+/// [`record_publish_failure`], against the edit ledger.
+pub(crate) async fn record_edit_failure<'e, E>(
+    exec: E,
+    id: &PhotoId,
+    attempts: i64,
+    next_retry_at: Option<DateTime<Utc>>,
+    error: &str,
+) -> Result<()>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    sqlx::query(
+        "UPDATE photos SET edit_publish_attempts = ?, edit_publish_next_retry_at = ?, \
+         edit_publish_last_error = ? WHERE photo_id = ?",
     )
     .bind(attempts)
     .bind(next_retry_at)

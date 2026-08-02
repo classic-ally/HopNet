@@ -1,6 +1,6 @@
 //! `photo_resources` table access.
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sqlx::Executor;
 use sqlx::sqlite::Sqlite;
 
@@ -208,16 +208,37 @@ impl StateStore {
     }
 }
 
+/// The photo's LIVE resources. Rows awaiting removal propagation are
+/// excluded: locally the resource is already gone, and every consumer here
+/// (sidecar compose, publish assembly, status) describes what Photos has,
+/// not what the mesh has yet to be told.
 pub(crate) async fn resources_for_photo<'e, E>(exec: E, id: &PhotoId) -> Result<Vec<ResourceRecord>>
 where
     E: Executor<'e, Database = Sqlite>,
 {
-    Ok(
-        sqlx::query_as("SELECT * FROM photo_resources WHERE photo_id = ? ORDER BY resource_type")
-            .bind(id)
-            .fetch_all(exec)
-            .await?,
+    Ok(sqlx::query_as(
+        "SELECT * FROM photo_resources WHERE photo_id = ? AND removed_at IS NULL \
+         ORDER BY resource_type",
     )
+    .bind(id)
+    .fetch_all(exec)
+    .await?)
+}
+
+/// Kinds this photo has removed locally but the mesh still holds.
+pub(crate) async fn pending_removals<'e, E>(exec: E, id: &PhotoId) -> Result<Vec<ResourceType>>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    Ok(sqlx::query_scalar(
+        "SELECT resource_type FROM photo_resources \
+         WHERE photo_id = ? AND removed_at IS NOT NULL \
+           AND published_content_hash IS NOT NULL \
+         ORDER BY resource_type",
+    )
+    .bind(id)
+    .fetch_all(exec)
+    .await?)
 }
 
 /// Mint a pending resource row (`content_hash`/`written_at` NULL).
@@ -297,6 +318,82 @@ where
         .bind(resource_type)
         .execute(exec)
         .await?;
+    Ok(())
+}
+
+/// Retire a resource the MESH still holds: keep the row as a removal
+/// marker until propagation clears it. Returns false when the mesh never
+/// saw this resource, in which case the caller hard-deletes instead.
+///
+/// The content columns are cleared with the same write — the blob's
+/// refcount was decremented alongside this call, so a row still naming the
+/// hash would make `fsck` report drift and would keep the eviction guard
+/// pinning bytes nothing references. What survives is
+/// `published_content_hash`: the only record that the mesh is owed a
+/// removal at all.
+pub(crate) async fn soft_remove_resource<'e, E>(
+    exec: E,
+    photo_id: &PhotoId,
+    resource_type: ResourceType,
+    at: DateTime<Utc>,
+) -> Result<bool>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    Ok(sqlx::query(
+        "UPDATE photo_resources \
+         SET removed_at = ?, content_hash = NULL, ext = NULL, size_bytes = NULL, \
+             retry_count = 0, next_retry_at = NULL, last_error = NULL \
+         WHERE photo_id = ? AND resource_type = ? AND published_content_hash IS NOT NULL",
+    )
+    .bind(at)
+    .bind(photo_id)
+    .bind(resource_type)
+    .execute(exec)
+    .await?
+    .rows_affected()
+        > 0)
+}
+
+/// Stamp what the mesh now holds for one resource.
+pub(crate) async fn mark_resource_edit_published<'e, E>(
+    exec: E,
+    photo_id: &PhotoId,
+    resource_type: ResourceType,
+    hash: &ContentHash,
+) -> Result<()>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    sqlx::query(
+        "UPDATE photo_resources SET published_content_hash = ? \
+         WHERE photo_id = ? AND resource_type = ?",
+    )
+    .bind(hash)
+    .bind(photo_id)
+    .bind(resource_type)
+    .execute(exec)
+    .await?;
+    Ok(())
+}
+
+/// The removal reached the mesh; the marker row has no further job.
+pub(crate) async fn finish_resource_removal<'e, E>(
+    exec: E,
+    photo_id: &PhotoId,
+    resource_type: ResourceType,
+) -> Result<()>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    sqlx::query(
+        "DELETE FROM photo_resources \
+         WHERE photo_id = ? AND resource_type = ? AND removed_at IS NOT NULL",
+    )
+    .bind(photo_id)
+    .bind(resource_type)
+    .execute(exec)
+    .await?;
     Ok(())
 }
 

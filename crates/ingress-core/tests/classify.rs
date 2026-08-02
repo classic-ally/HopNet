@@ -639,3 +639,67 @@ async fn restored_photo_regains_thumbnails() {
     assert!(photo.deleted_at.is_none());
     assert!(photo.materialized_at.is_none(), "drains its new thumbnails");
 }
+
+// Impact: a hard delete would take `published_content_hash` with it, and
+// divergence-as-absence is invisible to every predicate — the mesh would
+// serve the reverted render forever with nothing left to say so.
+// Should: retire a published resource to a marker row, clearing its content
+// columns so the refcount recount and the eviction guard both ignore it.
+// Should not: leave it visible as a live resource.
+#[tokio::test]
+async fn revert_soft_removes_only_what_the_mesh_holds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, ..) = store_with_roots().await;
+    let data_dir = DataDir::new(tmp.path().join("data"));
+    let t1 = Utc::now();
+
+    let edited = AssetDescriptorBuilder::edited_live_photo()
+        .modified_at(t1)
+        .build();
+    let id = seed_one(&store, &edited).await;
+    materialize_all(&store, &data_dir, &edited, &id).await;
+
+    // The mesh holds the edited render.
+    sqlx::query(
+        "UPDATE photo_resources SET published_content_hash = content_hash \
+         WHERE photo_id = ? AND resource_type = 1",
+    )
+    .bind(id.to_string())
+    .execute(store.raw_pool())
+    .await
+    .unwrap();
+
+    // A revert: the Edited resource stops being enumerated.
+    let mut revert = AssetDescriptorBuilder::live_photo().modified_at(t1).build();
+    revert.cloud_id = edited.cloud_id.clone();
+    revert.local_id = edited.local_id.clone();
+    revert.asset_modified_at = Some(t1 + Duration::seconds(20));
+    let (_, outcome) = apply_change(&store, &data_dir.spool(), &revert).await.unwrap();
+    assert!(outcome.resources_removed >= 1, "edited row removed");
+
+    let row: Option<(Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT removed_at, content_hash, published_content_hash FROM photo_resources \
+         WHERE photo_id = ? AND resource_type = 1",
+    )
+    .bind(id.to_string())
+    .fetch_optional(store.raw_pool())
+    .await
+    .unwrap();
+    let (removed_at, content_hash, published) = row.expect("marker row survives the revert");
+    assert!(removed_at.is_some(), "retired, not deleted");
+    assert!(
+        content_hash.is_none(),
+        "content columns cleared with the blob decrement"
+    );
+    assert!(published.is_some(), "the removal the mesh is owed");
+
+    assert!(
+        store
+            .resources_for_photo(&id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.resource_type != ResourceType::Edited),
+        "the retired row is not a live resource"
+    );
+}

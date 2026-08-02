@@ -13,14 +13,15 @@ use ingress_core::descriptor::AssetDescriptor;
 use ingress_core::fixtures::AssetDescriptorBuilder;
 use ingress_core::paths::DataDir;
 use ingress_core::publish::{
-    PublishConfig, PublishError, PublishItem, PublishOutcome, PublishState, Publisher,
-    ResolveEntry, ResolveOutcome, Responsibility, TombstoneOp, claim_publishable,
-    claim_tombstone_propagatable, run_publish_pass,
+    EditItem, PassWork, PublishConfig, PublishError, PublishItem, PublishOutcome, PublishState,
+    Publisher, ResolveEntry, ResolveOutcome, Responsibility, TombstoneOp, claim_editable,
+    claim_publishable, claim_tombstone_propagatable, run_publish_pass,
 };
 use ingress_core::scheduler::{
     BackoffConfig, CancelToken, FetchFailure, FetchRequest, FreeSpaceProbe, ResourceFetcher,
     Scheduler, SchedulerConfig, StreamSink,
 };
+use ingress_core::ids::ContentHash;
 use ingress_core::{PhotoId, SeedOutcome, StateStore, seed_descriptor};
 
 // ---------------------------------------------------------------- fixtures
@@ -89,6 +90,10 @@ struct FakePublisher {
     propagate_seen: Mutex<Vec<(String, TombstoneOp)>>,
     /// Scripted propagation results, popped per call; empty = Ok.
     propagate_scripted: Mutex<Vec<Result<(), PublishError>>>,
+    /// Every edit the pass submitted, in order.
+    edits_seen: Mutex<Vec<EditItem>>,
+    /// Scripted edit results, popped per call; empty = Ok.
+    edit_scripted: Mutex<Vec<Result<(), PublishError>>>,
     gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 
@@ -110,6 +115,8 @@ impl FakePublisher {
             resolve_seen: Mutex::new(Vec::new()),
             propagate_seen: Mutex::new(Vec::new()),
             propagate_scripted: Mutex::new(Vec::new()),
+            edits_seen: Mutex::new(Vec::new()),
+            edit_scripted: Mutex::new(Vec::new()),
             gate: None,
         }
     }
@@ -120,6 +127,14 @@ impl FakePublisher {
 
     fn script_propagate(&self, results: Vec<Result<(), PublishError>>) {
         *self.propagate_scripted.lock().unwrap() = results;
+    }
+
+    fn edits(&self) -> Vec<EditItem> {
+        self.edits_seen.lock().unwrap().clone()
+    }
+
+    fn script_edit(&self, results: Vec<Result<(), PublishError>>) {
+        *self.edit_scripted.lock().unwrap() = results;
     }
 
     fn set_resolve(&self, result: Result<ResolveOutcome, PublishError>) {
@@ -194,6 +209,12 @@ impl Publisher for FakePublisher {
             .unwrap()
             .push((consensus_photo_id.to_string(), op));
         let scripted = self.propagate_scripted.lock().unwrap().pop();
+        scripted.unwrap_or(Ok(()))
+    }
+
+    async fn publish_edit(&self, item: EditItem) -> Result<(), PublishError> {
+        self.edits_seen.lock().unwrap().push(item);
+        let scripted = self.edit_scripted.lock().unwrap().pop();
         scripted.unwrap_or(Ok(()))
     }
 }
@@ -348,13 +369,19 @@ async fn pass(rig: &Rig, publisher: &FakePublisher, state: &mut PublishState) ->
     let propagatable = claim_tombstone_propagatable(&rig.store, &rig.config.publish, &HashSet::new())
         .await
         .unwrap();
+    let editable = claim_editable(&rig.store, &rig.config.publish, &HashSet::new())
+        .await
+        .unwrap();
     run_publish_pass(
         &rig.store,
         &rig.data_dir.spool(),
         publisher,
         &rig.config.publish,
-        claimed,
-        propagatable,
+        PassWork {
+            claimed,
+            propagatable,
+            editable,
+        },
         state,
     )
         .await
@@ -1113,8 +1140,10 @@ async fn assemble_skips_mesh_unbound() {
         &rig.data_dir.spool(),
         &publisher,
         &rig.config.publish,
-        claimed,
-        Vec::new(),
+        PassWork {
+            claimed,
+            ..Default::default()
+        },
         &mut state,
     )
     .await
@@ -1537,4 +1566,430 @@ async fn propagation_rejection_gives_up_immediately() {
     let row = photo(&rig, &id).await;
     assert_eq!(row.tombstone_publish_attempts, rig.config.publish.retry_cap);
     assert!(row.tombstone_published_at.is_none());
+}
+
+// --------------------------------------------------------- edit propagation
+
+/// Simulate what the materialize tick leaves behind after PhotoKit reports a
+/// re-edit: fresh bytes in the spool and a new hash on the row, with
+/// `published_content_hash` still naming what the mesh holds.
+async fn re_edit(rig: &Rig, id: &PhotoId, resource_type: i64, bytes: &[u8]) -> ContentHash {
+    let hash = ContentHash::of_bytes(bytes);
+    let path = rig.data_dir.spool().blob_path(&hash, "jpg");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, bytes).unwrap();
+    sqlx::query(
+        "UPDATE photo_resources SET content_hash = ?, ext = 'jpg', size_bytes = ?, \
+         written_at = ? WHERE photo_id = ? AND resource_type = ?",
+    )
+    .bind(&hash)
+    .bind(bytes.len() as i64)
+    .bind(Utc::now())
+    .bind(id)
+    .bind(resource_type)
+    .execute(rig.store.raw_pool())
+    .await
+    .unwrap();
+    hash
+}
+
+/// Bump the modification date PhotoKit reports, which is the metadata half
+/// of the queue.
+async fn touch_metadata(rig: &Rig, id: &PhotoId) {
+    sqlx::query("UPDATE photos SET asset_modified_at = ? WHERE photo_id = ?")
+        .bind(Utc::now())
+        .bind(id)
+        .execute(rig.store.raw_pool())
+        .await
+        .unwrap();
+}
+
+async fn resource_marker(rig: &Rig, id: &PhotoId, resource_type: i64) -> Option<ContentHash> {
+    sqlx::query_scalar(
+        "SELECT published_content_hash FROM photo_resources \
+         WHERE photo_id = ? AND resource_type = ?",
+    )
+    .bind(id)
+    .bind(resource_type)
+    .fetch_one(rig.store.raw_pool())
+    .await
+    .unwrap()
+}
+
+// Impact: a freshly published photo and one whose bytes the mesh has never
+// seen would be indistinguishable if publish left the markers NULL — every
+// pass would re-upload the entire archive.
+// Should: leave nothing to say immediately after a publish.
+#[tokio::test(flavor = "multi_thread")]
+async fn publish_stamps_the_edit_baseline() {
+    let rig = rig().await;
+    let publisher = FakePublisher::ok();
+    let mut state = PublishState::default();
+    let id = materialize(&rig, "fresh", b"fresh-bytes").await;
+    // A real asset carries a modification date; the marker has to capture
+    // whatever it was at publish time, not merely be non-NULL.
+    touch_metadata(&rig, &id).await;
+
+    let report = pass(&rig, &publisher, &mut state).await;
+    assert_eq!(report.published, 1);
+    assert_eq!(report.edits_propagated, 0);
+    let row = photo(&rig, &id).await;
+    assert!(row.asset_modified_at.is_some());
+    assert_eq!(row.published_asset_modified_at, row.asset_modified_at);
+    assert!(resource_marker(&rig, &id, 0).await.is_some());
+
+    let report = pass(&rig, &publisher, &mut state).await;
+    assert_eq!(report.edits_propagated, 0, "a published photo is converged");
+    assert!(publisher.edits().is_empty());
+}
+
+// Impact: adoption uploads nothing — the bytes came from another device. A
+// missing baseline here would make this daemon "correct" the mesh by
+// re-uploading a resource set it was never asked for.
+// Should not: queue an edit for a photo adopted by fingerprint.
+#[tokio::test(flavor = "multi_thread")]
+async fn adoption_stamps_the_edit_baseline() {
+    const REMOTE: &str = "01912e5a-7b3c-7f21-a4d8-3e9f12ab34cd";
+    let rig = rig().await;
+    let id = materialize(&rig, "adopted", b"adopted-bytes").await;
+
+    let publisher = FakePublisher::ok();
+    publisher.set_resolve(Ok(outcome(
+        Responsibility::Holder,
+        vec![entry("cloud-adopted", "bb".repeat(32).as_str(), Some(REMOTE))],
+    )));
+    let mut state = PublishState::default();
+    let report = pass(&rig, &publisher, &mut state).await;
+    assert_eq!(report.adopted, 1);
+
+    let report = pass(&rig, &publisher, &mut state).await;
+    assert_eq!(report.edits_propagated, 0);
+    assert!(publisher.edits().is_empty(), "nothing to correct");
+    assert!(resource_marker(&rig, &id, 0).await.is_some());
+}
+
+// Impact: without this the mesh serves the pre-edit render forever —
+// published_at is set-once and nothing else re-enqueues the photo.
+// Should: submit the changed resource with its new bytes, then converge.
+#[tokio::test(flavor = "multi_thread")]
+async fn re_edit_propagates_once_and_converges() {
+    let rig = rig().await;
+    let publisher = FakePublisher::ok();
+    let mut state = PublishState::default();
+    let id = materialize(&rig, "edited", b"v1-bytes").await;
+    pass(&rig, &publisher, &mut state).await;
+
+    let new_hash = re_edit(&rig, &id, 0, b"v2-bytes-are-longer").await;
+    let report = pass(&rig, &publisher, &mut state).await;
+
+    assert_eq!(report.edits_propagated, 1);
+    assert_eq!(report.metadata_propagated, 0);
+    let edits = publisher.edits();
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].resources.len(), 1);
+    assert_eq!(edits[0].resources[0].content_hash, new_hash);
+    assert!(edits[0].removals.is_empty());
+    assert!(!edits[0].metadata_changed, "only the bytes moved");
+    assert_eq!(resource_marker(&rig, &id, 0).await.as_ref(), Some(&new_hash));
+
+    let report = pass(&rig, &publisher, &mut state).await;
+    assert_eq!(report.edits_propagated, 0);
+    assert_eq!(publisher.edits().len(), 1, "no re-submission");
+}
+
+// Impact: after publish the photo's blobs are evicted, so a metadata-only
+// refresh has no bytes to send — it must reach the mesh on its own.
+// Should: route a bare modification-date bump to the metadata counter.
+// Should not: carry any resource with it.
+#[tokio::test(flavor = "multi_thread")]
+async fn metadata_refresh_propagates_without_resources() {
+    let rig = rig().await;
+    let publisher = FakePublisher::ok();
+    let mut state = PublishState::default();
+    let id = materialize(&rig, "meta", b"meta-bytes").await;
+    pass(&rig, &publisher, &mut state).await;
+
+    touch_metadata(&rig, &id).await;
+    let report = pass(&rig, &publisher, &mut state).await;
+
+    assert_eq!(report.metadata_propagated, 1);
+    assert_eq!(report.edits_propagated, 0);
+    let edits = publisher.edits();
+    assert_eq!(edits.len(), 1);
+    assert!(edits[0].resources.is_empty());
+    assert!(edits[0].metadata_changed);
+
+    let report = pass(&rig, &publisher, &mut state).await;
+    assert_eq!(report.metadata_propagated, 0, "converged");
+}
+
+// Impact: a crop changes the pixels AND the dimensions that describe them;
+// splitting them across two transactions would leave a window where the
+// mesh serves one with the other's metadata.
+// Should: carry both in a single content edit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_crop_carries_its_metadata_with_the_bytes() {
+    let rig = rig().await;
+    let publisher = FakePublisher::ok();
+    let mut state = PublishState::default();
+    let id = materialize(&rig, "crop", b"crop-v1").await;
+    pass(&rig, &publisher, &mut state).await;
+
+    re_edit(&rig, &id, 0, b"crop-v2-different").await;
+    touch_metadata(&rig, &id).await;
+    let report = pass(&rig, &publisher, &mut state).await;
+
+    assert_eq!(report.edits_propagated, 1);
+    assert_eq!(report.metadata_propagated, 0, "one transaction, not two");
+    let edits = publisher.edits();
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].resources.len(), 1);
+    assert!(edits[0].metadata_changed);
+    assert!(
+        photo(&rig, &id).await.published_asset_modified_at
+            == photo(&rig, &id).await.asset_modified_at
+    );
+}
+
+// Impact: a revert deletes the local row, and a hard delete would take the
+// marker with it — the divergence would be an absence no predicate can see.
+// Should: keep the row as a removal marker, send the removal, then reap it.
+#[tokio::test(flavor = "multi_thread")]
+async fn revert_propagates_as_a_removal_and_reaps_the_marker_row() {
+    let rig = rig().await;
+    let publisher = FakePublisher::ok();
+    let mut state = PublishState::default();
+    let id = materialize(&rig, "revert", b"revert-bytes").await;
+    pass(&rig, &publisher, &mut state).await;
+
+    // Stand in for classify's soft-remove of a published resource.
+    sqlx::query(
+        "UPDATE photo_resources SET removed_at = ?, content_hash = NULL, ext = NULL, \
+         size_bytes = NULL WHERE photo_id = ? AND resource_type = 0",
+    )
+    .bind(Utc::now())
+    .bind(&id)
+    .execute(rig.store.raw_pool())
+    .await
+    .unwrap();
+
+    let report = pass(&rig, &publisher, &mut state).await;
+    assert_eq!(report.edits_propagated, 1);
+    let edits = publisher.edits();
+    assert_eq!(edits.len(), 1);
+    assert!(edits[0].resources.is_empty(), "a revert uploads nothing");
+    assert_eq!(edits[0].removals.len(), 1);
+
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM photo_resources WHERE photo_id = ? AND resource_type = 0",
+    )
+    .bind(&id)
+    .fetch_one(rig.store.raw_pool())
+    .await
+    .unwrap();
+    assert_eq!(rows, 0, "the marker row has no job left");
+}
+
+// Impact: an adopted photo lives in consensus under another device's id;
+// editing under the local id would target a photo that does not exist there.
+// Should: submit the edit under consensus_photo_id.
+#[tokio::test(flavor = "multi_thread")]
+async fn adopted_photo_edits_under_the_consensus_id() {
+    const REMOTE: &str = "01912e5a-7b3c-7f21-a4d8-3e9f12ab34cd";
+    let rig = rig().await;
+    let id = materialize(&rig, "adopted", b"adopted-bytes").await;
+
+    let publisher = FakePublisher::ok();
+    publisher.set_resolve(Ok(outcome(
+        Responsibility::Holder,
+        vec![entry("cloud-adopted", "bb".repeat(32).as_str(), Some(REMOTE))],
+    )));
+    let mut state = PublishState::default();
+    pass(&rig, &publisher, &mut state).await;
+
+    re_edit(&rig, &id, 0, b"adopted-then-edited").await;
+    pass(&rig, &publisher, &mut state).await;
+
+    let edits = publisher.edits();
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].consensus_photo_id, REMOTE);
+}
+
+// Impact: the node's device-tx gate rejects any transaction touching a scope
+// this device does not hold, so edits must park on the same standing as
+// publishes rather than burn attempts discovering 403s.
+// Should: hold the edit and consume no attempts when another device holds
+// responsibility.
+#[tokio::test(flavor = "multi_thread")]
+async fn edit_parks_when_another_device_is_responsible() {
+    let rig = rig().await;
+    let publisher = FakePublisher::ok();
+    let mut state = PublishState::default();
+    let id = materialize(&rig, "parked", b"parked-v1").await;
+    pass(&rig, &publisher, &mut state).await;
+
+    let old_marker = resource_marker(&rig, &id, 0).await;
+    re_edit(&rig, &id, 0, b"parked-v2-longer").await;
+    publisher.set_resolve(Ok(outcome(Responsibility::Other, Vec::new())));
+    let report = pass(&rig, &publisher, &mut state).await;
+
+    assert_eq!(report.edits_propagated, 0);
+    assert!(report.parked_responsibility);
+    assert!(publisher.edits().is_empty());
+    assert_eq!(photo(&rig, &id).await.edit_publish_attempts, 0);
+    assert_eq!(resource_marker(&rig, &id, 0).await, old_marker);
+}
+
+// Should: back off with the edit ledger, leaving the publish and tombstone
+// ledgers untouched, when an edit fails transiently.
+// Should not: stamp the marker.
+#[tokio::test(flavor = "multi_thread")]
+async fn edit_failure_uses_its_own_ledger() {
+    let rig = rig().await;
+    let publisher = FakePublisher::ok();
+    let mut state = PublishState::default();
+    let id = materialize(&rig, "flaky", b"flaky-v1").await;
+    pass(&rig, &publisher, &mut state).await;
+
+    let old_marker = resource_marker(&rig, &id, 0).await;
+    re_edit(&rig, &id, 0, b"flaky-v2-longer").await;
+    publisher.script_edit(vec![Err(PublishError::Transient("nope".into()))]);
+    let report = pass(&rig, &publisher, &mut state).await;
+
+    assert_eq!(report.failed, 1);
+    assert_eq!(report.edits_propagated, 0);
+    let row = photo(&rig, &id).await;
+    assert_eq!(row.edit_publish_attempts, 1);
+    assert_eq!(row.edit_publish_last_error.as_deref(), Some("nope"));
+    assert_eq!(row.publish_attempts, 0, "publish ledger untouched");
+    assert_eq!(row.tombstone_publish_attempts, 0);
+    assert_eq!(resource_marker(&rig, &id, 0).await, old_marker);
+}
+
+// Impact: a rejected edit is permanent — the same bytes will be refused
+// again, and spinning would keep the blobs pinned out of eviction forever.
+// Should: jump attempts to the cap on a rejection.
+#[tokio::test(flavor = "multi_thread")]
+async fn rejected_edit_burns_attempts_to_the_cap() {
+    let rig = rig().await;
+    let publisher = FakePublisher::ok();
+    let mut state = PublishState::default();
+    let id = materialize(&rig, "bad", b"bad-v1").await;
+    pass(&rig, &publisher, &mut state).await;
+
+    re_edit(&rig, &id, 0, b"bad-v2-longer").await;
+    publisher.script_edit(vec![Err(PublishError::Rejected("nope".into()))]);
+    let report = pass(&rig, &publisher, &mut state).await;
+
+    assert_eq!(report.gave_up, 1);
+    assert_eq!(report.edits_propagated, 0);
+    assert_eq!(
+        photo(&rig, &id).await.edit_publish_attempts,
+        rig.config.publish.retry_cap
+    );
+}
+
+// Impact: both edit handlers reject a photo the mesh still believes is
+// tombstoned, so a restore and an edit in one pass converge only if the
+// restore goes first.
+// Should: submit photo_restore before the edit.
+#[tokio::test(flavor = "multi_thread")]
+async fn restore_precedes_edit_within_a_scope() {
+    let rig = rig().await;
+    let publisher = FakePublisher::ok();
+    let mut state = PublishState::default();
+    let id = publish_then_tombstone(&rig, &publisher, &mut state, "back").await;
+    pass(&rig, &publisher, &mut state).await;
+
+    sqlx::query("UPDATE photos SET deleted_at = NULL WHERE photo_id = ?")
+        .bind(&id)
+        .execute(rig.store.raw_pool())
+        .await
+        .unwrap();
+    re_edit(&rig, &id, 0, b"back-and-edited").await;
+
+    let report = pass(&rig, &publisher, &mut state).await;
+    assert_eq!(report.restores_propagated, 1);
+    assert_eq!(report.edits_propagated, 1);
+    assert_eq!(
+        publisher.propagated().last(),
+        Some(&(id.to_string(), TombstoneOp::Restore)),
+        "the restore lands before the edit is attempted"
+    );
+    assert_eq!(publisher.edits().len(), 1);
+}
+
+// Impact: the shared half of the cutover depends on this — the node resolves
+// a shared photo's scope from its committed row, so an edit in a library
+// this device does not hold is rejected wholesale.
+// Should: park only the scope held elsewhere, leaving the other's edit told.
+#[tokio::test(flavor = "multi_thread")]
+async fn edits_partition_by_scope() {
+    let rig = rig().await;
+    add_shared_library(&rig, Some(MESH_LIB)).await;
+    let publisher = FakePublisher::ok();
+    let mut state = PublishState::default();
+
+    let personal = materialize(&rig, "p", b"p-bytes").await;
+    let shared = materialize_shared(&rig, "s", b"s-bytes").await;
+    pass(&rig, &publisher, &mut state).await;
+
+    re_edit(&rig, &personal, 0, b"p-bytes-v2-longer").await;
+    let shared_marker = resource_marker(&rig, &shared, 0).await;
+    re_edit(&rig, &shared, 0, b"s-bytes-v2-longer").await;
+
+    publisher.set_resolve_for(None, Ok(outcome(Responsibility::Holder, Vec::new())));
+    publisher.set_resolve_for(Some(MESH_LIB), Ok(outcome(Responsibility::Other, Vec::new())));
+    let report = pass(&rig, &publisher, &mut state).await;
+
+    assert_eq!(report.edits_propagated, 1, "personal only");
+    assert!(report.parked_responsibility);
+    let edits = publisher.edits();
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].photo.photo_id, personal);
+    assert_eq!(photo(&rig, &shared).await.edit_publish_attempts, 0);
+    assert_eq!(resource_marker(&rig, &shared, 0).await, shared_marker);
+}
+
+// Impact: the edit ledger is never reset — `reset_gave_up` touches only the
+// resource FETCH counters — so an attempt burned on a no-op is permanent
+// progress toward a cap that, once reached, excludes the photo from
+// `editable_photos` and silences its real edits for good.
+// Should: leave a converged photo's ledger and the report untouched.
+// Should not: submit anything for a photo with nothing left to say.
+#[tokio::test(flavor = "multi_thread")]
+async fn converged_photo_does_not_burn_an_edit_attempt() {
+    let rig = rig().await;
+    let publisher = FakePublisher::ok();
+    let mut state = PublishState::default();
+    let id = materialize(&rig, "conv", b"conv-bytes").await;
+    pass(&rig, &publisher, &mut state).await;
+
+    // The shape of a claim whose divergence was repaired before the pass
+    // reached it — a concurrent refetch, or a resource back mid-flight.
+    let stale_claim = photo(&rig, &id).await;
+    let report = run_publish_pass(
+        &rig.store,
+        &rig.data_dir.spool(),
+        &publisher,
+        &rig.config.publish,
+        PassWork {
+            editable: vec![stale_claim],
+            ..Default::default()
+        },
+        &mut state,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.edits_propagated, 0);
+    assert_eq!(report.metadata_propagated, 0);
+    assert_eq!(report.failed, 0, "a no-op is not a failed propagation");
+    assert_eq!(report.gave_up, 0);
+    assert!(publisher.edits().is_empty());
+
+    let row = photo(&rig, &id).await;
+    assert_eq!(row.edit_publish_attempts, 0);
+    assert!(row.edit_publish_next_retry_at.is_none());
+    assert!(row.edit_publish_last_error.is_none());
 }

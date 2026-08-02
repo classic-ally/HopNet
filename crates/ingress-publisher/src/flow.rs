@@ -15,9 +15,12 @@ use hopnet_common::CustomUUID;
 use hopnet_photos_core::PhotosCoreError;
 use hopnet_photos_core::dispatch::PhotoDispatch;
 use hopnet_photos_core::payloads::{build_photo_delete, build_photo_restore, encode_payload};
-use hopnet_photos_core::publisher::{ByteSource, PublishRequest, publish_photo_add};
+use hopnet_photos_core::publisher::{
+    ByteSource, EditRequest, EditResource as CoreEditResource, PublishRequest, publish_photo_add,
+    publish_photo_edit,
+};
 use ingress_core::publish::{
-    PublishError, PublishItem, PublishOutcome, Publisher, ResolveEntry, ResolveOutcome,
+    EditItem, PublishError, PublishItem, PublishOutcome, Publisher, ResolveEntry, ResolveOutcome,
     Responsibility, TombstoneOp,
 };
 
@@ -173,6 +176,87 @@ impl Publisher for NodePublisher {
             .await
             .map_err(classify)
     }
+
+    /// No confirm probe either, for a different reason than tombstones: an
+    /// edit is an idempotent REPLACEMENT against an id consensus already
+    /// holds. There is no unique id to collide with, so re-sending an
+    /// ambiguous edit lands the same bytes twice at worst.
+    async fn publish_edit(&self, item: EditItem) -> Result<(), PublishError> {
+        let photo_id = CustomUUID::from_str(&item.consensus_photo_id)
+            .map_err(|e| PublishError::Rejected(format!("consensus photo id not a uuid: {e}")))?;
+
+        let library_id = item
+            .library
+            .mesh_library_id
+            .as_deref()
+            .map(CustomUUID::from_str)
+            .transpose()
+            .map_err(|e| PublishError::Rejected(format!("mesh library id not a uuid: {e}")))?;
+
+        // Only compose metadata when it actually diverged: an unchanged
+        // photo would otherwise get a fresh key and fresh wraps on every
+        // byte-only edit, for no gain.
+        let metadata = if item.metadata_changed {
+            Some(
+                crate::map::to_photo_metadata(&item.sidecar, item.original_ext.as_deref())
+                    .map_err(PublishError::Rejected)?,
+            )
+        } else {
+            None
+        };
+
+        let mut resources = Vec::with_capacity(item.resources.len());
+        for resource in &item.resources {
+            let kind = kind_for(resource.resource_type)?;
+            if resource.size_bytes <= 0 {
+                return Err(PublishError::Rejected(format!(
+                    "edited resource {kind} has non-positive size"
+                )));
+            }
+            let file = tokio::fs::File::open(&resource.blob_path)
+                .await
+                .map_err(|e| {
+                    PublishError::Transient(format!("open {}: {e}", resource.blob_path.display()))
+                })?;
+            resources.push(CoreEditResource {
+                kind,
+                byte_len: resource.size_bytes as u64,
+                source: ByteSource::Stream(Box::new(file)),
+            });
+        }
+
+        let mut remove_resources = Vec::with_capacity(item.removals.len());
+        for resource_type in &item.removals {
+            remove_resources.push(kind_for(*resource_type)?);
+        }
+
+        publish_photo_edit(
+            &self.dispatch,
+            EditRequest {
+                photo_id,
+                library_id,
+                resources,
+                remove_resources,
+                metadata: metadata.as_ref(),
+            },
+        )
+        .await
+        .map(|_| ())
+        .map_err(classify)
+    }
+}
+
+/// Ingress resource type → RFC-011 kind. The names (and wire discriminants)
+/// are identical by design; a miss is permanent, not worth retrying.
+fn kind_for(
+    resource_type: ingress_core::model::ResourceType,
+) -> Result<hopnet_photos_core::asset::ResourceKind, PublishError> {
+    hopnet_photos_core::asset::ResourceKind::from_name(resource_type.as_str()).ok_or_else(|| {
+        PublishError::Rejected(format!(
+            "resource type `{}` has no RFC-011 kind",
+            resource_type.as_str()
+        ))
+    })
 }
 
 /// 64 hex chars → the 32-byte fingerprint the payload carries.

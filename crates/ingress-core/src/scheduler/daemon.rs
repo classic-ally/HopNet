@@ -189,9 +189,9 @@ impl<F: ResourceFetcher> Scheduler<F> {
                 let alive = publish_task.as_ref().is_some_and(|t| !t.is_finished());
                 if !alive && due(last_publish, self.shared.config.publish.interval) {
                     let skip = self.shared.inflight.lock().expect("inflight mutex").clone();
-                    // Both work lists are claimed together so one pass
-                    // covers uploads and tombstone propagation under a
-                    // single resolve per scope.
+                    // All three work lists are claimed together so one pass
+                    // covers uploads, tombstone propagation and edits under
+                    // a single resolve per scope.
                     let propagatable = match crate::publish::claim_tombstone_propagatable(
                         &self.shared.store,
                         &self.shared.config.publish,
@@ -215,6 +215,29 @@ impl<F: ResourceFetcher> Scheduler<F> {
                             Vec::new()
                         }
                     };
+                    let editable = match crate::publish::claim_editable(
+                        &self.shared.store,
+                        &self.shared.config.publish,
+                        &skip,
+                    )
+                    .await
+                    {
+                        Ok(rows) => rows,
+                        Err(e) => {
+                            let _ = self
+                                .shared
+                                .store
+                                .append_log(
+                                    "publish_error",
+                                    None,
+                                    Some(serde_json::json!({
+                                        "error": format!("claim editable: {e}")
+                                    })),
+                                )
+                                .await;
+                            Vec::new()
+                        }
+                    };
                     match crate::publish::claim_publishable(
                         &self.shared.store,
                         &self.shared.config.publish,
@@ -222,15 +245,23 @@ impl<F: ResourceFetcher> Scheduler<F> {
                     )
                     .await
                     {
-                        Ok(claimed) if !claimed.is_empty() || !propagatable.is_empty() => {
-                            // Inflight covers BOTH sets: a restore event
-                            // landing under an in-flight delete submission
-                            // would clear deleted_at just as the pass
-                            // stamps the marker, leaving a live photo
-                            // recorded as converged-deleted.
+                        Ok(claimed)
+                            if !claimed.is_empty()
+                                || !propagatable.is_empty()
+                                || !editable.is_empty() =>
+                        {
+                            // Inflight covers ALL THREE sets: a restore
+                            // event landing under an in-flight delete
+                            // submission would clear deleted_at just as the
+                            // pass stamps the marker, leaving a live photo
+                            // recorded as converged-deleted — and a PhotoKit
+                            // re-edit landing mid-submission would swap the
+                            // content hash under a marker about to record
+                            // the bytes that were actually sent.
                             let ids: Vec<PhotoId> = claimed
                                 .iter()
                                 .chain(propagatable.iter())
+                                .chain(editable.iter())
                                 .map(|p| p.photo_id.clone())
                                 .collect();
                             self.shared
@@ -250,8 +281,11 @@ impl<F: ResourceFetcher> Scheduler<F> {
                                     &shared.data_dir.spool(),
                                     publisher.as_ref(),
                                     &shared.config.publish,
-                                    claimed,
-                                    propagatable,
+                                    crate::publish::PassWork {
+                                        claimed,
+                                        propagatable,
+                                        editable,
+                                    },
                                     &mut state,
                                 )
                                 .await;

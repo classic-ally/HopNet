@@ -326,7 +326,22 @@ pub async fn apply_change(
                 {
                     reap.push((hash.clone(), ext));
                 }
-                crate::store::resources::delete_resource_row(&mut *tx, &plan.photo_id, *rt).await?;
+                // A resource the mesh holds cannot simply vanish: the row is
+                // the only record that a removal is owed, and no predicate
+                // can see a divergence whose local side has been deleted.
+                // It is retired to a marker instead, and reaped once the
+                // removal propagates.
+                if !crate::store::resources::soft_remove_resource(
+                    &mut *tx,
+                    &plan.photo_id,
+                    *rt,
+                    Utc::now(),
+                )
+                .await?
+                {
+                    crate::store::resources::delete_resource_row(&mut *tx, &plan.photo_id, *rt)
+                        .await?;
+                }
                 outcome.resources_removed += 1;
             }
         }

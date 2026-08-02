@@ -11,6 +11,7 @@ use hopnet_photos_core::asset::{
 use hopnet_photos_core::metadata::PhotoMetadata;
 use ingress_core::descriptor::MediaType;
 use ingress_core::publish::PublishItem;
+use ingress_core::sidecar::Sidecar;
 
 /// Extensions the interim raw rule treats as RAW originals (mirrors the
 /// `ext_for_uti` raw set; RFC-011 media_type 3 = raw).
@@ -45,17 +46,27 @@ pub fn mime_for_ext(ext: &str) -> &'static str {
 /// resource (PhotoKit exposes no direct "raw asset" flag at the descriptor
 /// level the sidecar preserves).
 pub fn media_type_code(item: &PublishItem) -> i32 {
-    match item.sidecar.media_type {
+    let original_ext = item
+        .resources
+        .iter()
+        .find(|r| r.resource_type.as_str() == ResourceKind::Original.as_str())
+        .map(|r| r.ext.as_str());
+    media_type_from(item.sidecar.media_type, original_ext)
+}
+
+/// The same rule against inputs an edit can supply. An edit never carries
+/// the Original's bytes — those are evicted after publish — so the raw
+/// check reads the extension straight off the DB row.
+pub fn media_type_from(media_type: MediaType, original_ext: Option<&str>) -> i32 {
+    match media_type {
         MediaType::Video => 1,
         MediaType::LivePhoto => 2,
         MediaType::Image => {
-            let original_is_raw = item
-                .resources
-                .iter()
-                .find(|r| r.resource_type.as_str() == ResourceKind::Original.as_str())
-                .map(|r| RAW_EXTS.contains(&r.ext.as_str()))
-                .unwrap_or(false);
-            if original_is_raw { 3 } else { 0 }
+            if original_ext.is_some_and(|ext| RAW_EXTS.contains(&ext)) {
+                3
+            } else {
+                0
+            }
         }
     }
 }
@@ -84,13 +95,14 @@ fn clamp_i32(value: impl TryInto<i32>) -> Option<i32> {
     value.try_into().ok().or(Some(i32::MAX))
 }
 
-/// Build the RFC-011 asset for one publishable photo. `SourceIdentity` is
-/// dropped at publish (metadata is encrypted client-side) but `validate()`
-/// requires it non-empty; `cloud_id` is the cross-device-stable choice, the
-/// daemon-minted photo id the fallback for local-only assets.
-pub fn to_photo_asset(item: &PublishItem) -> Result<PhotoAsset, String> {
-    let sidecar = &item.sidecar;
-
+/// Compose the RFC-011 metadata from a sidecar. Shared by publish and edit
+/// so a crop's dimensions reach the mesh through exactly the same mapping
+/// the first publish used — a second copy would drift the moment either
+/// side gained a field.
+pub fn to_photo_metadata(
+    sidecar: &Sidecar,
+    original_ext: Option<&str>,
+) -> Result<PhotoMetadata, String> {
     let date_taken = sidecar
         .captured_at
         .map(|at| at.to_rfc3339())
@@ -106,9 +118,9 @@ pub fn to_photo_asset(item: &PublishItem) -> Result<PhotoAsset, String> {
         None => (None, None, None, None),
     };
 
-    let metadata = PhotoMetadata {
+    Ok(PhotoMetadata {
         date_taken,
-        media_type: media_type_code(item),
+        media_type: media_type_from(sidecar.media_type, original_ext),
         width: sidecar.pixel_width.and_then(clamp_i32),
         height: sidecar.pixel_height.and_then(clamp_i32),
         duration_ms: sidecar.duration_ms.and_then(clamp_i32),
@@ -121,7 +133,21 @@ pub fn to_photo_asset(item: &PublishItem) -> Result<PhotoAsset, String> {
         group_type,
         group_index,
         is_group_pick,
-    };
+    })
+}
+
+/// Build the RFC-011 asset for one publishable photo. `SourceIdentity` is
+/// dropped at publish (metadata is encrypted client-side) but `validate()`
+/// requires it non-empty; `cloud_id` is the cross-device-stable choice, the
+/// daemon-minted photo id the fallback for local-only assets.
+pub fn to_photo_asset(item: &PublishItem) -> Result<PhotoAsset, String> {
+    let sidecar = &item.sidecar;
+    let original_ext = item
+        .resources
+        .iter()
+        .find(|r| r.resource_type.as_str() == ResourceKind::Original.as_str())
+        .map(|r| r.ext.clone());
+    let metadata = to_photo_metadata(sidecar, original_ext.as_deref())?;
 
     let mut resources = Vec::with_capacity(item.resources.len());
     for r in &item.resources {

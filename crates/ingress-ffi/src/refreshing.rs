@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ingress_core::publish::{
-    PublishError, PublishItem, PublishOutcome, Publisher, ResolveOutcome, TombstoneOp,
+    EditItem, PublishError, PublishItem, PublishOutcome, Publisher, ResolveOutcome, TombstoneOp,
 };
 
 /// Current publish credentials as the platform sees them.
@@ -127,6 +127,13 @@ impl<P: Publisher> Publisher for RefreshingPublisher<P> {
         self.note(&result);
         result
     }
+
+    async fn publish_edit(&self, item: EditItem) -> Result<(), PublishError> {
+        self.refresh_if_stale().await;
+        let result = self.state.lock().await.0.publish_edit(item).await;
+        self.note(&result);
+        result
+    }
 }
 
 #[cfg(test)]
@@ -157,6 +164,10 @@ mod tests {
             _consensus_photo_id: &str,
             _op: TombstoneOp,
         ) -> Result<(), PublishError> {
+            unreachable!("tests drive the wrapper through resolve only")
+        }
+
+        async fn publish_edit(&self, _item: EditItem) -> Result<(), PublishError> {
             unreachable!("tests drive the wrapper through resolve only")
         }
 
