@@ -13,10 +13,12 @@ use std::str::FromStr;
 
 use hopnet_common::CustomUUID;
 use hopnet_photos_core::PhotosCoreError;
+use hopnet_photos_core::dispatch::PhotoDispatch;
+use hopnet_photos_core::payloads::{build_photo_delete, build_photo_restore, encode_payload};
 use hopnet_photos_core::publisher::{ByteSource, PublishRequest, publish_photo_add};
 use ingress_core::publish::{
     PublishError, PublishItem, PublishOutcome, Publisher, ResolveEntry, ResolveOutcome,
-    Responsibility,
+    Responsibility, TombstoneOp,
 };
 
 use crate::dispatch::{CommitProbe, HttpDispatch, UNREACHABLE_PREFIX};
@@ -140,6 +142,36 @@ impl Publisher for NodePublisher {
                 })
                 .collect(),
         })
+    }
+
+    /// No confirm probe and no upload: `photo_delete` / `photo_restore`
+    /// carry only ids, and both handlers are idempotent (a delete of a
+    /// missing photo is skipped, not an error), so an ambiguous attempt is
+    /// safe to repeat.
+    async fn propagate_tombstone(
+        &self,
+        consensus_photo_id: &str,
+        op: TombstoneOp,
+    ) -> Result<(), PublishError> {
+        let photo_id = CustomUUID::from_str(consensus_photo_id)
+            .map_err(|e| PublishError::Rejected(format!("consensus photo id not a uuid: {e}")))?;
+
+        let (tx_type, payload) = match op {
+            TombstoneOp::Delete => (
+                "photo_delete",
+                encode_payload(&build_photo_delete(vec![photo_id])),
+            ),
+            TombstoneOp::Restore => (
+                "photo_restore",
+                encode_payload(&build_photo_restore(vec![photo_id])),
+            ),
+        };
+        let payload = payload.map_err(classify)?;
+
+        self.dispatch
+            .submit_transaction(tx_type, payload)
+            .await
+            .map_err(classify)
     }
 }
 

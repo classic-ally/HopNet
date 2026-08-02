@@ -355,6 +355,15 @@ CREATE TABLE photos (
     -- Tombstone (RFC-011-compatible; deleted_by deliberately absent, see notes)
     deleted_at        TEXT,                -- ISO 8601, NULL when active
 
+    -- Mesh convergence of the tombstone (see §Propagation to the mesh).
+    -- What the mesh has been told, as against deleted_at's "what Photos
+    -- believes"; the two disagreeing IS the propagation queue. RESETTABLE,
+    -- unlike published_at — a restore clears it so the next delete queues.
+    tombstone_published_at         TEXT,
+    tombstone_publish_attempts     INTEGER NOT NULL DEFAULT 0,
+    tombstone_publish_next_retry_at TEXT,
+    tombstone_publish_last_error   TEXT,
+
     FOREIGN KEY (library_id) REFERENCES libraries(library_id)
 );
 
@@ -364,6 +373,10 @@ CREATE INDEX idx_photos_deleted ON photos(deleted_at) WHERE deleted_at IS NOT NU
 CREATE INDEX idx_photos_group ON photos(group_id) WHERE group_id IS NOT NULL;
 CREATE INDEX idx_photos_unpublished ON photos(photo_id)
     WHERE published_at IS NULL AND materialized_at IS NOT NULL;
+CREATE INDEX idx_photos_tombstone_pending ON photos(photo_id)
+    WHERE published_at IS NOT NULL
+      AND ((deleted_at IS NOT NULL AND tombstone_published_at IS NULL)
+        OR (deleted_at IS NULL AND tombstone_published_at IS NOT NULL));
 ```
 
 Notes:
@@ -654,7 +667,7 @@ The daemon-loop tick (`ingress-core/src/publish.rs`; concrete publisher in `crat
 - **Eviction rides the pass.** After each publish pass — and again on the hourly cleanup tick, which catches strays — blobs whose every referencing photo in the library is decided (`NOT EXISTS … published_at IS NULL`) are stamped `evicted_at` and their spool files deleted under the spool-wide hash-liveness gate. Stamp first, then unlink: a crash between the two leaves a lingering file that fsck classifies as a benign orphan, never byte loss. `spool_evicted` is logged when a pass reclaims anything. This is the point of the spool — residence is bounded by publish latency, not library size.
 - **Driver exit codes** (`ingress-publish-e2e publish`): 0 drained, 2 unreachable-park, 3 = SOME scope responsibility-parked — since the pass is scope-partitioned, healthy scopes were still drained first (read `published`/`parked_responsibility` in the JSON, not just the code).
 - **Kick mid-stream**: a member removed from the mesh library loses the scope on both ends — the remove handler dissolves their responsibility row, and their daemon's next scoped resolve 403s (`library_not_member`), burning attempts toward `gave_up` for that scope only. No ingress-side reaction beyond the backoff this cycle; clearing the local mesh binding stops the attempts.
-- **Out of scope (this phase)**: re-edit propagation (a re-materialized published photo is NOT re-enqueued; content updates need their own transaction type), tombstone propagation, and favorites (Phase 4). Shared-library publish landed with the scope-partitioned pass above — the historical "shared libraries (Phase 3)" exclusion is closed.
+- **Out of scope (this phase)**: re-edit propagation (a re-materialized published photo is NOT re-enqueued; content updates need their own transaction type), tombstone propagation (designed but not built — see §Propagation to the mesh), and favorites (Phase 4). Shared-library publish landed with the scope-partitioned pass above — the historical "shared libraries (Phase 3)" exclusion is closed.
 
 ## Deletion and Retention
 
@@ -678,7 +691,7 @@ When a deletion event fires for an asset the daemon has previously ingested:
 
 Nothing else happens — the tombstone is a single-row update. Steps 3 and 4 mean the refcount remains accurate to the (still-existing) `photo_resources` rows. The photo disappears from active queries (`WHERE deleted_at IS NULL`) but is fully restorable until the retention window expires.
 
-Spool interplay: a tombstoned photo that never published counts as a live reference (`published_at IS NULL`), so its spool bytes are **not** evicted — they survive locally through the retention window and are reclaimed at hard delete. A tombstoned photo that already published keeps its rows through retention like any other, but its bytes follow the ordinary eviction rule; the mesh copy is unaffected (tombstone propagation to the mesh is a deferred feature).
+Spool interplay: a tombstoned photo that never published counts as a live reference (`published_at IS NULL`), so its spool bytes are **not** evicted — they survive locally through the retention window and are reclaimed at hard delete. A tombstoned photo that already published keeps its rows through retention like any other, but its bytes follow the ordinary eviction rule; the mesh copy is unaffected until propagation runs (see §Propagation to the mesh — designed, not yet built).
 
 This matches the `photos.md` reference provider's behavior: a soft-deleted `photos` row keeps its `photo_resources` rows alive, which in turn keep their data blocks alive. The daemon's `blobs.ref_count` is the analogue of the consensus layer's reference-provider check.
 
@@ -692,6 +705,53 @@ If PhotoKit subsequently emits a change event indicating the asset is alive agai
 No byte movement is required because nothing was moved on the original delete. Restore is atomic at the SQLite level: a single update statement on the `photos` row.
 
 If the asset has been deleted in PhotoKit and then re-imported as a fresh asset (new `cloud_id`), it is **not** a restore — it is a new photo, even if the bytes are identical. Rule 2b from the Asset Identity Model applies: a new `photo_id` is minted and the existing blob's refcount is incremented.
+
+### Propagation to the mesh
+
+**Status: designed, not implemented.** Both preceding subsections describe purely local state — a delete or restore observed from PhotoKit never reaches HopNet today, so the mesh keeps serving a photo the user has discarded (and keeps hiding one they have recovered). This subsection specifies the convergence mechanism; the work is tracked separately.
+
+The mesh side needs nothing new. `photo_delete` and `photo_restore` are registered handlers, and both are already in `DEVICE_TX_FUNCTIONS` — a daemon may submit them over `POST /api/photos/client/transaction` under its existing device token, subject to the per-scope responsibility gate that admits every other photo-targeting transaction. Delete authorization is already the uploader **or any member of the photo's shared library**, matching Apple's Shared Photo Library semantics where any participant may delete. The delete handler is idempotent on a missing photo. What is missing is entirely on the daemon: nothing turns a local tombstone into a submission.
+
+#### Why a marker column is required
+
+`published_at` doubles as both state and queue marker: `publishable_photos` selects `published_at IS NULL`, and stamping it removes the row from the queue permanently. That works because publication is **monotonic** — a photo goes unpublished to published exactly once, in one direction, and a nullable timestamp captures a one-way door completely.
+
+Deletion is **cyclic**. A user may delete, restore from Recently Deleted, and delete again without limit. A queue selecting `published_at IS NOT NULL AND deleted_at IS NOT NULL` has no off-switch: it would re-submit `photo_delete` for every tombstoned photo on every tick, through the retention window and beyond, until hard delete finally removes the row. Idempotency on the mesh side keeps this correct but not cheap — it is one consensus transaction per deleted photo per tick.
+
+So propagation state needs its own column, `tombstone_published_at`. This is consistent with the convention in §`photo_resources` that per-resource state is derivable from nullable timestamps rather than a stored `status` enum: a timestamp *is* the state, and doubles as the audit record. The prohibition is on enums shadowing timestamps, not on markers as such.
+
+#### The two-column state machine
+
+`deleted_at` records what Apple Photos believes. `tombstone_published_at` records what the mesh has been told. The queue is the delta.
+
+| `deleted_at` | `tombstone_published_at` | State | Action |
+|---|---|---|---|
+| NULL | NULL | Live; mesh agrees | none |
+| set | NULL | Deleted locally, mesh not told | submit `photo_delete`, then stamp |
+| set | set | Deleted; mesh converged | none |
+| NULL | set | Restored locally, mesh still tombstoned | submit `photo_restore`, then clear |
+
+The restore queue is the fourth row and costs nothing extra — the same column drives both directions.
+
+**`tombstone_published_at` must be resettable**, unlike `published_at`. A successful restore clears it, returning the row to the first state. If a restore left it set, the next delete would land in the third state and never propagate, leaving the mesh holding a photo Photos has discarded. This is a deliberate deviation from its neighbour in the same table, whose "set once, never reset" rule exists for the opposite reason (a re-publish of the same `photo_id` is hard-rejected by consensus).
+
+The propagation queue carries its own retry ledger rather than reusing `publish_attempts` / `publish_next_retry_at` / `publish_last_error`. Publish success resets that ledger, so the columns are technically free — but a photo that struggled to publish, succeeded, and then failed to propagate its delete would carry a blended failure history under a `publish_last_error` string describing the wrong operation.
+
+#### Marker as cache, resolve as repair
+
+`tombstone_published_at` is a local memo, not the truth. The truth is the mesh's `photos.deleted_at`, and the daemon already has a seam that reaches it: the resolve pre-pass deliberately resolves tombstoned rows (see §HopNet publish queue and the no-`deleted_at` rationale on the by-fingerprint lookups), it simply returns the committed id alone today. Extending that projection to carry the mesh's tombstone state lets a daemon whose marker is stale or absent — a rebuilt `state.db`, a Tier 3 re-scan — reconverge instead of diverging permanently.
+
+This mirrors publication exactly: `published_at` is the fast local marker, and adoption-by-fingerprint is the repair path when it is missing. One idea applied twice rather than two idioms side by side.
+
+#### Relationship to re-edit propagation
+
+Re-edit propagation is the same *pattern* at a different granularity, and should reuse the vocabulary rather than invent a parallel one. Both are convergence between local desired state and remote known state, with a marker recording last-converged and the delta forming the queue. Three things differ, and they are what make it separate work rather than a second instance:
+
+- **Granularity.** A tombstone is a property of the photo. An edit is a property of its resources — `photo_edit_content` carries `resources: Vec<PhotoResourceOp>`, so the marker belongs on `photo_resources`, not `photos`.
+- **Cardinality.** Deletion is a bit, so a timestamp suffices to say "told." An edit is a *value*: the marker must record *which* version the mesh holds, comparing against the resource's current `content_hash`. A bare timestamp cannot express that.
+- **Payload.** `photo_delete` carries only photo ids, so propagation is transaction-only. `photo_edit_content` carries data blocks that must be uploaded first, which means re-edit propagation drives the entire fetch/encrypt/upload pipeline, not just a submission. This is the bulk of the difference in cost.
+
+The bookkeeping generalizes; the work does not.
 
 ### Hard-delete cleanup
 
@@ -747,7 +807,7 @@ The daemon's deletion model is intentionally identical in shape to `photos.md`'s
 | `state.db.blobs.ref_count` | `DataBlockReferenceProvider` check on `photo_resources` |
 | Periodic cleanup of tombstones past retention | RFC-011's cleanup job for expired tombstones |
 
-The 30-day window is the same value in both layers, so when tombstone propagation to the mesh lands (deferred), in-flight tombstones carry over as-is.
+The 30-day window is the same value in both layers, so when tombstone propagation to the mesh lands (§Propagation to the mesh), in-flight tombstones carry over as-is.
 
 ## Failure Handling
 

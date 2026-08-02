@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ingress_core::publish::{
-    PublishError, PublishItem, PublishOutcome, Publisher, ResolveOutcome,
+    PublishError, PublishItem, PublishOutcome, Publisher, ResolveOutcome, TombstoneOp,
 };
 
 /// Current publish credentials as the platform sees them.
@@ -32,12 +32,15 @@ pub trait PublishCredentialsProvider: Send + Sync {
     fn current(&self) -> Option<FfiPublishCredentials>;
 }
 
+/// Builds a fresh inner publisher from a fresh credential set.
+type RebuildFn<P> = Box<dyn Fn(&FfiPublishCredentials) -> Result<P, String> + Send + Sync>;
+
 /// Wraps the real publisher; rebuilds it from fresh credentials after an
 /// unreachable pass. Generic over the inner publisher (and rebuild closure)
 /// so tests can observe rebuilds without a network.
 pub(crate) struct RefreshingPublisher<P: Publisher> {
     provider: Arc<dyn PublishCredentialsProvider>,
-    rebuild: Box<dyn Fn(&FfiPublishCredentials) -> Result<P, String> + Send + Sync>,
+    rebuild: RebuildFn<P>,
     /// The inner publisher plus the credentials it was built from.
     state: tokio::sync::Mutex<(P, FfiPublishCredentials)>,
     /// Set when a call returns NodeUnreachable; consumed (and cleared) by
@@ -74,11 +77,10 @@ impl<P: Publisher> RefreshingPublisher<P> {
         if fresh == state.1 {
             return;
         }
-        match (self.rebuild)(&fresh) {
-            Ok(inner) => *state = (inner, fresh),
-            // A malformed credential set cannot beat the working-but-stale
-            // one; keep the old client and let the pass park again.
-            Err(_) => {}
+        // A malformed credential set cannot beat the working-but-stale one;
+        // on Err keep the old client and let the pass park again.
+        if let Ok(inner) = (self.rebuild)(&fresh) {
+            *state = (inner, fresh);
         }
     }
 
@@ -108,6 +110,23 @@ impl<P: Publisher> Publisher for RefreshingPublisher<P> {
         self.note(&result);
         result
     }
+
+    async fn propagate_tombstone(
+        &self,
+        consensus_photo_id: &str,
+        op: TombstoneOp,
+    ) -> Result<(), PublishError> {
+        self.refresh_if_stale().await;
+        let result = self
+            .state
+            .lock()
+            .await
+            .0
+            .propagate_tombstone(consensus_photo_id, op)
+            .await;
+        self.note(&result);
+        result
+    }
 }
 
 #[cfg(test)]
@@ -130,6 +149,14 @@ mod tests {
     #[async_trait::async_trait]
     impl Publisher for MockInner {
         async fn publish(&self, _item: PublishItem) -> Result<PublishOutcome, PublishError> {
+            unreachable!("tests drive the wrapper through resolve only")
+        }
+
+        async fn propagate_tombstone(
+            &self,
+            _consensus_photo_id: &str,
+            _op: TombstoneOp,
+        ) -> Result<(), PublishError> {
             unreachable!("tests drive the wrapper through resolve only")
         }
 

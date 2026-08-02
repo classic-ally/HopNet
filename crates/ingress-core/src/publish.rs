@@ -157,12 +157,36 @@ pub struct ResolveOutcome {
     pub entries: Vec<ResolveEntry>,
 }
 
+/// Which direction a propagation carries (spec §Propagation to the mesh).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TombstoneOp {
+    /// Photos deleted it locally; tell the mesh (`photo_delete`).
+    Delete,
+    /// Photos got it back from Recently Deleted; tell the mesh
+    /// (`photo_restore`).
+    Restore,
+}
+
 /// The publish seam. Core stays free of HTTP/HopNet types the same way
 /// `ResourceFetcher` keeps PhotoKit out — the concrete impl (HTTP dispatch +
 /// RFC-011 mapping) lives out-of-crate.
 #[async_trait::async_trait]
 pub trait Publisher: Send + Sync + 'static {
     async fn publish(&self, item: PublishItem) -> std::result::Result<PublishOutcome, PublishError>;
+
+    /// Tell the mesh a published photo's tombstone state changed, under the
+    /// id consensus actually holds (`COALESCE(consensus_photo_id,
+    /// photo_id)` — an adopted photo lives under another device's id).
+    ///
+    /// Deliberately without a default: a no-op default would let a
+    /// publisher silently swallow deletes while the pass stamped them as
+    /// converged, which is exactly the divergence this feature exists to
+    /// close.
+    async fn propagate_tombstone(
+        &self,
+        consensus_photo_id: &str,
+        op: TombstoneOp,
+    ) -> std::result::Result<(), PublishError>;
 
     /// Pre-pass identity resolution for ONE publish scope: cloud_ids →
     /// fingerprints + committed ids + the caller's responsibility standing
@@ -200,6 +224,10 @@ pub struct PublishReport {
     /// Claimed photos with a NULL descriptor capsule (pre-column rows
     /// awaiting scan backfill) — skipped, no attempt burned.
     pub missing_descriptor: u64,
+    /// Tombstones the mesh was told about this pass (`photo_delete`).
+    pub tombstones_propagated: u64,
+    /// Restores the mesh was told about this pass (`photo_restore`).
+    pub restores_propagated: u64,
     /// Blobs spool-evicted at the end of the pass (every referent decided).
     pub evicted_blobs: u64,
     /// The pass aborted early because the node was unreachable.
@@ -218,6 +246,8 @@ impl PublishReport {
         self.failed += other.failed;
         self.gave_up += other.gave_up;
         self.missing_descriptor += other.missing_descriptor;
+        self.tombstones_propagated += other.tombstones_propagated;
+        self.restores_propagated += other.restores_propagated;
         self.evicted_blobs += other.evicted_blobs;
         self.parked = other.parked;
         self.parked_responsibility = other.parked_responsibility;
@@ -249,23 +279,53 @@ pub async fn claim_publishable(
     )
 }
 
-/// Run one publish pass over `claimed`. The caller has already registered
-/// the claimed ids inflight (their PhotoKit events defer until the pass
-/// ends, which also excludes supersede/hard-move races on the blob reads).
+/// Claim helper for the daemon tick: photos whose local tombstone state
+/// disagrees with what the mesh was told, minus `skip`. Both directions
+/// (pending delete and pending restore) come back together — the caller
+/// reads `deleted_at` to pick the transaction.
+pub async fn claim_tombstone_propagatable(
+    store: &StateStore,
+    cfg: &PublishConfig,
+    skip: &HashSet<PhotoId>,
+) -> Result<Vec<PhotoRecord>> {
+    Ok(crate::store::photos::tombstone_propagatable_photos(
+        store.pool(),
+        Utc::now(),
+        cfg.retry_cap,
+        cfg.batch,
+    )
+    .await?
+    .into_iter()
+    .filter(|p| !skip.contains(&p.photo_id))
+    .collect())
+}
+
+/// Run one publish pass over `claimed` and one propagation pass over
+/// `propagatable`. The caller has already registered both id sets inflight
+/// (their PhotoKit events defer until the pass ends, which also excludes
+/// supersede/hard-move races on the blob reads, and keeps a restore event
+/// from landing under an in-flight delete submission).
 ///
 /// The pass partitions by publish scope — the photo's library's
 /// `mesh_library_id` (None = personal partition) — and runs one
-/// resolve→adopt→gate→publish sequence per scope, personal first, then
-/// mesh ids in sorted order. Responsibility standing, parking, and
-/// resolve-failure attempt burning are all per-scope: a kicked member's
-/// 403ing shared library must not starve the personal queue. Node
+/// resolve→adopt→gate→publish→propagate sequence per scope, personal
+/// first, then mesh ids in sorted order. Responsibility standing, parking,
+/// and resolve-failure attempt burning are all per-scope: a kicked
+/// member's 403ing shared library must not starve the personal queue. Node
 /// unreachability is the one whole-pass condition — it parks everything.
+///
+/// Propagation shares the scope's single `resolve` call for its
+/// responsibility standing: the node's device-tx gate rejects any
+/// transaction touching a scope this device does not hold, so propagation
+/// must respect the same holder gate as publishing rather than discover it
+/// through 403s.
 pub async fn run_publish_pass(
     store: &StateStore,
     spool: &SpoolPaths,
     publisher: &dyn Publisher,
     cfg: &PublishConfig,
     claimed: Vec<PhotoRecord>,
+    propagatable: Vec<PhotoRecord>,
     state: &mut PublishState,
 ) -> Result<PublishReport> {
     let mut report = PublishReport::default();
@@ -275,28 +335,41 @@ pub async fn run_publish_pass(
         .iter()
         .map(|l| (&l.library_id, l.mesh_library_id.as_deref()))
         .collect();
+    let scope_of = |photo: &PhotoRecord| -> Option<String> {
+        photo
+            .library_id
+            .as_ref()
+            .and_then(|lib| mesh_of.get(lib).copied().flatten())
+            .map(str::to_string)
+    };
 
     // Partition preserving claim order within each scope. A photo whose
     // library is unknown or mesh-unbound lands in the personal partition
     // here; assemble_item re-reads the library fresh and skips it before
     // anything is published (claim-vs-pass race window only).
-    let mut partitions: Vec<(Option<String>, Vec<PhotoRecord>)> = Vec::new();
-    for photo in claimed {
-        let scope: Option<String> = photo
-            .library_id
-            .as_ref()
-            .and_then(|lib| mesh_of.get(lib).copied().flatten())
-            .map(str::to_string);
-        match partitions.iter_mut().find(|(s, _)| *s == scope) {
-            Some((_, photos)) => photos.push(photo),
-            None => partitions.push((scope, vec![photo])),
+    let mut partitions: Vec<(Option<String>, ScopeWork)> = Vec::new();
+    let slot = |scope: Option<String>, partitions: &mut Vec<(Option<String>, ScopeWork)>| {
+        match partitions.iter().position(|(s, _)| *s == scope) {
+            Some(i) => i,
+            None => {
+                partitions.push((scope, ScopeWork::default()));
+                partitions.len() - 1
+            }
         }
+    };
+    for photo in claimed {
+        let i = slot(scope_of(&photo), &mut partitions);
+        partitions[i].1.publish.push(photo);
+    }
+    for photo in propagatable {
+        let i = slot(scope_of(&photo), &mut partitions);
+        partitions[i].1.propagate.push(photo);
     }
     partitions.sort_by(|(a, _), (b, _)| a.cmp(b)); // None (personal) first
 
-    for (scope, photos) in partitions {
+    for (scope, work) in partitions {
         let control =
-            run_scope_pass(store, spool, publisher, cfg, scope.as_deref(), photos, state, &mut report)
+            run_scope_pass(store, spool, publisher, cfg, scope.as_deref(), work, state, &mut report)
                 .await?;
         if control == ScopeControl::ParkAll {
             break;
@@ -319,9 +392,16 @@ enum ScopeControl {
     ParkAll,
 }
 
-/// One scope's resolve→adopt→gate→publish sequence (the v1 whole-pass
-/// body, scoped). Mutates the shared `report`; per-scope failures burn
-/// attempts only for this scope's photos.
+/// One scope's two work lists.
+#[derive(Debug, Default)]
+struct ScopeWork {
+    publish: Vec<PhotoRecord>,
+    propagate: Vec<PhotoRecord>,
+}
+
+/// One scope's resolve→adopt→gate→publish→propagate sequence (the v1
+/// whole-pass body, scoped). Mutates the shared `report`; per-scope
+/// failures burn attempts only for this scope's photos.
 #[allow(clippy::too_many_arguments)]
 async fn run_scope_pass(
     store: &StateStore,
@@ -329,13 +409,20 @@ async fn run_scope_pass(
     publisher: &dyn Publisher,
     cfg: &PublishConfig,
     scope: Option<&str>,
-    claimed: Vec<PhotoRecord>,
+    work: ScopeWork,
     state: &mut PublishState,
     report: &mut PublishReport,
 ) -> Result<ScopeControl> {
+    let ScopeWork {
+        publish: claimed,
+        propagate,
+    } = work;
+
     // --- Resolve pre-pass: fingerprints + remote adoption + standing. ---
     // One batch call per scope; NULL-cloud_id photos simply get no entry
-    // (they publish with no fingerprint and are exempt from dedupe).
+    // (they publish with no fingerprint and are exempt from dedupe). A
+    // scope carrying only propagation work still calls resolve — with an
+    // empty id list — because responsibility standing is what it needs.
     let cloud_ids: Vec<String> = claimed.iter().filter_map(|p| p.cloud_id.clone()).collect();
     let resolved = match publisher.resolve(scope, &cloud_ids).await {
         Ok(outcome) => outcome,
@@ -362,6 +449,9 @@ async fn run_scope_pass(
             let msg = format!("resolve failed: {e}");
             for photo in &claimed {
                 record_failure(store, cfg, photo, &msg, report).await?;
+            }
+            for photo in &propagate {
+                record_propagate_failure(store, cfg, photo, &msg, report).await?;
             }
             return Ok(ScopeControl::Continue);
         }
@@ -420,7 +510,7 @@ async fn run_scope_pass(
     // --- Responsibility gate: mutations are holder-only, per scope. ---
     let scope_key = scope.map(str::to_string);
     if resolved.responsibility != Responsibility::Holder {
-        if !remaining.is_empty() {
+        if !remaining.is_empty() || !propagate.is_empty() {
             if state.not_responsible.insert(scope_key) {
                 let status = match resolved.responsibility {
                     Responsibility::Other => "other",
@@ -519,6 +609,92 @@ async fn run_scope_pass(
             }
             Err(PublishError::Transient(msg)) => {
                 record_failure(store, cfg, &photo, &msg, report).await?;
+            }
+        }
+    }
+
+    // --- Propagation: tell the mesh what Photos did to already-published
+    // photos. Runs after publishing so a photo added and deleted between
+    // two passes publishes first and is then tombstoned, rather than being
+    // deleted before consensus has heard of it.
+    for photo in propagate {
+        // `deleted_at` is read from the row as claimed. A PhotoKit event
+        // between claim and here cannot race it: the caller registered
+        // these ids inflight for the pass's duration.
+        let op = if photo.deleted_at.is_some() {
+            TombstoneOp::Delete
+        } else {
+            TombstoneOp::Restore
+        };
+        // An adopted photo lives in consensus under the id of whichever
+        // device published it first.
+        let consensus_id = photo
+            .consensus_photo_id
+            .clone()
+            .unwrap_or_else(|| photo.photo_id.to_string());
+
+        match publisher.propagate_tombstone(&consensus_id, op).await {
+            Ok(()) => {
+                match op {
+                    TombstoneOp::Delete => {
+                        crate::store::photos::mark_tombstone_published(
+                            store.pool(),
+                            &photo.photo_id,
+                            Utc::now(),
+                        )
+                        .await?;
+                        report.tombstones_propagated += 1;
+                    }
+                    TombstoneOp::Restore => {
+                        // Clearing, not stamping — a later delete has to be
+                        // able to queue again.
+                        crate::store::photos::clear_tombstone_published(
+                            store.pool(),
+                            &photo.photo_id,
+                        )
+                        .await?;
+                        report.restores_propagated += 1;
+                    }
+                }
+                if state.unreachable {
+                    state.unreachable = false;
+                    let _ = store.append_log("node_regained", None, None).await;
+                }
+            }
+            Err(PublishError::NodeUnreachable(msg)) => {
+                if !state.unreachable {
+                    state.unreachable = true;
+                    let _ = store
+                        .append_log(
+                            "node_unreachable",
+                            None,
+                            Some(serde_json::json!({ "error": msg })),
+                        )
+                        .await;
+                }
+                report.parked = true;
+                return Ok(ScopeControl::ParkAll);
+            }
+            Err(PublishError::Rejected(msg)) => {
+                crate::store::photos::record_tombstone_failure(
+                    store.pool(),
+                    &photo.photo_id,
+                    cfg.retry_cap,
+                    None,
+                    &msg,
+                )
+                .await?;
+                report.gave_up += 1;
+                let _ = store
+                    .append_log(
+                        "propagate_rejected",
+                        Some(&photo.photo_id),
+                        Some(serde_json::json!({ "error": msg, "op": format!("{op:?}") })),
+                    )
+                    .await;
+            }
+            Err(PublishError::Transient(msg)) => {
+                record_propagate_failure(store, cfg, &photo, &msg, report).await?;
             }
         }
     }
@@ -637,6 +813,45 @@ async fn assemble_item(
         resources,
         cloud_fingerprint: None, // stamped by the pass from the resolve entry
     }))
+}
+
+/// [`record_failure`] against the tombstone ledger. Separate columns, not a
+/// second use of the publish trio: a photo that struggled to publish,
+/// succeeded, then failed to propagate its delete would otherwise carry a
+/// blended history under a `publish_last_error` describing the wrong
+/// operation. The report's `failed`/`gave_up` counters are shared.
+async fn record_propagate_failure(
+    store: &StateStore,
+    cfg: &PublishConfig,
+    photo: &PhotoRecord,
+    msg: &str,
+    report: &mut PublishReport,
+) -> Result<()> {
+    let attempts = photo.tombstone_publish_attempts + 1;
+    let next_retry = Utc::now()
+        + chrono::Duration::from_std(crate::scheduler::backoff::delay(&cfg.backoff, attempts))
+            .unwrap_or_else(|_| chrono::Duration::hours(6));
+    crate::store::photos::record_tombstone_failure(
+        store.pool(),
+        &photo.photo_id,
+        attempts,
+        Some(next_retry),
+        msg,
+    )
+    .await?;
+    if attempts >= cfg.retry_cap {
+        report.gave_up += 1;
+        let _ = store
+            .append_log(
+                "propagate_gave_up",
+                Some(&photo.photo_id),
+                Some(serde_json::json!({ "error": msg, "attempts": attempts })),
+            )
+            .await;
+    } else {
+        report.failed += 1;
+    }
+    Ok(())
 }
 
 async fn record_failure(
