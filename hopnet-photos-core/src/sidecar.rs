@@ -1432,12 +1432,15 @@ mod tests {
         let lib_a = CustomUUID::retention_cutoff(10);
         let lib_b = CustomUUID::retention_cutoff(11);
 
-        for (i, lib) in [(20, &lib_a), (21, &lib_b)] {
-            let photo_id = CustomUUID::retention_cutoff(i);
-            let mut state = make_encrypted_state(&photo_id, &reader, None);
+        // Capture the seeded ids — retention_cutoff embeds fresh
+        // nanos/random bits per call, so a re-derived id never matches.
+        let photo_a = CustomUUID::retention_cutoff(20);
+        let photo_b = CustomUUID::retention_cutoff(21);
+        for (photo_id, lib) in [(&photo_a, &lib_a), (&photo_b, &lib_b)] {
+            let mut state = make_encrypted_state(photo_id, &reader, None);
             state.library_id = Some((*lib).clone());
             db.apply_backfill(&[PhotoChange {
-                photo_id,
+                photo_id: (*photo_id).clone(),
                 changed_at_height: 0,
                 state: Some(state),
             }])
@@ -1455,11 +1458,11 @@ mod tests {
         let states = db.library_states().unwrap();
         assert_eq!(states, vec![(lib_b, 9)]);
         assert!(
-            db.get_photo(&CustomUUID::retention_cutoff(20)).unwrap().is_none(),
+            db.get_photo(&photo_a).unwrap().is_none(),
             "purged library's photo gone"
         );
         assert!(
-            db.get_photo(&CustomUUID::retention_cutoff(21)).unwrap().is_some(),
+            db.get_photo(&photo_b).unwrap().is_some(),
             "other library's photo untouched"
         );
     }
