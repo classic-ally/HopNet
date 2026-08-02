@@ -2,8 +2,9 @@ use crate::error::PhotosCoreError;
 use hopnet_common::CustomUUID;
 use hopnet_photos::envelopes::{
     MetadataAccessEntry, PhotoAddEntry, PhotoAddPayload, PhotoDeleteEntry, PhotoDeletePayload,
-    PhotoFavoriteEntry, PhotoFavoritePayload, PhotoResourceOp, PhotoRestoreEntry,
-    PhotoRestorePayload,
+    PhotoEditContentEntry, PhotoEditContentPayload, PhotoEditMetadataEntry,
+    PhotoEditMetadataPayload, PhotoFavoriteEntry, PhotoFavoritePayload, PhotoResourceOp,
+    PhotoRestoreEntry, PhotoRestorePayload,
 };
 use serde::Serialize;
 
@@ -35,6 +36,63 @@ pub fn build_photo_add(drafts: Vec<PhotoAddDraft>) -> PhotoAddPayload {
                 metadata_access: d.metadata_access,
                 operation_id: d.operation_id,
                 cloud_fingerprint: d.cloud_fingerprint,
+            })
+            .collect(),
+    }
+}
+
+/// A content edit: new blobs for changed resources, kinds a revert dropped,
+/// and — when the metadata changed with them — a fresh ciphertext with the
+/// wraps of the key it is under. Metadata rides the content transaction
+/// rather than a second one so a crop's new dimensions land atomically with
+/// the pixels they describe.
+pub struct PhotoEditContentDraft {
+    pub photo_id: CustomUUID,
+    pub resources: Vec<PhotoResourceOp>,
+    pub encrypted_metadata: Option<Vec<u8>>,
+    pub metadata_nonce: Option<[u8; 12]>,
+    pub metadata_access: Vec<MetadataAccessEntry>,
+    /// Wire values of the `ResourceKind`s to drop.
+    pub remove_resources: Vec<i32>,
+    pub operation_id: CustomUUID,
+}
+
+pub fn build_photo_edit_content(drafts: Vec<PhotoEditContentDraft>) -> PhotoEditContentPayload {
+    PhotoEditContentPayload {
+        entries: drafts
+            .into_iter()
+            .map(|d| PhotoEditContentEntry {
+                photo_id: d.photo_id,
+                resources: d.resources,
+                encrypted_metadata: d.encrypted_metadata,
+                metadata_nonce: d.metadata_nonce,
+                operation_id: d.operation_id,
+                metadata_access: d.metadata_access,
+                remove_resources: d.remove_resources,
+            })
+            .collect(),
+    }
+}
+
+/// A metadata-only edit — no bytes moved, so nothing to upload.
+pub struct PhotoEditMetadataDraft {
+    pub photo_id: CustomUUID,
+    pub encrypted_metadata: Vec<u8>,
+    pub metadata_nonce: [u8; 12],
+    pub metadata_access: Vec<MetadataAccessEntry>,
+    pub operation_id: CustomUUID,
+}
+
+pub fn build_photo_edit_metadata(drafts: Vec<PhotoEditMetadataDraft>) -> PhotoEditMetadataPayload {
+    PhotoEditMetadataPayload {
+        entries: drafts
+            .into_iter()
+            .map(|d| PhotoEditMetadataEntry {
+                photo_id: d.photo_id,
+                encrypted_metadata: d.encrypted_metadata,
+                metadata_nonce: d.metadata_nonce,
+                operation_id: d.operation_id,
+                metadata_access: d.metadata_access,
             })
             .collect(),
     }
@@ -169,6 +227,50 @@ mod tests {
             payload.entries[0].operation_id.to_string(),
             payload.entries[1].operation_id.to_string()
         );
+    }
+
+    // Should: round-trip a content edit carrying wraps and removals.
+    #[test]
+    fn photo_edit_content_payload_round_trip() {
+        let payload = build_photo_edit_content(vec![PhotoEditContentDraft {
+            photo_id: CustomUUID::retention_cutoff(5),
+            resources: Vec::new(),
+            encrypted_metadata: Some(b"meta".to_vec()),
+            metadata_nonce: Some([0x11; 12]),
+            metadata_access: vec![MetadataAccessEntry {
+                user_id: 3,
+                ephemeral_pubkey: [0x21; 32],
+                encrypted_metadata_key: vec![0x31; 48],
+            }],
+            remove_resources: vec![1, 5],
+            operation_id: CustomUUID::retention_cutoff(6),
+        }]);
+        let encoded = encode_payload(&payload).unwrap();
+        let (decoded, _): (PhotoEditContentPayload, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(decoded.entries[0].remove_resources, vec![1, 5]);
+        assert_eq!(decoded.entries[0].metadata_access[0].user_id, 3);
+    }
+
+    // Should: round-trip a metadata-only edit's wraps.
+    #[test]
+    fn photo_edit_metadata_payload_round_trip() {
+        let payload = build_photo_edit_metadata(vec![PhotoEditMetadataDraft {
+            photo_id: CustomUUID::retention_cutoff(7),
+            encrypted_metadata: b"refreshed".to_vec(),
+            metadata_nonce: [0x41; 12],
+            metadata_access: vec![MetadataAccessEntry {
+                user_id: 4,
+                ephemeral_pubkey: [0x51; 32],
+                encrypted_metadata_key: vec![0x61; 48],
+            }],
+            operation_id: CustomUUID::retention_cutoff(8),
+        }]);
+        let encoded = encode_payload(&payload).unwrap();
+        let (decoded, _): (PhotoEditMetadataPayload, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(decoded.entries[0].metadata_access[0].user_id, 4);
+        assert_eq!(decoded.entries[0].encrypted_metadata, b"refreshed".to_vec());
     }
 
     #[test]

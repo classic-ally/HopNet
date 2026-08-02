@@ -40,6 +40,15 @@ pub enum PublishValidationError {
 
     #[error("uploader {uploaded_by} is not a member of the target library")]
     UploaderNotMember { uploaded_by: i32 },
+
+    #[error("edit changes nothing: no resources, no removals, no metadata")]
+    EmptyEdit,
+
+    #[error("duplicate removal of {0}")]
+    DuplicateRemoval(ResourceKind),
+
+    #[error("resource {0} is both edited and removed")]
+    EditedAndRemoved(ResourceKind),
 }
 
 #[derive(Debug, Error)]
