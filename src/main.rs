@@ -145,6 +145,24 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             tracing::info!("Found existing database file at {}", db_path);
         }
 
+        // Epoch boot transition (RFC-019 S6): must run BEFORE the pool
+        // opens — it may swap the database file. Parked outcomes continue
+        // booting on the old sealed database (HTTP + status up, engine
+        // parked by the sealed marker); Fatal means continuing would
+        // destroy a mesh member's state.
+        match regenesis::boot::boot_transition(&db_path, version::effective_running_code()) {
+            regenesis::boot::BootOutcome::NoBoundary => {}
+            regenesis::boot::BootOutcome::Transitioned { epoch } => {
+                tracing::info!(epoch, "epoch boundary crossed at boot");
+            }
+            regenesis::boot::BootOutcome::Parked(reason) => {
+                tracing::warn!(?reason, "epoch boundary parked — engine will not start");
+            }
+            regenesis::boot::BootOutcome::Fatal(detail) => {
+                panic!("epoch boot transition: {detail}");
+            }
+        }
+
         let manager = SqliteConnectionManager::file(&db_path);
         let pool = Pool::builder()
             .max_size(db::DB_POOL_MAX_SIZE)
@@ -173,7 +191,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     } else {
         tracing::info!("Initializing new database schema");
-        db::shared::initialize(conn)
+        db::shared::initialize(&conn)
     };
 
     match init_result {

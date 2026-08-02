@@ -54,9 +54,7 @@ pub fn database_exists(db_path: &str) -> bool {
 }
 
 /// Check if the database schema is initialized by checking for critical tables
-pub fn is_schema_initialized(
-    db: &PooledConnection<SqliteConnectionManager>,
-) -> Result<bool, DuckdbError> {
+pub fn is_schema_initialized(db: &rusqlite::Connection) -> Result<bool, DuckdbError> {
     // Check if the critical 'this_node' table exists (the legacy 'blocks'
     // table died with the bespoke engine at Stage 5b)
     let result = db.query_row(
@@ -170,21 +168,7 @@ impl r2d2::CustomizeConnection<rusqlite::Connection, rusqlite::Error> for Sqlite
     fn on_acquire(&self, conn: &mut rusqlite::Connection) -> Result<(), rusqlite::Error> {
         DB_COUNTERS.conn_acquires.fetch_add(1, Ordering::Relaxed);
 
-        // page_size must run before journal_mode = WAL: the WAL init writes
-        // the DB header at the current page size and locks it.
-        conn.execute_batch(&page_size_pragma())?;
-
-        conn.execute_batch(
-            "
-            PRAGMA journal_mode = WAL;
-            PRAGMA foreign_keys = ON;
-            PRAGMA busy_timeout = 5000;
-        ",
-        )?;
-        let overrides = env_pragma_overrides();
-        if !overrides.is_empty() {
-            conn.execute_batch(&overrides)?;
-        }
+        apply_connection_pragmas(conn)?;
 
         // Count successful commits / rollbacks across the whole codebase.
         // commit_hook returns false to allow the commit to proceed.
@@ -196,9 +180,30 @@ impl r2d2::CustomizeConnection<rusqlite::Connection, rusqlite::Error> for Sqlite
             DB_COUNTERS.txn_rollbacks.fetch_add(1, Ordering::Relaxed);
         }))?;
 
-        register_custom_functions(conn)?;
         Ok(())
     }
+}
+
+/// The connection setup every HopNet database handle needs — pooled or
+/// plain (the regenesis boot transition opens plain connections before
+/// the pool exists). Ordering is load-bearing: page_size must run before
+/// journal_mode = WAL because the WAL init writes the file header at the
+/// current page size and locks it.
+pub fn apply_connection_pragmas(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(&page_size_pragma())?;
+    conn.execute_batch(
+        "
+        PRAGMA journal_mode = WAL;
+        PRAGMA foreign_keys = ON;
+        PRAGMA busy_timeout = 5000;
+    ",
+    )?;
+    let overrides = env_pragma_overrides();
+    if !overrides.is_empty() {
+        conn.execute_batch(&overrides)?;
+    }
+    register_custom_functions(conn)?;
+    Ok(())
 }
 
 /// Register custom SQL functions needed by queries across the codebase
@@ -276,7 +281,7 @@ pub fn register_custom_functions(conn: &rusqlite::Connection) -> rusqlite::Resul
     Ok(())
 }
 
-pub fn initialize(db: PooledConnection<SqliteConnectionManager>) -> Result<(), DuckdbError> {
+pub fn initialize(db: &rusqlite::Connection) -> Result<(), DuckdbError> {
     db.execute_batch(
         "
             CREATE TABLE sequences (

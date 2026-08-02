@@ -334,6 +334,10 @@ pub fn spawn_engine(app_state: &AppState) -> Result<(), String> {
         app_state.consensus_queue.pending_pool(),
     );
 
+    // Rollback-window cleanup (RFC-019 S6): a freshly transitioned epoch
+    // retains the sealed epoch-N database until its own first decide.
+    spawn_rollback_cleanup(app_state.clone(), decided.clone());
+
     let engine = EngineHandle {
         input_tx,
         decided,
@@ -662,6 +666,59 @@ fn seal_candidate(
 /// own once the commit decides (phase leaves MORATORIUM). Lives for the
 /// engine's lifetime; outside a moratorium it is one cheap singleton
 /// read per second.
+/// RFC-019 S6 rollback window: delete the retained epoch-N database
+/// (`database.db.sealed`) once this epoch decides its first height past
+/// the genesis. Exits immediately when nothing is retained — i.e. on
+/// every boot except the first after a boundary. Crash-safe: a decide
+/// followed by a crash before deletion is caught by the initial check on
+/// the next boot's spawn.
+pub(crate) fn spawn_rollback_cleanup(
+    app_state: crate::AppState,
+    mut decided: tokio::sync::watch::Receiver<u64>,
+) {
+    let retained =
+        crate::regenesis::boot::sealed_path(&crate::db::shared::get_database_path());
+    if !retained.exists() {
+        return;
+    }
+    tokio::spawn(async move {
+        let genesis_height = {
+            let Ok(conn) = app_state.db_pool.get() else {
+                tracing::warn!("rollback cleanup: no db conn; retained database kept");
+                return;
+            };
+            match crate::regenesis::genesis::epoch_genesis_height(&conn) {
+                Some(h) => h,
+                None => {
+                    tracing::warn!(
+                        retained = %retained.display(),
+                        "retained database exists but this epoch has no genesis height meta; kept"
+                    );
+                    return;
+                }
+            }
+        };
+        loop {
+            if *decided.borrow() > genesis_height {
+                match std::fs::remove_file(&retained) {
+                    Ok(()) => tracing::info!(
+                        retained = %retained.display(),
+                        "rollback window closed: retained epoch database deleted"
+                    ),
+                    Err(e) => tracing::warn!(
+                        retained = %retained.display(),
+                        "rollback window cleanup failed: {e}"
+                    ),
+                }
+                return;
+            }
+            if decided.changed().await.is_err() {
+                return;
+            }
+        }
+    });
+}
+
 pub(crate) fn spawn_drain_watcher(
     app_state: AppState,
     input_tx: mpsc::Sender<HostInput>,

@@ -287,7 +287,7 @@ mod tests {
             .build(manager)
             .unwrap();
 
-        crate::db::shared::initialize(pool.get().unwrap()).unwrap();
+        crate::db::shared::initialize(&pool.get().unwrap()).unwrap();
         pool
     }
 

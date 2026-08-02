@@ -409,7 +409,7 @@ pub fn create_test_app_state_with_keys(
         .build(manager)
         .unwrap();
 
-    crate::db::shared::initialize(pool.get().unwrap()).unwrap();
+    crate::db::shared::initialize(&pool.get().unwrap()).unwrap();
 
     let jwt_secret = b"test_jwt_secret_key_for_testing_only";
     let encoding_key = EncodingKey::from_secret(jwt_secret);

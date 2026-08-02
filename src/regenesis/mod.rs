@@ -9,6 +9,7 @@
 //! the engine obligations are hopnet-consensus/spec/
 //! regenesis-seal-contract.md.
 
+pub mod boot;
 pub mod gate;
 pub mod genesis;
 pub mod handlers;

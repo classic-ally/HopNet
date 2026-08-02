@@ -64,6 +64,30 @@ pub fn write_seal_artifact_to(
     path: &std::path::Path,
 ) -> Result<std::path::PathBuf, String> {
     let mut conn = app_state.db_pool.get().map_err(|e| format!("conn: {e}"))?;
+    let artifact = serialize_verified_artifact(&mut conn)?;
+
+    // Unique tmp per writer: concurrent recomputes (multiple in-process
+    // nodes in tests; a crashed-then-woken node racing on_decided) each
+    // rename their own COMPLETE bytes — last rename wins, and every
+    // writer's bytes are identical (certified above).
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = path.with_extension(format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::write(&tmp, &artifact).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("rename to {}: {e}", path.display()))?;
+    Ok(path.to_path_buf())
+}
+
+/// Serialize the canonical artifact from a SEALED database on any plain
+/// connection — the pool-free entry the boot transition uses (the pool
+/// does not exist yet at boot) — and verify it against the COMMITTED
+/// snapshot_hash. A mismatch means this replica is the anomaly (diverged
+/// after voting, or synced past the seal): it must rebuild via epoch
+/// join (S7), never publish or import wrong bytes.
+pub fn serialize_verified_artifact(conn: &mut rusqlite::Connection) -> Result<Vec<u8>, String> {
     let tx = conn.transaction().map_err(|e| format!("tx: {e}"))?;
 
     let state =
@@ -89,18 +113,5 @@ pub fn write_seal_artifact_to(
             hex::encode(&committed_hash),
         ));
     }
-
-    // Unique tmp per writer: concurrent recomputes (multiple in-process
-    // nodes in tests; a crashed-then-woken node racing on_decided) each
-    // rename their own COMPLETE bytes — last rename wins, and every
-    // writer's bytes are identical (certified above).
-    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let tmp = path.with_extension(format!(
-        "tmp.{}.{}",
-        std::process::id(),
-        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    std::fs::write(&tmp, &artifact).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("rename to {}: {e}", path.display()))?;
-    Ok(path.to_path_buf())
+    Ok(artifact)
 }

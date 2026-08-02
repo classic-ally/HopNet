@@ -522,7 +522,7 @@ mod leave_tests {
             .connection_customizer(Box::new(crate::db::shared::SqliteInitializer))
             .build(manager)
             .unwrap();
-        crate::db::shared::initialize(pool.get().unwrap()).unwrap();
+        crate::db::shared::initialize(&pool.get().unwrap()).unwrap();
 
         let conn = pool.get().unwrap();
         conn.execute(
@@ -756,7 +756,7 @@ mod genesis_tests {
             .connection_customizer(Box::new(crate::db::shared::SqliteInitializer))
             .build(manager)
             .unwrap();
-        crate::db::shared::initialize(pool.get().unwrap()).unwrap();
+        crate::db::shared::initialize(&pool.get().unwrap()).unwrap();
 
         // Real user key material (the handler inserts the user + node).
         let signing_key = crate::types::PrivKey(SigningKey::from_bytes(&[7u8; 32]));
@@ -854,7 +854,7 @@ mod vote_out_tests {
             .connection_customizer(Box::new(crate::db::shared::SqliteInitializer))
             .build(manager)
             .unwrap();
-        crate::db::shared::initialize(pool.get().unwrap()).unwrap();
+        crate::db::shared::initialize(&pool.get().unwrap()).unwrap();
         let conn = pool.get().unwrap();
         conn.execute(
             "INSERT INTO users (user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt)
@@ -986,7 +986,7 @@ mod activation_batch_tests {
             .connection_customizer(Box::new(crate::db::shared::SqliteInitializer))
             .build(manager)
             .unwrap();
-        crate::db::shared::initialize(pool.get().unwrap()).unwrap();
+        crate::db::shared::initialize(&pool.get().unwrap()).unwrap();
         let conn = pool.get().unwrap();
         conn.execute(
             "INSERT INTO users (user_id, username, pubkey, x25519_pubkey, encrypted_privkey, key_salt)

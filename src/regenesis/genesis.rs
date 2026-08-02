@@ -110,6 +110,12 @@ pub fn current_epoch(conn: &rusqlite::Connection) -> u64 {
     meta_u64(conn, META_EPOCH).unwrap_or(1)
 }
 
+/// This epoch's genesis height H, if the database was born from a
+/// regenesis boundary (absent on epoch-1 databases, whose genesis is 0).
+pub fn epoch_genesis_height(conn: &rusqlite::Connection) -> Option<u64> {
+    meta_u64(conn, META_EPOCH_GENESIS_HEIGHT)
+}
+
 /// Build the epoch-N+1 genesis from a SEALED database. Pure function of
 /// committed-or-certified state: two honest replicas of the same sealed
 /// epoch produce byte-identical records and blocks.
@@ -345,7 +351,7 @@ mod tests {
     fn sealed_pool(flip: bool) -> r2d2::Pool<crate::db::SqliteConnectionManager> {
         let manager = crate::db::SqliteConnectionManager::memory();
         let pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
-        crate::db::shared::initialize(pool.get().unwrap()).unwrap();
+        crate::db::shared::initialize(&pool.get().unwrap()).unwrap();
         let conn = pool.get().unwrap();
 
         conn.execute(
