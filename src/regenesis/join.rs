@@ -537,6 +537,156 @@ async fn request(
     transport.request(peer, req, timeout).await
 }
 
+/// A brand-new node joining a mesh that is already past epoch 1
+/// (RFC-019 S7): epoch join SUBSUMES the height-0 bootstrap.
+///
+/// Unlike a straggler this runs IN PROCESS, with no restart. There is no
+/// file to swap and no pool-visible state to invalidate: a joining
+/// database holds exactly one row (`this_node`), and the import refuses
+/// outright unless every exported table is empty, so the precondition is
+/// machine-checked rather than assumed.
+///
+/// Trust is rooted in the join ceremony itself — the same TOFU the
+/// original height-0 bootstrap uses — and from there the FULL lineage
+/// chain is verified, so the joiner ends up with every record it needs
+/// to answer the next straggler.
+pub async fn epoch_join_bootstrap(
+    app_state: &AppState,
+    data_dir: &Path,
+    target_epoch: u64,
+    peers: &[PeerRef],
+    running_code: u32,
+) -> Result<(), String> {
+    let transport = CommsTransport {
+        comms: app_state.comms.clone(),
+    };
+    epoch_join_bootstrap_with(
+        app_state,
+        data_dir,
+        target_epoch,
+        peers,
+        running_code,
+        &transport,
+    )
+    .await
+}
+
+/// `epoch_join_bootstrap` over an explicit transport.
+pub async fn epoch_join_bootstrap_with(
+    app_state: &AppState,
+    data_dir: &Path,
+    target_epoch: u64,
+    peers: &[PeerRef],
+    running_code: u32,
+    transport: &dyn JoinTransport,
+) -> Result<(), String> {
+    set_state(format!("joining epoch {target_epoch} from scratch"));
+
+    // The whole chain from the first boundary: cheap (records are bytes),
+    // and it leaves this node able to serve any straggler afterwards.
+    let records = fetch_lineage_chain(transport, peers, 1).await?;
+    let target = genesis::verify_lineage_chain(&records, ChainAnchor::tofu(&records[0]))?;
+    let record = &target.record;
+    if record.epoch != target_epoch {
+        return Err(format!(
+            "mesh offered epoch {} but the coordinator said {target_epoch}",
+            record.epoch
+        ));
+    }
+    if running_code != record.required_version_code {
+        return Err(format!(
+            "epoch {} requires version {} (running {})",
+            record.epoch,
+            crate::version::format_code(record.required_version_code),
+            crate::version::format_code(running_code),
+        ));
+    }
+
+    // Reuse the straggler's staging for the download: resumable, and
+    // cleaned up once imported.
+    let staging = data_dir.join(JOIN_STAGING_DIR);
+    std::fs::create_dir_all(&staging).map_err(|e| format!("staging dir: {e}"))?;
+    fetch_snapshot(
+        transport,
+        peers,
+        record.epoch,
+        &record.snapshot_hash,
+        &staging,
+    )
+    .await?;
+    let artifact = std::fs::read(staged_snapshot_path(&staging))
+        .map_err(|e| format!("staged snapshot: {e}"))?;
+
+    let block = genesis::genesis_block_for(record)?;
+    let cert = genesis::synthetic_genesis_cert(&block);
+    let profile = hopnet_consensus::config::QuorumProfile::parse(&record.quorum_profile)
+        .ok_or_else(|| format!("unknown quorum profile {:?}", record.quorum_profile))?;
+
+    // ONE transaction, mirroring the height-0 bootstrap's shape.
+    {
+        let mut conn = app_state.db_pool.get().map_err(|e| e.to_string())?;
+        let tx = conn.transaction().map_err(|e| format!("tx: {e}"))?;
+        let report = crate::db::snapshot::import_snapshot_tx(&tx, &artifact)
+            .map_err(|e| format!("import: {e}"))?;
+        if !report.skipped.is_empty() {
+            // Same rule as the boot rebuild: a skipped section means this
+            // binary and the artifact disagree about the schema, and a
+            // partial import is not a state anyone can verify.
+            return Err(format!(
+                "snapshot import skipped sections {:?} — refusing a partial epoch join",
+                report.skipped
+            ));
+        }
+        hopnet_consensus::store::install_genesis(&tx, &block, &cert)
+            .map_err(|e| format!("install genesis: {e}"))?;
+        hopnet_consensus::store::meta_put(
+            &tx,
+            hopnet_consensus::store::META_CHAIN_ID,
+            block.block_hash.as_bytes().as_slice(),
+        )
+        .map_err(|e| format!("chain id: {e}"))?;
+        hopnet_consensus::store::meta_put(
+            &tx,
+            hopnet_consensus::store::META_QUORUM_PROFILE,
+            profile.as_str().as_bytes(),
+        )
+        .map_err(|e| format!("quorum profile: {e}"))?;
+        hopnet_consensus::store::meta_put(
+            &tx,
+            genesis::META_EPOCH,
+            &record.epoch.to_be_bytes(),
+        )
+        .map_err(|e| format!("epoch: {e}"))?;
+        hopnet_consensus::store::meta_put(
+            &tx,
+            genesis::META_EPOCH_GENESIS_HEIGHT,
+            &record.seal_height.to_be_bytes(),
+        )
+        .map_err(|e| format!("epoch genesis height: {e}"))?;
+        crate::db::shared::commit_timed(tx).map_err(|e| format!("join commit: {e}"))?;
+    }
+
+    // Keep every verified record — a joiner becomes a server.
+    for lr in &records {
+        let bytes = bincode::serde::encode_to_vec(lr, bincode::config::standard())
+            .map_err(|e| format!("lineage encode: {e}"))?;
+        genesis::write_lineage_bytes(data_dir, lr.record.epoch, &bytes)?;
+    }
+    app_state.epoch.store(record.epoch, Ordering::Relaxed);
+    clear_staging(&staging);
+
+    // A re-registered node may already hold fragments from a previous
+    // life; the imported inventory does not know that yet.
+    if let Ok(conn) = app_state.db_pool.get()
+        && let Err(e) = reconcile_fragment_store(&conn, &app_state.fragments_dir, now_unix())
+    {
+        tracing::warn!("fragment reconcile after join failed (harmless): {e}");
+    }
+
+    set_state(format!("joined epoch {} at height {}", record.epoch, record.seal_height));
+    Ok(())
+}
+
 /// Reconcile the fragment store against a freshly imported inventory
 /// (RFC-019 S7), in both directions:
 ///
@@ -1144,6 +1294,115 @@ mod tests {
             first_calls,
             "a complete staging refetches nothing"
         );
+    }
+
+    // Impact: without this a brand-new node simply cannot join a mesh
+    // that has ever crossed a boundary — the trusted height-0 genesis it
+    // would ask for no longer exists to serve.
+    // Should: verify the full lineage chain from a TOFU anchor, import
+    // the boundary snapshot in process, and land on the mesh's exact
+    // certified state with the epoch meta set.
+    // Should not: need a restart — there is no database to swap.
+    #[test]
+    fn fresh_node_joins_an_epoch_two_mesh() {
+        let server_dir = tempfile::tempdir().unwrap();
+        let server = transitioned(server_dir.path());
+
+        // A fresh joiner: schema initialized, this_node only — exactly
+        // what initialize_joining_node leaves behind.
+        let joiner_dir = tempfile::tempdir().unwrap();
+        let joiner_db = joiner_dir
+            .path()
+            .join("database.db")
+            .to_string_lossy()
+            .into_owned();
+        let signing = crate::db::PrivKey(ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]));
+        let verifying = crate::db::PubKey(signing.0.verifying_key());
+        let app_state = crate::consensus::tests::create_test_app_state_file_backed(
+            signing.clone(),
+            verifying,
+            &joiner_db,
+        );
+        {
+            let conn = app_state.db_pool.get().unwrap();
+            conn.execute(
+                "INSERT INTO this_node (internal_id, node_id, privkey) VALUES (1, 7, ?)",
+                rusqlite::params![signing],
+            )
+            .unwrap();
+        }
+
+        let transport = LocalTransport::new(vec![(2, server.clone())]);
+        rt().block_on(epoch_join_bootstrap_with(
+            &app_state,
+            joiner_dir.path(),
+            2,
+            &[peer(2)],
+            TARGET,
+            &transport,
+        ))
+        .expect("fresh node joins epoch 2");
+
+        let exported = |path: &str| -> Vec<u8> {
+            let mut conn = rusqlite::Connection::open(path).unwrap();
+            crate::db::shared::apply_connection_pragmas(&conn).unwrap();
+            let tx = conn.transaction().unwrap();
+            let h = crate::db::snapshot::compute_artifact_hash_tx(&tx).unwrap();
+            tx.commit().unwrap();
+            h.0.as_bytes().to_vec()
+        };
+        assert_eq!(
+            exported(&joiner_db),
+            exported(&server),
+            "the joiner holds exactly the mesh's certified state"
+        );
+
+        let conn = app_state.db_pool.get().unwrap();
+        assert_eq!(genesis::current_epoch(&conn), 2);
+        assert_eq!(genesis::epoch_genesis_height(&conn), Some(7));
+        assert_eq!(app_state.epoch.load(Ordering::Relaxed), 2);
+        // Its own identity is untouched, and the chain it verified is
+        // kept so it can serve the next joiner.
+        let nid: i32 = conn
+            .query_row("SELECT node_id FROM this_node", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(nid, 7);
+        assert!(genesis::lineage_path(joiner_dir.path(), 2).exists());
+        assert!(!staging_path(&joiner_db).exists(), "staging cleared");
+    }
+
+    // Should: refuse to join an epoch that requires another binary.
+    #[test]
+    fn fresh_join_refuses_a_version_it_cannot_run() {
+        let server_dir = tempfile::tempdir().unwrap();
+        let server = transitioned(server_dir.path());
+        let joiner_dir = tempfile::tempdir().unwrap();
+        let joiner_db = joiner_dir
+            .path()
+            .join("database.db")
+            .to_string_lossy()
+            .into_owned();
+        let signing = crate::db::PrivKey(ed25519_dalek::SigningKey::from_bytes(&[43u8; 32]));
+        let verifying = crate::db::PubKey(signing.0.verifying_key());
+        let app_state = crate::consensus::tests::create_test_app_state_file_backed(
+            signing, verifying, &joiner_db,
+        );
+
+        let transport = LocalTransport::new(vec![(2, server.clone())]);
+        let err = rt()
+            .block_on(epoch_join_bootstrap_with(
+                &app_state,
+                joiner_dir.path(),
+                2,
+                &[peer(2)],
+                TARGET + 100,
+                &transport,
+            ))
+            .expect_err("version mismatch must refuse");
+        assert!(err.contains("requires version"), "{err}");
+        // Nothing was imported.
+        let conn = app_state.db_pool.get().unwrap();
+        assert_eq!(genesis::current_epoch(&conn), 1);
     }
 
     // Impact: an upgrade-epoch straggler must not be told to restart

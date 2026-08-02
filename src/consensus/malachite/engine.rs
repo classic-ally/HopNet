@@ -504,7 +504,26 @@ pub async fn bootstrap_join(
             .is_some()
     };
 
-    if !already_installed {
+    if !already_installed && join_info.epoch >= 2 {
+        // The mesh is past its first epoch: the trusted height-0 genesis
+        // no longer exists to fetch. Verify the lineage chain and import
+        // the boundary snapshot instead — epoch join SUBSUMES the
+        // height-0 bootstrap (RFC-019 S7). In process: the database holds
+        // only this_node, so there is nothing to swap.
+        let data_dir = std::path::Path::new(&crate::db::shared::get_database_path())
+            .parent()
+            .map(|p| p.to_path_buf())
+            .ok_or("database path has no parent directory")?;
+        crate::regenesis::join::epoch_join_bootstrap(
+            app_state,
+            &data_dir,
+            join_info.epoch,
+            &peers,
+            crate::version::effective_running_code(),
+        )
+        .await
+        .map_err(|e| format!("epoch join: {e}"))?;
+    } else if !already_installed {
         let profile = QuorumProfile::parse(&join_info.quorum_profile)
             .ok_or_else(|| format!("unknown quorum profile {:?}", join_info.quorum_profile))?;
 
