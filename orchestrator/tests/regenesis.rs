@@ -1191,7 +1191,13 @@ impl TestScenario for RegenesisRollback {
         if code != Some(75) {
             return Ok(result);
         }
-        start_node(&docker, mesh_id, node0.node_id).await?;
+        // Recreate rather than start, so the override that carried this
+        // node across is dropped: abandoning a bad upgrade means going
+        // back to the old binary too, and it leaves the whole mesh on one
+        // version — otherwise the next boundary would target a version
+        // only this node runs, and the others would park instead of
+        // sealing.
+        recreate_node_with_env(&docker, mesh_id, node0.node_id, &[]).await?;
         let node0 = reauth_node(&docker, mesh_id, &node0).await?;
         let v = regenesis_status(&node0).await?;
         let restored = v["epoch"].as_str() == Some("1")
