@@ -211,6 +211,7 @@ async fn start_engine_with_candidates(
                         tokio::spawn(async move {
                             if let Err(e) = sync::sync_to_target(
                                 &app_state.comms,
+                                app_state.epoch.load(std::sync::atomic::Ordering::Relaxed),
                                 &app_state.db_pool,
                                 node_id,
                                 &input_tx,
@@ -580,6 +581,7 @@ fn fresh_node_syncs_vote_out_chain_without_wedging() {
             let mut decided = n2.decided.clone();
             let _ = sync::sync_to_tip(
                 &network.nodes[2].app_state.comms,
+                network.nodes[2].app_state.epoch.load(std::sync::atomic::Ordering::Relaxed),
                 &n2.input_tx,
                 &mut decided,
                 &peers,

@@ -430,6 +430,7 @@ pub(crate) fn spawn_tip_poll(app_state: AppState) {
             if let Err(e) =
                 sync::sync_to_tip(
                     &app_state.comms,
+                    app_state.epoch.load(Ordering::Relaxed),
                     &engine.input_tx,
                     &mut decided,
                     &peers,
@@ -480,7 +481,11 @@ pub async fn bootstrap_join(
         let profile = QuorumProfile::parse(&join_info.quorum_profile)
             .ok_or_else(|| format!("unknown quorum profile {:?}", join_info.quorum_profile))?;
 
-        let (block, cert) = sync::fetch_genesis(&app_state.comms, &peers)
+        let (block, cert) = sync::fetch_genesis(
+            &app_state.comms,
+            app_state.epoch.load(std::sync::atomic::Ordering::Relaxed),
+            &peers,
+        )
             .await
             .map_err(|e| format!("genesis fetch: {e}"))?;
 
@@ -521,6 +526,7 @@ pub async fn bootstrap_join(
     let mut decided = engine.decided.clone();
     let reached = sync::sync_to_tip(
         &app_state.comms,
+        app_state.epoch.load(std::sync::atomic::Ordering::Relaxed),
         &engine.input_tx,
         &mut decided,
         &peers,
@@ -570,6 +576,7 @@ pub(crate) fn spawn_driver(
                             tokio::spawn(async move {
                                 if let Err(e) = sync::sync_to_target(
                                     &app_state.comms,
+                                    app_state.epoch.load(std::sync::atomic::Ordering::Relaxed),
                                     &app_state.db_pool,
                                     node_id,
                                     &input_tx,
@@ -934,6 +941,7 @@ pub fn kick_sync_if_behind(app_state: &AppState, target: u64, hint_peer: i32) {
         }
     };
     let comms = app_state.comms.clone();
+    let epoch = app_state.epoch.load(Ordering::Relaxed);
     let db_pool = app_state.db_pool.clone();
     let input_tx = engine.input_tx.clone();
     let mut decided = engine.decided.clone();
@@ -942,6 +950,7 @@ pub fn kick_sync_if_behind(app_state: &AppState, target: u64, hint_peer: i32) {
     crate::consensus::queue::queue_rt().spawn(async move {
         if let Err(e) = sync::sync_to_target(
             &comms,
+            epoch,
             &db_pool,
             node_id,
             &input_tx,

@@ -267,14 +267,30 @@ pub enum StatusRequest {
     /// circularity (each side's probes keeping the other's view fresh)
     /// leaves exactly one probe direction per pair and the responder
     /// heightless.
-    Ping { decided_height: u64 },
+    ///
+    /// Also the hello of the (epoch, version) handshake (RFC-019 S6):
+    /// both sides learn each other's identity and log a structured
+    /// refusal on mismatch — turning the silent signature-domain failure
+    /// (chain_id is mixed into every vote) into a diagnosable one. The
+    /// responder still answers and records contact: reachability is a
+    /// transport fact, orthogonal to epoch membership.
+    Ping {
+        decided_height: u64,
+        epoch: u64,
+        version_code: u32,
+    },
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub enum StatusResponse {
     /// Current decided height (0 pre-genesis/pre-engine — reachability is
-    /// a transport property; a zero height just fails catch-up gates).
-    Pong { decided_height: u64 },
+    /// a transport property; a zero height just fails catch-up gates),
+    /// plus the responder's (epoch, version) — see Ping.
+    Pong {
+        decided_height: u64,
+        epoch: u64,
+        version_code: u32,
+    },
 }
 
 /// Inbound status scope: mesh plane, inline on the net runtime — one
@@ -293,14 +309,31 @@ impl hopnet_comms::RpcHandler for StatusScope {
         Box::pin(async move {
             // An inbound probe is itself an authenticated exchange — and it
             // carries the prober's height (see StatusRequest::Ping).
+            let my_epoch = app_state.epoch.load(std::sync::atomic::Ordering::Relaxed);
             match bincode::serde::decode_from_slice::<StatusRequest, _>(
                 &_payload,
                 bincode::config::standard(),
             ) {
-                Ok((StatusRequest::Ping { decided_height }, _)) => {
+                Ok((
+                    StatusRequest::Ping {
+                        decided_height,
+                        epoch,
+                        version_code,
+                    },
+                    _,
+                )) => {
                     app_state
                         .evidence
                         .record_contact_with_height(peer.node_id, decided_height);
+                    if epoch != my_epoch {
+                        tracing::warn!(
+                            peer = peer.node_id,
+                            peer_epoch = epoch,
+                            peer_version = %crate::version::format_code(version_code),
+                            local_epoch = my_epoch,
+                            "handshake: peer is in a different epoch (needs epoch join / upgrade)"
+                        );
+                    }
                 }
                 Err(_) => app_state.evidence.record_contact(peer.node_id),
             }
@@ -310,7 +343,11 @@ impl hopnet_comms::RpcHandler for StatusScope {
                 .map(|e| *e.decided.borrow())
                 .unwrap_or(0);
             bincode::serde::encode_to_vec(
-                &StatusResponse::Pong { decided_height },
+                &StatusResponse::Pong {
+                    decided_height,
+                    epoch: my_epoch,
+                    version_code: crate::version::effective_running_code(),
+                },
                 bincode::config::standard(),
             )
             .unwrap_or_default()
@@ -324,11 +361,14 @@ pub async fn status_probe(
     comms: &hopnet_comms::IrohComms,
     peer: &hopnet_comms::PeerRef,
     my_decided_height: u64,
+    my_epoch: u64,
     timeout: Duration,
 ) -> Result<u64, String> {
     let payload = bincode::serde::encode_to_vec(
         &StatusRequest::Ping {
             decided_height: my_decided_height,
+            epoch: my_epoch,
+            version_code: crate::version::effective_running_code(),
         },
         bincode::config::standard(),
     )
@@ -340,7 +380,20 @@ pub async fn status_probe(
     let (resp, _) =
         bincode::serde::decode_from_slice::<StatusResponse, _>(&raw, bincode::config::standard())
             .map_err(|e| format!("decode: {e}"))?;
-    let StatusResponse::Pong { decided_height } = resp;
+    let StatusResponse::Pong {
+        decided_height,
+        epoch,
+        version_code,
+    } = resp;
+    if epoch != my_epoch {
+        tracing::warn!(
+            peer = peer.node_id,
+            peer_epoch = epoch,
+            peer_version = %crate::version::format_code(version_code),
+            local_epoch = my_epoch,
+            "handshake: peer answered from a different epoch"
+        );
+    }
     Ok(decided_height)
 }
 
@@ -449,6 +502,7 @@ pub fn spawn_probe_scheduler(app_state: crate::AppState) {
                 now,
             );
             let t_probe = policy.t_probe(est.band);
+            let my_epoch = app_state.epoch.load(Ordering::Relaxed);
 
             // Targets = every registered node except self (pool nodes are
             // probed too — reputation for candidates, spec Decisions).
@@ -480,7 +534,7 @@ pub fn spawn_probe_scheduler(app_state: crate::AppState) {
                 let evidence = app_state.evidence.clone();
                 let g = policy.grace;
                 tokio::spawn(async move {
-                    if let Ok(h) = status_probe(&comms, &peer, decided, g).await {
+                    if let Ok(h) = status_probe(&comms, &peer, decided, my_epoch, g).await {
                         evidence.record_contact_with_height(peer.node_id, h);
                     }
                     // Failure: the silence is already recorded as the

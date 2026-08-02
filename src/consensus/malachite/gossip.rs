@@ -22,8 +22,15 @@ pub enum ConsensusNetRequest {
     /// `hopnet_consensus::codec::WireConsensusMsg`. Fire-and-forget (ack only).
     Gossip(Vec<u8>),
     /// Fetch decided (block, certificate) pairs for `[from_height, to_height]`
-    /// — the decided-value sync protocol.
-    DecidedFetch { from_height: u64, to_height: u64 },
+    /// — the decided-value sync protocol. Carries the requester's epoch
+    /// (RFC-019 S6 handshake): the server refuses a mismatch explicitly —
+    /// cross-epoch history is not syncable, it needs the lineage record
+    /// (S7's epoch join answers here).
+    DecidedFetch {
+        from_height: u64,
+        to_height: u64,
+        epoch: u64,
+    },
 }
 
 /// Wire response for the "consensus" scope.

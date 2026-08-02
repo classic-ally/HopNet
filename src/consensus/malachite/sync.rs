@@ -42,6 +42,7 @@ pub enum SyncError {
 /// or does not apply is skipped for the remainder of this sync.
 pub async fn sync_to_target(
     comms: &IrohComms,
+    epoch: u64,
     db_pool: &Pool<SqliteConnectionManager>,
     my_node_id: i32,
     input_tx: &mpsc::Sender<HostInput>,
@@ -51,7 +52,7 @@ pub async fn sync_to_target(
     evidence: Option<std::sync::Arc<crate::consensus::evidence::EvidenceMap>>,
 ) -> Result<(), SyncError> {
     let peers = peer_list(db_pool, my_node_id, hint_peer);
-    sync_loop(comms, input_tx, decided, Some(target), &peers, evidence).await?;
+    sync_loop(comms, epoch, input_tx, decided, Some(target), &peers, evidence).await?;
     Ok(())
 }
 
@@ -61,12 +62,13 @@ pub async fn sync_to_target(
 /// fills as blocks apply, so callers pass JoinInfo's bootstrap validators.
 pub async fn sync_to_tip(
     comms: &IrohComms,
+    epoch: u64,
     input_tx: &mpsc::Sender<HostInput>,
     decided: &mut watch::Receiver<u64>,
     peers: &[PeerRef],
     evidence: Option<std::sync::Arc<crate::consensus::evidence::EvidenceMap>>,
 ) -> Result<u64, SyncError> {
-    sync_loop(comms, input_tx, decided, None, peers, evidence).await
+    sync_loop(comms, epoch, input_tx, decided, None, peers, evidence).await
 }
 
 /// Shared fetch/feed/apply loop. With `target = Some(h)`: sync until decided
@@ -75,6 +77,7 @@ pub async fn sync_to_tip(
 /// is success; transport failures never count as tip evidence.
 async fn sync_loop(
     comms: &IrohComms,
+    epoch: u64,
     input_tx: &mpsc::Sender<HostInput>,
     decided: &mut watch::Receiver<u64>,
     target: Option<u64>,
@@ -120,7 +123,7 @@ async fn sync_loop(
             Some(t) => (from + CHUNK - 1).min(t),
             None => from + CHUNK - 1,
         };
-        match fetch_chunk(comms, &peer, from, to).await {
+        match fetch_chunk(comms, epoch, &peer, from, to).await {
             Ok(pairs) if !pairs.is_empty() => {
                 // Reachability evidence (RFC-CONSENSUS-002): the peer served
                 // us an authenticated chunk.
@@ -200,11 +203,12 @@ async fn sync_loop(
 /// engine-verified against the validator sets genesis establishes.
 pub async fn fetch_genesis(
     comms: &IrohComms,
+    epoch: u64,
     peers: &[PeerRef],
 ) -> Result<(Block, WireCommitCertificate), String> {
     let mut last_err = "no bootstrap peers".to_string();
     for peer in peers {
-        match fetch_chunk(comms, peer, 0, 0).await {
+        match fetch_chunk(comms, epoch, peer, 0, 0).await {
             Ok(pairs) => {
                 let Some((block, cert)) = pairs.into_iter().next() else {
                     last_err = format!("node {} has no genesis", peer.node_id);
@@ -259,6 +263,7 @@ pub(crate) fn peer_list(
 
 async fn fetch_chunk(
     comms: &IrohComms,
+    epoch: u64,
     peer: &PeerRef,
     from: u64,
     to: u64,
@@ -266,6 +271,7 @@ async fn fetch_chunk(
     let payload = crate::net::encode_payload(&ConsensusNetRequest::DecidedFetch {
         from_height: from,
         to_height: to,
+        epoch,
     });
     let reply = comms
         .rpc(peer, "consensus", payload, FETCH_TIMEOUT)

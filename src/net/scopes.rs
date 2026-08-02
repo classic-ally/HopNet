@@ -85,11 +85,11 @@ pub fn build_registry(app_state: &AppState) -> ScopeRegistry {
 const DECIDED_FETCH_MAX: u64 = 100;
 
 pub struct ConsensusScope {
-    app_state: AppState,
+    pub(crate) app_state: AppState,
 }
 
 impl ConsensusScope {
-    async fn serve(&self, peer: PeerRef, payload: Vec<u8>) -> ConsensusNetResponse {
+    pub(crate) async fn serve(&self, peer: PeerRef, payload: Vec<u8>) -> ConsensusNetResponse {
         let request: ConsensusNetRequest = match decode_payload(&payload) {
             Ok(r) => r,
             Err(e) => {
@@ -102,17 +102,16 @@ impl ConsensusScope {
         // well-formed exchange from this peer — covers gossip (votes
         // received first-hand) and decided-fetch serving.
         self.app_state.evidence.record_contact(peer.node_id);
-        // Malachite-engine traffic → the consensus shell (and the decided-
-        // block store for sync serving). "Not active" until spawn_engine
-        // installs the handle (pre-setup).
-        let Some(engine) = self.app_state.malachite.get() else {
-            return ConsensusNetResponse::Error {
-                message: "malachite engine not active".into(),
-            };
-        };
         match request {
             // Mesh plane: pure channel work — INLINE on the net runtime.
+            // Needs the live engine ("not active" until spawn_engine
+            // installs the handle — pre-setup, or parked on a seal).
             ConsensusNetRequest::Gossip(bytes) => {
+                let Some(engine) = self.app_state.malachite.get() else {
+                    return ConsensusNetResponse::Error {
+                        message: "malachite engine not active".into(),
+                    };
+                };
                 match codec::decode::<WireConsensusMsg>(&bytes) {
                     Ok(msg) => {
                         if engine
@@ -136,10 +135,29 @@ impl ConsensusScope {
                 }
             }
             // Consensus-support plane: blocking DB read — the QUEUE runtime.
+            // Deliberately served WITHOUT a live engine: decided history
+            // is a DB fact, and a sealed/parked node answering laggards
+            // their final blocks is load-bearing for rejoin (RFC-019).
             ConsensusNetRequest::DecidedFetch {
                 from_height,
                 to_height,
+                epoch,
             } => {
+                // Epoch gate (RFC-019 S6 handshake): decided history is
+                // only meaningful within one epoch — a cross-epoch
+                // requester needs the lineage record, not blocks (S7's
+                // epoch-join path extends this refusal into an answer).
+                let local_epoch = self
+                    .app_state
+                    .epoch
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if epoch != local_epoch {
+                    return ConsensusNetResponse::Error {
+                        message: format!(
+                            "epoch mismatch: local={local_epoch}, requester={epoch}"
+                        ),
+                    };
+                }
                 let app_state = self.app_state.clone();
                 crate::consensus::queue::queue_rt()
                     .spawn(

@@ -545,3 +545,82 @@ fn status_view_reports_epoch_and_awaiting_upgrade() {
     assert!(view.awaiting_upgrade);
     assert_eq!(view.target_version.as_deref(), Some("2099.1.0"));
 }
+
+// Impact: the (epoch, version) handshake is what turns silent cross-
+// epoch signature failures into diagnosable refusals — and the fetch
+// gate is the hook S7's epoch join extends into a lineage answer.
+// Should: refuse a DecidedFetch from a different epoch with a
+// structured error, serve a same-epoch one (engine parked or not), and
+// answer status pings with this node's (epoch, version).
+#[test]
+fn handshake_carries_epoch_and_refuses_mismatched_fetch() {
+    use crate::consensus::malachite::gossip::{ConsensusNetRequest, ConsensusNetResponse};
+    use crate::consensus::evidence::{StatusRequest, StatusResponse};
+
+    let node = MockNode::new(5);
+    register_node(&node);
+    let peer = hopnet_comms::PeerRef {
+        node_id: 42,
+        pubkey: [0u8; 32],
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    // Fetch from another epoch: refused before any DB read.
+    let scope = crate::net::scopes::ConsensusScope {
+        app_state: node.app_state.clone(),
+    };
+    let resp = rt.block_on(scope.serve(
+        peer,
+        crate::net::encode_payload(&ConsensusNetRequest::DecidedFetch {
+            from_height: 1,
+            to_height: 1,
+            epoch: 2,
+        }),
+    ));
+    match resp {
+        ConsensusNetResponse::Error { message } => {
+            assert!(message.contains("epoch mismatch"), "{message}")
+        }
+        other => panic!("expected refusal, got {other:?}"),
+    }
+
+    // Same epoch: served from the DB even with NO engine (a parked node
+    // answering a laggard its decided history).
+    let resp = rt.block_on(scope.serve(
+        peer,
+        crate::net::encode_payload(&ConsensusNetRequest::DecidedFetch {
+            from_height: 1,
+            to_height: 1,
+            epoch: 1,
+        }),
+    ));
+    assert!(
+        matches!(resp, ConsensusNetResponse::Decided { ref items } if items.is_empty()),
+        "expected empty Decided, got {resp:?}"
+    );
+
+    // Status ping answers with OUR (epoch, version).
+    let status = crate::consensus::evidence::StatusScope {
+        app_state: node.app_state.clone(),
+    };
+    let ping = bincode::serde::encode_to_vec(
+        &StatusRequest::Ping {
+            decided_height: 3,
+            epoch: 9,
+            version_code: 20990100,
+        },
+        bincode::config::standard(),
+    )
+    .unwrap();
+    let raw = rt.block_on(hopnet_comms::RpcHandler::handle(&status, peer, ping));
+    let (StatusResponse::Pong {
+        epoch,
+        version_code,
+        ..
+    }, _) = bincode::serde::decode_from_slice(&raw, bincode::config::standard()).unwrap();
+    assert_eq!(epoch, 1);
+    assert_eq!(version_code, crate::version::effective_running_code());
+}
