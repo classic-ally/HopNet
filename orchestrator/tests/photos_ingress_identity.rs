@@ -330,6 +330,7 @@ impl TestScenario for PhotosIngressIdentity {
             let payload = hopnet_photos::envelopes::PhotoIngressClaimPayload {
                 device_id: device_id(&token_b)?.parse().context("device uuid")?,
                 operation_id: hopnet::db::CustomUUID::new(None),
+                library_id: None,
             };
             let bytes = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
                 .context("encode claim")?;

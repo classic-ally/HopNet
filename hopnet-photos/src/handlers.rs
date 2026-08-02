@@ -7,7 +7,8 @@
 
 use crate::db::libraries;
 use crate::db::photos::{
-    delete_favorite, device_belongs_to_user, edit_photo_content, edit_photo_metadata,
+    delete_favorite, delete_ingress_responsibility_for_library, device_belongs_to_user,
+    edit_photo_content, edit_photo_metadata,
     hard_delete_expired_photo, insert_favorite, insert_photo_entry, lookup_photo_authz,
     restore_photo, soft_delete_photo, undo_content_edit, upsert_ingress_responsibility,
 };
@@ -672,7 +673,28 @@ impl TransactionHandler for PhotoIngressClaimHandler {
             return Err(DatabaseError::AuthorizationError);
         }
 
-        upsert_ingress_responsibility(db_tx, user_id, &payload.device_id, &payload.operation_id)
+        // A shared-scope claim is only meaningful for a member: kicked
+        // users lose the scope with their membership (the remove handler
+        // deletes their responsibility rows), and a non-member must not
+        // pre-stage one.
+        if let Some(lib) = &payload.library_id {
+            if !crate::db::libraries::is_member(db_tx, lib, user_id)? {
+                tracing::warn!(
+                    "photo_ingress_claim: user {} is not a member of library {}",
+                    user_id,
+                    lib,
+                );
+                return Err(DatabaseError::AuthorizationError);
+            }
+        }
+
+        upsert_ingress_responsibility(
+            db_tx,
+            user_id,
+            payload.library_id.as_ref(),
+            &payload.device_id,
+            &payload.operation_id,
+        )
     }
 }
 
@@ -898,7 +920,11 @@ impl TransactionHandler for LibraryRemoveMemberHandler {
         // a dangling view signal would just point at a library they can no
         // longer read. The convergence worker revokes their access rows
         // lazily (row-deletion revocation; key rotation is a future lane).
-        libraries::delete_view_change(db_tx, payload.user_id, &payload.library_id)
+        libraries::delete_view_change(db_tx, payload.user_id, &payload.library_id)?;
+        // Membership loss dissolves the target's ingress claim on this
+        // scope: their daemon must not keep passing the thin-client tx
+        // gate for a library they can no longer publish into.
+        delete_ingress_responsibility_for_library(db_tx, payload.user_id, &payload.library_id)
     }
 }
 
@@ -1986,19 +2012,37 @@ mod tests {
     }
 
     fn claim_bytes(device_id: &str) -> Vec<u8> {
+        claim_bytes_scoped(device_id, None)
+    }
+
+    fn claim_bytes_scoped(device_id: &str, library_id: Option<&str>) -> Vec<u8> {
         let payload = crate::envelopes::PhotoIngressClaimPayload {
             device_id: device_id.parse().unwrap(),
             operation_id: CustomUUID::new(None),
+            library_id: library_id.map(|l| l.parse().unwrap()),
         };
         bincode::serde::encode_to_vec(&payload, bincode::config::standard()).unwrap()
     }
 
     fn read_holder(conn: &Connection, user_id: i32) -> Option<String> {
-        conn.query_row(
-            "SELECT device_id FROM photo_ingress_responsibility WHERE user_id = ?1",
-            rusqlite::params![user_id],
-            |r| r.get(0),
-        )
+        read_holder_scoped(conn, user_id, None)
+    }
+
+    fn read_holder_scoped(conn: &Connection, user_id: i32, library_id: Option<&str>) -> Option<String> {
+        match library_id {
+            None => conn.query_row(
+                "SELECT device_id FROM photo_ingress_responsibility
+                 WHERE user_id = ?1 AND library_id IS NULL",
+                rusqlite::params![user_id],
+                |r| r.get(0),
+            ),
+            Some(lib) => conn.query_row(
+                "SELECT device_id FROM photo_ingress_responsibility
+                 WHERE user_id = ?1 AND library_id = ?2",
+                rusqlite::params![user_id, lib],
+                |r| r.get(0),
+            ),
+        }
         .ok()
     }
 
@@ -2115,6 +2159,137 @@ mod tests {
         ));
 
         assert_eq!(read_holder(&conn, 1), None, "no claim may have landed");
+    }
+
+    // Should: reject a shared-scope claim from a non-member and accept the
+    // same claim once the user has joined the library.
+    // Should not: change personal-claim validation in any way.
+    #[test]
+    fn shared_claim_requires_membership() {
+        let conn = fixture();
+        let lib = create_library(&conn, 1, 0x300);
+        let lib_s = lib.to_string();
+
+        // User 2 owns d9 but is not a member yet.
+        let bytes = claim_bytes_scoped("00000000-0000-0000-0000-0000000000d9", Some(&lib_s));
+        assert!(matches!(
+            validate(&conn, &PhotoIngressClaimHandler, "photo_ingress_claim", &bytes, Some(2)),
+            Err(DatabaseError::AuthorizationError)
+        ));
+
+        invite(&conn, &lib, 1, 2);
+        accept(&conn, &lib, 2);
+        apply(&conn, &PhotoIngressClaimHandler, "photo_ingress_claim", &bytes, Some(2));
+        assert_eq!(
+            read_holder_scoped(&conn, 2, Some(&lib_s)).as_deref(),
+            Some("00000000-0000-0000-0000-0000000000d9"),
+        );
+
+        // Personal claims never involve membership.
+        let personal = claim_bytes("00000000-0000-0000-0000-0000000000d1");
+        apply(&conn, &PhotoIngressClaimHandler, "photo_ingress_claim", &personal, Some(1));
+        assert_eq!(
+            read_holder(&conn, 1).as_deref(),
+            Some("00000000-0000-0000-0000-0000000000d1"),
+        );
+    }
+
+    // Should: hold personal + per-library responsibility rows for one user
+    // simultaneously, and transfer a shared-scope claim without touching
+    // the other scopes.
+    // Impact: the upsert's conflict targets must match the partial UNIQUE
+    // pair exactly — a mismatch would insert duplicates instead of
+    // transferring, and this is the test that would catch it.
+    #[test]
+    fn per_scope_rows_coexist() {
+        let conn = fixture();
+        let lib_a = create_library(&conn, 1, 0x310);
+        let lib_b = create_library(&conn, 1, 0x320);
+        let (a, b) = (lib_a.to_string(), lib_b.to_string());
+        let dev1 = "00000000-0000-0000-0000-0000000000d1";
+        let dev2 = "00000000-0000-0000-0000-0000000000d2";
+
+        for bytes in [
+            claim_bytes(dev1),
+            claim_bytes_scoped(dev1, Some(&a)),
+            claim_bytes_scoped(dev2, Some(&b)),
+        ] {
+            apply(&conn, &PhotoIngressClaimHandler, "photo_ingress_claim", &bytes, Some(1));
+        }
+        assert_eq!(read_holder(&conn, 1).as_deref(), Some(dev1));
+        assert_eq!(read_holder_scoped(&conn, 1, Some(&a)).as_deref(), Some(dev1));
+        assert_eq!(read_holder_scoped(&conn, 1, Some(&b)).as_deref(), Some(dev2));
+
+        // Transfer lib_a to dev2: personal and lib_b rows must not move.
+        let transfer = claim_bytes_scoped(dev2, Some(&a));
+        apply(&conn, &PhotoIngressClaimHandler, "photo_ingress_claim", &transfer, Some(1));
+        assert_eq!(read_holder_scoped(&conn, 1, Some(&a)).as_deref(), Some(dev2));
+        assert_eq!(read_holder(&conn, 1).as_deref(), Some(dev1));
+        assert_eq!(read_holder_scoped(&conn, 1, Some(&b)).as_deref(), Some(dev2));
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM photo_ingress_responsibility"),
+            3,
+            "transfer must never insert a duplicate scope row"
+        );
+    }
+
+    // Should: let two members hold responsibility for the same library
+    // independently, one row each.
+    // Impact: responsibility partitions publishing per member; dedup of
+    // the actual photos across members is the fingerprint pair's job.
+    #[test]
+    fn two_members_claim_same_library() {
+        let conn = fixture();
+        let lib = create_library(&conn, 1, 0x330);
+        invite(&conn, &lib, 1, 2);
+        accept(&conn, &lib, 2);
+        let lib_s = lib.to_string();
+
+        let one = claim_bytes_scoped("00000000-0000-0000-0000-0000000000d1", Some(&lib_s));
+        apply(&conn, &PhotoIngressClaimHandler, "photo_ingress_claim", &one, Some(1));
+        let two = claim_bytes_scoped("00000000-0000-0000-0000-0000000000d9", Some(&lib_s));
+        apply(&conn, &PhotoIngressClaimHandler, "photo_ingress_claim", &two, Some(2));
+
+        assert_eq!(
+            read_holder_scoped(&conn, 1, Some(&lib_s)).as_deref(),
+            Some("00000000-0000-0000-0000-0000000000d1"),
+        );
+        assert_eq!(
+            read_holder_scoped(&conn, 2, Some(&lib_s)).as_deref(),
+            Some("00000000-0000-0000-0000-0000000000d9"),
+        );
+    }
+
+    // Should: dissolve the removed member's responsibility row for that
+    // library on kick, leaving their personal claim intact.
+    // Impact: without this, a kicked member's daemon keeps passing the
+    // thin-client tx gate for a library it can no longer publish into.
+    #[test]
+    fn kick_dissolves_scope_claim() {
+        let conn = fixture();
+        let lib = create_library(&conn, 1, 0x340);
+        invite(&conn, &lib, 1, 2);
+        accept(&conn, &lib, 2);
+        let lib_s = lib.to_string();
+
+        let personal = claim_bytes("00000000-0000-0000-0000-0000000000d9");
+        apply(&conn, &PhotoIngressClaimHandler, "photo_ingress_claim", &personal, Some(2));
+        let scoped = claim_bytes_scoped("00000000-0000-0000-0000-0000000000d9", Some(&lib_s));
+        apply(&conn, &PhotoIngressClaimHandler, "photo_ingress_claim", &scoped, Some(2));
+
+        let kick = enc(&LibraryRemoveMemberPayload {
+            library_id: lib.clone(),
+            user_id: 2,
+            operation_id: CustomUUID::retention_cutoff(0x341),
+        });
+        apply(&conn, &LibraryRemoveMemberHandler, "library_remove_member", &kick, Some(1));
+
+        assert_eq!(read_holder_scoped(&conn, 2, Some(&lib_s)), None);
+        assert_eq!(
+            read_holder(&conn, 2).as_deref(),
+            Some("00000000-0000-0000-0000-0000000000d9"),
+            "personal claim must survive a library kick"
+        );
     }
 
     // --- Shared-library membership lifecycle ---

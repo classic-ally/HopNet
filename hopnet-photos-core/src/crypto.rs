@@ -125,6 +125,24 @@ pub fn unwrap_library_key(
     .map_err(Into::into)
 }
 
+/// Derive the cloud-fingerprint HMAC key for a shared library from its
+/// library key. Every member derives the same key, so the same
+/// PHCloudIdentifier yields the same fingerprint no matter which member's
+/// daemon publishes — that is what lets `idx_photos_fp_shared` dedupe
+/// across members (the per-user key used for the personal partition
+/// cannot: two members would compute different HMACs for one asset).
+///
+/// The context string is FROZEN: changing it changes every derived key,
+/// silently orphaning all committed shared fingerprints (dedupe would
+/// stop matching, and re-publishes would violate nothing until they
+/// collide). Mirrors `derive_photo_fingerprint_key`'s freeze on the
+/// personal context.
+pub fn derive_library_fingerprint_key(library_key: &Key) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key("hopnet photos cloud fingerprint library v1");
+    hasher.update(library_key.as_slice());
+    *hasher.finalize().as_bytes()
+}
+
 /// Convergence composite: unwrap the caller's own metadata-key wrap and
 /// re-wrap for a grant target. Returns the target's (ephemeral, wrapped)
 /// pair.
@@ -205,6 +223,28 @@ mod tests {
         let k1 = generate_metadata_key();
         let k2 = generate_metadata_key();
         assert_ne!(k1.as_slice(), k2.as_slice());
+    }
+
+    // Should: derive the library fingerprint key deterministically from
+    // the library key, matching a pinned vector, and differ across keys.
+    // Impact: the derive context is FROZEN — an accidental change would
+    // silently orphan every committed shared fingerprint (dedupe stops
+    // matching); this vector is the tripwire.
+    #[test]
+    fn library_fingerprint_key_vector_frozen() {
+        let key = Key::from([0x5A; 32]);
+        let derived = derive_library_fingerprint_key(&key);
+        assert_eq!(derived, derive_library_fingerprint_key(&key));
+        let pinned: [u8; 32] = [
+            212, 198, 80, 142, 123, 45, 135, 91, 134, 83, 45, 244, 44, 92, 26, 71, 203, 237, 80,
+            148, 73, 251, 218, 235, 19, 141, 200, 102, 154, 108, 102, 166,
+        ];
+        assert_eq!(
+            derived, pinned,
+            "library fingerprint derive context changed — this orphans all shared fingerprints"
+        );
+        let other = derive_library_fingerprint_key(&Key::from([0x5B; 32]));
+        assert_ne!(derived, other);
     }
 
     #[test]

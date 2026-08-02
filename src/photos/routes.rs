@@ -442,6 +442,7 @@ async fn post_ingress_claim(
     let payload = hopnet_photos::envelopes::PhotoIngressClaimPayload {
         device_id: body.device_id,
         operation_id: hopnet_common::CustomUUID::new(None),
+        library_id: None,
     };
     let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;

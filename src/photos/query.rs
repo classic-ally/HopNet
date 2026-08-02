@@ -456,7 +456,7 @@ pub fn read_ingress_responsibility(
     use rusqlite::OptionalExtension;
     let conn = pool.get().map_err(|e| format!("pool: {e}"))?;
     conn.query_row(
-        "SELECT device_id FROM photo_ingress_responsibility WHERE user_id = ?",
+        "SELECT device_id FROM photo_ingress_responsibility WHERE user_id = ? AND library_id IS NULL",
         rusqlite::params![user_id],
         |row| row.get(0),
     )

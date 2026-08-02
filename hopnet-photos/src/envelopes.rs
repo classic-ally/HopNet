@@ -211,10 +211,15 @@ pub struct PhotoUnfavoriteEntry {
 // --- photo_ingress_claim ---
 
 /// Claim (or transfer — same operation, upsert) ingress responsibility
-/// for the submitting user's personal scope. The handler validates the
-/// device exists and belongs to the submitting user against the
-/// consensus-replicated `device_tokens` table, then upserts
-/// `photo_ingress_responsibility`. JWT-route only in v1: the thin-client
+/// for the submitting user within one scope: the personal partition
+/// (`library_id: None`) or a shared library the user is a member of.
+/// Responsibility is per (user, scope) — each member claims
+/// independently for their own devices, and cross-member dedup within a
+/// shared library is the fingerprint pair's job, not responsibility's.
+/// The handler validates the device exists and belongs to the
+/// submitting user against the consensus-replicated `device_tokens`
+/// table (and membership for a shared scope), then upserts
+/// `photo_ingress_responsibility`. JWT-route only: the thin-client
 /// device route rejects this tx kind, so a daemon can never claim for
 /// itself.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -222,6 +227,10 @@ pub struct PhotoIngressClaimPayload {
     pub device_id: CustomUUID,
     /// UUIDv7 — audit/ordering stamp for the responsibility row.
     pub operation_id: CustomUUID,
+    /// Scope of the claim. FINAL bincode field (appended after the
+    /// personal-only v1 shipped — same precedent as
+    /// `PhotoAddEntry::cloud_fingerprint`).
+    pub library_id: Option<CustomUUID>,
 }
 
 /// System-maintenance batch hard-delete of expired tombstones. Submitted
@@ -598,12 +607,18 @@ mod tests {
     }
 
     /// Should: encode PhotoIngressClaimPayload as two length-prefixed
-    /// UUIDs (device_id, operation_id) in that order.
+    /// UUIDs (device_id, operation_id) followed by library_id as the
+    /// FINAL field — None a single 0x00 tail byte, Some 0x01 plus the
+    /// length-prefixed UUID, with every preceding byte identical between
+    /// the two encodings.
+    /// Impact: pins the amended (pre-release) wire position of the claim
+    /// scope; a positional shift silently corrupts decode.
     #[test]
     fn photo_ingress_claim_payload_golden_bytes() {
         let payload = PhotoIngressClaimPayload {
             device_id: "00000000-0000-0000-0000-0000000000aa".parse().unwrap(),
             operation_id: "00000000-0000-0000-0000-0000000000ab".parse().unwrap(),
+            library_id: None,
         };
         let mut expected = vec![0x10u8]; // varint(16) — device_id
         expected.extend_from_slice(&[0u8; 15]);
@@ -611,9 +626,25 @@ mod tests {
         expected.push(0x10); // varint(16) — operation_id
         expected.extend_from_slice(&[0u8; 15]);
         expected.push(0xab);
+        expected.push(0x00); // library_id: None tail
         let encoded =
             bincode::serde::encode_to_vec(&payload, bincode::config::standard()).unwrap();
         assert_eq!(encoded, expected, "PhotoIngressClaimPayload wire format changed");
+
+        let mut scoped = payload.clone();
+        scoped.library_id = Some("00000000-0000-0000-0000-0000000000ac".parse().unwrap());
+        let scoped_bytes =
+            bincode::serde::encode_to_vec(&scoped, bincode::config::standard()).unwrap();
+        let split = encoded.len() - 1;
+        assert_eq!(
+            scoped_bytes[..split],
+            encoded[..split],
+            "all fields before the scope must be byte-identical"
+        );
+        assert_eq!(scoped_bytes[split], 0x01, "Some tag byte");
+        assert_eq!(scoped_bytes[split + 1], 0x10, "varint(16) — library_id");
+        assert_eq!(scoped_bytes.last(), Some(&0xac));
+        assert_eq!(scoped_bytes.len(), encoded.len() + 17);
     }
 
     // Should: encode LibraryKeyWrap as signed-varint user_id, raw 32-byte

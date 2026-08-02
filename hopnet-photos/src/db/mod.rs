@@ -287,22 +287,39 @@ pub fn install_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error
             FOREIGN KEY (user_id) REFERENCES users(user_id)
         );
 
-        -- Ingress responsibility (v1, personal scope): the single device
-        -- allowed to publish ingress mutations for a user. Claimed and
-        -- transferred ONLY via the JWT claim route (photo_ingress_claim) —
-        -- daemons never auto-claim. Enforced at thin-client route
-        -- admission, not in handlers: the UNIQUE fingerprint pair above is
-        -- the correctness backstop for any admission race. device_tokens
-        -- is consensus-replicated, so the FK and the handler's ownership
-        -- check are deterministic on every validator.
+        -- Ingress responsibility, per (user, scope): the single device
+        -- allowed to publish ingress mutations for a user within a scope —
+        -- NULL library_id is the personal partition, non-NULL a shared
+        -- library the user is a member of. Each member claims
+        -- independently for their own devices; cross-member dedup within a
+        -- shared library is the fingerprint pair's job, not
+        -- responsibility's. Claimed and transferred ONLY via the JWT claim
+        -- route (photo_ingress_claim) — daemons never auto-claim. Enforced
+        -- at thin-client route admission, not in handlers: the UNIQUE
+        -- fingerprint pair above is the correctness backstop for any
+        -- admission race. device_tokens is consensus-replicated, so the FK
+        -- and the handler's ownership check are deterministic on every
+        -- validator.
         CREATE TABLE photo_ingress_responsibility (
-            user_id                  INTEGER PRIMARY KEY,
+            user_id                  INTEGER NOT NULL,
+            library_id               TEXT,                 -- NULL = personal scope
             device_id                TEXT NOT NULL,
             operation_id             TEXT NOT NULL,        -- UUIDv7, audit/ordering
 
             FOREIGN KEY (user_id) REFERENCES users(user_id),
-            FOREIGN KEY (device_id) REFERENCES device_tokens(id)
+            FOREIGN KEY (device_id) REFERENCES device_tokens(id),
+            FOREIGN KEY (library_id) REFERENCES shared_libraries(id)
         );
+
+        -- Split like idx_photos_fp_*: NULLs are distinct in UNIQUE
+        -- indexes, so a composite UNIQUE(user_id, library_id) would never
+        -- constrain the personal (NULL-library) row.
+        CREATE UNIQUE INDEX idx_ingress_resp_personal
+            ON photo_ingress_responsibility(user_id)
+            WHERE library_id IS NULL;
+        CREATE UNIQUE INDEX idx_ingress_resp_shared
+            ON photo_ingress_responsibility(user_id, library_id)
+            WHERE library_id IS NOT NULL;
         ",
     )
 }
@@ -598,5 +615,42 @@ mod tests {
         insert("p6", None, None).unwrap();
         insert("p7", None, None)
             .expect("NULL fingerprints are unconstrained (local-only assets)");
+    }
+
+    // Impact: the responsibility pair reuses the fingerprint indexes'
+    // NULL-distinctness split — a wrong predicate would let a user hold
+    // two holders for one scope, and the claim upsert's conflict targets
+    // would silently insert instead of transferring.
+    // Should: allow one personal row per user plus one row per shared
+    // library, including the same library across different users.
+    // Should not: allow a second personal row or a second row for the
+    // same (user, library).
+    #[test]
+    fn responsibility_partial_unique_index_semantics() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        install_schema(&conn).unwrap();
+
+        let insert = |user: i32, lib: Option<&str>, dev: &str| {
+            conn.execute(
+                "INSERT INTO photo_ingress_responsibility (user_id, library_id, device_id, operation_id)
+                 VALUES (?1, ?2, ?3, 'op')",
+                rusqlite::params![user, lib, dev],
+            )
+        };
+
+        insert(1, None, "d1").unwrap();
+        assert!(
+            insert(1, None, "d2").is_err(),
+            "second personal row for one user must be rejected"
+        );
+        insert(1, Some("lib1"), "d1").expect("personal and shared scopes coexist");
+        insert(1, Some("lib2"), "d2").expect("distinct libraries are distinct scopes");
+        assert!(
+            insert(1, Some("lib1"), "d2").is_err(),
+            "second row for one (user, library) must be rejected"
+        );
+        insert(2, Some("lib1"), "d9")
+            .expect("two members hold the same library independently");
     }
 }

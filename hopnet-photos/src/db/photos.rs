@@ -361,26 +361,65 @@ pub fn hard_delete_expired_photo(
     Ok(())
 }
 
-/// Upsert the ingress responsibility holder for a user's personal scope.
+/// Upsert the ingress responsibility holder for one of a user's scopes
+/// (personal partition when `library_id` is None, else a shared library).
 /// Claim and transfer are the same operation — last committed claim wins.
+/// The conflict target must name the matching partial UNIQUE index
+/// (idx_ingress_resp_personal / idx_ingress_resp_shared) or SQLite would
+/// insert a duplicate row instead of updating.
 pub fn upsert_ingress_responsibility(
     db_tx: &rusqlite::Transaction,
     user_id: i32,
+    library_id: Option<&CustomUUID>,
     device_id: &CustomUUID,
     operation_id: &CustomUUID,
 ) -> Result<(), DatabaseError> {
+    let result = match library_id {
+        None => db_tx.execute(
+            "INSERT INTO photo_ingress_responsibility (user_id, library_id, device_id, operation_id)
+             VALUES (?1, NULL, ?2, ?3)
+             ON CONFLICT(user_id) WHERE library_id IS NULL
+             DO UPDATE SET device_id = ?2, operation_id = ?3",
+            params![user_id, device_id, operation_id],
+        ),
+        Some(lib) => db_tx.execute(
+            "INSERT INTO photo_ingress_responsibility (user_id, library_id, device_id, operation_id)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(user_id, library_id) WHERE library_id IS NOT NULL
+             DO UPDATE SET device_id = ?3, operation_id = ?4",
+            params![user_id, lib, device_id, operation_id],
+        ),
+    };
+    result.map_err(|e| {
+        tracing::error!(
+            "photo_ingress_claim: upsert responsibility (user {}, device {}) failed: {e}",
+            user_id,
+            device_id,
+        );
+        DatabaseError::InsertError
+    })?;
+    Ok(())
+}
+
+/// Delete a user's ingress responsibility row for one shared library, if
+/// any. Idempotent — called by `library_remove_member` so a kicked or
+/// departing member's daemon stops passing the thin-client tx gate for a
+/// scope they can no longer publish into.
+pub fn delete_ingress_responsibility_for_library(
+    db_tx: &rusqlite::Transaction,
+    user_id: i32,
+    library_id: &CustomUUID,
+) -> Result<(), DatabaseError> {
     db_tx
         .execute(
-            "INSERT INTO photo_ingress_responsibility (user_id, device_id, operation_id)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(user_id) DO UPDATE SET device_id = ?2, operation_id = ?3",
-            params![user_id, device_id, operation_id],
+            "DELETE FROM photo_ingress_responsibility WHERE user_id = ?1 AND library_id = ?2",
+            params![user_id, library_id],
         )
         .map_err(|e| {
             tracing::error!(
-                "photo_ingress_claim: upsert responsibility (user {}, device {}) failed: {e}",
+                "library_remove_member: delete responsibility (user {}, library {}) failed: {e}",
                 user_id,
-                device_id,
+                library_id,
             );
             DatabaseError::InsertError
         })?;
