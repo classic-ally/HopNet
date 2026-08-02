@@ -137,15 +137,15 @@ CREATE TABLE photo_ingress_responsibility (
     device_id     TEXT NOT NULL,
     operation_id  TEXT NOT NULL,         -- UUIDv7, audit/ordering
 
+    PRIMARY KEY (user_id, library_id),   -- shared uniqueness + snapshot ordering
     FOREIGN KEY (user_id) REFERENCES users(user_id),
     FOREIGN KEY (device_id) REFERENCES device_tokens(id),
     FOREIGN KEY (library_id) REFERENCES shared_libraries(id)
 );
--- Split like idx_photos_fp_* (NULLs are distinct in UNIQUE indexes):
+-- NULLs are distinct even in the composite PK (SQLite rowid-table
+-- quirk), so the personal singleton needs the partial index:
 CREATE UNIQUE INDEX idx_ingress_resp_personal
     ON photo_ingress_responsibility(user_id) WHERE library_id IS NULL;
-CREATE UNIQUE INDEX idx_ingress_resp_shared
-    ON photo_ingress_responsibility(user_id, library_id) WHERE library_id IS NOT NULL;
 ```
 
 One device per (user, scope) may publish ingress mutations — the personal

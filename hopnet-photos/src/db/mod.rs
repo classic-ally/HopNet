@@ -300,26 +300,27 @@ pub fn install_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error
         -- admission race. device_tokens is consensus-replicated, so the FK
         -- and the handler's ownership check are deterministic on every
         -- validator.
+        -- The composite PK owns shared-scope uniqueness AND gives the
+        -- debug state snapshot its deterministic ORDER BY (snapshot
+        -- hashing requires a declared PK). SQLite treats NULLs as
+        -- distinct even in a PRIMARY KEY (rowid-table quirk), so the PK
+        -- cannot constrain the personal (NULL-library) row — the partial
+        -- index below does, mirroring idx_photos_fp_personal.
         CREATE TABLE photo_ingress_responsibility (
             user_id                  INTEGER NOT NULL,
             library_id               TEXT,                 -- NULL = personal scope
             device_id                TEXT NOT NULL,
             operation_id             TEXT NOT NULL,        -- UUIDv7, audit/ordering
 
+            PRIMARY KEY (user_id, library_id),
             FOREIGN KEY (user_id) REFERENCES users(user_id),
             FOREIGN KEY (device_id) REFERENCES device_tokens(id),
             FOREIGN KEY (library_id) REFERENCES shared_libraries(id)
         );
 
-        -- Split like idx_photos_fp_*: NULLs are distinct in UNIQUE
-        -- indexes, so a composite UNIQUE(user_id, library_id) would never
-        -- constrain the personal (NULL-library) row.
         CREATE UNIQUE INDEX idx_ingress_resp_personal
             ON photo_ingress_responsibility(user_id)
             WHERE library_id IS NULL;
-        CREATE UNIQUE INDEX idx_ingress_resp_shared
-            ON photo_ingress_responsibility(user_id, library_id)
-            WHERE library_id IS NOT NULL;
         ",
     )
 }
@@ -617,10 +618,11 @@ mod tests {
             .expect("NULL fingerprints are unconstrained (local-only assets)");
     }
 
-    // Impact: the responsibility pair reuses the fingerprint indexes'
-    // NULL-distinctness split — a wrong predicate would let a user hold
-    // two holders for one scope, and the claim upsert's conflict targets
-    // would silently insert instead of transferring.
+    // Impact: NULLs are distinct even in the composite PRIMARY KEY, so
+    // personal-scope uniqueness rests entirely on the partial index — a
+    // wrong predicate would let a user hold two holders for one scope,
+    // and the claim upsert's conflict targets would silently insert
+    // instead of transferring.
     // Should: allow one personal row per user plus one row per shared
     // library, including the same library across different users.
     // Should not: allow a second personal row or a second row for the

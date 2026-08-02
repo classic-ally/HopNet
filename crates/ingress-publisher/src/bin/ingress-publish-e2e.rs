@@ -282,9 +282,16 @@ async fn main() {
                 let report = run_publish_pass(&store, &spool, &publisher, &cfg, claimed, &mut state)
                     .await
                     .expect("publish pass");
-                let parked = report.parked || report.parked_responsibility;
+                // Unreachable parks the whole pass — nothing more can move.
+                // A responsibility park is PER SCOPE: a mixed claim batch may
+                // park one scope while another still has queued photos, so
+                // keep passing until a pass moves nothing (parked photos
+                // burn no attempts and stay claimable — a zero-progress pass
+                // means only parked scopes remain).
+                let progress = report.published + report.already_published + report.adopted;
+                let parked = report.parked;
                 totals.absorb(&report);
-                if parked {
+                if parked || progress == 0 {
                     break;
                 }
             }

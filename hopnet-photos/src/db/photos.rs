@@ -364,9 +364,11 @@ pub fn hard_delete_expired_photo(
 /// Upsert the ingress responsibility holder for one of a user's scopes
 /// (personal partition when `library_id` is None, else a shared library).
 /// Claim and transfer are the same operation — last committed claim wins.
-/// The conflict target must name the matching partial UNIQUE index
-/// (idx_ingress_resp_personal / idx_ingress_resp_shared) or SQLite would
-/// insert a duplicate row instead of updating.
+/// The conflict targets differ per scope: a shared row conflicts on the
+/// composite PK (NULLs are distinct, so a personal row never does); the
+/// personal row conflicts only on the partial idx_ingress_resp_personal,
+/// whose predicate the target must repeat or SQLite would insert a
+/// duplicate instead of updating.
 pub fn upsert_ingress_responsibility(
     db_tx: &rusqlite::Transaction,
     user_id: i32,
@@ -385,7 +387,7 @@ pub fn upsert_ingress_responsibility(
         Some(lib) => db_tx.execute(
             "INSERT INTO photo_ingress_responsibility (user_id, library_id, device_id, operation_id)
              VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(user_id, library_id) WHERE library_id IS NOT NULL
+             ON CONFLICT(user_id, library_id)
              DO UPDATE SET device_id = ?3, operation_id = ?4",
             params![user_id, lib, device_id, operation_id],
         ),
