@@ -265,10 +265,16 @@ pub fn verify_lineage(
 
 /// The seated set from a record, as an engine validator set — what a
 /// node verifies lineage against when the record's set IS the set it
-/// trusted (boot gate 2; S7 layers the overlap rule on top).
+/// trusted (boot gate 2; the chain verification layers the overlap rule
+/// on top).
 pub fn record_valset(record: &EpochGenesisRecord) -> Result<HopNetValidatorSet, String> {
-    let validators = record
-        .seated
+    valset_of(&record.seated)
+}
+
+/// An engine validator set from raw (node_id, pubkey) pairs — records
+/// and chain anchors carry the same shape.
+pub fn valset_of(seated: &[(i32, [u8; 32])]) -> Result<HopNetValidatorSet, String> {
+    let validators = seated
         .iter()
         .map(|(id, pk)| {
             ed25519_dalek::VerifyingKey::from_bytes(pk)
@@ -283,7 +289,7 @@ pub fn record_valset(record: &EpochGenesisRecord) -> Result<HopNetValidatorSet, 
 /// node's evidence for it. `final_cert` is a valid proof, not a
 /// canonical byte string — two nodes' lineage files may differ there
 /// and both verify.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct LineageRecord {
     pub record: EpochGenesisRecord,
     pub final_block: Vec<u8>,
@@ -318,9 +324,167 @@ pub fn write_lineage(dir: &std::path::Path, genesis: &EpochGenesis) -> Result<st
 
 pub fn read_lineage(path: &std::path::Path) -> Result<LineageRecord, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("lineage read: {e}"))?;
-    bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+    decode_lineage(&bytes)
+}
+
+/// Decode a lineage record from its on-disk/wire encoding — fetched
+/// records (the "regenesis" scope serves raw file bytes) and local files
+/// share one codec.
+pub fn decode_lineage(bytes: &[u8]) -> Result<LineageRecord, String> {
+    bincode::serde::decode_from_slice(bytes, bincode::config::standard())
         .map(|(r, _)| r)
         .map_err(|e| format!("lineage decode: {e}"))
+}
+
+/// The trust root a lineage chain is verified from.
+///
+/// A straggler anchors at its own database (`from_db`): the chain id it
+/// last trusted and the seated set it last saw. A fresh joiner has no
+/// prior state and anchors TOFU at the chain's first record (`tofu`) —
+/// trust rooted in the authenticated join ceremony, with every other
+/// check still enforced. An operator re-trust is `from_db` with
+/// `trusted` cleared: linkage, per-hop quorum, and the snapshot hash
+/// still hold; only the overlap requirement is waived.
+pub struct ChainAnchor {
+    /// Epoch the anchor speaks for — the first record must be epoch + 1.
+    pub epoch: u64,
+    /// The chain id the anchor trusts (its own META_CHAIN_ID).
+    pub chain_id: [u8; 32],
+    /// Last-trusted seated set for the first hop's overlap check.
+    /// None = overlap waived (TOFU or operator re-trust).
+    pub trusted: Option<Vec<(i32, [u8; 32])>>,
+    /// Quorum profile the trusted set operated under (Byzantine-bound
+    /// source for the overlap threshold).
+    pub profile: String,
+}
+
+impl ChainAnchor {
+    /// Anchor at this database's own trusted state: its epoch, chain id,
+    /// and the seated set at its decided tip.
+    pub fn from_db(conn: &rusqlite::Connection) -> Result<Self, String> {
+        let tip = store::last_decided_height(conn)
+            .map_err(|e| format!("decided tip: {e}"))?
+            .ok_or("no decided history to anchor at")?;
+        let chain_id: [u8; 32] = store::meta_get(conn, store::META_CHAIN_ID)
+            .map_err(|e| format!("chain id: {e}"))?
+            .ok_or("no chain id in consensus_meta")?
+            .try_into()
+            .map_err(|_| "malformed chain id".to_string())?;
+        let profile = match store::meta_get(conn, store::META_QUORUM_PROFILE)
+            .map_err(|e| format!("quorum profile: {e}"))?
+        {
+            Some(bytes) => String::from_utf8(bytes).map_err(|_| "malformed quorum profile")?,
+            None => return Err("no quorum profile in consensus_meta".into()),
+        };
+        let mut trusted: Vec<(i32, [u8; 32])> =
+            hopnet_consensus::validators::get_validators(conn, tip.0 + 1)
+                .map_err(|e| format!("trusted seated set: {e}"))?
+                .into_iter()
+                .map(|v| (v.node_id, v.pubkey.to_bytes()))
+                .collect();
+        trusted.sort_by_key(|(id, _)| *id);
+        if trusted.is_empty() {
+            return Err("empty trusted seated set".into());
+        }
+        Ok(ChainAnchor {
+            epoch: current_epoch(conn),
+            chain_id,
+            trusted: Some(trusted),
+            profile,
+        })
+    }
+
+    /// The fresh-joiner TOFU anchor: trust the chain the first record
+    /// claims to extend. No overlap is possible (there is no prior
+    /// trusted set); the join ceremony itself is the root, exactly as
+    /// in the original trusted height-0 bootstrap.
+    pub fn tofu(first: &LineageRecord) -> Self {
+        ChainAnchor {
+            epoch: first.record.epoch.saturating_sub(1),
+            chain_id: first.record.prev_chain_id,
+            trusted: None,
+            profile: first.record.quorum_profile.clone(),
+        }
+    }
+}
+
+/// Verify a lineage chain hop by hop from an anchor (RFC-019 S7). Per
+/// record E: epoch continuity, chain-id linkage (each epoch's chain id
+/// is DERIVED from the previous verified record via `genesis_block_for`
+/// — never taken from the peer), structural + internal-quorum checks
+/// (`verify_lineage` against the record's own seated set), and the
+/// weak-subjectivity OVERLAP rule: the boundary certificate's signers
+/// must intersect the anchor's trusted set in MORE than that set's
+/// Byzantine bound (`f_eq` from the active quorum profile — under
+/// Majority `f_eq == 0`, so the rule degenerates to at least one known
+/// signer, per spec). Each verified record's seated set then becomes
+/// the trusted set for the next hop.
+///
+/// Returns the last (target-epoch) record on success — its
+/// `snapshot_hash` is what the joiner's downloaded artifact must match.
+pub fn verify_lineage_chain<'a>(
+    records: &'a [LineageRecord],
+    anchor: ChainAnchor,
+) -> Result<&'a LineageRecord, String> {
+    if records.is_empty() {
+        return Err("empty lineage chain".into());
+    }
+    let mut epoch = anchor.epoch;
+    let mut chain_id = anchor.chain_id;
+    let mut trusted = anchor.trusted;
+    let mut profile = anchor.profile;
+
+    for lr in records {
+        let record = &lr.record;
+        if record.epoch != epoch + 1 {
+            return Err(format!(
+                "lineage gap: expected epoch {}, record is for {}",
+                epoch + 1,
+                record.epoch
+            ));
+        }
+        if record.prev_chain_id != chain_id {
+            return Err(format!(
+                "lineage linkage break at epoch {}: record extends a different chain",
+                record.epoch
+            ));
+        }
+        let final_block: Block = hopnet_consensus::codec::decode(&lr.final_block)
+            .map_err(|e| format!("epoch {} final block decode: {e:?}", record.epoch))?;
+        let cert: WireCommitCertificate = hopnet_consensus::codec::decode(&lr.final_cert)
+            .map_err(|e| format!("epoch {} final cert decode: {e:?}", record.epoch))?;
+
+        let record_profile = QuorumProfile::parse(&record.quorum_profile)
+            .ok_or_else(|| format!("epoch {}: unknown quorum profile", record.epoch))?;
+        verify_lineage(record, &final_block, &cert, &record_valset(record)?, &record_profile)
+            .map_err(|e| format!("epoch {} lineage: {e}", record.epoch))?;
+
+        if let Some(ref t) = trusted {
+            let anchor_profile = QuorumProfile::parse(&profile)
+                .ok_or_else(|| format!("epoch {}: unknown anchor profile", record.epoch))?;
+            let f = anchor_profile.f_eq(t.len() as u64);
+            let overlap = hopnet_consensus::verify::count_trusted_signers(
+                &Blake3Hash::from_bytes(record.prev_chain_id),
+                &cert,
+                &valset_of(t)?,
+            ) as u64;
+            if overlap <= f {
+                return Err(format!(
+                    "epoch {} overlap: only {overlap} of the {} trusted validators signed \
+                     the boundary (need more than the Byzantine bound {f}) — churn beyond \
+                     the overlap window requires manual re-trust",
+                    record.epoch,
+                    t.len()
+                ));
+            }
+        }
+
+        chain_id = *genesis_block_for(record)?.block_hash.0.as_bytes();
+        trusted = Some(record.seated.clone());
+        profile = record.quorum_profile.clone();
+        epoch = record.epoch;
+    }
+    Ok(records.last().expect("chain verified non-empty"))
 }
 
 #[cfg(test)]
@@ -529,5 +693,222 @@ mod tests {
         assert_eq!(cert.height, H);
         assert_eq!(cert.value_id, g.block.block_hash);
         assert!(cert.signatures.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Lineage CHAIN verification (RFC-019 S7): hop-by-hop linkage,
+    // per-hop quorum, and the weak-subjectivity overlap rule.
+    // ------------------------------------------------------------------
+
+    fn seated_of(ids: &[u8]) -> Vec<(i32, [u8; 32])> {
+        let mut s: Vec<(i32, [u8; 32])> = ids
+            .iter()
+            .map(|&id| (id as i32, key(id).verifying_key().to_bytes()))
+            .collect();
+        s.sort_by_key(|(id, _)| *id);
+        s
+    }
+
+    /// Build a verifiable chain: one record per hop, each certified by
+    /// the hop's own seated set over the PREVIOUS epoch's chain id, and
+    /// each epoch's chain id derived from the record before it — the same
+    /// derivation the verifier performs.
+    fn build_chain(
+        start_chain: [u8; 32],
+        start_epoch: u64,
+        hops: &[(&[u8], &str)],
+    ) -> Vec<LineageRecord> {
+        let mut chain = start_chain;
+        let mut out = Vec::new();
+        for (i, (ids, profile)) in hops.iter().enumerate() {
+            let epoch = start_epoch + 1 + i as u64;
+            let seal_height = H + i as u64 * 10;
+            let final_block = Block::new(BlockData {
+                height: seal_height,
+                round: 0,
+                parent_hash: Some(Blake3Hash::from_bytes([2; 32])),
+                transactions: Transactions(Vec::new()),
+            })
+            .unwrap();
+            let domain = Blake3Hash::from_bytes(chain);
+            let cert = WireCommitCertificate {
+                height: seal_height,
+                round: 0,
+                value_id: final_block.block_hash,
+                signatures: ids
+                    .iter()
+                    .map(|&id| {
+                        wire_commit_signature(
+                            &domain,
+                            &PrivKey(key(id)),
+                            Height(seal_height),
+                            final_block.block_hash,
+                            id as i32,
+                        )
+                    })
+                    .collect(),
+            };
+            let record = EpochGenesisRecord {
+                format_version: 1,
+                epoch,
+                required_version_code: TARGET,
+                prev_chain_id: chain,
+                final_block_hash: *final_block.block_hash.0.as_bytes(),
+                seal_height,
+                snapshot_hash: [epoch as u8; 32],
+                quorum_profile: (*profile).to_string(),
+                seated: seated_of(ids),
+            };
+            chain = *genesis_block_for(&record).unwrap().block_hash.0.as_bytes();
+            out.push(LineageRecord {
+                record,
+                final_block: hopnet_consensus::codec::encode(&final_block).unwrap(),
+                final_cert: hopnet_consensus::codec::encode(&cert).unwrap(),
+            });
+        }
+        out
+    }
+
+    fn anchor_at(trusted: Option<&[u8]>, profile: &str) -> ChainAnchor {
+        ChainAnchor {
+            epoch: 1,
+            chain_id: PREV_CHAIN,
+            trusted: trusted.map(seated_of),
+            profile: profile.to_string(),
+        }
+    }
+
+    // Impact: this is weak subjectivity in one assertion — a straggler
+    // accepts a boundary only if enough validators it ALREADY trusted
+    // signed it, so a mesh that re-keyed entirely cannot walk it onto a
+    // forged history.
+    // Should: accept a chain whose boundary certificate overlaps the
+    // trusted set beyond its Byzantine bound, and return the target
+    // record.
+    // Should not: accept one that overlaps only up to the bound.
+    #[test]
+    fn overlap_rule_holds_the_byzantine_bound_under_bft() {
+        // Trusted set of 4 under BFT: f_eq = 1, so 2 overlapping signers
+        // pass and 1 does not.
+        let two_overlap = build_chain(PREV_CHAIN, 1, &[(&[3, 4, 5], "bft")]);
+        let target =
+            verify_lineage_chain(&two_overlap, anchor_at(Some(&[1, 2, 3, 4]), "bft")).unwrap();
+        assert_eq!(target.record.epoch, 2);
+        assert_eq!(target.record.snapshot_hash, [2u8; 32]);
+
+        let one_overlap = build_chain(PREV_CHAIN, 1, &[(&[4, 5, 6], "bft")]);
+        let err = verify_lineage_chain(&one_overlap, anchor_at(Some(&[1, 2, 3, 4]), "bft"))
+            .expect_err("one overlapping signer is exactly the bound, not beyond it");
+        assert!(err.contains("overlap"), "{err}");
+        assert!(err.contains("manual re-trust"), "{err}");
+    }
+
+    // Impact: on a home mesh the profile's Byzantine bound is zero, so
+    // the spec's rule degenerates to "at least one validator I knew" —
+    // recorded here so the weaker guarantee is deliberate, not a bug.
+    // Should: accept a single overlapping signer under Majority.
+    // Should not: accept a boundary with no overlapping signer at all.
+    #[test]
+    fn overlap_rule_degenerates_under_majority() {
+        let one = build_chain(PREV_CHAIN, 1, &[(&[4, 5, 6], "majority")]);
+        assert!(verify_lineage_chain(&one, anchor_at(Some(&[1, 2, 3, 4]), "majority")).is_ok());
+
+        let none = build_chain(PREV_CHAIN, 1, &[(&[5, 6, 7], "majority")]);
+        let err = verify_lineage_chain(&none, anchor_at(Some(&[1, 2, 3, 4]), "majority"))
+            .expect_err("no overlap must refuse even under majority");
+        assert!(err.contains("overlap"), "{err}");
+    }
+
+    // Impact: each hop must be anchored in the hop BEFORE it, not in the
+    // node's original set — otherwise a multi-epoch straggler could
+    // never catch up through legitimate validator churn.
+    // Should: verify a multi-epoch chain by rotating the trusted set to
+    // each verified record's seated set.
+    #[test]
+    fn trusted_set_rotates_per_hop() {
+        // Anchor trusts {1,2}. Hop 1 is signed by {1,2,3,4} (overlap 2),
+        // hop 2 by {3,4,5} — which overlaps hop 1's seated set in {3,4}
+        // but the ORIGINAL anchor set in nothing. Verifying at all is
+        // what proves the rotation happened.
+        let chain = build_chain(PREV_CHAIN, 1, &[(&[1, 2, 3, 4], "bft"), (&[3, 4, 5], "bft")]);
+        let target = verify_lineage_chain(&chain, anchor_at(Some(&[1, 2]), "bft")).unwrap();
+        assert_eq!(target.record.epoch, 3, "the LATEST record is the target");
+        assert_eq!(target.record.snapshot_hash, [3u8; 32]);
+    }
+
+    // Should: refuse a chain that does not start at the anchor's next
+    // epoch, one whose records skip an epoch mid-chain, and an empty one.
+    #[test]
+    fn epoch_continuity_is_required() {
+        let ahead = build_chain(PREV_CHAIN, 2, &[(&[1, 2], "majority")]);
+        let err = verify_lineage_chain(&ahead, anchor_at(Some(&[1, 2]), "majority"))
+            .expect_err("a chain starting at epoch 3 cannot extend an epoch-1 anchor");
+        assert!(err.contains("gap"), "{err}");
+
+        let mut gapped =
+            build_chain(PREV_CHAIN, 1, &[(&[1, 2], "majority"), (&[1, 2], "majority")]);
+        gapped.remove(0);
+        assert!(verify_lineage_chain(&gapped, anchor_at(Some(&[1, 2]), "majority")).is_err());
+
+        assert!(verify_lineage_chain(&[], anchor_at(Some(&[1, 2]), "majority")).is_err());
+    }
+
+    // Impact: chain ids are DERIVED from each verified record, never
+    // taken from the server — a peer that swaps in a record from another
+    // lineage cannot make it link.
+    // Should not: accept a record whose prev_chain_id names a chain the
+    // verifier never derived.
+    #[test]
+    fn linkage_break_is_refused() {
+        let chain = build_chain([0x77; 32], 1, &[(&[1, 2], "majority")]);
+        let err = verify_lineage_chain(&chain, anchor_at(Some(&[1, 2]), "majority"))
+            .expect_err("a record extending a different chain must not link");
+        assert!(err.contains("linkage"), "{err}");
+    }
+
+    // Impact: the per-hop quorum check is what makes a record's claim
+    // about its own seated set meaningful; the overlap rule sits on top
+    // of it, never instead of it.
+    // Should not: accept a chain whose boundary certificate is
+    // sub-quorum for the set the record itself claims.
+    #[test]
+    fn sub_quorum_boundary_is_refused() {
+        let mut chain = build_chain(PREV_CHAIN, 1, &[(&[1, 2, 3, 4], "bft")]);
+        // Drop signatures below the record's own quorum (bft, 4 seated
+        // → 3 needed), keeping two signers that both overlap the anchor.
+        let mut cert: WireCommitCertificate =
+            hopnet_consensus::codec::decode(&chain[0].final_cert).unwrap();
+        cert.signatures.truncate(2);
+        chain[0].final_cert = hopnet_consensus::codec::encode(&cert).unwrap();
+
+        let err = verify_lineage_chain(&chain, anchor_at(Some(&[1, 2]), "bft"))
+            .expect_err("sub-quorum boundary certificate");
+        assert!(err.contains("lineage"), "{err}");
+    }
+
+    // Impact: a fresh joiner has no prior trusted set — its root is the
+    // authenticated join ceremony, exactly as in the trusted height-0
+    // bootstrap. Only the FIRST hop is unanchored; from there the chain
+    // binds as strictly as it does for a straggler, so a joiner can
+    // never adopt a lineage no existing node could have followed.
+    // Should: verify a full chain from a TOFU anchor built off the first
+    // record.
+    // Should not: waive overlap past the first hop, nor stop binding
+    // linkage because overlap was waived.
+    #[test]
+    fn tofu_anchor_waives_only_the_first_hop() {
+        let chain = build_chain(PREV_CHAIN, 1, &[(&[1, 2], "majority"), (&[2, 3], "majority")]);
+        let target = verify_lineage_chain(&chain, ChainAnchor::tofu(&chain[0])).unwrap();
+        assert_eq!(target.record.epoch, 3);
+
+        let churned = build_chain(PREV_CHAIN, 1, &[(&[1, 2], "majority"), (&[8, 9], "majority")]);
+        let err = verify_lineage_chain(&churned, ChainAnchor::tofu(&churned[0]))
+            .expect_err("churn beyond the overlap window is refused from any anchor");
+        assert!(err.contains("epoch 3 overlap"), "{err}");
+
+        let mut tampered = chain;
+        tampered[1].record.prev_chain_id = [0x5A; 32];
+        let tofu = ChainAnchor::tofu(&tampered[0]);
+        assert!(verify_lineage_chain(&tampered, tofu).is_err());
     }
 }
