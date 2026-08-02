@@ -548,7 +548,84 @@ impl TestScenario for PhotosIngressShared {
             .await
         );
 
-        // ── Step 8: non-member scoped claims are refused ────────────────
+        // ── Step 8: a shared-scope edit reaches the other member ────────
+        // Same gate as the tombstone above, but carrying bytes: the edit
+        // uploads new blobs into the shared library and swaps them under a
+        // photo bob adopted rather than published, so his node has to
+        // converge onto a render it never uploaded.
+
+        let edited_hashes = step!(
+            format!("Alice edits the {SHARED_COUNT} shared photos locally"),
+            async {
+                let (_, report) = driver(dir_a.path().to_path_buf(), vec!["edit".into()]).await?;
+                let photos = crate::tests::photos_ingress_publish::report_photos(&report)?;
+                let map: std::collections::HashMap<String, String> = photos
+                    .into_iter()
+                    .filter(|(id, _)| shared_ids.contains(id))
+                    .filter_map(|(id, resources)| {
+                        let hash = resources
+                            .iter()
+                            .find(|(kind, _)| kind == "edited")
+                            .map(|(_, hash)| hash.clone())?;
+                        Some((id, hash))
+                    })
+                    .collect();
+                anyhow::ensure!(
+                    map.len() == SHARED_COUNT as usize,
+                    "expected {SHARED_COUNT} edited renders, got {}",
+                    map.len()
+                );
+                Ok(map)
+            }
+            .await
+        );
+        step!(
+            "Shared edits propagate under the library scope",
+            async {
+                let (_, report) =
+                    driver(dir_a.path().to_path_buf(), publish_args(&token_a)).await?;
+                anyhow::ensure!(
+                    report["edits_propagated"].as_u64() == Some(SHARED_COUNT as u64),
+                    "propagated {}: {report}",
+                    report["edits_propagated"]
+                );
+                Ok(())
+            }
+            .await,
+            |_| Some(format!("{SHARED_COUNT} content edits committed"))
+        );
+        step!(
+            "Bob's node serves the edited render (cross-member edit)",
+            async {
+                for (id, expected) in &edited_hashes {
+                    let deadline = Instant::now() + Duration::from_secs(90);
+                    loop {
+                        let served = fetch_resource_with_retry(
+                            &client,
+                            &bob,
+                            id,
+                            "edited",
+                            Duration::from_secs(10),
+                        )
+                        .await
+                        .ok()
+                        .map(|bytes| blake3::hash(&bytes).to_hex().to_string());
+                        if served.as_deref() == Some(expected.as_str()) {
+                            break;
+                        }
+                        anyhow::ensure!(
+                            Instant::now() <= deadline,
+                            "bob still serves {served:?} for {id}, expected {expected}"
+                        );
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                }
+                Ok(())
+            }
+            .await
+        );
+
+        // ── Step 9: non-member scoped claims are refused ────────────────
 
         step!(
             "Non-member scoped claim is refused (403)",

@@ -37,6 +37,7 @@ mod orphan_cleanup;
 mod performance;
 pub(crate) mod persistence;
 mod photos;
+pub(crate) mod photos_ingress_edit;
 mod photos_ingress_identity;
 pub(crate) mod photos_ingress_publish;
 mod photos_ingress_shared;
@@ -404,6 +405,11 @@ pub async fn run_test_by_name(
                 .run(mesh_id, nodes, flags)
                 .await
         }
+        "photos-ingress-edit" => {
+            photos_ingress_edit::PhotosIngressEdit
+                .run(mesh_id, nodes, flags)
+                .await
+        }
         "recents-ordering" => recents::RecentsOrdering.run(mesh_id, nodes, flags).await,
         "range-download" => {
             range_download::RangeDownload
@@ -537,6 +543,7 @@ pub fn list_test_names() -> Vec<&'static str> {
         "photos-shared-library",
         "photos-ingress-shared",
         "photos-ingress-tombstone",
+        "photos-ingress-edit",
         "recents-ordering",
         "range-download",
         "takeout-happy-path",
