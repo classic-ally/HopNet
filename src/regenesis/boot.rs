@@ -443,7 +443,7 @@ fn read_epoch_of(db_path: &str) -> Result<u64, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use hopnet_consensus::context::Height;
@@ -453,7 +453,7 @@ mod tests {
     use rusqlite::params;
 
     const H: u64 = 7;
-    const TARGET: u32 = 20260800;
+    pub(crate) const TARGET: u32 = 20260800;
     const PREV_CHAIN: [u8; 32] = [3; 32];
 
     fn key(seed: u8) -> SigningKey {
@@ -468,7 +468,8 @@ mod tests {
     /// a really-signed final certificate, node-local rows to carry, one
     /// fragment with node-local column state, the sealed marker, and a
     /// committed snapshot_hash that matches the real artifact recompute.
-    fn sealed_db(dir: &Path) -> String {
+    /// Shared with the sibling regenesis test modules (rpc, join).
+    pub(crate) fn sealed_db(dir: &Path) -> String {
         let db_path = dir.join("database.db").to_string_lossy().into_owned();
         let mut conn = rusqlite::Connection::open(&db_path).unwrap();
         crate::db::shared::apply_connection_pragmas(&conn).unwrap();

@@ -1,4 +1,4 @@
-//! Server-side handlers for the host's five comms scopes, plus the registry
+//! Server-side handlers for the host's comms scopes, plus the registry
 //! constructor shared by `main.rs` and the in-process integration tests.
 //!
 //! SPAWN POLICY (load-bearing): comms invokes handlers INLINE on its net
@@ -8,12 +8,15 @@
 //!
 //! - mesh plane (pure channel/CPU work: consensus gossip intake, latency and
 //!   throughput echoes) is served inline on the net runtime;
-//! - consensus-support plane (TransactionForward, DecidedFetch) hops to the
-//!   QUEUE runtime (blocking DB allowed, never starved by API load).
-//!   TransactionForward is consensus INTAKE: if its ACK can't beat the
-//!   forwarder's timeout under load, proposers never receive batches and
-//!   blocks decide empty (the image-12 finding). DecidedFetch serves laggard
-//!   sync — same liveness class;
+//! - consensus-support plane (TransactionForward, DecidedFetch, the
+//!   regenesis scope) hops to the QUEUE runtime (blocking DB allowed, never
+//!   starved by API load). TransactionForward is consensus INTAKE: if its
+//!   ACK can't beat the forwarder's timeout under load, proposers never
+//!   receive batches and blocks decide empty (the image-12 finding).
+//!   DecidedFetch serves laggard sync — same liveness class. The regenesis
+//!   scope serves epoch rejoin (lineage + snapshot artifact, RFC-019 S7)
+//!   and, like DecidedFetch, answers WITHOUT a live engine — parked and
+//!   sealed nodes rescuing stragglers is load-bearing;
 //! - app plane (fragments, storage query, join) hops to the MAIN runtime and
 //!   degrades under API overload by design.
 
@@ -71,6 +74,12 @@ pub fn build_registry(app_state: &AppState) -> ScopeRegistry {
     scopes.rpc(
         "status",
         Arc::new(crate::consensus::evidence::StatusScope {
+            app_state: app_state.clone(),
+        }),
+    );
+    scopes.rpc(
+        "regenesis",
+        Arc::new(crate::regenesis::rpc::RegenesisScope {
             app_state: app_state.clone(),
         }),
     );

@@ -14,6 +14,7 @@ pub mod gate;
 pub mod genesis;
 pub mod handlers;
 pub mod routes;
+pub mod rpc;
 pub mod seal;
 
 use serde::{Deserialize, Serialize};
