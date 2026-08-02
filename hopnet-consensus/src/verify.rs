@@ -192,3 +192,46 @@ pub fn verify_round_certificate(
     }
     Ok(())
 }
+
+/// Verify a WIRE-form commit certificate in one call: decode, derive the
+/// profile's thresholds from the given set's size, verify. The epoch-
+/// boundary seam (RFC-019 S6 lineage gate; S7 joiners): those callers
+/// hold wire certificates and a quorum profile, not engine internals —
+/// `CommitCertificate` is not re-exported, deliberately.
+pub fn verify_wire_certificate(
+    chain_id: &Blake3Hash,
+    cert: &crate::codec::WireCommitCertificate,
+    valset: &HopNetValidatorSet,
+    profile: &crate::config::QuorumProfile,
+) -> Result<(), String> {
+    use crate::config::MalachiteThresholds as _;
+    let decoded: CommitCertificate<HopNetContext> = cert
+        .try_into()
+        .map_err(|e: crate::codec::CodecError| format!("certificate decode: {e:?}"))?;
+    let thresholds = profile.thresholds_for(valset.count() as u64);
+    verify_commit_certificate(chain_id, &decoded, valset, thresholds)
+        .map_err(|e| format!("certificate verification: {e:?}"))
+}
+
+/// Fabricate one wire commit signature: a precommit on (height, round 0,
+/// value_id) signed by `key` for validator `address`. The certificate-
+/// CONSTRUCTION seam for code that must build certificates outside a
+/// running engine (epoch-boundary verification tests, S7 join fixtures).
+/// The production decide path never calls this — real certificates come
+/// from malachite.
+pub fn wire_commit_signature(
+    chain_id: &Blake3Hash,
+    key: &crate::types::PrivKey,
+    height: crate::context::Height,
+    value_id: Blake3Hash,
+    address: i32,
+) -> (i32, crate::codec::WireSig) {
+    let vote = HopNetContext.new_precommit(
+        height,
+        malachitebft_core_types::Round::new(0),
+        NilOrVal::Val(value_id),
+        Address(address),
+    );
+    let sig = crate::signing::sign_vote(chain_id, key, &vote);
+    (address, crate::codec::WireSig(sig.0.to_bytes()))
+}

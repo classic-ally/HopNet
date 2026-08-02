@@ -128,6 +128,16 @@ impl CustomUUID {
         self.0.as_bytes()
     }
 
+    /// Deterministic UUID from fixed bytes — for synthetic protocol
+    /// transactions whose identity must be a pure function of their
+    /// content (the epoch genesis tx, RFC-019 S6: every node must build
+    /// a byte-identical genesis block independently). Deliberately not
+    /// v7: no timestamp semantics, so retention scans ignore it — such
+    /// transactions never enter the pending pool anyway.
+    pub fn from_fixed_bytes(bytes: [u8; 16]) -> CustomUUID {
+        CustomUUID(Uuid::from_bytes(bytes))
+    }
+
     /// UUIDv7 cutoff for retention scans: `days` before now.
     ///
     /// Preserves sub-second precision: UUIDv7 ordering is millisecond-granular,

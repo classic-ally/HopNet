@@ -10,6 +10,7 @@
 //! regenesis-seal-contract.md.
 
 pub mod gate;
+pub mod genesis;
 pub mod handlers;
 pub mod routes;
 pub mod seal;
