@@ -943,11 +943,28 @@ pub(crate) mod tests {
         )
         .unwrap();
 
+        // The artifact identity has to be known BEFORE the block is built:
+        // the boundary block carries the `regenesis_commit` that decides it,
+        // and `verify_lineage` binds the record to that commit. Computing it
+        // first is sound because the artifact covers only EXPORTED tables —
+        // `decided_blocks` is divergence-only and `consensus_meta` is
+        // node-local, so nothing `install_genesis` writes can move it. The
+        // assertion below pins exactly that.
+        let real_hash = {
+            let tx = conn.transaction().unwrap();
+            let h = crate::db::snapshot::compute_artifact_hash_tx(&tx).unwrap();
+            tx.commit().unwrap();
+            h
+        };
+        let committed: [u8; 32] = *real_hash.0.as_bytes();
+
         let final_block = Block::new(BlockData {
             height: H,
             round: 0,
             parent_hash: Some(Blake3Hash::from_bytes([2; 32])),
-            transactions: Transactions(Vec::new()),
+            transactions: Transactions(vec![crate::regenesis::genesis::tests::commit_tx(
+                committed, H,
+            )]),
         })
         .unwrap();
         let chain = Blake3Hash::from_bytes(PREV_CHAIN);
@@ -979,20 +996,20 @@ pub(crate) mod tests {
         conn.execute(
             "INSERT INTO regenesis_state (internal_id, phase, target_version_code, snapshot_hash, seal_height)
              VALUES (1, 2, ?, ?, ?)",
-            params![TARGET, vec![0u8; 32], H as i64],
+            params![TARGET, committed.to_vec(), H as i64],
         )
         .unwrap();
-        let real_hash = {
+        {
             let tx = conn.transaction().unwrap();
-            let h = crate::db::snapshot::compute_artifact_hash_tx(&tx).unwrap();
+            let after = crate::db::snapshot::compute_artifact_hash_tx(&tx).unwrap();
             tx.commit().unwrap();
-            h
-        };
-        conn.execute(
-            "UPDATE regenesis_state SET snapshot_hash = ?",
-            params![real_hash.as_bytes().to_vec()],
-        )
-        .unwrap();
+            assert_eq!(
+                *after.0.as_bytes(),
+                committed,
+                "installing the genesis moved the artifact hash — an exported \
+                 table is being written outside the export set"
+            );
+        }
         hopnet_consensus::store::meta_put(&conn, seal::META_SEALED_AT, &H.to_be_bytes()).unwrap();
 
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
@@ -1673,13 +1690,21 @@ pub(crate) mod tests {
     fn import_gate_failure_leaves_old_database_untouched() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = sealed_db(dir.path());
-        // Corrupt the committed identity: no artifact (file or recompute)
-        // can ever match — this replica is "diverged".
+        // Diverge the replica's LOCAL STATE, not its record: mutate an
+        // exported table so no recomputation can reproduce the committed
+        // identity, while the committed hash and the block's
+        // `regenesis_commit` still agree with each other.
+        //
+        // Corrupting `regenesis_state.snapshot_hash` instead would now trip
+        // the LINEAGE gate first — the record would no longer match the
+        // commit the quorum certified — and this test would stop exercising
+        // the import gate it is named for. Divergence is a property of local
+        // state; a mangled record is a different failure.
         {
             let conn = open(&db_path);
             conn.execute(
-                "UPDATE regenesis_state SET snapshot_hash = ?",
-                params![vec![9u8; 32]],
+                "UPDATE users SET username = 'diverged' WHERE user_id = 1",
+                [],
             )
             .unwrap();
             conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")

@@ -235,8 +235,20 @@ pub fn synthetic_genesis_cert(block: &Block) -> WireCommitCertificate {
 }
 
 /// Boot gate 2 (and S7's joiner verification): the epoch-N final block
-/// really is what the record points at, and the certificate is a valid
-/// quorum proof over it by the seated set this node already trusted.
+/// really is what the record points at, the certificate is a valid quorum
+/// proof over it by the seated set this node already trusted, AND every
+/// field of the record that the quorum actually decided matches what the
+/// block says.
+///
+/// That last clause is load-bearing and was missing. A record is a
+/// PEER-SUPPLIED structure; only the certificate is evidence. The
+/// certificate binds the block hash, so anything inside the block is
+/// transitively quorum-bound and anything outside it is just a claim.
+/// `snapshot_hash` in particular decides which bytes the joiner imports
+/// as its entire initial state — with it unbound, a peer could pair a
+/// GENUINE block and a GENUINE certificate with a substituted hash and
+/// have the joiner accept an artifact of the peer's choosing, because
+/// the peer then controls both sides of the artifact comparison.
 pub fn verify_lineage(
     record: &EpochGenesisRecord,
     final_block: &Block,
@@ -259,8 +271,51 @@ pub fn verify_lineage(
     if cert.value_id != final_block.block_hash || cert.height != final_block.data.height {
         return Err("certificate does not bind the final block".into());
     }
+    verify_commit_binds_record(record, final_block)?;
     let prev_chain_id = Blake3Hash::from_bytes(record.prev_chain_id);
     hopnet_consensus::verify::verify_wire_certificate(&prev_chain_id, cert, valset, profile)
+}
+
+/// The record's certified fields, checked against the `regenesis_commit`
+/// the block actually carries. Split out so the failure modes read as
+/// separate refusals rather than one opaque mismatch.
+///
+/// The boundary block is a SOLO commit by construction (the drain empties
+/// the pool and the proposer strips siblings), so "exactly one" is
+/// asserted rather than assumed — a block padded with extra commits would
+/// otherwise let a peer choose which one the joiner reads.
+fn verify_commit_binds_record(
+    record: &EpochGenesisRecord,
+    final_block: &Block,
+) -> Result<(), String> {
+    let mut commits = final_block
+        .data
+        .transactions
+        .iter()
+        .filter(|t| t.rpc.function == "regenesis_commit");
+    let commit = commits
+        .next()
+        .ok_or("final block carries no regenesis_commit")?;
+    if commits.next().is_some() {
+        return Err("final block carries more than one regenesis_commit".into());
+    }
+
+    let (payload, _) = bincode::serde::decode_from_slice::<super::RegenesisCommit, _>(
+        &commit.rpc.payload,
+        bincode::config::standard(),
+    )
+    .map_err(|e| format!("regenesis_commit payload decode: {e}"))?;
+
+    if payload.snapshot_hash != record.snapshot_hash {
+        return Err("record snapshot_hash is not the one regenesis_commit decided".into());
+    }
+    if payload.seal_height != record.seal_height {
+        return Err(format!(
+            "record seal height {} != committed seal height {}",
+            record.seal_height, payload.seal_height
+        ));
+    }
+    Ok(())
 }
 
 /// The seated set from a record, as an engine validator set — what a
@@ -509,7 +564,7 @@ pub fn verify_lineage_chain(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use hopnet_consensus::context::Height;
@@ -524,6 +579,76 @@ mod tests {
 
     fn key(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
+    }
+
+    /// A block at `height` carrying `txs`, plus a full-quorum certificate
+    /// over it by the fixture's two seated nodes. Every negative case below
+    /// needs a cert that genuinely binds its own block, or the earlier
+    /// cert-binding check fires and the assertion under test is never
+    /// reached.
+    fn certified(height: u64, txs: Vec<Transaction>) -> (Block, WireCommitCertificate) {
+        let block = Block::new(BlockData {
+            height,
+            round: 0,
+            parent_hash: Some(Blake3Hash::from_bytes([2; 32])),
+            transactions: Transactions(txs),
+        })
+        .unwrap();
+        let chain = Blake3Hash::from_bytes(PREV_CHAIN);
+        let cert = WireCommitCertificate {
+            height,
+            round: 0,
+            value_id: block.block_hash,
+            signatures: vec![
+                wire_commit_signature(
+                    &chain,
+                    &PrivKey(key(1)),
+                    Height(height),
+                    block.block_hash,
+                    1,
+                ),
+                wire_commit_signature(
+                    &chain,
+                    &PrivKey(key(2)),
+                    Height(height),
+                    block.block_hash,
+                    2,
+                ),
+            ],
+        };
+        (block, cert)
+    }
+
+    /// The boundary block as production builds it: a SOLO `regenesis_commit`
+    /// carrying the same snapshot identity the sealed row holds. The record
+    /// is verified AGAINST this block, so a fixture with an empty block
+    /// could never exercise that binding.
+    ///
+    /// Deterministic on purpose — Ed25519 signing is, and the nonce is
+    /// fixed rather than a fresh UUIDv7, so the block hash (and therefore
+    /// `canonical_bytes_golden`) is reproducible.
+    pub(crate) fn commit_tx(snapshot_hash: [u8; 32], seal_height: u64) -> Transaction {
+        let payload = bincode::serde::encode_to_vec(
+            &crate::regenesis::RegenesisCommit {
+                snapshot_hash,
+                seal_height,
+            },
+            bincode::config::standard(),
+        )
+        .unwrap();
+        let rpc = RpcCall {
+            function: "regenesis_commit".to_string(),
+            payload,
+        };
+        let signature = rpc.sign(&PrivKey(key(1))).unwrap();
+        Transaction {
+            rpc,
+            submitter: SignedIdentity { id: 1, signature },
+            user: None,
+            nonce: "00000000-0000-7000-8000-000000000001"
+                .parse::<CustomUUID>()
+                .unwrap(),
+        }
     }
 
     fn pubkey_blob(k: &SigningKey) -> Vec<u8> {
@@ -579,7 +704,7 @@ mod tests {
             height: H,
             round: 0,
             parent_hash: Some(Blake3Hash::from_bytes([2; 32])),
-            transactions: Transactions(Vec::new()),
+            transactions: Transactions(vec![commit_tx(SNAP, H)]),
         })
         .unwrap();
         let chain = Blake3Hash::from_bytes(PREV_CHAIN);
@@ -658,9 +783,14 @@ mod tests {
         let pool = sealed_pool(false);
         let g = build_epoch_genesis(&pool.get().unwrap()).unwrap();
         let digest = blake3::hash(&g.record.canonical_bytes().unwrap());
+        // Re-pinned when the fixture's boundary block gained the real
+        // `regenesis_commit` it always should have carried: the record
+        // embeds `final_block_hash`, so changing the block changes this
+        // digest. `format_version` is deliberately NOT bumped — the
+        // encoding is untouched, only the fixture's input.
         assert_eq!(
             digest.to_hex().as_str(),
-            "f56b90cd1454fea53030fa232865cf3876bcf7da311256bf4b8f06c2da8d2f54",
+            "07799f2e5a8d6ba21b0f4a060567bc6331371f8fec9b2616a163a0314e6b2edd",
             "canonical genesis encoding changed — if intentional, bump \
              format_version and re-pin"
         );
@@ -705,6 +835,70 @@ mod tests {
         })
         .unwrap();
         assert!(verify_lineage(&lineage.record, &other, &cert, &valset, &profile).is_err());
+    }
+
+    // Impact: this is the S7 straggler/join attack stated as a test. The
+    // record is PEER-SUPPLIED and only the certificate is evidence, so a
+    // field the quorum decided but nothing cross-checks is a field the
+    // serving peer chooses. `snapshot_hash` selects the bytes a joiner
+    // imports as its ENTIRE initial state, and the joiner compares its
+    // download against that same field — so leaving it unbound hands both
+    // sides of the comparison to the attacker.
+    // Should: refuse a record whose snapshot_hash was swapped, even though
+    //   the block and the quorum certificate are completely genuine.
+    // Should: refuse a swapped seal height on the same basis.
+    // Should not: accept a boundary block with no regenesis_commit to bind
+    //   against, nor one padded with a second commit to choose from.
+    #[test]
+    fn record_fields_must_match_the_committed_regenesis_commit() {
+        let pool = sealed_pool(false);
+        let g = build_epoch_genesis(&pool.get().unwrap()).unwrap();
+        let valset = record_valset(&g.record).unwrap();
+        let profile = QuorumProfile::parse(&g.record.quorum_profile).unwrap();
+
+        // Baseline: the honest record verifies.
+        verify_lineage(&g.record, &g.final_block, &g.final_cert, &valset, &profile).unwrap();
+
+        // THE ATTACK: genuine block, genuine cert, substituted snapshot
+        // identity. Everything the old implementation checked still holds.
+        let mut forged = g.record.clone();
+        forged.snapshot_hash = [0xFE; 32];
+        let err = verify_lineage(&forged, &g.final_block, &g.final_cert, &valset, &profile)
+            .expect_err("a substituted snapshot_hash must be refused");
+        assert!(err.contains("snapshot_hash"), "unexpected refusal: {err}");
+
+        // Same shape for the height the commit decided. Bumped in BOTH the
+        // record and the block so the pre-existing height check passes and
+        // only the commit binding can catch it.
+        let (lied_block, lied_cert) = certified(H + 1, vec![commit_tx(SNAP, H)]);
+        let mut lied = g.record.clone();
+        lied.seal_height = H + 1;
+        lied.final_block_hash = *lied_block.block_hash.0.as_bytes();
+        let err = verify_lineage(&lied, &lied_block, &lied_cert, &valset, &profile)
+            .expect_err("a seal height the commit did not decide must be refused");
+        assert!(err.contains("seal height"), "unexpected refusal: {err}");
+
+        // Nothing to bind against. The certificate has to cover THIS block,
+        // otherwise the earlier cert-binding check fires and the commit
+        // check is never reached.
+        let (empty, empty_cert) = certified(H, Vec::new());
+        let mut points_at_empty = g.record.clone();
+        points_at_empty.final_block_hash = *empty.block_hash.0.as_bytes();
+        let err = verify_lineage(&points_at_empty, &empty, &empty_cert, &valset, &profile)
+            .expect_err("a block with no regenesis_commit must be refused");
+        assert!(
+            err.contains("no regenesis_commit"),
+            "unexpected refusal: {err}"
+        );
+
+        // Two commits would let the peer pick which one the joiner reads.
+        let (padded, padded_cert) =
+            certified(H, vec![commit_tx(SNAP, H), commit_tx([0x11; 32], H)]);
+        let mut points_at_padded = g.record.clone();
+        points_at_padded.final_block_hash = *padded.block_hash.0.as_bytes();
+        let err = verify_lineage(&points_at_padded, &padded, &padded_cert, &valset, &profile)
+            .expect_err("more than one regenesis_commit must be refused");
+        assert!(err.contains("more than one"), "unexpected refusal: {err}");
     }
 
     // Should: refuse to construct from anything but a sealed database —
@@ -760,11 +954,15 @@ mod tests {
         for (i, (ids, profile)) in hops.iter().enumerate() {
             let epoch = start_epoch + 1 + i as u64;
             let seal_height = H + i as u64 * 10;
+            let snapshot_hash = [epoch as u8; 32];
+            // Each hop's block must carry the commit its record claims —
+            // `verify_lineage` binds the two, so an empty block here would
+            // make every hop unverifiable.
             let final_block = Block::new(BlockData {
                 height: seal_height,
                 round: 0,
                 parent_hash: Some(Blake3Hash::from_bytes([2; 32])),
-                transactions: Transactions(Vec::new()),
+                transactions: Transactions(vec![commit_tx(snapshot_hash, seal_height)]),
             })
             .unwrap();
             let domain = Blake3Hash::from_bytes(chain);
@@ -792,7 +990,7 @@ mod tests {
                 prev_chain_id: chain,
                 final_block_hash: *final_block.block_hash.0.as_bytes(),
                 seal_height,
-                snapshot_hash: [epoch as u8; 32],
+                snapshot_hash,
                 quorum_profile: (*profile).to_string(),
                 seated: seated_of(ids),
             };
