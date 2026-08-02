@@ -57,16 +57,19 @@ fn run_driver(data_dir: &Path, args: &[String]) -> Result<serde_json::Value> {
     serde_json::from_slice(&output.stdout).context("driver output json")
 }
 
-async fn run_driver_async(data_dir: PathBuf, args: Vec<String>) -> Result<serde_json::Value> {
+pub(crate) async fn run_driver_async(
+    data_dir: PathBuf,
+    args: Vec<String>,
+) -> Result<serde_json::Value> {
     tokio::task::spawn_blocking(move || run_driver(&data_dir, &args))
         .await
         .context("driver task")?
 }
 
 /// (photo_id, [(resource type name, blake3 hex)]) from a driver report.
-type ReportPhoto = (String, Vec<(String, String)>);
+pub(crate) type ReportPhoto = (String, Vec<(String, String)>);
 
-fn report_photos(report: &serde_json::Value) -> Result<Vec<ReportPhoto>> {
+pub(crate) fn report_photos(report: &serde_json::Value) -> Result<Vec<ReportPhoto>> {
     report["photos"]
         .as_array()
         .context("photos array")?

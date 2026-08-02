@@ -12,7 +12,12 @@
 //!                    fabricate N photos (personal, or shared when a mesh
 //!                    library id is given)
 //!   publish          --data-dir D --node-url U --device-token T
+//!                    drains BOTH queues: unpublished photos, and published
+//!                    photos whose tombstone state the mesh has not been told
 //!   reset-published  --data-dir D                 clear published_at (probe)
+//!   tombstone        --data-dir D [--restore]     set/clear deleted_at on
+//!                    every photo, standing in for a PhotoKit delete or a
+//!                    restore out of Recently Deleted
 //!
 //! Publish exit codes: 0 = queue drained; 2 = node unreachable (pass
 //! parked); 3 = SOME publish scope parked on responsibility — since the
@@ -28,7 +33,9 @@ use clap::{Parser, Subcommand};
 use ingress_core::descriptor::AssetDescriptor;
 use ingress_core::fixtures::AssetDescriptorBuilder;
 use ingress_core::paths::DataDir;
-use ingress_core::publish::{PublishState, claim_publishable, run_publish_pass};
+use ingress_core::publish::{
+    PublishState, claim_publishable, claim_tombstone_propagatable, run_publish_pass,
+};
 use ingress_core::scheduler::{
     CancelToken, FetchFailure, FetchRequest, FreeSpaceProbe, ResourceFetcher, Scheduler,
     SchedulerConfig, StreamSink,
@@ -75,6 +82,16 @@ enum Cmd {
     /// Clear published_at on every photo (idempotency probe: a re-publish
     /// must confirm-first and report already_published, never re-submit).
     ResetPublished,
+    /// Mark every photo deleted (or, with --restore, alive again) as though
+    /// PhotoKit had observed it — drives the propagation queue without a
+    /// Mac. Leaves `tombstone_published_at` alone; the next publish pass is
+    /// what tells the mesh.
+    Tombstone {
+        /// Clear deleted_at instead of setting it (restore from Recently
+        /// Deleted).
+        #[arg(long)]
+        restore: bool,
+    },
 }
 
 struct MaxProbe;
@@ -276,19 +293,36 @@ async fn main() {
                 let claimed = claim_publishable(&store, &cfg, &HashSet::new())
                     .await
                     .expect("claim");
-                if claimed.is_empty() {
+                let propagatable = claim_tombstone_propagatable(&store, &cfg, &HashSet::new())
+                    .await
+                    .expect("claim propagatable");
+                if claimed.is_empty() && propagatable.is_empty() {
                     break;
                 }
-                let report = run_publish_pass(&store, &spool, &publisher, &cfg, claimed, &mut state)
-                    .await
-                    .expect("publish pass");
+                let report = run_publish_pass(
+                    &store,
+                    &spool,
+                    &publisher,
+                    &cfg,
+                    claimed,
+                    propagatable,
+                    &mut state,
+                )
+                .await
+                .expect("publish pass");
                 // Unreachable parks the whole pass — nothing more can move.
                 // A responsibility park is PER SCOPE: a mixed claim batch may
                 // park one scope while another still has queued photos, so
                 // keep passing until a pass moves nothing (parked photos
                 // burn no attempts and stay claimable — a zero-progress pass
-                // means only parked scopes remain).
-                let progress = report.published + report.already_published + report.adopted;
+                // means only parked scopes remain). Propagation counts as
+                // progress: a pass that only told the mesh about deletes
+                // still moved the queue forward.
+                let progress = report.published
+                    + report.already_published
+                    + report.adopted
+                    + report.tombstones_propagated
+                    + report.restores_propagated;
                 let parked = report.parked;
                 totals.absorb(&report);
                 if parked || progress == 0 {
@@ -303,6 +337,8 @@ async fn main() {
                 "failed": totals.failed,
                 "gave_up": totals.gave_up,
                 "missing_descriptor": totals.missing_descriptor,
+                "tombstones_propagated": totals.tombstones_propagated,
+                "restores_propagated": totals.restores_propagated,
                 "evicted_blobs": totals.evicted_blobs,
                 "parked": totals.parked,
                 "parked_responsibility": totals.parked_responsibility,
@@ -326,6 +362,25 @@ async fn main() {
                 .expect("reset")
                 .rows_affected();
             println!("{}", serde_json::json!({ "reset": cleared }));
+        }
+
+        Cmd::Tombstone { restore } => {
+            let affected = if restore {
+                sqlx::query("UPDATE photos SET deleted_at = NULL WHERE deleted_at IS NOT NULL")
+                    .execute(store.raw_pool())
+                    .await
+                    .expect("restore")
+                    .rows_affected()
+            } else {
+                sqlx::query("UPDATE photos SET deleted_at = ? WHERE deleted_at IS NULL")
+                    .bind(chrono::Utc::now())
+                    .execute(store.raw_pool())
+                    .await
+                    .expect("tombstone")
+                    .rows_affected()
+            };
+            let key = if restore { "restored" } else { "tombstoned" };
+            println!("{}", serde_json::json!({ key: affected }));
         }
     }
 }
