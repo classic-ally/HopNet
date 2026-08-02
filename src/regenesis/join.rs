@@ -225,15 +225,32 @@ pub async fn run_epoch_join_with(
 ) -> Result<(), String> {
     let staging = staging_path(db_path);
 
-    // Idempotent: a complete staging is already verified — re-signal and
-    // return rather than refetching (a restart that raced the signal, or
-    // a second trigger firing).
+    // Idempotent: a complete staging is already verified, so re-signal
+    // rather than refetching (a restart that raced the signal, or a
+    // second trigger firing — several can observe the same epoch-ahead
+    // peer at once).
+    //
+    // The version gate applies here EXACTLY as it does on the fetch
+    // path. Signalling unconditionally would restart a node into a
+    // binary that can only park again: the boot path's staged-join gate
+    // refuses the epoch, so the node exits, boots, parks, and is briefly
+    // unreachable for nothing.
     if let Some(m) = read_manifest(&staging) {
-        set_state(format!(
-            "staged for epoch {} — awaiting restart",
-            m.target_epoch
-        ));
-        app_state.restart_signal.notify_one();
+        if running_code == m.required_version_code {
+            set_state(format!(
+                "staged for epoch {} — awaiting restart",
+                m.target_epoch
+            ));
+            app_state.restart_signal.notify_one();
+        } else {
+            set_state(format!(
+                "staged for epoch {}, but it requires version {} (running {}) — awaiting upgrade",
+                m.target_epoch,
+                crate::version::format_code(m.required_version_code),
+                crate::version::format_code(running_code),
+            ));
+            crate::regenesis::boot::write_awaiting_marker(db_path, m.required_version_code);
+        }
         return Ok(());
     }
     if peers.is_empty() {
@@ -1403,6 +1420,79 @@ mod tests {
         // Nothing was imported.
         let conn = app_state.db_pool.get().unwrap();
         assert_eq!(genesis::current_epoch(&conn), 1);
+    }
+
+    // Impact: several triggers can observe the same epoch-ahead peer at
+    // once, so the idempotent path runs often — and it must honour the
+    // version gate the fetch path just honoured. Signalling regardless
+    // restarts a node into a binary that can only park again, taking it
+    // offline for nothing. Caught on real containers, where a parked
+    // node staged correctly and was then restarted by a second trigger.
+    // Should: re-signal only when this binary can actually build the
+    // staged epoch.
+    // Should not: request a restart when the staged epoch needs another
+    // version — write the awaiting-upgrade marker instead.
+    #[test]
+    fn idempotent_restage_still_honours_the_version_gate() {
+        let server_dir = tempfile::tempdir().unwrap();
+        let server = transitioned(server_dir.path());
+        let client_dir = tempfile::tempdir().unwrap();
+        let (app_state, db_path) = straggler(client_dir.path());
+        let transport = LocalTransport::new(vec![(2, server.clone())]);
+
+        // First pass on the WRONG version: stages, marks, no restart.
+        rt().block_on(run_epoch_join_with(
+            &app_state,
+            &db_path,
+            JoinAnchor::OwnDb,
+            vec![peer(2)],
+            &transport,
+            TARGET + 100,
+        ))
+        .unwrap();
+        assert!(read_manifest(&staging_path(&db_path)).is_some());
+
+        // Second trigger over the SAME complete staging, same wrong
+        // version: still no restart.
+        rt().block_on(run_epoch_join_with(
+            &app_state,
+            &db_path,
+            JoinAnchor::OwnDb,
+            vec![peer(2)],
+            &transport,
+            TARGET + 100,
+        ))
+        .unwrap();
+        rt().block_on(async {
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(50),
+                    app_state.restart_signal.notified()
+                )
+                .await
+                .is_err(),
+                "a re-staged node on the wrong version must not restart"
+            );
+        });
+
+        // On the right binary, the same staging DOES ask for a restart.
+        rt().block_on(run_epoch_join_with(
+            &app_state,
+            &db_path,
+            JoinAnchor::OwnDb,
+            vec![peer(2)],
+            &transport,
+            TARGET,
+        ))
+        .unwrap();
+        rt().block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                app_state.restart_signal.notified(),
+            )
+            .await
+            .expect("the correct version restarts into the staged epoch");
+        });
     }
 
     // Impact: an upgrade-epoch straggler must not be told to restart
