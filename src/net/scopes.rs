@@ -154,18 +154,15 @@ impl ConsensusScope {
             } => {
                 // Epoch gate (RFC-019 S6 handshake): decided history is
                 // only meaningful within one epoch — a cross-epoch
-                // requester needs the lineage record, not blocks (S7's
-                // epoch-join path extends this refusal into an answer).
+                // requester needs the lineage record, not blocks. The
+                // structured refusal is the requester's signpost into the
+                // epoch-join path (S7); the "regenesis" scope answers it.
                 let local_epoch = self
                     .app_state
                     .epoch
                     .load(std::sync::atomic::Ordering::Relaxed);
                 if epoch != local_epoch {
-                    return ConsensusNetResponse::Error {
-                        message: format!(
-                            "epoch mismatch: local={local_epoch}, requester={epoch}"
-                        ),
-                    };
+                    return ConsensusNetResponse::EpochMismatch { local_epoch };
                 }
                 let app_state = self.app_state.clone();
                 crate::consensus::queue::queue_rt()

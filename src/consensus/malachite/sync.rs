@@ -35,6 +35,31 @@ pub enum SyncError {
     Exhausted { reached: u64, target: u64 },
     /// The consensus shell is gone.
     ShellStopped,
+    /// A peer refused with a NEWER epoch (RFC-019 S7): this node's decided
+    /// history is from a sealed epoch and no amount of block sync helps —
+    /// the caller must pivot into the epoch-join path. Surfaced on the
+    /// FIRST such refusal: one claim suffices because the join verifies
+    /// everything cryptographically before acting on it.
+    EpochAhead { peer: i32, peer_epoch: u64 },
+}
+
+/// A single fetch's failure, classified: transport/malformed strikes count
+/// against the peer; an epoch-ahead refusal is a signpost, not a strike.
+#[derive(Debug)]
+enum FetchError {
+    Transport(String),
+    EpochMismatch { peer_epoch: u64 },
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FetchError::Transport(m) => write!(f, "{m}"),
+            FetchError::EpochMismatch { peer_epoch } => {
+                write!(f, "epoch mismatch: peer is on epoch {peer_epoch}")
+            }
+        }
+    }
 }
 
 /// Sync until `decided` reaches `target`. Tries `hint_peer` first, then
@@ -188,6 +213,22 @@ async fn sync_loop(
                 tracing::debug!("sync: node {} has nothing for [{from}, {to}]", peer.node_id);
                 empty_answers += 1;
             }
+            // A peer on a NEWER epoch: block sync is over — the caller
+            // pivots into the epoch-join path (RFC-019 S7).
+            Err(FetchError::EpochMismatch { peer_epoch }) if peer_epoch > epoch => {
+                tracing::info!(
+                    peer = peer.node_id,
+                    peer_epoch,
+                    local_epoch = epoch,
+                    "sync: peer answered from a newer epoch (epoch join needed)"
+                );
+                return Err(SyncError::EpochAhead {
+                    peer: peer.node_id,
+                    peer_epoch,
+                });
+            }
+            // A peer BEHIND us (it is the straggler) counts like any
+            // other unusable answer.
             Err(e) => {
                 tracing::debug!("sync: fetch from node {} failed: {e}", peer.node_id);
                 failures += 1;
@@ -267,7 +308,7 @@ async fn fetch_chunk(
     peer: &PeerRef,
     from: u64,
     to: u64,
-) -> Result<Vec<(Block, WireCommitCertificate)>, String> {
+) -> Result<Vec<(Block, WireCommitCertificate)>, FetchError> {
     let payload = crate::net::encode_payload(&ConsensusNetRequest::DecidedFetch {
         from_height: from,
         to_height: to,
@@ -276,22 +317,65 @@ async fn fetch_chunk(
     let reply = comms
         .rpc(peer, "consensus", payload, FETCH_TIMEOUT)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| FetchError::Transport(e.to_string()))?;
+    parse_fetch_reply(&reply)
+}
+
+/// Decode and classify a decided-fetch reply. Split from the transport so
+/// the classification — the epoch-join signpost vs an ordinary strike —
+/// is testable without a mesh.
+fn parse_fetch_reply(reply: &[u8]) -> Result<Vec<(Block, WireCommitCertificate)>, FetchError> {
     let response: ConsensusNetResponse =
-        crate::net::decode_payload(&reply).map_err(|e| e.to_string())?;
+        crate::net::decode_payload(reply).map_err(|e| FetchError::Transport(e.to_string()))?;
 
     match response {
         ConsensusNetResponse::Decided { items } => {
             let mut out = Vec::with_capacity(items.len());
             for (block_bytes, cert_bytes) in &items {
-                let block: Block = codec::decode(block_bytes).map_err(|e| e.to_string())?;
+                let block: Block =
+                    codec::decode(block_bytes).map_err(|e| FetchError::Transport(e.to_string()))?;
                 let cert: WireCommitCertificate =
-                    codec::decode(cert_bytes).map_err(|e| e.to_string())?;
+                    codec::decode(cert_bytes).map_err(|e| FetchError::Transport(e.to_string()))?;
                 out.push((block, cert));
             }
             Ok(out)
         }
-        ConsensusNetResponse::Error { message } => Err(message),
-        other => Err(format!("unexpected response: {other:?}")),
+        ConsensusNetResponse::EpochMismatch { local_epoch } => Err(FetchError::EpochMismatch {
+            peer_epoch: local_epoch,
+        }),
+        ConsensusNetResponse::Error { message } => Err(FetchError::Transport(message)),
+        other => Err(FetchError::Transport(format!("unexpected response: {other:?}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Impact: the classification is the whole point of the structured
+    // refusal — an epoch-ahead peer must read as "pivot to epoch join",
+    // never as one more transport strike that exhausts the peer list.
+    // Should: classify an EpochMismatch reply as the epoch signpost and
+    // a bare Error reply as a transport failure.
+    #[test]
+    fn fetch_reply_classification() {
+        let mismatch = crate::net::encode_payload(&ConsensusNetResponse::EpochMismatch {
+            local_epoch: 3,
+        });
+        match parse_fetch_reply(&mismatch) {
+            Err(FetchError::EpochMismatch { peer_epoch: 3 }) => {}
+            other => panic!("expected epoch signpost, got {other:?}"),
+        }
+
+        let error = crate::net::encode_payload(&ConsensusNetResponse::Error {
+            message: "db pool exhausted".into(),
+        });
+        match parse_fetch_reply(&error) {
+            Err(FetchError::Transport(m)) => assert!(m.contains("db pool")),
+            other => panic!("expected transport strike, got {other:?}"),
+        }
+
+        let empty = crate::net::encode_payload(&ConsensusNetResponse::Decided { items: vec![] });
+        assert!(matches!(parse_fetch_reply(&empty), Ok(ref v) if v.is_empty()));
     }
 }

@@ -568,7 +568,8 @@ fn handshake_carries_epoch_and_refuses_mismatched_fetch() {
         .build()
         .unwrap();
 
-    // Fetch from another epoch: refused before any DB read.
+    // Fetch from another epoch: refused before any DB read, with the
+    // STRUCTURED refusal the S7 epoch-join classification pivots on.
     let scope = crate::net::scopes::ConsensusScope {
         app_state: node.app_state.clone(),
     };
@@ -581,10 +582,10 @@ fn handshake_carries_epoch_and_refuses_mismatched_fetch() {
         }),
     ));
     match resp {
-        ConsensusNetResponse::Error { message } => {
-            assert!(message.contains("epoch mismatch"), "{message}")
+        ConsensusNetResponse::EpochMismatch { local_epoch } => {
+            assert_eq!(local_epoch, 1)
         }
-        other => panic!("expected refusal, got {other:?}"),
+        other => panic!("expected structured refusal, got {other:?}"),
     }
 
     // Same epoch: served from the DB even with NO engine (a parked node
