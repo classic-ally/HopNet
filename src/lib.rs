@@ -18,12 +18,16 @@ pub mod devices;
 // Drive-owned (RFC-015, Stage D4): the DocumentProvider routes live in
 // hopnet_drive::http::documentprovider; the host mounts them in main.rs.
 pub mod capabilities;
+pub mod dev_seed;
 pub mod fileprovider;
 pub mod handlers;
 pub mod metrics;
 pub mod net;
 pub mod nodes;
 pub mod passphrase;
+pub mod photo_ingress;
+pub mod photos;
+pub mod photos_host;
 pub mod projections;
 pub mod reference_providers;
 pub mod setup;
@@ -81,6 +85,7 @@ pub struct AppState {
     /// Per-peer liveness evidence (RFC-CONSENSUS-002 S3). One writer lock
     /// per authenticated exchange; classification is pure over snapshots.
     pub evidence: Arc<consensus::evidence::EvidenceMap>,
+    pub photos_host: Arc<photos::PhotosHost>,
     /// The MAIN multi-thread runtime's handle, captured at startup.
     /// Host-side background work scheduled from consensus apply
     /// (`HostWorkScheduler`) spawns here — apply runs on the consensus

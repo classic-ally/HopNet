@@ -1,7 +1,7 @@
 //! Tier-2 on-demand invariant audit (spec §Recovery Tier 2): refcount
-//! drift, missing blob files (byte loss — loud, never repairable), orphan
-//! blob files (deleted only under `--repair` — the one destructive repair),
-//! and sidecar consistency, local and remote.
+//! drift, missing blob files (byte loss — loud, never repairable), and
+//! orphan blob files (deleted only under `--repair` — the one destructive
+//! repair).
 //!
 //! The default run is READ-ONLY: it works on a read-only store, takes no
 //! lock, and logs nothing. `--repair` requires a writable store; it takes
@@ -13,12 +13,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::error::Result;
-use crate::ids::{ContentHash, LibraryId, PhotoId};
-use crate::model::LibraryConfig;
-use crate::paths::{BlobPaths, DataDir};
+use crate::ids::{ContentHash, LibraryId};
+
+use crate::paths::DataDir;
 use crate::recovery::{RefcountDrift, recount_diff, repair_refcounts};
-use crate::sidecar::Sidecar;
-use crate::sidecar_io::find_sidecar;
 use crate::store::StateStore;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -26,8 +24,6 @@ pub struct FsckOptions {
     /// Apply repairs: refcount drift and orphan-file deletion. Requires a
     /// writable store; takes the exclusive run lock.
     pub repair: bool,
-    /// Byte-compare remote sidecars against local (default: existence only).
-    pub deep: bool,
 }
 
 /// A `blobs` row whose file is gone: byte loss (or manual tampering).
@@ -45,7 +41,6 @@ pub struct MissingBlob {
 /// rename and commit, or a crashed hard-delete's leftovers).
 #[derive(Debug, serde::Serialize)]
 pub struct OrphanBlob {
-    pub library_id: LibraryId,
     pub path: PathBuf,
 }
 
@@ -61,47 +56,6 @@ pub struct ExtMismatch {
     pub path: PathBuf,
 }
 
-#[derive(Debug, serde::Serialize)]
-pub struct SidecarFinding {
-    pub photo_id: PhotoId,
-    pub library_id: LibraryId,
-    #[serde(flatten)]
-    pub kind: SidecarProblem,
-}
-
-#[derive(Debug, serde::Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum SidecarProblem {
-    /// Materialized photo with no local sidecar (crash between the
-    /// completion tx and the first sidecar write).
-    Missing,
-    ParseError {
-        error: String,
-    },
-    /// Db-backed fields disagree with the document. Capture metadata lives
-    /// only in the sidecar and is deliberately not checkable.
-    Mismatch {
-        fields: Vec<String>,
-    },
-}
-
-#[derive(Debug, serde::Serialize)]
-pub struct RemoteFinding {
-    pub photo_id: PhotoId,
-    pub library_id: LibraryId,
-    #[serde(flatten)]
-    pub kind: RemoteProblem,
-}
-
-#[derive(Debug, serde::Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum RemoteProblem {
-    /// `sidecar_replicated_at` is stamped but the remote copy is absent.
-    Missing { path: PathBuf },
-    /// Remote bytes differ from local (`--deep` only).
-    Differs { path: PathBuf },
-}
-
 #[derive(Debug, Default, serde::Serialize)]
 pub struct FsckReport {
     pub refcount_drift: Vec<RefcountDrift>,
@@ -114,11 +68,6 @@ pub struct FsckReport {
     /// Unparseable names or wrong-depth entries in the blob tree — never
     /// deleted, listed for the operator.
     pub foreign_files: Vec<PathBuf>,
-    pub sidecar_findings: Vec<SidecarFinding>,
-    pub remote_findings: Vec<RemoteFinding>,
-    /// Roots that could not be checked (mount down). Advisory: an absent
-    /// mount must never read as byte loss.
-    pub skipped_roots: Vec<String>,
 }
 
 impl FsckReport {
@@ -131,8 +80,6 @@ impl FsckReport {
             && (self.orphan_blobs.len() as u64 == self.orphans_deleted)
             && self.ext_mismatches.is_empty()
             && self.foreign_files.is_empty()
-            && self.sidecar_findings.is_empty()
-            && self.remote_findings.is_empty()
     }
 }
 
@@ -168,11 +115,7 @@ pub async fn run_fsck(
         report.refcount_repaired = true;
     }
 
-    let libraries = store.libraries().await?;
-    for library in &libraries {
-        check_blob_tree(store, library, opts, &mut report).await?;
-        check_sidecars(store, data_dir, library, opts, &mut report).await?;
-    }
+    check_blob_tree(store, &data_dir.spool(), opts, &mut report).await?;
 
     if report.orphans_deleted > 0 {
         let samples: Vec<String> = report
@@ -195,46 +138,46 @@ pub async fn run_fsck(
     Ok(report)
 }
 
-/// Blob-existence (b) and orphan-scan (c) checks for one library.
+/// Blob-existence (b) and orphan-scan (c) checks over the process-global
+/// spool. The spool is hash-addressed: one file can back rows in several
+/// libraries, so a hash is "live" (bytes expected on disk) iff ANY
+/// library's row for it is unevicted.
 async fn check_blob_tree(
     store: &StateStore,
-    library: &LibraryConfig,
+    spool: &crate::paths::SpoolPaths,
     opts: &FsckOptions,
     report: &mut FsckReport,
 ) -> Result<()> {
-    let paths = BlobPaths::new(&library.blob_root);
-    let rows = store.blobs_for_library(&library.library_id).await?;
-
-    // Mount-down guard: an entirely-absent root is advisory, not thousands
-    // of byte-loss findings.
-    if !Path::new(&library.blob_root).is_dir() {
-        report.skipped_roots.push(format!(
-            "{}: blob root unavailable ({})",
-            library.library_id, library.blob_root
-        ));
-        return Ok(());
+    // Live hashes across every library. Spool-evicted rows are excluded —
+    // their bytes are SUPPOSED to be gone (HopNet holds them) — so a
+    // lingering file for an all-evicted hash classifies as a benign orphan
+    // in the walk below.
+    let mut row_exts: HashMap<ContentHash, (String, LibraryId)> = HashMap::new();
+    for library in store.libraries().await? {
+        for row in store.blobs_for_library(&library.library_id).await? {
+            if row.evicted_at.is_none() {
+                row_exts.insert(row.content_hash, (row.ext, library.library_id.clone()));
+            }
+        }
     }
 
-    // (b) every row's file must exist. The root is reachable here, so a
-    // miss is genuine.
-    let mut row_exts: HashMap<ContentHash, String> = HashMap::new();
-    for row in rows {
-        let expected = paths.blob_path(&row.content_hash, &row.ext);
+    // (b) every live hash's file must exist. The spool is a local
+    // directory — no mount-down class.
+    for (hash, (ext, library_id)) in &row_exts {
+        let expected = spool.blob_path(hash, ext);
         if !expected.is_file() {
             report.missing_blobs.push(MissingBlob {
-                library_id: library.library_id.clone(),
-                content_hash: row.content_hash.clone(),
-                ext: row.ext.clone(),
+                library_id: library_id.clone(),
+                content_hash: hash.clone(),
+                ext: ext.clone(),
                 expected_path: expected,
             });
         }
-        row_exts.insert(row.content_hash, row.ext);
     }
 
-    // (c) walk <blob_root>/blobs/ two fan-out levels, skipping .partial
-    // and Finder's .DS_Store droppings (browsing the share plants them at
-    // every level; flagging them would pin fsck at exit 1 forever).
-    let blobs_dir = paths.blobs_dir();
+    // (c) walk <spool>/blobs/ two fan-out levels, skipping .partial and
+    // Finder's .DS_Store droppings.
+    let blobs_dir = spool.blobs_dir();
     if !blobs_dir.is_dir() {
         return Ok(()); // nothing written yet; (b) already covered the rows
     }
@@ -257,14 +200,7 @@ async fn check_blob_tree(
                 continue;
             }
             for entry in fs::read_dir(bb.path()).map_err(io_invariant)?.flatten() {
-                classify_blob_file(
-                    &entry.path(),
-                    (&name, &bb_name),
-                    library,
-                    &row_exts,
-                    opts,
-                    report,
-                );
+                classify_blob_file(&entry.path(), (&name, &bb_name), &row_exts, opts, report);
             }
         }
     }
@@ -275,8 +211,7 @@ async fn check_blob_tree(
 fn classify_blob_file(
     path: &Path,
     fanout: (&str, &str),
-    library: &LibraryConfig,
-    row_exts: &HashMap<ContentHash, String>,
+    row_exts: &HashMap<ContentHash, (String, LibraryId)>,
     opts: &FsckOptions,
     report: &mut FsckReport,
 ) {
@@ -307,9 +242,9 @@ fn classify_blob_file(
     };
 
     match row_exts.get(&hash) {
-        Some(row_ext) if *row_ext == file_ext => {} // expected
-        Some(row_ext) => report.ext_mismatches.push(ExtMismatch {
-            library_id: library.library_id.clone(),
+        Some((row_ext, _)) if *row_ext == file_ext => {} // expected
+        Some((row_ext, library_id)) => report.ext_mismatches.push(ExtMismatch {
+            library_id: library_id.clone(),
             content_hash: hash,
             row_ext: row_ext.clone(),
             file_ext,
@@ -320,170 +255,12 @@ fn classify_blob_file(
                 report.orphans_deleted += 1;
             }
             report.orphan_blobs.push(OrphanBlob {
-                library_id: library.library_id.clone(),
                 path: path.to_path_buf(),
             });
         }
     }
 }
 
-/// Local consistency (d) and remote existence/deep (e) checks for one
-/// library's materialized photos.
-async fn check_sidecars(
-    store: &StateStore,
-    data_dir: &DataDir,
-    library: &LibraryConfig,
-    opts: &FsckOptions,
-    report: &mut FsckReport,
-) -> Result<()> {
-    let photos =
-        crate::store::photos::materialized_photos(store.pool(), &library.library_id).await?;
-    let local_root = data_dir.sidecar_root(&library.library_id);
-
-    let remote_root = library.sidecar_root_remote.as_deref().map(Path::new);
-    let remote_reachable = remote_root.is_some_and(Path::is_dir);
-    // An unreachable remote is only worth reporting if there is something
-    // to check there — a never-replicated library legitimately has no
-    // remote tree yet. Pushed lazily on the first stamped photo.
-    let mut remote_skip_noted = false;
-
-    for photo in photos {
-        let Some(local) = find_sidecar(&local_root, &photo.photo_id)? else {
-            report.sidecar_findings.push(SidecarFinding {
-                photo_id: photo.photo_id.clone(),
-                library_id: library.library_id.clone(),
-                kind: SidecarProblem::Missing,
-            });
-            continue;
-        };
-
-        let doc = match fs::read_to_string(&local)
-            .map_err(|e| e.to_string())
-            .and_then(|json| Sidecar::from_json(&json).map_err(|e| e.to_string()))
-        {
-            Ok(doc) => Some(doc),
-            Err(error) => {
-                report.sidecar_findings.push(SidecarFinding {
-                    photo_id: photo.photo_id.clone(),
-                    library_id: library.library_id.clone(),
-                    kind: SidecarProblem::ParseError { error },
-                });
-                None
-            }
-        };
-        if let Some(doc) = &doc {
-            let fields = diff_sidecar_fields(store, &photo, library, doc).await?;
-            if !fields.is_empty() {
-                report.sidecar_findings.push(SidecarFinding {
-                    photo_id: photo.photo_id.clone(),
-                    library_id: library.library_id.clone(),
-                    kind: SidecarProblem::Mismatch { fields },
-                });
-            }
-        }
-
-        // (e) remote: only for stamped photos with a reachable remote root.
-        if photo.sidecar_replicated_at.is_none() {
-            continue;
-        }
-        if !remote_reachable {
-            if let Some(root) = remote_root
-                && !remote_skip_noted
-            {
-                remote_skip_noted = true;
-                report.skipped_roots.push(format!(
-                    "{}: remote sidecar root unavailable ({})",
-                    library.library_id,
-                    root.display()
-                ));
-            }
-            continue;
-        }
-        let rel = local
-            .strip_prefix(&local_root)
-            .map_err(|_| crate::IngressError::Invariant("sidecar outside its root".into()))?;
-        let remote = remote_root.expect("reachable implies configured").join(rel);
-        if !remote.is_file() {
-            report.remote_findings.push(RemoteFinding {
-                photo_id: photo.photo_id.clone(),
-                library_id: library.library_id.clone(),
-                kind: RemoteProblem::Missing { path: remote },
-            });
-        } else if opts.deep {
-            let same = fs::read(&local)
-                .and_then(|l| fs::read(&remote).map(|r| l == r))
-                .unwrap_or(false);
-            if !same {
-                report.remote_findings.push(RemoteFinding {
-                    photo_id: photo.photo_id.clone(),
-                    library_id: library.library_id.clone(),
-                    kind: RemoteProblem::Differs { path: remote },
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Db-backed fields only: identity, tombstone, timestamps, and the
-/// written-resource set (order-insensitive). Capture metadata lives solely
-/// in the sidecar and cannot be cross-checked.
-async fn diff_sidecar_fields(
-    store: &StateStore,
-    photo: &crate::model::PhotoRecord,
-    library: &LibraryConfig,
-    doc: &Sidecar,
-) -> Result<Vec<String>> {
-    let mut fields = Vec::new();
-    if doc.photo_id != photo.photo_id {
-        fields.push("photo_id".to_string());
-    }
-    if doc.library_id != library.library_id {
-        fields.push("library_id".to_string());
-    }
-    if doc.cloud_id != photo.cloud_id {
-        fields.push("cloud_id".to_string());
-    }
-    if doc.deleted_at != photo.deleted_at {
-        fields.push("deleted_at".to_string());
-    }
-    if doc.ingested_at != photo.discovered_at {
-        fields.push("ingested_at".to_string());
-    }
-
-    let mut expected: Vec<(String, String, String, i64)> = store
-        .resources_for_photo(&photo.photo_id)
-        .await?
-        .into_iter()
-        .filter(|r| r.written_at.is_some())
-        .map(|r| {
-            (
-                r.resource_type.as_str().to_string(),
-                r.content_hash.map(|h| h.to_string()).unwrap_or_default(),
-                r.ext.unwrap_or_default(),
-                r.size_bytes.unwrap_or_default(),
-            )
-        })
-        .collect();
-    let mut actual: Vec<(String, String, String, i64)> = doc
-        .resources
-        .iter()
-        .map(|r| {
-            (
-                r.resource_type.clone(),
-                r.content_hash.clone(),
-                r.ext.clone(),
-                r.size_bytes,
-            )
-        })
-        .collect();
-    expected.sort();
-    actual.sort();
-    if expected != actual {
-        fields.push("resources".to_string());
-    }
-    Ok(fields)
-}
 
 fn is_hex_pair(s: &str) -> bool {
     s.len() == 2

@@ -42,6 +42,10 @@ impl hopnet_projection::Projection for DriveProjection {
         db::install_schema(conn)
     }
 
+    fn tables(&self) -> &'static [&'static str] {
+        db::TABLES
+    }
+
     fn exporter(
         &self,
         caps: &hopnet_projection::host::HostCapabilities,

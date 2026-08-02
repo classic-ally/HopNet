@@ -23,6 +23,11 @@ FileProvider currently uses a static API key generated at startup, validated by 
 
 Meanwhile, DocumentProvider already uses `device_token_auth_middleware` with consensus-replicated device tokens. The infrastructure exists — FileProvider just doesn't use it.
 
+### Device classes using this system
+
+- **FileProvider / DocumentProvider** — the original consumers, via the drive projection's `AuthClass::DeviceToken` mounts (`/api/integrations/*`).
+- **Photo-ingress daemon** (RFC-011 adapter) — registers as a device ("Photo Ingress") and authenticates against the photos thin-client surface, host-mounted at `/api/photos/client/*` under `device_token_auth_middleware`. The bootstrapped session is what signs its `photo_add` transactions and derives `uploaded_by`; because the token works against any node holding the consensus state, the daemon is not tied to a co-resident node, and revoking its device row revokes it mesh-wide.
+
 ### Design Goals
 
 1. **Session independence**: Device tokens self-bootstrap sessions without requiring prior user login

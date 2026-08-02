@@ -3,8 +3,9 @@
 //! verifies that).
 
 use ingress_ffi::{
-    FfiAssetDescriptor, FfiCaptureMetadata, FfiError, FfiHashResolutionKind, FfiLibraryScope,
-    FfiMediaType, FfiResolution, FfiResourceDescriptor, IngressSession,
+    FfiAssetDescriptor, FfiCaptureMetadata, FfiEnsureLibraryOutcome, FfiError,
+    FfiHashResolutionKind, FfiLibraryScope, FfiMediaType, FfiResolution, FfiResourceDescriptor,
+    IngressSession,
 };
 
 fn slice_descriptor(cloud_id: &str, live_photo: bool) -> FfiAssetDescriptor {
@@ -53,15 +54,14 @@ fn slice_descriptor(cloud_id: &str, live_photo: bool) -> FfiAssetDescriptor {
 struct Rig {
     session: std::sync::Arc<IngressSession>,
     data_dir: tempfile::TempDir,
-    blob_dir: tempfile::TempDir,
 }
 
 fn rig() -> Rig {
     let data_dir = tempfile::tempdir().unwrap();
-    let blob_dir = tempfile::tempdir().unwrap();
-    // Library config has no FFI surface (it lives in ingress-cli, Phase 6);
-    // seed via ingress-core BEFORE the session opens its pool, and drop the
-    // seeding store so exactly one writer pool is live at a time.
+    // Seed via ingress-core BEFORE the session opens its pool (the FFI's
+    // ensure_personal_library generates ids; the rig wants the fixed
+    // "personal" id), and drop the seeding store so exactly one writer pool
+    // is live at a time.
     {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -75,17 +75,10 @@ fn rig() -> Rig {
                 .insert_library(&ingress_core::LibraryConfig {
                     library_id: ingress_core::LibraryId::new("personal"),
                     display_name: "Personal".into(),
-                    blob_root: blob_dir.path().to_string_lossy().into_owned(),
-                    sidecar_root_remote: Some(
-                        blob_dir
-                            .path()
-                            .join("sidecar-backup")
-                            .to_string_lossy()
-                            .into_owned(),
-                    ),
                     scope_binding: None,
                     retention_days: 30,
                     created_at: chrono::Utc::now(),
+                    mesh_library_id: None,
                 })
                 .await
                 .unwrap();
@@ -95,7 +88,7 @@ fn rig() -> Rig {
     Rig {
         session,
         data_dir,
-        blob_dir,
+
     }
 }
 
@@ -151,23 +144,25 @@ fn end_to_end_live_photo() {
     ));
     assert!(outcome2.photo_completed);
     assert_eq!(outcome2.ext, "mov");
-    let sidecar_path = outcome2
-        .sidecar_path
-        .expect("sidecar written on completion");
-    assert!(std::path::Path::new(&sidecar_path).exists());
+    assert!(
+        outcome2.descriptor_persisted,
+        "capsule persisted on completion"
+    );
 
-    // Sidecar content sanity: both resources, capture offset preserved.
-    let doc: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&sidecar_path).unwrap()).unwrap();
-    assert_eq!(doc["resources"].as_array().unwrap().len(), 2);
-    assert_eq!(doc["captured_at"], "2019-08-14T16:22:03+02:00");
+    // Capsule content sanity: capture offset preserved, media type carried.
+    let json = sqlite_scalar(
+        rig.data_dir.path(),
+        "SELECT descriptor_json FROM photos LIMIT 1",
+    );
+    let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(doc["capture"]["captured_at"], "2019-08-14T16:22:03+02:00");
     assert_eq!(doc["media_type"], "live_photo");
 
-    // Blobs live under the configured root; .partial is empty.
-    assert!(std::path::Path::new(&outcome.blob_path).starts_with(rig.blob_dir.path()));
-    let partial = rig.blob_dir.path().join("blobs").join(".partial");
+    // Blobs live under the data dir's spool; .partial is empty.
+    let spool = rig.data_dir.path().join("spool");
+    assert!(std::path::Path::new(&outcome.blob_path).starts_with(&spool));
+    let partial = spool.join("blobs").join(".partial");
     assert_eq!(std::fs::read_dir(&partial).unwrap().count(), 0);
-    let _ = &rig.data_dir;
 }
 
 // Should: resolve a re-delivered descriptor to AlreadyKnown without streaming.
@@ -290,16 +285,16 @@ fn seed_and_drain_through_fetcher_trait() {
 }
 
 // Impact: this is the exact call sequence the Swift `cleanup` subcommand
-// performs — lock, hard-delete with retention 0, replicate, report.
-// Should: hard-delete an expired tombstone and replicate the other photo's
-// sidecar to the configured remote root, reporting both.
+// performs — lock, hard-delete past retention, snapshot, report.
+// Should: hard-delete an expired tombstone (rows + blob file) and write a
+// state snapshot, reporting both.
 #[test]
 fn cleanup_round_trip() {
     use ingress_ffi::FfiCleanupOptions;
 
     let rig = rig();
 
-    // One completed photo (sidecar becomes replication work)…
+    // One completed photo that survives the run…
     let keep = slice_descriptor("CLOUD-CLEAN-KEEP:001", false);
     rig.session.ingest_descriptor(keep.clone()).unwrap();
     let sink = rig.session.begin_original(keep.clone()).unwrap();
@@ -326,18 +321,12 @@ fn cleanup_round_trip() {
         .session
         .cleanup(FfiCleanupOptions {
             log_retention_days: 180,
-            snapshot_keep: 7,
+
             hard_delete_batch: 500,
-            replication_batch: 500,
         })
         .unwrap();
     assert_eq!(report.photos_hard_deleted, 1);
     assert_eq!(report.blob_files_deleted, 1);
-    assert!(report.sidecars_replicated >= 1);
-    assert!(!report.replication_stalled);
-    assert!(report.snapshots_written >= 1);
-    assert!(rig.blob_dir.path().join("sidecar-backup").is_dir());
-    assert!(rig.blob_dir.path().join("state-snapshots").is_dir());
 }
 
 /// The FFI crate has no direct sqlx dev-dep; shell out to sqlite3 for the
@@ -360,5 +349,83 @@ fn bad_timestamp_rejected() {
     assert!(matches!(
         rig.session.ingest_descriptor(desc).unwrap_err(),
         FfiError::InvalidDescriptor { .. }
+    ));
+}
+
+// ============================================================================
+// ensure_personal_library — the daemon-startup auto-bind surface
+// ============================================================================
+
+/// Read one scalar back out of state.db (same sqlite3-shell approach as
+/// `rusqlite_free_update` — no sqlx dev-dep in this crate).
+fn sqlite_scalar(data_dir: &std::path::Path, sql: &str) -> String {
+    let out = std::process::Command::new("sqlite3")
+        .arg(data_dir.join("state.db"))
+        .arg(sql)
+        .output()
+        .unwrap();
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+// Impact: the enablement flow depends on this being the ONLY provisioning
+// step a fresh install needs — without it every ingest silently parks as
+// scope_unmapped.
+// Should: create a personal library with a generated id when none exists.
+// Should: record the creation in the ingest log.
+#[test]
+fn ensure_personal_library_creates_when_absent() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let session = IngressSession::new(data_dir.path().to_string_lossy().into_owned()).unwrap();
+    let outcome = session
+        .ensure_personal_library()
+        .unwrap();
+    match outcome {
+        FfiEnsureLibraryOutcome::Created { library_id, .. } => {
+            assert!(library_id.contains('_'), "generated two-word id: {library_id}");
+        }
+        other => panic!("expected Created, got {other:?}"),
+    }
+    assert_eq!(
+        sqlite_scalar(
+            data_dir.path(),
+            "SELECT COUNT(*) FROM ingest_log WHERE event_type = 'library_added'",
+        ),
+        "1"
+    );
+}
+
+// Should: report the already-existing library instead of creating a second
+// personal-routing candidate.
+#[test]
+fn ensure_personal_library_is_idempotent() {
+    let rig = rig();
+    let outcome = rig.session.ensure_personal_library().unwrap();
+    match outcome {
+        FfiEnsureLibraryOutcome::AlreadyExists { library_id } => {
+            assert_eq!(library_id, "personal");
+        }
+        other => panic!("expected AlreadyExists, got {other:?}"),
+    }
+}
+
+// Impact: library writes and daemon/CLI runs share one exclusive run lock;
+// the auto-bind must respect a live holder rather than corrupting refcounts.
+// Should: refuse to bind while another live process holds the run lock.
+#[test]
+fn ensure_personal_library_refuses_live_run_lock() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let session = IngressSession::new(data_dir.path().to_string_lossy().into_owned()).unwrap();
+    // A lock file stamped with THIS (live) pid reads as another running
+    // process to the acquire path.
+    std::fs::write(
+        data_dir.path().join("drain.lock"),
+        format!("{}", std::process::id()),
+    )
+    .unwrap();
+    assert!(matches!(
+        session
+            .ensure_personal_library()
+            .unwrap_err(),
+        FfiError::Invariant { .. }
     ));
 }

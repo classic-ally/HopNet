@@ -59,18 +59,16 @@ CREATE TABLE photos (
     encrypted_metadata       BLOB NOT NULL,-- ChaCha20-Poly1305 encrypted metadata
     metadata_nonce           BLOB NOT NULL,-- 12-byte nonce for metadata decryption
 
-    -- Cross-asset grouping (burst, stack, panorama frames, HDR bracket).
-    -- Each frame is its own photo; group_id links them.
-    group_id         TEXT,
-    group_type       INTEGER,              -- see Group Types below
-    group_index      INTEGER,              -- ordering within group
-    is_group_pick    INTEGER NOT NULL DEFAULT 0,  -- 1 = key/representative frame
-
     -- Soft delete: NULL = active, set = tombstoned, 30-day retention window.
     -- Periodic cleanup hard-deletes the row and cascades to photo_resources
     -- once retention expires.
     deleted_at       TEXT,                 -- ISO 8601, NULL when active
     deleted_by       INTEGER,              -- user who deleted (FK users)
+
+    -- Cross-device asset identity: lowercase-hex keyed HMAC of the source
+    -- library's stable asset id (PHCloudIdentifier for the macOS ingress).
+    -- NULL = local-only or non-PhotoKit asset (no dedupe).
+    cloud_fingerprint TEXT,
 
     FOREIGN KEY (uploaded_by) REFERENCES users(user_id),
     FOREIGN KEY (deleted_by) REFERENCES users(user_id),
@@ -78,13 +76,107 @@ CREATE TABLE photos (
 );
 
 CREATE INDEX idx_photos_library ON photos(library_id);
-CREATE INDEX idx_photos_group ON photos(group_id) WHERE group_id IS NOT NULL;
 CREATE INDEX idx_photos_deleted ON photos(deleted_at) WHERE deleted_at IS NOT NULL;
+
+-- Dedupe uniqueness is a partial-index PAIR because SQLite treats NULLs as
+-- distinct in UNIQUE indexes: a composite UNIQUE(library_id, cloud_fingerprint)
+-- would never constrain personal (NULL-library) rows.
+CREATE UNIQUE INDEX idx_photos_fp_personal ON photos(cloud_fingerprint)
+    WHERE library_id IS NULL AND cloud_fingerprint IS NOT NULL;
+CREATE UNIQUE INDEX idx_photos_fp_shared ON photos(library_id, cloud_fingerprint)
+    WHERE library_id IS NOT NULL AND cloud_fingerprint IS NOT NULL;
 ```
 
-The `encrypted_metadata` blob contains all photo metadata: date taken, dimensions, orientation, media type, duration, camera make/model, GPS coordinates, EXIF data. None of this is queryable at the consensus level. The photo ID (UUIDv7) encodes upload timestamp, which is the only temporal signal visible to nodes.
+##### Cloud Fingerprint (cross-device identity)
 
-Bytes for a photo (original, edited variant, paired Live Photo video, thumbnails, etc.) live in `photo_resources` (below). A photo has at minimum one resource (the original). The `photos` row carries identity, grouping, and tombstone state only.
+Two devices ingesting the same source library (e.g. two Macs on one iCloud
+account) each mint their own photo ids, so without a shared identity key
+every asset would duplicate mesh-side. The fingerprint is that key:
+
+- **Computed node-side, keyed per-user**: `blake3::keyed_hash(k, cloud_id)`
+  where `k = blake3 derive_key("hopnet photos cloud fingerprint v1", user
+  Ed25519 privkey)` (context string frozen — changing it orphans every
+  committed fingerprint). The thin client obtains fingerprints from
+  `POST /api/photos/client/resolve`; it holds no user key material itself.
+  Keyed per RFC-014's confirmation-oracle rule: replicated state carries no
+  unkeyed function of the identifier, so validators (who hold no user keys)
+  cannot test whether a given cloud id is present.
+- **Opaque to validators**: handlers cannot re-derive it; enforcement is
+  solely the partial UNIQUE pair. A device can submit garbage fingerprints —
+  the blast radius is the user's own dedupe scope.
+- **Claim-on-conflict**: the resolve probe is the cooperative path (a hit
+  returns the committed photo id and the client adopts instead of
+  publishing); the UNIQUE index is the race backstop — the losing insert
+  fails deterministically at the proposer preflight, and the loser adopts on
+  its next resolve.
+- **Tombstones hold their fingerprint** until the 30-day hard delete frees
+  the index entry — a resolve on a mesh-deleted photo still returns its id
+  (the client adopts a tombstoned photo rather than colliding with it).
+  "Undelete by republish" is deliberately not a thing.
+- **Shared-library scoping**: a resolve carrying `library_id` uses the
+  **library-scoped key** instead — `blake3 derive_key("hopnet photos cloud
+  fingerprint library v1", library_key)` (context frozen, pinned by test
+  vector; the fn lives in photos-core beside the library-key wrap). Every
+  member derives the same key from their own `shared_library_keys` wrap
+  (the route unwraps it with the device-bootstrapped session), so the same
+  PHCloudIdentifier fingerprints identically no matter which member's
+  daemon publishes — `idx_photos_fp_shared` then dedupes across members,
+  and the shared lookup deliberately has NO owner filter (any member's
+  committed photo answers; membership is checked at the route, 403
+  `library_not_member`, with `library_key_pending` distinguishing
+  convergence lag). Two members' daemons racing one asset: the loser's
+  `photo_add` fails deterministically on the index and adopts the winner
+  on its next resolve.
+
+##### Ingress Responsibility (explicit publish designation)
+
+```sql
+CREATE TABLE photo_ingress_responsibility (
+    user_id       INTEGER NOT NULL,
+    library_id    TEXT,                  -- NULL = personal scope
+    device_id     TEXT NOT NULL,
+    operation_id  TEXT NOT NULL,         -- UUIDv7, audit/ordering
+
+    PRIMARY KEY (user_id, library_id),   -- shared uniqueness + snapshot ordering
+    FOREIGN KEY (user_id) REFERENCES users(user_id),
+    FOREIGN KEY (device_id) REFERENCES device_tokens(id),
+    FOREIGN KEY (library_id) REFERENCES shared_libraries(id)
+);
+-- NULLs are distinct even in the composite PK (SQLite rowid-table
+-- quirk), so the personal singleton needs the partial index:
+CREATE UNIQUE INDEX idx_ingress_resp_personal
+    ON photo_ingress_responsibility(user_id) WHERE library_id IS NULL;
+```
+
+One device per (user, scope) may publish ingress mutations — the personal
+partition (`library_id` NULL) and each shared library are independent
+scopes. Each member of a shared library claims independently for their own
+devices; cross-member dedup of the actual photos is the fingerprint's job,
+not responsibility's. Claims are **explicit and JWT-only**:
+`POST /api/photos/ingress/claim {"device_id", "library_id"?}` builds and
+submits the `photo_ingress_claim` tx server-side (curl/GUI friendly); a
+shared-scope claim requires applied membership (handler-enforced,
+deterministic), and `library_remove_member` dissolves the removed member's
+scope claim so a kicked member's daemon stops passing the gate.
+`GET /api/photos/ingress/responsibility` returns the personal holder plus
+per-library holders (shape additive on v1). The thin-client transaction
+route enforces `DEVICE_TX_FUNCTIONS` (which excludes the claim tx — a
+daemon can never designate itself) and 403s per scope with
+`ingress_not_responsible:{other|unclaimed}`: the route decodes the
+payload's touched scopes (photo_add carries them per entry; photo-targeting
+txs resolve them from the committed rows) and requires the authed device to
+hold EVERY one — holding the personal claim never admits shared-library
+writes or vice versa. Claim and transfer are one upsert — the dead-Mac
+case is any logged-in session re-claiming to a new device, after which the
+new daemon's first pass adopts the whole published archive by fingerprint
+instead of re-uploading it. Enforcement is admission-time (device identity
+is an HTTP-layer concept); the fingerprint UNIQUE pair is the correctness
+backstop for any admission race. Adoption and the resolve/committed probes
+are reads and deliberately ungated.
+
+The `encrypted_metadata` blob contains all photo metadata: date taken, dimensions, orientation, media type, duration, camera make/model, GPS coordinates, EXIF data, **and cross-asset grouping** (`group_id`, `group_type`, `group_index`, `is_group_pick`). None of this is queryable at the consensus level. The photo ID (UUIDv7) encodes upload timestamp, which is the only temporal signal visible to nodes.
+
+Bytes for a photo (original, edited variant, paired Live Photo video, thumbnails, etc.) live in `photo_resources` (below). A photo has at minimum one resource (the original). The `photos` row carries identity and tombstone state only.
 
 ##### Group Types
 
@@ -95,7 +187,7 @@ Bytes for a photo (original, edited variant, paired Live Photo video, thumbnails
 | 2 | `panorama_frames` | Source frames of a panorama |
 | 3 | `hdr_bracket` | Bracketed exposures of an HDR composite |
 
-A photo not part of any group has `group_id = NULL`. Group membership is observable at the consensus level (group_id is a plaintext UUID), but this leaks only the existence of related photos, not their content. Future work may encrypt group_id if even this is too much exposure.
+A photo not part of any group has `group_id = NULL` (inside the encrypted blob). Group membership is NOT observable at the consensus level — `group_id`, `group_type`, `group_index`, and `is_group_pick` are all inside `encrypted_metadata` (amended from the original plaintext design: no consensus query needs group awareness — deletion expands to a batch tx constructed client-side from sidecar queries, and burst rollup is a sidecar-only query at `idx_sidecar_group` — so the plaintext columns leaked structural correlation and photography habits via `group_type` without any offsetting consensus use). The original "future work may encrypt group_id" hedge is done.
 
 #### Photo Metadata Access
 
@@ -116,6 +208,8 @@ CREATE TABLE photo_metadata_access (
 ```
 
 This mirrors the `file_access` table pattern. When a photo is shared to a new context (shared library, shared album, individual share), the per-photo metadata key is wrapped with each new recipient's pubkey and a row is inserted. The metadata blob itself does not change.
+
+**Access-row existence is the read grant only for PERSONAL photos.** For shared-library photos, reads additionally require a `shared_library_members` row (Phase 3, "Design B"): the convergence worker pre-stages wraps for pending invitees *before* they accept, and a kicked member's wraps are deleted lazily — in both cases the wrap row alone must not read. The gate lives in `query_changes` (both statements, boundary batch included) and the resource byte path (`lookup_resource_block_authz`, wrap ∧ membership, 403 on non-membership).
 
 #### Photo Resources
 
@@ -150,19 +244,23 @@ CREATE INDEX idx_photo_resources_data_block ON photo_resources(data_block_id);
 
 The "primary display" resource for gallery view is `edited` if present, otherwise `original`. Clients enforce this at query time against the sidecar.
 
-All resources except thumbnails are required to be supplied by the client at upload time when they exist on the source asset — the daemon ingesting from PhotoKit must enumerate `PHAsset.assetResources` and submit every applicable resource. Thumbnails are generated client-side from whichever resource is the primary display. Each resource is encrypted with its own per-data-block key and replicated via the standard fragment distribution path. The server never sees raw image data.
+All resources are supplied by the ingesting client at upload time when they exist on the source asset — the daemon ingesting from PhotoKit enumerates `PHAsset.assetResources` and submits every applicable resource, and **generates the thumbnail resources itself** (~256px/~1024px JPEG renditions via `PHImageManager` at ingest; video assets get poster frames). Thumbnails are what keep the gallery renderable for formats browsers cannot decode (HEIC, HEVC). Each resource is encrypted with its own per-data-block key and replicated via the standard fragment distribution path.
+
+**Deferred: non-PhotoKit ingest paths must supply thumbnails too.** When manual/import upload of arbitrary image files lands (e.g. a user importing a HEIC without Apple Photos involved), that path needs its own rendition generation — either import-time generation in the ingesting client, or a node-side fallback renderer (a port of the interim viewer's `render.rs` decode cache). Recorded here so the HEIC-blank-cell gap doesn't silently recur on a new ingest surface.
 
 #### Shared Libraries
 
 ```sql
--- Shared library definition
+-- Shared library definition. The name is encrypted under the LIBRARY
+-- key (below), not a single-recipient seal — every member can render it.
 CREATE TABLE shared_libraries (
     id               TEXT PRIMARY KEY,     -- UUIDv7
-    encrypted_name   BLOB NOT NULL,        -- ChaCha20-Poly1305 encrypted library name
-    name_ephemeral_pubkey BLOB NOT NULL    -- X25519 ephemeral pubkey for name decryption
+    encrypted_name   BLOB NOT NULL,        -- ChaCha20-Poly1305 under the library key
+    name_nonce       BLOB NOT NULL         -- 12-byte nonce
 );
 
--- Library membership (N-way, no owner)
+-- Library membership (N-way, no owner). Membership is also the READ
+-- GATE for shared photos (see Photo Metadata Access).
 CREATE TABLE shared_library_members (
     library_id       TEXT NOT NULL,
     user_id          INTEGER NOT NULL,
@@ -171,9 +269,53 @@ CREATE TABLE shared_library_members (
     FOREIGN KEY (library_id) REFERENCES shared_libraries(id),
     FOREIGN KEY (user_id) REFERENCES users(user_id)
 );
+
+-- Per-member wrapped LIBRARY key (X25519 ECDH, LIBRARY_KEY_WRAP_DOMAIN,
+-- wrap id = library id). Decrypts the library name today; the designed
+-- seam for the future library-scoped cloud-fingerprint key.
+CREATE TABLE shared_library_keys (
+    library_id       TEXT NOT NULL,
+    user_id          INTEGER NOT NULL,
+    ephemeral_pubkey BLOB NOT NULL,
+    wrapped_key      BLOB NOT NULL,
+    PRIMARY KEY (library_id, user_id),
+    FOREIGN KEY (library_id) REFERENCES shared_libraries(id),
+    FOREIGN KEY (user_id) REFERENCES users(user_id)
+);
+
+-- Pending membership (consent pattern, mirroring drive's incoming_shares).
+-- Carries the invitee's library-key wrap, minted AT invite time, so
+-- accept needs no inviter online and the invite listing shows the name.
+CREATE TABLE shared_library_invites (
+    library_id       TEXT NOT NULL,
+    user_id          INTEGER NOT NULL,     -- invitee
+    invited_by       INTEGER NOT NULL,
+    operation_id     TEXT NOT NULL,
+    ephemeral_pubkey BLOB NOT NULL,
+    wrapped_key      BLOB NOT NULL,
+    PRIMARY KEY (library_id, user_id),
+    FOREIGN KEY (library_id) REFERENCES shared_libraries(id),
+    FOREIGN KEY (user_id) REFERENCES users(user_id),
+    FOREIGN KEY (invited_by) REFERENCES users(user_id)
+);
+
+-- Per-user VIEW-change signal: "your visibility into this library
+-- changed at height h". Written by accept/grant handlers, consumed by
+-- the sidecar sync worker to trigger a targeted library backfill.
+-- Deliberately NOT photo_changes: a membership or grant change alters
+-- the user's view, not the photo — bumping the global feed would make
+-- every member re-sync the whole library on each join.
+CREATE TABLE photo_view_changes (
+    user_id           INTEGER NOT NULL,
+    library_id        TEXT NOT NULL,
+    changed_at_height INTEGER NOT NULL,
+    PRIMARY KEY (user_id, library_id),
+    FOREIGN KEY (user_id) REFERENCES users(user_id),
+    FOREIGN KEY (library_id) REFERENCES shared_libraries(id)
+);
 ```
 
-There is no owner column. All members have equal standing — any member can add photos, remove photos, or invite new members. The `uploaded_by` field on `photos` records provenance for activity feeds but confers no special permissions.
+There is no owner column. All members have equal standing — any member can add photos, remove photos, invite new members, or remove members (self-removal is leave; removing another is kick). The `uploaded_by` field on `photos` records provenance for activity feeds but confers no special permissions. A library whose last member leaves is stranded (rows unreadable by anyone) — allowed, documented; GC is future work.
 
 #### Albums
 
@@ -225,18 +367,28 @@ CREATE TABLE photo_favorites (
 -- Enables undo, audit trail, and retention-aware cleanup.
 CREATE TABLE photo_operations (
     id                    TEXT PRIMARY KEY,  -- UUIDv7 (encodes timestamp)
-    library_id            TEXT,              -- NULL = personal operation
+    library_id            TEXT,              -- denormalized filter, NOT FK
     photo_id              TEXT NOT NULL,
     operation_type        INTEGER NOT NULL,  -- see Operation Types below
     resource_type         INTEGER,           -- which resource (content ops only); NULL otherwise
-    prior_data_block_id   TEXT,              -- previous data_block for the resource (content ops only)
-    new_data_block_id     TEXT,              -- new data_block for the resource (content ops only)
+    prior_data_block_id   TEXT,              -- soft pointer (NOT FK) — previous data_block (content ops only)
+    new_data_block_id     TEXT,              -- soft pointer (NOT FK) — new data_block (content ops only)
     operation_data        BLOB,              -- payload for non-content ops (encrypted metadata diff, album_id, etc.)
     performed_by          INTEGER NOT NULL,
 
     FOREIGN KEY (photo_id) REFERENCES photos(id),
     FOREIGN KEY (performed_by) REFERENCES users(user_id)
 );
+
+-- `prior_data_block_id` and `new_data_block_id` are deliberately NOT
+-- FK-constrained: operation rows are retained indefinitely for audit
+-- (see Retention), but the blobs they reference become collectable after
+-- the edit-history window. The PhotosReferenceProvider enforces the
+-- window via UUIDv7 timestamp filtering — a hard FK would raise
+-- SQLITE_CONSTRAINT on every orphan-cleanup pass once the first edit
+-- ages out, and that cleanup runs inside a consensus tx, so the failure
+-- would replay on every validator, forever. Soft-pointer-policed-by-
+-- provider is the design.
 
 CREATE INDEX idx_photo_ops_photo ON photo_operations(photo_id);
 CREATE INDEX idx_photo_ops_prior_data ON photo_operations(prior_data_block_id) WHERE prior_data_block_id IS NOT NULL;
@@ -270,6 +422,8 @@ A content edit on a Live Photo emits **two** operation entries (one for the `edi
 ### Client-Side Sidecar Database
 
 The sidecar is a local, non-replicated SQLite database maintained by each client. It holds the decrypted photo metadata that enables all query patterns. The sidecar is ephemeral — it can be deleted and rebuilt from consensus state at any time.
+
+Because it contains plaintext dates, locations, and camera metadata, the host creates the sidecar with mode `0600` on Unix. Sign-out drops the in-memory recipient key and stops synchronization but preserves the file and cursor for an incremental resume; the UI reports this paused-on-disk state explicitly. Choosing **Remove** deletes the file, while **Re-sync** deletes and rebuilds it from consensus.
 
 #### Sidecar Schema
 
@@ -362,6 +516,8 @@ The incremental path processes only changes since the last sync, so ongoing cost
 #### Thumbnail Caching
 
 Thumbnails are encrypted data blocks fetched and decrypted on demand as the user scrolls. Decrypted thumbnails are cached locally (in-memory LRU and/or on-disk cache) since they're immutable — the same `data_block_id` always produces the same bytes. The client prefetches thumbnails ahead of the scroll position to maintain smooth rendering.
+
+The node's content route serves `ETag: "{data_block_id}"` with `Cache-Control: private, immutable, max-age=31536000` and answers `If-None-Match` with 304. Because a content edit swaps the blob under the same `(photo_id, resource_type)` URL, clients must key caches by `data_block_id` (carried in the gallery/detail payloads' `resources` field); the ETag is the revalidation fallback.
 
 ### Deletion Lifecycle
 
@@ -485,10 +641,15 @@ The photos module registers its own transaction handlers via the existing `inven
 | `photo_edit_content` | `PhotoEditContentHandler` | Log content edit for a specific `resource_type`, update `photo_resources.data_block_id` for that row, distribute new file_access to library members |
 | `photo_edit_metadata` | `PhotoEditMetadataHandler` | Log metadata diff, update encrypted_metadata blob on photos row |
 | `photo_restore` | `PhotoRestoreHandler` | Restore soft-deleted photo within retention window (clear `deleted_at` / `deleted_by`) |
+| `photo_ingress_claim` | `PhotoIngressClaimHandler` | Claim/transfer ingress responsibility (upsert; device ownership validated against consensus-replicated `device_tokens`). JWT route only — excluded from `DEVICE_TX_FUNCTIONS`. |
 | `photo_undo` | `PhotoUndoHandler` | Revert most recent operation on a photo (content edit on a specific resource, or metadata edit) |
-| `create_shared_library` | `CreateSharedLibraryHandler` | Create library + initial membership |
-| `join_shared_library` | `JoinSharedLibraryHandler` | Add member, create file_access + photo_metadata_access for all existing library photos |
-| `leave_shared_library` | `LeaveSharedLibraryHandler` | Remove member, clean up their file_access and photo_metadata_access entries |
+| `create_shared_library` | `CreateSharedLibraryHandler` | Create library + creator membership + creator's library-key wrap |
+| `library_invite` | `LibraryInviteHandler` | Member-only; parks the invitee's library-key wrap on the invite row (accept works with the inviter offline) |
+| `library_invite_accept` | `LibraryInviteAcceptHandler` | Invitee-signed consent: membership + wrap promotion + view-change signal. Re-delivery is a deterministic NotFound |
+| `library_invite_decline` | `LibraryInviteDeclineHandler` | Invitee refuses, or any member retracts |
+| `library_remove_member` | `LibraryRemoveMemberHandler` | Leave/kick (one equal-standing op): deletes membership, key wrap, pending invite, view signal. Access rows revoked lazily by convergence |
+| `library_access_grant` | `LibraryAccessGrantHandler` | Convergence batch: OR-IGNORE metadata + blob wraps for ONE member-or-invitee target; validates every photo is live and in-library, every block backs one; recipient pubkey resolved from consensus state, never the wire; signals the target's view change |
+| `library_access_revoke` | `LibraryAccessRevokeHandler` | Convergence batch: delete a departed user's wraps. Target must be NEITHER member nor invitee — the inversion prevents a stealth kick bypassing `library_remove_member` |
 | `album_create` | `AlbumCreateHandler` | Create album |
 | `album_add_photo` | `AlbumAddPhotoHandler` | Add photo to album, log operation |
 | `album_remove_photo` | `AlbumRemovePhotoHandler` | Remove photo from album, log operation |
@@ -551,25 +712,69 @@ photo_edit_content handler (all nodes):
 
 The old data block is retained because the operation log entry references its `prior_data_block_id`. Any member can undo by submitting `photo_undo`, which swaps the `photo_resources` row back.
 
-### Shared Library: Join Flow
+### Shared Library: Invite, Join, and the Convergence Worker
 
-When a new member joins an existing library:
+Membership changes are consent-based (mirroring the drive share accept
+pattern) and access distribution is a **background convergence loop**, not
+a one-shot bulk transaction. The original design — one
+`join_shared_library` tx carrying every wrap — could not scale past a few
+thousand photos and made the join race (photos added between wrap
+computation and commit) unfixable handler-side, since validators hold no
+member key and cannot wrap.
+
+**The convergence worker** runs per signed-in user beside the sidecar sync
+worker (same session-key lifetime — no session, no unwrapping). Each 30 s
+tick (or an immediate poke from the invite route), per library the user
+belongs to:
 
 ```
-Client-side (initiated by existing member):
-  1. For each photo in library:
-     a. For each resource of the photo: wrap file key for new member
-     b. Wrap metadata key for new member
-  2. Submit join_shared_library transaction with all wrapped keys
-
-join_shared_library handler (all nodes):
-  1. Insert into shared_library_members
-  2. For each photo in library:
-     a. Insert file_access entries for every photo_resources row
-     b. Insert photo_metadata_access entry
+assertion set  = members ∪ pending invitees
+For each target in the assertion set (≠ self):
+  delta = live library photos/blocks the target has no wrap for
+  unwrap own wraps → rewrap for target → library_access_grant (≤500/batch)
+For each user holding wraps who is NEITHER member nor invitee:
+  library_access_revoke for their rows
+Loop until a pass emits nothing (cap 200 rounds/tick).
 ```
 
-This may be a large transaction for libraries with many photos. A batched approach (process N photos per consensus round) may be necessary for libraries exceeding a few thousand photos. This is a detail for implementation phase.
+Grant handlers are OR IGNORE (first committed wrap wins), so any member's
+worker can cover any delta and racing workers are harmless. A rejected tx
+means state moved (kick/leave race) — the next tick re-derives; nothing
+retries a stale batch. The worker's loop iterates a `ConvergeLane` enum
+with a single `Access` variant: the future **`Keys` rotation lane**
+(re-encrypt blocks under fresh keys after a kick, so remembered keys stop
+decrypting new fetches) slots in without changing the tick or tx surface —
+designed, deliberately not built.
+
+**Invite → accept flow:**
+
+```
+Invite (any member): rewrap the LIBRARY key for the invitee, submit
+  library_invite (wrap parked on the invite row), poke convergence —
+  access pre-staging begins immediately. Pre-staged rows are inert:
+  reads gate on membership.
+Accept (invitee-signed): insert membership + promote the library-key
+  wrap + delete invite + write the invitee's photo_view_changes signal.
+  The invitee instantly sees everything pre-staged — even if the
+  inviter has been offline since the invite.
+```
+
+**Client-side rematerialization**: the sidecar sync worker's
+membership-diff pre-phase reconciles against memberships +
+`photo_view_changes` (never the photo_changes cursor — the photos didn't
+change): a new library or moved view signal triggers a paged,
+cursor-independent backfill of photos-with-my-wraps; a departed library
+purges its local rows (the client half of kick — the mesh read gate
+closed the instant the membership row died). Publish-time fan-out
+(`fetch_library_members`) returns members ∪ invitees, so new adds/edits
+cover pending invitees directly; the worker is backfill, not race repair.
+
+**Revocation semantics (v1)**: kick = instant API revocation (membership
+row deletion closes the read gate) + lazy wrap deletion by convergence.
+This is deliberately NOT cryptographic revocation — a departed member who
+dumped DB state beforehand retains keys for the bytes they already had
+access to; the accepted trade until the `Keys` rotation lane lands.
+Plaintext already downloaded is theirs forever under any scheme.
 
 ## Retention Policy
 
@@ -630,26 +835,39 @@ The dispatch trait abstracts the boundary between client logic and transaction s
 ```rust
 #[async_trait]
 pub trait PhotoDispatch {
-    /// Upload encrypted data block bytes to the network
-    async fn upload_data_block(&self, ...) -> Result<DataBlockId>;
+    /// Encrypt and store one resource's bytes as a data block
+    async fn upload_data_block(
+        &self,
+        blob_id: BlobId,
+        source: Box<dyn AsyncRead + Unpin + Send>,
+        file_size: usize,
+        per_blob_key: chacha20poly1305::Key,
+    ) -> Result<UploadedDataBlock>;
 
     /// Submit a fully-formed photo transaction for consensus
-    async fn submit_transaction(&self, payload: Vec<u8>, tx_type: &str) -> Result<()>;
+    async fn submit_transaction(&self, tx_type: &str, payload: Vec<u8>) -> Result<()>;
 
-    /// Fetch library members' public keys (needed for key wrapping)
-    async fn fetch_library_members(&self, library_id: &str) -> Result<Vec<MemberInfo>>;
+    /// Resolve publish recipients. The dispatch derives the acting user
+    /// (`LibraryMembership::uploaded_by`) from its own authenticated state —
+    /// callers never supply an identity. None = personal library.
+    async fn fetch_library_members(
+        &self,
+        library_id: Option<CustomUUID>,
+    ) -> Result<LibraryMembership>;
 
     /// Fetch encrypted photo rows for sidecar hydration/sync
-    async fn fetch_photos_since(&self, height: u64) -> Result<Vec<EncryptedPhotoRow>>;
-
-    /// Fetch encrypted thumbnail data block
-    async fn fetch_thumbnail(&self, data_block_id: &str) -> Result<Vec<u8>>;
+    async fn fetch_photos_since(&self, height: u64) -> Result<SyncBatch>;
 }
 ```
 
+Content fetch (`fetch_data_block`) remains deferred to the thin-client
+dispatch commit; node clients fetch decrypted resource bytes via
+`GET /api/photos/{id}/resource/{type}` (blob_access-gated, Range-capable,
+ETag/immutable-cached).
+
 **Node client dispatch** (`src/photos/dispatch_local.rs`): calls directly into the local consensus submission pipeline and reads from the local database. Transaction submission is a function call, not an HTTP round-trip.
 
-**Thin client dispatch** (in the mobile app crate): makes HTTP requests to a remote node's photo API endpoints. The node receives the pre-formulated transaction payload and relays it to consensus. The thin client holds the user's keys and does all crypto locally — the node never sees unencrypted metadata or unwrapped keys.
+**Thin client dispatch** (`crates/ingress-publisher::HttpDispatch` today; the mobile app crate later): makes HTTP requests to a node's `/api/photos/client/*` routes, authenticated with an RFC-012 device token. The node receives the pre-formulated transaction payload and relays it to consensus. Metadata crypto happens client-side — the node never sees unencrypted metadata. Content bytes stream as plaintext with the client-minted per-blob key (see the encryption boundary note below): under device tokens the node can already unwrap the user's keys, so client-side content encryption would buy nothing while forcing the encrypt/RS pipeline to exist twice.
 
 ### Upload Flow by Client Type
 
@@ -671,7 +889,13 @@ photos-core::prepare_upload(raw_image, user_keys, library_members):
 The dispatch diverges only at submission:
 
 - **Node client**: `dispatch_local.upload_data_block()` writes fragments to local storage and triggers distribution. `dispatch_local.submit_transaction()` feeds the payload directly into consensus.
-- **Thin client**: `dispatch_remote.upload_data_block()` POSTs encrypted bytes to `POST /photos/upload`. `dispatch_remote.submit_transaction()` POSTs the payload to `POST /photos/submit`, where the node validates the request and submits to consensus on behalf of the thin client.
+- **Thin client**: `HttpDispatch` targets the shipped `/api/photos/client/*` surface (device-token auth class, host-mounted in `src/main.rs`):
+  - `GET  /api/photos/client/membership?library_id=` → `LibraryMembership` (`uploaded_by` derived from the authenticated device's user, never the caller)
+  - `POST /api/photos/client/data-block/{blob_id}` — raw streamed body of exactly `X-Hopnet-File-Size` plaintext bytes plus the client-minted per-blob key in `X-Hopnet-Blob-Key` (64 hex chars); returns `UploadedDataBlock`. The declared length is enforced inline server-side (a truncated body 422s mid-put, never a short-but-committed blob)
+  - `POST /api/photos/client/transaction` — same contract as the JWT route; the node signs via the device token's bootstrapped session and blocks until the consensus decision (120s)
+  - `GET  /api/photos/client/committed/{photo_id}` — confirm probe for the publisher idempotency contract: 200 iff the photo is committed AND owned by the authenticated user, 404 otherwise (404 ⇒ retrying the same photo_id is safe)
+
+**Encryption boundary (deliberate):** the thin client streams *plaintext* content plus the client-minted per-blob key; `api::put` on the node encrypts and RS-encodes exactly as it does for node clients. Client-side content encryption was evaluated and rejected for this phase: it would require splitting `api::put` into a client-reusable encoder plus a fragment-upload surface, triple upload bandwidth (RS 10+20 over ciphertext), and gain nothing while device tokens carry the wrapped user key. The route contract keeps room for a fragment-level variant if the key model tightens.
 
 ### Consumer Bindings
 
@@ -709,32 +933,38 @@ If the module is not compiled, no photos tables are created, no handlers are reg
 
 ## Implementation Phases
 
-### Phase 1: photos-core Crate and Schema [ ]
-- Extract `crates/photos-core/` with crypto, metadata, thumbnail, payload, and dispatch trait
-- Consensus-tracked photo tables (photos, photo_resources, photo_metadata_access)
-- `photo_add` / `photo_delete` consensus handlers in `src/photos/` (soft-delete model)
-- `DataBlockReferenceProvider` integration with orphan cleanup
-- Periodic cleanup job for expired soft-deleted photos
-- `dispatch_local` implementation for node clients
-- Basic HTTP API: upload, submit transaction, list photo IDs, delete, restore
-- Metadata sync endpoint (return encrypted blobs + photo_resources rows for sidecar hydration)
-- ECDH per-photo performance validation
+### Phase 1: photos-core Crate and Schema [~]
+- [~] Extract `hopnet-photos-core` with crypto, metadata, payload, dispatch trait, and optional sidecar; thumbnail generation remains deferred
+- [x] Consensus-tracked photo tables (photos, photo_metadata_access, photo_resources, photo_operations, shared_libraries, shared_library_members, photo_albums, photo_album_entries, photo_favorites) — `hopnet-photos` crate, RFC-016 projection registry
+- [x] `photo_add` / `photo_delete` / `photo_restore` consensus handlers — `PhotoAddHandler` (batch, per-entry `uploaded_by` authz, rejected non-NULL `library_id` until Phase 3), `PhotoDeleteHandler` (per-entry ownership check, `deleted_at` derived from `operation_id.extract_timestamp()` — no clocks in handlers), `PhotoRestoreHandler`. 6 handler tests covering authz, tombstone, restore-on-active rejection, nonexistent-library rejection, and validate-vs-apply transaction separation.
+- [x] `DataBlockReferenceProvider` integration with orphan cleanup — `PhotosReferenceProvider` with UUIDv7-timestamp-filtered edit-history retention; 10 tests covering both surfaces, the retention boundary, the over-exclusion leak direction, and Rust↔SQL implementation agreement
+- [x] `committed_blob_ids` distribution hook — `photo_add` arm extracts blob ids from resources for the storage engine's distribution kick
+- [x] Periodic cleanup job for expired soft-deleted photos — `photo_cleanup_expired` consensus handler (node-signed, wall-clock predicate host-side in scan query, deterministic `datetime(deleted_at, '+30 days') < datetime(scan_cutoff)` check in handler); `run_photo_tombstone_cleanup` scan job batching 50 IDs per tx via `TxGateway::submit_batch`; daily randomized apalis cron registered via `photos_host::spawn_tombstone_cleanup_worker`. 4 handler tests + 3 DB tests covering hard-delete, within-window skip, missing-photo idempotency, user-signed rejection, and active-photo skip.
+- [x] `dispatch_local` implementation for node clients — signs user transactions through the local consensus queue and reads the local encrypted sync feed
+- [x] Source-independent asset model in `hopnet-photos-core::asset` — namespaced source identities, typed resource kinds, resource descriptors, and validation
+- [x] Photo publisher — `hopnet-photos-core::publisher::publish_photo_add`: exact-length streaming upload via the dispatch (`ExactLen` adapter, no staging copy), per-recipient blob/metadata key wrapping, `PartialPublish` reconciliation contract; `PhotoDispatch` upload pipe (`upload_data_block`, `fetch_library_members`) implemented on the node-local `Submitter` with `uploaded_by` derived from the authenticated dispatch state, never the caller. 17 publisher tests. Thin-client byte-transport routes shipped (`/api/photos/client/*`, device-token auth — membership, streaming data-block upload with inline declared-length enforcement, transaction relay, committed-state confirm probe); the macOS ingress publisher adapter shipped as its Rust slice (`crates/ingress-publisher`: sidecar→PhotoAsset mapping, `HttpDispatch`, confirm-then-retry `NodePublisher`; publish queue + park-on-unreachable tick in the ingress daemon loop). Swift/FFI wiring of the daemon remains for the Mac phase
+- [~] Basic HTTP API — transaction submission, gallery/detail queries, recently-deleted view, and per-user sidecar lifecycle are mounted; keyset browse page `GET /photos/page` (base64url `sort_ms:photo_id` cursors, bidirectional, media-type filter pushdown) and month histogram `GET /photos/histogram` shipped; content fetch route `GET /photos/{id}/resource/{type}` shipped; manual multipart ingest `POST /photos` shipped (asset descriptor + per-kind resource parts, buffered — streaming multi-resource deferred with video; fresh UUIDv7 per request, SourceIdentity dropped at publish) (blob_access-gated, soft-delete-agnostic, Range support, ETag `"{data_block_id}"` + private/immutable caching with 304 revalidation; gallery/detail payloads carry per-photo `resources` lists from the sidecar cache); thin-client content upload routes shipped under `/api/photos/client/*` (device-token auth class)
+- [x] Metadata sync endpoint — user-scoped encrypted photo state + `photo_resources` rows with monotonic high-water marks
+- [ ] ECDH per-photo performance validation
 
-### Phase 2: Sidecar and History [ ]
-- Sidecar database schema and sync logic in `photos-core` (no framework dependency)
-- Initial hydration flow (full library decrypt)
-- Incremental sync (process new consensus transactions)
-- Operation log: content edits with undo
-- Metadata edit operations with undo
-- Deletion with 30-day retention and restore
-- Periodic cleanup job for expired deletions
+### Phase 2: Sidecar and History [x]
+- [x] Sidecar database schema and sync logic in `photos-core` (no framework dependency)
+- [x] Initial hydration flow (full library decrypt)
+- [x] Incremental sync (process new consensus transactions)
+- [x] Operation log: content edits with undo
+- [x] Metadata edit operations with undo
+- [x] Deletion with 30-day retention and restore
+- [x] Periodic cleanup job for expired deletions
 
-### Phase 3: Shared Libraries [ ]
-- Library creation and membership management
-- Auto-share on add (file_access + photo_metadata_access distribution to all members)
-- Member join flow with bulk key wrapping
-- Member leave with cleanup
-- Library member pubkey endpoint (for thin client key wrapping)
+### Phase 3: Shared Libraries [~]
+- [x] Library creation and membership lifecycle (2026-08-01): `create_shared_library` + invite/accept/decline/remove consensus txs (JWT-only — excluded from `DEVICE_TX_FUNCTIONS`), per-member wrapped library key (`shared_library_keys`; name encrypted under it), consent-pattern invites with invite-parked wraps, JWT routes `/api/photos/libraries{,/{id}/invite,accept,decline,leave}`
+- [x] Auto-share on add: `photo_add`/`photo_edit_content` fan out to members ∪ pending invitees (`read_library_membership` union); handler authz widened from uploader-only to member (equal standing) across delete/restore/edit/undo/favorite
+- [x] Access convergence worker (replaces the one-shot bulk join): per-user session-lifetime loop deriving grant/revoke deltas, `library_access_grant`/`_revoke` batches, rotation-lane seam (`ConvergeLane`)
+- [x] Membership-gated reads (Design B): shared photos require membership at `query_changes` (both statements) and the resource byte path; pre-staged invitee wraps inert until accept; kick = instant API revocation
+- [x] Sidecar rematerialization: membership-diff pre-phase, `photo_view_changes`-triggered paged backfill, purge on leave/kick (`sidecar_libraries` state)
+- [x] Ingress daemon shared publish (2026-08-02 — **closes the iCloud shared-library cutover gate**): `mesh_library_id` binding on the ingress `libraries` table (`library set-mesh-id`, scope-bound-only invariant), has-publish-target claim predicate, scope-partitioned publish pass (per-scope resolve/responsibility/parking/attempt-burn; unreachable still parks whole pass), per-(user, library) ingress responsibility with membership-checked claims and kick dissolution, library-scoped fingerprint key on `POST /api/photos/client/resolve` (derived from the library key — cross-member dedup, `photos-ingress-shared` scenario proves adopt-not-reupload e2e)
+- [ ] `Keys` rotation lane (cryptographic revocation after kick) — designed into the convergence contract, not built
+- [ ] Empty-library GC (last leaver strands the library row)
 
 ### Phase 4: Albums and Organization [ ]
 - Album CRUD with consensus
@@ -742,10 +972,10 @@ If the module is not compiled, no photos tables are created, no handlers are reg
 - Shared albums with non-library-members (per-photo metadata key wrapping)
 - Per-user favorites
 
-### Phase 5: Desktop Frontend [ ]
+### Phase 5: Desktop Frontend [~]
 - *Deferred — separate RFC for gallery UI, timeline view, shared library management*
 - Tauri command bindings to `photos-core`
-- Svelte gallery components
+- [x] Svelte photo gallery — ingress viewer components folded into the main frontend (windowed keyset browse grid with day headers and hover preview, month histogram rail with jump-to-month, media filters, lightbox with info panel and authenticated downloads); content rendered through a module-scope blob cache (authenticated fetch → object URL keyed by data_block_id, LRU-evicted, flushed on logout); sidecar opt-in/resume/remove flow retained; recently-deleted view rendered through the same grid. Favorites filter and shared-library dropdown deferred (Phases 3-4); lightbox video is full-buffer (no Range streaming through object URLs)
 
 ### Phase 6: Mobile Clients [ ]
 - *Deferred — UniFFI bindings for `photos-core`, thin client dispatch implementation*

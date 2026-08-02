@@ -257,6 +257,10 @@ pub async fn post_setup(
                                 e
                             );
                         }
+                        // Photo ingress deliberately NOT provisioned here:
+                        // minting is enablement-gated behind the
+                        // /photo-ingress/enable route (a fresh node cannot
+                        // already be enabled).
                     });
                 }
             }

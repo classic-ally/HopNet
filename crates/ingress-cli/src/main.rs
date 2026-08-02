@@ -38,7 +38,7 @@ async fn run(cli: Cli) -> Result<ExitCode, IngressError> {
             match args.photo {
                 Some(key) => {
                     let Some(view) =
-                        ingress_core::status::photo_status(&store, &data_dir, &key).await?
+                        ingress_core::status::photo_status(&store, &data_dir.spool(), &key).await?
                     else {
                         eprintln!("no photo matches {key:?} (tried photo_id, then cloud_id)");
                         return Ok(ExitCode::from(2));
@@ -70,7 +70,6 @@ async fn run(cli: Cli) -> Result<ExitCode, IngressError> {
             };
             let opts = ingress_core::fsck::FsckOptions {
                 repair: args.repair,
-                deep: args.deep,
             };
             let report = ingress_core::fsck::run_fsck(&store, &data_dir, &opts).await?;
             if args.json {
@@ -83,18 +82,6 @@ async fn run(cli: Cli) -> Result<ExitCode, IngressError> {
             } else {
                 ExitCode::from(1)
             })
-        }
-
-        Command::Recover(args) => {
-            let opts = ingress_core::recover::RecoverOptions {
-                roots: args.root,
-                libraries: args.library,
-                from_sidecars: args.from_sidecars,
-                force: args.force,
-            };
-            let report = ingress_core::recover::recover(&data_dir, &opts).await?;
-            render::print_recover(&report);
-            Ok(ExitCode::SUCCESS)
         }
 
         Command::Library(cmd) => run_library(&data_dir, cmd).await,
@@ -113,10 +100,6 @@ async fn run_library(data_dir: &DataDir, cmd: LibraryCommand) -> Result<ExitCode
             let opts = ingress_core::libconfig::AddLibraryOptions {
                 id,
                 display_name: args.display_name,
-                blob_root: args.blob_root.to_string_lossy().into_owned(),
-                sidecar_root_remote: args
-                    .sidecar_remote
-                    .map(|p| p.to_string_lossy().into_owned()),
                 scope: match args.scope {
                     AddScope::Personal => LibraryScope::Personal,
                     AddScope::Shared => LibraryScope::Shared,
@@ -128,9 +111,6 @@ async fn run_library(data_dir: &DataDir, cmd: LibraryCommand) -> Result<ExitCode
                 "added library {} ({:?})",
                 added.config.library_id, added.config.display_name
             );
-            if added.warn_no_remote {
-                render::print_no_remote_warning(added.config.library_id.as_str());
-            }
             Ok(ExitCode::SUCCESS)
         }
         LibraryCommand::List { json } => {
@@ -146,25 +126,12 @@ async fn run_library(data_dir: &DataDir, cmd: LibraryCommand) -> Result<ExitCode
                             l.library_id.to_string(),
                             l.display_name.clone(),
                             l.scope_binding.clone().unwrap_or_else(|| "personal".into()),
-                            l.blob_root.clone(),
-                            l.sidecar_root_remote
-                                .clone()
-                                .unwrap_or_else(|| "NO BACKUP".into()),
                             l.retention_days.to_string(),
+                            l.mesh_library_id.clone().unwrap_or_else(|| "-".into()),
                         ]
                     })
                     .collect();
-                render::table(
-                    &[
-                        "ID",
-                        "NAME",
-                        "SCOPE",
-                        "BLOB ROOT",
-                        "REMOTE SIDECARS",
-                        "RETENTION",
-                    ],
-                    &rows,
-                );
+                render::table(&["ID", "NAME", "SCOPE", "RETENTION", "MESH"], &rows);
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -191,6 +158,17 @@ async fn run_library(data_dir: &DataDir, cmd: LibraryCommand) -> Result<ExitCode
             let id = LibraryId::parse(&id)?;
             ingress_core::libconfig::set_retention(&store, data_dir, &id, days).await?;
             println!("retention for {id} set to {days} days");
+            Ok(ExitCode::SUCCESS)
+        }
+        LibraryCommand::SetMeshId { id, mesh_id, clear } => {
+            let store = open_existing_rw(data_dir).await?;
+            let id = LibraryId::parse(&id)?;
+            let mesh = if clear { None } else { mesh_id.as_deref() };
+            ingress_core::libconfig::set_mesh_library_id(&store, data_dir, &id, mesh).await?;
+            match mesh {
+                Some(mesh) => println!("{id} publishes into mesh library {mesh}"),
+                None => println!("cleared mesh binding for {id}"),
+            }
             Ok(ExitCode::SUCCESS)
         }
     }

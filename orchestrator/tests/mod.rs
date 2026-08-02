@@ -36,6 +36,11 @@ pub(crate) mod multi_user;
 mod orphan_cleanup;
 mod performance;
 pub(crate) mod persistence;
+mod photos;
+mod photos_ingress_identity;
+pub(crate) mod photos_ingress_publish;
+mod photos_ingress_shared;
+pub(crate) mod photos_shared_library;
 mod post_files_mixed;
 mod post_files_shape;
 mod range_download;
@@ -368,6 +373,31 @@ pub async fn run_test_by_name(
                 .run(mesh_id, nodes, flags)
                 .await
         }
+        "photos-upload-consistency" => {
+            photos::PhotosUploadConsistency
+                .run(mesh_id, nodes, flags)
+                .await
+        }
+        "photos-ingress-publish" => {
+            photos_ingress_publish::PhotosIngressPublish
+                .run(mesh_id, nodes, flags)
+                .await
+        }
+        "photos-ingress-identity" => {
+            photos_ingress_identity::PhotosIngressIdentity
+                .run(mesh_id, nodes, flags)
+                .await
+        }
+        "photos-shared-library" => {
+            photos_shared_library::PhotosSharedLibrary
+                .run(mesh_id, nodes, flags)
+                .await
+        }
+        "photos-ingress-shared" => {
+            photos_ingress_shared::PhotosIngressShared
+                .run(mesh_id, nodes, flags)
+                .await
+        }
         "recents-ordering" => recents::RecentsOrdering.run(mesh_id, nodes, flags).await,
         "range-download" => {
             range_download::RangeDownload
@@ -495,6 +525,11 @@ pub fn list_test_names() -> Vec<&'static str> {
         "orphan-cleanup",
         "device-token-session-bootstrap",
         "fileprovider-device-token-auth",
+        "photos-upload-consistency",
+        "photos-ingress-publish",
+        "photos-ingress-identity",
+        "photos-shared-library",
+        "photos-ingress-shared",
         "recents-ordering",
         "range-download",
         "takeout-happy-path",

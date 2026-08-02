@@ -66,7 +66,169 @@ apply functions inside consensus handlers.
 - [x] Distribution engine behind seams (event-driven on_decided kick, global
       workers, batched placement commits) + fragment RPC serve half
 - [x] api::get + blob manifest reads + tier-1 repair (rebalancer re-enabled)
-- [ ] Photos ingress as projection #2 (post-merge; encryption for free)
+- [~] Photos ingress as projection #2 (post-merge; encryption for free) —
+      Phase 1 schema + handlers + distribution hook + cleanup landed
+      2026-07-28: `hopnet-photos` crate (RFC-016 manifest) installs 9
+      consensus-tracked tables with zero plaintext photo metadata (group
+      fields folded into `encrypted_metadata`); `photo_add`/`photo_delete`/
+      `photo_restore`/`photo_cleanup_expired` consensus handlers;
+      `committed_blob_ids` hook for fragment distribution; `PhotosReferenceProvider`
+      pins blobs with UUIDv7-timestamp-filtered edit-history retention;
+      daily randomized apalis cron (`photos_host::spawn_tombstone_cleanup_worker`)
+      scans expired tombstones, batches 50 IDs per tx, handler verifies 30d
+      window deterministically via `scan_cutoff` in payload. 39 total tests.
+      `Projection::tables` trait method feeds the divergence checker from
+      each crate's `db::TABLES` const — no hardcoded table list to drift.
+      `register_uuid_extract_timestamp` moved to `hopnet-common::db_impl`.
+- [~] Photos server-side wiring (Track C, 2026-07-28): per-user sidecar
+      (`hopnet-photos-core::sidecar::SidecarDb`) with X25519-recipient
+      metadata decryption; `src/photos::PhotosHost` enables/disables
+      sidecars and runs a 30 s sync worker over `read_photo_changes`;
+      axum routes: `/api/photos/{gallery,recently-deleted,{id},
+      transaction,sync,sidecar/{status,enable,disable,reinit}}`.
+- [x] Photos shared ingest model: `hopnet-photos-core::asset` defines
+      source-independent identities, RFC-011 resource kinds, resource
+      descriptors, and validation.
+- [x] Photos content serving + gallery (2026-07-30): `GET /api/photos/
+      {id}/resource/{type}` streams decrypted resource bytes — blob_access
+      wrap as the read grant (404/403 split), soft-deleted photos still
+      serve during the 30-day window, Range/206 support, ETag
+      `"{data_block_id}"` + private/immutable caching with 304
+      revalidation; keyset browse page + month histogram endpoints;
+      ingress viewer components folded into the main frontend (windowed
+      grid, histogram rail, filters, lightbox) over a module-scope
+      authenticated blob cache keyed by data_block_id; manual multipart
+      ingest route `POST /api/photos` runs the full publisher server-side
+      (2026-07-30). Seeding suite (2026-07-30): `photo-seeder` bin +
+      `hopnet::dev_seed` (deterministic synthetic photos over HTTP,
+      targets a dev node or mesh nodes), `photos-upload-consistency`
+      orchestrator test (first cross-node validation of the photos
+      pipeline), `orchestrator creds` for browser sign-in. Deferred:
+      favorites (Phase 4), video Range streaming. (Shared libraries have
+      since landed — see the Phase 3 entries below.)
+- [x] Photo publisher (2026-07-30): `hopnet-photos-core::publisher`
+      turns a validated `PhotoAsset` + byte streams into an encrypted
+      `photo_add` — exact-length streaming upload (no staging copy),
+      per-recipient key wrapping, `PartialPublish` reconciliation
+      contract; `PhotoDispatch` gains the upload pipe
+      (`upload_data_block`, `fetch_library_members`), implemented on the
+      node-local `Submitter` with `uploaded_by` derived from
+      authenticated dispatch state.
+- [x] Thin-client dispatch routes + ingress publisher adapter, Rust
+      slice (2026-07-30): device-token-authenticated
+      `/api/photos/client/*` surface (membership, streaming data-block
+      upload with inline declared-length enforcement, transaction relay,
+      committed-state confirm probe); ingress-core publish queue
+      (`published_at` ledger, park-on-unreachable daemon tick, inflight
+      deferral); `crates/ingress-publisher` (sidecar→PhotoAsset mapping,
+      `HttpDispatch`, confirm-then-retry `NodePublisher`, e2e driver
+      bin); `photos-ingress-publish` orchestrator scenario. Swift/FFI
+      wiring landed 2026-07-30 (publish credentials via FfiDaemonOptions,
+      keychain provisioning from the app, soak-verified on a real
+      library); SMAppService packaging landed 2026-07-31 (below);
+      buffer-mode retention landed as the spool transplant (below).
+- [x] Thumbnail renditions (2026-07-30): the ingress daemon generates
+      ~256px/~1024px JPEG renditions per photo (PHImageManager,
+      synchronous delivery + ImageIO fallback; video poster frames) as
+      RFC-011 resources 5/6 via synthetic sentinel descriptors
+      (1005/1006); written thumbnails reopen on edit-set changes; backfill
+      migration re-queues pre-rendition archives. Gallery cells degrade to
+      placeholders on img decode errors. Soak-verified end-to-end with a
+      real library (HEIC + video cells render). Deferred: non-PhotoKit
+      import paths must generate their own thumbnails when import lands.
+- [x] Consensus photo identity (2026-07-31): `photos.cloud_fingerprint`
+      (per-user keyed HMAC of the PHCloudIdentifier, computed node-side
+      at `POST /api/photos/client/resolve`, enforced by a partial UNIQUE
+      pair) + `photo_ingress_responsibility` (explicit JWT-only
+      claim/transfer via `/api/photos/ingress/claim`, device tx route
+      gates on holder) + ingress remote adoption (resolve pre-pass stamps
+      mesh-held photos as adopted with `consensus_photo_id`, zero
+      uploads; non-holders adopt but park mutations without burning
+      retries). Wire break: `PhotoAddEntry` amended in place
+      (pre-release), dev meshes reseeded. `photos-ingress-identity`
+      orchestrator scenario covers the dual-device shape end to end.
+      Deferred: import-time fingerprints for non-PhotoKit paths.
+      (Library-scoped fingerprint keys have since landed — see the
+      ingress shared-library publish entry below; the cross-participant
+      PHCloudIdentifier agreement still wants a two-account spike before
+      real-world cutover of a multi-member SPL.)
+- [x] Photo-ingress packaging + provisioning plumbing (2026-07-31): the
+      daemon ships inside HopNet.app (build stages 1b/3b embed
+      `Contents/MacOS/photo-ingress` + the SMAppService agent plist,
+      signed individually, hardened runtime + photos-library entitlement;
+      bundle id now `com.hopnet.desktop.photo-ingress`). Owner-only
+      `/api/photo-ingress/{enable,disable,status}` routes provision the
+      keychain (device token + blob_root) and drive
+      registration/unregistration — the future settings pane's backing
+      API, enablement-gated minting (setup/login no longer mint
+      unconditionally). Daemon self-provisions at startup: canonical
+      `--data-dir` default, `ensure_personal_library` auto-bind from
+      keychain blob_root (closes the fresh-state `scope_unmapped` trap),
+      `--log-to-data-dir` log ownership, and `RefreshingPublisher`
+      credential re-read after unreachable passes (GUI ephemeral-port
+      relaunch heals without a daemon restart). Settings pane UI is the
+      next slice. Live smoke on the macbook (2026-08-01) passed the full
+      enable/disable/re-enable cycle on the production state.db; fixes it
+      forced: app unsandboxed (SMAppService EPERM), photos-library
+      entitlement + usage string on the MAIN app (TCC attributes the
+      bundled daemon to its containing bundle; hardened runtime denies
+      without prompt otherwise), and a GUI auto-login startup panic
+      (tokio `blocking_write` inside the runtime) that killed the HTTP
+      server on every release launch with a stored session key. The route
+      orchestration has since been extracted into `photo_ingress::flow`
+      behind a `ProvisioningDeps` seam, so its ordering/owner invariants
+      (creds-before-register, capture-before-wipe, owner-only 403) are
+      pinned by mock tests in Linux CI.
+- [~] Shared-library membership lifecycle, mesh side (RFC-011 Phase 3,
+      2026-08-01): create_shared_library + invite/accept/decline/
+      remove_member consensus txs (JWT-only; DEVICE list unchanged) with
+      per-member wrapped library key (name encrypted under it; seam for
+      the library-scoped fingerprint key); consent-pattern invites carry
+      the invitee's wrap so accept works inviter-offline. Access
+      distribution is a per-user CONVERGENCE worker (session-lifetime,
+      beside the sidecar sync worker): grant/revoke deltas toward
+      members ∪ invitees, OR-IGNORE handlers make racing workers
+      harmless, ConvergeLane seam reserves the future key-rotation lane.
+      Reads are membership-gated for shared photos (Design B — pre-staged
+      invitee wraps inert until accept; kick = instant API revocation);
+      sidecar rematerializes on membership diff + photo_view_changes
+      signals (join backfill / leave purge) instead of photo_changes
+      bumps. JWT routes /api/photos/libraries*, ingest route gains a
+      library_id target.
+- [x] Ingress shared-library publish (2026-08-02) — **closes the iCloud
+      cutover gate**: ingress `libraries` gains `mesh_library_id`
+      (`library set-mesh-id`, scope-bound-only; detach refused while
+      mesh-bound), claim predicate becomes has-publish-target, and the
+      publish pass partitions by scope (per-scope resolve/responsibility/
+      parking/attempt-burn — a kicked member's 403ing library can't
+      starve the personal queue; unreachable still parks the whole pass).
+      Responsibility reshaped to per-(user, library) with a split
+      partial-UNIQUE pair; shared claims are membership-checked and
+      dissolved on kick; the thin-client tx gate checks the exact scopes
+      a tx touches. Resolve accepts a library_id and derives the
+      LIBRARY-SCOPED fingerprint key from the shared library key (frozen
+      context, pinned vector) so every member computes identical
+      fingerprints — idx_photos_fp_shared finally dedupes cross-member;
+      `photos-ingress-shared` scenario proves publish → cross-member
+      byte-exact reads → second member's daemon ADOPTS instead of
+      re-uploading → per-library eviction, e2e. Cutover ops (wipe,
+      re-pull, bind, claim) can now cover both partitions.
+- [x] Ingress transplant: archive → transient spool (2026-08-01): the
+      daemon's independent archive on user-owned storage (blob roots,
+      sidecar JSON files, remote replication, snapshots, Tier-3 recover,
+      the `ingress-server` viewer crate) is deleted — HopNet is the
+      archive of record. Bytes stage in a single content-addressed spool
+      under the data dir and are evicted (`blobs.evicted_at` stamp +
+      hash-liveness-gated unlink) once every referencing photo's publish
+      is consensus-decided (`published_at`, incl. adoption). Publish
+      metadata comes from the `photos.descriptor_json` capsule; the
+      document is composed per pass (`Sidecar::compose`). Library
+      transitions are ledger-only; per-library storage roots dropped
+      from the schema; provisioning shrank to the device token (zero-arg
+      `ensure_personal_library`, body-less enable route, blob_root
+      purged from FFI/keychain/status). Recovery = re-scan + adoption.
+      Cutover is a fresh iCloud re-pull; the old NAS archive stays as an
+      untouched cold copy. RFC-011 ingress spec rewritten to match.
 - [x] hopnet-drive + hopnet-projection + hopnet-takeout extraction
       ([RFC-015](specs/hopnet-drive.md)) COMPLETE (stages D0–D5,
       2026-07-08): narrowed handler seam, per-projection schema units,
@@ -357,19 +519,20 @@ S3-compatible API layer enabling standard S3 clients and SDKs to interact with H
 - [ ] Integration with AWS CLI and standard S3 SDKs
 
 ### 11. Apple Photos Ingress ([spec](specs/apple-photos-ingress.md))
-**Status**: Phases 0–6 complete; Phase 7 (hardening) in progress; Phase 8 (interim viewer) started
+**Status**: Phases 0–6 complete; Phase 7 (hardening) in progress; Phase 8 retired; Phase 9 (HopNet transplant) complete — HopNet is the archive of record
 
-Interim daemon archiving an Apple Photos library (personal + iCloud Shared Photo Library) to content-addressed BLAKE3 blobs + JSON sidecars on user-controlled storage, designed to migrate into the RFC-011 photos module. Standalone Rust workspace at `crates/` (sqlx 0.9 pilot) + Swift PhotoKit shim at `apple/PhotoIngress/`. A freestanding read-only web viewer (`crates/ingress-server`, Phase 8) serves the archive off the storage host — folds into HopNet's own UI later.
+PhotoKit→HopNet on-ramp daemon (personal + iCloud Shared Photo Library). Bytes stage in a transient content-addressed spool under the daemon's data dir, publish into the mesh as encrypted data blocks through consensus (device-token thin-client routes via `crates/ingress-publisher`), and are evicted once decided — the daemon-minted photo_id becomes the consensus id with no remapping, and mesh-held photos re-associate via adoption. Standalone Rust workspace at `crates/` (sqlx 0.9 pilot) + Swift PhotoKit shim at `apple/PhotoIngress/`. The original user-owned-storage archive layer (blob roots, sidecars, replication, snapshots, viewer) was a stopgap and has been deleted (Phase 9).
 
 - [x] Phase 0: PhotoKit spike (identity, scope detection, streaming)
-- [x] Phase 1: ingress-core skeleton (schema, match precedence, sidecars)
+- [x] Phase 1: ingress-core skeleton (schema, match precedence)
 - [x] Phase 2: UniFFI bridge + vertical slice (one asset end-to-end)
 - [x] Phase 3: Pipeline (scheduler, retry/backoff, admission, SIGTERM)
-- [x] Phase 4: Discovery (change classification, reconciliation scan, hard moves, daemon loop)
-- [x] Phase 5: Lifecycle (hard-delete cleanup, snapshots, sidecar replication, Tier-1 repair)
-- [x] Phase 6: CLI (`ingress-cli`: status, fsck --repair, recover, library config)
-- [~] Phase 7: Hardening (mount-loss pause fix done + shared-library soak clean; LaunchAgent packaging + full soak remaining)
-- [~] Phase 8: Interim viewer (`ingress-server`: sidecar-index → Axum REST → Svelte grid; decode spike done)
+- [x] Phase 4: Discovery (change classification, reconciliation scan, library moves, daemon loop)
+- [x] Phase 5: Lifecycle (hard-delete cleanup, Tier-1 repair)
+- [x] Phase 6: CLI (`ingress-cli`: status, fsck --repair, library config)
+- [~] Phase 7: Hardening (packaging + provisioning + live smoke done; full personal-library soak remaining)
+- [x] Phase 8: Interim viewer — retired; crate deleted in Phase 9, gallery lives in HopNet's frontend
+- [x] Phase 9: HopNet transplant (descriptor capsule, spool eviction on decided publish, roots/sidecars/snapshots/recover demolished, token-only provisioning)
 
 ### Reliability Goals
 - **Single node failure**: No data loss, minimal performance impact

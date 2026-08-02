@@ -110,6 +110,13 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 tracing::warn!("FileProvider keychain base_url refresh failed: {:?}", e);
             }
         }
+        // Same refresh for the photo-ingress daemon's credentials.
+        if keychain::load_photo_ingress_config().is_ok() {
+            let url = format!("http://127.0.0.1:{}", port);
+            if let Err(e) = keychain::update_photo_ingress_base_url(&url) {
+                tracing::warn!("photo-ingress keychain base_url refresh failed: {:?}", e);
+            }
+        }
     }
 
     // Linux arm of the same discovery problem (RFC-018 S8): hopnet-mount
@@ -284,6 +291,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 storage: Arc::new(OnceCell::new()),
                 runtime: tokio::runtime::Handle::current(),
                 change_tx: tokio::sync::broadcast::channel(16).0,
+                photos_host: Arc::new(photos::PhotosHost::new()),
             };
 
             // If we loaded state from database, populate the OnceCell fields
@@ -338,7 +346,8 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                             };
                             app_state
                                 .session_store
-                                .blocking_write()
+                                .write()
+                                .await
                                 .insert(kc_user_id, session);
                             tracing::info!("Loaded owner session from keychain (auto-login ready)");
                             tokio::spawn(hopnet_takeout::jobs::maybe_resume_for_user(
@@ -462,6 +471,10 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 policy_tick_worker.run().await;
             });
 
+            // Photo tombstone cleanup — randomized daily scan, 30-day
+            // recovery window. Every node runs independently.
+            photos_host::spawn_tombstone_cleanup_worker(app_state.clone());
+
             // Spawn consensus queue batch processor — on the dedicated queue
             // runtime (see consensus::queue::queue_rt) so consensus keeps
             // draining when API load starves the main runtime.
@@ -572,6 +585,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                     "/takeout",
                     hopnet_takeout::routes::router(takeout_state.clone()),
                 )
+                .merge(photos::routes::router(app_state.clone()))
                 .nest("/admin", admin::routes::admin_routes())
                 .nest("/views", views::routes::router())
                 .route("/logout", post(auth::sign_out))
@@ -643,10 +657,32 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                     ),
                 )
                 .nest("/devices", devices::routes::router(app_state.clone()))
+                // Thin-client photos dispatch surface (photo-ingress daemon):
+                // device-token auth class, host-mounted because the handlers
+                // close over AppState (photos declares no projection mounts).
+                .nest(
+                    "/photos/client",
+                    photos::routes::device_router(app_state.clone()).layer(
+                        middleware::from_fn_with_state(
+                            app_state.clone(),
+                            devices::auth::device_token_auth_middleware,
+                        ),
+                    ),
+                )
                 .merge(test_routes)
                 .route("/setup", get(setup::get_setup))
                 .route("/setup", post(setup::post_setup))
                 .route("/login", post(auth::sign_in));
+
+            // Photo-ingress enablement plumbing (owner-only, JWT): the
+            // future settings pane's backing routes. macOS GUI process only —
+            // SMAppService and the keychain are per-user-session concerns of
+            // the machine the daemon runs on.
+            #[cfg(all(target_os = "macos", feature = "gui"))]
+            let api_routes = api_routes.nest(
+                "/photo-ingress",
+                photo_ingress::routes::router(app_state.clone()),
+            );
 
             // Projection mounts (RFC-016 Stage 4). Host routes close over
             // AppState first; each projection's routers are Router<()> and

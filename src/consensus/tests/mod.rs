@@ -462,6 +462,7 @@ pub fn create_test_app_state_with_keys(
         // runtime so scheduled work has somewhere real to land.
         runtime: test_iroh_rt().handle().clone(),
         change_tx: tokio::sync::broadcast::channel(16).0,
+        photos_host: Arc::new(crate::photos::PhotosHost::new()),
     };
     // Same scope map as production (build_registry keeps them from
     // drifting); comms spawns the accept loop on its net runtime.

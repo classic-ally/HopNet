@@ -30,6 +30,31 @@ impl StateStore {
             .await?;
         Ok(n)
     }
+
+    /// Persist the publish-metadata capsule (serialized
+    /// [`crate::descriptor::DescriptorCapsule`]). Rides the same trigger
+    /// points as materialization, metadata refresh, and heal — so the
+    /// column tracks the live descriptor.
+    pub async fn update_descriptor_capsule(&self, id: &PhotoId, json: &str) -> Result<()> {
+        sqlx::query("UPDATE photos SET descriptor_json = ? WHERE photo_id = ?")
+            .bind(json)
+            .bind(id)
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
+
+    /// Persist the capsule straight from a live descriptor — the single
+    /// metadata write every materialization/refresh/heal path funnels
+    /// through (the successor of the sidecar-file write).
+    pub async fn persist_descriptor(
+        &self,
+        id: &PhotoId,
+        desc: &crate::descriptor::AssetDescriptor,
+    ) -> Result<()> {
+        let json = serde_json::to_string(&crate::descriptor::DescriptorCapsule::from(desc))?;
+        self.update_descriptor_capsule(id, &json).await
+    }
 }
 
 pub(crate) async fn photo_by_cloud_id<'e, E>(exec: E, cloud_id: &str) -> Result<Option<PhotoRecord>>
@@ -191,52 +216,12 @@ pub(crate) async fn set_asset_modified_at<'e, E>(
 where
     E: Executor<'e, Database = Sqlite>,
 {
-    // The metadata refresh rewrote the sidecar just before this stamp — the
-    // remote copy is stale, so the dirty flag rides the same statement (T6).
-    sqlx::query(
-        "UPDATE photos SET asset_modified_at = ?, sidecar_replicated_at = NULL WHERE photo_id = ?",
-    )
-    .bind(at)
-    .bind(id)
-    .execute(exec)
-    .await?;
-    Ok(())
-}
-
-/// Every local sidecar rewrite dirties the remote copy (spec §photos notes:
-/// the NULL commits in the same transaction as the triggering state change).
-pub(crate) async fn mark_sidecar_dirty<'e, E>(exec: E, id: &PhotoId) -> Result<()>
-where
-    E: Executor<'e, Database = Sqlite>,
-{
-    sqlx::query("UPDATE photos SET sidecar_replicated_at = NULL WHERE photo_id = ?")
+    sqlx::query("UPDATE photos SET asset_modified_at = ? WHERE photo_id = ?")
+        .bind(at)
         .bind(id)
         .execute(exec)
         .await?;
     Ok(())
-}
-
-/// Stamp a successful remote replication. Guarded on still-NULL: a rewrite
-/// that landed after the copy was taken must win (the stamp would otherwise
-/// record a stale remote as current).
-pub(crate) async fn stamp_sidecar_replicated<'e, E>(
-    exec: E,
-    id: &PhotoId,
-    at: DateTime<Utc>,
-) -> Result<bool>
-where
-    E: Executor<'e, Database = Sqlite>,
-{
-    Ok(sqlx::query(
-        "UPDATE photos SET sidecar_replicated_at = ? \
-         WHERE photo_id = ? AND sidecar_replicated_at IS NULL",
-    )
-    .bind(at)
-    .bind(id)
-    .execute(exec)
-    .await?
-    .rows_affected()
-        > 0)
 }
 
 /// Hard-delete candidates: tombstones past their retention cutoff. The
@@ -275,47 +260,113 @@ where
     }
 }
 
-/// The replication work queue: dirty photos in libraries with a remote root.
-/// `materialized_at IS NOT NULL` keeps never-materialized photos (no sidecar
-/// exists) out of every pass; tombstoned materialized photos keep the stamp,
-/// so their deleted_at sidecar replicates — the resurrection case the column
-/// exists to prevent. Mid-re-edit photos defer to completion.
-pub(crate) async fn dirty_sidecar_photos<'e, E>(exec: E, limit: i64) -> Result<Vec<PhotoRecord>>
+/// The publish work queue: materialized, active, unpublished photos of any
+/// library WITH a publish target — the personal partition (`scope_binding
+/// IS NULL`) always has one, a scope-bound (shared) library only once an
+/// operator sets `mesh_library_id` (an unbound shared library published as
+/// personal-consensus photos would be exactly the dedup debt the old
+/// personal-only gate existed to avoid). Tombstones are excluded:
+/// tombstone propagation is out of scope, and a deleted-then-published
+/// photo would be unreachable in HopNet anyway. Attempts at the cap are
+/// terminal until an operator resets them.
+pub(crate) async fn publishable_photos<'e, E>(
+    exec: E,
+    now: DateTime<Utc>,
+    retry_cap: i64,
+    limit: i64,
+) -> Result<Vec<PhotoRecord>>
 where
     E: Executor<'e, Database = Sqlite>,
 {
     Ok(sqlx::query_as(
         "SELECT p.* FROM photos p \
          JOIN libraries l ON l.library_id = p.library_id \
-         WHERE p.sidecar_replicated_at IS NULL \
-           AND l.sidecar_root_remote IS NOT NULL \
+         WHERE (l.scope_binding IS NULL OR l.mesh_library_id IS NOT NULL) \
+           AND p.published_at IS NULL \
            AND p.materialized_at IS NOT NULL \
+           AND p.deleted_at IS NULL \
+           AND p.publish_attempts < ? \
+           AND (p.publish_next_retry_at IS NULL OR p.publish_next_retry_at <= ?) \
          ORDER BY p.photo_id \
          LIMIT ?",
     )
+    .bind(retry_cap)
+    .bind(now)
     .bind(limit)
     .fetch_all(exec)
     .await?)
 }
 
-/// Every materialized photo of one library, tombstoned included — fsck's
-/// sidecar-consistency population (a materialized photo must have a local
-/// sidecar; tombstoned ones carry their `deleted_at` in it).
-pub(crate) async fn materialized_photos<'e, E>(
-    exec: E,
-    library: &LibraryId,
-) -> Result<Vec<PhotoRecord>>
+/// Terminal publish success: stamp once and clear the retry ledger. Guarded
+/// on still-NULL so a duplicate mark (confirm race) is a no-op.
+pub(crate) async fn mark_published<'e, E>(exec: E, id: &PhotoId, at: DateTime<Utc>) -> Result<bool>
 where
     E: Executor<'e, Database = Sqlite>,
 {
-    Ok(sqlx::query_as(
-        "SELECT * FROM photos \
-         WHERE library_id = ? AND materialized_at IS NOT NULL \
-         ORDER BY photo_id",
+    Ok(sqlx::query(
+        "UPDATE photos SET published_at = ?, publish_attempts = 0, \
+         publish_next_retry_at = NULL, publish_last_error = NULL \
+         WHERE photo_id = ? AND published_at IS NULL",
     )
-    .bind(library)
-    .fetch_all(exec)
-    .await?)
+    .bind(at)
+    .bind(id)
+    .execute(exec)
+    .await?
+    .rows_affected()
+        > 0)
+}
+
+/// Remote adoption: the mesh already holds this asset (cloud-fingerprint
+/// match), published by another device or a previous state.db. Stamp
+/// published_at WITHOUT uploading and record the remote consensus id.
+/// Same still-NULL guard as [`mark_published`].
+pub(crate) async fn mark_adopted<'e, E>(
+    exec: E,
+    id: &PhotoId,
+    consensus_photo_id: &str,
+    at: DateTime<Utc>,
+) -> Result<bool>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    Ok(sqlx::query(
+        "UPDATE photos SET published_at = ?, consensus_photo_id = ?, publish_attempts = 0, \
+         publish_next_retry_at = NULL, publish_last_error = NULL \
+         WHERE photo_id = ? AND published_at IS NULL",
+    )
+    .bind(at)
+    .bind(consensus_photo_id)
+    .bind(id)
+    .execute(exec)
+    .await?
+    .rows_affected()
+        > 0)
+}
+
+/// Record one failed publish attempt. `attempts` is the caller-computed new
+/// total (set to the cap for permanent rejections); `next_retry_at = None`
+/// leaves the photo immediately claimable once attempts allow.
+pub(crate) async fn record_publish_failure<'e, E>(
+    exec: E,
+    id: &PhotoId,
+    attempts: i64,
+    next_retry_at: Option<DateTime<Utc>>,
+    error: &str,
+) -> Result<()>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    sqlx::query(
+        "UPDATE photos SET publish_attempts = ?, publish_next_retry_at = ?, \
+         publish_last_error = ? WHERE photo_id = ?",
+    )
+    .bind(attempts)
+    .bind(next_retry_at)
+    .bind(error)
+    .bind(id)
+    .execute(exec)
+    .await?;
+    Ok(())
 }
 
 /// Tombstone (spec §Deletion): set `deleted_at` only when active. Returns
