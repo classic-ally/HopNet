@@ -565,7 +565,7 @@ fn fresh_node_syncs_vote_out_chain_without_wedging() {
         // never reaches it — drive sync explicitly, exactly as the
         // production tip-poll does.
         connect_mesh(&network).await;
-        let mut n2 = start_engine(&network.nodes[2].app_state, 2).await;
+        let n2 = start_engine(&network.nodes[2].app_state, 2).await;
         let peers = vec![
             hopnet_comms::PeerRef {
                 node_id: 0,
@@ -635,6 +635,18 @@ fn fresh_node_syncs_vote_out_chain_without_wedging() {
 /// runs (proposer commit injection, drain watcher, terminal halt), not a
 /// test-local approximation.
 async fn start_engine_production(app_state: &AppState, node_id: i32) -> EngineNode {
+    start_engine_production_with_chain(app_state, node_id, chain_id()).await
+}
+
+/// Same stack with an explicit signing-domain chain id — the transition
+/// e2e must sign under the database-committed chain id (META_CHAIN_ID)
+/// exactly like spawn_engine, or the lineage gate would refuse its own
+/// certificates.
+async fn start_engine_production_with_chain(
+    app_state: &AppState,
+    node_id: i32,
+    chain: hopnet_consensus::types::Blake3Hash,
+) -> EngineNode {
     let db_pool = app_state.db_pool.clone();
     let (out_tx, out_rx) = mpsc::unbounded_channel();
     tokio::spawn(gossip::run_publisher(app_state.clone(), node_id, out_rx));
@@ -667,7 +679,7 @@ async fn start_engine_production(app_state: &AppState, node_id: i32) -> EngineNo
             // misses the final block is S7's rejoin case, not this
             // test's).
             HostCore::new(
-                chain_id(),
+                chain,
                 signer,
                 Address(node_id),
                 hopnet_consensus::config::QuorumProfile::Majority,
@@ -734,9 +746,19 @@ async fn start_engine_production(app_state: &AppState, node_id: i32) -> EngineNo
     // SEATED stragglers — a node that misses the final block pulls the
     // seal via decided-value sync from the halted-but-serving peers.
     crate::consensus::malachite::engine::spawn_tip_poll(app_state.clone());
+    // Rollback-window cleanup (spawn_engine parity): a no-op unless the
+    // XDG-derived data dir holds a retained epoch database.
+    crate::consensus::malachite::engine::spawn_rollback_cleanup(
+        app_state.clone(),
+        decided.clone(),
+    );
 
     EngineNode { input_tx, decided }
 }
+
+/// XDG_DATA_HOME is process-global and both boundary e2es derive their
+/// artifact/database paths from it — serialize them.
+static DATA_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 // Should: drive a real 3-node loopback mesh through the whole boundary
 // over the PRODUCTION driver stack — regenesis_start decides and the
@@ -751,8 +773,9 @@ async fn start_engine_production(app_state: &AppState, node_id: i32) -> EngineNo
 #[test]
 fn regenesis_seal_halts_mesh_and_writes_artifact() {
     // The artifact path derives from XDG_DATA_HOME; isolate it for this
-    // process. set_var is process-global, but nothing else in the lib
-    // tests resolves the data dir.
+    // process (set_var is process-global — hence the lock shared with
+    // the transition e2e).
+    let _guard = DATA_DIR_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let data_dir = std::env::temp_dir().join(format!("hopnet-seal-e2e-{}", std::process::id()));
     std::fs::create_dir_all(data_dir.join("hopnet")).unwrap();
     unsafe { std::env::set_var("XDG_DATA_HOME", &data_dir) };
@@ -893,6 +916,254 @@ fn regenesis_seal_halts_mesh_and_writes_artifact() {
 
         for e in &engines {
             let _ = e.input_tx.send(HostInput::Shutdown).await;
+        }
+    });
+    std::fs::remove_dir_all(&data_dir).ok();
+}
+
+// Should: carry ONE real node across the epoch boundary end-to-end —
+// seal (production stack), restart_signal fired, boot transition over
+// the same data dir, a FRESH AppState + engine over the new database,
+// then decide new heights in epoch 2 (continuous: H+1 onward), close
+// the rollback window, and run the epoch-2 boundary machinery again
+// (the second seal proves nothing one-shot leaked into the transition).
+// Should not: lose the node's identity, carried state, or the lineage
+// record across the swap.
+// Impact: S6's restart path exercised through the real code — gates,
+// import, carry, genesis at H, chain-id rotation — in-process. The
+// multi-node process restart is the orchestrator scenario's job.
+#[test]
+fn regenesis_transition_restarts_into_epoch_2() {
+    let _guard = DATA_DIR_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let data_dir =
+        std::env::temp_dir().join(format!("hopnet-transition-e2e-{}", std::process::id()));
+    std::fs::create_dir_all(data_dir.join("hopnet")).unwrap();
+    unsafe { std::env::set_var("XDG_DATA_HOME", &data_dir) };
+    let db_path = data_dir
+        .join("hopnet")
+        .join("database.db")
+        .to_string_lossy()
+        .into_owned();
+
+    // Solo mesh through the PRODUCTION genesis path (post_initial_setup),
+    // file-backed so there is something to restart over.
+    let node_keys = crate::consensus::tests::MockUser::new(0);
+    let user_keys = crate::consensus::tests::MockUser::new(1);
+    let app_state = crate::consensus::tests::create_test_app_state_file_backed(
+        node_keys.signing_key.clone(),
+        node_keys.verifying_key,
+        &db_path,
+    );
+    let x25519 = crate::auth::derive_x25519_pubkey_from_user(&user_keys.signing_key);
+    let (encrypted_privkey, key_salt) =
+        crate::auth::wrap_user_privkey(&user_keys.signing_key, "password").unwrap();
+    let user = crate::types::User::new(
+        0,
+        "test_user".to_string(),
+        user_keys.verifying_key,
+        x25519,
+        encrypted_privkey,
+        key_salt,
+    );
+    let db_node = crate::db::Node {
+        node_id: 0,
+        name: "node_0".to_string(),
+        owner: 0,
+        pubkey: node_keys.verifying_key,
+    };
+    let (user_id, node_id) =
+        crate::db::setup::post_initial_setup(&app_state, user, db_node).unwrap();
+    app_state.node_id.set(node_id).unwrap();
+    app_state.user_id.set(user_id).unwrap();
+    let (prev_chain, profile_meta) = {
+        let conn = app_state.db_pool.get().unwrap();
+        conn.execute("UPDATE nodes SET running_version_code = 20260800", [])
+            .unwrap();
+        (
+            hopnet_consensus::store::meta_get(&conn, hopnet_consensus::store::META_CHAIN_ID)
+                .unwrap()
+                .unwrap(),
+            hopnet_consensus::store::meta_get(&conn, hopnet_consensus::store::META_QUORUM_PROFILE)
+                .unwrap()
+                .unwrap(),
+        )
+    };
+
+    let state_of = |st: &AppState| {
+        let conn = st.db_pool.get().unwrap();
+        crate::db::regenesis::read_regenesis_state(&conn).unwrap()
+    };
+    let node_priv = node_keys.signing_key.clone();
+    let node_priv2 = node_keys.signing_key.clone();
+    fn build_start_tx(key: &crate::db::PrivKey) -> crate::consensus::types::Transaction {
+        crate::consensus::types::Transaction::new(
+            "regenesis_start".to_string(),
+            bincode::serde::encode_to_vec(
+                &crate::regenesis::RegenesisStart {
+                    target_version_code: 20260800,
+                },
+                bincode::config::standard(),
+            )
+            .unwrap(),
+            0,
+            key,
+        )
+        .unwrap()
+    }
+
+    let rt = crate::consensus::tests::test_iroh_rt();
+
+    // ---- Leg 1: seal epoch 1 --------------------------------------------
+    let seal_height = rt.block_on({
+        let app_state = app_state.clone();
+        let prev_chain = prev_chain.clone();
+        async move {
+            let mut engine = start_engine_production_with_chain(
+                &app_state,
+                0,
+                hopnet_consensus::types::Blake3Hash::from_bytes(
+                    prev_chain.as_slice().try_into().unwrap(),
+                ),
+            )
+            .await;
+            app_state
+                .consensus_queue
+                .enqueue_forwarded(vec![build_start_tx(&node_priv)])
+                .await;
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+            loop {
+                if state_of(&app_state).phase == crate::db::regenesis::RegenesisPhase::Sealed {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "epoch 1 never sealed: {:?}",
+                    state_of(&app_state)
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            let seal_height = state_of(&app_state).seal_height.unwrap();
+            wait_decided(&mut engine, seal_height, 60).await;
+
+            // The restart derivation ran at the tail of the seal work
+            // (marker + artifact already durable by then) and left the
+            // Notify permit for the binary's listener — us, here.
+            tokio::time::timeout(Duration::from_secs(30), app_state.restart_signal.notified())
+                .await
+                .expect("restart never requested despite version match");
+
+            let _ = engine.input_tx.send(HostInput::Shutdown).await;
+            seal_height
+        }
+    });
+
+    // ---- The boundary: the boot transition over the same data dir --------
+    let outcome =
+        crate::regenesis::boot::boot_transition(&db_path, crate::version::effective_running_code());
+    let crate::regenesis::boot::BootOutcome::Transitioned { epoch } = outcome else {
+        panic!("expected Transitioned, got {outcome:?}");
+    };
+    assert_eq!(epoch, 2);
+    assert!(crate::regenesis::boot::sealed_path(&db_path).exists());
+    let lineage_dir = data_dir.join("hopnet");
+    let lineage = crate::regenesis::genesis::read_lineage(
+        &crate::regenesis::genesis::lineage_path(&lineage_dir, 2),
+    )
+    .unwrap();
+    assert_eq!(lineage.record.seal_height, seal_height);
+
+    // ---- Leg 2: a FRESH AppState over the new database (OnceCells cannot
+    // re-set; a new AppState is the design) — same node identity.
+    let app_state2 = crate::consensus::tests::create_test_app_state_file_backed(
+        node_keys.signing_key.clone(),
+        node_keys.verifying_key,
+        &db_path,
+    );
+    let (new_chain, epoch_meta, carried_profile) = {
+        let conn = app_state2.db_pool.get().unwrap();
+        (
+            hopnet_consensus::store::meta_get(&conn, hopnet_consensus::store::META_CHAIN_ID)
+                .unwrap()
+                .unwrap(),
+            crate::regenesis::genesis::current_epoch(&conn),
+            hopnet_consensus::store::meta_get(&conn, hopnet_consensus::store::META_QUORUM_PROFILE)
+                .unwrap()
+                .unwrap(),
+        )
+    };
+    assert_eq!(epoch_meta, 2);
+    assert_ne!(new_chain, prev_chain, "chain id must rotate at the boundary");
+    assert_eq!(carried_profile, profile_meta, "quorum profile carried verbatim");
+    app_state2.node_id.set(0).unwrap();
+    app_state2.user_id.set(0).unwrap();
+    app_state2
+        .epoch
+        .store(epoch_meta, std::sync::atomic::Ordering::Relaxed);
+    {
+        // Identity carried: this_node survived the swap.
+        let conn = app_state2.db_pool.get().unwrap();
+        let nid: i32 = conn
+            .query_row("SELECT node_id FROM this_node", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(nid, 0);
+        assert!(crate::regenesis::seal::sealed_marker(&conn).is_none());
+    }
+
+    rt.block_on({
+        let app_state2 = app_state2.clone();
+        async move {
+            let mut engine = start_engine_production_with_chain(
+                &app_state2,
+                0,
+                hopnet_consensus::types::Blake3Hash::from_bytes(
+                    new_chain.as_slice().try_into().unwrap(),
+                ),
+            )
+            .await;
+            // The shell seeds the decided watch to start_height - 1 = H on
+            // its own thread — resume-at-H, observed once it settles.
+            wait_decided(&mut engine, seal_height, 30).await;
+
+            // New op in the new epoch: heights are continuous — the start
+            // decides at H+1, and the epoch-2 boundary machinery then runs
+            // the whole drain->commit->seal cycle again on its own.
+            app_state2
+                .consensus_queue
+                .enqueue_forwarded(vec![build_start_tx(&node_priv2)])
+                .await;
+            wait_decided(&mut engine, seal_height + 1, 120).await;
+
+            // Rollback window closes at the first decide past H.
+            let retained = crate::regenesis::boot::sealed_path(
+                &crate::db::shared::get_database_path(),
+            );
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            while retained.exists() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "retained epoch-1 database never cleaned up"
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+
+            // Epoch 2 seals itself at H+2 (drain watcher + proposer
+            // injection, unchanged by the transition).
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+            loop {
+                let s = state_of(&app_state2);
+                if s.phase == crate::db::regenesis::RegenesisPhase::Sealed {
+                    assert_eq!(s.seal_height, Some(seal_height + 2));
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "epoch 2 never sealed: {s:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            wait_decided(&mut engine, seal_height + 2, 60).await;
+            let _ = engine.input_tx.send(HostInput::Shutdown).await;
         }
     });
     std::fs::remove_dir_all(&data_dir).ok();

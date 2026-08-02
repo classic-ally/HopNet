@@ -393,23 +393,53 @@ pub fn create_test_app_state_with_keys(
     signing_key: crate::db::PrivKey,
     verifying_key: crate::db::PubKey,
 ) -> AppState {
+    create_test_app_state_on_manager(
+        signing_key,
+        verifying_key,
+        r2d2_sqlite::SqliteConnectionManager::memory(),
+    )
+}
+
+/// File-backed variant: the epoch-transition e2e restarts a node over the
+/// same on-disk database — a memory pool has nothing to restart. Skips
+/// schema install when the file already carries one (the restart leg).
+pub fn create_test_app_state_file_backed(
+    signing_key: crate::db::PrivKey,
+    verifying_key: crate::db::PubKey,
+    db_path: &str,
+) -> AppState {
+    create_test_app_state_on_manager(
+        signing_key,
+        verifying_key,
+        r2d2_sqlite::SqliteConnectionManager::file(db_path),
+    )
+}
+
+fn create_test_app_state_on_manager(
+    signing_key: crate::db::PrivKey,
+    verifying_key: crate::db::PubKey,
+    manager: r2d2_sqlite::SqliteConnectionManager,
+) -> AppState {
     use jsonwebtoken::{DecodingKey, EncodingKey};
     use once_cell::sync::OnceCell;
     use r2d2::Pool;
-    use r2d2_sqlite::SqliteConnectionManager;
     use std::sync::Arc;
 
     // RFC-015 boot tripwire (mirrors server startup): tests must see the
     // same cross-crate handler registrations as production.
     crate::assert_projection_registrations();
 
-    let manager = SqliteConnectionManager::memory();
     let pool = Pool::builder()
         .connection_customizer(Box::new(crate::db::shared::SqliteInitializer))
         .build(manager)
         .unwrap();
 
-    crate::db::shared::initialize(&pool.get().unwrap()).unwrap();
+    {
+        let conn = pool.get().unwrap();
+        if !crate::db::shared::is_schema_initialized(&conn).unwrap_or(false) {
+            crate::db::shared::initialize(&conn).unwrap();
+        }
+    }
 
     let jwt_secret = b"test_jwt_secret_key_for_testing_only";
     let encoding_key = EncodingKey::from_secret(jwt_secret);
