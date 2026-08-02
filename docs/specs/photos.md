@@ -113,41 +113,66 @@ every asset would duplicate mesh-side. The fingerprint is that key:
   the index entry — a resolve on a mesh-deleted photo still returns its id
   (the client adopts a tombstoned photo rather than colliding with it).
   "Undelete by republish" is deliberately not a thing.
-- **Shared-library scoping (Phase 3)**: the `(library_id, cloud_fingerprint)`
-  index already accommodates it, but cross-member dedupe requires the HMAC
-  key to be library-scoped (a shared secret distributed with the library
-  keys) — and a spike on whether PHCloudIdentifiers agree across iCloud
-  Shared Photo Library participants. Until then shared-library adds carry
-  whatever the publishing path computes for the personal scope: nothing,
-  since shared publishes are still rejected.
+- **Shared-library scoping**: a resolve carrying `library_id` uses the
+  **library-scoped key** instead — `blake3 derive_key("hopnet photos cloud
+  fingerprint library v1", library_key)` (context frozen, pinned by test
+  vector; the fn lives in photos-core beside the library-key wrap). Every
+  member derives the same key from their own `shared_library_keys` wrap
+  (the route unwraps it with the device-bootstrapped session), so the same
+  PHCloudIdentifier fingerprints identically no matter which member's
+  daemon publishes — `idx_photos_fp_shared` then dedupes across members,
+  and the shared lookup deliberately has NO owner filter (any member's
+  committed photo answers; membership is checked at the route, 403
+  `library_not_member`, with `library_key_pending` distinguishing
+  convergence lag). Two members' daemons racing one asset: the loser's
+  `photo_add` fails deterministically on the index and adopts the winner
+  on its next resolve.
 
 ##### Ingress Responsibility (explicit publish designation)
 
 ```sql
 CREATE TABLE photo_ingress_responsibility (
-    user_id       INTEGER PRIMARY KEY,   -- personal scope, v1
+    user_id       INTEGER NOT NULL,
+    library_id    TEXT,                  -- NULL = personal scope
     device_id     TEXT NOT NULL,
     operation_id  TEXT NOT NULL,         -- UUIDv7, audit/ordering
 
     FOREIGN KEY (user_id) REFERENCES users(user_id),
-    FOREIGN KEY (device_id) REFERENCES device_tokens(id)
+    FOREIGN KEY (device_id) REFERENCES device_tokens(id),
+    FOREIGN KEY (library_id) REFERENCES shared_libraries(id)
 );
+-- Split like idx_photos_fp_* (NULLs are distinct in UNIQUE indexes):
+CREATE UNIQUE INDEX idx_ingress_resp_personal
+    ON photo_ingress_responsibility(user_id) WHERE library_id IS NULL;
+CREATE UNIQUE INDEX idx_ingress_resp_shared
+    ON photo_ingress_responsibility(user_id, library_id) WHERE library_id IS NOT NULL;
 ```
 
-One device per user (personal scope) may publish ingress mutations. Claims
-are **explicit and JWT-only**: `POST /api/photos/ingress/claim
-{"device_id"}` builds and submits the `photo_ingress_claim` tx server-side
-(curl/GUI friendly); `GET /api/photos/ingress/responsibility` reads the
-holder. The thin-client transaction route enforces `DEVICE_TX_FUNCTIONS`
-(which excludes the claim tx — a daemon can never designate itself) and
-403s non-holders with `ingress_not_responsible:{other|unclaimed}`. Claim
-and transfer are one upsert — the dead-Mac case is any logged-in session
-re-claiming to a new device, after which the new daemon's first pass adopts
-the whole published archive by fingerprint instead of re-uploading it.
-Enforcement is admission-time (device identity is an HTTP-layer concept);
-the fingerprint UNIQUE pair is the correctness backstop for any admission
-race. Adoption and the resolve/committed probes are reads and deliberately
-ungated.
+One device per (user, scope) may publish ingress mutations — the personal
+partition (`library_id` NULL) and each shared library are independent
+scopes. Each member of a shared library claims independently for their own
+devices; cross-member dedup of the actual photos is the fingerprint's job,
+not responsibility's. Claims are **explicit and JWT-only**:
+`POST /api/photos/ingress/claim {"device_id", "library_id"?}` builds and
+submits the `photo_ingress_claim` tx server-side (curl/GUI friendly); a
+shared-scope claim requires applied membership (handler-enforced,
+deterministic), and `library_remove_member` dissolves the removed member's
+scope claim so a kicked member's daemon stops passing the gate.
+`GET /api/photos/ingress/responsibility` returns the personal holder plus
+per-library holders (shape additive on v1). The thin-client transaction
+route enforces `DEVICE_TX_FUNCTIONS` (which excludes the claim tx — a
+daemon can never designate itself) and 403s per scope with
+`ingress_not_responsible:{other|unclaimed}`: the route decodes the
+payload's touched scopes (photo_add carries them per entry; photo-targeting
+txs resolve them from the committed rows) and requires the authed device to
+hold EVERY one — holding the personal claim never admits shared-library
+writes or vice versa. Claim and transfer are one upsert — the dead-Mac
+case is any logged-in session re-claiming to a new device, after which the
+new daemon's first pass adopts the whole published archive by fingerprint
+instead of re-uploading it. Enforcement is admission-time (device identity
+is an HTTP-layer concept); the fingerprint UNIQUE pair is the correctness
+backstop for any admission race. Adoption and the resolve/committed probes
+are reads and deliberately ungated.
 
 The `encrypted_metadata` blob contains all photo metadata: date taken, dimensions, orientation, media type, duration, camera make/model, GPS coordinates, EXIF data, **and cross-asset grouping** (`group_id`, `group_type`, `group_index`, `is_group_pick`). None of this is queryable at the consensus level. The photo ID (UUIDv7) encodes upload timestamp, which is the only temporal signal visible to nodes.
 
@@ -937,7 +962,7 @@ If the module is not compiled, no photos tables are created, no handlers are reg
 - [x] Access convergence worker (replaces the one-shot bulk join): per-user session-lifetime loop deriving grant/revoke deltas, `library_access_grant`/`_revoke` batches, rotation-lane seam (`ConvergeLane`)
 - [x] Membership-gated reads (Design B): shared photos require membership at `query_changes` (both statements) and the resource byte path; pre-staged invitee wraps inert until accept; kick = instant API revocation
 - [x] Sidecar rematerialization: membership-diff pre-phase, `photo_view_changes`-triggered paged backfill, purge on leave/kick (`sidecar_libraries` state)
-- [ ] Ingress daemon shared publish (next cycle — opens the iCloud shared-library cutover): mesh library binding on the ingress `libraries` table, claim predicate extension, per-library ingress responsibility, library-scoped fingerprint key on `POST /api/photos/client/resolve` (derive from the library key — the seam exists)
+- [x] Ingress daemon shared publish (2026-08-02 — **closes the iCloud shared-library cutover gate**): `mesh_library_id` binding on the ingress `libraries` table (`library set-mesh-id`, scope-bound-only invariant), has-publish-target claim predicate, scope-partitioned publish pass (per-scope resolve/responsibility/parking/attempt-burn; unreachable still parks whole pass), per-(user, library) ingress responsibility with membership-checked claims and kick dissolution, library-scoped fingerprint key on `POST /api/photos/client/resolve` (derived from the library key — cross-member dedup, `photos-ingress-shared` scenario proves adopt-not-reupload e2e)
 - [ ] `Keys` rotation lane (cryptographic revocation after kick) — designed into the convergence contract, not built
 - [ ] Empty-library GC (last leaver strands the library row)
 

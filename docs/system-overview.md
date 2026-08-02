@@ -104,8 +104,8 @@ apply functions inside consensus handlers.
       targets a dev node or mesh nodes), `photos-upload-consistency`
       orchestrator test (first cross-node validation of the photos
       pipeline), `orchestrator creds` for browser sign-in. Deferred:
-      shared libraries (Phase 3), favorites (Phase 4), video Range
-      streaming.
+      favorites (Phase 4), video Range streaming. (Shared libraries have
+      since landed — see the Phase 3 entries below.)
 - [x] Photo publisher (2026-07-30): `hopnet-photos-core::publisher`
       turns a validated `PhotoAsset` + byte streams into an encrypted
       `photo_add` — exact-length streaming upload (no staging copy),
@@ -147,9 +147,11 @@ apply functions inside consensus handlers.
       retries). Wire break: `PhotoAddEntry` amended in place
       (pre-release), dev meshes reseeded. `photos-ingress-identity`
       orchestrator scenario covers the dual-device shape end to end.
-      Deferred: library-scoped fingerprint keys (Phase 3) +
-      cross-participant PHCloudIdentifier spike; import-time fingerprints
-      for non-PhotoKit paths.
+      Deferred: import-time fingerprints for non-PhotoKit paths.
+      (Library-scoped fingerprint keys have since landed — see the
+      ingress shared-library publish entry below; the cross-participant
+      PHCloudIdentifier agreement still wants a two-account spike before
+      real-world cutover of a multi-member SPL.)
 - [x] Photo-ingress packaging + provisioning plumbing (2026-07-31): the
       daemon ships inside HopNet.app (build stages 1b/3b embed
       `Contents/MacOS/photo-ingress` + the SMAppService agent plist,
@@ -192,9 +194,25 @@ apply functions inside consensus handlers.
       sidecar rematerializes on membership diff + photo_view_changes
       signals (join backfill / leave purge) instead of photo_changes
       bumps. JWT routes /api/photos/libraries*, ingest route gains a
-      library_id target. Remaining for cutover: ingress-side shared
-      publish (mesh binding, claim predicate, per-library responsibility,
-      library-scoped fingerprint resolve) — next cycle.
+      library_id target.
+- [x] Ingress shared-library publish (2026-08-02) — **closes the iCloud
+      cutover gate**: ingress `libraries` gains `mesh_library_id`
+      (`library set-mesh-id`, scope-bound-only; detach refused while
+      mesh-bound), claim predicate becomes has-publish-target, and the
+      publish pass partitions by scope (per-scope resolve/responsibility/
+      parking/attempt-burn — a kicked member's 403ing library can't
+      starve the personal queue; unreachable still parks the whole pass).
+      Responsibility reshaped to per-(user, library) with a split
+      partial-UNIQUE pair; shared claims are membership-checked and
+      dissolved on kick; the thin-client tx gate checks the exact scopes
+      a tx touches. Resolve accepts a library_id and derives the
+      LIBRARY-SCOPED fingerprint key from the shared library key (frozen
+      context, pinned vector) so every member computes identical
+      fingerprints — idx_photos_fp_shared finally dedupes cross-member;
+      `photos-ingress-shared` scenario proves publish → cross-member
+      byte-exact reads → second member's daemon ADOPTS instead of
+      re-uploading → per-library eviction, e2e. Cutover ops (wipe,
+      re-pull, bind, claim) can now cover both partitions.
 - [x] Ingress transplant: archive → transient spool (2026-08-01): the
       daemon's independent archive on user-owned storage (blob roots,
       sidecar JSON files, remote replication, snapshots, Tier-3 recover,
