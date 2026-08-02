@@ -387,15 +387,12 @@ pub fn list_page(
         None => (None, None),
     };
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(
-        rusqlite::params![cursor_ms, cursor_id, limit + 1],
-        |r| {
-            Ok(PhotoPageItem {
-                sort_ms: r.get(20)?,
-                row: map_row(r)?,
-            })
-        },
-    )?;
+    let rows = stmt.query_map(rusqlite::params![cursor_ms, cursor_id, limit + 1], |r| {
+        Ok(PhotoPageItem {
+            sort_ms: r.get(20)?,
+            row: map_row(r)?,
+        })
+    })?;
     let mut items = rows.collect::<Result<Vec<_>, _>>()?;
 
     let has_more = items.len() as i64 > limit;
@@ -604,20 +601,14 @@ impl<R: RecipientKey> SidecarDb<R> {
     ) -> Result<(), PhotosCoreError> {
         let meta = match (&state.ephemeral_pubkey, &state.encrypted_metadata_key) {
             (Some(eph), Some(wrapped)) => {
-                match unwrap_metadata_key(photo_id, eph, wrapped, &self.reader)
+                // A decrypt failure anywhere in this chain records the photo as
+                // undecryptable until a later change or explicit re-sync retries it.
+                unwrap_metadata_key(photo_id, eph, wrapped, &self.reader)
                     .and_then(|key| {
                         decrypt_metadata(&key, &state.metadata_nonce, &state.encrypted_metadata)
-                            .map_err(Into::into)
                     })
-                    .and_then(|pt| PhotoMetadata::from_json(&pt).map_err(Into::into))
-                {
-                    Ok(m) => Some(m),
-                    Err(_e) => {
-                        // Metadata decrypt failed — record as undecryptable
-                        // until a later change or explicit re-sync retries it.
-                        None
-                    }
-                }
+                    .and_then(|pt| PhotoMetadata::from_json(&pt))
+                    .ok()
             }
             _ => None,
         };
@@ -706,7 +697,10 @@ impl<R: RecipientKey> SidecarDb<R> {
         list_page(&self.conn, cursor, dir, filter, limit)
     }
 
-    pub fn month_histogram(&self, filter: &MediaFilter) -> Result<Vec<MonthBucket>, PhotosCoreError> {
+    pub fn month_histogram(
+        &self,
+        filter: &MediaFilter,
+    ) -> Result<Vec<MonthBucket>, PhotosCoreError> {
         month_histogram(&self.conn, filter)
     }
 
@@ -1155,9 +1149,14 @@ mod tests {
         let mut seen = Vec::new();
         let mut cursor = None;
         loop {
-            let (items, has_more) =
-                list_page(&db.conn, cursor.clone(), PageDir::Older, &MediaFilter::default(), 2)
-                    .unwrap();
+            let (items, has_more) = list_page(
+                &db.conn,
+                cursor.clone(),
+                PageDir::Older,
+                &MediaFilter::default(),
+                2,
+            )
+            .unwrap();
             seen.extend(page_ids(&items));
             if !has_more {
                 break;
@@ -1204,10 +1203,10 @@ mod tests {
         )
         .unwrap();
         assert!(has_more, "all[0] remains beyond the newer block");
-        assert_eq!(page_ids(&items), vec![
-            all[1].row.photo_id.clone(),
-            all[2].row.photo_id.clone()
-        ]);
+        assert_eq!(
+            page_ids(&items),
+            vec![all[1].row.photo_id.clone(), all[2].row.photo_id.clone()]
+        );
     }
 
     // Impact: histogram month jumps land on the wrong month if the boundary
@@ -1235,22 +1234,39 @@ mod tests {
         let boundary = (1748736000i64) * 1000;
         let anchor = Some((boundary, String::new()));
 
-        let (older, _) =
-            list_page(&db.conn, anchor.clone(), PageDir::Older, &MediaFilter::default(), 10)
-                .unwrap();
+        let (older, _) = list_page(
+            &db.conn,
+            anchor.clone(),
+            PageDir::Older,
+            &MediaFilter::default(),
+            10,
+        )
+        .unwrap();
         let older_dates: Vec<_> = older
             .iter()
             .map(|i| i.row.date_taken.clone().unwrap())
             .collect();
-        assert_eq!(older_dates, vec!["2025-05-20T00:00:00Z", "2025-05-10T00:00:00Z"]);
+        assert_eq!(
+            older_dates,
+            vec!["2025-05-20T00:00:00Z", "2025-05-10T00:00:00Z"]
+        );
 
-        let (newer, _) =
-            list_page(&db.conn, anchor, PageDir::Newer, &MediaFilter::default(), 10).unwrap();
+        let (newer, _) = list_page(
+            &db.conn,
+            anchor,
+            PageDir::Newer,
+            &MediaFilter::default(),
+            10,
+        )
+        .unwrap();
         let newer_dates: Vec<_> = newer
             .iter()
             .map(|i| i.row.date_taken.clone().unwrap())
             .collect();
-        assert_eq!(newer_dates, vec!["2025-06-15T00:00:00Z", "2025-06-01T00:00:00Z"]);
+        assert_eq!(
+            newer_dates,
+            vec!["2025-06-15T00:00:00Z", "2025-06-01T00:00:00Z"]
+        );
     }
 
     // Should: push media filters into SQL — video only/exclude, live only,
@@ -1263,7 +1279,10 @@ mod tests {
         for (seed, media_type) in [(1, 0), (2, 1), (3, 2), (4, 3)] {
             let id = CustomUUID::retention_cutoff(seed);
             let date = format!("2025-03-0{seed}T00:00:00Z");
-            states.push((id.clone(), make_state_with(&id, &reader, &date, media_type, vec![])));
+            states.push((
+                id.clone(),
+                make_state_with(&id, &reader, &date, media_type, vec![]),
+            ));
         }
         hydrate_all(&db, states);
 
@@ -1274,13 +1293,34 @@ mod tests {
             t
         };
 
-        assert_eq!(types_for(MediaFilter { video: Some(true), ..Default::default() }), vec![1]);
         assert_eq!(
-            types_for(MediaFilter { video: Some(false), ..Default::default() }),
+            types_for(MediaFilter {
+                video: Some(true),
+                ..Default::default()
+            }),
+            vec![1]
+        );
+        assert_eq!(
+            types_for(MediaFilter {
+                video: Some(false),
+                ..Default::default()
+            }),
             vec![0, 2, 3]
         );
-        assert_eq!(types_for(MediaFilter { live: Some(true), ..Default::default() }), vec![2]);
-        assert_eq!(types_for(MediaFilter { raw: Some(true), ..Default::default() }), vec![3]);
+        assert_eq!(
+            types_for(MediaFilter {
+                live: Some(true),
+                ..Default::default()
+            }),
+            vec![2]
+        );
+        assert_eq!(
+            types_for(MediaFilter {
+                raw: Some(true),
+                ..Default::default()
+            }),
+            vec![3]
+        );
     }
 
     // Should not: include soft-deleted or undecryptable photos in any page.
@@ -1296,8 +1336,7 @@ mod tests {
             make_state_with(&deleted, &reader, "2025-04-02T00:00:00Z", 0, vec![]);
         deleted_state.deleted_at = Some("2025-04-10T00:00:00Z".into());
         deleted_state.deleted_by = Some(1);
-        let mut opaque_state =
-            make_state_with(&opaque, &reader, "2025-04-03T00:00:00Z", 0, vec![]);
+        let mut opaque_state = make_state_with(&opaque, &reader, "2025-04-03T00:00:00Z", 0, vec![]);
         opaque_state.ephemeral_pubkey = None;
         opaque_state.encrypted_metadata_key = None;
 
@@ -1376,15 +1415,24 @@ mod tests {
         hydrate_all(&db, states);
 
         let buckets = month_histogram(&db.conn, &MediaFilter::default()).unwrap();
-        let flat: Vec<_> = buckets.iter().map(|b| (b.month.as_str(), b.count)).collect();
+        let flat: Vec<_> = buckets
+            .iter()
+            .map(|b| (b.month.as_str(), b.count))
+            .collect();
         assert_eq!(flat, vec![("2025-06", 3), ("2025-05", 2)]);
 
         let no_video = month_histogram(
             &db.conn,
-            &MediaFilter { video: Some(false), ..Default::default() },
+            &MediaFilter {
+                video: Some(false),
+                ..Default::default()
+            },
         )
         .unwrap();
-        let flat: Vec<_> = no_video.iter().map(|b| (b.month.as_str(), b.count)).collect();
+        let flat: Vec<_> = no_video
+            .iter()
+            .map(|b| (b.month.as_str(), b.count))
+            .collect();
         assert_eq!(flat, vec![("2025-06", 2), ("2025-05", 2)]);
     }
 

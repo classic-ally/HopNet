@@ -255,22 +255,24 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for ExactLen<R> {
 /// Recovers the typed length-validation error from an upload failure whose
 /// io::Error originated in `ExactLen`; passes every other error through.
 fn map_exact_len_error(err: PhotosCoreError) -> PhotosCoreError {
-    if let PhotosCoreError::Storage(hopnet_storage::StorageError::Read(ref io_err)) = err {
-        if let Some(e) = io_err.get_ref().and_then(|b| b.downcast_ref::<ExactLenError>()) {
-            return match e.actual {
-                Some(actual) => PublishValidationError::ResourceTooShort {
-                    kind: e.kind,
-                    expected: e.expected,
-                    actual,
-                }
-                .into(),
-                None => PublishValidationError::ResourceTooLong {
-                    kind: e.kind,
-                    expected: e.expected,
-                }
-                .into(),
-            };
-        }
+    if let PhotosCoreError::Storage(hopnet_storage::StorageError::Read(ref io_err)) = err
+        && let Some(e) = io_err
+            .get_ref()
+            .and_then(|b| b.downcast_ref::<ExactLenError>())
+    {
+        return match e.actual {
+            Some(actual) => PublishValidationError::ResourceTooShort {
+                kind: e.kind,
+                expected: e.expected,
+                actual,
+            }
+            .into(),
+            None => PublishValidationError::ResourceTooLong {
+                kind: e.kind,
+                expected: e.expected,
+            }
+            .into(),
+        };
     }
     err
 }
@@ -321,9 +323,7 @@ pub async fn publish_photo_add(
             &mut req.byte_sources[i].1,
             ByteSource::Stream(Box::new(tokio::io::empty())),
         );
-        let reader = match source {
-            ByteSource::Stream(r) => r,
-        };
+        let ByteSource::Stream(reader) = source;
 
         let content = req
             .asset
@@ -518,10 +518,10 @@ mod tests {
             per_blob_key: chacha20poly1305::Key,
         ) -> Result<UploadedDataBlock, PhotosCoreError> {
             let idx = self.log.lock().unwrap().uploads.len();
-            if let Some(n) = self.upload_fail_after {
-                if idx >= n {
-                    return Err(PhotosCoreError::Storage(hopnet_storage::StorageError::Rs));
-                }
+            if let Some(n) = self.upload_fail_after
+                && idx >= n
+            {
+                return Err(PhotosCoreError::Storage(hopnet_storage::StorageError::Rs));
             }
             let outcome = hopnet_storage::api::put(
                 source,
@@ -863,7 +863,7 @@ mod tests {
         let (decoded, _): (hopnet_photos::envelopes::PhotoAddPayload, _) =
             bincode::serde::decode_from_slice(payload_bytes, bincode::config::standard()).unwrap();
         let op = &decoded.entries[0].resources[0].op;
-        assert!(op.fragments.len() > 0);
+        assert!(!op.fragments.is_empty());
         for f in &op.fragments {
             assert_eq!(f.blob_id, op.blob_id);
         }

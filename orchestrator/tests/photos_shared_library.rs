@@ -39,7 +39,11 @@ fn bearer(node: &NodeInfo) -> String {
 
 /// Login with retry: the Argon2id unwrap takes seconds per attempt and the
 /// user row must have applied on this node first.
-pub(crate) async fn login_with_retry(node: &NodeInfo, username: &str, passphrase: &str) -> Result<NodeInfo> {
+pub(crate) async fn login_with_retry(
+    node: &NodeInfo,
+    username: &str,
+    passphrase: &str,
+) -> Result<NodeInfo> {
     let deadline = Instant::now() + Duration::from_secs(45);
     loop {
         match login_user(node, username, passphrase).await {
@@ -89,7 +93,10 @@ pub(crate) async fn create_library(client: &Client, node: &NodeInfo, name: &str)
 }
 
 /// GET /photos/libraries — the caller's memberships and pending invites.
-pub(crate) async fn list_libraries(client: &Client, node: &NodeInfo) -> Result<Vec<serde_json::Value>> {
+pub(crate) async fn list_libraries(
+    client: &Client,
+    node: &NodeInfo,
+) -> Result<Vec<serde_json::Value>> {
     let response = client
         .get(format!("{}/api/photos/libraries", base_url(node)))
         .header("Authorization", bearer(node))
@@ -234,12 +241,11 @@ async fn wait_for_gallery(
     let deadline = Instant::now() + timeout;
     loop {
         let outcome = gallery_photo_ids(client, node).await;
-        if let Ok(ids) = &outcome {
-            if required.iter().all(|id| ids.contains(*id))
-                && forbidden.iter().all(|id| !ids.contains(*id))
-            {
-                return Ok(());
-            }
+        if let Ok(ids) = &outcome
+            && required.iter().all(|id| ids.contains(*id))
+            && forbidden.iter().all(|id| !ids.contains(*id))
+        {
+            return Ok(());
         }
         if Instant::now() > deadline {
             match outcome {
@@ -282,7 +288,11 @@ async fn fetch_resource(
         .send()
         .await?;
     let status = response.status().as_u16();
-    let bytes = response.bytes().await.map(|b| b.to_vec()).unwrap_or_default();
+    let bytes = response
+        .bytes()
+        .await
+        .map(|b| b.to_vec())
+        .unwrap_or_default();
     Ok((status, bytes))
 }
 

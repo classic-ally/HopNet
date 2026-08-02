@@ -176,7 +176,10 @@ async fn access_pass(
         };
         let bytes = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
             .map_err(|e| format!("encode grant: {e}"))?;
-        match submitter.submit_transaction("library_access_grant", bytes).await {
+        match submitter
+            .submit_transaction("library_access_grant", bytes)
+            .await
+        {
             Ok(()) => submitted = true,
             Err(e) => tracing::debug!(
                 %user_id, library = %work.library_id, target = work.target,
@@ -228,9 +231,8 @@ pub(crate) fn derive_delta(
             if target == user_id {
                 continue;
             }
-            let missing_meta =
-                libraries::missing_metadata_grants(&conn, &lib, target, GRANT_BATCH)
-                    .map_err(|e| format!("{e:?}"))?;
+            let missing_meta = libraries::missing_metadata_grants(&conn, &lib, target, GRANT_BATCH)
+                .map_err(|e| format!("{e:?}"))?;
             let missing_blobs =
                 libraries::missing_blob_grants(&conn, &lib, &target_pubkey, GRANT_BATCH)
                     .map_err(|e| format!("{e:?}"))?;
@@ -260,9 +262,7 @@ pub(crate) fn derive_delta(
             });
         }
 
-        for target in
-            libraries::stale_access_users(&conn, &lib).map_err(|e| format!("{e:?}"))?
-        {
+        for target in libraries::stale_access_users(&conn, &lib).map_err(|e| format!("{e:?}"))? {
             let Some(pubkey) =
                 libraries::user_x25519_pubkey(&conn, target).map_err(|e| format!("{e:?}"))?
             else {
@@ -338,7 +338,8 @@ mod tests {
     fn derive_delta_grants_and_revokes() {
         let pool = pool();
         let conn = pool.get().unwrap();
-        let lib: hopnet_common::CustomUUID = "00000000-0000-0000-0000-0000000000a1".parse().unwrap();
+        let lib: hopnet_common::CustomUUID =
+            "00000000-0000-0000-0000-0000000000a1".parse().unwrap();
         conn.execute(
             "INSERT INTO shared_libraries (id, encrypted_name, name_nonce) VALUES (?1, x'00', x'00')",
             rusqlite::params![lib],
@@ -359,10 +360,12 @@ mod tests {
         .unwrap();
         // Photos: one live with the caller's wrap, one live WITHOUT a
         // caller wrap, one tombstoned.
-        let live: hopnet_common::CustomUUID = "00000000-0000-0000-0000-0000000000b1".parse().unwrap();
+        let live: hopnet_common::CustomUUID =
+            "00000000-0000-0000-0000-0000000000b1".parse().unwrap();
         let unwrapped: hopnet_common::CustomUUID =
             "00000000-0000-0000-0000-0000000000b2".parse().unwrap();
-        let dead: hopnet_common::CustomUUID = "00000000-0000-0000-0000-0000000000b3".parse().unwrap();
+        let dead: hopnet_common::CustomUUID =
+            "00000000-0000-0000-0000-0000000000b3".parse().unwrap();
         for (id, deleted) in [(&live, false), (&unwrapped, false), (&dead, true)] {
             conn.execute(
                 "INSERT INTO photos (id, library_id, uploaded_by, encrypted_metadata, metadata_nonce, deleted_at)
@@ -408,7 +411,8 @@ mod tests {
     fn derive_delta_converged_is_empty() {
         let pool = pool();
         let conn = pool.get().unwrap();
-        let lib: hopnet_common::CustomUUID = "00000000-0000-0000-0000-0000000000a2".parse().unwrap();
+        let lib: hopnet_common::CustomUUID =
+            "00000000-0000-0000-0000-0000000000a2".parse().unwrap();
         conn.execute(
             "INSERT INTO shared_libraries (id, encrypted_name, name_nonce) VALUES (?1, x'00', x'00')",
             rusqlite::params![lib],

@@ -298,9 +298,11 @@ mod tests {
 
     #[test]
     fn validates_original_only_asset() {
-        assert!(asset(vec![resource(ResourceKind::Original)])
-            .validate()
-            .is_ok());
+        assert!(
+            asset(vec![resource(ResourceKind::Original)])
+                .validate()
+                .is_ok()
+        );
     }
 
     #[test]
@@ -444,10 +446,9 @@ mod tests {
     // wire shape keeps round-tripping).
     #[test]
     fn resource_content_still_accepts_explicit_nulls() {
-        let content: ResourceContent = serde_json::from_str(
-            r#"{"byte_len":7,"content_hash":null,"format_hint":null}"#,
-        )
-        .unwrap();
+        let content: ResourceContent =
+            serde_json::from_str(r#"{"byte_len":7,"content_hash":null,"format_hint":null}"#)
+                .unwrap();
         assert_eq!(content.byte_len, 7);
         assert_eq!(content.content_hash, None);
         assert_eq!(content.format_hint, None);

@@ -54,17 +54,17 @@ pub fn insert_photo_entry(
             ],
         )
         .map_err(|e| {
-            if let rusqlite::Error::SqliteFailure(err, _) = &e {
-                if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE {
-                    // Deterministic on every validator: the fingerprint's
-                    // partial UNIQUE index is the dedupe backstop for
-                    // admission races (the loser re-resolves and adopts).
-                    tracing::warn!(
-                        "photo_add: photos row {} rejected — cloud_fingerprint already committed",
-                        entry.photo_id
-                    );
-                    return DatabaseError::InsertError;
-                }
+            if let rusqlite::Error::SqliteFailure(err, _) = &e
+                && err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+            {
+                // Deterministic on every validator: the fingerprint's
+                // partial UNIQUE index is the dedupe backstop for
+                // admission races (the loser re-resolves and adopts).
+                tracing::warn!(
+                    "photo_add: photos row {} rejected — cloud_fingerprint already committed",
+                    entry.photo_id
+                );
+                return DatabaseError::InsertError;
             }
             tracing::error!(
                 "photo_add: insert photos row {} failed: {e}",
@@ -443,7 +443,11 @@ pub fn device_belongs_to_user(
             |r| r.get(0),
         )
         .map_err(|e| {
-            tracing::error!("device_belongs_to_user ({}, {}) failed: {e}", device_id, user_id);
+            tracing::error!(
+                "device_belongs_to_user ({}, {}) failed: {e}",
+                device_id,
+                user_id
+            );
             DatabaseError::RecallError
         })
 }
@@ -476,6 +480,9 @@ fn insert_metadata_access_row(
     Ok(())
 }
 
+// Args mirror the photo_operations columns 1:1; grouping them into a struct
+// would only move the same list one indirection away from the INSERT.
+#[allow(clippy::too_many_arguments)]
 pub fn insert_operation_row(
     db_tx: &rusqlite::Transaction,
     operation_id: &CustomUUID,
@@ -534,13 +541,17 @@ pub fn upsert_photo_changes(
     Ok(())
 }
 
+/// `(uploaded_by, deleted_at, library_id)` — what a mutation handler needs to
+/// decide whether the caller may touch a photo row.
+pub type PhotoAuthz = (i32, Option<String>, Option<CustomUUID>);
+
 /// Look up a photo's owner, tombstone state, and library scope. Returns
 /// None if the photo doesn't exist. Used by mutation handlers for authz
 /// (owner-or-library-member) + tombstone gating.
 pub fn lookup_photo_authz(
     db_tx: &rusqlite::Transaction,
     photo_id: &CustomUUID,
-) -> Result<Option<(i32, Option<String>, Option<CustomUUID>)>, DatabaseError> {
+) -> Result<Option<PhotoAuthz>, DatabaseError> {
     match db_tx.query_row(
         "SELECT uploaded_by, deleted_at, library_id FROM photos WHERE id = ?1",
         rusqlite::params![photo_id],
@@ -1585,8 +1596,11 @@ mod tests {
     #[test]
     fn query_changes_gates_shared_photos_on_membership() {
         let conn = fixture();
-        conn.execute("INSERT INTO users (user_id, x25519_pubkey) VALUES (2, x'02')", [])
-            .unwrap();
+        conn.execute(
+            "INSERT INTO users (user_id, x25519_pubkey) VALUES (2, x'02')",
+            [],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO shared_libraries (id, encrypted_name, name_nonce)
              VALUES ('00000000-0000-0000-0000-0000000000f1', x'00', x'00')",
@@ -1876,14 +1890,25 @@ mod tests {
         let photo_id = CustomUUID::retention_cutoff(30);
         let blob_id = CustomUUID::retention_cutoff(31);
         let per_blob_key = chacha20poly1305::Key::from([0x11; 32]);
-        let wrap =
-            hopnet_storage::crypto::wrap_blob_key(&blob_id, &granted_pubkey, &per_blob_key)
-                .unwrap();
+        let wrap = hopnet_storage::crypto::wrap_blob_key(&blob_id, &granted_pubkey, &per_blob_key)
+            .unwrap();
         insert_photo_with_access(&conn, &photo_id, &blob_id, vec![wrap]);
 
-        assert!(get_blob_access_for_user(&conn, &blob_id, 2).unwrap().is_some());
-        assert!(get_blob_access_for_user(&conn, &blob_id, 3).unwrap().is_none());
-        assert!(get_blob_access_for_user(&conn, &blob_id, 99).unwrap().is_none());
+        assert!(
+            get_blob_access_for_user(&conn, &blob_id, 2)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            get_blob_access_for_user(&conn, &blob_id, 3)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            get_blob_access_for_user(&conn, &blob_id, 99)
+                .unwrap()
+                .is_none()
+        );
     }
 
     // Should: recover the exact per-blob key by unwrapping the stored access
@@ -1901,7 +1926,9 @@ mod tests {
         let wrap = hopnet_storage::crypto::wrap_blob_key(&blob_id, &pubkey, &per_blob_key).unwrap();
         insert_photo_with_access(&conn, &photo_id, &blob_id, vec![wrap]);
 
-        let access = get_blob_access_for_user(&conn, &blob_id, 2).unwrap().unwrap();
+        let access = get_blob_access_for_user(&conn, &blob_id, 2)
+            .unwrap()
+            .unwrap();
         let unwrapped = hopnet_storage::crypto::unwrap_blob_key(
             &access,
             &hopnet_storage::StaticRecipient(secret),

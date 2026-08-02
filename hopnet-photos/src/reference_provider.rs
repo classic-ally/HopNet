@@ -159,11 +159,7 @@ mod tests {
     }
 
     /// Insert a photo + a `photo_resources` row referencing `data_block_id`.
-    fn insert_photo_with_resource(
-        conn: &Connection,
-        photo_id: &str,
-        data_block_id: &str,
-    ) {
+    fn insert_photo_with_resource(conn: &Connection, photo_id: &str, data_block_id: &str) {
         conn.execute(
             "INSERT INTO data_blocks (id, file_hash, fragment_count, added_bytes, file_size)
              VALUES (?1, x'00', 1, 0, 10)",
@@ -188,12 +184,7 @@ mod tests {
     /// the apparent timestamp) referencing `prior` and/or `new` data blocks.
     /// The `prior`/`new` columns are soft pointers — no FK, no data_blocks
     /// row needed (the operation log outlives the blobs it points at).
-    fn insert_op(
-        conn: &Connection,
-        op_id: &str,
-        prior: Option<&str>,
-        new: Option<&str>,
-    ) {
+    fn insert_op(conn: &Connection, op_id: &str, prior: Option<&str>, new: Option<&str>) {
         conn.execute(
             "INSERT INTO photo_operations
                (id, photo_id, operation_type, prior_data_block_id, new_data_block_id, performed_by)
@@ -228,7 +219,9 @@ mod tests {
             "active photo resource must be pinned"
         );
         assert!(
-            !provider.references_data_block(&t, "blob_nonexistent").unwrap(),
+            !provider
+                .references_data_block(&t, "blob_nonexistent")
+                .unwrap(),
             "unreferenced blob must not be pinned"
         );
     }
@@ -280,7 +273,9 @@ mod tests {
         let t = tx(&mut conn);
         let provider = PhotosReferenceProvider;
         assert!(
-            provider.references_data_block(&t, "blob_superseded").unwrap(),
+            provider
+                .references_data_block(&t, "blob_superseded")
+                .unwrap(),
             "recently-superseded blob (5d old) must be pinned by op log"
         );
     }
@@ -303,7 +298,9 @@ mod tests {
         let t = tx(&mut conn);
         let provider = PhotosReferenceProvider;
         assert!(
-            !provider.references_data_block(&t, "blob_superseded_aged").unwrap(),
+            !provider
+                .references_data_block(&t, "blob_superseded_aged")
+                .unwrap(),
             "superseded blob referenced only by an op older than 30d must be collectable"
         );
         // The current blob is still pinned by photo_resources — so it's
@@ -440,10 +437,7 @@ mod tests {
         );
         // The current resource is in the subquery (resources arm has no
         // retention filter — rows are deleted, not aged).
-        assert!(
-            in_subquery("blob_current"),
-            "current resource in subquery"
-        );
+        assert!(in_subquery("blob_current"), "current resource in subquery");
     }
 
     /// The two implementations must agree on the boundary: a blob pinned

@@ -166,11 +166,8 @@ pub async fn ensure_photo_ingress_device_token(
         register_device_internal(app_state, user_id, "Photo Ingress").await?;
     // 127.0.0.1, not localhost — must match the ephemeral-port refresh in
     // main.rs so the daemon's credential-change detection sees ONE form.
-    keychain::store_photo_ingress_config(
-        &api_key,
-        &format!("http://127.0.0.1:{}", app_state.port),
-    )
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    keychain::store_photo_ingress_config(&api_key, &format!("http://127.0.0.1:{}", app_state.port))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(())
 }

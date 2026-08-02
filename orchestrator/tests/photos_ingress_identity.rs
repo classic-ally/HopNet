@@ -73,20 +73,23 @@ fn publish_args(node: &NodeInfo, token: &str) -> Vec<String> {
     ]
 }
 
-async fn register_device(
-    client: &reqwest::Client,
-    node: &NodeInfo,
-    name: &str,
-) -> Result<String> {
+async fn register_device(client: &reqwest::Client, node: &NodeInfo, name: &str) -> Result<String> {
     let response = client
         .post(format!("{}/api/devices/register", base_url(node)))
         .header("Authorization", format!("Bearer {}", node.jwt_token))
         .json(&serde_json::json!({ "device_name": name }))
         .send()
         .await?;
-    anyhow::ensure!(response.status().is_success(), "register: {}", response.status());
+    anyhow::ensure!(
+        response.status().is_success(),
+        "register: {}",
+        response.status()
+    );
     let body: serde_json::Value = response.json().await?;
-    body["api_key"].as_str().map(str::to_string).context("api_key missing")
+    body["api_key"]
+        .as_str()
+        .map(str::to_string)
+        .context("api_key missing")
 }
 
 fn device_id(api_key: &str) -> Result<&str> {
@@ -100,7 +103,11 @@ async fn claim(client: &reqwest::Client, node: &NodeInfo, api_key: &str) -> Resu
         .json(&serde_json::json!({ "device_id": device_id(api_key)? }))
         .send()
         .await?;
-    anyhow::ensure!(response.status().is_success(), "claim: {}", response.status());
+    anyhow::ensure!(
+        response.status().is_success(),
+        "claim: {}",
+        response.status()
+    );
     Ok(())
 }
 
@@ -109,11 +116,18 @@ async fn responsibility_holder(
     node: &NodeInfo,
 ) -> Result<Option<String>> {
     let response = client
-        .get(format!("{}/api/photos/ingress/responsibility", base_url(node)))
+        .get(format!(
+            "{}/api/photos/ingress/responsibility",
+            base_url(node)
+        ))
         .header("Authorization", format!("Bearer {}", node.jwt_token))
         .send()
         .await?;
-    anyhow::ensure!(response.status().is_success(), "responsibility: {}", response.status());
+    anyhow::ensure!(
+        response.status().is_success(),
+        "responsibility: {}",
+        response.status()
+    );
     let body: serde_json::Value = response.json().await?;
     Ok(body["device_id"].as_str().map(str::to_string))
 }
@@ -147,7 +161,11 @@ impl TestScenario for PhotosIngressIdentity {
                     Ok(value) => {
                         print_and_add_check(
                             &mut result,
-                            Check { name: $name.to_string(), passed: true, detail: None },
+                            Check {
+                                name: $name.to_string(),
+                                passed: true,
+                                detail: None,
+                            },
                         );
                         value
                     }
@@ -185,49 +203,67 @@ impl TestScenario for PhotosIngressIdentity {
 
         // Explicit-claim contract: an unclaimed scope parks the publish
         // (exit 3, nothing submitted, no retry attempts burned).
-        check_or_bail!("Unclaimed scope parks publish (exit 3)", async {
-            let (code, report) =
-                driver(dir_a.path().to_path_buf(), publish_args(&nodes[0], &token_a)).await?;
-            anyhow::ensure!(code == 3, "expected exit 3, got {code}: {report}");
-            anyhow::ensure!(
-                report["parked_responsibility"] == true
-                    && report["published"].as_u64() == Some(0)
-                    && report["failed"].as_u64() == Some(0),
-                "unexpected park report: {report}"
-            );
-            Ok(())
-        }
-        .await);
+        check_or_bail!(
+            "Unclaimed scope parks publish (exit 3)",
+            async {
+                let (code, report) = driver(
+                    dir_a.path().to_path_buf(),
+                    publish_args(&nodes[0], &token_a),
+                )
+                .await?;
+                anyhow::ensure!(code == 3, "expected exit 3, got {code}: {report}");
+                anyhow::ensure!(
+                    report["parked_responsibility"] == true
+                        && report["published"].as_u64() == Some(0)
+                        && report["failed"].as_u64() == Some(0),
+                    "unexpected park report: {report}"
+                );
+                Ok(())
+            }
+            .await
+        );
 
         // Claim for A (JWT route) and verify the holder reads back.
-        check_or_bail!("Claim responsibility for device A", claim(&client, &nodes[0], &token_a).await);
-        check_or_bail!("Responsibility reads back as device A", async {
-            let holder = responsibility_holder(&client, &nodes[0]).await?;
-            anyhow::ensure!(
-                holder.as_deref() == Some(device_id(&token_a)?),
-                "holder {holder:?}"
-            );
-            Ok(())
-        }
-        .await);
+        check_or_bail!(
+            "Claim responsibility for device A",
+            claim(&client, &nodes[0], &token_a).await
+        );
+        check_or_bail!(
+            "Responsibility reads back as device A",
+            async {
+                let holder = responsibility_holder(&client, &nodes[0]).await?;
+                anyhow::ensure!(
+                    holder.as_deref() == Some(device_id(&token_a)?),
+                    "holder {holder:?}"
+                );
+                Ok(())
+            }
+            .await
+        );
 
         // Holder publishes normally.
-        let photos_a = check_or_bail!("Device A publishes all photos", async {
-            let (code, report) =
-                driver(dir_a.path().to_path_buf(), publish_args(&nodes[0], &token_a)).await?;
-            anyhow::ensure!(
-                code == 0 && report["published"].as_u64() == Some(COUNT as u64),
-                "exit {code}: {report}"
-            );
-            let ids: HashSet<String> = report["photos"]
-                .as_array()
-                .context("photos")?
-                .iter()
-                .filter_map(|p| p["photo_id"].as_str().map(String::from))
-                .collect();
-            Ok::<_, anyhow::Error>(ids)
-        }
-        .await);
+        let photos_a = check_or_bail!(
+            "Device A publishes all photos",
+            async {
+                let (code, report) = driver(
+                    dir_a.path().to_path_buf(),
+                    publish_args(&nodes[0], &token_a),
+                )
+                .await?;
+                anyhow::ensure!(
+                    code == 0 && report["published"].as_u64() == Some(COUNT as u64),
+                    "exit {code}: {report}"
+                );
+                let ids: HashSet<String> = report["photos"]
+                    .as_array()
+                    .context("photos")?
+                    .iter()
+                    .filter_map(|p| p["photo_id"].as_str().map(String::from))
+                    .collect();
+                Ok::<_, anyhow::Error>(ids)
+            }
+            .await
+        );
 
         let consensus_ok =
             wait_for_minimum_view(nodes, base_view + 1, Duration::from_secs(60)).await;
@@ -256,98 +292,136 @@ impl TestScenario for PhotosIngressIdentity {
             )
             .await
         );
-        check_or_bail!("Device B adopts everything, uploads nothing", async {
-            let (code, report) =
-                driver(dir_b.path().to_path_buf(), publish_args(&nodes[0], &token_b)).await?;
-            anyhow::ensure!(
-                code == 0
-                    && report["adopted"].as_u64() == Some(COUNT as u64)
-                    && report["published"].as_u64() == Some(0),
-                "exit {code}: {report}"
-            );
-            // Every adopted photo maps onto one of A's consensus ids.
-            let adopted: Vec<&str> = report["photos"]
-                .as_array()
-                .context("photos")?
-                .iter()
-                .filter_map(|p| p["consensus_photo_id"].as_str())
-                .collect();
-            anyhow::ensure!(adopted.len() == COUNT as usize, "adoption ids: {report}");
-            for id in adopted {
-                anyhow::ensure!(photos_a.contains(id), "{id} not among device A's ids");
+        check_or_bail!(
+            "Device B adopts everything, uploads nothing",
+            async {
+                let (code, report) = driver(
+                    dir_b.path().to_path_buf(),
+                    publish_args(&nodes[0], &token_b),
+                )
+                .await?;
+                anyhow::ensure!(
+                    code == 0
+                        && report["adopted"].as_u64() == Some(COUNT as u64)
+                        && report["published"].as_u64() == Some(0),
+                    "exit {code}: {report}"
+                );
+                // Every adopted photo maps onto one of A's consensus ids.
+                let adopted: Vec<&str> = report["photos"]
+                    .as_array()
+                    .context("photos")?
+                    .iter()
+                    .filter_map(|p| p["consensus_photo_id"].as_str())
+                    .collect();
+                anyhow::ensure!(adopted.len() == COUNT as usize, "adoption ids: {report}");
+                for id in adopted {
+                    anyhow::ensure!(photos_a.contains(id), "{id} not among device A's ids");
+                }
+                Ok(())
             }
-            Ok(())
-        }
-        .await);
+            .await
+        );
 
         // A genuinely-new asset on B is HELD (A still holds responsibility).
         check_or_bail!(
             "Seed one new asset into dir B",
             driver(
                 dir_b.path().to_path_buf(),
-                vec!["seed".into(), "--count".into(), "1".into(), "--start".into(), "100".into()],
+                vec![
+                    "seed".into(),
+                    "--count".into(),
+                    "1".into(),
+                    "--start".into(),
+                    "100".into()
+                ],
             )
             .await
         );
-        check_or_bail!("Non-holder B parks its new asset (exit 3)", async {
-            let (code, report) =
-                driver(dir_b.path().to_path_buf(), publish_args(&nodes[0], &token_b)).await?;
-            anyhow::ensure!(
-                code == 3
-                    && report["parked_responsibility"] == true
-                    && report["published"].as_u64() == Some(0),
-                "exit {code}: {report}"
-            );
-            Ok(())
-        }
-        .await);
+        check_or_bail!(
+            "Non-holder B parks its new asset (exit 3)",
+            async {
+                let (code, report) = driver(
+                    dir_b.path().to_path_buf(),
+                    publish_args(&nodes[0], &token_b),
+                )
+                .await?;
+                anyhow::ensure!(
+                    code == 3
+                        && report["parked_responsibility"] == true
+                        && report["published"].as_u64() == Some(0),
+                    "exit {code}: {report}"
+                );
+                Ok(())
+            }
+            .await
+        );
 
         // Transfer = re-claim for B; the held asset publishes.
-        check_or_bail!("Transfer responsibility to device B", claim(&client, &nodes[0], &token_b).await);
-        check_or_bail!("Responsibility reads back as device B", async {
-            let holder = responsibility_holder(&client, &nodes[0]).await?;
-            anyhow::ensure!(
-                holder.as_deref() == Some(device_id(&token_b)?),
-                "holder {holder:?}"
-            );
-            Ok(())
-        }
-        .await);
-        check_or_bail!("Post-transfer B publishes the held asset", async {
-            let (code, report) =
-                driver(dir_b.path().to_path_buf(), publish_args(&nodes[0], &token_b)).await?;
-            anyhow::ensure!(
-                code == 0 && report["published"].as_u64() == Some(1),
-                "exit {code}: {report}"
-            );
-            Ok(())
-        }
-        .await);
+        check_or_bail!(
+            "Transfer responsibility to device B",
+            claim(&client, &nodes[0], &token_b).await
+        );
+        check_or_bail!(
+            "Responsibility reads back as device B",
+            async {
+                let holder = responsibility_holder(&client, &nodes[0]).await?;
+                anyhow::ensure!(
+                    holder.as_deref() == Some(device_id(&token_b)?),
+                    "holder {holder:?}"
+                );
+                Ok(())
+            }
+            .await
+        );
+        check_or_bail!(
+            "Post-transfer B publishes the held asset",
+            async {
+                let (code, report) = driver(
+                    dir_b.path().to_path_buf(),
+                    publish_args(&nodes[0], &token_b),
+                )
+                .await?;
+                anyhow::ensure!(
+                    code == 0 && report["published"].as_u64() == Some(1),
+                    "exit {code}: {report}"
+                );
+                Ok(())
+            }
+            .await
+        );
 
         // Negative: the device route must refuse self-claims — a daemon can
         // never designate itself.
-        check_or_bail!("Device-route claim is rejected (400)", async {
-            let payload = hopnet_photos::envelopes::PhotoIngressClaimPayload {
-                device_id: device_id(&token_b)?.parse().context("device uuid")?,
-                operation_id: hopnet::db::CustomUUID::new(None),
-                library_id: None,
-            };
-            let bytes = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
-                .context("encode claim")?;
-            let response = client
-                .post(format!("{}/api/photos/client/transaction", base_url(&nodes[0])))
-                .header("Authorization", format!("Bearer {token_b}"))
-                .json(&serde_json::json!({ "tx_type": "photo_ingress_claim", "payload": bytes }))
-                .send()
-                .await?;
-            anyhow::ensure!(
-                response.status() == reqwest::StatusCode::BAD_REQUEST,
-                "expected 400, got {}",
-                response.status()
-            );
-            Ok(())
-        }
-        .await);
+        check_or_bail!(
+            "Device-route claim is rejected (400)",
+            async {
+                let payload = hopnet_photos::envelopes::PhotoIngressClaimPayload {
+                    device_id: device_id(&token_b)?.parse().context("device uuid")?,
+                    operation_id: hopnet::db::CustomUUID::new(None),
+                    library_id: None,
+                };
+                let bytes = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
+                    .context("encode claim")?;
+                let response = client
+                    .post(format!(
+                        "{}/api/photos/client/transaction",
+                        base_url(&nodes[0])
+                    ))
+                    .header("Authorization", format!("Bearer {token_b}"))
+                    .json(
+                        &serde_json::json!({ "tx_type": "photo_ingress_claim", "payload": bytes }),
+                    )
+                    .send()
+                    .await?;
+                anyhow::ensure!(
+                    response.status() == reqwest::StatusCode::BAD_REQUEST,
+                    "expected 400, got {}",
+                    response.status()
+                );
+                Ok(())
+            }
+            .await
+        );
 
         result.duration = start.elapsed();
         Ok(result)

@@ -61,7 +61,10 @@ mod tests {
         assert!(status.keychain_provisioned);
         assert_eq!(status.device_id.as_deref(), Some("dev-1"));
         assert!(status.device_row_present);
-        assert_eq!(status.node_base_url.as_deref(), Some("http://127.0.0.1:4242"));
+        assert_eq!(
+            status.node_base_url.as_deref(),
+            Some("http://127.0.0.1:4242")
+        );
     }
 
     // Should not: invent device/url fields on an unprovisioned status.

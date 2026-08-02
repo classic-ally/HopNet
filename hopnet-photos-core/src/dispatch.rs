@@ -192,7 +192,10 @@ mod tests {
         assert_eq!(back.fragments.len(), 1);
         assert_eq!(back.fragments[0].chunk_number, 3);
         assert_eq!(back.fragments[0].local_index, 11);
-        assert_eq!(back.fragments[0].fragment_id, block.fragments[0].fragment_id);
+        assert_eq!(
+            back.fragments[0].fragment_id,
+            block.fragments[0].fragment_id
+        );
         assert_eq!(
             back.fragments[0].fragment_hash,
             block.fragments[0].fragment_hash

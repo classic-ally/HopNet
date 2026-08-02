@@ -138,10 +138,22 @@ pub struct UserLibraryRow {
     pub invited_by: Option<i32>,
 }
 
+/// `(library_id, encrypted_name, name_nonce, ephemeral_pubkey, wrapped_key,
+/// invited_by)` straight off the row, before `finish_library_row` checks the
+/// fixed-size fields.
+type LibraryRowCols = (
+    hopnet_common::CustomUUID,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    Option<i32>,
+);
+
 fn map_library_row(
     r: &rusqlite::Row<'_>,
     invited_by_col: Option<usize>,
-) -> rusqlite::Result<(hopnet_common::CustomUUID, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Option<i32>)> {
+) -> rusqlite::Result<LibraryRowCols> {
     Ok((
         r.get(0)?,
         r.get(1)?,
@@ -153,14 +165,7 @@ fn map_library_row(
 }
 
 fn finish_library_row(
-    (library_id, encrypted_name, nonce, eph, wrapped_key, invited_by): (
-        hopnet_common::CustomUUID,
-        Vec<u8>,
-        Vec<u8>,
-        Vec<u8>,
-        Vec<u8>,
-        Option<i32>,
-    ),
+    (library_id, encrypted_name, nonce, eph, wrapped_key, invited_by): LibraryRowCols,
 ) -> Result<UserLibraryRow, String> {
     Ok(UserLibraryRow {
         library_id,
@@ -224,12 +229,15 @@ pub fn read_user_libraries(
     Ok(out)
 }
 
+/// `(ephemeral_pubkey, wrapped_key)` — one X25519 key wrap as stored on a row.
+pub type KeyWrap = ([u8; 32], Vec<u8>);
+
 /// The caller's own library-key wrap for one library (membership only).
 pub fn read_own_library_key(
     pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
     user_id: i32,
     library_id: &hopnet_common::CustomUUID,
-) -> Result<Option<([u8; 32], Vec<u8>)>, String> {
+) -> Result<Option<KeyWrap>, String> {
     use rusqlite::OptionalExtension;
     let conn = pool.get().map_err(|e| format!("pool: {e}"))?;
     conn.query_row(
@@ -272,18 +280,19 @@ pub fn is_library_member(
         .map_err(|e| format!("membership: {e:?}"))
 }
 
+/// `(memberships, per-library view-change signals)` — what the sync worker
+/// diffs each tick to spot a library it has just joined or been kicked from.
+pub type MembershipState = (
+    Vec<hopnet_common::CustomUUID>,
+    Vec<(hopnet_common::CustomUUID, i64)>,
+);
+
 /// The sync worker's membership-diff inputs: the user's current library
 /// memberships and their per-library view-change signals.
 pub fn read_membership_state(
     pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
     user_id: i32,
-) -> Result<
-    (
-        Vec<hopnet_common::CustomUUID>,
-        Vec<(hopnet_common::CustomUUID, i64)>,
-    ),
-    String,
-> {
+) -> Result<MembershipState, String> {
     let conn = pool.get().map_err(|e| format!("pool: {e}"))?;
     let memberships = hopnet_photos::db::libraries::libraries_for_member(&conn, user_id)
         .map_err(|e| format!("memberships: {e:?}"))?;
@@ -359,21 +368,17 @@ pub fn read_resource_grant(
         .get()
         .map_err(|e| ResourceGrantError::Internal(format!("pool: {e}")))?;
 
-    let data_block_id = match photos::lookup_resource_block_authz(
-        &conn,
-        photo_id,
-        kind.as_wire(),
-        user_id,
-    )
-    .map_err(|e| ResourceGrantError::Internal(format!("resource lookup: {e:?}")))?
-    {
-        photos::ResourceBlockLookup::Found(id) => id,
-        photos::ResourceBlockLookup::NotFound => return Err(ResourceGrantError::NotFound),
-        // Shared photo, no membership: the wrap row alone (pre-staged
-        // invitee grant, or a kicked member's not-yet-revoked row) must
-        // not serve bytes.
-        photos::ResourceBlockLookup::NotMember => return Err(ResourceGrantError::Forbidden),
-    };
+    let data_block_id =
+        match photos::lookup_resource_block_authz(&conn, photo_id, kind.as_wire(), user_id)
+            .map_err(|e| ResourceGrantError::Internal(format!("resource lookup: {e:?}")))?
+        {
+            photos::ResourceBlockLookup::Found(id) => id,
+            photos::ResourceBlockLookup::NotFound => return Err(ResourceGrantError::NotFound),
+            // Shared photo, no membership: the wrap row alone (pre-staged
+            // invitee grant, or a kicked member's not-yet-revoked row) must
+            // not serve bytes.
+            photos::ResourceBlockLookup::NotMember => return Err(ResourceGrantError::Forbidden),
+        };
 
     let access = photos::get_blob_access_for_user(&conn, &data_block_id, user_id)
         .map_err(|e| ResourceGrantError::Internal(format!("access lookup: {e:?}")))?
@@ -539,10 +544,9 @@ pub fn read_photo_library_scopes(
         ))
         .map_err(|e| format!("photo scopes prepare: {e:?}"))?;
     let rows = stmt
-        .query_map(
-            rusqlite::params_from_iter(photo_ids.iter()),
-            |row| row.get(0),
-        )
+        .query_map(rusqlite::params_from_iter(photo_ids.iter()), |row| {
+            row.get(0)
+        })
         .map_err(|e| format!("photo scopes: {e:?}"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("photo scope rows: {e:?}"))?;
@@ -746,9 +750,8 @@ mod tests {
             crate::db::shared::commit_timed(tx).unwrap();
         }
 
-        let grant = read_resource_grant(&pool, 7, &photo_id, ResourceKind::Original)
-            .ok()
-            .expect("owner grant");
+        let grant =
+            read_resource_grant(&pool, 7, &photo_id, ResourceKind::Original).expect("owner grant");
         let key = hopnet_storage::crypto::unwrap_blob_key(
             &grant.access,
             &hopnet_storage::StaticRecipient(owner_secret),
@@ -766,7 +769,6 @@ mod tests {
         assert_eq!(out, plaintext);
 
         let grant = read_resource_grant(&pool, 7, &photo_id, ResourceKind::Original)
-            .ok()
             .expect("owner grant for range read");
         let stream = hopnet_storage::api::get_local(
             fragments_dir.clone(),
@@ -949,7 +951,10 @@ mod tests {
             .unwrap();
         }
 
-        assert_eq!(read_ingress_responsibility(&pool, 7, None), Ok(Some(device_id)));
+        assert_eq!(
+            read_ingress_responsibility(&pool, 7, None),
+            Ok(Some(device_id))
+        );
         assert_eq!(read_ingress_responsibility(&pool, 8, None), Ok(None));
     }
 
@@ -1027,9 +1032,15 @@ mod tests {
             read_shared_photo_by_fingerprint(&pool, &lib_a, "ee55"),
             Ok(Some(theirs))
         );
-        assert_eq!(read_shared_photo_by_fingerprint(&pool, &lib_b, "ee55"), Ok(None));
+        assert_eq!(
+            read_shared_photo_by_fingerprint(&pool, &lib_b, "ee55"),
+            Ok(None)
+        );
         // And the personal probe must not see the shared row.
-        assert_eq!(read_photo_by_fingerprint(&pool, 7, "ee55"), Ok(Some(personal)));
+        assert_eq!(
+            read_photo_by_fingerprint(&pool, 7, "ee55"),
+            Ok(Some(personal))
+        );
     }
 
     // Should: keep resolving a soft-deleted shared photo by fingerprint

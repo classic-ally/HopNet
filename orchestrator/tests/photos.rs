@@ -30,10 +30,7 @@ fn gallery_row_identity(row: &serde_json::Value) -> (String, String, i64, Vec<(i
             pairs
                 .iter()
                 .filter_map(|pair| {
-                    Some((
-                        pair.get(0)?.as_i64()?,
-                        pair.get(1)?.as_str()?.to_string(),
-                    ))
+                    Some((pair.get(0)?.as_i64()?, pair.get(1)?.as_str()?.to_string()))
                 })
                 .collect()
         })
@@ -56,7 +53,11 @@ async fn fetch_gallery(
         .header("Authorization", format!("Bearer {}", node.jwt_token))
         .send()
         .await?;
-    anyhow::ensure!(response.status().is_success(), "gallery: {}", response.status());
+    anyhow::ensure!(
+        response.status().is_success(),
+        "gallery: {}",
+        response.status()
+    );
     Ok(response.json().await?)
 }
 
@@ -72,7 +73,11 @@ async fn wait_for_gallery(
         match fetch_gallery(client, node).await {
             Ok(rows) if rows.len() >= expected => return Ok(rows),
             Ok(rows) if Instant::now() > deadline => {
-                anyhow::bail!("gallery has {} of {} photos after timeout", rows.len(), expected)
+                anyhow::bail!(
+                    "gallery has {} of {} photos after timeout",
+                    rows.len(),
+                    expected
+                )
             }
             Err(e) if Instant::now() > deadline => return Err(e),
             _ => tokio::time::sleep(Duration::from_secs(1)).await,
@@ -94,7 +99,11 @@ async fn walk_pages(client: &reqwest::Client, node: &NodeInfo) -> Result<Vec<Str
             .header("Authorization", format!("Bearer {}", node.jwt_token))
             .send()
             .await?;
-        anyhow::ensure!(response.status().is_success(), "page: {}", response.status());
+        anyhow::ensure!(
+            response.status().is_success(),
+            "page: {}",
+            response.status()
+        );
         let page: serde_json::Value = response.json().await?;
         let items = page["items"].as_array().context("page items")?;
         for item in items {
@@ -117,7 +126,8 @@ async fn fetch_resource_with_retry(
     timeout: Duration,
 ) -> Result<Vec<u8>> {
     let deadline = Instant::now() + timeout;
-    let mut last_error = String::new();
+    // Deferred init: every path that reaches the `bail!` below has assigned it.
+    let mut last_error;
     loop {
         let result = client
             .get(format!(
@@ -312,8 +322,7 @@ impl TestScenario for PhotosUploadConsistency {
                 }
             }
         }
-        let walk_parity =
-            walks.iter().all(|w| *w == walks[0]) && walks[0].len() == COUNT as usize;
+        let walk_parity = walks.iter().all(|w| *w == walks[0]) && walks[0].len() == COUNT as usize;
         print_and_add_check(
             &mut result,
             Check {
@@ -357,10 +366,7 @@ impl TestScenario for PhotosUploadConsistency {
         let bucket_shape = histograms[0]
             .as_array()
             .map(|buckets| {
-                let total: i64 = buckets
-                    .iter()
-                    .filter_map(|b| b["count"].as_i64())
-                    .sum();
+                let total: i64 = buckets.iter().filter_map(|b| b["count"].as_i64()).sum();
                 buckets.len() == MONTHS as usize && total == COUNT as i64
             })
             .unwrap_or(false);

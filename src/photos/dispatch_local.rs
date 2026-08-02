@@ -44,7 +44,7 @@ impl PhotoDispatch for Submitter {
 
     async fn fetch_photos_since(&self, height: u64) -> Result<SyncBatch, PhotosCoreError> {
         super::query::read_photo_changes(&self.app_state.db_pool, self.user_id, height)
-            .map_err(|e| PhotosCoreError::Dispatch(e))
+            .map_err(PhotosCoreError::Dispatch)
     }
 
     async fn upload_data_block(

@@ -25,19 +25,14 @@ const CLEANUP_BATCH_SIZE: usize = 50;
 /// `node_id`) or if the scan finds nothing to clean up.
 pub async fn run_photo_tombstone_cleanup(caps: &HostCapabilities) -> Result<(), String> {
     if caps.node_id().is_none() {
-        tracing::warn!(
-            "photo_tombstone_cleanup: node not initialised, skipping"
-        );
+        tracing::warn!("photo_tombstone_cleanup: node not initialised, skipping");
         return Ok(()); // Not an error — matches takeout pattern.
     }
 
     // Scan on a tight scope — the Connection and Statement must be
     // dropped before the first `.await` (they're !Send).
     let expired_ids: Vec<hopnet_common::CustomUUID> = {
-        let conn = caps
-            .db_pool
-            .get()
-            .map_err(|e| format!("db pool: {e}"))?;
+        let conn = caps.db_pool.get().map_err(|e| format!("db pool: {e}"))?;
         let mut stmt = conn
             .prepare(
                 "SELECT id FROM photos
@@ -87,11 +82,7 @@ pub async fn run_photo_tombstone_cleanup(caps: &HostCapabilities) -> Result<(), 
     let mut failures = 0usize;
     for (i, r) in results.into_iter().enumerate() {
         if let Err(e) = r {
-            tracing::error!(
-                "photo_tombstone_cleanup: batch {} failed: {:?}",
-                i,
-                e,
-            );
+            tracing::error!("photo_tombstone_cleanup: batch {} failed: {:?}", i, e,);
             failures += 1;
         }
     }

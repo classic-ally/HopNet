@@ -73,7 +73,11 @@ fn encode_jpeg(image: &image::DynamicImage) -> Vec<u8> {
 pub fn generate_photo(seed: u64, index: u32, months: u32) -> GeneratedPhoto {
     let h = mix(seed, index);
     // Per-index gradient coefficients — visually distinct cells in the grid.
-    let (a, b, c) = ((h % 7 + 1) as u32, ((h >> 4) % 5 + 1) as u32, (h >> 8) as u32);
+    let (a, b, c) = (
+        (h % 7 + 1) as u32,
+        ((h >> 4) % 5 + 1) as u32,
+        (h >> 8) as u32,
+    );
     let full = image::RgbImage::from_fn(1600, 1200, |x, y| {
         image::Rgb([
             ((x * a / 6 + c) % 256) as u8,
@@ -144,7 +148,11 @@ pub async fn setup_node(
         .await
         .context("POST /api/setup")?;
     if response.status() != reqwest::StatusCode::CREATED {
-        bail!("setup: {} {}", response.status(), response.text().await.unwrap_or_default());
+        bail!(
+            "setup: {} {}",
+            response.status(),
+            response.text().await.unwrap_or_default()
+        );
     }
     let body: serde_json::Value = response.json().await.context("setup response")?;
     body.get("passphrase")
@@ -162,7 +170,8 @@ pub async fn login(
     passphrase: &str,
 ) -> anyhow::Result<String> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
-    let mut last_error = String::new();
+    // Deferred init: every path that reaches the `bail!` below has assigned it.
+    let mut last_error;
     loop {
         match client
             .post(format!("{base_url}/api/login"))
@@ -220,8 +229,8 @@ pub async fn post_photo(
     jwt: &str,
     photo: &GeneratedPhoto,
 ) -> anyhow::Result<PostedPhoto> {
-    let mut form = reqwest::multipart::Form::new()
-        .text("asset", serde_json::to_string(&photo.asset)?);
+    let mut form =
+        reqwest::multipart::Form::new().text("asset", serde_json::to_string(&photo.asset)?);
     for (kind, bytes) in &photo.resources {
         form = form.part(
             kind.as_str().to_string(),
@@ -312,7 +321,10 @@ mod tests {
     fn generated_assets_validate_and_declare_true_lengths() {
         for index in 0..12 {
             let photo = generate_photo(42, index, 6);
-            photo.asset.validate().expect("generated asset must validate");
+            photo
+                .asset
+                .validate()
+                .expect("generated asset must validate");
             for (kind, bytes) in &photo.resources {
                 let declared = photo
                     .asset

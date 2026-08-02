@@ -134,7 +134,10 @@ mod tests {
         let (decoded, _): (PhotoAddPayload, _) =
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
         let encoded2 = encode_payload(&decoded).unwrap();
-        assert_eq!(encoded, encoded2, "bincode round-trip must be byte-identical");
+        assert_eq!(
+            encoded, encoded2,
+            "bincode round-trip must be byte-identical"
+        );
     }
 
     #[test]
@@ -172,13 +175,18 @@ mod tests {
     fn encode_payload_uses_standard_config() {
         // A single PhotoFavoriteEntry with fixed UUIDs: verify encoding
         // uses varint (not fixed-width integer).
-        let payload = build_photo_favorite(vec!["00000000-0000-0000-0000-000000000001"
-            .parse::<CustomUUID>()
-            .unwrap()]);
+        let payload = build_photo_favorite(vec![
+            "00000000-0000-0000-0000-000000000001"
+                .parse::<CustomUUID>()
+                .unwrap(),
+        ]);
         let encoded = encode_payload(&payload).unwrap();
         // Vec len varint(1) = 0x01, then photo_id UUID varint(16) + 16 bytes, then operation_id likewise.
         // The second byte is varint(16) = 0x10 (NOT 0x10 0x00 0x00 0x00 — that would be fixed-width).
         assert_eq!(encoded[0], 0x01, "vec len varint");
-        assert_eq!(encoded[1], 0x10, "UUID uses varint encoding (standard config)");
+        assert_eq!(
+            encoded[1], 0x10,
+            "UUID uses varint encoding (standard config)"
+        );
     }
 }

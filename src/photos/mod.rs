@@ -35,6 +35,12 @@ pub struct PhotosHost {
     lifecycle: tokio::sync::Mutex<()>,
 }
 
+impl Default for PhotosHost {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PhotosHost {
     pub fn new() -> Self {
         Self {
@@ -78,10 +84,10 @@ impl PhotosHost {
             stop_sidecar_state(state).await;
         }
         let path = sidecar_db_path(user_id);
-        if let Err(e) = std::fs::remove_file(&path) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(%user_id, "sidecar unlink on disable failed: {e}");
-            }
+        if let Err(e) = std::fs::remove_file(&path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(%user_id, "sidecar unlink on disable failed: {e}");
         }
     }
 

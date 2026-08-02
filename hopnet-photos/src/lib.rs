@@ -77,33 +77,32 @@ impl Projection for PhotosProjection {
     /// override, photo fragments would never replicate beyond the upload
     /// node. Pure decode (no DB, no IO — runs on the consensus shell
     /// thread post-decide).
-    fn committed_blob_ids(
-        &self,
-        function: &str,
-        payload: &[u8],
-    ) -> Vec<hopnet_storage::BlobId> {
+    fn committed_blob_ids(&self, function: &str, payload: &[u8]) -> Vec<hopnet_storage::BlobId> {
         match function {
-            "photo_add" => {
-                bincode::serde::decode_from_slice::<envelopes::PhotoAddPayload, _>(
-                    payload, bincode::config::standard(),
-                )
-                .map(|(p, _)| {
-                    p.entries.iter().flat_map(|e| &e.resources).map(|r| r.op.blob_id.clone()).collect()
-                })
-                .unwrap_or_default()
-            }
-            "photo_edit_content" => {
-                bincode::serde::decode_from_slice::<envelopes::PhotoEditContentPayload, _>(
-                    payload, bincode::config::standard(),
-                )
-                .map(|(p, _)| {
-                    p.entries.iter()
-                        .flat_map(|e| &e.resources)
-                        .map(|r| r.op.blob_id.clone())
-                        .collect()
-                })
-                .unwrap_or_default()
-            }
+            "photo_add" => bincode::serde::decode_from_slice::<envelopes::PhotoAddPayload, _>(
+                payload,
+                bincode::config::standard(),
+            )
+            .map(|(p, _)| {
+                p.entries
+                    .iter()
+                    .flat_map(|e| &e.resources)
+                    .map(|r| r.op.blob_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default(),
+            "photo_edit_content" => bincode::serde::decode_from_slice::<
+                envelopes::PhotoEditContentPayload,
+                _,
+            >(payload, bincode::config::standard())
+            .map(|(p, _)| {
+                p.entries
+                    .iter()
+                    .flat_map(|e| &e.resources)
+                    .map(|r| r.op.blob_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default(),
             _ => Vec::new(),
         }
     }

@@ -19,8 +19,9 @@ use crate::tests::photos_shared_library::{
     create_library, get_user_id, login_with_retry, post_member_action, record,
     wait_for_library_entry,
 };
-use crate::tests::{Check, TestResult, TestScenario, get_max_view, print_and_add_check,
-    wait_for_minimum_view};
+use crate::tests::{
+    Check, TestResult, TestScenario, get_max_view, print_and_add_check, wait_for_minimum_view,
+};
 use hopnet::dev_seed;
 
 const SHARED_COUNT: u32 = 4;
@@ -76,7 +77,9 @@ async fn driver(data_dir: PathBuf, args: Vec<String>) -> Result<(i32, serde_json
 }
 
 /// (photo_id, cloud_id, [(resource type, blake3)]) rows of a driver report.
-fn report_photos(report: &serde_json::Value) -> Result<Vec<(String, String, Vec<(String, String)>)>> {
+type ReportPhoto = (String, String, Vec<(String, String)>);
+
+fn report_photos(report: &serde_json::Value) -> Result<Vec<ReportPhoto>> {
     report["photos"]
         .as_array()
         .context("photos array")?
@@ -108,10 +111,21 @@ async fn register_device(client: &Client, node: &NodeInfo, name: &str) -> Result
         .json(&serde_json::json!({ "device_name": name }))
         .send()
         .await?;
-    anyhow::ensure!(response.status().is_success(), "register: {}", response.status());
+    anyhow::ensure!(
+        response.status().is_success(),
+        "register: {}",
+        response.status()
+    );
     let body: serde_json::Value = response.json().await?;
-    let api_key = body["api_key"].as_str().context("api_key missing")?.to_string();
-    let device_id = api_key.split('.').next().context("token shape")?.to_string();
+    let api_key = body["api_key"]
+        .as_str()
+        .context("api_key missing")?
+        .to_string();
+    let device_id = api_key
+        .split('.')
+        .next()
+        .context("token shape")?
+        .to_string();
     Ok((device_id, api_key))
 }
 
@@ -144,7 +158,12 @@ impl TestScenario for PhotosIngressShared {
         "Ingress daemon publishes an SPL-bound library into a mesh shared library: cross-member visibility, byte parity, library-scoped fingerprint dedup (adoption), per-scope parking, eviction"
     }
 
-    async fn run(&self, _mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
+    async fn run(
+        &self,
+        _mesh_id: u32,
+        nodes: &[NodeInfo],
+        _flags: &[String],
+    ) -> Result<TestResult> {
         let start = Instant::now();
         let mut result = TestResult::new();
         let client = Client::new();
@@ -190,14 +209,17 @@ impl TestScenario for PhotosIngressShared {
             |view| Some(format!("view {view}"))
         );
         let alice_pass = step!("Create user 'alice'", create_user(&nodes[0], "alice").await);
-        step!("User 'alice' creation consensus", async {
-            match wait_for_minimum_view(nodes, base_view + 1, Duration::from_secs(30)).await {
-                Ok(true) => Ok(()),
-                Ok(false) => anyhow::bail!("timeout"),
-                Err(e) => Err(e),
+        step!(
+            "User 'alice' creation consensus",
+            async {
+                match wait_for_minimum_view(nodes, base_view + 1, Duration::from_secs(30)).await {
+                    Ok(true) => Ok(()),
+                    Ok(false) => anyhow::bail!("timeout"),
+                    Err(e) => Err(e),
+                }
             }
-        }
-        .await);
+            .await
+        );
         let bob_pass = step!("Create user 'bob'", create_user(&nodes[0], "bob").await);
 
         let alice = step!(
@@ -230,20 +252,23 @@ impl TestScenario for PhotosIngressShared {
         );
         // The claim handler needs APPLIED membership on the claiming node —
         // poll until bob's entry reads "member".
-        step!("Bob's membership applies", async {
-            let deadline = Instant::now() + Duration::from_secs(30);
-            loop {
-                let entry =
-                    wait_for_library_entry(&client, &bob, &library_id, Duration::from_secs(10))
-                        .await?;
-                if entry["status"].as_str() == Some("member") {
-                    return Ok(());
+        step!(
+            "Bob's membership applies",
+            async {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    let entry =
+                        wait_for_library_entry(&client, &bob, &library_id, Duration::from_secs(10))
+                            .await?;
+                    if entry["status"].as_str() == Some("member") {
+                        return Ok(());
+                    }
+                    anyhow::ensure!(Instant::now() < deadline, "still '{}'", entry["status"]);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                 }
-                anyhow::ensure!(Instant::now() < deadline, "still '{}'", entry["status"]);
-                tokio::time::sleep(Duration::from_secs(1)).await;
             }
-        }
-        .await);
+            .await
+        );
 
         // ── Step 2: alice's daemon — device, scoped claim, seed ─────────
 
@@ -251,12 +276,15 @@ impl TestScenario for PhotosIngressShared {
             "Register alice's ingress device",
             register_device(&client, &alice, "Alice Ingress E2E").await
         );
-        step!("Alice claims the shared scope", async {
-            let status = claim_scope(&client, &alice, &device_a, Some(&library_id)).await?;
-            anyhow::ensure!(status.is_success(), "claim: {status}");
-            Ok(())
-        }
-        .await);
+        step!(
+            "Alice claims the shared scope",
+            async {
+                let status = claim_scope(&client, &alice, &device_a, Some(&library_id)).await?;
+                anyhow::ensure!(status.is_success(), "claim: {status}");
+                Ok(())
+            }
+            .await
+        );
 
         let dir_a = tempfile::tempdir().context("temp dir a")?;
         // Personal photos are seeded FIRST so the shared seed's report
@@ -293,12 +321,14 @@ impl TestScenario for PhotosIngressShared {
             )
             .await
         );
-        let shared_photos: Vec<(String, String, Vec<(String, String)>)> =
-            report_photos(&shared_seed.1)?
-                .into_iter()
-                .filter(|(id, _, _)| !personal_ids.contains(id))
-                .collect();
-        anyhow::ensure!(shared_photos.len() == SHARED_COUNT as usize, "shared seed split");
+        let shared_photos: Vec<ReportPhoto> = report_photos(&shared_seed.1)?
+            .into_iter()
+            .filter(|(id, _, _)| !personal_ids.contains(id))
+            .collect();
+        anyhow::ensure!(
+            shared_photos.len() == SHARED_COUNT as usize,
+            "shared seed split"
+        );
 
         // ── Step 3: publish — shared drains, personal parks, in ONE pass ─
 
@@ -329,7 +359,9 @@ impl TestScenario for PhotosIngressShared {
                 Ok(())
             }
             .await,
-            |_| Some(format!("published={SHARED_COUNT}, personal parked, blobs evicted"))
+            |_| Some(format!(
+                "published={SHARED_COUNT}, personal parked, blobs evicted"
+            ))
         );
 
         // ── Step 4: bob sees the photos, byte-exact, on HIS node ────────
@@ -353,42 +385,49 @@ impl TestScenario for PhotosIngressShared {
             |total| Some(format!("{total} gallery rows"))
         );
 
-        step!("Bob reads original bytes byte-exactly", async {
-            let mut verified = 0usize;
-            for (photo_id, _, resources) in &shared_photos {
-                for (kind, expected_hash) in resources {
-                    let bytes = fetch_resource_with_retry(
-                        &client,
-                        &bob,
-                        photo_id,
-                        kind,
-                        Duration::from_secs(30),
-                    )
-                    .await?;
-                    let hash = blake3::hash(&bytes).to_hex().to_string();
-                    anyhow::ensure!(&hash == expected_hash, "{photo_id}/{kind}: hash mismatch");
-                    verified += 1;
+        step!(
+            "Bob reads original bytes byte-exactly",
+            async {
+                let mut verified = 0usize;
+                for (photo_id, _, resources) in &shared_photos {
+                    for (kind, expected_hash) in resources {
+                        let bytes = fetch_resource_with_retry(
+                            &client,
+                            &bob,
+                            photo_id,
+                            kind,
+                            Duration::from_secs(30),
+                        )
+                        .await?;
+                        let hash = blake3::hash(&bytes).to_hex().to_string();
+                        anyhow::ensure!(&hash == expected_hash, "{photo_id}/{kind}: hash mismatch");
+                        verified += 1;
+                    }
                 }
+                Ok(verified)
             }
-            Ok(verified)
-        }
-        .await, |n| Some(format!("{n} resources byte-verified")));
+            .await,
+            |n| Some(format!("{n} resources byte-verified"))
+        );
 
         // ── Step 5: idempotency across the reset probe ──────────────────
 
-        step!("Reset + republish resolves shared as already_published", async {
-            driver(dir_a.path().to_path_buf(), vec!["reset-published".into()]).await?;
-            let (code, report) =
-                driver(dir_a.path().to_path_buf(), publish_args(&token_a)).await?;
-            anyhow::ensure!(
-                report["already_published"].as_u64() == Some(SHARED_COUNT as u64)
-                    && report["published"].as_u64() == Some(0)
-                    && code == 3,
-                "confirm-first not honored (exit {code}): {report}"
-            );
-            Ok(())
-        }
-        .await);
+        step!(
+            "Reset + republish resolves shared as already_published",
+            async {
+                driver(dir_a.path().to_path_buf(), vec!["reset-published".into()]).await?;
+                let (code, report) =
+                    driver(dir_a.path().to_path_buf(), publish_args(&token_a)).await?;
+                anyhow::ensure!(
+                    report["already_published"].as_u64() == Some(SHARED_COUNT as u64)
+                        && report["published"].as_u64() == Some(0)
+                        && code == 3,
+                    "confirm-first not honored (exit {code}): {report}"
+                );
+                Ok(())
+            }
+            .await
+        );
 
         // ── Step 6: bob's OWN daemon adopts instead of re-uploading ─────
         // Same iCloud identities (same --start indices), different member:
@@ -399,12 +438,15 @@ impl TestScenario for PhotosIngressShared {
             "Register bob's ingress device",
             register_device(&client, &bob, "Bob Ingress E2E").await
         );
-        step!("Bob claims the shared scope for his own device", async {
-            let status = claim_scope(&client, &bob, &device_b, Some(&library_id)).await?;
-            anyhow::ensure!(status.is_success(), "claim: {status}");
-            Ok(())
-        }
-        .await);
+        step!(
+            "Bob claims the shared scope for his own device",
+            async {
+                let status = claim_scope(&client, &bob, &device_b, Some(&library_id)).await?;
+                anyhow::ensure!(status.is_success(), "claim: {status}");
+                Ok(())
+            }
+            .await
+        );
 
         let dir_b = tempfile::tempdir().context("temp dir b")?;
         step!(
@@ -439,22 +481,27 @@ impl TestScenario for PhotosIngressShared {
                 Ok(())
             }
             .await,
-            |_| Some(format!("adopted={SHARED_COUNT}, published=0, spool evicted"))
+            |_| Some(format!(
+                "adopted={SHARED_COUNT}, published=0, spool evicted"
+            ))
         );
 
         // ── Step 7: non-member scoped claims are refused ────────────────
 
-        step!("Non-member scoped claim is refused (403)", async {
-            let (device_n, _) =
-                register_device(&client, &nodes[0], "Outsider Ingress E2E").await?;
-            let status = claim_scope(&client, &nodes[0], &device_n, Some(&library_id)).await?;
-            anyhow::ensure!(
-                status == reqwest::StatusCode::FORBIDDEN,
-                "expected 403, got {status}"
-            );
-            Ok(())
-        }
-        .await);
+        step!(
+            "Non-member scoped claim is refused (403)",
+            async {
+                let (device_n, _) =
+                    register_device(&client, &nodes[0], "Outsider Ingress E2E").await?;
+                let status = claim_scope(&client, &nodes[0], &device_n, Some(&library_id)).await?;
+                anyhow::ensure!(
+                    status == reqwest::StatusCode::FORBIDDEN,
+                    "expected 403, got {status}"
+                );
+                Ok(())
+            }
+            .await
+        );
 
         result.duration = start.elapsed();
         Ok(result)

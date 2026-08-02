@@ -52,7 +52,9 @@ pub fn router<S: Clone + Send + Sync + 'static>(app_state: AppState) -> Router<S
     // (the rest of the surface keeps axum's 2 MB default).
     let ingest = Router::new()
         .route("/photos", post(post_photo_ingest))
-        .layer(axum::extract::DefaultBodyLimit::max(PHOTO_INGEST_BODY_LIMIT));
+        .layer(axum::extract::DefaultBodyLimit::max(
+            PHOTO_INGEST_BODY_LIMIT,
+        ));
     reads_and_tx.merge(ingest).with_state(app_state)
 }
 
@@ -303,7 +305,12 @@ async fn post_photo_ingest(
             .await
             .map_err(|e| (StatusCode::BAD_REQUEST, format!("asset part: {e}")))?,
     )
-    .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, format!("asset descriptor: {e}")))?;
+    .map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("asset descriptor: {e}"),
+        )
+    })?;
 
     let mut byte_sources: Vec<(ResourceKind, ByteSource)> = Vec::new();
     while let Some(part) = multipart
@@ -447,12 +454,11 @@ async fn post_ingress_claim(
     // deterministically against consensus state.
     if let Some(lib) = body.library_id.clone() {
         let pool = state.db_pool.clone();
-        let member = tokio::task::spawn_blocking(move || {
-            super::query::is_library_member(&pool, uid, &lib)
-        })
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        let member =
+            tokio::task::spawn_blocking(move || super::query::is_library_member(&pool, uid, &lib))
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
         if !member {
             return Err((StatusCode::FORBIDDEN, "not a member of this library".into()));
         }
@@ -843,9 +849,7 @@ async fn get_sync_feed(
 const BLOB_KEY_HEADER: &str = "x-hopnet-blob-key";
 const FILE_SIZE_HEADER: &str = "x-hopnet-file-size";
 
-fn parse_blob_key_header(
-    headers: &axum::http::HeaderMap,
-) -> Result<chacha20poly1305::Key, String> {
+fn parse_blob_key_header(headers: &axum::http::HeaderMap) -> Result<chacha20poly1305::Key, String> {
     let raw = headers
         .get(BLOB_KEY_HEADER)
         .ok_or_else(|| format!("missing {BLOB_KEY_HEADER} header"))?
@@ -962,7 +966,10 @@ fn map_upload_error(e: hopnet_photos_core::PhotosCoreError) -> (StatusCode, Stri
         ref io_err,
     )) = e
     {
-        if let Some(b) = io_err.get_ref().and_then(|b| b.downcast_ref::<BodyLenError>()) {
+        if let Some(b) = io_err
+            .get_ref()
+            .and_then(|b| b.downcast_ref::<BodyLenError>())
+        {
             return (StatusCode::UNPROCESSABLE_ENTITY, b.to_string());
         }
         return (StatusCode::BAD_REQUEST, format!("body read: {io_err}"));
@@ -1048,8 +1055,9 @@ fn device_tx_scopes(
 ) -> Result<Vec<Option<hopnet_common::CustomUUID>>, (StatusCode, String)> {
     use hopnet_photos::envelopes as env;
     let cfg = bincode::config::standard();
-    let bad =
-        |e: bincode::error::DecodeError| (StatusCode::BAD_REQUEST, format!("undecodable payload: {e}"));
+    let bad = |e: bincode::error::DecodeError| {
+        (StatusCode::BAD_REQUEST, format!("undecodable payload: {e}"))
+    };
 
     macro_rules! entry_photo_ids {
         ($ty:ty) => {{
@@ -1240,7 +1248,12 @@ async fn post_client_resolve(
                 &wrapped,
                 &session_recipient(&session),
             )
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("library key: {e}")))?;
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("library key: {e}"),
+                )
+            })?;
             hopnet_photos_core::crypto::derive_library_fingerprint_key(&library_key)
         }
     };
@@ -1255,10 +1268,13 @@ async fn post_client_resolve(
 
         let mut entries = Vec::with_capacity(body.cloud_ids.len());
         for cloud_id in body.cloud_ids {
-            let fingerprint = hex::encode(blake3::keyed_hash(&fp_key, cloud_id.as_bytes()).as_bytes());
+            let fingerprint =
+                hex::encode(blake3::keyed_hash(&fp_key, cloud_id.as_bytes()).as_bytes());
             let photo_id = match &library_id {
                 None => super::query::read_photo_by_fingerprint(&pool, uid, &fingerprint)?,
-                Some(lib) => super::query::read_shared_photo_by_fingerprint(&pool, lib, &fingerprint)?,
+                Some(lib) => {
+                    super::query::read_shared_photo_by_fingerprint(&pool, lib, &fingerprint)?
+                }
             };
             entries.push(ResolveEntryResponse {
                 cloud_id,
@@ -1462,8 +1478,8 @@ async fn get_photo_resource(
     use axum::body::Body;
     use axum::http::header;
 
-    let kind =
-        hopnet_photos_core::asset::ResourceKind::from_name(&kind_name).ok_or(StatusCode::BAD_REQUEST)?;
+    let kind = hopnet_photos_core::asset::ResourceKind::from_name(&kind_name)
+        .ok_or(StatusCode::BAD_REQUEST)?;
     let requested_range = parse_range(&headers);
 
     let pool = state.db_pool.clone();
@@ -1564,7 +1580,13 @@ mod tests {
     // Should not: parse multi-range, suffix-range, or junk specs.
     #[test]
     fn parse_range_degrades_unsupported_specs_to_full_response() {
-        for value in ["bytes=0-99,200-299", "bytes=-100", "bytes=abc-", "items=0-99", ""] {
+        for value in [
+            "bytes=0-99,200-299",
+            "bytes=-100",
+            "bytes=abc-",
+            "items=0-99",
+            "",
+        ] {
             let h = headers_with(axum::http::header::RANGE, value);
             assert_eq!(parse_range(&h), None, "spec {value:?} must degrade");
         }
@@ -1649,7 +1671,11 @@ mod tests {
             }
         };
         let add = enc(&hopnet_photos::envelopes::PhotoAddPayload {
-            entries: vec![entry(None), entry(Some(lib.clone())), entry(Some(lib.clone()))],
+            entries: vec![
+                entry(None),
+                entry(Some(lib.clone())),
+                entry(Some(lib.clone())),
+            ],
         });
         let scopes = device_tx_scopes("photo_add", &add, &pool).unwrap();
         assert_eq!(scopes.len(), 2);
@@ -1701,7 +1727,10 @@ mod tests {
             ))
         );
         let boundary = encode_cursor(1748736000000, "");
-        assert_eq!(decode_cursor(&boundary), Some((1748736000000, String::new())));
+        assert_eq!(
+            decode_cursor(&boundary),
+            Some((1748736000000, String::new()))
+        );
         let negative = encode_cursor(-5, "id");
         assert_eq!(decode_cursor(&negative), Some((-5, "id".to_string())));
     }
@@ -1738,8 +1767,7 @@ mod tests {
         ));
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 
-        let (status, _) =
-            map_publish_error(PhotosCoreError::Dispatch("queue unavailable".into()));
+        let (status, _) = map_publish_error(PhotosCoreError::Dispatch("queue unavailable".into()));
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 
         let (status, _) = map_publish_error(PhotosCoreError::PartialPublish {
@@ -1770,10 +1798,7 @@ mod tests {
     }
 
     fn key_headers(value: &str) -> HeaderMap {
-        headers_with(
-            axum::http::HeaderName::from_static(BLOB_KEY_HEADER),
-            value,
-        )
+        headers_with(axum::http::HeaderName::from_static(BLOB_KEY_HEADER), value)
     }
 
     // Impact: a mis-parsed key would encrypt the blob under the wrong key —
@@ -1791,9 +1816,9 @@ mod tests {
     fn blob_key_header_rejects_malformed() {
         assert!(parse_blob_key_header(&HeaderMap::new()).is_err());
         for value in [
-            &"ab".repeat(31),          // 62 chars: too short
-            &"ab".repeat(33),          // 66 chars: too long
-            &format!("{}q", "ab".repeat(31)), // 63 chars: odd length
+            &"ab".repeat(31),                  // 62 chars: too short
+            &"ab".repeat(33),                  // 66 chars: too long
+            &format!("{}q", "ab".repeat(31)),  // 63 chars: odd length
             &format!("zz{}", "ab".repeat(31)), // non-hex
         ] {
             assert!(
@@ -1850,7 +1875,11 @@ mod tests {
         let mut out = Vec::new();
         let err = reader.read_to_end(&mut out).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
-        let inner = err.get_ref().unwrap().downcast_ref::<BodyLenError>().unwrap();
+        let inner = err
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<BodyLenError>()
+            .unwrap();
         assert_eq!(inner.expected, 1000);
         assert_eq!(inner.actual, Some(400));
     }
@@ -1867,7 +1896,11 @@ mod tests {
         let mut out = Vec::new();
         let err = reader.read_to_end(&mut out).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-        let inner = err.get_ref().unwrap().downcast_ref::<BodyLenError>().unwrap();
+        let inner = err
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<BodyLenError>()
+            .unwrap();
         assert_eq!(inner.actual, None);
     }
 

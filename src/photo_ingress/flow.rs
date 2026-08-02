@@ -115,7 +115,9 @@ pub(crate) async fn disable(
 
     let mut device_revoked = false;
     if req.revoke_device.unwrap_or(true)
-        && let Some(id) = device_id.as_deref().and_then(|s| CustomUUID::from_str(s).ok())
+        && let Some(id) = device_id
+            .as_deref()
+            .and_then(|s| CustomUUID::from_str(s).ok())
     {
         match deps.revoke_device(user_id, id).await {
             Ok(()) => device_revoked = true,

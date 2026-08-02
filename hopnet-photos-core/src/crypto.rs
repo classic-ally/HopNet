@@ -1,10 +1,10 @@
 use crate::error::PhotosCoreError;
-use chacha20poly1305::aead::{Aead, KeyInit, OsRng};
 use chacha20poly1305::aead::rand_core::RngCore;
+use chacha20poly1305::aead::{Aead, KeyInit, OsRng};
 use chacha20poly1305::{ChaCha20Poly1305, Key};
 use hopnet_common::CustomUUID;
-use hopnet_storage::types::BlobAccess;
 use hopnet_storage::RecipientKey;
+use hopnet_storage::types::BlobAccess;
 
 pub fn generate_metadata_key() -> Key {
     ChaCha20Poly1305::generate_key(OsRng)
@@ -169,10 +169,7 @@ pub fn rewrap_blob_key(
     hopnet_storage::crypto::wrap_blob_key(&own_access.blob_id, recipient, &key).map_err(Into::into)
 }
 
-pub fn compute_integrity_hash(
-    per_blob_key: &Key,
-    plaintext: &[u8],
-) -> hopnet_common::Blake3Hash {
+pub fn compute_integrity_hash(per_blob_key: &Key, plaintext: &[u8]) -> hopnet_common::Blake3Hash {
     hopnet_storage::crypto::integrity_hash(per_blob_key, plaintext)
 }
 
@@ -200,7 +197,9 @@ mod tests {
 
     #[test]
     fn metadata_key_wrap_unwrap_round_trip() {
-        let reader = StaticRecipient(hopnet_storage::x25519_dalek::StaticSecret::random_from_rng(OsRng));
+        let reader = StaticRecipient(hopnet_storage::x25519_dalek::StaticSecret::random_from_rng(
+            OsRng,
+        ));
         let key = generate_metadata_key();
         let photo_id = CustomUUID::retention_cutoff(0);
         let (eph, wrapped) = wrap_metadata_key(&photo_id, &reader.pubkey(), &key).unwrap();
@@ -210,8 +209,12 @@ mod tests {
 
     #[test]
     fn metadata_key_wrap_wrong_reader_fails() {
-        let r1 = StaticRecipient(hopnet_storage::x25519_dalek::StaticSecret::random_from_rng(OsRng));
-        let r2 = StaticRecipient(hopnet_storage::x25519_dalek::StaticSecret::random_from_rng(OsRng));
+        let r1 = StaticRecipient(hopnet_storage::x25519_dalek::StaticSecret::random_from_rng(
+            OsRng,
+        ));
+        let r2 = StaticRecipient(hopnet_storage::x25519_dalek::StaticSecret::random_from_rng(
+            OsRng,
+        ));
         let key = generate_metadata_key();
         let photo_id = CustomUUID::retention_cutoff(1);
         let (eph, wrapped) = wrap_metadata_key(&photo_id, &r1.pubkey(), &key).unwrap();
@@ -251,7 +254,9 @@ mod tests {
     fn wrap_blob_key_for_recipient_builds_valid_blob_access() {
         let key = generate_blob_key();
         let blob_id = CustomUUID::retention_cutoff(2);
-        let reader = StaticRecipient(hopnet_storage::x25519_dalek::StaticSecret::random_from_rng(OsRng));
+        let reader = StaticRecipient(hopnet_storage::x25519_dalek::StaticSecret::random_from_rng(
+            OsRng,
+        ));
         let access = wrap_blob_key_for_recipient(&blob_id, &reader.pubkey(), &key).unwrap();
         assert_eq!(access.wrapped_key.len(), 48);
         assert_eq!(access.recipient_pubkey, *reader.pubkey().as_bytes());

@@ -39,9 +39,9 @@ pub async fn handle_photo_tombstone_cleanup(
     hopnet_photos::jobs::run_photo_tombstone_cleanup(&caps)
         .await
         .map_err(|msg| {
-            apalis::prelude::Error::Failed(std::sync::Arc::new(Box::new(
-                std::io::Error::other(msg),
-            )))
+            apalis::prelude::Error::Failed(std::sync::Arc::new(Box::new(std::io::Error::other(
+                msg,
+            ))))
         })
 }
 

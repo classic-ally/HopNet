@@ -215,7 +215,12 @@ fn wrap_to_recipient_v1(
     let shared = ephemeral_secret.diffie_hellman(recipient);
 
     let wrap_key = wrap_key_v1(domain, shared.as_bytes());
-    let nonce = wrap_nonce_v1(domain, id_bytes, recipient.as_bytes(), ephemeral_public.as_bytes());
+    let nonce = wrap_nonce_v1(
+        domain,
+        id_bytes,
+        recipient.as_bytes(),
+        ephemeral_public.as_bytes(),
+    );
 
     let wrapped = ChaCha20Poly1305::new(&wrap_key)
         .encrypt(&nonce.into(), key.as_slice())
@@ -231,8 +236,12 @@ pub fn wrap_blob_key(
     recipient: &X25519PublicKey,
     per_blob_key: &chacha20poly1305::Key,
 ) -> Result<crate::types::BlobAccess, StorageError> {
-    let (ephemeral_pubkey, wrapped_key) =
-        wrap_to_recipient_v1(&BLOB_WRAP_DOMAIN, blob_id.as_bytes(), recipient, per_blob_key)?;
+    let (ephemeral_pubkey, wrapped_key) = wrap_to_recipient_v1(
+        &BLOB_WRAP_DOMAIN,
+        blob_id.as_bytes(),
+        recipient,
+        per_blob_key,
+    )?;
     Ok(crate::types::BlobAccess {
         blob_id: blob_id.clone(),
         recipient_pubkey: *recipient.as_bytes(),
@@ -279,7 +288,14 @@ pub fn unwrap_key_v1_in_domain(
     wrapped_key: &[u8],
     reader: &dyn RecipientKey,
 ) -> Result<chacha20poly1305::Key, StorageError> {
-    unwrap_v1(domain, id, recipient_pubkey, ephemeral_pubkey, wrapped_key, reader)
+    unwrap_v1(
+        domain,
+        id,
+        recipient_pubkey,
+        ephemeral_pubkey,
+        wrapped_key,
+        reader,
+    )
 }
 
 fn unwrap_v1(

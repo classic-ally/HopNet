@@ -64,7 +64,9 @@ async fn run_driver_async(data_dir: PathBuf, args: Vec<String>) -> Result<serde_
 }
 
 /// (photo_id, [(resource type name, blake3 hex)]) from a driver report.
-fn report_photos(report: &serde_json::Value) -> Result<Vec<(String, Vec<(String, String)>)>> {
+type ReportPhoto = (String, Vec<(String, String)>);
+
+fn report_photos(report: &serde_json::Value) -> Result<Vec<ReportPhoto>> {
     report["photos"]
         .as_array()
         .context("photos array")?
@@ -184,7 +186,11 @@ impl TestScenario for PhotosIngressPublish {
                     Ok(value) => {
                         print_and_add_check(
                             &mut result,
-                            Check { name: $name.to_string(), passed: true, detail: None },
+                            Check {
+                                name: $name.to_string(),
+                                passed: true,
+                                detail: None,
+                            },
                         );
                         value
                     }
@@ -208,36 +214,50 @@ impl TestScenario for PhotosIngressPublish {
         let base_view = check_or_bail!("Get initial consensus view", get_max_view(nodes).await);
 
         // Step 2: register the daemon's device token on node 0 (RFC-012).
-        let api_key = check_or_bail!("Register ingress device token", async {
-            let response = client
-                .post(format!("{}/api/devices/register", base_url(&nodes[0])))
-                .header("Authorization", format!("Bearer {}", nodes[0].jwt_token))
-                .json(&serde_json::json!({ "device_name": "Photo Ingress E2E" }))
-                .send()
-                .await?;
-            anyhow::ensure!(response.status().is_success(), "register: {}", response.status());
-            let body: serde_json::Value = response.json().await?;
-            body["api_key"]
-                .as_str()
-                .map(str::to_string)
-                .context("api_key missing")
-        }
-        .await);
+        let api_key = check_or_bail!(
+            "Register ingress device token",
+            async {
+                let response = client
+                    .post(format!("{}/api/devices/register", base_url(&nodes[0])))
+                    .header("Authorization", format!("Bearer {}", nodes[0].jwt_token))
+                    .json(&serde_json::json!({ "device_name": "Photo Ingress E2E" }))
+                    .send()
+                    .await?;
+                anyhow::ensure!(
+                    response.status().is_success(),
+                    "register: {}",
+                    response.status()
+                );
+                let body: serde_json::Value = response.json().await?;
+                body["api_key"]
+                    .as_str()
+                    .map(str::to_string)
+                    .context("api_key missing")
+            }
+            .await
+        );
 
         // Step 2b: claim ingress responsibility for the device (explicit-claim
         // contract — an unclaimed scope parks every publish).
-        check_or_bail!("Claim ingress responsibility", async {
-            let device_id = api_key.split('.').next().context("token shape")?;
-            let response = client
-                .post(format!("{}/api/photos/ingress/claim", base_url(&nodes[0])))
-                .header("Authorization", format!("Bearer {}", nodes[0].jwt_token))
-                .json(&serde_json::json!({ "device_id": device_id }))
-                .send()
-                .await?;
-            anyhow::ensure!(response.status().is_success(), "claim: {}", response.status());
-            Ok(())
-        }
-        .await);
+        check_or_bail!(
+            "Claim ingress responsibility",
+            async {
+                let device_id = api_key.split('.').next().context("token shape")?;
+                let response = client
+                    .post(format!("{}/api/photos/ingress/claim", base_url(&nodes[0])))
+                    .header("Authorization", format!("Bearer {}", nodes[0].jwt_token))
+                    .json(&serde_json::json!({ "device_id": device_id }))
+                    .send()
+                    .await?;
+                anyhow::ensure!(
+                    response.status().is_success(),
+                    "claim: {}",
+                    response.status()
+                );
+                Ok(())
+            }
+            .await
+        );
 
         // Step 3: fabricate daemon state (seed → drain, real pipeline).
         let seed_report = check_or_bail!(
@@ -308,7 +328,11 @@ impl TestScenario for PhotosIngressPublish {
                 Err(e) => {
                     print_and_add_check(
                         &mut result,
-                        Check { name, passed: false, detail: Some(e.to_string()) },
+                        Check {
+                            name,
+                            passed: false,
+                            detail: Some(e.to_string()),
+                        },
                     );
                     result.duration = start.elapsed();
                     return Ok(result);
@@ -345,8 +369,7 @@ impl TestScenario for PhotosIngressPublish {
                             verified += 1;
                         }
                         Err(e) => {
-                            content_failure =
-                                Some(format!("node {}: {e}", node.node_id));
+                            content_failure = Some(format!("node {}: {e}", node.node_id));
                             break 'content;
                         }
                     }
@@ -394,8 +417,7 @@ impl TestScenario for PhotosIngressPublish {
                 )
                 .await?;
                 let report =
-                    run_driver_async(data_dir.path().to_path_buf(), publish_args(&api_key))
-                        .await?;
+                    run_driver_async(data_dir.path().to_path_buf(), publish_args(&api_key)).await?;
                 anyhow::ensure!(
                     report["already_published"].as_u64() == Some(COUNT as u64)
                         && report["published"].as_u64() == Some(0),

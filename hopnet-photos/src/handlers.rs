@@ -8,9 +8,9 @@
 use crate::db::libraries;
 use crate::db::photos::{
     delete_favorite, delete_ingress_responsibility_for_library, device_belongs_to_user,
-    edit_photo_content, edit_photo_metadata,
-    hard_delete_expired_photo, insert_favorite, insert_photo_entry, lookup_photo_authz,
-    restore_photo, soft_delete_photo, undo_content_edit, upsert_ingress_responsibility,
+    edit_photo_content, edit_photo_metadata, hard_delete_expired_photo, insert_favorite,
+    insert_photo_entry, lookup_photo_authz, restore_photo, soft_delete_photo, undo_content_edit,
+    upsert_ingress_responsibility,
 };
 use crate::envelopes::{
     CreateSharedLibraryPayload, LibraryAccessGrantPayload, LibraryAccessRevokePayload,
@@ -149,13 +149,11 @@ impl TransactionHandler for PhotoAddHandler {
             // Shared-library adds require membership — deterministic
             // against consensus state; the device route cannot check this
             // (the payload is opaque bincode at the route layer).
-            if let Some(lib) = &entry.library_id {
-                if !libraries::is_member(db_tx, lib, user_id)? {
-                    tracing::warn!(
-                        "photo_add: user {user_id} is not a member of library {lib}",
-                    );
-                    return Err(DatabaseError::AuthorizationError);
-                }
+            if let Some(lib) = &entry.library_id
+                && !libraries::is_member(db_tx, lib, user_id)?
+            {
+                tracing::warn!("photo_add: user {user_id} is not a member of library {lib}",);
+                return Err(DatabaseError::AuthorizationError);
             }
             insert_photo_entry(db_tx, entry, ctx.fragments_dir)?;
         }
@@ -677,15 +675,15 @@ impl TransactionHandler for PhotoIngressClaimHandler {
         // users lose the scope with their membership (the remove handler
         // deletes their responsibility rows), and a non-member must not
         // pre-stage one.
-        if let Some(lib) = &payload.library_id {
-            if !crate::db::libraries::is_member(db_tx, lib, user_id)? {
-                tracing::warn!(
-                    "photo_ingress_claim: user {} is not a member of library {}",
-                    user_id,
-                    lib,
-                );
-                return Err(DatabaseError::AuthorizationError);
-            }
+        if let Some(lib) = &payload.library_id
+            && !crate::db::libraries::is_member(db_tx, lib, user_id)?
+        {
+            tracing::warn!(
+                "photo_ingress_claim: user {} is not a member of library {}",
+                user_id,
+                lib,
+            );
+            return Err(DatabaseError::AuthorizationError);
         }
 
         upsert_ingress_responsibility(
@@ -969,8 +967,8 @@ impl TransactionHandler for LibraryAccessGrantHandler {
             return Err(DatabaseError::AuthorizationError);
         }
         // The recipient pubkey comes from consensus state, never the wire.
-        let target_pubkey = libraries::user_x25519_pubkey(db_tx, target)?
-            .ok_or(DatabaseError::InvalidPayload)?;
+        let target_pubkey =
+            libraries::user_x25519_pubkey(db_tx, target)?.ok_or(DatabaseError::InvalidPayload)?;
 
         for grant in &payload.entries {
             // Live photos of THIS library only — tombstoned photos are
@@ -1033,8 +1031,8 @@ impl TransactionHandler for LibraryAccessRevokeHandler {
         {
             return Err(DatabaseError::AuthorizationError);
         }
-        let target_pubkey = libraries::user_x25519_pubkey(db_tx, target)?
-            .ok_or(DatabaseError::InvalidPayload)?;
+        let target_pubkey =
+            libraries::user_x25519_pubkey(db_tx, target)?.ok_or(DatabaseError::InvalidPayload)?;
 
         for photo_id in &payload.photo_ids {
             libraries::delete_metadata_access(db_tx, photo_id, target)?;
@@ -1102,6 +1100,7 @@ mod tests {
         HandlerCtx {
             fragments_dir,
             node_id: None,
+            height: 0,
             notifier: &NoopNotifier,
             work: &NoopScheduler,
         }
@@ -1121,6 +1120,9 @@ mod tests {
     struct NoopNotifier;
     impl hopnet_projection::ChangeNotifier for NoopNotifier {
         fn files_changed(&self) {}
+        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<()> {
+            tokio::sync::broadcast::channel(1).1
+        }
     }
 
     struct NoopScheduler;
@@ -2028,7 +2030,11 @@ mod tests {
         read_holder_scoped(conn, user_id, None)
     }
 
-    fn read_holder_scoped(conn: &Connection, user_id: i32, library_id: Option<&str>) -> Option<String> {
+    fn read_holder_scoped(
+        conn: &Connection,
+        user_id: i32,
+        library_id: Option<&str>,
+    ) -> Option<String> {
         match library_id {
             None => conn.query_row(
                 "SELECT device_id FROM photo_ingress_responsibility
@@ -2122,13 +2128,36 @@ mod tests {
         let dev_b = "00000000-0000-0000-0000-0000000000d2";
 
         let bytes = claim_bytes(dev_a);
-        validate(&conn, &PhotoIngressClaimHandler, "photo_ingress_claim", &bytes, Some(1)).unwrap();
-        apply(&conn, &PhotoIngressClaimHandler, "photo_ingress_claim", &bytes, Some(1));
+        validate(
+            &conn,
+            &PhotoIngressClaimHandler,
+            "photo_ingress_claim",
+            &bytes,
+            Some(1),
+        )
+        .unwrap();
+        apply(
+            &conn,
+            &PhotoIngressClaimHandler,
+            "photo_ingress_claim",
+            &bytes,
+            Some(1),
+        );
         assert_eq!(read_holder(&conn, 1).as_deref(), Some(dev_a));
 
         let bytes = claim_bytes(dev_b);
-        apply(&conn, &PhotoIngressClaimHandler, "photo_ingress_claim", &bytes, Some(1));
-        assert_eq!(read_holder(&conn, 1).as_deref(), Some(dev_b), "transfer = re-claim");
+        apply(
+            &conn,
+            &PhotoIngressClaimHandler,
+            "photo_ingress_claim",
+            &bytes,
+            Some(1),
+        );
+        assert_eq!(
+            read_holder(&conn, 1).as_deref(),
+            Some(dev_b),
+            "transfer = re-claim"
+        );
     }
 
     // Impact: the ownership check is the only thing stopping one user from
@@ -2142,19 +2171,37 @@ mod tests {
         // Device d9 belongs to user 2; user 1 must not claim it.
         let foreign = claim_bytes("00000000-0000-0000-0000-0000000000d9");
         assert!(matches!(
-            validate(&conn, &PhotoIngressClaimHandler, "photo_ingress_claim", &foreign, Some(1)),
+            validate(
+                &conn,
+                &PhotoIngressClaimHandler,
+                "photo_ingress_claim",
+                &foreign,
+                Some(1)
+            ),
             Err(DatabaseError::AuthorizationError)
         ));
 
         let missing = claim_bytes("00000000-0000-0000-0000-0000000000ee");
         assert!(matches!(
-            validate(&conn, &PhotoIngressClaimHandler, "photo_ingress_claim", &missing, Some(1)),
+            validate(
+                &conn,
+                &PhotoIngressClaimHandler,
+                "photo_ingress_claim",
+                &missing,
+                Some(1)
+            ),
             Err(DatabaseError::AuthorizationError)
         ));
 
         let owned = claim_bytes("00000000-0000-0000-0000-0000000000d1");
         assert!(matches!(
-            validate(&conn, &PhotoIngressClaimHandler, "photo_ingress_claim", &owned, None),
+            validate(
+                &conn,
+                &PhotoIngressClaimHandler,
+                "photo_ingress_claim",
+                &owned,
+                None
+            ),
             Err(DatabaseError::AuthorizationError)
         ));
 
@@ -2173,13 +2220,25 @@ mod tests {
         // User 2 owns d9 but is not a member yet.
         let bytes = claim_bytes_scoped("00000000-0000-0000-0000-0000000000d9", Some(&lib_s));
         assert!(matches!(
-            validate(&conn, &PhotoIngressClaimHandler, "photo_ingress_claim", &bytes, Some(2)),
+            validate(
+                &conn,
+                &PhotoIngressClaimHandler,
+                "photo_ingress_claim",
+                &bytes,
+                Some(2)
+            ),
             Err(DatabaseError::AuthorizationError)
         ));
 
         invite(&conn, &lib, 1, 2);
         accept(&conn, &lib, 2);
-        apply(&conn, &PhotoIngressClaimHandler, "photo_ingress_claim", &bytes, Some(2));
+        apply(
+            &conn,
+            &PhotoIngressClaimHandler,
+            "photo_ingress_claim",
+            &bytes,
+            Some(2),
+        );
         assert_eq!(
             read_holder_scoped(&conn, 2, Some(&lib_s)).as_deref(),
             Some("00000000-0000-0000-0000-0000000000d9"),
@@ -2187,7 +2246,13 @@ mod tests {
 
         // Personal claims never involve membership.
         let personal = claim_bytes("00000000-0000-0000-0000-0000000000d1");
-        apply(&conn, &PhotoIngressClaimHandler, "photo_ingress_claim", &personal, Some(1));
+        apply(
+            &conn,
+            &PhotoIngressClaimHandler,
+            "photo_ingress_claim",
+            &personal,
+            Some(1),
+        );
         assert_eq!(
             read_holder(&conn, 1).as_deref(),
             Some("00000000-0000-0000-0000-0000000000d1"),
@@ -2214,18 +2279,42 @@ mod tests {
             claim_bytes_scoped(dev1, Some(&a)),
             claim_bytes_scoped(dev2, Some(&b)),
         ] {
-            apply(&conn, &PhotoIngressClaimHandler, "photo_ingress_claim", &bytes, Some(1));
+            apply(
+                &conn,
+                &PhotoIngressClaimHandler,
+                "photo_ingress_claim",
+                &bytes,
+                Some(1),
+            );
         }
         assert_eq!(read_holder(&conn, 1).as_deref(), Some(dev1));
-        assert_eq!(read_holder_scoped(&conn, 1, Some(&a)).as_deref(), Some(dev1));
-        assert_eq!(read_holder_scoped(&conn, 1, Some(&b)).as_deref(), Some(dev2));
+        assert_eq!(
+            read_holder_scoped(&conn, 1, Some(&a)).as_deref(),
+            Some(dev1)
+        );
+        assert_eq!(
+            read_holder_scoped(&conn, 1, Some(&b)).as_deref(),
+            Some(dev2)
+        );
 
         // Transfer lib_a to dev2: personal and lib_b rows must not move.
         let transfer = claim_bytes_scoped(dev2, Some(&a));
-        apply(&conn, &PhotoIngressClaimHandler, "photo_ingress_claim", &transfer, Some(1));
-        assert_eq!(read_holder_scoped(&conn, 1, Some(&a)).as_deref(), Some(dev2));
+        apply(
+            &conn,
+            &PhotoIngressClaimHandler,
+            "photo_ingress_claim",
+            &transfer,
+            Some(1),
+        );
+        assert_eq!(
+            read_holder_scoped(&conn, 1, Some(&a)).as_deref(),
+            Some(dev2)
+        );
         assert_eq!(read_holder(&conn, 1).as_deref(), Some(dev1));
-        assert_eq!(read_holder_scoped(&conn, 1, Some(&b)).as_deref(), Some(dev2));
+        assert_eq!(
+            read_holder_scoped(&conn, 1, Some(&b)).as_deref(),
+            Some(dev2)
+        );
         assert_eq!(
             count(&conn, "SELECT COUNT(*) FROM photo_ingress_responsibility"),
             3,
@@ -2246,9 +2335,21 @@ mod tests {
         let lib_s = lib.to_string();
 
         let one = claim_bytes_scoped("00000000-0000-0000-0000-0000000000d1", Some(&lib_s));
-        apply(&conn, &PhotoIngressClaimHandler, "photo_ingress_claim", &one, Some(1));
+        apply(
+            &conn,
+            &PhotoIngressClaimHandler,
+            "photo_ingress_claim",
+            &one,
+            Some(1),
+        );
         let two = claim_bytes_scoped("00000000-0000-0000-0000-0000000000d9", Some(&lib_s));
-        apply(&conn, &PhotoIngressClaimHandler, "photo_ingress_claim", &two, Some(2));
+        apply(
+            &conn,
+            &PhotoIngressClaimHandler,
+            "photo_ingress_claim",
+            &two,
+            Some(2),
+        );
 
         assert_eq!(
             read_holder_scoped(&conn, 1, Some(&lib_s)).as_deref(),
@@ -2273,16 +2374,34 @@ mod tests {
         let lib_s = lib.to_string();
 
         let personal = claim_bytes("00000000-0000-0000-0000-0000000000d9");
-        apply(&conn, &PhotoIngressClaimHandler, "photo_ingress_claim", &personal, Some(2));
+        apply(
+            &conn,
+            &PhotoIngressClaimHandler,
+            "photo_ingress_claim",
+            &personal,
+            Some(2),
+        );
         let scoped = claim_bytes_scoped("00000000-0000-0000-0000-0000000000d9", Some(&lib_s));
-        apply(&conn, &PhotoIngressClaimHandler, "photo_ingress_claim", &scoped, Some(2));
+        apply(
+            &conn,
+            &PhotoIngressClaimHandler,
+            "photo_ingress_claim",
+            &scoped,
+            Some(2),
+        );
 
         let kick = enc(&LibraryRemoveMemberPayload {
             library_id: lib.clone(),
             user_id: 2,
             operation_id: CustomUUID::retention_cutoff(0x341),
         });
-        apply(&conn, &LibraryRemoveMemberHandler, "library_remove_member", &kick, Some(1));
+        apply(
+            &conn,
+            &LibraryRemoveMemberHandler,
+            "library_remove_member",
+            &kick,
+            Some(1),
+        );
 
         assert_eq!(read_holder_scoped(&conn, 2, Some(&lib_s)), None);
         assert_eq!(
@@ -2338,7 +2457,13 @@ mod tests {
             invitee: key_wrap(invitee),
             operation_id: CustomUUID::retention_cutoff(900),
         });
-        apply(conn, &LibraryInviteHandler, "library_invite", &bytes, Some(inviter));
+        apply(
+            conn,
+            &LibraryInviteHandler,
+            "library_invite",
+            &bytes,
+            Some(inviter),
+        );
     }
 
     fn accept(conn: &Connection, lib: &CustomUUID, invitee: i32) {
@@ -2380,7 +2505,13 @@ mod tests {
             operation_id: CustomUUID::retention_cutoff(0x201),
         });
         assert!(matches!(
-            validate(&conn, &CreateSharedLibraryHandler, "create_shared_library", &foreign, Some(1)),
+            validate(
+                &conn,
+                &CreateSharedLibraryHandler,
+                "create_shared_library",
+                &foreign,
+                Some(1)
+            ),
             Err(DatabaseError::AuthorizationError)
         ));
     }
@@ -2399,7 +2530,13 @@ mod tests {
             operation_id: CustomUUID::retention_cutoff(0x300),
         });
         assert!(matches!(
-            validate(&conn, &LibraryInviteHandler, "library_invite", &by_stranger, Some(2)),
+            validate(
+                &conn,
+                &LibraryInviteHandler,
+                "library_invite",
+                &by_stranger,
+                Some(2)
+            ),
             Err(DatabaseError::AuthorizationError)
         ));
         // Self-invite and member-invite are conflicts.
@@ -2409,7 +2546,13 @@ mod tests {
             operation_id: CustomUUID::retention_cutoff(0x301),
         });
         assert!(matches!(
-            validate(&conn, &LibraryInviteHandler, "library_invite", &self_invite, Some(1)),
+            validate(
+                &conn,
+                &LibraryInviteHandler,
+                "library_invite",
+                &self_invite,
+                Some(1)
+            ),
             Err(DatabaseError::ConflictError)
         ));
         // Unknown mesh user is rejected.
@@ -2419,7 +2562,13 @@ mod tests {
             operation_id: CustomUUID::retention_cutoff(0x302),
         });
         assert!(matches!(
-            validate(&conn, &LibraryInviteHandler, "library_invite", &unknown, Some(1)),
+            validate(
+                &conn,
+                &LibraryInviteHandler,
+                "library_invite",
+                &unknown,
+                Some(1)
+            ),
             Err(DatabaseError::InvalidPayload)
         ));
 
@@ -2432,7 +2581,13 @@ mod tests {
             operation_id: CustomUUID::retention_cutoff(0x303),
         });
         assert!(matches!(
-            validate(&conn, &LibraryInviteHandler, "library_invite", &dup, Some(1)),
+            validate(
+                &conn,
+                &LibraryInviteHandler,
+                "library_invite",
+                &dup,
+                Some(1)
+            ),
             Err(DatabaseError::ConflictError)
         ));
     }
@@ -2456,7 +2611,13 @@ mod tests {
             operation_id: CustomUUID::retention_cutoff(0x400),
         });
         assert!(matches!(
-            validate(&conn, &LibraryInviteAcceptHandler, "library_invite_accept", &bytes, Some(3)),
+            validate(
+                &conn,
+                &LibraryInviteAcceptHandler,
+                "library_invite_accept",
+                &bytes,
+                Some(3)
+            ),
             Err(DatabaseError::NotFound)
         ));
 
@@ -2464,18 +2625,29 @@ mod tests {
         assert!(crate::db::libraries::is_member(&conn, &lib, 2).unwrap());
         assert!(!crate::db::libraries::is_invitee(&conn, &lib, 2).unwrap());
         assert_eq!(
-            count(&conn, "SELECT COUNT(*) FROM shared_library_keys WHERE user_id = 2"),
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM shared_library_keys WHERE user_id = 2"
+            ),
             1,
             "invite wrap promoted"
         );
         assert_eq!(
-            crate::db::libraries::read_view_changes(&conn, 2).unwrap().len(),
+            crate::db::libraries::read_view_changes(&conn, 2)
+                .unwrap()
+                .len(),
             1,
             "backfill signal written"
         );
         // Re-delivery: invite row is gone.
         assert!(matches!(
-            validate(&conn, &LibraryInviteAcceptHandler, "library_invite_accept", &bytes, Some(2)),
+            validate(
+                &conn,
+                &LibraryInviteAcceptHandler,
+                "library_invite_accept",
+                &bytes,
+                Some(2)
+            ),
             Err(DatabaseError::NotFound)
         ));
     }
@@ -2494,10 +2666,22 @@ mod tests {
             operation_id: CustomUUID::retention_cutoff(0x500),
         });
         assert!(matches!(
-            validate(&conn, &LibraryInviteDeclineHandler, "library_invite_decline", &bytes, Some(3)),
+            validate(
+                &conn,
+                &LibraryInviteDeclineHandler,
+                "library_invite_decline",
+                &bytes,
+                Some(3)
+            ),
             Err(DatabaseError::AuthorizationError)
         ));
-        apply(&conn, &LibraryInviteDeclineHandler, "library_invite_decline", &bytes, Some(2));
+        apply(
+            &conn,
+            &LibraryInviteDeclineHandler,
+            "library_invite_decline",
+            &bytes,
+            Some(2),
+        );
         assert!(!crate::db::libraries::is_invitee(&conn, &lib, 2).unwrap());
     }
 
@@ -2518,7 +2702,13 @@ mod tests {
             operation_id: CustomUUID::retention_cutoff(0x600),
         });
         assert!(matches!(
-            validate(&conn, &LibraryRemoveMemberHandler, "library_remove_member", &by_stranger, Some(3)),
+            validate(
+                &conn,
+                &LibraryRemoveMemberHandler,
+                "library_remove_member",
+                &by_stranger,
+                Some(3)
+            ),
             Err(DatabaseError::AuthorizationError)
         ));
 
@@ -2528,17 +2718,32 @@ mod tests {
             user_id: 1,
             operation_id: CustomUUID::retention_cutoff(0x601),
         });
-        apply(&conn, &LibraryRemoveMemberHandler, "library_remove_member", &kick, Some(2));
+        apply(
+            &conn,
+            &LibraryRemoveMemberHandler,
+            "library_remove_member",
+            &kick,
+            Some(2),
+        );
         assert!(!crate::db::libraries::is_member(&conn, &lib, 1).unwrap());
         assert_eq!(
-            count(&conn, "SELECT COUNT(*) FROM shared_library_keys WHERE user_id = 1"),
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM shared_library_keys WHERE user_id = 1"
+            ),
             0,
             "kicked member's key wrap cleared"
         );
 
         // Removing someone who is neither member nor invitee → NotFound.
         assert!(matches!(
-            validate(&conn, &LibraryRemoveMemberHandler, "library_remove_member", &kick, Some(2)),
+            validate(
+                &conn,
+                &LibraryRemoveMemberHandler,
+                "library_remove_member",
+                &kick,
+                Some(2)
+            ),
             Err(DatabaseError::NotFound)
         ));
     }
@@ -2589,12 +2794,24 @@ mod tests {
 
         // Stranger target rejected.
         assert!(matches!(
-            validate(&conn, &LibraryAccessGrantHandler, "library_access_grant", &grant(3, &photo_id, &blob_id), Some(1)),
+            validate(
+                &conn,
+                &LibraryAccessGrantHandler,
+                "library_access_grant",
+                &grant(3, &photo_id, &blob_id),
+                Some(1)
+            ),
             Err(DatabaseError::AuthorizationError)
         ));
         // Foreign photo rejected.
         assert!(matches!(
-            validate(&conn, &LibraryAccessGrantHandler, "library_access_grant", &grant(2, &CustomUUID::retention_cutoff(0x7FF), &blob_id), Some(1)),
+            validate(
+                &conn,
+                &LibraryAccessGrantHandler,
+                "library_access_grant",
+                &grant(2, &CustomUUID::retention_cutoff(0x7FF), &blob_id),
+                Some(1)
+            ),
             Err(DatabaseError::ValidationError)
         ));
         // Empty batch rejected.
@@ -2606,19 +2823,36 @@ mod tests {
             operation_id: CustomUUID::retention_cutoff(0x704),
         });
         assert!(matches!(
-            validate(&conn, &LibraryAccessGrantHandler, "library_access_grant", &empty, Some(1)),
+            validate(
+                &conn,
+                &LibraryAccessGrantHandler,
+                "library_access_grant",
+                &empty,
+                Some(1)
+            ),
             Err(DatabaseError::InvalidPayload)
         ));
 
         // Grant to the pending invitee succeeds and signals.
-        apply(&conn, &LibraryAccessGrantHandler, "library_access_grant", &grant(2, &photo_id, &blob_id), Some(1));
+        apply(
+            &conn,
+            &LibraryAccessGrantHandler,
+            "library_access_grant",
+            &grant(2, &photo_id, &blob_id),
+            Some(1),
+        );
         assert_eq!(
-            count(&conn, "SELECT COUNT(*) FROM photo_metadata_access WHERE user_id = 2"),
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM photo_metadata_access WHERE user_id = 2"
+            ),
             1
         );
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM blob_access"), 1);
         assert_eq!(
-            crate::db::libraries::read_view_changes(&conn, 2).unwrap().len(),
+            crate::db::libraries::read_view_changes(&conn, 2)
+                .unwrap()
+                .len(),
             1
         );
 
@@ -2631,7 +2865,13 @@ mod tests {
         });
         apply(&conn, &PhotoDeleteHandler, "photo_delete", &del, Some(1));
         assert!(matches!(
-            validate(&conn, &LibraryAccessGrantHandler, "library_access_grant", &grant(2, &photo_id, &blob_id), Some(1)),
+            validate(
+                &conn,
+                &LibraryAccessGrantHandler,
+                "library_access_grant",
+                &grant(2, &photo_id, &blob_id),
+                Some(1)
+            ),
             Err(DatabaseError::ValidationError)
         ));
     }
@@ -2669,7 +2909,13 @@ mod tests {
             blob_wraps: vec![],
             operation_id: CustomUUID::retention_cutoff(0x803),
         });
-        apply(&conn, &LibraryAccessGrantHandler, "library_access_grant", &grant, Some(1));
+        apply(
+            &conn,
+            &LibraryAccessGrantHandler,
+            "library_access_grant",
+            &grant,
+            Some(1),
+        );
 
         let revoke = enc(&LibraryAccessRevokePayload {
             library_id: lib.clone(),
@@ -2680,7 +2926,13 @@ mod tests {
         });
         // Live member → rejected.
         assert!(matches!(
-            validate(&conn, &LibraryAccessRevokeHandler, "library_access_revoke", &revoke, Some(1)),
+            validate(
+                &conn,
+                &LibraryAccessRevokeHandler,
+                "library_access_revoke",
+                &revoke,
+                Some(1)
+            ),
             Err(DatabaseError::AuthorizationError)
         ));
 
@@ -2690,10 +2942,25 @@ mod tests {
             user_id: 2,
             operation_id: CustomUUID::retention_cutoff(0x805),
         });
-        apply(&conn, &LibraryRemoveMemberHandler, "library_remove_member", &kick, Some(1));
-        apply(&conn, &LibraryAccessRevokeHandler, "library_access_revoke", &revoke, Some(1));
+        apply(
+            &conn,
+            &LibraryRemoveMemberHandler,
+            "library_remove_member",
+            &kick,
+            Some(1),
+        );
+        apply(
+            &conn,
+            &LibraryAccessRevokeHandler,
+            "library_access_revoke",
+            &revoke,
+            Some(1),
+        );
         assert_eq!(
-            count(&conn, "SELECT COUNT(*) FROM photo_metadata_access WHERE user_id = 2"),
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM photo_metadata_access WHERE user_id = 2"
+            ),
             0,
             "departed user's wraps removed"
         );
@@ -2729,7 +2996,13 @@ mod tests {
             }],
         });
         assert!(matches!(
-            validate(&conn, &PhotoFavoriteHandler, "photo_favorite", &fav, Some(3)),
+            validate(
+                &conn,
+                &PhotoFavoriteHandler,
+                "photo_favorite",
+                &fav,
+                Some(3)
+            ),
             Err(DatabaseError::AuthorizationError)
         ));
 
@@ -2742,7 +3015,10 @@ mod tests {
         });
         apply(&conn, &PhotoDeleteHandler, "photo_delete", &del, Some(2));
         assert_eq!(
-            count(&conn, "SELECT COUNT(*) FROM photos WHERE deleted_at IS NOT NULL"),
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM photos WHERE deleted_at IS NOT NULL"
+            ),
             1
         );
     }

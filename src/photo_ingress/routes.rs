@@ -97,14 +97,18 @@ async fn get_status(
     State(app_state): State<AppState>,
     Extension(user_id): Extension<i32>,
 ) -> Result<Json<PhotoIngressStatus>, Failure> {
-    flow::status(&LiveDeps { app_state }, user_id).await.map(Json)
+    flow::status(&LiveDeps { app_state }, user_id)
+        .await
+        .map(Json)
 }
 
 async fn post_enable(
     State(app_state): State<AppState>,
     Extension(user_id): Extension<i32>,
 ) -> Result<Json<PhotoIngressStatus>, Failure> {
-    flow::enable(&LiveDeps { app_state }, user_id).await.map(Json)
+    flow::enable(&LiveDeps { app_state }, user_id)
+        .await
+        .map(Json)
 }
 
 async fn post_disable(

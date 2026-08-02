@@ -166,12 +166,15 @@ pub fn insert_invite(
     Ok(())
 }
 
+/// `(ephemeral_pubkey, wrapped_key)` — one X25519 key wrap as stored on a row.
+pub type KeyWrap = ([u8; 32], Vec<u8>);
+
 /// The invitee's library-key wrap parked on the invite row.
 pub fn get_invite_wrap(
     conn: &rusqlite::Connection,
     library_id: &CustomUUID,
     user_id: i32,
-) -> Result<Option<([u8; 32], Vec<u8>)>, DatabaseError> {
+) -> Result<Option<KeyWrap>, DatabaseError> {
     conn.query_row(
         "SELECT ephemeral_pubkey, wrapped_key FROM shared_library_invites
          WHERE library_id = ?1 AND user_id = ?2",
@@ -276,10 +279,7 @@ pub fn insert_blob_access_grant(
             ],
         )
         .map_err(|e| {
-            tracing::error!(
-                "grant blob access ({}) failed: {e}",
-                grant.data_block_id
-            );
+            tracing::error!("grant blob access ({}) failed: {e}", grant.data_block_id);
             DatabaseError::InsertError
         })?;
     Ok(())
@@ -554,6 +554,9 @@ pub fn stale_access_rows(
     Ok((photos, blocks))
 }
 
+/// A photo's metadata-key wrap, tagged with the photo it belongs to.
+pub type PhotoMetadataWrap = (CustomUUID, [u8; 32], Vec<u8>);
+
 /// The worker's own unwrap inputs: its metadata-access rows for a photo
 /// set. Photos the caller has no wrap for are absent from the result
 /// (another member's worker covers them).
@@ -561,7 +564,7 @@ pub fn own_metadata_wraps(
     conn: &rusqlite::Connection,
     user_id: i32,
     photo_ids: &[CustomUUID],
-) -> Result<Vec<(CustomUUID, [u8; 32], Vec<u8>)>, DatabaseError> {
+) -> Result<Vec<PhotoMetadataWrap>, DatabaseError> {
     let mut out = Vec::with_capacity(photo_ids.len());
     let mut stmt = conn
         .prepare(
@@ -829,7 +832,12 @@ mod tests {
         add_library(&conn, LIB);
         let lib: CustomUUID = LIB.parse().unwrap();
         for i in 0..5 {
-            add_photo(&conn, &format!("00000000-0000-0000-0000-0000000000c{i}"), LIB, false);
+            add_photo(
+                &conn,
+                &format!("00000000-0000-0000-0000-0000000000c{i}"),
+                LIB,
+                false,
+            );
         }
         assert_eq!(missing_metadata_grants(&conn, &lib, 2, 3).unwrap().len(), 3);
     }
@@ -922,7 +930,10 @@ mod tests {
         )
         .unwrap();
         tx.commit().unwrap();
-        assert_eq!(read_view_changes(&conn, 2).unwrap(), vec![(lib.clone(), 41)]);
+        assert_eq!(
+            read_view_changes(&conn, 2).unwrap(),
+            vec![(lib.clone(), 41)]
+        );
         let tx = conn.unchecked_transaction().unwrap();
         delete_view_change(&tx, 2, &lib).unwrap();
         tx.commit().unwrap();
@@ -946,8 +957,14 @@ mod tests {
         let blk: CustomUUID = "00000000-0000-0000-0000-0000000000e1".parse().unwrap();
 
         assert!(photo_in_library_live(&conn, &p1, &lib).unwrap());
-        assert!(!photo_in_library_live(&conn, &p2, &lib).unwrap(), "tombstoned");
-        assert!(!photo_in_library_live(&conn, &p1, &other).unwrap(), "wrong library");
+        assert!(
+            !photo_in_library_live(&conn, &p2, &lib).unwrap(),
+            "tombstoned"
+        );
+        assert!(
+            !photo_in_library_live(&conn, &p1, &other).unwrap(),
+            "wrong library"
+        );
         assert!(block_in_library(&conn, &blk, &lib).unwrap());
         assert!(!block_in_library(&conn, &blk, &other).unwrap());
     }

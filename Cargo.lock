@@ -2938,6 +2938,7 @@ dependencies = [
  "inventory",
  "rusqlite",
  "serde",
+ "tokio",
  "tracing",
 ]
 

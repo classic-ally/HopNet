@@ -543,13 +543,16 @@ mod tests {
         conn.execute("DELETE FROM photo_view_changes", []).unwrap();
         conn.execute("DELETE FROM photo_operations", []).unwrap();
         conn.execute("DELETE FROM photo_resources", []).unwrap();
-        conn.execute("DELETE FROM photo_metadata_access", []).unwrap();
+        conn.execute("DELETE FROM photo_metadata_access", [])
+            .unwrap();
         conn.execute("DELETE FROM photo_favorites", []).unwrap();
         conn.execute("DELETE FROM photo_album_entries", []).unwrap();
         conn.execute("DELETE FROM photos", []).unwrap();
-        conn.execute("DELETE FROM shared_library_invites", []).unwrap();
+        conn.execute("DELETE FROM shared_library_invites", [])
+            .unwrap();
         conn.execute("DELETE FROM shared_library_keys", []).unwrap();
-        conn.execute("DELETE FROM shared_library_members", []).unwrap();
+        conn.execute("DELETE FROM shared_library_members", [])
+            .unwrap();
         conn.execute("DELETE FROM shared_libraries", []).unwrap();
         uninstall_schema(&conn).unwrap();
 
@@ -614,8 +617,7 @@ mod tests {
         insert("p5", Some("lib2"), Some("fp_a"))
             .expect("same fingerprint under a different shared library is fine");
         insert("p6", None, None).unwrap();
-        insert("p7", None, None)
-            .expect("NULL fingerprints are unconstrained (local-only assets)");
+        insert("p7", None, None).expect("NULL fingerprints are unconstrained (local-only assets)");
     }
 
     // Impact: NULLs are distinct even in the composite PRIMARY KEY, so
@@ -652,7 +654,6 @@ mod tests {
             insert(1, Some("lib1"), "d2").is_err(),
             "second row for one (user, library) must be rejected"
         );
-        insert(2, Some("lib1"), "d9")
-            .expect("two members hold the same library independently");
+        insert(2, Some("lib1"), "d9").expect("two members hold the same library independently");
     }
 }

@@ -7,7 +7,10 @@ use clap::Parser;
 use hopnet::dev_seed;
 
 #[derive(Parser)]
-#[command(name = "photo-seeder", about = "Seed a HopNet node with synthetic photos over HTTP")]
+#[command(
+    name = "photo-seeder",
+    about = "Seed a HopNet node with synthetic photos over HTTP"
+)]
 struct Args {
     /// Node base URL (local dev node or an orchestrator mesh node).
     #[arg(long, default_value = "http://localhost:34632")]
@@ -58,7 +61,10 @@ async fn main() -> anyhow::Result<()> {
         args.passphrase.clone().expect("clap enforces presence")
     };
 
-    println!("logging in as {} at {} (Argon2id — a few seconds)...", args.username, args.base_url);
+    println!(
+        "logging in as {} at {} (Argon2id — a few seconds)...",
+        args.username, args.base_url
+    );
     let jwt = dev_seed::login(&client, &args.base_url, &args.username, &passphrase).await?;
 
     dev_seed::enable_sidecar(&client, &args.base_url, &jwt).await?;

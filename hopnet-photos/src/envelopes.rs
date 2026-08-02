@@ -384,12 +384,8 @@ mod tests {
     fn photo_delete_payload_golden_bytes() {
         let payload = PhotoDeletePayload {
             entries: vec![PhotoDeleteEntry {
-                photo_id: "00000000-0000-0000-0000-000000000001"
-                    .parse()
-                    .unwrap(),
-                operation_id: "00000000-0000-0000-0000-000000000002"
-                    .parse()
-                    .unwrap(),
+                photo_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                operation_id: "00000000-0000-0000-0000-000000000002".parse().unwrap(),
             }],
         };
         let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
@@ -401,15 +397,18 @@ mod tests {
         let mut expected = vec![0x01u8]; // vec len 1
         expected.push(0x10); // varint(16) — UUID length prefix
         expected.extend_from_slice(&[
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01,
         ]); // UUID bytes
         expected.push(0x10); // varint(16)
         expected.extend_from_slice(&[
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x02,
         ]); // UUID bytes
-        assert_eq!(encoded, expected, "bincode wire format changed — field reorder or type change");
+        assert_eq!(
+            encoded, expected,
+            "bincode wire format changed — field reorder or type change"
+        );
     }
 
     /// Golden bytes for MetadataAccessEntry — pins the fixed-size array
@@ -473,7 +472,10 @@ mod tests {
 
         let encoded2 = bincode::serde::encode_to_vec(&decoded, bincode::config::standard())
             .expect("re-encode must succeed");
-        assert_eq!(encoded, encoded2, "bincode round-trip must be byte-identical");
+        assert_eq!(
+            encoded, encoded2,
+            "bincode round-trip must be byte-identical"
+        );
     }
 
     /// Golden round-trip for photo_delete — verifies field order is frozen.
@@ -492,7 +494,10 @@ mod tests {
                 .expect("photo_delete decode must succeed");
         let encoded2 = bincode::serde::encode_to_vec(&decoded, bincode::config::standard())
             .expect("re-encode must succeed");
-        assert_eq!(encoded, encoded2, "bincode round-trip must be byte-identical");
+        assert_eq!(
+            encoded, encoded2,
+            "bincode round-trip must be byte-identical"
+        );
     }
 
     /// Golden round-trip for photo_restore — symmetric shape as delete.
@@ -511,7 +516,10 @@ mod tests {
                 .expect("photo_restore decode must succeed");
         let encoded2 = bincode::serde::encode_to_vec(&decoded, bincode::config::standard())
             .expect("re-encode must succeed");
-        assert_eq!(encoded, encoded2, "bincode round-trip must be byte-identical");
+        assert_eq!(
+            encoded, encoded2,
+            "bincode round-trip must be byte-identical"
+        );
     }
 
     /// Golden bytes for PhotoCleanupExpiredPayload — pins the Vec of UUID
@@ -532,17 +540,20 @@ mod tests {
         let mut expected = vec![0x02u8]; // vec len 2
         expected.push(0x10); // varint(16) — first UUID
         expected.extend_from_slice(&[
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x0a,
         ]);
         expected.push(0x10); // varint(16) — second UUID
         expected.extend_from_slice(&[
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0b,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x0b,
         ]);
         expected.push(0x14); // varint(20) — string len
         expected.extend_from_slice(b"2025-01-01T00:00:00Z");
-        assert_eq!(encoded, expected, "PhotoCleanupExpiredPayload wire format changed");
+        assert_eq!(
+            encoded, expected,
+            "PhotoCleanupExpiredPayload wire format changed"
+        );
     }
 
     /// Golden bytes for PhotoFavoriteEntry — two UUIDs.
@@ -585,12 +596,15 @@ mod tests {
         let mut with_fp = base.clone();
         with_fp.cloud_fingerprint = Some([0xD4; 32]);
 
-        let none_bytes =
-            bincode::serde::encode_to_vec(&base, bincode::config::standard()).unwrap();
+        let none_bytes = bincode::serde::encode_to_vec(&base, bincode::config::standard()).unwrap();
         let some_bytes =
             bincode::serde::encode_to_vec(&with_fp, bincode::config::standard()).unwrap();
 
-        assert_eq!(none_bytes.last(), Some(&0x00), "None must encode as a 0x00 tail");
+        assert_eq!(
+            none_bytes.last(),
+            Some(&0x00),
+            "None must encode as a 0x00 tail"
+        );
         assert_eq!(
             some_bytes.len(),
             none_bytes.len() + 32,
@@ -603,7 +617,11 @@ mod tests {
             "all fields before the fingerprint must be byte-identical"
         );
         assert_eq!(some_bytes[split], 0x01, "Some tag byte");
-        assert_eq!(some_bytes[split + 1..], [0xD4; 32], "raw fingerprint bytes, no length prefix");
+        assert_eq!(
+            some_bytes[split + 1..],
+            [0xD4; 32],
+            "raw fingerprint bytes, no length prefix"
+        );
     }
 
     /// Should: encode PhotoIngressClaimPayload as two length-prefixed
@@ -627,9 +645,11 @@ mod tests {
         expected.extend_from_slice(&[0u8; 15]);
         expected.push(0xab);
         expected.push(0x00); // library_id: None tail
-        let encoded =
-            bincode::serde::encode_to_vec(&payload, bincode::config::standard()).unwrap();
-        assert_eq!(encoded, expected, "PhotoIngressClaimPayload wire format changed");
+        let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard()).unwrap();
+        assert_eq!(
+            encoded, expected,
+            "PhotoIngressClaimPayload wire format changed"
+        );
 
         let mut scoped = payload.clone();
         scoped.library_id = Some("00000000-0000-0000-0000-0000000000ac".parse().unwrap());
@@ -696,7 +716,10 @@ mod tests {
         expected.push(0x10); // varint(16) — operation_id
         expected.extend_from_slice(&[0u8; 15]);
         expected.push(0xc2);
-        assert_eq!(encoded, expected, "CreateSharedLibraryPayload wire format changed");
+        assert_eq!(
+            encoded, expected,
+            "CreateSharedLibraryPayload wire format changed"
+        );
     }
 
     // Should: round-trip every membership-lifecycle payload byte-identically.
@@ -712,7 +735,10 @@ mod tests {
                 bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
             let encoded2 =
                 bincode::serde::encode_to_vec(&decoded, bincode::config::standard()).unwrap();
-            assert_eq!(encoded, encoded2, "bincode round-trip must be byte-identical");
+            assert_eq!(
+                encoded, encoded2,
+                "bincode round-trip must be byte-identical"
+            );
         }
 
         let lib: CustomUUID = "00000000-0000-0000-0000-0000000000d1".parse().unwrap();
@@ -778,7 +804,11 @@ mod tests {
         let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard()).unwrap();
         let (decoded, _): (PhotoEditMetadataPayload, _) =
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
-        let encoded2 = bincode::serde::encode_to_vec(&decoded, bincode::config::standard()).unwrap();
-        assert_eq!(encoded, encoded2, "bincode round-trip must be byte-identical");
+        let encoded2 =
+            bincode::serde::encode_to_vec(&decoded, bincode::config::standard()).unwrap();
+        assert_eq!(
+            encoded, encoded2,
+            "bincode round-trip must be byte-identical"
+        );
     }
 }
