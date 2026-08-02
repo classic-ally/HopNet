@@ -113,12 +113,10 @@ impl HopNetApplication {
             if tx.rpc.function != "regenesis_commit" {
                 continue;
             }
-            let Ok((commit, _)) =
-                bincode::serde::decode_from_slice::<crate::regenesis::RegenesisCommit, _>(
-                    &tx.rpc.payload,
-                    bincode::config::standard(),
-                )
-            else {
+            let Ok((commit, _)) = bincode::serde::decode_from_slice::<
+                crate::regenesis::RegenesisCommit,
+                _,
+            >(&tx.rpc.payload, bincode::config::standard()) else {
                 return Err("undecodable regenesis_commit payload".into());
             };
             // The payload's terminal height binds to the actual block

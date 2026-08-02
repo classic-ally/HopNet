@@ -42,7 +42,10 @@ pub struct TransactionForwardResponse {
 pub enum ForwardReply {
     /// Rejection: this node is not the proposer for its current (height,
     /// round). Includes the handler's position so the forwarder can retarget.
-    NotProposer { height: u64, round: u32 },
+    NotProposer {
+        height: u64,
+        round: u32,
+    },
     /// Immediate ACK before processing (phase 1).
     Ack,
     /// Final result after processing (phase 2).

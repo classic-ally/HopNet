@@ -432,7 +432,10 @@ impl StateReader for NullNet {
     fn placement_inputs(&self) -> Result<crate::traits::PlacementInputs, StorageError> {
         Err(StorageError::Host("null state reader".into()))
     }
-    fn placement_inputs_at(&self, _height: u64) -> Result<crate::traits::PlacementInputs, StorageError> {
+    fn placement_inputs_at(
+        &self,
+        _height: u64,
+    ) -> Result<crate::traits::PlacementInputs, StorageError> {
         Err(StorageError::Host("null state reader".into()))
     }
     fn fragment_sources(

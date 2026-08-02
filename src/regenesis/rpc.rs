@@ -52,18 +52,26 @@ pub enum RegenesisNetResponse {
         lineage_from: Option<u64>,
     },
     /// Encoded LineageRecord bytes (the exact on-disk encoding), ascending.
-    Lineage { records: Vec<Vec<u8>> },
+    Lineage {
+        records: Vec<Vec<u8>>,
+    },
     SnapshotInfo {
         epoch: u64,
         total_len: u64,
         snapshot_hash: [u8; 32],
     },
-    SnapshotChunk { data: Vec<u8> },
+    SnapshotChunk {
+        data: Vec<u8>,
+    },
     /// Honest refusal: the requested epoch is not served, or the artifact
     /// is unrecoverable here (lost file, state advanced past H, rollback
     /// window closed). The requester rotates peers.
-    NotAvailable { reason: String },
-    Error { message: String },
+    NotAvailable {
+        reason: String,
+    },
+    Error {
+        message: String,
+    },
 }
 
 pub struct RegenesisScope {
@@ -186,7 +194,9 @@ pub(crate) fn serve_request(db_path: &str, request: RegenesisNetRequest) -> Rege
                 }
             };
             let start = (offset as usize).min(bytes.len());
-            let end = start.saturating_add(len.min(SNAPSHOT_CHUNK_MAX) as usize).min(bytes.len());
+            let end = start
+                .saturating_add(len.min(SNAPSHOT_CHUNK_MAX) as usize)
+                .min(bytes.len());
             RegenesisNetResponse::SnapshotChunk {
                 data: bytes[start..end].to_vec(),
             }
@@ -195,11 +205,9 @@ pub(crate) fn serve_request(db_path: &str, request: RegenesisNetRequest) -> Rege
 }
 
 fn open_read_only(db_path: &str) -> Result<rusqlite::Connection, String> {
-    let conn = rusqlite::Connection::open_with_flags(
-        db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .map_err(|e| format!("open: {e}"))?;
+    let conn =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| format!("open: {e}"))?;
     conn.busy_timeout(std::time::Duration::from_secs(5))
         .map_err(|e| format!("busy_timeout: {e}"))?;
     Ok(conn)
@@ -209,7 +217,10 @@ fn lowest_lineage_epoch(data_dir: &std::path::Path) -> Option<u64> {
     let dir = std::fs::read_dir(data_dir.join(genesis::LINEAGE_DIR)).ok()?;
     dir.filter_map(|entry| {
         let name = entry.ok()?.file_name().into_string().ok()?;
-        name.strip_prefix("epoch-")?.strip_suffix(".bin")?.parse::<u64>().ok()
+        name.strip_prefix("epoch-")?
+            .strip_suffix(".bin")?
+            .parse::<u64>()
+            .ok()
     })
     .min()
 }
@@ -283,11 +294,9 @@ fn resolve_artifact(
             // readers never block the live pool.
             let mut live = open_read_only(db_path)?;
             let tx = live.transaction().map_err(|e| format!("tx: {e}"))?;
-            let (artifact, _manifest) = hopnet_common::snapshot::serialize_snapshot(
-                &tx,
-                &crate::db::snapshot::sections(),
-            )
-            .map_err(|e| format!("serialize: {e}"))?;
+            let (artifact, _manifest) =
+                hopnet_common::snapshot::serialize_snapshot(&tx, &crate::db::snapshot::sections())
+                    .map_err(|e| format!("serialize: {e}"))?;
             Ok(artifact)
         })();
         if let Ok(artifact) = recomputed
@@ -403,7 +412,10 @@ mod tests {
             std::fs::write(&path, vec![epoch as u8; 8]).unwrap();
         }
 
-        match serve_request(&db_path, RegenesisNetRequest::LineageFetch { from_epoch: 2 }) {
+        match serve_request(
+            &db_path,
+            RegenesisNetRequest::LineageFetch { from_epoch: 2 },
+        ) {
             RegenesisNetResponse::Lineage { records } => {
                 assert_eq!(records.len(), 2, "epochs 2 and 3, stop at the gap");
                 assert_eq!(records[1], vec![3u8; 8]);
@@ -411,7 +423,10 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
 
-        match serve_request(&db_path, RegenesisNetRequest::LineageFetch { from_epoch: 6 }) {
+        match serve_request(
+            &db_path,
+            RegenesisNetRequest::LineageFetch { from_epoch: 6 },
+        ) {
             RegenesisNetResponse::NotAvailable { .. } => {}
             other => panic!("unexpected: {other:?}"),
         }
@@ -534,10 +549,11 @@ mod tests {
         let db_path = transitioned_db(dir.path());
         let expected = snapshot_hash_of(dir.path());
 
-        let total_len = match serve_request(&db_path, RegenesisNetRequest::SnapshotInfo { epoch: 2 }) {
-            RegenesisNetResponse::SnapshotInfo { total_len, .. } => total_len,
-            other => panic!("unexpected: {other:?}"),
-        };
+        let total_len =
+            match serve_request(&db_path, RegenesisNetRequest::SnapshotInfo { epoch: 2 }) {
+                RegenesisNetResponse::SnapshotInfo { total_len, .. } => total_len,
+                other => panic!("unexpected: {other:?}"),
+            };
 
         let mut assembled = Vec::new();
         let step = 64u64; // tiny chunks to exercise many boundaries

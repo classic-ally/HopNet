@@ -36,11 +36,9 @@ pub fn artifact_path() -> std::path::PathBuf {
 pub fn run_seal_work(app_state: &AppState, seal_height: u64) {
     match app_state.db_pool.get() {
         Ok(conn) => {
-            if let Err(e) = hopnet_consensus::store::meta_put(
-                &conn,
-                META_SEALED_AT,
-                &seal_height.to_be_bytes(),
-            ) {
+            if let Err(e) =
+                hopnet_consensus::store::meta_put(&conn, META_SEALED_AT, &seal_height.to_be_bytes())
+            {
                 tracing::error!("seal marker write failed: {e}");
             }
         }

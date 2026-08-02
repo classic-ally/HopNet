@@ -12,8 +12,7 @@ use std::time::SystemTime;
 use hopnet_common::CustomUUID;
 
 use crate::transport::{
-    Height,
-    BoxFuture, Cursor, Health, Item, ItemId, ItemKind, NodeTransport, Page, StatfsInfo,
+    BoxFuture, Cursor, Health, Height, Item, ItemId, ItemKind, NodeTransport, Page, StatfsInfo,
     TransportError,
 };
 

@@ -9,7 +9,7 @@
 //! bit cast in `hopnet_common::height`.
 
 use hopnet_common::height::{height_from_db, height_to_db};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::store::StoreError;
 use crate::types::PubKey;
@@ -73,10 +73,7 @@ const LATEST_ACTIVE_CTE: &str = "
 
 /// The active validator set at `height` (latest effective row per node
 /// wins), joined to the host's `nodes` table for keys and identity.
-pub fn get_validators(
-    conn: &Connection,
-    height: u64,
-) -> Result<Vec<ValidatorEntry>, StoreError> {
+pub fn get_validators(conn: &Connection, height: u64) -> Result<Vec<ValidatorEntry>, StoreError> {
     let sql = format!(
         "{LATEST_ACTIVE_CTE}
         SELECT n.node_id, n.name, n.owner, n.pubkey
@@ -150,7 +147,11 @@ pub fn activate_validator(
         conn.execute(
             "UPDATE validators SET effective_height = ?
              WHERE node_id = ? AND effective_height = ?",
-            params![height_to_db(effective_height), node_id, height_to_db(old_height)],
+            params![
+                height_to_db(effective_height),
+                node_id,
+                height_to_db(old_height)
+            ],
         )?;
         tracing::info!(
             "Updated activation for node {node_id} from height {old_height} to height {effective_height}"

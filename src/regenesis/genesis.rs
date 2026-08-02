@@ -303,7 +303,10 @@ pub fn lineage_path(dir: &std::path::Path, epoch: u64) -> std::path::PathBuf {
 /// Write the lineage record atomically (tmp + rename), creating the
 /// lineage directory. Idempotent: recomputation writes equal content
 /// (modulo the node-local certificate, which is stable per node).
-pub fn write_lineage(dir: &std::path::Path, genesis: &EpochGenesis) -> Result<std::path::PathBuf, String> {
+pub fn write_lineage(
+    dir: &std::path::Path,
+    genesis: &EpochGenesis,
+) -> Result<std::path::PathBuf, String> {
     let record = LineageRecord {
         record: genesis.record.clone(),
         final_block: hopnet_consensus::codec::encode(&genesis.final_block)
@@ -468,8 +471,14 @@ pub fn verify_lineage_chain(
 
         let record_profile = QuorumProfile::parse(&record.quorum_profile)
             .ok_or_else(|| format!("epoch {}: unknown quorum profile", record.epoch))?;
-        verify_lineage(record, &final_block, &cert, &record_valset(record)?, &record_profile)
-            .map_err(|e| format!("epoch {} lineage: {e}", record.epoch))?;
+        verify_lineage(
+            record,
+            &final_block,
+            &cert,
+            &record_valset(record)?,
+            &record_profile,
+        )
+        .map_err(|e| format!("epoch {} lineage: {e}", record.epoch))?;
 
         if let Some(ref t) = trusted {
             let anchor_profile = QuorumProfile::parse(&profile)
@@ -553,8 +562,12 @@ mod tests {
             .unwrap();
         }
 
-        hopnet_consensus::store::meta_put(&conn, hopnet_consensus::store::META_CHAIN_ID, &PREV_CHAIN)
-            .unwrap();
+        hopnet_consensus::store::meta_put(
+            &conn,
+            hopnet_consensus::store::META_CHAIN_ID,
+            &PREV_CHAIN,
+        )
+        .unwrap();
         hopnet_consensus::store::meta_put(
             &conn,
             hopnet_consensus::store::META_QUORUM_PROFILE,
@@ -575,8 +588,20 @@ mod tests {
             round: 0,
             value_id: final_block.block_hash,
             signatures: vec![
-                wire_commit_signature(&chain, &PrivKey(key(1)), Height(H), final_block.block_hash, 1),
-                wire_commit_signature(&chain, &PrivKey(key(2)), Height(H), final_block.block_hash, 2),
+                wire_commit_signature(
+                    &chain,
+                    &PrivKey(key(1)),
+                    Height(H),
+                    final_block.block_hash,
+                    1,
+                ),
+                wire_commit_signature(
+                    &chain,
+                    &PrivKey(key(2)),
+                    Height(H),
+                    final_block.block_hash,
+                    2,
+                ),
             ],
         };
         hopnet_consensus::store::install_genesis(&conn, &final_block, &cert).unwrap();
@@ -654,8 +679,7 @@ mod tests {
 
         let lineage = read_lineage(&path).unwrap();
         assert_eq!(lineage.record, g.record);
-        let final_block: Block =
-            hopnet_consensus::codec::decode(&lineage.final_block).unwrap();
+        let final_block: Block = hopnet_consensus::codec::decode(&lineage.final_block).unwrap();
         let cert: WireCommitCertificate =
             hopnet_consensus::codec::decode(&lineage.final_cert).unwrap();
         let valset = record_valset(&lineage.record).unwrap();
@@ -689,7 +713,8 @@ mod tests {
     fn refuses_unsealed_state() {
         let pool = sealed_pool(false);
         let conn = pool.get().unwrap();
-        conn.execute("UPDATE regenesis_state SET phase = 1", []).unwrap();
+        conn.execute("UPDATE regenesis_state SET phase = 1", [])
+            .unwrap();
         assert!(build_epoch_genesis(&conn).is_err());
         conn.execute("DELETE FROM regenesis_state", []).unwrap();
         assert!(build_epoch_genesis(&conn).is_err());
@@ -842,7 +867,11 @@ mod tests {
         // hop 2 by {3,4,5} — which overlaps hop 1's seated set in {3,4}
         // but the ORIGINAL anchor set in nothing. Verifying at all is
         // what proves the rotation happened.
-        let chain = build_chain(PREV_CHAIN, 1, &[(&[1, 2, 3, 4], "bft"), (&[3, 4, 5], "bft")]);
+        let chain = build_chain(
+            PREV_CHAIN,
+            1,
+            &[(&[1, 2, 3, 4], "bft"), (&[3, 4, 5], "bft")],
+        );
         let target = verify_lineage_chain(&chain, anchor_at(Some(&[1, 2]), "bft")).unwrap();
         assert_eq!(target.record.epoch, 3, "the LATEST record is the target");
         assert_eq!(target.record.snapshot_hash, [3u8; 32]);
@@ -857,8 +886,11 @@ mod tests {
             .expect_err("a chain starting at epoch 3 cannot extend an epoch-1 anchor");
         assert!(err.contains("gap"), "{err}");
 
-        let mut gapped =
-            build_chain(PREV_CHAIN, 1, &[(&[1, 2], "majority"), (&[1, 2], "majority")]);
+        let mut gapped = build_chain(
+            PREV_CHAIN,
+            1,
+            &[(&[1, 2], "majority"), (&[1, 2], "majority")],
+        );
         gapped.remove(0);
         assert!(verify_lineage_chain(&gapped, anchor_at(Some(&[1, 2]), "majority")).is_err());
 
@@ -909,11 +941,19 @@ mod tests {
     // linkage because overlap was waived.
     #[test]
     fn tofu_anchor_waives_only_the_first_hop() {
-        let chain = build_chain(PREV_CHAIN, 1, &[(&[1, 2], "majority"), (&[2, 3], "majority")]);
+        let chain = build_chain(
+            PREV_CHAIN,
+            1,
+            &[(&[1, 2], "majority"), (&[2, 3], "majority")],
+        );
         let target = verify_lineage_chain(&chain, ChainAnchor::tofu(&chain[0])).unwrap();
         assert_eq!(target.record.epoch, 3);
 
-        let churned = build_chain(PREV_CHAIN, 1, &[(&[1, 2], "majority"), (&[8, 9], "majority")]);
+        let churned = build_chain(
+            PREV_CHAIN,
+            1,
+            &[(&[1, 2], "majority"), (&[8, 9], "majority")],
+        );
         let err = verify_lineage_chain(&churned, ChainAnchor::tofu(&churned[0]))
             .expect_err("churn beyond the overlap window is refused from any anchor");
         assert!(err.contains("epoch 3 overlap"), "{err}");

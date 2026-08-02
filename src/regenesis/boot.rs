@@ -338,7 +338,9 @@ pub fn boot_transition(db_path: &str, running_code: u32) -> BootOutcome {
 
     // The lineage record survives the boundary forever — written before
     // the swap so a crash never loses it (rewrite is idempotent).
-    let lineage_dir = Path::new(db_path).parent().unwrap_or_else(|| Path::new("."));
+    let lineage_dir = Path::new(db_path)
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
     if let Err(e) = genesis::write_lineage(lineage_dir, &epoch_genesis) {
         remove_with_sidecars(&next);
         return park("import", format!("lineage write: {e}"));
@@ -419,7 +421,9 @@ fn rollback_transition(db_path: &str) -> Option<BootOutcome> {
             )));
         }
         if let Some(epoch) = abandoned {
-            let dir = Path::new(db_path).parent().unwrap_or_else(|| Path::new("."));
+            let dir = Path::new(db_path)
+                .parent()
+                .unwrap_or_else(|| Path::new("."));
             // The abandoned boundary is not part of this mesh's history:
             // keeping its record would have us answer a joiner with a
             // lineage whose snapshot we then refuse to serve.
@@ -612,7 +616,10 @@ fn staged_join_transition(
         Err(e) => return Some(poison(&staging, format!("staged snapshot: {e}"))),
     };
     if *blake3::hash(&artifact).as_bytes() != target.record.snapshot_hash {
-        return Some(poison(&staging, "staged snapshot fails its certified hash".into()));
+        return Some(poison(
+            &staging,
+            "staged snapshot fails its certified hash".into(),
+        ));
     }
 
     // Rebuild with the SAME machinery the sealed path uses: certified
@@ -630,7 +637,9 @@ fn staged_join_transition(
 
     // Every verified record is kept forever — that is what lets a node
     // that arrived by join answer the next straggler.
-    let dir = Path::new(db_path).parent().unwrap_or_else(|| Path::new("."));
+    let dir = Path::new(db_path)
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
     for lr in &records {
         match bincode::serde::encode_to_vec(lr, bincode::config::standard()) {
             Ok(bytes) => {
@@ -646,13 +655,16 @@ fn staged_join_transition(
         }
     }
 
-    let owned = std::mem::replace(conn, match rusqlite::Connection::open_in_memory() {
-        Ok(c) => c,
-        Err(e) => {
-            remove_with_sidecars(&next);
-            return Some(park("staged-join", format!("placeholder connection: {e}")));
-        }
-    });
+    let owned = std::mem::replace(
+        conn,
+        match rusqlite::Connection::open_in_memory() {
+            Ok(c) => c,
+            Err(e) => {
+                remove_with_sidecars(&next);
+                return Some(park("staged-join", format!("placeholder connection: {e}")));
+            }
+        },
+    );
     if let Err(e) = checkpoint_and_swap(db_path, owned) {
         return Some(match e {
             SwapError::Refused(detail) => {
@@ -668,8 +680,8 @@ fn staged_join_transition(
     // a reconcile failure must never strand a node that just rejoined.
     match rusqlite::Connection::open(db_path) {
         Ok(fresh) => {
-            let fragments_dir = hopnet_storage::fragstore::get_fragments_dir()
-                .unwrap_or_else(|_| String::new());
+            let fragments_dir =
+                hopnet_storage::fragstore::get_fragments_dir().unwrap_or_else(|_| String::new());
             match join::reconcile_fragment_store(&fresh, &fragments_dir, join::now_unix()) {
                 Ok((remarked, orphans)) => tracing::info!(
                     remarked,
@@ -695,9 +707,7 @@ fn staged_join_transition(
 
 /// A staged chain's target record is a full genesis: the canonical block
 /// derives from the record, and the lineage evidence rides along.
-fn staged_epoch_genesis(
-    target: &genesis::LineageRecord,
-) -> Result<genesis::EpochGenesis, String> {
+fn staged_epoch_genesis(target: &genesis::LineageRecord) -> Result<genesis::EpochGenesis, String> {
     let final_block = hopnet_consensus::codec::decode(&target.final_block)
         .map_err(|e| format!("target final block: {e:?}"))?;
     let final_cert = hopnet_consensus::codec::decode(&target.final_cert)
@@ -846,9 +856,9 @@ fn read_epoch_of(db_path: &str) -> Result<u64, String> {
 pub(crate) mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
+    use hopnet_consensus::codec::WireCommitCertificate;
     use hopnet_consensus::context::Height;
     use hopnet_consensus::types::{Blake3Hash, Block, BlockData, PrivKey, Transactions};
-    use hopnet_consensus::codec::WireCommitCertificate;
     use hopnet_consensus::verify::wire_commit_signature;
     use rusqlite::params;
 
@@ -920,8 +930,12 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        hopnet_consensus::store::meta_put(&conn, hopnet_consensus::store::META_CHAIN_ID, &PREV_CHAIN)
-            .unwrap();
+        hopnet_consensus::store::meta_put(
+            &conn,
+            hopnet_consensus::store::META_CHAIN_ID,
+            &PREV_CHAIN,
+        )
+        .unwrap();
         hopnet_consensus::store::meta_put(
             &conn,
             hopnet_consensus::store::META_QUORUM_PROFILE,
@@ -942,8 +956,20 @@ pub(crate) mod tests {
             round: 0,
             value_id: final_block.block_hash,
             signatures: vec![
-                wire_commit_signature(&chain, &PrivKey(key(1)), Height(H), final_block.block_hash, 1),
-                wire_commit_signature(&chain, &PrivKey(key(2)), Height(H), final_block.block_hash, 2),
+                wire_commit_signature(
+                    &chain,
+                    &PrivKey(key(1)),
+                    Height(H),
+                    final_block.block_hash,
+                    1,
+                ),
+                wire_commit_signature(
+                    &chain,
+                    &PrivKey(key(2)),
+                    Height(H),
+                    final_block.block_hash,
+                    2,
+                ),
             ],
         };
         hopnet_consensus::store::install_genesis(&conn, &final_block, &cert).unwrap();
@@ -969,7 +995,8 @@ pub(crate) mod tests {
         .unwrap();
         hopnet_consensus::store::meta_put(&conn, seal::META_SEALED_AT, &H.to_be_bytes()).unwrap();
 
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
         drop(conn);
         db_path
     }
@@ -1020,8 +1047,7 @@ pub(crate) mod tests {
             crate::regenesis::rpc::RegenesisNetResponse::SnapshotInfo { .. } => {}
             other => panic!("server cannot serve its snapshot: {other:?}"),
         }
-        let snapshot =
-            std::fs::read(server_dir.join(seal::SEAL_ARTIFACT_FILENAME)).unwrap();
+        let snapshot = std::fs::read(server_dir.join(seal::SEAL_ARTIFACT_FILENAME)).unwrap();
         let lineage = std::fs::read(genesis::lineage_path(server_dir, 2)).unwrap();
 
         let db_path = sealed_db(client_dir);
@@ -1034,7 +1060,8 @@ pub(crate) mod tests {
                 [seal::META_SEALED_AT],
             )
             .unwrap();
-            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
         }
 
         let staging = join::staging_path(&db_path);
@@ -1106,8 +1133,14 @@ pub(crate) mod tests {
         assert!(seal::sealed_marker(&conn).is_none());
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM regenesis_state"), 0);
 
-        assert!(sealed_path(&fx.db_path).exists(), "rollback window retained");
-        assert!(genesis::lineage_path(client.path(), 2).exists(), "lineage kept");
+        assert!(
+            sealed_path(&fx.db_path).exists(),
+            "rollback window retained"
+        );
+        assert!(
+            genesis::lineage_path(client.path(), 2).exists(),
+            "lineage kept"
+        );
         assert!(!fx.staging.exists(), "staging cleared after the crossing");
     }
 
@@ -1132,7 +1165,11 @@ pub(crate) mod tests {
             other => panic!("expected an awaiting-upgrade park, got {other:?}"),
         }
         assert!(join::read_manifest(&fx.staging).is_some(), "staging kept");
-        assert_eq!(std::fs::read(&fx.db_path).unwrap(), before, "database untouched");
+        assert_eq!(
+            std::fs::read(&fx.db_path).unwrap(),
+            before,
+            "database untouched"
+        );
         assert!(awaiting_upgrade_path(&fx.db_path).exists());
 
         // The upgraded binary completes it.
@@ -1149,10 +1186,7 @@ pub(crate) mod tests {
     // Should: park and DISCARD the staging so the next attempt refetches.
     #[test]
     fn corrupt_staging_is_discarded() {
-        for (name, corrupt) in [
-            ("snapshot", true),
-            ("lineage", false),
-        ] {
+        for (name, corrupt) in [("snapshot", true), ("lineage", false)] {
             let client = tempfile::tempdir().unwrap();
             let server = tempfile::tempdir().unwrap();
             let fx = join_fixture(client.path(), server.path());
@@ -1214,7 +1248,8 @@ pub(crate) mod tests {
                 )
                 .unwrap();
             }
-            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
         }
 
         fx.stage(false);
@@ -1328,7 +1363,10 @@ pub(crate) mod tests {
             "back on the epoch-1 tip"
         );
         assert_eq!(seal_state_present(&db_path), (false, 0));
-        assert!(!sealed_path(&db_path).exists(), "retained database consumed");
+        assert!(
+            !sealed_path(&db_path).exists(),
+            "retained database consumed"
+        );
         assert!(
             !genesis::lineage_path(dir.path(), 2).exists(),
             "the abandoned boundary is not part of this mesh's history"
@@ -1435,7 +1473,11 @@ pub(crate) mod tests {
         write_rollback_marker(&db2);
         std::fs::remove_file(&db2).unwrap();
         std::fs::rename(sealed_path(&db2), &db2).unwrap();
-        assert_eq!(seal_state_present(&db2), (true, 1), "seal state still there");
+        assert_eq!(
+            seal_state_present(&db2),
+            (true, 1),
+            "seal state still there"
+        );
         match boot_transition(&db2, TARGET) {
             BootOutcome::RolledBack { epoch: 1 } => {}
             other => panic!("expected the in-place completion, got {other:?}"),
@@ -1462,7 +1504,11 @@ pub(crate) mod tests {
             other => panic!("expected a refusal, got {other:?}"),
         }
         assert!(!rollback_marker_path(&db_path).exists(), "marker dropped");
-        assert_eq!(std::fs::read(&db_path).unwrap(), before, "database untouched");
+        assert_eq!(
+            std::fs::read(&db_path).unwrap(),
+            before,
+            "database untouched"
+        );
         assert!(
             boundary_error().is_some_and(|e| e.contains("no boundary to abandon")),
             "the refusal is surfaced"
@@ -1535,9 +1581,10 @@ pub(crate) mod tests {
             Some(Height(H))
         );
         // New signing domain: chain id is the genesis block hash.
-        let chain = hopnet_consensus::store::meta_get(&conn, hopnet_consensus::store::META_CHAIN_ID)
-            .unwrap()
-            .unwrap();
+        let chain =
+            hopnet_consensus::store::meta_get(&conn, hopnet_consensus::store::META_CHAIN_ID)
+                .unwrap()
+                .unwrap();
         assert_ne!(chain.as_slice(), &PREV_CHAIN[..]);
         let profile =
             hopnet_consensus::store::meta_get(&conn, hopnet_consensus::store::META_QUORUM_PROFILE)
@@ -1592,7 +1639,10 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 outcome,
-                BootOutcome::Parked(ParkReason::AwaitingUpgrade { required: TARGET, .. })
+                BootOutcome::Parked(ParkReason::AwaitingUpgrade {
+                    required: TARGET,
+                    ..
+                })
             ),
             "got {outcome:?}"
         );
@@ -1632,7 +1682,8 @@ pub(crate) mod tests {
                 params![vec![9u8; 32]],
             )
             .unwrap();
-            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
         }
         let before = std::fs::read(&db_path).unwrap();
 
@@ -1667,13 +1718,17 @@ pub(crate) mod tests {
                 params![pubkey_blob(&key(8))],
             )
             .unwrap();
-            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
         }
         let outcome = boot_transition(&db_path, TARGET);
         assert!(
             matches!(
                 outcome,
-                BootOutcome::Parked(ParkReason::GateFailed { gate: "lineage", .. })
+                BootOutcome::Parked(ParkReason::GateFailed {
+                    gate: "lineage",
+                    ..
+                })
             ),
             "got {outcome:?}"
         );
@@ -1697,7 +1752,10 @@ pub(crate) mod tests {
         assert!(sealed_path(&db_path).exists());
 
         let outcome = boot_transition(&db_path, TARGET);
-        assert!(matches!(outcome, BootOutcome::Transitioned { epoch: 2 }), "got {outcome:?}");
+        assert!(
+            matches!(outcome, BootOutcome::Transitioned { epoch: 2 }),
+            "got {outcome:?}"
+        );
         assert!(Path::new(&db_path).exists());
         assert!(!next_path(&db_path).exists());
         let conn = open(&db_path);
@@ -1722,7 +1780,11 @@ pub(crate) mod tests {
     #[test]
     fn normal_boot_cleans_stale_residue() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("database.db").to_string_lossy().into_owned();
+        let db_path = dir
+            .path()
+            .join("database.db")
+            .to_string_lossy()
+            .into_owned();
         {
             let conn = rusqlite::Connection::open(&db_path).unwrap();
             crate::db::shared::apply_connection_pragmas(&conn).unwrap();
@@ -1743,7 +1805,11 @@ pub(crate) mod tests {
     #[test]
     fn fresh_node_is_no_boundary() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("database.db").to_string_lossy().into_owned();
+        let db_path = dir
+            .path()
+            .join("database.db")
+            .to_string_lossy()
+            .into_owned();
         assert!(matches!(
             boot_transition(&db_path, TARGET),
             BootOutcome::NoBoundary

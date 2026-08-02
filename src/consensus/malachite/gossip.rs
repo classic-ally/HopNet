@@ -40,14 +40,20 @@ pub enum ConsensusNetResponse {
     Ack,
     /// Decided (block bytes, certificate bytes) pairs, ascending and
     /// contiguous from `from_height` (bincode-encoded engine types)
-    Decided { items: Vec<(Vec<u8>, Vec<u8>)> },
-    Error { message: String },
+    Decided {
+        items: Vec<(Vec<u8>, Vec<u8>)>,
+    },
+    Error {
+        message: String,
+    },
     /// The structured epoch refusal (RFC-019 S7): decided history is only
     /// meaningful within one epoch, and the requester must be able to tell
     /// "you need an epoch join" from a transport failure — this variant is
     /// the sync client's signpost into the epoch-join path. Appended after
     /// the S6 variants so their bincode tags stay stable.
-    EpochMismatch { local_epoch: u64 },
+    EpochMismatch {
+        local_epoch: u64,
+    },
 }
 
 /// Per-publish send timeout (matches the old broadcast paths' 3s).

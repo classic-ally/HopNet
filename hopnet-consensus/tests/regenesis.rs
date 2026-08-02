@@ -215,7 +215,11 @@ fn post_seal_wake_is_inert() {
     sim.run_safety_only(40_000).unwrap();
     for i in 0..3 {
         assert_eq!(sim.decided_height(i), TERMINAL);
-        assert_eq!(sim.paused_at(i), None, "node {i} must be halted, not paused");
+        assert_eq!(
+            sim.paused_at(i),
+            None,
+            "node {i} must be halted, not paused"
+        );
     }
 
     // Late wakes: nothing moves.
@@ -224,6 +228,10 @@ fn post_seal_wake_is_inert() {
     }
     sim.run_safety_only(10_000).unwrap();
     for i in 0..3 {
-        assert_eq!(sim.decided_height(i), TERMINAL, "node {i} decided past the seal");
+        assert_eq!(
+            sim.decided_height(i),
+            TERMINAL,
+            "node {i} decided past the seal"
+        );
     }
 }

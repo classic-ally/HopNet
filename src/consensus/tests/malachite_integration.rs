@@ -754,10 +754,7 @@ async fn start_engine_production_with_chain(
     crate::consensus::malachite::engine::spawn_tip_poll(app_state.clone());
     // Rollback-window cleanup (spawn_engine parity): a no-op unless the
     // XDG-derived data dir holds a retained epoch database.
-    crate::consensus::malachite::engine::spawn_rollback_cleanup(
-        app_state.clone(),
-        decided.clone(),
-    );
+    crate::consensus::malachite::engine::spawn_rollback_cleanup(app_state.clone(), decided.clone());
 
     EngineNode { input_tx, decided }
 }
@@ -1099,8 +1096,14 @@ fn regenesis_transition_restarts_into_epoch_2() {
         )
     };
     assert_eq!(epoch_meta, 2);
-    assert_ne!(new_chain, prev_chain, "chain id must rotate at the boundary");
-    assert_eq!(carried_profile, profile_meta, "quorum profile carried verbatim");
+    assert_ne!(
+        new_chain, prev_chain,
+        "chain id must rotate at the boundary"
+    );
+    assert_eq!(
+        carried_profile, profile_meta,
+        "quorum profile carried verbatim"
+    );
     app_state2.node_id.set(0).unwrap();
     app_state2.user_id.set(0).unwrap();
     app_state2
@@ -1141,9 +1144,8 @@ fn regenesis_transition_restarts_into_epoch_2() {
             wait_decided(&mut engine, seal_height + 1, 120).await;
 
             // Rollback window closes at the first decide past H.
-            let retained = crate::regenesis::boot::sealed_path(
-                &crate::db::shared::get_database_path(),
-            );
+            let retained =
+                crate::regenesis::boot::sealed_path(&crate::db::shared::get_database_path());
             let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
             while retained.exists() {
                 assert!(
@@ -1187,8 +1189,7 @@ fn regenesis_transition_restarts_into_epoch_2() {
 #[test]
 fn straggler_rejoins_across_an_epoch_boundary() {
     let _guard = DATA_DIR_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let data_dir =
-        std::env::temp_dir().join(format!("hopnet-rejoin-e2e-{}", std::process::id()));
+    let data_dir = std::env::temp_dir().join(format!("hopnet-rejoin-e2e-{}", std::process::id()));
     std::fs::create_dir_all(data_dir.join("hopnet")).unwrap();
     unsafe { std::env::set_var("XDG_DATA_HOME", &data_dir) };
     let db_path = data_dir
@@ -1222,8 +1223,7 @@ fn straggler_rejoins_across_an_epoch_boundary() {
         owner: 0,
         pubkey: node_keys.verifying_key,
     };
-    let (user_id, node_id) =
-        crate::db::setup::post_initial_setup(&mesh, user, db_node).unwrap();
+    let (user_id, node_id) = crate::db::setup::post_initial_setup(&mesh, user, db_node).unwrap();
     mesh.node_id.set(node_id).unwrap();
     mesh.user_id.set(user_id).unwrap();
     // A second, non-seated member: registered in the mesh, so it is a
@@ -1253,7 +1253,8 @@ fn straggler_rejoins_across_an_epoch_boundary() {
         .into_owned();
     {
         let conn = mesh.db_pool.get().unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
     }
     std::fs::copy(&db_path, &straggler_db).unwrap();
     // Its own identity: this_node is node-local, so it must survive a
@@ -1266,7 +1267,8 @@ fn straggler_rejoins_across_an_epoch_boundary() {
             rusqlite::params![straggler_keys.signing_key],
         )
         .unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
     }
 
     let state_of = |st: &AppState| {
@@ -1340,9 +1342,7 @@ fn straggler_rejoins_across_an_epoch_boundary() {
     );
     mesh2.node_id.set(0).unwrap();
     mesh2.user_id.set(0).unwrap();
-    mesh2
-        .epoch
-        .store(2, std::sync::atomic::Ordering::Relaxed);
+    mesh2.epoch.store(2, std::sync::atomic::Ordering::Relaxed);
 
     // ---- The straggler wakes: still epoch 1, its own AppState and its
     // own database, talking to the mesh over real loopback comms.
@@ -1372,19 +1372,19 @@ fn straggler_rejoins_across_an_epoch_boundary() {
         // structured variant, not a transport error.
         let reply = hopnet_comms::Rpc::rpc(
             &straggler.comms,
-                &mesh_peer,
-                "consensus",
-                crate::net::encode_payload(
-                    &crate::consensus::malachite::gossip::ConsensusNetRequest::DecidedFetch {
-                        from_height: 1,
-                        to_height: 1,
-                        epoch: 1,
-                    },
-                ),
-                Duration::from_secs(10),
-            )
-            .await
-            .expect("the mesh answers");
+            &mesh_peer,
+            "consensus",
+            crate::net::encode_payload(
+                &crate::consensus::malachite::gossip::ConsensusNetRequest::DecidedFetch {
+                    from_height: 1,
+                    to_height: 1,
+                    epoch: 1,
+                },
+            ),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("the mesh answers");
         match crate::net::decode_payload(&reply).unwrap() {
             crate::consensus::malachite::gossip::ConsensusNetResponse::EpochMismatch {
                 local_epoch,
@@ -1402,12 +1402,9 @@ fn straggler_rejoins_across_an_epoch_boundary() {
         .await
         .expect("the straggler stages a verified epoch join");
 
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            straggler.restart_signal.notified(),
-        )
-        .await
-        .expect("the straggler requests a restart once staged");
+        tokio::time::timeout(Duration::from_secs(5), straggler.restart_signal.notified())
+            .await
+            .expect("the straggler requests a restart once staged");
     });
 
     // ---- The straggler's boot path rebuilds it onto the new epoch.

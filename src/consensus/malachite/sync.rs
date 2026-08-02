@@ -80,7 +80,16 @@ pub async fn sync_to_target(
     evidence: Option<std::sync::Arc<crate::consensus::evidence::EvidenceMap>>,
 ) -> Result<(), SyncError> {
     let peers = peer_list(db_pool, my_node_id, hint_peer);
-    sync_loop(comms, epoch, input_tx, decided, Some(target), &peers, evidence).await?;
+    sync_loop(
+        comms,
+        epoch,
+        input_tx,
+        decided,
+        Some(target),
+        &peers,
+        evidence,
+    )
+    .await?;
     Ok(())
 }
 
@@ -347,7 +356,9 @@ fn parse_fetch_reply(reply: &[u8]) -> Result<Vec<(Block, WireCommitCertificate)>
             peer_epoch: local_epoch,
         }),
         ConsensusNetResponse::Error { message } => Err(FetchError::Transport(message)),
-        other => Err(FetchError::Transport(format!("unexpected response: {other:?}"))),
+        other => Err(FetchError::Transport(format!(
+            "unexpected response: {other:?}"
+        ))),
     }
 }
 
@@ -362,9 +373,8 @@ mod tests {
     // a bare Error reply as a transport failure.
     #[test]
     fn fetch_reply_classification() {
-        let mismatch = crate::net::encode_payload(&ConsensusNetResponse::EpochMismatch {
-            local_epoch: 3,
-        });
+        let mismatch =
+            crate::net::encode_payload(&ConsensusNetResponse::EpochMismatch { local_epoch: 3 });
         match parse_fetch_reply(&mismatch) {
             Err(FetchError::EpochMismatch { peer_epoch: 3 }) => {}
             other => panic!("expected epoch signpost, got {other:?}"),

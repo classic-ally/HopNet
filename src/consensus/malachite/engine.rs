@@ -451,9 +451,7 @@ pub(crate) fn spawn_tip_poll(app_state: AppState) {
                     .get()
                     .ok()
                     .and_then(|c| crate::db::regenesis::read_regenesis_state(&c).ok())
-                    .is_some_and(|s| {
-                        s.phase != crate::db::regenesis::RegenesisPhase::Normal
-                    });
+                    .is_some_and(|s| s.phase != crate::db::regenesis::RegenesisPhase::Normal);
                 if !boundary_in_flight {
                     continue;
                 }
@@ -463,16 +461,15 @@ pub(crate) fn spawn_tip_poll(app_state: AppState) {
             }
             let peers = sync::peer_list(&app_state.db_pool, node_id, None);
             let mut decided = engine.decided.clone();
-            if let Err(e) =
-                sync::sync_to_tip(
-                    &app_state.comms,
-                    app_state.epoch.load(Ordering::Relaxed),
-                    &engine.input_tx,
-                    &mut decided,
-                    &peers,
-                    Some(app_state.evidence.clone()),
-                )
-                .await
+            if let Err(e) = sync::sync_to_tip(
+                &app_state.comms,
+                app_state.epoch.load(Ordering::Relaxed),
+                &engine.input_tx,
+                &mut decided,
+                &peers,
+                Some(app_state.evidence.clone()),
+            )
+            .await
                 && !pivot_on_epoch_ahead(&app_state, &e)
             {
                 tracing::debug!("tip-poll sync: {e:?}");
@@ -542,8 +539,8 @@ pub async fn bootstrap_join(
             app_state.epoch.load(std::sync::atomic::Ordering::Relaxed),
             &peers,
         )
-            .await
-            .map_err(|e| format!("genesis fetch: {e}"))?;
+        .await
+        .map_err(|e| format!("genesis fetch: {e}"))?;
 
         let old_txs = super::app::to_old_transactions(&block.data.transactions)
             .map_err(|e| format!("genesis bridge: {e}"))?;
@@ -677,9 +674,7 @@ pub(crate) fn spawn_driver(
 
 /// Committed regenesis phase, or None on any read failure (treated as
 /// "don't act" by every caller — hygiene skips, seal proposal skips).
-fn committed_regenesis_phase(
-    app_state: &AppState,
-) -> Option<crate::db::regenesis::RegenesisPhase> {
+fn committed_regenesis_phase(app_state: &AppState) -> Option<crate::db::regenesis::RegenesisPhase> {
     let conn = app_state.db_pool.get().ok()?;
     crate::db::regenesis::read_regenesis_state(&conn)
         .ok()
@@ -744,8 +739,7 @@ pub(crate) fn spawn_rollback_cleanup(
     app_state: crate::AppState,
     mut decided: tokio::sync::watch::Receiver<u64>,
 ) {
-    let retained =
-        crate::regenesis::boot::sealed_path(&crate::db::shared::get_database_path());
+    let retained = crate::regenesis::boot::sealed_path(&crate::db::shared::get_database_path());
     if !retained.exists() {
         return;
     }
@@ -878,8 +872,7 @@ async fn handle_need_value(
     // transaction of the final block, carrying the snapshot hash it
     // recomputes over the build connection (proposer-injected, queue-
     // bypassing: the cleanup_nonces precedent).
-    let propose_seal = regenesis_phase
-        == Some(crate::db::regenesis::RegenesisPhase::Moratorium)
+    let propose_seal = regenesis_phase == Some(crate::db::regenesis::RegenesisPhase::Moratorium)
         && candidates.is_empty()
         && pool.inflight_len() == 0;
 

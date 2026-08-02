@@ -165,15 +165,17 @@ pub fn read_staged_lineage(
         .iter()
         .map(|&epoch| {
             let path = staged_lineage_path(staging, epoch);
-            let bytes = std::fs::read(&path)
-                .map_err(|e| format!("staged lineage epoch {epoch}: {e}"))?;
+            let bytes =
+                std::fs::read(&path).map_err(|e| format!("staged lineage epoch {epoch}: {e}"))?;
             genesis::decode_lineage(&bytes)
         })
         .collect()
 }
 
 pub fn clear_staging(staging: &Path) {
-    if staging.exists() && let Err(e) = std::fs::remove_dir_all(staging) {
+    if staging.exists()
+        && let Err(e) = std::fs::remove_dir_all(staging)
+    {
         tracing::warn!(path = %staging.display(), "join staging cleanup failed: {e}");
     }
 }
@@ -299,7 +301,14 @@ pub async fn run_epoch_join_with(
             &staging,
         )
         .await?;
-        stage_manifest(&staging, &records, target_record, my_epoch, len, manual_anchor)?;
+        stage_manifest(
+            &staging,
+            &records,
+            target_record,
+            my_epoch,
+            len,
+            manual_anchor,
+        )?;
         set_state(format!(
             "staged for epoch {} — requesting restart",
             target_record.epoch
@@ -317,7 +326,14 @@ pub async fn run_epoch_join_with(
             &staging,
         )
         .await?;
-        stage_manifest(&staging, &records, target_record, my_epoch, len, manual_anchor)?;
+        stage_manifest(
+            &staging,
+            &records,
+            target_record,
+            my_epoch,
+            len,
+            manual_anchor,
+        )?;
         set_state(format!(
             "staged for epoch {}, but it requires version {} (running {}) — awaiting upgrade",
             target_record.epoch,
@@ -668,12 +684,8 @@ pub async fn epoch_join_bootstrap_with(
             profile.as_str().as_bytes(),
         )
         .map_err(|e| format!("quorum profile: {e}"))?;
-        hopnet_consensus::store::meta_put(
-            &tx,
-            genesis::META_EPOCH,
-            &record.epoch.to_be_bytes(),
-        )
-        .map_err(|e| format!("epoch: {e}"))?;
+        hopnet_consensus::store::meta_put(&tx, genesis::META_EPOCH, &record.epoch.to_be_bytes())
+            .map_err(|e| format!("epoch: {e}"))?;
         hopnet_consensus::store::meta_put(
             &tx,
             genesis::META_EPOCH_GENESIS_HEIGHT,
@@ -700,7 +712,10 @@ pub async fn epoch_join_bootstrap_with(
         tracing::warn!("fragment reconcile after join failed (harmless): {e}");
     }
 
-    set_state(format!("joined epoch {} at height {}", record.epoch, record.seal_height));
+    set_state(format!(
+        "joined epoch {} at height {}",
+        record.epoch, record.seal_height
+    ));
     Ok(())
 }
 
@@ -802,7 +817,9 @@ pub fn spawn_epoch_join(app_state: &AppState, anchor: JoinAnchor, peers: Vec<Pee
             set_state(format!("failed: {e}"));
             tracing::warn!("epoch join attempt failed: {e}");
         }
-        app_state.epoch_join_inflight.store(false, Ordering::Release);
+        app_state
+            .epoch_join_inflight
+            .store(false, Ordering::Release);
     });
 }
 
@@ -913,8 +930,7 @@ mod tests {
             snapshot_len: 0,
             manual_anchor: false,
         };
-        let bytes =
-            bincode::serde::encode_to_vec(&manifest, bincode::config::standard()).unwrap();
+        let bytes = bincode::serde::encode_to_vec(&manifest, bincode::config::standard()).unwrap();
         write_atomic(&manifest_path(&staging), &bytes).unwrap();
         let read = read_manifest(&staging).expect("manifest present");
         // The named lineage file was never staged: reading it must fail
@@ -927,7 +943,11 @@ mod tests {
     #[test]
     fn staging_sits_beside_the_database() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("database.db").to_string_lossy().into_owned();
+        let db_path = dir
+            .path()
+            .join("database.db")
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(staging_path(&db_path), dir.path().join(JOIN_STAGING_DIR));
     }
 
@@ -947,11 +967,9 @@ mod tests {
         let frags = frag_dir.to_string_lossy().into_owned();
 
         let backed = b"a fragment the new epoch still backs".to_vec();
-        let backed_hash =
-            hopnet_storage::Blake3Hash::from_bytes(*blake3::hash(&backed).as_bytes());
+        let backed_hash = hopnet_storage::Blake3Hash::from_bytes(*blake3::hash(&backed).as_bytes());
         let orphan = b"a fragment nothing backs any more".to_vec();
-        let orphan_hash =
-            hopnet_storage::Blake3Hash::from_bytes(*blake3::hash(&orphan).as_bytes());
+        let orphan_hash = hopnet_storage::Blake3Hash::from_bytes(*blake3::hash(&orphan).as_bytes());
         hopnet_storage::fragstore::store_fragment(&frags, &backed_hash, backed).unwrap();
         hopnet_storage::fragstore::store_fragment(&frags, &orphan_hash, orphan).unwrap();
 
@@ -975,8 +993,7 @@ mod tests {
 
         // The scan only sees fragments strictly older than the clock it
         // is given, so look from one second in the future.
-        let (remarked, orphans) =
-            reconcile_fragment_store(&conn, &frags, now_unix() + 1).unwrap();
+        let (remarked, orphans) = reconcile_fragment_store(&conn, &frags, now_unix() + 1).unwrap();
         assert_eq!(remarked, 1, "only the fragment actually on disk");
         assert_eq!(orphans, 1, "the unbacked file is deleted");
 
@@ -1065,14 +1082,13 @@ mod tests {
             };
             // Cap the requested length to force multi-chunk downloads.
             let req = match (req, self.chunk_cap) {
-                (
-                    RegenesisNetRequest::SnapshotChunk { epoch, offset, len },
-                    Some(cap),
-                ) => RegenesisNetRequest::SnapshotChunk {
-                    epoch,
-                    offset,
-                    len: len.min(cap),
-                },
+                (RegenesisNetRequest::SnapshotChunk { epoch, offset, len }, Some(cap)) => {
+                    RegenesisNetRequest::SnapshotChunk {
+                        epoch,
+                        offset,
+                        len: len.min(cap),
+                    }
+                }
                 (other, _) => other,
             };
             let lying = self.liars.contains(&peer.node_id);
@@ -1167,9 +1183,12 @@ mod tests {
         // The restart was requested: Notify holds one permit, so a
         // listener registered after the fact still completes.
         rt().block_on(async {
-            tokio::time::timeout(Duration::from_millis(50), app_state.restart_signal.notified())
-                .await
-                .expect("restart requested");
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                app_state.restart_signal.notified(),
+            )
+            .await
+            .expect("restart requested");
         });
     }
 
@@ -1193,8 +1212,12 @@ mod tests {
                 RegenesisNetResponse::SnapshotInfo { .. } => {}
                 other => panic!("unexpected: {other:?}"),
             }
-            std::fs::read(server_dir.path().join(crate::regenesis::seal::SEAL_ARTIFACT_FILENAME))
-                .unwrap()
+            std::fs::read(
+                server_dir
+                    .path()
+                    .join(crate::regenesis::seal::SEAL_ARTIFACT_FILENAME),
+            )
+            .unwrap()
         };
         std::fs::write(staged_partial_path(&staging), &full[..512]).unwrap();
 

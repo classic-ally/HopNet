@@ -347,24 +347,14 @@ pub async fn run_test_by_name(
                 .run(mesh_id, nodes, flags)
                 .await
         }
-        "vote-out-after-kill" => {
-            vote_out::VoteOutAfterKill
-                .run(mesh_id, nodes, flags)
-                .await
-        }
-        "regenesis-restart" => {
-            regenesis::RegenesisRestart
-                .run(mesh_id, nodes, flags)
-                .await
-        }
+        "vote-out-after-kill" => vote_out::VoteOutAfterKill.run(mesh_id, nodes, flags).await,
+        "regenesis-restart" => regenesis::RegenesisRestart.run(mesh_id, nodes, flags).await,
         "regenesis-awaiting-upgrade" => {
             regenesis::RegenesisAwaitingUpgrade
                 .run(mesh_id, nodes, flags)
                 .await
         }
-        "straggler-rejoin" => {
-            regenesis::StragglerRejoin.run(mesh_id, nodes, flags).await
-        }
+        "straggler-rejoin" => regenesis::StragglerRejoin.run(mesh_id, nodes, flags).await,
         "diverged-node-rebuild" => {
             regenesis::DivergedNodeRebuild
                 .run(mesh_id, nodes, flags)

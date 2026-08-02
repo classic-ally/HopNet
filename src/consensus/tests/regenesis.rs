@@ -475,11 +475,14 @@ fn seal_artifact_written_only_on_hash_match() {
     let dir = std::env::temp_dir().join(format!("hopnet-seal-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("regenesis-snapshot.bin");
-    let written =
-        crate::regenesis::seal::write_seal_artifact_to(&node.app_state, &path).unwrap();
+    let written = crate::regenesis::seal::write_seal_artifact_to(&node.app_state, &path).unwrap();
     let bytes = std::fs::read(&written).unwrap();
     assert!(bytes.starts_with(b"HOPSNAP\0"), "artifact magic");
-    assert_eq!(blake3::hash(&bytes).as_bytes(), &honest, "bytes are the certified bytes");
+    assert_eq!(
+        blake3::hash(&bytes).as_bytes(),
+        &honest,
+        "bytes are the certified bytes"
+    );
 
     // Tamper the committed hash: the writer must refuse (this replica
     // would be the diverged one).
@@ -538,8 +541,11 @@ fn status_view_reports_epoch_and_awaiting_upgrade() {
     // Sealed for a DIFFERENT version: parked awaiting the swap.
     {
         let conn = node.app_state.db_pool.get().unwrap();
-        conn.execute("UPDATE regenesis_state SET target_version_code = 20990100", [])
-            .unwrap();
+        conn.execute(
+            "UPDATE regenesis_state SET target_version_code = 20990100",
+            [],
+        )
+        .unwrap();
     }
     let view = status(&node);
     assert!(view.awaiting_upgrade);
@@ -620,8 +626,8 @@ fn rollback_route_refuses_when_there_is_no_boundary() {
 // answer status pings with this node's (epoch, version).
 #[test]
 fn handshake_carries_epoch_and_refuses_mismatched_fetch() {
-    use crate::consensus::malachite::gossip::{ConsensusNetRequest, ConsensusNetResponse};
     use crate::consensus::evidence::{StatusRequest, StatusResponse};
+    use crate::consensus::malachite::gossip::{ConsensusNetRequest, ConsensusNetResponse};
 
     let node = MockNode::new(5);
     register_node(&node);
@@ -683,11 +689,14 @@ fn handshake_carries_epoch_and_refuses_mismatched_fetch() {
     )
     .unwrap();
     let raw = rt.block_on(hopnet_comms::RpcHandler::handle(&status, peer, ping));
-    let (StatusResponse::Pong {
-        epoch,
-        version_code,
-        ..
-    }, _) = bincode::serde::decode_from_slice(&raw, bincode::config::standard()).unwrap();
+    let (
+        StatusResponse::Pong {
+            epoch,
+            version_code,
+            ..
+        },
+        _,
+    ) = bincode::serde::decode_from_slice(&raw, bincode::config::standard()).unwrap();
     assert_eq!(epoch, 1);
     assert_eq!(version_code, crate::version::effective_running_code());
 }

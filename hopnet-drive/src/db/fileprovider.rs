@@ -5,7 +5,7 @@
 
 use crate::model::CustomDateTime;
 use crate::paths::decrypt_path;
-use aes_siv::{Key, Nonce, siv::Aes256Siv};
+use aes_siv::{siv::Aes256Siv, Key, Nonce};
 use hopnet_common::height::{height_from_db, height_to_db};
 use hopnet_common::{CustomUUID, InodeType};
 use hopnet_projection::DatabaseError;
@@ -117,7 +117,8 @@ pub fn get_folder_contents(
                         let file_size = row.get::<_, Option<i64>>(4)?.map(|v| v as u64); // File size from data_blocks (NULL for folders)
                         let creation_date: Option<CustomDateTime> = row.get(5)?; // UUIDv7 timestamp or NULL for folders
                         let content_modification_date: Option<CustomDateTime> = row.get(6)?; // modified_at from data_blocks
-                        let modification_height: Option<u64> = row.get::<_, Option<i64>>(7)?.map(height_from_db); // Consensus height when item was last modified
+                        let modification_height: Option<u64> =
+                            row.get::<_, Option<i64>>(7)?.map(height_from_db); // Consensus height when item was last modified
 
                         // Decrypt the full path using the same pattern as get_files
                         let decrypted_path = decrypt_path(encrypted_path, siv_key, siv_nonce)
@@ -292,7 +293,8 @@ pub fn get_folder_changes_since_height(
                 let file_size = row.get::<_, Option<i64>>(6)?.map(|v| v as u64);
                 let creation_date: Option<CustomDateTime> = row.get(7)?;
                 let content_modification_date: Option<CustomDateTime> = row.get(8)?;
-                let modification_height: Option<u64> = row.get::<_, Option<i64>>(9)?.map(height_from_db);
+                let modification_height: Option<u64> =
+                    row.get::<_, Option<i64>>(9)?.map(height_from_db);
 
                 Ok((
                     status,
@@ -462,7 +464,8 @@ pub fn get_item_metadata_by_inode_id(
                     let file_size = row.get::<_, Option<i64>>(2)?.map(|v| v as u64); // NULL for folders
                     let creation_date: CustomDateTime = row.get(3)?; // UUIDv7 from inode.id (always exists)
                     let content_modification_date: Option<CustomDateTime> = row.get(4)?; // UUIDv7 from data_id (files only)
-                    let modification_height: Option<u64> = row.get::<_, Option<i64>>(5)?.map(height_from_db); // Consensus height when item was last modified
+                    let modification_height: Option<u64> =
+                        row.get::<_, Option<i64>>(5)?.map(height_from_db); // Consensus height when item was last modified
                     Ok((
                         path,
                         item_type,

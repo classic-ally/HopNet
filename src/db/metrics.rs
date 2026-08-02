@@ -33,7 +33,9 @@ pub fn get_metric(
                     rtt_variance: row.get(4)?,
                     rtt_jitter: row.get(5)?,
                     throughput: row.get(6)?,
-                    height: row.get::<_, i64>(7).map(hopnet_common::height::height_from_db)?, // New: consensus height
+                    height: row
+                        .get::<_, i64>(7)
+                        .map(hopnet_common::height::height_from_db)?, // New: consensus height
                     available: row.get(8)?,        // New: node availability
                     storage_total_gb: row.get(9)?, // New: storage capacity
                     storage_used_gb: row.get(10)?, // New: storage utilization
@@ -444,7 +446,11 @@ pub fn get_availability_history_with_conn(
         })?;
     let sparse: Vec<(i32, i64, bool)> = stmt
         .query_map(
-            rusqlite::params![hopnet_common::height::height_to_db(height), step_secs, window_start],
+            rusqlite::params![
+                hopnet_common::height::height_to_db(height),
+                step_secs,
+                window_start
+            ],
             |row| {
                 Ok((
                     row.get::<_, i32>(0)?,

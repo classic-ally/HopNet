@@ -202,10 +202,8 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             }
             regenesis::boot::BootOutcome::Parked(reason) => {
                 tracing::warn!(?reason, "epoch boundary parked — engine will not start");
-                rebuild_from_peers = matches!(
-                    reason,
-                    regenesis::boot::ParkReason::GateFailed { .. }
-                );
+                rebuild_from_peers =
+                    matches!(reason, regenesis::boot::ParkReason::GateFailed { .. });
             }
             regenesis::boot::BootOutcome::Fatal(detail) => {
                 panic!("epoch boot transition: {detail}");
@@ -545,7 +543,8 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             let random_second = rand::rng().random_range(5..55);
             let random_minute = rand::rng().random_range(0..60);
             let upgrade_cron_expression = format!("{} {} */6 * * *", random_second, random_minute);
-            let upgrade_schedule = apalis_cron::Schedule::from_str(&upgrade_cron_expression).unwrap();
+            let upgrade_schedule =
+                apalis_cron::Schedule::from_str(&upgrade_cron_expression).unwrap();
             let upgrade_cron_stream = apalis_cron::CronStream::new(upgrade_schedule);
 
             let upgrade_worker = WorkerBuilder::new("upgrade-tick")
@@ -715,7 +714,10 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                     "/consensus/regenesis/rollback",
                     post(regenesis::routes::post_regenesis_rollback),
                 )
-                .route("/consensus/evidence", get(consensus::evidence::get_evidence))
+                .route(
+                    "/consensus/evidence",
+                    get(consensus::evidence::get_evidence),
+                )
                 .layer(middleware::from_fn_with_state(
                     app_state.clone(),
                     consensus::routes::jwt_or_rpc_auth_middleware,

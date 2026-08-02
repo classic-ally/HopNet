@@ -2,7 +2,6 @@ use super::*;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
-
 /// Fragment information for distribution diagnostic
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FragmentInfo {
@@ -198,7 +197,8 @@ pub fn get_file_fragment_distribution(
                             row.get(0)?,                  // inode_id
                             row.get(1)?,                  // data_block_id
                             row.get::<_, i64>(2)? as u64, // file_size
-                            row.get::<_, Option<i64>>(3)?.map(hopnet_common::height::height_from_db), // placement_height
+                            row.get::<_, Option<i64>>(3)?
+                                .map(hopnet_common::height::height_from_db), // placement_height
                             row.get(4)?,                  // fragment_count
                         ))
                     },

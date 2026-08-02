@@ -390,7 +390,11 @@ impl TestEnv {
         conn.execute(
             "INSERT INTO modification_log (inode_id, owner_id, old_parent_id, modified_at_height)
              VALUES (?, ?, NULL, ?)",
-            rusqlite::params![inode_id, USER_ID, hopnet_common::height::height_to_db(height)],
+            rusqlite::params![
+                inode_id,
+                USER_ID,
+                hopnet_common::height::height_to_db(height)
+            ],
         )
         .unwrap();
     }
