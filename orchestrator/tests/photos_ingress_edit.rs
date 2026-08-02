@@ -111,33 +111,31 @@ async fn wait_for_resource_absent(
     }
 }
 
-/// The encrypted metadata blob each photo's gallery row carries. Its
-/// ciphertext changing is what a metadata refresh looks like from outside;
-/// proving it still DECRYPTS is RE-C2's unit test, since the orchestrator
-/// holds no member private key.
-async fn gallery_metadata(
+/// Every photo's metadata still decrypts, on every node.
+///
+/// This is the whole `metadata_access` amendment observed from outside. The
+/// gallery serves DECRYPTED rows and excludes any whose metadata the sidecar
+/// could not open (`undecryptable = 0` in its query), so a photo that
+/// vanishes here after an edit is one whose new ciphertext arrived without
+/// wraps that open it — the silent, permanent failure the field exists to
+/// prevent. A stored wrap still unwrapping to the OLD key looks exactly like
+/// this, and like nothing else.
+async fn assert_all_decryptable(
     client: &reqwest::Client,
-    node: &NodeInfo,
-) -> Result<HashMap<String, String>> {
-    let response = client
-        .get(format!("{}/api/photos/gallery?limit=200", base_url(node)))
-        .header("Authorization", format!("Bearer {}", node.jwt_token))
-        .send()
-        .await?;
-    anyhow::ensure!(
-        response.status().is_success(),
-        "gallery: {}",
-        response.status()
-    );
-    let rows: Vec<serde_json::Value> = response.json().await?;
-    Ok(rows
-        .iter()
-        .filter_map(|row| {
-            let id = row["photo_id"].as_str()?.to_string();
-            let meta = row["encrypted_metadata"].as_str()?.to_string();
-            Some((id, meta))
-        })
-        .collect())
+    nodes: &[NodeInfo],
+    photo_ids: &[String],
+) -> Result<()> {
+    for node in nodes {
+        wait_for_ids(client, node, photo_ids, Duration::from_secs(90))
+            .await
+            .with_context(|| {
+                format!(
+                    "node {}: a photo left the gallery — its metadata no longer decrypts",
+                    node.node_id
+                )
+            })?;
+    }
+    Ok(())
 }
 
 impl TestScenario for PhotosIngressEdit {
@@ -433,6 +431,14 @@ impl TestScenario for PhotosIngressEdit {
             .await
         );
 
+        // The edit carried metadata inline (its modification date advanced
+        // with the pixels), so a fresh key and fresh wraps travelled with
+        // it. Every photo must still decrypt.
+        check_or_bail!(
+            "Metadata still decrypts after the edit, on EVERY node",
+            assert_all_decryptable(&client, nodes, &photo_ids).await
+        );
+
         // Idempotency: a converged edit must never re-submit.
         check_or_bail!(
             "Converged edits do not re-propagate",
@@ -527,10 +533,6 @@ impl TestScenario for PhotosIngressEdit {
         );
 
         // --- Step 4: metadata alone — no bytes move at all. ---
-        let before = check_or_bail!(
-            "Capture metadata ciphertext",
-            gallery_metadata(&client, &nodes[0]).await
-        );
         check_or_bail!(
             "Refresh metadata locally",
             run_driver_async(
@@ -565,31 +567,8 @@ impl TestScenario for PhotosIngressEdit {
                 })
         );
         check_or_bail!(
-            "Metadata ciphertext replaced on EVERY node",
-            async {
-                for node in nodes {
-                    let deadline = Instant::now() + Duration::from_secs(90);
-                    loop {
-                        let now = gallery_metadata(&client, node).await.unwrap_or_default();
-                        let changed =
-                            photo_ids
-                                .iter()
-                                .all(|id| match (before.get(id), now.get(id)) {
-                                    (Some(old), Some(new)) => old != new,
-                                    _ => false,
-                                });
-                        if changed {
-                            break;
-                        }
-                        if Instant::now() > deadline {
-                            anyhow::bail!("node {} still holds the old ciphertext", node.node_id);
-                        }
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    }
-                }
-                Ok::<_, anyhow::Error>(())
-            }
-            .await
+            "Metadata still decrypts after the refresh, on EVERY node",
+            assert_all_decryptable(&client, nodes, &photo_ids).await
         );
 
         result.duration = start.elapsed();
