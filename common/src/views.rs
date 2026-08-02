@@ -209,4 +209,8 @@ pub struct RegenesisStatusView {
     pub rollback_retained: bool,
     /// Last boot-gate refusal, if the boundary could not be crossed.
     pub boundary_error: Option<String>,
+    /// Epoch-join progress or last failure (RFC-019 S7), while this node
+    /// is rebuilding from peers: fetching lineage, downloading the
+    /// snapshot, staged and awaiting restart.
+    pub epoch_join: Option<String>,
 }

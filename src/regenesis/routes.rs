@@ -132,6 +132,76 @@ pub async fn post_regenesis_abort(State(app_state): State<AppState>) -> impl Int
     .await
 }
 
+#[derive(Deserialize)]
+pub struct RetrustRequest {
+    /// The peer the operator vouches for.
+    pub node_id: i32,
+}
+
+/// POST /consensus/regenesis/retrust
+///
+/// The escape hatch when validator churn moved past the overlap window
+/// (RFC-019 S7): the operator points this node at a peer they trust and
+/// it re-bootstraps from the current epoch, keeping its fragment store —
+/// the same trust-on-first-use ceremony as the original join, re-invoked.
+///
+/// Waives the OVERLAP requirement only. Chain-id linkage, every hop's
+/// quorum proof, and the snapshot's certified hash are still enforced,
+/// so a peer named here still cannot serve arbitrary state.
+///
+/// Answers 202: the fetch runs in the background and can take minutes.
+pub async fn post_regenesis_retrust(
+    State(app_state): State<AppState>,
+    Json(body): Json<RetrustRequest>,
+) -> impl IntoResponse {
+    // The pubkey comes from our own (possibly stale) node table — it only
+    // names a key to dial, and everything fetched is verified anyway.
+    let peer = {
+        let Ok(conn) = app_state.db_pool.get() else {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "db unavailable").into_response();
+        };
+        let found: Option<crate::db::PubKey> = conn
+            .query_row(
+                "SELECT pubkey FROM nodes WHERE node_id = ?",
+                [body.node_id],
+                |row| row.get(0),
+            )
+            .ok();
+        match found {
+            Some(pk) => hopnet_comms::PeerRef {
+                node_id: body.node_id,
+                pubkey: pk.0.to_bytes(),
+            },
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    format!("node {} is not known to this node", body.node_id),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    if let Some(progress) = crate::regenesis::join::join_state()
+        && app_state
+            .epoch_join_inflight
+            .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return (StatusCode::CONFLICT, progress).into_response();
+    }
+
+    crate::regenesis::join::spawn_epoch_join(
+        &app_state,
+        crate::regenesis::join::JoinAnchor::Manual { peer },
+        vec![peer],
+    );
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "retrust": "started", "peer": body.node_id })),
+    )
+        .into_response()
+}
+
 /// GET /views/regenesis-status
 pub async fn get_regenesis_status(
     State(app_state): State<AppState>,
@@ -176,5 +246,6 @@ pub async fn get_regenesis_status(
         awaiting_upgrade,
         boundary_error: crate::regenesis::boot::boundary_error(),
         rollback_retained,
+        epoch_join: crate::regenesis::join::join_state(),
     }))
 }
