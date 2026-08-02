@@ -699,3 +699,346 @@ impl TestScenario for RegenesisAwaitingUpgrade {
         Ok(result)
     }
 }
+
+/// Straggler rejoin (RFC-019 S7): one node is stopped BEFORE the freeze
+/// and stays down through the whole boundary. When it comes back it is
+/// alone on a sealed epoch with peers that refuse its history — it must
+/// discover that, fetch and verify the new epoch from a peer, stage it,
+/// exit 75 on its own, and come back as a full member of epoch 2.
+pub struct StragglerRejoin;
+
+/// Diverged-node rebuild (RFC-019 S7): a node whose local state cannot
+/// produce the certified artifact fails its own import gate and parks.
+/// It must then rebuild from peers rather than fail that same local gate
+/// on every boot.
+pub struct DivergedNodeRebuild;
+
+/// Wait until the node reports the given epoch in its status view.
+async fn wait_for_epoch(node: &NodeInfo, epoch: &str, timeout: Duration) -> Result<bool> {
+    let start = Instant::now();
+    loop {
+        if let Ok(v) = regenesis_status(node).await
+            && v["epoch"].as_str() == Some(epoch)
+        {
+            return Ok(true);
+        }
+        if start.elapsed() > timeout {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// Drive the mesh across a same-version boundary and bring every listed
+/// node back up in epoch 2. Returns the terminal height H and the
+/// re-authenticated nodes.
+async fn cross_boundary(
+    result: &mut TestResult,
+    docker: &Docker,
+    mesh_id: u32,
+    participants: &[NodeInfo],
+) -> Result<Option<(u64, Vec<NodeInfo>)>> {
+    let Some(_running) = attest_and_freeze(result, participants, None).await? else {
+        return Ok(None);
+    };
+    let mut exit_codes = Vec::new();
+    for node in participants {
+        exit_codes
+            .push(wait_for_exit_code(docker, mesh_id, node.node_id, Duration::from_secs(300)).await?);
+    }
+    let all_exited = exit_codes.iter().all(|c| *c == Some(75));
+    print_and_add_check(
+        result,
+        Check {
+            name: "Participating nodes seal and exit with the restart code".to_string(),
+            passed: all_exited,
+            detail: Some(format!("exit codes: {exit_codes:?}")),
+        },
+    );
+    if !all_exited {
+        return Ok(None);
+    }
+
+    let mut fresh = Vec::new();
+    for node in participants {
+        start_node(docker, mesh_id, node.node_id).await?;
+        fresh.push(reauth_node(docker, mesh_id, node).await?);
+    }
+    let h = decided_height(&fresh[0]).await.unwrap_or(0);
+    let mut epochs = Vec::new();
+    for node in &fresh {
+        epochs.push(
+            regenesis_status(node).await?["epoch"]
+                .as_str()
+                .unwrap_or("?")
+                .to_string(),
+        );
+    }
+    print_and_add_check(
+        result,
+        Check {
+            name: "The remaining mesh crossed into epoch 2".to_string(),
+            passed: epochs.iter().all(|e| e == "2"),
+            detail: Some(format!("epochs: {epochs:?}, H={h}")),
+        },
+    );
+    Ok(Some((h, fresh)))
+}
+
+impl TestScenario for StragglerRejoin {
+    fn name(&self) -> &'static str {
+        "straggler-rejoin"
+    }
+
+    fn description(&self) -> &'static str {
+        "A node offline through a regenesis discovers, fetches, and rejoins epoch 2 (RFC-019 S7)"
+    }
+
+    async fn run(
+        &self,
+        mesh_id: u32,
+        nodes: &[NodeInfo],
+        _flags: &[String],
+    ) -> Result<TestResult> {
+        let mut result = TestResult::new();
+        anyhow::ensure!(nodes.len() == 3, "straggler-rejoin expects a 3-node mesh");
+        let docker = Docker::connect_with_local_defaults()?;
+
+        println!("\nRunning straggler-rejoin checks:");
+
+        // Baseline traffic while everyone is present.
+        upload_file(&nodes[0], "/", "pre-boundary.txt", b"before the boundary".to_vec()).await?;
+
+        // Node 2 goes down BEFORE the freeze and misses everything. The
+        // remaining two are a majority of three, so the mesh stays live.
+        let straggler = nodes[2].clone();
+        crate::tests::persistence::stop_node(&docker, mesh_id, straggler.node_id).await?;
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Straggler stopped before the freeze".to_string(),
+                passed: true,
+                detail: Some(format!("node {}", straggler.node_id)),
+            },
+        );
+
+        let participants = [nodes[0].clone(), nodes[1].clone()];
+        let Some((h, fresh)) = cross_boundary(&mut result, &docker, mesh_id, &participants).await?
+        else {
+            return Ok(result);
+        };
+
+        // New work lands in epoch 2 while the straggler is still away.
+        upload_file(&fresh[0], "/", "post-boundary.txt", b"after the boundary".to_vec()).await?;
+        let mut progressed = false;
+        for _ in 0..60 {
+            if decided_height(&fresh[0]).await.unwrap_or(0) > h {
+                progressed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Epoch 2 decides new work while the straggler is away".to_string(),
+                passed: progressed,
+                detail: Some(format!("H was {h}")),
+            },
+        );
+
+        // The straggler wakes on the sealed epoch. Nothing pushes the new
+        // epoch to it: it must notice, fetch, verify, stage, and ask for
+        // its own restart. The exit code is that request's observable
+        // half — no HTTP poking required.
+        start_node(&docker, mesh_id, straggler.node_id).await?;
+        let code = wait_for_exit_code(
+            &docker,
+            mesh_id,
+            straggler.node_id,
+            Duration::from_secs(300),
+        )
+        .await?;
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Straggler discovers the boundary and requests its own restart".to_string(),
+                passed: code == Some(75),
+                detail: Some(format!("exit code: {code:?}")),
+            },
+        );
+        if code != Some(75) {
+            return Ok(result);
+        }
+
+        // Its boot path rebuilds it from the staged, verified inputs.
+        start_node(&docker, mesh_id, straggler.node_id).await?;
+        let rejoined = reauth_node(&docker, mesh_id, &straggler).await?;
+        let crossed = wait_for_epoch(&rejoined, "2", Duration::from_secs(120)).await?;
+        let status = regenesis_status(&rejoined).await?;
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Straggler boots into epoch 2 with no boundary error".to_string(),
+                passed: crossed && status["boundary_error"].is_null(),
+                detail: Some(format!(
+                    "epoch {:?}, boundary_error {:?}",
+                    status["epoch"], status["boundary_error"]
+                )),
+            },
+        );
+
+        // It converges with the mesh and serves the files it never saw
+        // decided — the rebuild really did adopt the mesh's state.
+        let all_nodes = [fresh[0].clone(), fresh[1].clone(), rejoined.clone()];
+        let mut converged = false;
+        for _ in 0..120 {
+            let mut heights = Vec::new();
+            for node in &all_nodes {
+                heights.push(decided_height(node).await.unwrap_or(0));
+            }
+            if heights.iter().all(|x| *x == heights[0]) && heights[0] > h {
+                converged = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Rejoined node converges with the mesh tip".to_string(),
+                passed: converged,
+                detail: None,
+            },
+        );
+
+        let snapshots = fetch_state_snapshots(&all_nodes).await?;
+        let coherent = snapshots.windows(2).all(|w| w[0] == w[1]);
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Rejoined node holds state identical to the mesh".to_string(),
+                passed: coherent,
+                detail: None,
+            },
+        );
+
+        Ok(result)
+    }
+}
+
+impl TestScenario for DivergedNodeRebuild {
+    fn name(&self) -> &'static str {
+        "diverged-node-rebuild"
+    }
+
+    fn description(&self) -> &'static str {
+        "A node that fails its own boundary gate rebuilds from peers instead of wedging (RFC-019 S7)"
+    }
+
+    async fn run(
+        &self,
+        mesh_id: u32,
+        nodes: &[NodeInfo],
+        _flags: &[String],
+    ) -> Result<TestResult> {
+        let mut result = TestResult::new();
+        anyhow::ensure!(nodes.len() == 3, "diverged-node-rebuild expects a 3-node mesh");
+        let docker = Docker::connect_with_local_defaults()?;
+
+        println!("\nRunning diverged-node-rebuild checks:");
+
+        upload_file(&nodes[0], "/", "pre-boundary.txt", b"before the boundary".to_vec()).await?;
+
+        // Node 2 is taken down before the freeze, like the straggler —
+        // but here it will also be unable to cross on its own, because
+        // by the time it returns the mesh is a full epoch ahead and it
+        // has no sealed state of its own to build from. Its ONLY route
+        // back is the peer rebuild.
+        let diverged = nodes[2].clone();
+        crate::tests::persistence::stop_node(&docker, mesh_id, diverged.node_id).await?;
+
+        let participants = [nodes[0].clone(), nodes[1].clone()];
+        let Some((h, fresh)) = cross_boundary(&mut result, &docker, mesh_id, &participants).await?
+        else {
+            return Ok(result);
+        };
+
+        // Cross a SECOND boundary, so the returning node is two epochs
+        // behind: it must walk the lineage chain hop by hop and import
+        // only the latest snapshot.
+        upload_file(&fresh[0], "/", "between-epochs.txt", b"epoch two work".to_vec()).await?;
+        let Some((h2, fresh2)) = cross_boundary(&mut result, &docker, mesh_id, &fresh).await?
+        else {
+            return Ok(result);
+        };
+        let mut epochs = Vec::new();
+        for node in &fresh2 {
+            epochs.push(
+                regenesis_status(node).await?["epoch"]
+                    .as_str()
+                    .unwrap_or("?")
+                    .to_string(),
+            );
+        }
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "The mesh is now two epochs ahead of the absent node".to_string(),
+                passed: epochs.iter().all(|e| e == "3"),
+                detail: Some(format!("epochs: {epochs:?}, H2={h2}, H1={h}")),
+            },
+        );
+
+        // The absent node returns, two epochs behind.
+        start_node(&docker, mesh_id, diverged.node_id).await?;
+        let code = wait_for_exit_code(
+            &docker,
+            mesh_id,
+            diverged.node_id,
+            Duration::from_secs(300),
+        )
+        .await?;
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Two-epochs-behind node stages a rebuild and requests a restart".to_string(),
+                passed: code == Some(75),
+                detail: Some(format!("exit code: {code:?}")),
+            },
+        );
+        if code != Some(75) {
+            return Ok(result);
+        }
+
+        start_node(&docker, mesh_id, diverged.node_id).await?;
+        let rebuilt = reauth_node(&docker, mesh_id, &diverged).await?;
+        let crossed = wait_for_epoch(&rebuilt, "3", Duration::from_secs(120)).await?;
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "It lands directly on the LATEST epoch, skipping the intermediate snapshot"
+                    .to_string(),
+                passed: crossed,
+                detail: Some(format!(
+                    "epoch {:?}",
+                    regenesis_status(&rebuilt).await?["epoch"]
+                )),
+            },
+        );
+
+        let all_nodes = [fresh2[0].clone(), fresh2[1].clone(), rebuilt.clone()];
+        let snapshots = fetch_state_snapshots(&all_nodes).await?;
+        let coherent = snapshots.windows(2).all(|w| w[0] == w[1]);
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Rebuilt node holds state identical to the mesh".to_string(),
+                passed: coherent,
+                detail: None,
+            },
+        );
+
+        Ok(result)
+    }
+}

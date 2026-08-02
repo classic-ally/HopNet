@@ -131,7 +131,9 @@ pub fn mesh_creation_env(test_name: &str) -> Vec<(&'static str, &'static str)> {
         // Same seeding as vote-out: the 3-seat formation batch needs the
         // shortened spans. No grace override: the scenario detects the
         // seal by the exit code, never by racing HTTP against the exit.
-        "regenesis-restart" => vec![(
+        // Same seeding for the S7 rejoin scenarios: they drive the same
+        // boundary, with one node absent across it.
+        "regenesis-restart" | "straggler-rejoin" | "diverged-node-rebuild" => vec![(
             "HOPNET_GENESIS_CONSENSUS_POLICY",
             "probe_base=2;grace=1;s_full=6;p_prove=6",
         )],
@@ -212,7 +214,10 @@ pub fn preferred_auto_nodes(test_name: &str) -> Option<u32> {
         // 6); the test adds the 7th itself to watch the seam get crossed.
         "auto-seam" => Some(6),
         // Boundary scenarios are written against a 3-node mesh.
-        "regenesis-restart" | "regenesis-awaiting-upgrade" => Some(3),
+        "regenesis-restart"
+        | "regenesis-awaiting-upgrade"
+        | "straggler-rejoin"
+        | "diverged-node-rebuild" => Some(3),
         _ => None,
     }
 }
@@ -338,6 +343,14 @@ pub async fn run_test_by_name(
         }
         "regenesis-awaiting-upgrade" => {
             regenesis::RegenesisAwaitingUpgrade
+                .run(mesh_id, nodes, flags)
+                .await
+        }
+        "straggler-rejoin" => {
+            regenesis::StragglerRejoin.run(mesh_id, nodes, flags).await
+        }
+        "diverged-node-rebuild" => {
+            regenesis::DivergedNodeRebuild
                 .run(mesh_id, nodes, flags)
                 .await
         }
@@ -499,6 +512,8 @@ pub fn list_test_names() -> Vec<&'static str> {
         "vote-out-after-kill",
         "regenesis-restart",
         "regenesis-awaiting-upgrade",
+        "straggler-rejoin",
+        "diverged-node-rebuild",
         "mesh-growth",
         "auto-seam",
         "three-timescales",
