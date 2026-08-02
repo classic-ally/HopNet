@@ -12,7 +12,9 @@ use chrono::Utc;
 use hopnet_common::Blake3Hash;
 use hopnet_photos_core::dispatch::{LibraryMember, LibraryMembership, UploadedDataBlock, UploadedFragment};
 use ingress_core::descriptor::MediaType;
-use ingress_core::publish::{PublishError, PublishItem, PublishOutcome, PublishResource, Publisher};
+use ingress_core::publish::{
+    PublishError, PublishItem, PublishOutcome, PublishResource, Publisher, TombstoneOp,
+};
 use ingress_core::sidecar::{Sidecar, SidecarGroup};
 use ingress_publisher::NodePublisher;
 use ingress_publisher::map;
@@ -72,6 +74,10 @@ fn make_item(dir: &std::path::Path, resources: Vec<(&str, &str, Vec<u8>)>) -> Pu
             publish_last_error: None,
             consensus_photo_id: None,
             deleted_at: None,
+            tombstone_published_at: None,
+            tombstone_publish_attempts: 0,
+            tombstone_publish_next_retry_at: None,
+            tombstone_publish_last_error: None,
         },
         library: ingress_core::LibraryConfig {
             library_id: library_id.clone(),
@@ -760,4 +766,92 @@ async fn not_responsible_403_classifies_transient() {
     let publisher = NodePublisher::new(&base_url, "dev.secret").unwrap();
     let err = publisher.publish(simple_item(dir.path())).await.unwrap_err();
     assert!(matches!(err, PublishError::Transient(_)), "got {err:?}");
+}
+
+// ------------------------------------------------------ tombstone wire
+
+/// Decode a captured `/transaction` body into (tx_type, payload bytes).
+fn tx_payload(body: &serde_json::Value) -> (String, Vec<u8>) {
+    let tx_type = body["tx_type"].as_str().expect("tx_type").to_string();
+    let payload: Vec<u8> = body["payload"]
+        .as_array()
+        .expect("payload array")
+        .iter()
+        .map(|b| b.as_u64().expect("byte") as u8)
+        .collect();
+    (tx_type, payload)
+}
+
+// Impact: the mesh only learns a photo is deleted through these bytes —
+// a wrong tx_type or a payload consensus cannot decode means the tombstone
+// is silently lost while the daemon records it as converged.
+// Should: submit photo_delete carrying exactly the consensus id given.
+// Should: submit photo_restore for the opposite direction.
+#[tokio::test]
+async fn propagate_submits_decodable_delete_and_restore() {
+    let (stub, base_url) = start_stub().await;
+    let publisher = NodePublisher::new(&base_url, "device-token").unwrap();
+    let photo_id = "01912e5a-7b3c-7f21-a4d8-3e9f12ab34cd";
+
+    publisher
+        .propagate_tombstone(photo_id, TombstoneOp::Delete)
+        .await
+        .expect("delete");
+    publisher
+        .propagate_tombstone(photo_id, TombstoneOp::Restore)
+        .await
+        .expect("restore");
+
+    let bodies = stub.tx_bodies.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 2);
+
+    let (tx_type, payload) = tx_payload(&bodies[0]);
+    assert_eq!(tx_type, "photo_delete");
+    let (decoded, _) = bincode::serde::decode_from_slice::<
+        hopnet_photos::envelopes::PhotoDeletePayload,
+        _,
+    >(&payload, bincode::config::standard())
+    .expect("node must be able to decode the delete payload");
+    assert_eq!(decoded.entries.len(), 1);
+    assert_eq!(decoded.entries[0].photo_id.to_string(), photo_id);
+
+    let (tx_type, payload) = tx_payload(&bodies[1]);
+    assert_eq!(tx_type, "photo_restore");
+    let (decoded, _) = bincode::serde::decode_from_slice::<
+        hopnet_photos::envelopes::PhotoRestorePayload,
+        _,
+    >(&payload, bincode::config::standard())
+    .expect("node must be able to decode the restore payload");
+    assert_eq!(decoded.entries[0].photo_id.to_string(), photo_id);
+}
+
+// Impact: a 403 from the per-scope device-tx gate means "this device does
+// not hold the scope right now" — a claim or transfer fixes it, so the
+// tombstone must retry rather than burn straight to the cap.
+// Should: classify a gate rejection as transient.
+// Should not: treat an unparseable consensus id as retryable.
+#[tokio::test]
+async fn propagate_error_classification() {
+    let (stub, base_url) = start_stub().await;
+    let publisher = NodePublisher::new(&base_url, "device-token").unwrap();
+    let photo_id = "01912e5a-7b3c-7f21-a4d8-3e9f12ab34cd";
+
+    stub.tx_statuses.lock().unwrap().push_back(403);
+    let err = publisher
+        .propagate_tombstone(photo_id, TombstoneOp::Delete)
+        .await
+        .expect_err("gate refusal");
+    assert!(
+        matches!(err, PublishError::Transient(_)),
+        "403 must retry, got {err:?}"
+    );
+
+    let err = publisher
+        .propagate_tombstone("not-a-uuid", TombstoneOp::Delete)
+        .await
+        .expect_err("bad id");
+    assert!(
+        matches!(err, PublishError::Rejected(_)),
+        "malformed id is permanent, got {err:?}"
+    );
 }

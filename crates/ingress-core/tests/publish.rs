@@ -14,7 +14,8 @@ use ingress_core::fixtures::AssetDescriptorBuilder;
 use ingress_core::paths::DataDir;
 use ingress_core::publish::{
     PublishConfig, PublishError, PublishItem, PublishOutcome, PublishState, Publisher,
-    ResolveEntry, ResolveOutcome, Responsibility, claim_publishable, run_publish_pass,
+    ResolveEntry, ResolveOutcome, Responsibility, TombstoneOp, claim_publishable,
+    claim_tombstone_propagatable, run_publish_pass,
 };
 use ingress_core::scheduler::{
     BackoffConfig, CancelToken, FetchFailure, FetchRequest, FreeSpaceProbe, ResourceFetcher,
@@ -84,6 +85,10 @@ struct FakePublisher {
         Mutex<std::collections::HashMap<Option<String>, Result<ResolveOutcome, PublishError>>>,
     /// The (scope, cloud_id batch) pairs the pass sent to resolve.
     resolve_seen: Mutex<Vec<(Option<String>, Vec<String>)>>,
+    /// The (consensus id, direction) pairs the pass propagated, in order.
+    propagate_seen: Mutex<Vec<(String, TombstoneOp)>>,
+    /// Scripted propagation results, popped per call; empty = Ok.
+    propagate_scripted: Mutex<Vec<Result<(), PublishError>>>,
     gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 
@@ -103,8 +108,18 @@ impl FakePublisher {
             resolve_result: Mutex::new(None),
             resolve_results: Mutex::new(std::collections::HashMap::new()),
             resolve_seen: Mutex::new(Vec::new()),
+            propagate_seen: Mutex::new(Vec::new()),
+            propagate_scripted: Mutex::new(Vec::new()),
             gate: None,
         }
+    }
+
+    fn propagated(&self) -> Vec<(String, TombstoneOp)> {
+        self.propagate_seen.lock().unwrap().clone()
+    }
+
+    fn script_propagate(&self, results: Vec<Result<(), PublishError>>) {
+        *self.propagate_scripted.lock().unwrap() = results;
     }
 
     fn set_resolve(&self, result: Result<ResolveOutcome, PublishError>) {
@@ -168,6 +183,19 @@ impl Publisher for FakePublisher {
             },
         }
     }
+
+    async fn propagate_tombstone(
+        &self,
+        consensus_photo_id: &str,
+        op: TombstoneOp,
+    ) -> Result<(), PublishError> {
+        self.propagate_seen
+            .lock()
+            .unwrap()
+            .push((consensus_photo_id.to_string(), op));
+        let scripted = self.propagate_scripted.lock().unwrap().pop();
+        scripted.unwrap_or(Ok(()))
+    }
 }
 
 struct Rig {
@@ -223,7 +251,6 @@ async fn rig() -> Rig {
                     max: Duration::ZERO,
                 },
             },
-            ..SchedulerConfig::default()
         },
         _dirs: (blob_dir, data_tmp),
     }
@@ -318,12 +345,16 @@ async fn photo(rig: &Rig, id: &PhotoId) -> ingress_core::PhotoRecord {
 
 async fn pass(rig: &Rig, publisher: &FakePublisher, state: &mut PublishState) -> ingress_core::publish::PublishReport {
     let claimed = claim(rig).await;
+    let propagatable = claim_tombstone_propagatable(&rig.store, &rig.config.publish, &HashSet::new())
+        .await
+        .unwrap();
     run_publish_pass(
         &rig.store,
         &rig.data_dir.spool(),
         publisher,
         &rig.config.publish,
         claimed,
+        propagatable,
         state,
     )
         .await
@@ -1083,6 +1114,7 @@ async fn assemble_skips_mesh_unbound() {
         &publisher,
         &rig.config.publish,
         claimed,
+        Vec::new(),
         &mut state,
     )
     .await
@@ -1219,4 +1251,290 @@ async fn adoption_evicts_spool_bytes() {
     assert_eq!(publisher.calls.load(Ordering::Relaxed), 0, "zero uploads");
     assert_eq!(report.evicted_blobs, 1);
     assert!(!file.exists());
+}
+
+// ---------------------------------------------------- tombstone propagation
+
+/// Publish a photo, then tombstone it locally — the precondition for a
+/// pending delete.
+async fn publish_then_tombstone(
+    rig: &Rig,
+    publisher: &FakePublisher,
+    state: &mut PublishState,
+    local_id: &str,
+) -> PhotoId {
+    let id = materialize(rig, local_id, local_id.as_bytes()).await;
+    pass(rig, publisher, state).await;
+    sqlx::query("UPDATE photos SET deleted_at = ? WHERE photo_id = ?")
+        .bind(Utc::now())
+        .bind(&id)
+        .execute(rig.store.raw_pool())
+        .await
+        .unwrap();
+    id
+}
+
+// Impact: the mesh keeps serving a deleted photo until this fires, and the
+// only record that it still needs telling is the marker this stamps.
+// Should: submit photo_delete for a published photo tombstoned locally.
+// Should: converge — a second pass finds nothing left to say.
+#[tokio::test(flavor = "multi_thread")]
+async fn tombstone_propagates_once_and_converges() {
+    let rig = rig().await;
+    let publisher = FakePublisher::ok();
+    let mut state = PublishState::default();
+    let id = publish_then_tombstone(&rig, &publisher, &mut state, "gone").await;
+
+    let report = pass(&rig, &publisher, &mut state).await;
+    assert_eq!(report.tombstones_propagated, 1);
+    assert_eq!(
+        publisher.propagated(),
+        vec![(id.to_string(), TombstoneOp::Delete)]
+    );
+    assert!(photo(&rig, &id).await.tombstone_published_at.is_some());
+
+    let report = pass(&rig, &publisher, &mut state).await;
+    assert_eq!(report.tombstones_propagated, 0);
+    assert_eq!(publisher.propagated().len(), 1, "no re-submission");
+}
+
+// Impact: the resettable marker is the only thing that makes a delete →
+// restore → delete cycle converge; a set-once marker would strand the
+// second delete forever.
+// Should: submit photo_restore when the asset comes back from Recently
+// Deleted, then photo_delete again when it is deleted a second time.
+#[tokio::test(flavor = "multi_thread")]
+async fn restore_propagates_and_re_arms_the_next_delete() {
+    let rig = rig().await;
+    let publisher = FakePublisher::ok();
+    let mut state = PublishState::default();
+    let id = publish_then_tombstone(&rig, &publisher, &mut state, "cycle").await;
+    pass(&rig, &publisher, &mut state).await;
+
+    sqlx::query("UPDATE photos SET deleted_at = NULL WHERE photo_id = ?")
+        .bind(&id)
+        .execute(rig.store.raw_pool())
+        .await
+        .unwrap();
+    let report = pass(&rig, &publisher, &mut state).await;
+    assert_eq!(report.restores_propagated, 1);
+    assert!(photo(&rig, &id).await.tombstone_published_at.is_none());
+
+    sqlx::query("UPDATE photos SET deleted_at = ? WHERE photo_id = ?")
+        .bind(Utc::now())
+        .bind(&id)
+        .execute(rig.store.raw_pool())
+        .await
+        .unwrap();
+    let report = pass(&rig, &publisher, &mut state).await;
+    assert_eq!(report.tombstones_propagated, 1);
+
+    assert_eq!(
+        publisher.propagated(),
+        vec![
+            (id.to_string(), TombstoneOp::Delete),
+            (id.to_string(), TombstoneOp::Restore),
+            (id.to_string(), TombstoneOp::Delete),
+        ]
+    );
+}
+
+// Impact: an adopted photo lives in consensus under whichever device
+// published it first — deleting under the local id would silently no-op
+// against a photo that does not exist there.
+// Should: propagate under consensus_photo_id when the photo was adopted.
+#[tokio::test(flavor = "multi_thread")]
+async fn adopted_photo_propagates_under_the_consensus_id() {
+    const REMOTE: &str = "01912e5a-7b3c-7f21-a4d8-3e9f12ab34cd";
+    let rig = rig().await;
+    let id = materialize(&rig, "adopted", b"adopted-bytes").await;
+
+    let publisher = FakePublisher::ok();
+    publisher.set_resolve(Ok(outcome(
+        Responsibility::Holder,
+        vec![entry("cloud-adopted", "bb".repeat(32).as_str(), Some(REMOTE))],
+    )));
+    let mut state = PublishState::default();
+    pass(&rig, &publisher, &mut state).await;
+    assert_eq!(photo(&rig, &id).await.consensus_photo_id.as_deref(), Some(REMOTE));
+
+    sqlx::query("UPDATE photos SET deleted_at = ? WHERE photo_id = ?")
+        .bind(Utc::now())
+        .bind(&id)
+        .execute(rig.store.raw_pool())
+        .await
+        .unwrap();
+    pass(&rig, &publisher, &mut state).await;
+
+    assert_eq!(
+        publisher.propagated(),
+        vec![(REMOTE.to_string(), TombstoneOp::Delete)]
+    );
+}
+
+// Impact: the node's device-tx gate rejects any transaction touching a
+// scope this device does not hold, so propagation must park on the same
+// standing as publishing rather than burn attempts discovering 403s.
+// Should: hold the tombstone and consume no attempts when another device
+// holds responsibility.
+// Should not: submit anything to the publisher.
+#[tokio::test(flavor = "multi_thread")]
+async fn propagation_parks_when_another_device_is_responsible() {
+    let rig = rig().await;
+    let publisher = FakePublisher::ok();
+    let mut state = PublishState::default();
+    let id = publish_then_tombstone(&rig, &publisher, &mut state, "parked").await;
+
+    publisher.set_resolve(Ok(outcome(Responsibility::Other, Vec::new())));
+    let report = pass(&rig, &publisher, &mut state).await;
+
+    assert_eq!(report.tombstones_propagated, 0);
+    assert!(report.parked_responsibility);
+    assert!(publisher.propagated().is_empty());
+    let row = photo(&rig, &id).await;
+    assert_eq!(row.tombstone_publish_attempts, 0, "no attempts burned");
+    assert!(row.tombstone_published_at.is_none());
+}
+
+// Impact: a photo added and deleted between two passes must reach the mesh
+// before it is tombstoned there — a delete of a photo consensus has never
+// seen is a no-op, and the tombstone would be lost.
+// Should: publish before propagating within one scope.
+#[tokio::test(flavor = "multi_thread")]
+async fn publish_precedes_propagation_within_a_scope() {
+    let rig = rig().await;
+    let publisher = FakePublisher::ok();
+    let mut state = PublishState::default();
+    let old = publish_then_tombstone(&rig, &publisher, &mut state, "old").await;
+    let fresh = materialize(&rig, "fresh", b"fresh-bytes").await;
+
+    let report = pass(&rig, &publisher, &mut state).await;
+    assert_eq!(report.published, 1);
+    assert_eq!(report.tombstones_propagated, 1);
+    assert_eq!(publisher.seen.lock().unwrap().last(), Some(&fresh));
+    assert_eq!(
+        publisher.propagated(),
+        vec![(old.to_string(), TombstoneOp::Delete)]
+    );
+}
+
+// Should: back off with the tombstone ledger, leaving the publish ledger
+// untouched, when propagation fails transiently.
+// Should not: stamp the marker.
+#[tokio::test(flavor = "multi_thread")]
+async fn propagation_failure_uses_its_own_ledger() {
+    let rig = rig().await;
+    let publisher = FakePublisher::ok();
+    let mut state = PublishState::default();
+    let id = publish_then_tombstone(&rig, &publisher, &mut state, "flaky").await;
+
+    publisher.script_propagate(vec![Err(PublishError::Transient("nope".into()))]);
+    let report = pass(&rig, &publisher, &mut state).await;
+
+    assert_eq!(report.failed, 1);
+    assert_eq!(report.tombstones_propagated, 0);
+    let row = photo(&rig, &id).await;
+    assert_eq!(row.tombstone_publish_attempts, 1);
+    assert_eq!(row.tombstone_publish_last_error.as_deref(), Some("nope"));
+    assert_eq!(row.publish_attempts, 0, "publish ledger untouched");
+    assert!(row.publish_last_error.is_none());
+    assert!(row.tombstone_published_at.is_none());
+}
+
+// Impact: the shared half of the iCloud cutover depends on this path, and
+// the node's device-tx gate resolves a shared photo's scope from its
+// committed row — so a delete in a library this device does not hold is
+// rejected wholesale. The pass must partition tombstones by scope for the
+// same reason it partitions publishes.
+// Should: propagate personal and shared tombstones under their own scopes.
+// Should: park only the scope whose responsibility is held elsewhere,
+// leaving the other's tombstone told and its attempts unburned.
+#[tokio::test(flavor = "multi_thread")]
+async fn propagation_partitions_by_scope() {
+    let rig = rig().await;
+    add_shared_library(&rig, Some(MESH_LIB)).await;
+    let publisher = FakePublisher::ok();
+    let mut state = PublishState::default();
+
+    let personal = materialize(&rig, "p", b"p-bytes").await;
+    let shared = materialize_shared(&rig, "s", b"s-bytes").await;
+    pass(&rig, &publisher, &mut state).await;
+
+    sqlx::query("UPDATE photos SET deleted_at = ?")
+        .bind(Utc::now())
+        .execute(rig.store.raw_pool())
+        .await
+        .unwrap();
+
+    // Both scopes held: both tombstones travel, each under its own scope.
+    let report = pass(&rig, &publisher, &mut state).await;
+    assert_eq!(report.tombstones_propagated, 2);
+    let mut told: Vec<String> = publisher.propagated().into_iter().map(|(id, _)| id).collect();
+    told.sort();
+    let mut expected = vec![personal.to_string(), shared.to_string()];
+    expected.sort();
+    assert_eq!(told, expected);
+
+    // Re-arm both, then withhold responsibility for the shared scope only.
+    for id in [&personal, &shared] {
+        sqlx::query("UPDATE photos SET tombstone_published_at = NULL WHERE photo_id = ?")
+            .bind(id)
+            .execute(rig.store.raw_pool())
+            .await
+            .unwrap();
+    }
+    publisher.propagate_seen.lock().unwrap().clear();
+    publisher.set_resolve_for(Some(MESH_LIB), Ok(outcome(Responsibility::Other, Vec::new())));
+
+    let report = pass(&rig, &publisher, &mut state).await;
+    assert_eq!(report.tombstones_propagated, 1, "personal scope still moves");
+    assert!(report.parked_responsibility);
+    assert_eq!(
+        publisher.propagated(),
+        vec![(personal.to_string(), TombstoneOp::Delete)]
+    );
+    let shared_row = photo(&rig, &shared).await;
+    assert!(shared_row.tombstone_published_at.is_none());
+    assert_eq!(
+        shared_row.tombstone_publish_attempts, 0,
+        "a parked scope burns no attempts"
+    );
+}
+
+// Should: park the whole pass without burning attempts when the node goes
+// unreachable mid-propagation.
+#[tokio::test(flavor = "multi_thread")]
+async fn propagation_unreachable_parks_without_burning_attempts() {
+    let rig = rig().await;
+    let publisher = FakePublisher::ok();
+    let mut state = PublishState::default();
+    let id = publish_then_tombstone(&rig, &publisher, &mut state, "offline").await;
+
+    publisher.script_propagate(vec![Err(PublishError::NodeUnreachable("down".into()))]);
+    let report = pass(&rig, &publisher, &mut state).await;
+
+    assert!(report.parked);
+    assert_eq!(report.tombstones_propagated, 0);
+    let row = photo(&rig, &id).await;
+    assert_eq!(row.tombstone_publish_attempts, 0);
+    assert!(row.tombstone_published_at.is_none());
+}
+
+// Should: jump attempts straight to the cap on a permanent rejection, so a
+// malformed tombstone gives up instead of retrying forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn propagation_rejection_gives_up_immediately() {
+    let rig = rig().await;
+    let publisher = FakePublisher::ok();
+    let mut state = PublishState::default();
+    let id = publish_then_tombstone(&rig, &publisher, &mut state, "bad").await;
+
+    publisher.script_propagate(vec![Err(PublishError::Rejected("malformed".into()))]);
+    let report = pass(&rig, &publisher, &mut state).await;
+
+    assert_eq!(report.gave_up, 1);
+    assert_eq!(report.tombstones_propagated, 0);
+    let row = photo(&rig, &id).await;
+    assert_eq!(row.tombstone_publish_attempts, rig.config.publish.retry_cap);
+    assert!(row.tombstone_published_at.is_none());
 }

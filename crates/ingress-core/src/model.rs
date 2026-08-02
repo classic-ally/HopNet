@@ -168,6 +168,18 @@ pub struct PhotoRecord {
     pub consensus_photo_id: Option<String>,
 
     pub deleted_at: Option<DateTime<Utc>>,
+
+    /// What the mesh has been told about this photo's tombstone state, as
+    /// against `deleted_at`'s "what Apple Photos believes". The two
+    /// disagreeing IS the propagation queue (see §Propagation to the mesh).
+    ///
+    /// Deliberately RESETTABLE, unlike `published_at`: delete → restore →
+    /// delete is a legitimate cycle, and a restore clears this. Left set,
+    /// the next delete would read as already-converged and never propagate.
+    pub tombstone_published_at: Option<DateTime<Utc>>,
+    pub tombstone_publish_attempts: i64,
+    pub tombstone_publish_next_retry_at: Option<DateTime<Utc>>,
+    pub tombstone_publish_last_error: Option<String>,
 }
 
 /// A `photo_resources` row.

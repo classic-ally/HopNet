@@ -44,6 +44,7 @@ async fn fresh_migrate_creates_schema() {
             "idx_photos_group",
             "idx_photos_library",
             "idx_photos_pending",
+            "idx_photos_tombstone_pending",
             "idx_photos_unpublished",
         ]
     );
@@ -85,7 +86,7 @@ async fn migrate_is_idempotent() {
         .fetch_one(second.raw_pool())
         .await
         .unwrap();
-    assert_eq!(n, 8);
+    assert_eq!(n, 9);
 
     std::fs::remove_dir_all(&dir).ok();
 }
