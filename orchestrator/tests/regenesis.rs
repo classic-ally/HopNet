@@ -175,10 +175,20 @@ pub async fn recreate_node_with_env(
     for (k, v) in extra_env {
         unsafe { std::env::set_var(k, v) };
     }
-    let container_name = format!("hopnet-orchestrator-{mesh_id}-{node_id}");
-    let network_name = format!("hopnet-orchestrator-{mesh_id}-0");
-    let created =
-        crate::create_hopnet_container(docker, mesh_id, node_id, &container_name, &network_name, runtime).await;
+    // Go through `naming` rather than formatting the prefix here: resource
+    // names are per-checkout, so a literal `hopnet-orchestrator-` recreates
+    // the node onto a network this checkout never created.
+    let container_name = crate::naming::container_name(mesh_id, node_id);
+    let network_name = crate::naming::network_name(mesh_id);
+    let created = crate::create_hopnet_container(
+        docker,
+        mesh_id,
+        node_id,
+        &container_name,
+        &network_name,
+        runtime,
+    )
+    .await;
     for (k, _) in extra_env {
         unsafe { std::env::remove_var(k) };
     }
@@ -300,12 +310,7 @@ impl TestScenario for RegenesisRestart {
         "Freeze/abort, seal, exit 75, restart into epoch 2, decide new heights (RFC-019 S6)"
     }
 
-    async fn run(
-        &self,
-        mesh_id: u32,
-        nodes: &[NodeInfo],
-        _flags: &[String],
-    ) -> Result<TestResult> {
+    async fn run(&self, mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
         let mut result = TestResult::new();
         anyhow::ensure!(nodes.len() == 3, "regenesis-restart expects a 3-node mesh");
         let docker = Docker::connect_with_local_defaults()?;
@@ -313,7 +318,13 @@ impl TestScenario for RegenesisRestart {
         println!("\nRunning regenesis-restart checks:");
 
         // 1-2. Baseline traffic, attestations, same-version freeze.
-        upload_file(&nodes[0], "/", "pre-freeze.txt", b"before the boundary".to_vec()).await?;
+        upload_file(
+            &nodes[0],
+            "/",
+            "pre-freeze.txt",
+            b"before the boundary".to_vec(),
+        )
+        .await?;
         let Some(running) = attest_and_freeze(&mut result, nodes, None).await? else {
             return Ok(result);
         };
@@ -355,7 +366,13 @@ impl TestScenario for RegenesisRestart {
         let phase = regenesis_phase(&nodes[2]).await.unwrap_or_default();
         let reopened = status == 200 && phase == "normal";
         let tip_before = get_max_view(nodes).await.unwrap_or(0);
-        upload_file(&nodes[1], "/", "post-abort.txt", b"writes work again".to_vec()).await?;
+        upload_file(
+            &nodes[1],
+            "/",
+            "post-abort.txt",
+            b"writes work again".to_vec(),
+        )
+        .await?;
         let mut advanced = false;
         for _ in 0..20 {
             if get_max_view(nodes).await.unwrap_or(0) > tip_before {
@@ -536,12 +553,7 @@ impl TestScenario for RegenesisAwaitingUpgrade {
         "Upgrade-target seal parks nodes alive; per-node 'binary swap' completes epoch 2 (RFC-019 S6)"
     }
 
-    async fn run(
-        &self,
-        mesh_id: u32,
-        nodes: &[NodeInfo],
-        _flags: &[String],
-    ) -> Result<TestResult> {
+    async fn run(&self, mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
         let mut result = TestResult::new();
         anyhow::ensure!(
             nodes.len() == 3,
@@ -788,8 +800,9 @@ async fn cross_boundary(
     };
     let mut exit_codes = Vec::new();
     for node in participants {
-        exit_codes
-            .push(wait_for_exit_code(docker, mesh_id, node.node_id, Duration::from_secs(300)).await?);
+        exit_codes.push(
+            wait_for_exit_code(docker, mesh_id, node.node_id, Duration::from_secs(300)).await?,
+        );
     }
     let all_exited = exit_codes.iter().all(|c| *c == Some(75));
     print_and_add_check(
@@ -839,12 +852,7 @@ impl TestScenario for StragglerRejoin {
         "A node offline through a regenesis discovers, fetches, and rejoins epoch 2 (RFC-019 S7)"
     }
 
-    async fn run(
-        &self,
-        mesh_id: u32,
-        nodes: &[NodeInfo],
-        _flags: &[String],
-    ) -> Result<TestResult> {
+    async fn run(&self, mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
         let mut result = TestResult::new();
         anyhow::ensure!(nodes.len() == 3, "straggler-rejoin expects a 3-node mesh");
         let docker = Docker::connect_with_local_defaults()?;
@@ -852,7 +860,13 @@ impl TestScenario for StragglerRejoin {
         println!("\nRunning straggler-rejoin checks:");
 
         // Baseline traffic while everyone is present.
-        upload_file(&nodes[0], "/", "pre-boundary.txt", b"before the boundary".to_vec()).await?;
+        upload_file(
+            &nodes[0],
+            "/",
+            "pre-boundary.txt",
+            b"before the boundary".to_vec(),
+        )
+        .await?;
 
         // Node 2 goes down BEFORE the freeze and misses everything. The
         // remaining two are a majority of three, so the mesh stays live.
@@ -868,13 +882,20 @@ impl TestScenario for StragglerRejoin {
         );
 
         let participants = [nodes[0].clone(), nodes[1].clone()];
-        let Some((h, fresh)) = cross_boundary(&mut result, &docker, mesh_id, &participants, "2").await?
+        let Some((h, fresh)) =
+            cross_boundary(&mut result, &docker, mesh_id, &participants, "2").await?
         else {
             return Ok(result);
         };
 
         // New work lands in epoch 2 while the straggler is still away.
-        upload_file(&fresh[0], "/", "post-boundary.txt", b"after the boundary".to_vec()).await?;
+        upload_file(
+            &fresh[0],
+            "/",
+            "post-boundary.txt",
+            b"after the boundary".to_vec(),
+        )
+        .await?;
         let mut progressed = false;
         for _ in 0..60 {
             if decided_height(&fresh[0]).await.unwrap_or(0) > h {
@@ -970,19 +991,23 @@ impl TestScenario for DivergedNodeRebuild {
         "A node that fails its own boundary gate rebuilds from peers instead of wedging (RFC-019 S7)"
     }
 
-    async fn run(
-        &self,
-        mesh_id: u32,
-        nodes: &[NodeInfo],
-        _flags: &[String],
-    ) -> Result<TestResult> {
+    async fn run(&self, mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
         let mut result = TestResult::new();
-        anyhow::ensure!(nodes.len() == 3, "diverged-node-rebuild expects a 3-node mesh");
+        anyhow::ensure!(
+            nodes.len() == 3,
+            "diverged-node-rebuild expects a 3-node mesh"
+        );
         let docker = Docker::connect_with_local_defaults()?;
 
         println!("\nRunning diverged-node-rebuild checks:");
 
-        upload_file(&nodes[0], "/", "pre-boundary.txt", b"before the boundary".to_vec()).await?;
+        upload_file(
+            &nodes[0],
+            "/",
+            "pre-boundary.txt",
+            b"before the boundary".to_vec(),
+        )
+        .await?;
 
         // Node 2 is taken down before the freeze, like the straggler —
         // but here it will also be unable to cross on its own, because
@@ -993,7 +1018,8 @@ impl TestScenario for DivergedNodeRebuild {
         crate::tests::persistence::stop_node(&docker, mesh_id, diverged.node_id).await?;
 
         let participants = [nodes[0].clone(), nodes[1].clone()];
-        let Some((h, fresh)) = cross_boundary(&mut result, &docker, mesh_id, &participants, "2").await?
+        let Some((h, fresh)) =
+            cross_boundary(&mut result, &docker, mesh_id, &participants, "2").await?
         else {
             return Ok(result);
         };
@@ -1001,7 +1027,13 @@ impl TestScenario for DivergedNodeRebuild {
         // Cross a SECOND boundary, so the returning node is two epochs
         // behind: it must walk the lineage chain hop by hop and import
         // only the latest snapshot.
-        upload_file(&fresh[0], "/", "between-epochs.txt", b"epoch two work".to_vec()).await?;
+        upload_file(
+            &fresh[0],
+            "/",
+            "between-epochs.txt",
+            b"epoch two work".to_vec(),
+        )
+        .await?;
         let Some((h2, fresh2)) = cross_boundary(&mut result, &docker, mesh_id, &fresh, "3").await?
         else {
             return Ok(result);
@@ -1026,13 +1058,8 @@ impl TestScenario for DivergedNodeRebuild {
 
         // The absent node returns, two epochs behind.
         start_node(&docker, mesh_id, diverged.node_id).await?;
-        let code = wait_for_exit_code(
-            &docker,
-            mesh_id,
-            diverged.node_id,
-            Duration::from_secs(300),
-        )
-        .await?;
+        let code = wait_for_exit_code(&docker, mesh_id, diverged.node_id, Duration::from_secs(300))
+            .await?;
         print_and_add_check(
             &mut result,
             Check {
@@ -1111,12 +1138,7 @@ impl TestScenario for RegenesisRollback {
         "Abandon a crossed boundary, restore the retained epoch, and run again (RFC-019 S8)"
     }
 
-    async fn run(
-        &self,
-        mesh_id: u32,
-        nodes: &[NodeInfo],
-        _flags: &[String],
-    ) -> Result<TestResult> {
+    async fn run(&self, mesh_id: u32, nodes: &[NodeInfo], _flags: &[String]) -> Result<TestResult> {
         const TARGET: &str = "2026.8.1";
         let mut result = TestResult::new();
         anyhow::ensure!(nodes.len() == 3, "regenesis-rollback expects a 3-node mesh");
@@ -1124,7 +1146,13 @@ impl TestScenario for RegenesisRollback {
 
         println!("\nRunning regenesis-rollback checks:");
 
-        upload_file(&nodes[0], "/", "pre-rollback.txt", b"epoch one work".to_vec()).await?;
+        upload_file(
+            &nodes[0],
+            "/",
+            "pre-rollback.txt",
+            b"epoch one work".to_vec(),
+        )
+        .await?;
         let Some(_) = attest_and_freeze(&mut result, nodes, Some(TARGET)).await? else {
             return Ok(result);
         };
@@ -1224,9 +1252,8 @@ impl TestScenario for RegenesisRollback {
         for node in &nodes[1..] {
             let (status, body) = rollback(node).await?;
             anyhow::ensure!(status == 202, "parked rollback refused: {status} {body}");
-            let code =
-                wait_for_exit_code(&docker, mesh_id, node.node_id, Duration::from_secs(180))
-                    .await?;
+            let code = wait_for_exit_code(&docker, mesh_id, node.node_id, Duration::from_secs(180))
+                .await?;
             anyhow::ensure!(code == Some(75), "parked node did not restart: {code:?}");
             recreate_node_with_env(&docker, mesh_id, node.node_id, &[]).await?;
             fresh.push(reauth_node(&docker, mesh_id, node).await?);
@@ -1253,7 +1280,13 @@ impl TestScenario for RegenesisRollback {
         // is not a rollback. The committed Sealed phase refused every
         // submission, so this only passes because the boot path cleared
         // it on all three.
-        upload_file(&fresh[0], "/", "post-rollback.txt", b"the mesh lives".to_vec()).await?;
+        upload_file(
+            &fresh[0],
+            "/",
+            "post-rollback.txt",
+            b"the mesh lives".to_vec(),
+        )
+        .await?;
         let mut progressed = false;
         for _ in 0..90 {
             if decided_height(&fresh[0]).await.unwrap_or(0) > seal_height {
@@ -1329,7 +1362,9 @@ impl TestScenario for RegenesisRollback {
                 name: "Once the new epoch decides, the window closes and rollback is refused"
                     .to_string(),
                 passed: closed && status == 409,
-                detail: Some(format!("window closed: {closed}, rollback status: {status}")),
+                detail: Some(format!(
+                    "window closed: {closed}, rollback status: {status}"
+                )),
             },
         );
 
