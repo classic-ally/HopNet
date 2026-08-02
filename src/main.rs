@@ -168,6 +168,13 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             regenesis::boot::BootOutcome::Transitioned { epoch } => {
                 tracing::info!(epoch, "epoch boundary crossed at boot");
             }
+            regenesis::boot::BootOutcome::RolledBack { epoch } => {
+                tracing::warn!(
+                    epoch,
+                    "epoch boundary ABANDONED on operator request: running on the \
+                     retained database; the newer epoch's database is gone"
+                );
+            }
             regenesis::boot::BootOutcome::Parked(reason) => {
                 tracing::warn!(?reason, "epoch boundary parked — engine will not start");
                 rebuild_from_peers = matches!(

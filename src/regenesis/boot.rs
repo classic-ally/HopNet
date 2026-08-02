@@ -37,6 +37,12 @@ pub const SEALED_SUFFIX: &str = "sealed";
 /// committed state.
 pub const AWAITING_UPGRADE_FILENAME: &str = "awaiting-upgrade";
 
+/// Marker (beside the database) requesting that a pending or
+/// just-crossed epoch boundary be ABANDONED on the next boot — the
+/// operator's rollback request (RFC-019 S8). Honoured before every other
+/// boot path, and deleted only once the rollback is complete.
+pub const ROLLBACK_MARKER_FILENAME: &str = "rollback-epoch";
+
 #[derive(Debug)]
 pub enum BootOutcome {
     /// No boundary pending: normal boot.
@@ -44,6 +50,10 @@ pub enum BootOutcome {
     /// The boundary was crossed: `database.db` is now the epoch-`epoch`
     /// database and the engine will start at H+1.
     Transitioned { epoch: u64 },
+    /// A rollback request was honoured: the boundary was abandoned and
+    /// this node is back on `epoch`. DESTRUCTIVE — the newer epoch's
+    /// database is gone.
+    RolledBack { epoch: u64 },
     /// A gate refused; the node stays up on the OLD sealed database
     /// (HTTP + status served, engine parked by the sealed marker).
     Parked(ParkReason),
@@ -96,6 +106,32 @@ pub fn write_awaiting_marker(db_path: &str, required: u32) {
     }
 }
 
+pub fn rollback_marker_path(db_path: &str) -> PathBuf {
+    Path::new(db_path)
+        .parent()
+        .map(|p| p.join(ROLLBACK_MARKER_FILENAME))
+        .unwrap_or_else(|| PathBuf::from(ROLLBACK_MARKER_FILENAME))
+}
+
+/// Request that the next boot abandon the boundary. Durable and
+/// explicit: the operator's intent survives a crash, and the boot path
+/// owns the surgery.
+pub fn write_rollback_marker(db_path: &str) {
+    let path = rollback_marker_path(db_path);
+    if let Err(e) = std::fs::write(&path, "abandon the pending epoch boundary\n") {
+        tracing::error!(path = %path.display(), "rollback marker write failed: {e}");
+    }
+}
+
+/// Is there a boundary to abandon? True when a retained previous-epoch
+/// database exists (we crossed and the window is still open) or this
+/// database is sealed (we sealed but never crossed). False means a
+/// rollback request would be a no-op — the window closed, or there was
+/// never a boundary — and the route refuses rather than acting.
+pub fn rollback_available(db_path: &str, conn: &rusqlite::Connection) -> bool {
+    sealed_path(db_path).exists() || seal::sealed_marker(conn).is_some()
+}
+
 /// SQLite sidecars for a database file path.
 fn sidecars(path: &Path) -> [PathBuf; 2] {
     let base = path.to_string_lossy();
@@ -129,6 +165,16 @@ pub fn boot_transition(db_path: &str, running_code: u32) -> BootOutcome {
     let sealed = sealed_path(db_path);
     let awaiting = awaiting_upgrade_path(db_path);
 
+    // A rollback request outranks every other boot path (RFC-019 S8).
+    // BEFORE the missing-database dispatch, because a crash midway
+    // through a restore leaves exactly the state-D arrangement, which
+    // would otherwise be fatal; and before the staged-join branch,
+    // because a leftover staging would otherwise drag this node forward
+    // again immediately.
+    if let Some(outcome) = rollback_transition(db_path) {
+        return outcome;
+    }
+
     if !db.exists() {
         // State C: crashed between the two renames. The .next file is
         // complete by construction (built, committed, checkpointed and
@@ -154,11 +200,17 @@ pub fn boot_transition(db_path: &str, running_code: u32) -> BootOutcome {
         // State D: no live database, no complete build — but a retained
         // epoch database exists. Never boot fresh over a mesh identity.
         if sealed.exists() {
+            // A bare `mv` is NOT a rollback: the retained database still
+            // carries the sealed marker and the committed Sealed phase, so
+            // the next boot would re-cross the boundary (same binary) or
+            // park with no consensus (older binary). Point at the marker,
+            // which makes the boot path do it properly.
             return BootOutcome::Fatal(format!(
-                "database.db is missing but {} exists — manual recovery required \
-                 (to roll back: mv {} {db_path})",
+                "database.db is missing but {} exists — manual recovery required. \
+                 To abandon the boundary and return to the retained epoch, create \
+                 the rollback marker and restart: touch {}",
                 sealed.display(),
-                sealed.display()
+                rollback_marker_path(db_path).display()
             ));
         }
         // Fresh node: nothing to do.
@@ -310,6 +362,120 @@ pub fn boot_transition(db_path: &str, running_code: u32) -> BootOutcome {
         "epoch boundary crossed: fresh database installed, engine will start at H+1"
     );
     BootOutcome::Transitioned { epoch }
+}
+
+/// Abandon a pending or just-crossed epoch boundary (RFC-019 S8).
+/// Returns `None` when there is no rollback request to honour.
+///
+/// Restoring the retained database by hand is NOT enough: it still
+/// carries the sealed marker and the committed Sealed phase, so the very
+/// next boot would either re-cross the boundary (same binary — the
+/// silent-undo bug) or park with the engine refusing to start (older
+/// binary). Rolling back therefore means clearing that state too, which
+/// is what this owns.
+///
+/// Three arrangements, which together also make this resumable — the
+/// marker is deleted LAST, so a crash re-enters the machine one case
+/// further along:
+///
+/// 1. a retained database exists: discard the newer epoch's database,
+///    restore the retained one, clear its seal state;
+/// 2. no retained database but this one is sealed: the node sealed and
+///    parked without ever crossing — clear the seal state in place;
+/// 3. neither: nothing to abandon (the window closed, or the rollback
+///    already completed). Refuse, drop the marker, boot normally.
+///
+/// Clearing the committed `regenesis_state` row is a DELIBERATE mutation
+/// of consensus-committed state outside consensus. It is the only way the
+/// mesh runs again — a Sealed phase refuses every submission — and the
+/// spec sanctions it for exactly this window. Every node performs it
+/// identically, and the row is divergence-only, so it never enters the
+/// exported state hash. Recovery from a rollback is another regenesis,
+/// FORWARD; the abandoned boundary is never retried.
+fn rollback_transition(db_path: &str) -> Option<BootOutcome> {
+    let marker = rollback_marker_path(db_path);
+    if !marker.exists() {
+        return None;
+    }
+    let db = Path::new(db_path);
+    let sealed = sealed_path(db_path);
+
+    if sealed.exists() {
+        // Case 1. The epoch we are abandoning, named before its database
+        // is discarded, so its lineage record can go with it.
+        let abandoned = read_epoch_of(db_path).ok();
+        tracing::warn!(
+            retained = %sealed.display(),
+            abandoned_epoch = ?abandoned,
+            "rollback requested: discarding this epoch's database and restoring the retained one"
+        );
+        remove_with_sidecars(db);
+        if let Err(e) = std::fs::rename(&sealed, db) {
+            // Nothing else can proceed: the live database is gone and the
+            // retained one could not take its place.
+            return Some(BootOutcome::Fatal(format!(
+                "rollback: restoring {} -> {db_path}: {e}",
+                sealed.display()
+            )));
+        }
+        if let Some(epoch) = abandoned {
+            let dir = Path::new(db_path).parent().unwrap_or_else(|| Path::new("."));
+            // The abandoned boundary is not part of this mesh's history:
+            // keeping its record would have us answer a joiner with a
+            // lineage whose snapshot we then refuse to serve.
+            let _ = std::fs::remove_file(genesis::lineage_path(dir, epoch));
+        }
+    }
+
+    match clear_seal_state(db_path) {
+        Ok(true) => {}
+        Ok(false) if sealed.exists() => {}
+        Ok(false) => {
+            // Case 3: nothing was sealed and nothing was retained.
+            tracing::warn!(
+                "rollback requested but there is no boundary to abandon \
+                 (the window has closed, or the rollback already completed)"
+            );
+            if let Ok(mut slot) = BOUNDARY_ERROR.lock() {
+                *slot = Some("rollback: no boundary to abandon".to_string());
+            }
+            let _ = std::fs::remove_file(&marker);
+            return None;
+        }
+        Err(e) => return Some(BootOutcome::Fatal(format!("rollback: {e}"))),
+    }
+
+    // A staged join would otherwise carry this node straight back across.
+    crate::regenesis::join::clear_staging(&crate::regenesis::join::staging_path(db_path));
+    remove_with_sidecars(&next_path(db_path));
+    let _ = std::fs::remove_file(awaiting_upgrade_path(db_path));
+
+    let epoch = read_epoch_of(db_path).unwrap_or(1);
+    // LAST: until this is gone the rollback is still in progress.
+    let _ = std::fs::remove_file(&marker);
+    tracing::warn!(epoch, "rollback complete: the epoch boundary was abandoned");
+    Some(BootOutcome::RolledBack { epoch })
+}
+
+/// Clear the seal state from the database at `db_path`: the node-local
+/// sealed marker and the committed phase row. Returns whether anything
+/// was actually sealed. Idempotent — a resumed rollback re-runs it.
+fn clear_seal_state(db_path: &str) -> Result<bool, String> {
+    let conn = rusqlite::Connection::open(db_path).map_err(|e| format!("open: {e}"))?;
+    crate::db::shared::apply_connection_pragmas(&conn).map_err(|e| format!("pragmas: {e}"))?;
+    let was_sealed = seal::sealed_marker(&conn).is_some();
+    conn.execute(
+        "DELETE FROM consensus_meta WHERE key = ?",
+        [seal::META_SEALED_AT],
+    )
+    .map_err(|e| format!("clearing the sealed marker: {e}"))?;
+    // Plain DELETE rather than clear_to_normal_tx: absence is the
+    // canonical Normal encoding, so a second pass must not be an error.
+    conn.execute("DELETE FROM regenesis_state WHERE internal_id = 1", [])
+        .map_err(|e| format!("clearing the boundary phase: {e}"))?;
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .map_err(|e| format!("checkpoint: {e}"))?;
+    Ok(was_sealed)
 }
 
 /// How a swap failed: before anything moved (the old database is intact
@@ -1109,6 +1275,235 @@ pub(crate) mod tests {
             other => panic!("expected a normal boot, got {other:?}"),
         }
         assert!(!fx.staging.exists(), "redundant staging cleared");
+    }
+
+    // ------------------------------------------------------------------
+    // Rollback: abandoning a boundary (RFC-019 S8).
+    // ------------------------------------------------------------------
+
+    /// A node that has CROSSED: the S6 fixture put through the real
+    /// transition, so `database.db` is epoch 2 and `.sealed` is the
+    /// retained epoch-1 database.
+    fn crossed(dir: &Path) -> String {
+        let db_path = sealed_db(dir);
+        match boot_transition(&db_path, TARGET) {
+            BootOutcome::Transitioned { epoch: 2 } => {}
+            other => panic!("fixture failed to cross: {other:?}"),
+        }
+        db_path
+    }
+
+    fn seal_state_present(db_path: &str) -> (bool, i64) {
+        let conn = open(db_path);
+        (
+            seal::sealed_marker(&conn).is_some(),
+            count(&conn, "SELECT COUNT(*) FROM regenesis_state"),
+        )
+    }
+
+    // Impact: this is the escape hatch the spec promises for a bad epoch,
+    // and until now nothing had ever exercised it. A rollback that leaves
+    // the seal state behind is not a rollback — see the sibling test.
+    // Should: restore the retained database, return to the previous
+    // epoch, and clear both the sealed marker and the committed phase.
+    // Should not: keep the abandoned epoch's database or lineage record.
+    #[test]
+    fn rollback_restores_the_retained_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = crossed(dir.path());
+        assert!(sealed_path(&db_path).exists());
+        assert!(genesis::lineage_path(dir.path(), 2).exists());
+
+        write_rollback_marker(&db_path);
+        match boot_transition(&db_path, TARGET) {
+            BootOutcome::RolledBack { epoch: 1 } => {}
+            other => panic!("expected a rollback to epoch 1, got {other:?}"),
+        }
+
+        let conn = open(&db_path);
+        assert_eq!(genesis::current_epoch(&conn), 1);
+        assert_eq!(
+            hopnet_consensus::store::last_decided_height(&conn).unwrap(),
+            Some(Height(H)),
+            "back on the epoch-1 tip"
+        );
+        assert_eq!(seal_state_present(&db_path), (false, 0));
+        assert!(!sealed_path(&db_path).exists(), "retained database consumed");
+        assert!(
+            !genesis::lineage_path(dir.path(), 2).exists(),
+            "the abandoned boundary is not part of this mesh's history"
+        );
+        assert!(!rollback_marker_path(&db_path).exists());
+        assert!(!awaiting_upgrade_path(&db_path).exists());
+    }
+
+    // Impact: THIS is the bug that made a first-class mechanism
+    // necessary. Restoring the retained file by hand leaves the sealed
+    // marker and the committed Sealed phase in place, so the next boot
+    // re-runs the gates and silently crosses again — undoing the
+    // rollback with no diagnostic at all.
+    // Should: leave a rolled-back database that boots normally, forever.
+    // Should not: re-cross the boundary on any subsequent boot.
+    #[test]
+    fn a_rolled_back_database_does_not_re_cross() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = crossed(dir.path());
+        write_rollback_marker(&db_path);
+        assert!(matches!(
+            boot_transition(&db_path, TARGET),
+            BootOutcome::RolledBack { epoch: 1 }
+        ));
+
+        // Two more boots on the same binary that originally crossed.
+        for _ in 0..2 {
+            match boot_transition(&db_path, TARGET) {
+                BootOutcome::NoBoundary => {}
+                other => panic!("a rolled-back node must boot normally, got {other:?}"),
+            }
+        }
+        let conn = open(&db_path);
+        assert_eq!(genesis::current_epoch(&conn), 1);
+        assert!(!sealed_path(&db_path).exists());
+
+        // For contrast: the same restore WITHOUT clearing the seal state
+        // is what the old documented `mv` amounted to, and it re-crosses.
+        let dir2 = tempfile::tempdir().unwrap();
+        let db2 = crossed(dir2.path());
+        std::fs::remove_file(&db2).unwrap();
+        std::fs::rename(sealed_path(&db2), &db2).unwrap();
+        assert!(
+            matches!(
+                boot_transition(&db2, TARGET),
+                BootOutcome::Transitioned { epoch: 2 }
+            ),
+            "a bare file move re-crosses — which is why the marker exists"
+        );
+    }
+
+    // Impact: on an upgrade boundary the nodes that park never cross, so
+    // a whole-mesh rollback has to work for them too — otherwise the
+    // mesh is left half-abandoned and frozen.
+    // Should: clear the seal state in place when there is no retained
+    // database, returning the node to a normal epoch-1 boot.
+    #[test]
+    fn rollback_clears_a_parked_node_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = sealed_db(dir.path());
+        // Sealed for a version this binary does not run: parked, never
+        // crossed, so nothing is retained.
+        assert!(matches!(
+            boot_transition(&db_path, TARGET + 100),
+            BootOutcome::Parked(ParkReason::AwaitingUpgrade { .. })
+        ));
+        assert!(!sealed_path(&db_path).exists());
+        assert_eq!(seal_state_present(&db_path), (true, 1));
+
+        write_rollback_marker(&db_path);
+        match boot_transition(&db_path, TARGET + 100) {
+            BootOutcome::RolledBack { epoch: 1 } => {}
+            other => panic!("expected an in-place rollback, got {other:?}"),
+        }
+        assert_eq!(seal_state_present(&db_path), (false, 0));
+        // And it now boots normally even on the version it was sealed for.
+        assert!(matches!(
+            boot_transition(&db_path, TARGET),
+            BootOutcome::NoBoundary
+        ));
+    }
+
+    // Impact: the marker is deleted last precisely so a crash mid-restore
+    // resumes rather than wedging — and the half-restored arrangement is
+    // exactly the one state D would otherwise call fatal.
+    // Should: complete the rollback from either interruption point.
+    #[test]
+    fn rollback_resumes_after_a_crash() {
+        // Crash after discarding the live database, before the rename.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = crossed(dir.path());
+        write_rollback_marker(&db_path);
+        remove_with_sidecars(Path::new(&db_path));
+        assert!(sealed_path(&db_path).exists());
+        match boot_transition(&db_path, TARGET) {
+            BootOutcome::RolledBack { epoch: 1 } => {}
+            other => panic!("expected a resumed rollback, got {other:?}"),
+        }
+        assert_eq!(seal_state_present(&db_path), (false, 0));
+
+        // Crash after the rename, before the seal state was cleared.
+        let dir2 = tempfile::tempdir().unwrap();
+        let db2 = crossed(dir2.path());
+        write_rollback_marker(&db2);
+        std::fs::remove_file(&db2).unwrap();
+        std::fs::rename(sealed_path(&db2), &db2).unwrap();
+        assert_eq!(seal_state_present(&db2), (true, 1), "seal state still there");
+        match boot_transition(&db2, TARGET) {
+            BootOutcome::RolledBack { epoch: 1 } => {}
+            other => panic!("expected the in-place completion, got {other:?}"),
+        }
+        assert_eq!(seal_state_present(&db2), (false, 0));
+    }
+
+    // Impact: a stale or mistaken rollback request must not be
+    // destructive — the window closing is the forward-only clause, and
+    // past it there is nothing to go back to.
+    // Should: refuse, drop the marker, surface the reason, boot normally.
+    // Should not: touch the database.
+    #[test]
+    fn rollback_refused_when_there_is_no_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = crossed(dir.path());
+        // The window closed: the cleanup task deleted the retained file.
+        std::fs::remove_file(sealed_path(&db_path)).unwrap();
+        let before = std::fs::read(&db_path).unwrap();
+
+        write_rollback_marker(&db_path);
+        match boot_transition(&db_path, TARGET) {
+            BootOutcome::NoBoundary => {}
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(!rollback_marker_path(&db_path).exists(), "marker dropped");
+        assert_eq!(std::fs::read(&db_path).unwrap(), before, "database untouched");
+        assert!(
+            boundary_error().is_some_and(|e| e.contains("no boundary to abandon")),
+            "the refusal is surfaced"
+        );
+    }
+
+    // Impact: a staged join would otherwise carry a just-rolled-back node
+    // straight back across the boundary it was told to abandon.
+    // Should: clear join staging as part of the rollback.
+    #[test]
+    fn rollback_clears_staged_join_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = crossed(dir.path());
+        let staging = crate::regenesis::join::staging_path(&db_path);
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("snapshot.bin.partial"), b"stale").unwrap();
+
+        write_rollback_marker(&db_path);
+        assert!(matches!(
+            boot_transition(&db_path, TARGET),
+            BootOutcome::RolledBack { epoch: 1 }
+        ));
+        assert!(!staging.exists(), "staged join discarded with the boundary");
+    }
+
+    // Should: report a boundary as available to abandon while retained or
+    // sealed, and not otherwise — the route's precondition.
+    #[test]
+    fn rollback_availability_tracks_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let sealed = sealed_db(dir.path());
+        // Sealed but not yet crossed.
+        assert!(rollback_available(&sealed, &open(&sealed)));
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let db2 = crossed(dir2.path());
+        // Crossed, window open (retained database present).
+        assert!(rollback_available(&db2, &open(&db2)));
+        // Window closed.
+        std::fs::remove_file(sealed_path(&db2)).unwrap();
+        assert!(!rollback_available(&db2, &open(&db2)));
     }
 
     // Impact: this is the boundary itself — every assertion here is a
