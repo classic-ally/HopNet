@@ -141,7 +141,10 @@ pub fn mesh_creation_env(test_name: &str) -> Vec<(&'static str, &'static str)> {
         // 2026.8.1 staged (the start precondition) without a second image;
         // nodes then park awaiting-upgrade and are recreated one by one
         // with the running-version override — the "binary swap".
-        "regenesis-awaiting-upgrade" => vec![
+        // The rollback drill drives the same upgrade-target boundary:
+        // it needs a staged claim to seal for, and the crossed node is
+        // where the window opens.
+        "regenesis-awaiting-upgrade" | "regenesis-rollback" => vec![
             (
                 "HOPNET_GENESIS_CONSENSUS_POLICY",
                 "probe_base=2;grace=1;s_full=6;p_prove=6",
@@ -217,7 +220,8 @@ pub fn preferred_auto_nodes(test_name: &str) -> Option<u32> {
         "regenesis-restart"
         | "regenesis-awaiting-upgrade"
         | "straggler-rejoin"
-        | "diverged-node-rebuild" => Some(3),
+        | "diverged-node-rebuild"
+        | "regenesis-rollback" => Some(3),
         _ => None,
     }
 }
@@ -351,6 +355,11 @@ pub async fn run_test_by_name(
         }
         "diverged-node-rebuild" => {
             regenesis::DivergedNodeRebuild
+                .run(mesh_id, nodes, flags)
+                .await
+        }
+        "regenesis-rollback" => {
+            regenesis::RegenesisRollback
                 .run(mesh_id, nodes, flags)
                 .await
         }
@@ -514,6 +523,7 @@ pub fn list_test_names() -> Vec<&'static str> {
         "regenesis-awaiting-upgrade",
         "straggler-rejoin",
         "diverged-node-rebuild",
+        "regenesis-rollback",
         "mesh-growth",
         "auto-seam",
         "three-timescales",

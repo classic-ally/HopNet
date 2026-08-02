@@ -1042,3 +1042,243 @@ impl TestScenario for DivergedNodeRebuild {
         Ok(result)
     }
 }
+
+/// Rollback drill (RFC-019 S8): the escape hatch for a bad epoch. The
+/// mesh seals for an upgrade target, one node crosses into epoch 2, and
+/// then the whole mesh is told to ABANDON the boundary and come back on
+/// its retained epoch-1 databases — after which it must actually RUN
+/// again, not merely survive. Then the negative half: once the window
+/// has closed, rollback is correctly refused.
+pub struct RegenesisRollback;
+
+async fn rollback(node: &NodeInfo) -> Result<(u16, String)> {
+    post_json(node, "/api/consensus/regenesis/rollback", None).await
+}
+
+impl TestScenario for RegenesisRollback {
+    fn name(&self) -> &'static str {
+        "regenesis-rollback"
+    }
+
+    fn description(&self) -> &'static str {
+        "Abandon a crossed boundary, restore the retained epoch, and run again (RFC-019 S8)"
+    }
+
+    async fn run(
+        &self,
+        mesh_id: u32,
+        nodes: &[NodeInfo],
+        _flags: &[String],
+    ) -> Result<TestResult> {
+        const TARGET: &str = "2026.8.1";
+        let mut result = TestResult::new();
+        anyhow::ensure!(nodes.len() == 3, "regenesis-rollback expects a 3-node mesh");
+        let docker = Docker::connect_with_local_defaults()?;
+
+        println!("\nRunning regenesis-rollback checks:");
+
+        upload_file(&nodes[0], "/", "pre-rollback.txt", b"epoch one work".to_vec()).await?;
+        let Some(_) = attest_and_freeze(&mut result, nodes, Some(TARGET)).await? else {
+            return Ok(result);
+        };
+        let Some(seal_height) = wait_sealed_everywhere(nodes).await? else {
+            print_and_add_check(
+                &mut result,
+                Check {
+                    name: "Upgrade-target moratorium seals on its own".to_string(),
+                    passed: false,
+                    detail: Some("never sealed".to_string()),
+                },
+            );
+            return Ok(result);
+        };
+
+        // Cross exactly ONE node. This is the drill's entry position and
+        // it is stable: with no quorum of the carried set booted, nothing
+        // decides, so the rollback window stays open indefinitely. Do NOT
+        // try to hold it with a timer — on a real upgrade boundary a live
+        // quorum closes the window in ~15s, because the version
+        // attestation job decides H+1 as soon as it can.
+        recreate_node_with_env(
+            &docker,
+            mesh_id,
+            nodes[0].node_id,
+            &[("HOPNET_UPGRADE_VERSION_OVERRIDE", TARGET)],
+        )
+        .await?;
+        let node0 = reauth_node(&docker, mesh_id, &nodes[0]).await?;
+        let v = regenesis_status(&node0).await?;
+        let in_window = v["epoch"].as_str() == Some("2")
+            && v["rollback_retained"].as_bool() == Some(true)
+            && decided_height(&node0).await.unwrap_or(0) == seal_height;
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "One node crosses into epoch 2 with the rollback window open".to_string(),
+                passed: in_window,
+                detail: Some(format!(
+                    "epoch {:?}, retained {:?}, H={seal_height}",
+                    v["epoch"], v["rollback_retained"]
+                )),
+            },
+        );
+        if !in_window {
+            return Ok(result);
+        }
+
+        // Abandon it. The node writes its own marker and restarts; the
+        // boot path discards the epoch-2 database and restores the
+        // retained one.
+        let (status, body) = rollback(&node0).await?;
+        anyhow::ensure!(status == 202, "rollback refused: {status} {body}");
+        let code =
+            wait_for_exit_code(&docker, mesh_id, node0.node_id, Duration::from_secs(180)).await?;
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Rollback request restarts the crossed node".to_string(),
+                passed: code == Some(75),
+                detail: Some(format!("exit code: {code:?}")),
+            },
+        );
+        if code != Some(75) {
+            return Ok(result);
+        }
+        start_node(&docker, mesh_id, node0.node_id).await?;
+        let node0 = reauth_node(&docker, mesh_id, &node0).await?;
+        let v = regenesis_status(&node0).await?;
+        let restored = v["epoch"].as_str() == Some("1")
+            && v["phase"].as_str() == Some("normal")
+            && v["rollback_retained"].as_bool() == Some(false)
+            && v["boundary_error"].is_null();
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "It comes back on the retained epoch, with the seal cleared".to_string(),
+                passed: restored,
+                detail: Some(format!(
+                    "epoch {:?}, phase {:?}, retained {:?}, boundary_error {:?}",
+                    v["epoch"], v["phase"], v["rollback_retained"], v["boundary_error"]
+                )),
+            },
+        );
+
+        // The other two never crossed — they are parked ALIVE on their
+        // epoch-1 databases, so the same request abandons the seal in
+        // place. Recreate them without the version override: the whole
+        // mesh is going back to the version it was running.
+        let mut fresh = vec![node0];
+        for node in &nodes[1..] {
+            let (status, body) = rollback(node).await?;
+            anyhow::ensure!(status == 202, "parked rollback refused: {status} {body}");
+            let code =
+                wait_for_exit_code(&docker, mesh_id, node.node_id, Duration::from_secs(180))
+                    .await?;
+            anyhow::ensure!(code == Some(75), "parked node did not restart: {code:?}");
+            recreate_node_with_env(&docker, mesh_id, node.node_id, &[]).await?;
+            fresh.push(reauth_node(&docker, mesh_id, node).await?);
+        }
+        let mut epochs = Vec::new();
+        for node in &fresh {
+            epochs.push(
+                regenesis_status(node).await?["epoch"]
+                    .as_str()
+                    .unwrap_or("?")
+                    .to_string(),
+            );
+        }
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "The whole mesh is back on epoch 1".to_string(),
+                passed: epochs.iter().all(|e| e == "1"),
+                detail: Some(format!("epochs: {epochs:?}")),
+            },
+        );
+
+        // THE check that matters: a rollback that leaves the mesh frozen
+        // is not a rollback. The committed Sealed phase refused every
+        // submission, so this only passes because the boot path cleared
+        // it on all three.
+        upload_file(&fresh[0], "/", "post-rollback.txt", b"the mesh lives".to_vec()).await?;
+        let mut progressed = false;
+        for _ in 0..90 {
+            if decided_height(&fresh[0]).await.unwrap_or(0) > seal_height {
+                progressed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "The rolled-back mesh accepts writes and decides again".to_string(),
+                passed: progressed,
+                detail: Some(format!("H was {seal_height}")),
+            },
+        );
+        let snapshots = fetch_state_snapshots(&fresh).await?;
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Rolled-back replicas agree".to_string(),
+                passed: snapshots.windows(2).all(|w| w[0] == w[1]),
+                detail: None,
+            },
+        );
+        if !progressed {
+            return Ok(result);
+        }
+
+        // Negative half: recovery from a rollback is another regenesis,
+        // FORWARD. Take the mesh across a same-version boundary, let it
+        // decide past H, and the window is gone for good.
+        let Some(_) = attest_and_freeze(&mut result, &fresh, None).await? else {
+            return Ok(result);
+        };
+        let mut exits = Vec::new();
+        for node in &fresh {
+            exits.push(
+                wait_for_exit_code(&docker, mesh_id, node.node_id, Duration::from_secs(300))
+                    .await?,
+            );
+        }
+        anyhow::ensure!(
+            exits.iter().all(|c| *c == Some(75)),
+            "second boundary did not seal: {exits:?}"
+        );
+        let mut reborn = Vec::new();
+        for node in &fresh {
+            start_node(&docker, mesh_id, node.node_id).await?;
+            reborn.push(reauth_node(&docker, mesh_id, node).await?);
+        }
+        upload_file(&reborn[0], "/", "epoch-two.txt", b"forward only".to_vec()).await?;
+        let h2 = regenesis_status(&reborn[0]).await?["seal_height"]
+            .as_str()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        let mut closed = false;
+        for _ in 0..90 {
+            let v = regenesis_status(&reborn[0]).await?;
+            if v["rollback_retained"].as_bool() == Some(false)
+                && decided_height(&reborn[0]).await.unwrap_or(0) > h2
+            {
+                closed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        let (status, _) = rollback(&reborn[0]).await?;
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Once the new epoch decides, the window closes and rollback is refused"
+                    .to_string(),
+                passed: closed && status == 409,
+                detail: Some(format!("window closed: {closed}, rollback status: {status}")),
+            },
+        );
+
+        Ok(result)
+    }
+}
