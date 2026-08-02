@@ -242,9 +242,11 @@ pub fn read_policy(conn: &Connection) -> Result<crate::membership::ConsensusPoli
 }
 
 /// Install a decided (block, certificate) pair outside the engine's decide
-/// path. Genesis installation only: height 0 with the synthetic trusted
-/// certificate, plus `last_decided_height`. Everything after height 0 must go
-/// through the engine.
+/// path. Genesis installation only, at the block's own height — 0 for a
+/// fresh epoch-1 mesh, the boundary height H for an epoch-N+1 regenesis
+/// genesis (RFC-019: heights are continuous across epochs) — with the
+/// synthetic trusted certificate, plus `last_decided_height`. Everything
+/// after the genesis height must go through the engine.
 pub fn install_genesis(
     conn: &Connection,
     block: &Block,
@@ -252,17 +254,18 @@ pub fn install_genesis(
 ) -> Result<(), StoreError> {
     let block_bytes = codec::encode(block).map_err(StoreError::Codec)?;
     let cert_bytes = codec::encode(cert).map_err(StoreError::Codec)?;
+    let height = Height(block.data.height).as_db();
     conn.execute(
-        "INSERT INTO decided_blocks (height, block_hash, round, block) VALUES (0, ?, 0, ?)",
-        rusqlite::params![block.block_hash, block_bytes],
+        "INSERT INTO decided_blocks (height, block_hash, round, block) VALUES (?, ?, 0, ?)",
+        rusqlite::params![height, block.block_hash, block_bytes],
     )?;
     conn.execute(
-        "INSERT INTO decided_certificates (height, block_hash, round, certificate) VALUES (0, ?, 0, ?)",
-        rusqlite::params![block.block_hash, cert_bytes],
+        "INSERT INTO decided_certificates (height, block_hash, round, certificate) VALUES (?, ?, 0, ?)",
+        rusqlite::params![height, block.block_hash, cert_bytes],
     )?;
     conn.execute(
-        "INSERT OR REPLACE INTO consensus_meta (key, value) VALUES (?, 0)",
-        [META_LAST_DECIDED],
+        "INSERT OR REPLACE INTO consensus_meta (key, value) VALUES (?, ?)",
+        rusqlite::params![META_LAST_DECIDED, height],
     )?;
     Ok(())
 }
@@ -475,5 +478,69 @@ impl<C: DerefMut<Target = Connection> + 'static> Storage for SqliteStorage<C> {
 
     fn apply_error(e: ApplyError) -> StoreError {
         StoreError::Apply(e.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Blake3Hash, Block, BlockData, Transactions};
+
+    fn fresh_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        install_schema(&conn).unwrap();
+        conn
+    }
+
+    fn block_at(height: u64, parent: Option<Blake3Hash>) -> Block {
+        Block::new(BlockData {
+            height,
+            round: 0,
+            parent_hash: parent,
+            transactions: Transactions(Vec::new()),
+        })
+        .unwrap()
+    }
+
+    // Impact: RFC-019 heights are continuous across epochs — the epoch-N+1
+    // genesis sits at the boundary height H, not 0, and every boot reader
+    // derives the start height from what this writes.
+    // Should: install the genesis pair at the block's own height and report
+    // that height as last decided.
+    #[test]
+    fn install_genesis_at_boundary_height() {
+        let conn = fresh_conn();
+        let h = 41_u64;
+        let block = block_at(h, Some(Blake3Hash::new(blake3::hash(b"epoch-n-final"))));
+        let cert = WireCommitCertificate {
+            height: h,
+            round: 0,
+            value_id: block.block_hash,
+            signatures: Vec::new(),
+        };
+        install_genesis(&conn, &block, &cert).unwrap();
+
+        assert_eq!(last_decided_height(&conn).unwrap(), Some(Height(h)));
+        let pairs = decided_range(&conn, Height(h), Height(h)).unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0.block_hash, block.block_hash);
+        assert_eq!(pairs[0].1.value_id, block.block_hash);
+    }
+
+    // Should: keep the fresh-mesh path byte-for-byte — a height-0 genesis
+    // installs at 0 with last decided 0.
+    #[test]
+    fn install_genesis_at_height_zero_unchanged() {
+        let conn = fresh_conn();
+        let block = block_at(0, None);
+        let cert = WireCommitCertificate {
+            height: 0,
+            round: 0,
+            value_id: block.block_hash,
+            signatures: Vec::new(),
+        };
+        install_genesis(&conn, &block, &cert).unwrap();
+        assert_eq!(last_decided_height(&conn).unwrap(), Some(Height(0)));
+        assert_eq!(decided_range(&conn, Height(0), Height(0)).unwrap().len(), 1);
     }
 }
