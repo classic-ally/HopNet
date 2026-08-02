@@ -410,6 +410,10 @@ async fn post_transaction(
 #[derive(Deserialize)]
 struct IngressClaimBody {
     device_id: hopnet_common::CustomUUID,
+    /// Claim scope: absent = the personal partition, present = a shared
+    /// library the caller belongs to.
+    #[serde(default)]
+    library_id: Option<hopnet_common::CustomUUID>,
 }
 
 /// Claim (or transfer) ingress responsibility to one of the caller's
@@ -439,10 +443,25 @@ async fn post_ingress_claim(
         ));
     }
 
+    // Friendly pre-check only — the handler re-validates membership
+    // deterministically against consensus state.
+    if let Some(lib) = body.library_id.clone() {
+        let pool = state.db_pool.clone();
+        let member = tokio::task::spawn_blocking(move || {
+            super::query::is_library_member(&pool, uid, &lib)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        if !member {
+            return Err((StatusCode::FORBIDDEN, "not a member of this library".into()));
+        }
+    }
+
     let payload = hopnet_photos::envelopes::PhotoIngressClaimPayload {
         device_id: body.device_id,
         operation_id: hopnet_common::CustomUUID::new(None),
-        library_id: None,
+        library_id: body.library_id,
     };
     let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -458,8 +477,18 @@ async fn post_ingress_claim(
 }
 
 #[derive(Serialize)]
+struct IngressLibraryResponsibility {
+    library_id: String,
+    device_id: String,
+}
+
+/// Shape is additive on the v1 personal-only response: `device_id` keeps
+/// its meaning (personal-scope holder) and `libraries` lists the per-
+/// shared-library holders.
+#[derive(Serialize)]
 struct IngressResponsibilityResponse {
     device_id: Option<String>,
+    libraries: Vec<IngressLibraryResponsibility>,
 }
 
 async fn get_ingress_responsibility(
@@ -467,14 +496,27 @@ async fn get_ingress_responsibility(
     Extension(uid): Extension<i32>,
 ) -> Result<Json<IngressResponsibilityResponse>, (StatusCode, String)> {
     let pool = state.db_pool.clone();
-    let holder =
-        tokio::task::spawn_blocking(move || super::query::read_ingress_responsibility(&pool, uid))
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    Ok(Json(IngressResponsibilityResponse {
-        device_id: holder.map(|d| d.to_string()),
-    }))
+    let rows = tokio::task::spawn_blocking(move || {
+        super::query::read_ingress_responsibilities(&pool, uid)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let mut response = IngressResponsibilityResponse {
+        device_id: None,
+        libraries: Vec::new(),
+    };
+    for (scope, device) in rows {
+        match scope {
+            None => response.device_id = Some(device.to_string()),
+            Some(lib) => response.libraries.push(IngressLibraryResponsibility {
+                library_id: lib.to_string(),
+                device_id: device.to_string(),
+            }),
+        }
+    }
+    Ok(Json(response))
 }
 
 // --- Shared-library membership lifecycle (JWT) ---
@@ -993,12 +1035,70 @@ async fn post_client_data_block(
     Ok((StatusCode::CREATED, Json(uploaded)))
 }
 
+/// Distinct library scopes a device tx will touch (None = the personal
+/// partition). photo_add carries the scope explicitly per entry; every
+/// other device tx targets committed photos, whose scope comes from the
+/// photos table (unknown photo ids contribute no scope — the handler's
+/// deterministic NotFound is the backstop). Decode failure is a 400: the
+/// handler would reject the same bytes anyway.
+fn device_tx_scopes(
+    tx_type: &str,
+    payload: &[u8],
+    pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+) -> Result<Vec<Option<hopnet_common::CustomUUID>>, (StatusCode, String)> {
+    use hopnet_photos::envelopes as env;
+    let cfg = bincode::config::standard();
+    let bad =
+        |e: bincode::error::DecodeError| (StatusCode::BAD_REQUEST, format!("undecodable payload: {e}"));
+
+    macro_rules! entry_photo_ids {
+        ($ty:ty) => {{
+            let (p, _) = bincode::serde::decode_from_slice::<$ty, _>(payload, cfg).map_err(bad)?;
+            p.entries.into_iter().map(|e| e.photo_id).collect()
+        }};
+    }
+
+    let photo_ids: Vec<hopnet_common::CustomUUID> = match tx_type {
+        "photo_add" => {
+            let (p, _) = bincode::serde::decode_from_slice::<env::PhotoAddPayload, _>(payload, cfg)
+                .map_err(bad)?;
+            let mut scopes: Vec<Option<hopnet_common::CustomUUID>> = Vec::new();
+            for entry in p.entries {
+                if !scopes.contains(&entry.library_id) {
+                    scopes.push(entry.library_id);
+                }
+            }
+            return Ok(scopes);
+        }
+        "photo_delete" => entry_photo_ids!(env::PhotoDeletePayload),
+        "photo_restore" => entry_photo_ids!(env::PhotoRestorePayload),
+        "photo_edit_content" => entry_photo_ids!(env::PhotoEditContentPayload),
+        "photo_edit_metadata" => entry_photo_ids!(env::PhotoEditMetadataPayload),
+        "photo_undo" => entry_photo_ids!(env::PhotoUndoPayload),
+        "photo_favorite" => entry_photo_ids!(env::PhotoFavoritePayload),
+        "photo_unfavorite" => entry_photo_ids!(env::PhotoUnfavoritePayload),
+        other => {
+            // Unreachable behind the DEVICE_TX_FUNCTIONS check; refuse
+            // rather than silently passing an ungated tx kind.
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("tx_type not device-submittable: {other}"),
+            ));
+        }
+    };
+    super::query::read_photo_library_scopes(pool, &photo_ids)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
 /// Device-route mutations are double-gated beyond the shared contract:
 /// (a) tx_type must be device-submittable (no self-claims), (b) the authed
-/// device must hold ingress responsibility. The 403 body is machine-
-/// parseable (`ingress_not_responsible:{other|unclaimed}`) — a well-behaved
-/// daemon parks on the resolve pre-pass and never hits this; it exists as
-/// the admission backstop, with the fingerprint UNIQUE pair behind it.
+/// device must hold ingress responsibility for EVERY scope the tx touches
+/// — holding the personal claim must not admit writes into a shared
+/// library and vice versa (stale-daemon protection is the point of this
+/// gate). The 403 body is machine-parseable
+/// (`ingress_not_responsible:{other|unclaimed}`) — a well-behaved daemon
+/// parks on the resolve pre-pass and never hits this; it exists as the
+/// admission backstop, with the fingerprint UNIQUE pair behind it.
 async fn post_client_transaction(
     State(state): State<AppState>,
     Extension(uid): Extension<i32>,
@@ -1013,26 +1113,34 @@ async fn post_client_transaction(
     }
 
     let pool = state.db_pool.clone();
-    let holder =
-        tokio::task::spawn_blocking(move || super::query::read_ingress_responsibility(&pool, uid))
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    let tx_type = body.tx_type.clone();
+    let payload = body.payload.clone();
+    let device_id = device.0.clone();
+    tokio::task::spawn_blocking(move || {
+        let scopes = device_tx_scopes(&tx_type, &payload, &pool)?;
+        let held = super::query::read_ingress_responsibilities(&pool, uid)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    match holder {
-        Some(h) if h == device.0 => {}
-        Some(_) => {
-            return Err((
-                StatusCode::FORBIDDEN,
-                "ingress_not_responsible:other".into(),
-            ));
+        for scope in scopes {
+            match held.iter().find(|(s, _)| *s == scope) {
+                Some((_, holder)) if *holder == device_id => {}
+                Some(_) => {
+                    return Err((
+                        StatusCode::FORBIDDEN,
+                        "ingress_not_responsible:other".into(),
+                    ));
+                }
+                None => {
+                    return Err((
+                        StatusCode::FORBIDDEN,
+                        "ingress_not_responsible:unclaimed".into(),
+                    ));
+                }
+            }
         }
-        None => {
-            return Err((
-                StatusCode::FORBIDDEN,
-                "ingress_not_responsible:unclaimed".into(),
-            ));
-        }
-    }
+        Ok(())
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
 
     submit_photos_transaction(state, uid, body).await
 }
@@ -1045,6 +1153,12 @@ const RESOLVE_MAX_IDS: usize = 500;
 #[derive(Deserialize)]
 struct ResolveBody {
     cloud_ids: Vec<String>,
+    /// Resolve scope: absent = the personal partition (per-user
+    /// fingerprint key), present = a shared library (library-scoped key —
+    /// every member derives the same one, which is what makes the lookup
+    /// match ANY member's committed photos).
+    #[serde(default)]
+    library_id: Option<hopnet_common::CustomUUID>,
 }
 
 #[derive(Serialize)]
@@ -1085,11 +1199,54 @@ async fn post_client_resolve(
         .get_session(uid)
         .await
         .map_err(|s| (s, "no session".into()))?;
-    let fp_key = crate::auth::derive_photo_fingerprint_key(&session.user_keys.private_key);
 
+    // Scope selects the fingerprint key: the per-user key for the
+    // personal partition, the library-scoped key (derived from the
+    // caller's own library-key wrap) for a shared library. Both derives
+    // need only the session, which the device-token middleware
+    // bootstrapped.
     let pool = state.db_pool.clone();
+    let library_id = body.library_id.clone();
+    let fp_key = match &library_id {
+        None => crate::auth::derive_photo_fingerprint_key(&session.user_keys.private_key),
+        Some(lib) => {
+            let member_pool = state.db_pool.clone();
+            let (member_uid, member_lib) = (uid, lib.clone());
+            let member = tokio::task::spawn_blocking(move || {
+                super::query::is_library_member(&member_pool, member_uid, &member_lib)
+            })
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            if !member {
+                return Err((StatusCode::FORBIDDEN, "library_not_member".into()));
+            }
+            let key_pool = state.db_pool.clone();
+            let (key_uid, key_lib) = (uid, lib.clone());
+            let wrap = tokio::task::spawn_blocking(move || {
+                super::query::read_own_library_key(&key_pool, key_uid, &key_lib)
+            })
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            // A member without a wrap is convergence lag (another
+            // member's worker hasn't granted yet) — machine-parseable so
+            // the daemon can back off distinctly from non-membership.
+            let (eph, wrapped) =
+                wrap.ok_or((StatusCode::FORBIDDEN, "library_key_pending".to_string()))?;
+            let library_key = hopnet_photos_core::crypto::unwrap_library_key(
+                lib,
+                &eph,
+                &wrapped,
+                &session_recipient(&session),
+            )
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("library key: {e}")))?;
+            hopnet_photos_core::crypto::derive_library_fingerprint_key(&library_key)
+        }
+    };
+
     tokio::task::spawn_blocking(move || {
-        let holder = super::query::read_ingress_responsibility(&pool, uid)?;
+        let holder = super::query::read_ingress_responsibility(&pool, uid, library_id.as_ref())?;
         let responsibility = match &holder {
             Some(h) if *h == device.0 => "holder",
             Some(_) => "other",
@@ -1099,7 +1256,10 @@ async fn post_client_resolve(
         let mut entries = Vec::with_capacity(body.cloud_ids.len());
         for cloud_id in body.cloud_ids {
             let fingerprint = hex::encode(blake3::keyed_hash(&fp_key, cloud_id.as_bytes()).as_bytes());
-            let photo_id = super::query::read_photo_by_fingerprint(&pool, uid, &fingerprint)?;
+            let photo_id = match &library_id {
+                None => super::query::read_photo_by_fingerprint(&pool, uid, &fingerprint)?,
+                Some(lib) => super::query::read_shared_photo_by_fingerprint(&pool, lib, &fingerprint)?,
+            };
             entries.push(ResolveEntryResponse {
                 cloud_id,
                 fingerprint,
@@ -1428,6 +1588,104 @@ mod tests {
         let h = headers_with(axum::http::header::IF_NONE_MATCH, "\"other\"");
         assert!(!if_none_match_matches(&h, "\"abc\""));
         assert!(!if_none_match_matches(&HeaderMap::new(), "\"abc\""));
+    }
+
+    fn gate_test_pool() -> r2d2::Pool<r2d2_sqlite::SqliteConnectionManager> {
+        let manager = r2d2_sqlite::SqliteConnectionManager::memory();
+        let pool = r2d2::Pool::builder()
+            .max_size(1)
+            .connection_customizer(Box::new(crate::db::shared::SqliteInitializer))
+            .build(manager)
+            .unwrap();
+        crate::db::shared::initialize(pool.get().unwrap()).unwrap();
+        pool
+    }
+
+    fn enc<T: serde::Serialize>(payload: &T) -> Vec<u8> {
+        bincode::serde::encode_to_vec(payload, bincode::config::standard()).unwrap()
+    }
+
+    // Impact: "any responsibility passes" is the bug this gate exists to
+    // prevent — a stale daemon holding only its personal claim must not
+    // slip mutations into a shared library, and vice versa.
+    // Should: extract each distinct library among photo_add entries, and
+    // a targeting tx's scope from the committed photo row.
+    // Should not: let unknown photo ids contribute a scope (the handler's
+    // NotFound is the backstop), or decode garbage payloads.
+    #[test]
+    fn device_tx_scope_gate_is_exact() {
+        let pool = gate_test_pool();
+        {
+            let conn = pool.get().unwrap();
+            conn.execute(
+                "INSERT INTO users (user_id, username, pubkey, x25519_pubkey, \
+                 encrypted_privkey, key_salt) VALUES (7, 'u7', x'00', x'00', x'00', x'00')",
+                [],
+            )
+            .unwrap();
+        }
+        let lib = hopnet_common::CustomUUID::new(None);
+        {
+            let conn = pool.get().unwrap();
+            conn.execute(
+                "INSERT INTO shared_libraries (id, encrypted_name, name_nonce) VALUES (?, x'00', x'00')",
+                rusqlite::params![lib],
+            )
+            .unwrap();
+        }
+
+        // photo_add: one personal + two shared entries → two distinct scopes.
+        let entry = |library_id: Option<hopnet_common::CustomUUID>| {
+            hopnet_photos::envelopes::PhotoAddEntry {
+                photo_id: hopnet_common::CustomUUID::new(None),
+                library_id,
+                uploaded_by: 7,
+                encrypted_metadata: vec![0xEE; 4],
+                metadata_nonce: [0u8; 12],
+                resources: vec![],
+                metadata_access: vec![],
+                operation_id: hopnet_common::CustomUUID::new(None),
+                cloud_fingerprint: None,
+            }
+        };
+        let add = enc(&hopnet_photos::envelopes::PhotoAddPayload {
+            entries: vec![entry(None), entry(Some(lib.clone())), entry(Some(lib.clone()))],
+        });
+        let scopes = device_tx_scopes("photo_add", &add, &pool).unwrap();
+        assert_eq!(scopes.len(), 2);
+        assert!(scopes.contains(&None));
+        assert!(scopes.contains(&Some(lib.clone())));
+
+        // photo_delete: scope comes from the committed photo row; unknown
+        // ids contribute nothing.
+        let shared_photo = hopnet_common::CustomUUID::new(None);
+        {
+            let conn = pool.get().unwrap();
+            conn.execute(
+                "INSERT INTO photos (id, library_id, uploaded_by, encrypted_metadata, metadata_nonce) \
+                 VALUES (?, ?, 7, x'00', x'00')",
+                rusqlite::params![shared_photo, lib],
+            )
+            .unwrap();
+        }
+        let delete = enc(&hopnet_photos::envelopes::PhotoDeletePayload {
+            entries: vec![
+                hopnet_photos::envelopes::PhotoDeleteEntry {
+                    photo_id: shared_photo,
+                    operation_id: hopnet_common::CustomUUID::new(None),
+                },
+                hopnet_photos::envelopes::PhotoDeleteEntry {
+                    photo_id: hopnet_common::CustomUUID::new(None), // unknown
+                    operation_id: hopnet_common::CustomUUID::new(None),
+                },
+            ],
+        });
+        let scopes = device_tx_scopes("photo_delete", &delete, &pool).unwrap();
+        assert_eq!(scopes, vec![Some(lib)]);
+
+        // Garbage payload → 400, never a pass-through.
+        let err = device_tx_scopes("photo_delete", &[0xFF, 0xFF, 0xFF], &pool).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
     // Should: round-trip keyset cursors, including the empty-photo_id

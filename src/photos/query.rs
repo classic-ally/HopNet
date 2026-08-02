@@ -448,20 +448,105 @@ pub fn read_photo_by_fingerprint(
     Ok(row.and_then(|(id, owner)| (owner == user_id).then_some(id)))
 }
 
-/// Current ingress responsibility holder for a user's personal scope.
-pub fn read_ingress_responsibility(
+/// By-fingerprint committed lookup for a SHARED library. Unlike the
+/// personal variant there is deliberately no owner filter: any member's
+/// committed photo counts (that is the cross-member dedupe — two daemons
+/// publishing the same iCloud shared library converge on one row). The
+/// caller must have verified membership; same deliberate no-deleted_at
+/// rationale as [`read_photo_by_fingerprint`].
+pub fn read_shared_photo_by_fingerprint(
     pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
-    user_id: i32,
+    library_id: &hopnet_common::CustomUUID,
+    fingerprint_hex: &str,
 ) -> Result<Option<hopnet_common::CustomUUID>, String> {
     use rusqlite::OptionalExtension;
     let conn = pool.get().map_err(|e| format!("pool: {e}"))?;
     conn.query_row(
-        "SELECT device_id FROM photo_ingress_responsibility WHERE user_id = ? AND library_id IS NULL",
-        rusqlite::params![user_id],
+        "SELECT id FROM photos WHERE cloud_fingerprint = ? AND library_id = ?",
+        rusqlite::params![fingerprint_hex, library_id],
         |row| row.get(0),
     )
     .optional()
+    .map_err(|e| format!("shared fingerprint lookup: {e:?}"))
+}
+
+/// Current ingress responsibility holder for one of a user's scopes
+/// (None = personal partition).
+pub fn read_ingress_responsibility(
+    pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    user_id: i32,
+    library_id: Option<&hopnet_common::CustomUUID>,
+) -> Result<Option<hopnet_common::CustomUUID>, String> {
+    use rusqlite::OptionalExtension;
+    let conn = pool.get().map_err(|e| format!("pool: {e}"))?;
+    match library_id {
+        None => conn.query_row(
+            "SELECT device_id FROM photo_ingress_responsibility
+             WHERE user_id = ? AND library_id IS NULL",
+            rusqlite::params![user_id],
+            |row| row.get(0),
+        ),
+        Some(lib) => conn.query_row(
+            "SELECT device_id FROM photo_ingress_responsibility
+             WHERE user_id = ? AND library_id = ?",
+            rusqlite::params![user_id, lib],
+            |row| row.get(0),
+        ),
+    }
+    .optional()
     .map_err(|e| format!("responsibility lookup: {e:?}"))
+}
+
+/// Every responsibility row a user holds, as (scope, device) pairs —
+/// scope None is the personal partition. Feeds the device-tx gate and
+/// the JWT responsibility listing.
+pub fn read_ingress_responsibilities(
+    pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    user_id: i32,
+) -> Result<Vec<(Option<hopnet_common::CustomUUID>, hopnet_common::CustomUUID)>, String> {
+    let conn = pool.get().map_err(|e| format!("pool: {e}"))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT library_id, device_id FROM photo_ingress_responsibility
+             WHERE user_id = ? ORDER BY library_id",
+        )
+        .map_err(|e| format!("responsibility list prepare: {e:?}"))?;
+    let rows = stmt
+        .query_map(rusqlite::params![user_id], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .map_err(|e| format!("responsibility list: {e:?}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("responsibility list rows: {e:?}"))?;
+    Ok(rows)
+}
+
+/// Distinct library scopes of the given committed photos (None =
+/// personal). Unknown photo ids contribute no scope — the handler's
+/// deterministic NotFound is the backstop for those.
+pub fn read_photo_library_scopes(
+    pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+    photo_ids: &[hopnet_common::CustomUUID],
+) -> Result<Vec<Option<hopnet_common::CustomUUID>>, String> {
+    if photo_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let conn = pool.get().map_err(|e| format!("pool: {e}"))?;
+    let placeholders = vec!["?"; photo_ids.len()].join(",");
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT DISTINCT library_id FROM photos WHERE id IN ({placeholders})"
+        ))
+        .map_err(|e| format!("photo scopes prepare: {e:?}"))?;
+    let rows = stmt
+        .query_map(
+            rusqlite::params_from_iter(photo_ids.iter()),
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("photo scopes: {e:?}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("photo scope rows: {e:?}"))?;
+    Ok(rows)
 }
 
 fn pubkey_from_blob(blob: Vec<u8>) -> Result<hopnet_storage::x25519_dalek::PublicKey, String> {
@@ -864,7 +949,191 @@ mod tests {
             .unwrap();
         }
 
-        assert_eq!(read_ingress_responsibility(&pool, 7), Ok(Some(device_id)));
-        assert_eq!(read_ingress_responsibility(&pool, 8), Ok(None));
+        assert_eq!(read_ingress_responsibility(&pool, 7, None), Ok(Some(device_id)));
+        assert_eq!(read_ingress_responsibility(&pool, 8, None), Ok(None));
+    }
+
+    fn insert_library_with_member(
+        pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+        library_id: &hopnet_common::CustomUUID,
+        user_id: i32,
+    ) {
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO shared_libraries (id, encrypted_name, name_nonce) \
+             VALUES (?, x'00', x'00')",
+            rusqlite::params![library_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO shared_library_members (library_id, user_id) VALUES (?, ?)",
+            rusqlite::params![library_id, user_id],
+        )
+        .unwrap();
+    }
+
+    fn insert_shared_photo_with_fp(
+        pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
+        photo_id: &hopnet_common::CustomUUID,
+        library_id: &hopnet_common::CustomUUID,
+        uploaded_by: i32,
+        fingerprint_hex: &str,
+    ) {
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO photos (id, library_id, uploaded_by, encrypted_metadata, \
+                 metadata_nonce, cloud_fingerprint) VALUES (?, ?, ?, ?, ?, ?)",
+                rusqlite::params![
+                    photo_id,
+                    library_id,
+                    uploaded_by,
+                    vec![0u8; 4],
+                    vec![0u8; 12],
+                    fingerprint_hex
+                ],
+            )
+            .unwrap();
+    }
+
+    // Impact: this is the property that makes two members' daemons
+    // publishing one iCloud shared library converge on a single mesh
+    // photo instead of double-uploading.
+    // Should: resolve a shared fingerprint committed by ANOTHER member of
+    // the same library.
+    // Should not: match the same fingerprint under a different library or
+    // under the personal (NULL-library) scope.
+    #[test]
+    fn shared_fingerprint_probe_matches_any_member() {
+        let pool = test_pool();
+        let pubkey = hopnet_storage::x25519_dalek::PublicKey::from(
+            &hopnet_storage::x25519_dalek::StaticSecret::from([0x66; 32]),
+        );
+        insert_user(&pool, 7, &pubkey);
+        insert_user(&pool, 8, &pubkey);
+        let lib_a = hopnet_common::CustomUUID::new(None);
+        let lib_b = hopnet_common::CustomUUID::new(None);
+        insert_library_with_member(&pool, &lib_a, 7);
+        insert_library_with_member(&pool, &lib_b, 7);
+
+        // Committed by member 8 — member 7's resolve must still match.
+        let theirs = hopnet_common::CustomUUID::new(None);
+        insert_shared_photo_with_fp(&pool, &theirs, &lib_a, 8, "ee55");
+        // Same fingerprint value under the personal scope of user 7.
+        let personal = hopnet_common::CustomUUID::new(None);
+        insert_photo_row_with_fp(&pool, &personal, 7, "ee55");
+
+        assert_eq!(
+            read_shared_photo_by_fingerprint(&pool, &lib_a, "ee55"),
+            Ok(Some(theirs))
+        );
+        assert_eq!(read_shared_photo_by_fingerprint(&pool, &lib_b, "ee55"), Ok(None));
+        // And the personal probe must not see the shared row.
+        assert_eq!(read_photo_by_fingerprint(&pool, 7, "ee55"), Ok(Some(personal)));
+    }
+
+    // Should: keep resolving a soft-deleted shared photo by fingerprint
+    // (adopt, don't burn retries — same contract as the personal probe).
+    #[test]
+    fn shared_fingerprint_probe_resolves_tombstoned() {
+        let pool = test_pool();
+        let pubkey = hopnet_storage::x25519_dalek::PublicKey::from(
+            &hopnet_storage::x25519_dalek::StaticSecret::from([0x77; 32]),
+        );
+        insert_user(&pool, 7, &pubkey);
+        let lib = hopnet_common::CustomUUID::new(None);
+        insert_library_with_member(&pool, &lib, 7);
+        let photo_id = hopnet_common::CustomUUID::new(None);
+        insert_shared_photo_with_fp(&pool, &photo_id, &lib, 7, "ff66");
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE photos SET deleted_at = '2026-01-01T00:00:00Z', deleted_by = 7 WHERE id = ?",
+                rusqlite::params![photo_id],
+            )
+            .unwrap();
+
+        assert_eq!(
+            read_shared_photo_by_fingerprint(&pool, &lib, "ff66"),
+            Ok(Some(photo_id))
+        );
+    }
+
+    // Should: read personal and per-library responsibility independently,
+    // and list every scope's row in the all-scopes read.
+    #[test]
+    fn responsibility_reads_are_scoped() {
+        let pool = test_pool();
+        let pubkey = hopnet_storage::x25519_dalek::PublicKey::from(
+            &hopnet_storage::x25519_dalek::StaticSecret::from([0x88; 32]),
+        );
+        insert_user(&pool, 7, &pubkey);
+        let lib = hopnet_common::CustomUUID::new(None);
+        insert_library_with_member(&pool, &lib, 7);
+        let dev_personal = hopnet_common::CustomUUID::new(None);
+        let dev_shared = hopnet_common::CustomUUID::new(None);
+        {
+            let conn = pool.get().unwrap();
+            for dev in [&dev_personal, &dev_shared] {
+                conn.execute(
+                    "INSERT INTO device_tokens (id, user_id, api_key_hash, encrypted_device_name, \
+                     wrapped_user_key) VALUES (?, 7, ?, 'enc', ?)",
+                    rusqlite::params![dev, dev.to_string().into_bytes(), vec![0u8; 32]],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO photo_ingress_responsibility (user_id, library_id, device_id, operation_id) \
+                 VALUES (7, NULL, ?, ?)",
+                rusqlite::params![dev_personal, hopnet_common::CustomUUID::new(None)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO photo_ingress_responsibility (user_id, library_id, device_id, operation_id) \
+                 VALUES (7, ?, ?, ?)",
+                rusqlite::params![lib, dev_shared, hopnet_common::CustomUUID::new(None)],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            read_ingress_responsibility(&pool, 7, None),
+            Ok(Some(dev_personal.clone()))
+        );
+        assert_eq!(
+            read_ingress_responsibility(&pool, 7, Some(&lib)),
+            Ok(Some(dev_shared.clone()))
+        );
+        let all = read_ingress_responsibilities(&pool, 7).unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.contains(&(None, dev_personal)));
+        assert!(all.contains(&(Some(lib), dev_shared)));
+    }
+
+    // Should: report each distinct committed scope for a set of photo ids,
+    // contributing nothing for unknown ids.
+    #[test]
+    fn photo_scopes_distinct_and_ignore_unknown() {
+        let pool = test_pool();
+        let pubkey = hopnet_storage::x25519_dalek::PublicKey::from(
+            &hopnet_storage::x25519_dalek::StaticSecret::from([0x99; 32]),
+        );
+        insert_user(&pool, 7, &pubkey);
+        let lib = hopnet_common::CustomUUID::new(None);
+        insert_library_with_member(&pool, &lib, 7);
+        let personal = hopnet_common::CustomUUID::new(None);
+        let shared = hopnet_common::CustomUUID::new(None);
+        insert_photo_row_with_fp(&pool, &personal, 7, "aa77");
+        insert_shared_photo_with_fp(&pool, &shared, &lib, 7, "bb88");
+
+        let scopes = read_photo_library_scopes(
+            &pool,
+            &[personal, shared, hopnet_common::CustomUUID::new(None)],
+        )
+        .unwrap();
+        assert_eq!(scopes.len(), 2);
+        assert!(scopes.contains(&None));
+        assert!(scopes.contains(&Some(lib)));
+        assert_eq!(read_photo_library_scopes(&pool, &[]).unwrap(), vec![]);
     }
 }
