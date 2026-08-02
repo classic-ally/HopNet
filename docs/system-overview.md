@@ -108,8 +108,24 @@ an audit found a view-change safety hole. See RFC-013 for the full design
       fragment reconcile. Evidence: overlap/chain units, staged-boot
       gate battery, an in-process straggler rejoin over real comms
       ending in byte-identical state, and the orchestrator
-      straggler-rejoin / diverged-node-rebuild scenarios. Next: S8
-      upgrade epoch end-to-end (real binary bump, rollback drill).
+      straggler-rejoin / diverged-node-rebuild scenarios.
+  - S8 — upgrade epoch end-to-end: the version-bump flow was already
+      covered by S6's awaiting-upgrade scenario, and a second real
+      image was rejected as theatre for a no-op bump (identical
+      schemas — nothing for it to catch). The substance was the
+      rollback window, which had never been exercised and whose
+      documented procedure did not work: restoring the retained
+      database by hand leaves the sealed marker and committed phase
+      in place, so the next boot either re-crosses the boundary or
+      parks with no consensus. Rollback is now a marker the boot path
+      honours ahead of every other path, covering the crossed and the
+      never-crossed node alike, resumable across a crash, and exposed
+      as an authenticated route. Evidence: boot units per arrangement
+      and per crash point (incl. a regression pinning the old
+      re-cross), and the orchestrator regenesis-rollback drill —
+      abandon mesh-wide, prove the mesh RUNS again, then prove the
+      window is refused once the next epoch decides.
+  - **RFC-019 is complete.**
 
 ### 2. Storage Substrate ([RFC-014](specs/hopnet-storage.md)) + File Storage ([RFC-002](specs/file-storage.md))
 **Status**: Substrate extraction COMPLETE (stages A–F, 2026-07-07) — the `hopnet-storage`

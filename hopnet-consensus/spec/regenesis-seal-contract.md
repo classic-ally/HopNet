@@ -83,3 +83,14 @@ path at H+1 is S6's.
 > them too — a rejoining node imports committed state only, and starts
 > the new epoch with empty evidence. Clause 5 is unchanged: a rejoined
 > node gets no boundary-special seating grace.
+>
+> **Enforced (S8).** Clause 2's forward-only rule now has a mechanism
+> rather than prose behind it. Within the rollback window an operator may
+> abandon the boundary — `POST /consensus/regenesis/rollback` on every
+> node writes a marker that the boot path honours ahead of every other
+> path, restoring the retained database (or clearing the seal in place,
+> for a node that parked without crossing) and clearing the seal state
+> that would otherwise re-cross. Past the window the request is refused:
+> the retained database is gone, and recovery is another regenesis,
+> forward. Note that restoring the retained file by hand is NOT a
+> rollback — it leaves the sealed marker and committed phase behind.

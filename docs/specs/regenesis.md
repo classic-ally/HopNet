@@ -440,13 +440,32 @@ Ordered by when they can occur:
   boot everywhere):
   - each node RETAINS its sealed epoch-N database until epoch N+1
     decides its first block
-  - within that window: manual seal rollback — remove the N+1
-    genesis + seal marker, boot the old binary on the retained
-    database
+  - within that window: `POST /consensus/regenesis/rollback` on
+    EVERY node. Each writes a rollback marker and restarts; the boot
+    path then abandons the boundary before anything else runs —
+    discarding the N+1 database, restoring the retained one, and
+    clearing the seal state inside it. A node that sealed but never
+    crossed has nothing to restore and clears in place, so the same
+    request works mesh-wide (S8)
+  - **restoring the retained file by hand is NOT a rollback.** It
+    still carries the sealed marker and the committed Sealed phase,
+    so the next boot either re-crosses the boundary (same binary —
+    silently undoing the rollback) or parks with consensus refusing
+    to start (older binary). The marker exists because those two
+    pieces of state must be cleared with it
+  - rolling back CLEARS committed `regenesis_state` outside
+    consensus. Deliberate: a Sealed phase refuses every submission,
+    so it is the only way the mesh runs again. Every node does it
+    identically, and the row is divergence-only, so it never enters
+    the exported state hash
+  - roll back the WHOLE mesh. A node that rolls back beside peers
+    still in N+1 is pulled straight back across by the epoch join
+    (S7) — correct behaviour, not what the operator wanted
   - safe precisely because N+1 has decided nothing; no history
     exists to fork against
   - after N+1's first decide the retained database is released and
-    rollback is gone; recovery is another regenesis, forward
+    rollback is gone — the request is refused with 409; recovery is
+    another regenesis, forward
 - snapshot artifact lost mesh-wide (state still live):
   - the artifact is regenerable from any live mesh: a fresh
     housekeeping regenesis mints a new snapshot at a new boundary
@@ -751,10 +770,53 @@ protocol it checks.
     naming absent blobs by design), an epoch field on `PeerEvidence`
     (the pong trigger needs no stored state), and any frontend work
     (the status view carries `epoch_join` for headless checks).
-- [ ] S8 — upgrade epoch end-to-end: no-op version bump through the
+- [x] S8 — upgrade epoch end-to-end: no-op version bump through the
       full flow; rollback window exercised
-- [ ] S8 — upgrade epoch end-to-end: no-op version bump through the
-      full flow; rollback window exercised
+  - orchestrator: regenesis-rollback
+  - **The version-bump flow was already discharged** by S6's
+    `regenesis-awaiting-upgrade` (staged claim → upgrade-target
+    start → autonomous seal → parked-alive → per-node swap → epoch 2
+    → liveness gate → quorum decides past H).
+  - **A second real image was considered and rejected.** Piping a
+    version into the container environment IS what that scenario
+    already does, and for a NO-OP bump two images built from the
+    same tree have byte-identical schemas — so the one thing a real
+    binary could test, that the blind node-local carry is safe
+    across versions, has nothing to catch. A code-differing bump is
+    RFC-020's migrations hook. Recorded so nobody re-derives it.
+  - **The rollback window had never been exercised, and the
+    documented procedure did not work.** `database.db.sealed` is a
+    complete epoch-N database, but it still carries the sealed
+    marker and the committed Sealed phase, which `boot_transition`
+    reads only AFTER it would re-run the gates. A bare `mv` gave
+    either a silently undone rollback (same binary: every gate
+    passes again and the boundary re-crosses) or a live-but-frozen
+    node (older binary: parked, with `spawn_engine` refusing to
+    start consensus). Both the Failure Modes text and the state-D
+    hint in `boot.rs` were wrong; both are corrected.
+  - **Rollback is now a marker the boot path honours**, in the same
+    convention as awaiting-upgrade and the staged-join manifest.
+    It runs ahead of every other boot path — before the
+    missing-database dispatch, because a crash mid-restore leaves
+    exactly the arrangement state D calls fatal, and before the
+    staged-join branch, because leftover staging would drag the node
+    back across. One marker covers three arrangements (restore and
+    clear; clear in place; refuse — nothing to abandon), and
+    deleting it LAST makes the whole thing resumable: a crash
+    re-enters the machine one case further along.
+  - The abandoned epoch's lineage record is deleted. "Kept forever"
+    is about epochs the mesh actually entered; serving a joiner a
+    record for a boundary the mesh abandoned only makes it chase a
+    snapshot that will honestly answer `NotAvailable`.
+  - Evidence: boot units for each arrangement and each crash point,
+    including a regression that pins the bare-`mv` re-cross so the
+    reason for the mechanism cannot be lost; a route unit for the
+    409 guard; and `regenesis-rollback`, which crosses ONE node to
+    hold the window open (a live quorum closes it in ~15s, because
+    `nodes` rides across the boundary and the attestation job
+    decides H+1), abandons mesh-wide, and then checks the thing that
+    matters — the mesh accepts a write and decides again — before
+    confirming rollback is refused once the next epoch decides.
 
 ## Evidence
 
