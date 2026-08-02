@@ -6,6 +6,7 @@
 //! reference are atomic, so mark-and-sweep never observes a zero-ref blob
 //! (drive precedent: hopnet-drive/src/db/files.rs:210-227).
 
+use crate::db::libraries;
 use crate::envelopes::{MetadataAccessEntry, PhotoAddEntry};
 use hopnet_common::CustomUUID;
 use hopnet_projection::DatabaseError;
@@ -450,6 +451,65 @@ pub fn device_belongs_to_user(
             );
             DatabaseError::RecallError
         })
+}
+
+/// Users who hold a metadata wrap for this photo, are still entitled to
+/// one, and are NOT covered by `supplied` — the set a re-key would strand.
+///
+/// An edit that replaces `encrypted_metadata` under a fresh key must
+/// re-wrap that key for everyone: [`upsert_metadata_access_row`] overwrites
+/// only the rows a payload names, so anyone omitted keeps a row that
+/// unwraps to the SUPERSEDED key. Their metadata then fails to decrypt,
+/// silently and permanently, and the convergence worker cannot see it —
+/// `missing_metadata_grants` looks for an absent row, not a stale one.
+///
+/// The comparison is against current HOLDERS, not against membership:
+///
+/// - a member with no wrap yet is not required, because the writer cannot
+///   mint one for them and `missing_metadata_grants` already owns the gap;
+/// - a holder who has left the library is not required, because their row
+///   is stale either way and `stale_access_users` reaps it through
+///   `library_access_revoke`.
+///
+/// Entitled is members ∪ pending invitees ([`libraries::assertion_targets`])
+/// for a shared photo, and the uploader alone for a personal one — the same
+/// sets the `/membership` route hands writers, so a writer working from a
+/// live roster always satisfies this.
+pub fn uncovered_wrap_holders(
+    db_tx: &rusqlite::Transaction,
+    photo_id: &CustomUUID,
+    library_id: Option<&CustomUUID>,
+    uploaded_by: i32,
+    supplied: &[MetadataAccessEntry],
+) -> Result<Vec<i32>, DatabaseError> {
+    let mut stmt = db_tx
+        .prepare("SELECT user_id FROM photo_metadata_access WHERE photo_id = ?1")
+        .map_err(|e| {
+            tracing::error!("uncovered_wrap_holders: prepare for {photo_id} failed: {e}");
+            DatabaseError::RecallError
+        })?;
+    let holders: Vec<i32> = stmt
+        .query_map(params![photo_id], |r| r.get(0))
+        .and_then(|rows| rows.collect())
+        .map_err(|e| {
+            tracing::error!("uncovered_wrap_holders: read holders for {photo_id} failed: {e}");
+            DatabaseError::RecallError
+        })?;
+
+    let entitled: Vec<i32> = match library_id {
+        Some(library) => libraries::assertion_targets(db_tx, library)?
+            .into_iter()
+            .map(|(user_id, _pubkey)| user_id)
+            .collect(),
+        None => vec![uploaded_by],
+    };
+
+    Ok(holders
+        .into_iter()
+        .filter(|user_id| {
+            entitled.contains(user_id) && !supplied.iter().any(|a| a.user_id == *user_id)
+        })
+        .collect())
 }
 
 // --- Private helpers ---

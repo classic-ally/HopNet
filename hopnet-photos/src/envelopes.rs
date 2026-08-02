@@ -58,6 +58,12 @@ pub struct PhotoAddEntry {
     pub cloud_fingerprint: Option<[u8; 32]>,
 }
 
+/// The one resource every photo must have. `photo_add` enforces its
+/// presence client-side (`PhotoAsset::validate`); the edit handler refuses
+/// to remove it so an edit cannot retire an invariant the add path treats
+/// as load-bearing.
+pub const RESOURCE_TYPE_ORIGINAL: i32 = 0;
+
 /// A resource-type tag paired with its blob registration.
 /// The struct pairing is load-bearing where drive's parallel `blob_ops`
 /// and `inodes` vecs were — drive inodes carry path/owner/type beyond

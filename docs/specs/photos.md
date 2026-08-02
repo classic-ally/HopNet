@@ -658,6 +658,36 @@ The photos module registers its own transaction handlers via the existing `inven
 
 **Concurrent edit policy**: Last writer wins via consensus ordering. The `photo_edit_content` handler logs `prior_data_block_id` as the **current** value at execution time (looked up from `photo_resources` for the targeted `resource_type`), not the value claimed in the payload. This ensures the operation chain is contiguous even when edits race: if A's edit lands first (X → A_version) and B's lands second, B's log entry records (prior=A_version, new=B_version) regardless of what B's payload claimed. All versions are reachable by walking the operation log, and any superseded edit can be manually restored.
 
+**Edit payload validation** (both edit handlers): the handler is the trust
+boundary — every node applies it, and the publishing client's own checks are
+advisory by comparison. Enforced there, not only client-side:
+
+- *Shape* (`photo_edit_content`, `InvalidPayload`): an entry must upsert or
+  remove something; no kind may repeat within either list or appear in both
+  (the upsert loop runs first, so a kind in both would register a blob and
+  write its row only to delete it, stranding a data block reachable solely
+  from the operation log); and `remove_resources` may not name the original.
+  `photo_add` treats "every asset has an original" as an invariant, and an
+  edit must not be able to retire it — the operation log records only the
+  first removed kind's prior blob, so undo could not restore it either.
+- *Re-key coverage* (both, `ConflictError`): when an entry supplies a
+  non-empty `metadata_access`, it must carry a wrap for every user who
+  currently holds one for that photo **and is still entitled to one**
+  (members ∪ pending invitees, or the uploader for a personal photo).
+  Upserting only the supplied rows leaves anyone omitted holding a wrap of
+  the *superseded* key: their metadata stops decrypting, silently, at read
+  time, and the convergence worker cannot repair it — `missing_metadata_grants`
+  looks for an absent row, not a stale one. Coverage is measured against
+  current *holders* rather than membership so that a member with no wrap yet
+  (the worker's own job) and a holder who has left the library (the revoke
+  sweep's) neither block an edit. Every production writer of
+  `photo_metadata_access` mints rows only for members, invitees, or the
+  uploader, so that set is currently complete — **album sharing to a
+  non-library-member (above) must extend it**, or a re-key would strand
+  exactly those recipients. An empty `metadata_access` remains legal:
+  it declares a re-encrypt under the existing key, which the node cannot
+  verify either way since it never sees the key.
+
 ### Shared Library: Add Photo Flow
 
 When a member adds a photo to a shared library:

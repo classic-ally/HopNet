@@ -40,6 +40,83 @@ fn photo_write_allowed(
     }
 }
 
+/// Shape rules for one `photo_edit_content` entry, enforced here rather
+/// than only in the publishing client: this handler is what every node
+/// applies, so an entry that reaches it has already crossed the trust
+/// boundary. Deterministic — payload bytes only, no state read.
+fn validate_edit_shape(
+    entry: &crate::envelopes::PhotoEditContentEntry,
+) -> Result<(), DatabaseError> {
+    // A revert drops the edited render without replacing anything, so an
+    // entry is legal with removals alone — but an entry that does neither
+    // is a no-op the operation log would still record.
+    if entry.resources.is_empty() && entry.remove_resources.is_empty() {
+        return Err(DatabaseError::InvalidPayload);
+    }
+
+    let mut upserted: Vec<i32> = Vec::with_capacity(entry.resources.len());
+    for resource in &entry.resources {
+        if upserted.contains(&resource.resource_type) {
+            return Err(DatabaseError::InvalidPayload);
+        }
+        upserted.push(resource.resource_type);
+    }
+
+    let mut removed: Vec<i32> = Vec::with_capacity(entry.remove_resources.len());
+    for resource_type in &entry.remove_resources {
+        // The upsert loop runs before the delete loop, so a kind in both
+        // lists would register a blob, write its row, then delete it —
+        // leaving a data block reachable only from the operation log and an
+        // operation row naming a resource that no longer exists.
+        if upserted.contains(resource_type) || removed.contains(resource_type) {
+            return Err(DatabaseError::InvalidPayload);
+        }
+        if *resource_type == crate::envelopes::RESOURCE_TYPE_ORIGINAL {
+            return Err(DatabaseError::InvalidPayload);
+        }
+        removed.push(*resource_type);
+    }
+
+    Ok(())
+}
+
+/// Refuse an edit whose metadata wraps would leave an entitled holder
+/// unable to read the new ciphertext. See
+/// [`crate::db::photos::uncovered_wrap_holders`] for why the comparison is
+/// against current holders rather than membership.
+///
+/// `ConflictError`, not `InvalidPayload`: the payload is well-formed and the
+/// writer's roster is simply behind consensus, which is the same thing the
+/// tombstone check reports and the same thing a retry fixes.
+fn reject_stranding_rekey(
+    db_tx: &rusqlite::Transaction,
+    photo_id: &CustomUUID,
+    library_id: Option<&CustomUUID>,
+    uploaded_by: i32,
+    access: &[crate::envelopes::MetadataAccessEntry],
+) -> Result<(), DatabaseError> {
+    // An empty set is the "re-encrypted under the EXISTING key" case, which
+    // strands nobody. The node cannot verify that claim — it never sees the
+    // key — so it constrains only the case it CAN see, a supplied re-key.
+    if access.is_empty() {
+        return Ok(());
+    }
+    let stranded = crate::db::photos::uncovered_wrap_holders(
+        db_tx,
+        photo_id,
+        library_id,
+        uploaded_by,
+        access,
+    )?;
+    if !stranded.is_empty() {
+        tracing::warn!(
+            "edit of {photo_id} re-keys metadata without wraps for entitled users {stranded:?}",
+        );
+        return Err(DatabaseError::ConflictError);
+    }
+    Ok(())
+}
+
 /// Every consensus function this projection registers — the host boot
 /// tripwire asserts these are present in its dispatch table (guards
 /// against a linker dropping cross-crate inventory registrations).
@@ -408,12 +485,7 @@ impl TransactionHandler for PhotoEditContentHandler {
         let user_id = tx.user_id.ok_or(DatabaseError::AuthorizationError)?;
 
         for entry in &payload.entries {
-            // A revert drops the edited render without replacing anything,
-            // so an entry is legal with removals alone — but an entry that
-            // does neither is a no-op the log would still record.
-            if entry.resources.is_empty() && entry.remove_resources.is_empty() {
-                return Err(DatabaseError::InvalidPayload);
-            }
+            validate_edit_shape(entry)?;
             let (uploaded_by, deleted_at, library_id) =
                 lookup_photo_authz(db_tx, &entry.photo_id)?.ok_or(DatabaseError::NotFound)?;
             if !photo_write_allowed(db_tx, user_id, uploaded_by, library_id.as_ref())? {
@@ -422,6 +494,17 @@ impl TransactionHandler for PhotoEditContentHandler {
             if deleted_at.is_some() {
                 // Tombstoned — reject edits.
                 return Err(DatabaseError::ConflictError);
+            }
+            // Only when a ciphertext actually rides this entry: without one
+            // the wraps are never applied and there is nothing to strand.
+            if entry.encrypted_metadata.is_some() {
+                reject_stranding_rekey(
+                    db_tx,
+                    &entry.photo_id,
+                    library_id.as_ref(),
+                    uploaded_by,
+                    &entry.metadata_access,
+                )?;
             }
             edit_photo_content(db_tx, entry, ctx.fragments_dir, user_id)?;
         }
@@ -463,6 +546,16 @@ impl TransactionHandler for PhotoEditMetadataHandler {
             if deleted_at.is_some() {
                 return Err(DatabaseError::ConflictError);
             }
+            // This envelope always carries a ciphertext, so the re-key check
+            // is unconditional here — unlike photo_edit_content, where
+            // metadata is optional.
+            reject_stranding_rekey(
+                db_tx,
+                &entry.photo_id,
+                library_id.as_ref(),
+                uploaded_by,
+                &entry.metadata_access,
+            )?;
             edit_photo_metadata(db_tx, entry, user_id)?;
         }
         Ok(())
@@ -2127,6 +2220,353 @@ mod tests {
             Some(1),
         );
         assert!(matches!(result, Err(DatabaseError::InvalidPayload)));
+    }
+
+    // Impact: `photo_add` refuses an asset without an Original
+    // (`PhotoAsset::validate`). An edit that could retire one would leave a
+    // photo permanently un-servable at full fidelity on every node, with no
+    // path back — the operation log records only the FIRST removed kind's
+    // prior blob, so undo cannot restore it either.
+    // Should not: accept a removal naming the original.
+    #[test]
+    fn photo_edit_content_rejects_removing_the_original() {
+        let conn = fixture();
+        let photo_id = CustomUUID::retention_cutoff(0);
+        let add_bytes = add_payload_bytes(
+            photo_id.clone(),
+            1,
+            CustomUUID::retention_cutoff(1),
+            CustomUUID::retention_cutoff(2),
+            None,
+        );
+        apply(&conn, &PhotoAddHandler, "photo_add", &add_bytes, Some(1));
+
+        let bytes = edit_payload_bytes(
+            photo_id,
+            Vec::new(),
+            vec![crate::envelopes::RESOURCE_TYPE_ORIGINAL],
+            None,
+            CustomUUID::retention_cutoff(6),
+        );
+        let result = validate(
+            &conn,
+            &PhotoEditContentHandler,
+            "photo_edit_content",
+            &bytes,
+            Some(1),
+        );
+        assert!(matches!(result, Err(DatabaseError::InvalidPayload)));
+    }
+
+    // Impact: the upsert loop runs before the delete loop, so a kind in both
+    // lists registers a blob and writes its row only to delete it — leaving
+    // a data block reachable solely from the operation log, and an operation
+    // row naming a resource that does not exist.
+    // Should not: accept a kind that is both upserted and removed.
+    #[test]
+    fn photo_edit_content_rejects_a_kind_both_edited_and_removed() {
+        let conn = fixture();
+        let photo_id = CustomUUID::retention_cutoff(0);
+        let add_bytes = add_payload_bytes(
+            photo_id.clone(),
+            1,
+            CustomUUID::retention_cutoff(1),
+            CustomUUID::retention_cutoff(2),
+            None,
+        );
+        apply(&conn, &PhotoAddHandler, "photo_add", &add_bytes, Some(1));
+
+        let bytes = edit_payload_bytes(
+            photo_id,
+            vec![PhotoResourceOp {
+                resource_type: 1,
+                op: make_blob_op(CustomUUID::retention_cutoff(3)),
+            }],
+            vec![1],
+            None,
+            CustomUUID::retention_cutoff(6),
+        );
+        let result = validate(
+            &conn,
+            &PhotoEditContentHandler,
+            "photo_edit_content",
+            &bytes,
+            Some(1),
+        );
+        assert!(matches!(result, Err(DatabaseError::InvalidPayload)));
+    }
+
+    // Should not: accept the same kind twice in one entry's lists.
+    #[test]
+    fn photo_edit_content_rejects_duplicate_kinds() {
+        let conn = fixture();
+        let photo_id = CustomUUID::retention_cutoff(0);
+        let add_bytes = add_payload_bytes(
+            photo_id.clone(),
+            1,
+            CustomUUID::retention_cutoff(1),
+            CustomUUID::retention_cutoff(2),
+            None,
+        );
+        apply(&conn, &PhotoAddHandler, "photo_add", &add_bytes, Some(1));
+
+        let dup_removals = edit_payload_bytes(
+            photo_id.clone(),
+            Vec::new(),
+            vec![5, 5],
+            None,
+            CustomUUID::retention_cutoff(6),
+        );
+        assert!(matches!(
+            validate(
+                &conn,
+                &PhotoEditContentHandler,
+                "photo_edit_content",
+                &dup_removals,
+                Some(1),
+            ),
+            Err(DatabaseError::InvalidPayload)
+        ));
+
+        let dup_upserts = edit_payload_bytes(
+            photo_id,
+            vec![
+                PhotoResourceOp {
+                    resource_type: 1,
+                    op: make_blob_op(CustomUUID::retention_cutoff(3)),
+                },
+                PhotoResourceOp {
+                    resource_type: 1,
+                    op: make_blob_op(CustomUUID::retention_cutoff(4)),
+                },
+            ],
+            Vec::new(),
+            None,
+            CustomUUID::retention_cutoff(7),
+        );
+        assert!(matches!(
+            validate(
+                &conn,
+                &PhotoEditContentHandler,
+                "photo_edit_content",
+                &dup_upserts,
+                Some(1),
+            ),
+            Err(DatabaseError::InvalidPayload)
+        ));
+    }
+
+    /// Shared library `f1` with members 1 and 2, holding one photo both
+    /// members have a metadata wrap for.
+    fn shared_photo_two_holders(conn: &Connection, photo_id: &CustomUUID) -> CustomUUID {
+        let library_id: CustomUUID = "00000000-0000-0000-0000-0000000000f1".parse().unwrap();
+        conn.execute(
+            "INSERT INTO shared_libraries (id, encrypted_name, name_nonce) \
+             VALUES (?1, x'00', x'00')",
+            rusqlite::params![library_id],
+        )
+        .unwrap();
+        for uid in [1, 2] {
+            conn.execute(
+                "INSERT INTO shared_library_members (library_id, user_id) VALUES (?1, ?2)",
+                rusqlite::params![library_id, uid],
+            )
+            .unwrap();
+        }
+        let add_bytes = add_payload_bytes(
+            photo_id.clone(),
+            1,
+            CustomUUID::retention_cutoff(1),
+            CustomUUID::retention_cutoff(2),
+            Some(library_id.clone()),
+        );
+        apply(conn, &PhotoAddHandler, "photo_add", &add_bytes, Some(1));
+        // photo_add wraps for the uploader only; the second member's wrap
+        // is what `library_access_grant` mints once they join.
+        conn.execute(
+            "INSERT INTO photo_metadata_access \
+             (photo_id, user_id, ephemeral_pubkey, encrypted_metadata_key) \
+             VALUES (?1, 2, x'11', x'22')",
+            rusqlite::params![photo_id],
+        )
+        .unwrap();
+        library_id
+    }
+
+    // Impact: this is the whole reason both edit envelopes carry
+    // `metadata_access`. An omitted holder keeps a row that unwraps to the
+    // SUPERSEDED key, so their metadata stops decrypting — silently, at read
+    // time, forever. The convergence worker cannot repair it either:
+    // `missing_metadata_grants` looks for an absent row, not a stale one.
+    // Should not: accept a re-key that omits an entitled holder.
+    #[test]
+    fn photo_edit_content_rejects_a_rekey_that_strands_a_member() {
+        let conn = fixture();
+        let photo_id = CustomUUID::retention_cutoff(0);
+        shared_photo_two_holders(&conn, &photo_id);
+
+        let bytes = edit_payload_bytes(
+            photo_id,
+            vec![PhotoResourceOp {
+                resource_type: 1,
+                op: make_blob_op(CustomUUID::retention_cutoff(3)),
+            }],
+            Vec::new(),
+            Some((
+                b"recropped_meta".to_vec(),
+                vec![MetadataAccessEntry {
+                    user_id: 1,
+                    ephemeral_pubkey: [0x99; 32],
+                    encrypted_metadata_key: vec![0xAB; 48],
+                }],
+            )),
+            CustomUUID::retention_cutoff(6),
+        );
+        let result = validate(
+            &conn,
+            &PhotoEditContentHandler,
+            "photo_edit_content",
+            &bytes,
+            Some(1),
+        );
+        assert!(matches!(result, Err(DatabaseError::ConflictError)));
+    }
+
+    // Should not: accept a metadata-only re-key that omits an entitled
+    // holder — the ciphertext is mandatory in this envelope, so the check
+    // is unconditional.
+    #[test]
+    fn photo_edit_metadata_rejects_a_rekey_that_strands_a_member() {
+        let conn = fixture();
+        let photo_id = CustomUUID::retention_cutoff(0);
+        shared_photo_two_holders(&conn, &photo_id);
+
+        let payload = crate::envelopes::PhotoEditMetadataPayload {
+            entries: vec![crate::envelopes::PhotoEditMetadataEntry {
+                photo_id,
+                encrypted_metadata: b"refreshed_meta".to_vec(),
+                metadata_nonce: [0x44; 12],
+                operation_id: CustomUUID::retention_cutoff(7),
+                metadata_access: vec![MetadataAccessEntry {
+                    user_id: 1,
+                    ephemeral_pubkey: [0x77; 32],
+                    encrypted_metadata_key: vec![0xCD; 48],
+                }],
+            }],
+        };
+        let bytes = bincode::serde::encode_to_vec(&payload, bincode::config::standard()).unwrap();
+        let result = validate(
+            &conn,
+            &PhotoEditMetadataHandler,
+            "photo_edit_metadata",
+            &bytes,
+            Some(1),
+        );
+        assert!(matches!(result, Err(DatabaseError::ConflictError)));
+    }
+
+    // Impact: coverage is measured against entitled HOLDERS, not against
+    // every holder. A user removed from the library already holds an
+    // unusable row that `stale_access_users` reaps through
+    // `library_access_revoke`; demanding a wrap for them would stall every
+    // edit until that sweep ran.
+    // Should: accept a re-key that omits a holder who has left the library.
+    #[test]
+    fn photo_edit_content_rekey_may_omit_a_departed_holder() {
+        let conn = fixture();
+        let photo_id = CustomUUID::retention_cutoff(0);
+        let library_id = shared_photo_two_holders(&conn, &photo_id);
+        conn.execute(
+            "DELETE FROM shared_library_members WHERE library_id = ?1 AND user_id = 2",
+            rusqlite::params![library_id],
+        )
+        .unwrap();
+
+        let bytes = edit_payload_bytes(
+            photo_id.clone(),
+            vec![PhotoResourceOp {
+                resource_type: 1,
+                op: make_blob_op(CustomUUID::retention_cutoff(3)),
+            }],
+            Vec::new(),
+            Some((
+                b"recropped_meta".to_vec(),
+                vec![MetadataAccessEntry {
+                    user_id: 1,
+                    ephemeral_pubkey: [0x99; 32],
+                    encrypted_metadata_key: vec![0xAB; 48],
+                }],
+            )),
+            CustomUUID::retention_cutoff(6),
+        );
+        apply(
+            &conn,
+            &PhotoEditContentHandler,
+            "photo_edit_content",
+            &bytes,
+            Some(1),
+        );
+
+        let meta: Vec<u8> = conn
+            .query_row(
+                "SELECT encrypted_metadata FROM photos WHERE id = ?1",
+                rusqlite::params![photo_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(meta, b"recropped_meta".to_vec());
+    }
+
+    // Impact: the daemon wraps to members ∪ invitees, the same set the
+    // `/membership` route serves, so the shape it actually sends must pass.
+    // Should: accept a re-key covering every entitled holder.
+    #[test]
+    fn photo_edit_content_rekey_covering_every_holder_is_accepted() {
+        let conn = fixture();
+        let photo_id = CustomUUID::retention_cutoff(0);
+        shared_photo_two_holders(&conn, &photo_id);
+
+        let bytes = edit_payload_bytes(
+            photo_id.clone(),
+            vec![PhotoResourceOp {
+                resource_type: 1,
+                op: make_blob_op(CustomUUID::retention_cutoff(3)),
+            }],
+            Vec::new(),
+            Some((
+                b"recropped_meta".to_vec(),
+                vec![
+                    MetadataAccessEntry {
+                        user_id: 1,
+                        ephemeral_pubkey: [0x99; 32],
+                        encrypted_metadata_key: vec![0xAB; 48],
+                    },
+                    MetadataAccessEntry {
+                        user_id: 2,
+                        ephemeral_pubkey: [0x9A; 32],
+                        encrypted_metadata_key: vec![0xAC; 48],
+                    },
+                ],
+            )),
+            CustomUUID::retention_cutoff(6),
+        );
+        apply(
+            &conn,
+            &PhotoEditContentHandler,
+            "photo_edit_content",
+            &bytes,
+            Some(1),
+        );
+
+        let second: Vec<u8> = conn
+            .query_row(
+                "SELECT ephemeral_pubkey FROM photo_metadata_access \
+                 WHERE photo_id = ?1 AND user_id = 2",
+                rusqlite::params![photo_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(second, vec![0x9A; 32]);
     }
 
     // Should: rewrap the metadata key on a metadata-only edit too.
