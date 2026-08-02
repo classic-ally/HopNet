@@ -1440,3 +1440,101 @@ async fn propagation_failure_uses_its_own_ledger() {
     assert!(row.publish_last_error.is_none());
     assert!(row.tombstone_published_at.is_none());
 }
+
+// Impact: the shared half of the iCloud cutover depends on this path, and
+// the node's device-tx gate resolves a shared photo's scope from its
+// committed row — so a delete in a library this device does not hold is
+// rejected wholesale. The pass must partition tombstones by scope for the
+// same reason it partitions publishes.
+// Should: propagate personal and shared tombstones under their own scopes.
+// Should: park only the scope whose responsibility is held elsewhere,
+// leaving the other's tombstone told and its attempts unburned.
+#[tokio::test(flavor = "multi_thread")]
+async fn propagation_partitions_by_scope() {
+    let rig = rig().await;
+    add_shared_library(&rig, Some(MESH_LIB)).await;
+    let publisher = FakePublisher::ok();
+    let mut state = PublishState::default();
+
+    let personal = materialize(&rig, "p", b"p-bytes").await;
+    let shared = materialize_shared(&rig, "s", b"s-bytes").await;
+    pass(&rig, &publisher, &mut state).await;
+
+    sqlx::query("UPDATE photos SET deleted_at = ?")
+        .bind(Utc::now())
+        .execute(rig.store.raw_pool())
+        .await
+        .unwrap();
+
+    // Both scopes held: both tombstones travel, each under its own scope.
+    let report = pass(&rig, &publisher, &mut state).await;
+    assert_eq!(report.tombstones_propagated, 2);
+    let mut told: Vec<String> = publisher.propagated().into_iter().map(|(id, _)| id).collect();
+    told.sort();
+    let mut expected = vec![personal.to_string(), shared.to_string()];
+    expected.sort();
+    assert_eq!(told, expected);
+
+    // Re-arm both, then withhold responsibility for the shared scope only.
+    for id in [&personal, &shared] {
+        sqlx::query("UPDATE photos SET tombstone_published_at = NULL WHERE photo_id = ?")
+            .bind(id)
+            .execute(rig.store.raw_pool())
+            .await
+            .unwrap();
+    }
+    publisher.propagate_seen.lock().unwrap().clear();
+    publisher.set_resolve_for(Some(MESH_LIB), Ok(outcome(Responsibility::Other, Vec::new())));
+
+    let report = pass(&rig, &publisher, &mut state).await;
+    assert_eq!(report.tombstones_propagated, 1, "personal scope still moves");
+    assert!(report.parked_responsibility);
+    assert_eq!(
+        publisher.propagated(),
+        vec![(personal.to_string(), TombstoneOp::Delete)]
+    );
+    let shared_row = photo(&rig, &shared).await;
+    assert!(shared_row.tombstone_published_at.is_none());
+    assert_eq!(
+        shared_row.tombstone_publish_attempts, 0,
+        "a parked scope burns no attempts"
+    );
+}
+
+// Should: park the whole pass without burning attempts when the node goes
+// unreachable mid-propagation.
+#[tokio::test(flavor = "multi_thread")]
+async fn propagation_unreachable_parks_without_burning_attempts() {
+    let rig = rig().await;
+    let publisher = FakePublisher::ok();
+    let mut state = PublishState::default();
+    let id = publish_then_tombstone(&rig, &publisher, &mut state, "offline").await;
+
+    publisher.script_propagate(vec![Err(PublishError::NodeUnreachable("down".into()))]);
+    let report = pass(&rig, &publisher, &mut state).await;
+
+    assert!(report.parked);
+    assert_eq!(report.tombstones_propagated, 0);
+    let row = photo(&rig, &id).await;
+    assert_eq!(row.tombstone_publish_attempts, 0);
+    assert!(row.tombstone_published_at.is_none());
+}
+
+// Should: jump attempts straight to the cap on a permanent rejection, so a
+// malformed tombstone gives up instead of retrying forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn propagation_rejection_gives_up_immediately() {
+    let rig = rig().await;
+    let publisher = FakePublisher::ok();
+    let mut state = PublishState::default();
+    let id = publish_then_tombstone(&rig, &publisher, &mut state, "bad").await;
+
+    publisher.script_propagate(vec![Err(PublishError::Rejected("malformed".into()))]);
+    let report = pass(&rig, &publisher, &mut state).await;
+
+    assert_eq!(report.gave_up, 1);
+    assert_eq!(report.tombstones_propagated, 0);
+    let row = photo(&rig, &id).await;
+    assert_eq!(row.tombstone_publish_attempts, rig.config.publish.retry_cap);
+    assert!(row.tombstone_published_at.is_none());
+}
