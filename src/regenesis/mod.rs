@@ -13,6 +13,7 @@ pub mod boot;
 pub mod gate;
 pub mod genesis;
 pub mod handlers;
+pub mod join;
 pub mod routes;
 pub mod rpc;
 pub mod seal;

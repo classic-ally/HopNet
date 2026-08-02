@@ -96,6 +96,10 @@ pub struct AppState {
     /// This database's epoch (RFC-019 S6), loaded from consensus_meta
     /// at startup (1 when absent). Carried in the peer handshake.
     pub epoch: Arc<std::sync::atomic::AtomicU64>,
+    /// One epoch join at a time (RFC-019 S7). Per-AppState rather than a
+    /// static: several in-process nodes share one process in tests, and
+    /// each must be able to rejoin independently.
+    pub epoch_join_inflight: Arc<std::sync::atomic::AtomicBool>,
     /// The MAIN multi-thread runtime's handle, captured at startup.
     /// Host-side background work scheduled from consensus apply
     /// (`HostWorkScheduler`) spawns here — apply runs on the consensus

@@ -293,6 +293,7 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 storage: Arc::new(OnceCell::new()),
                 restart_signal: Arc::new(tokio::sync::Notify::new()),
                 epoch: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                epoch_join_inflight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 runtime: tokio::runtime::Handle::current(),
             };
 

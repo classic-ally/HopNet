@@ -490,6 +490,7 @@ fn create_test_app_state_on_manager(
         storage: Arc::new(once_cell::sync::OnceCell::new()),
         restart_signal: Arc::new(tokio::sync::Notify::new()),
         epoch: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        epoch_join_inflight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         // Tests run sync (no ambient runtime) — reuse the shared test
         // runtime so scheduled work has somewhere real to land.
         runtime: test_iroh_rt().handle().clone(),
