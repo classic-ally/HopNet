@@ -386,6 +386,11 @@
             # frontend
             pkgs.nodejs_24
             pkgs.pnpm
+
+            # ingress-ffi smoke tests read state.db back through the sqlite3
+            # CLI rather than take a sqlx dev-dep; macOS ships one, Linux
+            # does not, so the shell has to supply it.
+            pkgs.sqlite
           ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
             # hopnet-mount (RFC-018): fuser links libfuse3
             pkgs.fuse3
