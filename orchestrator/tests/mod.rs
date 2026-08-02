@@ -40,7 +40,7 @@ mod photos;
 mod photos_ingress_identity;
 pub(crate) mod photos_ingress_publish;
 mod photos_ingress_shared;
-mod photos_ingress_tombstone;
+pub(crate) mod photos_ingress_tombstone;
 pub(crate) mod photos_shared_library;
 mod post_files_mixed;
 mod post_files_shape;

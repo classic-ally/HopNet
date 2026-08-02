@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use crate::NodeInfo;
 use crate::tests::multi_user::create_user;
 use crate::tests::photos_ingress_publish::{fetch_resource_with_retry, wait_for_ids};
+use crate::tests::photos_ingress_tombstone::wait_for_absent;
 use crate::tests::photos_shared_library::{
     create_library, get_user_id, login_with_retry, post_member_action, record,
     wait_for_library_entry,
@@ -486,7 +487,68 @@ impl TestScenario for PhotosIngressShared {
             ))
         );
 
-        // ── Step 7: non-member scoped claims are refused ────────────────
+        // ── Step 7: a shared-scope tombstone reaches the other member ───
+        // The one combination the personal tombstone scenario cannot
+        // reach: the node's device-tx gate resolves a SHARED photo's scope
+        // from its committed row and refuses the whole transaction unless
+        // the submitting device holds that library. Alice's daemon does,
+        // so her delete must commit and converge onto bob's sidecar.
+
+        step!(
+            format!("Alice tombstones the {SHARED_COUNT} shared photos locally"),
+            driver(dir_a.path().to_path_buf(), vec!["tombstone".into()]).await
+        );
+        step!(
+            "Shared tombstones propagate under the library scope",
+            async {
+                let (_, report) =
+                    driver(dir_a.path().to_path_buf(), publish_args(&token_a)).await?;
+                anyhow::ensure!(
+                    report["tombstones_propagated"].as_u64() == Some(SHARED_COUNT as u64),
+                    "propagated {}: {report}",
+                    report["tombstones_propagated"]
+                );
+                // Alice's unpublished personal photos are tombstoned too;
+                // the mesh never heard of them, so they must not queue.
+                anyhow::ensure!(
+                    report["published"].as_u64() == Some(0),
+                    "a tombstoned photo must never publish: {report}"
+                );
+                Ok(())
+            }
+            .await,
+            |_| Some(format!("{SHARED_COUNT} deletes committed"))
+        );
+        step!(
+            "Bob's gallery loses the shared photos (cross-member delete)",
+            wait_for_absent(&client, &bob, &shared_ids, Duration::from_secs(90)).await
+        );
+
+        step!(
+            "Alice restores them locally",
+            driver(
+                dir_a.path().to_path_buf(),
+                vec!["tombstone".into(), "--restore".into()],
+            )
+            .await
+        );
+        step!(
+            "Shared restores propagate and bob sees them again",
+            async {
+                let (_, report) =
+                    driver(dir_a.path().to_path_buf(), publish_args(&token_a)).await?;
+                anyhow::ensure!(
+                    report["restores_propagated"].as_u64() == Some(SHARED_COUNT as u64),
+                    "restored {}: {report}",
+                    report["restores_propagated"]
+                );
+                wait_for_ids(&client, &bob, &shared_ids, Duration::from_secs(90)).await?;
+                Ok(())
+            }
+            .await
+        );
+
+        // ── Step 8: non-member scoped claims are refused ────────────────
 
         step!(
             "Non-member scoped claim is refused (403)",

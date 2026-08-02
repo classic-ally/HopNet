@@ -6,6 +6,7 @@ use crate::tests::photos_ingress_publish::{report_photos, run_driver_async, wait
 use crate::tests::{
     Check, TestResult, TestScenario, get_max_view, print_and_add_check, wait_for_minimum_view,
 };
+use hopnet::dev_seed;
 
 const COUNT: u32 = 4;
 
@@ -28,7 +29,7 @@ fn base_url(node: &NodeInfo) -> String {
     format!("http://{}:{}", node.ip_address, node.port)
 }
 
-async fn gallery_ids(client: &reqwest::Client, node: &NodeInfo) -> Vec<String> {
+pub(crate) async fn gallery_ids(client: &reqwest::Client, node: &NodeInfo) -> Vec<String> {
     let response = client
         .get(format!("{}/api/photos/gallery?limit=200", base_url(node)))
         .header("Authorization", format!("Bearer {}", node.jwt_token))
@@ -46,7 +47,7 @@ async fn gallery_ids(client: &reqwest::Client, node: &NodeInfo) -> Vec<String> {
 /// Poll a node's gallery until none of `gone` remains. The mirror of
 /// `wait_for_ids` — the sidecar converges from consensus asynchronously, so
 /// absence needs the same patience presence does.
-async fn wait_for_absent(
+pub(crate) async fn wait_for_absent(
     client: &reqwest::Client,
     node: &NodeInfo,
     gone: &[String],
@@ -229,6 +230,21 @@ impl TestScenario for PhotosIngressTombstone {
                     );
                     Ok(())
                 })
+        );
+        // Every gallery/recently-deleted read below goes through the per-user
+        // sidecar, which each node only opens once photos are enabled for
+        // that user.
+        check_or_bail!(
+            "Enable per-user sidecar on every node",
+            async {
+                for node in nodes {
+                    dev_seed::enable_sidecar(&client, &base_url(node), &node.jwt_token)
+                        .await
+                        .with_context(|| format!("node {}", node.node_id))?;
+                }
+                Ok::<_, anyhow::Error>(())
+            }
+            .await
         );
         check_or_bail!(
             "Photos visible on every node",
