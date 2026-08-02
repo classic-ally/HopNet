@@ -238,6 +238,20 @@ pub async fn sign_in(
                 {
                     tracing::warn!("Failed to ensure FileProvider device token: {:?}", e);
                 }
+
+                // Photo ingress is enablement-gated (the /photo-ingress/enable
+                // route is the sole minting entry): login only self-heals an
+                // EXISTING provision (revoked-token re-mint), never creates one.
+                if crate::fileprovider::keychain::load_photo_ingress_config().is_ok() {
+                    if let Err(e) = crate::devices::routes::ensure_photo_ingress_device_token(
+                        &app_state,
+                        db_user.user_id,
+                    )
+                    .await
+                    {
+                        tracing::warn!("Failed to ensure photo-ingress device token: {:?}", e);
+                    }
+                }
             }
         }
     }
@@ -285,6 +299,7 @@ pub async fn sign_out(
     }
 
     app_state.session_store.write().await.remove(&uid);
+    app_state.photos_host.shutdown(uid).await;
     StatusCode::OK
 }
 
@@ -344,6 +359,22 @@ pub fn derive_x25519_privkey_from_user(user_privkey: &PrivKey) -> x25519_dalek::
 
     // Create X25519 static secret
     x25519_dalek::StaticSecret::from(x25519_secret_bytes)
+}
+
+/// Derives the per-user photo fingerprint key from the user's Ed25519
+/// private key. Fingerprints are `blake3::keyed_hash(&key, cloud_id)` over
+/// the asset's stable cross-device identifier (PHCloudIdentifier), computed
+/// node-side in the resolve route — keyed so replicated state carries no
+/// unkeyed function of the identifier (RFC-014 confirmation-oracle rule).
+///
+/// The context string is FROZEN: changing it orphans every committed
+/// cloud_fingerprint (dedupe silently stops matching existing rows).
+pub fn derive_photo_fingerprint_key(user_privkey: &PrivKey) -> [u8; 32] {
+    let mut key = [0u8; 32];
+    let mut hasher = blake3::Hasher::new_derive_key("hopnet photos cloud fingerprint v1");
+    hasher.update(&user_privkey.to_bytes());
+    hasher.finalize_xof().fill(&mut key);
+    key
 }
 
 /// Wrap a user private key with a password using Argon2id + ChaCha20-Poly1305.

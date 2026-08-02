@@ -257,6 +257,13 @@ typedef void (*UniffiCallbackInterfacePhotoResourceFetcherMethod1)(uint64_t, Rus
     );
 
 #endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_PUBLISH_CREDENTIALS_PROVIDER_METHOD0
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_PUBLISH_CREDENTIALS_PROVIDER_METHOD0
+typedef void (*UniffiCallbackInterfacePublishCredentialsProviderMethod0)(uint64_t, RustBuffer* _Nonnull, 
+        RustCallStatus *_Nonnull uniffiCallStatus
+    );
+
+#endif
 #ifndef UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_PHOTO_RESOURCE_FETCHER
 #define UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_PHOTO_RESOURCE_FETCHER
 typedef struct UniffiVTableCallbackInterfacePhotoResourceFetcher {
@@ -265,6 +272,15 @@ typedef struct UniffiVTableCallbackInterfacePhotoResourceFetcher {
     UniffiCallbackInterfacePhotoResourceFetcherMethod0 _Nonnull descriptorFor;
     UniffiCallbackInterfacePhotoResourceFetcherMethod1 _Nonnull fetchResource;
 } UniffiVTableCallbackInterfacePhotoResourceFetcher;
+
+#endif
+#ifndef UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_PUBLISH_CREDENTIALS_PROVIDER
+#define UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_PUBLISH_CREDENTIALS_PROVIDER
+typedef struct UniffiVTableCallbackInterfacePublishCredentialsProvider {
+    UniffiCallbackInterfaceFree _Nonnull uniffiFree;
+    UniffiCallbackInterfaceClone _Nonnull uniffiClone;
+    UniffiCallbackInterfacePublishCredentialsProviderMethod0 _Nonnull current;
+} UniffiVTableCallbackInterfacePublishCredentialsProvider;
 
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_CLONE_PHOTORESOURCEFETCHER
@@ -290,6 +306,26 @@ RustBuffer uniffi_ingress_ffi_fn_method_photoresourcefetcher_descriptor_for(uint
 #ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_PHOTORESOURCEFETCHER_FETCH_RESOURCE
 #define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_PHOTORESOURCEFETCHER_FETCH_RESOURCE
 void uniffi_ingress_ffi_fn_method_photoresourcefetcher_fetch_resource(uint64_t ptr, RustBuffer request, uint64_t sink, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_CLONE_PUBLISHCREDENTIALSPROVIDER
+#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_CLONE_PUBLISHCREDENTIALSPROVIDER
+uint64_t uniffi_ingress_ffi_fn_clone_publishcredentialsprovider(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_FREE_PUBLISHCREDENTIALSPROVIDER
+#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_FREE_PUBLISHCREDENTIALSPROVIDER
+void uniffi_ingress_ffi_fn_free_publishcredentialsprovider(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_INIT_CALLBACK_VTABLE_PUBLISHCREDENTIALSPROVIDER
+#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_INIT_CALLBACK_VTABLE_PUBLISHCREDENTIALSPROVIDER
+void uniffi_ingress_ffi_fn_init_callback_vtable_publishcredentialsprovider(const UniffiVTableCallbackInterfacePublishCredentialsProvider* _Nonnull vtable
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_PUBLISHCREDENTIALSPROVIDER_CURRENT
+#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_PUBLISHCREDENTIALSPROVIDER_CURRENT
+RustBuffer uniffi_ingress_ffi_fn_method_publishcredentialsprovider_current(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_CLONE_CHUNKSINK
@@ -367,6 +403,11 @@ RustBuffer uniffi_ingress_ffi_fn_method_ingresssession_cleanup(uint64_t ptr, Rus
 RustBuffer uniffi_ingress_ffi_fn_method_ingresssession_drain(uint64_t ptr, uint64_t fetcher, RustBuffer options, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_ENSURE_PERSONAL_LIBRARY
+#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_ENSURE_PERSONAL_LIBRARY
+RustBuffer uniffi_ingress_ffi_fn_method_ingresssession_ensure_personal_library(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_FINISH_SCAN
 #define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_FINISH_SCAN
 RustBuffer uniffi_ingress_ffi_fn_method_ingresssession_finish_scan(uint64_t ptr, uint64_t enumerated, int64_t retry_cap, RustCallStatus *_Nonnull out_status
@@ -389,7 +430,7 @@ void uniffi_ingress_ffi_fn_method_ingresssession_observe_removed(uint64_t ptr, R
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_RUN_DAEMON
 #define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_RUN_DAEMON
-RustBuffer uniffi_ingress_ffi_fn_method_ingresssession_run_daemon(uint64_t ptr, uint64_t fetcher, RustBuffer options, RustCallStatus *_Nonnull out_status
+RustBuffer uniffi_ingress_ffi_fn_method_ingresssession_run_daemon(uint64_t ptr, uint64_t fetcher, RustBuffer options, RustBuffer credentials_provider, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_FN_METHOD_INGRESSSESSION_SCAN_ASSET
@@ -674,6 +715,12 @@ uint16_t uniffi_ingress_ffi_checksum_method_photoresourcefetcher_fetch_resource(
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_PUBLISHCREDENTIALSPROVIDER_CURRENT
+#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_PUBLISHCREDENTIALSPROVIDER_CURRENT
+uint16_t uniffi_ingress_ffi_checksum_method_publishcredentialsprovider_current(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_CHUNKSINK_ABORT
 #define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_CHUNKSINK_ABORT
 uint16_t uniffi_ingress_ffi_checksum_method_chunksink_abort(void
@@ -731,6 +778,12 @@ uint16_t uniffi_ingress_ffi_checksum_method_ingresssession_cleanup(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_DRAIN
 #define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_DRAIN
 uint16_t uniffi_ingress_ffi_checksum_method_ingresssession_drain(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_ENSURE_PERSONAL_LIBRARY
+#define UNIFFI_FFIDEF_UNIFFI_INGRESS_FFI_CHECKSUM_METHOD_INGRESSSESSION_ENSURE_PERSONAL_LIBRARY
+uint16_t uniffi_ingress_ffi_checksum_method_ingresssession_ensure_personal_library(void
     
 );
 #endif

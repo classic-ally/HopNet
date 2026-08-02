@@ -4,7 +4,6 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
-use ingress_core::recover::RecoverLibrarySpec;
 
 /// Operator CLI for the Apple Photos ingress daemon. Reads `state.db`
 /// directly — no PhotoKit, runs without Photos authorization.
@@ -30,10 +29,10 @@ fn default_data_dir() -> PathBuf {
 pub enum Command {
     /// Library, pipeline, and per-photo views.
     Status(StatusArgs),
-    /// Tier-2 invariant audit: refcounts, blob files, sidecars.
+    /// Tier-2 invariant audit: refcounts and blob files. (Disaster recovery
+    /// is a re-scan from PhotoKit + mesh adoption — there is no separate
+    /// rebuild subcommand since the mesh became the archive of record.)
     Fsck(FsckArgs),
-    /// Tier-3 disaster rebuild of state.db from a storage root.
-    Recover(RecoverArgs),
     /// Library configuration.
     #[command(subcommand)]
     Library(LibraryCommand),
@@ -57,35 +56,8 @@ pub struct FsckArgs {
     /// destructive repair). Takes the exclusive run lock.
     #[arg(long)]
     pub repair: bool,
-    /// Byte-compare remote sidecars (default: existence check only).
-    #[arg(long)]
-    pub deep: bool,
     #[arg(long)]
     pub json: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct RecoverArgs {
-    /// Storage root(s) whose state-snapshots/ are searched. Repeatable.
-    #[arg(long)]
-    pub root: Vec<PathBuf>,
-    /// Library spec(s) for the sidecar-tree rebuild:
-    /// id=<id>,blob=<path>[,sidecars=<path>][,scope=personal|shared][,retention=<days>][,name=<label>].
-    /// A wrong blob= path rebuilds a library pointing at the wrong tree —
-    /// the post-rebuild blob verification is the backstop. Repeatable.
-    #[arg(long, value_parser = parse_library_spec)]
-    pub library: Vec<RecoverLibrarySpec>,
-    /// Skip the snapshot search (the snapshots are known-bad).
-    #[arg(long)]
-    pub from_sidecars: bool,
-    /// Move an existing state.db aside (state.db.pre-recover.<ts>) instead
-    /// of refusing.
-    #[arg(long)]
-    pub force: bool,
-}
-
-fn parse_library_spec(s: &str) -> Result<RecoverLibrarySpec, String> {
-    RecoverLibrarySpec::parse(s).map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Subcommand)]
@@ -109,6 +81,18 @@ pub enum LibraryCommand {
     Rename { id: String, display_name: String },
     /// Change the tombstone retention window.
     SetRetention { id: String, days: i64 },
+    /// Bind a scope-bound (shared) library to a consensus shared-library
+    /// UUID — its publish target. Photos of a shared library publish only
+    /// while this is set.
+    SetMeshId {
+        id: String,
+        /// The mesh shared_libraries UUID.
+        #[arg(required_unless_present = "clear")]
+        mesh_id: Option<String>,
+        /// Clear the binding (stops shared publishing for this library).
+        #[arg(long, conflicts_with = "mesh_id")]
+        clear: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -119,17 +103,10 @@ pub enum BindScope {
 
 #[derive(Debug, Args)]
 pub struct LibraryAddArgs {
-    /// Absolute path to the per-library subtree on the storage root.
-    #[arg(long)]
-    pub blob_root: PathBuf,
     #[arg(long, value_enum)]
     pub scope: AddScope,
     #[arg(long)]
     pub display_name: Option<String>,
-    /// Remote sidecar backup root. Omitting it degrades disaster recovery
-    /// to blob-only — the command warns loudly.
-    #[arg(long)]
-    pub sidecar_remote: Option<PathBuf>,
     #[arg(long, default_value_t = 30)]
     pub retention_days: i64,
     /// Explicit id override (scripts/tests); lowercase [a-z0-9_].

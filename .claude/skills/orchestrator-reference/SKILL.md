@@ -38,6 +38,7 @@ cargo build --release --bin orchestrator --features skip-frontend
 
 | Command | Syntax | Description |
 |---------|--------|-------------|
+| **creds** | `orchestrator creds --mesh-id M` | Print mesh sign-in credentials (username/passphrase) and per-node browser URLs |
 | **status** | `orchestrator status --mesh-id M` | View consensus state (view, phase, role) across all nodes |
 | **divergence** | `orchestrator divergence --mesh-id M` | Detect state inconsistencies between nodes |
 | **history** | `orchestrator history --mesh-id M --node N [--view V]` | Query consensus history for a specific node. Optional `--view` for detailed state at that view. |
@@ -103,6 +104,8 @@ Pass means **test passed AND no divergence**. The mesh is only deleted when the 
 | `import-write-gate` | POST `/files` returns 409 mid-import for the same user (cross-node enforcement); succeeds after status Completed |
 | `import-status-counts` | `GET /takeout/import/status` returns aggregate counts after mixed-failure import (`imported=4, failed=1, total=5`); non-owner returns 404 |
 | `import-resume-after-restart` | Stop owner mid-import, restart, re-login: status stays Importing pre-login; login hook fires resume; creation walk completes; all files queryable cross-node |
+| `photos-upload-consistency` | Seed photos via the manual ingest route on node 0 (`hopnet::dev_seed`, deterministic images); verify sidecar sync, gallery/page/histogram parity, and byte-identical content on every node (remote fragment discovery). Seed a kept mesh manually with `photo-seeder --base-url http://localhost:<port>` |
+| `photos-ingress-publish` | Fabricate ingress-daemon state (state.db + blobs + sidecars, no PhotoKit) via the `ingress-publish-e2e` driver, publish into node 0 over the device-token thin-client routes (`/api/photos/client/*`), then verify consensus advance, per-node gallery presence, blake3 byte parity of served content on every node, and confirm-then-retry idempotency (drained queue republishes nothing; reset + republish resolves as already_published). Pre-build the driver: `cargo build --manifest-path crates/ingress-publisher/Cargo.toml --features e2e-bin` |
 | `post-files-consensus-shape` | Upload N files in a single POST `/files` request; assert one consensus view advance and all N files visible on every node (tripwire for batching regressions in `post_files`) |
 | `mixed-files-and-folders-one-request` | Upload N files into a deep nested path with no pre-existing parents; assert single view advance and all parents + files visible on every node |
 | `mount-cross-node-consistency` | Run the hopnet-mount FUSE daemon inside node 0's container (containers have `/dev/fuse` + CAP_SYS_ADMIN; image carries `hopnet-mount`, `fusermount3`, busybox); kernel writes through the mount verify byte-identical via other nodes' APIs, remote API writes/deletes surface through the mount |

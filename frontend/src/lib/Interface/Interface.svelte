@@ -14,6 +14,7 @@
     import ResiliencePane from "../panes/resilience/ResiliencePane.svelte";
     import MaintenancePane from "../panes/maintenance/MaintenancePane.svelte";
     import IncomingSharesPane from "../panes/shares/IncomingSharesPane.svelte";
+    import PhotosPane from "../panes/photos/PhotosPane.svelte";
     import { incomingShareCountStore, importStatusStore, currentUserStore } from "../stores";
     import { router, paneForPath, ACCOUNT_PATH_PREFIX } from "../router.svelte";
 
@@ -173,6 +174,12 @@
                         onClick={() => nav('/shared')}
                         badge={$incomingShareCountStore}
                     />
+                    <SidebarItem
+                        icon="i-carbon-image"
+                        title="Photos"
+                        selected={selectedItem === "photos"}
+                        onClick={() => nav('/photos')}
+                    />
                 {/if}
             </div>
             <AccountSidebarItem
@@ -198,6 +205,8 @@
             <MaintenancePane onToggleSidebar={toggleSidebar}/>
         {:else if selectedItem === "shared"}
             <IncomingSharesPane onToggleSidebar={toggleSidebar}/>
+        {:else if selectedItem === "photos"}
+            <PhotosPane onToggleSidebar={toggleSidebar}/>
         {:else if selectedItem === "recents"}
             <RecentsPane onToggleSidebar={toggleSidebar}/>
         {:else if selectedItem === "account"}

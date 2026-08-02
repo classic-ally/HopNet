@@ -1,0 +1,28 @@
+[package]
+name = "hopnet-photos"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+repository = "https://git.bentley.sh/HopNet/HopNet"
+description = "HopNet photos projection: encrypted consensus-tracked photo metadata + resources over the storage + consensus substrates (RFC-011 Phase 1: schema + GC reference provider)"
+
+[dependencies]
+hopnet-common = { path = "../common", features = ["database"] }
+hopnet-projection = { path = "../hopnet-projection", optional = true }
+hopnet-storage = { path = "../hopnet-storage" }
+
+serde = { version = "1.0.219", features = ["derive"] }
+bincode = { version = "2.0.1", features = ["serde"] }
+tracing = { version = "0.1.41", optional = true }
+chrono = { version = "0.4", optional = true }
+rusqlite = { version = "0.38", features = ["bundled", "functions"], optional = true }
+inventory = { version = "0.3.20", optional = true }
+hex = { version = "0.4.3", optional = true }
+
+[dev-dependencies]
+# content-serving tests wrap/unwrap real per-blob keys
+chacha20poly1305 = "0.10.1"
+
+[features]
+default = ["projection"]
+projection = ["dep:hopnet-projection", "dep:rusqlite", "dep:tracing", "dep:chrono", "dep:inventory", "dep:hex"]

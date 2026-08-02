@@ -93,7 +93,7 @@ fi
 
 # Remove non-distribution binaries that Tauri may have bundled.
 # These are developer tools and don't belong in the shipped .app.
-for extra in orchestrator snapshotter; do
+for extra in orchestrator snapshotter photo-seeder; do
     EXTRA_BINARY="$APP_BUNDLE/Contents/MacOS/$extra"
     if [ -f "$EXTRA_BINARY" ]; then
         echo "🗑️  Removing $extra binary from app bundle (not needed for distribution)"

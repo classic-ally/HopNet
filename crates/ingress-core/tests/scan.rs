@@ -4,7 +4,6 @@
 use chrono::{Duration, Utc};
 use ingress_core::fixtures::{AssetDescriptorBuilder, add_shared, store_with_personal};
 use ingress_core::model::ResourceType;
-use ingress_core::paths::DataDir;
 use ingress_core::resolve::{SeedOutcome, seed_descriptor};
 use ingress_core::scan::{ScanProbe, ScanVerdict, begin, finish, probe};
 use ingress_core::{AssetDescriptor, LibraryScope, PhotoId, StateStore};
@@ -33,8 +32,7 @@ async fn seed_one(store: &StateStore, desc: &AssetDescriptor) -> PhotoId {
 #[tokio::test]
 async fn probe_done_for_unchanged_marks_seen() {
     let (store, _) = store_with_personal().await;
-    let tmp = tempfile::tempdir().unwrap();
-    let data_dir = DataDir::new(tmp.path());
+    let _tmp = tempfile::tempdir().unwrap();
     let desc = AssetDescriptorBuilder::simple_image()
         .modified_at(Utc::now())
         .build();
@@ -42,11 +40,11 @@ async fn probe_done_for_unchanged_marks_seen() {
 
     let scan = begin(&store).await.unwrap();
     assert_eq!(
-        probe(&store, &data_dir, &scan, &probe_of(&desc)).await.unwrap(),
+        probe(&store, &scan, &probe_of(&desc)).await.unwrap(),
         ScanVerdict::Done
     );
 
-    let summary = finish(&store, &data_dir, &scan, 1, 5).await.unwrap();
+    let summary = finish(&store, &scan, 1, 5).await.unwrap();
     assert_eq!(summary.deletions_synthesized, 0);
     assert!(
         store
@@ -69,8 +67,7 @@ async fn probe_needs_full_for_every_change_class() {
     let (store, _) = store_with_personal().await;
     let shared = add_shared(&store).await;
     let _ = shared;
-    let tmp = tempfile::tempdir().unwrap();
-    let data_dir = DataDir::new(tmp.path());
+    let _tmp = tempfile::tempdir().unwrap();
     let t1 = Utc::now();
 
     let scan = begin(&store).await.unwrap();
@@ -80,7 +77,7 @@ async fn probe_needs_full_for_every_change_class() {
         .modified_at(t1)
         .build();
     assert_eq!(
-        probe(&store, &data_dir, &scan, &probe_of(&unknown)).await.unwrap(),
+        probe(&store, &scan, &probe_of(&unknown)).await.unwrap(),
         ScanVerdict::NeedsFull
     );
 
@@ -89,11 +86,11 @@ async fn probe_needs_full_for_every_change_class() {
         .modified_at(t1)
         .build();
     seed_one(&store, &tomb_desc).await;
-    ingress_core::classify::apply_removal(&store, &data_dir, &tomb_desc.local_id)
+    ingress_core::classify::apply_removal(&store, &tomb_desc.local_id)
         .await
         .unwrap();
     assert_eq!(
-        probe(&store, &data_dir, &scan, &probe_of(&tomb_desc)).await.unwrap(),
+        probe(&store, &scan, &probe_of(&tomb_desc)).await.unwrap(),
         ScanVerdict::NeedsFull
     );
 
@@ -105,7 +102,7 @@ async fn probe_needs_full_for_every_change_class() {
     let mut flipped = probe_of(&flip_desc);
     flipped.scope = LibraryScope::Shared;
     assert_eq!(
-        probe(&store, &data_dir, &scan, &flipped).await.unwrap(),
+        probe(&store, &scan, &flipped).await.unwrap(),
         ScanVerdict::NeedsFull
     );
 
@@ -117,7 +114,7 @@ async fn probe_needs_full_for_every_change_class() {
     let mut newer = probe_of(&mod_desc);
     newer.asset_modified_at = Some(t1 + Duration::seconds(5));
     assert_eq!(
-        probe(&store, &data_dir, &scan, &newer).await.unwrap(),
+        probe(&store, &scan, &newer).await.unwrap(),
         ScanVerdict::NeedsFull
     );
 
@@ -125,7 +122,7 @@ async fn probe_needs_full_for_every_change_class() {
     let null_desc = AssetDescriptorBuilder::simple_image().build();
     seed_one(&store, &null_desc).await;
     assert_eq!(
-        probe(&store, &data_dir, &scan, &probe_of(&null_desc)).await.unwrap(),
+        probe(&store, &scan, &probe_of(&null_desc)).await.unwrap(),
         ScanVerdict::NeedsFull
     );
 }
@@ -133,13 +130,12 @@ async fn probe_needs_full_for_every_change_class() {
 // Impact: offline deletion is detectable ONLY here — and over-synthesis
 // (tombstoning seen or scan-window-minted photos) restarts retention clocks
 // on live photos.
-// Should: tombstone exactly the unseen pre-scan photos, with sidecar edit +
+// Should: tombstone exactly the unseen pre-scan photos, with
 // deletion_observed, timestamped at the scan moment.
 #[tokio::test]
 async fn finish_synthesizes_deletions_for_unseen_only() {
     let (store, _) = store_with_personal().await;
-    let tmp = tempfile::tempdir().unwrap();
-    let data_dir = DataDir::new(tmp.path());
+    let _tmp = tempfile::tempdir().unwrap();
     let t1 = Utc::now();
 
     let seen_desc = AssetDescriptorBuilder::simple_image()
@@ -152,7 +148,7 @@ async fn finish_synthesizes_deletions_for_unseen_only() {
     let gone_id = seed_one(&store, &gone_desc).await;
 
     let scan = begin(&store).await.unwrap();
-    probe(&store, &data_dir, &scan, &probe_of(&seen_desc)).await.unwrap();
+    probe(&store, &scan, &probe_of(&seen_desc)).await.unwrap();
     // `gone` is never probed — absent from PhotoKit.
 
     // Minted mid-scan (observer insert racing the enumeration): protected by
@@ -162,7 +158,7 @@ async fn finish_synthesizes_deletions_for_unseen_only() {
         .build();
     let midscan_id = seed_one(&store, &midscan_desc).await;
 
-    let summary = finish(&store, &data_dir, &scan, 2, 5).await.unwrap();
+    let summary = finish(&store, &scan, 2, 5).await.unwrap();
     assert_eq!(summary.deletions_synthesized, 1);
     assert!(
         store
@@ -204,15 +200,14 @@ async fn finish_synthesizes_deletions_for_unseen_only() {
 #[tokio::test]
 async fn finish_with_zero_enumeration_skips_synthesis() {
     let (store, _) = store_with_personal().await;
-    let tmp = tempfile::tempdir().unwrap();
-    let data_dir = DataDir::new(tmp.path());
+    let _tmp = tempfile::tempdir().unwrap();
     let desc = AssetDescriptorBuilder::simple_image()
         .modified_at(Utc::now())
         .build();
     let id = seed_one(&store, &desc).await;
 
     let scan = begin(&store).await.unwrap();
-    let summary = finish(&store, &data_dir, &scan, 0, 5).await.unwrap();
+    let summary = finish(&store, &scan, 0, 5).await.unwrap();
     assert!(summary.synthesis_skipped);
     assert_eq!(summary.deletions_synthesized, 0);
     assert!(
@@ -233,8 +228,7 @@ async fn finish_with_zero_enumeration_skips_synthesis() {
 #[tokio::test]
 async fn finish_resets_gave_up_and_logs_counts() {
     let (store, _) = store_with_personal().await;
-    let tmp = tempfile::tempdir().unwrap();
-    let data_dir = DataDir::new(tmp.path());
+    let _tmp = tempfile::tempdir().unwrap();
     let desc = AssetDescriptorBuilder::simple_image()
         .modified_at(Utc::now())
         .build();
@@ -249,8 +243,8 @@ async fn finish_resets_gave_up_and_logs_counts() {
     }
 
     let scan = begin(&store).await.unwrap();
-    probe(&store, &data_dir, &scan, &probe_of(&desc)).await.unwrap();
-    let summary = finish(&store, &data_dir, &scan, 1, cap).await.unwrap();
+    probe(&store, &scan, &probe_of(&desc)).await.unwrap();
+    let summary = finish(&store, &scan, 1, cap).await.unwrap();
     assert_eq!(summary.gave_up_reset, 1);
 
     let row = store

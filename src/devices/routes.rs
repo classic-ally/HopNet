@@ -136,6 +136,45 @@ pub async fn ensure_fileprovider_device_token(
     Ok(())
 }
 
+/// Ensure a photo-ingress device token exists in the macOS Keychain
+/// (service `com.hopnet.desktop.photo-ingress`, read by the ingress
+/// daemon's Swift shell). Mirrors `ensure_fileprovider_device_token`:
+/// re-registers when the stored token's device row no longer exists
+/// (revoked), otherwise leaves it untouched.
+#[cfg(target_os = "macos")]
+pub async fn ensure_photo_ingress_device_token(
+    app_state: &AppState,
+    user_id: i32,
+) -> Result<(), StatusCode> {
+    use crate::db::devices::get_device_by_id;
+    use crate::fileprovider::keychain;
+
+    if let Ok((api_key, _base_url)) = keychain::load_photo_ingress_config()
+        && let Some(dot_pos) = api_key.find('.')
+        && let Ok(device_id) = CustomUUID::from_str(&api_key[..dot_pos])
+    {
+        let db_lock = app_state
+            .db_pool
+            .get()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if let Ok(Some(_)) = get_device_by_id(&db_lock, &device_id) {
+            return Ok(()); // Token still valid
+        }
+    }
+
+    let (_device_id, api_key) =
+        register_device_internal(app_state, user_id, "Photo Ingress").await?;
+    // 127.0.0.1, not localhost — must match the ephemeral-port refresh in
+    // main.rs so the daemon's credential-change detection sees ONE form.
+    keychain::store_photo_ingress_config(
+        &api_key,
+        &format!("http://127.0.0.1:{}", app_state.port),
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(())
+}
+
 /// GET /devices
 /// List user's devices (decrypted names, no API keys)
 async fn get_devices(
@@ -177,6 +216,36 @@ async fn get_devices(
     Ok(Json(devices))
 }
 
+/// Core device revocation: submit the revoke_device consensus transaction
+/// (idempotent — succeeds even if the device doesn't exist). Shared by the
+/// DELETE route and the photo-ingress disable flow.
+pub async fn revoke_device_internal(
+    app_state: &AppState,
+    user_id: i32,
+    device_id: CustomUUID,
+) -> Result<(), StatusCode> {
+    let payload = RevokeDevicePayload { device_id, user_id };
+
+    let encoded_payload = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let transaction = create_signed_user_transaction(
+        app_state,
+        "revoke_device".to_string(),
+        encoded_payload,
+        user_id,
+    )
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    app_state
+        .consensus_queue
+        .submit(transaction)
+        .await
+        .map(|_| ())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 /// DELETE /devices/:id
 /// Revoke a device token
 async fn delete_device(
@@ -184,37 +253,12 @@ async fn delete_device(
     Extension(user_id): Extension<i32>,
     Path(device_id_str): Path<String>,
 ) -> StatusCode {
-    // Parse device ID
     let device_id = match CustomUUID::from_str(&device_id_str) {
         Ok(id) => id,
         Err(_) => return StatusCode::BAD_REQUEST,
     };
-
-    // Build consensus payload
-    let payload = RevokeDevicePayload { device_id, user_id };
-
-    let encoded_payload = match bincode::serde::encode_to_vec(&payload, bincode::config::standard())
-    {
-        Ok(data) => data,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
-    };
-
-    // Create signed transaction with user authentication
-    let transaction = match create_signed_user_transaction(
-        &app_state,
-        "revoke_device".to_string(),
-        encoded_payload,
-        user_id,
-    )
-    .await
-    {
-        Ok(tx) => tx,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
-    };
-
-    // Submit to consensus (idempotent - succeeds even if device doesn't exist)
-    match app_state.consensus_queue.submit(transaction).await {
-        Ok(_) => StatusCode::OK,
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    match revoke_device_internal(&app_state, user_id, device_id).await {
+        Ok(()) => StatusCode::OK,
+        Err(status) => status,
     }
 }

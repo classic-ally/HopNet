@@ -9,8 +9,7 @@ use std::path::PathBuf;
 use crate::error::Result;
 use crate::ids::PhotoId;
 use crate::model::{LibraryConfig, PhotoRecord, ResourceRecord};
-use crate::paths::{BlobPaths, DataDir};
-use crate::sidecar_io::find_sidecar;
+use crate::paths::SpoolPaths;
 use crate::store::{LibraryStats, LogEvent, RetrySummary, StateStore};
 
 /// How many log events the per-photo view tails by default.
@@ -66,8 +65,6 @@ pub async fn status(store: &StateStore, retry_cap: i64) -> Result<StatusReport> 
 pub struct PhotoStatus {
     pub photo: PhotoRecord,
     pub resources: Vec<ResourceStatus>,
-    /// The local sidecar document, if present in the YYYY/MM tree.
-    pub sidecar_local: Option<PathBuf>,
     /// Newest-first ingest-log tail for this photo.
     pub events: Vec<LogEvent>,
 }
@@ -82,13 +79,15 @@ pub struct ResourceStatus {
     /// (never conflate "unknown" with "missing" — an absent mount must not
     /// read as byte loss).
     pub blob_exists: Option<bool>,
+    /// Spool-evicted: the bytes are deliberately gone (HopNet holds them).
+    pub evicted: bool,
 }
 
 /// Per-photo view. `key` is tried as a `photo_id` first, then a `cloud_id`.
 /// Returns None when neither matches.
 pub async fn photo_status(
     store: &StateStore,
-    data_dir: &DataDir,
+    spool: &SpoolPaths,
     key: &str,
 ) -> Result<Option<PhotoStatus>> {
     let by_id = store.photo(&PhotoId::from_string(key)).await?;
@@ -100,30 +99,28 @@ pub async fn photo_status(
         },
     };
 
-    let library: Option<LibraryConfig> = match &photo.library_id {
-        Some(id) => store.library(id).await?,
-        None => None,
-    };
-    let blob_paths = library.as_ref().map(|lib| BlobPaths::new(&lib.blob_root));
-
     let mut resources = Vec::new();
     for record in store.resources_for_photo(&photo.photo_id).await? {
-        let blob_path = match (&blob_paths, &record.content_hash, &record.ext) {
-            (Some(paths), Some(hash), Some(ext)) => Some(paths.blob_path(hash, ext)),
+        let blob_path = match (&record.content_hash, &record.ext) {
+            (Some(hash), Some(ext)) => Some(spool.blob_path(hash, ext)),
             _ => None,
         };
         let blob_exists = blob_path.as_ref().map(|p| p.is_file());
+        let evicted = match (&photo.library_id, &record.content_hash) {
+            (Some(lib), Some(hash)) => store
+                .blob(lib, hash)
+                .await?
+                .is_some_and(|b| b.evicted_at.is_some()),
+            _ => false,
+        };
         resources.push(ResourceStatus {
             record,
             blob_path,
             blob_exists,
+            evicted,
         });
     }
 
-    let sidecar_local = match &photo.library_id {
-        Some(lib) => find_sidecar(&data_dir.sidecar_root(lib), &photo.photo_id)?,
-        None => None,
-    };
     let events = store
         .log_tail_for_photo(&photo.photo_id, PHOTO_LOG_TAIL)
         .await?;
@@ -131,7 +128,6 @@ pub async fn photo_status(
     Ok(Some(PhotoStatus {
         photo,
         resources,
-        sidecar_local,
         events,
     }))
 }

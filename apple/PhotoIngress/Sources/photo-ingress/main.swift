@@ -21,13 +21,25 @@ func flagValue(_ args: [String], _ name: String) -> String? {
 }
 
 let args = Array(CommandLine.arguments.dropFirst())
-guard let command = args.first else {
-    print("usage: photo-ingress setup --data-dir D    (libraries: see `ingress-cli library add`)")
-    print("       photo-ingress ingest --data-dir D <local_id>")
-    exit(2)
-}
-guard let dataDir = flagValue(args, "--data-dir") else {
-    fail("--data-dir is required (deliberately no default — keeps slice state away from production paths)")
+// Zero arguments = the bundled LaunchAgent invocation (belt-and-braces for
+// BundleProgram argv semantics) — run the daemon.
+let command = args.first ?? "daemon"
+
+// Default mirrors ingress-cli's canonical data dir. The bundled LaunchAgent
+// plist cannot expand `~`, so the daemon must self-default; the explicit
+// flag remains for dev/soak isolation.
+let dataDir = flagValue(args, "--data-dir")
+    ?? FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".local/share/hopnet-photo-ingress").path
+
+// The bundled plist passes --log-to-data-dir: launchd's StandardOutPath
+// cannot be user-relative, so the daemon owns its log file instead.
+if args.contains("--log-to-data-dir") {
+    try? FileManager.default.createDirectory(atPath: dataDir, withIntermediateDirectories: true)
+    let logPath = dataDir + "/daemon.log"
+    freopen(logPath, "a", stdout)
+    freopen(logPath, "a", stderr)
+    setvbuf(stdout, nil, _IOLBF, 0)
 }
 
 // The PH resource types the daemon archives (spec mapping table), original first.
@@ -38,8 +50,8 @@ func describe(_ outcome: FfiWriteOutcome, label: String) {
     print("  [\(label)] hash=\(outcome.contentHash.prefix(16))… size=\(outcome.sizeBytes) " +
           "ext=\(outcome.ext) deduped=\(outcome.deduped)")
     print("           blob=\(outcome.blobPath)")
-    if let sidecar = outcome.sidecarPath {
-        print("           photo COMPLETE — sidecar=\(sidecar)")
+    if outcome.photoCompleted {
+        print("           photo COMPLETE — descriptor persisted=\(outcome.descriptorPersisted)")
     }
 }
 
@@ -52,8 +64,8 @@ func runSetup() throws {
     try ensureAuthorized()
     print("Photos authorization: granted")
     print("next: configure libraries with")
-    print("  ingress-cli --data-dir \(dataDir) library add --blob-root <path> --scope personal [--sidecar-remote <path>]")
-    print("  ingress-cli --data-dir \(dataDir) library add --blob-root <path> --scope shared   [--sidecar-remote <path>]")
+    print("  ingress-cli --data-dir \(dataDir) library add --scope personal")
+    print("  ingress-cli --data-dir \(dataDir) library add --scope shared")
 }
 
 func runIngest() throws {
@@ -76,7 +88,7 @@ func runIngest() throws {
         return
     case .unmappedScope(let photoId):
         print("resolution: UNMAPPED SCOPE photo_id=\(photoId)")
-        print("run setup with the appropriate blob root to bind this scope")
+        print("bind this scope with: ingress-cli library add --scope shared")
         return
     case .adopted(let photoId):
         print("resolution: ADOPTED photo_id=\(photoId) — pending rows now drain-eligible")
@@ -205,9 +217,7 @@ func printCleanup(_ c: FfiCleanupReport, indent: String = "  ") {
     print("\(indent)photos hard-deleted:  \(c.photosHardDeleted)")
     print("\(indent)blob files deleted:   \(c.blobFilesDeleted)")
     print("\(indent)log rows pruned:      \(c.logRowsPruned)")
-    print("\(indent)snapshots written:    \(c.snapshotsWritten)")
-    print("\(indent)sidecars replicated:  \(c.sidecarsReplicated) (missing \(c.sidecarsMissing))" +
-          (c.replicationStalled ? " REPLICATION STALLED (mount down?)" : ""))
+    print("\(indent)spool evicted:        \(c.spoolEvicted)")
 }
 
 /// One-shot lifecycle run. No PhotoKit involvement — needs no authorization;
@@ -216,9 +226,7 @@ func runCleanup() throws {
     let session = try IngressSession(dataDir: dataDir)
     let report = try session.cleanup(options: FfiCleanupOptions(
         logRetentionDays: Int64(intFlag("--log-retention-days", default: 180)),
-        snapshotKeep: UInt32(intFlag("--snapshot-keep", default: 7)),
-        hardDeleteBatch: UInt32(intFlag("--hard-delete-batch", default: 500)),
-        replicationBatch: UInt32(intFlag("--replication-batch", default: 500))
+        hardDeleteBatch: UInt32(intFlag("--hard-delete-batch", default: 500))
     ))
     print("cleanup report:")
     printCleanup(report)
@@ -229,6 +237,20 @@ func runCleanup() throws {
 func runDaemon() throws {
     try ensureAuthorized()
     let session = try IngressSession(dataDir: dataDir)
+
+    // Startup library ensure: the personal library needs no configuration
+    // (the spool is data-dir-derived), so it is created unconditionally
+    // when absent — this must precede the startup scan so seeded assets
+    // route into the library instead of minting unmapped rows. A failure
+    // (e.g. ingress-cli holds the run lock) aborts startup — the run lock
+    // would block the daemon loop anyway; launchd retries.
+    switch try session.ensurePersonalLibrary() {
+    case .created(let libraryId):
+        print("personal library created: \(libraryId)")
+    case .alreadyExists:
+        break
+    }
+
     let fetcher = PhotoKitFetcher()
     let retryCap = Int64(intFlag("--retry-cap", default: 5))
     let scanQueue = DispatchQueue(label: "photo-ingress.scan")
@@ -283,6 +305,15 @@ func runDaemon() throws {
         observer.stop()
     }
 
+    // Publish credentials: explicit flags (dev/soak) win over the keychain
+    // service the HopNet app provisions. Neither present = ingest-only.
+    let flagUrl = flagValue(args, "--node-url")
+    let flagToken = flagValue(args, "--device-token")
+    let keychain = (flagUrl == nil || flagToken == nil) ? PublishCredentials.load() : nil
+    let nodeUrl = flagUrl ?? keychain?.baseUrl
+    let deviceToken = flagToken ?? keychain?.deviceToken
+    let publishing = nodeUrl != nil && deviceToken != nil
+
     let options = FfiDaemonOptions(
         fetchConcurrency: UInt32(intFlag("--fetch-concurrency", default: 4)),
         retryCap: retryCap,
@@ -292,10 +323,24 @@ func runDaemon() throws {
         pressurePauseSecs: intFlag("--pressure-pause-secs", default: 60),
         storagePollSecs: intFlag("--storage-poll-secs", default: 15),
         cleanupIntervalSecs: intFlag("--cleanup-interval-secs", default: 3600),
-        replicationIntervalSecs: intFlag("--replication-interval-secs", default: 60)
+        publishNodeUrl: publishing ? nodeUrl : nil,
+        publishDeviceToken: publishing ? deviceToken : nil,
+        publishIntervalSecs: intFlag("--publish-interval-secs", default: 60)
     )
+    if publishing {
+        // Device id only — the secret half of the token stays out of logs.
+        print("publishing to \(nodeUrl!) (device \(deviceToken!.prefix(while: { $0 != "." })))")
+    } else {
+        print("publishing OFF — no --node-url/--device-token and no keychain " +
+              "credentials (\(PublishCredentials.service))")
+    }
+    // Flags pin credentials (dev/soak); only a fully keychain-sourced daemon
+    // re-reads them after unreachable passes (ephemeral-port healing).
+    let credentialsProvider: PublishCredentialsProvider? =
+        (flagUrl == nil && flagToken == nil) ? KeychainCredentialsProvider() : nil
     print("daemon running (scan interval \(scanInterval)s) — SIGTERM/SIGINT to stop")
-    let report = try session.runDaemon(fetcher: fetcher, options: options)
+    let report = try session.runDaemon(
+        fetcher: fetcher, options: options, credentialsProvider: credentialsProvider)
     print("daemon report:")
     print("  events applied:       \(report.eventsApplied) (deferred \(report.eventsDeferred))")
     print("  deletions:            \(report.deletions)")
@@ -312,6 +357,20 @@ func runDaemon() throws {
     print("  gave up:              \(report.drain.gaveUp)")
     print("  lifecycle:")
     printCleanup(report.cleanup, indent: "    ")
+    if publishing {
+        print("  publish:")
+        print("    published:          \(report.publish.published) " +
+              "(already \(report.publish.alreadyPublished), adopted \(report.publish.adopted))")
+        print("    failed:             \(report.publish.failed) " +
+              "(gave up \(report.publish.gaveUp), missing descriptor \(report.publish.missingDescriptor), " +
+              "spool evicted \(report.publish.evictedBlobs))")
+        if report.publish.parked {
+            print("    PARKED — node unreachable at last pass")
+        }
+        if report.publish.parkedResponsibility {
+            print("    PARKED — not the responsible ingress device")
+        }
+    }
 }
 
 // Never block the main thread on PhotoKit (spike lesson): work on a

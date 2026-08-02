@@ -60,6 +60,13 @@ private func mediaSubtypeFlags(_ asset: PHAsset) -> [String] {
     return flags
 }
 
+/// HopNet-synthetic thumbnail sentinels (Rust: `model.rs` `from_ph_type`,
+/// consts `PH_SENTINEL_THUMBNAIL_*` — keep in sync by hand). Real
+/// `PHAssetResourceType` occupies 1–12; these never collide. The renditions
+/// are daemon-generated via `PHImageManager`, not `PHAssetResource`-backed.
+public let phSentinelThumbnailSmall: Int32 = 1005
+public let phSentinelThumbnailMedium: Int32 = 1006
+
 /// Build the FFI descriptor for one asset. Spike-verified field sources:
 /// cloud id via batch mapping, scope via the `participatesInLibraryScope`
 /// KVC property (nil = hard error, never default to personal — spec
@@ -86,7 +93,7 @@ public func extractDescriptor(asset: PHAsset, cloudId: String?) throws -> FfiAss
     let mediaType: FfiMediaType =
         asset.mediaType == .video ? .video : (isLive ? .livePhoto : .image)
 
-    let resources = PHAssetResource.assetResources(for: asset).map { r in
+    var resources = PHAssetResource.assetResources(for: asset).map { r in
         FfiResourceDescriptor(
             phResourceType: Int32(r.type.rawValue),
             uti: r.uniformTypeIdentifier,
@@ -94,6 +101,24 @@ public func extractDescriptor(asset: PHAsset, cloudId: String?) throws -> FfiAss
             expectedSize: (r.value(forKey: "fileSize") as? Int64).map { UInt64($0) },
             locallyAvailable: r.value(forKey: "locallyAvailable") as? Bool
         )
+    }
+    // Thumbnail sentinels, appended for EVERY media type (video gets a
+    // poster frame). expectedSize is a constant admission estimate only —
+    // the scheduler would otherwise assume up to 64 MiB per rendition and
+    // could trip storage pauses; the Rust classify path deliberately never
+    // size-compares thumbnails. locallyAvailable: renditions come from the
+    // local preview cache.
+    for (sentinel, estimate) in [
+        (phSentinelThumbnailSmall, UInt64(65_536)),
+        (phSentinelThumbnailMedium, UInt64(524_288)),
+    ] {
+        resources.append(FfiResourceDescriptor(
+            phResourceType: sentinel,
+            uti: "public.jpeg",
+            originalFilename: nil,
+            expectedSize: estimate,
+            locallyAvailable: true
+        ))
     }
 
     let capture = FfiCaptureMetadata(

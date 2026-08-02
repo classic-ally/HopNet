@@ -204,28 +204,10 @@ impl r2d2::CustomizeConnection<rusqlite::Connection, rusqlite::Error> for Sqlite
 /// Register custom SQL functions needed by queries across the codebase
 pub fn register_custom_functions(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     // uuid_extract_timestamp(uuid_text) → INTEGER (NULL-safe: NULL in → NULL out)
-    // Parse UUIDv7 hex, extract 48-bit timestamp, return epoch millis
-    conn.create_scalar_function(
-        "uuid_extract_timestamp",
-        1,
-        rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
-        |ctx| {
-            let uuid_str: Option<String> = ctx.get(0)?;
-            match uuid_str {
-                None => Ok(None),
-                Some(s) => {
-                    let hex_only: String = s.replace('-', "");
-                    if hex_only.len() < 12 {
-                        return Ok(Some(0i64));
-                    }
-                    match i64::from_str_radix(&hex_only[..12], 16) {
-                        Ok(millis) => Ok(Some(millis)),
-                        Err(_) => Ok(Some(0i64)),
-                    }
-                }
-            }
-        },
-    )?;
+    // Parse UUIDv7 hex, extract 48-bit timestamp, return epoch millis.
+    // Implementation lives in hopnet-common so projections (and their tests)
+    // can register the same function without depending on the host crate.
+    hopnet_common::db_impl::register_uuid_extract_timestamp(conn)?;
 
     // reverse(text) → TEXT
     // String reversal for parent-path extraction patterns

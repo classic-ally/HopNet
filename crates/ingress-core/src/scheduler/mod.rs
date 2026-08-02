@@ -20,10 +20,9 @@ use crate::descriptor::AssetDescriptor;
 use crate::error::{IngressError, Result};
 use crate::ext::ext_for_uti;
 use crate::ids::PhotoId;
-use crate::model::{LibraryConfig, PhotoRecord, ResourceType};
-use crate::paths::{BlobPaths, DataDir, TempKey};
+use crate::model::{PhotoRecord, ResourceType};
+use crate::paths::{DataDir, TempKey};
 use crate::resolve::late_binding_merge;
-use crate::sidecar_io::write_photo_sidecar;
 use crate::store::{StateStore, photos};
 use crate::writer::{ResourceWrite, finalize_resource, sweep_partials};
 
@@ -45,11 +44,10 @@ pub struct SchedulerConfig {
     /// Daemon-loop cadence of the hourly lifecycle job (hard deletes, log
     /// pruning, snapshots).
     pub cleanup_interval: Duration,
-    /// Daemon-loop cadence of the dirty-sidecar replication drain — faster
-    /// than cleanup so the remote backup tracks changes closely, batch-capped
-    /// so one tick never stalls the loop.
-    pub replication_interval: Duration,
     pub cleanup: crate::cleanup::CleanupConfig,
+    /// HopNet publish tick (active only when a publisher is attached via
+    /// `Scheduler::with_publisher`).
+    pub publish: crate::publish::PublishConfig,
 }
 
 impl Default for SchedulerConfig {
@@ -63,8 +61,8 @@ impl Default for SchedulerConfig {
             storage_poll: Duration::from_secs(15),
             default_size_estimate: 64 * 1024 * 1024,
             cleanup_interval: Duration::from_secs(3600),
-            replication_interval: Duration::from_secs(60),
             cleanup: crate::cleanup::CleanupConfig::default(),
+            publish: crate::publish::PublishConfig::default(),
         }
     }
 }
@@ -121,6 +119,9 @@ struct Shared {
 pub struct Scheduler<F: ResourceFetcher> {
     fetcher: Arc<F>,
     shared: Arc<Shared>,
+    /// Attached via `with_publisher`; None = the daemon loop skips the
+    /// publish tick entirely (drain-only tools, tests, pre-integration).
+    publisher: Option<Arc<dyn crate::publish::Publisher>>,
 }
 
 impl<F: ResourceFetcher> Scheduler<F> {
@@ -146,7 +147,15 @@ impl<F: ResourceFetcher> Scheduler<F> {
                 pause: Mutex::new(PauseState::default()),
                 inflight: Mutex::new(HashSet::new()),
             }),
+            publisher: None,
         }
+    }
+
+    /// Attach a HopNet publisher; the daemon loop then runs the publish tick
+    /// (`config.publish`). Drain runs never publish.
+    pub fn with_publisher(mut self, publisher: Arc<dyn crate::publish::Publisher>) -> Self {
+        self.publisher = Some(publisher);
+        self
     }
 
     /// Drain until the queue is empty/terminal or cancellation. Blocking
@@ -187,23 +196,19 @@ impl<F: ResourceFetcher> Scheduler<F> {
     /// One-time run setup shared by `drain` and `run_daemon`: the exclusive
     /// pid-stamped lock (Tier-1 refcount repair on an unclean reclaim,
     /// BEFORE any work is admitted — repaired counts gate irreversible
-    /// deletes), blob-root creation, and the startup `.partial` sweep.
+    /// deletes), spool creation, and the startup `.partial` sweep.
     async fn prepare(&self) -> Result<(crate::runlock::DrainLock, u64)> {
         let acquired = crate::runlock::DrainLock::acquire(&self.shared.data_dir)?;
         if acquired.unclean {
             // Outcome lands in the ingest log (`refcount_repaired`, drift only).
             crate::recovery::repair_refcounts(&self.shared.store).await?;
         }
-        let libraries = self.shared.store.libraries().await?;
-        let mut swept = 0u64;
-        for lib in &libraries {
-            // First-run: the configured blob root may not exist yet, and the
-            // admission statvfs needs a real path to probe.
-            std::fs::create_dir_all(&lib.blob_root).map_err(|e| {
-                IngressError::Invariant(format!("blob_root {}: {e}", lib.blob_root))
-            })?;
-            swept += sweep_partials(&BlobPaths::new(&lib.blob_root))?;
-        }
+        let spool = self.shared.data_dir.spool();
+        // First-run: the spool may not exist yet, and the admission statvfs
+        // needs a real path to probe.
+        std::fs::create_dir_all(spool.blobs_dir())
+            .map_err(|e| IngressError::Invariant(format!("spool: {e}")))?;
+        let swept = sweep_partials(&spool)?;
         Ok((acquired.lock, swept))
     }
 
@@ -375,12 +380,7 @@ async fn photo_task<F: ResourceFetcher>(
         .library_id
         .clone()
         .expect("work query filters NULL libraries");
-    let library = shared
-        .store
-        .library(&library_id)
-        .await?
-        .ok_or_else(|| IngressError::Invariant(format!("no library row {library_id}")))?;
-    let paths = BlobPaths::new(&library.blob_root);
+    let paths = shared.data_dir.spool();
     let local_id = photo.local_id.clone().ok_or_else(|| {
         IngressError::Invariant(format!("photo {} has no local_id", photo.photo_id))
     })?;
@@ -412,7 +412,9 @@ async fn photo_task<F: ResourceFetcher>(
         .filter(|r| r.next_retry_at.map(|t| t <= Utc::now()).unwrap_or(true))
         .map(|r| r.resource_type)
         .collect();
-    pending.sort(); // ResourceType::Original == 0 sorts first
+    // Original first (identity merge depends on it), thumbnails last —
+    // renditions are the cheapest and least critical rows.
+    pending.sort_by_key(|rt| (rt.is_thumbnail(), *rt));
 
     let mut current_photo_id = photo.photo_id.clone();
     for resource_type in pending {
@@ -452,20 +454,20 @@ async fn photo_task<F: ResourceFetcher>(
         };
         let admitted = match admission::admit(
             shared.probe.as_ref(),
-            std::path::Path::new(&library.blob_root),
+            shared.data_dir.root(),
             &shared.inflight_bytes,
             expected,
             shared.config.reserve_floor_bytes,
         ) {
-            // A vanished blob root fails instantly, so treating it as a
-            // per-resource failure burns the whole retry budget in minutes
-            // and strands the queue until the next scan's gave-up reset.
-            // Pause-and-poll instead; the photo re-queues untouched.
+            // The spool lives on the local disk, but keep the pause-and-poll
+            // class for a probe failure — burning the retry budget on a
+            // transient statvfs error would strand the queue until the next
+            // scan's gave-up reset.
             Err(IngressError::StorageUnavailable(e)) => {
                 enter_pause(
                     &shared,
                     false,
-                    serde_json::json!({ "disk": "blob_root", "error": e }),
+                    serde_json::json!({ "disk": "spool", "error": e }),
                 )
                 .await;
                 return Ok(());
@@ -477,7 +479,7 @@ async fn photo_task<F: ResourceFetcher>(
                 &shared,
                 false,
                 serde_json::json!({
-                    "disk": "blob_root", "library": library_id.as_str(),
+                    "disk": "spool", "library": library_id.as_str(),
                     "reserve_floor": shared.config.reserve_floor_bytes,
                 }),
             )
@@ -489,7 +491,7 @@ async fn photo_task<F: ResourceFetcher>(
         let outcome = stream_one_resource(
             &shared,
             &fetcher,
-            &library,
+            &library_id,
             &paths,
             &desc,
             &photo,
@@ -519,8 +521,8 @@ enum TaskFlow {
 async fn stream_one_resource<F: ResourceFetcher>(
     shared: &Arc<Shared>,
     fetcher: &Arc<F>,
-    library: &LibraryConfig,
-    paths: &BlobPaths,
+    library_id: &crate::ids::LibraryId,
+    paths: &crate::paths::SpoolPaths,
     desc: &AssetDescriptor,
     photo: &PhotoRecord,
     current_photo_id: &mut PhotoId,
@@ -601,7 +603,7 @@ async fn stream_one_resource<F: ResourceFetcher>(
         && photo.cloud_id.is_some()
         && let Some(survivor) = late_binding_merge(
             &shared.store,
-            &library.library_id,
+            library_id,
             &finished.hash,
             desc,
             current_photo_id,
@@ -621,13 +623,13 @@ async fn stream_one_resource<F: ResourceFetcher>(
     }
 
     // Finalize under the per-(library, hash) lock.
-    let lock = shared.locks.lock_for(&library.library_id, &finished.hash);
+    let lock = shared.locks.lock_for(library_id, &finished.hash);
     let _guard = lock.lock().await;
     let size = finished.size_bytes;
     let outcome = finalize_resource(
         &shared.store,
         paths,
-        &library.library_id,
+        library_id,
         current_photo_id,
         resource_type,
         finished,
@@ -650,7 +652,7 @@ async fn stream_one_resource<F: ResourceFetcher>(
     }
 
     if outcome.photo_completed() {
-        write_photo_sidecar(&shared.store, &shared.data_dir, desc, current_photo_id).await?;
+        shared.store.persist_descriptor(current_photo_id, desc).await?;
     }
     Ok(TaskFlow::Continue)
 }

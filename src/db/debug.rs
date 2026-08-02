@@ -20,7 +20,11 @@ const EXCLUDED_COLUMNS: &[(&str, &[&str])] = &[
     ("timeout_certificates", &["signatures"]),
 ];
 
-/// All consensus-tracked tables (order matters for deterministic hashing)
+/// All consensus-tracked tables (order matters for deterministic hashing).
+/// Host/consensus/storage-owned tables live here; projection-owned tables
+/// flow from `manifests().iter().flat_map(|m| m.tables())` so the schema
+/// and the divergence coverage cannot drift (RFC-016: ONE source of truth
+/// per projection's `db::TABLES` const).
 const CONSENSUS_TABLES: &[&str] = &[
     "sequences",
     "users",
@@ -237,8 +241,20 @@ pub fn compute_state_snapshot_tx(
 
     let mut table_hashes = HashMap::new();
 
-    // Compute hash for each consensus-tracked table
-    for table_name in CONSENSUS_TABLES {
+    // Compute hash for each consensus-tracked table. Iterate the host's
+    // static list, then each projection's `tables()` manifest, deduped by
+    // name (the host list still names `inodes` and `takeouts` for legacy
+    // reasons — duplicates are benign because the HashMap insert overwrites
+    // with an identical hash, but the dedup gate avoids the redundant
+    // compute).
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let projection_tables = crate::projections::manifests()
+        .iter()
+        .flat_map(|m| m.tables().iter().copied());
+    for table_name in CONSENSUS_TABLES.iter().copied().chain(projection_tables) {
+        if !seen.insert(table_name) {
+            continue;
+        }
         let hash_info = compute_table_hash_tx(tx, table_name)?;
         table_hashes.insert(table_name.to_string(), hash_info);
     }

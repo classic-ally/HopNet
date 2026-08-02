@@ -6,7 +6,11 @@ use chrono::{DateTime, Utc};
 use crate::ids::{ContentHash, LibraryId, PhotoId};
 
 /// RFC-011 resource type values, used verbatim in `photo_resources.resource_type`.
-/// Thumbnails (5, 6) are deliberately absent — never stored by the daemon.
+/// Thumbnails (5, 6) are daemon-GENERATED JPEG renditions (PHImageManager),
+/// requested via the synthetic sentinel descriptors 1005/1006 that
+/// `DescriptorExtraction.swift` appends to every asset — sentinels because
+/// Apple's real `PHAssetResourceType` namespace (1–12) collides with the
+/// RFC values (PH 5/6 mean fullSizePhoto/Video and map to `Edited`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, sqlx::Type)]
 #[repr(i64)]
 pub enum ResourceType {
@@ -15,12 +19,21 @@ pub enum ResourceType {
     PairedVideo = 2,
     AdjustmentData = 3,
     RawAlternate = 4,
+    ThumbnailSmall = 5,
+    ThumbnailMedium = 6,
     EditedPairedVideo = 7,
 }
 
+/// Synthetic `ph_resource_type` sentinels for thumbnail renditions
+/// (1000 + RFC value; outside Apple's 1–12 namespace). Mirrored as
+/// `phSentinelThumbnailSmall`/`Medium` in `DescriptorExtraction.swift` —
+/// keep both sides in sync by hand (no FFI const export).
+pub const PH_SENTINEL_THUMBNAIL_SMALL: i32 = 1005;
+pub const PH_SENTINEL_THUMBNAIL_MEDIUM: i32 = 1006;
+
 impl ResourceType {
     /// Map a raw `PHAssetResourceType` value (spec §PhotoKit → ingress
-    /// resource mapping, spike-verified).
+    /// resource mapping, spike-verified) or a HopNet thumbnail sentinel.
     ///
     /// `None` = unrecognized type. Per the archive-known-and-log decision,
     /// the caller records an `unknown_resource_type` ingest-log event and
@@ -33,6 +46,8 @@ impl ResourceType {
             7 => Some(Self::AdjustmentData),     // adjustmentData
             4 => Some(Self::RawAlternate),       // alternatePhoto
             10 => Some(Self::EditedPairedVideo), // fullSizePairedVideo
+            PH_SENTINEL_THUMBNAIL_SMALL => Some(Self::ThumbnailSmall),
+            PH_SENTINEL_THUMBNAIL_MEDIUM => Some(Self::ThumbnailMedium),
             _ => None,
         }
     }
@@ -45,6 +60,8 @@ impl ResourceType {
             Self::PairedVideo => "paired_video",
             Self::AdjustmentData => "adjustment_data",
             Self::RawAlternate => "raw_alternate",
+            Self::ThumbnailSmall => "thumbnail_small",
+            Self::ThumbnailMedium => "thumbnail_medium",
             Self::EditedPairedVideo => "edited_paired_video",
         }
     }
@@ -56,9 +73,17 @@ impl ResourceType {
             "paired_video" => Some(Self::PairedVideo),
             "adjustment_data" => Some(Self::AdjustmentData),
             "raw_alternate" => Some(Self::RawAlternate),
+            "thumbnail_small" => Some(Self::ThumbnailSmall),
+            "thumbnail_medium" => Some(Self::ThumbnailMedium),
             "edited_paired_video" => Some(Self::EditedPairedVideo),
             _ => None,
         }
+    }
+
+    /// Daemon-generated renditions (mirrors `hopnet-photos-core`'s
+    /// `ResourceKind::is_thumbnail`).
+    pub const fn is_thumbnail(self) -> bool {
+        matches!(self, Self::ThumbnailSmall | Self::ThumbnailMedium)
     }
 }
 
@@ -127,7 +152,20 @@ pub struct PhotoRecord {
     pub discovered_at: DateTime<Utc>,
     pub asset_modified_at: Option<DateTime<Utc>>,
     pub materialized_at: Option<DateTime<Utc>>,
-    pub sidecar_replicated_at: Option<DateTime<Utc>>,
+    /// The serialized [`crate::descriptor::DescriptorCapsule`] — publish's
+    /// metadata source. NULL until materialization first writes it.
+    pub descriptor_json: Option<String>,
+
+    /// NULL = not yet published into HopNet; set once, never reset (a
+    /// re-edit must NOT re-enqueue — consensus rejects duplicate photo ids).
+    pub published_at: Option<DateTime<Utc>>,
+    pub publish_attempts: i64,
+    pub publish_next_retry_at: Option<DateTime<Utc>>,
+    pub publish_last_error: Option<String>,
+    /// Set when the publish pass ADOPTED a photo the mesh already held
+    /// (matched by cloud fingerprint) instead of uploading. The photo's
+    /// consensus identity is `COALESCE(consensus_photo_id, photo_id)`.
+    pub consensus_photo_id: Option<String>,
 
     pub deleted_at: Option<DateTime<Utc>>,
 }
@@ -154,13 +192,17 @@ pub struct ResourceRecord {
 pub struct LibraryConfig {
     pub library_id: LibraryId,
     pub display_name: String,
-    pub blob_root: String,
-    pub sidecar_root_remote: Option<String>,
     /// PhotoKit scope binding; the shared library uses the fixed marker
     /// `icloud-shared-library` (binary scope signal, one SPL per account).
     pub scope_binding: Option<String>,
     pub retention_days: i64,
     pub created_at: DateTime<Utc>,
+    /// The consensus `shared_libraries` UUID this library publishes into.
+    /// None = no publish target: a scope-bound library without one is
+    /// excluded from the publish claim. Requires `scope_binding` —
+    /// personal libraries publish to the personal partition by
+    /// definition (libconfig enforces both directions).
+    pub mesh_library_id: Option<String>,
 }
 
 /// The fixed `scope_binding` marker for the iCloud Shared Photo Library.
@@ -175,6 +217,9 @@ pub struct BlobRecord {
     pub size_bytes: i64,
     pub ref_count: i64,
     pub written_at: DateTime<Utc>,
+    /// Set when the local bytes were spool-evicted (every referencing photo
+    /// consensus-decided). NULL = bytes expected on disk.
+    pub evicted_at: Option<DateTime<Utc>>,
 }
 
 #[cfg(test)]
@@ -213,6 +258,26 @@ mod tests {
         assert_eq!(ResourceType::from_ph_type(999), None);
     }
 
+    // Impact: the sentinel mapping is what turns Swift's synthetic
+    // descriptors into thumbnail rows; a miss silently drops renditions
+    // forever (unknown_resource_type log + skip).
+    // Should: map the 1005/1006 sentinels to ThumbnailSmall/ThumbnailMedium.
+    // Should not: change any real PHAssetResourceType mapping (5|6 stay
+    // Edited — Apple's namespace collides with the RFC values).
+    #[test]
+    fn thumbnail_sentinels_map_outside_the_ph_namespace() {
+        assert_eq!(
+            ResourceType::from_ph_type(PH_SENTINEL_THUMBNAIL_SMALL),
+            Some(ResourceType::ThumbnailSmall)
+        );
+        assert_eq!(
+            ResourceType::from_ph_type(PH_SENTINEL_THUMBNAIL_MEDIUM),
+            Some(ResourceType::ThumbnailMedium)
+        );
+        assert_eq!(ResourceType::from_ph_type(5), Some(ResourceType::Edited));
+        assert_eq!(ResourceType::from_ph_type(6), Some(ResourceType::Edited));
+    }
+
     // Should: round-trip every resource type through its sidecar name.
     #[test]
     fn resource_type_name_round_trip() {
@@ -222,6 +287,8 @@ mod tests {
             ResourceType::PairedVideo,
             ResourceType::AdjustmentData,
             ResourceType::RawAlternate,
+            ResourceType::ThumbnailSmall,
+            ResourceType::ThumbnailMedium,
             ResourceType::EditedPairedVideo,
         ] {
             assert_eq!(ResourceType::from_name(rt.as_str()), Some(rt));

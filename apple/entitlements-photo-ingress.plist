@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+        photo-ingress daemon entitlements (hardened runtime resource access).
+
+        The daemon is signed with the hardened runtime (notarization
+        requirement). Under the hardened runtime, TCC-protected resource
+        access must be declared or tccd auto-denies WITHOUT showing the
+        consent prompt — the daemon's PHPhotoLibrary.requestAuthorization
+        callback fires immediately with .denied and no dialog appears.
+
+        Photos-library access is a resource-access entitlement, not a
+        provisioning-profile-gated one, so it is compatible with
+        Developer ID signing (unlike the fileprovider/application-group
+        entitlements discussed in entitlements-app.plist).
+
+        Deliberately NOT sandboxed: the daemon must read arbitrary
+        user-chosen blob roots (including SMB mounts).
+    -->
+    <key>com.apple.security.personal-information.photos-library</key>
+    <true/>
+</dict>
+</plist>
