@@ -87,21 +87,27 @@ pub async fn run_version_attestation(app_state: &AppState) -> AttestationOutcome
         return AttestationOutcome::NotReady;
     };
 
-    let running_code = crate::version::running_version_code();
-    // Staged = newest provider-staged version distinct from running.
-    // v1: the git-release provider never stages, so this is None.
-    let staged_code = {
-        let last = app_state.upgrade.last.read().await;
-        last.as_ref()
-            .and_then(|status| status.result.as_ref().ok())
-            .and_then(|report| {
-                report
-                    .available
-                    .iter()
-                    .filter(|v| v.staged)
-                    .filter_map(|v| crate::version::parse_code(&v.version))
-                    .find(|&code| code != running_code)
-            })
+    let running_code = crate::version::effective_running_code();
+    // Staged = the test-mode override if claimed, else the newest
+    // provider-staged version distinct from running. v1: the
+    // git-release provider never stages, so absent an override this is
+    // None.
+    let staged_code = match crate::version::effective_staged_code() {
+        Some(code) if code != running_code => Some(code),
+        Some(_) => None,
+        None => {
+            let last = app_state.upgrade.last.read().await;
+            last.as_ref()
+                .and_then(|status| status.result.as_ref().ok())
+                .and_then(|report| {
+                    report
+                        .available
+                        .iter()
+                        .filter(|v| v.staged)
+                        .filter_map(|v| crate::version::parse_code(&v.version))
+                        .find(|&code| code != running_code)
+                })
+        }
     };
 
     let committed = {

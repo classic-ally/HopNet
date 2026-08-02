@@ -22,6 +22,11 @@ pub fn running_version_str() -> &'static str {
 /// — a deliberate boot invariant now that the scheme is adopted: a
 /// non-CalVer version could never satisfy an epoch boot gate or attest
 /// itself, so failing at first use beats limping.
+///
+/// This is the raw compile-time identity. Runtime consumers of "what
+/// version is this node" (attestation, readiness views, the epoch boot
+/// gate, restart derivation, the peer handshake) should use
+/// [`effective_running_code`], which honours the test-mode override.
 pub fn running_version_code() -> u32 {
     parse_code(running_version_str()).unwrap_or_else(|| {
         panic!(
@@ -30,6 +35,49 @@ pub fn running_version_code() -> u32 {
             running_version_str()
         )
     })
+}
+
+/// Test-mode gate for the override seams, mirroring the AppState
+/// construction (src/main.rs): debug builds and HOPNET_TEST_MODE. The
+/// overrides exist so orchestrator scenarios can make a release-image
+/// node CLAIM a different version (awaiting-upgrade parking, upgrade-
+/// target regenesis) without building a second image; production
+/// release binaries ignore them entirely.
+fn test_mode() -> bool {
+    cfg!(debug_assertions) || std::env::var("HOPNET_TEST_MODE").is_ok()
+}
+
+/// The node's EFFECTIVE running version code: the compile-time identity,
+/// unless test mode is on and `HOPNET_UPGRADE_VERSION_OVERRIDE` holds a
+/// well-formed CalVer token (malformed overrides are ignored, not
+/// errors). All runtime version-identity consumers go through this.
+pub fn effective_running_code() -> u32 {
+    if test_mode() {
+        if let Ok(v) = std::env::var("HOPNET_UPGRADE_VERSION_OVERRIDE") {
+            if let Some(code) = parse_code(&v) {
+                return code;
+            }
+            tracing::warn!(
+                override_value = %v,
+                "ignoring malformed HOPNET_UPGRADE_VERSION_OVERRIDE"
+            );
+        }
+    }
+    running_version_code()
+}
+
+/// The node's effective STAGED version, if any: test mode may claim one
+/// via `HOPNET_UPGRADE_STAGED_OVERRIDE` (so a mesh can satisfy the
+/// regenesis start precondition for an upgrade target it never really
+/// staged); otherwise staging is the upgrade provider's business and
+/// this returns None — the v1 git-release provider never stages.
+pub fn effective_staged_code() -> Option<u32> {
+    if test_mode() {
+        if let Ok(v) = std::env::var("HOPNET_UPGRADE_STAGED_OVERRIDE") {
+            return parse_code(&v);
+        }
+    }
+    None
 }
 
 /// Parse a CalVer string (`YYYY.M.N`, optionally `v`-prefixed as release
@@ -93,6 +141,31 @@ mod tests {
         assert!(parse_code("2026.12.0") > parse_code("2026.9.9"));
         assert!(parse_code("2026.8.1") > parse_code("2026.8.0"));
         assert!(parse_code("2027.1.0") > parse_code("2026.12.99"));
+    }
+
+    // Should: honour the version/staged overrides in test mode, ignore a
+    // malformed running override, and report no staged version absent an
+    // override (the v1 provider never stages).
+    // Should not: let an override survive removal — the compile-time
+    // identity is always the fallback.
+    // (One test fn on purpose: env vars are process-global and cargo
+    // runs tests in parallel; serializing the mutations inside a single
+    // fn keeps the reads race-free.)
+    #[test]
+    fn overrides_are_test_mode_seams() {
+        // Test builds have debug_assertions, so test_mode() is on here.
+        unsafe { std::env::set_var("HOPNET_UPGRADE_VERSION_OVERRIDE", "2031.4.2") };
+        assert_eq!(effective_running_code(), 20310402);
+        unsafe { std::env::set_var("HOPNET_UPGRADE_VERSION_OVERRIDE", "not-calver") };
+        assert_eq!(effective_running_code(), running_version_code());
+        unsafe { std::env::remove_var("HOPNET_UPGRADE_VERSION_OVERRIDE") };
+        assert_eq!(effective_running_code(), running_version_code());
+
+        assert_eq!(effective_staged_code(), None);
+        unsafe { std::env::set_var("HOPNET_UPGRADE_STAGED_OVERRIDE", "2031.4.3") };
+        assert_eq!(effective_staged_code(), Some(20310403));
+        unsafe { std::env::remove_var("HOPNET_UPGRADE_STAGED_OVERRIDE") };
+        assert_eq!(effective_staged_code(), None);
     }
 
     // Should not: accept malformed or out-of-range tokens — month 0/13,

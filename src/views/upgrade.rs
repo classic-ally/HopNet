@@ -13,7 +13,7 @@ pub fn upgrade_view(
     mesh: Vec<MeshNodeVersions>,
     provider: Option<&ProviderStatus>,
 ) -> UpgradeReadinessView {
-    let running_code = crate::version::running_version_code();
+    let running_code = crate::version::effective_running_code();
 
     let mesh = mesh
         .into_iter()
@@ -42,7 +42,7 @@ pub fn upgrade_view(
         .unwrap_or_default();
 
     UpgradeReadinessView {
-        running: crate::version::running_version_str().to_string(),
+        running: crate::version::format_code(running_code),
         mesh,
         available,
         provider: ProviderStatusView {
