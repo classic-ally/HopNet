@@ -372,6 +372,32 @@ pub fn spawn_engine(app_state: &AppState) -> Result<(), String> {
 /// cohort doesn't poll in lockstep.
 const TIP_POLL_BASE: Duration = Duration::from_secs(5);
 
+/// True when a sync ended because the mesh is in a NEWER epoch. There is
+/// nothing to retry in that case — no amount of block sync crosses a
+/// boundary — so this starts the epoch join instead (RFC-019 S7) and the
+/// caller skips its usual failure logging.
+fn pivot_on_epoch_ahead(app_state: &AppState, e: &sync::SyncError) -> bool {
+    let sync::SyncError::EpochAhead { peer, peer_epoch } = e else {
+        return false;
+    };
+    tracing::info!(
+        peer,
+        peer_epoch,
+        "sync refused: the mesh crossed an epoch boundary this node missed — starting epoch join"
+    );
+    let Ok(node_id) = app_state.get_node_id() else {
+        return true;
+    };
+    // Hint the peer that answered: it demonstrably holds the new epoch.
+    let peers = sync::peer_list(&app_state.db_pool, node_id, Some(*peer));
+    crate::regenesis::join::spawn_epoch_join(
+        app_state,
+        crate::regenesis::join::JoinAnchor::OwnDb,
+        peers,
+    );
+    true
+}
+
 pub(crate) fn spawn_tip_poll(app_state: AppState) {
     crate::consensus::queue::queue_rt().spawn(async move {
         loop {
@@ -437,6 +463,7 @@ pub(crate) fn spawn_tip_poll(app_state: AppState) {
                     Some(app_state.evidence.clone()),
                 )
                 .await
+                && !pivot_on_epoch_ahead(&app_state, &e)
             {
                 tracing::debug!("tip-poll sync: {e:?}");
             }
@@ -586,6 +613,7 @@ pub(crate) fn spawn_driver(
                                     Some(app_state.evidence.clone()),
                                 )
                                 .await
+                                    && !pivot_on_epoch_ahead(&app_state, &e)
                                 {
                                     tracing::warn!("decided-value sync failed: {e:?}");
                                 }
@@ -947,6 +975,7 @@ pub fn kick_sync_if_behind(app_state: &AppState, target: u64, hint_peer: i32) {
     let mut decided = engine.decided.clone();
     let flag = engine.sync_inflight.clone();
     let evidence = app_state.evidence.clone();
+    let kick_state = app_state.clone();
     crate::consensus::queue::queue_rt().spawn(async move {
         if let Err(e) = sync::sync_to_target(
             &comms,
@@ -960,6 +989,7 @@ pub fn kick_sync_if_behind(app_state: &AppState, target: u64, hint_peer: i32) {
             Some(evidence),
         )
         .await
+            && !pivot_on_epoch_ahead(&kick_state, &e)
         {
             tracing::debug!("lag-kick sync toward {target} did not complete: {e:?}");
         }

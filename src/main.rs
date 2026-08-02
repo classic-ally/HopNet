@@ -125,6 +125,8 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Check if ephemeral database mode is requested (for testing)
     let use_ephemeral_db = std::env::var("HOPNET_EPHEMERAL_DB").is_ok();
 
+    // Set by a boundary gate refusal below; consumed once comms exist.
+    let mut rebuild_from_peers = false;
     let pool = if use_ephemeral_db {
         tracing::info!("Using ephemeral in-memory database (HOPNET_EPHEMERAL_DB set)");
         // Use shared-cache URI so all pool connections see the same in-memory DB
@@ -158,6 +160,9 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
         // booting on the old sealed database (HTTP + status up, engine
         // parked by the sealed marker); Fatal means continuing would
         // destroy a mesh member's state.
+        // A gate refusal is remembered: once comms exist, the node tries
+        // to rebuild from peers rather than fail the same local gate on
+        // every boot (RFC-019 S7).
         match regenesis::boot::boot_transition(&db_path, version::effective_running_code()) {
             regenesis::boot::BootOutcome::NoBoundary => {}
             regenesis::boot::BootOutcome::Transitioned { epoch } => {
@@ -165,6 +170,10 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
             }
             regenesis::boot::BootOutcome::Parked(reason) => {
                 tracing::warn!(?reason, "epoch boundary parked — engine will not start");
+                rebuild_from_peers = matches!(
+                    reason,
+                    regenesis::boot::ParkReason::GateFailed { .. }
+                );
             }
             regenesis::boot::BootOutcome::Fatal(detail) => {
                 panic!("epoch boot transition: {detail}");
@@ -307,6 +316,17 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
             let restart_signal = app_state.restart_signal.clone();
+
+            // A node parked by a boot gate (a diverged replica, a
+            // corrupted boundary) has no engine, so neither the tip poll
+            // nor the probe scheduler will ever run — this retry loop is
+            // its only path back to the mesh (RFC-019 S7).
+            if rebuild_from_peers {
+                tracing::warn!(
+                    "boundary gate refused from local state: attempting to rebuild from peers"
+                );
+                regenesis::join::spawn_parked_epoch_join(&app_state);
+            }
 
             // If we loaded state from database, populate the OnceCell fields
             if let Some(state) = startup_state_opt {

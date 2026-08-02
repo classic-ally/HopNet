@@ -1168,3 +1168,288 @@ fn regenesis_transition_restarts_into_epoch_2() {
     });
     std::fs::remove_dir_all(&data_dir).ok();
 }
+
+// Impact: the straggler's whole round trip through the real code — the
+// mesh crosses a boundary while this node is away, the node fetches and
+// verifies the epoch over the WIRE from a peer, stages it, and its boot
+// path rebuilds it onto the mesh's certified state. This is the case
+// S6 explicitly left open.
+// Should: refuse the straggler's cross-epoch sync with the structured
+// signpost, join over the regenesis scope, stage, cross at boot, and
+// land on state byte-identical to the mesh's.
+// Should not: lose the straggler's own node identity across the rebuild.
+#[test]
+fn straggler_rejoins_across_an_epoch_boundary() {
+    let _guard = DATA_DIR_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let data_dir =
+        std::env::temp_dir().join(format!("hopnet-rejoin-e2e-{}", std::process::id()));
+    std::fs::create_dir_all(data_dir.join("hopnet")).unwrap();
+    unsafe { std::env::set_var("XDG_DATA_HOME", &data_dir) };
+    let db_path = data_dir
+        .join("hopnet")
+        .join("database.db")
+        .to_string_lossy()
+        .into_owned();
+
+    // ---- The mesh: a solo validator through the production genesis path.
+    let node_keys = crate::consensus::tests::MockUser::new(0);
+    let user_keys = crate::consensus::tests::MockUser::new(1);
+    let mesh = crate::consensus::tests::create_test_app_state_file_backed(
+        node_keys.signing_key.clone(),
+        node_keys.verifying_key,
+        &db_path,
+    );
+    let x25519 = crate::auth::derive_x25519_pubkey_from_user(&user_keys.signing_key);
+    let (encrypted_privkey, key_salt) =
+        crate::auth::wrap_user_privkey(&user_keys.signing_key, "password").unwrap();
+    let user = crate::types::User::new(
+        0,
+        "test_user".to_string(),
+        user_keys.verifying_key,
+        x25519,
+        encrypted_privkey,
+        key_salt,
+    );
+    let db_node = crate::db::Node {
+        node_id: 0,
+        name: "node_0".to_string(),
+        owner: 0,
+        pubkey: node_keys.verifying_key,
+    };
+    let (user_id, node_id) =
+        crate::db::setup::post_initial_setup(&mesh, user, db_node).unwrap();
+    mesh.node_id.set(node_id).unwrap();
+    mesh.user_id.set(user_id).unwrap();
+    // A second, non-seated member: registered in the mesh, so it is a
+    // legitimate peer that simply goes offline across the boundary.
+    let straggler_keys = crate::consensus::tests::MockUser::new(2);
+    let prev_chain = {
+        let conn = mesh.db_pool.get().unwrap();
+        conn.execute(
+            "INSERT INTO nodes (node_id, name, owner, pubkey) VALUES (1, 'straggler', 0, ?)",
+            rusqlite::params![straggler_keys.verifying_key],
+        )
+        .unwrap();
+        conn.execute("UPDATE nodes SET running_version_code = 20260800", [])
+            .unwrap();
+        hopnet_consensus::store::meta_get(&conn, hopnet_consensus::store::META_CHAIN_ID)
+            .unwrap()
+            .unwrap()
+    };
+
+    // ---- The straggler: this node's own copy of the epoch-1 database,
+    // taken BEFORE the boundary — the offline-through-regenesis case.
+    let straggler_dir = data_dir.join("straggler");
+    std::fs::create_dir_all(&straggler_dir).unwrap();
+    let straggler_db = straggler_dir
+        .join("database.db")
+        .to_string_lossy()
+        .into_owned();
+    {
+        let conn = mesh.db_pool.get().unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    }
+    std::fs::copy(&db_path, &straggler_db).unwrap();
+    // Its own identity: this_node is node-local, so it must survive a
+    // rebuild that replaces every replicated table wholesale.
+    {
+        let conn = rusqlite::Connection::open(&straggler_db).unwrap();
+        crate::db::shared::apply_connection_pragmas(&conn).unwrap();
+        conn.execute(
+            "UPDATE this_node SET node_id = 1, privkey = ?",
+            rusqlite::params![straggler_keys.signing_key],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    }
+
+    let state_of = |st: &AppState| {
+        let conn = st.db_pool.get().unwrap();
+        crate::db::regenesis::read_regenesis_state(&conn).unwrap()
+    };
+    let node_priv = node_keys.signing_key.clone();
+    let rt = crate::consensus::tests::test_iroh_rt();
+
+    // ---- The mesh crosses the boundary while the straggler is away.
+    let seal_height = rt.block_on({
+        let mesh = mesh.clone();
+        let prev_chain = prev_chain.clone();
+        async move {
+            let mut engine = start_engine_production_with_chain(
+                &mesh,
+                0,
+                hopnet_consensus::types::Blake3Hash::from_bytes(
+                    prev_chain.as_slice().try_into().unwrap(),
+                ),
+            )
+            .await;
+            mesh.consensus_queue
+                .enqueue_forwarded(vec![
+                    crate::consensus::types::Transaction::new(
+                        "regenesis_start".to_string(),
+                        bincode::serde::encode_to_vec(
+                            &crate::regenesis::RegenesisStart {
+                                target_version_code: 20260800,
+                            },
+                            bincode::config::standard(),
+                        )
+                        .unwrap(),
+                        0,
+                        &node_priv,
+                    )
+                    .unwrap(),
+                ])
+                .await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+            loop {
+                if state_of(&mesh).phase == crate::db::regenesis::RegenesisPhase::Sealed {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the mesh never sealed: {:?}",
+                    state_of(&mesh)
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            let h = state_of(&mesh).seal_height.unwrap();
+            wait_decided(&mut engine, h, 60).await;
+            let _ = engine.input_tx.send(HostInput::Shutdown).await;
+            h
+        }
+    });
+
+    let crate::regenesis::boot::BootOutcome::Transitioned { epoch: 2 } =
+        crate::regenesis::boot::boot_transition(&db_path, crate::version::effective_running_code())
+    else {
+        panic!("the mesh failed to cross its own boundary");
+    };
+
+    // A fresh AppState over the transitioned database — the mesh is now
+    // serving epoch 2, and it is the only node on the global data path.
+    let mesh2 = crate::consensus::tests::create_test_app_state_file_backed(
+        node_keys.signing_key.clone(),
+        node_keys.verifying_key,
+        &db_path,
+    );
+    mesh2.node_id.set(0).unwrap();
+    mesh2.user_id.set(0).unwrap();
+    mesh2
+        .epoch
+        .store(2, std::sync::atomic::Ordering::Relaxed);
+
+    // ---- The straggler wakes: still epoch 1, its own AppState and its
+    // own database, talking to the mesh over real loopback comms.
+    let straggler = crate::consensus::tests::create_test_app_state_file_backed(
+        straggler_keys.signing_key.clone(),
+        straggler_keys.verifying_key,
+        &straggler_db,
+    );
+    assert_eq!(
+        straggler.epoch.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the straggler is still on the sealed epoch"
+    );
+    let mesh_peer = hopnet_comms::PeerRef {
+        node_id: 0,
+        pubkey: node_keys.verifying_key.0.to_bytes(),
+    };
+
+    rt.block_on(async {
+        straggler
+            .comms
+            .connect_to_addr(0, loopback_addr(&mesh2))
+            .await
+            .expect("straggler reaches the mesh");
+
+        // The signpost: a cross-epoch decided fetch is refused with the
+        // structured variant, not a transport error.
+        let reply = hopnet_comms::Rpc::rpc(
+            &straggler.comms,
+                &mesh_peer,
+                "consensus",
+                crate::net::encode_payload(
+                    &crate::consensus::malachite::gossip::ConsensusNetRequest::DecidedFetch {
+                        from_height: 1,
+                        to_height: 1,
+                        epoch: 1,
+                    },
+                ),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("the mesh answers");
+        match crate::net::decode_payload(&reply).unwrap() {
+            crate::consensus::malachite::gossip::ConsensusNetResponse::EpochMismatch {
+                local_epoch,
+            } => assert_eq!(local_epoch, 2),
+            other => panic!("expected the epoch signpost, got {other:?}"),
+        }
+
+        // The join itself, over the wire through the production path.
+        crate::regenesis::join::run_epoch_join(
+            &straggler,
+            &straggler_db,
+            crate::regenesis::join::JoinAnchor::OwnDb,
+            vec![mesh_peer],
+        )
+        .await
+        .expect("the straggler stages a verified epoch join");
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            straggler.restart_signal.notified(),
+        )
+        .await
+        .expect("the straggler requests a restart once staged");
+    });
+
+    // ---- The straggler's boot path rebuilds it onto the new epoch.
+    let outcome = crate::regenesis::boot::boot_transition(
+        &straggler_db,
+        crate::version::effective_running_code(),
+    );
+    let crate::regenesis::boot::BootOutcome::Transitioned { epoch } = outcome else {
+        panic!("expected the straggler to cross, got {outcome:?}");
+    };
+    assert_eq!(epoch, 2);
+
+    // Byte-identical replicated state, and the identity survived.
+    let exported_hash = |path: &str| -> Vec<u8> {
+        let mut conn = rusqlite::Connection::open(path).unwrap();
+        crate::db::shared::apply_connection_pragmas(&conn).unwrap();
+        let tx = conn.transaction().unwrap();
+        let h = crate::db::snapshot::compute_artifact_hash_tx(&tx).unwrap();
+        tx.commit().unwrap();
+        h.0.as_bytes().to_vec()
+    };
+    assert_eq!(
+        exported_hash(&straggler_db),
+        exported_hash(&db_path),
+        "the rejoined straggler holds exactly the mesh's certified state"
+    );
+    {
+        let conn = rusqlite::Connection::open(&straggler_db).unwrap();
+        assert_eq!(crate::regenesis::genesis::current_epoch(&conn), 2);
+        assert_eq!(
+            crate::regenesis::genesis::epoch_genesis_height(&conn),
+            Some(seal_height)
+        );
+        let nid: i32 = conn
+            .query_row("SELECT node_id FROM this_node", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(nid, 1, "the straggler kept its own identity");
+        // It can now answer the NEXT straggler: the chain it verified is
+        // kept, not just consumed.
+        assert!(
+            crate::regenesis::genesis::lineage_path(&straggler_dir, 2).exists(),
+            "the joined node keeps the lineage it verified"
+        );
+    }
+    assert!(
+        !crate::regenesis::join::staging_path(&straggler_db).exists(),
+        "staging cleared after the crossing"
+    );
+
+    std::fs::remove_dir_all(&data_dir).ok();
+}

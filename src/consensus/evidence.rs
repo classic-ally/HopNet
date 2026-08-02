@@ -363,7 +363,7 @@ pub async fn status_probe(
     my_decided_height: u64,
     my_epoch: u64,
     timeout: Duration,
-) -> Result<u64, String> {
+) -> Result<(u64, u64), String> {
     let payload = bincode::serde::encode_to_vec(
         &StatusRequest::Ping {
             decided_height: my_decided_height,
@@ -394,7 +394,11 @@ pub async fn status_probe(
             "handshake: peer answered from a different epoch"
         );
     }
-    Ok(decided_height)
+    // The peer's epoch escapes to the caller (RFC-019 S7): a node that
+    // slept through a boundary while the mesh stayed quiet has nothing
+    // else to learn from — no sync to fail, no gossip to arrive. The
+    // pong is its only signal that it must rejoin.
+    Ok((decided_height, epoch))
 }
 
 // ============================================================================
@@ -533,9 +537,24 @@ pub fn spawn_probe_scheduler(app_state: crate::AppState) {
                 let comms = app_state.comms.clone();
                 let evidence = app_state.evidence.clone();
                 let g = policy.grace;
+                let probe_state = app_state.clone();
                 tokio::spawn(async move {
-                    if let Ok(h) = status_probe(&comms, &peer, decided, my_epoch, g).await {
+                    if let Ok((h, peer_epoch)) =
+                        status_probe(&comms, &peer, decided, my_epoch, g).await
+                    {
                         evidence.record_contact_with_height(peer.node_id, h);
+                        // The offline-through-regenesis case (RFC-019 S7):
+                        // this node woke in a sealed epoch with a quiet
+                        // mesh around it. Nothing will sync and nothing
+                        // will gossip — the pong is the only thing that
+                        // tells it to rejoin.
+                        if peer_epoch > my_epoch {
+                            crate::regenesis::join::spawn_epoch_join(
+                                &probe_state,
+                                crate::regenesis::join::JoinAnchor::OwnDb,
+                                vec![peer],
+                            );
+                        }
                     }
                     // Failure: the silence is already recorded as the
                     // unanswered probe.
