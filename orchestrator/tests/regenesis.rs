@@ -713,6 +713,26 @@ pub struct StragglerRejoin;
 /// on every boot.
 pub struct DivergedNodeRebuild;
 
+/// Wait until every node reports the same decided height, above
+/// `floor`. A node that has just rebuilt from a snapshot starts at its
+/// epoch's genesis height and still has to decided-value-sync the tail,
+/// so comparing state before this settles compares a node mid-catch-up
+/// against the tip and reports a divergence that is really a race.
+async fn wait_for_convergence(nodes: &[NodeInfo], floor: u64, secs: u64) -> (bool, Vec<u64>) {
+    let mut heights = Vec::new();
+    for _ in 0..secs {
+        heights.clear();
+        for node in nodes {
+            heights.push(decided_height(node).await.unwrap_or(0));
+        }
+        if heights.iter().all(|h| *h == heights[0]) && heights[0] > floor {
+            return (true, heights);
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    (false, heights)
+}
+
 /// Do these replicas hold the same state? Compares the manifest top
 /// hash at a common height — NOT the whole report, which carries the
 /// node id and would never match. Returns a detail string naming the
@@ -916,24 +936,13 @@ impl TestScenario for StragglerRejoin {
         // It converges with the mesh and serves the files it never saw
         // decided — the rebuild really did adopt the mesh's state.
         let all_nodes = [fresh[0].clone(), fresh[1].clone(), rejoined.clone()];
-        let mut converged = false;
-        for _ in 0..120 {
-            let mut heights = Vec::new();
-            for node in &all_nodes {
-                heights.push(decided_height(node).await.unwrap_or(0));
-            }
-            if heights.iter().all(|x| *x == heights[0]) && heights[0] > h {
-                converged = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
+        let (converged, heights) = wait_for_convergence(&all_nodes, h, 120).await;
         print_and_add_check(
             &mut result,
             Check {
                 name: "Rejoined node converges with the mesh tip".to_string(),
                 passed: converged,
-                detail: None,
+                detail: Some(format!("heights: {heights:?}")),
             },
         );
 
@@ -1052,7 +1061,20 @@ impl TestScenario for DivergedNodeRebuild {
             },
         );
 
+        // It rebuilt AT the epoch-3 genesis height and still has to sync
+        // the tail; comparing state before that settles compares a node
+        // mid-catch-up against the tip.
         let all_nodes = [fresh2[0].clone(), fresh2[1].clone(), rebuilt.clone()];
+        let (converged, heights) = wait_for_convergence(&all_nodes, h2, 120).await;
+        print_and_add_check(
+            &mut result,
+            Check {
+                name: "Rebuilt node converges with the mesh tip".to_string(),
+                passed: converged,
+                detail: Some(format!("heights: {heights:?}, H2={h2}")),
+            },
+        );
+
         let snapshots = fetch_state_snapshots(&all_nodes).await?;
         let (coherent, detail) = coherence(&snapshots);
         print_and_add_check(
