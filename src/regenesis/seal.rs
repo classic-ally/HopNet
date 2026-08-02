@@ -52,6 +52,41 @@ pub fn run_seal_work(app_state: &AppState, seal_height: u64) {
             tracing::error!("seal artifact write failed (recomputed on next boot): {e}");
         }
     }
+
+    // Restart derivation (RFC-019 S6): DERIVED, never declared — compare
+    // the committed target with what this binary runs. Match → request a
+    // process restart (the binary listens on the signal and exits with
+    // the restart code; the boot transition crosses the boundary on the
+    // way back up). Mismatch → park awaiting upgrade: marker file for
+    // operators, process alive, engine off.
+    let target = app_state
+        .db_pool
+        .get()
+        .ok()
+        .and_then(|conn| crate::db::regenesis::read_regenesis_state(&conn).ok())
+        .and_then(|s| s.target_version_code);
+    let Some(target) = target else {
+        tracing::error!("restart derivation: sealed but no committed target version");
+        return;
+    };
+    let running = crate::version::effective_running_code();
+    if running == target {
+        tracing::info!(
+            version = %crate::version::format_code(target),
+            "sealed at the target version: requesting process restart"
+        );
+        app_state.restart_signal.notify_one();
+    } else {
+        tracing::warn!(
+            required = %crate::version::format_code(target),
+            running = %crate::version::format_code(running),
+            "sealed for a different version: parking awaiting upgrade"
+        );
+        crate::regenesis::boot::write_awaiting_marker(
+            &crate::db::shared::get_database_path(),
+            target,
+        );
+    }
 }
 
 /// Serialize the canonical snapshot from sealed local state and write it

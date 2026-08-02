@@ -458,6 +458,8 @@ pub fn create_test_app_state_with_keys(
         malachite: Arc::new(once_cell::sync::OnceCell::new()),
         evidence: std::sync::Arc::new(crate::consensus::evidence::EvidenceMap::new()),
         storage: Arc::new(once_cell::sync::OnceCell::new()),
+        restart_signal: Arc::new(tokio::sync::Notify::new()),
+        epoch: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         // Tests run sync (no ambient runtime) — reuse the shared test
         // runtime so scheduled work has somewhere real to land.
         runtime: test_iroh_rt().handle().clone(),

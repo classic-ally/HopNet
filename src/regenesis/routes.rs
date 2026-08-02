@@ -139,24 +139,42 @@ pub async fn get_regenesis_status(
     let pool = app_state.consensus_queue.pending_pool();
     let drained = pool.staged_len() == 0 && pool.inflight_len() == 0;
 
-    let state = {
+    // One blocking hop for everything that touches the DB or the
+    // filesystem (rollback-window file check).
+    let (state, rollback_retained) = {
         let app_state = app_state.clone();
         tokio::task::spawn_blocking(move || {
             let conn = app_state
                 .db_pool
                 .get()
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            crate::db::regenesis::read_regenesis_state(&conn)
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+            let state = crate::db::regenesis::read_regenesis_state(&conn)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let retained =
+                crate::regenesis::boot::sealed_path(&crate::db::shared::get_database_path())
+                    .exists();
+            Ok::<_, StatusCode>((state, retained))
         })
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??
     };
+
+    let running_code = crate::version::effective_running_code();
+    let awaiting_upgrade = state.phase == crate::db::regenesis::RegenesisPhase::Sealed
+        && state.target_version_code != Some(running_code);
 
     Ok(Json(RegenesisStatusView {
         phase: crate::regenesis::gate::phase_str(state.phase).to_string(),
         target_version: state.target_version_code.map(crate::version::format_code),
         seal_height: state.seal_height.map(|h| h.to_string()),
         drained,
+        epoch: app_state
+            .epoch
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .to_string(),
+        running_version: crate::version::format_code(running_code),
+        awaiting_upgrade,
+        boundary_error: crate::regenesis::boot::boundary_error(),
+        rollback_retained,
     }))
 }

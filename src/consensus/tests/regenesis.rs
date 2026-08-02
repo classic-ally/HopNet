@@ -492,3 +492,56 @@ fn seal_artifact_written_only_on_hash_match() {
     assert!(err.contains("diverged"), "{err}");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// Impact: the status view is the ONLY surface a headless operator (or
+// the orchestrator) has for "is this node parked awaiting a binary
+// swap" — a wrong awaiting_upgrade would send someone hunting a hung
+// process that is actually waiting for them.
+// Should: report the epoch, the effective running version, and
+// awaiting_upgrade = sealed-for-a-version-this-binary-does-not-run.
+// Should not: claim awaiting_upgrade while sealed at the version this
+// binary already runs (that node restarts itself).
+#[test]
+fn status_view_reports_epoch_and_awaiting_upgrade() {
+    let node = MockNode::new(4);
+    register_node(&node);
+    seat_with_version(&node, 4, 20260800);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let status = |node: &MockNode| {
+        rt.block_on(crate::regenesis::routes::get_regenesis_status(
+            axum::extract::State(node.app_state.clone()),
+        ))
+        .unwrap()
+        .0
+    };
+
+    let view = status(&node);
+    assert_eq!(view.phase, "normal");
+    assert_eq!(view.epoch, "1");
+    assert_eq!(
+        view.running_version,
+        crate::version::format_code(crate::version::effective_running_code())
+    );
+    assert!(!view.awaiting_upgrade);
+    assert!(!view.rollback_retained);
+
+    // Seal at the version this binary runs: NOT awaiting an upgrade.
+    apply(&node, "regenesis_start", start_payload(20260800)).unwrap();
+    apply(&node, "regenesis_commit", commit_payload([7u8; 32], 9)).unwrap();
+    let view = status(&node);
+    assert_eq!(view.phase, "sealed");
+    assert!(!view.awaiting_upgrade);
+
+    // Sealed for a DIFFERENT version: parked awaiting the swap.
+    {
+        let conn = node.app_state.db_pool.get().unwrap();
+        conn.execute("UPDATE regenesis_state SET target_version_code = 20990100", [])
+            .unwrap();
+    }
+    let view = status(&node);
+    assert!(view.awaiting_upgrade);
+    assert_eq!(view.target_version.as_deref(), Some("2099.1.0"));
+}

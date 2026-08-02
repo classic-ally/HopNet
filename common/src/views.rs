@@ -197,4 +197,16 @@ pub struct RegenesisStatusView {
     pub seal_height: Option<String>,
     /// This node's pool observation: nothing staged, nothing inflight.
     pub drained: bool,
+    /// This database's epoch (stringified u64; "1" for pre-regenesis meshes).
+    pub epoch: String,
+    /// The version this binary effectively runs.
+    pub running_version: String,
+    /// Sealed for a version this binary does not run: the node is parked
+    /// until its operator swaps the binary (RFC-019 S6 boot gate 1).
+    pub awaiting_upgrade: bool,
+    /// The retained previous-epoch database still exists (rollback
+    /// window: until this epoch's first decide).
+    pub rollback_retained: bool,
+    /// Last boot-gate refusal, if the boundary could not be crossed.
+    pub boundary_error: Option<String>,
 }

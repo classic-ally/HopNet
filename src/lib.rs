@@ -87,6 +87,15 @@ pub struct AppState {
     /// Per-peer liveness evidence (RFC-CONSENSUS-002 S3). One writer lock
     /// per authenticated exchange; classification is pure over snapshots.
     pub evidence: Arc<consensus::evidence::EvidenceMap>,
+    /// Restart request (RFC-019 S6): fired by the seal work when the
+    /// epoch is sealed and this binary already runs the target version.
+    /// The BINARY (main.rs) listens and exits with the documented
+    /// restart code; library code only ever notifies — never exits —
+    /// so in-process tests observe the signal instead of dying.
+    pub restart_signal: Arc<tokio::sync::Notify>,
+    /// This database's epoch (RFC-019 S6), loaded from consensus_meta
+    /// at startup (1 when absent). Carried in the peer handshake.
+    pub epoch: Arc<std::sync::atomic::AtomicU64>,
     /// The MAIN multi-thread runtime's handle, captured at startup.
     /// Host-side background work scheduled from consensus apply
     /// (`HostWorkScheduler`) spawns here — apply runs on the consensus

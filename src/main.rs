@@ -38,6 +38,14 @@ static ASSETS_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/frontend/dis
 /// GUI mode binds an ephemeral loopback port — see `run_server`.
 const HEADLESS_BACKEND_PORT: u16 = 34632;
 
+/// Exit code requesting a process restart (BSD EX_TEMPFAIL): the epoch
+/// sealed and this binary already runs the required version, so a fresh
+/// boot crosses the boundary (RFC-019 S6). Service managers should
+/// restart on it — systemd: `RestartForceExitStatus=75` (or plain
+/// `Restart=always`); the test orchestrator restarts containers
+/// explicitly after observing this code.
+const EXIT_CODE_RESTART: i32 = 75;
+
 /// Actual bound port. Populated by `run_server` after `TcpListener::bind`
 /// returns — needed in GUI mode because we bind `127.0.0.1:0` and let the
 /// kernel pick a free port, so two HopNet processes never clash.
@@ -283,8 +291,21 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                 malachite: Arc::new(OnceCell::new()),
                 evidence: std::sync::Arc::new(consensus::evidence::EvidenceMap::new()),
                 storage: Arc::new(OnceCell::new()),
+                restart_signal: Arc::new(tokio::sync::Notify::new()),
+                epoch: Arc::new(std::sync::atomic::AtomicU64::new(1)),
                 runtime: tokio::runtime::Handle::current(),
             };
+
+            // Epoch identity + restart listener (RFC-019 S6). The pool
+            // already points at the post-transition database, so this is
+            // the new epoch on a freshly crossed boundary.
+            if let Ok(conn) = app_state.db_pool.get() {
+                app_state.epoch.store(
+                    regenesis::genesis::current_epoch(&conn),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            let restart_signal = app_state.restart_signal.clone();
 
             // If we loaded state from database, populate the OnceCell fields
             if let Some(state) = startup_state_opt {
@@ -790,7 +811,29 @@ async fn run_server(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
                     .layer(trace_layer)
             };
 
-            serve(listener, app).await?;
+            // Serve until either the server dies or the seal work
+            // requests a restart (RFC-019 S6). The exit belongs to the
+            // BINARY: library code only fires the Notify, so in-process
+            // tests observe the signal instead of dying. The grace delay
+            // lets final-block gossip and in-flight serves settle before
+            // the whole mesh drops at once.
+            let restart_requested = restart_signal.notified();
+            tokio::select! {
+                r = serve(listener, app) => { r?; }
+                _ = restart_requested => {
+                    let grace_ms = std::env::var("HOPNET_RESTART_GRACE_MS")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(3000);
+                    tracing::info!(
+                        grace_ms,
+                        code = EXIT_CODE_RESTART,
+                        "restart requested (epoch sealed at target version): exiting for the service manager"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(grace_ms)).await;
+                    std::process::exit(EXIT_CODE_RESTART);
+                }
+            }
         }
         Err(error) => return Err(error.into()),
     }
