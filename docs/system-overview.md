@@ -213,6 +213,26 @@ apply functions inside consensus handlers.
       byte-exact reads → second member's daemon ADOPTS instead of
       re-uploading → per-library eviction, e2e. Cutover ops (wipe,
       re-pull, bind, claim) can now cover both partitions.
+- [x] Ingress tombstone + restore propagation (2026-08-02): deleting a
+      photo in Apple Photos now reaches the mesh, and pulling it back out
+      of Recently Deleted does too. `photos.tombstone_published_at` (with
+      its own retry ledger) records what consensus has been told; that
+      disagreeing with `deleted_at` IS the queue, in both directions. The
+      marker is deliberately RESETTABLE unlike `published_at` — delete →
+      restore → delete is a legitimate cycle, and a set-once marker would
+      strand the second delete. Rides the existing scope-partitioned pass
+      under the same holder gate (the node's device-tx gate would reject a
+      foreign-scope delete anyway) and runs AFTER publishing, so a photo
+      added and deleted between passes reaches consensus before being
+      tombstoned there; adopted photos propagate under
+      `consensus_photo_id`. The mesh side needed nothing — photo_delete /
+      photo_restore were already device-submittable, already gated, and
+      already authorized for any library member. Hard delete now holds a
+      published tombstone past its retention cutoff until the mesh knows
+      (surfaced as `tombstones_unpropagated` per library), because reaping
+      the row would strand the photo in HopNet with nothing left to repair
+      it. `photos-ingress-tombstone` proves both directions across a
+      3-node mesh with zero divergence.
 - [x] Ingress transplant: archive → transient spool (2026-08-01): the
       daemon's independent archive on user-owned storage (blob roots,
       sidecar JSON files, remote replication, snapshots, Tier-3 recover,
