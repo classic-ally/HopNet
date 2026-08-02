@@ -662,10 +662,97 @@ protocol it checks.
       alone)
     - app-layer heights were already u64 end-to-end (the RFC's i32
       widening concern was discharged before S6 — verified, no work)
-- [ ] S7 — stragglers + rejoin: overlap verification, snapshot
-      fetch, re-trust UI, fragment reconcile
-  - orchestrator: housekeeping-regenesis, straggler-rejoin,
-    diverged-node-rebuild
+- [x] S7 — stragglers + rejoin: overlap verification, snapshot
+      fetch, re-trust route, fragment reconcile
+  - orchestrator: straggler-rejoin, diverged-node-rebuild
+    (`housekeeping-regenesis` as listed IS the same-version full
+    cycle S6 landed as `regenesis-restart` — recorded here rather
+    than renamed, so the ledger and the scenario registry agree)
+  - **OQ3 resolved — artifact transport:** a NEW `regenesis` comms
+    scope, not the fragment RPC and not HTTP. It serves `EpochInfo`,
+    `LineageFetch`, `SnapshotInfo`, and `SnapshotChunk{offset,len}`.
+    Chunked at 4MiB under the transport's 8MiB frame cap; plain RPC
+    rather than a streamed scope so the transport's retry-once and
+    receiver-side dedup apply, which makes the download resumable by
+    construction — across peer rotation AND across a restart. The
+    scope answers WITHOUT a live engine, like DecidedFetch: a parked
+    or sealed node rescuing a straggler is load-bearing. It runs on
+    the queue runtime for the same reason (rejoin liveness must not
+    be starved by API load).
+  - **Artifact availability is honest, not fabricated.** A server
+    resolves the artifact in preference order: the on-disk file when
+    its blake3 matches the current lineage record; a recompute from
+    the retained `.sealed` database during the rollback window; a
+    re-serialize of the live database while nothing has decided past
+    H (valid by the boot rebuild's roundtrip gate). Otherwise it
+    answers `NotAvailable` and the requester rotates peers. Every
+    node writes the artifact at seal and nothing deletes it, so the
+    unavailable case needs mesh-wide file loss.
+  - **The straggler stages, then restarts.** The online half only
+    fetches, verifies, and stages under `<db_dir>/join-staging/`,
+    with the manifest written LAST as the completion marker; the
+    rebuild happens in the boot path, which already owns certified
+    import, node-local carry, the atomic swap, and the rollback
+    window from S6. Nothing online touches the live database, so the
+    worst a lying peer achieves is a wasted download. An incomplete
+    staging is KEPT (an interrupted download resumes); one that
+    fails verification at boot is discarded and refetched.
+  - **Gate order for a staged join: VERSION first.** The node-local
+    carry copies rows blind and is only safe under exact-version
+    equality, so an old binary parks (staging kept) before anything
+    schema-touching runs. Then chain + overlap, then the snapshot
+    hash, then the S6 `build_next` unchanged.
+  - **Fresh joiners import in process, no restart.** A joining
+    database holds one row and `import_snapshot_tx` refuses unless
+    every exported table is empty, so the precondition is
+    machine-checked; there is no file to swap. `JoinInfo` carries
+    the epoch and `bootstrap_join` branches on it — epoch join
+    subsumes the height-0 bootstrap, whose assertions are bypassed
+    rather than loosened. The anchor is the join ceremony itself
+    (TOFU), and the FULL chain from epoch 2 is verified.
+  - **Overlap rule, and its floor.** `count_trusted_signers` (new,
+    beside `verify_wire_certificate`, which only answers
+    quorum-of-the-given-set) measures the intersection between a
+    boundary certificate's signers and the verifier's own
+    last-trusted set; acceptance needs MORE than that set's
+    Byzantine bound, resolved from the active profile via
+    `hopnet_common::quorum`. Under Majority `f_eq == 0`, so the rule
+    degenerates to "at least one validator I already knew" — that is
+    this spec's own floor, implemented as written and pinned by a
+    test rather than silently strengthened. Votes are recreated at
+    the certificate's ACTUAL round: assuming round 0 would zero the
+    overlap for exactly the certificates produced under contention.
+  - **Only the first hop is ever unanchored.** A TOFU joiner waives
+    overlap for the record it roots at, and nothing after: a lineage
+    no existing node could have followed is not one a joiner may
+    adopt either. Each verified record's seated set becomes the
+    trusted set for the next hop, which is what lets a multi-epoch
+    straggler catch up through legitimate churn while importing only
+    the latest snapshot.
+  - **Every path keeps the whole chain.** The S6 transition, a
+    staged join, and a fresh join all persist every verified record
+    to `lineage/` — a node that arrived by joining can answer the
+    next straggler.
+  - Triggers, all reaching the same join: a sync refused with the
+    new structured `EpochMismatch` (tip poll, driver, lag kick — the
+    S5 note about a moratorium-wedged seated straggler is discharged
+    here); the status pong's epoch, which is the ONLY signal for a
+    node that woke beside a quiet mesh with nothing to sync and no
+    gossip arriving; and a boot-gate park, whose node has no engine
+    and therefore neither poll nor probe — `main.rs` starts its retry
+    loop.
+  - Fragment reconcile runs post-swap, pre-engine, as direct SQL:
+    re-mark what the new inventory backs and the disk verifies, drop
+    what it does not back. NOT the attestation path, whose exact
+    previous-count guard suits a live attestation and not a
+    wholesale reconciliation. `self_verified_height` stays NULL and
+    the existing self-check cron re-attests at its own pace.
+  - Deliberately NOT taken: a dead-pin sweep (pins already tolerate
+    naming absent blobs by design), an epoch field on `PeerEvidence`
+    (the pong trigger needs no stored state), and any frontend work
+    (the status view carries `epoch_join` for headless checks).
+- [ ] S8 — upgrade epoch end-to-end: no-op version bump through the
+      full flow; rollback window exercised
 - [ ] S8 — upgrade epoch end-to-end: no-op version bump through the
       full flow; rollback window exercised
 
@@ -689,8 +776,9 @@ No new verification machinery — new scenarios for existing tools:
 2. Authorization class for start/abort: "network admin" needs a
    concrete definition (genesis user? explicit role?) — shared with
    issue #21's remove_node authorization
-3. Snapshot artifact transport: existing fragment RPC, a comms
-   scope, or plain HTTP route; resumable fetch for large snapshots
+3. ~~Snapshot artifact transport~~ — RESOLVED in S7: a dedicated
+   `regenesis` comms scope, chunked offset/length over plain RPC so
+   retry and dedup make the fetch resumable. See the S7 ledger entry.
 4. Drain-complete detection from the proposer's seat: empty pool +
    tip applied, vs forwarded-transaction races — exact rule needs
    the queue's eyes

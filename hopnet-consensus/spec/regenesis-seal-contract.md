@@ -74,3 +74,12 @@ path at H+1 is S6's.
 > exercised end-to-end by the in-process transition roundtrip and the
 > orchestrator `regenesis-restart` / `regenesis-awaiting-upgrade`
 > scenarios.
+>
+> **Extended (S7).** Clause 2's "recovery is restart-shaped, never
+> rollback-shaped" now covers nodes that were ABSENT at the seal:
+> `regenesis::join` fetches and verifies the epoch from peers, stages
+> it, and requests the same restart, so the rebuild still happens in
+> the boot path and no recovery reaches backwards. Clause 3 holds for
+> them too — a rejoining node imports committed state only, and starts
+> the new epoch with empty evidence. Clause 5 is unchanged: a rejoined
+> node gets no boundary-special seating grace.

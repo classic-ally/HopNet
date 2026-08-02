@@ -94,9 +94,22 @@ an audit found a view-change safety hole. See RFC-013 for the full design
       roundtrip (epoch 2 decides H+1 and seals itself again),
       orchestrator regenesis-restart (full cycle, exit 75, epoch-2
       coherence) + regenesis-awaiting-upgrade (parked-alive, per-node
-      swap, liveness gate). Next: S7 stragglers + rejoin (overlap
-      verification, snapshot/lineage fetch, epoch join, fragment
-      reconcile).
+      swap, liveness gate).
+  - S7 — stragglers + rejoin: a `regenesis` comms scope serving
+      lineage records and the boundary snapshot in resumable 4MiB
+      chunks (engineless, so parked and sealed nodes rescue
+      stragglers); hop-by-hop lineage-chain verification with the
+      weak-subjectivity overlap rule (thresholds from the active
+      quorum profile, never hardcoded); stage-then-restart for a
+      straggler, reusing the S6 boot rebuild, with the version gate
+      ahead of anything schema-touching; in-process epoch join for
+      fresh nodes, which subsumes the height-0 bootstrap; a manual
+      re-trust route for churn past the overlap window; post-import
+      fragment reconcile. Evidence: overlap/chain units, staged-boot
+      gate battery, an in-process straggler rejoin over real comms
+      ending in byte-identical state, and the orchestrator
+      straggler-rejoin / diverged-node-rebuild scenarios. Next: S8
+      upgrade epoch end-to-end (real binary bump, rollback drill).
 
 ### 2. Storage Substrate ([RFC-014](specs/hopnet-storage.md)) + File Storage ([RFC-002](specs/file-storage.md))
 **Status**: Substrate extraction COMPLETE (stages A–F, 2026-07-07) — the `hopnet-storage`
