@@ -235,7 +235,20 @@ pub async fn post_regenesis_rollback(State(app_state): State<AppState>) -> impl 
 
     crate::regenesis::boot::write_rollback_marker(&db_path);
     tracing::warn!("rollback requested: restarting to abandon the epoch boundary");
-    app_state.restart_signal.notify_one();
+
+    // Signal AFTER this response has had a chance to reach the caller.
+    // The binary races `serve()` against the restart signal in a
+    // `tokio::select!`, so notifying inline cancels the server — and
+    // takes this very response down with it, leaving the operator with
+    // a transport error from a request that actually succeeded. Every
+    // other restart request comes from background work with nobody
+    // waiting on a socket; this one does not.
+    let signal = app_state.restart_signal.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        signal.notify_one();
+    });
+
     (
         StatusCode::ACCEPTED,
         Json(serde_json::json!({ "rollback": "requested" })),
