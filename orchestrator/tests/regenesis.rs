@@ -713,6 +713,30 @@ pub struct StragglerRejoin;
 /// on every boot.
 pub struct DivergedNodeRebuild;
 
+/// Do these replicas hold the same state? Compares the manifest top
+/// hash at a common height — NOT the whole report, which carries the
+/// node id and would never match. Returns a detail string naming the
+/// heights and hashes, so a failure says what diverged instead of just
+/// that something did.
+fn coherence(snapshots: &[(u32, hopnet_common::NodeStateReport)]) -> (bool, String) {
+    let agreed = snapshots.windows(2).all(|w| {
+        w[0].1.consensus_height == w[1].1.consensus_height
+            && w[0].1.manifest.top_hash == w[1].1.manifest.top_hash
+    });
+    let detail = snapshots
+        .iter()
+        .map(|(id, s)| {
+            format!(
+                "node {id} @{} {}",
+                s.consensus_height,
+                &s.manifest.top_hash.to_string()[..8.min(s.manifest.top_hash.to_string().len())]
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    (agreed, detail)
+}
+
 /// Wait until the node reports the given epoch in its status view.
 async fn wait_for_epoch(node: &NodeInfo, epoch: &str, timeout: Duration) -> Result<bool> {
     let start = Instant::now();
@@ -737,6 +761,7 @@ async fn cross_boundary(
     docker: &Docker,
     mesh_id: u32,
     participants: &[NodeInfo],
+    expect_epoch: &str,
 ) -> Result<Option<(u64, Vec<NodeInfo>)>> {
     let Some(_running) = attest_and_freeze(result, participants, None).await? else {
         return Ok(None);
@@ -777,8 +802,8 @@ async fn cross_boundary(
     print_and_add_check(
         result,
         Check {
-            name: "The remaining mesh crossed into epoch 2".to_string(),
-            passed: epochs.iter().all(|e| e == "2"),
+            name: format!("The remaining mesh crossed into epoch {expect_epoch}"),
+            passed: epochs.iter().all(|e| e == expect_epoch),
             detail: Some(format!("epochs: {epochs:?}, H={h}")),
         },
     );
@@ -823,7 +848,7 @@ impl TestScenario for StragglerRejoin {
         );
 
         let participants = [nodes[0].clone(), nodes[1].clone()];
-        let Some((h, fresh)) = cross_boundary(&mut result, &docker, mesh_id, &participants).await?
+        let Some((h, fresh)) = cross_boundary(&mut result, &docker, mesh_id, &participants, "2").await?
         else {
             return Ok(result);
         };
@@ -913,13 +938,13 @@ impl TestScenario for StragglerRejoin {
         );
 
         let snapshots = fetch_state_snapshots(&all_nodes).await?;
-        let coherent = snapshots.windows(2).all(|w| w[0] == w[1]);
+        let (coherent, detail) = coherence(&snapshots);
         print_and_add_check(
             &mut result,
             Check {
                 name: "Rejoined node holds state identical to the mesh".to_string(),
                 passed: coherent,
-                detail: None,
+                detail: Some(detail),
             },
         );
 
@@ -959,7 +984,7 @@ impl TestScenario for DivergedNodeRebuild {
         crate::tests::persistence::stop_node(&docker, mesh_id, diverged.node_id).await?;
 
         let participants = [nodes[0].clone(), nodes[1].clone()];
-        let Some((h, fresh)) = cross_boundary(&mut result, &docker, mesh_id, &participants).await?
+        let Some((h, fresh)) = cross_boundary(&mut result, &docker, mesh_id, &participants, "2").await?
         else {
             return Ok(result);
         };
@@ -968,7 +993,7 @@ impl TestScenario for DivergedNodeRebuild {
         // behind: it must walk the lineage chain hop by hop and import
         // only the latest snapshot.
         upload_file(&fresh[0], "/", "between-epochs.txt", b"epoch two work".to_vec()).await?;
-        let Some((h2, fresh2)) = cross_boundary(&mut result, &docker, mesh_id, &fresh).await?
+        let Some((h2, fresh2)) = cross_boundary(&mut result, &docker, mesh_id, &fresh, "3").await?
         else {
             return Ok(result);
         };
@@ -1029,13 +1054,13 @@ impl TestScenario for DivergedNodeRebuild {
 
         let all_nodes = [fresh2[0].clone(), fresh2[1].clone(), rebuilt.clone()];
         let snapshots = fetch_state_snapshots(&all_nodes).await?;
-        let coherent = snapshots.windows(2).all(|w| w[0] == w[1]);
+        let (coherent, detail) = coherence(&snapshots);
         print_and_add_check(
             &mut result,
             Check {
                 name: "Rebuilt node holds state identical to the mesh".to_string(),
                 passed: coherent,
-                detail: None,
+                detail: Some(detail),
             },
         );
 
@@ -1218,12 +1243,13 @@ impl TestScenario for RegenesisRollback {
             },
         );
         let snapshots = fetch_state_snapshots(&fresh).await?;
+        let (coherent, detail) = coherence(&snapshots);
         print_and_add_check(
             &mut result,
             Check {
                 name: "Rolled-back replicas agree".to_string(),
-                passed: snapshots.windows(2).all(|w| w[0] == w[1]),
-                detail: None,
+                passed: coherent,
+                detail: Some(detail),
             },
         );
         if !progressed {
