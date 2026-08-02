@@ -1,6 +1,6 @@
-//! E2E driver for the publish flow: fabricate a real ingress state (state.db
-//! + blobs + sidecars, via the actual seed → drain pipeline with an
-//! in-memory fetcher — no PhotoKit) and publish it into a live node.
+//! E2E driver for the publish flow: fabricate a real ingress state (state.db,
+//! blobs and sidecars, via the actual seed → drain pipeline with an in-memory
+//! fetcher — no PhotoKit) and publish it into a live node.
 //!
 //! Used by the orchestrator's `photos-ingress-publish` scenario and as a dev
 //! tool against a local node. Output is JSON on stdout for machine
@@ -18,6 +18,11 @@
 //!   tombstone        --data-dir D [--restore]     set/clear deleted_at on
 //!                    every photo, standing in for a PhotoKit delete or a
 //!                    restore out of Recently Deleted
+//!   edit             --data-dir D [--revert] [--metadata-only]
+//!                    re-deliver every asset's descriptor with an edited
+//!                    render added (or removed, or with only its
+//!                    modification date bumped) and drain — the real
+//!                    classify → reopen → refetch chain, not a DB poke
 //!
 //! Publish exit codes: 0 = queue drained; 2 = node unreachable (pass
 //! parked); 3 = SOME publish scope parked on responsibility — since the
@@ -93,6 +98,18 @@ enum Cmd {
         #[arg(long)]
         restore: bool,
     },
+    /// Re-deliver every seeded asset's descriptor as PhotoKit would after
+    /// the user edited it, then drain. Goes through classify, so the reopen
+    /// and refetch this exercises are the production ones.
+    Edit {
+        /// Drop the edited render again (Revert to Original).
+        #[arg(long)]
+        revert: bool,
+        /// Bump only the modification date — no resource set change, no new
+        /// bytes. Drives the metadata half of the edit queue.
+        #[arg(long)]
+        metadata_only: bool,
+    },
 }
 
 struct MaxProbe;
@@ -107,7 +124,57 @@ impl FreeSpaceProbe for MaxProbe {
 /// re-seed with the same count reproduces identical content hashes.
 struct MemoryFetcher {
     descriptors: std::collections::HashMap<String, AssetDescriptor>,
+    /// Bumped by `edit` so a refetched render yields DIFFERENT bytes.
+    /// Mixed in only for edit-mutable types: an Original is never reopened,
+    /// and changing its hash would look like corruption rather than an edit.
+    generation: u32,
 }
+
+/// What the descriptor should claim about the asset's edited state. The
+/// seed and the `edit` command build descriptors the same way so a
+/// re-delivery differs from the original in exactly one respect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditShape {
+    /// As shot: original + thumbnails.
+    Unedited,
+    /// Adjusted: a `fullSizePhoto` render alongside the original.
+    Edited,
+}
+
+/// The descriptor for one seeded asset. Deterministic in `index`, so any
+/// command can reconstruct exactly what `seed` delivered.
+///
+/// `modified_bump` seconds are added to the modification date: PhotoKit
+/// advances it on every change, and classify's fast path treats an
+/// unchanged date as "nothing happened".
+fn seeded_descriptor(
+    index: u32,
+    scope: ingress_core::descriptor::LibraryScope,
+    shape: EditShape,
+    modified_bump: i64,
+) -> AssetDescriptor {
+    let mut builder = AssetDescriptorBuilder::simple_image()
+        .with_cloud_id(&format!("e2e-cloud-{index}"))
+        .with_local_id(&format!("e2e-{index}"))
+        .with_thumbnails()
+        .scope(scope);
+    if shape == EditShape::Edited {
+        builder = builder.with_ph_resource(PH_FULL_SIZE_PHOTO, "public.heic");
+    }
+    let mut desc = builder.build();
+    // A fixed epoch plus the bump: reproducible across processes, and
+    // strictly increasing per bump so no delivery reads as stale.
+    desc.asset_modified_at = Some(
+        chrono::DateTime::from_timestamp(1_780_000_000 + modified_bump, 0)
+            .expect("valid timestamp"),
+    );
+    desc
+}
+
+/// PhotoKit's `photo` resource — the Original, which an edit never replaces.
+const PH_PHOTO: i32 = 1;
+/// PhotoKit's `fullSizePhoto` — the edited render an adjustment produces.
+const PH_FULL_SIZE_PHOTO: i32 = 5;
 
 fn photo_bytes(index: u32) -> Vec<u8> {
     // ~96 KiB patterned payload, unique per index.
@@ -136,7 +203,10 @@ impl ResourceFetcher for MemoryFetcher {
             .ok_or_else(|| FetchFailure::AssetUnavailable("bad local id".into()))?;
         // Mix the resource type in so original/thumbnail_small/medium hash
         // distinctly (otherwise all three would dedup to one blob).
-        let salt = (request.ph_resource_type as u32).wrapping_mul(0x9E37);
+        let mut salt = (request.ph_resource_type as u32).wrapping_mul(0x9E37);
+        if request.ph_resource_type != PH_PHOTO {
+            salt ^= self.generation.wrapping_mul(0x85EB);
+        }
         sink.write(&photo_bytes(index ^ salt))?;
         Ok(())
     }
@@ -247,12 +317,7 @@ async fn main() {
 
             let mut descriptors = std::collections::HashMap::new();
             for index in start..start + count {
-                let desc = AssetDescriptorBuilder::simple_image()
-                    .with_cloud_id(&format!("e2e-cloud-{index}"))
-                    .with_local_id(&format!("e2e-{index}"))
-                    .with_thumbnails()
-                    .scope(scope)
-                    .build();
+                let desc = seeded_descriptor(index, scope, EditShape::Unedited, 0);
                 match seed_descriptor(&store, &desc).await.expect("seed") {
                     SeedOutcome::MintedPending { .. } => {}
                     other => panic!("expected MintedPending, got {other:?}"),
@@ -263,7 +328,10 @@ async fn main() {
             let scheduler = Scheduler::new(
                 store.clone(),
                 data_dir.clone(),
-                Arc::new(MemoryFetcher { descriptors }),
+                Arc::new(MemoryFetcher {
+                    descriptors,
+                    generation: 0,
+                }),
                 Arc::new(MaxProbe),
                 SchedulerConfig::default(),
                 CancelToken::default(),
@@ -392,6 +460,90 @@ async fn main() {
             };
             let key = if restore { "restored" } else { "tombstoned" };
             println!("{}", serde_json::json!({ key: affected }));
+        }
+
+        Cmd::Edit {
+            revert,
+            metadata_only,
+        } => {
+            // Each mode is one step along the same asset's history, so the
+            // modification date advances with it — classify's fast path
+            // treats an unchanged date as "nothing happened". The byte
+            // generation advances only when a render is actually re-made.
+            //
+            // A metadata refresh keeps whatever shape the asset already has:
+            // re-delivering the edited render would make it a content edit,
+            // which is precisely what this mode exists to exclude.
+            let (bump, generation, key) = match (revert, metadata_only) {
+                (_, true) => (3, 2, "metadata_refreshed"),
+                (true, false) => (2, 2, "reverted"),
+                (false, false) => (1, 1, "edited"),
+            };
+
+            let photos: Vec<PhotoRecord> =
+                sqlx::query_as("SELECT * FROM photos WHERE local_id IS NOT NULL ORDER BY photo_id")
+                    .fetch_all(store.raw_pool())
+                    .await
+                    .expect("list photos");
+            let scope = |photo: &PhotoRecord| match photo.library_id.as_ref().map(|l| l.as_str()) {
+                Some("shared") => ingress_core::descriptor::LibraryScope::Shared,
+                _ => ingress_core::descriptor::LibraryScope::Personal,
+            };
+
+            let mut descriptors = std::collections::HashMap::new();
+            let mut affected = 0u64;
+            for photo in &photos {
+                let local_id = photo.local_id.clone().expect("filtered on local_id");
+                let index: u32 = local_id
+                    .strip_prefix("e2e-")
+                    .and_then(|s| s.parse().ok())
+                    .expect("seeded local id");
+                let shape = if metadata_only {
+                    let live = store
+                        .resources_for_photo(&photo.photo_id)
+                        .await
+                        .expect("resources");
+                    if live
+                        .iter()
+                        .any(|r| r.resource_type == ingress_core::model::ResourceType::Edited)
+                    {
+                        EditShape::Edited
+                    } else {
+                        EditShape::Unedited
+                    }
+                } else if revert {
+                    EditShape::Unedited
+                } else {
+                    EditShape::Edited
+                };
+                let desc = seeded_descriptor(index, scope(photo), shape, bump);
+                descriptors.insert(local_id, desc.clone());
+                ingress_core::classify::apply_change(&store, &data_dir.spool(), &desc)
+                    .await
+                    .expect("apply change");
+                affected += 1;
+            }
+
+            // Drain refetches whatever classify reopened. A metadata-only
+            // delivery reopens nothing, so this is a no-op there.
+            let scheduler = Scheduler::new(
+                store.clone(),
+                data_dir.clone(),
+                Arc::new(MemoryFetcher {
+                    descriptors,
+                    generation,
+                }),
+                Arc::new(MaxProbe),
+                SchedulerConfig::default(),
+                CancelToken::default(),
+            );
+            scheduler.drain().await.expect("drain");
+
+            let out = serde_json::json!({
+                key: affected,
+                "photos": photo_reports(&store).await,
+            });
+            println!("{}", serde_json::to_string_pretty(&out).unwrap());
         }
     }
 }
