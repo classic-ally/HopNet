@@ -662,6 +662,10 @@ async fn run_scope_pass(
                             )
                             .await;
                     }
+                    // `assemble_item` never returns it — a first publish
+                    // always has something to say — but the arm keeps the
+                    // two assemblers' skip vocabulary shared.
+                    AssembleSkip::NothingToDo => {}
                     AssembleSkip::Transient(msg) => {
                         record_failure(store, cfg, &photo, &msg, report).await?;
                     }
@@ -858,6 +862,7 @@ async fn propagate_edits(
                     .await;
                 continue;
             }
+            Err(AssembleSkip::NothingToDo) => continue,
             Err(AssembleSkip::Transient(msg)) => {
                 record_edit_failure(store, cfg, &photo, &msg, report).await?;
                 continue;
@@ -967,6 +972,12 @@ const EVICT_BATCH: i64 = 500;
 
 enum AssembleSkip {
     MissingDescriptor,
+    /// Nothing left to say — not a failure, and must not be recorded as
+    /// one. The edit ledger is never reset (`reset_gave_up` touches only
+    /// the resource FETCH counters), so an attempt burned on a no-op is
+    /// permanent progress toward a cap that silences the photo's real
+    /// edits.
+    NothingToDo,
     Transient(String),
 }
 
@@ -1152,9 +1163,7 @@ async fn assemble_edit_item(
     if resources.is_empty() && removals.is_empty() && !metadata_changed {
         // The divergence the claim saw is gone (a concurrent repair, or a
         // resource still mid-refetch). Nothing to say, nothing to burn.
-        return Ok(Err(AssembleSkip::Transient(
-            "no divergence left to propagate".into(),
-        )));
+        return Ok(Err(AssembleSkip::NothingToDo));
     }
 
     let original_ext = records

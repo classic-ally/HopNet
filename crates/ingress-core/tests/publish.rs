@@ -1950,3 +1950,46 @@ async fn edits_partition_by_scope() {
     assert_eq!(photo(&rig, &shared).await.edit_publish_attempts, 0);
     assert_eq!(resource_marker(&rig, &shared, 0).await, shared_marker);
 }
+
+// Impact: the edit ledger is never reset — `reset_gave_up` touches only the
+// resource FETCH counters — so an attempt burned on a no-op is permanent
+// progress toward a cap that, once reached, excludes the photo from
+// `editable_photos` and silences its real edits for good.
+// Should: leave a converged photo's ledger and the report untouched.
+// Should not: submit anything for a photo with nothing left to say.
+#[tokio::test(flavor = "multi_thread")]
+async fn converged_photo_does_not_burn_an_edit_attempt() {
+    let rig = rig().await;
+    let publisher = FakePublisher::ok();
+    let mut state = PublishState::default();
+    let id = materialize(&rig, "conv", b"conv-bytes").await;
+    pass(&rig, &publisher, &mut state).await;
+
+    // The shape of a claim whose divergence was repaired before the pass
+    // reached it — a concurrent refetch, or a resource back mid-flight.
+    let stale_claim = photo(&rig, &id).await;
+    let report = run_publish_pass(
+        &rig.store,
+        &rig.data_dir.spool(),
+        &publisher,
+        &rig.config.publish,
+        PassWork {
+            editable: vec![stale_claim],
+            ..Default::default()
+        },
+        &mut state,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.edits_propagated, 0);
+    assert_eq!(report.metadata_propagated, 0);
+    assert_eq!(report.failed, 0, "a no-op is not a failed propagation");
+    assert_eq!(report.gave_up, 0);
+    assert!(publisher.edits().is_empty());
+
+    let row = photo(&rig, &id).await;
+    assert_eq!(row.edit_publish_attempts, 0);
+    assert!(row.edit_publish_next_retry_at.is_none());
+    assert!(row.edit_publish_last_error.is_none());
+}
