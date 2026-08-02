@@ -88,7 +88,7 @@ fn report_photos(report: &serde_json::Value) -> Result<Vec<(String, Vec<(String,
 }
 
 /// Poll a node's gallery until every expected photo id appears.
-async fn wait_for_ids(
+pub(crate) async fn wait_for_ids(
     client: &reqwest::Client,
     node: &NodeInfo,
     expected: &[String],
@@ -124,7 +124,7 @@ async fn wait_for_ids(
 
 /// Content fetch with backoff (remote fragment discovery on non-uploader
 /// nodes takes a few seconds on first access).
-async fn fetch_resource_with_retry(
+pub(crate) async fn fetch_resource_with_retry(
     client: &reqwest::Client,
     node: &NodeInfo,
     photo_id: &str,

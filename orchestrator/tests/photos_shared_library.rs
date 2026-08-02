@@ -39,7 +39,7 @@ fn bearer(node: &NodeInfo) -> String {
 
 /// Login with retry: the Argon2id unwrap takes seconds per attempt and the
 /// user row must have applied on this node first.
-async fn login_with_retry(node: &NodeInfo, username: &str, passphrase: &str) -> Result<NodeInfo> {
+pub(crate) async fn login_with_retry(node: &NodeInfo, username: &str, passphrase: &str) -> Result<NodeInfo> {
     let deadline = Instant::now() + Duration::from_secs(45);
     loop {
         match login_user(node, username, passphrase).await {
@@ -51,7 +51,7 @@ async fn login_with_retry(node: &NodeInfo, username: &str, passphrase: &str) -> 
 }
 
 /// GET /users/me — resolve the caller's numeric user_id (invite/kick target).
-async fn get_user_id(client: &Client, node: &NodeInfo) -> Result<i32> {
+pub(crate) async fn get_user_id(client: &Client, node: &NodeInfo) -> Result<i32> {
     let response = client
         .get(format!("{}/api/users/me", base_url(node)))
         .header("Authorization", bearer(node))
@@ -67,7 +67,7 @@ async fn get_user_id(client: &Client, node: &NodeInfo) -> Result<i32> {
 }
 
 /// POST /photos/libraries — create a shared library, returns library_id.
-async fn create_library(client: &Client, node: &NodeInfo, name: &str) -> Result<String> {
+pub(crate) async fn create_library(client: &Client, node: &NodeInfo, name: &str) -> Result<String> {
     let response = client
         .post(format!("{}/api/photos/libraries", base_url(node)))
         .header("Authorization", bearer(node))
@@ -89,7 +89,7 @@ async fn create_library(client: &Client, node: &NodeInfo, name: &str) -> Result<
 }
 
 /// GET /photos/libraries — the caller's memberships and pending invites.
-async fn list_libraries(client: &Client, node: &NodeInfo) -> Result<Vec<serde_json::Value>> {
+pub(crate) async fn list_libraries(client: &Client, node: &NodeInfo) -> Result<Vec<serde_json::Value>> {
     let response = client
         .get(format!("{}/api/photos/libraries", base_url(node)))
         .header("Authorization", bearer(node))
@@ -105,7 +105,7 @@ async fn list_libraries(client: &Client, node: &NodeInfo) -> Result<Vec<serde_js
 
 /// POST /photos/libraries/{id}/{action} with an optional {user_id} body.
 /// Expects 200 (all lifecycle actions respond 200 on success).
-async fn post_member_action(
+pub(crate) async fn post_member_action(
     client: &Client,
     node: &NodeInfo,
     library_id: &str,
@@ -349,7 +349,7 @@ fn find_library<'a>(
 }
 
 /// Poll until the caller's library listing contains `library_id`.
-async fn wait_for_library_entry(
+pub(crate) async fn wait_for_library_entry(
     client: &Client,
     node: &NodeInfo,
     library_id: &str,
@@ -407,7 +407,7 @@ fn check_invite_entry(
 }
 
 /// Record one named check; Some(value) on pass, None on fail.
-fn record<T>(
+pub(crate) fn record<T>(
     result: &mut TestResult,
     name: impl Into<String>,
     outcome: Result<T>,
