@@ -364,6 +364,15 @@ CREATE TABLE photos (
     tombstone_publish_next_retry_at TEXT,
     tombstone_publish_last_error   TEXT,
 
+    -- Mesh convergence of the METADATA (see §Propagation of edits). The
+    -- asset_modified_at value the mesh's ciphertext was composed from; its
+    -- disagreement with the live column is the metadata half of the edit
+    -- queue. The content half lives on photo_resources.
+    published_asset_modified_at TEXT,
+    edit_publish_attempts       INTEGER NOT NULL DEFAULT 0,
+    edit_publish_next_retry_at  TEXT,
+    edit_publish_last_error     TEXT,
+
     FOREIGN KEY (library_id) REFERENCES libraries(library_id)
 );
 
@@ -377,6 +386,10 @@ CREATE INDEX idx_photos_tombstone_pending ON photos(photo_id)
     WHERE published_at IS NOT NULL
       AND ((deleted_at IS NOT NULL AND tombstone_published_at IS NULL)
         OR (deleted_at IS NULL AND tombstone_published_at IS NOT NULL));
+CREATE INDEX idx_photos_metadata_pending ON photos(photo_id)
+    WHERE published_at IS NOT NULL
+      AND deleted_at IS NULL
+      AND published_asset_modified_at IS NOT asset_modified_at;
 ```
 
 Notes:
@@ -388,7 +401,7 @@ Notes:
 - `asset_modified_at` powers the fast path's "unless metadata changed" check: if the incoming descriptor's `PHAsset.modificationDate` equals the stored value, the observer event is a no-op; if newer, the descriptor capsule is refreshed and resource-level changes are re-enumerated.
 - **There is no `deleted_by` column.** The daemon has a single implicit local user and no consensus `user_id` to record — storing a sentinel would be fabricating data. The mesh's `deleted_by` is assigned by `PhotoDeleteHandler` from the authenticated submitting user when propagation runs, so the fact is recorded exactly once, where a real identity exists.
 - `descriptor_json` is the **descriptor capsule**: the PhotoKit-computed metadata (media type/subtypes, favorite, capture metadata) that the publish document needs and that no other column stores. Written at materialization and refreshed on metadata-only changes; NULL means "materialized before the column existed" and self-heals via the reconciliation scan (see §Descriptor capsule and the publish document).
-- `published_at` is the HopNet publish terminal state and the retry ledger's clear signal (see §HopNet publish queue). It is set once and **never reset**, because a re-publish of the same `photo_id` is hard-rejected by consensus (re-edit propagation is a future content-update transaction). It is also the **eviction predicate**: a spool blob whose every referencing photo is decided — `published_at` set, by upload or adoption — is deletable (see §HopNet publish queue).
+- `published_at` is the HopNet publish terminal state and the retry ledger's clear signal (see §HopNet publish queue). It is set once and **never reset**, because a re-publish of the same `photo_id` is hard-rejected by consensus; content changes travel as edits instead (see §Propagation of edits). It is also part of the **eviction predicate**: a spool blob is deletable once every referencing photo is decided — `published_at` set, by upload or adoption — *and* no referencing resource is still owed an edit.
 
 ### `photo_resources`
 
@@ -404,15 +417,29 @@ CREATE TABLE photo_resources (
 
     -- Per-resource pipeline state (ingress-only)
     written_at       TEXT,                 -- ISO 8601; NULL = not yet durably on the storage root
-    retry_count      INTEGER NOT NULL DEFAULT 0,
+    retry_count      INTEGER NOT NULL DEFAULT 0,  -- the FETCH path's ledger, never the publish path's
     next_retry_at    TEXT,                 -- backoff deadline; NULL = not awaiting retry
     last_error       TEXT,
+
+    -- Mesh convergence of the BYTES (see §Propagation of edits). The
+    -- content_hash the mesh holds; disagreement with the live hash is the
+    -- content half of the edit queue. NULL on a published photo means the
+    -- row was minted after publish (a first edit) and never told.
+    published_content_hash TEXT,
+    -- Soft delete for a revert: the row outlives the local resource until
+    -- the removal reaches the mesh. A hard delete would take the marker
+    -- with it, and divergence-as-absence is invisible to every predicate.
+    removed_at             TEXT,
 
     PRIMARY KEY (photo_id, resource_type),
     FOREIGN KEY (photo_id) REFERENCES photos(photo_id)
 );
 
 CREATE INDEX idx_photo_resources_hash ON photo_resources(content_hash) WHERE content_hash IS NOT NULL;
+CREATE INDEX idx_photo_resources_edit_pending ON photo_resources(photo_id)
+    WHERE (removed_at IS NOT NULL AND published_content_hash IS NOT NULL)
+       OR (removed_at IS NULL AND written_at IS NOT NULL
+           AND published_content_hash IS NOT content_hash);
 ```
 
 Notes:
@@ -439,10 +466,10 @@ Notes:
 - **Resource lifecycle mirrors PhotoKit's current state; no version history.**
   - *First edit* (asset gains an edited rendition): a new row with `resource_type = 1` appears alongside the untouched `original` row (for Live Photos, an `edited_paired_video = 7` row appears as well). This is additional current resources, not history.
   - *Re-edit* (asset's edited rendition is replaced): the `edited` row is updated in place with the new `content_hash`. In the same transaction — the **write-commit transaction of the replacement bytes**, not the classification event (the new bytes must be fetched first; between classification and commit the row sits in the superseded-pending state, see §Per-resource state machine) — the superseded blob's refcount is decremented (unlinking the file at 0 only if the hash is no longer live in any library's ledger) and the new blob's refcount is incremented. Detection is a `fileSize` compare (descriptor vs stored `size_bytes`) on written edit-mutable rows; equal or absent sizes are assumed unchanged, and a false positive (changed size, identical bytes) nets to a refcount no-op. Superseded edit renditions are not retained — the daemon archives the current iCloud state; version history is RFC-011's operation log's job post-migration.
-  - *Revert to original* (user discards edits): the `edited` row (and `adjustment_data` row, if PhotoKit drops it) is deleted, with the same refcount decrement semantics.
+  - *Revert to original* (user discards edits): the `edited` row (and `adjustment_data` row, if PhotoKit drops it) is deleted, with the same refcount decrement semantics — **unless the mesh holds that resource**, in which case the row is retired to a removal marker (`removed_at` set, content columns cleared) and hard-deleted once the removal propagates (see §Propagation of edits). The blob decrement is unconditional either way.
   - The `original` row is never overwritten in any of these flows.
   - *Thumbnail regeneration*: written thumbnail rows (5, 6) reopen whenever the photo's edit-mutable set changes — first edit, re-edit, or revert — because the renditions render the *current* primary display. They are deliberately excluded from the `fileSize` re-edit compare (their descriptor size is a constant admission estimate; comparing it against real stored bytes would reopen them on every delivery). Metadata-only refreshes never touch them.
-  - *Backfill*: photos ingested before the daemon generated renditions never re-deliver descriptors (the reconciliation scan probes unchanged photos `Done`), so a schema migration mints pending 5/6 rows for materialized, library-bound, PhotoKit-addressable photos and clears their `materialized_at`. Tombstoned photos are skipped (the restore delivery heals them); unmapped-scope photos heal at adoption. Already-**published** photos re-materialize with thumbnails but do not re-publish — `published_at` is terminal until content-update propagation lands (future phase).
+  - *Backfill*: photos ingested before the daemon generated renditions never re-deliver descriptors (the reconciliation scan probes unchanged photos `Done`), so a schema migration mints pending 5/6 rows for materialized, library-bound, PhotoKit-addressable photos and clears their `materialized_at`. Tombstoned photos are skipped (the restore delivery heals them); unmapped-scope photos heal at adoption. Already-**published** photos re-materialize with thumbnails and do not re-publish — `published_at` is terminal — but their new rows now carry a NULL `published_content_hash`, which is exactly the first-edit case: the edit queue picks them up and tells the mesh (see §Propagation of edits).
   - *Thumbnail failure blocks materialization* (and therefore publish) at the retry cap, the same policy as any resource; the next scan's gave-up reset re-arms them.
 - **`adjustment_data` (type 3) is captured.** `PHAdjustmentData` is the reversible-edit recipe and cannot be re-derived once the Photos library is gone; RFC-011 expects it for edit reconstruction. The payload is a small non-image blob; it flows through the same content-addressed write path with an extension derived from its UTI.
 - A resource row is created for every resource enumerated on the asset at discovery time, before any bytes are fetched — mirroring the `photos` row's mint-before-materialize rule, so inflight per-resource progress is queryable.
@@ -667,7 +694,7 @@ The daemon-loop tick (`ingress-core/src/publish.rs`; concrete publisher in `crat
 - **Eviction rides the pass.** After each publish pass — and again on the hourly cleanup tick, which catches strays — blobs whose every referencing photo in the library is decided (`NOT EXISTS … published_at IS NULL`) are stamped `evicted_at` and their spool files deleted under the spool-wide hash-liveness gate. Stamp first, then unlink: a crash between the two leaves a lingering file that fsck classifies as a benign orphan, never byte loss. `spool_evicted` is logged when a pass reclaims anything. This is the point of the spool — residence is bounded by publish latency, not library size.
 - **Driver exit codes** (`ingress-publish-e2e publish`): 0 drained, 2 unreachable-park, 3 = SOME scope responsibility-parked — since the pass is scope-partitioned, healthy scopes were still drained first (read `published`/`parked_responsibility` in the JSON, not just the code).
 - **Kick mid-stream**: a member removed from the mesh library loses the scope on both ends — the remove handler dissolves their responsibility row, and their daemon's next scoped resolve 403s (`library_not_member`), burning attempts toward `gave_up` for that scope only. No ingress-side reaction beyond the backoff this cycle; clearing the local mesh binding stops the attempts.
-- **Out of scope (this phase)**: re-edit propagation (a re-materialized published photo is NOT re-enqueued; content updates need their own transaction type) and favorites (Phase 4). Tombstone and restore propagation ride this same pass — see §Propagation to the mesh. Shared-library publish landed with the scope-partitioned pass above — the historical "shared libraries (Phase 3)" exclusion is closed.
+- **Out of scope (this phase)**: favorites (Phase 4). Everything else that once sat here now rides this same pass: tombstones and restores (§Propagation to the mesh), edits and metadata refreshes (§Propagation of edits), and shared-library publish via the scope partition above. A re-materialized published photo is still never re-enqueued *here* — `published_at` is terminal — but it is no longer stranded: its content divergence is the edit queue's.
 
 ## Deletion and Retention
 
@@ -753,15 +780,63 @@ That repair path is **not built**. Today a rebuilt `state.db` re-derives `publis
 
 The intended shape mirrors publication exactly: `published_at` is the fast local marker, and adoption-by-fingerprint is the repair when it is missing. One idea applied twice rather than two idioms side by side.
 
-#### Relationship to re-edit propagation
+### Propagation of edits
 
-Re-edit propagation is the same *pattern* at a different granularity, and should reuse the vocabulary rather than invent a parallel one. Both are convergence between local desired state and remote known state, with a marker recording last-converged and the delta forming the queue. Three things differ, and they are what make it separate work rather than a second instance:
+**Status: implemented** (`crates/ingress-core/src/publish.rs`, migration `1786464000_edit_propagation`). Everything above concerns a photo's *existence*; this concerns its *content*. `published_at` is set-once, so without this an edit in Apple Photos leaves the mesh serving the pre-edit render forever.
 
-- **Granularity.** A tombstone is a property of the photo. An edit is a property of its resources — `photo_edit_content` carries `resources: Vec<PhotoResourceOp>`, so the marker belongs on `photo_resources`, not `photos`.
-- **Cardinality.** Deletion is a bit, so a timestamp suffices to say "told." An edit is a *value*: the marker must record *which* version the mesh holds, comparing against the resource's current `content_hash`. A bare timestamp cannot express that.
-- **Payload.** `photo_delete` carries only photo ids, so propagation is transaction-only. `photo_edit_content` carries data blocks that must be uploaded first, which means re-edit propagation drives the entire fetch/encrypt/upload pipeline, not just a submission. This is the bulk of the difference in cost.
+The daemon already detected every kind of change before any of this existed — `classify` reopens edit-mutable rows on a `fileSize` mismatch, reopens the thumbnails on any edit-set change (first edit, re-edit, revert), and stamps `asset_modified_at` on a metadata refresh (see §Change classification). What was missing was the record of what the mesh had been told, and a pass to tell it.
 
-The bookkeeping generalizes; the work does not.
+#### The markers are value-keyed
+
+Same vocabulary as tombstone propagation — a `published_*` column records what the mesh holds, and its disagreement with the live value IS the queue — but keyed on a value rather than on existence. Deletion is a bit, so a timestamp suffices to say "told." An edit is a *version*, and only the version can say whether the mesh is current.
+
+| Column | Live counterpart | Divergence means |
+|---|---|---|
+| `photo_resources.published_content_hash` | `content_hash` | these bytes have not reached the mesh |
+| `photos.published_asset_modified_at` | `asset_modified_at` | the mesh's metadata ciphertext is stale |
+
+Three shapes of content divergence share one predicate: a written resource whose hash no longer matches its marker (a re-edit), a resource minted after publish and never told (a first edit), and a resource removed locally that the mesh still serves (a revert).
+
+The metadata marker is exactly as precise as the detector driving it. `classify` only rewrites the descriptor capsule when the modification date advances, so a marker keyed on that date cannot miss a refresh it would otherwise have seen — and cannot fire on one that never happened.
+
+The whole queue is gated on `materialized_at IS NOT NULL`. A reopened resource clears it, so a photo mid-refetch cannot submit half an edit and stamp it converged. `deleted_at IS NULL` gates it too: both edit handlers reject a photo the mesh believes is tombstoned outright, and those photos belong to the tombstone queue instead.
+
+#### The ledger is per photo
+
+One transaction carries every diverged resource of a photo, so the failure is the photo's, and the retry ledger lives on `photos` (`edit_publish_attempts` and its two companions). It is separate from the publish trio for the reason the tombstone ledger is, and separate from `photo_resources.retry_count` for a sharper one: that column belongs to the **fetch** path. Blending "PhotoKit would not hand over the bytes" with "the node rejected the transaction" would leave a `last_error` describing the wrong half of the pipeline.
+
+#### A revert is a removal, not an edit back
+
+Apple Photos removes the edited render on Revert to Original rather than replacing it, and no upsert can express an absence — hence `remove_resources` on the envelope. Overwriting the edited slot with the original's bytes was the obvious alternative and is impossible besides: a published photo's blobs are evicted from the spool (§Storage-aware admission), so those bytes are not on local disk when the revert arrives.
+
+Locally, a hard delete of the resource row would take `published_content_hash` with it, and divergence-as-absence is invisible to every predicate above. So a resource the mesh holds is **retired to a marker row** — `removed_at` set, content columns cleared alongside the blob decrement so `fsck`'s refcount recount and the eviction guard both ignore it — and hard-deleted once the removal propagates. A resource the mesh never saw is still deleted outright.
+
+Mesh-side the blob is deliberately not decremented: `photo_operations` still references it for the 30-day undo window, and the orphan sweep collects it after.
+
+#### Two states that must never be confused
+
+`NULL` marker on a published photo means "the mesh has never seen these bytes." That is correct for a resource minted after publish, and catastrophic for one that was published normally — so both paths that set `published_at` stamp the baseline in the same transaction:
+
+- **`mark_published`**, or every pass would re-upload the entire archive.
+- **`mark_adopted`**, which uploads nothing because the bytes came from another device. Without the stamp this daemon would immediately "correct" the mesh by re-uploading a resource set it was never asked for.
+
+The migration backfills the same baseline for photos an older daemon published. Those blobs were evicted at publish time, so the queue would not merely be spurious — every entry would fail, burn its attempts, and land in `gave_up`.
+
+#### Eviction must not outrun propagation
+
+`evictable_blobs` spares a published photo's blob while its marker disagrees with the live hash. Eviction rides the end of every publish pass, so a refetched edit whose propagation parked — node unreachable, responsibility lost — would otherwise have its new bytes deleted before the next pass could send them, and PhotoKit will not re-deliver an unchanged asset. This is the same trade the hard-delete guard makes for tombstones: bounded local growth in exchange for guaranteed convergence, with `edits_unpropagated` in the per-library `status` view as the visible symptom.
+
+#### Ordering within a scope
+
+The scope now runs **publish → restore → edit → delete**. Publishing stays first for the reason it always was. Restores move ahead of edits and deletes behind them because both edit handlers reject a tombstoned photo; without the split, a restore-and-edit in one pass would burn an attempt on a `ConflictError` and only converge on the next one.
+
+`assemble_edit_item` shares `assemble_item`'s capsule → `Sidecar::compose` path so metadata composition cannot drift between publish and edit, but requires blobs on disk only for the **diverged** resources — a published photo's other blobs are legitimately gone.
+
+#### Metadata rides the content transaction
+
+A photo with diverged resources sends `photo_edit_content` with its metadata inline; a bare metadata refresh sends `photo_edit_metadata`. Never both for one photo: a crop changes the pixels and the dimensions that describe them, and splitting those across two transactions would open a window where the mesh serves one with the other's metadata.
+
+Both envelopes were amended to carry `metadata_access`. They previously carried a ciphertext with no way to ship the wraps of the key it was under, which assumed a writer who could recover the existing key by unwrapping its own `photo_metadata_access` row — true of a member client, false of the ingress daemon, which authenticates with a device token and holds no private key at all. Replacing the ciphertext under a fresh key without new wraps makes a photo's metadata undecryptable for every member, permanently, with no error at write time. The daemon therefore always mints a fresh metadata key and re-wraps to the current member set, exactly as `photo_add` does.
 
 ### Hard-delete cleanup
 
